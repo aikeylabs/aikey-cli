@@ -1,0 +1,445 @@
+use assert_cmd::Command;
+use predicates::prelude::*;
+use std::fs;
+use std::path::PathBuf;
+use tempfile::TempDir;
+
+/// Helper struct to manage test environment
+struct TestEnv {
+    _temp_dir: TempDir,
+    vault_path: PathBuf,
+    test_password: String,
+}
+
+impl TestEnv {
+    fn new() -> Self {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let vault_path = temp_dir.path().join(".aikey");
+
+        Self {
+            _temp_dir: temp_dir,
+            vault_path,
+            test_password: "test_master_password_123".to_string(),
+        }
+    }
+
+    /// Get a Command with HOME set to temp directory
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::cargo_bin("ak").expect("Failed to find ak binary");
+        cmd.env("HOME", self._temp_dir.path());
+        cmd.env("AK_TEST_PASSWORD", &self.test_password);
+        cmd
+    }
+
+    /// Initialize vault with test password (non-interactive)
+    fn init_vault(&self) {
+        // Create vault directory
+        fs::create_dir_all(&self.vault_path).expect("Failed to create vault directory");
+
+        // Use the library directly to initialize without interactive prompts
+        use rand::RngCore;
+        let mut salt = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+
+        // Create database file
+        let db_path = self.vault_path.join("vault.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("Failed to create database");
+
+        // Set strict permissions
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.vault_path, fs::Permissions::from_mode(0o700))
+                .expect("Failed to set vault directory permissions");
+            fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600))
+                .expect("Failed to set database permissions");
+        }
+
+        // Initialize schema
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS config (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            )",
+            [],
+        ).expect("Failed to create config table");
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS entries (
+                alias TEXT PRIMARY KEY,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        ).expect("Failed to create entries table");
+
+        // Store salt
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('salt', ?1)",
+            [&salt[..]],
+        ).expect("Failed to store salt");
+    }
+
+    /// Add a secret using environment variables
+    fn add_secret(&self, alias: &str, secret_value: &str) -> assert_cmd::assert::Assert {
+        self.cmd()
+            .arg("add")
+            .arg(alias)
+            .env("AK_TEST_SECRET", secret_value)
+            .assert()
+    }
+
+    /// Get vault database path
+    fn db_path(&self) -> PathBuf {
+        self.vault_path.join("vault.db")
+    }
+}
+
+#[test]
+fn test_01_initialization() {
+    let env = TestEnv::new();
+
+    // Initialize vault programmatically
+    env.init_vault();
+
+    // Verify vault directory exists
+    assert!(env.vault_path.exists(), "Vault directory should exist");
+    assert!(env.db_path().exists(), "Database file should exist");
+
+    // Verify permissions on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let vault_perms = fs::metadata(&env.vault_path)
+            .expect("Failed to get vault metadata")
+            .permissions()
+            .mode();
+        assert_eq!(vault_perms & 0o777, 0o700, "Vault directory should have 0700 permissions");
+
+        let db_perms = fs::metadata(&env.db_path())
+            .expect("Failed to get database metadata")
+            .permissions()
+            .mode();
+        assert_eq!(db_perms & 0o777, 0o600, "Database file should have 0600 permissions");
+    }
+
+    // Verify database schema
+    let conn = rusqlite::Connection::open(env.db_path()).expect("Failed to open database");
+
+    // Check config table exists
+    let config_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='config'",
+            [],
+            |row| row.get(0),
+        )
+        .map(|count: i32| count > 0)
+        .expect("Failed to check config table");
+    assert!(config_exists, "Config table should exist");
+
+    // Check entries table exists
+    let entries_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries'",
+            [],
+            |row| row.get(0),
+        )
+        .map(|count: i32| count > 0)
+        .expect("Failed to check entries table");
+    assert!(entries_exists, "Entries table should exist");
+
+    // Check salt exists
+    let salt_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM config WHERE key='salt'",
+            [],
+            |row| row.get(0),
+        )
+        .map(|count: i32| count > 0)
+        .expect("Failed to check salt");
+    assert!(salt_exists, "Salt should be stored in config");
+}
+
+#[test]
+fn test_02_crud_operations() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    // Test: Add a secret
+    env.add_secret("TEST_API_KEY", "sk-test-1234567890abcdef")
+        .success()
+        .stderr(predicate::str::contains("Secret 'TEST_API_KEY' added successfully"));
+
+    // Test: List secrets
+    env.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("TEST_API_KEY"));
+
+    // Test: Add another secret
+    env.add_secret("DATABASE_URL", "postgresql://user:pass@localhost/db")
+        .success()
+        .stderr(predicate::str::contains("Secret 'DATABASE_URL' added successfully"));
+
+    // Test: List should show both secrets
+    let list_output = env.cmd()
+        .arg("list")
+        .assert()
+        .success();
+
+    list_output
+        .stderr(predicate::str::contains("TEST_API_KEY"))
+        .stderr(predicate::str::contains("DATABASE_URL"));
+
+    // Test: Delete a secret
+    env.cmd()
+        .arg("delete")
+        .arg("TEST_API_KEY")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Secret 'TEST_API_KEY' deleted successfully"));
+
+    // Test: List should only show remaining secret
+    env.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("DATABASE_URL"))
+        .stderr(predicate::str::contains("TEST_API_KEY").not());
+
+    // Test: Delete non-existent secret should fail
+    env.cmd()
+        .arg("delete")
+        .arg("NONEXISTENT")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Error"));
+}
+
+#[test]
+fn test_03_injection_engine() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    // Add test secrets
+    env.add_secret("TEST_VAR", "secret_value_123").success();
+    env.add_secret("ANOTHER_VAR", "another_secret_456").success();
+
+    // Test: Run command with environment variable injection
+    // Use 'env' command to print environment variables
+    let output = env.cmd()
+        .arg("run")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg("echo TEST_VAR=$TEST_VAR ANOTHER_VAR=$ANOTHER_VAR")
+        .assert()
+        .success();
+
+    // Verify environment variables were injected
+    output
+        .stdout(predicate::str::contains("TEST_VAR=secret_value_123"))
+        .stdout(predicate::str::contains("ANOTHER_VAR=another_secret_456"));
+
+    // Test: Verify injection count message
+    env.cmd()
+        .arg("run")
+        .arg("--")
+        .arg("echo")
+        .arg("test")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Injecting 2 secret(s)"));
+}
+
+#[test]
+fn test_04_security_auth_failure() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    // Add a secret with correct password
+    env.add_secret("TEST_SECRET", "test_value").success();
+
+    // Test: Try to add with wrong password (override the env var)
+    let mut cmd = Command::cargo_bin("ak").expect("Failed to find ak binary");
+    cmd.env("HOME", env._temp_dir.path())
+        .env("AK_TEST_PASSWORD", "wrong_password")
+        .env("AK_TEST_SECRET", "some_value")
+        .arg("add")
+        .arg("ANOTHER_SECRET")
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("Error"))
+        .stderr(predicate::str::contains("Invalid master password").or(predicate::str::contains("corrupted vault")));
+
+    // Test: Try to get with wrong password
+    let mut cmd = Command::cargo_bin("ak").expect("Failed to find ak binary");
+    cmd.env("HOME", env._temp_dir.path())
+        .env("AK_TEST_PASSWORD", "wrong_password")
+        .arg("get")
+        .arg("TEST_SECRET")
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("Error"))
+        .stderr(predicate::str::contains("Invalid master password").or(predicate::str::contains("corrupted vault")));
+
+    // Test: Try to run with wrong password
+    let mut cmd = Command::cargo_bin("ak").expect("Failed to find ak binary");
+    cmd.env("HOME", env._temp_dir.path())
+        .env("AK_TEST_PASSWORD", "wrong_password")
+        .arg("run")
+        .arg("--")
+        .arg("echo")
+        .arg("test")
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("Error"))
+        .stderr(predicate::str::contains("Invalid master password").or(predicate::str::contains("corrupted vault")));
+
+    // Test: Verify correct password still works
+    env.add_secret("VALID_SECRET", "valid_value").success();
+}
+
+#[test]
+fn test_05_persistence() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    // Add secrets
+    env.add_secret("PERSISTENT_KEY_1", "value_one").success();
+    env.add_secret("PERSISTENT_KEY_2", "value_two").success();
+    env.add_secret("PERSISTENT_KEY_3", "value_three").success();
+
+    // Verify secrets are in database
+    let conn = rusqlite::Connection::open(env.db_path()).expect("Failed to open database");
+    let count: i32 = conn
+        .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+        .expect("Failed to count secrets");
+    assert_eq!(count, 3, "Should have 3 secrets in database");
+
+    // Simulate process exit by dropping the command
+    drop(env.cmd());
+
+    // Create new command instance (simulates new process)
+    let list_output = env.cmd()
+        .arg("list")
+        .assert()
+        .success();
+
+    // Verify all secrets still exist
+    list_output
+        .stderr(predicate::str::contains("PERSISTENT_KEY_1"))
+        .stderr(predicate::str::contains("PERSISTENT_KEY_2"))
+        .stderr(predicate::str::contains("PERSISTENT_KEY_3"));
+
+    // Delete one secret
+    env.cmd()
+        .arg("delete")
+        .arg("PERSISTENT_KEY_2")
+        .assert()
+        .success();
+
+    // Verify deletion persisted
+    let count_after: i32 = conn
+        .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))
+        .expect("Failed to count secrets after deletion");
+    assert_eq!(count_after, 2, "Should have 2 secrets after deletion");
+
+    // Verify correct secrets remain
+    env.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PERSISTENT_KEY_1"))
+        .stderr(predicate::str::contains("PERSISTENT_KEY_2").not())
+        .stderr(predicate::str::contains("PERSISTENT_KEY_3"));
+}
+
+#[test]
+fn test_06_empty_vault_operations() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    // Test: List empty vault
+    env.cmd()
+        .arg("list")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("No secrets stored yet"));
+
+    // Test: Run with empty vault
+    env.cmd()
+        .arg("run")
+        .arg("--")
+        .arg("echo")
+        .arg("test")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("No secrets in vault"));
+
+    // Test: Get non-existent secret
+    env.cmd()
+        .arg("get")
+        .arg("NONEXISTENT")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Error"));
+}
+
+#[test]
+fn test_07_special_characters_in_secrets() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    // Test secrets with special characters
+    let special_secret = "p@ssw0rd!#$%^&*(){}[]|\\:;\"'<>,.?/~`";
+    env.add_secret("SPECIAL_CHARS", special_secret).success();
+
+    // Verify it can be retrieved via run command
+    let output = env.cmd()
+        .arg("run")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg("printf '%s' \"$SPECIAL_CHARS\"")
+        .write_stdin(format!("{}\n", env.test_password))
+        .assert()
+        .success();
+
+    output.stdout(predicate::str::contains(special_secret));
+}
+
+#[test]
+fn test_08_run_command_exit_codes() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    env.add_secret("TEST_VAR", "test_value").success();
+
+    // Test: Successful command should exit with 0
+    env.cmd()
+        .arg("run")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg("exit 0")
+        .assert()
+        .success()
+        .code(0);
+
+    // Test: Failed command should preserve exit code
+    env.cmd()
+        .arg("run")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg("exit 42")
+        .assert()
+        .failure()
+        .code(42);
+}
