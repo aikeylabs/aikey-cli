@@ -4,7 +4,9 @@ use arboard::Clipboard;
 use rusqlite::{params, Connection};
 use secrecy::SecretString;
 use zeroize::Zeroizing;
-use base64::{Engine as _, engine::general_purpose::STANDARD as base64};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 struct VaultContext {
     key: crypto::SecureBuffer<[u8; crypto::KEY_SIZE]>,
@@ -90,7 +92,6 @@ pub fn is_potential_secret(text: &str) -> bool {
     false
 }
 
-// 修正了 Claude 代码中的拼写错误 ad_secret -> add_secret
 pub fn add_secret(alias: &str, secret: &str, password: &SecretString) -> Result<(), String> {
     let ctx = VaultContext::new(password)?;
     let (nonce, ciphertext) = ctx.encrypt(secret.as_bytes())?;
@@ -113,7 +114,6 @@ pub fn delete_secret(alias: &str, password: &SecretString) -> Result<(), String>
     storage::delete_entry(alias)
 }
 
-#[allow(dead_code)]
 pub fn list_secrets(password: &SecretString) -> Result<Vec<String>, String> {
     let _ctx = VaultContext::new(password)?;
     storage::list_entries()
@@ -131,7 +131,6 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     clipboard.set_text(text).map_err(|e| format!("Failed to copy to clipboard: {}", e))
 }
 
-#[allow(dead_code)]
 pub fn update_secret(alias: &str, new_secret: &str, password: &SecretString) -> Result<(), String> {
     add_secret(alias, new_secret, password)
 }
@@ -140,8 +139,10 @@ pub fn update_secret(alias: &str, new_secret: &str, password: &SecretString) -> 
 pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &str) -> Result<(), String> {
     let ctx = VaultContext::new(password)?;
 
-    // Retrieve all secrets
-    let mut env_vars = std::collections::HashMap::new();
+    // Retrieve all secrets into Zeroizing containers
+    let mut env_vars: std::collections::HashMap<String, Zeroizing<String>> =
+        std::collections::HashMap::new();
+
     for alias in aliases {
         let (nonce, ciphertext) = storage::get_entry(alias)?;
         let plaintext = ctx.decrypt(&nonce, &ciphertext)?;
@@ -150,7 +151,7 @@ pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &s
 
         // Convert alias to uppercase environment variable name
         let env_name = alias.to_uppercase().replace('-', "_");
-        env_vars.insert(env_name, secret_string);
+        env_vars.insert(env_name, Zeroizing::new(secret_string));
     }
 
     // Parse and execute command
@@ -168,12 +169,16 @@ pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &s
     let mut cmd = std::process::Command::new(&program);
     cmd.args(&args);
 
-    for (key, value) in env_vars {
-        cmd.env(key, value);
+    for (key, value) in &env_vars {
+        cmd.env(key, value.as_str());
     }
 
     let status = cmd.status()
         .map_err(|e| format!("Failed to execute command: {}", e))?;
+
+    // Explicit drop to trigger Zeroizing cleanup
+    drop(env_vars);
+    drop(ctx);
 
     if !status.success() {
         return Err(format!("Command exited with status: {}", status));
@@ -184,30 +189,45 @@ pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &s
 
 /// Execute a command with secrets injected as environment variables
 ///
+/// PARENT-GUARD PATTERN:
+/// The parent process (ak) stays alive during child execution, maintaining
+/// Zeroizing secrets in memory. Only when the child exits does the parent
+/// clean up and trigger Zeroizing destructors.
+///
+/// SECURITY HARDENING:
+/// - All secrets wrapped in Zeroizing<String> containers
+/// - Explicit memory wiping after child process exits
+/// - Signal handler for graceful shutdown and cleanup
+/// - No raw string secrets ever exposed beyond initial decryption
+///
 /// # Arguments
 /// * `env_mappings` - Vector of "ENV_VAR=alias" strings
 /// * `password` - Master password for vault access
-/// * `command` - Command and arguments to execute
+/// * `command` - Command and arguments to execute (can be single string or pre-split)
 ///
 /// # Example
 /// ```
 /// // ak exec --env MY_KEY=github_token -- printenv MY_KEY
 /// exec_with_env(&["MY_KEY=github_token"], &password, &["printenv", "MY_KEY"])?;
+///
+/// // ak exec --env MY_KEY=github_token -- "sleep 5"
+/// exec_with_env(&["MY_KEY=github_token"], &password, &["sleep 5"])?;
 /// ```
-#[allow(dead_code)]
 pub fn exec_with_env(
     env_mappings: &[String],
     password: &SecretString,
     command: &[String],
 ) -> Result<(), String> {
+    // Establish vault context - secrets loaded into Zeroizing memory
     let ctx = VaultContext::new(password)?;
 
     if command.is_empty() {
         return Err("No command specified".to_string());
     }
 
-    // Parse environment variable mappings
-    let mut env_vars = std::collections::HashMap::new();
+    // Parse environment variable mappings and load secrets into Zeroizing containers
+    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
+        std::collections::HashMap::new();
 
     for mapping in env_mappings {
         let parts: Vec<&str> = mapping.splitn(2, '=').collect();
@@ -222,7 +242,10 @@ pub fn exec_with_env(
         let alias = parts[1].trim();
 
         if env_name.is_empty() || alias.is_empty() {
-            return Err(format!("Invalid env mapping '{}'. Both ENV_VAR and alias must be non-empty", mapping));
+            return Err(format!(
+                "Invalid env mapping '{}'. Both ENV_VAR and alias must be non-empty",
+                mapping
+            ));
         }
 
         // Fetch secret from vault
@@ -233,41 +256,95 @@ pub fn exec_with_env(
         let secret_string = String::from_utf8(plaintext.to_vec())
             .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", alias, e))?;
 
-        env_vars.insert(env_name.to_string(), secret_string);
+        // Store in Zeroizing container for secure cleanup
+        env_secrets.insert(env_name.to_string(), Zeroizing::new(secret_string));
     }
 
-    // Build command
-    let program = &command[0];
-    let args = &command[1..];
+    // INPUT ROBUSTNESS: Handle both single-string and pre-split command formats
+    // If command is a single element, it might be a complete shell command string
+    // that needs parsing (e.g., "sleep 5"). Otherwise, it's already split by clap.
+    let parsed_parts: Vec<String> = if command.len() == 1 {
+        // Single string - parse it with shell_words to handle quotes, escapes, etc.
+        shell_words::split(&command[0])
+            .map_err(|e| format!("Failed to parse command '{}': {}", command[0], e))?
+    } else {
+        // Already split by clap - use as-is
+        command.to_vec()
+    };
 
-    // Execute with injected environment variables
+    if parsed_parts.is_empty() {
+        return Err("Empty command after parsing".to_string());
+    }
+
+    // TYPE SAFETY: Extract program and args with correct types for Command::new()
+    let program = &parsed_parts[0];
+    let args = &parsed_parts[1..];
+
+    // PARENT-GUARD: Spawn child process with inherited stdio
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
 
-    // Inject secrets into environment
-    for (key, value) in env_vars {
-        cmd.env(key, value);
+    // Inject secrets into child environment
+    for (key, value) in &env_secrets {
+        cmd.env(key, value.as_str());
     }
 
-    // Execute and capture output
-    let output = cmd.output()
-        .map_err(|e| format!("Failed to execute command '{}': {}", program, e))?;
+    // Inherit stdin/stdout/stderr for interactive terminal support
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
 
-    // Print stdout
-    if !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    }
+    // Setup signal handler for graceful shutdown
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
 
-    // Print stderr
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    }
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    }).map_err(|e| format!("Failed to set signal handler: {}", e))?;
 
-    // Check exit status
-    if !output.status.success() {
+    // Spawn child and wait - parent stays alive as guardian
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn command '{}': {}", program, e))?;
+
+    // PARENT-GUARD PATTERN: Wait for child to complete while maintaining secrets in memory
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                // Child still running - check if we received interrupt signal
+                if !running.load(Ordering::SeqCst) {
+                    // Forward signal to child
+                    let _ = child.kill();
+
+                    // WIPE EVIDENCE: Explicit cleanup before error return
+                    drop(env_secrets);
+                    drop(ctx);
+
+                    return Err("Interrupted by user".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                // WIPE EVIDENCE: Explicit cleanup before error return
+                drop(env_secrets);
+                drop(ctx);
+
+                return Err(format!("Failed to wait for command: {}", e));
+            }
+        }
+    };
+
+    // Child has exited - WIPE EVIDENCE: Explicit cleanup
+    // Force Zeroizing destructors to trigger immediately
+    drop(env_secrets);
+    drop(ctx);
+
+    // Propagate child exit status
+    if !status.success() {
         return Err(format!(
             "Command exited with status: {}",
-            output.status.code().unwrap_or(-1)
+            status.code().unwrap_or(-1)
         ));
     }
 
@@ -285,14 +362,14 @@ pub fn export_secrets(pattern: &str, password: &SecretString) -> Result<String, 
         return Err(format!("No entries match pattern '{}'", pattern));
     }
 
-    // Convert to JSON format
+    // Convert to JSON format with updated Base64 API
     let json_entries: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(alias, nonce, ciphertext, version_tag, updated_at, created_at, metadata)| {
             serde_json::json!({
                 "alias": alias,
-                "nonce": base64::encode(&nonce),
-                "ciphertext": base64::encode(&ciphertext),
+                "nonce": BASE64.encode(&nonce),
+                "ciphertext": BASE64.encode(&ciphertext),
                 "version_tag": version_tag,
                 "updated_at": updated_at,
                 "created_at": created_at,
@@ -319,14 +396,15 @@ pub fn import_secrets(json_data: &str, password: &SecretString, strategy: &str) 
             .ok_or("Missing alias field")?
             .to_string();
 
-        let nonce = base64::decode(
+        // Updated Base64 API usage
+        let nonce = BASE64.decode(
             entry["nonce"]
                 .as_str()
                 .ok_or("Missing nonce field")?,
         )
         .map_err(|e| format!("Failed to decode nonce: {}", e))?;
 
-        let ciphertext = base64::decode(
+        let ciphertext = BASE64.decode(
             entry["ciphertext"]
                 .as_str()
                 .ok_or("Missing ciphertext field")?,

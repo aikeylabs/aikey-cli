@@ -29,7 +29,7 @@ argon2 = "0.5"      # Password hashing with Argon2id
 aes-gcm = "0.10"    # AES-GCM authenticated encryption
 rand = "0.8"        # Cryptographically secure random number generation
 secrecy = "0.8"     # Memory-safe secret handling, prevents leakage in logs
-zeroize = "1.8"     # Explicit memory zeroing for sensitive data
+zeroize = { version = "1.8", features = ["derive", "serde"] }     # Explicit memory zeroing for sensitive data
 inquire = "0.7"     # Interactive password prompts with secure input
 arboard = "3.4"     # Clipboard access for Magic Add feature
 rpassword = "7.3"   # Secure password input without echo
@@ -40,6 +40,7 @@ serde = { version = "1.0", features = ["derive"] }  # Serialization framework
 serde_json = "1.0"  # JSON serialization for export/import
 base64 = "0.21"     # Base64 encoding for JSON export
 shell-words = "1.1" # Shell command parsing for run command
+ctrlc = "3.4"       # Signal handling for graceful shutdown
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"        # System calls for mlock (memory pinning)
