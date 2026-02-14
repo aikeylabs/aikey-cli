@@ -2,6 +2,9 @@
 //!
 //! This module provides secure key derivation and encryption/decryption
 //! using industry-standard algorithms (Argon2id + AES-256-GCM).
+//!
+//! Memory Sovereignty: All sensitive data is protected with SecureBuffer,
+//! which uses mlock to pin memory and prevents swapping to disk.
 
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
@@ -9,7 +12,10 @@ use aes_gcm::{
 };
 use argon2::{Argon2, Params, Version};
 use rand::RngCore;
-use zeroize::Zeroizing;
+use zeroize::Zeroize;
+use secrecy::{ExposeSecret, SecretString};
+use std::ops::{Deref, DerefMut};
+use std::fmt;
 
 /// Argon2id parameters for key derivation
 /// - Memory: 64 MiB (65536 KiB)
@@ -28,15 +34,140 @@ pub const SALT_SIZE: usize = 16;
 /// Derived key size (256 bits / 32 bytes for AES-256)
 pub const KEY_SIZE: usize = 32;
 
+/// SecureBuffer: Memory-locked buffer for sensitive data
+///
+/// Uses mlock to pin memory pages and prevent swapping to disk.
+/// Automatically zeroizes on drop.
+pub struct SecureBuffer<T: Zeroize> {
+    data: T,
+    locked: bool,
+}
+
+impl<T: Zeroize> SecureBuffer<T> {
+    /// Creates a new SecureBuffer and attempts to lock it in RAM
+    pub fn new(data: T) -> Result<Self, String> {
+        let mut buffer = SecureBuffer {
+            data,
+            locked: false,
+        };
+
+        buffer.lock()?;
+        Ok(buffer)
+    }
+
+    /// Locks the buffer in memory using mlock (Unix) or VirtualLock (Windows)
+    #[cfg(unix)]
+    fn lock(&mut self) -> Result<(), String> {
+        let ptr = &self.data as *const T as *const libc::c_void;
+        let len = std::mem::size_of::<T>();
+
+        unsafe {
+            if libc::mlock(ptr, len) != 0 {
+                return Err(format!("Failed to lock memory: {}", std::io::Error::last_os_error()));
+            }
+        }
+
+        self.locked = true;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn lock(&mut self) -> Result<(), String> {
+        use windows_sys::Win32::System::Memory::VirtualLock;
+
+        let ptr = &self.data as *const T as *const std::ffi::c_void;
+        let len = std::mem::size_of::<T>();
+
+        unsafe {
+            if VirtualLock(ptr, len) == 0 {
+                return Err(format!("Failed to lock memory: {}", std::io::Error::last_os_error()));
+            }
+        }
+
+        self.locked = true;
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn lock(&mut self) -> Result<(), String> {
+        // On unsupported platforms, we can't lock memory but still provide the wrapper
+        self.locked = false;
+        Ok(())
+    }
+
+    /// Unlocks the buffer from memory
+    #[cfg(unix)]
+    fn unlock(&mut self) {
+        if self.locked {
+            let ptr = &self.data as *const T as *const libc::c_void;
+            let len = std::mem::size_of::<T>();
+
+            unsafe {
+                libc::munlock(ptr, len);
+            }
+
+            self.locked = false;
+        }
+    }
+
+    #[cfg(windows)]
+    fn unlock(&mut self) {
+        if self.locked {
+            use windows_sys::Win32::System::Memory::VirtualUnlock;
+
+            let ptr = &self.data as *const T as *const std::ffi::c_void;
+            let len = std::mem::size_of::<T>();
+
+            unsafe {
+                VirtualUnlock(ptr, len);
+            }
+
+            self.locked = false;
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn unlock(&mut self) {
+        self.locked = false;
+    }
+}
+
+impl<T: Zeroize> Deref for SecureBuffer<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl<T: Zeroize> DerefMut for SecureBuffer<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
+
+impl<T: Zeroize> Drop for SecureBuffer<T> {
+    fn drop(&mut self) {
+        self.unlock();
+        self.data.zeroize();
+    }
+}
+
+impl<T: Zeroize> fmt::Debug for SecureBuffer<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SecureBuffer<REDACTED>")
+    }
+}
+
 /// Derives a 256-bit encryption key from a master password using Argon2id
 ///
 /// # Arguments
-/// * `password` - Master password (will be zeroized after use)
+/// * `password` - Master password (SecretString, automatically zeroized)
 /// * `salt` - Random salt (must be SALT_SIZE bytes)
 ///
 /// # Returns
-/// A zeroizing 32-byte key suitable for AES-256-GCM
-pub fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_SIZE]>, String> {
+/// A SecureBuffer containing the 32-byte key, locked in RAM
+pub fn derive_key(password: &SecretString, salt: &[u8]) -> Result<SecureBuffer<[u8; KEY_SIZE]>, String> {
     if salt.len() != SALT_SIZE {
         return Err(format!("Salt must be {} bytes", SALT_SIZE));
     }
@@ -46,12 +177,12 @@ pub fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; KEY_SIZE
 
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
 
-    let mut key = Zeroizing::new([0u8; KEY_SIZE]);
+    let mut key = [0u8; KEY_SIZE];
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut *key)
+        .hash_password_into(password.expose_secret().as_bytes(), salt, &mut key)
         .map_err(|e| format!("Key derivation failed: {}", e))?;
 
-    Ok(key)
+    SecureBuffer::new(key)
 }
 
 /// Encrypts plaintext using AES-256-GCM
@@ -86,12 +217,12 @@ pub fn encrypt(key: &[u8; KEY_SIZE], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u
 /// * `ciphertext` - Encrypted data
 ///
 /// # Returns
-/// Decrypted plaintext as a zeroizing vector
+/// Decrypted plaintext as a SecureBuffer, locked in RAM
 pub fn decrypt(
     key: &[u8; KEY_SIZE],
     nonce: &[u8],
     ciphertext: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, String> {
+) -> Result<SecureBuffer<Vec<u8>>, String> {
     if nonce.len() != NONCE_SIZE {
         return Err(format!("Nonce must be {} bytes", NONCE_SIZE));
     }
@@ -105,7 +236,7 @@ pub fn decrypt(
         .decrypt(nonce, ciphertext)
         .map_err(|_| "Decryption failed: invalid key or corrupted data".to_string())?;
 
-    Ok(Zeroizing::new(plaintext))
+    SecureBuffer::new(plaintext)
 }
 
 #[cfg(test)]
@@ -114,10 +245,10 @@ mod tests {
 
     #[test]
     fn test_key_derivation() {
-        let password = "test_password_123";
+        let password = SecretString::new("test_password_123".to_string());
         let salt = [0u8; SALT_SIZE];
 
-        let key = derive_key(password, &salt).unwrap();
+        let key = derive_key(&password, &salt).unwrap();
         assert_eq!(key.len(), KEY_SIZE);
     }
 

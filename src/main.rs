@@ -1,12 +1,14 @@
 mod crypto;
 mod storage;
+mod synapse;
 
 use clap::{Parser, Subcommand};
-use inquire::{Password, Confirm};
+use inquire::Confirm;
 use rand::RngCore;
 use arboard::Clipboard;
 use std::collections::HashMap;
 use zeroize::Zeroizing;
+use secrecy::SecretString;
 
 /// AiKeyLabs - Secure local secret management CLI
 #[derive(Parser)]
@@ -36,6 +38,9 @@ enum Commands {
     Get {
         /// Alias of the secret to retrieve
         alias: String,
+        /// Print secret to stdout instead of copying to clipboard
+        #[arg(long)]
+        print: bool,
     },
 
     /// List all secret aliases
@@ -53,6 +58,21 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
+
+    /// Export secrets to an encrypted .akb file
+    Export {
+        /// Pattern to match secrets (e.g., "openai-*", "*")
+        pattern: String,
+        /// Output file path (e.g., "backup.akb")
+        #[arg(short, long)]
+        output: String,
+    },
+
+    /// Import secrets from an encrypted .akb file
+    Import {
+        /// Input file path (e.g., "backup.akb")
+        input: String,
+    },
 }
 
 fn main() {
@@ -61,10 +81,12 @@ fn main() {
     let result = match cli.command {
         Commands::Init => handle_init(),
         Commands::Add { alias, magic } => handle_add(&alias, magic),
-        Commands::Get { alias } => handle_get(&alias),
+        Commands::Get { alias, print } => handle_get(&alias, print),
         Commands::List => handle_list(),
         Commands::Delete { alias } => handle_delete(&alias),
         Commands::Run { args } => handle_run(&args),
+        Commands::Export { pattern, output } => handle_export(&pattern, &output),
+        Commands::Import { input } => handle_import(&input),
     };
 
     if let Err(e) = result {
@@ -73,25 +95,28 @@ fn main() {
     }
 }
 
+/// Securely prompts for a password without echoing to terminal
+/// Returns a SecretString that is automatically zeroized on drop
+fn prompt_password(prompt: &str) -> Result<SecretString, String> {
+    eprint!("{}", prompt);
+    let password = rpassword::read_password()
+        .map_err(|e| format!("Failed to read password: {}", e))?;
+    Ok(SecretString::new(password))
+}
+
 fn handle_init() -> Result<(), String> {
     eprintln!("Initializing AiKeyLabs vault...");
 
     // Check for non-interactive mode (for testing)
     let password = if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
-        test_password
+        SecretString::new(test_password)
     } else {
         // Prompt for master password
-        let password = Password::new("Enter master password:")
-            .with_display_mode(inquire::PasswordDisplayMode::Masked)
-            .prompt()
-            .map_err(|e| format!("Failed to read password: {}", e))?;
+        let password = prompt_password("Enter master password: ")?;
+        let password_confirm = prompt_password("Confirm master password: ")?;
 
-        let password_confirm = Password::new("Confirm master password:")
-            .with_display_mode(inquire::PasswordDisplayMode::Masked)
-            .prompt()
-            .map_err(|e| format!("Failed to read password: {}", e))?;
-
-        if password != password_confirm {
+        use secrecy::ExposeSecret;
+        if password.expose_secret() != password_confirm.expose_secret() {
             return Err("Passwords do not match".to_string());
         }
 
@@ -121,13 +146,10 @@ fn handle_add(alias: &str, magic: bool) -> Result<(), String> {
 
     // Check for non-interactive mode (for testing)
     let password = if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
-        test_password
+        SecretString::new(test_password)
     } else {
         // Prompt for master password
-        Password::new("Enter master password:")
-            .with_display_mode(inquire::PasswordDisplayMode::Masked)
-            .prompt()
-            .map_err(|e| format!("Failed to read password: {}", e))?
+        prompt_password("Enter master password: ")?
     };
 
     // Get salt from database
@@ -177,9 +199,8 @@ fn handle_add(alias: &str, magic: bool) -> Result<(), String> {
 
         // If not using clipboard, prompt for secret value
         if !used_clipboard {
-            secret = Password::new(&format!("Enter secret value for '{}':", alias))
-                .with_display_mode(inquire::PasswordDisplayMode::Masked)
-                .prompt()
+            eprint!("Enter secret value for '{}': ", alias);
+            secret = rpassword::read_password()
                 .map_err(|e| format!("Failed to read secret: {}", e))?;
         }
 
@@ -199,7 +220,13 @@ fn handle_add(alias: &str, magic: bool) -> Result<(), String> {
 
 /// Verifies the password by attempting to decrypt an existing entry
 /// Returns Ok if vault is empty or password is correct
+/// Skips verification if database needs migration (old schema with potentially invalid data)
 fn verify_password(key: &[u8; crypto::KEY_SIZE]) -> Result<(), String> {
+    // Skip password verification if migration is needed (old schema might have invalid data)
+    if storage::needs_migration()? {
+        return Ok(());
+    }
+
     // Get all entries to check if vault has any secrets
     let entries = storage::list_entries()?;
 
@@ -213,7 +240,7 @@ fn verify_password(key: &[u8; crypto::KEY_SIZE]) -> Result<(), String> {
     let (nonce, ciphertext) = storage::get_entry(first_alias)?;
 
     // Attempt decryption - this will fail if password is wrong
-    crypto::decrypt(key, &nonce, &ciphertext)
+    let _plaintext = crypto::decrypt(key, &nonce, &ciphertext)
         .map_err(|_| "Invalid master password".to_string())?;
 
     Ok(())
@@ -254,19 +281,16 @@ fn is_potential_secret(text: &str) -> bool {
     false
 }
 
-fn handle_get(alias: &str) -> Result<(), String> {
+fn handle_get(alias: &str, print: bool) -> Result<(), String> {
     // Check if vault exists
     storage::ensure_vault_exists()?;
 
     // Check for non-interactive mode (for testing)
     let password = if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
-        test_password
+        SecretString::new(test_password)
     } else {
         // Prompt for master password
-        Password::new("Enter master password:")
-            .with_display_mode(inquire::PasswordDisplayMode::Masked)
-            .prompt()
-            .map_err(|e| format!("Failed to read password: {}", e))?
+        prompt_password("Enter master password: ")?
     };
 
     // Get salt from database
@@ -287,13 +311,17 @@ fn handle_get(alias: &str) -> Result<(), String> {
     let secret_str = String::from_utf8(plaintext.to_vec())
         .map_err(|_| "Secret contains invalid UTF-8".to_string())?;
 
-    // Copy to clipboard
-    let mut clipboard = Clipboard::new()
-        .map_err(|e| format!("Failed to access clipboard: {}", e))?;
-    clipboard.set_text(&secret_str)
-        .map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
+    // Copy to clipboard or print to stdout
+    if print {
+        println!("{}", secret_str);
+    } else {
+        let mut clipboard = Clipboard::new()
+            .map_err(|e| format!("Failed to access clipboard: {}", e))?;
+        clipboard.set_text(&secret_str)
+            .map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
 
-    eprintln!("✓ Secret '{}' copied to clipboard", alias);
+        eprintln!("✓ Secret '{}' copied to clipboard", alias);
+    }
 
     Ok(())
 }
@@ -335,13 +363,10 @@ fn handle_run(args: &[String]) -> Result<(), String> {
 
     // Check for non-interactive mode (for testing)
     let password = if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
-        test_password
+        SecretString::new(test_password)
     } else {
         // Prompt for master password
-        Password::new("Enter master password:")
-            .with_display_mode(inquire::PasswordDisplayMode::Masked)
-            .prompt()
-            .map_err(|e| format!("Failed to read password: {}", e))?
+        prompt_password("Enter master password: ")?
     };
 
     // Get salt from database
@@ -403,5 +428,118 @@ fn handle_run(args: &[String]) -> Result<(), String> {
             }
         }
         std::process::exit(1);
+    }
+}
+
+fn handle_export(pattern: &str, output: &str) -> Result<(), String> {
+    use std::path::Path;
+
+    // Check if vault exists
+    storage::ensure_vault_exists()?;
+
+    // Check if output file already exists
+    let output_path = Path::new(output);
+    if output_path.exists() {
+        let confirm = Confirm::new(&format!("File '{}' already exists. Overwrite?", output))
+            .with_default(false)
+            .prompt()
+            .map_err(|e| format!("Failed to get confirmation: {}", e))?;
+
+        if !confirm {
+            return Err("Export cancelled".to_string());
+        }
+    }
+
+    // Prompt for master password
+    let password = if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
+        SecretString::new(test_password)
+    } else {
+        prompt_password("Enter master password: ")?
+    };
+
+    eprintln!("Exporting secrets matching pattern '{}'...", pattern);
+
+    // Perform export
+    let count = synapse::export_vault(pattern, output_path, &password)?;
+
+    eprintln!("✓ Successfully exported {} secret(s) to '{}'", count, output);
+    eprintln!("⚠️  Keep this file secure - it contains encrypted secrets!");
+
+    Ok(())
+}
+
+fn handle_import(input: &str) -> Result<(), String> {
+    use std::path::Path;
+
+    // Check if vault exists
+    storage::ensure_vault_exists()?;
+
+    // Check if input file exists
+    let input_path = Path::new(input);
+    if !input_path.exists() {
+        return Err(format!("File '{}' not found", input));
+    }
+
+    // Prompt for master password
+    let password = if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
+        SecretString::new(test_password)
+    } else {
+        prompt_password("Enter master password: ")?
+    };
+
+    eprintln!("Importing secrets from '{}'...", input);
+
+    // Perform import
+    let result = synapse::import_vault(input_path, &password)?;
+
+    // Display detailed table if there are operations
+    if !result.operations.is_empty() {
+        eprintln!("\n┌─────────────────────────────────┬──────────┬────────────────────────┐");
+        eprintln!("│ Alias                           │ Status   │ Version (Old -> New)   │");
+        eprintln!("├─────────────────────────────────┼──────────┼────────────────────────┤");
+
+        for op in &result.operations {
+            let status_str = match op.status {
+                synapse::ImportStatus::Added => "Added   ",
+                synapse::ImportStatus::Updated => "Updated ",
+                synapse::ImportStatus::Skipped => "Skipped ",
+            };
+
+            let version_str = match op.old_version {
+                Some(old_v) => format!("v{} -> v{}", old_v, op.new_version),
+                None => "New".to_string(),
+            };
+
+            // Handle skipped entries differently
+            let version_display = if op.status == synapse::ImportStatus::Skipped {
+                format!("v{} (Keep Local)", op.old_version.unwrap_or(0))
+            } else {
+                version_str
+            };
+
+            eprintln!("│ {:<31} │ {} │ {:<22} │",
+                truncate_string(&op.alias, 31),
+                status_str,
+                truncate_string(&version_display, 22)
+            );
+        }
+
+        eprintln!("└─────────────────────────────────┴──────────┴────────────────────────┘");
+    }
+
+    eprintln!("\n✓ Import complete:");
+    eprintln!("  • Added: {} new secret(s)", result.added);
+    eprintln!("  • Updated: {} secret(s)", result.updated);
+    eprintln!("  • Skipped: {} secret(s) (local version newer)", result.skipped);
+
+    Ok(())
+}
+
+/// Helper function to truncate strings for table display
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[0..max_len-3])
     }
 }
