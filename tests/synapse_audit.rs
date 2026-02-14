@@ -129,7 +129,7 @@ fn test_smart_merge_version_priority() {
 
     // Verify still has v3
     test_cmd(&vault_path)
-        .args(&["get", "key_a", "--print"])
+        .args(&["get", "key_a"])
         .assert()
         .success()
         .stdout(predicate::str::contains("value_v3"));
@@ -167,7 +167,7 @@ fn test_smart_merge_timestamp_priority() {
 
     // Verify still has new value
     test_cmd(&vault_path)
-        .args(&["get", "key_b", "--print"])
+        .args(&["get", "key_b"])
         .assert()
         .success()
         .stdout(predicate::str::contains("new_value"));

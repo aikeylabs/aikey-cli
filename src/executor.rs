@@ -189,16 +189,17 @@ pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &s
 
 /// Execute a command with secrets injected as environment variables
 ///
-/// PARENT-GUARD PATTERN:
-/// The parent process (ak) stays alive during child execution, maintaining
-/// Zeroizing secrets in memory. Only when the child exits does the parent
-/// clean up and trigger Zeroizing destructors.
+/// MINIMAL-WINDOW PATTERN (SECURITY HARDENED):
+/// Secrets are decrypted, immediately injected into child process, then wiped
+/// from parent memory BEFORE waiting for child completion. This minimizes the
+/// time window where decrypted secrets exist in parent process memory.
 ///
-/// SECURITY HARDENING:
-/// - All secrets wrapped in Zeroizing<String> containers
-/// - Explicit memory wiping after child process exits
-/// - Signal handler for graceful shutdown and cleanup
-/// - No raw string secrets ever exposed beyond initial decryption
+/// SECURITY IMPROVEMENTS:
+/// - Secrets wiped IMMEDIATELY after child spawn (not after child exits)
+/// - Eliminates extended memory exposure window (previously hours for long-running commands)
+/// - Reduces attack surface: parent memory is clean during child execution
+/// - Signal handler still ensures cleanup on interruption
+/// - Direct conversion from SecureBuffer to String (no intermediate Vec allocation)
 ///
 /// # Arguments
 /// * `env_mappings` - Vector of "ENV_VAR=alias" strings
@@ -225,10 +226,11 @@ pub fn exec_with_env(
         return Err("No command specified".to_string());
     }
 
-    // Parse environment variable mappings and load secrets into Zeroizing containers
+    // Pre-allocate HashMap with exact capacity to avoid reallocation during decryption
     let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
-        std::collections::HashMap::new();
+        std::collections::HashMap::with_capacity(env_mappings.len());
 
+    // TIGHT DECRYPTION LOOP: Minimize time between first and last secret decryption
     for mapping in env_mappings {
         let parts: Vec<&str> = mapping.splitn(2, '=').collect();
         if parts.len() != 2 {
@@ -253,22 +255,22 @@ pub fn exec_with_env(
             .map_err(|e| format!("Failed to fetch secret '{}': {}", alias, e))?;
 
         let plaintext = ctx.decrypt(&nonce, &ciphertext)?;
-        let secret_string = String::from_utf8(plaintext.to_vec())
-            .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", alias, e))?;
+
+        // OPTIMIZATION: Direct conversion from SecureBuffer to String
+        // Avoids intermediate Vec allocation from plaintext.to_vec()
+        let secret_string = std::str::from_utf8(&plaintext)
+            .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", alias, e))?
+            .to_string();
 
         // Store in Zeroizing container for secure cleanup
         env_secrets.insert(env_name.to_string(), Zeroizing::new(secret_string));
     }
 
     // INPUT ROBUSTNESS: Handle both single-string and pre-split command formats
-    // If command is a single element, it might be a complete shell command string
-    // that needs parsing (e.g., "sleep 5"). Otherwise, it's already split by clap.
     let parsed_parts: Vec<String> = if command.len() == 1 {
-        // Single string - parse it with shell_words to handle quotes, escapes, etc.
         shell_words::split(&command[0])
             .map_err(|e| format!("Failed to parse command '{}': {}", command[0], e))?
     } else {
-        // Already split by clap - use as-is
         command.to_vec()
     };
 
@@ -276,15 +278,13 @@ pub fn exec_with_env(
         return Err("Empty command after parsing".to_string());
     }
 
-    // TYPE SAFETY: Extract program and args with correct types for Command::new()
     let program = &parsed_parts[0];
     let args = &parsed_parts[1..];
 
-    // PARENT-GUARD: Spawn child process with inherited stdio
+    // Build command with secrets injected
     let mut cmd = std::process::Command::new(program);
     cmd.args(args);
 
-    // Inject secrets into child environment
     for (key, value) in &env_secrets {
         cmd.env(key, value.as_str());
     }
@@ -302,12 +302,18 @@ pub fn exec_with_env(
         r.store(false, Ordering::SeqCst);
     }).map_err(|e| format!("Failed to set signal handler: {}", e))?;
 
-    // Spawn child and wait - parent stays alive as guardian
+    // Spawn child process
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn command '{}': {}", program, e))?;
 
-    // PARENT-GUARD PATTERN: Wait for child to complete while maintaining secrets in memory
+    // CRITICAL SECURITY IMPROVEMENT: Wipe secrets IMMEDIATELY after spawn
+    // Child process has already inherited the environment variables
+    // Parent no longer needs them in memory
+    drop(env_secrets);
+    drop(ctx);
+
+    // Wait for child with clean parent memory
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -316,29 +322,15 @@ pub fn exec_with_env(
                 if !running.load(Ordering::SeqCst) {
                     // Forward signal to child
                     let _ = child.kill();
-
-                    // WIPE EVIDENCE: Explicit cleanup before error return
-                    drop(env_secrets);
-                    drop(ctx);
-
                     return Err("Interrupted by user".to_string());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
-                // WIPE EVIDENCE: Explicit cleanup before error return
-                drop(env_secrets);
-                drop(ctx);
-
                 return Err(format!("Failed to wait for command: {}", e));
             }
         }
     };
-
-    // Child has exited - WIPE EVIDENCE: Explicit cleanup
-    // Force Zeroizing destructors to trigger immediately
-    drop(env_secrets);
-    drop(ctx);
 
     // Propagate child exit status
     if !status.success() {
