@@ -67,9 +67,12 @@ impl TestEnv {
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS entries (
-                alias TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alias TEXT NOT NULL UNIQUE,
                 nonce BLOB NOT NULL,
                 ciphertext BLOB NOT NULL,
+                version_tag INTEGER NOT NULL DEFAULT 1,
+                metadata TEXT,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             )",
             [],

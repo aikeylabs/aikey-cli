@@ -72,6 +72,7 @@ dependencies = [
  "arboard",
  "argon2",
  "assert_cmd",
+ "base64",
  "bincode",
  "clap",
  "hmac",
@@ -85,6 +86,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "shell-words",
  "tempfile",
  "windows-sys 0.52.0",
  "zeroize",
@@ -204,6 +206,12 @@ name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+
+[[package]]
+name = "base64"
+version = "0.21.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
 
 [[package]]
 name = "base64ct"
@@ -1310,6 +1318,12 @@ dependencies = [
  "cpufeatures",
  "digest",
 ]
+
+[[package]]
+name = "shell-words"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shlex"

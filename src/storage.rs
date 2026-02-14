@@ -48,7 +48,7 @@ pub fn ensure_vault_exists() -> Result<(), String> {
 }
 
 /// Initializes the vault database with proper permissions
-pub fn initialize_vault(salt: &[u8]) -> Result<(), String> {
+pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), String> {
     let vault_dir = if let Ok(test_path) = std::env::var("AK_VAULT_PATH")
         .or_else(|_| std::env::var("AK_STORAGE_PATH")) {
         PathBuf::from(test_path)
@@ -121,12 +121,8 @@ pub fn initialize_vault(salt: &[u8]) -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to store salt: {}", e))?;
 
-    let password_raw = std::env::var("AK_MASTER_PASSWORD")
-        .map_err(|_| "AK_MASTER_PASSWORD environment variable not set during init".to_string())?;
-
-    let secret_password = SecretString::new(password_raw);
-
-    let key = crate::crypto::derive_key(&secret_password, salt)
+    // Derive key directly from password parameter instead of environment variable
+    let key = crate::crypto::derive_key(password, salt)
         .map_err(|e| format!("Key derivation failed: {}", e))?;
 
     // Use &*key to dereference SecureBuffer and get &[u8; 32]
