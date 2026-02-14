@@ -1,8 +1,8 @@
-//! AiKeyLabs AK Core Component (placeholder)
-//! This crate reserves the aikeylabs-ak name for official use.
+//! AiKeyLabs AK - Secure local-first secret management
+//!
+//! This library provides the core functionality for the AK CLI tool.
 
-/// Initialize AK core component (placeholder logic)
-/// Returns true if initialization is successful
-pub fn init() -> bool {
-    true
-}
+pub mod crypto;
+pub mod storage;
+pub mod synapse;
+pub mod executor;

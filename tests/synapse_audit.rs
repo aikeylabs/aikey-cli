@@ -7,6 +7,7 @@
 //! 4. CLI summary output formatting
 
 use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin;
 use predicates::prelude::*;
 use std::fs;
 use std::path::PathBuf;
@@ -22,7 +23,7 @@ fn setup_test_vault() -> (TempDir, PathBuf) {
 
 /// Helper to create a Command with test environment variables
 fn test_cmd(vault_path: &PathBuf) -> Command {
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::new(cargo_bin("ak"));
     cmd.env("AK_VAULT_PATH", vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd
@@ -30,7 +31,7 @@ fn test_cmd(vault_path: &PathBuf) -> Command {
 
 /// Helper to add a secret with a specific value
 fn add_secret(vault_path: &PathBuf, alias: &str, value: &str) {
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::new(cargo_bin("ak"));
     cmd.env("AK_VAULT_PATH", vault_path.to_str().unwrap())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .env("AK_TEST_SECRET", value)
@@ -70,7 +71,7 @@ fn test_hmac_bit_flip_detection() {
     // Export to .akb file
     let export_path = _temp_dir.path().join("export.akb");
     test_cmd(&vault_path)
-        .args(&["export", "--output", export_path.to_str().unwrap(), "*"])
+        .args(&["export", "*", export_path.to_str().unwrap()])
         .assert()
         .success();
 
@@ -112,7 +113,7 @@ fn test_smart_merge_version_priority() {
     // Export v2
     let export_v2 = _temp_dir.path().join("v2.akb");
     test_cmd(&vault_path)
-        .args(&["export", "--output", export_v2.to_str().unwrap(), "*"])
+        .args(&["export", "*", export_v2.to_str().unwrap()])
         .assert()
         .success();
 
@@ -147,7 +148,7 @@ fn test_smart_merge_timestamp_priority() {
     // Export immediately (older timestamp)
     let export_old = _temp_dir.path().join("old.akb");
     test_cmd(&vault_path)
-        .args(&["export", "--output", export_old.to_str().unwrap(), "*"])
+        .args(&["export", "*", export_old.to_str().unwrap()])
         .assert()
         .success();
 
@@ -187,7 +188,7 @@ fn test_import_detailed_summary() {
     // Export all
     let export_path = _temp_dir.path().join("all.akb");
     test_cmd(&vault_path)
-        .args(&["export", "--output", export_path.to_str().unwrap(), "*"])
+        .args(&["export", "*", export_path.to_str().unwrap()])
         .assert()
         .success();
 
@@ -229,7 +230,7 @@ fn test_memory_safety_verification() {
     // Export (uses derive_dual_keys with SecureBuffer)
     let export_path = _temp_dir.path().join("secure.akb");
     test_cmd(&vault_path)
-        .args(&["export", "--output", export_path.to_str().unwrap(), "*"])
+        .args(&["export", "*", export_path.to_str().unwrap()])
         .assert()
         .success();
 
@@ -257,7 +258,7 @@ fn test_export_file_permissions() {
     // Export
     let export_path = _temp_dir.path().join("export.akb");
     test_cmd(&vault_path)
-        .args(&["export", "--output", export_path.to_str().unwrap(), "*"])
+        .args(&["export", "*", export_path.to_str().unwrap()])
         .assert()
         .success();
 

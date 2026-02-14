@@ -9,6 +9,10 @@ repository = "https://github.com/AiKey-Founder/aikey-labs"
 keywords = ["aikeylabs", "ak", "core", "key-management", "cli-utilities"]
 categories = ["command-line-utilities"]
 
+[lib]
+name = "aikeylabs_ak"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ak"
 path = "src/main.rs"

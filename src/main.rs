@@ -1,13 +1,7 @@
-mod crypto;
-mod storage;
-mod synapse;
-
+use aikeylabs_ak::{crypto, storage, synapse, executor};
 use clap::{Parser, Subcommand};
 use inquire::Confirm;
 use rand::RngCore;
-use arboard::Clipboard;
-use std::collections::HashMap;
-use zeroize::Zeroizing;
 use secrecy::SecretString;
 
 /// AiKeyLabs - Secure local secret management CLI
@@ -52,6 +46,14 @@ enum Commands {
         alias: String,
     },
 
+    /// Update an existing secret in the vault
+    Update {
+        /// Alias of the secret to update
+        alias: String,
+        /// New secret value (if not provided, will prompt)
+        value: Option<String>,
+    },
+
     /// Run a command with secrets injected as environment variables
     Run {
         /// Command and arguments to execute (use -- to separate)
@@ -64,7 +66,6 @@ enum Commands {
         /// Pattern to match secrets (e.g., "openai-*", "*")
         pattern: String,
         /// Output file path (e.g., "backup.akb")
-        #[arg(short, long)]
         output: String,
     },
 
@@ -84,6 +85,7 @@ fn main() {
         Commands::Get { alias, print } => handle_get(&alias, print),
         Commands::List => handle_list(),
         Commands::Delete { alias } => handle_delete(&alias),
+        Commands::Update { alias, value } => handle_update(&alias, value),
         Commands::Run { args } => handle_run(&args),
         Commands::Export { pattern, output } => handle_export(&pattern, &output),
         Commands::Import { input } => handle_import(&input),
@@ -102,6 +104,14 @@ fn prompt_password(prompt: &str) -> Result<SecretString, String> {
     let password = rpassword::read_password()
         .map_err(|e| format!("Failed to read password: {}", e))?;
     Ok(SecretString::new(password))
+}
+
+/// Prompts for a secret value (similar to password but returns String)
+fn prompt_secret(prompt: &str) -> Result<String, String> {
+    eprint!("{}", prompt);
+    let secret = rpassword::read_password()
+        .map_err(|e| format!("Failed to read secret: {}", e))?;
+    Ok(secret)
 }
 
 fn handle_init() -> Result<(), String> {
@@ -152,23 +162,10 @@ fn handle_add(alias: &str, magic: bool) -> Result<(), String> {
         prompt_password("Enter master password: ")?
     };
 
-    // Get salt from database
-    let salt = storage::get_salt()?;
-
-    // Derive encryption key
-    let key = crypto::derive_key(&password, &salt)
-        .map_err(|_| "Invalid master password or corrupted vault.".to_string())?;
-
-    // Verify password by attempting to decrypt an existing entry (if any exist)
-    verify_password(&key)?;
-
     // Get secret value
     let secret = if magic {
         // Magic Add: Use clipboard content
-        let mut clipboard = Clipboard::new()
-            .map_err(|e| format!("Failed to access clipboard: {}", e))?;
-        clipboard.get_text()
-            .map_err(|e| format!("Failed to read from clipboard: {}", e))?
+        executor::read_from_clipboard()?
     } else if let Ok(test_secret) = std::env::var("AK_TEST_SECRET") {
         // Non-interactive mode for testing
         test_secret
@@ -177,22 +174,20 @@ fn handle_add(alias: &str, magic: bool) -> Result<(), String> {
         let mut secret = String::new();
         let mut used_clipboard = false;
 
-        if let Ok(mut clipboard) = Clipboard::new() {
-            if let Ok(clipboard_content) = clipboard.get_text() {
-                // Detect common secret patterns
-                if is_potential_secret(&clipboard_content) {
-                    let use_clipboard = Confirm::new(&format!(
-                        "Detected potential secret in clipboard ({}... pattern). Use it?",
-                        &clipboard_content.chars().take(10).collect::<String>()
-                    ))
-                    .with_default(true)
-                    .prompt()
-                    .unwrap_or(false);
+        if let Ok(clipboard_content) = executor::read_from_clipboard() {
+            // Detect common secret patterns
+            if executor::is_potential_secret(&clipboard_content) {
+                let use_clipboard = Confirm::new(&format!(
+                    "Detected potential secret in clipboard ({}... pattern). Use it?",
+                    &clipboard_content.chars().take(10).collect::<String>()
+                ))
+                .with_default(true)
+                .prompt()
+                .unwrap_or(false);
 
-                    if use_clipboard {
-                        secret = clipboard_content;
-                        used_clipboard = true;
-                    }
+                if use_clipboard {
+                    secret = clipboard_content;
+                    used_clipboard = true;
                 }
             }
         }
@@ -207,78 +202,12 @@ fn handle_add(alias: &str, magic: bool) -> Result<(), String> {
         secret
     };
 
-    // Encrypt the secret
-    let (nonce, ciphertext) = crypto::encrypt(&key, secret.as_bytes())?;
-
-    // Store in database
-    storage::store_entry(alias, &nonce, &ciphertext)?;
+    // Add the secret using executor (performs password verification)
+    executor::add_secret(alias, &secret, &password)?;
 
     eprintln!("✓ Secret '{}' added successfully", alias);
 
     Ok(())
-}
-
-/// Verifies the password by attempting to decrypt an existing entry
-/// Returns Ok if vault is empty or password is correct
-/// Skips verification if database needs migration (old schema with potentially invalid data)
-fn verify_password(key: &[u8; crypto::KEY_SIZE]) -> Result<(), String> {
-    // Skip password verification if migration is needed (old schema might have invalid data)
-    if storage::needs_migration()? {
-        return Ok(());
-    }
-
-    // Get all entries to check if vault has any secrets
-    let entries = storage::list_entries()?;
-
-    // If vault is empty, password is valid (nothing to verify against)
-    if entries.is_empty() {
-        return Ok(());
-    }
-
-    // Try to decrypt the first entry to verify password
-    let first_alias = &entries[0];
-    let (nonce, ciphertext) = storage::get_entry(first_alias)?;
-
-    // Attempt decryption - this will fail if password is wrong
-    let _plaintext = crypto::decrypt(key, &nonce, &ciphertext)
-        .map_err(|_| "Invalid master password".to_string())?;
-
-    Ok(())
-}
-
-/// Detects if a string matches common secret patterns
-fn is_potential_secret(text: &str) -> bool {
-    let trimmed = text.trim();
-
-    // Check for common API key patterns
-    if trimmed.starts_with("sk-") ||           // OpenAI, Stripe
-       trimmed.starts_with("pk-") ||           // Stripe public key
-       trimmed.starts_with("rk-") ||           // Stripe restricted key
-       trimmed.starts_with("Bearer ") ||       // Bearer tokens
-       trimmed.starts_with("ghp_") ||          // GitHub personal access token
-       trimmed.starts_with("gho_") ||          // GitHub OAuth token
-       trimmed.starts_with("ghs_") ||          // GitHub server token
-       trimmed.starts_with("github_pat_") ||   // GitHub fine-grained PAT
-       trimmed.starts_with("glpat-") ||        // GitLab personal access token
-       trimmed.starts_with("AKIA") ||          // AWS access key
-       trimmed.starts_with("AIza") ||          // Google API key
-       trimmed.starts_with("ya29.") {          // Google OAuth token
-        return true;
-    }
-
-    // Check for JWT tokens (three base64 segments separated by dots)
-    let parts: Vec<&str> = trimmed.split('.').collect();
-    if parts.len() == 3 && parts.iter().all(|p| p.len() > 10 && p.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')) {
-        return true;
-    }
-
-    // Check for long alphanumeric strings (likely API keys)
-    if trimmed.len() >= 32 && trimmed.len() <= 512 &&
-       trimmed.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
-        return true;
-    }
-
-    false
 }
 
 fn handle_get(alias: &str, print: bool) -> Result<(), String> {
@@ -293,33 +222,14 @@ fn handle_get(alias: &str, print: bool) -> Result<(), String> {
         prompt_password("Enter master password: ")?
     };
 
-    // Get salt from database
-    let salt = storage::get_salt()?;
-
-    // Derive encryption key
-    let key = crypto::derive_key(&password, &salt)
-        .map_err(|_| "Invalid master password or corrupted vault.".to_string())?;
-
-    // Retrieve encrypted entry
-    let (nonce, ciphertext) = storage::get_entry(alias)?;
-
-    // Decrypt the secret
-    let plaintext = crypto::decrypt(&key, &nonce, &ciphertext)
-        .map_err(|_| "Invalid master password or corrupted vault.".to_string())?;
-
-    // Convert to string
-    let secret_str = String::from_utf8(plaintext.to_vec())
-        .map_err(|_| "Secret contains invalid UTF-8".to_string())?;
+    // Get the secret using executor
+    let secret_str = executor::get_secret(alias, &password)?;
 
     // Copy to clipboard or print to stdout
     if print {
         println!("{}", secret_str);
     } else {
-        let mut clipboard = Clipboard::new()
-            .map_err(|e| format!("Failed to access clipboard: {}", e))?;
-        clipboard.set_text(&secret_str)
-            .map_err(|e| format!("Failed to copy to clipboard: {}", e))?;
-
+        executor::copy_to_clipboard(&secret_str)?;
         eprintln!("✓ Secret '{}' copied to clipboard", alias);
     }
 
@@ -330,7 +240,7 @@ fn handle_list() -> Result<(), String> {
     // Check if vault exists
     storage::ensure_vault_exists()?;
 
-    let aliases = storage::list_entries()?;
+    let aliases = executor::list_secrets()?;
 
     if aliases.is_empty() {
         eprintln!("No secrets stored yet. Use 'ak add <alias>' to add one.");
@@ -348,8 +258,39 @@ fn handle_delete(alias: &str) -> Result<(), String> {
     // Check if vault exists
     storage::ensure_vault_exists()?;
 
-    storage::delete_entry(alias)?;
+    executor::delete_secret(alias)?;
     eprintln!("✓ Secret '{}' deleted successfully", alias);
+    Ok(())
+}
+
+fn handle_update(alias: &str, value: Option<String>) -> Result<(), String> {
+    // Check if vault exists
+    storage::ensure_vault_exists()?;
+
+    // Check if the entry exists
+    if !storage::entry_exists(alias)? {
+        return Err(format!("Secret '{}' not found", alias));
+    }
+
+    // Get the secret value
+    let secret = if let Some(val) = value {
+        val
+    } else if let Ok(test_secret) = std::env::var("AK_TEST_SECRET") {
+        test_secret
+    } else {
+        prompt_secret("Enter new secret value: ")?
+    };
+
+    // Get master password
+    let password = if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
+        SecretString::new(test_password)
+    } else {
+        prompt_password("Enter master password: ")?
+    };
+
+    // Update the secret (delete old, add new)
+    executor::update_secret(alias, &secret, &password)?;
+    eprintln!("✓ Secret '{}' updated successfully", alias);
     Ok(())
 }
 
@@ -369,50 +310,16 @@ fn handle_run(args: &[String]) -> Result<(), String> {
         prompt_password("Enter master password: ")?
     };
 
-    // Get salt from database
-    let salt = storage::get_salt()?;
-
-    // Derive encryption key
-    let key = crypto::derive_key(&password, &salt)
-        .map_err(|_| "Invalid master password or corrupted vault.".to_string())?;
-
-    // Fetch all encrypted entries
+    // Get all entries count for display
     let entries = storage::get_all_entries()?;
-
     if entries.is_empty() {
         eprintln!("Warning: No secrets in vault. Running command without injected environment variables.");
     } else {
         eprintln!("✓ Injecting {} secret(s) as environment variables", entries.len());
     }
 
-    // Decrypt all entries into a HashMap with secure memory handling
-    let mut decrypted_map: HashMap<String, Zeroizing<String>> = HashMap::new();
-
-    for (alias, nonce, ciphertext) in entries {
-        let plaintext = crypto::decrypt(&key, &nonce, &ciphertext)
-            .map_err(|_| "Invalid master password or corrupted vault.".to_string())?;
-        let secret_str = String::from_utf8(plaintext.to_vec())
-            .map_err(|_| format!("Secret '{}' contains invalid UTF-8", alias))?;
-
-        decrypted_map.insert(alias, Zeroizing::new(secret_str));
-    }
-
-    // Spawn the child process with injected environment variables
-    let mut child = std::process::Command::new(&args[0])
-        .args(&args[1..])
-        .envs(decrypted_map.iter().map(|(k, v)| (k, v.as_str())))
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn command '{}': {}", args[0], e))?;
-
-    // Immediately drop the decrypted map to zero memory
-    drop(decrypted_map);
-
-    // Wait for the child process to complete
-    let status = child.wait()
-        .map_err(|e| format!("Failed to wait for child process: {}", e))?;
+    // Run command with secrets using executor
+    let status = executor::run_with_secrets(args, &password)?;
 
     // Exit with the same code as the child process
     if let Some(code) = status.code() {
@@ -459,8 +366,8 @@ fn handle_export(pattern: &str, output: &str) -> Result<(), String> {
 
     eprintln!("Exporting secrets matching pattern '{}'...", pattern);
 
-    // Perform export
-    let count = synapse::export_vault(pattern, output_path, &password)?;
+    // Perform export using executor
+    let count = executor::export_secrets(pattern, output_path, &password)?;
 
     eprintln!("✓ Successfully exported {} secret(s) to '{}'", count, output);
     eprintln!("⚠️  Keep this file secure - it contains encrypted secrets!");
@@ -489,8 +396,8 @@ fn handle_import(input: &str) -> Result<(), String> {
 
     eprintln!("Importing secrets from '{}'...", input);
 
-    // Perform import
-    let result = synapse::import_vault(input_path, &password)?;
+    // Perform import using executor
+    let result = executor::import_secrets(input_path, &password)?;
 
     // Display detailed table if there are operations
     if !result.operations.is_empty() {

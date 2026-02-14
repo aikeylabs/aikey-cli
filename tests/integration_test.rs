@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin;
 use predicates::prelude::*;
 use std::fs;
 use std::path::PathBuf;
@@ -25,7 +26,7 @@ impl TestEnv {
 
     /// Get a Command with HOME set to temp directory
     fn cmd(&self) -> Command {
-        let mut cmd = Command::cargo_bin("ak").expect("Failed to find ak binary");
+        let mut cmd = Command::new(cargo_bin("ak"));
         cmd.env("HOME", self._temp_dir.path());
         cmd.env("AK_TEST_PASSWORD", &self.test_password);
         cmd
@@ -85,6 +86,15 @@ impl TestEnv {
     fn add_secret(&self, alias: &str, secret_value: &str) -> assert_cmd::assert::Assert {
         self.cmd()
             .arg("add")
+            .arg(alias)
+            .env("AK_TEST_SECRET", secret_value)
+            .assert()
+    }
+
+    /// Update a secret using environment variables
+    fn update_secret(&self, alias: &str, secret_value: &str) -> assert_cmd::assert::Assert {
+        self.cmd()
+            .arg("update")
             .arg(alias)
             .env("AK_TEST_SECRET", secret_value)
             .assert()
@@ -263,7 +273,7 @@ fn test_04_security_auth_failure() {
     env.add_secret("TEST_SECRET", "test_value").success();
 
     // Test: Try to add with wrong password (override the env var)
-    let mut cmd = Command::cargo_bin("ak").expect("Failed to find ak binary");
+    let mut cmd = Command::new(cargo_bin("ak"));
     cmd.env("HOME", env._temp_dir.path())
         .env("AK_TEST_PASSWORD", "wrong_password")
         .env("AK_TEST_SECRET", "some_value")
@@ -276,7 +286,7 @@ fn test_04_security_auth_failure() {
         .stderr(predicate::str::contains("Invalid master password").or(predicate::str::contains("corrupted vault")));
 
     // Test: Try to get with wrong password
-    let mut cmd = Command::cargo_bin("ak").expect("Failed to find ak binary");
+    let mut cmd = Command::new(cargo_bin("ak"));
     cmd.env("HOME", env._temp_dir.path())
         .env("AK_TEST_PASSWORD", "wrong_password")
         .arg("get")
@@ -288,7 +298,7 @@ fn test_04_security_auth_failure() {
         .stderr(predicate::str::contains("Invalid master password").or(predicate::str::contains("corrupted vault")));
 
     // Test: Try to run with wrong password
-    let mut cmd = Command::cargo_bin("ak").expect("Failed to find ak binary");
+    let mut cmd = Command::new(cargo_bin("ak"));
     cmd.env("HOME", env._temp_dir.path())
         .env("AK_TEST_PASSWORD", "wrong_password")
         .arg("run")
@@ -442,4 +452,52 @@ fn test_08_run_command_exit_codes() {
         .assert()
         .failure()
         .code(42);
+}
+
+#[test]
+fn test_09_update_secret() {
+    let env = TestEnv::new();
+    env.init_vault();
+
+    // Test: Add initial secret
+    env.add_secret("UPDATE_TEST", "initial_value")
+        .success()
+        .stderr(predicate::str::contains("Secret 'UPDATE_TEST' added successfully"));
+
+    // Test: Update the secret with new value
+    env.update_secret("UPDATE_TEST", "updated_value")
+        .success()
+        .stderr(predicate::str::contains("Secret 'UPDATE_TEST' updated successfully"));
+
+    // Test: Verify the updated value via run command
+    let output = env.cmd()
+        .arg("run")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg("printf '%s' \"$UPDATE_TEST\"")
+        .assert()
+        .success();
+
+    output.stdout(predicate::str::contains("updated_value"));
+
+    // Test: Update non-existent secret should fail
+    env.cmd()
+        .arg("update")
+        .arg("NONEXISTENT")
+        .env("AK_TEST_SECRET", "some_value")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Secret 'NONEXISTENT' not found"));
+
+    // Test: Update with wrong password should fail
+    let mut cmd = Command::new(cargo_bin("ak"));
+    cmd.env("HOME", env._temp_dir.path())
+        .env("AK_TEST_PASSWORD", "wrong_password")
+        .env("AK_TEST_SECRET", "new_value")
+        .arg("update")
+        .arg("UPDATE_TEST")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Error"));
 }
