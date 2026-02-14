@@ -263,3 +263,11 @@ mod tests {
         assert_eq!(&*decrypted, plaintext);
     }
 }
+
+/// Generates a random salt for key derivation
+pub fn generate_salt(salt: &mut [u8; SALT_SIZE]) -> Result<(), String> {
+    use rand::RngCore;
+    use rand::rngs::OsRng;
+    OsRng.fill_bytes(salt);
+    Ok(())
+}
