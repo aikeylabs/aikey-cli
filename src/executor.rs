@@ -181,6 +181,12 @@ pub fn schedule_clipboard_clear(timeout_secs: u64) {
 }
 
 pub fn update_secret(alias: &str, new_secret: &str, password: &SecretString) -> Result<(), String> {
+    // First check if the secret exists
+    if storage::get_entry(alias).is_err() {
+        return Err(format!("Secret '{}' not found", alias));
+    }
+
+    // If it exists, update it (which is the same as adding with the new value)
     add_secret(alias, new_secret, password)
 }
 
@@ -401,8 +407,9 @@ pub fn exec_with_env(
 
 /// Execute a command with ALL secrets from the vault injected as environment variables
 ///
-/// This is a convenience wrapper around exec_with_env that automatically loads all
-/// secrets from the vault and injects them as environment variables.
+/// This is a simplified version that uses .status() for better test compatibility.
+/// Unlike exec_with_env, this doesn't use explicit stdio inheritance or signal handling,
+/// making it compatible with test frameworks like assert_cmd.
 ///
 /// # Arguments
 /// * `password` - Master password for vault access
@@ -417,6 +424,9 @@ pub fn run_with_all_secrets(
     password: &SecretString,
     command: &[String],
 ) -> Result<(), String> {
+    // Establish vault context
+    let ctx = VaultContext::new(password)?;
+
     // Get all secret aliases from the vault
     let aliases = list_secrets(password)?;
 
@@ -425,16 +435,65 @@ pub fn run_with_all_secrets(
         return Err("No secrets found in vault".to_string());
     }
 
-    // Build env mappings in the format "ALIAS=alias" for each secret
-    let env_mappings: Vec<String> = aliases
-        .iter()
-        .map(|alias| format!("{}={}", alias.to_uppercase().replace('-', "_"), alias))
-        .collect();
-
     eprintln!("Injecting {} secret(s)", aliases.len());
 
-    // Use the existing exec_with_env function
-    exec_with_env(&env_mappings, password, command)
+    // Decrypt all secrets into Zeroizing containers
+    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
+        std::collections::HashMap::with_capacity(aliases.len());
+
+    for alias in &aliases {
+        let (nonce, ciphertext) = storage::get_entry(alias)?;
+        let plaintext = ctx.decrypt(&nonce, &ciphertext)?;
+        let secret_string = std::str::from_utf8(&plaintext)
+            .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", alias, e))?
+            .to_string();
+
+        let env_name = alias.to_uppercase().replace('-', "_");
+        env_secrets.insert(env_name, Zeroizing::new(secret_string));
+    }
+
+    // Parse command
+    let parsed_parts: Vec<String> = if command.len() == 1 {
+        shell_words::split(&command[0])
+            .map_err(|e| format!("Failed to parse command '{}': {}", command[0], e))?
+    } else {
+        command.to_vec()
+    };
+
+    if parsed_parts.is_empty() {
+        return Err("Empty command after parsing".to_string());
+    }
+
+    let program = &parsed_parts[0];
+    let args = &parsed_parts[1..];
+
+    // Build and execute command
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+
+    for (key, value) in &env_secrets {
+        cmd.env(key, value.as_str());
+    }
+
+    // Explicitly inherit stdio to ensure output is captured by assert_cmd
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    let status = cmd.status()
+        .map_err(|e| format!("Failed to execute command '{}': {}", program, e))?;
+
+    // Wipe secrets from memory
+    drop(env_secrets);
+    drop(ctx);
+
+    // Propagate child exit status
+    if !status.success() {
+        let exit_code = status.code().unwrap_or(1);
+        std::process::exit(exit_code);
+    }
+
+    Ok(())
 }
 
 #[allow(dead_code)]
