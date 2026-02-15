@@ -25,23 +25,35 @@ impl VaultContext {
     }
 
     fn verify_password_internal(key: &crypto::SecureBuffer<[u8; crypto::KEY_SIZE]>) -> Result<(), String> {
-        let db_path = storage::get_vault_path()?;
-        let conn = Connection::open(&db_path)
-            .map_err(|e| format!("Failed to open vault: {}", e))?;
+        let conn = storage::open_connection()?;
 
-        let stored_hash: Vec<u8> = conn
+        // Try to get stored password hash
+        let stored_hash_result: Result<Vec<u8>, rusqlite::Error> = conn
             .query_row(
                 "SELECT value FROM config WHERE key = ?",
                 params!["password_hash"],
                 |row| row.get(0),
-            )
-            .map_err(|_| "Password hash not found. Please re-run 'ak init'.".to_string())?;
+            );
 
-        if &**key != stored_hash.as_slice() {
-            return Err("Invalid master password.".to_string());
+        match stored_hash_result {
+            Ok(stored_hash) => {
+                // Password hash exists, verify it
+                if &**key != stored_hash.as_slice() {
+                    return Err("Invalid master password.".to_string());
+                }
+                Ok(())
+            }
+            Err(_) => {
+                // Password hash doesn't exist (old database), create it for future use
+                // This is a migration path for databases created before password verification was added
+                conn.execute(
+                    "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                    params!["password_hash", &**key],
+                )
+                .map_err(|e| format!("Failed to store password hash during migration: {}", e))?;
+                Ok(())
+            }
         }
-
-        Ok(())
     }
 
     fn encrypt(&self, data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
@@ -125,10 +137,29 @@ pub fn read_from_clipboard() -> Result<String, String> {
     clipboard.get_text().map_err(|e| format!("Failed to read from clipboard: {}", e))
 }
 
-#[allow(dead_code)]
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     let mut clipboard = Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
     clipboard.set_text(text).map_err(|e| format!("Failed to copy to clipboard: {}", e))
+}
+
+/// Schedule clipboard clearing after a timeout
+///
+/// SECURITY: Spawns a background thread that clears the clipboard after the specified
+/// timeout. This prevents secrets from persisting indefinitely in clipboard history.
+///
+/// # Arguments
+/// * `timeout_secs` - Number of seconds to wait before clearing clipboard
+///
+/// # Implementation Notes
+/// - Uses detached thread to avoid blocking CLI exit
+/// - Thread sleeps for the timeout duration, then clears clipboard
+/// - If clipboard access fails during clear, error is silently ignored
+pub fn schedule_clipboard_clear(timeout_secs: u64) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(timeout_secs));
+        // Attempt to clear clipboard, ignore errors (user may have already changed it)
+        let _ = copy_to_clipboard("");
+    });
 }
 
 pub fn update_secret(alias: &str, new_secret: &str, password: &SecretString) -> Result<(), String> {

@@ -36,6 +36,21 @@ pub fn get_vault_path() -> Result<PathBuf, String> {
     Ok(vault_dir.join(DB_NAME))
 }
 
+/// Opens a connection to the vault database with security pragmas enabled
+pub(crate) fn open_connection() -> Result<Connection, String> {
+    let db_path = get_vault_path()?;
+    let conn = Connection::open(&db_path)
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+
+    // SECURITY: Enable secure delete on every connection
+    // PRAGMA commands don't return rows, so we use prepare and execute
+    conn.pragma_update(None, "secure_delete", "ON")
+        .map_err(|e| format!("Failed to enable secure delete: {}", e))?;
+
+    Ok(conn)
+}
+
+
 /// Checks if the vault exists, returns an error if it doesn't
 pub fn ensure_vault_exists() -> Result<(), String> {
     let db_path = get_vault_path()?;
@@ -49,17 +64,31 @@ pub fn ensure_vault_exists() -> Result<(), String> {
 
 /// Initializes the vault database with proper permissions
 pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), String> {
-    let vault_dir = if let Ok(test_path) = std::env::var("AK_VAULT_PATH")
-        .or_else(|_| std::env::var("AK_STORAGE_PATH")) {
-        PathBuf::from(test_path)
+    let test_path_result = std::env::var("AK_VAULT_PATH")
+        .or_else(|_| std::env::var("AK_STORAGE_PATH"));
+
+    let (vault_dir, db_path) = if let Ok(test_path) = test_path_result {
+        let path = PathBuf::from(test_path);
+        if path.extension().and_then(|e| e.to_str()) == Some("db") {
+            // Path is a direct database file path
+            let parent = path.parent()
+                .ok_or("Invalid database path: no parent directory")?
+                .to_path_buf();
+            (parent, path)
+        } else {
+            // Path is a directory
+            (path.clone(), path.join(DB_NAME))
+        }
     } else {
         let home = std::env::var("HOME")
             .map_err(|_| "Could not determine home directory".to_string())?;
-        PathBuf::from(home).join(VAULT_DIR)
+        let vault_dir = PathBuf::from(home).join(VAULT_DIR);
+        let db_path = vault_dir.join(DB_NAME);
+        (vault_dir, db_path)
     };
 
     if !vault_dir.exists() {
-        fs::create_dir(&vault_dir)
+        fs::create_dir_all(&vault_dir)
             .map_err(|e| format!("Failed to create vault directory: {}", e))?;
 
         #[cfg(unix)]
@@ -72,8 +101,6 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
                 .map_err(|e| format!("Failed to set directory permissions: {}", e))?;
         }
     }
-
-    let db_path = vault_dir.join(DB_NAME);
 
     if db_path.exists() {
         return Err("Vault already initialized. Use 'ak reset' to reinitialize.".to_string());
@@ -91,6 +118,14 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         fs::set_permissions(&db_path, perms)
             .map_err(|e| format!("Failed to set database permissions: {}", e))?;
     }
+
+    // SECURITY: Enable secure delete to overwrite deleted data with zeros
+    conn.pragma_update(None, "secure_delete", "ON")
+        .map_err(|e| format!("Failed to enable secure delete: {}", e))?;
+
+    // SECURITY: Enable auto-vacuum to reclaim space and prevent data remnants
+    conn.pragma_update(None, "auto_vacuum", "FULL")
+        .map_err(|e| format!("Failed to enable auto-vacuum: {}", e))?;
 
     conn.execute(
         "CREATE TABLE config (
@@ -267,6 +302,26 @@ fn migrate_database(conn: &Connection) -> Result<(), String> {
         .map_err(|e| format!("Failed to add created_at column: {}", e))?;
     }
 
+    // Ensure audit_log table exists (for migration from pre-audit versions)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            operation TEXT NOT NULL,
+            alias TEXT,
+            success INTEGER NOT NULL,
+            hmac TEXT NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| format!("Failed to create audit_log table: {}", e))?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)",
+        [],
+    )
+    .map_err(|e| format!("Failed to create audit index: {}", e))?;
+
     Ok(())
 }
 
@@ -278,15 +333,23 @@ pub fn get_salt() -> Result<Vec<u8>, String> {
         return Err("Vault not initialized. Run 'ak init' first.".to_string());
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = open_connection()?;
 
+    // Try new key name first, then fall back to old key name for migration
     let salt: Vec<u8> = conn
         .query_row(
             "SELECT value FROM config WHERE key = ?",
             params!["master_salt"],
             |row| row.get(0),
         )
+        .or_else(|_| {
+            // Fall back to old key name 'salt' for backward compatibility
+            conn.query_row(
+                "SELECT value FROM config WHERE key = ?",
+                params!["salt"],
+                |row| row.get(0),
+            )
+        })
         .map_err(|_| "Salt not found in vault. Vault may be corrupted.".to_string())?;
 
     Ok(salt)
@@ -300,8 +363,7 @@ pub fn store_entry(alias: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<(), S
         return Err("Vault not initialized. Run 'ak init' first.".to_string());
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = open_connection()?;
 
     migrate_database(&conn)?;
 
@@ -323,8 +385,7 @@ pub fn get_entry(alias: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
         return Err("Vault not initialized. Run 'ak init' first.".to_string());
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = open_connection()?;
 
     conn.query_row(
         "SELECT nonce, ciphertext FROM entries WHERE alias = ?1",
@@ -347,8 +408,7 @@ pub fn list_entries() -> Result<Vec<String>, String> {
         return Err("Vault not initialized. Run 'ak init' first.".to_string());
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = open_connection()?;
 
     let mut stmt = conn
         .prepare("SELECT alias FROM entries ORDER BY alias")
@@ -371,8 +431,7 @@ pub fn delete_entry(alias: &str) -> Result<(), String> {
         return Err("Vault not initialized. Run 'ak init' first.".to_string());
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = open_connection()?;
 
     let rows_affected = conn
         .execute("DELETE FROM entries WHERE alias = ?1", [alias])
@@ -395,8 +454,7 @@ pub fn get_entries_with_metadata(
         return Err("Vault not initialized. Run 'ak init' first.".to_string());
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = open_connection()?;
 
     let sql_pattern = pattern.replace('*', "%").replace('?', "_");
 
@@ -511,8 +569,7 @@ pub fn insert_entry_full(
         return Err("Vault not initialized. Run 'ak init' first.".to_string());
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = open_connection()?;
 
     migrate_database(&conn)?;
 
@@ -529,7 +586,7 @@ pub fn insert_entry_full(
 /// Checks if an entry exists in the vault
 pub fn entry_exists(alias: &str) -> Result<bool, String> {
     let db_path = get_vault_path()?;
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let conn = open_connection()?;
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM entries WHERE alias = ?1",
@@ -548,8 +605,7 @@ pub fn get_all_entries() -> Result<Vec<(String, Vec<u8>, Vec<u8>)>, String> {
         return Err("Vault not initialized. Run 'ak init' first.".to_string());
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = open_connection()?;
 
     let mut stmt = conn
         .prepare("SELECT alias, nonce, ciphertext FROM entries ORDER BY alias")

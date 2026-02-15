@@ -2,6 +2,7 @@ mod storage;
 mod crypto;
 mod executor;
 mod synapse;
+mod audit;
 
 use clap::{Parser, Subcommand};
 use secrecy::SecretString;
@@ -28,6 +29,9 @@ enum Commands {
     },
     Get {
         alias: String,
+        /// Clipboard auto-clear timeout in seconds (default: 30, 0 to disable)
+        #[arg(short, long, default_value = "30")]
+        timeout: u64,
     },
     Delete {
         alias: String,
@@ -67,6 +71,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             crypto::generate_salt(&mut salt)?;
             println!("Initializing vault...");
             storage::initialize_vault(&salt, &password)?;
+            audit::initialize_audit_log()?;
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::Init, None, true);
             println!("Vault initialized successfully!");
         }
         Commands::Add { alias } => {
@@ -85,22 +91,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 secret
             };
 
-            executor::add_secret(&alias, secret.trim(), &password)?;
+            let result = executor::add_secret(&alias, secret.trim(), &password);
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(&alias), result.is_ok());
+            result?;
             println!("Secret added successfully!");
         }
-        Commands::Get { alias } => {
+        Commands::Get { alias, timeout } => {
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
-            let secret = executor::get_secret(&alias, &password)?;
-            println!("Secret: {}", &*secret);
+            let result = executor::get_secret(&alias, &password);
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::Get, Some(&alias), result.is_ok());
+            let secret = result?;
+
+            // Copy to clipboard
+            executor::copy_to_clipboard(&secret)?;
+            println!("Secret copied to clipboard.");
+
+            // Auto-clear clipboard after timeout (if enabled)
+            if timeout > 0 {
+                println!("Clipboard will be cleared in {} seconds...", timeout);
+                executor::schedule_clipboard_clear(timeout);
+            }
         }
         Commands::Delete { alias } => {
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
-            executor::delete_secret(&alias, &password)?;
+            let result = executor::delete_secret(&alias, &password);
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(&alias), result.is_ok());
+            result?;
             println!("Secret deleted.");
         }
         Commands::List => {
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
-            let entries = executor::list_secrets(&password)?;
+            let result = executor::list_secrets(&password);
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::List, None, result.is_ok());
+            let entries = result?;
 
             if entries.is_empty() {
                 println!("No secrets stored.");
@@ -121,25 +144,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut secret = Zeroizing::new(String::new());
             io::stdin().read_line(&mut secret)?;
 
-            executor::update_secret(&alias, secret.trim(), &password)?;
+            let result = executor::update_secret(&alias, secret.trim(), &password);
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::Update, Some(&alias), result.is_ok());
+            result?;
             println!("Secret updated successfully!");
         }
         Commands::Export { pattern, output } => {
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
             let output_path = std::path::Path::new(&output);
 
-            let count = synapse::export_vault(&pattern, output_path, &password)?;
+            let result = synapse::export_vault(&pattern, output_path, &password);
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::Export, Some(&pattern), result.is_ok());
+            let count = result?;
             println!("Exported {} secret(s) to {}", count, output);
         }
         Commands::Import { file } => {
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
             let input_path = std::path::Path::new(&file);
 
-            let result = synapse::import_vault(input_path, &password)?;
+            let result = synapse::import_vault(input_path, &password);
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::Import, Some(&file), result.is_ok());
+            let import_result = result?;
             eprintln!("Import complete:");
-            eprintln!("  Added: {}", result.added);
-            eprintln!("  Updated: {}", result.updated);
-            eprintln!("  Skipped: {}", result.skipped);
+            eprintln!("  Added: {}", import_result.added);
+            eprintln!("  Updated: {}", import_result.updated);
+            eprintln!("  Skipped: {}", import_result.skipped);
         }
         Commands::Exec { env_mappings, command } => {
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
@@ -148,7 +177,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("No command specified. Use -- to separate command from flags.".into());
             }
 
-            executor::exec_with_env(&env_mappings, &password, &command)?;
+            let result = executor::exec_with_env(&env_mappings, &password, &command);
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::Exec, None, result.is_ok());
+            result?;
         }
     }
     Ok(())
