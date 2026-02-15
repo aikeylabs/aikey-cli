@@ -1,12 +1,13 @@
 use crate::crypto;
 use crate::storage;
 use arboard::Clipboard;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 use secrecy::SecretString;
 use zeroize::Zeroizing;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use rayon::prelude::*;
 
 struct VaultContext {
     key: crypto::SecureBuffer<[u8; crypto::KEY_SIZE]>,
@@ -17,11 +18,28 @@ struct VaultContext {
 impl VaultContext {
     fn new(password: &SecretString) -> Result<Self, String> {
         storage::ensure_vault_exists()?;
+
+        // Check rate limiting before attempting authentication
+        let mut rate_limiter = crate::ratelimit::RateLimiter::load()?;
+        rate_limiter.check_allowed()?;
+
         let salt = storage::get_salt()?;
         let key = crypto::derive_key(password, &salt)
             .map_err(|_| "Invalid master password or corrupted vault.".to_string())?;
-        Self::verify_password_internal(&key)?;
-        Ok(VaultContext { key, salt })
+
+        // Verify password with rate limiting
+        match Self::verify_password_internal(&key) {
+            Ok(_) => {
+                // Success - reset rate limiter
+                rate_limiter.record_success()?;
+                Ok(VaultContext { key, salt })
+            }
+            Err(e) => {
+                // Failure - record attempt
+                rate_limiter.record_failure()?;
+                Err(e)
+            }
+        }
     }
 
     fn verify_password_internal(key: &crypto::SecureBuffer<[u8; crypto::KEY_SIZE]>) -> Result<(), String> {
@@ -212,7 +230,8 @@ pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &s
     drop(ctx);
 
     if !status.success() {
-        return Err(format!("Command exited with status: {}", status));
+        let exit_code = status.code().unwrap_or(1);
+        std::process::exit(exit_code);
     }
 
     Ok(())
@@ -261,40 +280,48 @@ pub fn exec_with_env(
     let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
         std::collections::HashMap::with_capacity(env_mappings.len());
 
-    // TIGHT DECRYPTION LOOP: Minimize time between first and last secret decryption
-    for mapping in env_mappings {
-        let parts: Vec<&str> = mapping.splitn(2, '=').collect();
-        if parts.len() != 2 {
-            return Err(format!(
-                "Invalid env mapping '{}'. Expected format: ENV_VAR=alias",
-                mapping
-            ));
-        }
+    // PARALLEL DECRYPTION: Use rayon for concurrent secret decryption
+    // This significantly improves performance for vaults with 100+ secrets
+    let decryption_results: Result<Vec<(String, Zeroizing<String>)>, String> = env_mappings
+        .par_iter()
+        .map(|mapping| {
+            let parts: Vec<&str> = mapping.splitn(2, '=').collect();
+            if parts.len() != 2 {
+                return Err(format!(
+                    "Invalid env mapping '{}'. Expected format: ENV_VAR=alias",
+                    mapping
+                ));
+            }
 
-        let env_name = parts[0].trim();
-        let alias = parts[1].trim();
+            let env_name = parts[0].trim();
+            let alias = parts[1].trim();
 
-        if env_name.is_empty() || alias.is_empty() {
-            return Err(format!(
-                "Invalid env mapping '{}'. Both ENV_VAR and alias must be non-empty",
-                mapping
-            ));
-        }
+            if env_name.is_empty() || alias.is_empty() {
+                return Err(format!(
+                    "Invalid env mapping '{}'. Both ENV_VAR and alias must be non-empty",
+                    mapping
+                ));
+            }
 
-        // Fetch secret from vault
-        let (nonce, ciphertext) = storage::get_entry(alias)
-            .map_err(|e| format!("Failed to fetch secret '{}': {}", alias, e))?;
+            // Fetch secret from vault
+            let (nonce, ciphertext) = storage::get_entry(alias)
+                .map_err(|e| format!("Failed to fetch secret '{}': {}", alias, e))?;
 
-        let plaintext = ctx.decrypt(&nonce, &ciphertext)?;
+            let plaintext = ctx.decrypt(&nonce, &ciphertext)?;
 
-        // OPTIMIZATION: Direct conversion from SecureBuffer to String
-        // Avoids intermediate Vec allocation from plaintext.to_vec()
-        let secret_string = std::str::from_utf8(&plaintext)
-            .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", alias, e))?
-            .to_string();
+            // OPTIMIZATION: Direct conversion from SecureBuffer to String
+            // Avoids intermediate Vec allocation from plaintext.to_vec()
+            let secret_string = std::str::from_utf8(&plaintext)
+                .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", alias, e))?
+                .to_string();
 
-        // Store in Zeroizing container for secure cleanup
-        env_secrets.insert(env_name.to_string(), Zeroizing::new(secret_string));
+            Ok((env_name.to_string(), Zeroizing::new(secret_string)))
+        })
+        .collect();
+
+    // Collect results into HashMap
+    for (env_name, secret) in decryption_results? {
+        env_secrets.insert(env_name, secret);
     }
 
     // INPUT ROBUSTNESS: Handle both single-string and pre-split command formats
@@ -365,13 +392,49 @@ pub fn exec_with_env(
 
     // Propagate child exit status
     if !status.success() {
-        return Err(format!(
-            "Command exited with status: {}",
-            status.code().unwrap_or(-1)
-        ));
+        let exit_code = status.code().unwrap_or(1);
+        std::process::exit(exit_code);
     }
 
     Ok(())
+}
+
+/// Execute a command with ALL secrets from the vault injected as environment variables
+///
+/// This is a convenience wrapper around exec_with_env that automatically loads all
+/// secrets from the vault and injects them as environment variables.
+///
+/// # Arguments
+/// * `password` - Master password for vault access
+/// * `command` - Command and arguments to execute
+///
+/// # Example
+/// ```
+/// // ak run -- printenv
+/// run_with_all_secrets(&password, &["printenv"])?;
+/// ```
+pub fn run_with_all_secrets(
+    password: &SecretString,
+    command: &[String],
+) -> Result<(), String> {
+    // Get all secret aliases from the vault
+    let aliases = list_secrets(password)?;
+
+    if aliases.is_empty() {
+        eprintln!("Injecting 0 secret(s)");
+        return Err("No secrets found in vault".to_string());
+    }
+
+    // Build env mappings in the format "ALIAS=alias" for each secret
+    let env_mappings: Vec<String> = aliases
+        .iter()
+        .map(|alias| format!("{}={}", alias.to_uppercase().replace('-', "_"), alias))
+        .collect();
+
+    eprintln!("Injecting {} secret(s)", aliases.len());
+
+    // Use the existing exec_with_env function
+    exec_with_env(&env_mappings, password, command)
 }
 
 #[allow(dead_code)]
