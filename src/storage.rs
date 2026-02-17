@@ -156,6 +156,25 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
     )
     .map_err(|e| format!("Failed to store salt: {}", e))?;
 
+    // Store KDF parameters for future use (e.g., password changes)
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params!["kdf_m_cost", &crate::crypto::ARGON2_M_COST.to_le_bytes()],
+    )
+    .map_err(|e| format!("Failed to store KDF m_cost: {}", e))?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params!["kdf_t_cost", &crate::crypto::ARGON2_T_COST.to_le_bytes()],
+    )
+    .map_err(|e| format!("Failed to store KDF t_cost: {}", e))?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params!["kdf_p_cost", &crate::crypto::ARGON2_P_COST.to_le_bytes()],
+    )
+    .map_err(|e| format!("Failed to store KDF p_cost: {}", e))?;
+
     // Derive key directly from password parameter instead of environment variable
     let key = crate::crypto::derive_key(password, salt)
         .map_err(|e| format!("Key derivation failed: {}", e))?;
@@ -355,6 +374,59 @@ pub fn get_salt() -> Result<Vec<u8>, String> {
     Ok(salt)
 }
 
+/// Retrieves KDF parameters from the vault
+pub fn get_kdf_params() -> Result<(u32, u32, u32), String> {
+    let db_path = get_vault_path()?;
+
+    if !db_path.exists() {
+        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+    }
+
+    let conn = open_connection()?;
+
+    // Try to get stored KDF parameters, fall back to defaults if not found
+    let m_cost: u32 = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params!["kdf_m_cost"],
+            |row| {
+                let bytes: Vec<u8> = row.get(0)?;
+                Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(0, "kdf_m_cost".to_string(), rusqlite::types::Type::Blob)
+                })?))
+            },
+        )
+        .unwrap_or(crate::crypto::ARGON2_M_COST);
+
+    let t_cost: u32 = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params!["kdf_t_cost"],
+            |row| {
+                let bytes: Vec<u8> = row.get(0)?;
+                Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(0, "kdf_t_cost".to_string(), rusqlite::types::Type::Blob)
+                })?))
+            },
+        )
+        .unwrap_or(crate::crypto::ARGON2_T_COST);
+
+    let p_cost: u32 = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params!["kdf_p_cost"],
+            |row| {
+                let bytes: Vec<u8> = row.get(0)?;
+                Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(0, "kdf_p_cost".to_string(), rusqlite::types::Type::Blob)
+                })?))
+            },
+        )
+        .unwrap_or(crate::crypto::ARGON2_P_COST);
+
+    Ok((m_cost, t_cost, p_cost))
+}
+
 /// Stores an encrypted entry in the vault
 pub fn store_entry(alias: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<(), String> {
     let db_path = get_vault_path()?;
@@ -440,6 +512,118 @@ pub fn delete_entry(alias: &str) -> Result<(), String> {
     if rows_affected == 0 {
         return Err(format!("Entry '{}' not found", alias));
     }
+
+    Ok(())
+}
+
+/// Changes the master password by re-encrypting all entries
+pub fn change_password(old_password: &SecretString, new_password: &SecretString) -> Result<(), String> {
+    let db_path = get_vault_path()?;
+
+    if !db_path.exists() {
+        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+    }
+
+    // Get salt and KDF parameters
+    let salt = get_salt()?;
+    let (m_cost, t_cost, p_cost) = get_kdf_params()?;
+
+    // Derive old key to verify password
+    let old_key = crate::crypto::derive_key_with_params(old_password, &salt, m_cost, t_cost, p_cost)
+        .map_err(|e| format!("Failed to derive old key: {}", e))?;
+
+    // Verify old password by attempting to decrypt an entry
+    let conn = open_connection()?;
+
+    // Get first entry to test decryption
+    let test_result: Result<(Vec<u8>, Vec<u8>), rusqlite::Error> = conn.query_row(
+        "SELECT nonce, ciphertext FROM entries LIMIT 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+
+    if let Ok((nonce, ciphertext)) = test_result {
+        // Try to decrypt with old key to verify password
+        crate::crypto::decrypt(&old_key, &nonce, &ciphertext)
+            .map_err(|_| "Incorrect password".to_string())?;
+    }
+
+    // Generate new salt for new password
+    let mut new_salt = [0u8; 16];
+    crate::crypto::generate_salt(&mut new_salt)
+        .map_err(|e| format!("Failed to generate salt: {}", e))?;
+
+    // Derive new key with default parameters (which will be stored in DB)
+    let new_key = crate::crypto::derive_key_with_params(
+        new_password,
+        &new_salt,
+        crate::crypto::ARGON2_M_COST,
+        crate::crypto::ARGON2_T_COST,
+        crate::crypto::ARGON2_P_COST,
+    )
+    .map_err(|e| format!("Failed to derive new key: {}", e))?;
+
+    // Get all entries
+    let mut stmt = conn
+        .prepare("SELECT id, alias, nonce, ciphertext FROM entries")
+        .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+
+    let entries: Vec<(i64, String, Vec<u8>, Vec<u8>)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+            ))
+        })
+        .map_err(|e| format!("Failed to query entries: {}", e))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect entries: {}", e))?;
+
+    // Re-encrypt all entries with new key
+    for (id, alias, old_nonce, old_ciphertext) in entries {
+        // Decrypt with old key
+        let plaintext = crate::crypto::decrypt(&old_key, &old_nonce, &old_ciphertext)
+            .map_err(|e| format!("Failed to decrypt entry '{}': {}", alias, e))?;
+
+        // Encrypt with new key
+        let (new_nonce, new_ciphertext) = crate::crypto::encrypt(&new_key, &plaintext)
+            .map_err(|e| format!("Failed to encrypt entry '{}': {}", alias, e))?;
+
+        // Update entry in database
+        conn.execute(
+            "UPDATE entries SET nonce = ?, ciphertext = ? WHERE id = ?",
+            params![new_nonce, new_ciphertext, id],
+        )
+        .map_err(|e| format!("Failed to update entry '{}': {}", alias, e))?;
+    }
+
+    // Update salt in config
+    conn.execute(
+        "UPDATE config SET value = ? WHERE key = ?",
+        params![&new_salt[..], "master_salt"],
+    )
+    .map_err(|e| format!("Failed to update salt: {}", e))?;
+
+    // Update KDF parameters to default values (stored as binary)
+    conn.execute(
+        "UPDATE config SET value = ? WHERE key = ?",
+        params![&crate::crypto::ARGON2_M_COST.to_le_bytes()[..], "kdf_m_cost"],
+    )
+    .map_err(|e| format!("Failed to update m_cost: {}", e))?;
+
+    conn.execute(
+        "UPDATE config SET value = ? WHERE key = ?",
+        params![&crate::crypto::ARGON2_T_COST.to_le_bytes()[..], "kdf_t_cost"],
+    )
+    .map_err(|e| format!("Failed to update t_cost: {}", e))?;
+
+    conn.execute(
+        "UPDATE config SET value = ? WHERE key = ?",
+        params![&crate::crypto::ARGON2_P_COST.to_le_bytes()[..], "kdf_p_cost"],
+    )
+    .map_err(|e| format!("Failed to update p_cost: {}", e))?;
 
     Ok(())
 }
@@ -585,7 +769,6 @@ pub fn insert_entry_full(
 
 /// Checks if an entry exists in the vault
 pub fn entry_exists(alias: &str) -> Result<bool, String> {
-    let db_path = get_vault_path()?;
     let conn = open_connection()?;
     let count: i64 = conn
         .query_row(

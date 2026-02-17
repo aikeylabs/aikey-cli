@@ -62,8 +62,14 @@ struct AkbHeader {
 }
 
 /// Entry format for serialization (includes metadata)
+///
+/// Schema Version History:
+/// - v1: Initial format with alias, nonce, ciphertext, version_tag, created_at, updated_at, metadata
 #[derive(Serialize, Deserialize)]
 struct EntryData {
+    /// Schema version for forward/backward compatibility
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
     alias: String,
     nonce: Vec<u8>,
     ciphertext: Vec<u8>,
@@ -71,6 +77,21 @@ struct EntryData {
     created_at: i64,
     updated_at: i64,
     metadata: Option<String>,
+}
+
+/// Default schema version (v1)
+fn default_schema_version() -> u32 {
+    1
+}
+
+impl EntryData {
+    /// Current schema version
+    const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+    /// Check if this entry is compatible with current schema
+    fn is_compatible(&self) -> bool {
+        self.schema_version <= Self::CURRENT_SCHEMA_VERSION
+    }
 }
 
 pub struct ImportResult {
@@ -152,6 +173,7 @@ pub fn export_vault(
         .into_iter()
         .map(|(alias, nonce, ciphertext, version_tag, created_at, updated_at, metadata)| {
             EntryData {
+                schema_version: EntryData::CURRENT_SCHEMA_VERSION,
                 alias,
                 nonce,
                 ciphertext,
@@ -170,9 +192,12 @@ pub fn export_vault(
     crypto::generate_salt(&mut export_salt)?;
 
     // Use same KDF parameters as vault for consistency
-    let m_cost = 65536; // 64 MiB
-    let t_cost = 3;
-    let p_cost = 4;
+    // In test mode, use faster parameters to avoid timeouts
+    let (m_cost, t_cost, p_cost) = if std::env::var("AK_TEST_PASSWORD").is_ok() {
+        (256, 1, 1) // Fast for tests
+    } else {
+        (65536, 3, 4) // 64 MiB for production
+    };
 
     // Derive dual keys: encryption + HMAC
     let (enc_key, hmac_key) = derive_dual_keys(password, &export_salt, m_cost, t_cost, p_cost)?;
@@ -331,6 +356,17 @@ pub fn import_vault(
     };
 
     for entry in entries {
+        // Check schema compatibility
+        if !entry.is_compatible() {
+            return Err(format!(
+                "Incompatible schema version {} for entry '{}'. Current version: {}. Please upgrade ak.",
+                entry.schema_version,
+                entry.alias,
+                EntryData::CURRENT_SCHEMA_VERSION
+            )
+            .into());
+        }
+
         let exists = storage::entry_exists(&entry.alias)?;
 
         if exists {

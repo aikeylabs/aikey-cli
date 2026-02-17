@@ -7,8 +7,8 @@
 use crate::crypto;
 use crate::storage;
 use hmac::{Hmac, Mac};
-use rusqlite::{params, Connection};
-use secrecy::{ExposeSecret, SecretString};
+use rusqlite::params;
+use secrecy::SecretString;
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;

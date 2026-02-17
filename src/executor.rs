@@ -24,7 +24,11 @@ impl VaultContext {
         rate_limiter.check_allowed()?;
 
         let salt = storage::get_salt()?;
-        let key = crypto::derive_key(password, &salt)
+
+        // Get KDF parameters from database
+        let (m_cost, t_cost, p_cost) = storage::get_kdf_params()?;
+
+        let key = crypto::derive_key_with_params(password, &salt, m_cost, t_cost, p_cost)
             .map_err(|_| "Invalid master password or corrupted vault.".to_string())?;
 
         // Verify password with rate limiting

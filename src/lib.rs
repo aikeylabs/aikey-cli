@@ -6,3 +6,5 @@ pub mod crypto;
 pub mod storage;
 pub mod synapse;
 pub mod executor;
+pub mod audit;
+pub mod ratelimit;

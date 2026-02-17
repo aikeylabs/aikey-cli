@@ -3,9 +3,10 @@ mod crypto;
 mod executor;
 mod synapse;
 mod audit;
+mod ratelimit;
 
 use clap::{Parser, Subcommand};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use std::env;
 use std::io::{self, Write};
 use zeroize::Zeroizing;
@@ -59,6 +60,14 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+    /// Execute a command with all secrets automatically injected as environment variables
+    Run {
+        /// The command to execute (use -- to separate)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Change the master password
+    ChangePassword,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -94,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = executor::add_secret(&alias, secret.trim(), &password);
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(&alias), result.is_ok());
             result?;
-            println!("Secret added successfully!");
+            eprintln!("Secret '{}' added successfully", alias);
         }
         Commands::Get { alias, timeout } => {
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
@@ -102,14 +111,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Get, Some(&alias), result.is_ok());
             let secret = result?;
 
-            // Copy to clipboard
-            executor::copy_to_clipboard(&secret)?;
-            println!("Secret copied to clipboard.");
+            // Check if clipboard should be disabled (for testing)
+            if std::env::var("AK_NO_CLIPBOARD").is_ok() {
+                println!("{}", secret.as_str());
+            } else {
+                // Copy to clipboard
+                executor::copy_to_clipboard(&secret)?;
+                println!("Secret copied to clipboard.");
 
-            // Auto-clear clipboard after timeout (if enabled)
-            if timeout > 0 {
-                println!("Clipboard will be cleared in {} seconds...", timeout);
-                executor::schedule_clipboard_clear(timeout);
+                // Auto-clear clipboard after timeout (if enabled)
+                if timeout > 0 {
+                    println!("Clipboard will be cleared in {} seconds...", timeout);
+                    executor::schedule_clipboard_clear(timeout);
+                }
             }
         }
         Commands::Delete { alias } => {
@@ -137,17 +151,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Update { alias } => {
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
 
-            // Secure secret input with explicit flush
-            print!("Enter New Secret: ");
-            io::stdout().flush()?;
+            // Check for test environment variable first
+            let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
+                Zeroizing::new(test_secret)
+            } else {
+                // Secure secret input with explicit flush
+                print!("Enter New Secret: ");
+                io::stdout().flush()?;
 
-            let mut secret = Zeroizing::new(String::new());
-            io::stdin().read_line(&mut secret)?;
+                let mut secret = Zeroizing::new(String::new());
+                io::stdin().read_line(&mut secret)?;
+                secret
+            };
 
             let result = executor::update_secret(&alias, secret.trim(), &password);
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Update, Some(&alias), result.is_ok());
             result?;
-            println!("Secret updated successfully!");
+            eprintln!("Secret '{}' updated successfully", alias);
         }
         Commands::Export { pattern, output } => {
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
@@ -180,6 +200,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = executor::exec_with_env(&env_mappings, &password, &command);
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Exec, None, result.is_ok());
             result?;
+        }
+        Commands::Run { command } => {
+            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
+
+            if command.is_empty() {
+                return Err("No command specified. Use -- to separate command from flags.".into());
+            }
+
+            let result = executor::run_with_all_secrets(&password, &command);
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::Exec, None, result.is_ok());
+            result?;
+        }
+        Commands::ChangePassword => {
+            let old_password = prompt_password_secure("Enter Current Master Password: ", cli.password_stdin)?;
+            let new_password = prompt_password_secure("Enter New Master Password: ", false)?;
+            let confirm_password = prompt_password_secure("Confirm New Master Password: ", false)?;
+
+            if new_password.expose_secret() != confirm_password.expose_secret() {
+                return Err("Passwords do not match".into());
+            }
+
+            println!("Changing master password...");
+            let result = storage::change_password(&old_password, &new_password);
+            let _ = audit::log_audit_event(&old_password, audit::AuditOperation::Init, None, result.is_ok());
+            result?;
+            println!("Master password changed successfully!");
         }
     }
     Ok(())

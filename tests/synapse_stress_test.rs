@@ -30,6 +30,7 @@ fn test_command(vault_path: &PathBuf) -> Command {
     let mut cmd = Command::cargo_bin("ak").unwrap();
     cmd.env("AK_VAULT_PATH", vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.env("AK_NO_CLIPBOARD", "1");
     cmd
 }
 
@@ -108,38 +109,37 @@ fn test_smart_merge_version_priority() {
     init_vault_with_entries(&vault_path, vec![("key_a", "local_secret_v2")]);
 
     // Update key_a to increment version (simulate v2)
-    Command::cargo_bin("ak")
-        .unwrap()
-        .args(&["update", "key_a", "local_secret_v2_updated"])
+    test_command(&vault_path)
+        .arg("update")
+        .arg("key_a")
+        .env("AK_TEST_SECRET", "local_secret_v2_updated")
         .assert()
         .success();
 
     // Export current state (v2)
     let export_v2_path = _temp_dir.path().join("export_v2.akb");
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["export", "*", export_v2_path.to_str().unwrap()])
         .assert()
         .success();
 
     // Update key_a again to v3
-    Command::cargo_bin("ak")
-        .unwrap()
-        .args(&["update", "key_a", "local_secret_v3"])
+    test_command(&vault_path)
+        .arg("update")
+        .arg("key_a")
+        .env("AK_TEST_SECRET", "local_secret_v3")
         .assert()
         .success();
 
     // Now import the v2 export - should be skipped (local v3 > import v2)
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["import", export_v2_path.to_str().unwrap()])
         .assert()
         .success()
-        .stderr(predicate::str::contains("Skipped: 1 secret(s)"));
+        .stderr(predicate::str::contains("Skipped: 1"));
 
     // Verify key_a still has v3 value
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["get", "key_a"])
         .assert()
         .success()
@@ -157,41 +157,40 @@ fn test_smart_merge_timestamp_priority() {
 
     // Export immediately (older timestamp)
     let export_old_path = _temp_dir.path().join("export_old.akb");
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["export", "*", export_old_path.to_str().unwrap()])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("Exported 1 secret(s)"));
 
     // Wait a moment to ensure timestamp difference
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Update key_b with same version but newer timestamp
-    Command::cargo_bin("ak")
-        .unwrap()
-        .args(&["update", "key_b", "new_value"])
+    test_command(&vault_path)
+        .arg("update")
+        .arg("key_b")
+        .env("AK_TEST_SECRET", "new_value")
         .assert()
         .success();
 
     // Export again (newer timestamp)
     let export_new_path = _temp_dir.path().join("export_new.akb");
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["export", "*", export_new_path.to_str().unwrap()])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("Exported 1 secret(s)"));
 
     // Import the older export - should be skipped (local timestamp newer)
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["import", export_old_path.to_str().unwrap()])
         .assert()
         .success()
-        .stderr(predicate::str::contains("Skipped: 1 secret(s)"));
+        .stderr(predicate::str::contains("Skipped: 1"));
 
     // Verify key_b still has new value
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["get", "key_b"])
         .assert()
         .success()
@@ -213,22 +212,22 @@ fn test_import_summary_output() {
 
     // Export all entries
     let export_path = _temp_dir.path().join("export_all.akb");
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["export", "*", export_path.to_str().unwrap()])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("Exported 3 secret(s)"));
 
     // Update key_a locally (will be skipped on import)
-    Command::cargo_bin("ak")
-        .unwrap()
-        .args(&["update", "key_a", "value_a_updated"])
+    test_command(&vault_path)
+        .arg("update")
+        .arg("key_a")
+        .env("AK_TEST_SECRET", "value_a_updated")
         .assert()
         .success();
 
     // Delete key_b locally (will be added on import)
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["delete", "key_b"])
         .assert()
         .success();
@@ -236,14 +235,13 @@ fn test_import_summary_output() {
     // key_c remains unchanged (will be skipped on import)
 
     // Import - should show: 1 added (key_b), 0 updated, 2 skipped (key_a, key_c)
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["import", export_path.to_str().unwrap()])
         .assert()
         .success()
         .stderr(predicate::str::contains("Import complete:"))
-        .stderr(predicate::str::contains("Added: 1 new secret(s)"))
-        .stderr(predicate::str::contains("Skipped: 2 secret(s)"));
+        .stderr(predicate::str::contains("Added: 1"))
+        .stderr(predicate::str::contains("Skipped: 2"));
 
     println!("✓ Import summary output test passed");
 }
@@ -261,12 +259,11 @@ fn test_export_import_roundtrip() {
 
     // Export all entries
     let export_path = _temp_dir.path().join("backup.akb");
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["export", "*", export_path.to_str().unwrap()])
         .assert()
         .success()
-        .stderr(predicate::str::contains("Successfully exported 3 secret(s)"));
+        .stdout(predicate::str::contains("Exported 3 secret(s)"));
 
     // Verify export file exists and has restrictive permissions
     assert!(export_path.exists());
@@ -281,43 +278,50 @@ fn test_export_import_roundtrip() {
 
     // Create a new vault for import
     let import_vault_path = _temp_dir.path().join(".ak_vault_import.db");
-    std::env::set_var("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
 
     // Initialize new vault
-    Command::cargo_bin("ak")
-        .unwrap()
-        .arg("init")
+    let mut cmd = Command::cargo_bin("ak").unwrap();
+    cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
+    cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.arg("init")
         .assert()
         .success();
 
     // Import the backup
-    Command::cargo_bin("ak")
-        .unwrap()
-        .args(&["import", export_path.to_str().unwrap()])
+    let mut cmd = Command::cargo_bin("ak").unwrap();
+    cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
+    cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.args(&["import", export_path.to_str().unwrap()])
         .assert()
         .success()
-        .stderr(predicate::str::contains("Added: 3 new secret(s)"))
-        .stderr(predicate::str::contains("Updated: 0 secret(s)"))
-        .stderr(predicate::str::contains("Skipped: 0 secret(s)"));
+        .stderr(predicate::str::contains("Added: 3"))
+        .stderr(predicate::str::contains("Updated: 0"))
+        .stderr(predicate::str::contains("Skipped: 0"));
 
     // Verify all entries were imported correctly
-    Command::cargo_bin("ak")
-        .unwrap()
-        .args(&["get", "github_token"])
+    let mut cmd = Command::cargo_bin("ak").unwrap();
+    cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
+    cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.env("AK_NO_CLIPBOARD", "1");
+    cmd.args(&["get", "github_token"])
         .assert()
         .success()
         .stdout(predicate::str::contains("ghp_test123"));
 
-    Command::cargo_bin("ak")
-        .unwrap()
-        .args(&["get", "openai_key"])
+    let mut cmd = Command::cargo_bin("ak").unwrap();
+    cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
+    cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.env("AK_NO_CLIPBOARD", "1");
+    cmd.args(&["get", "openai_key"])
         .assert()
         .success()
         .stdout(predicate::str::contains("sk-test456"));
 
-    Command::cargo_bin("ak")
-        .unwrap()
-        .args(&["get", "aws_secret"])
+    let mut cmd = Command::cargo_bin("ak").unwrap();
+    cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
+    cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.env("AK_NO_CLIPBOARD", "1");
+    cmd.args(&["get", "aws_secret"])
         .assert()
         .success()
         .stdout(predicate::str::contains("aws_test789"));
@@ -339,34 +343,35 @@ fn test_pattern_export() {
 
     // Export only openai keys
     let export_path = _temp_dir.path().join("openai_backup.akb");
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["export", "openai*", export_path.to_str().unwrap()])
         .assert()
         .success()
-        .stderr(predicate::str::contains("Successfully exported 2 secret(s)"));
+        .stdout(predicate::str::contains("Exported 2 secret(s)"));
 
     // Create new vault and import
     let import_vault_path = _temp_dir.path().join(".ak_vault_import.db");
-    std::env::set_var("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
 
-    Command::cargo_bin("ak")
-        .unwrap()
-        .arg("init")
+    let mut cmd = Command::cargo_bin("ak").unwrap();
+    cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
+    cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.arg("init")
         .assert()
         .success();
 
-    Command::cargo_bin("ak")
-        .unwrap()
-        .args(&["import", export_path.to_str().unwrap()])
+    let mut cmd = Command::cargo_bin("ak").unwrap();
+    cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
+    cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.args(&["import", export_path.to_str().unwrap()])
         .assert()
         .success()
-        .stderr(predicate::str::contains("Added: 2 new secret(s)"));
+        .stderr(predicate::str::contains("Added: 2"));
 
     // Verify only openai keys were imported
-    Command::cargo_bin("ak")
-        .unwrap()
-        .args(&["list"])
+    let mut cmd = Command::cargo_bin("ak").unwrap();
+    cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
+    cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.args(&["list"])
         .assert()
         .success()
         .stdout(predicate::str::contains("openai_key_1"))
@@ -382,9 +387,10 @@ fn test_invalid_akb_file() {
     let (_temp_dir, _vault_path) = setup_test_vault();
 
     // Initialize vault
-    Command::cargo_bin("ak")
-        .unwrap()
-        .arg("init")
+    let mut cmd = Command::cargo_bin("ak").unwrap();
+    cmd.env("AK_VAULT_PATH", _vault_path.to_str().unwrap());
+    cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.arg("init")
         .assert()
         .success();
 
@@ -393,9 +399,10 @@ fn test_invalid_akb_file() {
     fs::write(&invalid_path, b"INVALID_DATA").expect("Failed to write invalid file");
 
     // Attempt to import - should fail
-    Command::cargo_bin("ak")
-        .unwrap()
-        .args(&["import", invalid_path.to_str().unwrap()])
+    let mut cmd = Command::cargo_bin("ak").unwrap();
+    cmd.env("AK_VAULT_PATH", _vault_path.to_str().unwrap());
+    cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.args(&["import", invalid_path.to_str().unwrap()])
         .assert()
         .failure()
         .stderr(predicate::str::contains("Invalid .akb file"));
@@ -412,11 +419,11 @@ fn test_wrong_password_import() {
 
     // Export with test password
     let export_path = _temp_dir.path().join("export.akb");
-    Command::cargo_bin("ak")
-        .unwrap()
+    test_command(&vault_path)
         .args(&["export", "*", export_path.to_str().unwrap()])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("Exported 1 secret(s)"));
 
     // Create new vault with different password
     let import_vault_path = _temp_dir.path().join(".ak_vault_import.db");

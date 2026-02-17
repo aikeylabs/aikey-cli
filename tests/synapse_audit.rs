@@ -26,6 +26,7 @@ fn test_cmd(vault_path: &PathBuf) -> Command {
     let mut cmd = Command::new(cargo_bin("ak"));
     cmd.env("AK_VAULT_PATH", vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
+    cmd.env("AK_NO_CLIPBOARD", "1");
     cmd
 }
 

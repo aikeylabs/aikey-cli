@@ -21,9 +21,9 @@ use std::fmt;
 /// - Memory: 64 MiB (65536 KiB)
 /// - Iterations: 3
 /// - Parallelism: 4 threads
-const ARGON2_M_COST: u32 = 65536;
-const ARGON2_T_COST: u32 = 3;
-const ARGON2_P_COST: u32 = 4;
+pub const ARGON2_M_COST: u32 = 65536;
+pub const ARGON2_T_COST: u32 = 3;
+pub const ARGON2_P_COST: u32 = 4;
 
 /// AES-GCM nonce size (96 bits / 12 bytes)
 pub const NONCE_SIZE: usize = 12;
@@ -173,6 +173,31 @@ pub fn derive_key(password: &SecretString, salt: &[u8]) -> Result<SecureBuffer<[
     }
 
     let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(KEY_SIZE))
+        .map_err(|e| format!("Invalid Argon2 parameters: {}", e))?;
+
+    let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut key = [0u8; KEY_SIZE];
+    argon2
+        .hash_password_into(password.expose_secret().as_bytes(), salt, &mut key)
+        .map_err(|e| format!("Key derivation failed: {}", e))?;
+
+    SecureBuffer::new(key)
+}
+
+/// Derives a key from password and salt using custom Argon2id parameters
+pub fn derive_key_with_params(
+    password: &SecretString,
+    salt: &[u8],
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> Result<SecureBuffer<[u8; KEY_SIZE]>, String> {
+    if salt.len() != SALT_SIZE {
+        return Err(format!("Salt must be {} bytes", SALT_SIZE));
+    }
+
+    let params = Params::new(m_cost, t_cost, p_cost, Some(KEY_SIZE))
         .map_err(|e| format!("Invalid Argon2 parameters: {}", e))?;
 
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, Version::V0x13, params);
