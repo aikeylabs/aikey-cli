@@ -127,6 +127,11 @@ pub fn is_potential_secret(text: &str) -> bool {
 }
 
 pub fn add_secret(alias: &str, secret: &str, password: &SecretString) -> Result<(), String> {
+    // Check if the secret already exists
+    if storage::get_entry(alias).is_ok() {
+        return Err(format!("Secret '{}' already exists. Use 'update' command to modify it.", alias));
+    }
+
     let ctx = VaultContext::new(password)?;
     let (nonce, ciphertext) = ctx.encrypt(secret.as_bytes())?;
     storage::store_entry(alias, &nonce, &ciphertext)
@@ -151,6 +156,11 @@ pub fn delete_secret(alias: &str, password: &SecretString) -> Result<(), String>
 pub fn list_secrets(password: &SecretString) -> Result<Vec<String>, String> {
     let _ctx = VaultContext::new(password)?;
     storage::list_entries()
+}
+
+pub fn list_secrets_with_metadata(password: &SecretString) -> Result<Vec<storage::SecretMetadata>, String> {
+    let _ctx = VaultContext::new(password)?;
+    storage::list_entries_with_metadata()
 }
 
 #[allow(dead_code)]
@@ -190,8 +200,10 @@ pub fn update_secret(alias: &str, new_secret: &str, password: &SecretString) -> 
         return Err(format!("Secret '{}' not found", alias));
     }
 
-    // If it exists, update it (which is the same as adding with the new value)
-    add_secret(alias, new_secret, password)
+    // Encrypt and store the new value
+    let ctx = VaultContext::new(password)?;
+    let (nonce, ciphertext) = ctx.encrypt(new_secret.as_bytes())?;
+    storage::store_entry(alias, &nonce, &ciphertext)
 }
 
 #[allow(dead_code)]
@@ -427,7 +439,8 @@ pub fn exec_with_env(
 pub fn run_with_all_secrets(
     password: &SecretString,
     command: &[String],
-) -> Result<(), String> {
+    json_mode: bool,
+) -> Result<(usize, i32), String> {
     // Establish vault context
     let ctx = VaultContext::new(password)?;
 
@@ -435,11 +448,13 @@ pub fn run_with_all_secrets(
     let aliases = list_secrets(password)?;
 
     if aliases.is_empty() {
-        eprintln!("Injecting 0 secret(s)");
         return Err("No secrets found in vault".to_string());
     }
 
-    eprintln!("Injecting {} secret(s)", aliases.len());
+    let secrets_count = aliases.len();
+    if !json_mode {
+        eprintln!("Injecting {} secret(s)", secrets_count);
+    }
 
     // Decrypt all secrets into Zeroizing containers
     let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
@@ -491,13 +506,14 @@ pub fn run_with_all_secrets(
     drop(env_secrets);
     drop(ctx);
 
-    // Propagate child exit status
+    let exit_code = status.code().unwrap_or(1);
+
+    // Return secrets count and exit code
     if !status.success() {
-        let exit_code = status.code().unwrap_or(1);
-        std::process::exit(exit_code);
+        return Err(format!("Command exited with code {}", exit_code));
     }
 
-    Ok(())
+    Ok((secrets_count, exit_code))
 }
 
 #[allow(dead_code)]
