@@ -17,7 +17,7 @@ fn test_ghost_execution() {
 
     // Initialize vault
     let init = Command::new("cargo")
-        .args(&["run", "--", "init"])
+        .args(&["run", "--bin", "ak", "--", "init"])
         .env("AK_VAULT_PATH", test_vault)
         .env("AK_TEST_PASSWORD", "test_password")
         .output()
@@ -31,7 +31,7 @@ fn test_ghost_execution() {
 
     // Add a test secret
     let add = Command::new("cargo")
-        .args(&["run", "--", "add", "test_key"])
+        .args(&["run", "--bin", "ak", "--", "add", "test_key"])
         .env("AK_VAULT_PATH", test_vault)
         .env("AK_TEST_PASSWORD", "test_password")
         .env("AK_TEST_SECRET", "my_secret_value")
@@ -46,7 +46,7 @@ fn test_ghost_execution() {
 
     // Test exec command
     let exec = Command::new("cargo")
-        .args(&["run", "--", "exec", "--env", "MY_KEY=test_key", "--", "printenv", "MY_KEY"])
+        .args(&["run", "--bin", "ak", "--", "exec", "--env", "MY_KEY=test_key", "--", "printenv", "MY_KEY"])
         .env("AK_VAULT_PATH", test_vault)
         .env("AK_TEST_PASSWORD", "test_password")
         .output()
@@ -84,7 +84,7 @@ fn test_multiple_env_vars() {
 
     // Initialize vault
     Command::new("cargo")
-        .args(&["run", "--", "init"])
+        .args(&["run", "--bin", "ak", "--", "init"])
         .env("AK_VAULT_PATH", test_vault)
         .env("AK_TEST_PASSWORD", "test_password")
         .output()
@@ -92,7 +92,7 @@ fn test_multiple_env_vars() {
 
     // Add first secret
     Command::new("cargo")
-        .args(&["run", "--", "add", "key1"])
+        .args(&["run", "--bin", "ak", "--", "add", "key1"])
         .env("AK_VAULT_PATH", test_vault)
         .env("AK_TEST_PASSWORD", "test_password")
         .env("AK_TEST_SECRET", "value1")
@@ -101,7 +101,7 @@ fn test_multiple_env_vars() {
 
     // Add second secret
     Command::new("cargo")
-        .args(&["run", "--", "add", "key2"])
+        .args(&["run", "--bin", "ak", "--", "add", "key2"])
         .env("AK_VAULT_PATH", test_vault)
         .env("AK_TEST_PASSWORD", "test_password")
         .env("AK_TEST_SECRET", "value2")
@@ -110,7 +110,7 @@ fn test_multiple_env_vars() {
 
     // Test multiple env vars
     let exec = Command::new("cargo")
-        .args(&["run", "--", "exec", "--env", "VAR1=key1", "--env", "VAR2=key2", "--", "sh", "-c", "echo $VAR1:$VAR2"])
+        .args(&["run", "--bin", "ak", "--", "exec", "--env", "VAR1=key1", "--env", "VAR2=key2", "--", "sh", "-c", "echo $VAR1:$VAR2"])
         .env("AK_VAULT_PATH", test_vault)
         .env("AK_TEST_PASSWORD", "test_password")
         .output()

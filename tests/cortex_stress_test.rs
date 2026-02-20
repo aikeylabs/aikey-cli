@@ -246,7 +246,7 @@ fn test_03_versioning_logic() {
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .env("AK_TEST_SECRET", "value_v2")
-        .arg("add")
+        .arg("update")
         .arg("test_secret")
         .assert()
         .success();
@@ -271,7 +271,7 @@ fn test_03_versioning_logic() {
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .env("AK_TEST_SECRET", "value_v3")
-        .arg("add")
+        .arg("update")
         .arg("test_secret")
         .assert()
         .success();

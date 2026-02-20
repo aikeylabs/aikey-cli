@@ -5,11 +5,20 @@
 
 use rusqlite::{params, Connection, Result as SqlResult};
 use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+/// Metadata for a secret entry (used for JSON output)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretMetadata {
+    pub alias: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
+}
 
 /// Default vault directory path
 const VAULT_DIR: &str = ".aikey";
@@ -493,6 +502,43 @@ pub fn list_entries() -> Result<Vec<String>, String> {
         .map_err(|e| format!("Failed to collect results: {}", e))?;
 
     Ok(aliases)
+}
+
+/// List all entries with metadata (for JSON output)
+pub fn list_entries_with_metadata() -> Result<Vec<SecretMetadata>, String> {
+    let db_path = get_vault_path()?;
+
+    if !db_path.exists() {
+        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+    }
+
+    let conn = open_connection()?;
+
+    let mut stmt = conn
+        .prepare("SELECT alias, created_at FROM entries ORDER BY alias")
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let entries = stmt
+        .query_map([], |row| {
+            let alias: String = row.get(0)?;
+            let created_at: Option<i64> = row.get(1).ok();
+            Ok((alias, created_at))
+        })
+        .map_err(|e| format!("Failed to query entries: {}", e))?
+        .collect::<SqlResult<Vec<(String, Option<i64>)>>>()
+        .map_err(|e| format!("Failed to collect results: {}", e))?;
+
+    let metadata: Vec<SecretMetadata> = entries
+        .into_iter()
+        .map(|(alias, created_at)| {
+            SecretMetadata {
+                alias,
+                created_at,
+            }
+        })
+        .collect();
+
+    Ok(metadata)
 }
 
 /// Deletes an entry from the vault

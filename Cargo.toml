@@ -17,6 +17,10 @@ path = "src/lib.rs"
 name = "ak"
 path = "src/main.rs"
 
+[[bin]]
+name = "aikey"
+path = "src/main.rs"
+
 [dependencies]
 # CLI framework
 clap = { version = "4.0", features = ["derive"] }
@@ -43,6 +47,7 @@ base64 = "0.21"     # Base64 encoding for JSON export
 shell-words = "1.1" # Shell command parsing for run command
 ctrlc = "3.4"       # Signal handling for graceful shutdown
 rayon = "1.8"       # Parallel iteration for performance
+dirs = "5.0"        # Home directory detection for config files
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"        # System calls for mlock (memory pinning)
