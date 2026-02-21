@@ -14,7 +14,7 @@ use std::io::{self, Write};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
-#[command(name = "aikey", about = "AiKey - Secure local-first secret management", version = "0.2.0")]
+#[command(name = "aikey", about = "AiKey - Secure local-first secret management", version = "0.2.0", disable_version_flag = true)]
 struct Cli {
     /// Read password from stdin instead of prompting (for automation/testing)
     #[arg(long, global = true)]
@@ -24,8 +24,12 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Print version information
+    #[arg(short = 'V', long)]
+    version: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -141,6 +145,29 @@ enum ProjectAction {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
+    // Handle --version flag
+    if cli.version {
+        const VERSION: &str = env!("CARGO_PKG_VERSION");
+        if cli.json {
+            json_output::success(serde_json::json!({
+                "version": VERSION
+            }));
+        } else {
+            println!("aikey {}", VERSION);
+        }
+        return Ok(());
+    }
+
+    // Ensure a command was provided
+    if cli.command.is_none() {
+        if cli.json {
+            json_output::error("No command specified. Use --help for usage information.", 1);
+        } else {
+            eprintln!("Error: No command specified. Use --help for usage information.");
+            std::process::exit(1);
+        }
+    }
+
     // Wrapper to handle JSON error output
     if let Err(e) = run_command(&cli) {
         if cli.json {
@@ -154,7 +181,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    match &cli.command {
+    let command = cli.command.as_ref().unwrap();
+    match command {
         Commands::Init => {
             let password = prompt_password_secure("Set Master Password: ", cli.password_stdin, cli.json)?;
             let mut salt = [0u8; 16];
