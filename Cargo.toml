@@ -1,6 +1,6 @@
 [package]
 name = "aikeylabs-ak"
-version = "0.0.2-alpha"
+version = "0.2.0"
 edition = "2021"
 authors = ["AiKey Founder <aikeyfounder@gmail.com>"]
 description = "Secure local-first secret management CLI tool"

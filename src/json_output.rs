@@ -1,5 +1,6 @@
 use serde_json::json;
 use std::process;
+use crate::error_codes::ErrorCode;
 
 /// Output a success JSON response and exit with code 0
 pub fn success(data: serde_json::Value) -> ! {
@@ -94,6 +95,19 @@ pub fn error_with_data_stderr(message: &str, data: serde_json::Value, exit_code:
     }
 
     // Output to stderr to avoid mixing with child process stdout
+    eprintln!("{}", serde_json::to_string_pretty(&response).unwrap());
+    process::exit(exit_code);
+}
+
+/// Output an error JSON response with error code (Platform API v0.2)
+pub fn error_with_code(message: &str, code: ErrorCode, exit_code: i32) -> ! {
+    let response = json!({
+        "ok": false,
+        "code": code.as_str(),
+        "message": message
+    });
+
+    // Output to stderr for JSON mode (stdout reserved for actual data)
     eprintln!("{}", serde_json::to_string_pretty(&response).unwrap());
     process::exit(exit_code);
 }

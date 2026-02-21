@@ -5,6 +5,7 @@ mod synapse;
 mod audit;
 mod ratelimit;
 mod json_output;
+mod error_codes;
 
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
@@ -13,7 +14,7 @@ use std::io::{self, Write};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
-#[command(name = "aikey", about = "AiKey - Secure local-first secret management", version = "0.1.0")]
+#[command(name = "aikey", about = "AiKey - Secure local-first secret management", version = "0.2.0")]
 struct Cli {
     /// Read password from stdin instead of prompting (for automation/testing)
     #[arg(long, global = true)]
@@ -73,6 +74,11 @@ enum Commands {
     },
     /// Change the master password
     ChangePassword,
+    /// Secret management commands (Platform API v0.2)
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
     /// Profile management commands
     Profile {
         #[command(subcommand)]
@@ -91,6 +97,18 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum SecretAction {
+    /// Set a secret value (reads from stdin for security)
+    Set {
+        /// Secret name/alias
+        name: String,
+        /// Read secret value from stdin
+        #[arg(long)]
+        from_stdin: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProfileAction {
     /// List all profiles
     List,
@@ -98,6 +116,8 @@ enum ProfileAction {
     Use { name: String },
     /// Show profile details
     Show { name: String },
+    /// Show current active profile
+    Current,
 }
 
 #[derive(Subcommand)]
@@ -508,6 +528,61 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Master password changed successfully!");
             }
         }
+        Commands::Secret { action } => {
+            match action {
+                SecretAction::Set { name, from_stdin } => {
+                    if !from_stdin {
+                        let err_msg = "The --from-stdin flag is required for security. Secret values must not be passed via command-line arguments.";
+                        if cli.json {
+                            json_output::error_with_code(err_msg, error_codes::ErrorCode::InvalidInput, 1);
+                        } else {
+                            return Err(err_msg.into());
+                        }
+                    }
+
+                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+
+                    // Read secret value from stdin
+                    let mut secret = Zeroizing::new(String::new());
+                    io::stdin().read_line(&mut secret)?;
+                    let secret_value = secret.trim();
+
+                    if secret_value.is_empty() {
+                        let err_msg = "Secret value cannot be empty";
+                        if cli.json {
+                            json_output::error_with_code(err_msg, error_codes::ErrorCode::InvalidInput, 1);
+                        } else {
+                            return Err(err_msg.into());
+                        }
+                    }
+
+                    // Try to add the secret (will fail if it already exists)
+                    let result = executor::add_secret(name, secret_value, &password);
+                    let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(name), result.is_ok());
+
+                    match result {
+                        Ok(_) => {
+                            if cli.json {
+                                json_output::success(serde_json::json!({
+                                    "ok": true,
+                                    "name": name
+                                }));
+                            } else {
+                                println!("Secret '{}' set successfully", name);
+                            }
+                        }
+                        Err(e) => {
+                            let error_code = error_codes::ErrorCode::from_error_message(&e);
+                            if cli.json {
+                                json_output::error_with_code(&e, error_code, 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Commands::Profile { action } => {
             match action {
                 ProfileAction::List => {
@@ -530,8 +605,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         });
 
                         std::fs::write(config_file, serde_json::to_string_pretty(&config)?)?;
-                        println!("Switched to profile: {}", name);
-                        println!("Note: Profile functionality is limited in this preview.");
+
+                        if cli.json {
+                            json_output::success(serde_json::json!({
+                                "ok": true,
+                                "profile": name
+                            }));
+                        } else {
+                            println!("Switched to profile: {}", name);
+                            println!("Note: Profile functionality is limited in this preview.");
+                        }
                     } else {
                         return Err("Could not determine config directory".into());
                     }
@@ -546,6 +629,52 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         println!("Profile: {}", name);
                         println!("Profile details will be available in a future release.");
+                    }
+                }
+                ProfileAction::Current => {
+                    // Read current profile from config file
+                    if let Some(config_dir) = dirs::config_dir() {
+                        let config_file = config_dir.join("aikey").join("config.json");
+
+                        if config_file.exists() {
+                            let config_content = std::fs::read_to_string(config_file)?;
+                            let config: serde_json::Value = serde_json::from_str(&config_content)?;
+
+                            if let Some(current_profile) = config.get("current_profile").and_then(|v| v.as_str()) {
+                                if cli.json {
+                                    json_output::success(serde_json::json!({
+                                        "ok": true,
+                                        "profile": current_profile
+                                    }));
+                                } else {
+                                    println!("Current profile: {}", current_profile);
+                                }
+                            } else {
+                                // No current_profile in config
+                                if cli.json {
+                                    json_output::error_with_code(
+                                        "No active profile configured",
+                                        error_codes::ErrorCode::NoActiveProfile,
+                                        1
+                                    );
+                                } else {
+                                    println!("No active profile configured");
+                                }
+                            }
+                        } else {
+                            // Config file doesn't exist
+                            if cli.json {
+                                json_output::error_with_code(
+                                    "No active profile configured",
+                                    error_codes::ErrorCode::NoActiveProfile,
+                                    1
+                                );
+                            } else {
+                                println!("No active profile configured");
+                            }
+                        }
+                    } else {
+                        return Err("Could not determine config directory".into());
                     }
                 }
             }
