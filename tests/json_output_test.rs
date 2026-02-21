@@ -107,8 +107,8 @@ fn test_json_list_empty_vault() {
         .assert()
         .success();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "success");
     assert_eq!(json["secrets"].as_array().unwrap().len(), 0);
@@ -130,9 +130,9 @@ fn test_json_list_with_secrets() {
         .assert()
         .success();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    eprintln!("JSON output: {}", stdout);
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    eprintln!("JSON output: {}", stderr);
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "success");
 
@@ -168,8 +168,8 @@ fn test_json_add_success() {
         .assert()
         .success();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "success");
     assert_eq!(json["alias"], "TEST_KEY");
@@ -193,8 +193,8 @@ fn test_json_add_duplicate() {
         .assert()
         .failure();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "error");
     assert!(json["error"].as_str().unwrap().contains("already exists"));
@@ -214,8 +214,8 @@ fn test_json_get_success() {
         .assert()
         .success();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "success");
     assert_eq!(json["alias"], "GET_TEST");
@@ -234,8 +234,8 @@ fn test_json_get_not_found() {
         .assert()
         .failure();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "error");
     assert!(json["error"].as_str().unwrap().contains("not found"));
@@ -256,8 +256,8 @@ fn test_json_update_success() {
         .assert()
         .success();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "success");
     assert_eq!(json["alias"], "UPDATE_KEY");
@@ -277,8 +277,8 @@ fn test_json_update_not_found() {
         .assert()
         .failure();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "error");
     assert!(json["error"].as_str().unwrap().contains("not found"));
@@ -298,8 +298,8 @@ fn test_json_delete_success() {
         .assert()
         .success();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "success");
     assert_eq!(json["alias"], "DELETE_KEY");
@@ -318,8 +318,8 @@ fn test_json_delete_not_found() {
         .assert()
         .failure();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "error");
     assert!(json["error"].as_str().unwrap().contains("not found"));
@@ -339,8 +339,8 @@ fn test_json_change_password_success() {
         .assert()
         .success();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "success");
     assert_eq!(json["message"], "Master password changed successfully");
@@ -362,8 +362,8 @@ fn test_json_run_command() {
         .assert()
         .success();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "success");
     assert_eq!(json["secrets_injected"], 1);
@@ -384,8 +384,8 @@ fn test_json_run_no_secrets() {
         .assert()
         .failure();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "error");
     assert!(json["error"].as_str().unwrap().contains("No secrets found"));
@@ -408,8 +408,8 @@ fn test_json_run_command_failure() {
         .assert()
         .failure();
 
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    let json: Value = serde_json::from_str(&stdout).expect("Should be valid JSON");
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "error");
     assert_eq!(json["exit_code"], 42);
