@@ -136,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
         Commands::Init => {
-            let password = prompt_password_secure("Set Master Password: ", cli.password_stdin)?;
+            let password = prompt_password_secure("Set Master Password: ", cli.password_stdin, cli.json)?;
             let mut salt = [0u8; 16];
             crypto::generate_salt(&mut salt)?;
 
@@ -165,15 +165,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Add { alias } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
+            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
 
             // Check for test environment variable first
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
                 Zeroizing::new(test_secret)
             } else {
                 // Secure secret input with explicit flush
-                print!("Enter Secret: ");
-                io::stdout().flush()?;
+                if !cli.json {
+                    print!("Enter Secret: ");
+                    io::stdout().flush()?;
+                }
 
                 let mut secret = Zeroizing::new(String::new());
                 io::stdin().read_line(&mut secret)?;
@@ -201,7 +203,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Get { alias, timeout } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
+            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
             let result = executor::get_secret(alias, &password);
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Get, Some(alias), result.is_ok());
 
@@ -240,7 +242,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Delete { alias } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
+            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
             let result = executor::delete_secret(alias, &password);
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(alias), result.is_ok());
 
@@ -262,7 +264,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::List => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
+            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
 
             if cli.json {
                 // JSON mode: return array of objects with metadata
@@ -303,15 +305,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Update { alias } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
+            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
 
             // Check for test environment variable first
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
                 Zeroizing::new(test_secret)
             } else {
                 // Secure secret input with explicit flush
-                print!("Enter New Secret: ");
-                io::stdout().flush()?;
+                if !cli.json {
+                    print!("Enter New Secret: ");
+                    io::stdout().flush()?;
+                }
 
                 let mut secret = Zeroizing::new(String::new());
                 io::stdin().read_line(&mut secret)?;
@@ -339,8 +343,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Export { pattern, output } => {
-            let vault_password = prompt_password_secure("Enter Vault Master Password: ", cli.password_stdin)?;
-            let export_password = prompt_password_secure("Enter Export Password: ", cli.password_stdin)?;
+            let vault_password = prompt_password_secure("Enter Vault Master Password: ", cli.password_stdin, cli.json)?;
+            let export_password = prompt_password_secure("Enter Export Password: ", cli.password_stdin, cli.json)?;
             let output_path = std::path::Path::new(output);
 
             let result = synapse::export_vault(pattern, output_path, &vault_password, &export_password);
@@ -368,8 +372,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Import { file } => {
-            let export_password = prompt_password_secure("Enter Export Password: ", cli.password_stdin)?;
-            let vault_password = prompt_password_secure("Enter Vault Master Password: ", cli.password_stdin)?;
+            let export_password = prompt_password_secure("Enter Export Password: ", cli.password_stdin, cli.json)?;
+            let vault_password = prompt_password_secure("Enter Vault Master Password: ", cli.password_stdin, cli.json)?;
             let input_path = std::path::Path::new(file);
 
             let result = synapse::import_vault(input_path, &export_password, &vault_password);
@@ -400,7 +404,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Exec { env_mappings, command } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
+            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
 
             if command.is_empty() {
                 let err_msg = "No command specified. Use -- to separate command from flags.";
@@ -423,7 +427,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Run { command } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
+            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
 
             if command.is_empty() {
                 let err_msg = "No command specified. Use -- to separate command from flags.";
@@ -470,9 +474,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::ChangePassword => {
-            let old_password = prompt_password_secure("Enter Current Master Password: ", cli.password_stdin)?;
-            let new_password = prompt_password_secure("Enter New Master Password: ", false)?;
-            let confirm_password = prompt_password_secure("Confirm New Master Password: ", false)?;
+            let old_password = prompt_password_secure("Enter Current Master Password: ", cli.password_stdin, cli.json)?;
+            let new_password = prompt_password_secure("Enter New Master Password: ", false, cli.json)?;
+            let confirm_password = prompt_password_secure("Confirm New Master Password: ", false, cli.json)?;
 
             if new_password.expose_secret() != confirm_password.expose_secret() {
                 if cli.json {
@@ -671,7 +675,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// - Ensures raw password string is wiped from memory on scope exit
 /// - Supports AK_TEST_PASSWORD environment variable for testing
 /// - Supports reading from stdin when password_stdin is true
-fn prompt_password_secure(prompt: &str, password_stdin: bool) -> io::Result<SecretString> {
+fn prompt_password_secure(prompt: &str, password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
     // Check for test password environment variable
     if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
         return Ok(SecretString::new(test_password));
@@ -685,9 +689,11 @@ fn prompt_password_secure(prompt: &str, password_stdin: bool) -> io::Result<Secr
         return Ok(SecretString::new(trimmed));
     }
 
-    // Explicit flush to ensure prompt is visible and TTY is clean
-    print!("{}", prompt);
-    io::stdout().flush()?;
+    // Only show prompt if not in JSON mode
+    if !json_mode {
+        print!("{}", prompt);
+        io::stdout().flush()?;
+    }
 
     // Read password into Zeroizing container IMMEDIATELY
     let mut password_raw = Zeroizing::new(String::new());
