@@ -279,12 +279,20 @@ pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &s
 /// * `command` - Command and arguments to execute (can be single string or pre-split)
 ///
 /// # Example
-/// ```
+/// ```no_run
+/// use secrecy::SecretString;
+/// use aikeylabs_ak::executor::exec_with_env;
+///
+/// # fn main() -> Result<(), String> {
+/// let password = SecretString::new("master_password".to_string());
+///
 /// // ak exec --env MY_KEY=github_token -- printenv MY_KEY
-/// exec_with_env(&["MY_KEY=github_token"], &password, &["printenv", "MY_KEY"])?;
+/// exec_with_env(&["MY_KEY=github_token".to_string()], &password, &["printenv".to_string(), "MY_KEY".to_string()])?;
 ///
 /// // ak exec --env MY_KEY=github_token -- "sleep 5"
-/// exec_with_env(&["MY_KEY=github_token"], &password, &["sleep 5"])?;
+/// exec_with_env(&["MY_KEY=github_token".to_string()], &password, &["sleep".to_string(), "5".to_string()])?;
+/// # Ok(())
+/// # }
 /// ```
 pub fn exec_with_env(
     env_mappings: &[String],
@@ -432,9 +440,17 @@ pub fn exec_with_env(
 /// * `command` - Command and arguments to execute
 ///
 /// # Example
-/// ```
+/// ```no_run
+/// use secrecy::SecretString;
+/// use aikeylabs_ak::executor::run_with_all_secrets;
+///
+/// # fn main() -> Result<(), String> {
+/// let password = SecretString::new("master_password".to_string());
+///
 /// // ak run -- printenv
-/// run_with_all_secrets(&password, &["printenv"])?;
+/// let (secrets_count, exit_code) = run_with_all_secrets(&password, &["printenv".to_string()], false)?;
+/// # Ok(())
+/// # }
 /// ```
 pub fn run_with_all_secrets(
     password: &SecretString,
@@ -494,10 +510,17 @@ pub fn run_with_all_secrets(
         cmd.env(key, value.as_str());
     }
 
-    // Explicitly inherit stdio to ensure output is captured by assert_cmd
-    cmd.stdin(std::process::Stdio::inherit());
-    cmd.stdout(std::process::Stdio::inherit());
-    cmd.stderr(std::process::Stdio::inherit());
+    // In JSON mode, suppress child process output to avoid polluting JSON response
+    // In normal mode, inherit stdio to show command output
+    if json_mode {
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+    } else {
+        cmd.stdin(std::process::Stdio::inherit());
+        cmd.stdout(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::inherit());
+    }
 
     let status = cmd.status()
         .map_err(|e| format!("Failed to execute command '{}': {}", program, e))?;
