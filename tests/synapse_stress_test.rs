@@ -66,7 +66,7 @@ fn test_hmac_bit_flip_detection() {
         .args(&["export", "*", export_path.to_str().unwrap()])
         .assert()
         .success()
-        .stderr(predicate::str::contains("Successfully exported 1 secret(s)"));
+        .stdout(predicate::str::contains("Exported 1 secret(s)"));
 
     // Read the exported file
     let mut file_data = fs::read(&export_path).expect("Failed to read export file");
