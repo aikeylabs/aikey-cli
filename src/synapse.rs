@@ -65,28 +65,29 @@ struct AkbHeader {
 ///
 /// Schema Version History:
 /// - v1: Initial format with alias, nonce, ciphertext, version_tag, created_at, updated_at, metadata
+/// - v2: Stores plaintext secret value instead of vault-encrypted ciphertext
 #[derive(Serialize, Deserialize)]
 struct EntryData {
     /// Schema version for forward/backward compatibility
     #[serde(default = "default_schema_version")]
     schema_version: u32,
     alias: String,
-    nonce: Vec<u8>,
-    ciphertext: Vec<u8>,
+    /// Plaintext secret value (will be encrypted with export password)
+    secret_value: Vec<u8>,
     version_tag: i64,
     created_at: i64,
     updated_at: i64,
     metadata: Option<String>,
 }
 
-/// Default schema version (v1)
+/// Default schema version (v2)
 fn default_schema_version() -> u32 {
-    1
+    2
 }
 
 impl EntryData {
     /// Current schema version
-    const CURRENT_SCHEMA_VERSION: u32 = 1;
+    const CURRENT_SCHEMA_VERSION: u32 = 2;
 
     /// Check if this entry is compatible with current schema
     fn is_compatible(&self) -> bool {
@@ -151,14 +152,16 @@ fn derive_dual_keys(
 /// # Arguments
 /// * `pattern` - Glob pattern for filtering entries (e.g., "*", "api_*")
 /// * `output_path` - Path to write .akb file
-/// * `password` - Master password for encryption
+/// * `vault_password` - Vault master password for decryption
+/// * `export_password` - Password for encrypting the .akb file
 ///
 /// # Returns
 /// Number of entries exported
 pub fn export_vault(
     pattern: &str,
     output_path: &Path,
-    password: &SecretString,
+    vault_password: &SecretString,
+    export_password: &SecretString,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     // Fetch entries matching pattern with full metadata
     let entries = storage::get_entries_with_metadata(pattern)
@@ -168,23 +171,35 @@ pub fn export_vault(
         return Err(format!("No entries match pattern '{}'", pattern).into());
     }
 
-    // Convert to serializable format
-    let entry_data: Vec<EntryData> = entries
+    // Get vault salt and KDF parameters
+    let vault_salt = storage::get_salt()?;
+    let (m_cost, t_cost, p_cost) = storage::get_kdf_params()?;
+
+    // Derive vault key for decryption
+    let vault_key = crypto::derive_key_with_params(vault_password, &vault_salt, m_cost, t_cost, p_cost)
+        .map_err(|e| format!("Failed to derive vault key: {}", e))?;
+
+    // Decrypt all entries and convert to serializable format
+    let entry_data: Result<Vec<EntryData>, String> = entries
         .into_iter()
         .map(|(alias, nonce, ciphertext, version_tag, created_at, updated_at, metadata)| {
-            EntryData {
+            // Decrypt secret value with vault key
+            let secret_value = crypto::decrypt(&vault_key, &nonce, &ciphertext)
+                .map_err(|e| format!("Failed to decrypt entry '{}': {}", alias, e))?;
+
+            Ok(EntryData {
                 schema_version: EntryData::CURRENT_SCHEMA_VERSION,
                 alias,
-                nonce,
-                ciphertext,
+                secret_value: secret_value.to_vec(),
                 version_tag,
                 created_at,
                 updated_at,
                 metadata,
-            }
+            })
         })
         .collect();
 
+    let entry_data = entry_data?;
     let count = entry_data.len();
 
     // Generate fresh salt for this export (forward secrecy)
@@ -199,8 +214,8 @@ pub fn export_vault(
         (65536, 3, 4) // 64 MiB for production
     };
 
-    // Derive dual keys: encryption + HMAC
-    let (enc_key, hmac_key) = derive_dual_keys(password, &export_salt, m_cost, t_cost, p_cost)?;
+    // Derive dual keys: encryption + HMAC using export password
+    let (enc_key, hmac_key) = derive_dual_keys(export_password, &export_salt, m_cost, t_cost, p_cost)?;
 
     // Serialize payload
     let payload = bincode::serialize(&entry_data)
@@ -271,7 +286,8 @@ pub fn export_vault(
 ///
 /// # Arguments
 /// * `input_path` - Path to .akb file
-/// * `password` - Master password for decryption
+/// * `export_password` - Password for decrypting the .akb file
+/// * `vault_password` - Vault master password for re-encryption
 ///
 /// # Returns
 /// ImportResult with counts of added/updated/skipped entries
@@ -281,7 +297,8 @@ pub fn export_vault(
 /// - Uses smart merge: only updates if incoming version is newer
 pub fn import_vault(
     input_path: &Path,
-    password: &SecretString,
+    export_password: &SecretString,
+    vault_password: &SecretString,
 ) -> Result<ImportResult, Box<dyn std::error::Error>> {
     // Read entire file
     let file_data = fs::read(input_path)
@@ -323,9 +340,9 @@ pub fn import_vault(
     let ciphertext = &file_data[HEADER_SIZE..file_data.len() - HMAC_SIZE];
     let stored_hmac = &file_data[file_data.len() - HMAC_SIZE..];
 
-    // Derive keys using stored KDF parameters
+    // Derive keys using stored KDF parameters and export password
     let (enc_key, hmac_key) = derive_dual_keys(
-        password,
+        export_password,
         &header.kdf_params.salt,
         header.kdf_params.m_cost,
         header.kdf_params.t_cost,
@@ -348,6 +365,14 @@ pub fn import_vault(
     let entries: Vec<EntryData> = bincode::deserialize(&plaintext)
         .map_err(|e| format!("Failed to deserialize entries: {}", e))?;
 
+    // Get vault salt and KDF parameters for re-encryption
+    let vault_salt = storage::get_salt()?;
+    let (m_cost, t_cost, p_cost) = storage::get_kdf_params()?;
+
+    // Derive vault key for re-encryption
+    let vault_key = crypto::derive_key_with_params(vault_password, &vault_salt, m_cost, t_cost, p_cost)
+        .map_err(|e| format!("Failed to derive vault key: {}", e))?;
+
     // Import entries with smart merge logic
     let mut result = ImportResult {
         added: 0,
@@ -367,6 +392,10 @@ pub fn import_vault(
             .into());
         }
 
+        // Re-encrypt secret value with vault key
+        let (vault_nonce, vault_ciphertext) = crypto::encrypt(&vault_key, &entry.secret_value)
+            .map_err(|e| format!("Failed to encrypt entry '{}': {}", entry.alias, e))?;
+
         let exists = storage::entry_exists(&entry.alias)?;
 
         if exists {
@@ -380,8 +409,8 @@ pub fn import_vault(
             {
                 storage::update_entry_full(
                     &entry.alias,
-                    &entry.nonce,
-                    &entry.ciphertext,
+                    &vault_nonce,
+                    &vault_ciphertext,
                     entry.version_tag,
                     entry.updated_at,
                     entry.created_at,
@@ -395,8 +424,8 @@ pub fn import_vault(
             // Insert new entry
             storage::insert_entry_full(
                 &entry.alias,
-                &entry.nonce,
-                &entry.ciphertext,
+                &vault_nonce,
+                &vault_ciphertext,
                 entry.version_tag,
                 entry.updated_at,
                 entry.created_at,

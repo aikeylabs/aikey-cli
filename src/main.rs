@@ -339,11 +339,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Export { pattern, output } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
+            let vault_password = prompt_password_secure("Enter Vault Master Password: ", cli.password_stdin)?;
+            let export_password = prompt_password_secure("Enter Export Password: ", cli.password_stdin)?;
             let output_path = std::path::Path::new(output);
 
-            let result = synapse::export_vault(pattern, output_path, &password);
-            let _ = audit::log_audit_event(&password, audit::AuditOperation::Export, Some(pattern), result.is_ok());
+            let result = synapse::export_vault(pattern, output_path, &vault_password, &export_password);
+            let _ = audit::log_audit_event(&vault_password, audit::AuditOperation::Export, Some(pattern), result.is_ok());
 
             let count = match result {
                 Ok(c) => c,
@@ -367,11 +368,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Import { file } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin)?;
+            let export_password = prompt_password_secure("Enter Export Password: ", cli.password_stdin)?;
+            let vault_password = prompt_password_secure("Enter Vault Master Password: ", cli.password_stdin)?;
             let input_path = std::path::Path::new(file);
 
-            let result = synapse::import_vault(input_path, &password);
-            let _ = audit::log_audit_event(&password, audit::AuditOperation::Import, Some(file), result.is_ok());
+            let result = synapse::import_vault(input_path, &export_password, &vault_password);
+            let _ = audit::log_audit_event(&vault_password, audit::AuditOperation::Import, Some(file), result.is_ok());
 
             let import_result = match result {
                 Ok(r) => r,
@@ -426,7 +428,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             if command.is_empty() {
                 let err_msg = "No command specified. Use -- to separate command from flags.";
                 if cli.json {
-                    json_output::error(err_msg, 1);
+                    json_output::error_stderr(err_msg, 1);
                 } else {
                     return Err(err_msg.into());
                 }
@@ -438,7 +440,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             match result {
                 Ok((secrets_count, exit_code)) => {
                     if cli.json {
-                        json_output::success(serde_json::json!({
+                        json_output::success_stderr(serde_json::json!({
                             "secrets_injected": secrets_count,
                             "exit_code": exit_code
                         }));
@@ -453,7 +455,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     if cli.json {
-                        json_output::error_with_data(
+                        json_output::error_with_data_stderr(
                             &e,
                             serde_json::json!({
                                 "exit_code": exit_code
@@ -480,7 +482,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            println!("Changing master password...");
+            if !cli.json {
+                println!("Changing master password...");
+            }
             let result = storage::change_password(&old_password, &new_password);
             let _ = audit::log_audit_event(&old_password, audit::AuditOperation::Init, None, result.is_ok());
 
