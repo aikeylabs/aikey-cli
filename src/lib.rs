@@ -8,3 +8,8 @@ pub mod synapse;
 pub mod executor;
 pub mod audit;
 pub mod ratelimit;
+pub mod config;
+pub mod env_resolver;
+pub mod env_renderer;
+pub mod commands_project;
+pub mod commands_env;

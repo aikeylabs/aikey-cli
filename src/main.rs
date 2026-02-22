@@ -131,6 +131,15 @@ enum ProfileAction {
 
 #[derive(Subcommand)]
 enum EnvAction {
+    /// Generate or update .env file from project config
+    Generate {
+        /// Preview changes without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the target .env file path
+        #[arg(long)]
+        env_file: Option<String>,
+    },
     /// Inject secrets into environment (use 'aikey exec' for now)
     Inject,
     /// Export secrets to .env file
@@ -714,6 +723,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Env { action } => {
             match action {
+                EnvAction::Generate { dry_run, env_file } => {
+                    commands_env::handle_env_generate(*dry_run, env_file.as_deref(), cli.json)?;
+                }
                 EnvAction::Inject => {
                     commands_env::handle_env_inject(cli.json)?;
                 }
