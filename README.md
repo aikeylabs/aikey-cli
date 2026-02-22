@@ -9,11 +9,16 @@ A secure, local-first secret management tool built with Rust. Store API keys, to
 ## Features (v0.3)
 
 ### Developer Workflow (New in v0.3)
+- **Quickstart wizard**: Get started quickly with `aikey quickstart`
 - **Project configuration**: Initialize and manage project-specific environment variables
 - **Environment generation**: Automatically generate `.env` files from your vault
 - **Environment injection**: Inject secrets into your shell environment
+- **Environment export**: Export variables in multiple formats (dotenv, shell, json)
+- **Environment validation**: Check that all required variables are configured
 - **Template support**: Pre-configured templates for Node.js, Python, and other stacks
 - **Smart merging**: Preserve comments and unknown variables when updating `.env` files
+- **Local statistics**: View project and profile counts with `aikey stats`
+- **Browser & VS Code integration**: Seamless workflow with companion extensions
 
 ### Secure Storage
 - **Local-first**: All secrets stored encrypted in `~/.aikey/vault.db`
@@ -158,6 +163,22 @@ JSON output is written to stderr to avoid mixing with command output, making it 
 
 The v0.3 release introduces a complete developer workflow for managing environment variables across projects and profiles.
 
+### Quick Start
+
+For new projects, use the quickstart wizard:
+
+```bash
+aikey quickstart
+```
+
+This friendly command will:
+1. Check if your project is already configured
+2. If not, guide you through project initialization
+3. Provide clear next steps including:
+   - Using the browser extension to configure profiles and keys
+   - Using the VS Code extension for inline secret insertion
+   - Example commands for daily development
+
 ### Initialize a project
 
 ```bash
@@ -237,26 +258,92 @@ Alternatively, use the existing `aikey run` command:
 aikey run -- npm start
 ```
 
-### Preview Features
+### Export environment variables
 
-The following commands are available but still in development:
+Export resolved variables to stdout in different formats:
 
 ```bash
-# Profile management (Preview)
-aikey profile create dev
-aikey profile list
-aikey profile switch dev
+# Export as .env format (default)
+aikey env export
 
-# Environment templates (Preview)
-aikey env create staging
-aikey env set staging DATABASE_URL=db_secret_alias
+# Export as shell commands
+aikey env export --format shell
 
-# Project contexts (Preview)
-aikey project init
-aikey project link my-project
+# Export as JSON
+aikey env export --format json
 ```
 
-Note: Preview features may have incomplete functionality or breaking changes in future releases.
+This is useful for:
+- CI/CD pipelines
+- Debugging environment configuration
+- Integrating with other tools
+
+### Check environment health
+
+Validate that all required variables can be resolved:
+
+```bash
+aikey env check
+```
+
+Returns exit code 0 if all variables are satisfied, or exit code 2 if any are missing. Useful for:
+- Pre-deployment validation
+- CI/CD health checks
+- Quick status verification
+
+### View local statistics
+
+```bash
+aikey stats
+```
+
+Shows local usage statistics:
+- Number of projects in current directory
+- Number of configured profiles
+- Vault initialization status
+
+Note: All statistics are local-only with no remote calls or telemetry.
+
+### Integration with Browser and VS Code Extensions
+
+The CLI workflow is designed to work seamlessly with AiKey's other tools:
+
+**Browser Extension**:
+- Manage profiles (dev, staging, prod)
+- Add and organize API keys
+- Switch between profiles
+- The CLI automatically uses your current profile
+
+**VS Code Extension**:
+- Insert secrets directly into your code
+- View project status in the sidebar
+- Quick access to environment commands
+- Real-time validation of required variables
+
+**Typical Workflow**:
+1. Run `aikey quickstart` in your project
+2. Use the browser extension to add your API keys to a profile
+3. Run `aikey env generate` to create your `.env` file
+4. Use the VS Code extension to insert secrets as needed
+5. Run `aikey env inject` or `aikey run` to execute your application
+
+### Profile Management
+
+```bash
+# List all profiles
+aikey profile list
+
+# Show current profile
+aikey profile current
+
+# Switch to a different profile
+aikey profile use staging
+
+# Show profile details
+aikey profile show dev
+```
+
+Profiles allow you to organize secrets by environment (dev, staging, prod) and switch between them easily.
 
 ## Security
 
@@ -318,12 +405,17 @@ src/
 - [x] Developer workflow commands (`project init`, `project status`)
 - [x] Environment generation (`env generate` with merge support)
 - [x] Environment injection (`env inject` with shell eval support)
+- [x] Environment export (`env export` with multiple formats)
+- [x] Environment validation (`env check` with exit codes)
 - [x] Project configuration management
 - [x] Template support for Node.js, Python, and other stacks
+- [x] Quickstart wizard for new projects
+- [x] Profile management commands
+- [x] Local statistics (`stats` command)
 - [x] Comprehensive unit and integration tests
 
 ### Planned for v0.4
-- [ ] Complete profile management implementation
+- [ ] Complete profile management implementation (vault integration)
 - [ ] Shell completion scripts
 - [ ] Password strength meter during init
 
@@ -332,7 +424,6 @@ src/
 - [ ] Vault backup and restore
 - [ ] Secret expiration and rotation reminders
 - [ ] Multi-vault support
-- [ ] `aikey quickstart` command for first-time users
 
 ## License
 
