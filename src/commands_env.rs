@@ -112,18 +112,36 @@ pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
         });
         println!("{}", serde_json::to_string_pretty(&response).unwrap());
     } else {
-        println!("Environment Injection");
-        println!("====================");
-        println!("Profile: {}", current_profile);
-        println!("\nVariables to inject:");
+        // Check if we're being eval'd (output should be shell commands)
+        let is_eval_mode = std::env::var("AIKEY_INJECT_MODE").unwrap_or_default() == "eval";
 
-        for var in &resolved {
-            let status = if var.value.is_some() { "✓" } else { "✗" };
-            println!("  {} {}", status, var.name);
+        if is_eval_mode {
+            // Output shell export commands for eval
+            for var in &resolved {
+                if let Some(value) = &var.value {
+                    // Escape single quotes in the value
+                    let escaped_value = value.replace('\'', "'\\''");
+                    println!("export {}='{}'", var.name, escaped_value);
+                } else {
+                    println!("export {}=''", var.name);
+                }
+            }
+        } else {
+            // Human-readable output with usage instructions
+            println!("Environment Injection");
+            println!("====================");
+            println!("Profile: {}", current_profile);
+            println!("\nVariables to inject:");
+
+            for var in &resolved {
+                let status = if var.value.is_some() { "✓" } else { "✗" };
+                println!("  {} {}", status, var.name);
+            }
+
+            println!("\nTo inject these variables into your shell, run:");
+            println!("  eval \"$(AIKEY_INJECT_MODE=eval aikey env inject)\"");
+            println!("\nOr use 'aikey exec --env VAR=alias -- command' to run a command with these variables.");
         }
-
-        println!("\nNote: Full env injection support coming in a future release.");
-        println!("Use 'aikey exec --env VAR=alias -- command' for now.");
     }
 
     Ok(())
