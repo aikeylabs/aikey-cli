@@ -150,3 +150,112 @@ impl EnvTemplate {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_project_config_parse_json() {
+        let json = r#"{
+            "version": "1",
+            "project": {
+                "name": "test-project"
+            },
+            "env": {
+                "target": ".env.local"
+            },
+            "requiredVars": ["API_KEY", "DATABASE_URL"],
+            "defaults": {
+                "profile": "dev"
+            }
+        }"#;
+
+        let config: ProjectConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.project.name, "test-project");
+        assert_eq!(config.requiredVars.len(), 2);
+        assert_eq!(config.env.target, ".env.local");
+        assert_eq!(config.defaults.profile, Some("dev".to_string()));
+    }
+
+    #[test]
+    fn test_project_config_parse_yaml() {
+        let yaml = r#"
+version: "1"
+project:
+  name: test-project
+env:
+  target: .env.local
+requiredVars:
+  - API_KEY
+  - DATABASE_URL
+defaults:
+  profile: dev
+"#;
+
+        let config: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.project.name, "test-project");
+        assert_eq!(config.requiredVars.len(), 2);
+        assert_eq!(config.env.target, ".env.local");
+        assert_eq!(config.defaults.profile, Some("dev".to_string()));
+    }
+
+    #[test]
+    fn test_project_config_minimal() {
+        let json = r#"{
+            "version": "1",
+            "project": {
+                "name": "minimal"
+            },
+            "env": {
+                "target": ".env"
+            }
+        }"#;
+
+        let config: ProjectConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.project.name, "minimal");
+        assert_eq!(config.requiredVars.len(), 0);
+        assert_eq!(config.env.target, ".env");
+        assert_eq!(config.defaults.profile, None);
+    }
+
+    #[test]
+    fn test_project_config_discover() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("aikey.config.json");
+
+        let config = ProjectConfig::new("test".to_string());
+        config.save(&config_path).unwrap();
+
+        std::env::set_current_dir(temp_dir.path()).unwrap();
+        let (found_path, found_config) = ProjectConfig::discover().unwrap().unwrap();
+
+        assert_eq!(found_config.project.name, "test");
+        assert!(found_path.ends_with("aikey.config.json"));
+    }
+
+    #[test]
+    fn test_env_template_node_vars() {
+        let vars = EnvTemplate::node_vars();
+        assert!(vars.contains(&"OPENAI_API_KEY"));
+        assert!(vars.contains(&"ANTHROPIC_API_KEY"));
+        assert!(vars.len() > 0);
+    }
+
+    #[test]
+    fn test_env_template_python_vars() {
+        let vars = EnvTemplate::python_vars();
+        assert!(vars.contains(&"OPENAI_API_KEY"));
+        assert!(vars.contains(&"ANTHROPIC_API_KEY"));
+        assert!(vars.len() > 0);
+    }
+
+    #[test]
+    fn test_env_template_other_vars() {
+        let vars = EnvTemplate::other_vars();
+        assert!(vars.contains(&"OPENAI_API_KEY"));
+        assert!(vars.contains(&"ANTHROPIC_API_KEY"));
+        assert!(vars.len() > 0);
+    }
+}

@@ -119,3 +119,168 @@ impl EnvRenderer {
         (added, updated, missing)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env_resolver::{ResolvedVar, VarSource};
+
+    #[test]
+    fn test_render_env_file() {
+        let resolved = vec![
+            ResolvedVar {
+                name: "KEY1".to_string(),
+                value: Some("value1".to_string()),
+                source: VarSource::Profile,
+            },
+            ResolvedVar {
+                name: "KEY2".to_string(),
+                value: Some("value2".to_string()),
+                source: VarSource::Profile,
+            },
+        ];
+
+        let content = EnvRenderer::render_env_file(&resolved);
+        assert_eq!(content, "KEY1=value1\nKEY2=value2");
+    }
+
+    #[test]
+    fn test_render_env_file_with_missing() {
+        let resolved = vec![
+            ResolvedVar {
+                name: "KEY1".to_string(),
+                value: Some("value1".to_string()),
+                source: VarSource::Profile,
+            },
+            ResolvedVar {
+                name: "KEY2".to_string(),
+                value: None,
+                source: VarSource::Missing,
+            },
+        ];
+
+        let content = EnvRenderer::render_env_file(&resolved);
+        assert_eq!(content, "KEY1=value1\nKEY2=");
+    }
+
+    #[test]
+    fn test_merge_env_file_no_existing() {
+        let resolved = vec![
+            ResolvedVar {
+                name: "KEY1".to_string(),
+                value: Some("value1".to_string()),
+                source: VarSource::Profile,
+            },
+        ];
+
+        let content = EnvRenderer::merge_env_file(None, &resolved);
+        assert_eq!(content, "KEY1=value1");
+    }
+
+    #[test]
+    fn test_merge_env_file_preserves_comments() {
+        let existing = "# This is a comment\nKEY1=old_value\n# Another comment\nUNKNOWN_KEY=keep_this";
+        let resolved = vec![
+            ResolvedVar {
+                name: "KEY1".to_string(),
+                value: Some("new_value".to_string()),
+                source: VarSource::Profile,
+            },
+        ];
+
+        let content = EnvRenderer::merge_env_file(Some(existing), &resolved);
+        assert!(content.contains("# This is a comment"));
+        assert!(content.contains("# Another comment"));
+        assert!(content.contains("UNKNOWN_KEY=keep_this"));
+        assert!(content.contains("KEY1=new_value"));
+        assert!(!content.contains("KEY1=old_value"));
+    }
+
+    #[test]
+    fn test_merge_env_file_updates_known_keys() {
+        let existing = "KEY1=old1\nKEY2=old2\nUNKNOWN=keep";
+        let resolved = vec![
+            ResolvedVar {
+                name: "KEY1".to_string(),
+                value: Some("new1".to_string()),
+                source: VarSource::Profile,
+            },
+            ResolvedVar {
+                name: "KEY2".to_string(),
+                value: Some("new2".to_string()),
+                source: VarSource::Profile,
+            },
+        ];
+
+        let content = EnvRenderer::merge_env_file(Some(existing), &resolved);
+        assert!(content.contains("UNKNOWN=keep"));
+        assert!(content.contains("KEY1=new1"));
+        assert!(content.contains("KEY2=new2"));
+        assert!(!content.contains("old1"));
+        assert!(!content.contains("old2"));
+    }
+
+    #[test]
+    fn test_get_changes_summary_all_new() {
+        let resolved = vec![
+            ResolvedVar {
+                name: "KEY1".to_string(),
+                value: Some("value1".to_string()),
+                source: VarSource::Profile,
+            },
+            ResolvedVar {
+                name: "KEY2".to_string(),
+                value: Some("value2".to_string()),
+                source: VarSource::Profile,
+            },
+        ];
+
+        let (added, updated, missing) = EnvRenderer::get_changes_summary(None, &resolved);
+        assert_eq!(added.len(), 2);
+        assert_eq!(updated.len(), 0);
+        assert_eq!(missing.len(), 0);
+    }
+
+    #[test]
+    fn test_get_changes_summary_with_updates() {
+        let existing = "KEY1=old_value";
+        let resolved = vec![
+            ResolvedVar {
+                name: "KEY1".to_string(),
+                value: Some("new_value".to_string()),
+                source: VarSource::Profile,
+            },
+            ResolvedVar {
+                name: "KEY2".to_string(),
+                value: Some("value2".to_string()),
+                source: VarSource::Profile,
+            },
+        ];
+
+        let (added, updated, missing) = EnvRenderer::get_changes_summary(Some(existing), &resolved);
+        assert_eq!(added, vec!["KEY2"]);
+        assert_eq!(updated, vec!["KEY1"]);
+        assert_eq!(missing.len(), 0);
+    }
+
+    #[test]
+    fn test_get_changes_summary_with_missing() {
+        let resolved = vec![
+            ResolvedVar {
+                name: "KEY1".to_string(),
+                value: Some("value1".to_string()),
+                source: VarSource::Profile,
+            },
+            ResolvedVar {
+                name: "KEY2".to_string(),
+                value: None,
+                source: VarSource::Missing,
+            },
+        ];
+
+        let (added, updated, missing) = EnvRenderer::get_changes_summary(None, &resolved);
+        assert_eq!(added, vec!["KEY1"]);
+        assert_eq!(updated.len(), 0);
+        assert_eq!(missing, vec!["KEY2"]);
+    }
+}

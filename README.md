@@ -1,12 +1,19 @@
-# AiKey CLI v0.0.2-alpha
+# AiKey CLI v0.3
 
 A secure, local-first secret management tool built with Rust. Store API keys, tokens, and other sensitive data encrypted on your machine.
 
-**Status**: Alpha release - Core functionality complete with comprehensive testing.
+**Status**: Beta release - Core functionality complete with comprehensive testing and developer workflow support.
 
 **Primary command**: `aikey` (short alias: `ak`)
 
-## Features (v0.0.2-alpha)
+## Features (v0.3)
+
+### Developer Workflow (New in v0.3)
+- **Project configuration**: Initialize and manage project-specific environment variables
+- **Environment generation**: Automatically generate `.env` files from your vault
+- **Environment injection**: Inject secrets into your shell environment
+- **Template support**: Pre-configured templates for Node.js, Python, and other stacks
+- **Smart merging**: Preserve comments and unknown variables when updating `.env` files
 
 ### Secure Storage
 - **Local-first**: All secrets stored encrypted in `~/.aikey/vault.db`
@@ -32,7 +39,9 @@ A secure, local-first secret management tool built with Rust. Store API keys, to
 - **Project contexts**: Manage secrets per project with automatic context switching
 
 ### Testing & Quality
-- **Comprehensive test suite**: 19 integration tests covering all core functionality
+- **Comprehensive test suite**: 90+ tests covering all core functionality
+- **Unit tests**: Config parsing, environment resolution, and rendering logic
+- **Integration tests**: Full command workflows including v0.3 developer features
 - **Security testing**: Authentication failure, injection safety, special characters
 - **Persistence testing**: Vault integrity across operations
 
@@ -145,6 +154,89 @@ aikey run --json -- echo "test"
 
 JSON output is written to stderr to avoid mixing with command output, making it safe for automation and scripting.
 
+## Developer Workflow (v0.3)
+
+The v0.3 release introduces a complete developer workflow for managing environment variables across projects and profiles.
+
+### Initialize a project
+
+```bash
+aikey project init
+```
+
+This interactive command will:
+1. Prompt for project name (defaults to folder name)
+2. Ask for language/stack (Node.js, Python, or Other)
+3. Set the `.env` file target
+4. Suggest common environment variables based on your stack
+5. Create an `aikey.config.json` file in your project
+
+Example `aikey.config.json`:
+```json
+{
+  "version": "1",
+  "project": {
+    "name": "my-app"
+  },
+  "env": {
+    "target": ".env"
+  },
+  "requiredVars": [
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "DATABASE_URL"
+  ]
+}
+```
+
+### Check project status
+
+```bash
+aikey project status
+```
+
+Shows:
+- Project configuration path
+- Current profile
+- Required variables and their satisfaction status
+- Helpful hints for next steps
+
+### Generate .env file
+
+```bash
+aikey env generate
+```
+
+Generates or updates your `.env` file with values from your current profile:
+- Preserves comments and unknown variables
+- Updates only the variables listed in `requiredVars`
+- Writes empty placeholders for missing values
+
+Options:
+```bash
+# Preview changes without writing
+aikey env generate --dry-run
+
+# Use a different .env file
+aikey env generate --env-file .env.local
+```
+
+### Inject variables into shell
+
+```bash
+eval "$(AIKEY_INJECT_MODE=eval aikey env inject)"
+```
+
+Injects your project's required variables into the current shell environment. This is useful for:
+- Running commands that need environment variables
+- Testing without creating `.env` files
+- Temporary environment setup
+
+Alternatively, use the existing `aikey run` command:
+```bash
+aikey run -- npm start
+```
+
 ### Preview Features
 
 The following commands are available but still in development:
@@ -210,17 +302,28 @@ cargo test
 
 ```
 src/
-├── main.rs       # CLI interface and command handlers
-├── crypto.rs     # Encryption/decryption and key derivation
-└── storage.rs    # SQLite database operations
+├── main.rs              # CLI interface and command handlers
+├── crypto.rs            # Encryption/decryption and key derivation
+├── storage.rs           # SQLite database operations
+├── config.rs            # Project configuration management
+├── env_resolver.rs      # Environment variable resolution
+├── env_renderer.rs      # .env file rendering and merging
+├── commands_project.rs  # Project command handlers
+└── commands_env.rs      # Environment command handlers
 ```
 
 ## Roadmap
 
-### Planned for v0.1.0
+### Completed in v0.3
+- [x] Developer workflow commands (`project init`, `project status`)
+- [x] Environment generation (`env generate` with merge support)
+- [x] Environment injection (`env inject` with shell eval support)
+- [x] Project configuration management
+- [x] Template support for Node.js, Python, and other stacks
+- [x] Comprehensive unit and integration tests
+
+### Planned for v0.4
 - [ ] Complete profile management implementation
-- [ ] Complete environment templates implementation
-- [ ] Complete project contexts implementation
 - [ ] Shell completion scripts
 - [ ] Password strength meter during init
 
@@ -229,6 +332,7 @@ src/
 - [ ] Vault backup and restore
 - [ ] Secret expiration and rotation reminders
 - [ ] Multi-vault support
+- [ ] `aikey quickstart` command for first-time users
 
 ## License
 

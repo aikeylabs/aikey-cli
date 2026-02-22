@@ -59,3 +59,125 @@ impl EnvResolver {
         (satisfied, total)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ProjectConfig;
+
+    #[test]
+    fn test_resolve_all_satisfied() {
+        let config = ProjectConfig::new("test".to_string());
+        let mut config = config;
+        config.requiredVars = vec!["KEY1".to_string(), "KEY2".to_string()];
+
+        let mut profile_vars = HashMap::new();
+        profile_vars.insert("KEY1".to_string(), "value1".to_string());
+        profile_vars.insert("KEY2".to_string(), "value2".to_string());
+
+        let resolved = EnvResolver::resolve(&config, "default", &profile_vars).unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "KEY1");
+        assert_eq!(resolved[0].value, Some("value1".to_string()));
+        assert_eq!(resolved[0].source, VarSource::Profile);
+        assert_eq!(resolved[1].name, "KEY2");
+        assert_eq!(resolved[1].value, Some("value2".to_string()));
+        assert_eq!(resolved[1].source, VarSource::Profile);
+    }
+
+    #[test]
+    fn test_resolve_partial_satisfied() {
+        let config = ProjectConfig::new("test".to_string());
+        let mut config = config;
+        config.requiredVars = vec!["KEY1".to_string(), "KEY2".to_string(), "KEY3".to_string()];
+
+        let mut profile_vars = HashMap::new();
+        profile_vars.insert("KEY1".to_string(), "value1".to_string());
+
+        let resolved = EnvResolver::resolve(&config, "default", &profile_vars).unwrap();
+
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[0].value, Some("value1".to_string()));
+        assert_eq!(resolved[0].source, VarSource::Profile);
+        assert_eq!(resolved[1].value, None);
+        assert_eq!(resolved[1].source, VarSource::Missing);
+        assert_eq!(resolved[2].value, None);
+        assert_eq!(resolved[2].source, VarSource::Missing);
+    }
+
+    #[test]
+    fn test_resolve_none_satisfied() {
+        let config = ProjectConfig::new("test".to_string());
+        let mut config = config;
+        config.requiredVars = vec!["KEY1".to_string(), "KEY2".to_string()];
+
+        let profile_vars = HashMap::new();
+        let resolved = EnvResolver::resolve(&config, "default", &profile_vars).unwrap();
+
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().all(|v| v.value.is_none()));
+        assert!(resolved.iter().all(|v| v.source == VarSource::Missing));
+    }
+
+    #[test]
+    fn test_all_satisfied() {
+        let resolved = vec![
+            ResolvedVar {
+                name: "KEY1".to_string(),
+                value: Some("value1".to_string()),
+                source: VarSource::Profile,
+            },
+            ResolvedVar {
+                name: "KEY2".to_string(),
+                value: Some("value2".to_string()),
+                source: VarSource::Profile,
+            },
+        ];
+
+        assert!(EnvResolver::all_satisfied(&resolved));
+    }
+
+    #[test]
+    fn test_not_all_satisfied() {
+        let resolved = vec![
+            ResolvedVar {
+                name: "KEY1".to_string(),
+                value: Some("value1".to_string()),
+                source: VarSource::Profile,
+            },
+            ResolvedVar {
+                name: "KEY2".to_string(),
+                value: None,
+                source: VarSource::Missing,
+            },
+        ];
+
+        assert!(!EnvResolver::all_satisfied(&resolved));
+    }
+
+    #[test]
+    fn test_count_satisfied() {
+        let resolved = vec![
+            ResolvedVar {
+                name: "KEY1".to_string(),
+                value: Some("value1".to_string()),
+                source: VarSource::Profile,
+            },
+            ResolvedVar {
+                name: "KEY2".to_string(),
+                value: None,
+                source: VarSource::Missing,
+            },
+            ResolvedVar {
+                name: "KEY3".to_string(),
+                value: Some("value3".to_string()),
+                source: VarSource::Profile,
+            },
+        ];
+
+        let (satisfied, total) = EnvResolver::count_satisfied(&resolved);
+        assert_eq!(satisfied, 2);
+        assert_eq!(total, 3);
+    }
+}
