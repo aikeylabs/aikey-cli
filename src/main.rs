@@ -103,6 +103,8 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Quick setup wizard for new projects
+    Quickstart,
 }
 
 #[derive(Subcommand)]
@@ -762,6 +764,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     commands_project::handle_project_status(cli.json)?;
                 }
             }
+        }
+        Commands::Quickstart => {
+            commands_project::handle_quickstart(cli.json)?;
         }
     }
     Ok(())
