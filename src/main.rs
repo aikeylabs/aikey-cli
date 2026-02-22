@@ -6,6 +6,11 @@ mod audit;
 mod ratelimit;
 mod json_output;
 mod error_codes;
+mod config;
+mod env_resolver;
+mod env_renderer;
+mod commands_project;
+mod commands_env;
 
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
@@ -710,16 +715,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Env { action } => {
             match action {
                 EnvAction::Inject => {
-                    if cli.json {
-                        let response = serde_json::json!({
-                            "message": "Use 'aikey exec --env VAR=alias -- command' instead",
-                            "status": "not_implemented"
-                        });
-                        println!("{}", serde_json::to_string_pretty(&response)?);
-                    } else {
-                        println!("Use 'aikey exec --env VAR=alias -- command' for now.");
-                        println!("'aikey env inject' will be implemented in a future release.");
-                    }
+                    commands_env::handle_env_inject(cli.json)?;
                 }
                 EnvAction::Export => {
                     if cli.json {
@@ -748,74 +744,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Project { action } => {
             match action {
                 ProjectAction::Init => {
-                    let config_path = std::path::Path::new("aikey.config.json");
-                    if config_path.exists() {
-                        return Err("aikey.config.json already exists in current directory".into());
-                    }
-
-                    let config = serde_json::json!({
-                        "version": "1",
-                        "project": {
-                            "name": "My AI App"
-                        },
-                        "env": {
-                            "target": ".env"
-                        },
-                        "requiredVars": [],
-                        "defaults": {
-                            "profile": "default"
-                        }
-                    });
-
-                    std::fs::write(config_path, serde_json::to_string_pretty(&config)?)?;
-
-                    if cli.json {
-                        let response = serde_json::json!({
-                            "status": "created",
-                            "path": "aikey.config.json"
-                        });
-                        println!("{}", serde_json::to_string_pretty(&response)?);
-                    } else {
-                        println!("Created aikey.config.json in current directory");
-                    }
+                    commands_project::handle_project_init(cli.json)?;
                 }
                 ProjectAction::Status => {
-                    let mut current_dir = std::env::current_dir()?;
-                    let mut found = false;
-                    let mut config_path_str = String::new();
-
-                    loop {
-                        let config_path = current_dir.join("aikey.config.json");
-                        if config_path.exists() {
-                            config_path_str = config_path.display().to_string();
-                            found = true;
-                            break;
-                        }
-
-                        if !current_dir.pop() {
-                            break;
-                        }
-                    }
-
-                    if cli.json {
-                        let response = if found {
-                            serde_json::json!({
-                                "found": true,
-                                "path": config_path_str
-                            })
-                        } else {
-                            serde_json::json!({
-                                "found": false
-                            })
-                        };
-                        println!("{}", serde_json::to_string_pretty(&response)?);
-                    } else {
-                        if found {
-                            println!("Found: {}", config_path_str);
-                        } else {
-                            println!("No aikey.config.json found in current directory or parent directories");
-                        }
-                    }
+                    commands_project::handle_project_status(cli.json)?;
                 }
             }
         }
