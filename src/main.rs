@@ -105,6 +105,8 @@ enum Commands {
     },
     /// Quick setup wizard for new projects
     Quickstart,
+    /// Show local usage statistics
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -144,9 +146,13 @@ enum EnvAction {
     },
     /// Inject secrets into environment (use 'aikey exec' for now)
     Inject,
-    /// Export secrets to .env file
-    Export,
-    /// Check required environment variables
+    /// Export resolved environment variables to stdout
+    Export {
+        /// Output format: dotenv, shell, or json
+        #[arg(long, default_value = "dotenv")]
+        format: String,
+    },
+    /// Check if all required environment variables can be resolved
     Check,
 }
 
@@ -193,6 +199,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
     }
+    Ok(())
+}
+
+/// Handle `aikey stats` command
+fn handle_stats(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use std::path::Path;
+
+    // Count project configs
+    let mut project_count = 0;
+    if let Ok(entries) = std::fs::read_dir(".") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with("aikey.config.")) {
+                project_count += 1;
+            }
+        }
+    }
+
+    // Count profiles from global config
+    let mut profile_count = 0;
+    if let Some(config_dir) = dirs::config_dir() {
+        let config_file = config_dir.join("aikey").join("config.json");
+        if config_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&config_file) {
+                if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(profiles) = config.get("profiles").and_then(|v| v.as_array()) {
+                        profile_count = profiles.len();
+                    }
+                }
+            }
+        }
+    }
+
+    // Check if vault exists
+    let vault_exists = if let Some(config_dir) = dirs::config_dir() {
+        let vault_path = config_dir.join("aikey").join("vault.db");
+        vault_path.exists()
+    } else {
+        false
+    };
+
+    if json_mode {
+        let response = serde_json::json!({
+            "ok": true,
+            "projects": project_count,
+            "profiles": profile_count,
+            "vault_initialized": vault_exists
+        });
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!("AiKey Local Statistics");
+        println!("======================");
+        println!("Projects (current dir): {}", project_count);
+        println!("Profiles: {}", profile_count);
+        println!("Vault: {}", if vault_exists { "initialized" } else { "not initialized" });
+        println!("\nNote: These statistics are local-only and do not involve any remote calls.");
+    }
+
     Ok(())
 }
 
@@ -731,27 +795,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 EnvAction::Inject => {
                     commands_env::handle_env_inject(cli.json)?;
                 }
-                EnvAction::Export => {
-                    if cli.json {
-                        let response = serde_json::json!({
-                            "status": "not_implemented"
-                        });
-                        println!("{}", serde_json::to_string_pretty(&response)?);
-                    } else {
-                        println!("Environment export is not implemented yet.");
-                        println!("This feature will be available in a future release.");
-                    }
+                EnvAction::Export { format } => {
+                    commands_env::handle_env_export(format, cli.json)?;
                 }
                 EnvAction::Check => {
-                    if cli.json {
-                        let response = serde_json::json!({
-                            "status": "not_implemented"
-                        });
-                        println!("{}", serde_json::to_string_pretty(&response)?);
-                    } else {
-                        println!("Environment check is not implemented yet.");
-                        println!("This feature will be available in a future release.");
-                    }
+                    commands_env::handle_env_check(cli.json)?;
                 }
             }
         }
@@ -767,6 +815,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Quickstart => {
             commands_project::handle_quickstart(cli.json)?;
+        }
+        Commands::Stats => {
+            handle_stats(cli.json)?;
         }
     }
     Ok(())

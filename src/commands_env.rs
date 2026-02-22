@@ -165,3 +165,119 @@ pub fn get_current_profile() -> Result<String, Box<dyn std::error::Error>> {
 
     Ok("default".to_string())
 }
+
+/// Handle `aikey env export` command
+pub fn handle_env_export(format: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (_config_path, config) = ProjectConfig::discover()?.ok_or_else(|| {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No aikey.config.json found",
+        )) as Box<dyn std::error::Error>
+    })?;
+
+    let current_profile = get_current_profile()?;
+    let profile_vars: HashMap<String, String> = HashMap::new();
+
+    let resolved = EnvResolver::resolve(&config, &current_profile, &profile_vars).map_err(|e| {
+        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>
+    })?;
+
+    match format {
+        "dotenv" | ".env" => {
+            // Output in .env format
+            for var in &resolved {
+                if let Some(value) = &var.value {
+                    println!("{}={}", var.name, value);
+                } else {
+                    println!("{}=", var.name);
+                }
+            }
+        }
+        "shell" => {
+            // Output as shell export commands
+            for var in &resolved {
+                if let Some(value) = &var.value {
+                    let escaped_value = value.replace('\'', "'\\''");
+                    println!("export {}='{}'", var.name, escaped_value);
+                } else {
+                    println!("export {}=''", var.name);
+                }
+            }
+        }
+        "json" => {
+            // Output as JSON
+            let vars: HashMap<String, Option<String>> = resolved
+                .iter()
+                .map(|v| (v.name.clone(), v.value.clone()))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&vars)?);
+        }
+        _ => {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("Unknown format: {}. Use 'dotenv', 'shell', or 'json'", format),
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle `aikey env check` command
+pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (_config_path, config) = ProjectConfig::discover()?.ok_or_else(|| {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No aikey.config.json found",
+        )) as Box<dyn std::error::Error>
+    })?;
+
+    let current_profile = get_current_profile()?;
+    let profile_vars: HashMap<String, String> = HashMap::new();
+
+    let resolved = EnvResolver::resolve(&config, &current_profile, &profile_vars).map_err(|e| {
+        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>
+    })?;
+
+    let total = resolved.len();
+    let satisfied: Vec<_> = resolved.iter().filter(|v| v.value.is_some()).collect();
+    let missing: Vec<_> = resolved.iter().filter(|v| v.value.is_none()).collect();
+    let satisfied_count = satisfied.len();
+    let missing_count = missing.len();
+
+    if json_mode {
+        let response = serde_json::json!({
+            "ok": missing_count == 0,
+            "profile": current_profile,
+            "total": total,
+            "satisfied": satisfied_count,
+            "missing": missing_count,
+            "missing_vars": missing.iter().map(|v| &v.name).collect::<Vec<_>>()
+        });
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!("Environment Check");
+        println!("=================");
+        println!("Profile: {}", current_profile);
+        println!("Status: {}/{} variables satisfied", satisfied_count, total);
+
+        if !missing.is_empty() {
+            println!("\nMissing variables:");
+            for var in &missing {
+                println!("  ✗ {}", var.name);
+            }
+            println!("\nTo configure these variables:");
+            println!("  • Use the browser extension to add keys to your profile");
+            println!("  • Or run 'aikey env generate' to create placeholders in .env");
+        } else {
+            println!("\n✓ All required variables are configured");
+        }
+    }
+
+    // Exit with code 2 if there are missing vars, 0 if all satisfied
+    if missing_count > 0 {
+        std::process::exit(2);
+    }
+
+    Ok(())
+}
