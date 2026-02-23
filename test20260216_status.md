@@ -65,7 +65,7 @@ When resuming with "go test20260216":
 
 ## Test Command
 ```bash
-cd /Users/lautom/aikeylabs-ak
+cd /Users/lautom/aikeylabs-aikey-cli
 cargo test --test synapse_stress_test
 ```
 

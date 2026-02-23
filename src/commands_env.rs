@@ -167,8 +167,8 @@ pub fn get_current_profile() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 /// Handle `aikey env export` command
-pub fn handle_env_export(format: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (_config_path, config) = ProjectConfig::discover()?.ok_or_else(|| {
+pub fn handle_env_export(format: &str, _json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (_, config) = ProjectConfig::discover()?.ok_or_else(|| {
         Box::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "No aikey.config.json found",
@@ -225,7 +225,7 @@ pub fn handle_env_export(format: &str, json_mode: bool) -> Result<(), Box<dyn st
 
 /// Handle `aikey env check` command
 pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (_config_path, config) = ProjectConfig::discover()?.ok_or_else(|| {
+    let (_, config) = ProjectConfig::discover()?.ok_or_else(|| {
         Box::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "No aikey.config.json found",

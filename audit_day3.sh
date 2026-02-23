@@ -8,7 +8,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 echo "=========================================="
-echo "AikeyLabs-AK Day 3 Audit Suite"
+echo "AiKey CLI Day 3 Audit Suite"
 echo "=========================================="
 
 # Cleanup function

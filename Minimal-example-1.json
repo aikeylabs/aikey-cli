@@ -1,0 +1,13 @@
+{
+  "version": "1",
+  "project": {
+    "name": "My AI App"
+  },
+  "env": {
+    "target": ".env"
+  },
+  "requiredVars": [],
+  "defaults": {
+    "profile": "default"
+  }
+}

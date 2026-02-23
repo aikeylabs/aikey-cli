@@ -160,6 +160,29 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
     .map_err(|e| format!("Failed to create entries table: {}", e))?;
 
     conn.execute(
+        "CREATE TABLE profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            is_active INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| format!("Failed to create profiles table: {}", e))?;
+
+    conn.execute(
+        "CREATE TABLE bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_name TEXT NOT NULL,
+            alias TEXT NOT NULL,
+            FOREIGN KEY (profile_name) REFERENCES profiles(name),
+            UNIQUE(profile_name, alias)
+        )",
+        [],
+    )
+    .map_err(|e| format!("Failed to create bindings table: {}", e))?;
+
+    conn.execute(
         "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
         params!["master_salt", salt],
     )
@@ -853,4 +876,109 @@ pub fn get_all_entries() -> Result<Vec<(String, Vec<u8>, Vec<u8>)>, String> {
         .map_err(|e| format!("Failed to collect results: {}", e))?;
 
     Ok(entries)
+}
+
+/// Get all profiles
+pub fn get_all_profiles() -> Result<Vec<crate::profiles::Profile>, String> {
+    let conn = open_connection()?;
+    crate::profiles::list_profiles(&conn)
+}
+
+/// Get the active profile
+pub fn get_active_profile() -> Result<Option<crate::profiles::Profile>, String> {
+    let conn = open_connection()?;
+    crate::profiles::get_active_profile(&conn)
+}
+
+/// Create a new profile
+pub fn create_profile(name: &str) -> Result<crate::profiles::Profile, String> {
+    let conn = open_connection()?;
+    crate::profiles::create_profile(&conn, name)
+}
+
+/// Set a profile as active
+pub fn set_active_profile(name: &str) -> Result<crate::profiles::Profile, String> {
+    let conn = open_connection()?;
+    crate::profiles::set_active_profile(&conn, name)
+}
+
+/// Delete a profile
+pub fn delete_profile(name: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    crate::profiles::delete_profile(&conn, name)
+}
+
+/// Bind a secret to a profile
+pub fn bind_secret_to_profile(profile_name: &str, alias: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "INSERT OR IGNORE INTO bindings (profile_name, alias) VALUES (?, ?)",
+        params![profile_name, alias],
+    )
+    .map_err(|e| format!("Failed to bind secret to profile: {}", e))?;
+    Ok(())
+}
+
+/// Unbind a secret from a profile
+pub fn unbind_secret_from_profile(profile_name: &str, alias: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "DELETE FROM bindings WHERE profile_name = ? AND alias = ?",
+        params![profile_name, alias],
+    )
+    .map_err(|e| format!("Failed to unbind secret from profile: {}", e))?;
+    Ok(())
+}
+
+/// Get all secrets bound to a profile
+pub fn get_profile_secrets(profile_name: &str) -> Result<Vec<String>, String> {
+    let conn = open_connection()?;
+    let mut stmt = conn
+        .prepare("SELECT alias FROM bindings WHERE profile_name = ? ORDER BY alias")
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let secrets = stmt
+        .query_map(params![profile_name], |row| row.get(0))
+        .map_err(|e| format!("Failed to query bindings: {}", e))?
+        .collect::<SqlResult<Vec<String>>>()
+        .map_err(|e| format!("Failed to collect results: {}", e))?;
+
+    Ok(secrets)
+}
+
+/// Get all secrets bound to a profile (with connection parameter)
+pub fn get_profile_bindings(conn: &Connection, profile_name: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT alias FROM bindings WHERE profile_name = ? ORDER BY alias")
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let secrets = stmt
+        .query_map(params![profile_name], |row| row.get(0))
+        .map_err(|e| format!("Failed to query bindings: {}", e))?
+        .collect::<SqlResult<Vec<String>>>()
+        .map_err(|e| format!("Failed to collect results: {}", e))?;
+
+    Ok(secrets)
+}
+
+/// Add a binding between a secret and a profile
+pub fn add_profile_binding(conn: &Connection, profile_name: &str, alias: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO bindings (profile_name, alias) VALUES (?, ?)",
+        params![profile_name, alias],
+    )
+    .map_err(|e| format!("Failed to add binding: {}", e))?;
+
+    Ok(())
+}
+
+/// Remove a binding between a secret and a profile
+pub fn remove_profile_binding(conn: &Connection, profile_name: &str, alias: &str) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM bindings WHERE profile_name = ? AND alias = ?",
+        params![profile_name, alias],
+    )
+    .map_err(|e| format!("Failed to remove binding: {}", e))?;
+
+    Ok(())
 }

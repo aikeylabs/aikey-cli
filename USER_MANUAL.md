@@ -1,4 +1,4 @@
-# AiKeyLabs-AK User Manual
+# AiKey CLI User Manual
 
 **Version:** 0.0.1-alpha
 **Last Updated:** February 15, 2026
@@ -21,7 +21,7 @@
 
 ## Introduction
 
-AiKeyLabs-AK (`ak`) is a secure, local-first secret management CLI tool built with Rust. It provides military-grade encryption for storing API keys, tokens, passwords, and other sensitive credentials on your local machine.
+AiKey CLI (`aikey`, with `ak` as a short alias) is a secure, local-first secret management CLI tool built with Rust. It provides military-grade encryption for storing API keys, tokens, passwords, and other sensitive credentials on your local machine.
 
 ### Key Features
 
@@ -48,7 +48,7 @@ AiKeyLabs-AK (`ak`) is a secure, local-first secret management CLI tool built wi
 ```bash
 # Clone the repository
 git clone https://github.com/AiKey-Founder/aikey-labs.git
-cd aikeylabs-ak
+cd aikeylabs-aikey-cli
 
 # Build and install
 cargo install --path .

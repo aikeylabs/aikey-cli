@@ -160,6 +160,6 @@ if [ -d "$TEST_TMP_DIR" ]; then
 fi
 
 # 清理代码警告
-cargo fix --lib -p aikeylabs-ak > /dev/null 2>&1
+cargo fix --lib -p aikeylabs-aikey-cli > /dev/null 2>&1
 log_info "✅ 代码警告已清理"
 log_info "✅ Day 4 Ghost Execution 全功能验证完成！"

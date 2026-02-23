@@ -4,7 +4,7 @@
 set -e
 
 echo "Building the project..."
-cd /Users/lautom/aikeylabs-ak
+cd /Users/lautom/aikeylabs-aikey-cli
 cargo build --release
 
 echo ""

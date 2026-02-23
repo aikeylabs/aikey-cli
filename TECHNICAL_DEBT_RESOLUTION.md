@@ -303,7 +303,7 @@ done
 $ cargo build --release
    Compiling rayon-core v1.13.0
    Compiling rayon v1.11.0
-   Compiling aikeylabs-ak v0.0.1-alpha
+   Compiling aikeylabs-aikey-cli v0.0.1-alpha
     Finished `release` profile [optimized] target(s) in 15.23s
 ```
 

@@ -1,16 +1,16 @@
 [package]
-name = "aikeylabs-ak"
+name = "aikeylabs-aikey-cli"
 version = "0.3.0"
 edition = "2021"
 authors = ["AiKey Founder <aikeyfounder@gmail.com>"]
 description = "Secure local-first secret management CLI tool"
 license = "Apache-2.0"
 repository = "https://github.com/AiKey-Founder/aikey-labs"
-keywords = ["aikeylabs", "ak", "core", "key-management", "cli-utilities"]
+keywords = ["aikeylabs", "aikey", "cli", "key-management", "cli-utilities"]
 categories = ["command-line-utilities"]
 
 [lib]
-name = "aikeylabs_ak"
+name = "aikeylabs_aikey_cli"
 path = "src/lib.rs"
 
 [[bin]]

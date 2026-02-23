@@ -11,6 +11,10 @@ mod env_resolver;
 mod env_renderer;
 mod commands_project;
 mod commands_env;
+mod rpc;
+mod daemon;
+mod profiles;
+mod core;
 
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
@@ -103,6 +107,15 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Start the AiKey daemon for background secret management
+    Daemon {
+        /// TCP port to listen on (default: 9999)
+        #[arg(long, default_value = "9999")]
+        port: u16,
+        /// Enable Unix socket support (default: true on Unix)
+        #[arg(long)]
+        unix_socket: bool,
+    },
     /// Quick setup wizard for new projects
     Quickstart,
     /// Show local usage statistics
@@ -131,6 +144,10 @@ enum ProfileAction {
     Show { name: String },
     /// Show current active profile
     Current,
+    /// Create a new profile
+    Create { name: String },
+    /// Delete a profile
+    Delete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -204,8 +221,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Handle `aikey stats` command
 fn handle_stats(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    use std::path::Path;
-
     // Count project configs
     let mut project_count = 0;
     if let Ok(entries) = std::fs::read_dir(".") {
@@ -694,95 +709,164 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Profile { action } => {
             match action {
                 ProfileAction::List => {
-                    if cli.json {
-                        println!("[]");
-                    } else {
-                        println!("No profiles configured.");
-                        println!("Profile management will be available in a future release.");
+                    let result = storage::get_all_profiles();
+                    match result {
+                        Ok(profiles) => {
+                            if cli.json {
+                                json_output::success(serde_json::json!({
+                                    "profiles": profiles
+                                }));
+                            } else {
+                                if profiles.is_empty() {
+                                    println!("No profiles configured.");
+                                } else {
+                                    println!("Profiles:");
+                                    for profile in profiles {
+                                        let status = if profile.is_active { " (active)" } else { "" };
+                                        println!("  {}{}", profile.name, status);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if cli.json {
+                                json_output::error(&e, 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
                     }
                 }
                 ProfileAction::Use { name } => {
-                    // Store profile preference in config file
-                    if let Some(config_dir) = dirs::config_dir() {
-                        let aikey_dir = config_dir.join("aikey");
-                        std::fs::create_dir_all(&aikey_dir)?;
-                        let config_file = aikey_dir.join("config.json");
-
-                        let config = serde_json::json!({
-                            "current_profile": name
-                        });
-
-                        std::fs::write(config_file, serde_json::to_string_pretty(&config)?)?;
-
-                        if cli.json {
-                            json_output::success(serde_json::json!({
-                                "ok": true,
-                                "profile": name
-                            }));
-                        } else {
-                            println!("Switched to profile: {}", name);
-                            println!("Note: Profile functionality is limited in this preview.");
+                    let result = storage::set_active_profile(name);
+                    match result {
+                        Ok(profile) => {
+                            if cli.json {
+                                json_output::success(serde_json::json!({
+                                    "ok": true,
+                                    "profile": profile.name
+                                }));
+                            } else {
+                                println!("Switched to profile: {}", profile.name);
+                            }
                         }
-                    } else {
-                        return Err("Could not determine config directory".into());
+                        Err(e) => {
+                            if cli.json {
+                                json_output::error(&e, 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
                     }
                 }
                 ProfileAction::Show { name } => {
-                    if cli.json {
-                        let profile_info = serde_json::json!({
-                            "name": name,
-                            "status": "not_implemented"
-                        });
-                        println!("{}", serde_json::to_string_pretty(&profile_info)?);
-                    } else {
-                        println!("Profile: {}", name);
-                        println!("Profile details will be available in a future release.");
+                    let result = storage::get_all_profiles();
+                    match result {
+                        Ok(profiles) => {
+                            if let Some(profile) = profiles.iter().find(|p| p.name == *name) {
+                                if cli.json {
+                                    json_output::success(serde_json::json!({
+                                        "profile": profile
+                                    }));
+                                } else {
+                                    println!("Profile: {}", profile.name);
+                                    println!("Active: {}", if profile.is_active { "yes" } else { "no" });
+                                    println!("Created: {}", profile.created_at);
+                                }
+                            } else {
+                                let err_msg = format!("Profile '{}' not found", name);
+                                if cli.json {
+                                    json_output::error(&err_msg, 1);
+                                } else {
+                                    return Err(err_msg.into());
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if cli.json {
+                                json_output::error(&e, 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
                     }
                 }
                 ProfileAction::Current => {
-                    // Read current profile from config file
-                    if let Some(config_dir) = dirs::config_dir() {
-                        let config_file = config_dir.join("aikey").join("config.json");
-
-                        if config_file.exists() {
-                            let config_content = std::fs::read_to_string(config_file)?;
-                            let config: serde_json::Value = serde_json::from_str(&config_content)?;
-
-                            if let Some(current_profile) = config.get("current_profile").and_then(|v| v.as_str()) {
-                                if cli.json {
-                                    json_output::success(serde_json::json!({
-                                        "ok": true,
-                                        "profile": current_profile
-                                    }));
-                                } else {
-                                    println!("Current profile: {}", current_profile);
-                                }
+                    let result = storage::get_active_profile();
+                    match result {
+                        Ok(Some(profile)) => {
+                            if cli.json {
+                                json_output::success(serde_json::json!({
+                                    "ok": true,
+                                    "profile": profile.name
+                                }));
                             } else {
-                                // No current_profile in config
-                                if cli.json {
-                                    json_output::error_with_code(
-                                        "No active profile configured",
-                                        error_codes::ErrorCode::NoActiveProfile,
-                                        1
-                                    );
-                                } else {
-                                    println!("No active profile configured");
-                                }
+                                println!("Current profile: {}", profile.name);
                             }
-                        } else {
-                            // Config file doesn't exist
+                        }
+                        Ok(None) => {
+                            let err_msg = "No active profile configured";
                             if cli.json {
                                 json_output::error_with_code(
-                                    "No active profile configured",
+                                    err_msg,
                                     error_codes::ErrorCode::NoActiveProfile,
                                     1
                                 );
                             } else {
-                                println!("No active profile configured");
+                                println!("{}", err_msg);
                             }
                         }
-                    } else {
-                        return Err("Could not determine config directory".into());
+                        Err(e) => {
+                            if cli.json {
+                                json_output::error(&e, 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+                ProfileAction::Create { name } => {
+                    let result = storage::create_profile(name);
+                    match result {
+                        Ok(profile) => {
+                            if cli.json {
+                                json_output::success(serde_json::json!({
+                                    "ok": true,
+                                    "profile": profile.name
+                                }));
+                            } else {
+                                println!("Profile '{}' created successfully", profile.name);
+                            }
+                        }
+                        Err(e) => {
+                            if cli.json {
+                                json_output::error(&e, 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+                ProfileAction::Delete { name } => {
+                    let result = storage::delete_profile(name);
+                    match result {
+                        Ok(_) => {
+                            if cli.json {
+                                json_output::success(serde_json::json!({
+                                    "ok": true,
+                                    "message": format!("Profile '{}' deleted", name)
+                                }));
+                            } else {
+                                println!("Profile '{}' deleted successfully", name);
+                            }
+                        }
+                        Err(e) => {
+                            if cli.json {
+                                json_output::error(&e, 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
                     }
                 }
             }
@@ -812,6 +896,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     commands_project::handle_project_status(cli.json)?;
                 }
             }
+        }
+        Commands::Daemon { port, unix_socket } => {
+            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+            daemon::start_daemon(*port, *unix_socket, &password, cli.json)?;
         }
         Commands::Quickstart => {
             commands_project::handle_quickstart(cli.json)?;

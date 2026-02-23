@@ -1,4 +1,4 @@
-# AiKeyLabs-AK Usage Scenarios Guide
+# AiKey CLI Usage Scenarios Guide
 
 **Version:** 0.0.1-alpha
 **Target Audience:** Developers, DevOps Engineers, Security Teams
@@ -1041,7 +1041,7 @@ echo "Secret rotation complete. New vault exported."
 
 ## Summary
 
-This guide covers 20 real-world scenarios for using AiKeyLabs-AK:
+This guide covers 20 real-world scenarios for using AiKey CLI (`aikey` / `ak`):
 
 **Individual Use:**
 - Daily development workflows

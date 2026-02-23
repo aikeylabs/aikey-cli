@@ -1,20 +1,27 @@
-/// Standard error codes for Platform API (v0.2)
-/// These codes provide a stable interface for IDE and tool integrations
+/// Unified error model for daemon, RPC, and CLI
+/// Preserves backward compatibility with existing error codes while supporting daemon-level errors
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
-    /// Secret with the given name already exists
+    // External/stable codes (guaranteed in CLI and RPC responses)
     AliasExists,
-    /// Secret with the given name does not exist
     AliasNotFound,
-    /// Vault is locked or password is incorrect
     VaultLocked,
-    /// No active profile is configured
     NoActiveProfile,
-    /// Invalid input provided
     InvalidInput,
-    /// Unknown or unclassified error
     UnknownError,
+    UnsupportedProtocol,
+    InternalError,
+
+    // Internal daemon codes (not exposed externally)
+    Unauthorized,
+    Forbidden,
+    IoError,
+    Timeout,
+    VaultNotInitialized,
+    ProfileNotFound,
 }
 
 impl ErrorCode {
@@ -26,6 +33,33 @@ impl ErrorCode {
             ErrorCode::NoActiveProfile => "NO_ACTIVE_PROFILE",
             ErrorCode::InvalidInput => "INVALID_INPUT",
             ErrorCode::UnknownError => "UNKNOWN_ERROR",
+            ErrorCode::UnsupportedProtocol => "UNSUPPORTED_PROTOCOL",
+            ErrorCode::InternalError => "INTERNAL_ERROR",
+            ErrorCode::Unauthorized => "UNAUTHORIZED",
+            ErrorCode::Forbidden => "FORBIDDEN",
+            ErrorCode::IoError => "IO_ERROR",
+            ErrorCode::Timeout => "TIMEOUT",
+            ErrorCode::VaultNotInitialized => "VAULT_NOT_INITIALIZED",
+            ErrorCode::ProfileNotFound => "PROFILE_NOT_FOUND",
+        }
+    }
+
+    pub fn code(&self) -> i32 {
+        match self {
+            ErrorCode::AliasExists => 1001,
+            ErrorCode::AliasNotFound => 1002,
+            ErrorCode::VaultLocked => 1003,
+            ErrorCode::NoActiveProfile => 1004,
+            ErrorCode::InvalidInput => 1005,
+            ErrorCode::UnknownError => 1006,
+            ErrorCode::UnsupportedProtocol => -32001,
+            ErrorCode::InternalError => -32603,
+            ErrorCode::Unauthorized => -32002,
+            ErrorCode::Forbidden => -32003,
+            ErrorCode::IoError => -32004,
+            ErrorCode::Timeout => -32005,
+            ErrorCode::VaultNotInitialized => -32006,
+            ErrorCode::ProfileNotFound => -32007,
         }
     }
 
@@ -44,5 +78,65 @@ impl ErrorCode {
         } else {
             ErrorCode::UnknownError
         }
+    }
+}
+
+/// Unified error type for daemon, RPC, and CLI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Error {
+    pub code: ErrorCode,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+impl Error {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    pub fn alias_exists(name: &str) -> Self {
+        Self::new(ErrorCode::AliasExists, format!("Secret already exists: {}", name))
+    }
+
+    pub fn alias_not_found(name: &str) -> Self {
+        Self::new(ErrorCode::AliasNotFound, format!("Secret not found: {}", name))
+    }
+
+    pub fn vault_locked() -> Self {
+        Self::new(ErrorCode::VaultLocked, "Vault is locked or password is incorrect")
+    }
+
+    pub fn no_active_profile() -> Self {
+        Self::new(ErrorCode::NoActiveProfile, "No active profile is configured")
+    }
+
+    pub fn invalid_input(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::InvalidInput, msg)
+    }
+
+    pub fn unknown_error(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::UnknownError, msg)
+    }
+
+    pub fn vault_not_initialized() -> Self {
+        Self::new(ErrorCode::VaultNotInitialized, "Vault not initialized")
+    }
+
+    pub fn profile_not_found(name: &str) -> Self {
+        Self::new(ErrorCode::ProfileNotFound, format!("Profile not found: {}", name))
+    }
+
+    pub fn internal_error(msg: impl Into<String>) -> Self {
+        Self::new(ErrorCode::InternalError, msg)
     }
 }
