@@ -13,6 +13,7 @@ mod commands_project;
 mod commands_env;
 mod rpc;
 mod daemon;
+mod daemon_client;
 mod profiles;
 mod core;
 
@@ -107,14 +108,10 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectAction,
     },
-    /// Start the AiKey daemon for background secret management
+    /// Daemon management commands
     Daemon {
-        /// TCP port to listen on (default: 9999)
-        #[arg(long, default_value = "9999")]
-        port: u16,
-        /// Enable Unix socket support (default: true on Unix)
-        #[arg(long)]
-        unix_socket: bool,
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
     },
     /// Quick setup wizard for new projects
     Quickstart,
@@ -178,6 +175,21 @@ enum ProjectAction {
     /// Initialize a new project configuration
     Init,
     /// Show project configuration status
+    Status,
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Start the daemon for background secret management
+    Start {
+        /// TCP port to listen on (default: 9999)
+        #[arg(long, default_value = "9999")]
+        port: u16,
+        /// Enable Unix socket support (default: true on Unix)
+        #[arg(long)]
+        unix_socket: bool,
+    },
+    /// Check daemon status and connectivity
     Status,
 }
 
@@ -707,10 +719,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Profile { action } => {
+            let client = daemon_client::DaemonClient::default();
             match action {
                 ProfileAction::List => {
-                    let result = storage::get_all_profiles();
-                    match result {
+                    match client.list_profiles() {
                         Ok(profiles) => {
                             if cli.json {
                                 json_output::success(serde_json::json!({
@@ -722,8 +734,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 } else {
                                     println!("Profiles:");
                                     for profile in profiles {
-                                        let status = if profile.is_active { " (active)" } else { "" };
-                                        println!("  {}{}", profile.name, status);
+                                        println!("  {}", profile);
                                     }
                                 }
                             }
@@ -738,16 +749,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ProfileAction::Use { name } => {
-                    let result = storage::set_active_profile(name);
-                    match result {
-                        Ok(profile) => {
+                    match client.use_profile(name) {
+                        Ok(profile_name) => {
                             if cli.json {
                                 json_output::success(serde_json::json!({
                                     "ok": true,
-                                    "profile": profile.name
+                                    "profile": profile_name
                                 }));
                             } else {
-                                println!("Switched to profile: {}", profile.name);
+                                println!("Switched to profile: {}", profile_name);
                             }
                         }
                         Err(e) => {
@@ -760,18 +770,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ProfileAction::Show { name } => {
-                    let result = storage::get_all_profiles();
-                    match result {
+                    match client.list_profiles() {
                         Ok(profiles) => {
-                            if let Some(profile) = profiles.iter().find(|p| p.name == *name) {
+                            if profiles.contains(name) {
                                 if cli.json {
                                     json_output::success(serde_json::json!({
-                                        "profile": profile
+                                        "profile": name
                                     }));
                                 } else {
-                                    println!("Profile: {}", profile.name);
-                                    println!("Active: {}", if profile.is_active { "yes" } else { "no" });
-                                    println!("Created: {}", profile.created_at);
+                                    println!("Profile: {}", name);
                                 }
                             } else {
                                 let err_msg = format!("Profile '{}' not found", name);
@@ -792,28 +799,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ProfileAction::Current => {
-                    let result = storage::get_active_profile();
-                    match result {
-                        Ok(Some(profile)) => {
+                    match client.get_current_profile() {
+                        Ok(profile_name) => {
                             if cli.json {
                                 json_output::success(serde_json::json!({
                                     "ok": true,
-                                    "profile": profile.name
+                                    "profile": profile_name
                                 }));
                             } else {
-                                println!("Current profile: {}", profile.name);
-                            }
-                        }
-                        Ok(None) => {
-                            let err_msg = "No active profile configured";
-                            if cli.json {
-                                json_output::error_with_code(
-                                    err_msg,
-                                    error_codes::ErrorCode::NoActiveProfile,
-                                    1
-                                );
-                            } else {
-                                println!("{}", err_msg);
+                                println!("Current profile: {}", profile_name);
                             }
                         }
                         Err(e) => {
@@ -826,16 +820,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ProfileAction::Create { name } => {
-                    let result = storage::create_profile(name);
-                    match result {
-                        Ok(profile) => {
+                    match client.create_profile(name) {
+                        Ok(profile_name) => {
                             if cli.json {
                                 json_output::success(serde_json::json!({
                                     "ok": true,
-                                    "profile": profile.name
+                                    "profile": profile_name
                                 }));
                             } else {
-                                println!("Profile '{}' created successfully", profile.name);
+                                println!("Profile '{}' created successfully", profile_name);
                             }
                         }
                         Err(e) => {
@@ -848,8 +841,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ProfileAction::Delete { name } => {
-                    let result = storage::delete_profile(name);
-                    match result {
+                    match client.delete_profile(name) {
                         Ok(_) => {
                             if cli.json {
                                 json_output::success(serde_json::json!({
@@ -897,9 +889,46 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Daemon { port, unix_socket } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-            daemon::start_daemon(*port, *unix_socket, &password, cli.json)?;
+        Commands::Daemon { action } => {
+            match action {
+                Some(DaemonAction::Start { port, unix_socket }) => {
+                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    daemon::start_daemon(*port, *unix_socket, &password, cli.json)?;
+                }
+                Some(DaemonAction::Status) => {
+                    match daemon_client::check_daemon_status() {
+                        Ok(status) => {
+                            if cli.json {
+                                json_output::success(serde_json::json!({
+                                    "status": "running",
+                                    "details": status
+                                }));
+                            } else {
+                                println!("✓ Daemon is running");
+                                if let Some(uptime) = status.get("uptime") {
+                                    println!("  Uptime: {}", uptime);
+                                }
+                                if let Some(version) = status.get("version") {
+                                    println!("  Version: {}", version);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if cli.json {
+                                json_output::error(&format!("Daemon is not running: {}", e), 1);
+                            } else {
+                                eprintln!("✗ Daemon is not running: {}", e);
+                            }
+                            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)));
+                        }
+                    }
+                }
+                None => {
+                    // Default to start if no subcommand specified
+                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    daemon::start_daemon(9999, true, &password, cli.json)?;
+                }
+            }
         }
         Commands::Quickstart => {
             commands_project::handle_quickstart(cli.json)?;

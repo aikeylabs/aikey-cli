@@ -1,6 +1,7 @@
 use crate::config::ProjectConfig;
-use crate::env_resolver::EnvResolver;
 use crate::env_renderer::EnvRenderer;
+use crate::daemon_client::DaemonClient;
+use crate::env_resolver::VarSource;
 use std::collections::HashMap;
 
 /// Handle `aikey env generate` command
@@ -15,14 +16,12 @@ pub fn handle_env_generate(
     let env_target = env_file_override.unwrap_or(&config.env.target);
     let env_path = std::path::Path::new(env_target);
 
-    // Get current profile
-    let current_profile = get_current_profile()?;
+    // Get current profile via daemon
+    let client = DaemonClient::default();
+    let current_profile = client.get_current_profile()?;
 
-    // For now, use empty profile vars (in full implementation, resolve from vault)
-    let profile_vars: HashMap<String, String> = HashMap::new();
-
-    let resolved = EnvResolver::resolve(&config, &current_profile, &profile_vars)
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
+    // Resolve environment variables via daemon
+    let resolved = resolve_env_via_daemon(&client, &config, &current_profile)?;
 
     // Get changes summary
     let existing_content = if env_path.exists() {
@@ -89,11 +88,12 @@ pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
     let (_config_path, config) = ProjectConfig::discover()?
         .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
 
-    let current_profile = get_current_profile()?;
-    let profile_vars: HashMap<String, String> = HashMap::new();
+    // Get current profile via daemon
+    let client = DaemonClient::default();
+    let current_profile = client.get_current_profile()?;
 
-    let resolved = EnvResolver::resolve(&config, &current_profile, &profile_vars)
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
+    // Resolve environment variables via daemon
+    let resolved = resolve_env_via_daemon(&client, &config, &current_profile)?;
 
     if json_mode {
         let vars: Vec<_> = resolved
@@ -175,12 +175,12 @@ pub fn handle_env_export(format: &str, _json_mode: bool) -> Result<(), Box<dyn s
         )) as Box<dyn std::error::Error>
     })?;
 
-    let current_profile = get_current_profile()?;
-    let profile_vars: HashMap<String, String> = HashMap::new();
+    // Get current profile via daemon
+    let client = DaemonClient::default();
+    let current_profile = client.get_current_profile()?;
 
-    let resolved = EnvResolver::resolve(&config, &current_profile, &profile_vars).map_err(|e| {
-        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>
-    })?;
+    // Resolve environment variables via daemon
+    let resolved = resolve_env_via_daemon(&client, &config, &current_profile)?;
 
     match format {
         "dotenv" | ".env" => {
@@ -232,12 +232,12 @@ pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
         )) as Box<dyn std::error::Error>
     })?;
 
-    let current_profile = get_current_profile()?;
-    let profile_vars: HashMap<String, String> = HashMap::new();
+    // Get current profile via daemon
+    let client = DaemonClient::default();
+    let current_profile = client.get_current_profile()?;
 
-    let resolved = EnvResolver::resolve(&config, &current_profile, &profile_vars).map_err(|e| {
-        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>
-    })?;
+    // Resolve environment variables via daemon
+    let resolved = resolve_env_via_daemon(&client, &config, &current_profile)?;
 
     let total = resolved.len();
     let satisfied: Vec<_> = resolved.iter().filter(|v| v.value.is_some()).collect();
@@ -280,4 +280,39 @@ pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
     }
 
     Ok(())
+}
+
+/// Resolve environment variables via daemon RPC
+fn resolve_env_via_daemon(
+    client: &DaemonClient,
+    config: &ProjectConfig,
+    _current_profile: &str,
+) -> Result<Vec<crate::env_resolver::ResolvedVar>, Box<dyn std::error::Error>> {
+    // Get required vars from config
+    let required_vars = &config.requiredVars;
+
+    // Build template from required variables
+    let template_parts: Vec<String> = required_vars
+        .iter()
+        .map(|var| format!("{}={{{}}}", var, var))
+        .collect();
+    let template = template_parts.join("\n");
+
+    // Resolve via daemon
+    let resolved_str = client.resolve_env(&template)
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
+
+    // Parse resolved variables back into ResolvedVar structs
+    let mut resolved = Vec::new();
+    for line in resolved_str.lines() {
+        if let Some((name, value)) = line.split_once('=') {
+            resolved.push(crate::env_resolver::ResolvedVar {
+                name: name.to_string(),
+                value: if value.is_empty() { None } else { Some(value.to_string()) },
+                source: if value.is_empty() { VarSource::Missing } else { VarSource::Profile },
+            });
+        }
+    }
+
+    Ok(resolved)
 }

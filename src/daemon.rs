@@ -48,6 +48,16 @@ impl DaemonConfig {
     /// Get default Unix socket path
     #[cfg(unix)]
     fn default_socket_path() -> Option<PathBuf> {
+        // Check for AIKEYD_SOCKET_PATH override
+        if let Ok(path) = std::env::var("AIKEYD_SOCKET_PATH") {
+            return Some(PathBuf::from(path));
+        }
+
+        // Fall back to ~/.aikey/aikeyd.sock
+        if let Some(home) = dirs::home_dir() {
+            return Some(home.join(".aikey").join("aikeyd.sock"));
+        }
+
         dirs::runtime_dir().map(|dir| dir.join("aikeyd.sock"))
     }
 
@@ -121,10 +131,25 @@ impl DaemonServer {
     /// Start Unix socket server
     #[cfg(unix)]
     fn start_unix_socket(&self, socket_path: &PathBuf) -> Result<(), String> {
-        // Remove existing socket if it exists
+        // Check if daemon is already running
         if socket_path.exists() {
-            fs::remove_file(socket_path)
-                .map_err(|e| format!("Failed to remove existing socket: {}", e))?;
+            // Try to connect to see if it's actually running
+            match UnixStream::connect(socket_path) {
+                Ok(_) => {
+                    return Err(format!("AiKey daemon is already running at {:?}", socket_path));
+                }
+                Err(_) => {
+                    // Socket exists but daemon isn't running, remove stale socket
+                    fs::remove_file(socket_path)
+                        .map_err(|e| format!("Failed to remove stale socket: {}", e))?;
+                }
+            }
+        }
+
+        // Ensure parent directory exists
+        if let Some(parent) = socket_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create socket directory: {}", e))?;
         }
 
         let listener = UnixListener::bind(socket_path)
@@ -218,15 +243,45 @@ fn process_request(data: &[u8], vault_password: &Arc<Mutex<Option<String>>>) -> 
     let request: Request = serde_json::from_str(&request_str)
         .map_err(|e| format!("Invalid JSON-RPC request: {}", e))?;
 
+    // Check protocol version
+    if !request.is_protocol_supported() {
+        let err = RpcError::unsupported_protocol();
+        let resp = ErrorResponse::new(err).with_id(request.id.unwrap_or(Value::Null));
+        return serde_json::to_string(&Response::Error(resp))
+            .map_err(|e| format!("Failed to serialize response: {}", e));
+    }
+
     let response = match request.method.as_str() {
+        // System methods
+        methods::SYSTEM_PING => handle_system_ping(&request),
+        methods::SYSTEM_STATUS => handle_system_status(&request),
+
+        // Auth methods (no-ops for now)
+        methods::AUTH_UNLOCK => handle_auth_unlock(&request),
+        methods::AUTH_LOCK => handle_auth_lock(&request),
+        methods::AUTH_SESSION_STATUS => handle_auth_session_status(&request),
+
+        // Profile methods
+        methods::PROFILE_LIST => handle_profile_list(&request),
+        methods::PROFILE_CURRENT => handle_profile_current(&request),
+        methods::PROFILE_USE => handle_profile_use(&request),
+        methods::PROFILE_CREATE => handle_profile_create(&request),
+        methods::PROFILE_DELETE => handle_profile_delete(&request),
+
+        // Secret methods
         methods::SECRET_GET => handle_get_secret(&request, vault_password),
         methods::SECRET_LIST => handle_list_secrets(&request, vault_password),
         methods::SECRET_UPSERT => handle_add_secret(&request, vault_password),
         methods::SECRET_DELETE => handle_delete_secret(&request, vault_password),
+
+        // Binding methods
         methods::BINDING_LIST => handle_list_bindings(&request, vault_password),
         methods::BINDING_SET => handle_set_binding(&request, vault_password),
         methods::BINDING_DELETE => handle_delete_binding(&request, vault_password),
+
+        // Environment methods
         methods::ENV_RESOLVE => handle_resolve_env(&request, vault_password),
+
         _ => Err(RpcError::new(-32601, "Method not found")),
     };
 
@@ -251,7 +306,115 @@ fn process_request(data: &[u8], vault_password: &Arc<Mutex<Option<String>>>) -> 
         .map_err(|e| format!("Failed to serialize response: {}", e))
 }
 
-/// Handle get_secret RPC method
+/// Handle system.ping RPC method
+fn handle_system_ping(_request: &Request) -> Result<Value, RpcError> {
+    Ok(json!({
+        "status": "ok"
+    }))
+}
+
+/// Handle system.status RPC method
+fn handle_system_status(_request: &Request) -> Result<Value, RpcError> {
+    Ok(json!({
+        "status": "running",
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
+/// Handle auth.unlock RPC method (no-op for now)
+fn handle_auth_unlock(_request: &Request) -> Result<Value, RpcError> {
+    Ok(json!({
+        "status": "unlocked"
+    }))
+}
+
+/// Handle auth.lock RPC method (no-op for now)
+fn handle_auth_lock(_request: &Request) -> Result<Value, RpcError> {
+    Ok(json!({
+        "status": "locked"
+    }))
+}
+
+/// Handle auth.session.status RPC method (no-op for now)
+fn handle_auth_session_status(_request: &Request) -> Result<Value, RpcError> {
+    Ok(json!({
+        "status": "active"
+    }))
+}
+
+/// Handle profile.list RPC method
+fn handle_profile_list(_request: &Request) -> Result<Value, RpcError> {
+    let profiles = storage::get_all_profiles()
+        .map_err(|e| RpcError::new(crate::rpc::error_codes::INTERNAL_ERROR, format!("Failed to list profiles: {}", e)))?;
+
+    Ok(json!({
+        "profiles": profiles
+    }))
+}
+
+/// Handle profile.current RPC method
+fn handle_profile_current(_request: &Request) -> Result<Value, RpcError> {
+    let profile = storage::get_active_profile()
+        .map_err(|e| RpcError::new(crate::rpc::error_codes::INTERNAL_ERROR, format!("Failed to get current profile: {}", e)))?;
+
+    match profile {
+        Some(p) => Ok(json!({
+            "profile": p.name
+        })),
+        None => Err(RpcError::no_active_profile()),
+    }
+}
+
+/// Handle profile.use RPC method
+fn handle_profile_use(request: &Request) -> Result<Value, RpcError> {
+    let params = &request.params.data;
+
+    let name = params.get("name")
+        .and_then(|v: &Value| v.as_str())
+        .ok_or_else(|| RpcError::new(-32602, "Missing or invalid 'name' parameter"))?;
+
+    let profile = storage::set_active_profile(name)
+        .map_err(|e| RpcError::new(crate::rpc::error_codes::INTERNAL_ERROR, format!("Failed to set active profile: {}", e)))?;
+
+    Ok(json!({
+        "profile": profile.name
+    }))
+}
+
+/// Handle profile.create RPC method
+fn handle_profile_create(request: &Request) -> Result<Value, RpcError> {
+    let params = &request.params.data;
+
+    let name = params.get("name")
+        .and_then(|v: &Value| v.as_str())
+        .ok_or_else(|| RpcError::new(-32602, "Missing or invalid 'name' parameter"))?;
+
+    let profile = storage::create_profile(name)
+        .map_err(|e| RpcError::new(crate::rpc::error_codes::INTERNAL_ERROR, format!("Failed to create profile: {}", e)))?;
+
+    Ok(json!({
+        "profile": profile.name
+    }))
+}
+
+/// Handle profile.delete RPC method
+fn handle_profile_delete(request: &Request) -> Result<Value, RpcError> {
+    let params = &request.params.data;
+
+    let name = params.get("name")
+        .and_then(|v: &Value| v.as_str())
+        .ok_or_else(|| RpcError::new(-32602, "Missing or invalid 'name' parameter"))?;
+
+    storage::delete_profile(name)
+        .map_err(|e| RpcError::new(crate::rpc::error_codes::INTERNAL_ERROR, format!("Failed to delete profile: {}", e)))?;
+
+    Ok(json!({
+        "profile": name,
+        "status": "deleted"
+    }))
+}
+
+
 fn handle_get_secret(request: &Request, vault_password: &Arc<Mutex<Option<String>>>) -> Result<Value, RpcError> {
     let params = &request.params.data;
 
