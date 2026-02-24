@@ -26,6 +26,9 @@ const VAULT_DIR: &str = ".aikey";
 /// Database filename
 const DB_NAME: &str = "vault.db";
 
+/// Default binding domain
+const DEFAULT_BINDING_DOMAIN: &str = "default";
+
 /// Returns the full path to the vault database
 pub fn get_vault_path() -> Result<PathBuf, String> {
     if let Ok(test_path) = std::env::var("AK_VAULT_PATH")
@@ -56,7 +59,87 @@ pub(crate) fn open_connection() -> Result<Connection, String> {
     conn.pragma_update(None, "secure_delete", "ON")
         .map_err(|e| format!("Failed to enable secure delete: {}", e))?;
 
+    // Ensure required tables exist (idempotent migrations)
+    apply_migrations(&conn)?;
+
     Ok(conn)
+}
+
+fn apply_migrations(conn: &Connection) -> Result<(), String> {
+    // Core tables
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value BLOB NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| format!("Failed to ensure config table: {}", e))?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias TEXT NOT NULL UNIQUE,
+            nonce BLOB NOT NULL,
+            ciphertext BLOB NOT NULL,
+            version_tag INTEGER NOT NULL DEFAULT 1,
+            metadata TEXT,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )",
+        [],
+    )
+    .map_err(|e| format!("Failed to ensure entries table: {}", e))?;
+
+    // Profiles and bindings
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            is_active INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        )",
+        [],
+    )
+    .map_err(|e| format!("Failed to ensure profiles table: {}", e))?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS bindings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_name TEXT NOT NULL,
+            domain TEXT NOT NULL DEFAULT 'default',
+            alias TEXT NOT NULL,
+            FOREIGN KEY (profile_name) REFERENCES profiles(name),
+            UNIQUE(profile_name, domain)
+        )",
+        [],
+    )
+    .map_err(|e| format!("Failed to ensure bindings table: {}", e))?;
+
+    // Ensure domain column exists for older databases BEFORE creating index
+    let has_domain: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('bindings') WHERE name='domain'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count > 0)
+        .unwrap_or(false);
+
+    if !has_domain {
+        conn.execute(
+            "ALTER TABLE bindings ADD COLUMN domain TEXT NOT NULL DEFAULT 'default'",
+            [],
+        )
+        .map_err(|e| format!("Failed to add domain column to bindings: {}", e))?;
+    }
+
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_profile_domain ON bindings(profile_name, domain)",
+        [],
+    )
+    .map_err(|e| format!("Failed to ensure bindings index: {}", e))?;
+
+    Ok(())
 }
 
 
@@ -174,6 +257,7 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         "CREATE TABLE bindings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             profile_name TEXT NOT NULL,
+            domain TEXT NOT NULL DEFAULT 'default',
             alias TEXT NOT NULL,
             FOREIGN KEY (profile_name) REFERENCES profiles(name),
             UNIQUE(profile_name, alias)
@@ -908,37 +992,37 @@ pub fn delete_profile(name: &str) -> Result<(), String> {
     crate::profiles::delete_profile(&conn, name)
 }
 
-/// Bind a secret to a profile
-pub fn bind_secret_to_profile(profile_name: &str, alias: &str) -> Result<(), String> {
+/// Bind a secret to a profile for a given domain (env var)
+pub fn bind_secret_to_profile(profile_name: &str, domain: &str, alias: &str) -> Result<(), String> {
     let conn = open_connection()?;
     conn.execute(
-        "INSERT OR IGNORE INTO bindings (profile_name, alias) VALUES (?, ?)",
-        params![profile_name, alias],
+        "INSERT INTO bindings (profile_name, domain, alias) VALUES (?, ?, ?) ON CONFLICT(profile_name, domain) DO UPDATE SET alias=excluded.alias",
+        params![profile_name, domain, alias],
     )
     .map_err(|e| format!("Failed to bind secret to profile: {}", e))?;
     Ok(())
 }
 
 /// Unbind a secret from a profile
-pub fn unbind_secret_from_profile(profile_name: &str, alias: &str) -> Result<(), String> {
+pub fn unbind_secret_from_profile(profile_name: &str, domain: &str, alias: &str) -> Result<(), String> {
     let conn = open_connection()?;
     conn.execute(
-        "DELETE FROM bindings WHERE profile_name = ? AND alias = ?",
-        params![profile_name, alias],
+        "DELETE FROM bindings WHERE profile_name = ? AND domain = ? AND alias = ?",
+        params![profile_name, domain, alias],
     )
     .map_err(|e| format!("Failed to unbind secret from profile: {}", e))?;
     Ok(())
 }
 
-/// Get all secrets bound to a profile
+/// Get all secrets bound to a profile (default domain)
 pub fn get_profile_secrets(profile_name: &str) -> Result<Vec<String>, String> {
     let conn = open_connection()?;
     let mut stmt = conn
-        .prepare("SELECT alias FROM bindings WHERE profile_name = ? ORDER BY alias")
+        .prepare("SELECT alias FROM bindings WHERE profile_name = ? AND domain = ? ORDER BY alias")
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     let secrets = stmt
-        .query_map(params![profile_name], |row| row.get(0))
+        .query_map(params![profile_name, DEFAULT_BINDING_DOMAIN], |row| row.get(0))
         .map_err(|e| format!("Failed to query bindings: {}", e))?
         .collect::<SqlResult<Vec<String>>>()
         .map_err(|e| format!("Failed to collect results: {}", e))?;
@@ -946,26 +1030,25 @@ pub fn get_profile_secrets(profile_name: &str) -> Result<Vec<String>, String> {
     Ok(secrets)
 }
 
-/// Get all secrets bound to a profile (with connection parameter)
-pub fn get_profile_bindings(conn: &Connection, profile_name: &str) -> Result<Vec<String>, String> {
+/// Get all bindings for a profile (domain -> alias)
+pub fn get_profile_bindings(conn: &Connection, profile_name: &str) -> Result<Vec<(String, String)>, String> {
     let mut stmt = conn
-        .prepare("SELECT alias FROM bindings WHERE profile_name = ? ORDER BY alias")
+        .prepare("SELECT domain, alias FROM bindings WHERE profile_name = ? ORDER BY domain")
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
-    let secrets = stmt
-        .query_map(params![profile_name], |row| row.get(0))
+    let bindings = stmt
+        .query_map(params![profile_name], |row| Ok((row.get(0)?, row.get(1)?)))
         .map_err(|e| format!("Failed to query bindings: {}", e))?
-        .collect::<SqlResult<Vec<String>>>()
-        .map_err(|e| format!("Failed to collect results: {}", e))?;
+        .collect::<SqlResult<Vec<(String, String)>>>();
 
-    Ok(secrets)
+    bindings.map_err(|e| format!("Failed to collect results: {}", e))
 }
 
 /// Add a binding between a secret and a profile
-pub fn add_profile_binding(conn: &Connection, profile_name: &str, alias: &str) -> Result<(), String> {
+pub fn add_profile_binding(conn: &Connection, profile_name: &str, domain: &str, alias: &str) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO bindings (profile_name, alias) VALUES (?, ?)",
-        params![profile_name, alias],
+        "INSERT INTO bindings (profile_name, domain, alias) VALUES (?, ?, ?) ON CONFLICT(profile_name, domain) DO UPDATE SET alias=excluded.alias",
+        params![profile_name, domain, alias],
     )
     .map_err(|e| format!("Failed to add binding: {}", e))?;
 
@@ -973,10 +1056,10 @@ pub fn add_profile_binding(conn: &Connection, profile_name: &str, alias: &str) -
 }
 
 /// Remove a binding between a secret and a profile
-pub fn remove_profile_binding(conn: &Connection, profile_name: &str, alias: &str) -> Result<(), String> {
+pub fn remove_profile_binding(conn: &Connection, profile_name: &str, domain: &str, alias: &str) -> Result<(), String> {
     conn.execute(
-        "DELETE FROM bindings WHERE profile_name = ? AND alias = ?",
-        params![profile_name, alias],
+        "DELETE FROM bindings WHERE profile_name = ? AND domain = ? AND alias = ?",
+        params![profile_name, domain, alias],
     )
     .map_err(|e| format!("Failed to remove binding: {}", e))?;
 

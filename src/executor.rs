@@ -1,5 +1,6 @@
 use crate::crypto;
 use crate::storage;
+use crate::daemon_client::DaemonClient;
 use arboard::Clipboard;
 use rusqlite::params;
 use secrecy::SecretString;
@@ -532,6 +533,162 @@ pub fn run_with_all_secrets(
     let exit_code = status.code().unwrap_or(1);
 
     // Return secrets count and exit code
+    if !status.success() {
+        return Err(format!("Command exited with code {}", exit_code));
+    }
+
+    Ok((secrets_count, exit_code))
+}
+
+/// Execute a command with environment variables resolved via daemon RPC
+/// This avoids direct vault access and relies on daemon for secret retrieval.
+pub fn exec_with_env_via_daemon(
+    env_mappings: &[String],
+    command: &[String],
+    client: &DaemonClient,
+) -> Result<(), String> {
+    if command.is_empty() {
+        return Err("No command specified".to_string());
+    }
+
+    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
+        std::collections::HashMap::with_capacity(env_mappings.len());
+
+    let decryption_results: Result<Vec<(String, Zeroizing<String>)>, String> = env_mappings
+        .par_iter()
+        .map(|mapping| {
+            let parts: Vec<&str> = mapping.splitn(2, '=').collect();
+            if parts.len() != 2 {
+                return Err(format!(
+                    "Invalid env mapping '{}'. Expected format: ENV_VAR=alias",
+                    mapping
+                ));
+            }
+
+            let env_name = parts[0].trim();
+            let alias = parts[1].trim();
+
+            if env_name.is_empty() || alias.is_empty() {
+                return Err(format!(
+                    "Invalid env mapping '{}'. Both ENV_VAR and alias must be non-empty",
+                    mapping
+                ));
+            }
+
+            // Fetch secret value via daemon
+            let value = client.get_secret(alias)?;
+            Ok((env_name.to_string(), Zeroizing::new(value)))
+        })
+        .collect();
+
+    for (env_name, secret) in decryption_results? {
+        env_secrets.insert(env_name, secret);
+    }
+
+    let parsed_parts: Vec<String> = if command.len() == 1 {
+        shell_words::split(&command[0])
+            .map_err(|e| format!("Failed to parse command '{}': {}", command[0], e))?
+    } else {
+        command.to_vec()
+    };
+
+    if parsed_parts.is_empty() {
+        return Err("Empty command after parsing".to_string());
+    }
+
+    let program = &parsed_parts[0];
+    let args = &parsed_parts[1..];
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+
+    for (key, value) in &env_secrets {
+        cmd.env(key, value.as_str());
+    }
+
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    let status = cmd
+        .status()
+        .map_err(|e| format!("Failed to execute command '{}': {}", program, e))?;
+
+    drop(env_secrets);
+
+    if !status.success() {
+        let exit_code = status.code().unwrap_or(1);
+        return Err(format!("Command exited with code {}", exit_code));
+    }
+
+    Ok(())
+}
+
+/// Execute a command with ALL secrets fetched via daemon RPC
+pub fn run_with_all_secrets_via_daemon(
+    command: &[String],
+    json_mode: bool,
+    client: &DaemonClient,
+) -> Result<(usize, i32), String> {
+    let aliases = client.list_secrets()?;
+
+    if aliases.is_empty() {
+        return Err("No secrets found in vault".to_string());
+    }
+
+    let secrets_count = aliases.len();
+    if !json_mode {
+        eprintln!("Injecting {} secret(s)", secrets_count);
+    }
+
+    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
+        std::collections::HashMap::with_capacity(aliases.len());
+
+    for alias in &aliases {
+        let value = client.get_secret(alias)?;
+        let env_name = alias.to_uppercase().replace('-', "_");
+        env_secrets.insert(env_name, Zeroizing::new(value));
+    }
+
+    let parsed_parts: Vec<String> = if command.len() == 1 {
+        shell_words::split(&command[0])
+            .map_err(|e| format!("Failed to parse command '{}': {}", command[0], e))?
+    } else {
+        command.to_vec()
+    };
+
+    if parsed_parts.is_empty() {
+        return Err("Empty command after parsing".to_string());
+    }
+
+    let program = &parsed_parts[0];
+    let args = &parsed_parts[1..];
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+
+    for (key, value) in &env_secrets {
+        cmd.env(key, value.as_str());
+    }
+
+    if json_mode {
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+    } else {
+        cmd.stdin(std::process::Stdio::inherit());
+        cmd.stdout(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::inherit());
+    }
+
+    let status = cmd
+        .status()
+        .map_err(|e| format!("Failed to execute command '{}': {}", program, e))?;
+
+    drop(env_secrets);
+
+    let exit_code = status.code().unwrap_or(1);
+
     if !status.success() {
         return Err(format!("Command exited with code {}", exit_code));
     }

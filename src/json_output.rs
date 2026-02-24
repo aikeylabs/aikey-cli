@@ -2,6 +2,17 @@ use serde_json::json;
 use std::process;
 use crate::error_codes::ErrorCode;
 
+/// Output a raw JSON payload to stderr without wrapping or exiting
+pub fn print_json(value: serde_json::Value) {
+    eprintln!("{}", serde_json::to_string_pretty(&value).unwrap());
+}
+
+/// Output a raw JSON payload to stderr and exit with code
+pub fn print_json_exit(value: serde_json::Value, exit_code: i32) -> ! {
+    eprintln!("{}", serde_json::to_string_pretty(&value).unwrap());
+    process::exit(exit_code);
+}
+
 /// Output a success JSON response and exit with code 0
 pub fn success(data: serde_json::Value) -> ! {
     let mut response = json!({

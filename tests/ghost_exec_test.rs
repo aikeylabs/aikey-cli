@@ -1,28 +1,54 @@
-use std::process::Command;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn unique_suffix() -> String {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{}", pid, nanos)
+}
+
+fn cleanup_sqlite_artifacts(base: &str) {
+    if Path::new(base).is_dir() {
+        let _ = fs::remove_dir_all(base);
+    } else {
+        let _ = fs::remove_file(base);
+        let _ = fs::remove_file(format!("{}-shm", base));
+        let _ = fs::remove_file(format!("{}-wal", base));
+    }
+}
+
+fn run_ak(args: &[&str], vault_path: &str, socket_path: &str, extra_env: &[(&str, &str)]) -> std::process::Output {
+    let exe = assert_cmd::cargo::cargo_bin!("ak");
+
+    let mut cmd = Command::new(exe);
+    cmd.args(args);
+    cmd.env("AK_VAULT_PATH", vault_path);
+    cmd.env("AIKEYD_SOCKET_PATH", socket_path);
+    cmd.env("AK_TEST_PASSWORD", "test_password");
+
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+
+    cmd.output().expect("Failed to run ak")
+}
 
 #[test]
 fn test_ghost_execution() {
-    let test_vault = "/tmp/test_ghost_exec.db";
+    let suffix = unique_suffix();
+    let test_vault = format!("/tmp/test_ghost_exec-{}.db", suffix);
+    let test_socket = format!("/tmp/aikeyd-test_ghost_exec-{}.sock", suffix);
 
-    // Cleanup - handle both files and directories
-    if Path::new(test_vault).is_dir() {
-        let _ = fs::remove_dir_all(test_vault);
-    } else {
-        let _ = fs::remove_file(test_vault);
-        let _ = fs::remove_file(format!("{}-shm", test_vault));
-        let _ = fs::remove_file(format!("{}-wal", test_vault));
-    }
+    cleanup_sqlite_artifacts(&test_vault);
+    let _ = fs::remove_file(&test_socket);
 
     // Initialize vault
-    let init = Command::new("cargo")
-        .args(&["run", "--bin", "ak", "--", "init"])
-        .env("AK_VAULT_PATH", test_vault)
-        .env("AK_TEST_PASSWORD", "test_password")
-        .output()
-        .expect("Failed to init");
-
+    let init = run_ak(&["init"], &test_vault, &test_socket, &[]);
     if !init.status.success() {
         eprintln!("Init stdout: {}", String::from_utf8_lossy(&init.stdout));
         eprintln!("Init stderr: {}", String::from_utf8_lossy(&init.stderr));
@@ -30,14 +56,7 @@ fn test_ghost_execution() {
     assert!(init.status.success(), "Failed to initialize vault");
 
     // Add a test secret
-    let add = Command::new("cargo")
-        .args(&["run", "--bin", "ak", "--", "add", "test_key"])
-        .env("AK_VAULT_PATH", test_vault)
-        .env("AK_TEST_PASSWORD", "test_password")
-        .env("AK_TEST_SECRET", "my_secret_value")
-        .output()
-        .expect("Failed to add secret");
-
+    let add = run_ak(&["add", "test_key"], &test_vault, &test_socket, &[("AK_TEST_SECRET", "my_secret_value")]);
     if !add.status.success() {
         eprintln!("Add stdout: {}", String::from_utf8_lossy(&add.stdout));
         eprintln!("Add stderr: {}", String::from_utf8_lossy(&add.stderr));
@@ -45,12 +64,12 @@ fn test_ghost_execution() {
     assert!(add.status.success(), "Failed to add secret");
 
     // Test exec command
-    let exec = Command::new("cargo")
-        .args(&["run", "--bin", "ak", "--", "exec", "--env", "MY_KEY=test_key", "--", "printenv", "MY_KEY"])
-        .env("AK_VAULT_PATH", test_vault)
-        .env("AK_TEST_PASSWORD", "test_password")
-        .output()
-        .expect("Failed to exec");
+    let exec = run_ak(
+        &["exec", "--env", "MY_KEY=test_key", "--", "printenv", "MY_KEY"],
+        &test_vault,
+        &test_socket,
+        &[],
+    );
 
     let output = String::from_utf8_lossy(&exec.stdout);
     if !output.contains("my_secret_value") {
@@ -59,62 +78,50 @@ fn test_ghost_execution() {
     }
     assert!(output.contains("my_secret_value"), "Secret not injected into environment");
 
-    // Cleanup
-    if Path::new(test_vault).is_dir() {
-        let _ = fs::remove_dir_all(test_vault);
-    } else {
-        let _ = fs::remove_file(test_vault);
-        let _ = fs::remove_file(format!("{}-shm", test_vault));
-        let _ = fs::remove_file(format!("{}-wal", test_vault));
-    }
+    cleanup_sqlite_artifacts(&test_vault);
+    let _ = fs::remove_file(&test_socket);
 }
 
 #[test]
 fn test_multiple_env_vars() {
-    let test_vault = "/tmp/test_multi_env.db";
+    let suffix = unique_suffix();
+    let test_vault = format!("/tmp/test_multi_env-{}.db", suffix);
+    let test_socket = format!("/tmp/aikeyd-test_multi_env-{}.sock", suffix);
 
-    // Cleanup - handle both files and directories
-    if Path::new(test_vault).is_dir() {
-        let _ = fs::remove_dir_all(test_vault);
-    } else {
-        let _ = fs::remove_file(test_vault);
-        let _ = fs::remove_file(format!("{}-shm", test_vault));
-        let _ = fs::remove_file(format!("{}-wal", test_vault));
-    }
+    cleanup_sqlite_artifacts(&test_vault);
+    let _ = fs::remove_file(&test_socket);
 
     // Initialize vault
-    Command::new("cargo")
-        .args(&["run", "--bin", "ak", "--", "init"])
-        .env("AK_VAULT_PATH", test_vault)
-        .env("AK_TEST_PASSWORD", "test_password")
-        .output()
-        .expect("Failed to init");
+    let init = run_ak(&["init"], &test_vault, &test_socket, &[]);
+    if !init.status.success() {
+        eprintln!("Init stdout: {}", String::from_utf8_lossy(&init.stdout));
+        eprintln!("Init stderr: {}", String::from_utf8_lossy(&init.stderr));
+    }
+    assert!(init.status.success(), "Failed to initialize vault");
 
     // Add first secret
-    Command::new("cargo")
-        .args(&["run", "--bin", "ak", "--", "add", "key1"])
-        .env("AK_VAULT_PATH", test_vault)
-        .env("AK_TEST_PASSWORD", "test_password")
-        .env("AK_TEST_SECRET", "value1")
-        .output()
-        .expect("Failed to add key1");
+    let add1 = run_ak(&["add", "key1"], &test_vault, &test_socket, &[("AK_TEST_SECRET", "value1")]);
+    if !add1.status.success() {
+        eprintln!("Add key1 stdout: {}", String::from_utf8_lossy(&add1.stdout));
+        eprintln!("Add key1 stderr: {}", String::from_utf8_lossy(&add1.stderr));
+    }
+    assert!(add1.status.success(), "Failed to add key1");
 
     // Add second secret
-    Command::new("cargo")
-        .args(&["run", "--bin", "ak", "--", "add", "key2"])
-        .env("AK_VAULT_PATH", test_vault)
-        .env("AK_TEST_PASSWORD", "test_password")
-        .env("AK_TEST_SECRET", "value2")
-        .output()
-        .expect("Failed to add key2");
+    let add2 = run_ak(&["add", "key2"], &test_vault, &test_socket, &[("AK_TEST_SECRET", "value2")]);
+    if !add2.status.success() {
+        eprintln!("Add key2 stdout: {}", String::from_utf8_lossy(&add2.stdout));
+        eprintln!("Add key2 stderr: {}", String::from_utf8_lossy(&add2.stderr));
+    }
+    assert!(add2.status.success(), "Failed to add key2");
 
     // Test multiple env vars
-    let exec = Command::new("cargo")
-        .args(&["run", "--bin", "ak", "--", "exec", "--env", "VAR1=key1", "--env", "VAR2=key2", "--", "sh", "-c", "echo $VAR1:$VAR2"])
-        .env("AK_VAULT_PATH", test_vault)
-        .env("AK_TEST_PASSWORD", "test_password")
-        .output()
-        .expect("Failed to exec");
+    let exec = run_ak(
+        &["exec", "--env", "VAR1=key1", "--env", "VAR2=key2", "--", "sh", "-c", "echo $VAR1:$VAR2"],
+        &test_vault,
+        &test_socket,
+        &[],
+    );
 
     let output = String::from_utf8_lossy(&exec.stdout);
     if !output.contains("value1:value2") {
@@ -123,12 +130,6 @@ fn test_multiple_env_vars() {
     }
     assert!(output.contains("value1:value2"), "Multiple secrets not injected correctly");
 
-    // Cleanup
-    if Path::new(test_vault).is_dir() {
-        let _ = fs::remove_dir_all(test_vault);
-    } else {
-        let _ = fs::remove_file(test_vault);
-        let _ = fs::remove_file(format!("{}-shm", test_vault));
-        let _ = fs::remove_file(format!("{}-wal", test_vault));
-    }
+    cleanup_sqlite_artifacts(&test_vault);
+    let _ = fs::remove_file(&test_socket);
 }

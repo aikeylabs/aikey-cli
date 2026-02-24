@@ -16,12 +16,14 @@ mod daemon;
 mod daemon_client;
 mod profiles;
 mod core;
+mod global_config;
 
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
 use std::env;
 use std::io::{self, Write};
 use zeroize::Zeroizing;
+use error_codes::ErrorCode;
 
 #[derive(Parser)]
 #[command(name = "aikey", about = "AiKey - Secure local-first secret management", version = "0.2.0", disable_version_flag = true)]
@@ -128,6 +130,21 @@ enum SecretAction {
         /// Read secret value from stdin
         #[arg(long)]
         from_stdin: bool,
+    },
+    /// Upsert a secret value (reads from stdin for security)
+    Upsert {
+        /// Secret name/alias
+        name: String,
+        /// Read secret value from stdin
+        #[arg(long)]
+        from_stdin: bool,
+    },
+    /// List all secrets (metadata only)
+    List,
+    /// Delete a secret
+    Delete {
+        /// Secret name/alias
+        name: String,
     },
 }
 
@@ -559,8 +576,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Exec { env_mappings, command } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-
             if command.is_empty() {
                 let err_msg = "No command specified. Use -- to separate command from flags.";
                 if cli.json {
@@ -570,8 +585,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let result = executor::exec_with_env(env_mappings, &password, command);
-            let _ = audit::log_audit_event(&password, audit::AuditOperation::Exec, None, result.is_ok());
+            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let client = daemon_client::DaemonClient::default();
+            client.unlock(password.expose_secret())
+                .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
+
+            let result = executor::exec_with_env_via_daemon(env_mappings, command, &client);
 
             if let Err(e) = result {
                 if cli.json {
@@ -582,8 +601,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Run { command } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-
             if command.is_empty() {
                 let err_msg = "No command specified. Use -- to separate command from flags.";
                 if cli.json {
@@ -593,8 +610,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let result = executor::run_with_all_secrets(&password, command, cli.json);
-            let _ = audit::log_audit_event(&password, audit::AuditOperation::Exec, None, result.is_ok());
+            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let client = daemon_client::DaemonClient::default();
+            client.unlock(password.expose_secret())
+                .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
+
+            let result = executor::run_with_all_secrets_via_daemon(command, cli.json, &client);
 
             match result {
                 Ok((secrets_count, exit_code)) => {
@@ -664,18 +685,53 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Secret { action } => {
+            let client = daemon_client::DaemonClient::default();
             match action {
                 SecretAction::Set { name, from_stdin } => {
                     if !from_stdin {
                         let err_msg = "The --from-stdin flag is required for security. Secret values must not be passed via command-line arguments.";
                         if cli.json {
-                            json_output::error_with_code(err_msg, error_codes::ErrorCode::InvalidInput, 1);
+                            json_output::print_json_exit(serde_json::json!({
+                                "ok": false,
+                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                "message": err_msg
+                            }), 1);
                         } else {
                             return Err(err_msg.into());
                         }
                     }
 
                     let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    client.unlock(password.expose_secret())
+                        .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
+
+                    let existing = client.list_secrets();
+                    let existing = match existing {
+                        Ok(list) => list,
+                        Err(e) => {
+                            if cli.json {
+                                json_output::print_json_exit(serde_json::json!({
+                                    "ok": false,
+                                    "message": e
+                                }), 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    };
+
+                    if existing.iter().any(|alias| alias == name) {
+                        let err_msg = format!("Secret '{}' already exists", name);
+                        if cli.json {
+                            json_output::print_json_exit(serde_json::json!({
+                                "ok": false,
+                                "code": error_codes::ErrorCode::AliasExists.as_str(),
+                                "message": err_msg
+                            }), 1);
+                        } else {
+                            return Err(err_msg.into());
+                        }
+                    }
 
                     // Read secret value from stdin
                     let mut secret = Zeroizing::new(String::new());
@@ -685,20 +741,23 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if secret_value.is_empty() {
                         let err_msg = "Secret value cannot be empty";
                         if cli.json {
-                            json_output::error_with_code(err_msg, error_codes::ErrorCode::InvalidInput, 1);
+                            json_output::print_json_exit(serde_json::json!({
+                                "ok": false,
+                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                "message": err_msg
+                            }), 1);
                         } else {
                             return Err(err_msg.into());
                         }
                     }
 
-                    // Try to add the secret (will fail if it already exists)
-                    let result = executor::add_secret(name, secret_value, &password);
+                    let result = client.upsert_secret(name, secret_value);
                     let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(name), result.is_ok());
 
                     match result {
                         Ok(_) => {
                             if cli.json {
-                                json_output::success(serde_json::json!({
+                                json_output::print_json(serde_json::json!({
                                     "ok": true,
                                     "name": name
                                 }));
@@ -707,9 +766,147 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         Err(e) => {
-                            let error_code = error_codes::ErrorCode::from_error_message(&e);
                             if cli.json {
-                                json_output::error_with_code(&e, error_code, 1);
+                                let code = error_codes::ErrorCode::from_error_message(&e);
+                                json_output::print_json_exit(serde_json::json!({
+                                    "ok": false,
+                                    "code": code.as_str(),
+                                    "message": e
+                                }), 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+                SecretAction::Upsert { name, from_stdin } => {
+                    if !from_stdin {
+                        let err_msg = "The --from-stdin flag is required for security. Secret values must not be passed via command-line arguments.";
+                        if cli.json {
+                            json_output::print_json_exit(serde_json::json!({
+                                "ok": false,
+                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                "message": err_msg
+                            }), 1);
+                        } else {
+                            return Err(err_msg.into());
+                        }
+                    }
+
+                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    client.unlock(password.expose_secret())
+                        .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
+
+                    let mut secret = Zeroizing::new(String::new());
+                    io::stdin().read_line(&mut secret)?;
+                    let secret_value = secret.trim();
+
+                    if secret_value.is_empty() {
+                        let err_msg = "Secret value cannot be empty";
+                        if cli.json {
+                            json_output::print_json_exit(serde_json::json!({
+                                "ok": false,
+                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                "message": err_msg
+                            }), 1);
+                        } else {
+                            return Err(err_msg.into());
+                        }
+                    }
+
+                    let result = client.upsert_secret(name, secret_value);
+                    let _ = audit::log_audit_event(&password, audit::AuditOperation::Update, Some(name), result.is_ok());
+
+                    match result {
+                        Ok(_) => {
+                            if cli.json {
+                                json_output::print_json(serde_json::json!({
+                                    "ok": true,
+                                    "name": name
+                                }));
+                            } else {
+                                println!("Secret '{}' upserted successfully", name);
+                            }
+                        }
+                        Err(e) => {
+                            if cli.json {
+                                let code = error_codes::ErrorCode::from_error_message(&e);
+                                json_output::print_json_exit(serde_json::json!({
+                                    "ok": false,
+                                    "code": code.as_str(),
+                                    "message": e
+                                }), 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+                SecretAction::List => {
+                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    client.unlock(password.expose_secret())
+                        .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
+
+                    let result = client.list_secrets_with_metadata();
+                    let _ = audit::log_audit_event(&password, audit::AuditOperation::List, None, result.is_ok());
+
+                    match result {
+                        Ok(secrets) => {
+                            if cli.json {
+                                json_output::print_json(serde_json::json!({
+                                    "ok": true,
+                                    "secrets": secrets
+                                }));
+                            } else if secrets.is_empty() {
+                                println!("No secrets stored.");
+                            } else {
+                                println!("Stored secrets:");
+                                for secret in secrets {
+                                    println!("  {}", secret.alias);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if cli.json {
+                                let code = error_codes::ErrorCode::from_error_message(&e);
+                                json_output::print_json_exit(serde_json::json!({
+                                    "ok": false,
+                                    "code": code.as_str(),
+                                    "message": e
+                                }), 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+                SecretAction::Delete { name } => {
+                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    client.unlock(password.expose_secret())
+                        .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
+
+                    let result = client.delete_secret(name);
+                    let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(name), result.is_ok());
+
+                    match result {
+                        Ok(_) => {
+                            if cli.json {
+                                json_output::print_json(serde_json::json!({
+                                    "ok": true,
+                                    "name": name
+                                }));
+                            } else {
+                                println!("Secret '{}' deleted successfully", name);
+                            }
+                        }
+                        Err(e) => {
+                            if cli.json {
+                                let code = error_codes::ErrorCode::from_error_message(&e);
+                                json_output::print_json_exit(serde_json::json!({
+                                    "ok": false,
+                                    "code": code.as_str(),
+                                    "message": e
+                                }), 1);
                             } else {
                                 return Err(e.into());
                             }
@@ -725,9 +922,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     match client.list_profiles() {
                         Ok(profiles) => {
                             if cli.json {
-                                json_output::success(serde_json::json!({
-                                    "profiles": profiles
-                                }));
+                                let profiles_json: Vec<_> = profiles
+                                    .iter()
+                                    .map(|name| serde_json::json!({
+                                        "name": name,
+                                        "description": serde_json::Value::Null
+                                    }))
+                                    .collect();
+                                json_output::print_json(serde_json::Value::Array(profiles_json));
                             } else {
                                 if profiles.is_empty() {
                                     println!("No profiles configured.");
@@ -741,7 +943,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Err(e) => {
                             if cli.json {
-                                json_output::error(&e, 1);
+                                json_output::print_json_exit(serde_json::json!({
+                                    "ok": false,
+                                    "message": e
+                                }), 1);
                             } else {
                                 return Err(e.into());
                             }
@@ -751,8 +956,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ProfileAction::Use { name } => {
                     match client.use_profile(name) {
                         Ok(profile_name) => {
+                            let _ = global_config::set_current_profile(&profile_name);
                             if cli.json {
-                                json_output::success(serde_json::json!({
+                                json_output::print_json(serde_json::json!({
                                     "ok": true,
                                     "profile": profile_name
                                 }));
@@ -762,7 +968,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Err(e) => {
                             if cli.json {
-                                json_output::error(&e, 1);
+                                json_output::print_json_exit(serde_json::json!({
+                                    "ok": false,
+                                    "message": e
+                                }), 1);
                             } else {
                                 return Err(e.into());
                             }
@@ -799,10 +1008,23 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ProfileAction::Current => {
+                    if let Ok(Some(profile_name)) = global_config::get_current_profile() {
+                        if cli.json {
+                            json_output::print_json(serde_json::json!({
+                                "ok": true,
+                                "profile": profile_name
+                            }));
+                        } else {
+                            println!("Current profile: {}", profile_name);
+                        }
+                        return Ok(());
+                    }
+
                     match client.get_current_profile() {
                         Ok(profile_name) => {
+                            let _ = global_config::set_current_profile(&profile_name);
                             if cli.json {
-                                json_output::success(serde_json::json!({
+                                json_output::print_json(serde_json::json!({
                                     "ok": true,
                                     "profile": profile_name
                                 }));
@@ -812,9 +1034,21 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Err(e) => {
                             if cli.json {
-                                json_output::error(&e, 1);
+                                if let Some(code) = e.code {
+                                    if code == crate::rpc::error_codes::NO_ACTIVE_PROFILE {
+                                        json_output::print_json_exit(serde_json::json!({
+                                            "ok": false,
+                                            "profile": serde_json::Value::Null,
+                                            "code": ErrorCode::NoActiveProfile.as_str()
+                                        }), 1);
+                                    }
+                                }
+                                json_output::print_json_exit(serde_json::json!({
+                                    "ok": false,
+                                    "message": e.message
+                                }), 1);
                             } else {
-                                return Err(e.into());
+                                return Err(e.message.into());
                             }
                         }
                     }

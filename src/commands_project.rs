@@ -1,7 +1,6 @@
 use crate::config::{ProjectConfig, EnvTemplate};
-use crate::env_resolver::EnvResolver;
-use crate::commands_env::get_current_profile;
-use std::collections::HashMap;
+use crate::daemon_client::DaemonClient;
+use crate::json_output;
 use std::io::{self, Write};
 
 /// Handle `aikey project init` command
@@ -139,43 +138,76 @@ pub fn handle_project_init(json_mode: bool) -> Result<(), Box<dyn std::error::Er
 
 /// Handle `aikey project status` command
 pub fn handle_project_status(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (config_path, config) = ProjectConfig::discover()?
-        .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found in current directory or parent directories")) as Box<dyn std::error::Error>)?;
+    let discovered = ProjectConfig::discover()?;
+    let (config_path, config) = match discovered {
+        Some(pair) => pair,
+        None => {
+            if json_mode {
+                json_output::print_json_exit(serde_json::json!({
+                    "ok": false,
+                    "code": crate::error_codes::ErrorCode::InvalidInput.as_str(),
+                    "message": "No aikey.config.json found in current directory or parent directories"
+                }), 1);
+            }
+            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found in current directory or parent directories")));
+        }
+    };
 
-    // Get current profile
-    let current_profile = get_current_profile()?;
+    let template_parts: Vec<String> = config.requiredVars
+        .iter()
+        .map(|var| format!("{}={{{}}}", var, var))
+        .collect();
+    let template = template_parts.join("\n");
 
-    // For now, we'll use an empty profile vars map since we don't have vault access here
-    // In a full implementation, this would resolve from the vault
-    let profile_vars: HashMap<String, String> = HashMap::new();
+    let project_path = config_path.parent().and_then(|p| p.to_str());
+    let config_path_str = config_path.to_str();
 
-    let resolved = EnvResolver::resolve(&config, &current_profile, &profile_vars)?;
-    let (satisfied, total) = EnvResolver::count_satisfied(&resolved);
+    let client = DaemonClient::default();
+    let result = client.resolve_env_details(&template, project_path, config_path_str, false)?;
+
+    let profile_name = result.get("profile_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+    let satisfied = result.get("satisfied").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let total = result.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+    let mut missing_vars = Vec::new();
+    if let Some(vars) = result.get("resolved_vars").and_then(|v| v.as_array()) {
+        for var in vars {
+            let name = var.get("name").and_then(|v| v.as_str());
+            let source = var.get("source").and_then(|v| v.as_str());
+            if let (Some(name), Some(source)) = (name, source) {
+                if source == "Missing" {
+                    missing_vars.push(name.to_string());
+                }
+            }
+        }
+    }
 
     if json_mode {
         let response = serde_json::json!({
+            "ok": true,
             "config_path": config_path.display().to_string(),
             "project_name": config.project.name,
-            "profile": current_profile,
+            "profile": profile_name,
             "required_vars": config.requiredVars,
             "satisfied": satisfied,
-            "total": total
+            "total": total,
+            "missing_vars": missing_vars
         });
-        println!("{}", serde_json::to_string_pretty(&response).unwrap());
+        json_output::print_json(response);
     } else {
         println!("Project Configuration Status");
         println!("============================");
         println!("Config path: {}", config_path.display());
         println!("Project name: {}", config.project.name);
-        println!("Current profile: {}", current_profile);
+        println!("Current profile: {}", profile_name);
         println!("Required variables: {}/{} satisfied", satisfied, total);
 
         if satisfied < total {
             println!("\nMissing variables:");
-            for var in &resolved {
-                if var.value.is_none() {
-                    println!("  - {}", var.name);
-                }
+            for var in &missing_vars {
+                println!("  - {}", var);
             }
             println!("\nRun 'aikey env generate' to update your .env file");
         } else {
@@ -226,7 +258,14 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
     handle_project_init(json_mode)?;
 
     // Print additional quickstart guidance
-    if !json_mode {
+    if json_mode {
+        json_output::print_json(serde_json::json!({
+            "ok": true,
+            "message": "AiKey project initialized",
+            "config_exists": false,
+            "config_path": config_path.display().to_string()
+        }));
+    } else {
         println!("\n🎉 Setup complete!");
         println!("\n📚 What's next?");
         println!("\n1. Configure your profiles and keys:");

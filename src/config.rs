@@ -56,8 +56,14 @@ impl ProjectConfig {
 
     /// Discover project config by walking up from current directory
     pub fn discover() -> Result<Option<(PathBuf, ProjectConfig)>, String> {
-        let mut current_dir = std::env::current_dir()
+        let current_dir = std::env::current_dir()
             .map_err(|e| format!("Failed to get current directory: {}", e))?;
+        Self::discover_from(&current_dir)
+    }
+
+    /// Discover project config by walking up from a specific directory
+    pub fn discover_from(start_dir: &Path) -> Result<Option<(PathBuf, ProjectConfig)>, String> {
+        let mut current_dir = start_dir.to_path_buf();
 
         loop {
             // Try each config file name in order

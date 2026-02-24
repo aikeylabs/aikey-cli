@@ -1,15 +1,42 @@
 //! Daemon client for connecting to AiKey daemon
-//!
+//! 
 //! Provides connection management, auto-start logic, retry/timeout handling,
-//! and typed wrappers for RPC methods.
+//! and typed wrappers for RPC methods. Note: secret-related operations require
+//! calling `auth.unlock` first to set the session vault password.
 
 use crate::rpc::{Request, Response, methods};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
+
+pub struct RpcClientError {
+    pub code: Option<i32>,
+    pub message: String,
+}
+
+impl std::fmt::Display for RpcClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(code) = self.code {
+            write!(f, "[code {}] {}", code, self.message)
+        } else {
+            write!(f, "{}", self.message)
+        }
+    }
+}
+
+impl std::fmt::Debug for RpcClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcClientError")
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+impl std::error::Error for RpcClientError {}
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -47,9 +74,22 @@ impl Default for DaemonClientConfig {
 impl DaemonClientConfig {
     #[cfg(unix)]
     fn default_socket_path() -> Option<PathBuf> {
-        // Check for AIKEYD_SOCKET_PATH override
+        // Explicit override
         if let Ok(path) = std::env::var("AIKEYD_SOCKET_PATH") {
             return Some(PathBuf::from(path));
+        }
+
+        // Derive from test/storage overrides to isolate per-vault daemon during tests
+        if let Ok(test_path) = std::env::var("AK_VAULT_PATH").or_else(|_| std::env::var("AK_STORAGE_PATH")) {
+            let path = PathBuf::from(test_path);
+            if path.extension().and_then(|e| e.to_str()) == Some("db") {
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("aikeyd");
+                if let Some(parent) = path.parent() {
+                    return Some(parent.join(format!("aikeyd-{}.sock", stem)));
+                }
+            } else {
+                return Some(path.join("aikeyd.sock"));
+            }
         }
 
         // Fall back to ~/.aikey/aikeyd.sock
@@ -118,6 +158,31 @@ impl DaemonClient {
         Err("Failed to connect to daemon after retries".to_string())
     }
 
+    /// Send a request to the daemon without attempting auto-start (used by native host)
+    pub fn send_request_no_autostart(&self, request: &Request) -> Result<Response, String> {
+        let request_json = serde_json::to_string(request)
+            .map_err(|e| format!("Failed to serialize request: {}", e))?;
+
+        for attempt in 0..=self.config.max_retries {
+            match self.send_request_internal(&request_json) {
+                Ok(response_str) => {
+                    return serde_json::from_str(&response_str)
+                        .map_err(|e| format!("Failed to parse response: {}", e));
+                }
+                Err(e) => {
+                    if attempt < self.config.max_retries {
+                        thread::sleep(Duration::from_millis(self.config.retry_delay_ms));
+                        continue;
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Err("Failed to connect to daemon after retries".to_string())
+    }
+
     /// Internal request sending without auto-start
     fn send_request_internal(&self, request_json: &str) -> Result<String, String> {
         if self.config.prefer_unix_socket {
@@ -161,8 +226,19 @@ impl DaemonClient {
         let exe = std::env::current_exe()
             .map_err(|e| format!("Failed to get current executable: {}", e))?;
 
-        let _child = Command::new(exe)
-            .arg("daemon")
+        let mut cmd = Command::new(exe);
+        cmd.arg("daemon").arg("start");
+
+        // Ensure the daemon uses the same socket path as this client (even if env is not set)
+        if let Some(socket_path) = &self.config.socket_path {
+            cmd.env("AIKEYD_SOCKET_PATH", socket_path);
+            cmd.arg("--unix-socket");
+        }
+
+        // IMPORTANT: detach stdio so the background daemon doesn't keep parent pipes open
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("Failed to spawn daemon process: {}", e))?;
 
@@ -221,18 +297,19 @@ impl DaemonClient {
     // ===== Typed RPC Method Wrappers =====
 
     /// Get current profile
-    pub fn get_current_profile(&self) -> Result<String, String> {
+    pub fn get_current_profile(&self) -> Result<String, RpcClientError> {
         let request = Request::new(methods::PROFILE_CURRENT, serde_json::json!({}));
-        let response = self.send_request(&request)?;
+        let response = self.send_request(&request)
+            .map_err(|e| RpcClientError { code: None, message: e })?;
 
         match response {
             Response::Success(resp) => {
                 resp.result.get("name")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
-                    .ok_or_else(|| "Invalid response format".to_string())
+                    .ok_or_else(|| RpcClientError { code: None, message: "Invalid response format".to_string() })
             }
-            Response::Error(err) => Err(format!("RPC error: {}", err.error.message)),
+            Response::Error(err) => Err(RpcClientError { code: Some(err.error.code), message: err.error.message }),
         }
     }
 
@@ -310,7 +387,33 @@ impl DaemonClient {
                     .and_then(|v| v.as_array())
                     .map(|arr| {
                         arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .filter_map(|v| {
+                                if let Some(alias) = v.get("alias").and_then(|x| x.as_str()) {
+                                    Some(alias.to_string())
+                                } else {
+                                    v.as_str().map(|s| s.to_string())
+                                }
+                            })
+                            .collect()
+                    })
+                    .ok_or_else(|| "Invalid response format".to_string())
+            }
+            Response::Error(err) => Err(format!("RPC error: {}", err.error.message)),
+        }
+    }
+
+    /// List all secrets with metadata
+    pub fn list_secrets_with_metadata(&self) -> Result<Vec<crate::storage::SecretMetadata>, String> {
+        let request = Request::new(methods::SECRET_LIST, serde_json::json!({}));
+        let response = self.send_request(&request)?;
+
+        match response {
+            Response::Success(resp) => {
+                resp.result.get("secrets")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| serde_json::from_value::<crate::storage::SecretMetadata>(v.clone()).ok())
                             .collect()
                     })
                     .ok_or_else(|| "Invalid response format".to_string())
@@ -321,7 +424,7 @@ impl DaemonClient {
 
     /// Get a secret value
     pub fn get_secret(&self, name: &str) -> Result<String, String> {
-        let request = Request::new(methods::SECRET_GET, serde_json::json!({ "name": name }));
+        let request = Request::new(methods::SECRET_GET, serde_json::json!({ "alias": name }));
         let response = self.send_request(&request)?;
 
         match response {
@@ -335,9 +438,38 @@ impl DaemonClient {
         }
     }
 
+    /// Upsert a secret value
+    pub fn upsert_secret(&self, name: &str, value: &str) -> Result<(), String> {
+        let request = Request::new(methods::SECRET_UPSERT, serde_json::json!({ "alias": name, "value": value }));
+        let response = self.send_request(&request)?;
+
+        match response {
+            Response::Success(_) => Ok(()),
+            Response::Error(err) => Err(format!("RPC error: {}", err.error.message)),
+        }
+    }
+
+    /// Delete a secret value
+    pub fn delete_secret(&self, name: &str) -> Result<(), String> {
+        let request = Request::new(methods::SECRET_DELETE, serde_json::json!({ "alias": name }));
+        let response = self.send_request(&request)?;
+
+        match response {
+            Response::Success(_) => Ok(()),
+            Response::Error(err) => Err(format!("RPC error: {}", err.error.message)),
+        }
+    }
+
     /// Resolve environment variables
-    pub fn resolve_env(&self, template: &str) -> Result<String, String> {
-        let request = Request::new(methods::ENV_RESOLVE, serde_json::json!({ "template": template }));
+    pub fn resolve_env(&self, template: &str, project_path: Option<&str>, config_path: Option<&str>, include_values: bool) -> Result<String, String> {
+        let mut params = serde_json::json!({ "template": template, "include_values": include_values });
+        if let Some(path) = project_path {
+            params["project_path"] = serde_json::Value::String(path.to_string());
+        }
+        if let Some(path) = config_path {
+            params["config_path"] = serde_json::Value::String(path.to_string());
+        }
+        let request = Request::new(methods::ENV_RESOLVE, params);
         let response = self.send_request(&request)?;
 
         match response {
@@ -351,6 +483,73 @@ impl DaemonClient {
         }
     }
 
+    /// Resolve environment variables and return structured details
+    pub fn resolve_env_details(&self, template: &str, project_path: Option<&str>, config_path: Option<&str>, include_values: bool) -> Result<serde_json::Value, String> {
+        let mut params = serde_json::json!({ "template": template, "include_values": include_values });
+        if let Some(path) = project_path {
+            params["project_path"] = serde_json::Value::String(path.to_string());
+        }
+        if let Some(path) = config_path {
+            params["config_path"] = serde_json::Value::String(path.to_string());
+        }
+        let request = Request::new(methods::ENV_RESOLVE, params);
+        let response = self.send_request(&request)?;
+
+        match response {
+            Response::Success(resp) => Ok(resp.result),
+            Response::Error(err) => Err(format!("RPC error: {}", err.error.message)),
+        }
+    }
+
+    /// List bindings for a profile
+    pub fn list_bindings(&self, profile_name: &str) -> Result<Vec<(String, String)>, String> {
+        let request = Request::new(methods::BINDING_LIST, serde_json::json!({ "profile_name": profile_name }));
+        let response = self.send_request(&request)?;
+
+        match response {
+            Response::Success(resp) => {
+                resp.result.get("bindings")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| {
+                                let domain = v.get("domain").and_then(|d| d.as_str());
+                                let alias = v.get("alias").and_then(|a| a.as_str());
+                                match (domain, alias) {
+                                    (Some(d), Some(a)) => Some((d.to_string(), a.to_string())),
+                                    _ => None,
+                                }
+                            })
+                            .collect()
+                    })
+                    .ok_or_else(|| "Invalid response format".to_string())
+            }
+            Response::Error(err) => Err(format!("RPC error: {}", err.error.message)),
+        }
+    }
+
+    /// Set a binding for a profile
+    pub fn set_binding(&self, profile_name: &str, domain: &str, secret_alias: &str) -> Result<(), String> {
+        let request = Request::new(methods::BINDING_SET, serde_json::json!({ "profile_name": profile_name, "domain": domain, "secret_alias": secret_alias }));
+        let response = self.send_request(&request)?;
+
+        match response {
+            Response::Success(_) => Ok(()),
+            Response::Error(err) => Err(format!("RPC error: {}", err.error.message)),
+        }
+    }
+
+    /// Delete a binding for a profile
+    pub fn delete_binding(&self, profile_name: &str, domain: &str, secret_alias: &str) -> Result<(), String> {
+        let request = Request::new(methods::BINDING_DELETE, serde_json::json!({ "profile_name": profile_name, "domain": domain, "secret_alias": secret_alias }));
+        let response = self.send_request(&request)?;
+
+        match response {
+            Response::Success(_) => Ok(()),
+            Response::Error(err) => Err(format!("RPC error: {}", err.error.message)),
+        }
+    }
+
     /// Get daemon status
     pub fn get_status(&self) -> Result<serde_json::Value, String> {
         let request = Request::new(methods::SYSTEM_STATUS, serde_json::json!({}));
@@ -358,6 +557,17 @@ impl DaemonClient {
 
         match response {
             Response::Success(resp) => Ok(resp.result),
+            Response::Error(err) => Err(format!("RPC error: {}", err.error.message)),
+        }
+    }
+
+    /// Unlock daemon session by setting vault password
+    pub fn unlock(&self, password: &str) -> Result<(), String> {
+        let request = Request::new(methods::AUTH_UNLOCK, serde_json::json!({ "password": password }));
+        let response = self.send_request(&request)?;
+
+        match response {
+            Response::Success(_) => Ok(()),
             Response::Error(err) => Err(format!("RPC error: {}", err.error.message)),
         }
     }

@@ -75,6 +75,29 @@ pub fn create_profile(conn: &Connection, name: &str) -> Result<Profile, String> 
 
 /// Set a profile as active
 pub fn set_active_profile(conn: &Connection, name: &str) -> Result<Profile, String> {
+    // Ensure the profile exists; if not, create it
+    let exists = conn
+        .query_row(
+            "SELECT id FROM profiles WHERE name = ?",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| format!("Failed to check profile existence: {}", e))?;
+
+    if exists.is_none() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("Failed to get current time: {}", e))?
+            .as_secs() as i64;
+
+        conn.execute(
+            "INSERT INTO profiles (name, is_active, created_at) VALUES (?, 0, ?)",
+            params![name, now],
+        )
+        .map_err(|e| format!("Failed to create profile: {}", e))?;
+    }
+
     // Deactivate all profiles
     conn.execute("UPDATE profiles SET is_active = 0", [])
         .map_err(|e| format!("Failed to deactivate profiles: {}", e))?;
@@ -86,7 +109,6 @@ pub fn set_active_profile(conn: &Connection, name: &str) -> Result<Profile, Stri
     )
     .map_err(|e| format!("Failed to activate profile: {}", e))?;
 
-    // Retrieve and return the activated profile
     conn.query_row(
         "SELECT id, name, is_active, created_at FROM profiles WHERE name = ?",
         params![name],

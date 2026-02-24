@@ -2,7 +2,26 @@ use crate::config::ProjectConfig;
 use crate::env_renderer::EnvRenderer;
 use crate::daemon_client::DaemonClient;
 use crate::env_resolver::VarSource;
+use crate::{core, storage, global_config};
+use secrecy::{SecretString, ExposeSecret};
+use zeroize::Zeroizing;
+use std::io::{self, Write};
 use std::collections::HashMap;
+
+fn prompt_password_for_env(json_mode: bool) -> Result<SecretString, Box<dyn std::error::Error>> {
+    if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
+        return Ok(SecretString::new(test_password));
+    }
+
+    if !json_mode {
+        print!("Enter Master Password: ");
+        io::stdout().flush()?;
+    }
+
+    let mut password_raw = Zeroizing::new(String::new());
+    io::stdin().read_line(&mut password_raw)?;
+    Ok(SecretString::new(password_raw.trim().to_string()))
+}
 
 /// Handle `aikey env generate` command
 pub fn handle_env_generate(
@@ -10,7 +29,7 @@ pub fn handle_env_generate(
     env_file_override: Option<&str>,
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_config_path, config) = ProjectConfig::discover()?
+    let (config_path, config) = ProjectConfig::discover()?
         .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
 
     let env_target = env_file_override.unwrap_or(&config.env.target);
@@ -18,10 +37,13 @@ pub fn handle_env_generate(
 
     // Get current profile via daemon
     let client = DaemonClient::default();
+    let password = prompt_password_for_env(json_mode)?;
+    client.unlock(password.expose_secret())
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
     let current_profile = client.get_current_profile()?;
 
     // Resolve environment variables via daemon
-    let resolved = resolve_env_via_daemon(&client, &config, &current_profile)?;
+    let resolved = resolve_env_via_daemon(&client, &config, &current_profile, &password, Some(&config_path))?;
 
     // Get changes summary
     let existing_content = if env_path.exists() {
@@ -85,15 +107,18 @@ pub fn handle_env_generate(
 
 /// Handle `aikey env inject` command
 pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (_config_path, config) = ProjectConfig::discover()?
+    let (config_path, config) = ProjectConfig::discover()?
         .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
 
     // Get current profile via daemon
     let client = DaemonClient::default();
+    let password = prompt_password_for_env(json_mode)?;
+    client.unlock(password.expose_secret())
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
     let current_profile = client.get_current_profile()?;
 
     // Resolve environment variables via daemon
-    let resolved = resolve_env_via_daemon(&client, &config, &current_profile)?;
+    let resolved = resolve_env_via_daemon(&client, &config, &current_profile, &password, Some(&config_path))?;
 
     if json_mode {
         let vars: Vec<_> = resolved
@@ -149,26 +174,16 @@ pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
 
 /// Get current profile from global config
 pub fn get_current_profile() -> Result<String, Box<dyn std::error::Error>> {
-    if let Some(config_dir) = dirs::config_dir() {
-        let config_file = config_dir.join("aikey").join("config.json");
-
-        if config_file.exists() {
-            let content = std::fs::read_to_string(&config_file)?;
-
-            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(profile) = config.get("current_profile").and_then(|v| v.as_str()) {
-                    return Ok(profile.to_string());
-                }
-            }
-        }
+    if let Ok(Some(profile)) = global_config::get_current_profile() {
+        return Ok(profile);
     }
 
     Ok("default".to_string())
 }
 
 /// Handle `aikey env export` command
-pub fn handle_env_export(format: &str, _json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (_, config) = ProjectConfig::discover()?.ok_or_else(|| {
+pub fn handle_env_export(format: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (config_path, config) = ProjectConfig::discover()?.ok_or_else(|| {
         Box::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "No aikey.config.json found",
@@ -177,10 +192,13 @@ pub fn handle_env_export(format: &str, _json_mode: bool) -> Result<(), Box<dyn s
 
     // Get current profile via daemon
     let client = DaemonClient::default();
+    let password = prompt_password_for_env(json_mode)?;
+    client.unlock(password.expose_secret())
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
     let current_profile = client.get_current_profile()?;
 
     // Resolve environment variables via daemon
-    let resolved = resolve_env_via_daemon(&client, &config, &current_profile)?;
+    let resolved = resolve_env_via_daemon(&client, &config, &current_profile, &password, Some(&config_path))?;
 
     match format {
         "dotenv" | ".env" => {
@@ -225,7 +243,7 @@ pub fn handle_env_export(format: &str, _json_mode: bool) -> Result<(), Box<dyn s
 
 /// Handle `aikey env check` command
 pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (_, config) = ProjectConfig::discover()?.ok_or_else(|| {
+    let (config_path, config) = ProjectConfig::discover()?.ok_or_else(|| {
         Box::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "No aikey.config.json found",
@@ -234,10 +252,13 @@ pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
 
     // Get current profile via daemon
     let client = DaemonClient::default();
+    let password = prompt_password_for_env(json_mode)?;
+    client.unlock(password.expose_secret())
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
     let current_profile = client.get_current_profile()?;
 
     // Resolve environment variables via daemon
-    let resolved = resolve_env_via_daemon(&client, &config, &current_profile)?;
+    let resolved = resolve_env_via_daemon(&client, &config, &current_profile, &password, Some(&config_path))?;
 
     let total = resolved.len();
     let satisfied: Vec<_> = resolved.iter().filter(|v| v.value.is_some()).collect();
@@ -287,6 +308,8 @@ fn resolve_env_via_daemon(
     client: &DaemonClient,
     config: &ProjectConfig,
     _current_profile: &str,
+    password: &SecretString,
+    config_path: Option<&std::path::Path>,
 ) -> Result<Vec<crate::env_resolver::ResolvedVar>, Box<dyn std::error::Error>> {
     // Get required vars from config
     let required_vars = &config.requiredVars;
@@ -299,20 +322,42 @@ fn resolve_env_via_daemon(
     let template = template_parts.join("\n");
 
     // Resolve via daemon
-    let resolved_str = client.resolve_env(&template)
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
+    let project_path = config_path
+        .and_then(|p| p.parent())
+        .and_then(|p| p.to_str());
+    let config_path_str = config_path.and_then(|p| p.to_str());
 
-    // Parse resolved variables back into ResolvedVar structs
-    let mut resolved = Vec::new();
-    for line in resolved_str.lines() {
-        if let Some((name, value)) = line.split_once('=') {
-            resolved.push(crate::env_resolver::ResolvedVar {
-                name: name.to_string(),
-                value: if value.is_empty() { None } else { Some(value.to_string()) },
-                source: if value.is_empty() { VarSource::Missing } else { VarSource::Profile },
-            });
+    let resolved_str = match client.resolve_env(&template, project_path, config_path_str, true) {
+        Ok(resolved) => Some(resolved),
+        Err(err) => {
+            if err.contains("No project configuration found") {
+                None
+            } else {
+                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, err)) as Box<dyn std::error::Error>);
+            }
         }
+    };
+
+    if let Some(resolved_str) = resolved_str {
+        // Parse resolved variables back into ResolvedVar structs
+        let mut resolved = Vec::new();
+        for line in resolved_str.lines() {
+            if let Some((name, value)) = line.split_once('=') {
+                resolved.push(crate::env_resolver::ResolvedVar {
+                    name: name.to_string(),
+                    value: if value.is_empty() { None } else { Some(value.to_string()) },
+                    source: if value.is_empty() { VarSource::Missing } else { VarSource::Profile },
+                });
+            }
+        }
+
+        return Ok(resolved);
     }
 
-    Ok(resolved)
+    let conn = storage::open_connection()
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
+    let context = core::Core::resolve_environment_with_config(&conn, password, config)
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
+
+    Ok(context.resolved_vars)
 }

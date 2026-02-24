@@ -13,6 +13,8 @@ pub mod env_resolver;
 pub mod env_renderer;
 pub mod commands_project;
 pub mod commands_env;
+pub mod json_output;
+pub mod global_config;
 pub mod error_codes;
 pub mod rpc;
 pub mod daemon;

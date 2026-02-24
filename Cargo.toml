@@ -21,6 +21,10 @@ path = "src/main.rs"
 name = "aikey"
 path = "src/main.rs"
 
+[[bin]]
+name = "aikey-native-host"
+path = "src/native_host.rs"
+
 [dependencies]
 # CLI framework
 clap = { version = "4.0", features = ["derive"] }
