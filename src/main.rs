@@ -23,6 +23,7 @@ use secrecy::{ExposeSecret, SecretString};
 use std::env;
 use std::io::{self, Write};
 use zeroize::Zeroizing;
+use rpassword::prompt_password;
 use error_codes::ErrorCode;
 
 #[derive(Parser)]
@@ -1178,7 +1179,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// SECURITY HARDENING:
 /// - Wraps password in Zeroizing<String> IMMEDIATELY upon input
-/// - Explicitly flushes stdout before reading to prevent TTY leaks
+/// - Disables TTY echo for interactive password entry
 /// - Converts to SecretString only after zeroizing wrapper is in place
 /// - Ensures raw password string is wiped from memory on scope exit
 /// - Supports AK_TEST_PASSWORD environment variable for testing
@@ -1189,7 +1190,7 @@ fn prompt_password_secure(prompt: &str, password_stdin: bool, json_mode: bool) -
         return Ok(SecretString::new(test_password));
     }
 
-    // If password_stdin is true, read directly from stdin without prompt
+    // If password_stdin is true, read directly from stdin without prompt or TTY interaction
     if password_stdin {
         let mut password_raw = Zeroizing::new(String::new());
         io::stdin().read_line(&mut password_raw)?;
@@ -1197,20 +1198,13 @@ fn prompt_password_secure(prompt: &str, password_stdin: bool, json_mode: bool) -
         return Ok(SecretString::new(trimmed));
     }
 
-    // Only show prompt if not in JSON mode
-    if !json_mode {
-        print!("{}", prompt);
-        io::stdout().flush()?;
-    }
+    // Interactive TTY path: disable echo using rpassword
+    // In JSON mode我们依然不打印提示文案，避免污染机器可读输出
+    let prompt_str = if json_mode { "" } else { prompt };
+    let password = prompt_password(prompt_str)?;
 
-    // Read password into Zeroizing container IMMEDIATELY
-    let mut password_raw = Zeroizing::new(String::new());
-    io::stdin().read_line(&mut password_raw)?;
-
-    // Trim and convert to SecretString while maintaining zeroizing protection
+    // Wrap in Zeroizing for additional in-memory protection
+    let password_raw = Zeroizing::new(password);
     let trimmed = password_raw.trim().to_string();
-    let secret = SecretString::new(trimmed);
-
-    // password_raw is automatically zeroized when it goes out of scope
-    Ok(secret)
+    Ok(SecretString::new(trimmed))
 }
