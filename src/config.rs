@@ -17,6 +17,20 @@ pub struct ProviderConfig {
     pub default_model: Option<String>,
 }
 
+/// A single logical-model mapping entry: resolves a logical name to a concrete
+/// provider, model ID, and vault key alias for a given environment.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LogicalModelMapping {
+    /// Provider name (e.g. "openai", "anthropic")
+    pub provider: String,
+    /// Concrete model ID passed to the provider API (e.g. "gpt-4o-mini")
+    #[serde(rename = "providerModelId", skip_serializing_if = "Option::is_none")]
+    pub provider_model_id: Option<String>,
+    /// Vault alias for the API key (e.g. "openai:default")
+    #[serde(rename = "keyAlias")]
+    pub key_alias: String,
+}
+
 /// Project configuration structure following CONFIG_SPEC.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
@@ -38,6 +52,10 @@ pub struct ProjectConfig {
     /// Lifecycle hooks (pre/post run, etc.)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub hooks: HashMap<String, Vec<String>>,
+    /// env → logicalModel → LogicalModelMapping
+    /// e.g. envMappings["dev"]["chat-main"] = { provider: "openai", providerModelId: "gpt-4o-mini", keyAlias: "openai:default" }
+    #[serde(default, rename = "envMappings", skip_serializing_if = "HashMap::is_empty")]
+    pub env_mappings: HashMap<String, HashMap<String, LogicalModelMapping>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +96,7 @@ impl ProjectConfig {
             providers: HashMap::new(),
             tenants: HashMap::new(),
             hooks: HashMap::new(),
+            env_mappings: HashMap::new(),
         }
     }
 

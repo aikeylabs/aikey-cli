@@ -7,6 +7,7 @@ use secrecy::{SecretString, ExposeSecret};
 use zeroize::Zeroizing;
 use std::io::{self, Write};
 use std::collections::HashMap;
+use shell_words;
 
 fn prompt_password_for_env(json_mode: bool) -> Result<SecretString, Box<dyn std::error::Error>> {
     if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
@@ -298,6 +299,60 @@ pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
     // Exit with code 2 if there are missing vars, 0 if all satisfied
     if missing_count > 0 {
         std::process::exit(2);
+    }
+
+    Ok(())
+}
+
+/// Handle `aikey env inject -- <command>` — run a command with project env vars injected
+pub fn handle_env_run(command: &[String], json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (config_path, config) = ProjectConfig::discover()?
+        .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
+
+    let client = DaemonClient::new_default();
+    let password = prompt_password_for_env(json_mode)?;
+    client.unlock(password.expose_secret())
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
+    let current_profile = client.get_current_profile()?;
+
+    let resolved = resolve_env_via_daemon(&client, &config, &current_profile, &password, Some(&config_path))?;
+
+    let mut env_map: HashMap<String, String> = HashMap::new();
+    for var in &resolved {
+        if let Some(value) = &var.value {
+            env_map.insert(var.name.clone(), value.clone());
+        }
+    }
+
+    if !json_mode {
+        eprintln!("Injecting {} variable(s) (project mode)", env_map.len());
+    }
+
+    let parsed_parts: Vec<String> = if command.len() == 1 {
+        shell_words::split(&command[0])
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())) as Box<dyn std::error::Error>)?
+    } else {
+        command.to_vec()
+    };
+
+    if parsed_parts.is_empty() {
+        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Empty command")));
+    }
+
+    let mut cmd = std::process::Command::new(&parsed_parts[0]);
+    cmd.args(&parsed_parts[1..]);
+    for (k, v) in &env_map {
+        cmd.env(k, v);
+    }
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    let status = cmd.status()
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
     }
 
     Ok(())

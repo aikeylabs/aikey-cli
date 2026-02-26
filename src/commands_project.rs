@@ -1,4 +1,4 @@
-use crate::config::{ProjectConfig, EnvTemplate};
+use crate::config::{ProjectConfig, ProviderConfig, EnvTemplate};
 use crate::daemon_client::DaemonClient;
 use crate::json_output;
 use std::io::{self, Write};
@@ -280,6 +280,138 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
         println!("   • Use 'Insert from AiKey' to insert secrets into your code");
         println!("   • View project status in the AiKey panel");
         println!("\n💡 Tip: Run 'aikey project status' anytime to check your configuration");
+    }
+
+    Ok(())
+}
+
+/// Handle `aikey setup` — alias for quickstart (initialize vault and configure first profile)
+pub fn handle_setup(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    handle_quickstart(json_mode)
+}
+
+/// Handle `aikey project map` — bind a required var to a vault alias in the project config
+pub fn handle_project_map(
+    var: &str,
+    alias: &str,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (config_path, mut config) = ProjectConfig::discover()?
+        .ok_or("No aikey.config.json found")?;
+
+    config.bindings.insert(var.to_string(), alias.to_string());
+
+    if !config.required_vars.contains(&var.to_string()) {
+        config.required_vars.push(var.to_string());
+    }
+
+    config.save(&config_path)?;
+
+    if json_mode {
+        json_output::print_json(serde_json::json!({
+            "ok": true,
+            "var": var,
+            "alias": alias
+        }));
+    } else {
+        println!("Mapped {} → {}", var, alias);
+    }
+
+    Ok(())
+}
+
+/// Handle `aikey provider add` — add/update a provider entry in the project config
+pub fn handle_provider_add(
+    name: &str,
+    key_alias: &str,
+    default_model: Option<&str>,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (config_path, mut config) = ProjectConfig::discover()?
+        .ok_or("No aikey.config.json found")?;
+
+    config.providers.insert(name.to_string(), ProviderConfig {
+        key_alias: key_alias.to_string(),
+        default_model: default_model.map(|s| s.to_string()),
+    });
+
+    config.save(&config_path)?;
+
+    if json_mode {
+        json_output::print_json(serde_json::json!({
+            "ok": true,
+            "provider": name,
+            "key_alias": key_alias,
+            "default_model": default_model
+        }));
+    } else {
+        println!("Provider '{}' added (alias: {})", name, key_alias);
+    }
+
+    Ok(())
+}
+
+/// Handle `aikey provider rm` — remove a provider from the project config
+pub fn handle_provider_rm(
+    name: &str,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (config_path, mut config) = ProjectConfig::discover()?
+        .ok_or("No aikey.config.json found")?;
+
+    if config.providers.remove(name).is_none() {
+        let msg = format!("Provider '{}' not found in config", name);
+        if json_mode {
+            json_output::print_json_exit(serde_json::json!({
+                "ok": false,
+                "message": msg
+            }), 1);
+        }
+        return Err(msg.into());
+    }
+
+    config.save(&config_path)?;
+
+    if json_mode {
+        json_output::print_json(serde_json::json!({
+            "ok": true,
+            "provider": name
+        }));
+    } else {
+        println!("Provider '{}' removed", name);
+    }
+
+    Ok(())
+}
+
+/// Handle `aikey provider ls` — list providers in the project config
+pub fn handle_provider_ls(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (_, config) = ProjectConfig::discover()?
+        .ok_or("No aikey.config.json found")?;
+
+    if json_mode {
+        let providers: Vec<_> = config.providers.iter().map(|(name, cfg)| {
+            serde_json::json!({
+                "name": name,
+                "key_alias": cfg.key_alias,
+                "default_model": cfg.default_model
+            })
+        }).collect();
+        json_output::print_json(serde_json::json!({ "ok": true, "providers": providers }));
+    } else if config.providers.is_empty() {
+        println!("No providers configured.");
+    } else {
+        println!("Providers:");
+        let mut names: Vec<_> = config.providers.keys().collect();
+        names.sort();
+        for name in names {
+            let cfg = &config.providers[name];
+            if let Some(model) = &cfg.default_model {
+                println!("  {} (alias: {}, model: {})", name, cfg.key_alias, model);
+            } else {
+                println!("  {} (alias: {})", name, cfg.key_alias);
+            }
+        }
     }
 
     Ok(())

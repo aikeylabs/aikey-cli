@@ -126,6 +126,11 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Provider management commands
+    Provider {
+        #[command(subcommand)]
+        action: ProviderAction,
+    },
     /// Daemon management commands
     Daemon {
         #[command(subcommand)]
@@ -133,6 +138,8 @@ enum Commands {
     },
     /// Quick setup wizard for new projects
     Quickstart,
+    /// Initialize vault and configure first profile (alias for init + quickstart)
+    Setup,
     /// Show local usage statistics
     Stats,
     /// Show recent run/exec event log
@@ -197,8 +204,12 @@ enum EnvAction {
         #[arg(long)]
         env_file: Option<String>,
     },
-    /// Inject secrets into environment (use 'aikey exec' for now)
-    Inject,
+    /// Inject secrets into current shell, or run a command with secrets injected
+    Inject {
+        /// Command to run with secrets injected (use -- to separate)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
     /// Export resolved environment variables to stdout
     Export {
         /// Output format: dotenv, shell, or json
@@ -215,6 +226,35 @@ enum ProjectAction {
     Init,
     /// Show project configuration status
     Status,
+    /// Map a required variable to a vault alias in the project config
+    Map {
+        /// Environment variable name (e.g. OPENAI_API_KEY)
+        var: String,
+        /// Vault alias to bind it to (e.g. openai-work)
+        alias: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProviderAction {
+    /// Add a provider to the project config
+    Add {
+        /// Provider name (e.g. openai, anthropic)
+        name: String,
+        /// Vault alias for the provider's API key
+        #[arg(long, value_name = "ALIAS")]
+        key_alias: String,
+        /// Default model for this provider
+        #[arg(long, value_name = "MODEL")]
+        default_model: Option<String>,
+    },
+    /// Remove a provider from the project config
+    Rm {
+        /// Provider name to remove
+        name: String,
+    },
+    /// List providers in the project config
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -654,7 +694,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     &client,
                 )
             } else {
-                executor::run_with_all_secrets_via_daemon(command, cli.json, &client)
+                // No --provider: use project config to inject all configured provider keys
+                let project_config = config::ProjectConfig::discover()
+                    .ok()
+                    .flatten()
+                    .map(|(_, cfg)| cfg);
+
+                if let Some(cfg) = project_config.as_ref() {
+                    executor::run_with_project_config_via_daemon(cfg, command, cli.json, &client)
+                } else {
+                    executor::run_with_all_secrets_via_daemon(command, cli.json, &client)
+                }
             };
 
             match result {
@@ -1142,8 +1192,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 EnvAction::Generate { dry_run, env_file } => {
                     commands_env::handle_env_generate(*dry_run, env_file.as_deref(), cli.json)?;
                 }
-                EnvAction::Inject => {
-                    commands_env::handle_env_inject(cli.json)?;
+                EnvAction::Inject { command } => {
+                    if command.is_empty() {
+                        commands_env::handle_env_inject(cli.json)?;
+                    } else {
+                        commands_env::handle_env_run(command, cli.json)?;
+                    }
                 }
                 EnvAction::Export { format } => {
                     commands_env::handle_env_export(format, cli.json)?;
@@ -1160,6 +1214,22 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 ProjectAction::Status => {
                     commands_project::handle_project_status(cli.json)?;
+                }
+                ProjectAction::Map { var, alias } => {
+                    commands_project::handle_project_map(var, alias, cli.json)?;
+                }
+            }
+        }
+        Commands::Provider { action } => {
+            match action {
+                ProviderAction::Add { name, key_alias, default_model } => {
+                    commands_project::handle_provider_add(name, key_alias, default_model.as_deref(), cli.json)?;
+                }
+                ProviderAction::Rm { name } => {
+                    commands_project::handle_provider_rm(name, cli.json)?;
+                }
+                ProviderAction::Ls => {
+                    commands_project::handle_provider_ls(cli.json)?;
                 }
             }
         }
@@ -1206,6 +1276,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Quickstart => {
             commands_project::handle_quickstart(cli.json)?;
+        }
+        Commands::Setup => {
+            commands_project::handle_setup(cli.json)?;
         }
         Commands::Stats => {
             handle_stats(cli.json)?;

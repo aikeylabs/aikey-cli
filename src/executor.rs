@@ -831,7 +831,6 @@ pub fn run_with_provider_via_daemon(
 ///    (via daemon), falling back to using the var name as the alias directly.
 ///
 /// Returns `(secrets_injected, exit_code)`.
-#[allow(dead_code)]
 pub fn run_with_project_config_via_daemon(
     config: &ProjectConfig,
     command: &[String],
