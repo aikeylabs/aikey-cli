@@ -1,6 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use std::fs;
+
+/// Per-provider configuration: which vault alias to use and optional default model
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderConfig {
+    /// Vault alias that holds the API key for this provider
+    #[serde(rename = "keyAlias")]
+    pub key_alias: String,
+    /// Default model to use when none is specified
+    #[serde(rename = "defaultModel", skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+}
 
 /// Project configuration structure following CONFIG_SPEC.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,9 +23,15 @@ pub struct ProjectConfig {
     #[serde(default)]
     pub requiredVars: Vec<String>,
     #[serde(default)]
-    pub bindings: std::collections::HashMap<String, String>,
+    pub bindings: HashMap<String, String>,
     #[serde(default)]
     pub defaults: Defaults,
+    /// Provider → ProviderConfig mapping (Stage 0 resolution engine)
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderConfig>,
+    /// Tenant → (provider → keyAlias) overrides for multi-tenant setups
+    #[serde(default)]
+    pub tenants: HashMap<String, HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,8 +67,10 @@ impl ProjectConfig {
                 target: ".env".to_string(),
             },
             requiredVars: Vec::new(),
-            bindings: std::collections::HashMap::new(),
+            bindings: HashMap::new(),
             defaults: Defaults { profile: None },
+            providers: HashMap::new(),
+            tenants: HashMap::new(),
         }
     }
 

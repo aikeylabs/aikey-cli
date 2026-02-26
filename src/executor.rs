@@ -1,5 +1,7 @@
 use crate::crypto;
 use crate::storage;
+use crate::config::ProjectConfig;
+use crate::providers::Provider;
 use crate::daemon_client::DaemonClient;
 use arboard::Clipboard;
 use rusqlite::params;
@@ -689,6 +691,197 @@ pub fn run_with_all_secrets_via_daemon(
 
     let exit_code = status.code().unwrap_or(1);
 
+    if !status.success() {
+        return Err(format!("Command exited with code {}", exit_code));
+    }
+
+    Ok((secrets_count, exit_code))
+}
+
+/// Execute a command with a single provider's key resolved via the 5-step resolver.
+///
+/// Uses `resolver::resolve` to determine the vault alias, then fetches it via daemon
+/// and injects it as the provider's canonical env var (e.g. `OPENAI_API_KEY`).
+/// If `model` is resolved, it is also injected as `AIKEY_MODEL`.
+pub fn run_with_provider_via_daemon(
+    provider: &str,
+    model: Option<&str>,
+    tenant: Option<&str>,
+    config: Option<&ProjectConfig>,
+    command: &[String],
+    json_mode: bool,
+    client: &DaemonClient,
+) -> Result<(usize, i32), String> {
+    use crate::resolver::{resolve, ResolveRequest};
+
+    let request = ResolveRequest {
+        provider: provider.to_string(),
+        model: model.map(|s| s.to_string()),
+        tenant: tenant.map(|s| s.to_string()),
+        ..Default::default()
+    };
+
+    let resolved = resolve(&request, config).map_err(|e| e.to_string())?;
+
+    let secret = client.get_secret(&resolved.key_alias)
+        .map_err(|e| format!("Failed to fetch secret '{}': {}", resolved.key_alias, e))?;
+
+    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
+        std::collections::HashMap::new();
+    env_secrets.insert(resolved.env_var.clone(), Zeroizing::new(secret));
+
+    if let Some(m) = &resolved.model {
+        env_secrets.insert("AIKEY_MODEL".to_string(), Zeroizing::new(m.clone()));
+    }
+
+    let secrets_count = env_secrets.len();
+    if !json_mode {
+        eprintln!("Injecting {} secret(s) for provider '{}'", secrets_count, provider);
+    }
+
+    let parsed_parts: Vec<String> = if command.len() == 1 {
+        shell_words::split(&command[0])
+            .map_err(|e| format!("Failed to parse command '{}': {}", command[0], e))?
+    } else {
+        command.to_vec()
+    };
+
+    if parsed_parts.is_empty() {
+        return Err("Empty command after parsing".to_string());
+    }
+
+    let program = &parsed_parts[0];
+    let args = &parsed_parts[1..];
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    for (key, value) in &env_secrets {
+        cmd.env(key, value.as_str());
+    }
+
+    if json_mode {
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+    } else {
+        cmd.stdin(std::process::Stdio::inherit());
+        cmd.stdout(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::inherit());
+    }
+
+    let status = cmd
+        .status()
+        .map_err(|e| format!("Failed to execute command '{}': {}", program, e))?;
+
+    drop(env_secrets);
+
+    let exit_code = status.code().unwrap_or(1);
+    if !status.success() {
+        return Err(format!("Command exited with code {}", exit_code));
+    }
+
+    Ok((secrets_count, exit_code))
+}
+
+/// Execute a command with secrets resolved from a project config via daemon RPC.
+///
+/// Resolution order:
+/// 1. `config.providers` — each provider's `keyAlias` is fetched and injected as
+///    `Provider::env_var()` (e.g. `OPENAI_API_KEY`).
+/// 2. `config.requiredVars` — each var is looked up in the active profile's bindings
+///    (via daemon), falling back to using the var name as the alias directly.
+///
+/// Returns `(secrets_injected, exit_code)`.
+pub fn run_with_project_config_via_daemon(
+    config: &ProjectConfig,
+    command: &[String],
+    json_mode: bool,
+    client: &DaemonClient,
+) -> Result<(usize, i32), String> {
+    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
+        std::collections::HashMap::new();
+
+    // 1. Provider-based resolution
+    for (provider_name, provider_cfg) in &config.providers {
+        let env_var = Provider::from_str(provider_name).env_var();
+        match client.get_secret(&provider_cfg.key_alias) {
+            Ok(value) => { env_secrets.insert(env_var, Zeroizing::new(value)); }
+            Err(e) => {
+                if !json_mode {
+                    eprintln!("Warning: could not fetch secret '{}' for provider '{}': {}", provider_cfg.key_alias, provider_name, e);
+                }
+            }
+        }
+    }
+
+    // 2. requiredVars resolution via active profile bindings
+    // Build a domain->alias map from the active profile's bindings
+    let binding_map: std::collections::HashMap<String, String> = client
+        .get_current_profile()
+        .ok()
+        .and_then(|profile| client.list_bindings(&profile).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    for var_name in &config.requiredVars {
+        if env_secrets.contains_key(var_name) {
+            continue; // already set by providers block
+        }
+        // binding map: domain -> alias; fall back to var_name as alias
+        let alias = binding_map.get(var_name).cloned().unwrap_or_else(|| var_name.clone());
+        match client.get_secret(&alias) {
+            Ok(value) => { env_secrets.insert(var_name.clone(), Zeroizing::new(value)); }
+            Err(e) => {
+                if !json_mode {
+                    eprintln!("Warning: could not fetch secret '{}' for var '{}': {}", alias, var_name, e);
+                }
+            }
+        }
+    }
+
+    let secrets_count = env_secrets.len();
+    if !json_mode {
+        eprintln!("Injecting {} secret(s) (project mode)", secrets_count);
+    }
+
+    let parsed_parts: Vec<String> = if command.len() == 1 {
+        shell_words::split(&command[0])
+            .map_err(|e| format!("Failed to parse command '{}': {}", command[0], e))?
+    } else {
+        command.to_vec()
+    };
+
+    if parsed_parts.is_empty() {
+        return Err("Empty command after parsing".to_string());
+    }
+
+    let program = &parsed_parts[0];
+    let args = &parsed_parts[1..];
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    for (key, value) in &env_secrets {
+        cmd.env(key, value.as_str());
+    }
+
+    if json_mode {
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+    } else {
+        cmd.stdin(std::process::Stdio::inherit());
+        cmd.stdout(std::process::Stdio::inherit());
+        cmd.stderr(std::process::Stdio::inherit());
+    }
+
+    let status = cmd
+        .status()
+        .map_err(|e| format!("Failed to execute command '{}': {}", program, e))?;
+
+    drop(env_secrets);
+
+    let exit_code = status.code().unwrap_or(1);
     if !status.success() {
         return Err(format!("Command exited with code {}", exit_code));
     }

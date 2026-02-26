@@ -17,6 +17,8 @@ mod daemon_client;
 mod profiles;
 mod core;
 mod global_config;
+mod providers;
+mod resolver;
 
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
@@ -85,6 +87,18 @@ enum Commands {
     },
     /// Execute a command with all secrets automatically injected as environment variables
     Run {
+        /// Resolve a specific provider's key and inject it (e.g. openai, anthropic)
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+
+        /// Model hint passed through to the process (sets AIKEY_MODEL env var)
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+
+        /// Tenant override for multi-tenant key resolution
+        #[arg(long, value_name = "TENANT")]
+        tenant: Option<String>,
+
         /// The command to execute (use -- to separate)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
@@ -601,7 +615,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Run { command } => {
+        Commands::Run { provider, model, tenant, command } => {
             if command.is_empty() {
                 let err_msg = "No command specified. Use -- to separate command from flags.";
                 if cli.json {
@@ -616,7 +630,25 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             client.unlock(password.expose_secret())
                 .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
 
-            let result = executor::run_with_all_secrets_via_daemon(command, cli.json, &client);
+            let result = if let Some(provider_name) = provider {
+                // Provider-mode: resolve a single provider key via the 5-step resolver
+                let project_config = config::ProjectConfig::discover()
+                    .ok()
+                    .flatten()
+                    .map(|(_, cfg)| cfg);
+
+                executor::run_with_provider_via_daemon(
+                    provider_name,
+                    model.as_deref(),
+                    tenant.as_deref(),
+                    project_config.as_ref(),
+                    command,
+                    cli.json,
+                    &client,
+                )
+            } else {
+                executor::run_with_all_secrets_via_daemon(command, cli.json, &client)
+            };
 
             match result {
                 Ok((secrets_count, exit_code)) => {

@@ -21,3 +21,5 @@ pub mod daemon;
 pub mod daemon_client;
 pub mod profiles;
 pub mod core;
+pub mod providers;
+pub mod resolver;
