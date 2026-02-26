@@ -139,6 +139,30 @@ fn apply_migrations(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to ensure bindings index: {}", e))?;
 
+    // Events table for usage tracking
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            provider TEXT,
+            alias TEXT,
+            command TEXT,
+            exit_code INTEGER,
+            duration_ms INTEGER,
+            secrets_count INTEGER,
+            error TEXT
+        )",
+        [],
+    )
+    .map_err(|e| format!("Failed to ensure events table: {}", e))?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)",
+        [],
+    )
+    .map_err(|e| format!("Failed to ensure events index: {}", e))?;
+
     Ok(())
 }
 

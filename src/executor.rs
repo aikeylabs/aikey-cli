@@ -3,6 +3,7 @@ use crate::storage;
 use crate::config::ProjectConfig;
 use crate::providers::Provider;
 use crate::daemon_client::DaemonClient;
+use crate::events::EventBuilder;
 use arboard::Clipboard;
 use rusqlite::params;
 use secrecy::SecretString;
@@ -404,6 +405,8 @@ pub fn exec_with_env(
     drop(env_secrets);
     drop(ctx);
 
+    let t0 = std::time::Instant::now();
+
     // Wait for child with clean parent memory
     let status = loop {
         match child.try_wait() {
@@ -413,6 +416,11 @@ pub fn exec_with_env(
                 if !running.load(Ordering::SeqCst) {
                     // Forward signal to child
                     let _ = child.kill();
+                    let _ = EventBuilder::new("exec")
+                        .command(&parsed_parts.join(" "))
+                        .duration_ms(t0.elapsed().as_millis() as i64)
+                        .error("Interrupted by user")
+                        .record();
                     return Err("Interrupted by user".to_string());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -423,9 +431,18 @@ pub fn exec_with_env(
         }
     };
 
+    let duration_ms = t0.elapsed().as_millis() as i64;
+    let exit_code = status.code().unwrap_or(1);
+
+    let _ = EventBuilder::new("exec")
+        .command(&parsed_parts.join(" "))
+        .exit_code(exit_code)
+        .duration_ms(duration_ms)
+        .secrets_count(env_mappings.len() as i32)
+        .record();
+
     // Propagate child exit status
     if !status.success() {
-        let exit_code = status.code().unwrap_or(1);
         std::process::exit(exit_code);
     }
 
@@ -525,6 +542,7 @@ pub fn run_with_all_secrets(
         cmd.stderr(std::process::Stdio::inherit());
     }
 
+    let t0 = std::time::Instant::now();
     let status = cmd.status()
         .map_err(|e| format!("Failed to execute command '{}': {}", program, e))?;
 
@@ -533,6 +551,14 @@ pub fn run_with_all_secrets(
     drop(ctx);
 
     let exit_code = status.code().unwrap_or(1);
+    let duration_ms = t0.elapsed().as_millis() as i64;
+
+    let _ = EventBuilder::new("run")
+        .command(&parsed_parts.join(" "))
+        .exit_code(exit_code)
+        .duration_ms(duration_ms)
+        .secrets_count(secrets_count as i32)
+        .record();
 
     // Return secrets count and exit code
     if !status.success() {
@@ -769,6 +795,7 @@ pub fn run_with_provider_via_daemon(
         cmd.stderr(std::process::Stdio::inherit());
     }
 
+    let t0 = std::time::Instant::now();
     let status = cmd
         .status()
         .map_err(|e| format!("Failed to execute command '{}': {}", program, e))?;
@@ -776,6 +803,16 @@ pub fn run_with_provider_via_daemon(
     drop(env_secrets);
 
     let exit_code = status.code().unwrap_or(1);
+    let duration_ms = t0.elapsed().as_millis() as i64;
+
+    let _ = EventBuilder::new("run")
+        .provider(provider)
+        .command(&parsed_parts.join(" "))
+        .exit_code(exit_code)
+        .duration_ms(duration_ms)
+        .secrets_count(secrets_count as i32)
+        .record();
+
     if !status.success() {
         return Err(format!("Command exited with code {}", exit_code));
     }
@@ -875,6 +912,7 @@ pub fn run_with_project_config_via_daemon(
         cmd.stderr(std::process::Stdio::inherit());
     }
 
+    let t0 = std::time::Instant::now();
     let status = cmd
         .status()
         .map_err(|e| format!("Failed to execute command '{}': {}", program, e))?;
@@ -882,6 +920,15 @@ pub fn run_with_project_config_via_daemon(
     drop(env_secrets);
 
     let exit_code = status.code().unwrap_or(1);
+    let duration_ms = t0.elapsed().as_millis() as i64;
+
+    let _ = EventBuilder::new("run")
+        .command(&parsed_parts.join(" "))
+        .exit_code(exit_code)
+        .duration_ms(duration_ms)
+        .secrets_count(secrets_count as i32)
+        .record();
+
     if !status.success() {
         return Err(format!("Command exited with code {}", exit_code));
     }

@@ -23,3 +23,4 @@ pub mod profiles;
 pub mod core;
 pub mod providers;
 pub mod resolver;
+pub mod events;

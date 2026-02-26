@@ -19,6 +19,7 @@ mod core;
 mod global_config;
 mod providers;
 mod resolver;
+mod events;
 
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
@@ -134,6 +135,12 @@ enum Commands {
     Quickstart,
     /// Show local usage statistics
     Stats,
+    /// Show recent run/exec event log
+    Logs {
+        /// Number of entries to show (default: 20)
+        #[arg(short, long, default_value = "20")]
+        limit: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1202,6 +1209,31 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Stats => {
             handle_stats(cli.json)?;
+        }
+        Commands::Logs { limit } => {
+            let entries = events::list_events(*limit)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("No events recorded yet.");
+            } else {
+                println!("{:<6} {:<20} {:<10} {:<12} {:<5} {}",
+                    "ID", "TIMESTAMP", "TYPE", "PROVIDER", "EXIT", "COMMAND");
+                println!("{}", "-".repeat(72));
+                for e in &entries {
+                    let ts = e.timestamp.to_string();
+                    println!("{:<6} {:<20} {:<10} {:<12} {:<5} {}",
+                        e.id,
+                        ts,
+                        e.event_type,
+                        e.provider.as_deref().unwrap_or("-"),
+                        e.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
+                        e.command.as_deref().unwrap_or("-"),
+                    );
+                }
+            }
         }
     }
     Ok(())
