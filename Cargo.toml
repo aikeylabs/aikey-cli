@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "aikey-sdk"]
+
 [package]
 name = "aikeylabs-aikey-cli"
 version = "0.3.0"

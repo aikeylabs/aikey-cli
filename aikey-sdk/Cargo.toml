@@ -1,0 +1,19 @@
+[package]
+name = "aikey-sdk"
+version = "0.1.0"
+edition = "2021"
+authors = ["AiKey Founder <aikeyfounder@gmail.com>"]
+description = "Embed AiKey secret resolution in your Rust applications"
+license = "Apache-2.0"
+repository = "https://github.com/AiKey-Founder/aikey-labs"
+keywords = ["aikey", "secrets", "api-keys", "llm", "sdk"]
+categories = ["authentication", "api-bindings"]
+
+[dependencies]
+aikeylabs-aikey-cli = { path = ".." }
+secrecy = "0.8"
+zeroize = { version = "1.8", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"

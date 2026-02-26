@@ -65,6 +65,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aikey-sdk"
+version = "0.1.0"
+dependencies = [
+ "aikeylabs-aikey-cli",
+ "secrecy",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "aikeylabs-aikey-cli"
 version = "0.3.0"
 dependencies = [
