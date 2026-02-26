@@ -1,7 +1,7 @@
 # Technical Debt Resolution Report
 
 **Date:** February 15, 2026
-**Version:** 0.0.1-alpha
+**Version:** 0.4.0-alpha.1
 **Status:** ✅ ALL RESOLVED
 
 ---
@@ -303,7 +303,7 @@ done
 $ cargo build --release
    Compiling rayon-core v1.13.0
    Compiling rayon v1.11.0
-   Compiling aikeylabs-aikey-cli v0.0.1-alpha
+   Compiling aikeylabs-aikey-cli v0.4.0-alpha.1
     Finished `release` profile [optimized] target(s) in 15.23s
 ```
 

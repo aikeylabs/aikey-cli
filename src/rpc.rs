@@ -1,5 +1,5 @@
-/// JSON-RPC 2.0 protocol implementation
-/// Defines request/response structures, error model, and method constants
+//! JSON-RPC 2.0 protocol implementation
+//! Defines request/response structures, error model, and method constants
 
 use serde::{Deserialize, Serialize};
 

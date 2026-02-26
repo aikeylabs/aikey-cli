@@ -29,7 +29,7 @@ impl EnvResolver {
     ) -> Result<Vec<ResolvedVar>, String> {
         let mut resolved = Vec::new();
 
-        for var_name in &config.requiredVars {
+        for var_name in &config.required_vars {
             let value = profile_vars.get(var_name).cloned();
             let source = if value.is_some() {
                 VarSource::Profile
@@ -69,7 +69,7 @@ mod tests {
     fn test_resolve_all_satisfied() {
         let config = ProjectConfig::new("test".to_string());
         let mut config = config;
-        config.requiredVars = vec!["KEY1".to_string(), "KEY2".to_string()];
+        config.required_vars = vec!["KEY1".to_string(), "KEY2".to_string()];
 
         let mut profile_vars = HashMap::new();
         profile_vars.insert("KEY1".to_string(), "value1".to_string());
@@ -90,7 +90,7 @@ mod tests {
     fn test_resolve_partial_satisfied() {
         let config = ProjectConfig::new("test".to_string());
         let mut config = config;
-        config.requiredVars = vec!["KEY1".to_string(), "KEY2".to_string(), "KEY3".to_string()];
+        config.required_vars = vec!["KEY1".to_string(), "KEY2".to_string(), "KEY3".to_string()];
 
         let mut profile_vars = HashMap::new();
         profile_vars.insert("KEY1".to_string(), "value1".to_string());
@@ -110,7 +110,7 @@ mod tests {
     fn test_resolve_none_satisfied() {
         let config = ProjectConfig::new("test".to_string());
         let mut config = config;
-        config.requiredVars = vec!["KEY1".to_string(), "KEY2".to_string()];
+        config.required_vars = vec!["KEY1".to_string(), "KEY2".to_string()];
 
         let profile_vars = HashMap::new();
         let resolved = EnvResolver::resolve(&config, "default", &profile_vars).unwrap();

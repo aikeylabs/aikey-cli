@@ -1,6 +1,6 @@
 # AiKey CLI Usage Scenarios Guide
 
-**Version:** 0.0.1-alpha
+**Version:** 0.4.0-alpha.1
 **Target Audience:** Developers, DevOps Engineers, Security Teams
 **Last Updated:** February 15, 2026
 
@@ -379,7 +379,7 @@ spec:
 
 **Enable Audit Logging:**
 ```bash
-# Audit logging is automatic in v0.0.1-alpha
+# Audit logging is automatic in v0.4.0-alpha.1
 # All operations are logged with HMAC verification
 
 # View audit log (future feature)

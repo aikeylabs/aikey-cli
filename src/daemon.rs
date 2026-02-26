@@ -204,23 +204,16 @@ impl DaemonServer {
 fn handle_tcp_client(mut stream: TcpStream, vault_password: Arc<Mutex<Option<String>>>) -> Result<(), String> {
     let mut buffer = vec![0; 8192];
 
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => break, // Connection closed
-            Ok(n) => {
-                let request_data = &buffer[..n];
-                let response = process_request(request_data, &vault_password)?;
-
-                stream.write_all(response.as_bytes())
-                    .map_err(|e| format!("Failed to write response: {}", e))?;
-
-                // Close connection after a single request to unblock client reads
-                break;
-            }
-            Err(e) => {
-                eprintln!("Error reading from stream: {}", e);
-                break;
-            }
+    match stream.read(&mut buffer) {
+        Ok(0) => {} // Connection closed
+        Ok(n) => {
+            let request_data = &buffer[..n];
+            let response = process_request(request_data, &vault_password)?;
+            stream.write_all(response.as_bytes())
+                .map_err(|e| format!("Failed to write response: {}", e))?;
+        }
+        Err(e) => {
+            eprintln!("Error reading from stream: {}", e);
         }
     }
 
@@ -232,23 +225,16 @@ fn handle_tcp_client(mut stream: TcpStream, vault_password: Arc<Mutex<Option<Str
 fn handle_unix_client(mut stream: UnixStream, vault_password: Arc<Mutex<Option<String>>>) -> Result<(), String> {
     let mut buffer = vec![0; 8192];
 
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => break, // Connection closed
-            Ok(n) => {
-                let request_data = &buffer[..n];
-                let response = process_request(request_data, &vault_password)?;
-
-                stream.write_all(response.as_bytes())
-                    .map_err(|e| format!("Failed to write response: {}", e))?;
-
-                // Close connection after a single request to unblock client reads
-                break;
-            }
-            Err(e) => {
-                eprintln!("Error reading from stream: {}", e);
-                break;
-            }
+    match stream.read(&mut buffer) {
+        Ok(0) => {} // Connection closed
+        Ok(n) => {
+            let request_data = &buffer[..n];
+            let response = process_request(request_data, &vault_password)?;
+            stream.write_all(response.as_bytes())
+                .map_err(|e| format!("Failed to write response: {}", e))?;
+        }
+        Err(e) => {
+            eprintln!("Error reading from stream: {}", e);
         }
     }
 

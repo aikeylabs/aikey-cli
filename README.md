@@ -1,4 +1,4 @@
-# AiKey CLI v0.3
+# AiKey CLI v0.4.0-alpha.1
 
 A secure, local-first secret management tool built with Rust. Store API keys, tokens, and other sensitive data encrypted on your machine.
 
@@ -6,9 +6,9 @@ A secure, local-first secret management tool built with Rust. Store API keys, to
 
 **Primary command**: `aikey` (short alias: `ak`)
 
-## Features (v0.3)
+## Features (v0.4.0-alpha.1)
 
-### Developer Workflow (New in v0.3)
+### Developer Workflow (New in v0.4.0-alpha.1)
 - **Quickstart wizard**: Get started quickly with `aikey quickstart`
 - **Project configuration**: Initialize and manage project-specific environment variables
 - **Environment generation**: Automatically generate `.env` files from your vault
@@ -46,7 +46,7 @@ A secure, local-first secret management tool built with Rust. Store API keys, to
 ### Testing & Quality
 - **Comprehensive test suite**: 90+ tests covering all core functionality
 - **Unit tests**: Config parsing, environment resolution, and rendering logic
-- **Integration tests**: Full command workflows including v0.3 developer features
+- **Integration tests**: Full command workflows including v0.4.0-alpha.1 developer features
 - **Security testing**: Authentication failure, injection safety, special characters
 - **Persistence testing**: Vault integrity across operations
 
@@ -159,9 +159,9 @@ aikey run --json -- echo "test"
 
 JSON output is written to stderr to avoid mixing with command output, making it safe for automation and scripting.
 
-## Developer Workflow (v0.3)
+## Developer Workflow (v0.4.0-alpha.1)
 
-The v0.3 release introduces a complete developer workflow for managing environment variables across projects and profiles.
+The v0.4.0-alpha.1 release introduces a complete developer workflow for managing environment variables across projects and profiles.
 
 ### Quick Start
 
@@ -401,7 +401,7 @@ src/
 
 ## Roadmap
 
-### Completed in v0.3
+### Completed in v0.4.0-alpha.1
 - [x] Developer workflow commands (`project init`, `project status`)
 - [x] Environment generation (`env generate` with merge support)
 - [x] Environment injection (`env inject` with shell eval support)
@@ -414,7 +414,7 @@ src/
 - [x] Local statistics (`stats` command)
 - [x] Comprehensive unit and integration tests
 
-### Planned for v0.4
+### Planned for v0.4.0 (stable)
 - [ ] Complete profile management implementation (vault integration)
 - [ ] Shell completion scripts
 - [ ] Password strength meter during init

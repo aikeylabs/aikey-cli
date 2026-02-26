@@ -121,7 +121,7 @@ pub fn handle_project_init(json_mode: bool) -> Result<(), Box<dyn std::error::Er
     // Create and save config
     let mut config = ProjectConfig::new(project_name);
     config.env.target = env_target;
-    config.requiredVars = required_vars;
+    config.required_vars = required_vars;
 
     config.save(config_path)?;
 
@@ -153,7 +153,7 @@ pub fn handle_project_status(json_mode: bool) -> Result<(), Box<dyn std::error::
         }
     };
 
-    let template_parts: Vec<String> = config.requiredVars
+    let template_parts: Vec<String> = config.required_vars
         .iter()
         .map(|var| format!("{}={{{}}}", var, var))
         .collect();
@@ -162,7 +162,7 @@ pub fn handle_project_status(json_mode: bool) -> Result<(), Box<dyn std::error::
     let project_path = config_path.parent().and_then(|p| p.to_str());
     let config_path_str = config_path.to_str();
 
-    let client = DaemonClient::default();
+    let client = DaemonClient::new_default();
     let result = client.resolve_env_details(&template, project_path, config_path_str, false)?;
 
     let profile_name = result.get("profile_name")
@@ -190,7 +190,7 @@ pub fn handle_project_status(json_mode: bool) -> Result<(), Box<dyn std::error::
             "config_path": config_path.display().to_string(),
             "project_name": config.project.name,
             "profile": profile_name,
-            "required_vars": config.requiredVars,
+            "required_vars": config.required_vars,
             "satisfied": satisfied,
             "total": total,
             "missing_vars": missing_vars

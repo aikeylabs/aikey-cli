@@ -36,7 +36,7 @@ pub fn handle_env_generate(
     let env_path = std::path::Path::new(env_target);
 
     // Get current profile via daemon
-    let client = DaemonClient::default();
+    let client = DaemonClient::new_default();
     let password = prompt_password_for_env(json_mode)?;
     client.unlock(password.expose_secret())
         .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
@@ -111,7 +111,7 @@ pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
         .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
 
     // Get current profile via daemon
-    let client = DaemonClient::default();
+    let client = DaemonClient::new_default();
     let password = prompt_password_for_env(json_mode)?;
     client.unlock(password.expose_secret())
         .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
@@ -191,7 +191,7 @@ pub fn handle_env_export(format: &str, json_mode: bool) -> Result<(), Box<dyn st
     })?;
 
     // Get current profile via daemon
-    let client = DaemonClient::default();
+    let client = DaemonClient::new_default();
     let password = prompt_password_for_env(json_mode)?;
     client.unlock(password.expose_secret())
         .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
@@ -251,7 +251,7 @@ pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
     })?;
 
     // Get current profile via daemon
-    let client = DaemonClient::default();
+    let client = DaemonClient::new_default();
     let password = prompt_password_for_env(json_mode)?;
     client.unlock(password.expose_secret())
         .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
@@ -312,7 +312,7 @@ fn resolve_env_via_daemon(
     config_path: Option<&std::path::Path>,
 ) -> Result<Vec<crate::env_resolver::ResolvedVar>, Box<dyn std::error::Error>> {
     // Get required vars from config
-    let required_vars = &config.requiredVars;
+    let required_vars = &config.required_vars;
 
     // Build template from required variables
     let template_parts: Vec<String> = required_vars

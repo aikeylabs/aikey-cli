@@ -1,5 +1,5 @@
-/// Unified error model for daemon, RPC, and CLI
-/// Preserves backward compatibility with existing error codes while supporting daemon-level errors
+//! Unified error model for daemon, RPC, and CLI
+//! Preserves backward compatibility with existing error codes while supporting daemon-level errors
 
 use serde::{Deserialize, Serialize};
 

@@ -1,6 +1,6 @@
 # AiKey CLI User Manual
 
-**Version:** 0.0.1-alpha
+**Version:** 0.4.0-alpha.1
 **Last Updated:** February 15, 2026
 
 ---
@@ -60,7 +60,7 @@ The binary will be installed as `ak` in your cargo bin directory (typically `~/.
 
 ```bash
 ak --version
-# Output: ak 0.1.0
+# Output: ak 0.4.0-alpha.1
 ```
 
 ---

@@ -55,9 +55,16 @@ pub(crate) fn open_connection() -> Result<Connection, String> {
         .map_err(|e| format!("Failed to open database: {}", e))?;
 
     // SECURITY: Enable secure delete on every connection
-    // PRAGMA commands don't return rows, so we use prepare and execute
     conn.pragma_update(None, "secure_delete", "ON")
         .map_err(|e| format!("Failed to enable secure delete: {}", e))?;
+
+    // WAL mode for better concurrency and crash safety
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| format!("Failed to enable WAL mode: {}", e))?;
+
+    // Enforce foreign key constraints
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| format!("Failed to enable foreign keys: {}", e))?;
 
     // Ensure required tables exist (idempotent migrations)
     apply_migrations(&conn)?;
@@ -151,7 +158,12 @@ fn apply_migrations(conn: &Connection) -> Result<(), String> {
             exit_code INTEGER,
             duration_ms INTEGER,
             secrets_count INTEGER,
-            error TEXT
+            error TEXT,
+            project TEXT,
+            env TEXT,
+            profile TEXT,
+            ok INTEGER NOT NULL DEFAULT 0,
+            error_type TEXT
         )",
         [],
     )
@@ -162,6 +174,28 @@ fn apply_migrations(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("Failed to ensure events index: {}", e))?;
+
+    // Migration guards for new event columns on existing databases
+    for (col, ddl) in &[
+        ("project",    "ALTER TABLE events ADD COLUMN project TEXT"),
+        ("env",        "ALTER TABLE events ADD COLUMN env TEXT"),
+        ("profile",    "ALTER TABLE events ADD COLUMN profile TEXT"),
+        ("ok",         "ALTER TABLE events ADD COLUMN ok INTEGER NOT NULL DEFAULT 0"),
+        ("error_type", "ALTER TABLE events ADD COLUMN error_type TEXT"),
+    ] {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('events') WHERE name=?1",
+                [col],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_col {
+            conn.execute(ddl, [])
+                .map_err(|e| format!("Failed to add events.{} column: {}", col, e))?;
+        }
+    }
 
     Ok(())
 }

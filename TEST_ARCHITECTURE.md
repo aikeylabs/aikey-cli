@@ -1,6 +1,6 @@
 # Comprehensive Test Architecture
 
-**Project:** AiKey CLI (ak engine) v0.0.1-alpha
+**Project:** AiKey CLI (ak engine) v0.4.0-alpha.1
 **Date:** February 15, 2026
 **Test Coverage Target:** 95%+
 

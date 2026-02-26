@@ -12,6 +12,7 @@ use crate::providers::Provider;
 
 /// Input context for a single resolution request.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct ResolveRequest {
     /// Provider name (e.g. "openai", "anthropic")
     pub provider: String,
@@ -27,6 +28,7 @@ pub struct ResolveRequest {
 
 /// The outcome of a successful resolution.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ResolveResult {
     /// The vault alias that was used to fetch the secret
     pub key_alias: String,
@@ -81,7 +83,7 @@ pub fn resolve(
         return Err(ResolveError::MissingProvider);
     }
 
-    let provider = Provider::from_str(&request.provider);
+    let provider = Provider::parse(&request.provider);
     let env_var = provider.env_var();
 
     // Step 4 – explicit alias (highest priority, short-circuits everything)
@@ -168,11 +170,12 @@ mod tests {
             version: "1".to_string(),
             project: crate::config::ProjectInfo { id: None, name: "test".to_string() },
             env: crate::config::EnvConfig { target: ".env".to_string() },
-            requiredVars: vec![],
+            required_vars: vec![],
             bindings: HashMap::new(),
             defaults: crate::config::Defaults { profile: None },
             providers,
             tenants,
+            hooks: HashMap::new(),
         }
     }
 

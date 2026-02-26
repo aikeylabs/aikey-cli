@@ -118,7 +118,7 @@ impl DaemonClient {
     }
 
     /// Create a client with default configuration
-    pub fn default() -> Self {
+    pub fn new_default() -> Self {
         Self::new(DaemonClientConfig::default())
     }
 
@@ -586,7 +586,7 @@ impl DaemonClient {
 
 /// Check daemon status
 pub fn check_daemon_status() -> Result<serde_json::Value, String> {
-    let client = DaemonClient::default();
+    let client = DaemonClient::new_default();
     client.ping()?;
     client.get_status()
 }

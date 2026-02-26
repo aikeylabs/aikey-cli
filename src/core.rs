@@ -121,7 +121,7 @@ impl Core {
 
         // Convert bindings to a HashMap for resolution using env var name -> secret value
         let mut profile_vars = HashMap::new();
-        for var_name in &config.requiredVars {
+        for var_name in &config.required_vars {
             let alias = binding_map.get(var_name).cloned().unwrap_or_else(|| var_name.clone());
             if let Ok(secret_value) = executor::get_secret(&alias, password) {
                 profile_vars.insert(var_name.clone(), secret_value.to_string());
@@ -168,7 +168,7 @@ impl Core {
 
         let binding_map = Self::build_binding_map(conn, &profile.name, config)?;
         let mut profile_vars = HashMap::new();
-        for var_name in &config.requiredVars {
+        for var_name in &config.required_vars {
             let alias = binding_map.get(var_name).cloned().unwrap_or_else(|| var_name.clone());
             if storage::entry_exists(&alias).unwrap_or(false) {
                 profile_vars.insert(var_name.clone(), "set".to_string());
@@ -218,7 +218,7 @@ impl Core {
 
         // Convert bindings to a HashMap for resolution
         let mut profile_vars = HashMap::new();
-        for var_name in &config.requiredVars {
+        for var_name in &config.required_vars {
             let alias = binding_map.get(var_name).cloned().unwrap_or_else(|| var_name.clone());
             if let Ok(secret_value) = executor::get_secret(&alias, password) {
                 profile_vars.insert(var_name.clone(), secret_value.to_string());

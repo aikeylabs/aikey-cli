@@ -13,9 +13,17 @@ pub enum Provider {
     Custom(String),
 }
 
+impl std::str::FromStr for Provider {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Provider::parse(s))
+    }
+}
+
 impl Provider {
     /// Parse a provider name string (case-insensitive) into a Provider variant.
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "openai"    => Provider::OpenAI,
             "anthropic" => Provider::Anthropic,
@@ -27,6 +35,7 @@ impl Provider {
     }
 
     /// The canonical name used in config files and CLI flags.
+    #[allow(dead_code)]
     pub fn name(&self) -> &str {
         match self {
             Provider::OpenAI    => "openai",
@@ -66,15 +75,15 @@ mod tests {
 
     #[test]
     fn test_custom_provider_env_var() {
-        let p = Provider::from_str("myservice");
+        let p = Provider::parse("myservice");
         assert_eq!(p.env_var(), "AIKEY_MYSERVICE_API_KEY");
     }
 
     #[test]
     fn test_from_str_case_insensitive() {
-        assert_eq!(Provider::from_str("OpenAI"),    Provider::OpenAI);
-        assert_eq!(Provider::from_str("ANTHROPIC"), Provider::Anthropic);
-        assert_eq!(Provider::from_str("Google"),    Provider::Google);
+        assert_eq!(Provider::parse("OpenAI"),    Provider::OpenAI);
+        assert_eq!(Provider::parse("ANTHROPIC"), Provider::Anthropic);
+        assert_eq!(Provider::parse("Google"),    Provider::Google);
     }
 
     #[test]

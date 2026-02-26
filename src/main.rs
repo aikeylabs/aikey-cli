@@ -608,7 +608,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-            let client = daemon_client::DaemonClient::default();
+            let client = daemon_client::DaemonClient::new_default();
             client.unlock(password.expose_secret())
                 .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
 
@@ -633,7 +633,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-            let client = daemon_client::DaemonClient::default();
+            let client = daemon_client::DaemonClient::new_default();
             client.unlock(password.expose_secret())
                 .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
 
@@ -725,7 +725,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Secret { action } => {
-            let client = daemon_client::DaemonClient::default();
+            let client = daemon_client::DaemonClient::new_default();
             match action {
                 SecretAction::Set { name, from_stdin } => {
                     if !from_stdin {
@@ -956,7 +956,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Profile { action } => {
-            let client = daemon_client::DaemonClient::default();
+            let client = daemon_client::DaemonClient::new_default();
             match action {
                 ProfileAction::List => {
                     match client.list_profiles() {

@@ -173,7 +173,7 @@ fn process_json_bytes(bytes: &[u8]) -> serde_json::Value {
         id: None,
     };
 
-    let client = DaemonClient::default();
+    let client = DaemonClient::new_default();
     match client.send_request_no_autostart(&rpc_request) {
         Ok(Response::Success(resp)) => success_value(resp.result, id),
         Ok(Response::Error(err)) => {

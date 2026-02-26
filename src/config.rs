@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::fs;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 /// Per-provider configuration: which vault alias to use and optional default model
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderConfig {
@@ -20,8 +23,8 @@ pub struct ProjectConfig {
     pub version: String,
     pub project: ProjectInfo,
     pub env: EnvConfig,
-    #[serde(default)]
-    pub requiredVars: Vec<String>,
+    #[serde(default, rename = "requiredVars")]
+    pub required_vars: Vec<String>,
     #[serde(default)]
     pub bindings: HashMap<String, String>,
     #[serde(default)]
@@ -32,6 +35,9 @@ pub struct ProjectConfig {
     /// Tenant → (provider → keyAlias) overrides for multi-tenant setups
     #[serde(default)]
     pub tenants: HashMap<String, HashMap<String, String>>,
+    /// Lifecycle hooks (pre/post run, etc.)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub hooks: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,11 +72,12 @@ impl ProjectConfig {
             env: EnvConfig {
                 target: ".env".to_string(),
             },
-            requiredVars: Vec::new(),
+            required_vars: Vec::new(),
             bindings: HashMap::new(),
             defaults: Defaults { profile: None },
             providers: HashMap::new(),
             tenants: HashMap::new(),
+            hooks: HashMap::new(),
         }
     }
 
@@ -143,6 +150,16 @@ impl ProjectConfig {
         fs::write(path, content)
             .map_err(|e| format!("Failed to write config file: {}", e))?;
 
+        #[cfg(unix)]
+        {
+            let metadata = fs::metadata(path)
+                .map_err(|e| format!("Failed to read config metadata: {}", e))?;
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(path, perms)
+                .map_err(|e| format!("Failed to set config permissions: {}", e))?;
+        }
+
         Ok(())
     }
 }
@@ -200,7 +217,7 @@ mod tests {
 
         let config: ProjectConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.project.name, "test-project");
-        assert_eq!(config.requiredVars.len(), 2);
+        assert_eq!(config.required_vars.len(), 2);
         assert_eq!(config.env.target, ".env.local");
         assert_eq!(config.defaults.profile, Some("dev".to_string()));
     }
@@ -222,7 +239,7 @@ defaults:
 
         let config: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.project.name, "test-project");
-        assert_eq!(config.requiredVars.len(), 2);
+        assert_eq!(config.required_vars.len(), 2);
         assert_eq!(config.env.target, ".env.local");
         assert_eq!(config.defaults.profile, Some("dev".to_string()));
     }
@@ -241,7 +258,7 @@ defaults:
 
         let config: ProjectConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.project.name, "minimal");
-        assert_eq!(config.requiredVars.len(), 0);
+        assert_eq!(config.required_vars.len(), 0);
         assert_eq!(config.env.target, ".env");
         assert_eq!(config.defaults.profile, None);
     }

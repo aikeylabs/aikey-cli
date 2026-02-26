@@ -64,7 +64,7 @@ impl VaultContext {
         match stored_hash_result {
             Ok(stored_hash) => {
                 // Password hash exists, verify it
-                if &**key != stored_hash.as_slice() {
+                if key.as_slice() != stored_hash.as_slice() {
                     return Err("Invalid master password.".to_string());
                 }
                 Ok(())
@@ -83,11 +83,11 @@ impl VaultContext {
     }
 
     fn encrypt(&self, data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
-        crypto::encrypt(&*self.key, data)
+        crypto::encrypt(&self.key, data)
     }
 
     fn decrypt(&self, nonce: &[u8], ciphertext: &[u8]) -> Result<crypto::SecureBuffer<Vec<u8>>, String> {
-        crypto::decrypt(&*self.key, nonce, ciphertext)
+        crypto::decrypt(&self.key, nonce, ciphertext)
             .map_err(|_| "Invalid master password or corrupted vault.".to_string())
     }
 }
@@ -298,6 +298,7 @@ pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &s
 /// # Ok(())
 /// # }
 /// ```
+#[allow(dead_code)]
 pub fn exec_with_env(
     env_mappings: &[String],
     password: &SecretString,
@@ -472,6 +473,7 @@ pub fn exec_with_env(
 /// # Ok(())
 /// # }
 /// ```
+#[allow(dead_code)]
 pub fn run_with_all_secrets(
     password: &SecretString,
     command: &[String],
@@ -825,10 +827,11 @@ pub fn run_with_provider_via_daemon(
 /// Resolution order:
 /// 1. `config.providers` — each provider's `keyAlias` is fetched and injected as
 ///    `Provider::env_var()` (e.g. `OPENAI_API_KEY`).
-/// 2. `config.requiredVars` — each var is looked up in the active profile's bindings
+/// 2. `config.required_vars` — each var is looked up in the active profile's bindings
 ///    (via daemon), falling back to using the var name as the alias directly.
 ///
 /// Returns `(secrets_injected, exit_code)`.
+#[allow(dead_code)]
 pub fn run_with_project_config_via_daemon(
     config: &ProjectConfig,
     command: &[String],
@@ -840,7 +843,7 @@ pub fn run_with_project_config_via_daemon(
 
     // 1. Provider-based resolution
     for (provider_name, provider_cfg) in &config.providers {
-        let env_var = Provider::from_str(provider_name).env_var();
+        let env_var = Provider::parse(provider_name).env_var();
         match client.get_secret(&provider_cfg.key_alias) {
             Ok(value) => { env_secrets.insert(env_var, Zeroizing::new(value)); }
             Err(e) => {
@@ -861,7 +864,7 @@ pub fn run_with_project_config_via_daemon(
         .into_iter()
         .collect();
 
-    for var_name in &config.requiredVars {
+    for var_name in &config.required_vars {
         if env_secrets.contains_key(var_name) {
             continue; // already set by providers block
         }
