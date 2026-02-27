@@ -1,6 +1,11 @@
-use crate::config::{ProjectConfig, ProviderConfig, EnvTemplate};
+use crate::config::{ProjectConfig, ProviderConfig, EnvTemplate, LogicalModelMapping};
 use crate::daemon_client::DaemonClient;
 use crate::json_output;
+use crate::global_config;
+use crate::{crypto, storage, audit};
+use secrecy::SecretString;
+use secrecy::ExposeSecret;
+use zeroize::Zeroizing;
 use std::io::{self, Write};
 
 /// Handle `aikey project init` command
@@ -220,6 +225,41 @@ pub fn handle_project_status(json_mode: bool) -> Result<(), Box<dyn std::error::
 
 /// Handle `aikey quickstart` command
 pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Step 0: initialize vault if it doesn't exist yet
+    let vault_path = storage::get_vault_path()?;
+    if !vault_path.exists() {
+        if json_mode {
+            json_output::print_json(serde_json::json!({
+                "step": "vault_init",
+                "message": "Vault not found. Initializing vault first."
+            }));
+        } else {
+            println!("No vault found. Let's create one first.");
+            println!("You'll set a master password to protect your secrets.\n");
+        }
+
+        let password = if json_mode {
+            // In JSON mode read from stdin without prompt
+            let mut pw = String::new();
+            io::stdin().read_line(&mut pw)?;
+            SecretString::new(pw.trim().to_string().into())
+        } else {
+            let pw = rpassword::prompt_password("Set Master Password: ")
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            SecretString::new(pw.into())
+        };
+        let mut salt = [0u8; 16];
+        crypto::generate_salt(&mut salt)?;
+        storage::initialize_vault(&salt, &password)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        audit::initialize_audit_log()?;
+        let _ = audit::log_audit_event(&password, audit::AuditOperation::Init, None, true);
+
+        if !json_mode {
+            println!("Vault initialized.\n");
+        }
+    }
+
     let config_path = std::path::Path::new("aikey.config.json");
 
     // Check if config already exists
@@ -290,19 +330,54 @@ pub fn handle_setup(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     handle_quickstart(json_mode)
 }
 
-/// Handle `aikey project map` — bind a required var to a vault alias in the project config
+/// Handle `aikey project map` — bind a required var to a vault alias, and optionally
+/// add an envMappings entry when --env, --provider, and --key-alias are provided.
 pub fn handle_project_map(
     var: &str,
     alias: &str,
+    env: Option<&str>,
+    provider: Option<&str>,
+    model: Option<&str>,
+    key_alias: Option<&str>,
+    impl_id: Option<&str>,
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Verify master password before mutating config
+    let prompt_str = if json_mode { "" } else { "Enter Master Password: " };
+    let password = rpassword::prompt_password(prompt_str)?;
+    let password_raw = Zeroizing::new(password);
+    let secret = SecretString::new(password_raw.trim().to_string());
+
+    let client = DaemonClient::new_default();
+    client.unlock(secret.expose_secret())
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)) as Box<dyn std::error::Error>)?;
+    // Verify the password is actually correct by performing a decryption operation
+    client.list_secrets()
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)) as Box<dyn std::error::Error>)?;
+
     let (config_path, mut config) = ProjectConfig::discover()?
         .ok_or("No aikey.config.json found")?;
 
+    // Always update bindings / required_vars
     config.bindings.insert(var.to_string(), alias.to_string());
-
     if !config.required_vars.contains(&var.to_string()) {
         config.required_vars.push(var.to_string());
+    }
+
+    // Optionally write an envMappings entry
+    if let (Some(env_name), Some(prov), Some(ka)) = (env, provider, key_alias) {
+        let logical_name = var.to_string();
+        let entry = LogicalModelMapping {
+            provider: prov.to_string(),
+            provider_model_id: model.map(|m| m.to_string()),
+            key_alias: ka.to_string(),
+            impl_id: impl_id.map(|i| i.to_string()),
+        };
+        config
+            .env_mappings
+            .entry(env_name.to_string())
+            .or_default()
+            .insert(logical_name, entry);
     }
 
     config.save(&config_path)?;
@@ -351,13 +426,31 @@ pub fn handle_provider_add(
     Ok(())
 }
 
-/// Handle `aikey provider rm` — remove a provider from the project config
+/// Handle `aikey provider rm` — remove a provider from the profile config
 pub fn handle_provider_rm(
     name: &str,
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (config_path, mut config) = ProjectConfig::discover()?
         .ok_or("No aikey.config.json found")?;
+
+    if !json_mode {
+        let key_alias = config.providers.get(name)
+            .map(|p| p.key_alias.as_str())
+            .unwrap_or(name);
+        let profile = global_config::get_current_profile()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "default".to_string());
+        print!("Remove {}:{} from profile '{}' config? (y/N) ", name, key_alias, profile);
+        io::stdout().flush().ok();
+        let mut response = String::new();
+        io::stdin().read_line(&mut response).ok();
+        if !response.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
 
     if config.providers.remove(name).is_none() {
         let msg = format!("Provider '{}' not found in config", name);
@@ -411,6 +504,78 @@ pub fn handle_provider_ls(json_mode: bool) -> Result<(), Box<dyn std::error::Err
             } else {
                 println!("  {} (alias: {})", name, cfg.key_alias);
             }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle `aikey doctor` — run diagnostics and health checks
+pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let mut checks: Vec<serde_json::Value> = Vec::new();
+    let mut all_ok = true;
+
+    // Check 1: project config exists
+    let config_result = ProjectConfig::discover();
+    let config_ok = config_result.as_ref().map(|r| r.is_some()).unwrap_or(false);
+    checks.push(serde_json::json!({
+        "check": "project_config",
+        "ok": config_ok,
+        "message": if config_ok { "aikey.config.json found" } else { "No aikey.config.json found in current or parent directories" }
+    }));
+    if !config_ok { all_ok = false; }
+
+    // Check 2: daemon reachable
+    let client = DaemonClient::new_default();
+    let daemon_ok = client.ping().is_ok();
+    checks.push(serde_json::json!({
+        "check": "daemon",
+        "ok": daemon_ok,
+        "message": if daemon_ok { "Daemon is running" } else { "Daemon is not reachable — run `aikey daemon start`" }
+    }));
+    if !daemon_ok { all_ok = false; }
+
+    // Check 3: if config found, verify all key aliases resolve
+    if config_ok {
+        if let Ok(Some((_, config))) = config_result {
+            for (provider_name, provider_cfg) in &config.providers {
+                let alias = &provider_cfg.key_alias;
+                let resolved = if daemon_ok {
+                    client.get_secret(alias).is_ok()
+                } else {
+                    false
+                };
+                checks.push(serde_json::json!({
+                    "check": format!("key_alias:{}", alias),
+                    "provider": provider_name,
+                    "ok": resolved,
+                    "message": if resolved {
+                        format!("Key alias '{}' resolves", alias)
+                    } else {
+                        format!("Key alias '{}' not found in vault", alias)
+                    }
+                }));
+                if !resolved { all_ok = false; }
+            }
+        }
+    }
+
+    if json_mode {
+        json_output::print_json(serde_json::json!({
+            "ok": all_ok,
+            "checks": checks
+        }));
+    } else {
+        for check in &checks {
+            let ok = check["ok"].as_bool().unwrap_or(false);
+            let msg = check["message"].as_str().unwrap_or("");
+            let icon = if ok { "✓" } else { "✗" };
+            println!("{} {}", icon, msg);
+        }
+        if all_ok {
+            println!("\nAll checks passed.");
+        } else {
+            println!("\nSome checks failed. See above for details.");
         }
     }
 

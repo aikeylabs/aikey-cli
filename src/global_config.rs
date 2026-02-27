@@ -8,6 +8,9 @@ pub struct GlobalConfig {
     #[serde(rename = "currentProfile")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_profile: Option<String>,
+    #[serde(rename = "currentEnv")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_env: Option<String>,
     #[serde(rename = "currentOrg")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_org: Option<String>,
@@ -18,6 +21,7 @@ impl Default for GlobalConfig {
         Self {
             version: "1".to_string(),
             current_profile: None,
+            current_env: None,
             current_org: None,
         }
     }
@@ -68,5 +72,16 @@ pub fn set_current_profile(profile: &str) -> Result<(), String> {
 pub fn get_current_profile() -> Result<Option<String>, String> {
     let config = load_config()?;
     Ok(config.current_profile)
+}
+
+pub fn set_current_env(env: &str) -> Result<(), String> {
+    let mut config = load_config()?;
+    config.current_env = Some(env.to_string());
+    save_config(&config)
+}
+
+pub fn get_current_env() -> Result<Option<String>, String> {
+    let config = load_config()?;
+    Ok(config.current_env)
 }
 

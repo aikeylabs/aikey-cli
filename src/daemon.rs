@@ -202,13 +202,12 @@ impl DaemonServer {
 
 /// Handle a single TCP client connection
 fn handle_tcp_client(mut stream: TcpStream, vault_password: Arc<Mutex<Option<String>>>) -> Result<(), String> {
-    let mut buffer = vec![0; 8192];
+    let mut buffer = Vec::new();
 
-    match stream.read(&mut buffer) {
+    match stream.read_to_end(&mut buffer) {
         Ok(0) => {} // Connection closed
-        Ok(n) => {
-            let request_data = &buffer[..n];
-            let response = process_request(request_data, &vault_password)?;
+        Ok(_) => {
+            let response = process_request(&buffer, &vault_password)?;
             stream.write_all(response.as_bytes())
                 .map_err(|e| format!("Failed to write response: {}", e))?;
         }
@@ -223,13 +222,12 @@ fn handle_tcp_client(mut stream: TcpStream, vault_password: Arc<Mutex<Option<Str
 /// Handle a single Unix socket client connection
 #[cfg(unix)]
 fn handle_unix_client(mut stream: UnixStream, vault_password: Arc<Mutex<Option<String>>>) -> Result<(), String> {
-    let mut buffer = vec![0; 8192];
+    let mut buffer = Vec::new();
 
-    match stream.read(&mut buffer) {
+    match stream.read_to_end(&mut buffer) {
         Ok(0) => {} // Connection closed
-        Ok(n) => {
-            let request_data = &buffer[..n];
-            let response = process_request(request_data, &vault_password)?;
+        Ok(_) => {
+            let response = process_request(&buffer, &vault_password)?;
             stream.write_all(response.as_bytes())
                 .map_err(|e| format!("Failed to write response: {}", e))?;
         }

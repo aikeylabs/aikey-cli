@@ -29,6 +29,9 @@ pub struct LogicalModelMapping {
     /// Vault alias for the API key (e.g. "openai:default")
     #[serde(rename = "keyAlias")]
     pub key_alias: String,
+    /// Optional implementation/SDK identifier (e.g. "openai-sdk", "langchain")
+    #[serde(rename = "implId", skip_serializing_if = "Option::is_none")]
+    pub impl_id: Option<String>,
 }
 
 /// Project configuration structure following CONFIG_SPEC.md
@@ -142,12 +145,12 @@ impl ProjectConfig {
 
         if filename.ends_with(".json") || filename == ".aikeyrc" {
             serde_json::from_str(&content)
-                .map_err(|e| format!("Failed to parse JSON config: {}", e))
+                .map_err(|e| format!("Invalid aikey.config.json: {}", e))
         } else if filename.ends_with(".yaml") || filename.ends_with(".yml") {
             serde_yaml::from_str(&content)
-                .map_err(|e| format!("Failed to parse YAML config: {}", e))
+                .map_err(|e| format!("Invalid aikey.config.json: {}", e))
         } else {
-            Err("Unsupported config file format".to_string())
+            Err("Invalid aikey.config.json: unsupported file format".to_string())
         }
     }
 

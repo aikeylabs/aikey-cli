@@ -81,6 +81,21 @@ impl ErrorCode {
     }
 }
 
+/// Centralized user-facing message templates.
+/// Use these constants instead of hardcoding strings at call sites.
+pub mod msgs {
+    pub const NO_CONFIG_FOUND: &str =
+        "No aikey.config.json found. Run 'aikey project init' to create one.";
+    pub const NO_CONFIG_FOUND_HINT: &str =
+        "No aikey.config.json found. Run 'aikey project init' to create one, or use --provider to specify a provider directly.";
+    pub const NO_CONFIG_FOUND_DIR: &str =
+        "No aikey.config.json found in current directory or parent directories";
+    pub const NO_PROJECT_CONFIG: &str =
+        "No project configuration found. Run 'aikey project init' first.";
+    pub const INVALID_PASSWORD: &str = "Invalid master password or corrupted vault.";
+    pub const INVALID_PASSWORD_SHORT: &str = "Invalid master password.";
+}
+
 /// Unified error type for daemon, RPC, and CLI
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Error {

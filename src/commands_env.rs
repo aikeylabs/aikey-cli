@@ -5,23 +5,30 @@ use crate::env_resolver::VarSource;
 use crate::{core, storage, global_config};
 use secrecy::{SecretString, ExposeSecret};
 use zeroize::Zeroizing;
-use std::io::{self, Write};
 use std::collections::HashMap;
-use shell_words;
 
 fn prompt_password_for_env(json_mode: bool) -> Result<SecretString, Box<dyn std::error::Error>> {
+    #[cfg(test)]
     if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
         return Ok(SecretString::new(test_password));
     }
 
-    if !json_mode {
-        print!("Enter Master Password: ");
-        io::stdout().flush()?;
-    }
-
-    let mut password_raw = Zeroizing::new(String::new());
-    io::stdin().read_line(&mut password_raw)?;
+    let prompt_str = if json_mode { "" } else { "Enter Master Password: " };
+    let password = rpassword::prompt_password(prompt_str)?;
+    let password_raw = Zeroizing::new(password);
     Ok(SecretString::new(password_raw.trim().to_string()))
+}
+
+/// Validate that a variable name is a safe shell identifier: [A-Z_][A-Z0-9_]*
+fn validate_var_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let valid = !name.is_empty()
+        && name.chars().next().map_or(false, |c| c.is_ascii_uppercase() || c == '_')
+        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("Invalid variable name '{}': must match [A-Z_][A-Z0-9_]*", name).into())
+    }
 }
 
 /// Handle `aikey env generate` command
@@ -73,6 +80,15 @@ pub fn handle_env_generate(
         println!("Target: {}", env_target);
         println!("Profile: {}", current_profile);
 
+        // P0 Security Warning: Inform users that secrets are not written to .env
+        let has_secrets = resolved.iter().any(|v| !matches!(v.name.as_str(), "AIKEY_PROJECT" | "AIKEY_ENV" | "AIKEY_PROFILE"));
+        if has_secrets {
+            println!("\n⚠️  Security Notice:");
+            println!("   API keys and secrets are NOT written to .env files.");
+            println!("   Only non-sensitive context (AIKEY_PROJECT, AIKEY_ENV, AIKEY_PROFILE) is written.");
+            println!("   Secrets are injected at runtime via 'aikey run -- <command>'.");
+        }
+
         if !added.is_empty() {
             println!("\nAdded variables:");
             for var in &added {
@@ -107,7 +123,7 @@ pub fn handle_env_generate(
 }
 
 /// Handle `aikey env inject` command
-pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_env_inject(json_mode: bool, unsafe_plaintext: bool) -> Result<(), Box<dyn std::error::Error>> {
     let (config_path, config) = ProjectConfig::discover()?
         .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
 
@@ -142,8 +158,33 @@ pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
         let is_eval_mode = std::env::var("AIKEY_INJECT_MODE").unwrap_or_default() == "eval";
 
         if is_eval_mode {
+            // P0: Block plaintext output unless --unsafe-plaintext is used
+            if !unsafe_plaintext {
+                eprintln!("❌ ERROR: Plaintext secret exposure is disabled by default.");
+                eprintln!();
+                eprintln!("   'aikey env inject' in eval mode would expose secrets in your shell.");
+                eprintln!();
+                eprintln!("   ⚠️  RECOMMENDED: Use 'aikey run -- <command>' instead for secure injection.");
+                eprintln!();
+                eprintln!("   If you understand the risks and still want to proceed, use:");
+                eprintln!("   eval \"$(AIKEY_INJECT_MODE=eval aikey env inject --unsafe-plaintext)\"");
+                eprintln!();
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Plaintext secret exposure blocked (use --unsafe-plaintext to override)"
+                )));
+            }
+
+            // Show prominent warning
+            eprintln!("⚠️  WARNING: Exporting secrets in plaintext to shell environment!");
+            eprintln!("   - Secrets will be visible in shell history");
+            eprintln!("   - Secrets will be visible to all processes");
+            eprintln!("   - Consider using 'aikey run -- <command>' instead");
+            eprintln!();
+
             // Output shell export commands for eval
             for var in &resolved {
+                validate_var_name(&var.name)?;
                 if let Some(value) = &var.value {
                     // Escape single quotes in the value
                     let escaped_value = value.replace('\'', "'\\''");
@@ -164,9 +205,12 @@ pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
                 println!("  {} {}", status, var.name);
             }
 
-            println!("\nTo inject these variables into your shell, run:");
-            println!("  eval \"$(AIKEY_INJECT_MODE=eval aikey env inject)\"");
-            println!("\nOr use 'aikey exec --env VAR=alias -- command' to run a command with these variables.");
+            println!("\n⚠️  Security Notice:");
+            println!("   Direct shell injection exposes secrets in your environment.");
+            println!("   RECOMMENDED: Use 'aikey run -- <command>' for secure injection.");
+            println!("\nTo inject these variables into your shell (NOT RECOMMENDED), run:");
+            println!("  eval \"$(AIKEY_INJECT_MODE=eval aikey env inject --unsafe-plaintext)\"");
+            println!("\nOr use 'aikey run -- <command>' to run a command with secrets injected securely.");
         }
     }
 
@@ -183,7 +227,7 @@ pub fn get_current_profile() -> Result<String, Box<dyn std::error::Error>> {
 }
 
 /// Handle `aikey env export` command
-pub fn handle_env_export(format: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_env_export(format: &str, json_mode: bool, unsafe_plaintext: bool) -> Result<(), Box<dyn std::error::Error>> {
     let (config_path, config) = ProjectConfig::discover()?.ok_or_else(|| {
         Box::new(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -201,6 +245,40 @@ pub fn handle_env_export(format: &str, json_mode: bool) -> Result<(), Box<dyn st
     // Resolve environment variables via daemon
     let resolved = resolve_env_via_daemon(&client, &config, &current_profile, &password, Some(&config_path))?;
 
+    // P0: Check if any sensitive vars are present
+    let has_sensitive = resolved.iter().any(|v| v.is_sensitive && v.value.is_some());
+
+    if has_sensitive && !unsafe_plaintext {
+        eprintln!("❌ ERROR: Plaintext secret exposure is disabled by default.");
+        eprintln!();
+        eprintln!("   'aikey env export' would expose secrets in plaintext output.");
+        eprintln!();
+        eprintln!("   ⚠️  RECOMMENDED: Use 'aikey run -- <command>' instead for secure injection.");
+        eprintln!();
+        eprintln!("   If you understand the risks and still want to proceed, use:");
+        eprintln!("   aikey env export --unsafe-plaintext");
+        eprintln!();
+        return Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Plaintext secret exposure blocked (use --unsafe-plaintext to override)"
+        )));
+    }
+
+    // Show prominent warning if unsafe mode is enabled
+    if has_sensitive && unsafe_plaintext {
+        let sensitive_names: Vec<&str> = resolved
+            .iter()
+            .filter(|v| v.is_sensitive && v.value.is_some())
+            .map(|v| v.name.as_str())
+            .collect();
+
+        eprintln!("⚠️  WARNING: Exporting secrets in plaintext: {}", sensitive_names.join(", "));
+        eprintln!("   - Do NOT redirect this output to logs or files");
+        eprintln!("   - Do NOT commit this output to version control");
+        eprintln!("   - Secrets will be visible in your terminal");
+        eprintln!();
+    }
+
     match format {
         "dotenv" | ".env" => {
             // Output in .env format
@@ -215,6 +293,7 @@ pub fn handle_env_export(format: &str, json_mode: bool) -> Result<(), Box<dyn st
         "shell" => {
             // Output as shell export commands
             for var in &resolved {
+                validate_var_name(&var.name)?;
                 if let Some(value) = &var.value {
                     let escaped_value = value.replace('\'', "'\\''");
                     println!("export {}='{}'", var.name, escaped_value);
@@ -304,58 +383,30 @@ pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// Handle `aikey env inject -- <command>` — run a command with project env vars injected
+/// Handle `aikey env inject -- <command>` — run a command with project env vars injected.
+/// Delegates to the same executor path as `aikey run` so both share resolution logic.
 pub fn handle_env_run(command: &[String], json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (config_path, config) = ProjectConfig::discover()?
+    let (_, config) = ProjectConfig::discover()?
         .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
 
     let client = DaemonClient::new_default();
-    let password = prompt_password_for_env(json_mode)?;
-    client.unlock(password.expose_secret())
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
-    let current_profile = client.get_current_profile()?;
 
-    let resolved = resolve_env_via_daemon(&client, &config, &current_profile, &password, Some(&config_path))?;
-
-    let mut env_map: HashMap<String, String> = HashMap::new();
-    for var in &resolved {
-        if let Some(value) = &var.value {
-            env_map.insert(var.name.clone(), value.clone());
+    // P1-Q1: env inject doesn't support --logical-model or --tenant (legacy alias)
+    match crate::executor::run_with_project_config_via_daemon(&config, command, json_mode, &client, None, None) {
+        Ok((_, exit_code)) => {
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // Propagate non-zero exit codes from the subprocess
+            if let Some(code_str) = e.strip_prefix("Command exited with code ") {
+                std::process::exit(code_str.parse::<i32>().unwrap_or(1));
+            }
+            Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)
         }
     }
-
-    if !json_mode {
-        eprintln!("Injecting {} variable(s) (project mode)", env_map.len());
-    }
-
-    let parsed_parts: Vec<String> = if command.len() == 1 {
-        shell_words::split(&command[0])
-            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())) as Box<dyn std::error::Error>)?
-    } else {
-        command.to_vec()
-    };
-
-    if parsed_parts.is_empty() {
-        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Empty command")));
-    }
-
-    let mut cmd = std::process::Command::new(&parsed_parts[0]);
-    cmd.args(&parsed_parts[1..]);
-    for (k, v) in &env_map {
-        cmd.env(k, v);
-    }
-    cmd.stdin(std::process::Stdio::inherit());
-    cmd.stdout(std::process::Stdio::inherit());
-    cmd.stderr(std::process::Stdio::inherit());
-
-    let status = cmd.status()
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
-
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-
-    Ok(())
 }
 
 /// Resolve environment variables via daemon RPC
@@ -402,6 +453,7 @@ fn resolve_env_via_daemon(
                     name: name.to_string(),
                     value: if value.is_empty() { None } else { Some(value.to_string()) },
                     source: if value.is_empty() { VarSource::Missing } else { VarSource::Profile },
+                    is_sensitive: config.bindings.contains_key(name),
                 });
             }
         }

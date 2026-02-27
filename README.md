@@ -228,10 +228,12 @@ Shows:
 aikey env generate
 ```
 
-Generates or updates your `.env` file with values from your current profile:
+Generates or updates your `.env` file for **placeholders / non-sensitive context**:
 - Preserves comments and unknown variables
 - Updates only the variables listed in `requiredVars`
 - Writes empty placeholders for missing values
+
+Security note: `.env` should not be treated as a safe place for secrets. Prefer `aikey run -- <cmd>` for the blessed execution path.
 
 Options:
 ```bash
@@ -323,9 +325,9 @@ The CLI workflow is designed to work seamlessly with AiKey's other tools:
 **Typical Workflow**:
 1. Run `aikey quickstart` in your project
 2. Use the browser extension to add your API keys to a profile
-3. Run `aikey env generate` to create your `.env` file
+3. (Optional) Run `aikey env generate` to create/update `.env` placeholders (non-sensitive context)
 4. Use the VS Code extension to insert secrets as needed
-5. Run `aikey env inject` or `aikey run` to execute your application
+5. Prefer `aikey run -- <cmd>` to execute your application (`aikey env inject` is advanced shell glue)
 
 ### Profile Management
 

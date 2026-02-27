@@ -7,6 +7,10 @@ pub struct ResolvedVar {
     pub name: String,
     pub value: Option<String>,
     pub source: VarSource,
+    /// True when the value is a secret (API key, token, etc.) that must not be
+    /// written to disk in plaintext. `env generate` will emit a placeholder
+    /// instead of the real value for these variables.
+    pub is_sensitive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,11 +40,14 @@ impl EnvResolver {
             } else {
                 VarSource::Missing
             };
+            // Variables bound to a vault alias hold secrets (API keys, tokens).
+            let is_sensitive = config.bindings.contains_key(var_name);
 
             resolved.push(ResolvedVar {
                 name: var_name.clone(),
                 value,
                 source,
+                is_sensitive,
             });
         }
 
@@ -127,11 +134,13 @@ mod tests {
                 name: "KEY1".to_string(),
                 value: Some("value1".to_string()),
                 source: VarSource::Profile,
+                is_sensitive: false,
             },
             ResolvedVar {
                 name: "KEY2".to_string(),
                 value: Some("value2".to_string()),
                 source: VarSource::Profile,
+                is_sensitive: false,
             },
         ];
 
@@ -145,11 +154,13 @@ mod tests {
                 name: "KEY1".to_string(),
                 value: Some("value1".to_string()),
                 source: VarSource::Profile,
+                is_sensitive: false,
             },
             ResolvedVar {
                 name: "KEY2".to_string(),
                 value: None,
                 source: VarSource::Missing,
+                is_sensitive: false,
             },
         ];
 
@@ -163,16 +174,19 @@ mod tests {
                 name: "KEY1".to_string(),
                 value: Some("value1".to_string()),
                 source: VarSource::Profile,
+                is_sensitive: false,
             },
             ResolvedVar {
                 name: "KEY2".to_string(),
                 value: None,
                 source: VarSource::Missing,
+                is_sensitive: false,
             },
             ResolvedVar {
                 name: "KEY3".to_string(),
                 value: Some("value3".to_string()),
                 source: VarSource::Profile,
+                is_sensitive: false,
             },
         ];
 

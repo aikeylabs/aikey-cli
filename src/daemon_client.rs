@@ -6,7 +6,7 @@
 
 use crate::rpc::{Request, Response, methods};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, Shutdown};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -270,6 +270,8 @@ impl DaemonClient {
 
         stream.write_all(request_json.as_bytes())
             .map_err(|e| format!("Failed to send request: {}", e))?;
+        stream.shutdown(Shutdown::Write)
+            .map_err(|e| format!("Failed to shutdown write: {}", e))?;
 
         let mut response = String::new();
         stream.read_to_string(&mut response)
@@ -281,11 +283,14 @@ impl DaemonClient {
     /// Send request via Unix socket
     #[cfg(unix)]
     fn send_via_unix_socket(&self, request_json: &str, socket_path: &PathBuf) -> Result<String, String> {
+        use std::net::Shutdown;
         let mut stream = UnixStream::connect(socket_path)
             .map_err(|e| format!("Failed to connect to Unix socket at {:?}: {}", socket_path, e))?;
 
         stream.write_all(request_json.as_bytes())
             .map_err(|e| format!("Failed to send request: {}", e))?;
+        stream.shutdown(Shutdown::Write)
+            .map_err(|e| format!("Failed to shutdown write: {}", e))?;
 
         let mut response = String::new();
         stream.read_to_string(&mut response)

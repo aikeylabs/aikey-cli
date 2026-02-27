@@ -27,7 +27,7 @@ use std::env;
 use std::io::{self, Write};
 use zeroize::Zeroizing;
 use rpassword::prompt_password;
-use error_codes::ErrorCode;
+use error_codes::{msgs, ErrorCode};
 
 #[derive(Parser)]
 #[command(name = "aikey", about = "AiKey - Secure local-first secret management", version = "0.2.0", disable_version_flag = true)]
@@ -92,6 +92,10 @@ enum Commands {
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
 
+        /// Logical model name for narrowing injection (e.g. chat-main, embeddings)
+        #[arg(long, value_name = "LOGICAL_MODEL")]
+        logical_model: Option<String>,
+
         /// Model hint passed through to the process (sets AIKEY_MODEL env var)
         #[arg(long, value_name = "MODEL")]
         model: Option<String>,
@@ -99,6 +103,10 @@ enum Commands {
         /// Tenant override for multi-tenant key resolution
         #[arg(long, value_name = "TENANT")]
         tenant: Option<String>,
+
+        /// Show what would be resolved without executing the command
+        #[arg(long)]
+        dry_run: bool,
 
         /// The command to execute (use -- to separate)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -147,6 +155,29 @@ enum Commands {
         /// Number of entries to show (default: 20)
         #[arg(short, long, default_value = "20")]
         limit: u32,
+    },
+    /// Manage API keys (rotate, etc.)
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
+    },
+    /// Run diagnostics and health checks
+    Doctor,
+    /// Show project/env/profile status and resolution summary (no secrets)
+    Status,
+    /// Start an interactive shell with non-sensitive context (advanced mode)
+    Shell,
+}
+
+#[derive(Subcommand)]
+enum KeyAction {
+    /// Rotate a secret to a new value
+    Rotate {
+        /// Secret name/alias to rotate
+        name: String,
+        /// Read new value from stdin instead of interactive prompt
+        #[arg(long)]
+        from_stdin: bool,
     },
 }
 
@@ -209,15 +240,26 @@ enum EnvAction {
         /// Command to run with secrets injected (use -- to separate)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+        /// Allow plaintext secret exposure (DANGEROUS - secrets will be visible in shell history)
+        #[arg(long)]
+        unsafe_plaintext: bool,
     },
     /// Export resolved environment variables to stdout
     Export {
         /// Output format: dotenv, shell, or json
         #[arg(long, default_value = "dotenv")]
         format: String,
+        /// Allow plaintext secret exposure (DANGEROUS - secrets will be visible in output)
+        #[arg(long)]
+        unsafe_plaintext: bool,
     },
     /// Check if all required environment variables can be resolved
     Check,
+    /// Switch the active logical environment (e.g. dev, staging, prod)
+    Use {
+        /// Environment name to activate
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -232,6 +274,21 @@ enum ProjectAction {
         var: String,
         /// Vault alias to bind it to (e.g. openai-work)
         alias: String,
+        /// Logical environment name for envMappings (e.g. dev, prod)
+        #[arg(long, value_name = "ENV")]
+        env: Option<String>,
+        /// Provider name for envMappings entry (e.g. openai)
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+        /// Concrete model ID for envMappings entry (e.g. gpt-4o-mini)
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Vault key alias for envMappings entry (overrides positional alias for envMappings)
+        #[arg(long = "key-alias", value_name = "ALIAS")]
+        key_alias: Option<String>,
+        /// Provider-specific model implementation ID (e.g. gpt-4o-mini)
+        #[arg(long, value_name = "IMPL")]
+        impl_id: Option<String>,
     },
 }
 
@@ -248,7 +305,7 @@ enum ProviderAction {
         #[arg(long, value_name = "MODEL")]
         default_model: Option<String>,
     },
-    /// Remove a provider from the project config
+    /// Remove a provider from the profile config
     Rm {
         /// Provider name to remove
         name: String,
@@ -662,7 +719,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Run { provider, model, tenant, command } => {
+        Commands::Run { provider, logical_model, model, tenant, dry_run, command } => {
             if command.is_empty() {
                 let err_msg = "No command specified. Use -- to separate command from flags.";
                 if cli.json {
@@ -672,69 +729,127 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // P1-Q2: Tenant precedence: --tenant > AIKEY_TENANT env var
+            let env_tenant = std::env::var("AIKEY_TENANT").ok();
+            let resolved_tenant = tenant.as_deref().or(env_tenant.as_deref());
+
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
             let client = daemon_client::DaemonClient::new_default();
             client.unlock(password.expose_secret())
                 .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
 
-            let result = if let Some(provider_name) = provider {
-                // Provider-mode: resolve a single provider key via the 5-step resolver
-                let project_config = config::ProjectConfig::discover()
-                    .ok()
-                    .flatten()
-                    .map(|(_, cfg)| cfg);
-
-                executor::run_with_provider_via_daemon(
-                    provider_name,
-                    model.as_deref(),
-                    tenant.as_deref(),
-                    project_config.as_ref(),
-                    command,
-                    cli.json,
-                    &client,
-                )
-            } else {
-                // No --provider: use project config to inject all configured provider keys
-                let project_config = config::ProjectConfig::discover()
-                    .ok()
-                    .flatten()
-                    .map(|(_, cfg)| cfg);
-
-                if let Some(cfg) = project_config.as_ref() {
-                    executor::run_with_project_config_via_daemon(cfg, command, cli.json, &client)
+            if *dry_run {
+                let infos = if let Some(provider_name) = provider {
+                    let project_config = config::ProjectConfig::discover()
+                        .ok()
+                        .flatten()
+                        .map(|(_, cfg)| cfg);
+                    executor::dry_run_provider(provider_name, model.as_deref(), resolved_tenant, project_config.as_ref(), &client)?
                 } else {
-                    executor::run_with_all_secrets_via_daemon(command, cli.json, &client)
-                }
-            };
-
-            match result {
-                Ok((secrets_count, exit_code)) => {
-                    if cli.json {
-                        json_output::success_stderr(serde_json::json!({
-                            "secrets_injected": secrets_count,
-                            "exit_code": exit_code
-                        }));
+                    let project_config = config::ProjectConfig::discover()
+                        .ok()
+                        .flatten()
+                        .map(|(_, cfg)| cfg);
+                    if let Some(cfg) = project_config.as_ref() {
+                        executor::dry_run_project_config(cfg, &client, logical_model.as_deref(), resolved_tenant)?
+                    } else {
+                        return Err(msgs::NO_CONFIG_FOUND_HINT.into());
                     }
-                }
-                Err(e) => {
-                    // Extract exit code from error message if present
-                    let exit_code = if let Some(code_str) = e.strip_prefix("Command exited with code ") {
-                        code_str.parse::<i32>().unwrap_or(1)
-                    } else {
-                        1
-                    };
+                };
 
-                    if cli.json {
-                        json_output::error_with_data_stderr(
-                            &e,
-                            serde_json::json!({
-                                "exit_code": exit_code
-                            }),
-                            exit_code
-                        );
+                if cli.json {
+                    json_output::print_json(serde_json::json!({
+                        "dry_run": true,
+                        "command": command,
+                        "injections": infos
+                    }));
+                } else {
+                    // P1-Q4: Enhanced dry-run output
+                    println!("Dry Run — Resolution Summary");
+                    println!("============================");
+                    println!();
+
+                    for info in &infos {
+                        println!("Environment Variable: {}", info.env_var);
+                        println!("  Provider:      {}", info.provider);
+                        if let Some(model) = &info.model {
+                            println!("  Model:         {}", model);
+                        }
+                        if !info.key_alias.is_empty() {
+                            println!("  Key Alias:     {}", info.key_alias);
+                        }
+                        println!("  Source:        {}", info.source);
+                        if info.tenant_override {
+                            println!("  Tenant Override: YES");
+                        }
+                        println!();
+                    }
+
+                    println!("Will inject {} variable(s) into:", infos.len());
+                    println!("  {}", command.join(" "));
+                    println!();
+                    println!("Note: Secret values are hidden. Use 'aikey run' without --dry-run to execute.");
+                }
+            } else {
+                let result = if let Some(provider_name) = provider {
+                    // Provider-mode: resolve a single provider key via the 5-step resolver
+                    let project_config = config::ProjectConfig::discover()
+                        .ok()
+                        .flatten()
+                        .map(|(_, cfg)| cfg);
+
+                    executor::run_with_provider_via_daemon(
+                        provider_name,
+                        model.as_deref(),
+                        resolved_tenant,
+                        project_config.as_ref(),
+                        command,
+                        cli.json,
+                        &client,
+                    )
+                } else {
+                    // No --provider: use project config to inject all configured provider keys
+                    let project_config = config::ProjectConfig::discover()
+                        .ok()
+                        .flatten()
+                        .map(|(_, cfg)| cfg);
+
+                    if let Some(cfg) = project_config.as_ref() {
+                        executor::run_with_project_config_via_daemon(cfg, command, cli.json, &client, logical_model.as_deref(), resolved_tenant)
                     } else {
-                        eprintln!("Error: {}", e);
-                        std::process::exit(exit_code);
+                        return Err(msgs::NO_CONFIG_FOUND_HINT.into());
+                    }
+                };
+
+                match result {
+                    Ok((secrets_count, exit_code)) => {
+                        if cli.json {
+                            json_output::success_stderr(serde_json::json!({
+                                "secrets_injected": secrets_count,
+                                "exit_code": exit_code
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        // Extract exit code from error message if present
+                        let exit_code = if let Some(code_str) = e.strip_prefix("Command exited with code ") {
+                            code_str.parse::<i32>().unwrap_or(1)
+                        } else {
+                            1
+                        };
+
+                        if cli.json {
+                            json_output::error_with_data_stderr(
+                                &e,
+                                serde_json::json!({
+                                    "exit_code": exit_code
+                                }),
+                                exit_code
+                            );
+                        } else {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(exit_code);
+                        }
                     }
                 }
             }
@@ -1192,18 +1307,30 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 EnvAction::Generate { dry_run, env_file } => {
                     commands_env::handle_env_generate(*dry_run, env_file.as_deref(), cli.json)?;
                 }
-                EnvAction::Inject { command } => {
+                EnvAction::Inject { command, unsafe_plaintext } => {
                     if command.is_empty() {
-                        commands_env::handle_env_inject(cli.json)?;
+                        commands_env::handle_env_inject(cli.json, *unsafe_plaintext)?;
                     } else {
                         commands_env::handle_env_run(command, cli.json)?;
                     }
                 }
-                EnvAction::Export { format } => {
-                    commands_env::handle_env_export(format, cli.json)?;
+                EnvAction::Export { format, unsafe_plaintext } => {
+                    commands_env::handle_env_export(format, cli.json, *unsafe_plaintext)?;
                 }
                 EnvAction::Check => {
                     commands_env::handle_env_check(cli.json)?;
+                }
+                EnvAction::Use { name } => {
+                    global_config::set_current_env(name)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    if cli.json {
+                        json_output::print_json(serde_json::json!({
+                            "ok": true,
+                            "env": name
+                        }));
+                    } else {
+                        println!("Switched to environment: {}", name);
+                    }
                 }
             }
         }
@@ -1215,8 +1342,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ProjectAction::Status => {
                     commands_project::handle_project_status(cli.json)?;
                 }
-                ProjectAction::Map { var, alias } => {
-                    commands_project::handle_project_map(var, alias, cli.json)?;
+                ProjectAction::Map { var, alias, env, provider, model, key_alias, impl_id } => {
+                    commands_project::handle_project_map(var, alias, env.as_deref(), provider.as_deref(), model.as_deref(), key_alias.as_deref(), impl_id.as_deref(), cli.json)?;
                 }
             }
         }
@@ -1283,6 +1410,77 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Stats => {
             handle_stats(cli.json)?;
         }
+        Commands::Key { action } => {
+            match action {
+                KeyAction::Rotate { name, from_stdin } => {
+                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    let client = daemon_client::DaemonClient::new_default();
+                    client.unlock(password.expose_secret())
+                        .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
+
+                    let new_value = if *from_stdin {
+                        let mut buf = Zeroizing::new(String::new());
+                        io::stdin().read_line(&mut buf)?;
+                        buf
+                    } else {
+                        let val = rpassword::prompt_password(format!("New value for '{}': ", name))
+                            .map_err(|e| format!("Failed to read new key value: {}", e))?;
+                        Zeroizing::new(val)
+                    };
+                    let new_value_str = new_value.trim();
+
+                    if new_value_str.is_empty() {
+                        let err_msg = "New key value cannot be empty";
+                        if cli.json {
+                            json_output::print_json_exit(serde_json::json!({
+                                "ok": false,
+                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                "message": err_msg
+                            }), 1);
+                        } else {
+                            return Err(err_msg.into());
+                        }
+                    }
+
+                    let result = client.upsert_secret(name, new_value_str);
+                    let _ = audit::log_audit_event(&password, audit::AuditOperation::Update, Some(name), result.is_ok());
+
+                    match result {
+                        Ok(_) => {
+                            if cli.json {
+                                json_output::print_json(serde_json::json!({
+                                    "ok": true,
+                                    "name": name
+                                }));
+                            } else {
+                                println!("Key '{}' rotated successfully", name);
+                            }
+                        }
+                        Err(e) => {
+                            if cli.json {
+                                let code = error_codes::ErrorCode::from_error_message(&e);
+                                json_output::print_json_exit(serde_json::json!({
+                                    "ok": false,
+                                    "code": code.as_str(),
+                                    "message": e
+                                }), 1);
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Commands::Doctor => {
+            commands_project::handle_doctor(cli.json)?;
+        }
+        Commands::Status => {
+            commands_project::handle_project_status(cli.json)?;
+        }
+        Commands::Shell => {
+            handle_shell_command(cli.json)?;
+        }
         Commands::Logs { limit } => {
             let entries = events::list_events(*limit)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -1316,6 +1514,81 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// SECURITY HARDENING:
 /// - Wraps password in Zeroizing<String> IMMEDIATELY upon input
+/// P1-Q3: Handle aikey shell command
+/// Starts an interactive subshell with non-sensitive context only.
+/// Secrets are NOT exported as long-lived env vars; each command uses aikey run injection.
+fn handle_shell_command(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if json_mode {
+        return Err("Shell mode is not supported in JSON mode".into());
+    }
+
+    // Get project config to determine context
+    let config = config::ProjectConfig::discover()
+        .ok()
+        .flatten()
+        .map(|(_, cfg)| cfg);
+
+    let project_name = config.as_ref().map(|c| c.project.name.as_str()).unwrap_or("unknown");
+
+    // Get current environment and profile
+    let current_env = global_config::get_current_env().ok().flatten();
+    let current_profile = global_config::get_current_profile().ok().flatten();
+
+    println!("AiKey Shell - Advanced Mode");
+    println!("===========================");
+    println!("Project: {}", project_name);
+    if let Some(env) = &current_env {
+        println!("Environment: {}", env);
+    }
+    if let Some(profile) = &current_profile {
+        println!("Profile: {}", profile);
+    }
+    println!();
+    println!("⚠️  Security Notice:");
+    println!("   Secrets are NOT exported to this shell.");
+    println!("   Use 'aikey run -- <command>' to inject secrets per-command.");
+    println!();
+    println!("Type 'exit' to leave the AiKey shell.");
+    println!();
+
+    // Determine user's shell
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+
+    // Build environment with non-sensitive context only
+    let mut cmd = std::process::Command::new(&shell);
+
+    // P1-Q3: Export only non-sensitive context
+    if let Some(env) = current_env {
+        cmd.env("AIKEY_ENV", env);
+    }
+    if let Some(profile) = current_profile {
+        cmd.env("AIKEY_PROFILE", profile);
+    }
+    cmd.env("AIKEY_PROJECT", project_name);
+
+    // Set a marker so users know they're in an aikey shell
+    cmd.env("AIKEY_SHELL", "1");
+
+    // Customize prompt to show we're in aikey shell
+    let ps1 = std::env::var("PS1").unwrap_or_else(|_| "\\$ ".to_string());
+    cmd.env("PS1", format!("(aikey) {}", ps1));
+
+    // Start the subshell
+    let status = cmd.status()?;
+
+    // Cleanup message on exit
+    println!();
+    println!("Exited AiKey shell.");
+
+    if !status.success() {
+        if let Some(code) = status.code() {
+            std::process::exit(code);
+        }
+    }
+
+    Ok(())
+}
+
 /// - Disables TTY echo for interactive password entry
 /// - Converts to SecretString only after zeroizing wrapper is in place
 /// - Ensures raw password string is wiped from memory on scope exit
