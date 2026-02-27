@@ -33,7 +33,7 @@ fn test_project_init_existing_config() {
 
     // Create initial config
     let initial_config = r#"{
-        "version": "1",
+        "schemaVersion": "1",
         "project": {
             "name": "existing-project"
         },
@@ -81,7 +81,7 @@ fn test_project_status_with_config() {
     let config_path = temp_dir.path().join("aikey.config.json");
 
     let config = r#"{
-        "version": "1",
+        "schemaVersion": "1",
         "project": {
             "name": "test-project"
         },
@@ -110,7 +110,7 @@ fn test_env_generate_no_existing_env() {
     let config_path = temp_dir.path().join("aikey.config.json");
 
     let config = r#"{
-        "version": "1",
+        "schemaVersion": "1",
         "project": {
             "name": "test-project"
         },
@@ -146,7 +146,7 @@ fn test_env_generate_with_existing_env() {
     let env_path = temp_dir.path().join(".env");
 
     let config = r#"{
-        "version": "1",
+        "schemaVersion": "1",
         "project": {
             "name": "test-project"
         },
@@ -185,7 +185,7 @@ fn test_env_generate_dry_run() {
     let env_path = temp_dir.path().join(".env");
 
     let config = r#"{
-        "version": "1",
+        "schemaVersion": "1",
         "project": {
             "name": "test-project"
         },
@@ -216,7 +216,7 @@ fn test_env_inject_basic() {
     let config_path = temp_dir.path().join("aikey.config.json");
 
     let config = r#"{
-        "version": "1",
+        "schemaVersion": "1",
         "project": {
             "name": "test-project"
         },
@@ -248,7 +248,7 @@ fn test_env_inject_eval_mode() {
     let config_path = temp_dir.path().join("aikey.config.json");
 
     let config = r#"{
-        "version": "1",
+        "schemaVersion": "1",
         "project": {
             "name": "test-project"
         },

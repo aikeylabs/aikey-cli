@@ -34,6 +34,7 @@ pub struct LogicalModelMapping {
 /// Project configuration structure following CONFIG_SPEC.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
+    #[serde(rename = "schemaVersion")]
     pub version: String,
     pub project: ProjectInfo,
     pub env: EnvConfig,
@@ -221,7 +222,7 @@ mod tests {
     #[test]
     fn test_project_config_parse_json() {
         let json = r#"{
-            "version": "1",
+            "schemaVersion": "1",
             "project": {
                 "name": "test-project"
             },
@@ -244,7 +245,7 @@ mod tests {
     #[test]
     fn test_project_config_parse_yaml() {
         let yaml = r#"
-version: "1"
+schemaVersion: "1"
 project:
   name: test-project
 env:
@@ -266,7 +267,7 @@ defaults:
     #[test]
     fn test_project_config_minimal() {
         let json = r#"{
-            "version": "1",
+            "schemaVersion": "1",
             "project": {
                 "name": "minimal"
             },
