@@ -57,7 +57,7 @@ pub enum ResolveError {
     /// No provider name was given
     MissingProvider,
     /// No alias could be found for the provider in any config layer
-    NoAliasFound { provider: String },
+    NoAliasFound { provider: String, profile: Option<String> },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -65,8 +65,10 @@ impl std::fmt::Display for ResolveError {
         match self {
             ResolveError::MissingProvider =>
                 write!(f, "provider name is required"),
-            ResolveError::NoAliasFound { provider } =>
-                write!(f, "no key alias found for provider '{}'; add it to aikey.config.json providers section", provider),
+            ResolveError::NoAliasFound { provider, profile } => {
+                let profile_str = profile.as_deref().unwrap_or("default");
+                write!(f, "Missing key: {}:<keyAlias> in profile '{}'.\nFix: run 'aikey provider add {} --alias <alias>' or aikey setup", provider, profile_str, provider)
+            }
         }
     }
 }
@@ -130,6 +132,7 @@ pub fn resolve(
     // Steps 1 & 5 – no config match; caller must handle vault lookup by alias
     Err(ResolveError::NoAliasFound {
         provider: request.provider.clone(),
+        profile: request.profile.clone(),
     })
 }
 
@@ -176,6 +179,7 @@ mod tests {
             providers,
             tenants,
             hooks: HashMap::new(),
+            env_mappings: HashMap::new(),
         }
     }
 
@@ -252,7 +256,7 @@ mod tests {
             ..Default::default()
         };
         let err = resolve(&req, None).unwrap_err();
-        assert_eq!(err, ResolveError::NoAliasFound { provider: "openai".to_string() });
+        assert_eq!(err, ResolveError::NoAliasFound { provider: "openai".to_string(), profile: None });
     }
 
     #[test]
@@ -270,7 +274,7 @@ mod tests {
             ..Default::default()
         };
         let err = resolve(&req, Some(&cfg)).unwrap_err();
-        assert_eq!(err, ResolveError::NoAliasFound { provider: "cohere".to_string() });
+        assert_eq!(err, ResolveError::NoAliasFound { provider: "cohere".to_string(), profile: None });
     }
 
     #[test]
