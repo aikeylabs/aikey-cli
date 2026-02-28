@@ -2,7 +2,6 @@ use crate::crypto;
 use crate::storage;
 use crate::config::ProjectConfig;
 use crate::providers::Provider;
-use crate::daemon_client::DaemonClient;
 use crate::events::EventBuilder;
 use crate::global_config;
 use crate::error_codes::msgs;
@@ -306,7 +305,7 @@ pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &s
 /// # Example
 /// ```no_run
 /// use secrecy::SecretString;
-/// use aikeylabs_ak::executor::exec_with_env;
+/// use aikeylabs_aikey_cli::executor::exec_with_env;
 ///
 /// # fn main() -> Result<(), String> {
 /// let password = SecretString::new("master_password".to_string());
@@ -484,7 +483,7 @@ pub fn exec_with_env(
 /// # Example
 /// ```no_run
 /// use secrecy::SecretString;
-/// use aikeylabs_ak::executor::run_with_all_secrets;
+/// use aikeylabs_aikey_cli::executor::run_with_all_secrets;
 ///
 /// # fn main() -> Result<(), String> {
 /// let password = SecretString::new("master_password".to_string());
@@ -592,54 +591,6 @@ pub fn run_with_all_secrets(
     Ok((secrets_count, exit_code))
 }
 
-/// Execute a command with environment variables resolved via daemon RPC
-/// This avoids direct vault access and relies on daemon for secret retrieval.
-pub fn exec_with_env_via_daemon(
-    env_mappings: &[String],
-    command: &[String],
-    client: &DaemonClient,
-) -> Result<(), String> {
-    if command.is_empty() {
-        return Err("No command specified".to_string());
-    }
-
-    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
-        std::collections::HashMap::with_capacity(env_mappings.len());
-
-    let decryption_results: Result<Vec<(String, Zeroizing<String>)>, String> = env_mappings
-        .par_iter()
-        .map(|mapping| {
-            let parts: Vec<&str> = mapping.splitn(2, '=').collect();
-            if parts.len() != 2 {
-                return Err(format!(
-                    "Invalid env mapping '{}'. Expected format: ENV_VAR=alias",
-                    mapping
-                ));
-            }
-
-            let env_name = parts[0].trim();
-            let alias = parts[1].trim();
-
-            if env_name.is_empty() || alias.is_empty() {
-                return Err(format!(
-                    "Invalid env mapping '{}'. Both ENV_VAR and alias must be non-empty",
-                    mapping
-                ));
-            }
-
-            // Fetch secret value via daemon
-            let value = client.get_secret(alias)?;
-            Ok((env_name.to_string(), Zeroizing::new(value)))
-        })
-        .collect();
-
-    for (env_name, secret) in decryption_results? {
-        env_secrets.insert(env_name, secret);
-    }
-
-    spawn_with_env(env_secrets, command, false, None).map(|_| ())
-}
-
 /// Inject non-sensitive context vars (AIKEY_PROJECT, AIKEY_ENV, AIKEY_PROFILE)
 /// into a Command. Values are sourced from global config; missing values are silently skipped.
 fn inject_context_vars(cmd: &mut std::process::Command, project_name: Option<&str>) {
@@ -711,100 +662,6 @@ fn spawn_with_env(
     }
 
     Ok((secrets_count, exit_code))
-}
-
-/// Execute a command with ALL secrets fetched via daemon RPC
-pub fn run_with_all_secrets_via_daemon(
-    command: &[String],
-    json_mode: bool,
-    client: &DaemonClient,
-) -> Result<(usize, i32), String> {
-    let aliases = client.list_secrets()?;
-
-    if aliases.is_empty() {
-        return Err("No secrets found in vault".to_string());
-    }
-
-    let secrets_count = aliases.len();
-    if !json_mode {
-        eprintln!("Injecting {} secret(s)", secrets_count);
-    }
-
-    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
-        std::collections::HashMap::with_capacity(aliases.len());
-
-    for alias in &aliases {
-        let value = client.get_secret(alias)?;
-        let env_name = alias.to_uppercase().replace('-', "_");
-        env_secrets.insert(env_name, Zeroizing::new(value));
-    }
-
-    spawn_with_env(env_secrets, command, json_mode, None)
-}
-
-/// Execute a command with a single provider's key resolved via the 5-step resolver.
-///
-/// Uses `resolver::resolve` to determine the vault alias, then fetches it via daemon
-/// and injects it as the provider's canonical env var (e.g. `OPENAI_API_KEY`).
-/// If `model` is resolved, it is also injected as `AIKEY_MODEL`.
-pub fn run_with_provider_via_daemon(
-    provider: &str,
-    model: Option<&str>,
-    tenant: Option<&str>,
-    config: Option<&ProjectConfig>,
-    command: &[String],
-    json_mode: bool,
-    client: &DaemonClient,
-) -> Result<(usize, i32), String> {
-    use crate::resolver::{resolve, ResolveRequest};
-
-    let request = ResolveRequest {
-        provider: provider.to_string(),
-        model: model.map(|s| s.to_string()),
-        tenant: tenant.map(|s| s.to_string()),
-        ..Default::default()
-    };
-
-    let resolved = resolve(&request, config).map_err(|e| e.to_string())?;
-
-    let profile = client.get_current_profile().unwrap_or_else(|_| "default".to_string());
-    let secret = client.get_secret(&resolved.key_alias)
-        .map_err(|_| format!("Missing key: {}:{} in profile '{}'", provider, resolved.key_alias, profile))?;
-
-    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
-        std::collections::HashMap::new();
-    env_secrets.insert(resolved.env_var.clone(), Zeroizing::new(secret));
-
-    if let Some(m) = &resolved.model {
-        env_secrets.insert("AIKEY_MODEL".to_string(), Zeroizing::new(m.clone()));
-    }
-
-    let secrets_count = env_secrets.len();
-    if !json_mode {
-        eprintln!("Injecting {} secret(s) for provider '{}'", secrets_count, provider);
-    }
-
-    let parsed_parts: Vec<String> = if command.len() == 1 {
-        shell_words::split(&command[0])
-            .map_err(|e| format!("Failed to parse command '{}': {}", command[0], e))?
-    } else {
-        command.to_vec()
-    };
-
-    let t0 = std::time::Instant::now();
-    let result = spawn_with_env(env_secrets, command, json_mode, config.map(|c| c.project.name.as_str()));
-    let duration_ms = t0.elapsed().as_millis() as i64;
-    let exit_code = match &result { Ok((_, c)) => *c, Err(e) => e.strip_prefix("Command exited with code ").and_then(|s| s.parse().ok()).unwrap_or(1) };
-
-    let _ = EventBuilder::new("run")
-        .provider(provider)
-        .command(&parsed_parts.join(" "))
-        .exit_code(exit_code)
-        .duration_ms(duration_ms)
-        .secrets_count(secrets_count as i32)
-        .record();
-
-    result
 }
 
 /// Compute injection set from env_mappings with tenant override tracking
@@ -945,129 +802,6 @@ fn compute_injection_set_from_env_mappings(
         .map(|set| set.into_iter().map(|(provider, key_alias, model, _)| (provider, key_alias, model)).collect())
 }
 
-pub fn run_with_project_config_via_daemon(
-    config: &ProjectConfig,
-    command: &[String],
-    json_mode: bool,
-    client: &DaemonClient,
-    logical_model: Option<&str>,
-    tenant: Option<&str>,
-) -> Result<(usize, i32), String> {
-    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
-        std::collections::HashMap::new();
-
-    // Stage0 Decision I: Mapping-closed injection boundary
-    // If envMappings[env] exists and is non-empty, inject only mapping-derived credentials (closed set)
-    // Only fall back to config.providers when mappings are missing/empty
-    let current_env = crate::global_config::get_current_env().ok().flatten();
-    let has_env_mappings = current_env.as_ref()
-        .and_then(|env| config.env_mappings.get(env.as_str()))
-        .map(|map| !map.is_empty())
-        .unwrap_or(false);
-
-    if has_env_mappings {
-        // Mapping-closed mode: inject only from env_mappings
-        // Stage0 Decision H & I: Collision detection happens here
-        let injection_set = compute_injection_set_from_env_mappings(
-            config,
-            current_env.as_ref().unwrap(),
-            logical_model,
-            tenant,
-        )?; // Propagate collision errors
-
-        for (provider, key_alias, _model) in injection_set {
-            let env_var = Provider::parse(&provider).env_var();
-            match client.get_secret(&key_alias) {
-                Ok(value) => {
-                    env_secrets.insert(env_var, Zeroizing::new(value));
-                }
-                Err(e) => {
-                    if !json_mode {
-                        eprintln!("Warning: could not fetch secret '{}' for provider '{}': {}", key_alias, provider, e);
-                    }
-                }
-            }
-        }
-    } else {
-        // Fallback mode: use config.providers (legacy compatibility)
-        for (provider_name, provider_cfg) in &config.providers {
-            let env_var = Provider::parse(provider_name).env_var();
-            match client.get_secret(&provider_cfg.key_alias) {
-                Ok(value) => { env_secrets.insert(env_var, Zeroizing::new(value)); }
-                Err(e) => {
-                    if !json_mode {
-                        eprintln!("Warning: could not fetch secret '{}' for provider '{}': {}", provider_cfg.key_alias, provider_name, e);
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. requiredVars resolution via active profile bindings
-    // Stage0 Decision I: requiredVars collision detection
-    // If a requiredVars entry collides with a provider env var → FAIL (no silent override)
-    let binding_map: std::collections::HashMap<String, String> = client
-        .get_current_profile()
-        .ok()
-        .and_then(|profile| client.list_bindings(&profile).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-
-    for var_name in &config.required_vars {
-        // Stage0 Decision I: Collision detection for requiredVars
-        if env_secrets.contains_key(var_name) {
-            // Collision: requiredVars entry collides with a provider env var
-            return Err(format!(
-                "Collision detected: requiredVars entry '{}' collides with a provider env var.\n\
-                 \n\
-                 Fix:\n\
-                 - Remove '{}' from requiredVars if it should come from a provider\n\
-                 - Or rename the provider env var to avoid collision\n\
-                 - requiredVars and provider env vars must not overlap",
-                var_name, var_name
-            ));
-        }
-
-        // binding map: domain -> alias; fall back to var_name as alias
-        let alias = binding_map.get(var_name).cloned().unwrap_or_else(|| var_name.clone());
-        match client.get_secret(&alias) {
-            Ok(value) => { env_secrets.insert(var_name.clone(), Zeroizing::new(value)); }
-            Err(e) => {
-                if !json_mode {
-                    eprintln!("Warning: could not fetch secret '{}' for var '{}': {}", alias, var_name, e);
-                }
-            }
-        }
-    }
-
-    let secrets_count = env_secrets.len();
-    if !json_mode {
-        let mode = if has_env_mappings { "mapping-closed" } else { "provider-fallback" };
-        eprintln!("Injecting {} secret(s) ({})", secrets_count, mode);
-    }
-
-    let parsed_parts: Vec<String> = if command.len() == 1 {
-        shell_words::split(&command[0])
-            .map_err(|e| format!("Failed to parse command '{}': {}", command[0], e))?
-    } else {
-        command.to_vec()
-    };
-
-    let t0 = std::time::Instant::now();
-    let result = spawn_with_env(env_secrets, command, json_mode, Some(config.project.name.as_str()));
-    let duration_ms = t0.elapsed().as_millis() as i64;
-    let exit_code = match &result { Ok((_, c)) => *c, Err(e) => e.strip_prefix("Command exited with code ").and_then(|s| s.parse().ok()).unwrap_or(1) };
-
-    let _ = EventBuilder::new("run")
-        .command(&parsed_parts.join(" "))
-        .exit_code(exit_code)
-        .duration_ms(duration_ms)
-        .secrets_count(secrets_count as i32)
-        .record();
-
-    result
-}
 
 #[allow(dead_code)]
 pub fn export_secrets(pattern: &str, password: &SecretString) -> Result<String, String> {
@@ -1194,12 +928,267 @@ pub fn import_secrets(json_data: &str, password: &SecretString, strategy: &str) 
 ///
 /// Resolves the provider key alias and returns the list of env var names that
 /// would be injected, without actually running any command.
+/// Dry-run variant of `run_with_project_config_via_daemon`.
+///
+/// Stage0 Decision H: --dry-run output contract
+/// - No execution occurs
+/// - No secret values shown
+/// - Stable output ordering (sorted by env_var)
+/// - Strict tenant_override_applied (true only when override actually matched and changed key_alias)
+/// - Implements mapping-closed boundary (same as run)
+
+/// Execute a command with a single provider's key resolved via the 5-step resolver.
+/// Password-based version (no daemon).
+///
+/// Uses `resolver::resolve` to determine the vault alias, then fetches it directly
+/// and injects it as the provider's canonical env var (e.g. `OPENAI_API_KEY`).
+/// If `model` is resolved, it is also injected as `AIKEY_MODEL`.
+pub fn run_with_provider(
+    provider: &str,
+    model: Option<&str>,
+    tenant: Option<&str>,
+    config: Option<&ProjectConfig>,
+    password: &SecretString,
+    command: &[String],
+    json_mode: bool,
+) -> Result<(usize, i32), String> {
+    use crate::resolver::{resolve, ResolveRequest};
+
+    let ctx = VaultContext::new(password)?;
+
+    let request = ResolveRequest {
+        provider: provider.to_string(),
+        model: model.map(|s| s.to_string()),
+        tenant: tenant.map(|s| s.to_string()),
+        ..Default::default()
+    };
+
+    let resolved = resolve(&request, config).map_err(|e| e.to_string())?;
+
+    // Fetch secret from vault
+    let (nonce, ciphertext) = storage::get_entry(&resolved.key_alias)
+        .map_err(|_| format!("Missing key: {} in vault", resolved.key_alias))?;
+    let plaintext = ctx.decrypt(&nonce, &ciphertext)?;
+    let secret = std::str::from_utf8(&plaintext)
+        .map_err(|e| format!("Invalid UTF-8 in secret: {}", e))?
+        .to_string();
+
+    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
+        std::collections::HashMap::new();
+    env_secrets.insert(resolved.env_var.clone(), Zeroizing::new(secret));
+
+    if let Some(m) = &resolved.model {
+        env_secrets.insert("AIKEY_MODEL".to_string(), Zeroizing::new(m.clone()));
+    }
+
+    let secrets_count = env_secrets.len();
+    if !json_mode {
+        eprintln!("Injecting {} secret(s) for provider '{}'", secrets_count, provider);
+    }
+
+    let parsed_parts: Vec<String> = if command.len() == 1 {
+        shell_words::split(&command[0])
+            .map_err(|e| format!("Failed to parse command '{}': {}", command[0], e))?
+    } else {
+        command.to_vec()
+    };
+
+    let t0 = std::time::Instant::now();
+    let result = spawn_with_env(env_secrets, command, json_mode, config.map(|c| c.project.name.as_str()));
+    let duration_ms = t0.elapsed().as_millis() as i64;
+    let exit_code = match &result {
+        Ok((_, c)) => *c,
+        Err(e) => e.strip_prefix("Command exited with code ")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    };
+
+    let _ = EventBuilder::new("run")
+        .provider(provider)
+        .command(&parsed_parts.join(" "))
+        .exit_code(exit_code)
+        .duration_ms(duration_ms)
+        .secrets_count(secrets_count as i32)
+        .record();
+
+    result
+}
+
+/// Execute a command with secrets resolved from a project config.
+/// Password-based version (no daemon).
+///
+/// Resolution order (Stage0 Decision I - mapping-closed boundary):
+/// - If `envMappings[env]` exists and is non-empty: inject only mapping-derived credentials (closed set)
+/// - If `envMappings[env]` is missing/empty: fall back to `config.providers`
+/// - `config.required_vars` are always resolved independently
+///
+/// Returns `(secrets_injected, exit_code)`.
+pub fn run_with_project_config(
+    config: &ProjectConfig,
+    password: &SecretString,
+    command: &[String],
+    json_mode: bool,
+    logical_model: Option<&str>,
+    tenant: Option<&str>,
+) -> Result<(usize, i32), String> {
+    let ctx = VaultContext::new(password)?;
+    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
+        std::collections::HashMap::new();
+
+    // Stage0 Decision I: Mapping-closed injection boundary
+    let current_env = crate::global_config::get_current_env().ok().flatten();
+    let has_env_mappings = current_env.as_ref()
+        .and_then(|env| config.env_mappings.get(env.as_str()))
+        .map(|map| !map.is_empty())
+        .unwrap_or(false);
+
+    if has_env_mappings {
+        // Mapping-closed mode: inject only from env_mappings
+        let injection_set = compute_injection_set_from_env_mappings(
+            config,
+            current_env.as_ref().unwrap(),
+            logical_model,
+            tenant,
+        )?;
+
+        for (provider, key_alias, _model) in injection_set {
+            let env_var = Provider::parse(&provider).env_var();
+            match storage::get_entry(&key_alias) {
+                Ok((nonce, ciphertext)) => {
+                    match ctx.decrypt(&nonce, &ciphertext) {
+                        Ok(plaintext) => {
+                            let secret = std::str::from_utf8(&plaintext)
+                                .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", key_alias, e))?
+                                .to_string();
+                            env_secrets.insert(env_var, Zeroizing::new(secret));
+                        }
+                        Err(e) => {
+                            if !json_mode {
+                                eprintln!("Warning: could not decrypt secret '{}': {}", key_alias, e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !json_mode {
+                        eprintln!("Warning: could not fetch secret '{}' for provider '{}': {}", key_alias, provider, e);
+                    }
+                }
+            }
+        }
+    } else {
+        // Fallback mode: use config.providers (legacy compatibility)
+        for (provider_name, provider_cfg) in &config.providers {
+            let env_var = Provider::parse(provider_name).env_var();
+            match storage::get_entry(&provider_cfg.key_alias) {
+                Ok((nonce, ciphertext)) => {
+                    match ctx.decrypt(&nonce, &ciphertext) {
+                        Ok(plaintext) => {
+                            let secret = std::str::from_utf8(&plaintext)
+                                .map_err(|e| format!("Invalid UTF-8 in secret: {}", e))?
+                                .to_string();
+                            env_secrets.insert(env_var, Zeroizing::new(secret));
+                        }
+                        Err(e) => {
+                            if !json_mode {
+                                eprintln!("Warning: could not decrypt secret '{}': {}", provider_cfg.key_alias, e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if !json_mode {
+                        eprintln!("Warning: could not fetch secret '{}' for provider '{}': {}", provider_cfg.key_alias, provider_name, e);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. requiredVars resolution via bindings
+    // Stage0 Decision I: requiredVars collision detection
+    for var_name in &config.required_vars {
+        if env_secrets.contains_key(var_name) {
+            return Err(format!(
+                "Collision detected: requiredVars entry '{}' collides with a provider env var.\n\
+                 \n\
+                 Fix:\n\
+                 - Remove '{}' from requiredVars if it should come from a provider\n\
+                 - Or rename the provider env var to avoid collision\n\
+                 - requiredVars and provider env vars must not overlap",
+                var_name, var_name
+            ));
+        }
+
+        // Use binding if exists, otherwise use var_name as alias
+        let alias = config.bindings.get(var_name)
+            .cloned()
+            .unwrap_or_else(|| var_name.clone());
+
+        match storage::get_entry(&alias) {
+            Ok((nonce, ciphertext)) => {
+                match ctx.decrypt(&nonce, &ciphertext) {
+                    Ok(plaintext) => {
+                        let secret = std::str::from_utf8(&plaintext)
+                            .map_err(|e| format!("Invalid UTF-8 in secret: {}", e))?
+                            .to_string();
+                        env_secrets.insert(var_name.clone(), Zeroizing::new(secret));
+                    }
+                    Err(e) => {
+                        if !json_mode {
+                            eprintln!("Warning: could not decrypt secret '{}': {}", alias, e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if !json_mode {
+                    eprintln!("Warning: could not fetch secret '{}' for var '{}': {}", alias, var_name, e);
+                }
+            }
+        }
+    }
+
+    let secrets_count = env_secrets.len();
+    if !json_mode {
+        let mode = if has_env_mappings { "mapping-closed" } else { "provider-fallback" };
+        eprintln!("Injecting {} secret(s) ({})", secrets_count, mode);
+    }
+
+    let parsed_parts: Vec<String> = if command.len() == 1 {
+        shell_words::split(&command[0])
+            .map_err(|e| format!("Failed to parse command '{}': {}", command[0], e))?
+    } else {
+        command.to_vec()
+    };
+
+    let t0 = std::time::Instant::now();
+    let result = spawn_with_env(env_secrets, command, json_mode, Some(config.project.name.as_str()));
+    let duration_ms = t0.elapsed().as_millis() as i64;
+    let exit_code = match &result {
+        Ok((_, c)) => *c,
+        Err(e) => e.strip_prefix("Command exited with code ")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+    };
+
+    let _ = EventBuilder::new("run")
+        .command(&parsed_parts.join(" "))
+        .exit_code(exit_code)
+        .duration_ms(duration_ms)
+        .secrets_count(secrets_count as i32)
+        .record();
+
+    result
+}
+
+/// Dry-run for provider mode - shows what would be injected without executing.
+/// No password needed (metadata only).
 pub fn dry_run_provider(
     provider: &str,
     model: Option<&str>,
     tenant: Option<&str>,
     config: Option<&ProjectConfig>,
-    client: &DaemonClient,
 ) -> Result<Vec<DryRunInfo>, String> {
     use crate::resolver::{resolve, ResolveRequest, ResolveSource};
 
@@ -1212,94 +1201,67 @@ pub fn dry_run_provider(
 
     let resolved = resolve(&request, config).map_err(|e| e.to_string())?;
 
-    // Validate the secret is accessible
-    let profile = client.get_current_profile().unwrap_or_else(|_| "default".to_string());
-    client.get_secret(&resolved.key_alias)
-        .map_err(|_| format!("Missing key: {}:{} in profile '{}'", provider, resolved.key_alias, profile))?;
+    let source = match resolved.source {
+        ResolveSource::Explicit => "Explicit",
+        ResolveSource::Tenant => "Tenant",
+        ResolveSource::Base => "Base",
+        ResolveSource::LogicalModel => "LogicalModel",
+    };
 
-    // P1-Q4: Return detailed dry-run information
-    let tenant_override = matches!(resolved.source, ResolveSource::Tenant);
-    let source = format!("{:?}", resolved.source);
+    let info = DryRunInfo {
+        env_var: resolved.env_var,
+        provider: resolved.provider,
+        model: resolved.model,
+        key_alias: resolved.key_alias,
+        tenant_override: resolved.source == ResolveSource::Tenant,
+        source: source.to_string(),
+    };
 
-    let mut infos = vec![DryRunInfo {
-        env_var: resolved.env_var.clone(),
-        provider: resolved.provider.clone(),
-        model: resolved.model.clone(),
-        key_alias: resolved.key_alias.clone(),
-        tenant_override,
-        source,
-    }];
-
-    // Add AIKEY_MODEL if model is present
-    if resolved.model.is_some() {
-        infos.push(DryRunInfo {
-            env_var: "AIKEY_MODEL".to_string(),
-            provider: resolved.provider.clone(),
-            model: resolved.model.clone(),
-            key_alias: String::new(), // Not applicable for AIKEY_MODEL
-            tenant_override: false,
-            source: "Context".to_string(),
-        });
-    }
-
-    Ok(infos)
+    Ok(vec![info])
 }
 
-/// Dry-run variant of `run_with_project_config_via_daemon`.
-///
-/// Stage0 Decision H: --dry-run output contract
-/// - No execution occurs
-/// - No secret values shown
-/// - Stable output ordering (sorted by env_var)
-/// - Strict tenant_override_applied (true only when override actually matched and changed key_alias)
-/// - Implements mapping-closed boundary (same as run)
+/// Dry-run for project config mode - shows what would be injected without executing.
+/// No password needed (metadata only).
 pub fn dry_run_project_config(
     config: &ProjectConfig,
-    client: &DaemonClient,
     logical_model: Option<&str>,
     tenant: Option<&str>,
 ) -> Result<Vec<DryRunInfo>, String> {
-    let mut infos: Vec<DryRunInfo> = Vec::new();
-    let profile = client.get_current_profile().unwrap_or_else(|_| "default".to_string());
+    let current_env = crate::global_config::get_current_env()
+        .ok()
+        .flatten()
+        .ok_or("No current environment set. Use 'aikey env use <env>'")?;
 
-    // Stage0 Decision I: Mapping-closed injection boundary (same as run)
-    let current_env = crate::global_config::get_current_env().ok().flatten();
-    let has_env_mappings = current_env.as_ref()
-        .and_then(|env| config.env_mappings.get(env.as_str()))
+    let has_env_mappings = config.env_mappings.get(&current_env)
         .map(|map| !map.is_empty())
         .unwrap_or(false);
 
+    let mut infos = Vec::new();
+
     if has_env_mappings {
-        // Mapping-closed mode: inject only from env_mappings
-        // Stage0 Decision H & I: Collision detection happens here
+        // Use compute_injection_set_with_tenant_tracking for accurate tenant_override tracking
         let injection_set = compute_injection_set_with_tenant_tracking(
             config,
-            current_env.as_ref().unwrap(),
+            &current_env,
             logical_model,
             tenant,
-        )?; // Propagate collision errors
+        )?;
 
         for (provider, key_alias, model, tenant_override_applied) in injection_set {
             let env_var = Provider::parse(&provider).env_var();
-            client.get_secret(&key_alias)
-                .map_err(|_| format!("Missing key: {}:{} in profile '{}'", provider, key_alias, profile))?;
-
             infos.push(DryRunInfo {
                 env_var,
-                provider: provider.clone(),
+                provider,
                 model,
-                key_alias: key_alias.clone(),
+                key_alias,
                 tenant_override: tenant_override_applied,
                 source: "LogicalModel".to_string(),
             });
         }
     } else {
-        // Fallback mode: use config.providers (legacy compatibility)
+        // Fallback mode: use config.providers
         for (provider_name, provider_cfg) in &config.providers {
             let env_var = Provider::parse(provider_name).env_var();
-            client.get_secret(&provider_cfg.key_alias)
-                .map_err(|_| format!("Missing key: {}:{} in profile '{}'", provider_name, provider_cfg.key_alias, profile))?;
-
             infos.push(DryRunInfo {
                 env_var,
                 provider: provider_name.clone(),
@@ -1311,42 +1273,7 @@ pub fn dry_run_project_config(
         }
     }
 
-    let binding_map: std::collections::HashMap<String, String> = client
-        .list_bindings(&profile)
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-
-    for var_name in &config.required_vars {
-        // Stage0 Decision I: Collision detection for requiredVars
-        if infos.iter().any(|info| info.env_var == *var_name) {
-            // Collision: requiredVars entry collides with a provider env var
-            return Err(format!(
-                "Collision detected: requiredVars entry '{}' collides with a provider env var.\n\
-                 \n\
-                 Fix:\n\
-                 - Remove '{}' from requiredVars if it should come from a provider\n\
-                 - Or rename the provider env var to avoid collision\n\
-                 - requiredVars and provider env vars must not overlap",
-                var_name, var_name
-            ));
-        }
-
-        let alias = binding_map.get(var_name).cloned().unwrap_or_else(|| var_name.clone());
-        client.get_secret(&alias)
-            .map_err(|_| format!("Missing key: {} in profile '{}'", alias, profile))?;
-
-        infos.push(DryRunInfo {
-            env_var: var_name.clone(),
-            provider: "custom".to_string(),
-            model: None,
-            key_alias: alias,
-            tenant_override: false,
-            source: "Binding".to_string(),
-        });
-    }
-
-    // Stage0 Decision H: Stable output ordering (sort by env_var)
+    // Sort byr stable output
     infos.sort_by(|a, b| a.env_var.cmp(&b.env_var));
 
     Ok(infos)

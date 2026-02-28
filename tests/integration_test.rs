@@ -29,6 +29,7 @@ impl TestEnv {
         let mut cmd = Command::new(cargo_bin("ak"));
         cmd.env("HOME", self._temp_dir.path());
         cmd.env("AK_TEST_PASSWORD", &self.test_password);
+        cmd.current_dir(self._temp_dir.path());  // Set working directory to temp dir
         cmd
     }
 
@@ -106,6 +107,29 @@ impl TestEnv {
     /// Get vault database path
     fn db_path(&self) -> PathBuf {
         self.vault_path.join("vault.db")
+    }
+
+    /// Create a minimal project config file for testing
+    fn create_test_config(&self, required_vars: Vec<&str>) {
+        let required_vars_json: Vec<String> = required_vars.iter().map(|v| format!("\"{}\"", v)).collect();
+        let config = format!(
+            r#"{{
+    "schemaVersion": "0.1.0",
+    "project": {{"name": "test"}},
+    "env": {{"target": ".env"}},
+    "providers": {{}},
+    "requiredVars": [{}],
+    "bindings": {{}},
+    "envMappings": {{}}
+}}"#,
+            required_vars_json.join(", ")
+        );
+        let config_path = self._temp_dir.path().join("aikey.config.json");
+        fs::write(&config_path, config)
+            .expect("Failed to create test config");
+
+        // Verify the file was created
+        assert!(config_path.exists(), "Config file should exist at {:?}", config_path);
     }
 }
 
@@ -236,6 +260,9 @@ fn test_03_injection_engine() {
     let env = TestEnv::new();
     env.init_vault();
 
+    // Create config file with required vars
+    env.create_test_config(vec!["TEST_VAR", "ANOTHER_VAR"]);
+
     // Add test secrets
     env.add_secret("TEST_VAR", "secret_value_123").success();
     env.add_secret("ANOTHER_VAR", "another_secret_456").success();
@@ -362,15 +389,16 @@ fn test_06_empty_vault_operations() {
         .success()
         .stdout(predicate::str::contains("No secrets stored"));
 
-    // Test: Run with empty vault
+    // Test: Run with empty vault and empty config (no required vars)
+    env.create_test_config(vec![]);
     env.cmd()
         .arg("run")
         .arg("--")
         .arg("echo")
         .arg("test")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("No secrets found in vault"));
+        .success()  // Should succeed with 0 injections
+        .stderr(predicate::str::contains("Injecting 0 secret(s)"));
 
     // Test: Get non-existent secret
     env.cmd()
@@ -385,6 +413,9 @@ fn test_06_empty_vault_operations() {
 fn test_07_special_characters_in_secrets() {
     let env = TestEnv::new();
     env.init_vault();
+
+    // Create config with SPECIAL_CHARS as required var
+    env.create_test_config(vec!["SPECIAL_CHARS"]);
 
     // Test secrets with special characters
     let special_secret = "p@ssw0rd!#$%^&*(){}[]|\\:;\"'<>,.?/~`";
@@ -408,6 +439,9 @@ fn test_07_special_characters_in_secrets() {
 fn test_08_run_command_exit_codes() {
     let env = TestEnv::new();
     env.init_vault();
+
+    // Create config with TEST_VAR as required var
+    env.create_test_config(vec!["TEST_VAR"]);
 
     env.add_secret("TEST_VAR", "test_value").success();
 
@@ -438,6 +472,9 @@ fn test_08_run_command_exit_codes() {
 fn test_09_update_secret() {
     let env = TestEnv::new();
     env.init_vault();
+
+    // Create config with UPDATE_TEST as required var
+    env.create_test_config(vec!["UPDATE_TEST"]);
 
     // Test: Add initial secret
     env.add_secret("UPDATE_TEST", "initial_value")

@@ -30,6 +30,7 @@ impl TestEnv {
         let mut cmd = Command::new(cargo_bin("ak"));
         cmd.env("HOME", self._temp_dir.path());
         cmd.env("AK_TEST_PASSWORD", &self.test_password);
+        cmd.current_dir(self._temp_dir.path());  // Set working directory to temp dir
         cmd
     }
 
@@ -93,6 +94,26 @@ impl TestEnv {
             .arg(alias)
             .env("AK_TEST_SECRET", secret_value)
             .assert()
+    }
+
+    /// Create a minimal project config file for testing
+    fn create_test_config(&self, required_vars: Vec<&str>) {
+        let required_vars_json: Vec<String> = required_vars.iter().map(|v| format!("\"{}\"", v)).collect();
+        let config = format!(
+            r#"{{
+    "schemaVersion": "0.1.0",
+    "project": {{"name": "test"}},
+    "env": {{"target": ".env"}},
+    "providers": {{}},
+    "requiredVars": [{}],
+    "bindings": {{}},
+    "envMappings": {{}}
+}}"#,
+            required_vars_json.join(", ")
+        );
+        let config_path = self._temp_dir.path().join("aikey.config.json");
+        fs::write(&config_path, config)
+            .expect("Failed to create test config");
     }
 }
 
@@ -352,6 +373,7 @@ fn test_json_run_command() {
     env.init_vault();
 
     env.add_secret("TEST_VAR", "test_value").success();
+    env.create_test_config(vec!["TEST_VAR"]);
 
     let output = env.cmd()
         .arg("run")
@@ -374,6 +396,7 @@ fn test_json_run_command() {
 fn test_json_run_no_secrets() {
     let env = TestEnv::new();
     env.init_vault();
+    env.create_test_config(vec![]);
 
     let output = env.cmd()
         .arg("run")
@@ -382,13 +405,13 @@ fn test_json_run_no_secrets() {
         .arg("echo")
         .arg("test")
         .assert()
-        .failure();
+        .success();
 
     let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
     let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
-    assert_eq!(json["status"], "error");
-    assert!(json["error"].as_str().unwrap().contains("No secrets found"));
+    assert_eq!(json["status"], "success");
+    assert_eq!(json["secrets_injected"], 0);
 }
 
 #[test]
@@ -397,6 +420,7 @@ fn test_json_run_command_failure() {
     env.init_vault();
 
     env.add_secret("TEST_VAR", "value").success();
+    env.create_test_config(vec!["TEST_VAR"]);
 
     let output = env.cmd()
         .arg("run")

@@ -35,6 +35,7 @@ impl TestEnv {
         let mut cmd = Command::new(cargo_bin("aikey"));
         cmd.env("HOME", self._temp_dir.path());
         cmd.env("AK_TEST_PASSWORD", &self.test_password);
+        cmd.current_dir(self._temp_dir.path());  // Set working directory to temp dir
         cmd
     }
 
@@ -43,6 +44,7 @@ impl TestEnv {
         let mut cmd = Command::new(cargo_bin("ak"));
         cmd.env("HOME", self._temp_dir.path());
         cmd.env("AK_TEST_PASSWORD", &self.test_password);
+        cmd.current_dir(self._temp_dir.path());  // Set working directory to temp dir
         cmd
     }
 
@@ -106,6 +108,26 @@ impl TestEnv {
             .arg(alias)
             .env("AK_TEST_SECRET", secret_value)
             .assert()
+    }
+
+    /// Create a minimal project config file for testing
+    fn create_test_config(&self, required_vars: Vec<&str>) {
+        let required_vars_json: Vec<String> = required_vars.iter().map(|v| format!("\"{}\"", v)).collect();
+        let config = format!(
+            r#"{{
+    "schemaVersion": "0.1.0",
+    "project": {{"name": "test"}},
+    "env": {{"target": ".env"}},
+    "providers": {{}},
+    "requiredVars": [{}],
+    "bindings": {{}},
+    "envMappings": {{}}
+}}"#,
+            required_vars_json.join(", ")
+        );
+        let config_path = self._temp_dir.path().join("aikey.config.json");
+        fs::write(&config_path, config)
+            .expect("Failed to create test config");
     }
 }
 
@@ -323,6 +345,7 @@ fn test_exec_command_with_json() {
     env.init_vault();
 
     env.add_secret("API_KEY", "sk-123").success();
+    env.create_test_config(vec!["API_KEY"]);
 
     let output = env.cmd()
         .arg("run")
@@ -348,6 +371,7 @@ fn test_exec_command_exit_code_propagation() {
     env.init_vault();
 
     env.add_secret("TEST_VAR", "value").success();
+    env.create_test_config(vec!["TEST_VAR"]);
 
     let output = env.cmd()
         .arg("run")
