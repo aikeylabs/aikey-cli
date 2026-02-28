@@ -810,17 +810,21 @@ pub fn run_with_provider_via_daemon(
 /// Compute injection set from env_mappings with tenant override tracking
 /// Returns (provider, keyAlias, model, tenant_override_applied)
 /// tenant_override_applied is true ONLY when a tenant override actually matched and changed the key_alias
+///
+/// Stage0 Decision H & I: Collision detection
+/// - De-duplicate by final env_var
+/// - If same env_var maps to multiple different key_alias values → FAIL FAST with actionable guidance
 fn compute_injection_set_with_tenant_tracking(
     config: &ProjectConfig,
     env: &str,
     logical_model_filter: Option<&str>,
     tenant: Option<&str>,
-) -> Vec<(String, String, Option<String>, bool)> {
+) -> Result<Vec<(String, String, Option<String>, bool)>, String> {
     use crate::resolver::{resolve, ResolveRequest};
-    use std::collections::HashSet;
+    use std::collections::HashMap;
 
     let mut injection_set = Vec::new();
-    let mut seen = HashSet::new();
+    let mut env_var_to_entries: HashMap<String, Vec<(String, String, String)>> = HashMap::new(); // env_var -> [(logical_model, provider, key_alias)]
 
     // Get env_mappings for the current environment
     if let Some(env_map) = config.env_mappings.get(env) {
@@ -852,27 +856,73 @@ fn compute_injection_set_with_tenant_tracking(
             };
 
             if let Ok(resolved) = resolve(&request, Some(config)) {
-                let key = (resolved.provider.clone(), resolved.key_alias.clone());
-                if !seen.contains(&key) {
-                    seen.insert(key);
+                let env_var = Provider::parse(&resolved.provider).env_var();
 
-                    // Strict tenant_override_applied: true ONLY when override actually changed the key_alias
-                    let tenant_override_applied = tenant.is_some()
-                        && base_key_alias.is_some()
-                        && base_key_alias.as_ref() != Some(&resolved.key_alias);
-
-                    injection_set.push((
-                        resolved.provider,
-                        resolved.key_alias,
-                        resolved.model,
-                        tenant_override_applied,
+                // Track for collision detection
+                env_var_to_entries
+                    .entry(env_var.clone())
+                    .or_default()
+                    .push((
+                        logical_model_name.clone(),
+                        resolved.provider.clone(),
+                        resolved.key_alias.clone(),
                     ));
-                }
+
+                // Strict tenant_override_applied: true ONLY when override actually changed the key_alias
+                let tenant_override_applied = tenant.is_some()
+                    && base_key_alias.is_some()
+                    && base_key_alias.as_ref() != Some(&resolved.key_alias);
+
+                injection_set.push((
+                    resolved.provider,
+                    resolved.key_alias,
+                    resolved.model,
+                    tenant_override_applied,
+                ));
             }
         }
     }
 
-    injection_set
+    // Stage0 Decision H & I: Collision detection
+    // If same env_var maps to multiple different key_alias values → FAIL FAST
+    for (env_var, entries) in &env_var_to_entries {
+        let unique_aliases: std::collections::HashSet<&String> = entries.iter().map(|(_, _, alias)| alias).collect();
+
+        if unique_aliases.len() > 1 {
+            // Collision detected: same env_var → multiple different key_alias values
+            let mut error_msg = format!(
+                "Collision detected: env_var '{}' maps to multiple different key aliases:\n",
+                env_var
+            );
+
+            for (logical_model, provider, key_alias) in entries {
+                error_msg.push_str(&format!(
+                    "  - logical_model '{}' (provider: {}) → {}\n",
+                    logical_model, provider, key_alias
+                ));
+            }
+
+            error_msg.push_str("\nFix:\n");
+            error_msg.push_str("  - Use --logical-model <name> to narrow injection to a single model\n");
+            error_msg.push_str("  - Or update envMappings to use different providers for these models\n");
+
+            return Err(error_msg);
+        }
+    }
+
+    // De-duplicate by (provider, key_alias) to avoid injecting the same credential twice
+    let mut seen = std::collections::HashSet::new();
+    let mut deduplicated = Vec::new();
+
+    for entry in injection_set {
+        let key = (entry.0.clone(), entry.1.clone());
+        if !seen.contains(&key) {
+            seen.insert(key);
+            deduplicated.push(entry);
+        }
+    }
+
+    Ok(deduplicated)
 }
 
 /// Execute a command with secrets resolved from a project config via daemon RPC.
@@ -890,11 +940,9 @@ fn compute_injection_set_from_env_mappings(
     env: &str,
     logical_model_filter: Option<&str>,
     tenant: Option<&str>,
-) -> Vec<(String, String, Option<String>)> {
+) -> Result<Vec<(String, String, Option<String>)>, String> {
     compute_injection_set_with_tenant_tracking(config, env, logical_model_filter, tenant)
-        .into_iter()
-        .map(|(provider, key_alias, model, _)| (provider, key_alias, model))
-        .collect()
+        .map(|set| set.into_iter().map(|(provider, key_alias, model, _)| (provider, key_alias, model)).collect())
 }
 
 pub fn run_with_project_config_via_daemon(
@@ -919,12 +967,13 @@ pub fn run_with_project_config_via_daemon(
 
     if has_env_mappings {
         // Mapping-closed mode: inject only from env_mappings
+        // Stage0 Decision H & I: Collision detection happens here
         let injection_set = compute_injection_set_from_env_mappings(
             config,
             current_env.as_ref().unwrap(),
             logical_model,
             tenant,
-        );
+        )?; // Propagate collision errors
 
         for (provider, key_alias, _model) in injection_set {
             let env_var = Provider::parse(&provider).env_var();
@@ -955,7 +1004,8 @@ pub fn run_with_project_config_via_daemon(
     }
 
     // 2. requiredVars resolution via active profile bindings
-    // Build a domain->alias map from the active profile's bindings
+    // Stage0 Decision I: requiredVars collision detection
+    // If a requiredVars entry collides with a provider env var → FAIL (no silent override)
     let binding_map: std::collections::HashMap<String, String> = client
         .get_current_profile()
         .ok()
@@ -965,9 +1015,20 @@ pub fn run_with_project_config_via_daemon(
         .collect();
 
     for var_name in &config.required_vars {
+        // Stage0 Decision I: Collision detection for requiredVars
         if env_secrets.contains_key(var_name) {
-            continue; // already set by providers block
+            // Collision: requiredVars entry collides with a provider env var
+            return Err(format!(
+                "Collision detected: requiredVars entry '{}' collides with a provider env var.\n\
+                 \n\
+                 Fix:\n\
+                 - Remove '{}' from requiredVars if it should come from a provider\n\
+                 - Or rename the provider env var to avoid collision\n\
+                 - requiredVars and provider env vars must not overlap",
+                var_name, var_name
+            ));
         }
+
         // binding map: domain -> alias; fall back to var_name as alias
         let alias = binding_map.get(var_name).cloned().unwrap_or_else(|| var_name.clone());
         match client.get_secret(&alias) {
@@ -1210,12 +1271,13 @@ pub fn dry_run_project_config(
 
     if has_env_mappings {
         // Mapping-closed mode: inject only from env_mappings
+        // Stage0 Decision H & I: Collision detection happens here
         let injection_set = compute_injection_set_with_tenant_tracking(
             config,
             current_env.as_ref().unwrap(),
             logical_model,
             tenant,
-        );
+        )?; // Propagate collision errors
 
         for (provider, key_alias, model, tenant_override_applied) in injection_set {
             let env_var = Provider::parse(&provider).env_var();
@@ -1256,10 +1318,20 @@ pub fn dry_run_project_config(
         .collect();
 
     for var_name in &config.required_vars {
-        // Skip if already added from providers
+        // Stage0 Decision I: Collision detection for requiredVars
         if infos.iter().any(|info| info.env_var == *var_name) {
-            continue;
+            // Collision: requiredVars entry collides with a provider env var
+            return Err(format!(
+                "Collision detected: requiredVars entry '{}' collides with a provider env var.\n\
+                 \n\
+                 Fix:\n\
+                 - Remove '{}' from requiredVars if it should come from a provider\n\
+                 - Or rename the provider env var to avoid collision\n\
+                 - requiredVars and provider env vars must not overlap",
+                var_name, var_name
+            ));
         }
+
         let alias = binding_map.get(var_name).cloned().unwrap_or_else(|| var_name.clone());
         client.get_secret(&alias)
             .map_err(|_| format!("Missing key: {} in profile '{}'", alias, profile))?;
