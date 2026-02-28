@@ -384,27 +384,74 @@ pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
 }
 
 /// Handle `aikey env inject -- <command>` — run a command with project env vars injected.
-/// Delegates to the same executor path as `aikey run` so both share resolution logic.
-pub fn handle_env_run(command: &[String], json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// P0-B1: MUST be equivalent to `aikey run -- <cmd>` (same implementation path, same semantics).
+pub fn handle_env_run(
+    command: &[String],
+    json_mode: bool,
+    logical_model: Option<&str>,
+    tenant: Option<&str>,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_, config) = ProjectConfig::discover()?
         .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
 
     let client = DaemonClient::new_default();
 
-    // P1-Q1: env inject doesn't support --logical-model or --tenant (legacy alias)
-    match crate::executor::run_with_project_config_via_daemon(&config, command, json_mode, &client, None, None) {
-        Ok((_, exit_code)) => {
-            if exit_code != 0 {
-                std::process::exit(exit_code);
+    // P0-B1: env inject -- <cmd> uses the same execution path as run -- <cmd>
+    // This ensures: same injection-set algorithm, same dry-run contract, same exit codes, same events
+    if dry_run {
+        // Dry-run mode: show what would be injected without executing
+        let infos = crate::executor::dry_run_project_config(&config, &client, logical_model, tenant)?;
+
+        if json_mode {
+            crate::json_output::print_json(serde_json::json!({
+                "dry_run": true,
+                "command": command,
+                "injections": infos
+            }));
+        } else {
+            println!("Dry Run — Resolution Summary");
+            println!("============================");
+            println!();
+
+            for info in &infos {
+                println!("Environment Variable: {}", info.env_var);
+                println!("  Provider:      {}", info.provider);
+                if let Some(model) = &info.model {
+                    println!("  Model:         {}", model);
+                }
+                if !info.key_alias.is_empty() {
+                    println!("  Key Alias:     {}", info.key_alias);
+                }
+                println!("  Source:        {}", info.source);
+                if info.tenant_override {
+                    println!("  Tenant Override: YES");
+                }
+                println!();
             }
-            Ok(())
+
+            println!("Will inject {} variable(s) into:", infos.len());
+            println!("  {}", command.join(" "));
+            println!();
+            println!("Note: Secret values are hidden. Use 'aikey env inject' without --dry-run to execute.");
         }
-        Err(e) => {
-            // Propagate non-zero exit codes from the subprocess
-            if let Some(code_str) = e.strip_prefix("Command exited with code ") {
-                std::process::exit(code_str.parse::<i32>().unwrap_or(1));
+        Ok(())
+    } else {
+        // Execute mode: run the command with injected secrets
+        match crate::executor::run_with_project_config_via_daemon(&config, command, json_mode, &client, logical_model, tenant) {
+            Ok((_, exit_code)) => {
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
             }
-            Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)
+            Err(e) => {
+                // Propagate non-zero exit codes from the subprocess
+                if let Some(code_str) = e.strip_prefix("Command exited with code ") {
+                    std::process::exit(code_str.parse::<i32>().unwrap_or(1));
+                }
+                Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)
+            }
         }
     }
 }

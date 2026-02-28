@@ -243,6 +243,15 @@ enum EnvAction {
         /// Allow plaintext secret exposure (DANGEROUS - secrets will be visible in shell history)
         #[arg(long)]
         unsafe_plaintext: bool,
+        /// Logical model name for narrowing injection (e.g. chat-main, embeddings)
+        #[arg(long, value_name = "LOGICAL_MODEL")]
+        logical_model: Option<String>,
+        /// Tenant override for multi-tenant key resolution
+        #[arg(long, value_name = "TENANT")]
+        tenant: Option<String>,
+        /// Show what would be resolved without executing the command
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Export resolved environment variables to stdout
     Export {
@@ -1307,11 +1316,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 EnvAction::Generate { dry_run, env_file } => {
                     commands_env::handle_env_generate(*dry_run, env_file.as_deref(), cli.json)?;
                 }
-                EnvAction::Inject { command, unsafe_plaintext } => {
+                EnvAction::Inject { command, unsafe_plaintext, logical_model, tenant, dry_run } => {
                     if command.is_empty() {
                         commands_env::handle_env_inject(cli.json, *unsafe_plaintext)?;
                     } else {
-                        commands_env::handle_env_run(command, cli.json)?;
+                        // P0-B1: env inject -- <cmd> MUST be equivalent to run -- <cmd>
+                        // Apply same tenant precedence: --tenant > AIKEY_TENANT env var
+                        let env_tenant = std::env::var("AIKEY_TENANT").ok();
+                        let resolved_tenant = tenant.as_deref().or(env_tenant.as_deref());
+
+                        commands_env::handle_env_run(command, cli.json, logical_model.as_deref(), resolved_tenant, *dry_run)?;
                     }
                 }
                 EnvAction::Export { format, unsafe_plaintext } => {
