@@ -1,11 +1,11 @@
-//! Unified error model for daemon, RPC, and CLI
-//! Preserves backward compatibility with existing error codes while supporting daemon-level errors
+//! Unified error model for CLI
+//! Provides structured error codes and messages for consistent error handling
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorCode {
-    // External/stable codes (guaranteed in CLI and RPC responses)
+    // External/stable codes (guaranteed in CLI responses)
     AliasExists,
     AliasNotFound,
     VaultLocked,
@@ -15,7 +15,7 @@ pub enum ErrorCode {
     UnsupportedProtocol,
     InternalError,
 
-    // Internal daemon codes (not exposed externally)
+    // Internal codes
     Unauthorized,
     Forbidden,
     IoError,
@@ -96,7 +96,7 @@ pub mod msgs {
     pub const INVALID_PASSWORD_SHORT: &str = "Invalid master password.";
 }
 
-/// Unified error type for daemon, RPC, and CLI
+/// Unified error type for CLI
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Error {
     pub code: ErrorCode,

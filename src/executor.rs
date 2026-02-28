@@ -794,7 +794,7 @@ fn compute_injection_set_with_tenant_tracking(
     Ok(deduplicated)
 }
 
-/// Execute a command with secrets resolved from a project config via daemon RPC.
+/// Execute a command with secrets resolved from a project config.
 ///
 /// Resolution order (Stage0 Decision I - mapping-closed boundary):
 /// - If `envMappings[env]` exists and is non-empty: inject only mapping-derived credentials (closed set)
@@ -936,11 +936,10 @@ pub fn import_secrets(json_data: &str, password: &SecretString, strategy: &str) 
     Ok(())
 }
 
-/// Dry-run variant of `run_with_provider_via_daemon`.
+/// Dry-run for provider mode.
 ///
 /// Resolves the provider key alias and returns the list of env var names that
 /// would be injected, without actually running any command.
-/// Dry-run variant of `run_with_project_config_via_daemon`.
 ///
 /// Stage0 Decision H: --dry-run output contract
 /// - No execution occurs
