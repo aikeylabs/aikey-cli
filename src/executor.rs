@@ -807,23 +807,15 @@ pub fn run_with_provider_via_daemon(
     result
 }
 
-/// Execute a command with secrets resolved from a project config via daemon RPC.
-///
-/// Resolution order:
-/// 1. `config.providers` — each provider's `keyAlias` is fetched and injected as
-///    `Provider::env_var()` (e.g. `OPENAI_API_KEY`).
-/// 2. `config.required_vars` — each var is looked up in the active profile's bindings
-///    (via daemon), falling back to using the var name as the alias directly.
-///
-/// Returns `(secrets_injected, exit_code)`.
-/// P1-Q1: Compute injection set from env_mappings
-/// Returns a de-duplicated list of (provider, keyAlias, model) tuples
-fn compute_injection_set_from_env_mappings(
+/// Compute injection set from env_mappings with tenant override tracking
+/// Returns (provider, keyAlias, model, tenant_override_applied)
+/// tenant_override_applied is true ONLY when a tenant override actually matched and changed the key_alias
+fn compute_injection_set_with_tenant_tracking(
     config: &ProjectConfig,
     env: &str,
     logical_model_filter: Option<&str>,
     tenant: Option<&str>,
-) -> Vec<(String, String, Option<String>)> {
+) -> Vec<(String, String, Option<String>, bool)> {
     use crate::resolver::{resolve, ResolveRequest};
     use std::collections::HashSet;
 
@@ -832,15 +824,26 @@ fn compute_injection_set_from_env_mappings(
 
     // Get env_mappings for the current environment
     if let Some(env_map) = config.env_mappings.get(env) {
-        for (logical_model_name, mapping) in env_map {
-            // P1-Q1: If --logical-model is specified, filter to that model only
+        for (logical_model_name, _mapping) in env_map {
+            // If --logical-model is specified, filter to that model only
             if let Some(filter) = logical_model_filter {
                 if logical_model_name != filter {
                     continue;
                 }
             }
 
-            // Resolve with tenant override if present
+            // Resolve WITHOUT tenant to get base key_alias
+            let base_request = ResolveRequest {
+                logical_model: Some(logical_model_name.clone()),
+                env: Some(env.to_string()),
+                tenant: None,
+                ..Default::default()
+            };
+            let base_key_alias = resolve(&base_request, Some(config))
+                .ok()
+                .map(|r| r.key_alias);
+
+            // Resolve WITH tenant to get final key_alias
             let request = ResolveRequest {
                 logical_model: Some(logical_model_name.clone()),
                 env: Some(env.to_string()),
@@ -852,10 +855,17 @@ fn compute_injection_set_from_env_mappings(
                 let key = (resolved.provider.clone(), resolved.key_alias.clone());
                 if !seen.contains(&key) {
                     seen.insert(key);
+
+                    // Strict tenant_override_applied: true ONLY when override actually changed the key_alias
+                    let tenant_override_applied = tenant.is_some()
+                        && base_key_alias.is_some()
+                        && base_key_alias.as_ref() != Some(&resolved.key_alias);
+
                     injection_set.push((
                         resolved.provider,
                         resolved.key_alias,
                         resolved.model,
+                        tenant_override_applied,
                     ));
                 }
             }
@@ -863,6 +873,28 @@ fn compute_injection_set_from_env_mappings(
     }
 
     injection_set
+}
+
+/// Execute a command with secrets resolved from a project config via daemon RPC.
+///
+/// Resolution order (Stage0 Decision I - mapping-closed boundary):
+/// - If `envMappings[env]` exists and is non-empty: inject only mapping-derived credentials (closed set)
+/// - If `envMappings[env]` is missing/empty: fall back to `config.providers`
+/// - `config.required_vars` are always resolved independently
+///
+/// Returns `(secrets_injected, exit_code)`.
+/// P1-Q1: Compute injection set from env_mappings
+/// Returns a de-duplicated list of (provider, keyAlias, model) tuples
+fn compute_injection_set_from_env_mappings(
+    config: &ProjectConfig,
+    env: &str,
+    logical_model_filter: Option<&str>,
+    tenant: Option<&str>,
+) -> Vec<(String, String, Option<String>)> {
+    compute_injection_set_with_tenant_tracking(config, env, logical_model_filter, tenant)
+        .into_iter()
+        .map(|(provider, key_alias, model, _)| (provider, key_alias, model))
+        .collect()
 }
 
 pub fn run_with_project_config_via_daemon(
@@ -876,11 +908,20 @@ pub fn run_with_project_config_via_daemon(
     let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
         std::collections::HashMap::new();
 
-    // P1-Q1: Multi-provider injection from env_mappings
-    if let Ok(Some(current_env)) = crate::global_config::get_current_env() {
+    // Stage0 Decision I: Mapping-closed injection boundary
+    // If envMappings[env] exists and is non-empty, inject only mapping-derived credentials (closed set)
+    // Only fall back to config.providers when mappings are missing/empty
+    let current_env = crate::global_config::get_current_env().ok().flatten();
+    let has_env_mappings = current_env.as_ref()
+        .and_then(|env| config.env_mappings.get(env.as_str()))
+        .map(|map| !map.is_empty())
+        .unwrap_or(false);
+
+    if has_env_mappings {
+        // Mapping-closed mode: inject only from env_mappings
         let injection_set = compute_injection_set_from_env_mappings(
             config,
-            &current_env,
+            current_env.as_ref().unwrap(),
             logical_model,
             tenant,
         );
@@ -898,20 +939,16 @@ pub fn run_with_project_config_via_daemon(
                 }
             }
         }
-    }
-
-    // 1. Provider-based resolution (fallback if no env_mappings)
-    for (provider_name, provider_cfg) in &config.providers {
-        let env_var = Provider::parse(provider_name).env_var();
-        // Skip if already injected from env_mappings
-        if env_secrets.contains_key(&env_var) {
-            continue;
-        }
-        match client.get_secret(&provider_cfg.key_alias) {
-            Ok(value) => { env_secrets.insert(env_var, Zeroizing::new(value)); }
-            Err(e) => {
-                if !json_mode {
-                    eprintln!("Warning: could not fetch secret '{}' for provider '{}': {}", provider_cfg.key_alias, provider_name, e);
+    } else {
+        // Fallback mode: use config.providers (legacy compatibility)
+        for (provider_name, provider_cfg) in &config.providers {
+            let env_var = Provider::parse(provider_name).env_var();
+            match client.get_secret(&provider_cfg.key_alias) {
+                Ok(value) => { env_secrets.insert(env_var, Zeroizing::new(value)); }
+                Err(e) => {
+                    if !json_mode {
+                        eprintln!("Warning: could not fetch secret '{}' for provider '{}': {}", provider_cfg.key_alias, provider_name, e);
+                    }
                 }
             }
         }
@@ -945,7 +982,8 @@ pub fn run_with_project_config_via_daemon(
 
     let secrets_count = env_secrets.len();
     if !json_mode {
-        eprintln!("Injecting {} secret(s) (project mode)", secrets_count);
+        let mode = if has_env_mappings { "mapping-closed" } else { "provider-fallback" };
+        eprintln!("Injecting {} secret(s) ({})", secrets_count, mode);
     }
 
     let parsed_parts: Vec<String> = if command.len() == 1 {
@@ -1148,8 +1186,12 @@ pub fn dry_run_provider(
 
 /// Dry-run variant of `run_with_project_config_via_daemon`.
 ///
-/// Resolves all provider and required-var secrets and returns the list of env
-/// var names that would be injected, without actually running any command.
+/// Stage0 Decision H: --dry-run output contract
+/// - No execution occurs
+/// - No secret values shown
+/// - Stable output ordering (sorted by env_var)
+/// - Strict tenant_override_applied (true only when override actually matched and changed key_alias)
+/// - Implements mapping-closed boundary (same as run)
 pub fn dry_run_project_config(
     config: &ProjectConfig,
     client: &DaemonClient,
@@ -1159,16 +1201,23 @@ pub fn dry_run_project_config(
     let mut infos: Vec<DryRunInfo> = Vec::new();
     let profile = client.get_current_profile().unwrap_or_else(|_| "default".to_string());
 
-    // P1-Q1: Multi-provider injection from env_mappings
-    if let Ok(Some(current_env)) = crate::global_config::get_current_env() {
-        let injection_set = compute_injection_set_from_env_mappings(
+    // Stage0 Decision I: Mapping-closed injection boundary (same as run)
+    let current_env = crate::global_config::get_current_env().ok().flatten();
+    let has_env_mappings = current_env.as_ref()
+        .and_then(|env| config.env_mappings.get(env.as_str()))
+        .map(|map| !map.is_empty())
+        .unwrap_or(false);
+
+    if has_env_mappings {
+        // Mapping-closed mode: inject only from env_mappings
+        let injection_set = compute_injection_set_with_tenant_tracking(
             config,
-            &current_env,
+            current_env.as_ref().unwrap(),
             logical_model,
             tenant,
         );
 
-        for (provider, key_alias, model) in injection_set {
+        for (provider, key_alias, model, tenant_override_applied) in injection_set {
             let env_var = Provider::parse(&provider).env_var();
             client.get_secret(&key_alias)
                 .map_err(|_| format!("Missing key: {}:{} in profile '{}'", provider, key_alias, profile))?;
@@ -1178,30 +1227,26 @@ pub fn dry_run_project_config(
                 provider: provider.clone(),
                 model,
                 key_alias: key_alias.clone(),
-                tenant_override: tenant.is_some(),
+                tenant_override: tenant_override_applied,
                 source: "LogicalModel".to_string(),
             });
         }
-    }
+    } else {
+        // Fallback mode: use config.providers (legacy compatibility)
+        for (provider_name, provider_cfg) in &config.providers {
+            let env_var = Provider::parse(provider_name).env_var();
+            client.get_secret(&provider_cfg.key_alias)
+                .map_err(|_| format!("Missing key: {}:{} in profile '{}'", provider_name, provider_cfg.key_alias, profile))?;
 
-    // P1-Q4: Collect detailed information for each provider (fallback)
-    for (provider_name, provider_cfg) in &config.providers {
-        let env_var = Provider::parse(provider_name).env_var();
-        // Skip if already added from env_mappings
-        if infos.iter().any(|info| info.env_var == env_var) {
-            continue;
+            infos.push(DryRunInfo {
+                env_var,
+                provider: provider_name.clone(),
+                model: provider_cfg.default_model.clone(),
+                key_alias: provider_cfg.key_alias.clone(),
+                tenant_override: false,
+                source: "Base".to_string(),
+            });
         }
-        client.get_secret(&provider_cfg.key_alias)
-            .map_err(|_| format!("Missing key: {}:{} in profile '{}'", provider_name, provider_cfg.key_alias, profile))?;
-
-        infos.push(DryRunInfo {
-            env_var,
-            provider: provider_name.clone(),
-            model: provider_cfg.default_model.clone(),
-            key_alias: provider_cfg.key_alias.clone(),
-            tenant_override: false,
-            source: "Base".to_string(),
-        });
     }
 
     let binding_map: std::collections::HashMap<String, String> = client
@@ -1228,6 +1273,9 @@ pub fn dry_run_project_config(
             source: "Binding".to_string(),
         });
     }
+
+    // Stage0 Decision H: Stable output ordering (sort by env_var)
+    infos.sort_by(|a, b| a.env_var.cmp(&b.env_var));
 
     Ok(infos)
 }
