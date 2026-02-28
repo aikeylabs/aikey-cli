@@ -576,12 +576,24 @@ pub fn run_with_all_secrets(
     let exit_code = status.code().unwrap_or(1);
     let duration_ms = t0.elapsed().as_millis() as i64;
 
-    let _ = EventBuilder::new("run")
+    // Get current env and profile from global config for event recording
+    let current_env = crate::global_config::get_current_env().ok().flatten();
+    let current_profile = crate::global_config::get_current_profile().ok().flatten();
+
+    let mut event = EventBuilder::new("run")
         .command(&parsed_parts.join(" "))
         .exit_code(exit_code)
         .duration_ms(duration_ms)
-        .secrets_count(secrets_count as i32)
-        .record();
+        .secrets_count(secrets_count as i32);
+
+    if let Some(env) = current_env {
+        event = event.env(&env);
+    }
+    if let Some(prof) = current_profile {
+        event = event.profile(&prof);
+    }
+
+    let _ = event.record();
 
     // Return secrets count and exit code
     if !status.success() {
@@ -591,8 +603,8 @@ pub fn run_with_all_secrets(
     Ok((secrets_count, exit_code))
 }
 
-/// Inject non-sensitive context vars (AIKEY_PROJECT, AIKEY_ENV, AIKEY_PROFILE)
-/// into a Command. Values are sourced from global config; missing values are silently skipped.
+/// Inject non-sensitive context vars (AIKEY_PROJECT, AIKEY_ENV, AIKEY_PROFILE) into a Command.
+/// Values are sourced from global config; missing values are silently skipped.
 fn inject_context_vars(cmd: &mut std::process::Command, project_name: Option<&str>) {
     if let Some(name) = project_name {
         cmd.env("AIKEY_PROJECT", name);
@@ -1003,13 +1015,29 @@ pub fn run_with_provider(
             .unwrap_or(1)
     };
 
-    let _ = EventBuilder::new("run")
+    // Get context for event recording
+    let project_name = config.map(|c| c.project.name.as_str());
+    let current_env = crate::global_config::get_current_env().ok().flatten();
+    let current_profile = crate::global_config::get_current_profile().ok().flatten();
+
+    let mut event = EventBuilder::new("run")
         .provider(provider)
         .command(&parsed_parts.join(" "))
         .exit_code(exit_code)
         .duration_ms(duration_ms)
-        .secrets_count(secrets_count as i32)
-        .record();
+        .secrets_count(secrets_count as i32);
+
+    if let Some(proj) = project_name {
+        event = event.project(proj);
+    }
+    if let Some(env) = current_env {
+        event = event.env(&env);
+    }
+    if let Some(prof) = current_profile {
+        event = event.profile(&prof);
+    }
+
+    let _ = event.record();
 
     result
 }
@@ -1172,12 +1200,24 @@ pub fn run_with_project_config(
             .unwrap_or(1)
     };
 
-    let _ = EventBuilder::new("run")
+    // Get current profile from global config for event recording
+    let current_profile = crate::global_config::get_current_profile().ok().flatten();
+
+    let mut event = EventBuilder::new("run")
         .command(&parsed_parts.join(" "))
         .exit_code(exit_code)
         .duration_ms(duration_ms)
         .secrets_count(secrets_count as i32)
-        .record();
+        .project(&config.project.name);
+
+    if let Some(env) = &current_env {
+        event = event.env(env);
+    }
+    if let Some(prof) = current_profile {
+        event = event.profile(&prof);
+    }
+
+    let _ = event.record();
 
     result
 }
