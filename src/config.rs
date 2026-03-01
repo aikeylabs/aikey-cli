@@ -116,12 +116,26 @@ impl ProjectConfig {
         let mut current_dir = start_dir.to_path_buf();
 
         loop {
-            // Try each config file name in order
-            for filename in &["aikey.config.json", "aikey.config.yaml", "aikey.config.yml", ".aikeyrc"] {
-                let config_path = current_dir.join(filename);
-                if config_path.exists() {
-                    let config = ProjectConfig::load(&config_path)?;
-                    return Ok(Some((config_path, config)));
+            // Stage 0: Only support aikey.config.json (single blessed format)
+            let config_path = current_dir.join("aikey.config.json");
+            if config_path.exists() {
+                let config = ProjectConfig::load(&config_path)?;
+                return Ok(Some((config_path, config)));
+            }
+
+            // Check for deprecated formats and provide migration guidance
+            for deprecated in &["aikey.config.yaml", "aikey.config.yml", ".aikeyrc"] {
+                let deprecated_path = current_dir.join(deprecated);
+                if deprecated_path.exists() {
+                    return Err(format!(
+                        "Found deprecated config format: {}\n\n\
+                        Stage 0 only supports aikey.config.json.\n\
+                        Please convert your config to JSON format:\n\
+                          1. Rename {} to aikey.config.json\n\
+                          2. Convert YAML syntax to JSON if needed\n\n\
+                        Example: https://github.com/AiKey-Founder/aikey-labs/blob/main/docs/config-schema.md",
+                        deprecated, deprecated
+                    ));
                 }
             }
 
@@ -143,15 +157,76 @@ impl ProjectConfig {
             .and_then(|n| n.to_str())
             .unwrap_or("config");
 
-        if filename.ends_with(".json") || filename == ".aikeyrc" {
-            serde_json::from_str(&content)
-                .map_err(|e| format!("Invalid aikey.config.json: {}", e))
-        } else if filename.ends_with(".yaml") || filename.ends_with(".yml") {
-            serde_yaml::from_str(&content)
-                .map_err(|e| format!("Invalid aikey.config.json: {}", e))
-        } else {
-            Err("Invalid aikey.config.json: unsupported file format".to_string())
+        // Stage 0: Only support JSON format
+        if !filename.ends_with(".json") {
+            return Err(format!(
+                "Unsupported config format: {}\n\
+                Stage 0 only supports aikey.config.json (JSON format).",
+                filename
+            ));
         }
+
+        let config: Self = serde_json::from_str(&content)
+            .map_err(|e| format!("Invalid aikey.config.json: {}", e))?;
+
+        // Validate: reject secret-like fields
+        config.validate_no_secrets()?;
+
+        Ok(config)
+    }
+
+    /// Validate that config doesn't contain secret-like fields
+    fn validate_no_secrets(&self) -> Result<(), String> {
+        // Check for secret-like field names in the raw JSON
+        // This is a defense-in-depth check since our schema shouldn't allow these anyway
+        let secret_patterns = [
+            "apiKey", "api_key", "apikey",
+            "token", "accessToken", "access_token",
+            "secret", "secretKey", "secret_key",
+            "password", "passwd", "pwd",
+            "key", "privateKey", "private_key",
+        ];
+
+        // We need to re-parse as Value to check for unexpected fields
+        // In a real implementation, you'd check the raw JSON string or use a custom deserializer
+        // For now, we'll add a warning in the error message
+
+        // Check provider configs for suspicious patterns
+        for (provider_name, provider_config) in &self.providers {
+            if secret_patterns.iter().any(|p| provider_config.key_alias.to_lowercase().contains(p)) {
+                // This is actually OK - keyAlias is supposed to reference a vault entry
+                // But if it looks like an actual secret value, warn
+                if provider_config.key_alias.len() > 32 &&
+                   (provider_config.key_alias.starts_with("sk-") ||
+                    provider_config.key_alias.starts_with("pk-") ||
+                    provider_config.key_alias.contains("secret")) {
+                    return Err(format!(
+                        "SECURITY WARNING: Provider '{}' keyAlias looks like an actual secret value.\n\
+                        keyAlias should be a vault reference (e.g. 'openai:default'), not the actual API key.\n\
+                        Never store secrets in aikey.config.json - use 'aikey secret set' instead.",
+                        provider_name
+                    ));
+                }
+            }
+        }
+
+        // Check bindings for suspicious values
+        for (var_name, binding_value) in &self.bindings {
+            if binding_value.len() > 32 &&
+               (binding_value.starts_with("sk-") ||
+                binding_value.starts_with("pk-") ||
+                binding_value.starts_with("Bearer ") ||
+                binding_value.starts_with("ghp_")) {
+                return Err(format!(
+                    "SECURITY WARNING: Binding '{}' appears to contain an actual secret.\n\
+                    Bindings should reference vault entries (e.g. 'db:prod'), not actual secrets.\n\
+                    Never store secrets in aikey.config.json - use 'aikey secret set' instead.",
+                    var_name
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Save config to a file
@@ -160,15 +235,20 @@ impl ProjectConfig {
             .and_then(|n| n.to_str())
             .unwrap_or("config");
 
-        let content = if filename.ends_with(".json") || filename == ".aikeyrc" {
-            serde_json::to_string_pretty(self)
-                .map_err(|e| format!("Failed to serialize config: {}", e))?
-        } else if filename.ends_with(".yaml") || filename.ends_with(".yml") {
-            serde_yaml::to_string(self)
-                .map_err(|e| format!("Failed to serialize config: {}", e))?
-        } else {
-            return Err("Unsupported config file format".to_string());
-        };
+        // Stage 0: Only support JSON format
+        if !filename.ends_with(".json") {
+            return Err(format!(
+                "Unsupported config format: {}\n\
+                Stage 0 only supports aikey.config.json (JSON format).",
+                filename
+            ));
+        }
+
+        // Validate before saving
+        self.validate_no_secrets()?;
+
+        let content = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
         fs::write(path, content)
             .map_err(|e| format!("Failed to write config file: {}", e))?;
@@ -178,7 +258,7 @@ impl ProjectConfig {
             let metadata = fs::metadata(path)
                 .map_err(|e| format!("Failed to read config metadata: {}", e))?;
             let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
+            perms.set_mode(0o644); // Config is not secret, can be world-readable
             fs::set_permissions(path, perms)
                 .map_err(|e| format!("Failed to set config permissions: {}", e))?;
         }
@@ -246,25 +326,23 @@ mod tests {
     }
 
     #[test]
-    fn test_project_config_parse_yaml() {
-        let yaml = r#"
-schemaVersion: "1"
-project:
-  name: test-project
-env:
-  target: .env.local
-requiredVars:
-  - API_KEY
-  - DATABASE_URL
-defaults:
-  profile: dev
-"#;
+    fn test_project_config_rejects_secret_in_binding() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("aikey.config.json");
 
-        let config: ProjectConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.project.name, "test-project");
-        assert_eq!(config.required_vars.len(), 2);
-        assert_eq!(config.env.target, ".env.local");
-        assert_eq!(config.defaults.profile, Some("dev".to_string()));
+        let json = r#"{
+            "schemaVersion": "1",
+            "project": {"name": "test"},
+            "env": {"target": ".env"},
+            "bindings": {
+                "OPENAI_API_KEY": "sk-1234567890abcdefghijklmnopqrstuvwxyz"
+            }
+        }"#;
+
+        fs::write(&config_path, json).unwrap();
+        let result = ProjectConfig::load(&config_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("SECURITY WARNING"));
     }
 
     #[test]

@@ -1,10 +1,8 @@
 use crate::config::{ProjectConfig, ProviderConfig, EnvTemplate, LogicalModelMapping};
-use crate::daemon_client::DaemonClient;
 use crate::json_output;
 use crate::global_config;
 use crate::{crypto, storage, audit};
 use secrecy::SecretString;
-use secrecy::ExposeSecret;
 use zeroize::Zeroizing;
 use std::io::{self, Write};
 
@@ -162,28 +160,31 @@ pub fn handle_project_status(json_mode: bool) -> Result<(), Box<dyn std::error::
         .iter()
         .map(|var| format!("{}={{{}}}", var, var))
         .collect();
-    let template = template_parts.join("\n");
+    let _template = template_parts.join("\n");
 
-    let project_path = config_path.parent().and_then(|p| p.to_str());
-    let config_path_str = config_path.to_str();
+    let _project_path = config_path.parent().and_then(|p| p.to_str());
+    let _config_path_str = config_path.to_str();
 
-    let client = DaemonClient::new_default();
-    let result = client.resolve_env_details(&template, project_path, config_path_str, false)?;
+    // Get current profile
+    let profile_name = global_config::get_current_profile()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "default".to_string());
 
-    let profile_name = result.get("profile_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default");
-    let satisfied = result.get("satisfied").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let total = result.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
+    // Check which required vars are satisfied by checking profile bindings
+    let total = config.required_vars.len();
+    let mut satisfied = 0;
     let mut missing_vars = Vec::new();
-    if let Some(vars) = result.get("resolved_vars").and_then(|v| v.as_array()) {
-        for var in vars {
-            let name = var.get("name").and_then(|v| v.as_str());
-            let source = var.get("source").and_then(|v| v.as_str());
-            if let (Some(name), Some(source)) = (name, source) {
-                if source == "Missing" {
-                    missing_vars.push(name.to_string());
+
+    // Get profile bindings to check satisfaction
+    if let Ok(conn) = storage::open_connection() {
+        if let Ok(bindings) = storage::get_profile_bindings(&conn, &profile_name) {
+            let binding_domains: std::collections::HashSet<String> = bindings.iter().map(|(domain, _)| domain.clone()).collect();
+            for var in &config.required_vars {
+                if binding_domains.contains(var) {
+                    satisfied += 1;
+                } else {
+                    missing_vars.push(var.clone());
                 }
             }
         }
@@ -348,11 +349,8 @@ pub fn handle_project_map(
     let password_raw = Zeroizing::new(password);
     let secret = SecretString::new(password_raw.trim().to_string());
 
-    let client = DaemonClient::new_default();
-    client.unlock(secret.expose_secret())
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)) as Box<dyn std::error::Error>)?;
-    // Verify the password is actually correct by performing a decryption operation
-    client.list_secrets()
+    // Verify the password is correct by attempting to list secrets
+    crate::executor::list_secrets(&secret)
         .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)) as Box<dyn std::error::Error>)?;
 
     let (config_path, mut config) = ProjectConfig::discover()?
@@ -525,37 +523,44 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     }));
     if !config_ok { all_ok = false; }
 
-    // Check 2: daemon reachable
-    let client = DaemonClient::new_default();
-    let daemon_ok = client.ping().is_ok();
-    checks.push(serde_json::json!({
-        "check": "daemon",
-        "ok": daemon_ok,
-        "message": if daemon_ok { "Daemon is running" } else { "Daemon is not reachable — run `aikey daemon start`" }
-    }));
-    if !daemon_ok { all_ok = false; }
-
-    // Check 3: if config found, verify all key aliases resolve
+    // Check 2: if config found, verify all key aliases exist in vault
     if config_ok {
         if let Ok(Some((_, config))) = config_result {
-            for (provider_name, provider_cfg) in &config.providers {
-                let alias = &provider_cfg.key_alias;
-                let resolved = if daemon_ok {
-                    client.get_secret(alias).is_ok()
-                } else {
-                    false
-                };
-                checks.push(serde_json::json!({
-                    "check": format!("key_alias:{}", alias),
-                    "provider": provider_name,
-                    "ok": resolved,
-                    "message": if resolved {
-                        format!("Key alias '{}' resolves", alias)
-                    } else {
-                        format!("Key alias '{}' not found in vault", alias)
+            // Prompt for password to check vault
+            let password_result = rpassword::prompt_password("Enter Master Password (for vault check): ");
+            if let Ok(password_str) = password_result {
+                let password = SecretString::new(password_str);
+                if let Ok(secrets) = crate::executor::list_secrets(&password) {
+                    for (provider_name, provider_cfg) in &config.providers {
+                        let alias = &provider_cfg.key_alias;
+                        let resolved = secrets.contains(alias);
+                        checks.push(serde_json::json!({
+                            "check": format!("key_alias:{}", alias),
+                            "provider": provider_name,
+                            "ok": resolved,
+                            "message": if resolved {
+                                format!("Key alias '{}' resolves", alias)
+                            } else {
+                                format!("Key alias '{}' not found in vault", alias)
+                            }
+                        }));
+                        if !resolved { all_ok = false; }
                     }
+                } else {
+                    checks.push(serde_json::json!({
+                        "check": "vault_access",
+                        "ok": false,
+                        "message": "Failed to access vault (incorrect password or vault corrupted)"
+                    }));
+                    all_ok = false;
+                }
+            } else {
+                checks.push(serde_json::json!({
+                    "check": "vault_access",
+                    "ok": false,
+                    "message": "Password prompt failed"
                 }));
-                if !resolved { all_ok = false; }
+                all_ok = false;
             }
         }
     }

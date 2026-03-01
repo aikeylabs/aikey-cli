@@ -11,9 +11,6 @@ mod env_resolver;
 mod env_renderer;
 mod commands_project;
 mod commands_env;
-mod rpc;
-mod daemon;
-mod daemon_client;
 mod profiles;
 mod core;
 mod global_config;
@@ -138,11 +135,6 @@ enum Commands {
     Provider {
         #[command(subcommand)]
         action: ProviderAction,
-    },
-    /// Daemon management commands
-    Daemon {
-        #[command(subcommand)]
-        action: Option<DaemonAction>,
     },
     /// Quick setup wizard for new projects
     Quickstart,
@@ -321,21 +313,6 @@ enum ProviderAction {
     },
     /// List providers in the project config
     Ls,
-}
-
-#[derive(Subcommand)]
-enum DaemonAction {
-    /// Start the daemon for background secret management
-    Start {
-        /// TCP port to listen on (default: 9999)
-        #[arg(long, default_value = "9999")]
-        port: u16,
-        /// Enable Unix socket support (default: true on Unix)
-        #[arg(long)]
-        unix_socket: bool,
-    },
-    /// Check daemon status and connectivity
-    Status,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -714,11 +691,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-            let client = daemon_client::DaemonClient::new_default();
-            client.unlock(password.expose_secret())
-                .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
 
-            let result = executor::exec_with_env_via_daemon(env_mappings, command, &client);
+            let result = executor::exec_with_env(env_mappings, &password, command);
 
             if let Err(e) = result {
                 if cli.json {
@@ -743,9 +717,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let resolved_tenant = tenant.as_deref().or(env_tenant.as_deref());
 
             let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-            let client = daemon_client::DaemonClient::new_default();
-            client.unlock(password.expose_secret())
-                .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
 
             if *dry_run {
                 let infos = if let Some(provider_name) = provider {
@@ -753,14 +724,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .ok()
                         .flatten()
                         .map(|(_, cfg)| cfg);
-                    executor::dry_run_provider(provider_name, model.as_deref(), resolved_tenant, project_config.as_ref(), &client)?
+                    executor::dry_run_provider(provider_name, model.as_deref(), resolved_tenant, project_config.as_ref())?
                 } else {
                     let project_config = config::ProjectConfig::discover()
                         .ok()
                         .flatten()
                         .map(|(_, cfg)| cfg);
                     if let Some(cfg) = project_config.as_ref() {
-                        executor::dry_run_project_config(cfg, &client, logical_model.as_deref(), resolved_tenant)?
+                        executor::dry_run_project_config(cfg, logical_model.as_deref(), resolved_tenant)?
                     } else {
                         return Err(msgs::NO_CONFIG_FOUND_HINT.into());
                     }
@@ -807,14 +778,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .flatten()
                         .map(|(_, cfg)| cfg);
 
-                    executor::run_with_provider_via_daemon(
+                    executor::run_with_provider(
                         provider_name,
                         model.as_deref(),
                         resolved_tenant,
                         project_config.as_ref(),
+                        &password,
                         command,
                         cli.json,
-                        &client,
                     )
                 } else {
                     // No --provider: use project config to inject all configured provider keys
@@ -824,7 +795,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .map(|(_, cfg)| cfg);
 
                     if let Some(cfg) = project_config.as_ref() {
-                        executor::run_with_project_config_via_daemon(cfg, command, cli.json, &client, logical_model.as_deref(), resolved_tenant)
+                        executor::run_with_project_config(cfg, &password, command, cli.json, logical_model.as_deref(), resolved_tenant)
                     } else {
                         return Err(msgs::NO_CONFIG_FOUND_HINT.into());
                     }
@@ -899,7 +870,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Secret { action } => {
-            let client = daemon_client::DaemonClient::new_default();
             match action {
                 SecretAction::Set { name, from_stdin } => {
                     if !from_stdin {
@@ -916,10 +886,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-                    client.unlock(password.expose_secret())
-                        .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
 
-                    let existing = client.list_secrets();
+                    let existing = executor::list_secrets(&password);
                     let existing = match existing {
                         Ok(list) => list,
                         Err(e) => {
@@ -965,7 +933,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let result = client.upsert_secret(name, secret_value);
+                    let result = executor::add_secret(name, secret_value, &password);
                     let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(name), result.is_ok());
 
                     match result {
@@ -1008,8 +976,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-                    client.unlock(password.expose_secret())
-                        .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
 
                     let mut secret = Zeroizing::new(String::new());
                     io::stdin().read_line(&mut secret)?;
@@ -1028,7 +994,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let result = client.upsert_secret(name, secret_value);
+                    // Check if secret exists to determine add vs update
+                    let existing = executor::list_secrets(&password).unwrap_or_default();
+                    let result = if existing.iter().any(|alias| alias == name) {
+                        executor::update_secret(name, secret_value, &password)
+                    } else {
+                        executor::add_secret(name, secret_value, &password)
+                    };
                     let _ = audit::log_audit_event(&password, audit::AuditOperation::Update, Some(name), result.is_ok());
 
                     match result {
@@ -1058,10 +1030,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 SecretAction::List => {
                     let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-                    client.unlock(password.expose_secret())
-                        .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
 
-                    let result = client.list_secrets_with_metadata();
+                    let result = executor::list_secrets_with_metadata(&password);
                     let _ = audit::log_audit_event(&password, audit::AuditOperation::List, None, result.is_ok());
 
                     match result {
@@ -1096,10 +1066,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 SecretAction::Delete { name } => {
                     let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-                    client.unlock(password.expose_secret())
-                        .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
 
-                    let result = client.delete_secret(name);
+                    let result = executor::delete_secret(name, &password);
                     let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(name), result.is_ok());
 
                     match result {
@@ -1130,10 +1098,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Profile { action } => {
-            let client = daemon_client::DaemonClient::new_default();
             match action {
                 ProfileAction::List => {
-                    match client.list_profiles() {
+                    let profiles = storage::get_all_profiles()
+                        .map(|ps| ps.into_iter().map(|p| p.name).collect::<Vec<_>>());
+                    match profiles {
                         Ok(profiles) => {
                             if cli.json {
                                 let profiles_json: Vec<_> = profiles
@@ -1168,16 +1137,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ProfileAction::Use { name } => {
-                    match client.use_profile(name) {
-                        Ok(profile_name) => {
-                            let _ = global_config::set_current_profile(&profile_name);
+                    match storage::set_active_profile(name) {
+                        Ok(profile) => {
+                            let _ = global_config::set_current_profile(&profile.name);
                             if cli.json {
                                 json_output::print_json(serde_json::json!({
                                     "ok": true,
-                                    "profile": profile_name
+                                    "profile": profile.name
                                 }));
                             } else {
-                                println!("Switched to profile: {}", profile_name);
+                                println!("Switched to profile: {}", profile.name);
                             }
                         }
                         Err(e) => {
@@ -1193,7 +1162,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ProfileAction::Show { name } => {
-                    match client.list_profiles() {
+                    let profiles = storage::get_all_profiles()
+                        .map(|ps| ps.into_iter().map(|p| p.name).collect::<Vec<_>>());
+                    match profiles {
                         Ok(profiles) => {
                             if profiles.contains(name) {
                                 if cli.json {
@@ -1222,21 +1193,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ProfileAction::Current => {
-                    if let Ok(Some(profile_name)) = global_config::get_current_profile() {
-                        if cli.json {
-                            json_output::print_json(serde_json::json!({
-                                "ok": true,
-                                "profile": profile_name
-                            }));
-                        } else {
-                            println!("Current profile: {}", profile_name);
-                        }
-                        return Ok(());
-                    }
-
-                    match client.get_current_profile() {
-                        Ok(profile_name) => {
-                            let _ = global_config::set_current_profile(&profile_name);
+                    match global_config::get_current_profile() {
+                        Ok(Some(profile_name)) => {
                             if cli.json {
                                 json_output::print_json(serde_json::json!({
                                     "ok": true,
@@ -1246,37 +1204,39 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 println!("Current profile: {}", profile_name);
                             }
                         }
-                        Err(e) => {
+                        Ok(None) => {
                             if cli.json {
-                                if let Some(code) = e.code {
-                                    if code == crate::rpc::error_codes::NO_ACTIVE_PROFILE {
-                                        json_output::print_json_exit(serde_json::json!({
-                                            "ok": false,
-                                            "profile": serde_json::Value::Null,
-                                            "code": ErrorCode::NoActiveProfile.as_str()
-                                        }), 1);
-                                    }
-                                }
                                 json_output::print_json_exit(serde_json::json!({
                                     "ok": false,
-                                    "message": e.message
+                                    "profile": serde_json::Value::Null,
+                                    "code": error_codes::ErrorCode::NoActiveProfile.as_str()
                                 }), 1);
                             } else {
-                                return Err(e.message.into());
+                                return Err("No active profile set".into());
+                            }
+                        }
+                        Err(e) => {
+                            if cli.json {
+                                json_output::print_json_exit(serde_json::json!({
+                                    "ok": false,
+                                    "message": e
+                                }), 1);
+                            } else {
+                                return Err(e.into());
                             }
                         }
                     }
                 }
                 ProfileAction::Create { name } => {
-                    match client.create_profile(name) {
-                        Ok(profile_name) => {
+                    match storage::create_profile(name) {
+                        Ok(profile) => {
                             if cli.json {
                                 json_output::success(serde_json::json!({
                                     "ok": true,
-                                    "profile": profile_name
+                                    "profile": profile.name
                                 }));
                             } else {
-                                println!("Profile '{}' created successfully", profile_name);
+                                println!("Profile '{}' created successfully", profile.name);
                             }
                         }
                         Err(e) => {
@@ -1289,7 +1249,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 ProfileAction::Delete { name } => {
-                    match client.delete_profile(name) {
+                    match storage::delete_profile(name) {
                         Ok(_) => {
                             if cli.json {
                                 json_output::success(serde_json::json!({
@@ -1374,47 +1334,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Daemon { action } => {
-            match action {
-                Some(DaemonAction::Start { port, unix_socket }) => {
-                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-                    daemon::start_daemon(*port, *unix_socket, &password, cli.json)?;
-                }
-                Some(DaemonAction::Status) => {
-                    match daemon_client::check_daemon_status() {
-                        Ok(status) => {
-                            if cli.json {
-                                json_output::success(serde_json::json!({
-                                    "status": "running",
-                                    "details": status
-                                }));
-                            } else {
-                                println!("✓ Daemon is running");
-                                if let Some(uptime) = status.get("uptime") {
-                                    println!("  Uptime: {}", uptime);
-                                }
-                                if let Some(version) = status.get("version") {
-                                    println!("  Version: {}", version);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if cli.json {
-                                json_output::error(&format!("Daemon is not running: {}", e), 1);
-                            } else {
-                                eprintln!("✗ Daemon is not running: {}", e);
-                            }
-                            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)));
-                        }
-                    }
-                }
-                None => {
-                    // Default to start if no subcommand specified
-                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-                    daemon::start_daemon(9999, true, &password, cli.json)?;
-                }
-            }
-        }
         Commands::Quickstart => {
             commands_project::handle_quickstart(cli.json)?;
         }
@@ -1428,9 +1347,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             match action {
                 KeyAction::Rotate { name, from_stdin } => {
                     let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-                    let client = daemon_client::DaemonClient::new_default();
-                    client.unlock(password.expose_secret())
-                        .map_err(|e| format!("Failed to unlock daemon: {}", e))?;
 
                     let new_value = if *from_stdin {
                         let mut buf = Zeroizing::new(String::new());
@@ -1456,7 +1372,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let result = client.upsert_secret(name, new_value_str);
+                    // Check if secret exists to determine add vs update
+                    let existing = executor::list_secrets(&password).unwrap_or_default();
+                    let result = if existing.iter().any(|alias| alias == name) {
+                        executor::update_secret(name, new_value_str, &password)
+                    } else {
+                        executor::add_secret(name, new_value_str, &password)
+                    };
                     let _ = audit::log_audit_event(&password, audit::AuditOperation::Update, Some(name), result.is_ok());
 
                     match result {
