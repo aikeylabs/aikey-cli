@@ -43,7 +43,7 @@ fn test_01_schema_integrity() {
     let db_path = setup_test_vault(&temp_dir);
 
     // Initialize vault using the CLI
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .arg("init")
@@ -144,7 +144,7 @@ fn test_02_migration_test() {
     println!("✓ Created old database schema (missing version_tag, metadata, id)");
 
     // Now use the CLI to add a new secret (should trigger migration)
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .env("AK_TEST_SECRET", "new_value")
@@ -203,7 +203,7 @@ fn test_03_versioning_logic() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
 
     // Initialize vault
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .arg("init")
@@ -211,7 +211,7 @@ fn test_03_versioning_logic() {
         .success();
 
     // Add initial secret (version should be 1)
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .env("AK_TEST_SECRET", "value_v1")
@@ -242,7 +242,7 @@ fn test_03_versioning_logic() {
     println!("✓ Initial version = 1");
 
     // Update secret (version should increment to 2)
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .env("AK_TEST_SECRET", "value_v2")
@@ -267,7 +267,7 @@ fn test_03_versioning_logic() {
     println!("✓ After first update: version = 2");
 
     // Update again (version should increment to 3)
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .env("AK_TEST_SECRET", "value_v3")
@@ -300,7 +300,7 @@ fn test_04_metadata_parsing() {
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
 
     // Initialize vault
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .arg("init")
@@ -364,7 +364,7 @@ fn test_04_metadata_parsing() {
     println!("  - purpose: {}", parsed["purpose"]);
 
     // Test ak list command (should not crash with metadata present)
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .arg("list")

@@ -26,7 +26,7 @@ impl TestEnv {
 
     /// Get a Command with HOME set to temp directory
     fn cmd(&self) -> Command {
-        let mut cmd = Command::new(cargo_bin("ak"));
+        let mut cmd = Command::new(cargo_bin("aikey"));
         cmd.env("HOME", self._temp_dir.path());
         cmd.env("AK_TEST_PASSWORD", &self.test_password);
         cmd.current_dir(self._temp_dir.path());  // Set working directory to temp dir
@@ -303,7 +303,7 @@ fn test_04_security_auth_failure() {
     env.add_secret("TEST_SECRET", "test_value").success();
 
     // Test: Try to add with wrong password (override the env var)
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("HOME", env._temp_dir.path())
         .env("AK_TEST_PASSWORD", "wrong_password")
         .env("AK_TEST_SECRET", "some_value")
@@ -508,7 +508,7 @@ fn test_09_update_secret() {
         .stderr(predicate::str::contains("Secret 'NONEXISTENT' not found"));
 
     // Test: Update with wrong password should fail
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("HOME", env._temp_dir.path())
         .env("AK_TEST_PASSWORD", "wrong_password")
         .env("AK_TEST_SECRET", "new_value")

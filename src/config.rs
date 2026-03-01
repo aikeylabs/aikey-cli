@@ -133,7 +133,7 @@ impl ProjectConfig {
                         Please convert your config to JSON format:\n\
                           1. Rename {} to aikey.config.json\n\
                           2. Convert YAML syntax to JSON if needed\n\n\
-                        Example: https://github.com/AiKey-Founder/aikey-labs/blob/main/docs/config-schema.md",
+                        Example: https://github.com/aikeylabs/aikey-cli/blob/main/docs/config-schema.md",
                         deprecated, deprecated
                     ));
                 }

@@ -40,7 +40,7 @@ fn test_rate_limiting_basic() {
     let _db_path = setup_test_vault(&temp_dir);
 
     // Initialize vault
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "correct_password")
         .arg("init")
@@ -50,7 +50,7 @@ fn test_rate_limiting_basic() {
     println!("✓ Vault initialized");
 
     // Attempt 1: Wrong password
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "wrong_password_1")
         .arg("list")
@@ -60,7 +60,7 @@ fn test_rate_limiting_basic() {
     println!("✓ Attempt 1: Wrong password rejected");
 
     // Attempt 2: Wrong password
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "wrong_password_2")
         .arg("list")
@@ -70,7 +70,7 @@ fn test_rate_limiting_basic() {
     println!("✓ Attempt 2: Wrong password rejected");
 
     // Attempt 3: Wrong password
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "wrong_password_3")
         .arg("list")
@@ -80,7 +80,7 @@ fn test_rate_limiting_basic() {
     println!("✓ Attempt 3: Wrong password rejected");
 
     // Attempt 4: Should be rate limited
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     let output = cmd
         .env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "wrong_password_4")
@@ -107,7 +107,7 @@ fn test_rate_limiting_reset_on_success() {
     let _db_path = setup_test_vault(&temp_dir);
 
     // Initialize vault
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "correct_password")
         .arg("init")
@@ -116,7 +116,7 @@ fn test_rate_limiting_reset_on_success() {
 
     // Two wrong attempts
     for i in 1..=2 {
-        let mut cmd = Command::cargo_bin("ak").unwrap();
+        let mut cmd = Command::cargo_bin("aikey").unwrap();
         cmd.env("HOME", temp_dir.path())
             .env("AK_TEST_PASSWORD", format!("wrong_{}", i))
             .arg("list")
@@ -127,7 +127,7 @@ fn test_rate_limiting_reset_on_success() {
     println!("✓ Two failed attempts recorded");
 
     // Successful attempt should reset counter
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "correct_password")
         .arg("list")
@@ -138,7 +138,7 @@ fn test_rate_limiting_reset_on_success() {
 
     // Should be able to attempt again (counter reset)
     for i in 1..=3 {
-        let mut cmd = Command::cargo_bin("ak").unwrap();
+        let mut cmd = Command::cargo_bin("aikey").unwrap();
         cmd.env("HOME", temp_dir.path())
             .env("AK_TEST_PASSWORD", format!("wrong_again_{}", i))
             .arg("list")
@@ -158,7 +158,7 @@ fn test_audit_log_creation() {
     let db_path = setup_test_vault(&temp_dir);
 
     // Initialize vault
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
         .arg("init")
@@ -201,7 +201,7 @@ fn test_schema_versioning() {
     let _db_path = setup_test_vault(&temp_dir);
 
     // Initialize vault
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
         .arg("init")
@@ -209,7 +209,7 @@ fn test_schema_versioning() {
         .success();
 
     // Add a secret
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
         .env("AK_TEST_SECRET", "test_value")
@@ -222,7 +222,7 @@ fn test_schema_versioning() {
 
     // Export with schema version
     let export_path = temp_dir.path().join("export.akb");
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
         .arg("export")
@@ -243,7 +243,7 @@ fn test_schema_versioning() {
     println!("✓ Export file size: {} bytes", file_size);
 
     // Import back
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
         .arg("import")
@@ -263,7 +263,7 @@ fn test_parallel_decryption_performance() {
     let _db_path = setup_test_vault(&temp_dir);
 
     // Initialize vault
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
         .arg("init")
@@ -272,7 +272,7 @@ fn test_parallel_decryption_performance() {
 
     // Add 20 secrets
     for i in 1..=20 {
-        let mut cmd = Command::cargo_bin("ak").unwrap();
+        let mut cmd = Command::cargo_bin("aikey").unwrap();
         cmd.env("HOME", temp_dir.path())
             .env("AK_TEST_PASSWORD", "test_password")
             .env("AK_TEST_SECRET", format!("secret_value_{}", i))
@@ -294,7 +294,7 @@ fn test_parallel_decryption_performance() {
     // Test exec with parallel decryption
     let start = std::time::Instant::now();
 
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     let mut cmd_with_env = cmd
         .env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
@@ -334,7 +334,7 @@ fn test_secure_delete_pragma() {
     let db_path = setup_test_vault(&temp_dir);
 
     // Initialize vault
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
         .arg("init")
@@ -410,7 +410,7 @@ fn test_migration_compatibility() {
     println!("✓ Created old database schema");
 
     // Try to add a secret (should trigger migration)
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
         .env("AK_TEST_SECRET", "test_value")
@@ -459,7 +459,7 @@ fn test_clipboard_timeout_flag() {
     let _db_path = setup_test_vault(&temp_dir);
 
     // Initialize vault
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
         .arg("init")
@@ -467,7 +467,7 @@ fn test_clipboard_timeout_flag() {
         .success();
 
     // Add a secret
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
         .env("AK_TEST_SECRET", "test_value")
@@ -477,7 +477,7 @@ fn test_clipboard_timeout_flag() {
         .success();
 
     // Get with custom timeout
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     let output = cmd
         .env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
@@ -497,7 +497,7 @@ fn test_clipboard_timeout_flag() {
     println!("✓ Timeout flag accepted");
 
     // Get with timeout disabled
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("HOME", temp_dir.path())
         .env("AK_TEST_PASSWORD", "test_password")
         .arg("get")

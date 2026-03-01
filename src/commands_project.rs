@@ -131,9 +131,10 @@ pub fn handle_project_init(json_mode: bool) -> Result<(), Box<dyn std::error::Er
     if !json_mode {
         println!("\n✓ Created aikey.config.json");
         println!("\nNext steps:");
-        println!("  1. Set up profiles and keys using the browser extension");
-        println!("  2. Run 'aikey env generate' to create your .env file");
-        println!("  3. Use 'aikey project status' to check configuration");
+        println!("  1. Run 'aikey setup' to create a profile and add keys");
+        println!("  2. Run 'aikey env generate' to create/update your .env file (non-sensitive only)");
+        println!("  3. Use 'aikey run -- <command>' to run with secrets injected");
+        println!("  4. Use 'aikey project status' to check configuration");
     }
 
     Ok(())
@@ -277,11 +278,8 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
             println!("\nYour project is already configured!");
             println!("\nNext steps:");
             println!("  • Run 'aikey project status' to check your configuration");
-            println!("  • Run 'aikey env generate' to create/update your .env file");
-            println!("  • Use 'aikey env inject' to inject secrets into your shell");
-            println!("\nFor more information:");
-            println!("  • Browser extension: Configure profiles and manage keys");
-            println!("  • VS Code extension: Insert from AiKey, view project status");
+            println!("  • Run 'aikey env generate' to create/update your .env file (non-sensitive only)");
+            println!("  • Use 'aikey run -- <command>' to run with secrets injected");
         }
         return Ok(());
     }
@@ -307,20 +305,15 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
             "config_path": config_path.display().to_string()
         }));
     } else {
-        println!("\n🎉 Setup complete!");
-        println!("\n📚 What's next?");
-        println!("\n1. Configure your profiles and keys:");
-        println!("   • Install the AiKey browser extension to manage profiles");
-        println!("   • Add your API keys (OpenAI, Anthropic, etc.) to your profile");
-        println!("\n2. Generate your .env file:");
+        println!("\nSetup complete!");
+        println!("\nWhat's next?");
+        println!("\n1. Add keys to your local vault:");
+        println!("   $ aikey secret set <name> --from-stdin");
+        println!("\n2. Generate your .env file (non-sensitive only):");
         println!("   $ aikey env generate");
-        println!("\n3. Inject secrets into your shell:");
-        println!("   $ eval \"$(AIKEY_INJECT_MODE=eval aikey env inject)\"");
-        println!("\n4. Use the VS Code extension:");
-        println!("   • Install 'AiKey' from the VS Code marketplace");
-        println!("   • Use 'Insert from AiKey' to insert secrets into your code");
-        println!("   • View project status in the AiKey panel");
-        println!("\n💡 Tip: Run 'aikey project status' anytime to check your configuration");
+        println!("\n3. Run your app with secrets injected:");
+        println!("   $ aikey run -- <command>");
+        println!("\nTip: Run 'aikey project status' anytime to check your configuration");
     }
 
     Ok(())

@@ -27,7 +27,7 @@ fn setup_test_vault() -> (TempDir, PathBuf) {
 
 /// Helper to create a Command with test environment variables
 fn test_command(vault_path: &PathBuf) -> Command {
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.env("AK_NO_CLIPBOARD", "1");
@@ -280,7 +280,7 @@ fn test_export_import_roundtrip() {
     let import_vault_path = _temp_dir.path().join(".ak_vault_import.db");
 
     // Initialize new vault
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.arg("init")
@@ -288,7 +288,7 @@ fn test_export_import_roundtrip() {
         .success();
 
     // Import the backup
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.args(&["import", export_path.to_str().unwrap()])
@@ -299,7 +299,7 @@ fn test_export_import_roundtrip() {
         .stderr(predicate::str::contains("Skipped: 0"));
 
     // Verify all entries were imported correctly
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.env("AK_NO_CLIPBOARD", "1");
@@ -308,7 +308,7 @@ fn test_export_import_roundtrip() {
         .success()
         .stdout(predicate::str::contains("ghp_test123"));
 
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.env("AK_NO_CLIPBOARD", "1");
@@ -317,7 +317,7 @@ fn test_export_import_roundtrip() {
         .success()
         .stdout(predicate::str::contains("sk-test456"));
 
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.env("AK_NO_CLIPBOARD", "1");
@@ -352,14 +352,14 @@ fn test_pattern_export() {
     // Create new vault and import
     let import_vault_path = _temp_dir.path().join(".ak_vault_import.db");
 
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.arg("init")
         .assert()
         .success();
 
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.args(&["import", export_path.to_str().unwrap()])
@@ -368,7 +368,7 @@ fn test_pattern_export() {
         .stderr(predicate::str::contains("Added: 2"));
 
     // Verify only openai keys were imported
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.args(&["list"])
@@ -387,7 +387,7 @@ fn test_invalid_akb_file() {
     let (_temp_dir, _vault_path) = setup_test_vault();
 
     // Initialize vault
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", _vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.arg("init")
@@ -399,7 +399,7 @@ fn test_invalid_akb_file() {
     fs::write(&invalid_path, b"INVALID_DATA").expect("Failed to write invalid file");
 
     // Attempt to import - should fail
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", _vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.args(&["import", invalid_path.to_str().unwrap()])
@@ -430,14 +430,14 @@ fn test_wrong_password_import() {
     std::env::set_var("AK_VAULT_PATH", import_vault_path.to_str().unwrap());
     std::env::set_var("AK_TEST_PASSWORD", "different_password");
 
-    Command::cargo_bin("ak")
+    Command::cargo_bin("aikey")
         .unwrap()
         .arg("init")
         .assert()
         .success();
 
     // Attempt to import with wrong password - should fail HMAC verification
-    Command::cargo_bin("ak")
+    Command::cargo_bin("aikey")
         .unwrap()
         .args(&["import", export_path.to_str().unwrap()])
         .assert()

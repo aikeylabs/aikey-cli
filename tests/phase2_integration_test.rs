@@ -41,7 +41,7 @@ impl TestEnv {
 
     /// Get a Command using 'ak' alias
     fn cmd_ak(&self) -> Command {
-        let mut cmd = Command::new(cargo_bin("ak"));
+        let mut cmd = Command::new(cargo_bin("aikey"));
         cmd.env("HOME", self._temp_dir.path());
         cmd.env("AK_TEST_PASSWORD", &self.test_password);
         cmd.current_dir(self._temp_dir.path());  // Set working directory to temp dir

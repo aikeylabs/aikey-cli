@@ -23,7 +23,7 @@ fn setup_test_vault() -> (TempDir, PathBuf) {
 
 /// Helper to create a Command with test environment variables
 fn test_cmd(vault_path: &PathBuf) -> Command {
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("AK_VAULT_PATH", vault_path.to_str().unwrap());
     cmd.env("AK_TEST_PASSWORD", "test_password_123");
     cmd.env("AK_NO_CLIPBOARD", "1");
@@ -32,7 +32,7 @@ fn test_cmd(vault_path: &PathBuf) -> Command {
 
 /// Helper to add a secret with a specific value
 fn add_secret(vault_path: &PathBuf, alias: &str, value: &str) {
-    let mut cmd = Command::new(cargo_bin("ak"));
+    let mut cmd = Command::new(cargo_bin("aikey"));
     cmd.env("AK_VAULT_PATH", vault_path.to_str().unwrap())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .env("AK_TEST_SECRET", value)
@@ -51,7 +51,7 @@ fn update_secret(vault_path: &PathBuf, alias: &str, value: &str) {
 
 /// Helper to delete a secret
 fn delete_secret(vault_path: &PathBuf, alias: &str) {
-    let mut cmd = Command::cargo_bin("ak").unwrap();
+    let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.env("AK_VAULT_PATH", vault_path.to_str().unwrap())
         .env("AK_TEST_PASSWORD", "test_password_123")
         .args(&["delete", alias])

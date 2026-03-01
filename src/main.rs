@@ -24,7 +24,7 @@ use std::env;
 use std::io::{self, Write};
 use zeroize::Zeroizing;
 use rpassword::prompt_password;
-use error_codes::{msgs, ErrorCode};
+use error_codes::msgs;
 
 #[derive(Parser)]
 #[command(name = "aikey", about = "AiKey - Secure local-first secret management", version = "0.2.0", disable_version_flag = true)]
@@ -227,14 +227,11 @@ enum EnvAction {
         #[arg(long)]
         env_file: Option<String>,
     },
-    /// Inject secrets into current shell, or run a command with secrets injected
+    /// Run a command with secrets injected, or show an injection preview
     Inject {
         /// Command to run with secrets injected (use -- to separate)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
-        /// Allow plaintext secret exposure (DANGEROUS - secrets will be visible in shell history)
-        #[arg(long)]
-        unsafe_plaintext: bool,
         /// Logical model name for narrowing injection (e.g. chat-main, embeddings)
         #[arg(long, value_name = "LOGICAL_MODEL")]
         logical_model: Option<String>,
@@ -244,15 +241,6 @@ enum EnvAction {
         /// Show what would be resolved without executing the command
         #[arg(long)]
         dry_run: bool,
-    },
-    /// Export resolved environment variables to stdout
-    Export {
-        /// Output format: dotenv, shell, or json
-        #[arg(long, default_value = "dotenv")]
-        format: String,
-        /// Allow plaintext secret exposure (DANGEROUS - secrets will be visible in output)
-        #[arg(long)]
-        unsafe_plaintext: bool,
     },
     /// Check if all required environment variables can be resolved
     Check,
@@ -1276,9 +1264,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 EnvAction::Generate { dry_run, env_file } => {
                     commands_env::handle_env_generate(*dry_run, env_file.as_deref(), cli.json)?;
                 }
-                EnvAction::Inject { command, unsafe_plaintext, logical_model, tenant, dry_run } => {
+                EnvAction::Inject { command, logical_model, tenant, dry_run } => {
                     if command.is_empty() {
-                        commands_env::handle_env_inject(cli.json, *unsafe_plaintext)?;
+                        commands_env::handle_env_inject(cli.json)?;
                     } else {
                         // P0-B1: env inject -- <cmd> MUST be equivalent to run -- <cmd>
                         // Apply same tenant precedence: --tenant > AIKEY_TENANT env var
@@ -1287,9 +1275,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                         commands_env::handle_env_run(command, cli.json, logical_model.as_deref(), resolved_tenant, *dry_run)?;
                     }
-                }
-                EnvAction::Export { format, unsafe_plaintext } => {
-                    commands_env::handle_env_export(format, cli.json, *unsafe_plaintext)?;
                 }
                 EnvAction::Check => {
                     commands_env::handle_env_check(cli.json)?;

@@ -206,7 +206,7 @@ pub fn ensure_vault_exists() -> Result<(), String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     Ok(())
@@ -253,7 +253,7 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
     }
 
     if db_path.exists() {
-        return Err("Vault already initialized. Use 'ak reset' to reinitialize.".to_string());
+        return Err("Vault already initialized. If you need a fresh vault, delete the local vault file and run 'aikey init' again.".to_string());
     }
 
     let conn = Connection::open(&db_path)
@@ -523,7 +523,7 @@ pub fn get_salt() -> Result<Vec<u8>, String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = open_connection()?;
@@ -553,7 +553,7 @@ pub fn get_kdf_params() -> Result<(u32, u32, u32), String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = open_connection()?;
@@ -606,7 +606,7 @@ pub fn store_entry(alias: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<(), S
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = open_connection()?;
@@ -628,7 +628,7 @@ pub fn get_entry(alias: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = open_connection()?;
@@ -651,7 +651,7 @@ pub fn list_entries() -> Result<Vec<String>, String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = open_connection()?;
@@ -674,7 +674,7 @@ pub fn list_entries_with_metadata() -> Result<Vec<SecretMetadata>, String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = open_connection()?;
@@ -711,7 +711,7 @@ pub fn delete_entry(alias: &str) -> Result<(), String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = open_connection()?;
@@ -732,7 +732,7 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     // Get salt and KDF parameters
@@ -846,7 +846,7 @@ pub fn get_entries_with_metadata(
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = open_connection()?;
@@ -888,7 +888,7 @@ pub fn get_entry_with_metadata(
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = Connection::open(&db_path)
@@ -931,7 +931,7 @@ pub fn update_entry_full(
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = Connection::open(&db_path)
@@ -961,7 +961,7 @@ pub fn insert_entry_full(
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = open_connection()?;
@@ -996,7 +996,7 @@ pub fn get_all_entries() -> Result<Vec<(String, Vec<u8>, Vec<u8>)>, String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run 'ak init' first.".to_string());
+        return Err("Vault not initialized. Run 'aikey init' first.".to_string());
     }
 
     let conn = open_connection()?;

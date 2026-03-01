@@ -1,5 +1,8 @@
 /target
 **/*.db
+*.akb
+*.save
+.claude/
 .env
 .env.*
 *.log

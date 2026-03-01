@@ -3,7 +3,6 @@ use crate::env_renderer::EnvRenderer;
 use crate::{core, storage, global_config};
 use secrecy::SecretString;
 use zeroize::Zeroizing;
-use std::collections::HashMap;
 
 fn prompt_password_for_env(json_mode: bool) -> Result<SecretString, Box<dyn std::error::Error>> {
     #[cfg(test)]
@@ -15,18 +14,6 @@ fn prompt_password_for_env(json_mode: bool) -> Result<SecretString, Box<dyn std:
     let password = rpassword::prompt_password(prompt_str)?;
     let password_raw = Zeroizing::new(password);
     Ok(SecretString::new(password_raw.trim().to_string()))
-}
-
-/// Validate that a variable name is a safe shell identifier: [A-Z_][A-Z0-9_]*
-fn validate_var_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let valid = !name.is_empty()
-        && name.chars().next().map_or(false, |c| c.is_ascii_uppercase() || c == '_')
-        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-    if valid {
-        Ok(())
-    } else {
-        Err(format!("Invalid variable name '{}': must match [A-Z_][A-Z0-9_]*", name).into())
-    }
 }
 
 /// Handle `aikey env generate` command
@@ -120,7 +107,7 @@ pub fn handle_env_generate(
 }
 
 /// Handle `aikey env inject` command
-pub fn handle_env_inject(json_mode: bool, unsafe_plaintext: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     let (config_path, config) = ProjectConfig::discover()?
         .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
 
@@ -150,167 +137,36 @@ pub fn handle_env_inject(json_mode: bool, unsafe_plaintext: bool) -> Result<(), 
         });
         println!("{}", serde_json::to_string_pretty(&response).unwrap());
     } else {
-        // Check if we're being eval'd (output should be shell commands)
+        // Check if we're being eval'd (output would be shell commands)
         let is_eval_mode = std::env::var("AIKEY_INJECT_MODE").unwrap_or_default() == "eval";
 
         if is_eval_mode {
-            // P0: Block plaintext output unless --unsafe-plaintext is used
-            if !unsafe_plaintext {
-                eprintln!("❌ ERROR: Plaintext secret exposure is disabled by default.");
-                eprintln!();
-                eprintln!("   'aikey env inject' in eval mode would expose secrets in your shell.");
-                eprintln!();
-                eprintln!("   ⚠️  RECOMMENDED: Use 'aikey run -- <command>' instead for secure injection.");
-                eprintln!();
-                eprintln!("   If you understand the risks and still want to proceed, use:");
-                eprintln!("   eval \"$(AIKEY_INJECT_MODE=eval aikey env inject --unsafe-plaintext)\"");
-                eprintln!();
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Plaintext secret exposure blocked (use --unsafe-plaintext to override)"
-                )));
-            }
-
-            // Show prominent warning
-            eprintln!("⚠️  WARNING: Exporting secrets in plaintext to shell environment!");
-            eprintln!("   - Secrets will be visible in shell history");
-            eprintln!("   - Secrets will be visible to all processes");
-            eprintln!("   - Consider using 'aikey run -- <command>' instead");
+            eprintln!("❌ ERROR: Plaintext shell injection is not supported in this Stage 0 Rust CLI.");
             eprintln!();
-
-            // Output shell export commands for eval
-            for var in &resolved {
-                validate_var_name(&var.name)?;
-                if let Some(value) = &var.value {
-                    // Escape single quotes in the value
-                    let escaped_value = value.replace('\'', "'\\''");
-                    println!("export {}='{}'", var.name, escaped_value);
-                } else {
-                    println!("export {}=''", var.name);
-                }
-            }
-        } else {
-            // Human-readable output with usage instructions
-            println!("Environment Injection");
-            println!("====================");
-            println!("Profile: {}", current_profile);
-            println!("\nVariables to inject:");
-
-            for var in &resolved {
-                let status = if var.value.is_some() { "✓" } else { "✗" };
-                println!("  {} {}", status, var.name);
-            }
-
-            println!("\n⚠️  Security Notice:");
-            println!("   Direct shell injection exposes secrets in your environment.");
-            println!("   RECOMMENDED: Use 'aikey run -- <command>' for secure injection.");
-            println!("\nTo inject these variables into your shell (NOT RECOMMENDED), run:");
-            println!("  eval \"$(AIKEY_INJECT_MODE=eval aikey env inject --unsafe-plaintext)\"");
-            println!("\nOr use 'aikey run -- <command>' to run a command with secrets injected securely.");
-        }
-    }
-
-    Ok(())
-}
-
-/// Get current profile from global config
-pub fn get_current_profile() -> Result<String, Box<dyn std::error::Error>> {
-    if let Ok(Some(profile)) = global_config::get_current_profile() {
-        return Ok(profile);
-    }
-
-    Ok("default".to_string())
-}
-
-/// Handle `aikey env export` command
-pub fn handle_env_export(format: &str, json_mode: bool, unsafe_plaintext: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (config_path, config) = ProjectConfig::discover()?.ok_or_else(|| {
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "No aikey.config.json found",
-        )) as Box<dyn std::error::Error>
-    })?;
-
-    // Get current profile
-    let password = prompt_password_for_env(json_mode)?;
-    let current_profile = global_config::get_current_profile()
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?
-        .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No active profile")) as Box<dyn std::error::Error>)?;
-
-    // Resolve environment variables
-    let resolved = resolve_env_direct(&config, &current_profile, &password, Some(&config_path))?;
-
-    // P0: Check if any sensitive vars are present
-    let has_sensitive = resolved.iter().any(|v| v.is_sensitive && v.value.is_some());
-
-    if has_sensitive && !unsafe_plaintext {
-        eprintln!("❌ ERROR: Plaintext secret exposure is disabled by default.");
-        eprintln!();
-        eprintln!("   'aikey env export' would expose secrets in plaintext output.");
-        eprintln!();
-        eprintln!("   ⚠️  RECOMMENDED: Use 'aikey run -- <command>' instead for secure injection.");
-        eprintln!();
-        eprintln!("   If you understand the risks and still want to proceed, use:");
-        eprintln!("   aikey env export --unsafe-plaintext");
-        eprintln!();
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Plaintext secret exposure blocked (use --unsafe-plaintext to override)"
-        )));
-    }
-
-    // Show prominent warning if unsafe mode is enabled
-    if has_sensitive && unsafe_plaintext {
-        let sensitive_names: Vec<&str> = resolved
-            .iter()
-            .filter(|v| v.is_sensitive && v.value.is_some())
-            .map(|v| v.name.as_str())
-            .collect();
-
-        eprintln!("⚠️  WARNING: Exporting secrets in plaintext: {}", sensitive_names.join(", "));
-        eprintln!("   - Do NOT redirect this output to logs or files");
-        eprintln!("   - Do NOT commit this output to version control");
-        eprintln!("   - Secrets will be visible in your terminal");
-        eprintln!();
-    }
-
-    match format {
-        "dotenv" | ".env" => {
-            // Output in .env format
-            for var in &resolved {
-                if let Some(value) = &var.value {
-                    println!("{}={}", var.name, value);
-                } else {
-                    println!("{}=", var.name);
-                }
-            }
-        }
-        "shell" => {
-            // Output as shell export commands
-            for var in &resolved {
-                validate_var_name(&var.name)?;
-                if let Some(value) = &var.value {
-                    let escaped_value = value.replace('\'', "'\\''");
-                    println!("export {}='{}'", var.name, escaped_value);
-                } else {
-                    println!("export {}=''", var.name);
-                }
-            }
-        }
-        "json" => {
-            // Output as JSON
-            let vars: HashMap<String, Option<String>> = resolved
-                .iter()
-                .map(|v| (v.name.clone(), v.value.clone()))
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&vars)?);
-        }
-        _ => {
+            eprintln!("   'aikey env inject' in eval mode would expose secrets in your shell.");
+            eprintln!();
+            eprintln!("   Use 'aikey run -- <command>' instead for secure injection.");
+            eprintln!();
             return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("Unknown format: {}. Use 'dotenv', 'shell', or 'json'", format),
+                std::io::ErrorKind::PermissionDenied,
+                "Plaintext secret exposure is not supported (use aikey run instead)"
             )));
         }
+
+        // Human-readable output with usage instructions
+        println!("Environment Injection");
+        println!("====================");
+        println!("Profile: {}", current_profile);
+        println!("\nVariables to inject:");
+
+        for var in &resolved {
+            let status = if var.value.is_some() { "✓" } else { "✗" };
+            println!("  {} {}", status, var.name);
+        }
+
+        println!("\nSecurity Notice:");
+        println!("  Direct shell injection is intentionally not supported.");
+        println!("  Use 'aikey run -- <command>' to run a command with secrets injected securely.");
     }
 
     Ok(())
@@ -362,8 +218,9 @@ pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
                 println!("  ✗ {}", var.name);
             }
             println!("\nTo configure these variables:");
-            println!("  • Use the browser extension to add keys to your profile");
-            println!("  • Or run 'aikey env generate' to create placeholders in .env");
+            println!("  • Add keys to your local vault: 'aikey secret set <name> --from-stdin'");
+            println!("  • Run 'aikey project map' / 'aikey provider add' to bind vars to keys");
+            println!("  • Then run 'aikey env generate' to create non-sensitive placeholders in .env");
         } else {
             println!("\n✓ All required variables are configured");
         }

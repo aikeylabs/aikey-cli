@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["AiKey Founder <aikeyfounder@gmail.com>"]
 description = "Embed AiKey secret resolution in your Rust applications"
 license = "Apache-2.0"
-repository = "https://github.com/AiKey-Founder/aikey-labs"
+repository = "https://github.com/aikeylabs/aikey-cli"
 keywords = ["aikey", "secrets", "api-keys", "llm", "sdk"]
 categories = ["authentication", "api-bindings"]
 
