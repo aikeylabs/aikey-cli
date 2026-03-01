@@ -34,6 +34,8 @@ When using AiKey CLI:
 3. **Use strong passwords** - The vault uses Argon2id for key derivation
 4. **Keep your system secure** - AiKey stores encrypted secrets locally
 5. **Review config files** - Ensure `aikey.config.json` contains no sensitive data before committing
+6. **Use the blessed path** - Only use `aikey run -- <cmd>` for secret injection
+7. **Never write secrets to files** - Do not redirect secret output to files or logs
 
 ## Security Features
 
@@ -41,7 +43,9 @@ When using AiKey CLI:
 - **No network transmission** - Secrets never leave your machine
 - **Memory safety** - Built in Rust with secure memory handling
 - **Minimal attack surface** - Direct password-based vault access (no daemon)
-- **Runtime-only injection** - Secrets only exist in child process memory
+- **Runtime-only injection** - Secrets only exist in child process memory during execution
+- **No plaintext export** - No workflows that write secrets to files or persistent environment variables
+- **Single blessed path** - Only `aikey run -- <cmd>` injects secrets into processes
 
 ## Audit History
 

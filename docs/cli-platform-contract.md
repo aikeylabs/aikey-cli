@@ -1,15 +1,27 @@
-# AiKey CLI Platform Contract (minimal)
+# AiKey CLI Platform Contract
 
 This document defines the **minimal, externally-consumable** contract for automation and integrations.
 
 It is intentionally small. Everything not stated here is **non-contractual**.
 
+## Core Principle
+
+**The only blessed path for secret injection is `aikey run -- <cmd>`.**
+
+The CLI does not provide plaintext secret export, eval-style injection, or any workflow that writes secrets to files or environment variables outside of child process execution.
+
 ## Scope
 
+This contract covers:
 - `--json` mode behavior
 - stdout/stderr channel rules (for automation)
-- exit codes
-- password/secret input constraints in automation
+- Exit codes
+- Password/secret input constraints in automation
+
+This contract does NOT cover:
+- Plaintext secret export (not provided)
+- Eval-style shell injection (not provided)
+- Writing secrets to files or persistent environment variables (not provided)
 
 ## `--json` mode (general)
 
@@ -57,7 +69,33 @@ In `--json` mode, interactive password prompts are intentionally **suppressed** 
 - Stable, uniform JSON schema across *all* commands is **not** promised here.
 - Stable stdout/stderr placement for JSON across *all* commands is **not** promised here (capture both).
 
-## Security invariants (Stage 0 alignment)
+## Security Invariants (Stage 0)
 
-- Secrets must not be written to project files (including `.env`).
-- Plaintext exposure is an advanced/dangerous escape hatch only; integrations should not rely on it.
+**Secrets are never written to files:**
+- Secrets must not be written to project files (including `.env`)
+- `.env` files (if generated) contain only non-sensitive context variables
+- Secrets are injected only into child process memory via `aikey run -- <cmd>`
+
+**No plaintext export:**
+- The Stage 0 CLI does not provide plaintext secret export functionality
+- There is no eval-style injection mode
+- Integrations must use `aikey run -- <cmd>` for secret access
+
+**Runtime-only injection:**
+- Secrets exist only in the child process environment during execution
+- Secrets are decrypted on-demand and never persisted to disk in plaintext
+- Child process inherits secrets; they are cleared when the process exits
+
+## Integration Guidelines
+
+**For automation and CI/CD:**
+1. Use `aikey run -- <cmd>` to execute commands with secrets
+2. Use `--json` mode for machine-readable output
+3. Use `--password-stdin` for non-interactive password input
+4. Capture both stdout and stderr (JSON may appear on either)
+5. Check exit codes for success/failure
+
+**What NOT to do:**
+- Do not attempt to export secrets to environment variables
+- Do not rely on any legacy flags or commands outside this contract
+- Do not write secrets to files or logs

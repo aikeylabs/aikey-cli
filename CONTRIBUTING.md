@@ -109,6 +109,7 @@ Thank you for your interest in contributing to AiKey CLI! This document provides
 - Add doc comments for public APIs
 - Update relevant documentation in `docs/`
 - Include examples for new functionality
+- Ensure documentation aligns with Stage 0 contract (no plaintext export, runtime-only injection)
 
 ## Security
 
@@ -116,6 +117,7 @@ Thank you for your interest in contributing to AiKey CLI! This document provides
 - Follow secure coding practices
 - Report security vulnerabilities privately to aikeyfounder@gmail.com
 - See SECURITY.md for more details
+- Ensure new features align with Stage 0 security contract (no plaintext export, runtime-only injection)
 
 ## Code Review Process
 
@@ -128,7 +130,7 @@ Thank you for your interest in contributing to AiKey CLI! This document provides
 
 - Open an issue for questions about the codebase
 - Check existing documentation in the `docs/` directory
-- Review the Stage 0 blueprint documents for architecture details
+- Review README.md for Stage 0 architecture and security principles
 
 ## License
 

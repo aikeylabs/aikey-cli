@@ -1,57 +1,107 @@
 # AiKey CLI (Stage 0)
 
-This folder contains the **AiKey CLI implementation**.
+**AiKey** is a secure, local-first secret management CLI for developers. It provides runtime credential injection without storing secrets in project files.
 
-Stage 0 goal: AiKey is a **runtime credential layer** ("management, not a password book"). Projects declare intent in `aikey.config.json` (no secrets). At runtime, credentials are resolved and injected via **one blessed path**: `aikey run -- <cmd>`.
+## Stage 0 Contract
 
-## Authoritative Stage 0 docs (repo root)
+AiKey is a **runtime credential layer** ("management, not a password book"). Projects declare intent in `aikey.config.json` (no secrets). At runtime, credentials are resolved and injected via **one blessed path**: `aikey run -- <cmd>`.
 
-The CLI docs in this folder are intentionally minimal. The **authoritative** Stage 0 contracts live in the repo root:
+**What Stage 0 includes:**
+- Config-driven secret injection (`aikey.config.json`)
+- Runtime-only credential access (`aikey run -- <cmd>`)
+- Local encrypted vault (Argon2id + AES-256-GCM)
+- Non-sensitive context variables in `.env` files
 
-- `Stage0-End-State-Blueprint-en.md` (end-state product shape)
-- `AiKey-Stage0-Interaction-Spec-en.md` (CLI/SDK interaction + UX/output contracts)
-- `AiKey-Stage0-TechSpec.md` (engineering contract/invariants)
-- `Stage0-Decisions-Execution-Semantics.md` (decisions: `.env`, `env inject`, `--dry-run`, config)
+**What Stage 0 does NOT include:**
+- Plaintext secret export workflows
+- Eval-style shell injection
+- Writing secrets to files or environment variables outside child processes
 
-If anything here conflicts with the files above, treat the root docs as the source of truth.
+> **Important:** The Stage 0 contract does not include plaintext secret export or inject workflows. If the current binary still exposes legacy flags or subcommands, they are out of contract and will be removed in a future release. Integrations must not rely on them.
 
-## 5-minute main path (Stage 0)
+## Quick Start (5 minutes)
 
-1) **Setup** (one-time on a machine)
+### 1. Setup (one-time per machine)
 
 ```bash
 aikey setup
 ```
 
-2) **Project init** (write a committable declaration, no secrets)
+This initializes your local encrypted vault.
+
+### 2. Create Project Config (no secrets)
 
 ```bash
-aikey init
-# (or legacy) aikey project init
+cd your-project
+aikey project init
 ```
 
-This creates `aikey.config.json`.
+This creates `aikey.config.json` - a committable declaration file that specifies which secrets your project needs, but contains no actual secret values.
 
-3) **Run** (the only blessed execution path)
+> **Note:** Run `aikey --help` to see your build's available commands. The project config file is always `aikey.config.json`.
+
+### 3. Add Secrets to Vault
 
 ```bash
-aikey run -- <cmd>
+aikey secret set MY_API_KEY
 ```
 
-- Secrets are injected **only into the child process environment**.
-- `.env` (if generated) stores **non-sensitive context only**.
-- For repeat-run workflows, use `aikey shell` (non-sensitive context only; each command still uses `aikey run`).
+Secrets are stored encrypted in your local vault, never in project files.
 
-## Machine-readable interface (`--json`)
+### 4. Run Commands (the blessed path)
 
-If you build integrations, see `docs/cli-platform-contract.md` for the minimal external contract around `--json`, stdout/stderr, and exit codes.
+```bash
+aikey run -- <your-command>
+```
 
-## Security posture (Stage 0)
+This is the **only blessed execution path**. Secrets are injected into the child process environment at runtime and exist only in that process's memory.
 
-- Secrets must never be written to project files (including `.env`).
-- Plaintext exposure is an **advanced/dangerous escape hatch** only (behind an explicit flag like `--unsafe-plaintext`) and must be kept out of new-user Quickstart.
+**Examples:**
+```bash
+aikey run -- npm start
+aikey run -- python app.py
+aikey run -- ./my-script.sh
+```
 
-## Notes
+### What About .env Files?
 
-- This repo currently contains legacy subsystems (e.g. daemon/prototype flows). Stage 0 documentation is intentionally focused on **CLI+SDK** and the single blessed path.
-- For actual available commands in your build, run `aikey --help`.
+If your project generates a `.env` file, it contains **non-sensitive context only** (project name, environment name, etc.) plus placeholders. Actual secret values are never written to `.env` files.
+
+For workflows that need repeated commands, you can use `aikey shell` to set up non-sensitive context, but each command execution still goes through `aikey run`.
+
+## For Integrations and Automation
+
+If you're building integrations or automation, see `docs/cli-platform-contract.md` for the minimal external contract around:
+- `--json` mode behavior
+- stdout/stderr handling
+- Exit codes
+- Password input in automation
+
+**Key principle:** Integrations must use `aikey run -- <cmd>` for secret injection. The CLI does not provide plaintext secret export functionality.
+
+## Security Posture
+
+**Core principles:**
+1. **Secrets never in files** - No secrets in `aikey.config.json`, `.env`, or any project files
+2. **Runtime-only injection** - Secrets exist only in child process memory during execution
+3. **Local-first encryption** - All secrets encrypted with Argon2id + AES-256-GCM
+4. **No network transmission** - Secrets never leave your machine
+5. **Single blessed path** - Only `aikey run -- <cmd>` injects secrets
+
+**What this means:**
+- Your `aikey.config.json` is safe to commit (it declares intent, not values)
+- Generated `.env` files contain only non-sensitive context
+- Secrets are decrypted on-demand and injected directly into child process environment
+- No plaintext secret export or eval-style injection workflows
+
+For security vulnerability reporting, see `SECURITY.md`.
+
+## Additional Notes
+
+- Historical daemon/prototype subsystems have been removed; Stage 0 focuses on the single blessed path (`aikey run -- <cmd>`)
+- For the complete list of available commands in your build, run `aikey --help`
+- This is an open-source project under Apache-2.0 license - contributions welcome! See `CONTRIBUTING.md`
+
+## License
+
+Apache-2.0 - See `LICENSE` file for details.
