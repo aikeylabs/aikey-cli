@@ -20,8 +20,8 @@ pub struct SecretMetadata {
     pub created_at: Option<i64>,
 }
 
-/// Default vault directory path
-const VAULT_DIR: &str = ".aikey";
+/// Default vault data directory path (~/.aikey/data/)
+const VAULT_DIR: &str = ".aikey/data";
 
 /// Database filename
 const DB_NAME: &str = "vault.db";

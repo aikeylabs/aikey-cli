@@ -11,6 +11,7 @@ mod env_resolver;
 mod env_renderer;
 mod commands_project;
 mod commands_env;
+mod commands_proxy;
 mod profiles;
 mod core;
 mod global_config;
@@ -159,6 +160,34 @@ enum Commands {
     Status,
     /// Start an interactive shell with non-sensitive context (advanced mode)
     Shell,
+    /// Manage the local aikey-proxy process
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProxyAction {
+    /// Start the local aikey-proxy (authenticates once, no separate password needed)
+    Start {
+        /// Path to aikey-proxy.yaml (auto-detected if omitted)
+        #[arg(long)]
+        config: Option<String>,
+        /// Run in background and return immediately
+        #[arg(short, long)]
+        detach: bool,
+    },
+    /// Stop the running aikey-proxy
+    Stop,
+    /// Show aikey-proxy status and health
+    Status,
+    /// Restart aikey-proxy (stop + start in background)
+    Restart {
+        /// Path to aikey-proxy.yaml (auto-detected if omitted)
+        #[arg(long)]
+        config: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -904,6 +933,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // Read secret value from stdin
+                    eprint!("Enter secret value (then press Enter): ");
+                    let _ = io::stderr().flush();
                     let mut secret = Zeroizing::new(String::new());
                     io::stdin().read_line(&mut secret)?;
                     let secret_value = secret.trim();
@@ -965,6 +996,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
 
+                    eprint!("Enter secret value (then press Enter): ");
+                    let _ = io::stderr().flush();
                     let mut secret = Zeroizing::new(String::new());
                     io::stdin().read_line(&mut secret)?;
                     let secret_value = secret.trim();
@@ -1334,6 +1367,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
 
                     let new_value = if *from_stdin {
+                        eprint!("Enter new value for '{}' (then press Enter): ", name);
+                        let _ = io::stderr().flush();
                         let mut buf = Zeroizing::new(String::new());
                         io::stdin().read_line(&mut buf)?;
                         buf
@@ -1401,6 +1436,33 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Shell => {
             handle_shell_command(cli.json)?;
+        }
+        Commands::Proxy { action } => {
+            match action {
+                ProxyAction::Start { config, detach } => {
+                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    // Verify the password is valid before handing it to the proxy.
+                    executor::list_secrets(&password)
+                        .map_err(|e| format!("vault authentication failed: {}", e))?;
+                    commands_proxy::handle_start(
+                        config.as_deref(),
+                        *detach,
+                        &password,
+                    )?;
+                }
+                ProxyAction::Stop => {
+                    commands_proxy::handle_stop()?;
+                }
+                ProxyAction::Status => {
+                    commands_proxy::handle_status()?;
+                }
+                ProxyAction::Restart { config } => {
+                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    executor::list_secrets(&password)
+                        .map_err(|e| format!("vault authentication failed: {}", e))?;
+                    commands_proxy::handle_restart(config.as_deref(), &password)?;
+                }
+            }
         }
         Commands::Logs { limit } => {
             let entries = events::list_events(*limit)
