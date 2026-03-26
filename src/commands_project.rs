@@ -131,7 +131,7 @@ pub fn handle_project_init(json_mode: bool) -> Result<(), Box<dyn std::error::Er
     if !json_mode {
         println!("\n✓ Created aikey.config.json");
         println!("\nNext steps:");
-        println!("  1. Run 'aikey setup' to create a profile and add keys");
+        println!("  1. Run 'aikey secret set <provider>:<alias>' to add provider keys (e.g. aikey secret set anthropic:default)");
         println!("  2. Run 'aikey env generate' to create/update your .env file (non-sensitive only)");
         println!("  3. Use 'aikey run -- <command>' to run with secrets injected");
         println!("  4. Use 'aikey project status' to check configuration");
@@ -240,8 +240,12 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
             println!("You'll set a master password to protect your secrets.\n");
         }
 
-        let password = if json_mode {
-            // In JSON mode read from stdin without prompt
+        let password = if let Ok(test_pw) = std::env::var("AK_TEST_PASSWORD") {
+            // CI / sandbox mode: bypass interactive prompt via env var.
+            // AK_TEST_PASSWORD is only set in test environments; production never sets it.
+            SecretString::new(test_pw)
+        } else if json_mode {
+            // JSON / scripted mode: read password from stdin (suitable for piped CI).
             let mut pw = String::new();
             io::stdin().read_line(&mut pw)?;
             SecretString::new(pw.trim().to_string().into())
@@ -319,10 +323,6 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-/// Handle `aikey setup` — alias for quickstart (initialize vault and configure first profile)
-pub fn handle_setup(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    handle_quickstart(json_mode)
-}
 
 /// Handle `aikey project map` — bind a required var to a vault alias, and optionally
 /// add an envMappings entry when --env, --provider, and --key-alias are provided.

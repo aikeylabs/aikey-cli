@@ -1,8 +1,11 @@
-//! Proxy lifecycle management commands: start, stop, status, restart.
+//! Proxy lifecycle management commands: start, stop, status, restart, verify.
 //!
 //! `aikey proxy start` authenticates once with the vault master password,
 //! then spawns `aikey-proxy` as a child process with the password injected
 //! via `AIKEY_VAULT_PASSWORD` — no second prompt required.
+//!
+//! A lightweight `proxy_guard` is exported for use by other commands (e.g. `run`)
+//! so the proxy is automatically started in the background when needed.
 
 use secrecy::{ExposeSecret, SecretString};
 use std::fs;
@@ -12,10 +15,45 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-// Default proxy listen address for health checks.
-const PROXY_HEALTH_ADDR: &str = "127.0.0.1:27200";
+// Fallback proxy listen address when the config cannot be parsed.
+const PROXY_HEALTH_ADDR_DEFAULT: &str = "127.0.0.1:27200";
 const PID_FILENAME: &str = "proxy.pid";
 const DEFAULT_CONFIG_NAME: &str = "aikey-proxy.yaml";
+
+/// Read the `listen.host:port` from the yaml config (best-effort, falls back to default).
+fn proxy_listen_addr(config_path: Option<&std::path::Path>) -> String {
+    let path = match config_path {
+        Some(p) => p.to_path_buf(),
+        None => match resolve_config(None) {
+            Ok(p) => p,
+            Err(_) => return PROXY_HEALTH_ADDR_DEFAULT.to_string(),
+        },
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return PROXY_HEALTH_ADDR_DEFAULT.to_string(),
+    };
+    // Minimal parse: look for `host:` and `port:` lines under `listen:`.
+    let mut host = "127.0.0.1".to_string();
+    let mut port = 27200u16;
+    let mut in_listen = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "listen:" { in_listen = true; continue; }
+        if in_listen {
+            if trimmed.starts_with("host:") {
+                host = trimmed.trim_start_matches("host:").trim().trim_matches('"').to_string();
+            } else if trimmed.starts_with("port:") {
+                if let Ok(p) = trimmed.trim_start_matches("port:").trim().parse::<u16>() {
+                    port = p;
+                }
+            } else if !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with(' ') {
+                in_listen = false; // left the listen block
+            }
+        }
+    }
+    format!("{}:{}", host, port)
+}
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -25,20 +63,19 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
     // 1. Check if already running.
     if let Some(pid) = read_pid() {
         if process_alive(pid) {
-            println!("proxy already running (pid: {})", pid);
-            println!("listen: http://{}", PROXY_HEALTH_ADDR);
+            eprintln!("proxy already running (pid: {})", pid);
+            eprintln!("listen: http://{}", PROXY_HEALTH_ADDR_DEFAULT);
             return Ok(());
         }
         // Stale PID file — remove it.
         let _ = fs::remove_file(pid_path()?);
     }
 
-    // 2. Locate proxy binary first so its directory is available for config lookup.
+    // 2. Locate proxy binary.
     let proxy_bin = find_proxy_binary()?;
 
-    // 3. Resolve config: proxy bin dir → cwd → ~/.aikey/
-    let proxy_dir = proxy_bin.parent().map(|p| p.to_path_buf());
-    let config_path = resolve_config(config, proxy_dir.as_deref())?;
+    // 3. Resolve config: cwd → ~/.aikey/
+    let config_path = resolve_config(config)?;
 
     eprintln!("Starting aikey-proxy...");
     eprintln!("  config: {}", config_path.display());
@@ -56,8 +93,8 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
             .map_err(|e| format!("failed to spawn aikey-proxy: {}", e))?;
         let pid = child.id();
         write_pid(pid)?;
-        println!("proxy started (pid: {})", pid);
-        println!("listen: http://{}", PROXY_HEALTH_ADDR);
+        eprintln!("proxy started (pid: {})", pid);
+        eprintln!("listen: http://{}", PROXY_HEALTH_ADDR_DEFAULT);
     } else {
         // Foreground: inherit stdio so logs are visible; write PID before waiting.
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -78,13 +115,13 @@ pub fn handle_stop() -> Result<(), Box<dyn std::error::Error>> {
     let pid = match read_pid() {
         Some(p) => p,
         None => {
-            println!("proxy not running");
+            eprintln!("proxy not running");
             return Ok(());
         }
     };
 
     if !process_alive(pid) {
-        println!("proxy not running (stale pid file cleaned up)");
+        eprintln!("proxy not running (stale pid file cleaned up)");
         let _ = fs::remove_file(pid_path()?);
         return Ok(());
     }
@@ -92,7 +129,7 @@ pub fn handle_stop() -> Result<(), Box<dyn std::error::Error>> {
     // Send SIGTERM on Unix, TerminateProcess on Windows.
     terminate_process(pid)?;
     let _ = fs::remove_file(pid_path()?);
-    println!("proxy stopped (pid: {})", pid);
+    eprintln!("proxy stopped (pid: {})", pid);
     Ok(())
 }
 
@@ -100,17 +137,19 @@ pub fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
     match read_pid() {
         None => {
             println!("status:  stopped");
+            println!("hint:    run `aikey proxy start` to start");
         }
         Some(pid) => {
             if !process_alive(pid) {
                 println!("status:  stopped (stale pid file)");
+                println!("hint:    run `aikey proxy start` to start");
                 let _ = fs::remove_file(pid_path()?);
             } else {
-                let healthy = port_reachable(PROXY_HEALTH_ADDR, Duration::from_millis(500));
+                let healthy = port_reachable(PROXY_HEALTH_ADDR_DEFAULT, Duration::from_millis(500));
                 let health_str = if healthy { "healthy" } else { "unreachable" };
                 println!("status:  running ({})", health_str);
                 println!("pid:     {}", pid);
-                println!("listen:  http://{}", PROXY_HEALTH_ADDR);
+                println!("listen:  http://{}", PROXY_HEALTH_ADDR_DEFAULT);
             }
         }
     }
@@ -206,16 +245,20 @@ fn terminate_process(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
 /// Non-blocking TCP connect to check if the proxy port is reachable.
 fn port_reachable(addr: &str, timeout: Duration) -> bool {
     TcpStream::connect_timeout(
-        &addr.parse().unwrap_or_else(|_| "127.0.0.1:27200".parse().unwrap()),
+        &addr.parse().unwrap_or_else(|_| PROXY_HEALTH_ADDR_DEFAULT.parse().unwrap()),
         timeout,
     ).is_ok()
 }
 
-/// Locate the `aikey-proxy` binary:
+/// Locate the `aikey-proxy` binary using the following priority order:
 /// 1. `AIKEY_PROXY_BIN` env var — explicit override for CI / custom installs
-/// 2. PATH — standard install via `make install` in the aikey-proxy project
+/// 2. Same directory as the running `aikey` binary — co-installed layout
+/// 3. `~/.aikey/bin/aikey-proxy` — user-local install
+/// 4. System `PATH` — standard install via `make install`
 fn find_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // 1. Explicit override.
+    let bin_name = if cfg!(windows) { "aikey-proxy.exe" } else { "aikey-proxy" };
+
+    // 1. Explicit override via env var.
     if let Ok(val) = std::env::var("AIKEY_PROXY_BIN") {
         let p = PathBuf::from(val);
         if p.exists() {
@@ -224,8 +267,25 @@ fn find_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
         return Err(format!("AIKEY_PROXY_BIN is set but binary not found: {}", p.display()).into());
     }
 
-    // 2. PATH lookup.
-    let bin_name = if cfg!(windows) { "aikey-proxy.exe" } else { "aikey-proxy" };
+    // 2. Same directory as the current `aikey` binary.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(bin_name);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    // 3. ~/.aikey/bin/aikey-proxy
+    if let Some(home) = dirs::home_dir() {
+        let candidate = home.join(".aikey").join("bin").join(bin_name);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    // 4. System PATH lookup.
     let which_cmd = if cfg!(windows) { "where" } else { "which" };
     if let Ok(out) = Command::new(which_cmd).arg(bin_name).output() {
         if out.status.success() {
@@ -241,15 +301,153 @@ fn find_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
         }
     }
 
-    Err("aikey-proxy not found in PATH. Run `make install` in the aikey-proxy project, or set AIKEY_PROXY_BIN.".into())
+    Err("aikey-proxy not found. Searched: same dir as aikey, ~/.aikey/bin/, system PATH. \
+         Run `make install` in the aikey-proxy project, or set AIKEY_PROXY_BIN.".into())
+}
+
+/// Verify current project / env / provider connectivity end-to-end.
+///
+/// Checks in order:
+/// 1. Vault is accessible (validated by caller before this function is called)
+/// 2. Project config discovery
+/// 3. Active logical environment
+/// 4. Provider resolution from config
+/// 5. Proxy health (auto-starts in background if not running)
+pub fn handle_verify(password: &SecretString) -> Result<(), Box<dyn std::error::Error>> {
+    let mut failed = false;
+
+    // Step 1: vault already validated by caller.
+    println!("vault:    ok");
+
+    // Step 2: project config.
+    let config = crate::config::ProjectConfig::discover()
+        .ok()
+        .flatten()
+        .map(|(_, cfg)| cfg);
+
+    let project_name = config.as_ref()
+        .map(|c| c.project.name.as_str())
+        .unwrap_or("(no project config)");
+    println!("project:  {}", project_name);
+
+    // Step 3: current env.
+    let current_env = crate::global_config::get_current_env()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "dev".to_string());
+    println!("env:      {}", current_env);
+
+    // Step 4: provider from config.
+    let provider = config.as_ref().and_then(|cfg| {
+        // Prefer envMappings for the active env, fall back to providers map.
+        if let Some(env_map) = cfg.env_mappings.get(&current_env) {
+            env_map.values().next().map(|m| m.provider.clone())
+        } else {
+            cfg.providers.keys().next().cloned()
+        }
+    });
+
+    match &provider {
+        Some(p) => println!("provider: {}", p),
+        None => {
+            println!("provider: (not configured)");
+            println!("hint:     run `aikey project map` to configure a provider for this env");
+        }
+    }
+
+    // Step 5: proxy health — auto-start if needed.
+    let proxy_up = match read_pid() {
+        Some(pid) if process_alive(pid) => {
+            port_reachable(PROXY_HEALTH_ADDR_DEFAULT, Duration::from_millis(500))
+        }
+        _ => false,
+    };
+
+    if !proxy_up {
+        eprintln!("proxy not running — attempting to start...");
+        match handle_start(None, true, password) {
+            Ok(_) => {
+                std::thread::sleep(Duration::from_millis(800));
+                if port_reachable(PROXY_HEALTH_ADDR_DEFAULT, Duration::from_millis(1000)) {
+                    println!("proxy:    running (healthy)");
+                } else {
+                    println!("proxy:    unreachable after start attempt");
+                    println!("hint:     run `aikey proxy status` to debug");
+                    failed = true;
+                }
+            }
+            Err(e) => {
+                println!("proxy:    failed to start ({})", e);
+                println!("hint:     run `aikey proxy start` to troubleshoot");
+                failed = true;
+            }
+        }
+    } else {
+        println!("proxy:    running (healthy)");
+    }
+
+    println!();
+    if failed {
+        println!("result:   failed");
+        return Err("verification failed — check hints above".into());
+    }
+
+    println!("result:   ok");
+    Ok(())
+}
+
+/// Lightweight proxy guard for use by `aikey run` and other commands.
+///
+/// Checks whether `aikey-proxy` is running and reachable. If not, silently
+/// starts it in the background using the given vault password. Returns `true`
+/// if the proxy is (or becomes) reachable, `false` if startup failed.
+///
+/// Designed to be transparent to end users: no output on the happy path.
+pub fn proxy_guard(password: &SecretString) -> bool {
+    let health_addr = proxy_listen_addr(None);
+
+    // Fast path: already running and healthy.
+    if let Some(pid) = read_pid() {
+        if process_alive(pid) && port_reachable(&health_addr, Duration::from_millis(300)) {
+            return true;
+        }
+    }
+
+    // Proxy not running — start silently in background.
+    eprintln!("[aikey] proxy not running, starting in background...");
+    match handle_start(None, true, password) {
+        Ok(_) => {
+            // Poll up to 5 s for the port to open (matches CI test timeout).
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let up = loop {
+                if port_reachable(&health_addr, Duration::from_millis(300)) {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            };
+            if !up {
+                eprintln!("[aikey] warning: proxy started but port {} unreachable", health_addr);
+                eprintln!("[aikey] hint:    run `aikey proxy status` to debug");
+            }
+            up
+        }
+        Err(e) => {
+            eprintln!("[aikey] warning: could not start proxy: {}", e);
+            eprintln!("[aikey] hint:    run `aikey proxy start` to troubleshoot");
+            false
+        }
+    }
 }
 
 /// Resolve the proxy config file path in priority order:
 /// 1. Explicit `--config` argument
-/// 2. Same directory as the `aikey-proxy` binary
-/// 3. Current working directory
-/// 4. `~/.aikey/aikey-proxy.yaml`
-fn resolve_config(explicit: Option<&str>, proxy_dir: Option<&std::path::Path>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+/// 2. `AIKEY_PROXY_CONFIG` environment variable
+/// 3. Current working directory (`aikey-proxy.yaml`)
+/// 4. `~/.aikey/config/aikey-proxy.yaml`
+fn resolve_config(explicit: Option<&str>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(p) = explicit {
         let path = PathBuf::from(p);
         if !path.exists() {
@@ -258,15 +456,21 @@ fn resolve_config(explicit: Option<&str>, proxy_dir: Option<&std::path::Path>) -
         return Ok(path);
     }
 
-    // Same directory as the proxy binary (highest priority after explicit)
-    if let Some(dir) = proxy_dir {
-        let candidate = dir.join(DEFAULT_CONFIG_NAME);
-        if candidate.exists() {
-            return Ok(candidate);
+    // AIKEY_PROXY_CONFIG env var.
+    if let Ok(env_val) = std::env::var("AIKEY_PROXY_CONFIG") {
+        let path = PathBuf::from(&env_val);
+        if path.exists() {
+            return Ok(path);
         }
+        // Warn and fall back instead of failing hard, so the proxy can still start.
+        let default_path = dirs::home_dir()
+            .map(|h| h.join(".aikey").join("config").join(DEFAULT_CONFIG_NAME).display().to_string())
+            .unwrap_or_else(|| format!("~/.aikey/config/{}", DEFAULT_CONFIG_NAME));
+        eprintln!("Warning: AIKEY_PROXY_CONFIG not found: {}", path.display());
+        eprintln!("         Falling back to default: {}", default_path);
     }
 
-    // Current working directory
+    // Current working directory.
     let cwd_cfg = PathBuf::from(DEFAULT_CONFIG_NAME);
     if cwd_cfg.exists() {
         return Ok(cwd_cfg);
@@ -280,7 +484,6 @@ fn resolve_config(explicit: Option<&str>, proxy_dir: Option<&std::path::Path>) -
         }
     }
 
-    Err(format!(
-        "aikey-proxy.yaml not found. Searched: proxy bin dir, current directory, ~/.aikey/config/. Use --config to specify explicitly."
-    ).into())
+    Err("aikey-proxy.yaml not found. Searched: current directory, ~/.aikey/config/. \
+         Use --config to specify explicitly.".into())
 }

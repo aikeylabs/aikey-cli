@@ -78,7 +78,7 @@ impl std::fmt::Display for ResolveError {
                 write!(f, "either provider name or logical model is required"),
             ResolveError::NoAliasFound { provider, profile } => {
                 let profile_str = profile.as_deref().unwrap_or("default");
-                write!(f, "Missing key: {}:<keyAlias> in profile '{}'.\nFix: run 'aikey provider add {} --alias <alias>' or aikey setup", provider, profile_str, provider)
+                write!(f, "Missing key: {}:<keyAlias> in profile '{}'.\nFix: run 'aikey provider add --key-alias <alias> {}' or 'aikey quickstart'", provider, profile_str, provider)
             }
             ResolveError::LogicalModelNotFound { logical_model, env } => {
                 write!(f, "Logical model '{}' not found in envMappings for env '{}'.\nFix: run 'aikey project map' to configure logical model mappings", logical_model, env)

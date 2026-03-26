@@ -1,3 +1,4 @@
+use crate::audit;
 use crate::crypto;
 use crate::storage;
 use crate::config::ProjectConfig;
@@ -40,7 +41,16 @@ struct VaultContext {
 
 impl VaultContext {
     fn new(password: &SecretString) -> Result<Self, String> {
-        storage::ensure_vault_exists()?;
+        // Auto-initialize vault on first use so the user never needs to run
+        // `aikey setup` before using any vault command.
+        let vault_path = storage::get_vault_path()?;
+        if !vault_path.exists() {
+            let mut salt = [0u8; 16];
+            crypto::generate_salt(&mut salt)?;
+            storage::initialize_vault(&salt, password)?;
+            let _ = audit::initialize_audit_log();
+            let _ = audit::log_audit_event(password, audit::AuditOperation::Init, None, true);
+        }
 
         // Check rate limiting before attempting authentication
         let mut rate_limiter = crate::ratelimit::RateLimiter::load()?;
@@ -1047,6 +1057,89 @@ pub fn run_with_provider(
 /// Resolution order (Stage0 Decision I - mapping-closed boundary):
 /// - If `envMappings[env]` exists and is non-empty: inject only mapping-derived credentials (closed set)
 /// - If `envMappings[env]` is missing/empty: fall back to `config.providers`
+/// Fallback injection when no project config and no `--provider` flag is given.
+///
+/// Scans vault aliases for `{provider}:{name}` patterns, picks the `:default`
+/// variant per provider (or first found), and injects the canonical env var for
+/// each detected provider.  This allows `aikey run -- <cmd>` to work without any
+/// project config file.
+///
+/// Returns `(secrets_injected, exit_code)`.
+pub fn run_from_vault(
+    password: &SecretString,
+    command: &[String],
+    json_mode: bool,
+) -> Result<(usize, i32), String> {
+    let ctx = VaultContext::new(password)?;
+    let aliases = storage::list_entries().unwrap_or_default();
+
+    if aliases.is_empty() {
+        return Err(
+            "No API keys stored. Add one with:\n  aikey secret set anthropic:default".to_string()
+        );
+    }
+
+    // Group aliases by provider prefix (format: "provider:name").
+    // Prefer ":default" variant; fall back to first seen per provider.
+    let mut provider_alias: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for alias in &aliases {
+        if let Some((provider, _)) = alias.split_once(':') {
+            let is_default = alias.ends_with(":default");
+            if is_default || !provider_alias.contains_key(provider) {
+                provider_alias.insert(provider.to_string(), alias.clone());
+            }
+        }
+    }
+
+    if provider_alias.is_empty() {
+        return Err(
+            "No provider keys found in vault (expected format: provider:alias).\n\
+             Add one with: aikey secret set anthropic:default".to_string()
+        );
+    }
+
+    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
+        std::collections::HashMap::new();
+
+    for (provider_name, key_alias) in &provider_alias {
+        let env_var = Provider::parse(provider_name).env_var();
+        match storage::get_entry(key_alias) {
+            Ok((nonce, ciphertext)) => {
+                match ctx.decrypt(&nonce, &ciphertext) {
+                    Ok(plaintext) => {
+                        let secret = std::str::from_utf8(&plaintext)
+                            .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", key_alias, e))?
+                            .to_string();
+                        env_secrets.insert(env_var, Zeroizing::new(secret));
+                    }
+                    Err(e) => {
+                        if !json_mode {
+                            eprintln!("Warning: could not decrypt '{}': {}", key_alias, e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if !json_mode {
+                    eprintln!("Warning: could not fetch '{}': {}", key_alias, e);
+                }
+            }
+        }
+    }
+
+    if env_secrets.is_empty() {
+        return Err("No secrets could be decrypted from vault.".to_string());
+    }
+
+    let secrets_count = env_secrets.len();
+    if !json_mode {
+        eprintln!("Injecting {} secret(s) (vault-auto)", secrets_count);
+    }
+
+    spawn_with_env(env_secrets, command, json_mode, None)
+}
+
 /// - `config.required_vars` are always resolved independently
 ///
 /// Returns `(secrets_injected, exit_code)`.

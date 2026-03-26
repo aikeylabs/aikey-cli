@@ -22,7 +22,7 @@ mod events;
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use zeroize::Zeroizing;
 use rpassword::prompt_password;
 use error_codes::msgs;
@@ -48,6 +48,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize the vault (runs automatically on first use)
+    #[command(hide = true)]
     Init,
     Add {
         alias: String,
@@ -102,6 +104,10 @@ enum Commands {
         #[arg(long, value_name = "TENANT")]
         tenant: Option<String>,
 
+        /// Override the active profile for this invocation (e.g. personal, work)
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+
         /// Show what would be resolved without executing the command
         #[arg(long)]
         dry_run: bool,
@@ -139,8 +145,6 @@ enum Commands {
     },
     /// Quick setup wizard for new projects
     Quickstart,
-    /// Initialize vault and configure first profile (alias for init + quickstart)
-    Setup,
     /// Show local usage statistics
     Stats,
     /// Show recent run/exec event log
@@ -188,6 +192,8 @@ enum ProxyAction {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Verify current project/env/provider connectivity through the proxy
+    Verify,
 }
 
 #[derive(Subcommand)]
@@ -363,7 +369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if cli.json {
             json_output::error(&e.to_string(), 1);
         } else {
-            eprintln!("Error: {:?}", e);
+            eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     }
@@ -459,7 +465,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Add { alias } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
 
             // Check for test environment variable first
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
@@ -497,7 +503,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Get { alias, timeout } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
             let result = executor::get_secret(alias, &password);
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Get, Some(alias), result.is_ok());
 
@@ -536,7 +542,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Delete { alias } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
             let result = executor::delete_secret(alias, &password);
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(alias), result.is_ok());
 
@@ -558,7 +564,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::List => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
 
             if cli.json {
                 // JSON mode: return array of objects with metadata
@@ -599,7 +605,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Update { alias } => {
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
 
             // Check for test environment variable first
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
@@ -707,7 +713,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
 
             let result = executor::exec_with_env(env_mappings, &password, command);
 
@@ -719,7 +725,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Run { provider, logical_model, model, tenant, dry_run, command } => {
+        Commands::Run { provider, logical_model, model, tenant, profile, dry_run, command } => {
             if command.is_empty() {
                 let err_msg = "No command specified. Use -- to separate command from flags.";
                 if cli.json {
@@ -729,11 +735,27 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // P1-Q2: Tenant precedence: --tenant > AIKEY_TENANT env var
+            // Tenant precedence: --tenant > AIKEY_TENANT env var
             let env_tenant = std::env::var("AIKEY_TENANT").ok();
             let resolved_tenant = tenant.as_deref().or(env_tenant.as_deref());
 
-            let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+
+            // Profile override: --profile temporarily switches the active profile for this run.
+            let _profile_guard = if let Some(p) = profile {
+                let prev = global_config::get_current_profile().ok().flatten();
+                global_config::set_current_profile(p)
+                    .map_err(|e| format!("failed to set profile '{}': {}", p, e))?;
+                Some(prev)
+            } else {
+                None
+            };
+
+            // Proxy guard: ensure aikey-proxy is running before executing the command.
+            // Runs silently in the happy path; warns on failure but does not abort.
+            if !*dry_run {
+                commands_proxy::proxy_guard(&password);
+            }
 
             if *dry_run {
                 let infos = if let Some(provider_name) = provider {
@@ -750,7 +772,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(cfg) = project_config.as_ref() {
                         executor::dry_run_project_config(cfg, logical_model.as_deref(), resolved_tenant)?
                     } else {
-                        return Err(msgs::NO_CONFIG_FOUND_HINT.into());
+                        return Err("No aikey.config.json found and no --provider specified.\n\
+                            For dry-run, use: aikey run --provider anthropic --dry-run -- <cmd>".into());
                     }
                 };
 
@@ -805,7 +828,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         cli.json,
                     )
                 } else {
-                    // No --provider: use project config to inject all configured provider keys
+                    // No --provider: use project config if present, otherwise
+                    // fall back to vault-auto detection (zero-config path).
                     let project_config = config::ProjectConfig::discover()
                         .ok()
                         .flatten()
@@ -814,7 +838,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(cfg) = project_config.as_ref() {
                         executor::run_with_project_config(cfg, &password, command, cli.json, logical_model.as_deref(), resolved_tenant)
                     } else {
-                        return Err(msgs::NO_CONFIG_FOUND_HINT.into());
+                        executor::run_from_vault(&password, command, cli.json)
                     }
                 };
 
@@ -848,6 +872,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             std::process::exit(exit_code);
                         }
                     }
+                }
+            }
+
+            // Restore previous profile if we overrode it.
+            if let Some(prev_profile) = _profile_guard {
+                if let Some(p) = prev_profile {
+                    let _ = global_config::set_current_profile(&p);
                 }
             }
         }
@@ -902,7 +933,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    if let Err(e) = validate_secret_name(name) {
+                        if cli.json {
+                            json_output::print_json_exit(serde_json::json!({
+                                "ok": false,
+                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                "message": e
+                            }), 1);
+                        } else {
+                            return Err(e.into());
+                        }
+                    }
+
+                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
 
                     let existing = executor::list_secrets(&password);
                     let existing = match existing {
@@ -920,7 +963,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     if existing.iter().any(|alias| alias == name) {
-                        let err_msg = format!("Secret '{}' already exists", name);
+                        let err_msg = format!(
+                            "Secret '{}' already exists. Use 'aikey secret upsert {}' to overwrite.",
+                            name, name
+                        );
                         if cli.json {
                             json_output::print_json_exit(serde_json::json!({
                                 "ok": false,
@@ -932,9 +978,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // Read secret value from stdin
-                    eprint!("Enter secret value (then press Enter): ");
-                    let _ = io::stderr().flush();
+                    // Read secret value from stdin (only show prompt when stdin is a terminal)
+                    if std::io::stdin().is_terminal() {
+                        eprint!("Enter secret value (then press Enter): ");
+                        let _ = io::stderr().flush();
+                    }
                     let mut secret = Zeroizing::new(String::new());
                     io::stdin().read_line(&mut secret)?;
                     let secret_value = secret.trim();
@@ -994,10 +1042,24 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    if let Err(e) = validate_secret_name(name) {
+                        if cli.json {
+                            json_output::print_json_exit(serde_json::json!({
+                                "ok": false,
+                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                "message": e
+                            }), 1);
+                        } else {
+                            return Err(e.into());
+                        }
+                    }
 
-                    eprint!("Enter secret value (then press Enter): ");
-                    let _ = io::stderr().flush();
+                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+
+                    if std::io::stdin().is_terminal() {
+                        eprint!("Enter secret value (then press Enter): ");
+                        let _ = io::stderr().flush();
+                    }
                     let mut secret = Zeroizing::new(String::new());
                     io::stdin().read_line(&mut secret)?;
                     let secret_value = secret.trim();
@@ -1050,7 +1112,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 SecretAction::List => {
-                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
 
                     let result = executor::list_secrets_with_metadata(&password);
                     let _ = audit::log_audit_event(&password, audit::AuditOperation::List, None, result.is_ok());
@@ -1086,7 +1148,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 SecretAction::Delete { name } => {
-                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
 
                     let result = executor::delete_secret(name, &password);
                     let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(name), result.is_ok());
@@ -1355,16 +1417,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Quickstart => {
             commands_project::handle_quickstart(cli.json)?;
         }
-        Commands::Setup => {
-            commands_project::handle_setup(cli.json)?;
-        }
         Commands::Stats => {
             handle_stats(cli.json)?;
         }
         Commands::Key { action } => {
             match action {
                 KeyAction::Rotate { name, from_stdin } => {
-                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
 
                     let new_value = if *from_stdin {
                         eprint!("Enter new value for '{}' (then press Enter): ", name);
@@ -1440,7 +1499,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Proxy { action } => {
             match action {
                 ProxyAction::Start { config, detach } => {
-                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
                     // Verify the password is valid before handing it to the proxy.
                     executor::list_secrets(&password)
                         .map_err(|e| format!("vault authentication failed: {}", e))?;
@@ -1457,10 +1516,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     commands_proxy::handle_status()?;
                 }
                 ProxyAction::Restart { config } => {
-                    let password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
                     executor::list_secrets(&password)
                         .map_err(|e| format!("vault authentication failed: {}", e))?;
                     commands_proxy::handle_restart(config.as_deref(), &password)?;
+                }
+                ProxyAction::Verify => {
+                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+                    executor::list_secrets(&password)
+                        .map_err(|e| format!("vault authentication failed: {}", e))?;
+                    commands_proxy::handle_verify(&password)?;
                 }
             }
         }
@@ -1574,9 +1639,46 @@ fn handle_shell_command(json_mode: bool) -> Result<(), Box<dyn std::error::Error
 
 /// - Disables TTY echo for interactive password entry
 /// - Converts to SecretString only after zeroizing wrapper is in place
+/// Validate a secret key name (alias).
+/// Allowed: alphanumeric, `_`, `-`, `:` (for provider:alias format).
+/// Max length: 256 characters. Empty names and names with spaces/slashes are rejected.
+fn validate_secret_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Secret name cannot be empty.".to_string());
+    }
+    if name.len() > 256 {
+        return Err(format!("Secret name is too long ({} chars). Maximum is 256 characters.", name.len()));
+    }
+    if let Some(bad) = name.chars().find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | ':' | '.')) {
+        return Err(format!(
+            "Secret name contains invalid character '{bad}'. \
+             Allowed: letters, digits, '_', '-', ':', '.'"
+        ));
+    }
+    Ok(())
+}
+
 /// - Ensures raw password string is wiped from memory on scope exit
 /// - Supports AK_TEST_PASSWORD environment variable for testing
 /// - Supports reading from stdin when password_stdin is true
+/// Prompt for the vault master password, adapting the message to whether the
+/// vault already exists ("Enter") or is about to be created ("Set").
+fn prompt_vault_password(password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
+    let vault_exists = storage::get_vault_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    let prompt = if vault_exists {
+        "Enter Master Password: "
+    } else {
+        if !json_mode && !password_stdin && std::env::var("AK_TEST_PASSWORD").is_err() {
+            eprintln!("Welcome to aikey! No vault found — setting up for the first time.");
+            eprintln!("Choose a master password to protect your secrets (you cannot recover it if lost).");
+        }
+        "Set Master Password: "
+    };
+    prompt_password_secure(prompt, password_stdin, json_mode)
+}
+
 fn prompt_password_secure(prompt: &str, password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
     // Check for test password environment variable
     if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
@@ -1592,9 +1694,21 @@ fn prompt_password_secure(prompt: &str, password_stdin: bool, json_mode: bool) -
     }
 
     // Interactive TTY path: disable echo using rpassword
-    // In JSON mode我们依然不打印提示文案，避免污染机器可读输出
+    // In JSON mode we suppress the prompt to avoid polluting machine-readable output
     let prompt_str = if json_mode { "" } else { prompt };
-    let password = prompt_password(prompt_str)?;
+    let password = prompt_password(prompt_str).map_err(|e| {
+        // rpassword fails with "Device not configured" (OS error 6) when no TTY is available.
+        // Convert to a user-friendly message instead of exposing the internal OS error.
+        if e.kind() == io::ErrorKind::Other || e.raw_os_error() == Some(6) {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "aikey requires an interactive terminal to read the master password.\n\
+                 Tip: run from a terminal, or set AK_TEST_PASSWORD for scripted use.",
+            )
+        } else {
+            e
+        }
+    })?;
 
     // Wrap in Zeroizing for additional in-memory protection
     let password_raw = Zeroizing::new(password);

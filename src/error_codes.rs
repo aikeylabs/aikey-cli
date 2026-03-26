@@ -144,7 +144,7 @@ impl Error {
     }
 
     pub fn vault_not_initialized() -> Self {
-        Self::new(ErrorCode::VaultNotInitialized, "Vault not initialized")
+        Self::new(ErrorCode::VaultNotInitialized, "Vault not initialized. Run any aikey command to initialize it automatically.")
     }
 
     pub fn profile_not_found(name: &str) -> Self {
