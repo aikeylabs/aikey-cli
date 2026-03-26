@@ -167,7 +167,9 @@ pub fn add_secret(alias: &str, secret: &str, password: &SecretString) -> Result<
 
     let ctx = VaultContext::new(password)?;
     let (nonce, ciphertext) = ctx.encrypt(secret.as_bytes())?;
-    storage::store_entry(alias, &nonce, &ciphertext)
+    storage::store_entry(alias, &nonce, &ciphertext)?;
+    let _ = storage::bump_vault_change_seq();
+    Ok(())
 }
 
 pub fn get_secret(alias: &str, password: &SecretString) -> Result<Zeroizing<String>, String> {
@@ -183,7 +185,9 @@ pub fn get_secret(alias: &str, password: &SecretString) -> Result<Zeroizing<Stri
 
 pub fn delete_secret(alias: &str, password: &SecretString) -> Result<(), String> {
     let _ctx = VaultContext::new(password)?;
-    storage::delete_entry(alias)
+    storage::delete_entry(alias)?;
+    let _ = storage::bump_vault_change_seq();
+    Ok(())
 }
 
 pub fn list_secrets(password: &SecretString) -> Result<Vec<String>, String> {
@@ -236,7 +240,9 @@ pub fn update_secret(alias: &str, new_secret: &str, password: &SecretString) -> 
     // Encrypt and store the new value
     let ctx = VaultContext::new(password)?;
     let (nonce, ciphertext) = ctx.encrypt(new_secret.as_bytes())?;
-    storage::store_entry(alias, &nonce, &ciphertext)
+    storage::store_entry(alias, &nonce, &ciphertext)?;
+    let _ = storage::bump_vault_change_seq();
+    Ok(())
 }
 
 #[allow(dead_code)]

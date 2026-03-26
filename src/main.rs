@@ -500,6 +500,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }));
             } else {
                 eprintln!("Secret '{}' added successfully", alias);
+                commands_proxy::maybe_warn_stale();
             }
         }
         Commands::Get { alias, timeout } => {
@@ -561,6 +562,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }));
             } else {
                 println!("Secret deleted.");
+                commands_proxy::maybe_warn_stale();
             }
         }
         Commands::List => {
@@ -640,6 +642,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }));
             } else {
                 eprintln!("Secret '{}' updated successfully", alias);
+                commands_proxy::maybe_warn_stale();
             }
         }
         Commands::Export { pattern, output } => {
@@ -1012,6 +1015,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 }));
                             } else {
                                 println!("Secret '{}' set successfully", name);
+                                commands_proxy::maybe_warn_stale();
                             }
                         }
                         Err(e) => {
@@ -1095,6 +1099,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 }));
                             } else {
                                 println!("Secret '{}' upserted successfully", name);
+                                commands_proxy::maybe_warn_stale();
                             }
                         }
                         Err(e) => {
@@ -1162,6 +1167,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 }));
                             } else {
                                 println!("Secret '{}' deleted successfully", name);
+                                commands_proxy::maybe_warn_stale();
                             }
                         }
                         Err(e) => {

@@ -10,6 +10,7 @@
 use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 use std::io;
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -19,6 +20,88 @@ use std::time::Duration;
 const PROXY_HEALTH_ADDR_DEFAULT: &str = "127.0.0.1:27200";
 const PID_FILENAME: &str = "proxy.pid";
 const DEFAULT_CONFIG_NAME: &str = "aikey-proxy.yaml";
+
+// ---------------------------------------------------------------------------
+// Vault change-sequence state helpers
+// ---------------------------------------------------------------------------
+
+/// Whether the running proxy's vault snapshot is up-to-date.
+#[derive(Debug, PartialEq)]
+pub enum ProxyVaultState {
+    /// Proxy has loaded the latest vault snapshot.
+    Current,
+    /// Vault has been written since the proxy last loaded it.
+    Stale,
+    /// Sequence numbers are unavailable (vault not initialised, proxy never
+    /// recorded its loaded seq, etc.).
+    Unknown,
+}
+
+/// Returns the vault snapshot state of the currently running proxy.
+/// Does NOT check whether the proxy process is alive; call `is_proxy_running`
+/// before this if you only want to inspect a live proxy.
+pub fn proxy_vault_state() -> ProxyVaultState {
+    let vault_seq = match crate::storage::get_vault_change_seq() {
+        Ok(s) => s,
+        Err(_) => return ProxyVaultState::Unknown,
+    };
+    let proxy_seq = match crate::storage::get_proxy_loaded_seq() {
+        Ok(s) => s,
+        Err(_) => return ProxyVaultState::Unknown,
+    };
+    if vault_seq > proxy_seq {
+        ProxyVaultState::Stale
+    } else {
+        ProxyVaultState::Current
+    }
+}
+
+/// Returns true if the proxy process is running.
+pub fn is_proxy_running() -> bool {
+    read_pid().map_or(false, |pid| process_alive(pid))
+}
+
+/// Prints a restart hint if the proxy is running and its vault snapshot is stale.
+/// Call this after any vault-write operation.
+pub fn maybe_warn_stale() {
+    if is_proxy_running() && proxy_vault_state() == ProxyVaultState::Stale {
+        eprintln!("restart proxy to apply new keys: aikey proxy restart");
+    }
+}
+
+/// Sends `POST /admin/reload` to the running proxy and waits for the response.
+/// Returns Ok(()) when the proxy confirms a successful graceful reload.
+fn post_admin_reload() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = TcpStream::connect(PROXY_HEALTH_ADDR_DEFAULT)
+        .map_err(|e| format!("cannot connect to proxy at {}: {}", PROXY_HEALTH_ADDR_DEFAULT, e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(35)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    let request = "POST /admin/reload HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    {
+        let mut w = stream.try_clone()?;
+        w.write_all(request.as_bytes())?;
+    }
+
+    let reader = BufReader::new(stream);
+    let mut lines = reader.lines();
+
+    // Read and check the HTTP status line.
+    let status_line = lines
+        .next()
+        .ok_or("proxy closed connection without response")??;
+    if !status_line.contains("200") {
+        // Drain the rest of the body for the error message.
+        let mut body = String::new();
+        let mut in_body = false;
+        for line in lines.flatten() {
+            if in_body { body.push_str(&line); body.push('\n'); }
+            else if line.is_empty() { in_body = true; }
+        }
+        return Err(format!("proxy reload failed: {} — {}", status_line.trim(), body.trim()).into());
+    }
+    Ok(())
+}
 
 /// Read the `listen.host:port` from the yaml config (best-effort, falls back to default).
 fn proxy_listen_addr(config_path: Option<&std::path::Path>) -> String {
@@ -95,12 +178,24 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
         write_pid(pid)?;
         eprintln!("proxy started (pid: {})", pid);
         eprintln!("listen: http://{}", PROXY_HEALTH_ADDR_DEFAULT);
+
+        // Record the vault snapshot that this proxy generation was started with.
+        if let Ok(seq) = crate::storage::get_vault_change_seq() {
+            let _ = crate::storage::set_proxy_loaded_seq(seq);
+        }
     } else {
         // Foreground: inherit stdio so logs are visible; write PID before waiting.
         cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
         let mut child = cmd.spawn()
             .map_err(|e| format!("failed to spawn aikey-proxy: {}", e))?;
-        write_pid(child.id())?;
+        let pid = child.id();
+        write_pid(pid)?;
+
+        // Record vault snapshot seq for the foreground process too.
+        if let Ok(seq) = crate::storage::get_vault_change_seq() {
+            let _ = crate::storage::set_proxy_loaded_seq(seq);
+        }
+
         let status = child.wait()?;
         let _ = fs::remove_file(pid_path()?);
         if !status.success() {
@@ -150,6 +245,16 @@ pub fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
                 println!("status:  running ({})", health_str);
                 println!("pid:     {}", pid);
                 println!("listen:  http://{}", PROXY_HEALTH_ADDR_DEFAULT);
+
+                // Vault snapshot staleness check.
+                match proxy_vault_state() {
+                    ProxyVaultState::Current => println!("vault sync: current"),
+                    ProxyVaultState::Stale => {
+                        println!("vault sync: stale");
+                        println!("hint:    restart proxy to apply new keys: aikey proxy restart");
+                    }
+                    ProxyVaultState::Unknown => {} // suppress if no data yet
+                }
             }
         }
     }
@@ -157,9 +262,27 @@ pub fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn handle_restart(config: Option<&str>, password: &SecretString) -> Result<(), Box<dyn std::error::Error>> {
-    // Stop if running, then start again.
+    // If proxy is running, prefer graceful reload (no port downtime, no stream interruption).
+    if is_proxy_running() {
+        eprintln!("Reloading proxy (graceful)...");
+        match post_admin_reload() {
+            Ok(()) => {
+                // Proxy has written loaded_vault_change_seq internally after the new
+                // generation became active.  The CLI mirrors it so status is consistent.
+                if let Ok(seq) = crate::storage::get_vault_change_seq() {
+                    let _ = crate::storage::set_proxy_loaded_seq(seq);
+                }
+                eprintln!("proxy reloaded successfully");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("graceful reload failed ({}), falling back to hard restart", e);
+            }
+        }
+    }
+
+    // Proxy not running or graceful reload failed — hard restart.
     handle_stop()?;
-    // Small pause to let the port free up.
     std::thread::sleep(Duration::from_millis(300));
     handle_start(config, true, password)
 }
@@ -308,15 +431,24 @@ fn find_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
 /// Verify current project / env / provider connectivity end-to-end.
 ///
 /// Checks in order:
-/// 1. Vault is accessible (validated by caller before this function is called)
-/// 2. Project config discovery
-/// 3. Active logical environment
-/// 4. Provider resolution from config
-/// 5. Proxy health (auto-starts in background if not running)
+/// 1. Vault snapshot staleness (bail early if stale — results would be misleading)
+/// 2. Vault is accessible (validated by caller before this function is called)
+/// 3. Project config discovery
+/// 4. Active logical environment
+/// 5. Provider resolution from config
+/// 6. Proxy health (auto-starts in background if not running)
 pub fn handle_verify(password: &SecretString) -> Result<(), Box<dyn std::error::Error>> {
+    // Step 1: bail early if the proxy is running on a stale vault snapshot.
+    if is_proxy_running() && proxy_vault_state() == ProxyVaultState::Stale {
+        eprintln!("proxy is using an outdated vault snapshot.");
+        eprintln!("restart proxy to apply new keys: aikey proxy restart");
+        eprintln!("Then re-run: aikey proxy verify");
+        return Err("verify aborted: proxy vault snapshot is stale".into());
+    }
+
     let mut failed = false;
 
-    // Step 1: vault already validated by caller.
+    // Step 2: vault already validated by caller.
     println!("vault:    ok");
 
     // Step 2: project config.
@@ -409,6 +541,11 @@ pub fn proxy_guard(password: &SecretString) -> bool {
     // Fast path: already running and healthy.
     if let Some(pid) = read_pid() {
         if process_alive(pid) && port_reachable(&health_addr, Duration::from_millis(300)) {
+            // Warn once if the proxy is serving from a stale vault snapshot.
+            if proxy_vault_state() == ProxyVaultState::Stale {
+                eprintln!("[aikey] proxy is using an outdated vault snapshot.");
+                eprintln!("[aikey] restart proxy to apply new keys: aikey proxy restart");
+            }
             return true;
         }
     }

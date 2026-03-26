@@ -1123,3 +1123,77 @@ pub fn remove_profile_binding(conn: &Connection, profile_name: &str, domain: &st
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Runtime vault/proxy change-sequence tracking
+// ---------------------------------------------------------------------------
+// These two keys in the config table allow the CLI to detect when a running
+// proxy is serving requests with a stale vault snapshot:
+//   runtime.vault.change_seq          — incremented on every vault write that
+//                                       can affect proxy key resolution
+//   runtime.proxy.loaded_vault_change_seq — written by the CLI after proxy
+//                                       starts or completes a graceful reload
+
+const VAULT_CHANGE_SEQ_KEY: &str = "runtime.vault.change_seq";
+const PROXY_LOADED_SEQ_KEY: &str = "runtime.proxy.loaded_vault_change_seq";
+
+/// Read a u64 stored as an 8-byte little-endian BLOB from the config table.
+/// Returns 0 if the key does not exist or the vault has not been initialised.
+fn read_u64_config(key: &str) -> Result<u64, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    let conn = open_connection()?;
+    let result: rusqlite::Result<Vec<u8>> = conn.query_row(
+        "SELECT value FROM config WHERE key = ?",
+        params![key],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(bytes) => {
+            let arr: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| format!("corrupt config value for '{}'", key))?;
+            Ok(u64::from_le_bytes(arr))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        Err(e) => Err(format!("failed to read '{}': {}", key, e)),
+    }
+}
+
+/// Write a u64 as an 8-byte little-endian BLOB into the config table.
+fn write_u64_config(key: &str, value: u64) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params![key, value.to_le_bytes().to_vec()],
+    )
+    .map_err(|e| format!("failed to write '{}': {}", key, e))?;
+    Ok(())
+}
+
+/// Returns the current vault change sequence number (0 if vault not yet created).
+pub fn get_vault_change_seq() -> Result<u64, String> {
+    read_u64_config(VAULT_CHANGE_SEQ_KEY)
+}
+
+/// Increments `runtime.vault.change_seq` by 1.
+/// Called after any vault write that can affect which keys the proxy resolves.
+/// Failures are non-fatal — callers should use `let _ = ...`.
+pub fn bump_vault_change_seq() -> Result<(), String> {
+    let current = read_u64_config(VAULT_CHANGE_SEQ_KEY)?;
+    write_u64_config(VAULT_CHANGE_SEQ_KEY, current.saturating_add(1))
+}
+
+/// Returns the vault change_seq that was snapshotted when the proxy last
+/// started or completed a graceful reload (0 if never recorded).
+pub fn get_proxy_loaded_seq() -> Result<u64, String> {
+    read_u64_config(PROXY_LOADED_SEQ_KEY)
+}
+
+/// Persists the vault change_seq that the proxy has just loaded.
+/// Called by the CLI immediately after confirming proxy start / graceful reload.
+pub fn set_proxy_loaded_seq(seq: u64) -> Result<(), String> {
+    write_u64_config(PROXY_LOADED_SEQ_KEY, seq)
+}
