@@ -70,6 +70,8 @@ pub fn maybe_warn_stale() {
 }
 
 /// Sends `POST /admin/reload` to the running proxy and waits for the response.
+/// Injects the current trace context via the W3C `traceparent` header so the
+/// reload operation can be correlated with CLI log records by trace_id.
 /// Returns Ok(()) when the proxy confirms a successful graceful reload.
 fn post_admin_reload() -> Result<(), Box<dyn std::error::Error>> {
     let stream = TcpStream::connect(PROXY_HEALTH_ADDR_DEFAULT)
@@ -77,7 +79,15 @@ fn post_admin_reload() -> Result<(), Box<dyn std::error::Error>> {
     stream.set_read_timeout(Some(Duration::from_secs(35)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-    let request = "POST /admin/reload HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    // Inject traceparent so the proxy's reload logs share the same trace_id.
+    let traceparent_header = crate::observability::trace()
+        .map(|tc| format!("traceparent: {}\r\n", tc.traceparent))
+        .unwrap_or_default();
+
+    let request = format!(
+        "POST /admin/reload HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n{}\r\n",
+        traceparent_header
+    );
     {
         let mut w = stream.try_clone()?;
         w.write_all(request.as_bytes())?;

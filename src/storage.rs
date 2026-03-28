@@ -175,6 +175,62 @@ fn apply_migrations(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("Failed to ensure events index: {}", e))?;
 
+    // ---- Platform account (global identity) ----
+    // Stores the JWT and account metadata from aikey-control-service login.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS platform_account (
+            id              INTEGER PRIMARY KEY CHECK (id = 1), -- singleton row
+            account_id      TEXT NOT NULL,
+            email           TEXT NOT NULL,
+            jwt_token       TEXT NOT NULL,   -- Bearer token; refresh by re-login
+            control_url     TEXT NOT NULL,   -- e.g. https://control.aikey.io
+            logged_in_at    INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )",
+        [],
+    )
+    .map_err(|e| format!("Failed to ensure platform_account table: {}", e))?;
+
+    // ---- Team-managed virtual key cache ----
+    // Local mirror of managed_virtual_keys from the control service.
+    // provider_key_nonce + provider_key_ciphertext hold the real provider key
+    // re-encrypted with the local vault AES key (same scheme as entries table).
+    //
+    // local_state drives CLI/proxy behaviour; server share_status is authoritative
+    // but may be slightly stale between syncs.
+    //
+    // cache_schema_version allows the proxy to reject incompatible cache rows
+    // and prompt the user to re-sync.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS managed_virtual_keys_cache (
+            virtual_key_id       TEXT PRIMARY KEY,
+            org_id               TEXT NOT NULL,
+            seat_id              TEXT NOT NULL,
+            alias                TEXT NOT NULL,
+            provider_code        TEXT NOT NULL,
+            protocol_type        TEXT NOT NULL DEFAULT 'openai_compatible',
+            base_url             TEXT NOT NULL,
+            credential_id        TEXT NOT NULL,
+            credential_revision  TEXT NOT NULL,
+            virtual_key_revision TEXT NOT NULL,
+            key_status           TEXT NOT NULL DEFAULT 'active',
+            share_status         TEXT NOT NULL DEFAULT 'pending_claim',
+            local_state          TEXT NOT NULL DEFAULT 'synced_inactive',
+            expires_at           INTEGER,
+            provider_key_nonce      BLOB,        -- NULL until delivered
+            provider_key_ciphertext BLOB,        -- NULL until delivered
+            cache_schema_version INTEGER NOT NULL DEFAULT 1,
+            synced_at            INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )",
+        [],
+    )
+    .map_err(|e| format!("Failed to ensure managed_virtual_keys_cache table: {}", e))?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mvkc_local_state ON managed_virtual_keys_cache(local_state)",
+        [],
+    )
+    .map_err(|e| format!("Failed to ensure managed_virtual_keys_cache index: {}", e))?;
+
     // Migration guards for new event columns on existing databases
     for (col, ddl) in &[
         ("project",    "ALTER TABLE events ADD COLUMN project TEXT"),
@@ -1196,4 +1252,287 @@ pub fn get_proxy_loaded_seq() -> Result<u64, String> {
 /// Called by the CLI immediately after confirming proxy start / graceful reload.
 pub fn set_proxy_loaded_seq(seq: u64) -> Result<(), String> {
     write_u64_config(PROXY_LOADED_SEQ_KEY, seq)
+}
+
+// ---------------------------------------------------------------------------
+// Platform account (control-service login session)
+// ---------------------------------------------------------------------------
+
+/// Singleton row in the `platform_account` table.
+#[derive(Debug, Clone)]
+pub struct PlatformAccount {
+    pub account_id: String,
+    pub email: String,
+    pub jwt_token: String,
+    pub control_url: String,
+    pub logged_in_at: i64,
+}
+
+/// Upserts the singleton platform_account row (id = 1).
+pub fn save_platform_account(
+    account_id: &str,
+    email: &str,
+    jwt_token: &str,
+    control_url: &str,
+) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "INSERT OR REPLACE INTO platform_account
+             (id, account_id, email, jwt_token, control_url, logged_in_at)
+         VALUES (1, ?1, ?2, ?3, ?4, strftime('%s', 'now'))",
+        params![account_id, email, jwt_token, control_url],
+    )
+    .map_err(|e| format!("Failed to save platform account: {}", e))?;
+    Ok(())
+}
+
+/// Returns the stored platform account, or `None` if not logged in.
+pub fn get_platform_account() -> Result<Option<PlatformAccount>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_connection()?;
+    let result = conn.query_row(
+        "SELECT account_id, email, jwt_token, control_url, logged_in_at
+           FROM platform_account WHERE id = 1",
+        [],
+        |row| {
+            Ok(PlatformAccount {
+                account_id: row.get(0)?,
+                email: row.get(1)?,
+                jwt_token: row.get(2)?,
+                control_url: row.get(3)?,
+                logged_in_at: row.get(4)?,
+            })
+        },
+    );
+    match result {
+        Ok(acc) => Ok(Some(acc)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to read platform account: {}", e)),
+    }
+}
+
+/// Deletes the platform_account row (logout).
+pub fn clear_platform_account() -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute("DELETE FROM platform_account WHERE id = 1", [])
+        .map_err(|e| format!("Failed to clear platform account: {}", e))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Team-managed virtual key cache
+// ---------------------------------------------------------------------------
+
+/// Row from `managed_virtual_keys_cache`.
+#[derive(Debug, Clone)]
+pub struct VirtualKeyCacheEntry {
+    pub virtual_key_id: String,
+    pub org_id: String,
+    pub seat_id: String,
+    pub alias: String,
+    pub provider_code: String,
+    pub protocol_type: String,
+    pub base_url: String,
+    pub credential_id: String,
+    pub credential_revision: String,
+    pub virtual_key_revision: String,
+    pub key_status: String,
+    pub share_status: String,
+    /// `synced_inactive` | `active` — controls proxy routing.
+    pub local_state: String,
+    pub expires_at: Option<i64>,
+    pub provider_key_nonce: Option<Vec<u8>>,
+    pub provider_key_ciphertext: Option<Vec<u8>>,
+    pub synced_at: i64,
+}
+
+/// Inserts or replaces a cache entry.
+/// `provider_key_nonce` / `provider_key_ciphertext` may be `None` until the key is accepted.
+pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "INSERT OR REPLACE INTO managed_virtual_keys_cache (
+             virtual_key_id, org_id, seat_id, alias,
+             provider_code, protocol_type, base_url,
+             credential_id, credential_revision, virtual_key_revision,
+             key_status, share_status, local_state,
+             expires_at,
+             provider_key_nonce, provider_key_ciphertext,
+             cache_schema_version, synced_at
+         ) VALUES (
+             ?1,  ?2,  ?3,  ?4,
+             ?5,  ?6,  ?7,
+             ?8,  ?9,  ?10,
+             ?11, ?12, ?13,
+             ?14,
+             ?15, ?16,
+             1,   strftime('%s', 'now')
+         )",
+        params![
+            entry.virtual_key_id,
+            entry.org_id,
+            entry.seat_id,
+            entry.alias,
+            entry.provider_code,
+            entry.protocol_type,
+            entry.base_url,
+            entry.credential_id,
+            entry.credential_revision,
+            entry.virtual_key_revision,
+            entry.key_status,
+            entry.share_status,
+            entry.local_state,
+            entry.expires_at,
+            entry.provider_key_nonce,
+            entry.provider_key_ciphertext,
+        ],
+    )
+    .map_err(|e| format!("Failed to upsert virtual key cache: {}", e))?;
+    Ok(())
+}
+
+/// Returns all cached virtual key entries.
+pub fn list_virtual_key_cache() -> Result<Vec<VirtualKeyCacheEntry>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(vec![]);
+    }
+    let conn = open_connection()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT virtual_key_id, org_id, seat_id, alias,
+                    provider_code, protocol_type, base_url,
+                    credential_id, credential_revision, virtual_key_revision,
+                    key_status, share_status, local_state,
+                    expires_at,
+                    provider_key_nonce, provider_key_ciphertext,
+                    synced_at
+               FROM managed_virtual_keys_cache
+              ORDER BY alias",
+        )
+        .map_err(|e| format!("Failed to prepare list query: {}", e))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(VirtualKeyCacheEntry {
+                virtual_key_id: row.get(0)?,
+                org_id: row.get(1)?,
+                seat_id: row.get(2)?,
+                alias: row.get(3)?,
+                provider_code: row.get(4)?,
+                protocol_type: row.get(5)?,
+                base_url: row.get(6)?,
+                credential_id: row.get(7)?,
+                credential_revision: row.get(8)?,
+                virtual_key_revision: row.get(9)?,
+                key_status: row.get(10)?,
+                share_status: row.get(11)?,
+                local_state: row.get(12)?,
+                expires_at: row.get(13)?,
+                provider_key_nonce: row.get(14)?,
+                provider_key_ciphertext: row.get(15)?,
+                synced_at: row.get(16)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query virtual key cache: {}", e))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to read virtual key cache rows: {}", e))
+}
+
+/// Returns a single cached entry by virtual_key_id, or `None`.
+pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCacheEntry>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_connection()?;
+    let result = conn.query_row(
+        "SELECT virtual_key_id, org_id, seat_id, alias,
+                provider_code, protocol_type, base_url,
+                credential_id, credential_revision, virtual_key_revision,
+                key_status, share_status, local_state,
+                expires_at,
+                provider_key_nonce, provider_key_ciphertext,
+                synced_at
+           FROM managed_virtual_keys_cache
+          WHERE virtual_key_id = ?1",
+        params![virtual_key_id],
+        |row| {
+            Ok(VirtualKeyCacheEntry {
+                virtual_key_id: row.get(0)?,
+                org_id: row.get(1)?,
+                seat_id: row.get(2)?,
+                alias: row.get(3)?,
+                provider_code: row.get(4)?,
+                protocol_type: row.get(5)?,
+                base_url: row.get(6)?,
+                credential_id: row.get(7)?,
+                credential_revision: row.get(8)?,
+                virtual_key_revision: row.get(9)?,
+                key_status: row.get(10)?,
+                share_status: row.get(11)?,
+                local_state: row.get(12)?,
+                expires_at: row.get(13)?,
+                provider_key_nonce: row.get(14)?,
+                provider_key_ciphertext: row.get(15)?,
+                synced_at: row.get(16)?,
+            })
+        },
+    );
+    match result {
+        Ok(entry) => Ok(Some(entry)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to get virtual key cache entry: {}", e)),
+    }
+}
+
+/// Sets `local_state` for a cached key (e.g., `"active"` or `"synced_inactive"`).
+pub fn set_virtual_key_local_state(virtual_key_id: &str, local_state: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE managed_virtual_keys_cache
+            SET local_state = ?1, synced_at = strftime('%s', 'now')
+          WHERE virtual_key_id = ?2",
+        params![local_state, virtual_key_id],
+    )
+    .map_err(|e| format!("Failed to update local_state: {}", e))?;
+    Ok(())
+}
+
+/// Updates `share_status` in the local cache (mirrors server state after claim).
+pub fn set_virtual_key_share_status_local(
+    virtual_key_id: &str,
+    share_status: &str,
+) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE managed_virtual_keys_cache
+            SET share_status = ?1, synced_at = strftime('%s', 'now')
+          WHERE virtual_key_id = ?2",
+        params![share_status, virtual_key_id],
+    )
+    .map_err(|e| format!("Failed to update share_status: {}", e))?;
+    Ok(())
+}
+
+/// Counts entries with `share_status = 'pending_claim'` in the local cache.
+/// Used for the non-intrusive startup hint (no vault auth required).
+pub fn count_pending_virtual_keys() -> Result<usize, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    let conn = open_connection()?;
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM managed_virtual_keys_cache WHERE share_status = 'pending_claim'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Failed to count pending keys: {}", e))?;
+    Ok(count as usize)
 }

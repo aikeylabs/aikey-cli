@@ -21,3 +21,5 @@ pub mod core;
 pub mod providers;
 pub mod resolver;
 pub mod events;
+pub mod platform_client;
+pub mod commands_account;

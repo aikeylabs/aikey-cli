@@ -12,12 +12,15 @@ mod env_renderer;
 mod commands_project;
 mod commands_env;
 mod commands_proxy;
+mod commands_account;
+mod platform_client;
 mod profiles;
 mod core;
 mod global_config;
 mod providers;
 mod resolver;
 mod events;
+mod observability;
 
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
@@ -153,10 +156,15 @@ enum Commands {
         #[arg(short, long, default_value = "20")]
         limit: u32,
     },
-    /// Manage API keys (rotate, etc.)
+    /// Manage API keys (rotate, list, accept, sync, use)
     Key {
         #[command(subcommand)]
         action: KeyAction,
+    },
+    /// Manage your aikey-control-service account session
+    Account {
+        #[command(subcommand)]
+        action: AccountAction,
     },
     /// Run diagnostics and health checks
     Doctor,
@@ -198,7 +206,7 @@ enum ProxyAction {
 
 #[derive(Subcommand)]
 enum KeyAction {
-    /// Rotate a secret to a new value
+    /// Rotate a local secret to a new value
     Rotate {
         /// Secret name/alias to rotate
         name: String,
@@ -206,6 +214,40 @@ enum KeyAction {
         #[arg(long)]
         from_stdin: bool,
     },
+    /// List all team-managed virtual keys (fetches from server if logged in)
+    List,
+    /// Accept and download pending team keys (all pending if no id given)
+    Accept {
+        /// Virtual key ID to accept (omit to accept all pending keys)
+        id: Option<String>,
+    },
+    /// Sync all team key metadata from the control service
+    Sync,
+    /// Activate a team key for proxy routing (sets local_state = active)
+    Use {
+        /// Virtual key ID to activate
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccountAction {
+    /// Log in to an aikey-control-service instance
+    Login {
+        /// Control service URL (e.g. http://localhost:8080)
+        #[arg(long)]
+        url: Option<String>,
+        /// Account email address
+        #[arg(long)]
+        email: Option<String>,
+        /// Account password (prefer interactive prompt; for CI use AIKEY_PLATFORM_PASSWORD)
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Show current login status
+    Status,
+    /// Log out (removes stored JWT)
+    Logout,
 }
 
 #[derive(Subcommand)]
@@ -339,6 +381,10 @@ enum ProviderAction {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialise process-global trace context (trace_id, span_id, command_id).
+    // This must be called before any logging or proxy calls.
+    observability::init_trace();
+
     let cli = Cli::parse();
 
     // Handle --version flag
@@ -364,16 +410,131 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Wrapper to handle JSON error output
-    if let Err(e) = run_command(&cli) {
-        if cli.json {
-            json_output::error(&e.to_string(), 1);
-        } else {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
+    // Determine command name for structured log fields (best-effort, no secrets).
+    let cmd_name = command_name(cli.command.as_ref());
+
+    observability::log_event(
+        observability::EVENT_CLI_COMMAND_STARTED,
+        &format!("command started: {}", cmd_name),
+    );
+
+    let start = std::time::Instant::now();
+
+    // Execute command and log outcome.
+    match run_command(&cli) {
+        Ok(()) => {
+            let duration_ms = start.elapsed().as_millis() as i64;
+            let mut extra = std::collections::BTreeMap::new();
+            extra.insert("duration_ms", serde_json::Value::from(duration_ms));
+            extra.insert("command", serde_json::Value::from(cmd_name.clone()));
+            observability::write_log(
+                observability::Level::Info,
+                &format!("command completed: {}", cmd_name),
+                Some(observability::EVENT_CLI_COMMAND_COMPLETED),
+                None,
+                None,
+                extra,
+            );
+        }
+        Err(e) => {
+            let duration_ms = start.elapsed().as_millis() as i64;
+            use std::collections::BTreeMap;
+            let mut extra = BTreeMap::new();
+            extra.insert("duration_ms", serde_json::Value::from(duration_ms));
+            extra.insert("command", serde_json::Value::from(cmd_name.clone()));
+            observability::write_log(
+                observability::Level::Error,
+                &format!("command failed: {}", cmd_name),
+                Some(observability::EVENT_CLI_COMMAND_FAILED),
+                None,
+                Some(&e.to_string()),
+                extra,
+            );
+            if cli.json {
+                json_output::error(&e.to_string(), 1);
+            } else {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
     }
     Ok(())
+}
+
+/// Returns a stable command name string suitable for log fields.
+/// Never includes secret values or passwords.
+fn command_name(cmd: Option<&Commands>) -> String {
+    match cmd {
+        None => "unknown".to_string(),
+        Some(c) => match c {
+            Commands::Init => "init".to_string(),
+            Commands::Add { .. } => "add".to_string(),
+            Commands::Get { .. } => "get".to_string(),
+            Commands::Delete { .. } => "delete".to_string(),
+            Commands::List => "list".to_string(),
+            Commands::Update { .. } => "update".to_string(),
+            Commands::Export { .. } => "export".to_string(),
+            Commands::Import { .. } => "import".to_string(),
+            Commands::Exec { .. } => "exec".to_string(),
+            Commands::Run { .. } => "run".to_string(),
+            Commands::ChangePassword => "change-password".to_string(),
+            Commands::Secret { action } => format!("secret.{}", match action {
+                SecretAction::Set { .. } => "set",
+                SecretAction::Upsert { .. } => "upsert",
+                SecretAction::List => "list",
+                SecretAction::Delete { .. } => "delete",
+            }),
+            Commands::Profile { action } => format!("profile.{}", match action {
+                ProfileAction::List => "list",
+                ProfileAction::Use { .. } => "use",
+                ProfileAction::Show { .. } => "show",
+                ProfileAction::Current => "current",
+                ProfileAction::Create { .. } => "create",
+                ProfileAction::Delete { .. } => "delete",
+            }),
+            Commands::Env { action } => format!("env.{}", match action {
+                EnvAction::Generate { .. } => "generate",
+                EnvAction::Inject { .. } => "inject",
+                EnvAction::Check => "check",
+                EnvAction::Use { .. } => "use",
+            }),
+            Commands::Project { action } => format!("project.{}", match action {
+                ProjectAction::Init => "init",
+                ProjectAction::Status => "status",
+                ProjectAction::Map { .. } => "map",
+            }),
+            Commands::Provider { action } => format!("provider.{}", match action {
+                ProviderAction::Add { .. } => "add",
+                ProviderAction::Rm { .. } => "rm",
+                ProviderAction::Ls => "ls",
+            }),
+            Commands::Quickstart => "quickstart".to_string(),
+            Commands::Stats => "stats".to_string(),
+            Commands::Logs { .. } => "logs".to_string(),
+            Commands::Key { action } => format!("key.{}", match action {
+                KeyAction::Rotate { .. } => "rotate",
+                KeyAction::List => "list",
+                KeyAction::Accept { .. } => "accept",
+                KeyAction::Sync => "sync",
+                KeyAction::Use { .. } => "use",
+            }),
+            Commands::Account { action } => format!("account.{}", match action {
+                AccountAction::Login { .. } => "login",
+                AccountAction::Status => "status",
+                AccountAction::Logout => "logout",
+            }),
+            Commands::Doctor => "doctor".to_string(),
+            Commands::Status => "status".to_string(),
+            Commands::Shell => "shell".to_string(),
+            Commands::Proxy { action } => format!("proxy.{}", match action {
+                ProxyAction::Start { .. } => "start",
+                ProxyAction::Stop => "stop",
+                ProxyAction::Status => "status",
+                ProxyAction::Restart { .. } => "restart",
+                ProxyAction::Verify => "verify",
+            }),
+        },
+    }
 }
 
 /// Handle `aikey stats` command
@@ -434,6 +595,17 @@ fn handle_stats(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let command = cli.command.as_ref().unwrap();
+
+    // Interactive accept prompt: if there are pending team keys in local cache,
+    // ask the user whether to accept them before proceeding with the real command.
+    // Skipped in JSON mode, for Key/Account subcommands, and in non-TTY contexts.
+    if !cli.json {
+        match command {
+            Commands::Key { .. } | Commands::Account { .. } => {}
+            _ => { let _ = commands_account::maybe_prompt_accept_pending(); }
+        }
+    }
+
     match command {
         Commands::Init => {
             let password = prompt_password_secure("Set Master Password: ", cli.password_stdin, cli.json)?;
@@ -1490,6 +1662,38 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                }
+                KeyAction::List => {
+                    commands_account::handle_key_list(cli.json)?;
+                }
+                KeyAction::Accept { id } => {
+                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+                    commands_account::handle_key_accept(id.as_deref(), &password, cli.json)?;
+                }
+                KeyAction::Sync => {
+                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+                    commands_account::handle_key_sync(&password, cli.json)?;
+                }
+                KeyAction::Use { id } => {
+                    commands_account::handle_key_use(id, cli.json)?;
+                }
+            }
+        }
+        Commands::Account { action } => {
+            match action {
+                AccountAction::Login { url, email, password: login_password } => {
+                    commands_account::handle_login(
+                        cli.json,
+                        url.clone(),
+                        email.clone(),
+                        login_password.clone(),
+                    )?;
+                }
+                AccountAction::Status => {
+                    commands_account::handle_account_status(cli.json)?;
+                }
+                AccountAction::Logout => {
+                    commands_account::handle_logout(cli.json)?;
                 }
             }
         }
