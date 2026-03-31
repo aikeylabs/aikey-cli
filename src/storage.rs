@@ -18,6 +18,12 @@ pub struct SecretMetadata {
     pub alias: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
+    /// Provider code (e.g. "anthropic", "openai"); None for plain secrets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    /// Custom upstream base URL set by the user; overrides the provider default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 /// Default vault data directory path (~/.aikey/data/)
@@ -230,6 +236,94 @@ fn apply_migrations(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("Failed to ensure managed_virtual_keys_cache index: {}", e))?;
+
+    // Migration guards for managed_virtual_keys_cache new columns.
+    for (col, ddl) in &[
+        (
+            "local_alias",
+            // v0.6: user-set local display name; does not affect server alias
+            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN local_alias TEXT",
+        ),
+        (
+            "supported_providers",
+            // v0.7: JSON array of provider codes this key supports (e.g. '["anthropic"]')
+            // Populated from delivery payload slots at accept/sync time; used by `aikey use`
+            // to know which env vars to write into ~/.aikey/active.env.
+            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN supported_providers TEXT",
+        ),
+        (
+            "provider_base_urls",
+            // v0.7: JSON object mapping provider_code → upstream base_url for each provider
+            // slot (e.g. {"anthropic":"https://api.anthropic.com"}). Allows path-prefix proxy
+            // routing to use the correct per-provider admin-configured upstream URL.
+            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN provider_base_urls TEXT",
+        ),
+    ] {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('managed_virtual_keys_cache') WHERE name=?1",
+                [col],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_col {
+            conn.execute(ddl, [])
+                .map_err(|e| format!("Failed to add managed_virtual_keys_cache.{} column: {}", col, e))?;
+        }
+    }
+
+    // Migration guards for entries routing columns (v0.7+).
+    for (col, ddl, desc) in &[
+        (
+            "provider_code",
+            "ALTER TABLE entries ADD COLUMN provider_code TEXT",
+            // NULL = ordinary secret, not involved in provider routing.
+            // Set via --provider flag or interactive prompt on `aikey add`.
+            "entries.provider_code",
+        ),
+        (
+            "base_url",
+            "ALTER TABLE entries ADD COLUMN base_url TEXT",
+            // User-supplied upstream base URL (e.g. a third-party proxy).
+            // Overrides the provider's default when set.
+            "entries.base_url",
+        ),
+    ] {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name=?1",
+                [col],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_col {
+            conn.execute(ddl, [])
+                .map_err(|e| format!("Failed to add {} column: {}", desc, e))?;
+        }
+    }
+
+    // Migration guards for platform_account OAuth columns (v0.5+).
+    // jwt_token is repurposed as the OAuth access_token; refresh_token and
+    // token_expires_at are new columns that allow silent token renewal.
+    for (col, ddl) in &[
+        ("refresh_token",    "ALTER TABLE platform_account ADD COLUMN refresh_token TEXT"),
+        ("token_expires_at", "ALTER TABLE platform_account ADD COLUMN token_expires_at INTEGER"),
+    ] {
+        let has_col: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('platform_account') WHERE name=?1",
+                [col],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_col {
+            conn.execute(ddl, [])
+                .map_err(|e| format!("Failed to add platform_account.{} column: {}", col, e))?;
+        }
+    }
 
     // Migration guards for new event columns on existing databases
     for (col, ddl) in &[
@@ -735,29 +829,24 @@ pub fn list_entries_with_metadata() -> Result<Vec<SecretMetadata>, String> {
 
     let conn = open_connection()?;
 
+    // provider_code and base_url may not exist on older vaults — use ifnull to default to NULL.
     let mut stmt = conn
-        .prepare("SELECT alias, created_at FROM entries ORDER BY alias")
+        .prepare("SELECT alias, created_at, provider_code, base_url FROM entries ORDER BY alias")
+        .or_else(|_| conn.prepare("SELECT alias, created_at, NULL, NULL FROM entries ORDER BY alias"))
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
-    let entries = stmt
+    let metadata: Vec<SecretMetadata> = stmt
         .query_map([], |row| {
-            let alias: String = row.get(0)?;
-            let created_at: Option<i64> = row.get(1).ok();
-            Ok((alias, created_at))
+            Ok(SecretMetadata {
+                alias:         row.get(0)?,
+                created_at:    row.get(1).ok(),
+                provider_code: row.get(2).ok().flatten(),
+                base_url:      row.get(3).ok().flatten(),
+            })
         })
         .map_err(|e| format!("Failed to query entries: {}", e))?
-        .collect::<SqlResult<Vec<(String, Option<i64>)>>>()
+        .collect::<SqlResult<Vec<SecretMetadata>>>()
         .map_err(|e| format!("Failed to collect results: {}", e))?;
-
-    let metadata: Vec<SecretMetadata> = entries
-        .into_iter()
-        .map(|(alias, created_at)| {
-            SecretMetadata {
-                alias,
-                created_at,
-            }
-        })
-        .collect();
 
     Ok(metadata)
 }
@@ -1259,13 +1348,21 @@ pub fn set_proxy_loaded_seq(seq: u64) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// Singleton row in the `platform_account` table.
+///
+/// `jwt_token` holds the current OAuth access_token (Bearer).
+/// `refresh_token` is the long-lived opaque token for silent renewal.
+/// `token_expires_at` is the Unix timestamp when the access_token expires.
+/// When `token_expires_at` is `None` the row was created by an older CLI version
+/// and the token may still be valid (legacy 24-hour window).
 #[derive(Debug, Clone)]
 pub struct PlatformAccount {
     pub account_id: String,
     pub email: String,
-    pub jwt_token: String,
+    pub jwt_token: String,         // current access_token (Bearer)
     pub control_url: String,
     pub logged_in_at: i64,
+    pub refresh_token: Option<String>,    // OAuth refresh token; None on legacy rows
+    pub token_expires_at: Option<i64>,    // Unix epoch when access_token expires
 }
 
 /// Upserts the singleton platform_account row (id = 1).
@@ -1294,7 +1391,8 @@ pub fn get_platform_account() -> Result<Option<PlatformAccount>, String> {
     }
     let conn = open_connection()?;
     let result = conn.query_row(
-        "SELECT account_id, email, jwt_token, control_url, logged_in_at
+        "SELECT account_id, email, jwt_token, control_url, logged_in_at,
+                refresh_token, token_expires_at
            FROM platform_account WHERE id = 1",
         [],
         |row| {
@@ -1304,6 +1402,8 @@ pub fn get_platform_account() -> Result<Option<PlatformAccount>, String> {
                 jwt_token: row.get(2)?,
                 control_url: row.get(3)?,
                 logged_in_at: row.get(4)?,
+                refresh_token: row.get(5)?,
+                token_expires_at: row.get(6)?,
             })
         },
     );
@@ -1314,12 +1414,211 @@ pub fn get_platform_account() -> Result<Option<PlatformAccount>, String> {
     }
 }
 
+/// Upserts the singleton platform_account row with OAuth token data.
+///
+/// `access_token` is the short-lived Bearer JWT (1 h).
+/// `refresh_token` is the long-lived opaque renewal token (30 d).
+/// `token_expires_at` is the Unix timestamp when `access_token` expires.
+pub fn save_oauth_session(
+    account_id: &str,
+    email: &str,
+    access_token: &str,
+    refresh_token: &str,
+    token_expires_at: i64,
+    control_url: &str,
+) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "INSERT OR REPLACE INTO platform_account
+             (id, account_id, email, jwt_token, control_url, logged_in_at,
+              refresh_token, token_expires_at)
+         VALUES (1, ?1, ?2, ?3, ?4, strftime('%s', 'now'), ?5, ?6)",
+        params![account_id, email, access_token, control_url, refresh_token, token_expires_at],
+    )
+    .map_err(|e| format!("Failed to save OAuth session: {}", e))?;
+    Ok(())
+}
+
+/// Updates only the access_token and its expiry after a silent refresh.
+pub fn update_access_token(access_token: &str, token_expires_at: i64) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE platform_account SET jwt_token = ?1, token_expires_at = ?2 WHERE id = 1",
+        params![access_token, token_expires_at],
+    )
+    .map_err(|e| format!("Failed to update access token: {}", e))?;
+    Ok(())
+}
+
+/// Updates access_token, refresh_token, and expiry after a token refresh.
+/// Call this whenever the server returns both tokens (e.g. POST /v1/auth/cli/token/refresh).
+pub fn update_tokens(
+    access_token: &str,
+    refresh_token: &str,
+    token_expires_at: i64,
+) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE platform_account SET jwt_token = ?1, refresh_token = ?2, token_expires_at = ?3 WHERE id = 1",
+        params![access_token, refresh_token, token_expires_at],
+    )
+    .map_err(|e| format!("Failed to update tokens: {}", e))?;
+    Ok(())
+}
+
 /// Deletes the platform_account row (logout).
 pub fn clear_platform_account() -> Result<(), String> {
     let conn = open_connection()?;
     conn.execute("DELETE FROM platform_account WHERE id = 1", [])
         .map_err(|e| format!("Failed to clear platform account: {}", e))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Active key configuration (global mutex for proxy routing)
+// ---------------------------------------------------------------------------
+
+/// Holds the currently-active key selection written by `aikey use`.
+/// Stored as three TEXT entries in the `config` table.
+///
+/// `key_type` = "team" | "personal" | "" (empty = nothing active)
+/// `key_ref`  = virtual_key_id (team) OR alias (personal)
+/// `providers` = JSON array of provider codes the active key supports
+#[derive(Debug, Clone)]
+pub struct ActiveKeyConfig {
+    pub key_type: String,
+    pub key_ref: String,
+    pub providers: Vec<String>,
+}
+
+const ACTIVE_KEY_TYPE_KEY: &str = "active_key_type";
+const ACTIVE_KEY_REF_KEY: &str = "active_key_ref";
+const ACTIVE_KEY_PROVIDERS_KEY: &str = "active_key_providers";
+
+/// Returns the current active key config, or `None` if no key is active.
+pub fn get_active_key_config() -> Result<Option<ActiveKeyConfig>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_connection()?;
+
+    let key_type: Option<String> = conn
+        .query_row(
+            "SELECT CAST(value AS TEXT) FROM config WHERE key = ?1",
+            params![ACTIVE_KEY_TYPE_KEY],
+            |row| row.get(0),
+        )
+        .ok();
+
+    match key_type.as_deref() {
+        None | Some("") => return Ok(None),
+        _ => {}
+    }
+
+    let key_ref: String = conn
+        .query_row(
+            "SELECT CAST(value AS TEXT) FROM config WHERE key = ?1",
+            params![ACTIVE_KEY_REF_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+
+    let providers_json: String = conn
+        .query_row(
+            "SELECT CAST(value AS TEXT) FROM config WHERE key = ?1",
+            params![ACTIVE_KEY_PROVIDERS_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| "[]".to_string());
+
+    let providers: Vec<String> = serde_json::from_str(&providers_json).unwrap_or_default();
+
+    Ok(Some(ActiveKeyConfig {
+        key_type: key_type.unwrap_or_default(),
+        key_ref,
+        providers,
+    }))
+}
+
+/// Persists the active key configuration (upserts three config rows).
+pub fn set_active_key_config(cfg: &ActiveKeyConfig) -> Result<(), String> {
+    let conn = open_connection()?;
+    let providers_json = serde_json::to_string(&cfg.providers)
+        .map_err(|e| format!("Failed to serialize providers: {}", e))?;
+
+    for (k, v) in &[
+        (ACTIVE_KEY_TYPE_KEY, cfg.key_type.as_str()),
+        (ACTIVE_KEY_REF_KEY, cfg.key_ref.as_str()),
+    ] {
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+            params![k, v.as_bytes().to_vec()],
+        )
+        .map_err(|e| format!("Failed to write active key config '{}': {}", k, e))?;
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+        params![ACTIVE_KEY_PROVIDERS_KEY, providers_json.as_bytes().to_vec()],
+    )
+    .map_err(|e| format!("Failed to write active key config providers: {}", e))?;
+
+    Ok(())
+}
+
+/// Clears all three active key config rows (no key active).
+pub fn clear_active_key_config() -> Result<(), String> {
+    let conn = open_connection()?;
+    for k in &[ACTIVE_KEY_TYPE_KEY, ACTIVE_KEY_REF_KEY, ACTIVE_KEY_PROVIDERS_KEY] {
+        conn.execute(
+            "DELETE FROM config WHERE key = ?1",
+            params![k],
+        )
+        .map_err(|e| format!("Failed to clear active key config '{}': {}", k, e))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Generic text config helpers
+// ---------------------------------------------------------------------------
+
+const SESSION_BACKEND_KEY: &str = "session.backend";
+
+/// Read a plain-text config value. Returns `None` if the key is absent or the
+/// vault does not exist yet.
+pub fn get_text_config(key: &str) -> Option<String> {
+    let db_path = get_vault_path().ok()?;
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = open_connection().ok()?;
+    conn.query_row(
+        "SELECT CAST(value AS TEXT) FROM config WHERE key = ?",
+        params![key],
+        |row| row.get::<_, String>(0),
+    ).ok()
+}
+
+/// Write a plain-text config value. Silent on failure.
+pub fn set_text_config(key: &str, value: &str) {
+    if let Ok(conn) = open_connection() {
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+            params![key, value],
+        );
+    }
+}
+
+/// Returns the user's preferred session backend: `"keychain"`, `"file"`, `"disabled"`,
+/// or `None` if the user has not yet been asked.
+pub fn get_session_backend_pref() -> Option<String> {
+    get_text_config(SESSION_BACKEND_KEY)
+}
+
+/// Persist the session backend preference.
+pub fn set_session_backend_pref(pref: &str) {
+    set_text_config(SESSION_BACKEND_KEY, pref);
 }
 
 // ---------------------------------------------------------------------------
@@ -1332,6 +1631,7 @@ pub struct VirtualKeyCacheEntry {
     pub virtual_key_id: String,
     pub org_id: String,
     pub seat_id: String,
+    /// Server-assigned alias (authoritative, never modified locally).
     pub alias: String,
     pub provider_code: String,
     pub protocol_type: String,
@@ -1347,12 +1647,25 @@ pub struct VirtualKeyCacheEntry {
     pub provider_key_nonce: Option<Vec<u8>>,
     pub provider_key_ciphertext: Option<Vec<u8>>,
     pub synced_at: i64,
+    /// User-set local display name (`aikey key alias`). `None` → use server alias.
+    pub local_alias: Option<String>,
+    /// Provider codes this key supports (e.g. `["anthropic"]`), parsed from JSON.
+    /// Populated from delivery payload slots at accept/sync time.
+    /// Used by `aikey use` to write the correct provider env vars.
+    pub supported_providers: Vec<String>,
+    /// Per-provider upstream base URLs (JSON object). Keys: provider code, Values: base URL.
+    /// Populated from delivery payload slots; empty map until first key accept/sync.
+    pub provider_base_urls: std::collections::HashMap<String, String>,
 }
 
 /// Inserts or replaces a cache entry.
 /// `provider_key_nonce` / `provider_key_ciphertext` may be `None` until the key is accepted.
 pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), String> {
     let conn = open_connection()?;
+    let supported_providers_json = serde_json::to_string(&entry.supported_providers)
+        .unwrap_or_else(|_| "[]".to_string());
+    let provider_base_urls_json = serde_json::to_string(&entry.provider_base_urls)
+        .unwrap_or_else(|_| "{}".to_string());
     conn.execute(
         "INSERT OR REPLACE INTO managed_virtual_keys_cache (
              virtual_key_id, org_id, seat_id, alias,
@@ -1361,7 +1674,9 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              key_status, share_status, local_state,
              expires_at,
              provider_key_nonce, provider_key_ciphertext,
-             cache_schema_version, synced_at
+             cache_schema_version, synced_at,
+             local_alias, supported_providers,
+             provider_base_urls
          ) VALUES (
              ?1,  ?2,  ?3,  ?4,
              ?5,  ?6,  ?7,
@@ -1369,7 +1684,9 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              ?11, ?12, ?13,
              ?14,
              ?15, ?16,
-             1,   strftime('%s', 'now')
+             1,   strftime('%s', 'now'),
+             ?17, ?18,
+             ?19
          )",
         params![
             entry.virtual_key_id,
@@ -1388,10 +1705,23 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
             entry.expires_at,
             entry.provider_key_nonce,
             entry.provider_key_ciphertext,
+            entry.local_alias,
+            supported_providers_json,
+            provider_base_urls_json,
         ],
     )
     .map_err(|e| format!("Failed to upsert virtual key cache: {}", e))?;
     Ok(())
+}
+
+/// Parses a JSON array string into a `Vec<String>`, returning empty vec on failure.
+fn parse_providers_json(json: Option<String>) -> Vec<String> {
+    json.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+/// Parses a JSON object string into a `HashMap<String, String>`, returning empty map on failure.
+fn parse_base_urls_json(json: Option<String>) -> std::collections::HashMap<String, String> {
+    json.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
 /// Returns all cached virtual key entries.
@@ -1409,9 +1739,10 @@ pub fn list_virtual_key_cache() -> Result<Vec<VirtualKeyCacheEntry>, String> {
                     key_status, share_status, local_state,
                     expires_at,
                     provider_key_nonce, provider_key_ciphertext,
-                    synced_at
+                    synced_at, local_alias, supported_providers,
+                    provider_base_urls
                FROM managed_virtual_keys_cache
-              ORDER BY alias",
+              ORDER BY COALESCE(local_alias, alias)",
         )
         .map_err(|e| format!("Failed to prepare list query: {}", e))?;
 
@@ -1435,6 +1766,9 @@ pub fn list_virtual_key_cache() -> Result<Vec<VirtualKeyCacheEntry>, String> {
                 provider_key_nonce: row.get(14)?,
                 provider_key_ciphertext: row.get(15)?,
                 synced_at: row.get(16)?,
+                local_alias: row.get(17)?,
+                supported_providers: parse_providers_json(row.get(18)?),
+                provider_base_urls: parse_base_urls_json(row.get(19)?),
             })
         })
         .map_err(|e| format!("Failed to query virtual key cache: {}", e))?;
@@ -1457,7 +1791,8 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
                 key_status, share_status, local_state,
                 expires_at,
                 provider_key_nonce, provider_key_ciphertext,
-                synced_at
+                synced_at, local_alias, supported_providers,
+                provider_base_urls
            FROM managed_virtual_keys_cache
           WHERE virtual_key_id = ?1",
         params![virtual_key_id],
@@ -1480,6 +1815,9 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
                 provider_key_nonce: row.get(14)?,
                 provider_key_ciphertext: row.get(15)?,
                 synced_at: row.get(16)?,
+                local_alias: row.get(17)?,
+                supported_providers: parse_providers_json(row.get(18)?),
+                provider_base_urls: parse_base_urls_json(row.get(19)?),
             })
         },
     );
@@ -1488,6 +1826,162 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(format!("Failed to get virtual key cache entry: {}", e)),
     }
+}
+
+/// Looks up a cached entry by alias (tries `local_alias` first, then `alias`).
+/// Returns `None` if no entry matches.
+pub fn get_virtual_key_cache_by_alias(alias: &str) -> Result<Option<VirtualKeyCacheEntry>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_connection()?;
+    let result = conn.query_row(
+        "SELECT virtual_key_id, org_id, seat_id, alias,
+                provider_code, protocol_type, base_url,
+                credential_id, credential_revision, virtual_key_revision,
+                key_status, share_status, local_state,
+                expires_at,
+                provider_key_nonce, provider_key_ciphertext,
+                synced_at, local_alias, supported_providers,
+                provider_base_urls
+           FROM managed_virtual_keys_cache
+          WHERE local_alias = ?1 OR alias = ?1
+          ORDER BY CASE WHEN local_alias = ?1 THEN 0 ELSE 1 END
+          LIMIT 1",
+        params![alias],
+        |row| {
+            Ok(VirtualKeyCacheEntry {
+                virtual_key_id: row.get(0)?,
+                org_id: row.get(1)?,
+                seat_id: row.get(2)?,
+                alias: row.get(3)?,
+                provider_code: row.get(4)?,
+                protocol_type: row.get(5)?,
+                base_url: row.get(6)?,
+                credential_id: row.get(7)?,
+                credential_revision: row.get(8)?,
+                virtual_key_revision: row.get(9)?,
+                key_status: row.get(10)?,
+                share_status: row.get(11)?,
+                local_state: row.get(12)?,
+                expires_at: row.get(13)?,
+                provider_key_nonce: row.get(14)?,
+                provider_key_ciphertext: row.get(15)?,
+                synced_at: row.get(16)?,
+                local_alias: row.get(17)?,
+                supported_providers: parse_providers_json(row.get(18)?),
+                provider_base_urls: parse_base_urls_json(row.get(19)?),
+            })
+        },
+    );
+    match result {
+        Ok(entry) => Ok(Some(entry)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to get virtual key cache entry by alias: {}", e)),
+    }
+}
+
+/// Sets all team virtual key entries to `local_state = 'synced_inactive'`.
+/// Called by `aikey use` before activating a new key (global mutex).
+pub fn set_all_virtual_keys_inactive() -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE managed_virtual_keys_cache
+            SET local_state = 'synced_inactive',
+                synced_at   = strftime('%s', 'now')
+          WHERE local_state = 'active'",
+        [],
+    )
+    .map_err(|e| format!("Failed to deactivate all virtual keys: {}", e))?;
+    Ok(())
+}
+
+/// Returns the `provider_code` stored for a personal key (entries table), or `None`.
+/// Returns `None` if the entry does not exist or has no provider code.
+pub fn get_entry_provider_code(alias: &str) -> Result<Option<String>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_connection()?;
+    let result: rusqlite::Result<Option<String>> = conn.query_row(
+        "SELECT provider_code FROM entries WHERE alias = ?1",
+        params![alias],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(code) => Ok(code),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to get entry provider_code: {}", e)),
+    }
+}
+
+/// Sets the `provider_code` for a personal key entry.
+/// Pass `None` to clear the provider code.
+pub fn set_entry_provider_code(alias: &str, provider_code: Option<&str>) -> Result<(), String> {
+    let conn = open_connection()?;
+    let rows = conn.execute(
+        "UPDATE entries SET provider_code = ?1 WHERE alias = ?2",
+        params![provider_code, alias],
+    )
+    .map_err(|e| format!("Failed to set entry provider_code: {}", e))?;
+    if rows == 0 {
+        return Err(format!("Entry '{}' not found", alias));
+    }
+    Ok(())
+}
+
+/// Returns the custom upstream `base_url` for a personal key entry.
+/// Returns `None` if not set (proxy or SDK uses provider default).
+pub fn get_entry_base_url(alias: &str) -> Result<Option<String>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_connection()?;
+    let result: rusqlite::Result<Option<String>> = conn.query_row(
+        "SELECT base_url FROM entries WHERE alias = ?1",
+        params![alias],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(url) => Ok(url),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(_) => Ok(None), // column may not exist on older vaults
+    }
+}
+
+/// Sets the custom upstream `base_url` for a personal key entry.
+/// Pass `None` to clear (proxy will fall back to the provider default).
+pub fn set_entry_base_url(alias: &str, base_url: Option<&str>) -> Result<(), String> {
+    let conn = open_connection()?;
+    let rows = conn.execute(
+        "UPDATE entries SET base_url = ?1 WHERE alias = ?2",
+        params![base_url, alias],
+    )
+    .map_err(|e| format!("Failed to set entry base_url: {}", e))?;
+    if rows == 0 {
+        return Err(format!("Entry '{}' not found", alias));
+    }
+    Ok(())
+}
+
+/// Sets a user-defined local alias for a cached key.
+/// Pass `None` to clear the local alias and revert to the server alias.
+pub fn set_virtual_key_local_alias(
+    virtual_key_id: &str,
+    local_alias: Option<&str>,
+) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE managed_virtual_keys_cache
+            SET local_alias = ?1, synced_at = strftime('%s', 'now')
+          WHERE virtual_key_id = ?2",
+        params![local_alias, virtual_key_id],
+    )
+    .map_err(|e| format!("Failed to update local_alias: {}", e))?;
+    Ok(())
 }
 
 /// Sets `local_state` for a cached key (e.g., `"active"` or `"synced_inactive"`).
@@ -1519,7 +2013,8 @@ pub fn set_virtual_key_share_status_local(
     Ok(())
 }
 
-/// Counts entries with `share_status = 'pending_claim'` in the local cache.
+/// Counts entries with `share_status = 'pending_claim'` that have NOT been
+/// dismissed by the user (`local_state != 'prompt_dismissed'`).
 /// Used for the non-intrusive startup hint (no vault auth required).
 pub fn count_pending_virtual_keys() -> Result<usize, String> {
     let db_path = get_vault_path()?;
@@ -1529,10 +2024,35 @@ pub fn count_pending_virtual_keys() -> Result<usize, String> {
     let conn = open_connection()?;
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM managed_virtual_keys_cache WHERE share_status = 'pending_claim'",
+            "SELECT COUNT(*) FROM managed_virtual_keys_cache
+              WHERE share_status = 'pending_claim'
+                AND key_status   = 'active'
+                AND local_state  != 'prompt_dismissed'",
             [],
             |row| row.get(0),
         )
         .map_err(|e| format!("Failed to count pending keys: {}", e))?;
     Ok(count as usize)
+}
+
+/// Marks the given virtual key IDs as `local_state = 'prompt_dismissed'` so
+/// the startup pending-key prompt never fires for them again.
+/// Called when the user presses N at the accept prompt.
+pub fn dismiss_pending_keys(virtual_key_ids: &[String]) -> Result<(), String> {
+    if virtual_key_ids.is_empty() {
+        return Ok(());
+    }
+    let conn = open_connection()?;
+    for id in virtual_key_ids {
+        conn.execute(
+            "UPDATE managed_virtual_keys_cache
+                SET local_state = 'prompt_dismissed',
+                    synced_at   = strftime('%s', 'now')
+              WHERE virtual_key_id = ?1
+                AND share_status   = 'pending_claim'",
+            params![id],
+        )
+        .map_err(|e| format!("Failed to dismiss key {}: {}", id, e))?;
+    }
+    Ok(())
 }

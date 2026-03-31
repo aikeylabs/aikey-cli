@@ -7,6 +7,7 @@
 //! A lightweight `proxy_guard` is exported for use by other commands (e.g. `run`)
 //! so the proxy is automatically started in the background when needed.
 
+use rpassword;
 use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 use std::io;
@@ -59,6 +60,142 @@ pub fn proxy_vault_state() -> ProxyVaultState {
 /// Returns true if the proxy process is running.
 pub fn is_proxy_running() -> bool {
     read_pid().map_or(false, |pid| process_alive(pid))
+}
+
+/// Sends `POST /admin/reload` to the proxy if it is currently running.
+///
+/// Called by `aikey use` after updating the active key config so the proxy
+/// picks up the new route without a full restart.  Errors are suppressed —
+/// the proxy remains reachable even if the reload HTTP call fails.
+pub fn try_reload_proxy() {
+    if is_proxy_running() {
+        if let Err(e) = post_admin_reload() {
+            eprintln!("[aikey] proxy reload hint failed (non-fatal): {}", e);
+        }
+    }
+}
+
+/// Silently start the proxy in the background using the given password.
+///
+/// Unlike `proxy_guard`, this function produces no output on the happy path —
+/// it is intended for fully transparent auto-start triggered by other commands.
+/// Returns `true` if the proxy is up after the call, `false` otherwise.
+fn silently_start_proxy(password: &SecretString) -> bool {
+    // Already running — nothing to do.
+    if is_proxy_running() {
+        return true;
+    }
+
+    let proxy_bin = match find_proxy_binary() {
+        Ok(b) => b,
+        Err(_) => return false, // binary not installed — skip silently
+    };
+    let config_path = match resolve_config(None) {
+        Ok(p) => p,
+        Err(_) => return false, // no config — skip silently
+    };
+
+    let mut cmd = std::process::Command::new(&proxy_bin);
+    cmd.arg("--config").arg(&config_path);
+    cmd.env("AIKEY_VAULT_PASSWORD", password.expose_secret());
+    cmd.stdout(std::process::Stdio::null())
+       .stderr(std::process::Stdio::null());
+
+    match cmd.spawn() {
+        Ok(child) => {
+            let pid = child.id();
+            let _ = write_pid(pid);
+            if let Ok(seq) = crate::storage::get_vault_change_seq() {
+                let _ = crate::storage::set_proxy_loaded_seq(seq);
+            }
+            // Poll up to 4 s for proxy to become reachable.
+            let health_addr = proxy_listen_addr(None);
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
+            loop {
+                if port_reachable(&health_addr, Duration::from_millis(300)) {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Try to auto-start the proxy silently using `AIKEY_VAULT_PASSWORD` or
+/// `AK_TEST_PASSWORD` environment variables.
+///
+/// Called at the top of every command dispatch so that the proxy is running
+/// whenever a vault password is pre-injected (e.g. CI / scripted sessions).
+/// No-ops completely when neither env var is set — no prompt, no output.
+pub fn try_auto_start_from_env() {
+    if is_proxy_running() {
+        return;
+    }
+    let pw = std::env::var("AIKEY_VAULT_PASSWORD")
+        .or_else(|_| std::env::var("AK_TEST_PASSWORD"));
+    if let Ok(pw_val) = pw {
+        let _ = silently_start_proxy(&SecretString::new(pw_val));
+    }
+}
+
+/// Ensure the proxy is running, prompting for the vault password when needed.
+///
+/// Called by `aikey use` / `aikey key use` so that the proxy is always started
+/// after activating a key.  Priority:
+///   1. Already running → no-op
+///   2. `AIKEY_VAULT_PASSWORD` / `AK_TEST_PASSWORD` env var → silent start
+///   3. Interactive TTY → prompt once for vault password, then start
+///   4. Non-TTY without env var → print a hint but don't block
+pub fn ensure_proxy_for_use(password_stdin: bool) {
+    if is_proxy_running() {
+        return;
+    }
+
+    // 1. Try env var (fully silent).
+    {
+        let pw = std::env::var("AIKEY_VAULT_PASSWORD")
+            .or_else(|_| std::env::var("AK_TEST_PASSWORD"));
+        if let Ok(pw_val) = pw {
+            let started = silently_start_proxy(&SecretString::new(pw_val));
+            if started {
+                eprintln!("[aikey] proxy started in background");
+            }
+            return;
+        }
+    }
+
+    // 2. Interactive: prompt once.
+    use std::io::IsTerminal;
+    if io::stderr().is_terminal() || password_stdin {
+        eprint!("\n  Proxy not running. Enter vault password to start it: ");
+        let _ = io::stderr().flush();
+        let pw = if password_stdin {
+            let mut line = String::new();
+            let _ = io::stdin().read_line(&mut line);
+            SecretString::new(line.trim().to_string())
+        } else {
+            match rpassword::read_password() {
+                Ok(p) => SecretString::new(p),
+                Err(_) => {
+                    eprintln!("\n  [aikey] Could not read password — run `aikey proxy start` manually.");
+                    return;
+                }
+            }
+        };
+        let started = silently_start_proxy(&pw);
+        if started {
+            eprintln!("  [aikey] proxy started (pid recorded)");
+        } else {
+            eprintln!("  [aikey] proxy failed to start — run `aikey proxy start` to debug");
+        }
+    } else {
+        // Non-interactive, no env var — print a one-line hint.
+        eprintln!("[aikey] proxy not running — run `aikey proxy start` to enable routing");
+    }
 }
 
 /// Prints a restart hint if the proxy is running and its vault snapshot is stale.
@@ -633,4 +770,25 @@ fn resolve_config(explicit: Option<&str>) -> Result<PathBuf, Box<dyn std::error:
 
     Err("aikey-proxy.yaml not found. Searched: current directory, ~/.aikey/config/. \
          Use --config to specify explicitly.".into())
+}
+
+// ---------------------------------------------------------------------------
+// Public diagnostic helpers (used by `aikey doctor`)
+// ---------------------------------------------------------------------------
+
+/// Returns the proxy listen address (e.g. `127.0.0.1:27200`).
+pub fn doctor_proxy_addr() -> String {
+    proxy_listen_addr(None)
+}
+
+/// Returns `(is_running, pid)` — checks PID file + process alive + port reachable.
+pub fn doctor_proxy_status() -> (bool, Option<u32>) {
+    let addr = proxy_listen_addr(None);
+    match read_pid() {
+        Some(pid) if process_alive(pid) && port_reachable(&addr, Duration::from_millis(500)) => {
+            (true, Some(pid))
+        }
+        Some(pid) if process_alive(pid) => (false, Some(pid)), // alive but port not open yet
+        _ => (false, None),
+    }
 }

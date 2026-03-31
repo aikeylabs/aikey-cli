@@ -1,5 +1,6 @@
 mod storage;
 mod crypto;
+mod session;
 mod executor;
 mod synapse;
 mod audit;
@@ -56,6 +57,10 @@ enum Commands {
     Init,
     Add {
         alias: String,
+        /// Provider code for proxy routing (e.g. openai, anthropic). Makes this
+        /// key selectable via `aikey use` with path-prefix routing in the proxy.
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
     },
     Get {
         alias: String,
@@ -115,6 +120,13 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
+        /// Bypass the proxy: decrypt the real key from the vault and inject it directly
+        /// into the child process environment, overriding any proxy env vars inherited
+        /// from the shell. Only valid for personal keys. Useful for verifying that a
+        /// direct connection to the real provider/gateway works.
+        #[arg(long)]
+        direct: bool,
+
         /// The command to execute (use -- to separate)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
@@ -166,6 +178,40 @@ enum Commands {
         #[command(subcommand)]
         action: AccountAction,
     },
+    /// Log in to an aikey-control-service (shortcut for `account login`)
+    Login {
+        /// Control service URL (e.g. http://localhost:8080)
+        #[arg(long)]
+        url: Option<String>,
+        /// One-time login token for copy-paste fallback: SESSION_ID:LOGIN_TOKEN
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Log out from the current session (shortcut for `account logout`)
+    Logout,
+    /// Activate a key for proxy routing (shortcut for `key use`)
+    Use {
+        /// Virtual key alias or ID to activate (omit for interactive picker)
+        alias_or_id: Option<String>,
+        /// Skip installing the shell precmd hook into ~/.zshrc / ~/.bashrc
+        #[arg(long)]
+        no_hook: bool,
+        /// Narrow to a specific provider (e.g. --provider anthropic).
+        /// When given without a value, shows an interactive menu to select one.
+        /// Without this flag, all default providers are injected (generic gateway mode).
+        #[arg(long, value_name = "PROVIDER", num_args = 0..=1, default_missing_value = "")]
+        provider: Option<String>,
+    },
+    /// Open the User Console in the default browser (restores login session)
+    Browse {
+        /// Page to open: overview (default), keys, account, usage
+        page: Option<String>,
+        /// Override port for dev mode (e.g. --port 3000 for Vite dev server)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Show current identity: login session, active key, and vault state
+    Whoami,
     /// Run diagnostics and health checks
     Doctor,
     /// Show project/env/profile status and resolution summary (no secrets)
@@ -223,26 +269,34 @@ enum KeyAction {
     },
     /// Sync all team key metadata from the control service
     Sync,
-    /// Activate a team key for proxy routing (sets local_state = active)
+    /// Activate a key for proxy routing and write ~/.aikey/active.env
     Use {
-        /// Virtual key ID to activate
-        id: String,
+        /// Virtual key alias or ID to activate
+        alias_or_id: String,
+        /// Skip installing the shell precmd hook into ~/.zshrc / ~/.bashrc
+        #[arg(long)]
+        no_hook: bool,
+    },
+    /// Set a local display name for a team key (does not affect server alias)
+    Alias {
+        /// Current alias or virtual key ID
+        old_alias: String,
+        /// New local display name
+        new_alias: String,
     },
 }
 
 #[derive(Subcommand)]
 enum AccountAction {
-    /// Log in to an aikey-control-service instance
+    /// Log in to an aikey-control-service instance via browser + email activation (OAuth device flow)
     Login {
         /// Control service URL (e.g. http://localhost:8080)
         #[arg(long)]
         url: Option<String>,
-        /// Account email address
+        /// One-time login token for copy-paste fallback: SESSION_ID:LOGIN_TOKEN
+        /// (shown on the activation page when the browser flow does not complete)
         #[arg(long)]
-        email: Option<String>,
-        /// Account password (prefer interactive prompt; for CI use AIKEY_PLATFORM_PASSWORD)
-        #[arg(long)]
-        password: Option<String>,
+        token: Option<String>,
     },
     /// Show current login status
     Status,
@@ -256,6 +310,9 @@ enum SecretAction {
     Set {
         /// Secret name/alias
         name: String,
+        /// Provider code for proxy routing (e.g. openai, anthropic)
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
         /// Read secret value from stdin
         #[arg(long)]
         from_stdin: bool,
@@ -264,6 +321,9 @@ enum SecretAction {
     Upsert {
         /// Secret name/alias
         name: String,
+        /// Provider code for proxy routing (e.g. openai, anthropic)
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
         /// Read secret value from stdin
         #[arg(long)]
         from_stdin: bool,
@@ -385,7 +445,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This must be called before any logging or proxy calls.
     observability::init_trace();
 
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|err| {
+        // Intercept "unrecognized subcommand" errors and show a friendly message
+        // with fuzzy suggestions instead of the raw clap output.
+        use clap::error::ErrorKind;
+        if matches!(err.kind(), ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument) {
+            // Extract the bad token from the error message (clap embeds it in single quotes).
+            let bad = err.to_string();
+            let token = bad
+                .split('\'')
+                .nth(1)
+                .unwrap_or("?")
+                .to_string();
+
+            // All top-level subcommand names for fuzzy matching.
+            const KNOWN: &[&str] = &[
+                "add", "get", "delete", "list", "update", "export", "import",
+                "exec", "run", "use", "whoami", "login", "logout", "browse",
+                "init", "status", "doctor", "shell", "key", "account", "secret",
+                "profile", "env", "project", "provider", "proxy",
+                "change-password", "quickstart", "stats", "logs",
+            ];
+
+            let suggestion = KNOWN.iter()
+                .filter_map(|s| {
+                    let score = similarity(&token.to_lowercase(), s);
+                    if score >= 0.5 { Some((*s, score)) } else { None }
+                })
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+
+            eprintln!("error: unrecognized command '{}'", token);
+            if let Some((hint, _)) = suggestion {
+                eprintln!();
+                eprintln!("  Did you mean '{}'?  Try: aikey {} --help", hint, hint);
+            }
+            eprintln!();
+            eprintln!("  Run 'aikey --help' for a list of all commands.");
+            std::process::exit(2);
+        }
+        // All other clap errors (missing required args, bad values, etc.) — print as-is.
+        err.exit()
+    });
 
     // Handle --version flag
     if cli.version {
@@ -450,10 +550,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(&e.to_string()),
                 extra,
             );
+            // If vault authentication failed, the session cache may hold a stale password.
+            // Auto-invalidate so the next command prompts fresh instead of silently
+            // reusing the wrong password and triggering the rate-limiter again.
+            let err_str = e.to_string();
+            let is_auth_error = err_str.contains("Invalid master password")
+                || err_str.contains("vault authentication failed");
+            if is_auth_error {
+                session::invalidate();
+            }
             if cli.json {
-                json_output::error(&e.to_string(), 1);
+                json_output::error(&err_str, 1);
             } else {
                 eprintln!("Error: {}", e);
+                if is_auth_error {
+                    eprintln!("  Hint: Session cache cleared — next command will prompt for your password.");
+                }
                 std::process::exit(1);
             }
         }
@@ -517,12 +629,18 @@ fn command_name(cmd: Option<&Commands>) -> String {
                 KeyAction::Accept { .. } => "accept",
                 KeyAction::Sync => "sync",
                 KeyAction::Use { .. } => "use",
+                KeyAction::Alias { .. } => "alias",
             }),
+            Commands::Use { .. } => "key.use".to_string(),
+            Commands::Whoami => "whoami".to_string(),
             Commands::Account { action } => format!("account.{}", match action {
                 AccountAction::Login { .. } => "login",
                 AccountAction::Status => "status",
                 AccountAction::Logout => "logout",
             }),
+            Commands::Login { .. } => "account.login".to_string(),
+            Commands::Logout => "account.logout".to_string(),
+            Commands::Browse { .. } => "browse".to_string(),
             Commands::Doctor => "doctor".to_string(),
             Commands::Status => "status".to_string(),
             Commands::Shell => "shell".to_string(),
@@ -596,12 +714,26 @@ fn handle_stats(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
 fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let command = cli.command.as_ref().unwrap();
 
+    // Auto-start proxy silently when AIKEY_VAULT_PASSWORD (or AK_TEST_PASSWORD)
+    // is available in the environment.  Skipped for proxy lifecycle commands which
+    // manage the process themselves, and for version/init which predate the proxy.
+    match command {
+        Commands::Proxy { .. } | Commands::Init => {}
+        _ => { commands_proxy::try_auto_start_from_env(); }
+    }
+
     // Interactive accept prompt: if there are pending team keys in local cache,
     // ask the user whether to accept them before proceeding with the real command.
     // Skipped in JSON mode, for Key/Account subcommands, and in non-TTY contexts.
     if !cli.json {
         match command {
-            Commands::Key { .. } | Commands::Account { .. } => {}
+            // Skip for Key/Account subcommands (they handle their own key flows),
+            // auth commands, and List (List prompts for vault password first and
+            // then calls maybe_prompt_accept_pending_with_password to reuse it).
+            Commands::Key { .. } | Commands::Account { .. }
+            | Commands::Login { .. } | Commands::Logout
+            | Commands::Browse { .. }
+            | Commands::Use { .. } | Commands::Whoami | Commands::List => {}
             _ => { let _ = commands_account::maybe_prompt_accept_pending(); }
         }
     }
@@ -636,19 +768,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Vault initialized successfully!");
             }
         }
-        Commands::Add { alias } => {
-            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+        Commands::Add { alias, provider } => {
+            let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
-            // Check for test environment variable first
+            // Step 2: read secret value (from env, hidden TTY prompt, or stdin).
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
                 Zeroizing::new(test_secret)
+            } else if std::io::stdin().is_terminal() {
+                let val = rpassword::prompt_password("Enter Secret: ")
+                    .map_err(|e| format!("Failed to read secret value: {}", e))?;
+                Zeroizing::new(val)
             } else {
-                // Secure secret input with explicit flush
-                if !cli.json {
-                    print!("Enter Secret: ");
-                    io::stdout().flush()?;
-                }
-
+                // Non-TTY (pipe / automation): read from stdin directly — no flag needed.
                 let mut secret = Zeroizing::new(String::new());
                 io::stdin().read_line(&mut secret)?;
                 secret
@@ -665,13 +796,101 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Step 3: resolve provider + base_url.
+            // --provider flag takes precedence; otherwise prompt interactively on TTY.
+            let (resolved_provider, resolved_base_url): (Option<String>, Option<String>) =
+                if let Some(code) = provider {
+                    // Flag provided — use it, no base_url prompt.
+                    (Some(code.to_lowercase()), None)
+                } else if std::io::stdin().is_terminal() && !cli.json {
+                    // Interactive TTY: show a numbered provider menu.
+                    use colored::Colorize;
+                    const KNOWN: &[(&str, &str)] = &[
+                        ("anthropic", "https://api.anthropic.com"),
+                        ("openai",    "https://api.openai.com"),
+                        ("google",    "https://generativelanguage.googleapis.com"),
+                        ("deepseek",  "https://api.deepseek.com"),
+                        ("kimi",      "https://api.moonshot.cn"),
+                    ];
+                    println!();
+                    println!("Select provider (or press Enter to skip):");
+                    for (i, (name, _)) in KNOWN.iter().enumerate() {
+                        println!("  {}  {}", format!("[{}]", i + 1).dimmed(), name);
+                    }
+                    println!("  {}  other / custom base URL", "[6]".dimmed());
+                    print!("Choice: ");
+                    io::stdout().flush()?;
+                    let mut choice = String::new();
+                    io::stdin().read_line(&mut choice)?;
+                    let choice = choice.trim();
+
+                    if choice.is_empty() {
+                        (None, None)
+                    } else if let Ok(n) = choice.parse::<usize>() {
+                        if n >= 1 && n <= KNOWN.len() {
+                            let (name, default_url) = KNOWN[n - 1];
+                            // Ask whether to use the default or a custom URL.
+                            print!("Base URL [{}]: ", default_url.dimmed());
+                            io::stdout().flush()?;
+                            let mut url_input = String::new();
+                            io::stdin().read_line(&mut url_input)?;
+                            let url_input = url_input.trim().to_string();
+                            let base_url = if url_input.is_empty() {
+                                None  // use provider default; proxy falls back automatically
+                            } else {
+                                Some(url_input)
+                            };
+                            (Some(name.to_string()), base_url)
+                        } else if n == KNOWN.len() + 1 {
+                            // Custom — provider code is optional (leave blank for a generic gateway).
+                            print!("Provider code (e.g. openai, leave blank for generic gateway): ");
+                            io::stdout().flush()?;
+                            let mut pcode = String::new();
+                            io::stdin().read_line(&mut pcode)?;
+                            let pcode = pcode.trim().to_lowercase();
+                            print!("Base URL: ");
+                            io::stdout().flush()?;
+                            let mut url = String::new();
+                            io::stdin().read_line(&mut url)?;
+                            let url = url.trim().to_string();
+                            (
+                                if pcode.is_empty() { None } else { Some(pcode) },
+                                if url.is_empty() { None } else { Some(url) },
+                            )
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    // Non-TTY / JSON: no interactive prompt, provider stays unset.
+                    (None, None)
+                };
+
+            if let Some(ref code) = resolved_provider {
+                let _ = storage::set_entry_provider_code(alias, Some(code.as_str()));
+            }
+            if let Some(ref url) = resolved_base_url {
+                let _ = storage::set_entry_base_url(alias, Some(url.as_str()));
+            }
+
             if cli.json {
                 json_output::success(serde_json::json!({
                     "alias": alias,
-                    "message": "Secret added successfully"
+                    "message": "Secret added successfully",
+                    "provider": resolved_provider,
+                    "base_url": resolved_base_url,
                 }));
             } else {
-                eprintln!("Secret '{}' added successfully", alias);
+                use colored::Colorize;
+                eprintln!("Secret '{}' added.", alias.bold());
+                if let Some(ref code) = resolved_provider {
+                    eprintln!("  provider: {}", code.dimmed());
+                }
+                if let Some(ref url) = resolved_base_url {
+                    eprintln!("  base_url: {}", url.dimmed());
+                }
                 commands_proxy::maybe_warn_stale();
             }
         }
@@ -715,7 +934,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Delete { alias } => {
-            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+            let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
             let result = executor::delete_secret(alias, &password);
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(alias), result.is_ok());
 
@@ -740,6 +959,26 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::List => {
             let password = prompt_vault_password(cli.password_stdin, cli.json)?;
 
+            // Show pending-key banner (if any) and reuse the vault password
+            // already entered above — avoids a second password prompt.
+            if !cli.json {
+                let _ = commands_account::maybe_prompt_accept_pending_with_password(&password);
+            }
+
+            // Silently refresh managed key metadata from the server before
+            // reading the cache, so revoked / recycled / expired keys are
+            // immediately hidden without requiring a separate `aikey key sync`.
+            // Failures are non-fatal — we fall back to the local cache.
+            let _ = commands_account::sync_managed_key_metadata();
+
+            // Only active keys are shown; revoked / recycled / expired keys
+            // are hidden so the output reflects currently usable keys only.
+            let managed: Vec<_> = storage::list_virtual_key_cache()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e.key_status == "active")
+                .collect();
+
             if cli.json {
                 // JSON mode: return array of objects with metadata
                 let result = executor::list_secrets_with_metadata(&password);
@@ -748,7 +987,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 match result {
                     Ok(entries) => {
                         json_output::success(serde_json::json!({
-                            "secrets": entries
+                            "secrets": entries,
+                            "managed_keys": managed.iter().map(|e| serde_json::json!({
+                                "virtual_key_id": e.virtual_key_id,
+                                "alias":          e.alias,
+                                "provider_code":  e.provider_code,
+                                "key_status":     e.key_status,
+                                "share_status":   e.share_status,
+                                "local_state":    e.local_state,
+                                "has_key":        e.provider_key_ciphertext.is_some(),
+                            })).collect::<Vec<_>>(),
                         }));
                     }
                     Err(err) => {
@@ -756,8 +1004,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             } else {
-                // Text mode: return simple list of aliases
-                let result = executor::list_secrets(&password);
+                // Text mode
+                let result = executor::list_secrets_with_metadata(&password);
                 let _ = audit::log_audit_event(&password, audit::AuditOperation::List, None, result.is_ok());
 
                 let entries = match result {
@@ -767,30 +1015,108 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                // Human-readable output
+                use colored::Colorize;
+
+                // Read active key config once for LOCAL column.
+                let active_cfg = storage::get_active_key_config().ok().flatten();
+
+                // ── Personal keys (local vault secrets) ──────────────────
+                println!("{}", format!("Personal keys  ({}):", entries.len()).bold());
                 if entries.is_empty() {
-                    println!("No secrets stored.");
+                    println!("  {}", "(none)".dimmed());
                 } else {
-                    println!("Stored secrets:");
-                    for entry in entries {
-                        println!("  {}", entry);
+                    println!("  {:<20}  {:<28}  {:<10}  {}",
+                        "ALIAS".bold(), "PROVIDER / BASE_URL".bold(),
+                        "LOCAL".bold(), "KEY".bold());
+                    println!("  {}", "─".repeat(66).dimmed());
+                    for entry in &entries {
+                        let provider_col = match (&entry.base_url, &entry.provider_code) {
+                            (Some(url), _) if !url.is_empty() => url.as_str().to_string(),
+                            (_, Some(code)) if !code.is_empty() => code.clone(),
+                            _ => String::new(),
+                        };
+                        let is_active = active_cfg.as_ref().map_or(false, |cfg| {
+                            cfg.key_type == "personal" && cfg.key_ref == entry.alias
+                        });
+                        let local_str = if is_active {
+                            format!("{:<10}", "active").green().to_string()
+                        } else {
+                            format!("{:<10}", "").to_string()
+                        };
+                        println!("  {:<20}  {:<28}  {}  {}",
+                            format!("{:<20}", &entry.alias).bold(),
+                            format!("{:<28}", if provider_col.len() > 28 { &provider_col[..28] } else { &provider_col }).dimmed(),
+                            local_str,
+                            "✓".green().bold(),
+                        );
                     }
+                }
+
+                // ── Team keys (server-managed, from local cache) ──────────
+                println!();
+                println!("{}", format!("Team keys  ({}):", managed.len()).bold());
+                if managed.is_empty() {
+                    println!("  {}", "(none)".dimmed());
+                } else {
+                    println!("  {:<24}  {:<12}  {:<10}  {:<16}  {:<4}  {}",
+                        "ALIAS".bold(), "PROVIDER".bold(), "STATUS".bold(),
+                        "LOCAL".bold(), "KEY".bold(), "SHARE".bold());
+                    println!("  {}", "─".repeat(80).dimmed());
+                    for e in &managed {
+                        let has_key = if e.provider_key_ciphertext.is_some() {
+                            "✓".green().bold().to_string()
+                        } else {
+                            String::new()
+                        };
+                        // Show local_alias if set; append server alias dimmed when different.
+                        let display_name = e.local_alias.as_deref().unwrap_or(e.alias.as_str());
+                        let raw_alias = if display_name.len() > 24 { &display_name[..24] } else { display_name };
+                        let alias = format!("{:<24}", raw_alias).bold().to_string();
+                        let server_alias_hint = if e.local_alias.is_some() {
+                            format!(" {}", format!("(← {})", e.alias).dimmed())
+                        } else {
+                            String::new()
+                        };
+                        let provider = format!("{:<12}", &e.provider_code).dimmed().to_string();
+                        let status_str = match e.key_status.as_str() {
+                            "active"  => format!("{:<10}", "active").green().bold().to_string(),
+                            "revoked" => format!("{:<10}", "revoked").red().to_string(),
+                            other     => format!("{:<10}", other).dimmed().to_string(),
+                        };
+                        let local_str = match e.local_state.as_str() {
+                            "active"          => format!("{:<16}", "active").green().to_string(),
+                            "synced_inactive" => format!("{:<16}", "inactive").dimmed().to_string(),
+                            other             => format!("{:<16}", other).dimmed().to_string(),
+                        };
+                        let share = match e.share_status.as_str() {
+                            "pending_claim" => "pending ←".yellow().to_string(),
+                            _ => String::new(),
+                        };
+                        println!("  {}  {}  {}  {}  {:<4}  {}{}",
+                            alias, provider, status_str, local_str, has_key, share, server_alias_hint);
+                    }
+                    // Pending notice is shown as a startup prompt before every
+                    // command (see maybe_prompt_accept_pending), so no need to repeat.
                 }
             }
         }
         Commands::Update { alias } => {
-            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+            let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
             // Check for test environment variable first
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
                 Zeroizing::new(test_secret)
+            } else if std::io::stdin().is_terminal() {
+                // Hidden prompt on TTY
+                let val = rpassword::prompt_password("Enter New Secret: ")
+                    .map_err(|e| format!("Failed to read secret value: {}", e))?;
+                Zeroizing::new(val)
             } else {
-                // Secure secret input with explicit flush
+                // Plain stdin for pipes / automation
                 if !cli.json {
                     print!("Enter New Secret: ");
                     io::stdout().flush()?;
                 }
-
                 let mut secret = Zeroizing::new(String::new());
                 io::stdin().read_line(&mut secret)?;
                 secret
@@ -888,7 +1214,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+            let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
             let result = executor::exec_with_env(env_mappings, &password, command);
 
@@ -900,7 +1226,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Run { provider, logical_model, model, tenant, profile, dry_run, command } => {
+        Commands::Run { provider, logical_model, model, tenant, profile, dry_run, direct, command } => {
             if command.is_empty() {
                 let err_msg = "No command specified. Use -- to separate command from flags.";
                 if cli.json {
@@ -914,7 +1240,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let env_tenant = std::env::var("AIKEY_TENANT").ok();
             let resolved_tenant = tenant.as_deref().or(env_tenant.as_deref());
 
-            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+            let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
             // Profile override: --profile temporarily switches the active profile for this run.
             let _profile_guard = if let Some(p) = profile {
@@ -925,6 +1251,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
+
+            // --direct: bypass proxy — decrypt the real key and inject it directly
+            // into the child process, overriding any proxy env vars from the shell.
+            // Only personal keys are supported (team keys are always proxy-routed).
+            if *direct {
+                commands_account::handle_run_direct(command, &password, cli.json)?;
+                return Ok(());
+            }
 
             // Proxy guard: ensure aikey-proxy is running before executing the command.
             // Runs silently in the happy path; warns on failure but does not abort.
@@ -1084,6 +1418,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Invalidate cached session — the password has changed.
+            session::invalidate();
+
             if cli.json {
                 json_output::success(serde_json::json!({
                     "message": "Master password changed successfully"
@@ -1094,7 +1431,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Secret { action } => {
             match action {
-                SecretAction::Set { name, from_stdin } => {
+                SecretAction::Set { name, provider, from_stdin } => {
                     if !from_stdin {
                         let err_msg = "The --from-stdin flag is required for security. Secret values must not be passed via command-line arguments.";
                         if cli.json {
@@ -1120,7 +1457,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+                    let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
                     let existing = executor::list_secrets(&password);
                     let existing = match existing {
@@ -1153,13 +1490,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // Read secret value from stdin (only show prompt when stdin is a terminal)
-                    if std::io::stdin().is_terminal() {
-                        eprint!("Enter secret value (then press Enter): ");
-                        let _ = io::stderr().flush();
-                    }
-                    let mut secret = Zeroizing::new(String::new());
-                    io::stdin().read_line(&mut secret)?;
+                    // Read secret value: hidden prompt on TTY, plain stdin for pipes
+                    let secret = if std::io::stdin().is_terminal() {
+                        let val = rpassword::prompt_password("Enter secret value: ")
+                            .map_err(|e| format!("Failed to read secret value: {}", e))?;
+                        Zeroizing::new(val)
+                    } else {
+                        let mut buf = Zeroizing::new(String::new());
+                        io::stdin().read_line(&mut buf)?;
+                        buf
+                    };
                     let secret_value = secret.trim();
 
                     if secret_value.is_empty() {
@@ -1180,6 +1520,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     match result {
                         Ok(_) => {
+                            // Persist provider_code if supplied.
+                            if let Some(code) = provider {
+                                let _ = storage::set_entry_provider_code(name, Some(code.to_lowercase().as_str()));
+                            }
                             if cli.json {
                                 json_output::print_json(serde_json::json!({
                                     "ok": true,
@@ -1204,7 +1548,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                SecretAction::Upsert { name, from_stdin } => {
+                SecretAction::Upsert { name, provider, from_stdin } => {
                     if !from_stdin {
                         let err_msg = "The --from-stdin flag is required for security. Secret values must not be passed via command-line arguments.";
                         if cli.json {
@@ -1230,14 +1574,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+                    let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
-                    if std::io::stdin().is_terminal() {
-                        eprint!("Enter secret value (then press Enter): ");
-                        let _ = io::stderr().flush();
-                    }
-                    let mut secret = Zeroizing::new(String::new());
-                    io::stdin().read_line(&mut secret)?;
+                    // Read secret value: hidden prompt on TTY, plain stdin for pipes
+                    let secret = if std::io::stdin().is_terminal() {
+                        let val = rpassword::prompt_password("Enter secret value: ")
+                            .map_err(|e| format!("Failed to read secret value: {}", e))?;
+                        Zeroizing::new(val)
+                    } else {
+                        let mut buf = Zeroizing::new(String::new());
+                        io::stdin().read_line(&mut buf)?;
+                        buf
+                    };
                     let secret_value = secret.trim();
 
                     if secret_value.is_empty() {
@@ -1264,6 +1612,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     match result {
                         Ok(_) => {
+                            // Persist provider_code if supplied.
+                            if let Some(code) = provider {
+                                let _ = storage::set_entry_provider_code(name, Some(code.to_lowercase().as_str()));
+                            }
                             if cli.json {
                                 json_output::print_json(serde_json::json!({
                                     "ok": true,
@@ -1325,7 +1677,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 SecretAction::Delete { name } => {
-                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+                    let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
                     let result = executor::delete_secret(name, &password);
                     let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(name), result.is_ok());
@@ -1601,7 +1953,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Key { action } => {
             match action {
                 KeyAction::Rotate { name, from_stdin } => {
-                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+                    let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
                     let new_value = if *from_stdin {
                         eprint!("Enter new value for '{}' (then press Enter): ", name);
@@ -1667,26 +2019,29 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     commands_account::handle_key_list(cli.json)?;
                 }
                 KeyAction::Accept { id } => {
-                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+                    let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
                     commands_account::handle_key_accept(id.as_deref(), &password, cli.json)?;
                 }
                 KeyAction::Sync => {
                     let password = prompt_vault_password(cli.password_stdin, cli.json)?;
                     commands_account::handle_key_sync(&password, cli.json)?;
                 }
-                KeyAction::Use { id } => {
-                    commands_account::handle_key_use(id, cli.json)?;
+                KeyAction::Use { alias_or_id, no_hook } => {
+                    commands_proxy::ensure_proxy_for_use(cli.password_stdin);
+                    commands_account::handle_key_use(alias_or_id, *no_hook, None, cli.json)?;
+                }
+                KeyAction::Alias { old_alias, new_alias } => {
+                    commands_account::handle_key_alias(old_alias, new_alias, cli.json)?;
                 }
             }
         }
         Commands::Account { action } => {
             match action {
-                AccountAction::Login { url, email, password: login_password } => {
+                AccountAction::Login { url, token } => {
                     commands_account::handle_login(
                         cli.json,
                         url.clone(),
-                        email.clone(),
-                        login_password.clone(),
+                        token.clone(),
                     )?;
                 }
                 AccountAction::Status => {
@@ -1696,6 +2051,34 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     commands_account::handle_logout(cli.json)?;
                 }
             }
+        }
+        Commands::Login { url, token } => {
+            commands_account::handle_login(cli.json, url.clone(), token.clone())?;
+        }
+        Commands::Logout => {
+            commands_account::handle_logout(cli.json)?;
+        }
+        Commands::Use { alias_or_id, no_hook, provider } => {
+            // Resolve alias: if omitted, show interactive picker (TTY only).
+            let resolved_alias: String = match alias_or_id {
+                Some(a) => a.clone(),
+                None => {
+                    if !std::io::stdin().is_terminal() || cli.json {
+                        return Err("alias required in non-interactive mode (usage: aikey use <ALIAS>)".into());
+                    }
+                    pick_key_interactively()?
+                }
+            };
+            commands_proxy::ensure_proxy_for_use(cli.password_stdin);
+            commands_account::handle_key_use(
+                &resolved_alias, *no_hook, provider.as_deref(), cli.json,
+            )?;
+        }
+        Commands::Browse { page, port } => {
+            commands_account::handle_browse(page.as_deref(), *port, cli.json)?;
+        }
+        Commands::Whoami => {
+            commands_account::handle_whoami(cli.json)?;
         }
         Commands::Doctor => {
             commands_project::handle_doctor(cli.json)?;
@@ -1873,7 +2256,81 @@ fn validate_secret_name(name: &str) -> Result<(), String> {
 /// - Supports reading from stdin when password_stdin is true
 /// Prompt for the vault master password, adapting the message to whether the
 /// vault already exists ("Enter") or is about to be created ("Set").
+/// Returns the master password, using the 30-minute session cache when available.
+/// Use for LOW-sensitivity commands (list, get, run, key sync, proxy start, …).
+/// After a successful vault operation the caller should call `session::refresh()`.
+/// Fuzzy similarity in [0.0, 1.0] combining prefix match, edit distance, and bigrams.
+/// Used to suggest close matches for mistyped subcommands.
+fn similarity(a: &str, b: &str) -> f64 {
+    if a.is_empty() || b.is_empty() { return 0.0; }
+    if a == b { return 1.0; }
+    if b.starts_with(a) || a.starts_with(b) { return 0.95; }
+
+    // Edit distance (insertions/deletions/substitutions), normalised.
+    let ed = edit_distance(a, b);
+    let max_len = a.len().max(b.len()) as f64;
+    let ed_score = 1.0 - (ed as f64 / max_len);
+
+    // Bigram Jaccard.
+    let bigram_score = {
+        fn bigrams(s: &str) -> std::collections::HashSet<(char, char)> {
+            let ch: Vec<char> = s.chars().collect();
+            ch.windows(2).map(|w| (w[0], w[1])).collect()
+        }
+        let ba = bigrams(a);
+        let bb = bigrams(b);
+        if ba.is_empty() || bb.is_empty() { 0.0 } else {
+            let i = ba.intersection(&bb).count() as f64;
+            let u = ba.union(&bb).count() as f64;
+            if u == 0.0 { 0.0 } else { i / u }
+        }
+    };
+
+    // Weighted combination: edit distance is more reliable for short tokens.
+    0.6 * ed_score + 0.4 * bigram_score
+}
+
+/// Simple edit distance (Levenshtein) for short strings.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in 0..=m { dp[i][0] = i; }
+    for j in 0..=n { dp[0][j] = j; }
+    for i in 1..=m {
+        for j in 1..=n {
+            dp[i][j] = if a[i-1] == b[j-1] {
+                dp[i-1][j-1]
+            } else {
+                1 + dp[i-1][j].min(dp[i][j-1]).min(dp[i-1][j-1])
+            };
+        }
+    }
+    dp[m][n]
+}
+
 fn prompt_vault_password(password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
+    // Skip cache when reading from stdin or in automated test mode.
+    if !password_stdin && std::env::var("AK_TEST_PASSWORD").is_err() {
+        if let Some(cached) = session::try_get() {
+            // Slide the TTL forward on each successful cached use.
+            session::refresh();
+            return Ok(cached);
+        }
+    }
+    let pw = prompt_vault_password_fresh(password_stdin, json_mode)?;
+    // One-time prompt: ask user which session backend to use (keychain/file/disabled).
+    session::maybe_configure_backend();
+    // Store in cache after a fresh prompt (low-sensitivity path).
+    session::store(&pw);
+    Ok(pw)
+}
+
+/// Always prompts for the master password — never reads from cache.
+/// Use for HIGH-sensitivity commands (add, delete, update, import, export,
+/// secret set/upsert/delete, change-password, key accept, exec, run --direct).
+fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
     let vault_exists = storage::get_vault_path()
         .map(|p| p.exists())
         .unwrap_or(false);
@@ -1924,4 +2381,76 @@ fn prompt_password_secure(prompt: &str, password_stdin: bool, json_mode: bool) -
     let password_raw = Zeroizing::new(password);
     let trimmed = password_raw.trim().to_string();
     Ok(SecretString::new(trimmed))
+}
+
+/// Show an interactive arrow-key picker with all available personal + team keys.
+/// Returns the alias/id that the user selected.
+fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    // Gather personal keys
+    let personal = storage::list_entries_with_metadata().unwrap_or_default();
+    // Gather team keys
+    let team = storage::list_virtual_key_cache().unwrap_or_default();
+
+    if personal.is_empty() && team.is_empty() {
+        return Err("No keys found. Add a personal key with `aikey add` or accept a team key with `aikey key accept`.".into());
+    }
+
+    // Active key for LOCAL column
+    let active_cfg = storage::get_active_key_config().ok().flatten();
+
+    // Build display rows; keep alias/id parallel for lookup after selection.
+    // Format: TYPE  ALIAS                  PROVIDER / BASE_URL             LOCAL
+    let mut items: Vec<String> = Vec::new();
+    let mut aliases: Vec<String> = Vec::new();
+
+    for entry in &personal {
+        let provider_col = match (&entry.base_url, &entry.provider_code) {
+            (Some(url), _) if !url.is_empty() => url.clone(),
+            (_, Some(code)) if !code.is_empty() => code.clone(),
+            _ => String::new(),
+        };
+        let is_active = active_cfg.as_ref().map_or(false, |cfg| {
+            cfg.key_type == "personal" && cfg.key_ref == entry.alias
+        });
+        let active_marker = if is_active { " ◀ active" } else { "" };
+        let row = format!(
+            "personal  {:<22}  {:<28}{}",
+            if entry.alias.len() > 22 { &entry.alias[..22] } else { &entry.alias },
+            if provider_col.len() > 28 { &provider_col[..28] } else { &provider_col },
+            active_marker,
+        );
+        items.push(row);
+        aliases.push(entry.alias.clone());
+    }
+
+    for e in &team {
+        let display_name = e.local_alias.as_deref().unwrap_or(e.alias.as_str());
+        let is_active = active_cfg.as_ref().map_or(false, |cfg| {
+            cfg.key_type == "team" && cfg.key_ref == e.virtual_key_id
+        });
+        let active_marker = if is_active { " ◀ active" } else { "" };
+        let row = format!(
+            "team      {:<22}  {:<28}{}",
+            if display_name.len() > 22 { &display_name[..22] } else { display_name },
+            if e.provider_code.len() > 28 { &e.provider_code[..28] } else { &e.provider_code },
+            active_marker,
+        );
+        items.push(row);
+        aliases.push(e.virtual_key_id.clone());
+    }
+
+    let header = format!("          {:<22}  {:<28}",
+        "ALIAS", "PROVIDER / BASE_URL");
+    println!("  {}", header.bold());
+    println!("  {}", "─".repeat(56).dimmed());
+
+    let selected = inquire::Select::new("Select a key to activate:", items.clone())
+        .prompt()
+        .map_err(|e| format!("Selection cancelled: {}", e))?;
+
+    // Find the index of the selected item to retrieve the corresponding alias.
+    let idx = items.iter().position(|r| r == &selected).unwrap_or(0);
+    Ok(aliases[idx].clone())
 }

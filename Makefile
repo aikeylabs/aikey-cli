@@ -69,9 +69,16 @@ fmt-check:
 # Install / uninstall
 # ---------------------------------------------------------------------------
 
-## Install release binary to ~/.cargo/bin
+## Install release binary to ~/.aikey/bin (ad-hoc signed on macOS)
 install: release
-	$(CARGO) install --path .
+	@mkdir -p $(HOME)/.aikey/bin
+	cp target/release/$(BIN_NAME) $(HOME)/.aikey/bin/$(BIN_NAME)
+	chmod 755 $(HOME)/.aikey/bin/$(BIN_NAME)
+ifeq ($(shell uname -s),Darwin)
+	@xattr -d com.apple.provenance $(HOME)/.aikey/bin/$(BIN_NAME) 2>/dev/null || true
+	@codesign -fs - $(HOME)/.aikey/bin/$(BIN_NAME) 2>/dev/null || true
+	@echo "macOS: cleared provenance & re-signed"
+endif
 
 ## Remove installed binary
 uninstall:

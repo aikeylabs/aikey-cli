@@ -501,80 +501,290 @@ pub fn handle_provider_ls(json_mode: bool) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-/// Handle `aikey doctor` — run diagnostics and health checks
+/// Handle `aikey doctor` — connectivity and health diagnostics.
+///
+/// No master password required. Checks run sequentially and stream output
+/// as each result arrives so the user sees progress immediately.
 pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let mut checks: Vec<serde_json::Value> = Vec::new();
-    let mut all_ok = true;
+    use colored::Colorize;
+    use std::time::Instant;
 
-    // Check 1: project config exists
-    let config_result = ProjectConfig::discover();
-    let config_ok = config_result.as_ref().map(|r| r.is_some()).unwrap_or(false);
-    checks.push(serde_json::json!({
-        "check": "project_config",
-        "ok": config_ok,
-        "message": if config_ok { "aikey.config.json found" } else { "No aikey.config.json found in current or parent directories" }
-    }));
-    if !config_ok { all_ok = false; }
+    // Accumulates results for --json mode.
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let mut any_failed = false;
 
-    // Check 2: if config found, verify all key aliases exist in vault
-    if config_ok {
-        if let Ok(Some((_, config))) = config_result {
-            // Prompt for password to check vault
-            let password_result = rpassword::prompt_password("Enter Master Password (for vault check): ");
-            if let Ok(password_str) = password_result {
-                let password = SecretString::new(password_str);
-                if let Ok(secrets) = crate::executor::list_secrets(&password) {
-                    for (provider_name, provider_cfg) in &config.providers {
-                        let alias = &provider_cfg.key_alias;
-                        let resolved = secrets.contains(alias);
-                        checks.push(serde_json::json!({
-                            "check": format!("key_alias:{}", alias),
-                            "provider": provider_name,
-                            "ok": resolved,
-                            "message": if resolved {
-                                format!("Key alias '{}' resolves", alias)
-                            } else {
-                                format!("Key alias '{}' not found in vault", alias)
-                            }
-                        }));
-                        if !resolved { all_ok = false; }
-                    }
-                } else {
-                    checks.push(serde_json::json!({
-                        "check": "vault_access",
-                        "ok": false,
-                        "message": "Failed to access vault (incorrect password or vault corrupted)"
-                    }));
-                    all_ok = false;
+    // Helper: print one check row, collect for JSON.
+    // label is left-padded to 18 chars; detail is the right-hand info string.
+    let mut emit = |label: &str, ok: bool, detail: &str, hint: Option<&str>| {
+        let icon = if ok { "✓".green() } else { "✗".red() };
+        if !json_mode {
+            println!("{} {:<18} {}", icon, label, detail);
+            if let Some(h) = hint {
+                println!("  {}", format!("→ {}", h).dimmed());
+            }
+        }
+        results.push(serde_json::json!({
+            "check": label,
+            "ok": ok,
+            "detail": detail,
+            "hint": hint,
+        }));
+        if !ok { any_failed = true; }
+    };
+
+    if !json_mode {
+        println!("{}", "─".repeat(52).dimmed());
+    }
+
+    // ── 1. Internet connectivity ─────────────────────────────
+    {
+        let start = Instant::now();
+        use std::net::TcpStream;
+        let ok = TcpStream::connect_timeout(
+            &"1.1.1.1:443".parse().unwrap(),
+            std::time::Duration::from_secs(3),
+        ).is_ok();
+        let ms = start.elapsed().as_millis();
+        emit("internet",
+            ok,
+            &if ok { format!("reachable  ({} ms)", ms) } else { "unreachable".to_string() },
+            if ok { None } else { Some("check network connection or VPN") });
+    }
+
+    // ── 2. Vault ─────────────────────────────────────────────
+    {
+        let vault_path = storage::get_vault_path().ok();
+        let exists = vault_path.as_ref().map(|p| p.exists()).unwrap_or(false);
+        let detail = match &vault_path {
+            Some(p) if exists => format!("found  ({})", p.display()),
+            Some(p) => format!("not found  ({})", p.display()),
+            None => "cannot resolve path".to_string(),
+        };
+        emit("vault", exists, &detail,
+            if exists { None } else { Some("run 'aikey init' to create your vault") });
+    }
+
+    // ── 3. Session cache ─────────────────────────────────────
+    {
+        let cached = crate::session::try_get().is_some();
+        emit("session",
+            true,  // not a failure either way — just informational
+            if cached { "password cached" } else { "no cache  (will prompt on next command)" },
+            None);
+    }
+
+    // Collects provider connectivity results from the parallel block; merged into `results`
+    // and `any_failed` after all `emit` calls (to avoid borrow-conflict with the emit closure).
+    let mut prov_merge: Option<(Vec<serde_json::Value>, bool)> = None;
+
+    // ── 4. Proxy process + reachability ──────────────────────
+    let proxy_addr = crate::commands_proxy::doctor_proxy_addr();
+    let (proxy_up, proxy_pid) = crate::commands_proxy::doctor_proxy_status();
+    {
+        let detail = match (proxy_up, proxy_pid) {
+            (true, Some(pid)) => {
+                // Measure latency against /health.
+                let start = Instant::now();
+                let url = format!("http://{}/health", proxy_addr);
+                let ok = ureq::get(&url).call().is_ok();
+                let ms = start.elapsed().as_millis();
+                if ok { format!("running  (pid {}, {} ms)", pid, ms) }
+                else   { format!("pid {} alive but /health unreachable", pid) }
+            }
+            (false, Some(pid)) => format!("pid {} alive but port not open", pid),
+            _ => "not running".to_string(),
+        };
+        let hint = if proxy_up { None } else {
+            Some("run 'aikey proxy start' or just run any aikey command (auto-start)")
+        };
+        emit("proxy", proxy_up, &detail, hint);
+    }
+
+    // ── 5. Provider connectivity (parallel, streaming) ───────
+    if proxy_up {
+        let base = format!("http://{}", proxy_addr);
+
+        // Fetch the active key's provider list (no probing — just metadata).
+        let targets: Vec<(String, String)> = ureq::get(&format!("{}/health/provider-targets", base))
+            .call()
+            .ok()
+            .and_then(|r| r.into_json::<serde_json::Value>().ok())
+            .and_then(|j| {
+                j["targets"].as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| {
+                            let p = t["provider"].as_str()?.to_string();
+                            let u = t["base_url"].as_str()?.to_string();
+                            Some((p, u))
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+
+        if targets.is_empty() {
+            if !json_mode {
+                println!("  {} {:<18} {}",
+                    "·".dimmed(), "providers",
+                    "no active key — run 'aikey use' first".dimmed());
+            }
+        } else {
+            let n = targets.len();
+            let is_tty = atty::is(atty::Stream::Stdout);
+
+            // Print placeholder rows (TTY only — non-TTY results append in completion order).
+            if !json_mode && is_tty {
+                for (name, _) in &targets {
+                    println!("{} {:<18} {}", "·".dimmed(), name, "testing...".dimmed());
                 }
-            } else {
-                checks.push(serde_json::json!({
-                    "check": "vault_access",
-                    "ok": false,
-                    "message": "Password prompt failed"
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+            }
+
+            // Spawn one thread per provider; each probes via HTTP GET (any response = reachable).
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, bool, u128)>();
+            for (i, (_, url)) in targets.iter().enumerate() {
+                let tx2 = tx.clone();
+                let url = url.clone();
+                std::thread::spawn(move || {
+                    let start = Instant::now();
+                    let agent = ureq::AgentBuilder::new()
+                        .timeout(std::time::Duration::from_secs(5))
+                        .build();
+                    // Any HTTP response (including 4xx/5xx) means network is reachable.
+                    let ok = match agent.get(&url).call() {
+                        Ok(_) => true,
+                        Err(ureq::Error::Status(_, _)) => true,
+                        Err(_) => false,
+                    };
+                    let ms = start.elapsed().as_millis();
+                    tx2.send((i, ok, ms)).ok();
+                });
+            }
+            drop(tx);
+
+            // Receive results; update the pre-printed placeholder line in-place (TTY mode).
+            // Collect into a local vec to avoid conflicting with the `emit` closure borrow on
+            // `results` and `any_failed` (emit is still used after this block for key/control checks).
+            let mut prov_items: Vec<serde_json::Value> = Vec::with_capacity(n);
+            let mut prov_any_failed = false;
+            for (i, ok, ms) in rx.iter() {
+                let name = &targets[i].0;
+                // Show the hostname of the probed URL so it's clear what was tested.
+                let host = targets[i].1
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .unwrap_or(&targets[i].1);
+                let detail = if ok {
+                    format!("reachable  ({}, {} ms)", host, ms)
+                } else {
+                    format!("unreachable  ({})", host)
+                };
+
+                if !json_mode {
+                    use std::io::Write;
+                    let icon = if ok { "✓".green() } else { "✗".red() };
+                    let line = format!("{} {:<18} {}", icon, name, detail);
+                    if is_tty {
+                        // Move cursor up to row i (counted from the bottom of the block),
+                        // overwrite the placeholder, then restore position to the bottom.
+                        // The trailing \r resets the column to 0 so subsequent println!
+                        // calls start at the left margin, not mid-line.
+                        let up = n - i;
+                        print!("\x1b[{}A\r\x1b[2K{}", up, line);
+                        print!("\x1b[{}B\r", up);
+                    } else {
+                        println!("{}", line);
+                    }
+                    std::io::stdout().flush().ok();
+                }
+
+                prov_items.push(serde_json::json!({
+                    "check": format!("provider:{}", name),
+                    "ok": ok,
+                    "detail": detail,
                 }));
-                all_ok = false;
+                if !ok {
+                    prov_any_failed = true;
+                }
+            }
+
+            if !json_mode && prov_any_failed {
+                println!("  {}", "→ check firewall, VPN, or provider status page".dimmed());
+            }
+            // Merge into outer results after the parallel section finishes.
+            prov_merge = Some((prov_items, prov_any_failed));
+        }
+
+        // ── 6. Active key validity (via proxy) ────────────────
+        if let Ok(resp) = ureq::get(&format!("{}/health/keys", base)).call() {
+            if let Ok(body) = resp.into_string() {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(keys) = json["keys"].as_array() {
+                        for k in keys {
+                            let provider = k["provider"].as_str().unwrap_or("?");
+                            let key_ref  = k["key_ref"].as_str().unwrap_or("?");
+                            let ok       = k["ok"].as_bool().unwrap_or(false);
+                            let ms       = k["latency_ms"].as_i64().unwrap_or(0);
+                            let err      = k["error"].as_str().unwrap_or("");
+                            let label = provider.to_string();
+                            let detail = if ok {
+                                format!("valid  ({}, {} ms)", key_ref, ms)
+                            } else {
+                                format!("failed  ({}): {}", key_ref, err)
+                            };
+                            let hint = if ok { None } else if err.contains("invalid") || err.contains("401") || err.contains("403") {
+                                Some("re-add the key with 'aikey add' or re-accept with 'aikey key accept'")
+                            } else {
+                                Some("check provider reachability above")
+                            };
+                            emit(&label, ok, &detail, hint);
+                        }
+                    } else if json["message"].as_str().is_some() {
+                        emit("active key", true, "no key active  (run 'aikey use' to activate one)", None);
+                    }
+                }
             }
         }
     }
 
-    if json_mode {
-        json_output::print_json(serde_json::json!({
-            "ok": all_ok,
-            "checks": checks
-        }));
-    } else {
-        for check in &checks {
-            let ok = check["ok"].as_bool().unwrap_or(false);
-            let msg = check["message"].as_str().unwrap_or("");
-            let icon = if ok { "✓" } else { "✗" };
-            println!("{} {}", icon, msg);
-        }
-        if all_ok {
-            println!("\nAll checks passed.");
+    // ── 7. Control service ───────────────────────────────────
+    if let Ok(Some(account)) = storage::get_platform_account() {
+        let url = format!("{}/health", account.control_url.trim_end_matches('/'));
+        let start = Instant::now();
+        let ok = ureq::get(&url).call().is_ok();
+        let ms = start.elapsed().as_millis();
+        let detail = if ok {
+            format!("reachable  ({}, {} ms)", account.control_url, ms)
         } else {
-            println!("\nSome checks failed. See above for details.");
+            format!("unreachable  ({})", account.control_url)
+        };
+        emit("control service", ok, &detail,
+            if ok { None } else { Some("check network or try 'aikey login' again") });
+    }
+
+    // Merge provider connectivity results (collected during the parallel block above).
+    // Done here — after all emit() calls — to avoid the borrow conflict between the emit
+    // closure's captured &mut results/any_failed and the provider block's direct access.
+    if let Some((items, failed)) = prov_merge {
+        results.extend(items);
+        if failed { any_failed = true; }
+    }
+
+    if !json_mode {
+        println!("{}", "─".repeat(52).dimmed());
+        if any_failed {
+            println!("{}", "Some checks failed — see hints above.".yellow());
+        } else {
+            println!("{}", "All checks passed.".green());
         }
+    } else {
+        json_output::print_json(serde_json::json!({
+            "ok": !any_failed,
+            "checks": results,
+        }));
     }
 
     Ok(())

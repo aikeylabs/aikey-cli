@@ -21,5 +21,8 @@ pub mod core;
 pub mod providers;
 pub mod resolver;
 pub mod events;
+pub mod observability;
 pub mod platform_client;
 pub mod commands_account;
+pub mod commands_proxy;
+pub mod session;
