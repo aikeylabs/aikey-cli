@@ -83,6 +83,50 @@ pub struct PendingKeyItem {
     pub share_status: String,
 }
 
+/// Returned by GET /accounts/me/sync-version.
+#[derive(Debug, Deserialize)]
+pub struct SyncVersionResponse {
+    pub account_id: String,
+    pub sync_version: i64,
+}
+
+/// One item from GET /accounts/me/managed-keys-snapshot.
+/// JSON field names match `VirtualKeyCacheEntry` in storage.rs for direct merge.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ManagedKeySnapshotItem {
+    pub virtual_key_id: String,
+    pub org_id: String,
+    pub seat_id: String,
+    pub alias: String,
+    pub provider_code: String,
+    pub protocol_type: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub supported_providers: Vec<String>,
+    #[serde(default)]
+    pub provider_base_urls: std::collections::HashMap<String, String>,
+    pub credential_id: String,
+    pub credential_revision: String,
+    pub virtual_key_revision: String,
+    pub key_status: String,
+    pub share_status: String,
+    /// "active" | "inactive" — pre-computed by server.
+    pub effective_status: String,
+    /// "" | "seat_disabled" | "key_revoked" | "key_expired" | "not_claimed"
+    pub effective_reason: String,
+    /// Unix timestamp (seconds) when the key expires. `None` = no expiry.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    pub sync_version: i64,
+}
+
+/// Returned by GET /accounts/me/managed-keys-snapshot.
+#[derive(Debug, Deserialize)]
+pub struct ManagedKeysSnapshotResponse {
+    pub sync_version: i64,
+    pub keys: Vec<ManagedKeySnapshotItem>,
+}
+
 /// One item from GET /accounts/me/all-keys
 #[derive(Debug, Deserialize, Clone)]
 pub struct KeyItem {
@@ -331,6 +375,36 @@ impl PlatformClient {
 
         serde_json::from_value(data["keys"].clone())
             .map_err(|e| format!("failed to deserialise keys: {}", e))
+    }
+
+    // ---- Snapshot sync (Phase B) --------------------------------------------
+
+    /// GET /accounts/me/sync-version
+    /// Returns the current server-side sync_version for the account.
+    /// The CLI compares this with `local_seen_sync_version` to decide whether
+    /// to pull a fresh snapshot.
+    pub fn get_sync_version(&self) -> Result<SyncVersionResponse, String> {
+        let url = format!("{}/accounts/me/sync-version", self.base_url);
+        let resp = ureq::get(&url)
+            .set("Authorization", &format!("Bearer {}", self.jwt))
+            .call()
+            .map_err(|e| format!("sync-version request failed: {}", e))?;
+        resp.into_json::<SyncVersionResponse>()
+            .map_err(|e| format!("failed to parse sync-version response: {}", e))
+    }
+
+    /// GET /accounts/me/managed-keys-snapshot
+    /// Fetches the full account-dimension projection of the current key state.
+    /// Also triggers a server-side refresh of `account_managed_virtual_keys`
+    /// and bumps `sync_version`, so the returned `sync_version` is always fresh.
+    pub fn get_managed_keys_snapshot(&self) -> Result<ManagedKeysSnapshotResponse, String> {
+        let url = format!("{}/accounts/me/managed-keys-snapshot", self.base_url);
+        let resp = ureq::get(&url)
+            .set("Authorization", &format!("Bearer {}", self.jwt))
+            .call()
+            .map_err(|e| format!("managed-keys-snapshot request failed: {}", e))?;
+        resp.into_json::<ManagedKeysSnapshotResponse>()
+            .map_err(|e| format!("failed to parse managed-keys-snapshot response: {}", e))
     }
 
     // ---- Key delivery -------------------------------------------------------

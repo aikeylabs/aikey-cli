@@ -425,16 +425,24 @@ pub fn invalidate() {
 mod tests {
     use super::*;
     use std::env;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    // Global mutex: tests that override HOME must run sequentially.
+    static HOME_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Redirect all session file paths to a temp directory by overriding HOME.
     fn with_temp_home(f: impl FnOnce()) {
+        let _lock = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
-        // Override HOME so that dirs::home_dir() returns tmp path.
-        // NOTE: This is inherently process-global; tests using this must not run
-        // in parallel with other tests that rely on HOME.
+        let prev_home = env::var("HOME").ok();
         env::set_var("HOME", tmp.path());
         f();
+        // Restore original HOME to avoid poisoning other tests.
+        match prev_home {
+            Some(h) => env::set_var("HOME", h),
+            None => env::remove_var("HOME"),
+        }
         // tmp is dropped — files cleaned up automatically.
     }
 

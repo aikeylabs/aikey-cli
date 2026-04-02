@@ -203,7 +203,7 @@ impl ProjectConfig {
                     return Err(format!(
                         "SECURITY WARNING: Provider '{}' keyAlias looks like an actual secret value.\n\
                         keyAlias should be a vault reference (e.g. 'openai:default'), not the actual API key.\n\
-                        Never store secrets in aikey.config.json - use 'aikey secret set' instead.",
+                        Never store API Keys in aikey.config.json - use 'aikey add' instead.",
                         provider_name
                     ));
                 }
@@ -220,7 +220,7 @@ impl ProjectConfig {
                 return Err(format!(
                     "SECURITY WARNING: Binding '{}' appears to contain an actual secret.\n\
                     Bindings should reference vault entries (e.g. 'db:prod'), not actual secrets.\n\
-                    Never store secrets in aikey.config.json - use 'aikey secret set' instead.",
+                    Never store API Keys in aikey.config.json - use 'aikey add' instead.",
                     var_name
                 ));
             }

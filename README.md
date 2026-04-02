@@ -21,13 +21,9 @@ AiKey is a **runtime credential layer** ("management, not a password book"). Pro
 
 ## Quick Start (5 minutes)
 
-### 1. Setup (one-time per machine)
+### 1. Initialize Vault (one-time per machine)
 
-```bash
-aikey setup
-```
-
-This initializes your local encrypted vault.
+The vault is created automatically when you run any `aikey` command for the first time (e.g. `aikey quickstart` or `aikey add`). You'll be prompted to set a master password.
 
 ### 2. Create Project Config (no secrets)
 
@@ -40,13 +36,13 @@ This creates `aikey.config.json` - a committable declaration file that specifies
 
 > **Note:** Run `aikey --help` to see your build's available commands. The project config file is always `aikey.config.json`.
 
-### 3. Add Secrets to Vault
+### 3. Add API Keys to Vault
 
 ```bash
-aikey secret set MY_API_KEY
+aikey add anthropic:default
 ```
 
-Secrets are stored encrypted in your local vault, never in project files.
+API Keys are stored encrypted in your local vault, never in project files.
 
 ### 4. Run Commands (the blessed path)
 

@@ -131,7 +131,7 @@ pub fn handle_project_init(json_mode: bool) -> Result<(), Box<dyn std::error::Er
     if !json_mode {
         println!("\n✓ Created aikey.config.json");
         println!("\nNext steps:");
-        println!("  1. Run 'aikey secret set <provider>:<alias>' to add provider keys (e.g. aikey secret set anthropic:default)");
+        println!("  1. Run 'aikey add <provider>:<alias>' to add provider keys (e.g. aikey add anthropic:default)");
         println!("  2. Run 'aikey env generate' to create/update your .env file (non-sensitive only)");
         println!("  3. Use 'aikey run -- <command>' to run with secrets injected");
         println!("  4. Use 'aikey project status' to check configuration");
@@ -237,7 +237,7 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
             }));
         } else {
             println!("No vault found. Let's create one first.");
-            println!("You'll set a master password to protect your secrets.\n");
+            println!("You'll set a master password to protect your API Keys.\n");
         }
 
         let password = if let Ok(test_pw) = std::env::var("AK_TEST_PASSWORD") {
@@ -312,7 +312,7 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
         println!("\nSetup complete!");
         println!("\nWhat's next?");
         println!("\n1. Add keys to your local vault:");
-        println!("   $ aikey secret set <name> --from-stdin");
+        println!("   $ aikey add <provider>:<alias>");
         println!("\n2. Generate your .env file (non-sensitive only):");
         println!("   $ aikey env generate");
         println!("\n3. Run your app with secrets injected:");
@@ -595,7 +595,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             _ => "not running".to_string(),
         };
         let hint = if proxy_up { None } else {
-            Some("run 'aikey proxy start' or just run any aikey command (auto-start)")
+            Some("proxy auto-starts with any aikey command — try 'aikey doctor' to diagnose")
         };
         emit("proxy", proxy_up, &detail, hint);
     }

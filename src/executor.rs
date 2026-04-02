@@ -41,10 +41,17 @@ struct VaultContext {
 
 impl VaultContext {
     fn new(password: &SecretString) -> Result<Self, String> {
-        // Auto-initialize vault on first use so the user never needs to run
-        // `aikey setup` before using any vault command.
+        // Auto-initialize vault on first use so the user never needs a separate
+        // initialization step before using any vault command.
+        // Check for master_salt (not just file existence) because session backend
+        // selection may have created the DB file before vault init runs.
         let vault_path = storage::get_vault_path()?;
-        if !vault_path.exists() {
+        let needs_init = if vault_path.exists() {
+            storage::get_salt().is_err()
+        } else {
+            true
+        };
+        if needs_init {
             let mut salt = [0u8; 16];
             crypto::generate_salt(&mut salt)?;
             storage::initialize_vault(&salt, password)?;
@@ -162,7 +169,7 @@ pub fn is_potential_secret(text: &str) -> bool {
 pub fn add_secret(alias: &str, secret: &str, password: &SecretString) -> Result<(), String> {
     // Check if the secret already exists
     if storage::get_entry(alias).is_ok() {
-        return Err(format!("Secret '{}' already exists. Use 'update' command to modify it.", alias));
+        return Err(format!("API Key '{}' already exists. Use 'update' command to modify it.", alias));
     }
 
     let ctx = VaultContext::new(password)?;
@@ -234,7 +241,7 @@ pub fn schedule_clipboard_clear(timeout_secs: u64) {
 pub fn update_secret(alias: &str, new_secret: &str, password: &SecretString) -> Result<(), String> {
     // First check if the secret exists
     if storage::get_entry(alias).is_err() {
-        return Err(format!("Secret '{}' not found", alias));
+        return Err(format!("API Key '{}' not found", alias));
     }
 
     // Encrypt and store the new value
@@ -1057,6 +1064,67 @@ pub fn run_with_provider(
     result
 }
 
+/// Execute a command using the currently active key (team or personal) via proxy.
+///
+/// Reads `active_key_config` to determine which providers are active, then injects
+/// proxy-routed env vars (e.g. `ANTHROPIC_API_KEY=<vk_id>`, `ANTHROPIC_BASE_URL=
+/// http://127.0.0.1:27200/anthropic`) into the child process. This allows
+/// `aikey run -- claude` to work when a team key is active without any project config.
+///
+/// Returns `(secrets_injected, exit_code)`.
+pub fn run_with_active_key(
+    command: &[String],
+    json_mode: bool,
+) -> Result<(usize, i32), String> {
+    use crate::commands_account::{provider_env_vars_pub, provider_proxy_prefix_pub};
+
+    let active_cfg = crate::storage::get_active_key_config()
+        .map_err(|e| format!("Failed to read active key config: {}", e))?
+        .ok_or("No active key. Run `aikey use <alias>` first.")?;
+
+    let proxy_port: u16 = 27200;
+
+    let providers: Vec<String> = if active_cfg.providers.is_empty() {
+        // Fallback: inject common providers so the child can reach any.
+        vec!["anthropic", "openai", "google", "deepseek", "kimi"]
+            .into_iter().map(String::from).collect()
+    } else {
+        active_cfg.providers.clone()
+    };
+
+    let token_value = if active_cfg.key_type == "team" {
+        active_cfg.key_ref.clone()
+    } else {
+        format!("aikey_personal_{}", active_cfg.key_ref)
+    };
+
+    let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
+        std::collections::HashMap::new();
+
+    for provider in &providers {
+        if let Some((api_var, base_var)) = provider_env_vars_pub(provider) {
+            env_secrets.insert(api_var.to_string(), Zeroizing::new(token_value.clone()));
+            let base_url = format!(
+                "http://127.0.0.1:{}/{}",
+                proxy_port,
+                provider_proxy_prefix_pub(provider),
+            );
+            env_secrets.insert(base_var.to_string(), Zeroizing::new(base_url));
+        }
+    }
+
+    let secrets_count = env_secrets.len();
+    if !json_mode {
+        let display_name = if active_cfg.key_type == "team" { "team key" } else { "personal key" };
+        eprintln!(
+            "Injecting {} env var(s) via proxy for {} '{}'",
+            secrets_count, display_name, active_cfg.key_ref,
+        );
+    }
+
+    spawn_with_env(env_secrets, command, json_mode, None)
+}
+
 /// Execute a command with secrets resolved from a project config.
 /// Password-based version (no daemon).
 ///
@@ -1081,7 +1149,7 @@ pub fn run_from_vault(
 
     if aliases.is_empty() {
         return Err(
-            "No API keys stored. Add one with:\n  aikey secret set anthropic:default".to_string()
+            "No API Keys stored. Add one with:\n  aikey add anthropic:default".to_string()
         );
     }
 
@@ -1101,7 +1169,7 @@ pub fn run_from_vault(
     if provider_alias.is_empty() {
         return Err(
             "No provider keys found in vault (expected format: provider:alias).\n\
-             Add one with: aikey secret set anthropic:default".to_string()
+             Add one with: aikey add anthropic:default".to_string()
         );
     }
 

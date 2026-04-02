@@ -32,8 +32,28 @@ pub fn config_path() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(path));
     }
 
-    let config_dir = dirs::config_dir().ok_or_else(|| "Could not determine config directory".to_string())?;
-    Ok(config_dir.join("aikey").join("config.json"))
+    let home = dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())?;
+    let new_path = home.join(".aikey").join("config").join("config.json");
+
+    // Auto-migrate from legacy path (dirs::config_dir()/aikey/config.json)
+    if !new_path.exists() {
+        if let Some(legacy_dir) = dirs::config_dir() {
+            let legacy_path = legacy_dir.join("aikey").join("config.json");
+            if legacy_path.exists() {
+                if let Some(parent) = new_path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                if fs::copy(&legacy_path, &new_path).is_ok() {
+                    let _ = fs::remove_file(&legacy_path);
+                    // Clean up empty legacy dir
+                    let legacy_aikey_dir = legacy_dir.join("aikey");
+                    let _ = fs::remove_dir(&legacy_aikey_dir); // only succeeds if empty
+                }
+            }
+        }
+    }
+
+    Ok(new_path)
 }
 
 pub fn load_config() -> Result<GlobalConfig, String> {

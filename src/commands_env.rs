@@ -218,7 +218,7 @@ pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
                 println!("  ✗ {}", var.name);
             }
             println!("\nTo configure these variables:");
-            println!("  • Add keys to your local vault: 'aikey secret set <name> --from-stdin'");
+            println!("  • Add keys to your local vault: 'aikey add <provider>:<alias>'");
             println!("  • Run 'aikey project map' / 'aikey provider add' to bind vars to keys");
             println!("  • Then run 'aikey env generate' to create non-sensitive placeholders in .env");
         } else {

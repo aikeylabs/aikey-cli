@@ -171,7 +171,7 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
     // 2. Interactive: prompt once.
     use std::io::IsTerminal;
     if io::stderr().is_terminal() || password_stdin {
-        eprint!("\n  Proxy not running. Enter vault password to start it: ");
+        eprint!("\n  Proxy not running. Enter Master Password to start it: ");
         let _ = io::stderr().flush();
         let pw = if password_stdin {
             let mut line = String::new();

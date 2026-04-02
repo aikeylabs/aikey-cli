@@ -7,3 +7,4 @@
 .env.*
 *.log
 .DS_Store
+.cargo-target/

@@ -258,6 +258,13 @@ fn apply_migrations(conn: &Connection) -> Result<(), String> {
             // routing to use the correct per-provider admin-configured upstream URL.
             "ALTER TABLE managed_virtual_keys_cache ADD COLUMN provider_base_urls TEXT",
         ),
+        (
+            "owner_account_id",
+            // v0.8: account scope for multi-account support; NULL = pre-v0.8 row (treated as current account).
+            // Set to the logged-in account_id at key accept / sync time.
+            // Used to scope-disable keys from previous accounts on account switch.
+            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN owner_account_id TEXT",
+        ),
     ] {
         let has_col: bool = conn
             .query_row(
@@ -402,8 +409,22 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         }
     }
 
+    // If the DB file exists, check whether it was fully initialized (has master_salt).
+    // The file may exist without salt if session-backend selection created it first.
     if db_path.exists() {
-        return Err("Vault already initialized. If you need a fresh vault, delete the local vault file and run 'aikey init' again.".to_string());
+        let probe = Connection::open(&db_path)
+            .map_err(|e| format!("Failed to open database: {}", e))?;
+        let has_salt: bool = probe
+            .query_row(
+                "SELECT COUNT(*) FROM config WHERE key = 'master_salt'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) > 0;
+        if has_salt {
+            return Err("Vault already initialized. If you need a fresh vault, delete the local vault file and run 'aikey init' again.".to_string());
+        }
+        // DB exists but no salt — fall through to complete initialization
     }
 
     let conn = Connection::open(&db_path)
@@ -428,7 +449,7 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         .map_err(|e| format!("Failed to enable auto-vacuum: {}", e))?;
 
     conn.execute(
-        "CREATE TABLE config (
+        "CREATE TABLE IF NOT EXISTS config (
             key TEXT PRIMARY KEY,
             value BLOB NOT NULL
         )",
@@ -437,7 +458,7 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
     .map_err(|e| format!("Failed to create config table: {}", e))?;
 
     conn.execute(
-        "CREATE TABLE entries (
+        "CREATE TABLE IF NOT EXISTS entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             alias TEXT NOT NULL UNIQUE,
             nonce BLOB NOT NULL,
@@ -451,7 +472,7 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
     .map_err(|e| format!("Failed to create entries table: {}", e))?;
 
     conn.execute(
-        "CREATE TABLE profiles (
+        "CREATE TABLE IF NOT EXISTS profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             is_active INTEGER NOT NULL DEFAULT 0,
@@ -462,7 +483,7 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
     .map_err(|e| format!("Failed to create profiles table: {}", e))?;
 
     conn.execute(
-        "CREATE TABLE bindings (
+        "CREATE TABLE IF NOT EXISTS bindings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             profile_name TEXT NOT NULL,
             domain TEXT NOT NULL DEFAULT 'default',
@@ -1566,6 +1587,42 @@ pub fn set_active_key_config(cfg: &ActiveKeyConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Drops all rows from `managed_virtual_keys_cache`.
+/// NOTE: Prefer `disable_keys_for_account_scope` on account switch —
+/// it keeps the ciphertext rows so the previous account can access them again
+/// after re-login, while still preventing the new account from using those keys.
+pub fn clear_virtual_key_cache() -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute("DELETE FROM managed_virtual_keys_cache", [])
+        .map_err(|e| format!("Failed to clear virtual key cache: {}", e))?;
+    Ok(())
+}
+
+/// On account switch: marks all cached keys not owned by `new_account_id` as
+/// `disabled_by_account_scope`.
+///
+/// Keys are preserved so they remain available if the user logs back into the
+/// previous account.  Proxy and `aikey use` both reject any key whose
+/// `local_state` is not `active`, so scope-disabled keys are effectively inert
+/// until the owning account is active again.
+///
+/// Pre-v0.8 rows where `owner_account_id IS NULL` are also scope-disabled —
+/// they will be restored to `synced_inactive` the next time a sync runs under
+/// the account that originally accepted them.
+pub fn disable_keys_for_account_scope(new_account_id: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE managed_virtual_keys_cache
+            SET local_state = 'disabled_by_account_scope',
+                synced_at   = strftime('%s', 'now')
+          WHERE (owner_account_id IS NULL OR owner_account_id != ?1)
+            AND local_state != 'disabled_by_account_scope'",
+        params![new_account_id],
+    )
+    .map_err(|e| format!("Failed to scope-disable keys for account switch: {}", e))?;
+    Ok(())
+}
+
 /// Clears all three active key config rows (no key active).
 pub fn clear_active_key_config() -> Result<(), String> {
     let conn = open_connection()?;
@@ -1622,6 +1679,55 @@ pub fn set_session_backend_pref(pref: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Seat status cache (background sync)
+// ---------------------------------------------------------------------------
+
+const SEAT_STATUS_CACHE_KEY: &str = "account.seat_statuses";
+const LAST_STATUS_SYNC_KEY: &str = "account.last_status_sync";
+
+/// Persist seat statuses as a JSON string: `{"seat_id": "active"|"suspended"|...}`.
+pub fn set_seat_status_cache(json: &str) {
+    set_text_config(SEAT_STATUS_CACHE_KEY, json);
+}
+
+/// Read the cached seat statuses JSON. Returns `None` if never synced.
+pub fn get_seat_status_cache() -> Option<String> {
+    get_text_config(SEAT_STATUS_CACHE_KEY)
+}
+
+/// Record the Unix timestamp of the last successful status sync.
+pub fn set_last_status_sync(ts: i64) {
+    set_text_config(LAST_STATUS_SYNC_KEY, &ts.to_string());
+}
+
+/// Read the Unix timestamp of the last successful status sync.
+pub fn get_last_status_sync() -> i64 {
+    get_text_config(LAST_STATUS_SYNC_KEY)
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot sync version (Phase C incremental sync)
+// ---------------------------------------------------------------------------
+
+const LOCAL_SEEN_SYNC_VERSION_KEY: &str = "account.local_seen_sync_version";
+
+/// Read the last sync_version the CLI successfully pulled from the server.
+/// Returns 0 if never synced (ensures first run triggers an initial pull,
+/// since the server starts at version ≥ 1).
+pub fn get_local_seen_sync_version() -> i64 {
+    get_text_config(LOCAL_SEEN_SYNC_VERSION_KEY)
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the sync_version returned by the last successful snapshot pull.
+pub fn set_local_seen_sync_version(v: i64) {
+    set_text_config(LOCAL_SEEN_SYNC_VERSION_KEY, &v.to_string());
+}
+
+// ---------------------------------------------------------------------------
 // Team-managed virtual key cache
 // ---------------------------------------------------------------------------
 
@@ -1641,7 +1747,15 @@ pub struct VirtualKeyCacheEntry {
     pub virtual_key_revision: String,
     pub key_status: String,
     pub share_status: String,
-    /// `synced_inactive` | `active` — controls proxy routing.
+    /// Controls CLI and proxy behaviour. Valid values:
+    /// - `active`                    — currently selected key; proxy routes through it.
+    /// - `synced_inactive`           — known and valid but not selected.
+    /// - `prompt_dismissed`          — user dismissed the accept banner; no longer prompted.
+    /// - `disabled_by_account_scope` — belongs to a different account; cannot be activated.
+    /// - `disabled_by_account_status`— server: owning account is disabled.
+    /// - `disabled_by_seat_status`   — server: owning seat is suspended/revoked.
+    /// - `disabled_by_key_status`    — server: key itself is revoked/expired.
+    /// - `stale`                     — not returned by last server snapshot; may be outdated.
     pub local_state: String,
     pub expires_at: Option<i64>,
     pub provider_key_nonce: Option<Vec<u8>>,
@@ -1656,6 +1770,9 @@ pub struct VirtualKeyCacheEntry {
     /// Per-provider upstream base URLs (JSON object). Keys: provider code, Values: base URL.
     /// Populated from delivery payload slots; empty map until first key accept/sync.
     pub provider_base_urls: std::collections::HashMap<String, String>,
+    /// The `account_id` that last synced/accepted this key. `None` for pre-v0.8 rows.
+    /// Used to scope-disable keys when the user switches to a different account.
+    pub owner_account_id: Option<String>,
 }
 
 /// Inserts or replaces a cache entry.
@@ -1676,7 +1793,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              provider_key_nonce, provider_key_ciphertext,
              cache_schema_version, synced_at,
              local_alias, supported_providers,
-             provider_base_urls
+             provider_base_urls, owner_account_id
          ) VALUES (
              ?1,  ?2,  ?3,  ?4,
              ?5,  ?6,  ?7,
@@ -1686,7 +1803,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              ?15, ?16,
              1,   strftime('%s', 'now'),
              ?17, ?18,
-             ?19
+             ?19, ?20
          )",
         params![
             entry.virtual_key_id,
@@ -1708,6 +1825,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
             entry.local_alias,
             supported_providers_json,
             provider_base_urls_json,
+            entry.owner_account_id,
         ],
     )
     .map_err(|e| format!("Failed to upsert virtual key cache: {}", e))?;
@@ -1740,7 +1858,7 @@ pub fn list_virtual_key_cache() -> Result<Vec<VirtualKeyCacheEntry>, String> {
                     expires_at,
                     provider_key_nonce, provider_key_ciphertext,
                     synced_at, local_alias, supported_providers,
-                    provider_base_urls
+                    provider_base_urls, owner_account_id
                FROM managed_virtual_keys_cache
               ORDER BY COALESCE(local_alias, alias)",
         )
@@ -1769,6 +1887,7 @@ pub fn list_virtual_key_cache() -> Result<Vec<VirtualKeyCacheEntry>, String> {
                 local_alias: row.get(17)?,
                 supported_providers: parse_providers_json(row.get(18)?),
                 provider_base_urls: parse_base_urls_json(row.get(19)?),
+                owner_account_id: row.get(20)?,
             })
         })
         .map_err(|e| format!("Failed to query virtual key cache: {}", e))?;
@@ -1792,7 +1911,7 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
                 expires_at,
                 provider_key_nonce, provider_key_ciphertext,
                 synced_at, local_alias, supported_providers,
-                provider_base_urls
+                provider_base_urls, owner_account_id
            FROM managed_virtual_keys_cache
           WHERE virtual_key_id = ?1",
         params![virtual_key_id],
@@ -1818,6 +1937,7 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
                 local_alias: row.get(17)?,
                 supported_providers: parse_providers_json(row.get(18)?),
                 provider_base_urls: parse_base_urls_json(row.get(19)?),
+                owner_account_id: row.get(20)?,
             })
         },
     );
@@ -1844,7 +1964,7 @@ pub fn get_virtual_key_cache_by_alias(alias: &str) -> Result<Option<VirtualKeyCa
                 expires_at,
                 provider_key_nonce, provider_key_ciphertext,
                 synced_at, local_alias, supported_providers,
-                provider_base_urls
+                provider_base_urls, owner_account_id
            FROM managed_virtual_keys_cache
           WHERE local_alias = ?1 OR alias = ?1
           ORDER BY CASE WHEN local_alias = ?1 THEN 0 ELSE 1 END
@@ -1872,6 +1992,7 @@ pub fn get_virtual_key_cache_by_alias(alias: &str) -> Result<Option<VirtualKeyCa
                 local_alias: row.get(17)?,
                 supported_providers: parse_providers_json(row.get(18)?),
                 provider_base_urls: parse_base_urls_json(row.get(19)?),
+                owner_account_id: row.get(20)?,
             })
         },
     );
@@ -2013,8 +2134,9 @@ pub fn set_virtual_key_share_status_local(
     Ok(())
 }
 
-/// Counts entries with `share_status = 'pending_claim'` that have NOT been
-/// dismissed by the user (`local_state != 'prompt_dismissed'`).
+/// Counts entries with `share_status = 'pending_claim'` that are in `synced_inactive` state.
+/// Only `synced_inactive` keys warrant an accept prompt — all other states (dismissed,
+/// scope-disabled, etc.) should not trigger a banner.
 /// Used for the non-intrusive startup hint (no vault auth required).
 pub fn count_pending_virtual_keys() -> Result<usize, String> {
     let db_path = get_vault_path()?;
@@ -2027,7 +2149,7 @@ pub fn count_pending_virtual_keys() -> Result<usize, String> {
             "SELECT COUNT(*) FROM managed_virtual_keys_cache
               WHERE share_status = 'pending_claim'
                 AND key_status   = 'active'
-                AND local_state  != 'prompt_dismissed'",
+                AND local_state  = 'synced_inactive'",
             [],
             |row| row.get(0),
         )

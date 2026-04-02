@@ -42,6 +42,7 @@ pub fn handle_login(
     json_mode: bool,
     flag_url: Option<String>,
     flag_token: Option<String>,
+    flag_email: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let default_url = std::env::var("AIKEY_CONTROL_URL")
         .unwrap_or_else(|_| "http://localhost:8080".to_string());
@@ -76,24 +77,35 @@ pub fn handle_login(
     )
     .map_err(|e| format!("Login failed: {}", e))?;
 
-    let login_url = format!(
+    // Browser URL: use dev server if detected (Vite proxies /auth to Go backend).
+    let browser_base = resolve_browse_base_url(&control_url, None);
+    let mut login_url = format!(
         "{}/auth/cli/login?s={}&d={}",
-        control_url.trim_end_matches('/'),
+        browser_base.trim_end_matches('/'),
         session.login_session_id,
         session.device_code,
     );
+    // Append Base64URL-encoded email so the login page can auto-fill it.
+    if let Some(ref email) = flag_email {
+        let encoded = base64_url_encode(email);
+        login_url.push_str(&format!("&email={}", encoded));
+    }
 
     if !json_mode {
-        println!("Opening browser for login…");
-        println!("If your browser did not open, visit:");
-        println!("  {}", login_url);
+        let step = |n: &str| format!("  {}", format!("Step {}", n).bold().cyan());
         println!();
-        println!("Enter your email in the browser, click 'Send Login Link',");
-        println!("then check your email and click the activation link.");
-        println!("Waiting… (session expires in {}s)", session.expires_in_seconds);
+        println!("{}  Opening browser…", step("1"));
+        println!("          {}", login_url.dimmed());
         println!();
-        println!("Tip: if polling times out, copy the one-time token from");
-        println!("     the activation page and re-run with --token SESSION_ID:LOGIN_TOKEN");
+        if flag_email.is_some() {
+            println!("{}  Your {} is pre-filled — click {}", step("2"), "email".bold(), "\"Send Login Link\"".bold());
+        } else {
+            println!("{}  Enter your {} and click {}", step("2"), "email".bold(), "\"Send Login Link\"".bold());
+        }
+        println!();
+        println!("{}  Check your inbox and click the {} link", step("3"), "activation".bold());
+        println!();
+        println!("  {}", "Waiting for confirmation…".dimmed());
     }
 
     open_url_silently(&login_url);
@@ -108,8 +120,10 @@ pub fn handle_login(
         if SystemTime::now() > deadline {
             if !json_mode {
                 eprintln!();
-                eprintln!("Login session expired.");
-                eprint!("Paste the one-time login token (or press Enter to cancel): ");
+                eprintln!("  {}", "Session expired.".yellow());
+                eprintln!("  Tip: copy the one-time {} from the {} page and run:", "token".bold(), "activation".bold());
+                eprintln!("       {}", "aikey login --token SESSION_ID:LOGIN_TOKEN".bold());
+                eprint!("  Paste token (or press Enter to cancel): ");
                 io::stderr().flush().ok();
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
@@ -216,6 +230,41 @@ fn finish_login(
         .as_secs() as i64;
     let token_expires_at = now_secs + expires_in;
 
+    // Detect account switch: if a different account was previously logged in,
+    // purge all data that is scoped to the old account before saving the new one.
+    // This prevents the new account from seeing or being prompted for the old
+    // account's team keys, pending accepts, and seat statuses.
+    let previous_account_id = storage::get_platform_account()
+        .ok()
+        .flatten()
+        .map(|a| a.account_id);
+    let is_account_switch = previous_account_id
+        .as_deref()
+        .map(|prev| prev != account.account_id)
+        .unwrap_or(false);
+
+    if is_account_switch {
+        // Scope-disable all keys that don't belong to the new account.
+        // Rows are preserved; proxy and `aikey use` ignore any key whose
+        // local_state is not `active`.  The next sync under this account
+        // will restore keys it owns to `synced_inactive`.
+        let _ = storage::disable_keys_for_account_scope(&account.account_id);
+        // Clear active key config — it may reference an old team key.
+        // Personal keys are vault-scoped and remain usable by any account.
+        if let Ok(Some(cfg)) = storage::get_active_key_config() {
+            if cfg.key_type == "team" {
+                // Deactivate team key — it belongs to the old account.
+                // Personal keys are vault-local and remain valid for the new account.
+                let _ = storage::clear_active_key_config();
+            }
+        }
+        // Clear seat status cache so whoami shows fresh data for the new account.
+        storage::set_seat_status_cache("{}");
+        storage::set_last_status_sync(0);
+        // Reset snapshot sync version so the new account triggers a full re-sync.
+        storage::set_local_seen_sync_version(0);
+    }
+
     storage::save_oauth_session(
         &account.account_id,
         &account.email,
@@ -225,6 +274,12 @@ fn finish_login(
         control_url,
     )?;
 
+    // Pull the account's current key snapshot immediately after login.
+    // This ensures keys are visible right after `aikey login` without needing
+    // a separate `aikey key list` or `aikey key sync` call.
+    // Non-fatal: if the server is unreachable the local cache is still usable.
+    let _ = run_snapshot_sync();
+
     if json_mode {
         crate::json_output::print_json(serde_json::json!({
             "ok": true,
@@ -232,8 +287,9 @@ fn finish_login(
             "email": account.email,
         }));
     } else {
-        println!("Logged in as {} ({})", account.email, account.account_id);
-        println!("Run 'aikey key list' to view your team keys.");
+        println!();
+        println!("  {} Logged in as {}", "✓".green().bold(), account.email.bold());
+        println!("    Run {} to view your team keys.", "'aikey key list'".bold());
     }
     Ok(())
 }
@@ -445,6 +501,13 @@ fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> Str
     control_url.to_string()
 }
 
+/// Base64URL-encode a string (URL-safe, no padding).
+/// Compatible with the JS `atob` + URL-safe alphabet decoder on the web side.
+fn base64_url_encode(input: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input.as_bytes())
+}
+
 /// `aikey account logout`
 /// `aikey whoami` — compact identity card: login session + active key + vault state.
 pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -453,6 +516,8 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     let account = storage::get_platform_account().ok().flatten();
     let active_cfg = storage::get_active_key_config().ok().flatten();
     let vault_exists = storage::get_vault_path().map(|p| p.exists()).unwrap_or(false);
+
+    let local_seen_version = storage::get_local_seen_sync_version();
 
     if json_mode {
         let active_json = active_cfg.as_ref().map(|cfg| serde_json::json!({
@@ -469,6 +534,9 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 "control_url": a.control_url,
             })),
             "active_key": active_json,
+            "sync": {
+                "local_seen_sync_version": local_seen_version,
+            },
         }));
         return Ok(());
     }
@@ -515,10 +583,38 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
+    // ── Sync status ──────────────────────────────────────────────────────────
+    if account.is_some() {
+        let version_str = if local_seen_version == 0 {
+            "not synced".dimmed().to_string()
+        } else {
+            format!("v{}", local_seen_version).dimmed().to_string()
+        };
+        println!("{:<16} {}", "Key sync:".bold(), version_str);
+    }
+
     Ok(())
 }
 
 pub fn handle_logout(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Scope-disable all team keys so the proxy stops routing them immediately.
+    // Passing "" disables every row regardless of owner_account_id, since no
+    // row has owner_account_id = "".
+    let _ = storage::disable_keys_for_account_scope("");
+
+    // Clear the active key config if it references a team key — a logged-out
+    // session has no valid account to own team keys.
+    if let Ok(Some(cfg)) = storage::get_active_key_config() {
+        if cfg.key_type == "team" {
+            let _ = storage::clear_active_key_config();
+        }
+    }
+
+    // Reset sync version so the next login always performs a full sync,
+    // even if the new account happens to be different from the old one
+    // (in which case finish_login won't detect an "account switch").
+    storage::set_local_seen_sync_version(0);
+
     storage::clear_platform_account()?;
     if json_mode {
         crate::json_output::print_json(serde_json::json!({ "ok": true }));
@@ -526,6 +622,211 @@ pub fn handle_logout(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         println!("Logged out.");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase C — incremental snapshot sync
+// ---------------------------------------------------------------------------
+
+/// Maps a server-computed (effective_status, effective_reason) pair to a local_state value,
+/// taking into account the entry's pre-existing local state to preserve user decisions.
+fn compute_local_state_from_effective(
+    effective_status: &str,
+    effective_reason: &str,
+    existing_state: &str,
+) -> String {
+    if effective_status != "active" {
+        // Server says this key cannot currently be used.
+        return match effective_reason {
+            "seat_disabled"                   => "disabled_by_seat_status".to_string(),
+            "key_revoked" | "key_expired"     => "disabled_by_key_status".to_string(),
+            "account_disabled"                => "disabled_by_account_status".to_string(),
+            _                                 => "synced_inactive".to_string(), // e.g. not_claimed
+        };
+    }
+
+    // effective_status == "active": preserve meaningful local states.
+    match existing_state {
+        // Key is currently active in proxy — keep it active.
+        "active" => "active".to_string(),
+        // User dismissed the accept banner — don't re-show it.
+        "prompt_dismissed" => "prompt_dismissed".to_string(),
+        // Was disabled by scope/status — server says it's valid again, restore.
+        "disabled_by_account_scope"
+        | "disabled_by_account_status"
+        | "disabled_by_seat_status"
+        | "disabled_by_key_status"
+        | "stale" => "synced_inactive".to_string(),
+        // Default (synced_inactive, empty, new entry).
+        _ => "synced_inactive".to_string(),
+    }
+}
+
+/// Merges a server snapshot into the local managed_virtual_keys_cache.
+///
+/// Coverage rules (design doc §5.3):
+/// - Server fields overwrite local server-mirrored fields.
+/// - Local-only fields (local_alias, key material, owner_account_id) are preserved.
+/// - local_state is recomputed from effective_status / effective_reason.
+/// - Keys owned by current account that are absent from the snapshot are marked `stale`.
+fn apply_snapshot_to_cache(
+    items: &[crate::platform_client::ManagedKeySnapshotItem],
+    current_account_id: &str,
+) {
+    use std::collections::HashSet;
+    let seen_ids: HashSet<String> = items.iter().map(|i| i.virtual_key_id.clone()).collect();
+
+    for item in items {
+        let existing = storage::get_virtual_key_cache(&item.virtual_key_id)
+            .ok()
+            .flatten();
+
+        // Preserve local-only fields from the existing cache entry.
+        let local_alias  = existing.as_ref().and_then(|e| e.local_alias.clone());
+        let nonce        = existing.as_ref().and_then(|e| e.provider_key_nonce.clone());
+        let ciphertext   = existing.as_ref().and_then(|e| e.provider_key_ciphertext.clone());
+        let existing_state = existing.as_ref().map(|e| e.local_state.as_str()).unwrap_or("");
+
+        let local_state = compute_local_state_from_effective(
+            &item.effective_status,
+            &item.effective_reason,
+            existing_state,
+        );
+
+        let entry = storage::VirtualKeyCacheEntry {
+            virtual_key_id:       item.virtual_key_id.clone(),
+            org_id:               item.org_id.clone(),
+            seat_id:              item.seat_id.clone(),
+            alias:                item.alias.clone(),
+            provider_code:        item.provider_code.clone(),
+            protocol_type:        item.protocol_type.clone(),
+            base_url:             item.base_url.clone(),
+            credential_id:        item.credential_id.clone(),
+            credential_revision:  item.credential_revision.clone(),
+            virtual_key_revision: item.virtual_key_revision.clone(),
+            key_status:           item.key_status.clone(),
+            share_status:         item.share_status.clone(),
+            local_state,
+            expires_at:           item.expires_at,
+            provider_key_nonce:   nonce,
+            provider_key_ciphertext: ciphertext,
+            synced_at:            0,
+            local_alias,
+            supported_providers:  item.supported_providers.clone(),
+            provider_base_urls:   item.provider_base_urls.clone(),
+            owner_account_id:     Some(current_account_id.to_string()),
+        };
+
+        let _ = storage::upsert_virtual_key_cache(&entry);
+
+        // If this key is currently active in the proxy, refresh active.env so the
+        // proxy picks up any updated provider list without requiring a restart.
+        if !entry.supported_providers.is_empty() {
+            if let Ok(Some(active_cfg)) = crate::storage::get_active_key_config() {
+                if active_cfg.key_type == "team" && active_cfg.key_ref == entry.virtual_key_id {
+                    let display = entry.local_alias.as_deref().unwrap_or(entry.alias.as_str());
+                    let _ = write_active_env(
+                        "team", &entry.virtual_key_id, display,
+                        &entry.supported_providers, 27200,
+                    );
+                }
+            }
+        }
+    }
+
+    // Mark stale: keys the current account owns locally but the server no longer returns.
+    // This includes the currently-active key: if the server has removed it from the
+    // snapshot, it is no longer valid and must be deactivated immediately.
+    if let Ok(cached) = storage::list_virtual_key_cache() {
+        for entry in cached {
+            if entry.owner_account_id.as_deref() == Some(current_account_id)
+                && !seen_ids.contains(&entry.virtual_key_id)
+                && entry.local_state != "stale"
+            {
+                let _ = storage::set_virtual_key_local_state(&entry.virtual_key_id, "stale");
+                // If this key was the active proxy key, clear the active key config
+                // so the proxy stops routing it on next reload.
+                if entry.local_state == "active" {
+                    if let Ok(Some(cfg)) = storage::get_active_key_config() {
+                        if cfg.key_type == "team" && cfg.key_ref == entry.virtual_key_id {
+                            let _ = storage::clear_active_key_config();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Runs one snapshot sync cycle (blocking):
+/// 1. Calls GET /accounts/me/sync-version — fast server round-trip.
+/// 2. Compares remote version with `local_seen_sync_version` in the config table.
+/// 3. If the version has changed, pulls the full snapshot and merges it.
+/// 4. Updates `local_seen_sync_version` and bumps `vault_change_seq`.
+///
+/// Returns `Ok(true)` if a new snapshot was applied, `Ok(false)` if already
+/// up-to-date or not logged in, `Err(msg)` on network / parse failure.
+pub fn run_snapshot_sync() -> Result<bool, String> {
+    let acc = match storage::get_platform_account().ok().flatten() {
+        Some(a) => a,
+        None => return Ok(false),
+    };
+    let token = match try_refresh_if_needed(&acc) {
+        Ok(t) => t,
+        Err(e) => return Err(format!("token refresh: {}", e)),
+    };
+    let client = PlatformClient::new(&acc.control_url, &token);
+
+    // Fast version check — one lightweight request before pulling the full snapshot.
+    let remote_version = match client.get_sync_version() {
+        Ok(r) => r.sync_version,
+        Err(e) => return Err(format!("sync-version: {}", e)),
+    };
+    let local_seen = storage::get_local_seen_sync_version();
+    if remote_version <= local_seen {
+        return Ok(false); // already up-to-date
+    }
+
+    // Version has changed — pull the full snapshot.
+    let snapshot = match client.get_managed_keys_snapshot() {
+        Ok(s) => s,
+        Err(e) => return Err(format!("snapshot: {}", e)),
+    };
+
+    apply_snapshot_to_cache(&snapshot.keys, &acc.account_id);
+
+    // Record the new version so the next command skips the snapshot pull.
+    storage::set_local_seen_sync_version(snapshot.sync_version);
+    let _ = storage::bump_vault_change_seq();
+
+    Ok(true)
+}
+
+/// Spawns a background thread to check and apply a server snapshot update.
+///
+/// Single-flight: if a sync is already in progress (e.g. from a concurrent
+/// command invocation), this call is a no-op. This prevents duplicate snapshot
+/// fetches and local-cache write races when multiple commands run close together.
+///
+/// Non-blocking: the calling command is not delayed.
+/// All errors are silently suppressed — the local cache remains usable offline.
+pub fn try_background_snapshot_sync() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // Static flag: true while a background sync thread is running.
+    static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+    // compare_exchange(expected=false, new=true): only one thread wins.
+    if SYNC_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return; // another sync is already running — skip
+    }
+
+    std::thread::spawn(|| {
+        let _ = run_snapshot_sync();
+        SYNC_IN_PROGRESS.store(false, Ordering::Release);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -562,14 +863,24 @@ pub fn sync_managed_key_metadata() -> bool {
             Ok(e) => e,
             Err(_) => continue,
         };
-        // Non-active keys must not remain locally active.
-        let local_state = if item.key_status == "active" {
-            existing
-                .as_ref()
-                .map(|e| e.local_state.clone())
-                .unwrap_or_else(|| "synced_inactive".to_string())
-        } else {
-            "synced_inactive".to_string()
+        // If the key was scope-disabled (belonged to a different account) but
+        // the server is now returning it for the current account, restore it.
+        let existing_state = existing.as_ref().map(|e| e.local_state.as_str()).unwrap_or("");
+        let local_state = match (item.key_status.as_str(), existing_state) {
+            // Server says key is active; restore scope-disabled back to synced_inactive
+            // (the current account now owns it again after re-login).
+            ("active", "disabled_by_account_scope") => "synced_inactive".to_string(),
+            // Server says key is active; preserve non-disabled states (active, synced_inactive,
+            // prompt_dismissed).
+            ("active", state) if !state.starts_with("disabled_by_") => {
+                if state.is_empty() {
+                    "synced_inactive".to_string()
+                } else {
+                    state.to_string()
+                }
+            }
+            // Any other combination: fall back to synced_inactive.
+            _ => "synced_inactive".to_string(),
         };
         // Preserve key material and delivery-time fields (base_url, credential_id, etc.).
         let nonce = existing.as_ref().and_then(|e| e.provider_key_nonce.clone());
@@ -611,6 +922,7 @@ pub fn sync_managed_key_metadata() -> bool {
             local_alias,
             supported_providers,
             provider_base_urls,
+            owner_account_id: Some(acc.account_id.clone()),
         };
         let _ = storage::upsert_virtual_key_cache(&entry);
 
@@ -641,12 +953,12 @@ pub fn sync_managed_key_metadata() -> bool {
 pub fn handle_key_list(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     let logged_in = storage::get_platform_account()?.is_some();
 
-    // Sync metadata from server; warn on failure only in interactive mode.
-    let server_ok = sync_managed_key_metadata();
-    if !server_ok && !json_mode {
-        if logged_in {
-            eprintln!("Warning: could not reach control service. Showing local cache.");
-        }
+    // Sync key state from server using the snapshot path; warn on failure only in
+    // interactive mode.  run_snapshot_sync() is a no-op when the server version
+    // matches local_seen, so it's fast after the background sync has already run.
+    let server_ok = run_snapshot_sync().is_ok();
+    if !server_ok && !json_mode && logged_in {
+        eprintln!("Warning: could not reach control service. Showing local cache.");
     }
 
     let maybe_client: Option<()> = if logged_in { Some(()) } else { None };
@@ -814,6 +1126,10 @@ pub fn handle_key_accept(
             .ok()
             .flatten();
         let existing_local_alias = existing.as_ref().and_then(|e| e.local_alias.clone());
+        let current_account_id = storage::get_platform_account()
+            .ok()
+            .flatten()
+            .map(|a| a.account_id);
 
         // Build supported_providers from payload (all active binding provider codes).
         // Fall back to just the primary binding's provider if payload.supported_providers is empty.
@@ -853,6 +1169,7 @@ pub fn handle_key_accept(
             local_alias: existing_local_alias,
             supported_providers,
             provider_base_urls,
+            owner_account_id: current_account_id,
         };
         storage::upsert_virtual_key_cache(&entry)?;
 
@@ -894,162 +1211,123 @@ pub fn handle_key_accept(
 
 /// `aikey key sync`
 ///
-/// Refreshes all key metadata from the control service.  For keys that have
-/// already been delivered (`share_status = claimed`) but are missing their
-/// local ciphertext, re-fetches the delivery payload and re-encrypts.
+/// Two-phase sync: (1) forces a full metadata refresh via the snapshot path
+/// (resetting local_seen_sync_version to 0); (2) re-downloads missing key
+/// material for claimed keys that lack local ciphertext.
 pub fn handle_key_sync(
     password: &SecretString,
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = get_authenticated_client()?;
+    // Phase 1: Force a full metadata refresh via the snapshot path.
+    // Reset local_seen_sync_version to 0 so run_snapshot_sync always pulls
+    // fresh state from the server, regardless of the cached version.
+    storage::set_local_seen_sync_version(0);
+    if let Err(e) = run_snapshot_sync() {
+        if !json_mode {
+            eprintln!("Warning: metadata sync failed: {}. Continuing with key material download.", e);
+        }
+    }
 
-    // Fetch all key metadata.
-    let items = client.get_all_keys()?;
-    let mut synced = 0usize;
+    // Phase 2: Re-download missing key material for claimed keys.
+    // Keys that have been claimed but lack local ciphertext need a full delivery
+    // fetch (e.g. first sync after aikey login, or after vault reset).
+    let client = get_authenticated_client()?;
+    let vault_key = derive_vault_key(password)?;
+    let account_id = storage::get_platform_account()
+        .ok()
+        .flatten()
+        .map(|a| a.account_id);
+
     let mut downloaded = 0usize;
 
-    let vault_key = derive_vault_key(password)?;
+    let cached = storage::list_virtual_key_cache().unwrap_or_default();
+    for entry in &cached {
+        let needs_download = entry.share_status == "claimed"
+            && entry.provider_key_ciphertext.is_none();
+        if !needs_download {
+            continue;
+        }
 
-    for item in &items {
-        let existing = storage::get_virtual_key_cache(&item.virtual_key_id)?;
-
-        // Check if we need to (re-)download the actual key material.
-        let needs_download = item.share_status == "claimed"
-            && existing
-                .as_ref()
-                .map(|e| e.provider_key_ciphertext.is_none())
-                .unwrap_or(true);
-
-        if needs_download {
-            match client.get_key_delivery(&item.virtual_key_id) {
-                Ok(payload) => {
-                    match payload.primary_binding() {
-                        None => {
-                            if !json_mode {
-                                eprintln!("Warning: key {} has no active bindings — skipping.", item.virtual_key_id);
-                            }
+        match client.get_key_delivery(&entry.virtual_key_id) {
+            Ok(payload) => {
+                match payload.primary_binding() {
+                    None => {
+                        if !json_mode {
+                            eprintln!(
+                                "Warning: key {} has no active bindings — skipping.",
+                                entry.virtual_key_id
+                            );
                         }
-                        Some(binding) => {
-                            let protocol_type = payload.primary_protocol_type().to_string();
-                            let (nonce, ciphertext) =
-                                crypto::encrypt(&vault_key, binding.provider_key.as_bytes())
-                                    .map_err(|e| format!("Failed to encrypt provider key: {}", e))?;
+                    }
+                    Some(binding) => {
+                        let protocol_type = payload.primary_protocol_type().to_string();
+                        let (nonce, ciphertext) =
+                            crypto::encrypt(&vault_key, binding.provider_key.as_bytes())
+                                .map_err(|e| format!("Failed to encrypt provider key: {}", e))?;
 
-                            let local_state = if payload.key_status == "active" {
-                                existing
-                                    .as_ref()
-                                    .map(|e| e.local_state.clone())
-                                    .unwrap_or_else(|| "synced_inactive".to_string())
-                            } else {
-                                "synced_inactive".to_string()
-                            };
+                        // Preserve the local_state set by Phase 1 (snapshot sync).
+                        let local_state = entry.local_state.clone();
 
-                            let sync_supported_providers = if !payload.supported_providers.is_empty() {
-                                payload.supported_providers.clone()
-                            } else if !binding.provider_code.is_empty() {
-                                vec![binding.provider_code.clone()]
-                            } else {
-                                existing.as_ref().map(|e| e.supported_providers.clone()).unwrap_or_default()
-                            };
-                            let sync_provider_base_urls: std::collections::HashMap<String, String> = payload.slots
+                        let sync_supported_providers = if !payload.supported_providers.is_empty() {
+                            payload.supported_providers.clone()
+                        } else if !binding.provider_code.is_empty() {
+                            vec![binding.provider_code.clone()]
+                        } else {
+                            entry.supported_providers.clone()
+                        };
+                        let sync_provider_base_urls: std::collections::HashMap<String, String> =
+                            payload.slots
                                 .iter()
                                 .flat_map(|slot| slot.binding_targets.iter())
                                 .map(|b| (b.provider_code.clone(), b.base_url.clone()))
                                 .collect();
-                            let entry = VirtualKeyCacheEntry {
-                                virtual_key_id: payload.virtual_key_id.clone(),
-                                org_id: payload.org_id.clone(),
-                                seat_id: payload.seat_id.clone(),
-                                alias: payload.alias.clone(),
-                                provider_code: binding.provider_code.clone(),
-                                protocol_type,
-                                base_url: binding.base_url.clone(),
-                                credential_id: binding.credential_id.clone(),
-                                credential_revision: binding.credential_revision.clone(),
-                                virtual_key_revision: payload.current_revision.clone(),
-                                key_status: payload.key_status.clone(),
-                                share_status: payload.share_status.clone(),
-                                local_state,
-                                expires_at: None,
-                                provider_key_nonce: Some(nonce),
-                                provider_key_ciphertext: Some(ciphertext),
-                                synced_at: 0,
-                                local_alias: existing.as_ref().and_then(|e| e.local_alias.clone()),
-                                supported_providers: sync_supported_providers,
-                                provider_base_urls: sync_provider_base_urls,
-                            };
-                            storage::upsert_virtual_key_cache(&entry)?;
-                            downloaded += 1;
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !json_mode {
-                        eprintln!("Warning: could not fetch delivery for {}: {}", item.virtual_key_id, e);
+
+                        let updated = VirtualKeyCacheEntry {
+                            virtual_key_id:       payload.virtual_key_id.clone(),
+                            org_id:               payload.org_id.clone(),
+                            seat_id:              payload.seat_id.clone(),
+                            alias:                payload.alias.clone(),
+                            provider_code:        binding.provider_code.clone(),
+                            protocol_type,
+                            base_url:             binding.base_url.clone(),
+                            credential_id:        binding.credential_id.clone(),
+                            credential_revision:  binding.credential_revision.clone(),
+                            virtual_key_revision: payload.current_revision.clone(),
+                            key_status:           payload.key_status.clone(),
+                            share_status:         payload.share_status.clone(),
+                            local_state,
+                            expires_at:           entry.expires_at,
+                            provider_key_nonce:   Some(nonce),
+                            provider_key_ciphertext: Some(ciphertext),
+                            synced_at:            0,
+                            local_alias:          entry.local_alias.clone(),
+                            supported_providers:  sync_supported_providers,
+                            provider_base_urls:   sync_provider_base_urls,
+                            owner_account_id:     account_id.clone(),
+                        };
+                        storage::upsert_virtual_key_cache(&updated)?;
+                        downloaded += 1;
                     }
                 }
             }
-        } else {
-            // Metadata-only update.
-            let local_state = if item.key_status == "active" {
-                existing
-                    .as_ref()
-                    .map(|e| e.local_state.clone())
-                    .unwrap_or_else(|| "synced_inactive".to_string())
-            } else {
-                "synced_inactive".to_string()
-            };
-            let nonce = existing.as_ref().and_then(|e| e.provider_key_nonce.clone());
-            let ciphertext = existing.as_ref().and_then(|e| e.provider_key_ciphertext.clone());
-            let base_url = existing.as_ref().map(|e| e.base_url.clone()).unwrap_or_default();
-            let credential_id = existing.as_ref().map(|e| e.credential_id.clone()).unwrap_or_default();
-            let credential_revision = existing.as_ref().map(|e| e.credential_revision.clone()).unwrap_or_default();
-            let virtual_key_revision = existing.as_ref().map(|e| e.virtual_key_revision.clone()).unwrap_or_default();
-
-            let meta_supported_providers = if !item.supported_providers.is_empty() {
-                item.supported_providers.clone()
-            } else {
-                existing.as_ref().map(|e| e.supported_providers.clone()).unwrap_or_default()
-            };
-            // Preserve existing provider_base_urls — metadata sync doesn't re-deliver base URLs.
-            let meta_provider_base_urls = existing.as_ref()
-                .map(|e| e.provider_base_urls.clone())
-                .unwrap_or_default();
-            let entry = VirtualKeyCacheEntry {
-                virtual_key_id: item.virtual_key_id.clone(),
-                org_id: item.org_id.clone(),
-                seat_id: item.seat_id.clone(),
-                alias: item.alias.clone(),
-                provider_code: item.provider_code.clone(),
-                protocol_type: "openai_compatible".to_string(),
-                base_url,
-                credential_id,
-                credential_revision,
-                virtual_key_revision,
-                key_status: item.key_status.clone(),
-                share_status: item.share_status.clone(),
-                local_state,
-                expires_at: None,
-                provider_key_nonce: nonce,
-                provider_key_ciphertext: ciphertext,
-                synced_at: 0,
-                local_alias: existing.as_ref().and_then(|e| e.local_alias.clone()),
-                supported_providers: meta_supported_providers,
-                provider_base_urls: meta_provider_base_urls,
-            };
-            storage::upsert_virtual_key_cache(&entry)?;
+            Err(e) => {
+                if !json_mode {
+                    eprintln!(
+                        "Warning: could not fetch delivery for {}: {}",
+                        entry.virtual_key_id, e
+                    );
+                }
+            }
         }
-        synced += 1;
     }
 
     if json_mode {
         crate::json_output::print_json(serde_json::json!({
             "ok": true,
-            "synced": synced,
             "downloaded": downloaded,
         }));
     } else {
-        println!("Sync complete: {} key(s) updated, {} key(s) downloaded.", synced, downloaded);
+        println!("Sync complete: {} key(s) downloaded.", downloaded);
     }
     Ok(())
 }
@@ -1062,6 +1340,11 @@ pub fn handle_key_sync(
 ///
 /// Accepts both canonical codes ("anthropic") and common brand-name aliases
 /// ("claude", "claude-3", etc.) that servers may use.
+/// Public re-export of `provider_env_vars` for use by `executor::run_with_active_key`.
+pub fn provider_env_vars_pub(provider_code: &str) -> Option<(&'static str, &'static str)> {
+    provider_env_vars(provider_code)
+}
+
 fn provider_env_vars(provider_code: &str) -> Option<(&'static str, &'static str)> {
     match provider_code.to_lowercase().as_str() {
         "anthropic" | "claude" => Some(("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")),
@@ -1079,6 +1362,11 @@ fn provider_env_vars(provider_code: &str) -> Option<(&'static str, &'static str)
 /// The proxy's path-prefix router only recognises the canonical names
 /// (e.g. `/anthropic/v1/...`), so env vars written by `write_active_env`
 /// must use these — even when the server sends a brand alias like "Claude".
+/// Public re-export of `provider_proxy_prefix` for use by `executor::run_with_active_key`.
+pub fn provider_proxy_prefix_pub(provider_code: &str) -> &'static str {
+    provider_proxy_prefix(provider_code)
+}
+
 fn provider_proxy_prefix(provider_code: &str) -> &'static str {
     match provider_code.to_lowercase().as_str() {
         "anthropic" | "claude" => "anthropic",
@@ -1342,6 +1630,33 @@ pub fn handle_key_use(
                 entry.alias, entry.key_status
             ).into());
         }
+        if entry.local_state.starts_with("disabled_by_") {
+            let reason = match entry.local_state.as_str() {
+                "disabled_by_account_scope" => format!(
+                    "Key '{}' belongs to a different account and cannot be activated.\n\
+                     Log in to the correct account with: aikey account login",
+                    entry.alias
+                ),
+                "disabled_by_seat_status" => format!(
+                    "Key '{}' is unavailable because your seat has been suspended.\n\
+                     Contact your organization admin for details.",
+                    entry.alias
+                ),
+                "disabled_by_account_status" => format!(
+                    "Key '{}' is unavailable because the account has been disabled.",
+                    entry.alias
+                ),
+                "disabled_by_key_status" => format!(
+                    "Key '{}' has been revoked or expired. Run 'aikey key sync' to refresh.",
+                    entry.alias
+                ),
+                other => format!(
+                    "Key '{}' is currently unavailable (state: {}). Run 'aikey key sync' to refresh.",
+                    entry.alias, other
+                ),
+            };
+            return Err(reason.into());
+        }
         if entry.provider_key_ciphertext.is_none() {
             return Err(format!(
                 "Key '{}' has not been delivered yet. Run 'aikey key accept {}' first.",
@@ -1503,15 +1818,16 @@ pub fn handle_key_use(
             }
         }
         println!();
+        println!("  {}", "Next steps:".bold());
         if let Some(msg) = hook_msg {
             println!("{}", msg.dimmed());
-            println!();
-            println!("{} Run: {}", "→".dimmed(), "source ~/.aikey/active.env".cyan());
-            println!("{} Or open a new terminal window.", "→".dimmed());
+            println!("  {} Apply now:       {}", "→".dimmed(), "source ~/.aikey/active.env".cyan());
         } else {
-            println!("{} Press {} once again to apply in this terminal (to active shell hook).", "→".dimmed(), "Enter".bold());
-            println!("{} Or open a new terminal window.", "→".dimmed());
+            println!("  {} Apply now:       {}", "→".dimmed(), "source ~/.aikey/active.env".cyan());
         }
+        println!("  {} Or open a new terminal — env vars will be ready automatically.", "→".dimmed());
+        println!("  {} Tools can use:   {}", "→".dimmed(),
+            format!("http://127.0.0.1:{}/{}", PROXY_PORT, provider_proxy_prefix(primary_provider)).cyan());
     }
     Ok(())
 }
@@ -1572,7 +1888,7 @@ fn collect_pending_for_prompt() -> Option<Vec<storage::VirtualKeyCacheEntry>> {
         .filter(|e| {
             e.share_status == "pending_claim"
                 && e.key_status == "active"
-                && e.local_state != "prompt_dismissed"
+                && e.local_state == "synced_inactive"
         })
         .collect();
     if entries.is_empty() { None } else { Some(entries) }
@@ -1687,5 +2003,111 @@ fn truncate(s: &str, max: usize) -> &str {
         s
     } else {
         &s[..max]
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::compute_local_state_from_effective;
+
+    // ── inactive paths ──────────────────────────────────────────────────────
+
+    #[test]
+    fn inactive_seat_disabled_maps_correctly() {
+        assert_eq!(
+            compute_local_state_from_effective("inactive", "seat_disabled", ""),
+            "disabled_by_seat_status"
+        );
+    }
+
+    #[test]
+    fn inactive_key_revoked_maps_correctly() {
+        assert_eq!(
+            compute_local_state_from_effective("inactive", "key_revoked", "active"),
+            "disabled_by_key_status"
+        );
+    }
+
+    #[test]
+    fn inactive_key_expired_maps_correctly() {
+        assert_eq!(
+            compute_local_state_from_effective("inactive", "key_expired", "active"),
+            "disabled_by_key_status"
+        );
+    }
+
+    #[test]
+    fn inactive_account_disabled_maps_correctly() {
+        assert_eq!(
+            compute_local_state_from_effective("inactive", "account_disabled", "active"),
+            "disabled_by_account_status"
+        );
+    }
+
+    #[test]
+    fn inactive_unknown_reason_maps_to_synced_inactive() {
+        // not_claimed and any unknown reason → synced_inactive
+        assert_eq!(
+            compute_local_state_from_effective("inactive", "not_claimed", ""),
+            "synced_inactive"
+        );
+        assert_eq!(
+            compute_local_state_from_effective("inactive", "", ""),
+            "synced_inactive"
+        );
+    }
+
+    // ── active paths — existing state is preserved or restored ──────────────
+
+    #[test]
+    fn active_preserves_active_state() {
+        assert_eq!(
+            compute_local_state_from_effective("active", "", "active"),
+            "active"
+        );
+    }
+
+    #[test]
+    fn active_preserves_prompt_dismissed() {
+        assert_eq!(
+            compute_local_state_from_effective("active", "", "prompt_dismissed"),
+            "prompt_dismissed"
+        );
+    }
+
+    #[test]
+    fn active_restores_disabled_scope_to_synced_inactive() {
+        assert_eq!(
+            compute_local_state_from_effective("active", "", "disabled_by_account_scope"),
+            "synced_inactive"
+        );
+        assert_eq!(
+            compute_local_state_from_effective("active", "", "disabled_by_account_status"),
+            "synced_inactive"
+        );
+        assert_eq!(
+            compute_local_state_from_effective("active", "", "disabled_by_seat_status"),
+            "synced_inactive"
+        );
+        assert_eq!(
+            compute_local_state_from_effective("active", "", "disabled_by_key_status"),
+            "synced_inactive"
+        );
+        assert_eq!(
+            compute_local_state_from_effective("active", "", "stale"),
+            "synced_inactive"
+        );
+    }
+
+    #[test]
+    fn active_new_entry_defaults_to_synced_inactive() {
+        assert_eq!(
+            compute_local_state_from_effective("active", "", ""),
+            "synced_inactive"
+        );
+        assert_eq!(
+            compute_local_state_from_effective("active", "", "synced_inactive"),
+            "synced_inactive"
+        );
     }
 }
