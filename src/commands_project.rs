@@ -250,7 +250,7 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
             io::stdin().read_line(&mut pw)?;
             SecretString::new(pw.trim().to_string().into())
         } else {
-            let pw = crate::prompt_hidden("Set Master Password: ")
+            let pw = crate::prompt_hidden("\u{1F512} Set Master Password: ")
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             SecretString::new(pw.into())
         };
@@ -337,7 +337,7 @@ pub fn handle_project_map(
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Verify master password before mutating config
-    let prompt_str = if json_mode { "" } else { "Enter Master Password: " };
+    let prompt_str = if json_mode { "" } else { "\u{1F512} Enter Master Password: " };
     let password = crate::prompt_hidden(prompt_str)?;
     let password_raw = Zeroizing::new(password);
     let secret = SecretString::new(password_raw.trim().to_string());
@@ -579,7 +579,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
 
     // ── 4. Proxy process + reachability ──────────────────────
     let proxy_addr = crate::commands_proxy::doctor_proxy_addr();
-    let (proxy_up, proxy_pid) = crate::commands_proxy::doctor_proxy_status();
+    let (mut proxy_up, proxy_pid) = crate::commands_proxy::doctor_proxy_status();
     {
         let detail = match (proxy_up, proxy_pid) {
             (true, Some(pid)) => {
@@ -594,10 +594,25 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             (false, Some(pid)) => format!("pid {} alive but port not open", pid),
             _ => "not running".to_string(),
         };
-        let hint = if proxy_up { None } else {
-            Some("proxy auto-starts with any aikey command — try 'aikey doctor' to diagnose")
-        };
-        emit("proxy", proxy_up, &detail, hint);
+
+        if proxy_up {
+            emit("proxy", true, &detail, None);
+        } else {
+            emit("proxy", false, &detail, Some("attempting restart..."));
+            // Auto-restart: try env var first, then prompt for password.
+            if !json_mode {
+                crate::commands_proxy::ensure_proxy_for_use(false);
+                // Re-check after restart attempt.
+                let (up, _) = crate::commands_proxy::doctor_proxy_status();
+                if up {
+                    proxy_up = true;
+                    emit("proxy restart", true, "proxy restarted successfully", None);
+                } else {
+                    emit("proxy restart", false, "restart failed",
+                        Some("run 'aikey proxy start' manually to debug"));
+                }
+            }
+        }
     }
 
     // ── 5. Provider connectivity (parallel, streaming) ───────
@@ -750,7 +765,67 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
-    // ── 7. Control service ───────────────────────────────────
+    // ── 7. Shell hook installed ───────────────────────────────
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        let hook_marker = "# aikey shell hook";
+
+        let rc_file = if shell.contains("zsh") {
+            Some(format!("{}/.zshrc", home))
+        } else if shell.contains("bash") {
+            // Check .bashrc first, then .bash_profile.
+            let bashrc = format!("{}/.bashrc", home);
+            let profile = format!("{}/.bash_profile", home);
+            if std::path::Path::new(&bashrc).exists() { Some(bashrc) }
+            else { Some(profile) }
+        } else {
+            None
+        };
+
+        let installed = rc_file.as_ref().map_or(false, |rc| {
+            std::fs::read_to_string(rc)
+                .map(|c| c.contains(hook_marker))
+                .unwrap_or(false)
+        });
+
+        if installed {
+            emit("shell hook", true, "installed", None);
+        } else if rc_file.is_some() {
+            emit("shell hook", false, "not installed",
+                Some("installing shell hook..."));
+            // Trigger installation (prompts user in TTY mode).
+            if !json_mode {
+                let _ = crate::commands_account::ensure_shell_hook(false);
+            }
+        } else {
+            emit("shell hook", false, "unsupported shell",
+                Some("add 'source ~/.aikey/active.env' to your shell config manually"));
+        }
+    }
+
+    // ── 8. SQLite WAL size ──────────────────────────────────
+    {
+        if let Ok(vault_path) = storage::get_vault_path() {
+            let wal_path = vault_path.with_extension("db-wal");
+            if wal_path.exists() {
+                let wal_size = std::fs::metadata(&wal_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let wal_mb = wal_size / (1024 * 1024);
+                if wal_mb >= 1000 {
+                    emit("vault WAL", false,
+                        &format!("{}MB — needs checkpoint", wal_mb),
+                        Some("run: sqlite3 ~/.aikey/data/vault.db 'PRAGMA wal_checkpoint(TRUNCATE);'"));
+                } else {
+                    emit("vault WAL", true,
+                        &format!("{}MB", wal_mb), None);
+                }
+            }
+        }
+    }
+
+    // ── 9. Control service ───────────────────────────────────
     if let Ok(Some(account)) = storage::get_platform_account() {
         let url = format!("{}/health", account.control_url.trim_end_matches('/'));
         let start = Instant::now();

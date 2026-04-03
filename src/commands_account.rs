@@ -95,7 +95,8 @@ fn configure_proxy_collector(control_url: &str, json_mode: bool) {
                 cached
             } else {
                 // No cached password — prompt inline.
-                eprint!("    Restart proxy to apply. Enter Master Password: ");
+                eprintln!("    Restart proxy to apply.");
+                eprint!("    \u{1F512} Enter Master Password: ");
                 let _ = io::Write::flush(&mut io::stderr());
                 match rpassword::read_password() {
                     Ok(p) => SecretString::new(p),

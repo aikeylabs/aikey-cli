@@ -172,15 +172,16 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
     use std::io::IsTerminal;
     if io::stderr().is_terminal() || password_stdin {
         eprintln!();
+        eprintln!("  Proxy not running — starting it now.");
         let pw = if password_stdin {
-            eprint!("  Proxy not running. Enter Master Password to start it: ");
+            eprint!("  \u{1F512} Enter Master Password: ");
             let _ = io::stderr().flush();
             let mut line = String::new();
             let _ = io::stdin().read_line(&mut line);
             eprintln!("***");
             SecretString::new(line.trim().to_string())
         } else {
-            match crate::prompt_hidden("  Proxy not running. Enter Master Password to start it: ") {
+            match crate::prompt_hidden("  \u{1F512} Enter Master Password: ") {
                 Ok(p) => SecretString::new(p),
                 Err(_) => {
                     eprintln!("  [aikey] Could not read password — run `aikey proxy start` manually.");

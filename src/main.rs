@@ -72,6 +72,7 @@ enum Commands {
     Delete {
         alias: String,
     },
+    #[command(alias = "ls")]
     List,
     Update {
         alias: String,
@@ -732,7 +733,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     match command {
         Commands::Init => {
-            let password = prompt_password_secure("Set Master Password: ", cli.password_stdin, cli.json)?;
+            let password = prompt_password_secure("\u{1F512} Set Master Password: ", cli.password_stdin, cli.json)?;
             let mut salt = [0u8; 16];
             crypto::generate_salt(&mut salt)?;
 
@@ -767,7 +768,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
                 Zeroizing::new(test_secret)
             } else if std::io::stdin().is_terminal() {
-                let val = prompt_hidden("Enter API Key: ")
+                let val = prompt_hidden("\u{1F511} Enter API Key: ")
                     .map_err(|e| format!("Failed to read API Key value: {}", e))?;
                 Zeroizing::new(val)
             } else {
@@ -1091,13 +1092,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Zeroizing::new(test_secret)
             } else if std::io::stdin().is_terminal() {
                 // Hidden prompt on TTY
-                let val = prompt_hidden("Enter New Secret: ")
+                let val = prompt_hidden("\u{1F511} Enter New Secret: ")
                     .map_err(|e| format!("Failed to read secret value: {}", e))?;
                 Zeroizing::new(val)
             } else {
                 // Plain stdin for pipes / automation
                 if !cli.json {
-                    print!("Enter New Secret: ");
+                    print!("\u{1F511} Enter New Secret: ");
                     io::stdout().flush()?;
                 }
                 let mut secret = Zeroizing::new(String::new());
@@ -1127,8 +1128,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Export { pattern, output } => {
-            let vault_password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-            let export_password = prompt_password_secure("Enter Export Password: ", cli.password_stdin, cli.json)?;
+            let vault_password = prompt_password_secure("\u{1F512} Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let export_password = prompt_password_secure("\u{1F512} Enter Export Password: ", cli.password_stdin, cli.json)?;
             let output_path = std::path::Path::new(output);
 
             let result = synapse::export_vault(pattern, output_path, &vault_password, &export_password);
@@ -1156,8 +1157,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Import { file } => {
-            let export_password = prompt_password_secure("Enter Export Password: ", cli.password_stdin, cli.json)?;
-            let vault_password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let export_password = prompt_password_secure("\u{1F512} Enter Export Password: ", cli.password_stdin, cli.json)?;
+            let vault_password = prompt_password_secure("\u{1F512} Enter Master Password: ", cli.password_stdin, cli.json)?;
             let input_path = std::path::Path::new(file);
 
             let result = synapse::import_vault(input_path, &export_password, &vault_password);
@@ -1378,9 +1379,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::ChangePassword => {
-            let old_password = prompt_password_secure("Enter Master Password: ", cli.password_stdin, cli.json)?;
-            let new_password = prompt_password_secure("Enter New Master Password: ", false, cli.json)?;
-            let confirm_password = prompt_password_secure("Confirm New Master Password: ", false, cli.json)?;
+            let old_password = prompt_password_secure("\u{1F512} Enter Master Password: ", cli.password_stdin, cli.json)?;
+            let new_password = prompt_password_secure("\u{1F512} Enter New Master Password: ", false, cli.json)?;
+            let confirm_password = prompt_password_secure("\u{1F512} Confirm New Master Password: ", false, cli.json)?;
 
             if new_password.expose_secret() != confirm_password.expose_secret() {
                 if cli.json {
@@ -1478,7 +1479,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     // Read secret value: hidden prompt on TTY, plain stdin for pipes
                     let secret = if std::io::stdin().is_terminal() {
-                        let val = prompt_hidden("Enter API Key value: ")
+                        let val = prompt_hidden("\u{1F511} Enter API Key value: ")
                             .map_err(|e| format!("Failed to read secret value: {}", e))?;
                         Zeroizing::new(val)
                     } else {
@@ -1564,7 +1565,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     // Read secret value: hidden prompt on TTY, plain stdin for pipes
                     let secret = if std::io::stdin().is_terminal() {
-                        let val = prompt_hidden("Enter API Key value: ")
+                        let val = prompt_hidden("\u{1F511} Enter API Key value: ")
                             .map_err(|e| format!("Failed to read secret value: {}", e))?;
                         Zeroizing::new(val)
                     } else {
@@ -1948,7 +1949,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         io::stdin().read_line(&mut buf)?;
                         buf
                     } else {
-                        let val = prompt_hidden(&format!("New value for '{}': ", name))
+                        let val = prompt_hidden(&format!("\u{1F511} New value for '{}': ", name))
                             .map_err(|e| format!("Failed to read new key value: {}", e))?;
                         Zeroizing::new(val)
                     };
@@ -2318,13 +2319,13 @@ fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Res
         .map(|p| p.exists())
         .unwrap_or(false);
     let prompt = if vault_exists {
-        "Enter Master Password: "
+        "\u{1F512} Enter Master Password: "
     } else {
         if !json_mode && !password_stdin && std::env::var("AK_TEST_PASSWORD").is_err() {
             eprintln!("Welcome to aikey! No vault found — setting up for the first time.");
             eprintln!("Choose a master password to protect your API Keys (you cannot recover it if lost).");
         }
-        "Set Master Password: "
+        "\u{1F512} Set Master Password: "
     };
     prompt_password_secure(prompt, password_stdin, json_mode)
 }
