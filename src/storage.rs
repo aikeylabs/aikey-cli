@@ -1404,6 +1404,17 @@ pub fn save_platform_account(
     Ok(())
 }
 
+/// Updates only the control_url of the existing platform_account row.
+pub fn update_platform_control_url(new_url: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE platform_account SET control_url = ?1 WHERE id = 1",
+        params![new_url],
+    )
+    .map_err(|e| format!("Failed to update control_url: {}", e))?;
+    Ok(())
+}
+
 /// Returns the stored platform account, or `None` if not logged in.
 pub fn get_platform_account() -> Result<Option<PlatformAccount>, String> {
     let db_path = get_vault_path()?;

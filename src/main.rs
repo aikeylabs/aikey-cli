@@ -22,6 +22,8 @@ mod providers;
 mod resolver;
 mod events;
 mod observability;
+mod ui_frame;
+mod ui_select;
 
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
@@ -305,6 +307,12 @@ enum AccountAction {
     Status,
     /// Log out (removes stored JWT)
     Logout,
+    /// Update the control panel URL without re-logging in
+    #[command(name = "set-url")]
+    SetUrl {
+        /// New control panel URL (e.g. http://192.168.1.100:3000)
+        url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -639,6 +647,7 @@ fn command_name(cmd: Option<&Commands>) -> String {
                 AccountAction::Login { .. } => "login",
                 AccountAction::Status => "status",
                 AccountAction::Logout => "logout",
+                AccountAction::SetUrl { .. } => "set-url",
             }),
             Commands::Login { .. } => "account.login".to_string(),
             Commands::Logout => "account.logout".to_string(),
@@ -993,21 +1002,21 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     })).collect::<Vec<_>>(),
                 }));
             } else {
-
                 use colored::Colorize;
 
                 // Read active key config once for LOCAL column.
                 let active_cfg = storage::get_active_key_config().ok().flatten();
 
-                // ── Personal keys (local vault secrets) ──────────────────
-                println!("{}", format!("Personal keys  ({}):", entries.len()).bold());
+                let mut rows: Vec<String> = Vec::new();
+
+                // ── Personal keys section ──────────────────────────────
+                rows.push(format!("\u{1F4CB} Personal Keys ({})", entries.len()));
+                rows.push(format!("{:<20}  {:<28}  {:<10}  {}",
+                    "ALIAS", "PROVIDER / BASE_URL", "LOCAL", "KEY"));
+                rows.push("\u{2500}".repeat(80));
                 if entries.is_empty() {
-                    println!("  {}", "(none)".dimmed());
+                    rows.push("(none)".to_string());
                 } else {
-                    println!("  {:<20}  {:<28}  {:<10}  {}",
-                        "ALIAS".bold(), "PROVIDER / BASE_URL".bold(),
-                        "LOCAL".bold(), "KEY".bold());
-                    println!("  {}", "─".repeat(66).dimmed());
                     for entry in &entries {
                         let provider_col = match (&entry.base_url, &entry.provider_code) {
                             (Some(url), _) if !url.is_empty() => url.as_str().to_string(),
@@ -1017,46 +1026,40 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let is_active = active_cfg.as_ref().map_or(false, |cfg| {
                             cfg.key_type == "personal" && cfg.key_ref == entry.alias
                         });
-                        let local_str = if is_active {
+                        let local_col = if is_active {
                             format!("{:<10}", "active").green().to_string()
                         } else {
-                            format!("{:<10}", "").to_string()
+                            format!("{:<10}", "")
                         };
-                        println!("  {:<20}  {:<28}  {}  {}",
-                            format!("{:<20}", &entry.alias).bold(),
-                            format!("{:<28}", if provider_col.len() > 28 { &provider_col[..28] } else { &provider_col }).dimmed(),
-                            local_str,
-                            "✓".green().bold(),
-                        );
+                        rows.push(format!("{:<20}  {:<28}  {}  {}",
+                            &entry.alias,
+                            if provider_col.len() > 28 { &provider_col[..28] } else { &provider_col },
+                            local_col,
+                            "\u{2713}",
+                        ));
                     }
                 }
 
-                // ── Team keys (server-managed, from local cache) ──────────
-                println!();
-                println!("{}", format!("Team keys  ({}):", managed.len()).bold());
+                // ── Blank separator ──────────────────────────────────
+                rows.push(String::new());
+
+                // ── Team keys section ────────────────────────────────
+                rows.push(format!("\u{1F465} Team Keys ({})", managed.len()));
+                rows.push(format!("{:<24}  {:<16}  {:<16}  {:<16}  {:<4}  {}",
+                    "ALIAS", "PROVIDER", "LOCAL", "REMOTE STATUS", "KEY", "SHARE"));
+                rows.push("\u{2500}".repeat(80));
                 if managed.is_empty() {
-                    println!("  {}", "(none)".dimmed());
+                    rows.push("(none)".to_string());
                 } else {
-                    println!("  {:<24}  {:<16}  {:<16}  {:<16}  {:<4}  {}",
-                        "ALIAS".bold(), "PROVIDER".bold(), "LOCAL".bold(),
-                        "REMOTE STATUS".bold(), "KEY".bold(), "SHARE".bold());
-                    println!("  {}", "─".repeat(92).dimmed());
                     for e in &managed {
-                        let has_key = if e.provider_key_ciphertext.is_some() {
-                            "✓".green().bold().to_string()
-                        } else {
-                            String::new()
-                        };
-                        // Show local_alias if set; append server alias dimmed when different.
+                        let has_key = if e.provider_key_ciphertext.is_some() { "\u{2713}" } else { "" };
                         let display_name = e.local_alias.as_deref().unwrap_or(e.alias.as_str());
                         let raw_alias = if display_name.len() > 24 { &display_name[..24] } else { display_name };
-                        let alias = format!("{:<24}", raw_alias).bold().to_string();
                         let server_alias_hint = if e.local_alias.is_some() {
-                            format!(" {}", format!("(← {})", e.alias).dimmed())
+                            format!(" (\u{2190} {})", e.alias)
                         } else {
                             String::new()
                         };
-                        let provider = format!("{:<16}", &e.provider_code).dimmed().to_string();
                         let local_str = match e.local_state.as_str() {
                             "active"                     => format!("{:<16}", "active").green().to_string(),
                             "synced_inactive"            => format!("{:<16}", "inactive").dimmed().to_string(),
@@ -1068,20 +1071,21 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             "stale"                      => format!("{:<16}", "stale").dimmed().to_string(),
                             other                        => format!("{:<16}", other).dimmed().to_string(),
                         };
-                        let status_str = match e.key_status.as_str() {
-                            "active"  => format!("{:<16}", "active").green().bold().to_string(),
-                            "revoked" => format!("{:<16}", "revoked").red().to_string(),
-                            other     => format!("{:<16}", other).dimmed().to_string(),
-                        };
+                        let status_str = &e.key_status;
                         let share = match e.share_status.as_str() {
-                            "pending_claim" => "pending ←".yellow().to_string(),
+                            "pending_claim" => "pending \u{2190}".yellow().to_string(),
                             _ => String::new(),
                         };
-                        println!("  {}  {}  {}  {}  {:<4}  {}{}",
-                            alias, provider, local_str, status_str, has_key, share, server_alias_hint);
+                        rows.push(format!("{:<24}  {:<16}  {}  {}  {:<4}  {}{}",
+                            raw_alias, &e.provider_code, local_str, status_str, has_key, share, server_alias_hint));
                     }
-                    // Pending notice is shown in `aikey key list` output above.
                 }
+
+                ui_frame::print_box(
+                    "\u{1F511}",
+                    "Keys",
+                    &rows,
+                );
             }
         }
         Commands::Update { alias } => {
@@ -2034,6 +2038,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 AccountAction::Logout => {
                     commands_account::handle_logout(cli.json)?;
                 }
+                AccountAction::SetUrl { url } => {
+                    commands_account::handle_set_control_url(url, cli.json)?;
+                }
             }
         }
         Commands::Login { url, token, email } => {
@@ -2462,29 +2469,28 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
         }
     }
 
-    let header = format!("          {:<22}  {:<28}",
-        "ALIAS", "PROVIDER / BASE_URL");
-    println!("  {}", header.bold());
-    println!("  {}", "─".repeat(56).dimmed());
+    let header = format!("        {:<22}  {:<28}", "ALIAS", "PROVIDER / BASE_URL");
 
-    loop {
-        let selected = inquire::Select::new("Select a key to activate:", items.clone())
-            .prompt()
-            .map_err(|e| format!("Selection cancelled: {}", e))?;
+    // Find initial cursor: prefer the currently active key, else first selectable.
+    let initial = active_cfg.as_ref()
+        .and_then(|cfg| {
+            aliases.iter().position(|a| {
+                (cfg.key_type == "team" && *a == cfg.key_ref)
+                    || (cfg.key_type == "personal" && *a == cfg.key_ref)
+            })
+        })
+        .and_then(|i| if selectable[i] { Some(i) } else { None })
+        .or_else(|| selectable.iter().position(|&s| s))
+        .unwrap_or(0);
 
-        let idx = items.iter().position(|r| r == &selected).unwrap_or(0);
-
-        if selectable[idx] {
-            return Ok(aliases[idx].clone());
-        }
-
-        eprintln!(
-            "\n  {} This key belongs to a different account and cannot be selected.",
-            "✗".red()
-        );
-        eprintln!(
-            "  Switch account with: {}\n",
-            "aikey account login".bold()
-        );
+    match ui_select::box_select(
+        "Select a key to activate",
+        &header,
+        &items,
+        &selectable,
+        initial,
+    )? {
+        ui_select::SelectResult::Selected(idx) => Ok(aliases[idx].clone()),
+        ui_select::SelectResult::Cancelled => Err("Selection cancelled.".into()),
     }
 }

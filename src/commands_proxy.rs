@@ -784,6 +784,14 @@ pub fn doctor_proxy_addr() -> String {
     proxy_listen_addr(None)
 }
 
+/// Returns the proxy listen port from config, falling back to 27200.
+pub fn proxy_port() -> u16 {
+    let addr = proxy_listen_addr(None);
+    addr.rsplit(':').next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(27200)
+}
+
 /// Returns `(is_running, pid)` — checks PID file + process alive + port reachable.
 pub fn doctor_proxy_status() -> (bool, Option<u32>) {
     let addr = proxy_listen_addr(None);

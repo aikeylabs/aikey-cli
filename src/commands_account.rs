@@ -131,6 +131,60 @@ fn save_control_url_to_config(url: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// account set-url
+// ---------------------------------------------------------------------------
+
+/// `aikey account set-url <URL>`
+///
+/// Updates the control panel URL without re-authenticating. Useful when the
+/// server IP changes (e.g. after a reboot with DHCP).
+pub fn handle_set_control_url(url: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let url = url.trim_end_matches('/');
+
+    // Update config.json (used by login flow for default URL).
+    save_control_url_to_config(url);
+
+    // Update the platform_account row if logged in (used by all API calls).
+    if let Ok(Some(acc)) = storage::get_platform_account() {
+        let old_url = acc.control_url.clone();
+        storage::update_platform_control_url(url)?;
+
+        // Also update proxy collector_url (nginx proxies collector on same origin).
+        configure_proxy_collector(url, json_mode);
+
+        if json_mode {
+            crate::json_output::print_json(serde_json::json!({
+                "ok": true,
+                "old_url": old_url,
+                "new_url": url,
+            }));
+        } else {
+            println!("{} Control URL updated.", "\u{2713}".green());
+            println!("  {} → {}", old_url.dimmed(), url.bold());
+            println!("  Proxy collector URL also updated.");
+            println!();
+            println!("  {} Restart proxy to apply: {}", "\u{2192}".dimmed(), "aikey proxy restart".bold());
+        }
+    } else {
+        // Not logged in — only save to config.json.
+        if json_mode {
+            crate::json_output::print_json(serde_json::json!({
+                "ok": true,
+                "new_url": url,
+                "note": "not logged in — saved to config only",
+            }));
+        } else {
+            println!("{} Control URL saved to config.", "\u{2713}".green());
+            println!("  URL: {}", url.bold());
+            println!("  Log in with: {}", format!("aikey login --control-url {}", url).cyan());
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // account login / status / logout
 // ---------------------------------------------------------------------------
 
@@ -858,7 +912,7 @@ fn apply_snapshot_to_cache(
                     let display = entry.local_alias.as_deref().unwrap_or(entry.alias.as_str());
                     let _ = write_active_env(
                         "team", &entry.virtual_key_id, display,
-                        &entry.supported_providers, 27200,
+                        &entry.supported_providers, crate::commands_proxy::proxy_port(),
                     );
                 }
             }
@@ -1213,7 +1267,7 @@ pub fn sync_managed_key_metadata() -> bool {
             if let Ok(Some(active_cfg)) = crate::storage::get_active_key_config() {
                 if active_cfg.key_type == "team" && active_cfg.key_ref == entry.virtual_key_id {
                     let display = entry.local_alias.as_deref().unwrap_or(entry.alias.as_str());
-                    let _ = write_active_env("team", &entry.virtual_key_id, display, &entry.supported_providers, 27200);
+                    let _ = write_active_env("team", &entry.virtual_key_id, display, &entry.supported_providers, crate::commands_proxy::proxy_port());
                 }
             }
         }
@@ -1492,6 +1546,160 @@ pub fn handle_run_direct(
     std::process::exit(status.code().unwrap_or(1));
 }
 
+/// Auto-configure `~/.kimi/config.toml` so Kimi CLI works through the proxy.
+///
+/// Kimi CLI requires a static config with `[providers.kimi]` and `[models.*]`
+/// (env vars alone are not enough — it won't select a model without config).
+/// This function ensures the provider block points to the aikey proxy and the
+/// api_key matches the current token. Model entries are added idempotently.
+fn configure_kimi_cli(token_value: &str, proxy_port: u16) {
+    use colored::Colorize;
+    use std::io::{IsTerminal, Write};
+
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let config_dir = std::path::PathBuf::from(&home).join(".kimi");
+    let config_path = config_dir.join("config.toml");
+
+    let base_url = format!("http://127.0.0.1:{}/kimi/v1", proxy_port);
+
+    // Read existing config or start with defaults.
+    let mut content = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+    let marker = "# managed by aikey";
+
+    // Already configured — silent update (no prompt needed for subsequent switches).
+    if content.contains(marker) {
+        let mut updated = String::new();
+        let mut in_kimi_provider = false;
+        for line in content.lines() {
+            if line.starts_with("[providers.kimi]") {
+                in_kimi_provider = true;
+                updated.push_str(line);
+            } else if line.starts_with('[') {
+                in_kimi_provider = false;
+                updated.push_str(line);
+            } else if in_kimi_provider && line.starts_with("api_key = ") {
+                updated.push_str(&format!("api_key = \"{}\"", token_value));
+            } else if in_kimi_provider && line.starts_with("base_url = ") {
+                updated.push_str(&format!("base_url = \"{}\"", base_url));
+            } else if line.starts_with("default_model = ") {
+                // Why: TOML section keys cannot contain dots, so "kimi-k2.5" becomes
+                // key "kimi-k2-5". Kimi CLI validates default_model against key names.
+                let fixed = line
+                    .replace("\"kimi-k2.5\"", "\"kimi-k2-5\"")
+                    .replace("\"moonshot-v1.128k\"", "\"moonshot-v1-128k\"");
+                updated.push_str(&fixed);
+            } else {
+                updated.push_str(line);
+            }
+            updated.push('\n');
+        }
+        let _ = std::fs::write(&config_path, updated);
+        return;
+    }
+
+    // First time — prompt user before modifying their config.
+    if io::stderr().is_terminal() {
+        let mut rows: Vec<String> = vec![
+            format!("File:    {}", "~/.kimi/config.toml"),
+            format!("Add:     provider  base_url={}", base_url),
+            format!("         models: kimi-k2.5, moonshot-v1-128k"),
+        ];
+        if !content.is_empty() {
+            rows.push(format!("Backup:  {}", "~/.kimi/config.aikey_backup.toml"));
+        }
+        crate::ui_frame::eprint_box("\u{2753}", "Configure Kimi CLI", &rows);
+        eprint!("  Proceed? [Y/n]: ");
+        io::stderr().flush().ok();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_ok() {
+            if input.trim().to_lowercase() == "n" {
+                eprintln!("  {}", "Skipped. Run 'aikey use kimi' again to retry.".dimmed());
+                return;
+            }
+        }
+    }
+
+    // Backup original config before first modification.
+    let backup_path = config_dir.join("config.aikey_backup.toml");
+    if !content.is_empty() && !backup_path.exists() {
+        let _ = std::fs::copy(&config_path, &backup_path);
+    }
+
+    let _ = std::fs::create_dir_all(&config_dir);
+
+    // If default_model is empty, set it.
+    if content.contains("default_model = \"\"") {
+        content = content.replace("default_model = \"\"", "default_model = \"kimi-k2-5\"");
+    }
+
+    let kimi_provider = format!(
+        "[providers.kimi]  {}\ntype = \"kimi\"\nbase_url = \"{}\"\napi_key = \"{}\"",
+        marker, base_url, token_value
+    );
+    let kimi_models = concat!(
+        "[models.kimi-k2-5]\nprovider = \"kimi\"\nmodel = \"kimi-k2.5\"\nmax_context_size = 131072\n\n",
+        "[models.moonshot-v1-128k]\nprovider = \"kimi\"\nmodel = \"moonshot-v1-128k\"\nmax_context_size = 131072",
+    );
+
+    if content.contains("[providers]") && !content.contains("[providers.") {
+        content = content.replace("[providers]", &kimi_provider);
+    } else if !content.contains("[providers.kimi]") {
+        content.push_str(&format!("\n{}\n", kimi_provider));
+    }
+
+    if content.contains("[models]") && !content.contains("[models.") {
+        content = content.replace("[models]", kimi_models);
+    } else if !content.contains("[models.kimi") {
+        content.push_str(&format!("\n{}\n", kimi_models));
+    }
+
+    match std::fs::write(&config_path, &content) {
+        Ok(_) => {
+            eprintln!("  {} Kimi CLI auto-configured: {}",
+                "✓".green().bold(),
+                config_path.display().to_string().dimmed());
+        }
+        Err(e) => {
+            eprintln!("  {} Could not configure Kimi CLI: {}",
+                "!".yellow(), e);
+        }
+    }
+}
+
+/// Restore `~/.kimi/config.toml` from the backup created by `configure_kimi_cli`.
+///
+/// Called when `aikey use` switches to a key that does not include kimi.
+/// If a backup exists (`config.aikey_backup.toml`), it is moved back to `config.toml`.
+/// If no backup exists but the config contains our marker, it is left as-is
+/// (the user may have modified it after we configured it).
+fn unconfigure_kimi_cli() {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let config_dir = std::path::PathBuf::from(&home).join(".kimi");
+    let config_path = config_dir.join("config.toml");
+    let backup_path = config_dir.join("config.aikey_backup.toml");
+
+    if backup_path.exists() {
+        // Restore the original config from backup.
+        let _ = std::fs::rename(&backup_path, &config_path);
+    } else if config_path.exists() {
+        // No backup but config exists — check if it's ours.
+        let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+        if content.contains("# managed by aikey") {
+            // We created this file from scratch (there was no original).
+            // Remove it so Kimi CLI returns to its default behavior.
+            let _ = std::fs::remove_file(&config_path);
+        }
+    }
+}
+
 fn write_active_env(
     key_type: &str,
     key_ref: &str,    // virtual_key_id (team) or alias (personal)
@@ -1589,10 +1797,15 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
     // Prompt the user before writing.
     use std::io::{IsTerminal, Write};
     if io::stderr().is_terminal() {
-        eprint!(
-            "  Install shell hook in {}? [Y/n]: ",
-            rc_file
-        );
+        let shell_name = if is_zsh { "zsh" } else { "bash" };
+        let hook_desc = if is_zsh { "precmd hook" } else { "PROMPT_COMMAND" };
+        let rows = vec![
+            format!("Shell:  {}", shell_name),
+            format!("File:   {}", rc_file),
+            format!("Add:    {} \u{2192} source ~/.aikey/active.env", hook_desc),
+        ];
+        crate::ui_frame::eprint_box("\u{2753}", "Install Shell Hook", &rows);
+        eprint!("  Proceed? [Y/n]: ");
         io::stderr().flush().ok();
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_ok() {
@@ -1626,7 +1839,7 @@ pub fn handle_key_use(
     provider_override: Option<&str>, // --provider flag or None
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const PROXY_PORT: u16 = 27200;
+    let proxy_port: u16 = crate::commands_proxy::proxy_port();
 
     // ── 1. Resolve key — try team keys first, then personal ──────────────────
     let team_entry = storage::get_virtual_key_cache(alias_or_id)?
@@ -1790,10 +2003,29 @@ pub fn handle_key_use(
     crate::commands_proxy::try_reload_proxy();
 
     // ── 5. Write ~/.aikey/active.env (proxy sentinel tokens) ──────────────────
-    write_active_env(key_type, &key_ref, &display_name, &providers, PROXY_PORT)?;
+    write_active_env(key_type, &key_ref, &display_name, &providers, proxy_port)?;
 
     // ── 6. Shell hook (one-time, first use) ───────────────────────────────────
     let hook_msg = if !json_mode { ensure_shell_hook(no_hook) } else { None };
+
+    // ── 6b. Auto-configure / unconfigure third-party CLI tools ─────────────
+    if !json_mode {
+        let has_kimi = providers.iter().any(|p| {
+            let c = p.to_lowercase();
+            c == "kimi" || c == "moonshot"
+        });
+        if has_kimi {
+            let token_value = if key_type == "team" {
+                format!("aikey_vk_{}", key_ref)
+            } else {
+                format!("aikey_personal_{}", key_ref)
+            };
+            configure_kimi_cli(&token_value, proxy_port);
+        } else {
+            // Switching away from kimi — restore Kimi CLI to standalone mode.
+            unconfigure_kimi_cli();
+        }
+    }
 
     // ── 7. Output ─────────────────────────────────────────────────────────────
     let primary_provider = providers.first().map(String::as_str).unwrap_or("unknown");
@@ -1808,13 +2040,9 @@ pub fn handle_key_use(
         }));
     } else {
         use colored::Colorize;
-        println!("{} {} {} is now {} {}.",
-            "✓".green().bold(),
-            format!("'{}'", display_name).bold(),
-            format!("[{}]", primary_provider).dimmed(),
-            "active".green().bold(),
-            "(proxy)".dimmed());
-        println!();
+
+        // Collect env var lines.
+        let mut env_lines: Vec<String> = Vec::new();
         for provider in &providers {
             if let Some((api_key_var, base_url_var)) = provider_env_vars(provider) {
                 let token_value = if key_type == "team" {
@@ -1822,25 +2050,31 @@ pub fn handle_key_use(
                 } else {
                     format!("aikey_personal_{}", key_ref)
                 };
-                let base_url = format!("http://127.0.0.1:{}/{}", PROXY_PORT, provider_proxy_prefix(provider));
-                println!("  {:<24} = {}", api_key_var.bold(), token_value.cyan());
-                println!("  {:<24} = {}", base_url_var.bold(), base_url.cyan());
+                let base_url = format!("http://127.0.0.1:{}/{}", proxy_port, provider_proxy_prefix(provider));
+                env_lines.push(format!("{:<24} = {}", api_key_var, token_value));
+                env_lines.push(format!("{:<24} = {}", base_url_var, base_url));
             }
         }
-        println!();
-        println!("  {}", "Next steps:".bold());
-        if let Some(msg) = hook_msg {
-            // Shell hook was just installed or failed — user needs to source manually.
-            println!("{}", msg.dimmed());
-            println!("  {} Apply now:       {}", "→".dimmed(), "source ~/.aikey/active.env".cyan());
-            println!("  {} Or open a new terminal — env vars will be ready automatically.", "→".dimmed());
+
+        let proxy_url = format!("http://127.0.0.1:{}/{}", proxy_port, provider_proxy_prefix(primary_provider));
+
+        let status = if hook_msg.is_some() {
+            "\u{2192} Shell hook just installed. Open a new terminal or: source ~/.aikey/active.env"
         } else {
-            // Shell hook active — precmd/PROMPT_COMMAND already sourced active.env
-            // by the time the user sees the next prompt. No action needed.
-            println!("  {} Env vars applied (shell hook active).", "✓".green().bold());
+            "\u{2713} Env vars applied (shell hook active)"
+        };
+
+        let mut rows: Vec<String> = Vec::new();
+        for line in &env_lines {
+            rows.push(line.clone());
         }
-        println!("  {} Tools can use:   {}", "→".dimmed(),
-            format!("http://127.0.0.1:{}/{}", PROXY_PORT, provider_proxy_prefix(primary_provider)).cyan());
+        rows.push(String::new()); // blank separator
+        rows.push(status.to_string());
+        rows.push(format!("\u{2192} Proxy: {}", proxy_url));
+
+        let title = format!("'{}' [{}] is now active", display_name, primary_provider);
+        crate::ui_frame::print_box("\u{2705}", &title, &rows);
+        println!();
     }
     Ok(())
 }

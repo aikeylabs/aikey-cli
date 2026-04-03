@@ -33,7 +33,6 @@ aes-gcm = "0.10"    # AES-GCM authenticated encryption
 rand = "0.8"        # Cryptographically secure random number generation
 secrecy = "0.8"     # Memory-safe secret handling, prevents leakage in logs
 zeroize = { version = "1.8", features = ["derive", "serde"] }     # Explicit memory zeroing for sensitive data
-inquire = "0.7"     # Interactive password prompts with secure input
 arboard = "3.4"     # Clipboard access for Magic Add feature
 rpassword = "7.3"   # Secure password input without echo
 hmac = "0.12"       # HMAC for integrity verification

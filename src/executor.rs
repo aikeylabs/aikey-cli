@@ -1082,7 +1082,7 @@ pub fn run_with_active_key(
         .map_err(|e| format!("Failed to read active key config: {}", e))?
         .ok_or("No active key. Run `aikey use <alias>` first.")?;
 
-    let proxy_port: u16 = 27200;
+    let proxy_port: u16 = crate::commands_proxy::proxy_port();
 
     let providers: Vec<String> = if active_cfg.providers.is_empty() {
         // Fallback: inject common providers so the child can reach any.
