@@ -11,7 +11,7 @@ fn prompt_password_for_env(json_mode: bool) -> Result<SecretString, Box<dyn std:
     }
 
     let prompt_str = if json_mode { "" } else { "Enter Master Password: " };
-    let password = rpassword::prompt_password(prompt_str)?;
+    let password = crate::prompt_hidden(prompt_str)?;
     let password_raw = Zeroizing::new(password);
     Ok(SecretString::new(password_raw.trim().to_string()))
 }

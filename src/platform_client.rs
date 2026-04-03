@@ -72,17 +72,6 @@ pub struct RefreshResponse {
     pub expires_in: i64,
 }
 
-/// One item from GET /accounts/me/pending-keys
-#[derive(Debug, Deserialize, Clone)]
-pub struct PendingKeyItem {
-    pub virtual_key_id: String,
-    pub org_id: String,
-    pub seat_id: String,
-    pub alias: String,
-    pub provider_code: String,
-    pub share_status: String,
-}
-
 /// Returned by GET /accounts/me/sync-version.
 #[derive(Debug, Deserialize)]
 pub struct SyncVersionResponse {
@@ -344,22 +333,6 @@ impl PlatformClient {
     // ---- Key discovery ------------------------------------------------------
 
     /// GET /accounts/me/pending-keys
-    pub fn get_pending_keys(&self) -> Result<Vec<PendingKeyItem>, String> {
-        let url = format!("{}/accounts/me/pending-keys", self.base_url);
-
-        let resp = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {}", self.jwt))
-            .call()
-            .map_err(|e| format!("pending-keys request failed: {}", e))?;
-
-        let data: serde_json::Value = resp
-            .into_json()
-            .map_err(|e| format!("failed to parse pending-keys response: {}", e))?;
-
-        serde_json::from_value(data["pending_keys"].clone())
-            .map_err(|e| format!("failed to deserialise pending_keys: {}", e))
-    }
-
     /// GET /accounts/me/all-keys
     pub fn get_all_keys(&self) -> Result<Vec<KeyItem>, String> {
         let url = format!("{}/accounts/me/all-keys", self.base_url);
@@ -385,7 +358,10 @@ impl PlatformClient {
     /// to pull a fresh snapshot.
     pub fn get_sync_version(&self) -> Result<SyncVersionResponse, String> {
         let url = format!("{}/accounts/me/sync-version", self.base_url);
-        let resp = ureq::get(&url)
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(2))
+            .build();
+        let resp = agent.get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
             .map_err(|e| format!("sync-version request failed: {}", e))?;
@@ -395,11 +371,14 @@ impl PlatformClient {
 
     /// GET /accounts/me/managed-keys-snapshot
     /// Fetches the full account-dimension projection of the current key state.
-    /// Also triggers a server-side refresh of `account_managed_virtual_keys`
-    /// and bumps `sync_version`, so the returned `sync_version` is always fresh.
+    /// Also triggers a server-side refresh of `account_managed_virtual_keys`,
+    /// so the returned `sync_version` is always fresh.
     pub fn get_managed_keys_snapshot(&self) -> Result<ManagedKeysSnapshotResponse, String> {
         let url = format!("{}/accounts/me/managed-keys-snapshot", self.base_url);
-        let resp = ureq::get(&url)
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(2))
+            .build();
+        let resp = agent.get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
             .map_err(|e| format!("managed-keys-snapshot request failed: {}", e))?;

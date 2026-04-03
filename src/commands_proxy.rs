@@ -2,7 +2,7 @@
 //!
 //! `aikey proxy start` authenticates once with the vault master password,
 //! then spawns `aikey-proxy` as a child process with the password injected
-//! via `AIKEY_VAULT_PASSWORD` — no second prompt required.
+//! via `AIKEY_MASTER_PASSWORD` — no second prompt required.
 //!
 //! A lightweight `proxy_guard` is exported for use by other commands (e.g. `run`)
 //! so the proxy is automatically started in the background when needed.
@@ -97,7 +97,7 @@ fn silently_start_proxy(password: &SecretString) -> bool {
 
     let mut cmd = std::process::Command::new(&proxy_bin);
     cmd.arg("--config").arg(&config_path);
-    cmd.env("AIKEY_VAULT_PASSWORD", password.expose_secret());
+    cmd.env("AIKEY_MASTER_PASSWORD", password.expose_secret());
     cmd.stdout(std::process::Stdio::null())
        .stderr(std::process::Stdio::null());
 
@@ -125,30 +125,30 @@ fn silently_start_proxy(password: &SecretString) -> bool {
     }
 }
 
-/// Try to auto-start the proxy silently using `AIKEY_VAULT_PASSWORD` or
+/// Try to auto-start the proxy silently using `AIKEY_MASTER_PASSWORD` or
 /// `AK_TEST_PASSWORD` environment variables.
 ///
 /// Called at the top of every command dispatch so that the proxy is running
-/// whenever a vault password is pre-injected (e.g. CI / scripted sessions).
+/// whenever a master password is pre-injected (e.g. CI / scripted sessions).
 /// No-ops completely when neither env var is set — no prompt, no output.
 pub fn try_auto_start_from_env() {
     if is_proxy_running() {
         return;
     }
-    let pw = std::env::var("AIKEY_VAULT_PASSWORD")
+    let pw = std::env::var("AIKEY_MASTER_PASSWORD")
         .or_else(|_| std::env::var("AK_TEST_PASSWORD"));
     if let Ok(pw_val) = pw {
         let _ = silently_start_proxy(&SecretString::new(pw_val));
     }
 }
 
-/// Ensure the proxy is running, prompting for the vault password when needed.
+/// Ensure the proxy is running, prompting for the master password when needed.
 ///
 /// Called by `aikey use` / `aikey key use` so that the proxy is always started
 /// after activating a key.  Priority:
 ///   1. Already running → no-op
-///   2. `AIKEY_VAULT_PASSWORD` / `AK_TEST_PASSWORD` env var → silent start
-///   3. Interactive TTY → prompt once for vault password, then start
+///   2. `AIKEY_MASTER_PASSWORD` / `AK_TEST_PASSWORD` env var → silent start
+///   3. Interactive TTY → prompt once for master password, then start
 ///   4. Non-TTY without env var → print a hint but don't block
 pub fn ensure_proxy_for_use(password_stdin: bool) {
     if is_proxy_running() {
@@ -157,7 +157,7 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
 
     // 1. Try env var (fully silent).
     {
-        let pw = std::env::var("AIKEY_VAULT_PASSWORD")
+        let pw = std::env::var("AIKEY_MASTER_PASSWORD")
             .or_else(|_| std::env::var("AK_TEST_PASSWORD"));
         if let Ok(pw_val) = pw {
             let started = silently_start_proxy(&SecretString::new(pw_val));
@@ -171,17 +171,19 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
     // 2. Interactive: prompt once.
     use std::io::IsTerminal;
     if io::stderr().is_terminal() || password_stdin {
-        eprint!("\n  Proxy not running. Enter Master Password to start it: ");
-        let _ = io::stderr().flush();
+        eprintln!();
         let pw = if password_stdin {
+            eprint!("  Proxy not running. Enter Master Password to start it: ");
+            let _ = io::stderr().flush();
             let mut line = String::new();
             let _ = io::stdin().read_line(&mut line);
+            eprintln!("***");
             SecretString::new(line.trim().to_string())
         } else {
-            match rpassword::read_password() {
+            match crate::prompt_hidden("  Proxy not running. Enter Master Password to start it: ") {
                 Ok(p) => SecretString::new(p),
                 Err(_) => {
-                    eprintln!("\n  [aikey] Could not read password — run `aikey proxy start` manually.");
+                    eprintln!("  [aikey] Could not read password — run `aikey proxy start` manually.");
                     return;
                 }
             }
@@ -314,7 +316,7 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
     // 4. Build the child command, injecting the password via env.
     let mut cmd = Command::new(&proxy_bin);
     cmd.arg("--config").arg(&config_path);
-    cmd.env("AIKEY_VAULT_PASSWORD", password.expose_secret());
+    cmd.env("AIKEY_MASTER_PASSWORD", password.expose_secret());
 
     if detach {
         // Background: stdout/stderr go to /dev/null; we just write the PID.
@@ -678,7 +680,7 @@ pub fn handle_verify(password: &SecretString) -> Result<(), Box<dyn std::error::
 /// Lightweight proxy guard for use by `aikey run` and other commands.
 ///
 /// Checks whether `aikey-proxy` is running and reachable. If not, silently
-/// starts it in the background using the given vault password. Returns `true`
+/// starts it in the background using the given master password. Returns `true`
 /// if the proxy is (or becomes) reachable, `false` if startup failed.
 ///
 /// Designed to be transparent to end users: no output on the happy path.

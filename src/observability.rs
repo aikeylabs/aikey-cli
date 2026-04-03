@@ -8,7 +8,7 @@
 //!   correlation by trace_id.
 //!
 //! # Security
-//! No secrets, vault passwords, or provider keys are ever passed to these functions.
+//! No secrets, master passwords, or provider keys are ever passed to these functions.
 //! Callers are responsible for sanitising values before logging.
 
 use serde::Serialize;

@@ -250,7 +250,7 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
             io::stdin().read_line(&mut pw)?;
             SecretString::new(pw.trim().to_string().into())
         } else {
-            let pw = rpassword::prompt_password("Set Master Password: ")
+            let pw = crate::prompt_hidden("Set Master Password: ")
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             SecretString::new(pw.into())
         };
@@ -338,7 +338,7 @@ pub fn handle_project_map(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Verify master password before mutating config
     let prompt_str = if json_mode { "" } else { "Enter Master Password: " };
-    let password = rpassword::prompt_password(prompt_str)?;
+    let password = crate::prompt_hidden(prompt_str)?;
     let password_raw = Zeroizing::new(password);
     let secret = SecretString::new(password_raw.trim().to_string());
 
@@ -736,7 +736,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 format!("failed  ({}): {}", key_ref, err)
                             };
                             let hint = if ok { None } else if err.contains("invalid") || err.contains("401") || err.contains("403") {
-                                Some("re-add the key with 'aikey add' or re-accept with 'aikey key accept'")
+                                Some("re-add the key with 'aikey add' or re-sync with 'aikey key sync'")
                             } else {
                                 Some("check provider reachability above")
                             };

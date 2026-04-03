@@ -1093,7 +1093,7 @@ pub fn run_with_active_key(
     };
 
     let token_value = if active_cfg.key_type == "team" {
-        active_cfg.key_ref.clone()
+        format!("aikey_vk_{}", active_cfg.key_ref)
     } else {
         format!("aikey_personal_{}", active_cfg.key_ref)
     };

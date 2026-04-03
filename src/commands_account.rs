@@ -3,7 +3,6 @@
 //! Covers:
 //!  - `aikey account login` / `aikey account status` / `aikey account logout`
 //!  - `aikey key list`  — show cached + server keys
-//!  - `aikey key accept [id]` — download & claim a pending key (re-encrypts locally)
 //!  - `aikey key sync`  — refresh metadata from server
 //!  - `aikey key use <id>` — activate a key for proxy routing
 
@@ -16,6 +15,119 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::crypto;
 use crate::platform_client::{PlatformClient, PollResponse};
 use crate::storage::{self, VirtualKeyCacheEntry};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Read `controlPanelUrl` from `~/.aikey/config/config.json` (if present).
+fn read_control_url_from_config() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = std::path::PathBuf::from(home).join(".aikey/config/config.json");
+    let data = std::fs::read_to_string(path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
+    parsed["controlPanelUrl"].as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Auto-configure proxy `collector_url` in `~/.aikey/config/aikey-proxy.yaml`.
+/// Uses the same control_url (nginx proxies collector API on the same port).
+fn configure_proxy_collector(control_url: &str, json_mode: bool) {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let proxy_config = std::path::PathBuf::from(&home).join(".aikey/config/aikey-proxy.yaml");
+    if !proxy_config.exists() {
+        return; // No proxy config yet — skip silently.
+    }
+
+    // Collector API is proxied through nginx on the same origin as the control panel.
+    // Proxy uploads to {collector_url}/v1/usage-events:batch
+    let collector_url = control_url.trim_end_matches('/').to_string();
+
+    let content = match std::fs::read_to_string(&proxy_config) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Check if collector_url is already set to the correct value.
+    if content.contains(&format!("collector_url: \"{}\"", collector_url)) {
+        return; // Already configured correctly.
+    }
+
+    // Update or insert collector_url.
+    let updated = if content.contains("collector_url:") {
+        // Replace existing line.
+        let mut result = String::new();
+        for line in content.lines() {
+            if line.trim_start().starts_with("collector_url:") {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                result.push_str(&format!("{}collector_url: \"{}\"", indent, collector_url));
+            } else {
+                result.push_str(line);
+            }
+            result.push('\n');
+        }
+        result
+    } else if content.contains("flush_interval:") {
+        // Append after flush_interval.
+        let mut result = String::new();
+        for line in content.lines() {
+            result.push_str(line);
+            result.push('\n');
+            if line.trim_start().starts_with("flush_interval:") {
+                result.push_str(&format!("  collector_url: \"{}\"\n", collector_url));
+            }
+        }
+        result
+    } else {
+        return; // Can't find a safe place to insert.
+    };
+
+    if std::fs::write(&proxy_config, &updated).is_ok() && !json_mode {
+        eprintln!("    Usage reporting → {}", collector_url);
+        // Proxy reads YAML at startup only; reload won't pick up config changes.
+        // Auto-restart proxy so the new collector_url takes effect immediately.
+        if crate::commands_proxy::is_proxy_running() {
+            let pw = if let Some(cached) = crate::session::try_get() {
+                cached
+            } else {
+                // No cached password — prompt inline.
+                eprint!("    Restart proxy to apply. Enter Master Password: ");
+                let _ = io::Write::flush(&mut io::stderr());
+                match rpassword::read_password() {
+                    Ok(p) => SecretString::new(p),
+                    Err(_) => {
+                        eprintln!("\n    Run {} manually.", "'aikey proxy restart'".bold());
+                        return;
+                    }
+                }
+            };
+            let _ = crate::commands_proxy::handle_restart(None, &pw);
+        }
+    }
+}
+
+/// Persist `controlPanelUrl` in `~/.aikey/config/config.json`.
+fn save_control_url_to_config(url: &str) {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let dir = std::path::PathBuf::from(&home).join(".aikey/config");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("config.json");
+
+    let mut obj: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_else(|| serde_json::json!({"version": "1"}));
+
+    obj["controlPanelUrl"] = serde_json::Value::String(url.to_string());
+    let _ = std::fs::write(&path, serde_json::to_string_pretty(&obj).unwrap_or_default());
+}
 
 // ---------------------------------------------------------------------------
 // account login / status / logout
@@ -35,25 +147,35 @@ use crate::storage::{self, VirtualKeyCacheEntry};
 /// the activation page as `--token SESSION_ID:LOGIN_TOKEN`.
 ///
 /// Flag precedence (highest → lowest):
-///   1. CLI flags (`--url`, `--token`)
+///   1. CLI flag (`--control-url`)
 ///   2. Environment variable `AIKEY_CONTROL_URL`
-///   3. Interactive prompt (suppressed in `--json` mode)
+///   3. Config file (`~/.aikey/config/config.json` → `controlPanelUrl`)
+///   4. Interactive prompt (suppressed in `--json` mode)
 pub fn handle_login(
     json_mode: bool,
     flag_url: Option<String>,
     flag_token: Option<String>,
     flag_email: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve default URL: env var → config file → hardcoded fallback.
     let default_url = std::env::var("AIKEY_CONTROL_URL")
-        .unwrap_or_else(|_| "http://localhost:8080".to_string());
+        .ok()
+        .or_else(|| read_control_url_from_config())
+        .unwrap_or_else(|| "http://localhost:3000".to_string());
 
     let control_url = if let Some(u) = flag_url {
         u
     } else if json_mode {
-        std::env::var("AIKEY_CONTROL_URL")
-            .map_err(|_| "AIKEY_CONTROL_URL env var required in non-interactive mode (or use --url)")?
+        // Non-interactive: use default (which may come from config/env).
+        default_url.clone()
+    } else if std::env::var("AIKEY_CONTROL_URL").is_ok() || read_control_url_from_config().is_some() {
+        // Already configured via env or config file — use it directly, no prompt.
+        if !json_mode {
+            eprintln!("  Control Panel: {}", default_url);
+        }
+        default_url
     } else {
-        print!("Control service URL [{}]: ", default_url);
+        print!("Control Panel URL [{}]: ", default_url);
         io::stdout().flush()?;
         let mut buf = String::new();
         io::stdin().read_line(&mut buf)?;
@@ -77,11 +199,11 @@ pub fn handle_login(
     )
     .map_err(|e| format!("Login failed: {}", e))?;
 
-    // Browser URL: use dev server if detected (Vite proxies /auth to Go backend).
-    let browser_base = resolve_browse_base_url(&control_url, None);
+    // Browser URL: in production nginx serves both Web and API on the same
+    // origin (control_url), so use it directly for the browser login page.
     let mut login_url = format!(
         "{}/auth/cli/login?s={}&d={}",
-        browser_base.trim_end_matches('/'),
+        control_url.trim_end_matches('/'),
         session.login_session_id,
         session.device_code,
     );
@@ -291,6 +413,14 @@ fn finish_login(
         println!("  {} Logged in as {}", "✓".green().bold(), account.email.bold());
         println!("    Run {} to view your team keys.", "'aikey key list'".bold());
     }
+
+    // Persist control URL to config.json so future logins skip the prompt.
+    save_control_url_to_config(&control_url);
+
+    // Auto-configure proxy collector_url so usage reporting works out of the box.
+    // Collector runs on the same host as the control panel, fixed port 27300.
+    configure_proxy_collector(&control_url, json_mode);
+
     Ok(())
 }
 
@@ -388,7 +518,7 @@ pub fn handle_account_status(json_mode: bool) -> Result<(), Box<dyn std::error::
                 }));
             } else {
                 println!("Logged in as : {} ({})", acc.email, acc.account_id);
-                println!("Control URL  : {}", acc.control_url);
+                println!("Control Panel: {}", acc.control_url);
             }
         }
         None => {
@@ -802,6 +932,156 @@ pub fn run_snapshot_sync() -> Result<bool, String> {
     Ok(true)
 }
 
+/// Full snapshot sync: metadata + claim unclaimed keys + download key material.
+///
+/// Called by `aikey list` (when version changed) and `aikey key sync`.
+/// Requires the master password to encrypt downloaded provider keys into the vault.
+///
+/// Returns the number of newly downloaded keys.
+pub fn run_full_snapshot_sync(password: &SecretString) -> Result<usize, String> {
+    use colored::Colorize;
+
+    let acc = match storage::get_platform_account().ok().flatten() {
+        Some(a) => a,
+        None => return Ok(0),
+    };
+    let token = match try_refresh_if_needed(&acc) {
+        Ok(t) => t,
+        Err(e) => return Err(format!("token refresh: {}", e)),
+    };
+    let client = PlatformClient::new(&acc.control_url, &token);
+
+    // Pull the full snapshot (metadata).
+    let snapshot = match client.get_managed_keys_snapshot() {
+        Ok(s) => s,
+        Err(e) => return Err(format!("snapshot: {}", e)),
+    };
+
+    apply_snapshot_to_cache(&snapshot.keys, &acc.account_id);
+    storage::set_local_seen_sync_version(snapshot.sync_version);
+    let _ = storage::bump_vault_change_seq();
+
+    // Claim any unclaimed keys and download missing key material.
+    let vault_key = derive_vault_key(password)?;
+    let account_id = Some(acc.account_id.clone());
+
+    let cached = storage::list_virtual_key_cache().unwrap_or_default();
+    let mut downloaded = 0usize;
+
+    for entry in &cached {
+        // Needs claim: pending_claim but not yet claimed on server.
+        let needs_claim = entry.share_status == "pending_claim"
+            && entry.key_status == "active";
+        // Needs download: claimed (or about to be) but missing local ciphertext.
+        let needs_download = entry.provider_key_ciphertext.is_none()
+            && entry.key_status == "active"
+            && !entry.local_state.starts_with("disabled_by_");
+
+        if !needs_claim && !needs_download {
+            continue;
+        }
+
+        // Claim on server first if pending.
+        if needs_claim {
+            if let Err(e) = client.claim_key(&entry.virtual_key_id) {
+                eprintln!("  {} could not claim {}: {}",
+                    "✗".red(), entry.alias, e);
+                continue;
+            }
+        }
+
+        // Download the delivery payload (plaintext provider key over TLS).
+        match client.get_key_delivery(&entry.virtual_key_id) {
+            Ok(payload) => {
+                match payload.primary_binding() {
+                    None => {
+                        eprintln!("  {} key '{}' has no active bindings — skipping.",
+                            "!".yellow(), entry.alias);
+                    }
+                    Some(binding) => {
+                        let protocol_type = payload.primary_protocol_type().to_string();
+                        let (nonce, ciphertext) =
+                            crypto::encrypt(&vault_key, binding.provider_key.as_bytes())
+                                .map_err(|e| format!("encrypt: {}", e))?;
+
+                        let sync_supported_providers = if !payload.supported_providers.is_empty() {
+                            payload.supported_providers.clone()
+                        } else if !binding.provider_code.is_empty() {
+                            vec![binding.provider_code.clone()]
+                        } else {
+                            entry.supported_providers.clone()
+                        };
+                        let sync_provider_base_urls: std::collections::HashMap<String, String> =
+                            payload.slots
+                                .iter()
+                                .flat_map(|slot| slot.binding_targets.iter())
+                                .map(|b| (b.provider_code.clone(), b.base_url.clone()))
+                                .collect();
+
+                        let updated = VirtualKeyCacheEntry {
+                            virtual_key_id:       payload.virtual_key_id.clone(),
+                            org_id:               payload.org_id.clone(),
+                            seat_id:              payload.seat_id.clone(),
+                            alias:                payload.alias.clone(),
+                            provider_code:        binding.provider_code.clone(),
+                            protocol_type,
+                            base_url:             binding.base_url.clone(),
+                            credential_id:        binding.credential_id.clone(),
+                            credential_revision:  binding.credential_revision.clone(),
+                            virtual_key_revision: payload.current_revision.clone(),
+                            key_status:           payload.key_status.clone(),
+                            share_status:         payload.share_status.clone(),
+                            local_state:          "synced_inactive".to_string(),
+                            expires_at:           entry.expires_at,
+                            provider_key_nonce:   Some(nonce),
+                            provider_key_ciphertext: Some(ciphertext),
+                            synced_at:            0,
+                            local_alias:          entry.local_alias.clone(),
+                            supported_providers:  sync_supported_providers,
+                            provider_base_urls:   sync_provider_base_urls,
+                            owner_account_id:     account_id.clone(),
+                        };
+                        let _ = storage::upsert_virtual_key_cache(&updated);
+
+                        eprintln!("  {} New key: {} {}",
+                            "✓".green().bold(),
+                            payload.alias.bold(),
+                            format!("[{}]", binding.provider_code).dimmed());
+
+                        downloaded += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("  {} could not fetch key '{}': {}",
+                    "✗".red(), entry.alias, e);
+            }
+        }
+    }
+
+    Ok(downloaded)
+}
+
+/// Returns true if the remote sync_version differs from local (i.e. server has changes).
+/// Returns false if already up-to-date or not logged in.
+pub fn check_sync_version_changed() -> Result<bool, String> {
+    let acc = match storage::get_platform_account().ok().flatten() {
+        Some(a) => a,
+        None => return Ok(false),
+    };
+    let token = match try_refresh_if_needed(&acc) {
+        Ok(t) => t,
+        Err(e) => return Err(format!("token refresh: {}", e)),
+    };
+    let client = PlatformClient::new(&acc.control_url, &token);
+    let remote_version = match client.get_sync_version() {
+        Ok(r) => r.sync_version,
+        Err(e) => return Err(format!("sync-version: {}", e)),
+    };
+    let local_seen = storage::get_local_seen_sync_version();
+    Ok(remote_version > local_seen)
+}
+
 /// Spawns a background thread to check and apply a server snapshot update.
 ///
 /// Single-flight: if a sync is already in progress (e.g. from a concurrent
@@ -948,7 +1228,7 @@ pub fn sync_managed_key_metadata() -> bool {
 /// `aikey key list`
 ///
 /// Fetches all team keys from the control service (if logged in) and merges
-/// with local cache, then displays a table.  No vault password required —
+/// with local cache, then displays a table.  No master password required —
 /// key material stays encrypted; only metadata is shown.
 pub fn handle_key_list(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     let logged_in = storage::get_platform_account()?.is_some();
@@ -1021,185 +1301,13 @@ pub fn handle_key_list(json_mode: bool) -> Result<(), Box<dyn std::error::Error>
         );
     }
 
-    let pending_count = cached.iter().filter(|e| e.share_status == "pending_claim").count();
+    let pending_count = cached.iter().filter(|e|
+        e.provider_key_ciphertext.is_none() && e.key_status == "active"
+        && !e.local_state.starts_with("disabled_by_")
+    ).count();
     if pending_count > 0 {
         println!();
-        println!("  {} key(s) pending. Run 'aikey key accept' to download all.", pending_count);
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// aikey key accept
-// ---------------------------------------------------------------------------
-
-/// `aikey key accept [id]`
-///
-/// With no argument: fetches all pending keys from the server and accepts every
-/// one in a single pass (vault password prompted once).
-/// With an explicit id: accepts only that specific key (original behaviour).
-///
-/// Downloads the real provider key for each target, re-encrypts it with the
-/// local vault AES key, stores in `managed_virtual_keys_cache`, and marks each
-/// key as claimed on the server.
-pub fn handle_key_accept(
-    id: Option<&str>,
-    password: &SecretString,
-    json_mode: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let client = get_authenticated_client()?;
-
-    // Build the list of key IDs to accept.
-    let ids_to_accept: Vec<String> = match id {
-        Some(given_id) => vec![given_id.to_string()],
-        None => {
-            // No id given → accept all pending keys.
-            let pending = client.get_pending_keys()?;
-            if pending.is_empty() {
-                if json_mode {
-                    crate::json_output::print_json(serde_json::json!({
-                        "ok": true,
-                        "accepted": 0,
-                        "message": "No pending keys."
-                    }));
-                } else {
-                    println!("No pending team keys.");
-                }
-                return Ok(());
-            }
-            pending.into_iter().map(|k| k.virtual_key_id).collect()
-        }
-    };
-
-    // Derive vault AES key once for all keys in this batch.
-    let vault_key = derive_vault_key(password)?;
-
-    let mut accepted: Vec<serde_json::Value> = Vec::new();
-
-    for virtual_key_id in &ids_to_accept {
-        if !json_mode {
-            println!("  {} {}", "Fetching".dimmed(), virtual_key_id.dimmed());
-        }
-
-        // Fetch full delivery payload (includes plaintext provider key over TLS).
-        let payload = match client.get_key_delivery(virtual_key_id) {
-            Ok(p) => p,
-            Err(e) => {
-                if json_mode {
-                    accepted.push(serde_json::json!({
-                        "ok": false,
-                        "virtual_key_id": virtual_key_id,
-                        "error": e.to_string(),
-                    }));
-                } else {
-                    eprintln!("  {} {}: {}", "✗".red(), "could not fetch key".red(), e);
-                }
-                continue;
-            }
-        };
-
-        // Extract the primary binding target from the first slot.
-        let binding = match payload.primary_binding() {
-            Some(b) => b,
-            None => {
-                let msg = format!("Key {} has no active bindings — skipping.", virtual_key_id);
-                if json_mode {
-                    accepted.push(serde_json::json!({
-                        "ok": false,
-                        "virtual_key_id": virtual_key_id,
-                        "error": msg,
-                    }));
-                } else {
-                    eprintln!("Warning: {}", msg);
-                }
-                continue;
-            }
-        };
-        let protocol_type = payload.primary_protocol_type().to_string();
-
-        let (nonce, ciphertext) = crypto::encrypt(&vault_key, binding.provider_key.as_bytes())
-            .map_err(|e| format!("Failed to encrypt provider key: {}", e))?;
-
-        // Preserve local_alias if the key was previously accepted and renamed.
-        let existing = storage::get_virtual_key_cache(&payload.virtual_key_id)
-            .ok()
-            .flatten();
-        let existing_local_alias = existing.as_ref().and_then(|e| e.local_alias.clone());
-        let current_account_id = storage::get_platform_account()
-            .ok()
-            .flatten()
-            .map(|a| a.account_id);
-
-        // Build supported_providers from payload (all active binding provider codes).
-        // Fall back to just the primary binding's provider if payload.supported_providers is empty.
-        let supported_providers = if !payload.supported_providers.is_empty() {
-            payload.supported_providers.clone()
-        } else if !binding.provider_code.is_empty() {
-            vec![binding.provider_code.clone()]
-        } else {
-            vec![]
-        };
-
-        // Build per-provider base_url map from all delivery slots (preserves admin-configured URLs).
-        let provider_base_urls: std::collections::HashMap<String, String> = payload.slots
-            .iter()
-            .flat_map(|slot| slot.binding_targets.iter())
-            .map(|b| (b.provider_code.clone(), b.base_url.clone()))
-            .collect();
-
-        let entry = VirtualKeyCacheEntry {
-            virtual_key_id: payload.virtual_key_id.clone(),
-            org_id: payload.org_id.clone(),
-            seat_id: payload.seat_id.clone(),
-            alias: payload.alias.clone(),
-            provider_code: binding.provider_code.clone(),
-            protocol_type,
-            base_url: binding.base_url.clone(),
-            credential_id: binding.credential_id.clone(),
-            credential_revision: binding.credential_revision.clone(),
-            virtual_key_revision: payload.current_revision.clone(),
-            key_status: payload.key_status.clone(),
-            share_status: "claimed".to_string(),
-            local_state: "synced_inactive".to_string(),
-            expires_at: None,
-            provider_key_nonce: Some(nonce),
-            provider_key_ciphertext: Some(ciphertext),
-            synced_at: 0,
-            local_alias: existing_local_alias,
-            supported_providers,
-            provider_base_urls,
-            owner_account_id: current_account_id,
-        };
-        storage::upsert_virtual_key_cache(&entry)?;
-
-        // Tell the server it is claimed.
-        client.claim_key(virtual_key_id)?;
-
-        if json_mode {
-            accepted.push(serde_json::json!({
-                "ok": true,
-                "virtual_key_id": virtual_key_id,
-                "alias": payload.alias,
-                "provider_code": binding.provider_code,
-            }));
-        } else {
-            println!("  {} Key {} {} accepted.",
-                "✓".green().bold(),
-                format!("'{}'", payload.alias).bold(),
-                format!("[{}]", binding.provider_code).dimmed());
-            println!("  {} Run {} to activate.",
-                "→".dimmed(),
-                format!("aikey key use {}", virtual_key_id).cyan());
-        }
-    }
-
-    if json_mode {
-        crate::json_output::print_json(serde_json::json!({
-            "ok": true,
-            "accepted": accepted.len(),
-            "keys": accepted,
-        }));
+        println!("  {} key(s) not yet synced. Run 'aikey key sync' to download.", pending_count);
     }
 
     Ok(())
@@ -1218,108 +1326,9 @@ pub fn handle_key_sync(
     password: &SecretString,
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Phase 1: Force a full metadata refresh via the snapshot path.
-    // Reset local_seen_sync_version to 0 so run_snapshot_sync always pulls
-    // fresh state from the server, regardless of the cached version.
+    // Force a full sync by resetting local_seen_sync_version to 0.
     storage::set_local_seen_sync_version(0);
-    if let Err(e) = run_snapshot_sync() {
-        if !json_mode {
-            eprintln!("Warning: metadata sync failed: {}. Continuing with key material download.", e);
-        }
-    }
-
-    // Phase 2: Re-download missing key material for claimed keys.
-    // Keys that have been claimed but lack local ciphertext need a full delivery
-    // fetch (e.g. first sync after aikey login, or after vault reset).
-    let client = get_authenticated_client()?;
-    let vault_key = derive_vault_key(password)?;
-    let account_id = storage::get_platform_account()
-        .ok()
-        .flatten()
-        .map(|a| a.account_id);
-
-    let mut downloaded = 0usize;
-
-    let cached = storage::list_virtual_key_cache().unwrap_or_default();
-    for entry in &cached {
-        let needs_download = entry.share_status == "claimed"
-            && entry.provider_key_ciphertext.is_none();
-        if !needs_download {
-            continue;
-        }
-
-        match client.get_key_delivery(&entry.virtual_key_id) {
-            Ok(payload) => {
-                match payload.primary_binding() {
-                    None => {
-                        if !json_mode {
-                            eprintln!(
-                                "Warning: key {} has no active bindings — skipping.",
-                                entry.virtual_key_id
-                            );
-                        }
-                    }
-                    Some(binding) => {
-                        let protocol_type = payload.primary_protocol_type().to_string();
-                        let (nonce, ciphertext) =
-                            crypto::encrypt(&vault_key, binding.provider_key.as_bytes())
-                                .map_err(|e| format!("Failed to encrypt provider key: {}", e))?;
-
-                        // Preserve the local_state set by Phase 1 (snapshot sync).
-                        let local_state = entry.local_state.clone();
-
-                        let sync_supported_providers = if !payload.supported_providers.is_empty() {
-                            payload.supported_providers.clone()
-                        } else if !binding.provider_code.is_empty() {
-                            vec![binding.provider_code.clone()]
-                        } else {
-                            entry.supported_providers.clone()
-                        };
-                        let sync_provider_base_urls: std::collections::HashMap<String, String> =
-                            payload.slots
-                                .iter()
-                                .flat_map(|slot| slot.binding_targets.iter())
-                                .map(|b| (b.provider_code.clone(), b.base_url.clone()))
-                                .collect();
-
-                        let updated = VirtualKeyCacheEntry {
-                            virtual_key_id:       payload.virtual_key_id.clone(),
-                            org_id:               payload.org_id.clone(),
-                            seat_id:              payload.seat_id.clone(),
-                            alias:                payload.alias.clone(),
-                            provider_code:        binding.provider_code.clone(),
-                            protocol_type,
-                            base_url:             binding.base_url.clone(),
-                            credential_id:        binding.credential_id.clone(),
-                            credential_revision:  binding.credential_revision.clone(),
-                            virtual_key_revision: payload.current_revision.clone(),
-                            key_status:           payload.key_status.clone(),
-                            share_status:         payload.share_status.clone(),
-                            local_state,
-                            expires_at:           entry.expires_at,
-                            provider_key_nonce:   Some(nonce),
-                            provider_key_ciphertext: Some(ciphertext),
-                            synced_at:            0,
-                            local_alias:          entry.local_alias.clone(),
-                            supported_providers:  sync_supported_providers,
-                            provider_base_urls:   sync_provider_base_urls,
-                            owner_account_id:     account_id.clone(),
-                        };
-                        storage::upsert_virtual_key_cache(&updated)?;
-                        downloaded += 1;
-                    }
-                }
-            }
-            Err(e) => {
-                if !json_mode {
-                    eprintln!(
-                        "Warning: could not fetch delivery for {}: {}",
-                        entry.virtual_key_id, e
-                    );
-                }
-            }
-        }
-    }
+    let downloaded = run_full_snapshot_sync(password)?;
 
     if json_mode {
         crate::json_output::print_json(serde_json::json!({
@@ -1372,9 +1381,9 @@ fn provider_proxy_prefix(provider_code: &str) -> &'static str {
         "anthropic" | "claude" => "anthropic",
         "openai" | "gpt" | "chatgpt" => "openai",
         "google" | "gemini"   => "google",
-        "kimi"                => "kimi",
+        "kimi"                => "kimi/v1",
         "deepseek"            => "deepseek",
-        "moonshot"            => "moonshot",
+        "moonshot"            => "moonshot/v1",
         other => {
             // Unknown provider: pass through as-is (proxy may still handle it
             // if a matching path prefix is registered in the future).
@@ -1502,7 +1511,7 @@ fn write_active_env(
     for provider in providers {
         if let Some((api_key_var, base_url_var)) = provider_env_vars(provider) {
             let token_value = if key_type == "team" {
-                key_ref.to_string()
+                format!("aikey_vk_{}", key_ref)
             } else {
                 format!("aikey_personal_{}", key_ref)
             };
@@ -1659,7 +1668,7 @@ pub fn handle_key_use(
         }
         if entry.provider_key_ciphertext.is_none() {
             return Err(format!(
-                "Key '{}' has not been delivered yet. Run 'aikey key accept {}' first.",
+                "Key '{}' ({}) has not been delivered yet. Run 'aikey key sync' to download.",
                 entry.alias, entry.virtual_key_id
             ).into());
         }
@@ -1808,7 +1817,7 @@ pub fn handle_key_use(
         for provider in &providers {
             if let Some((api_key_var, base_url_var)) = provider_env_vars(provider) {
                 let token_value = if key_type == "team" {
-                    key_ref.clone()
+                    format!("aikey_vk_{}", key_ref)
                 } else {
                     format!("aikey_personal_{}", key_ref)
                 };
@@ -1820,12 +1829,15 @@ pub fn handle_key_use(
         println!();
         println!("  {}", "Next steps:".bold());
         if let Some(msg) = hook_msg {
+            // Shell hook was just installed or failed — user needs to source manually.
             println!("{}", msg.dimmed());
             println!("  {} Apply now:       {}", "→".dimmed(), "source ~/.aikey/active.env".cyan());
+            println!("  {} Or open a new terminal — env vars will be ready automatically.", "→".dimmed());
         } else {
-            println!("  {} Apply now:       {}", "→".dimmed(), "source ~/.aikey/active.env".cyan());
+            // Shell hook active — precmd/PROMPT_COMMAND already sourced active.env
+            // by the time the user sees the next prompt. No action needed.
+            println!("  {} Env vars applied (shell hook active).", "✓".green().bold());
         }
-        println!("  {} Or open a new terminal — env vars will be ready automatically.", "→".dimmed());
         println!("  {} Tools can use:   {}", "→".dimmed(),
             format!("http://127.0.0.1:{}/{}", PROXY_PORT, provider_proxy_prefix(primary_provider)).cyan());
     }
@@ -1862,123 +1874,6 @@ pub fn handle_key_alias(old_alias: &str, new_alias: &str, json_mode: bool) -> Re
             format!("'{}'", old_alias).dimmed(),
             format!("'{}'", new_alias).bold(),
             format!("(server alias: {})", entry.alias).dimmed());
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Startup interactive accept prompt
-// ---------------------------------------------------------------------------
-
-/// Returns un-dismissed pending entries, or `None` if the prompt should be skipped
-/// (nothing pending, not logged in, or not a TTY).
-fn collect_pending_for_prompt() -> Option<Vec<storage::VirtualKeyCacheEntry>> {
-    if storage::count_pending_virtual_keys().unwrap_or(0) == 0 {
-        return None;
-    }
-    if storage::get_platform_account().ok().flatten().is_none() {
-        return None;
-    }
-    if !io::stderr().is_terminal() {
-        return None;
-    }
-    let entries: Vec<_> = storage::list_virtual_key_cache()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|e| {
-            e.share_status == "pending_claim"
-                && e.key_status == "active"
-                && e.local_state == "synced_inactive"
-        })
-        .collect();
-    if entries.is_empty() { None } else { Some(entries) }
-}
-
-/// Prints the pending-key banner and reads the user's choice.
-/// Returns `true` if the user typed "y", `false` / dismissed / skipped otherwise.
-fn show_pending_banner(pending_entries: &[storage::VirtualKeyCacheEntry]) -> bool {
-    eprintln!();
-    eprintln!("{}", format!("  {} new team key(s) pending to accept:", pending_entries.len())
-        .yellow().bold());
-    for e in pending_entries {
-        let provider = if e.provider_code.is_empty() { "unknown" } else { &e.provider_code };
-        eprintln!("  {} {}  {}",
-            "•".yellow(),
-            e.alias.bold(),
-            format!("[{}]", provider).dimmed());
-    }
-    eprint!("\n  {} ", "Accept?".bold());
-    eprint!("{}  {}  {} ",
-        "[Y] yes".green(),
-        "[N] never remind".red(),
-        "Enter = skip".dimmed());
-    eprint!(": ");
-    io::stderr().flush().ok();
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return false;
-    }
-
-    match input.trim().to_lowercase().as_str() {
-        "n" => {
-            let ids: Vec<String> = pending_entries.iter().map(|e| e.virtual_key_id.clone()).collect();
-            let _ = storage::dismiss_pending_keys(&ids);
-            eprintln!("{}", "  Dismissed. Run 'aikey key accept' to download later.".dimmed());
-            eprintln!();
-            false
-        }
-        "y" => true,
-        _ => {
-            eprintln!();
-            false
-        }
-    }
-}
-
-/// Accepts the given pending keys and prints a result line for each.
-fn run_accept_batch(pending_entries: &[storage::VirtualKeyCacheEntry], password: &SecretString) {
-    eprintln!();
-    for e in pending_entries {
-        match handle_key_accept(Some(e.virtual_key_id.as_str()), password, false) {
-            Ok(_) => {}
-            Err(err) => eprintln!("Warning: could not accept key {}: {}", e.alias, err),
-        }
-    }
-    eprintln!();
-}
-
-/// Called at the start of commands that do **not** already have the vault
-/// password in hand (e.g. `aikey proxy status`, `aikey stats`).
-///
-/// Shows the pending-key banner; if the user types Y, prompts for the vault
-/// password and accepts all pending keys.  N dismisses permanently; Enter
-/// skips until next time.  All failures are silently swallowed.
-pub fn maybe_prompt_accept_pending() -> Result<(), String> {
-    let pending = match collect_pending_for_prompt() {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    if show_pending_banner(&pending) {
-        let password_str = match rpassword::prompt_password("Vault master password: ") {
-            Ok(p) => p,
-            Err(_) => return Ok(()),
-        };
-        run_accept_batch(&pending, &SecretString::new(password_str));
-    }
-    Ok(())
-}
-
-/// Variant for commands that already hold the vault password (e.g. `aikey list`).
-///
-/// Reuses the caller's password so the user is not asked to type it twice.
-pub fn maybe_prompt_accept_pending_with_password(password: &SecretString) -> Result<(), String> {
-    let pending = match collect_pending_for_prompt() {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    if show_pending_banner(&pending) {
-        run_accept_batch(&pending, password);
     }
     Ok(())
 }

@@ -28,8 +28,9 @@ use secrecy::{ExposeSecret, SecretString};
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use zeroize::Zeroizing;
-use rpassword::prompt_password;
 use error_codes::msgs;
+
+use aikeylabs_aikey_cli::prompt_hidden;
 
 #[derive(Parser)]
 #[command(name = "aikey", about = "AiKey - Secure local-first secret management", version = "0.2.0", disable_version_flag = true)]
@@ -168,7 +169,7 @@ enum Commands {
         #[arg(short, long, default_value = "20")]
         limit: u32,
     },
-    /// Manage API keys (rotate, list, accept, sync, use)
+    /// Manage API keys (rotate, list, sync, use)
     Key {
         #[command(subcommand)]
         action: KeyAction,
@@ -180,8 +181,8 @@ enum Commands {
     },
     /// Log in to an aikey-control-service (shortcut for `account login`)
     Login {
-        /// Control service URL (e.g. http://localhost:8080)
-        #[arg(long)]
+        /// Control Panel URL (e.g. http://192.168.1.100:3000)
+        #[arg(long = "control-url", alias = "url")]
         url: Option<String>,
         /// One-time login token for copy-paste fallback: SESSION_ID:LOGIN_TOKEN
         #[arg(long)]
@@ -265,11 +266,6 @@ enum KeyAction {
     },
     /// List all team-managed virtual keys (fetches from server if logged in)
     List,
-    /// Accept and download pending team keys (all pending if no id given)
-    Accept {
-        /// Virtual key ID to accept (omit to accept all pending keys)
-        id: Option<String>,
-    },
     /// Sync all team key metadata from the control service
     Sync,
     /// Activate a key for proxy routing and write ~/.aikey/active.env
@@ -293,8 +289,8 @@ enum KeyAction {
 enum AccountAction {
     /// Log in to an aikey-control-service instance via browser + email activation (OAuth device flow)
     Login {
-        /// Control service URL (e.g. http://localhost:8080)
-        #[arg(long)]
+        /// Control Panel URL (e.g. http://192.168.1.100:3000)
+        #[arg(long = "control-url", alias = "url")]
         url: Option<String>,
         /// One-time login token for copy-paste fallback: SESSION_ID:LOGIN_TOKEN
         /// (shown on the activation page when the browser flow does not complete)
@@ -632,7 +628,6 @@ fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Key { action } => format!("key.{}", match action {
                 KeyAction::Rotate { .. } => "rotate",
                 KeyAction::List => "list",
-                KeyAction::Accept { .. } => "accept",
                 KeyAction::Sync => "sync",
                 KeyAction::Use { .. } => "use",
                 KeyAction::Alias { .. } => "alias",
@@ -718,7 +713,7 @@ fn handle_stats(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
 fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let command = cli.command.as_ref().unwrap();
 
-    // Auto-start proxy silently when AIKEY_VAULT_PASSWORD (or AK_TEST_PASSWORD)
+    // Auto-start proxy silently when AIKEY_MASTER_PASSWORD (or AK_TEST_PASSWORD)
     // is available in the environment.  Skipped for proxy lifecycle commands which
     // manage the process themselves, and for version/init which predate the proxy.
     match command {
@@ -733,22 +728,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Commands::Proxy { .. } | Commands::Init => {}
         _ => { commands_account::try_background_snapshot_sync(); }
-    }
-
-    // Interactive accept prompt: if there are pending team keys in local cache,
-    // ask the user whether to accept them before proceeding with the real command.
-    // Skipped in JSON mode, for Key/Account subcommands, and in non-TTY contexts.
-    if !cli.json {
-        match command {
-            // Skip for Key/Account subcommands (they handle their own key flows),
-            // auth commands, and List (List prompts for vault password first and
-            // then calls maybe_prompt_accept_pending_with_password to reuse it).
-            Commands::Key { .. } | Commands::Account { .. }
-            | Commands::Login { .. } | Commands::Logout
-            | Commands::Browse { .. }
-            | Commands::Use { .. } | Commands::Whoami | Commands::List => {}
-            _ => { let _ = commands_account::maybe_prompt_accept_pending(); }
-        }
     }
 
     match command {
@@ -788,7 +767,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
                 Zeroizing::new(test_secret)
             } else if std::io::stdin().is_terminal() {
-                let val = rpassword::prompt_password("Enter API Key: ")
+                let val = prompt_hidden("Enter API Key: ")
                     .map_err(|e| format!("Failed to read API Key value: {}", e))?;
                 Zeroizing::new(val)
             } else {
@@ -842,8 +821,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     } else if let Ok(n) = choice.parse::<usize>() {
                         if n >= 1 && n <= KNOWN.len() {
                             let (name, default_url) = KNOWN[n - 1];
-                            // Ask whether to use the default or a custom URL.
-                            print!("Base URL (press Enter for default: {}): ", default_url.dimmed());
+                            println!();
+                            println!("  Using {}  →  {}", name.bold(), default_url.dimmed());
+                            print!("  Custom URL (press Enter to use default): ");
                             io::stdout().flush()?;
                             let mut url_input = String::new();
                             io::stdin().read_line(&mut url_input)?;
@@ -970,18 +950,23 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::List => {
-            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
-
-            // Show pending-key banner (if any) and reuse the vault password
-            // already entered above — avoids a second password prompt.
-            if !cli.json {
-                let _ = commands_account::maybe_prompt_accept_pending_with_password(&password);
+            // Version-gated sync: only prompt for Master Password when the
+            // server has changes (new keys, status updates, etc.).
+            // No password needed when version is unchanged (most common case).
+            match commands_account::check_sync_version_changed() {
+                Ok(true) => {
+                    // Server has new data — need password for full sync (claim + encrypt).
+                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+                    let _ = commands_account::run_full_snapshot_sync(&password);
+                }
+                Ok(false) => {
+                    // Already up-to-date — no sync needed, no password.
+                }
+                Err(_) => {
+                    // Server unreachable (timeout / network error) — skip sync,
+                    // show local cache as-is.
+                }
             }
-
-            // Silently refresh key state via the snapshot path before reading
-            // the cache.  Uses the version-check shortcut — no-op when already
-            // up-to-date.  Failures are non-fatal; we fall back to local cache.
-            let _ = commands_account::run_snapshot_sync();
 
             // Only active keys are shown; revoked / recycled / expired keys
             // are hidden so the output reflects currently usable keys only.
@@ -991,41 +976,22 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|e| e.key_status == "active")
                 .collect();
 
+            let entries = storage::list_entries_with_metadata().unwrap_or_default();
+
             if cli.json {
-                // JSON mode: return array of objects with metadata
-                let result = executor::list_secrets_with_metadata(&password);
-                let _ = audit::log_audit_event(&password, audit::AuditOperation::List, None, result.is_ok());
-
-                match result {
-                    Ok(entries) => {
-                        json_output::success(serde_json::json!({
-                            "secrets": entries,
-                            "managed_keys": managed.iter().map(|e| serde_json::json!({
-                                "virtual_key_id": e.virtual_key_id,
-                                "alias":          e.alias,
-                                "provider_code":  e.provider_code,
-                                "key_status":     e.key_status,
-                                "share_status":   e.share_status,
-                                "local_state":    e.local_state,
-                                "has_key":        e.provider_key_ciphertext.is_some(),
-                            })).collect::<Vec<_>>(),
-                        }));
-                    }
-                    Err(err) => {
-                        json_output::error(&err, 1);
-                    }
-                }
+                json_output::success(serde_json::json!({
+                    "secrets": entries,
+                    "managed_keys": managed.iter().map(|e| serde_json::json!({
+                        "virtual_key_id": e.virtual_key_id,
+                        "alias":          e.alias,
+                        "provider_code":  e.provider_code,
+                        "key_status":     e.key_status,
+                        "share_status":   e.share_status,
+                        "local_state":    e.local_state,
+                        "has_key":        e.provider_key_ciphertext.is_some(),
+                    })).collect::<Vec<_>>(),
+                }));
             } else {
-                // Text mode
-                let result = executor::list_secrets_with_metadata(&password);
-                let _ = audit::log_audit_event(&password, audit::AuditOperation::List, None, result.is_ok());
-
-                let entries = match result {
-                    Ok(e) => e,
-                    Err(err) => {
-                        return Err(err.into());
-                    }
-                };
 
                 use colored::Colorize;
 
@@ -1113,8 +1079,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         println!("  {}  {}  {}  {}  {:<4}  {}{}",
                             alias, provider, local_str, status_str, has_key, share, server_alias_hint);
                     }
-                    // Pending notice is shown as a startup prompt before every
-                    // command (see maybe_prompt_accept_pending), so no need to repeat.
+                    // Pending notice is shown in `aikey key list` output above.
                 }
             }
         }
@@ -1126,7 +1091,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Zeroizing::new(test_secret)
             } else if std::io::stdin().is_terminal() {
                 // Hidden prompt on TTY
-                let val = rpassword::prompt_password("Enter New Secret: ")
+                let val = prompt_hidden("Enter New Secret: ")
                     .map_err(|e| format!("Failed to read secret value: {}", e))?;
                 Zeroizing::new(val)
             } else {
@@ -1513,7 +1478,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     // Read secret value: hidden prompt on TTY, plain stdin for pipes
                     let secret = if std::io::stdin().is_terminal() {
-                        let val = rpassword::prompt_password("Enter API Key value: ")
+                        let val = prompt_hidden("Enter API Key value: ")
                             .map_err(|e| format!("Failed to read secret value: {}", e))?;
                         Zeroizing::new(val)
                     } else {
@@ -1599,7 +1564,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     // Read secret value: hidden prompt on TTY, plain stdin for pipes
                     let secret = if std::io::stdin().is_terminal() {
-                        let val = rpassword::prompt_password("Enter API Key value: ")
+                        let val = prompt_hidden("Enter API Key value: ")
                             .map_err(|e| format!("Failed to read secret value: {}", e))?;
                         Zeroizing::new(val)
                     } else {
@@ -1983,7 +1948,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         io::stdin().read_line(&mut buf)?;
                         buf
                     } else {
-                        let val = rpassword::prompt_password(format!("New value for '{}': ", name))
+                        let val = prompt_hidden(&format!("New value for '{}': ", name))
                             .map_err(|e| format!("Failed to read new key value: {}", e))?;
                         Zeroizing::new(val)
                     };
@@ -2038,10 +2003,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 KeyAction::List => {
                     commands_account::handle_key_list(cli.json)?;
-                }
-                KeyAction::Accept { id } => {
-                    let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
-                    commands_account::handle_key_accept(id.as_deref(), &password, cli.json)?;
                 }
                 KeyAction::Sync => {
                     let password = prompt_vault_password(cli.password_stdin, cli.json)?;
@@ -2351,7 +2312,7 @@ fn prompt_vault_password(password_stdin: bool, json_mode: bool) -> io::Result<Se
 
 /// Always prompts for the master password — never reads from cache.
 /// Use for HIGH-sensitivity commands (add, delete, update, import, export,
-/// secret set/upsert/delete, change-password, key accept, exec, run --direct).
+/// secret set/upsert/delete, change-password, exec, run --direct).
 fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
     let vault_exists = storage::get_vault_path()
         .map(|p| p.exists())
@@ -2382,12 +2343,9 @@ fn prompt_password_secure(prompt: &str, password_stdin: bool, json_mode: bool) -
         return Ok(SecretString::new(trimmed));
     }
 
-    // Interactive TTY path: disable echo using rpassword
-    // In JSON mode we suppress the prompt to avoid polluting machine-readable output
+    // Interactive TTY path: show `*` per keystroke for visual feedback.
     let prompt_str = if json_mode { "" } else { prompt };
-    let password = prompt_password(prompt_str).map_err(|e| {
-        // rpassword fails with "Device not configured" (OS error 6) when no TTY is available.
-        // Convert to a user-friendly message instead of exposing the internal OS error.
+    let password = prompt_hidden(prompt_str).map_err(|e| {
         if e.kind() == io::ErrorKind::Other || e.raw_os_error() == Some(6) {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -2416,7 +2374,7 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
     let team = storage::list_virtual_key_cache().unwrap_or_default();
 
     if personal.is_empty() && team.is_empty() {
-        return Err("No keys found. Add a personal key with `aikey add` or accept a team key with `aikey key accept`.".into());
+        return Err("No keys found. Add a personal key with `aikey add` or sync team keys with `aikey key sync`.".into());
     }
 
     // Active key for LOCAL column
@@ -2450,8 +2408,20 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
         selectable.push(true);
     }
 
-    // Partition team keys: current account (selectable) vs other account (view-only).
-    let (own_team, other_account_team): (Vec<_>, Vec<_>) = team.iter()
+    // Filter out unusable team keys (revoked, expired, stale, etc.).
+    // Only show keys that are either usable or belong to another account (for visibility).
+    let visible_team: Vec<_> = team.iter()
+        .filter(|e| {
+            e.key_status == "active"
+                && e.local_state != "stale"
+                && e.local_state != "disabled_by_key_status"
+                && e.local_state != "disabled_by_seat_status"
+                && e.local_state != "disabled_by_account_status"
+        })
+        .collect();
+
+    // Partition: current account (selectable) vs other account (view-only).
+    let (own_team, other_account_team): (Vec<_>, Vec<_>) = visible_team.into_iter()
         .partition(|e| e.local_state != "disabled_by_account_scope");
 
     for e in &own_team {
