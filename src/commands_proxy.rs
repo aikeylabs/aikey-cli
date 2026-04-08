@@ -191,9 +191,18 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
         };
         let started = silently_start_proxy(&pw);
         if started {
-            eprintln!("  [aikey] proxy started (pid recorded)");
+            eprintln!("  [aikey] proxy started in background");
         } else {
-            eprintln!("  [aikey] proxy failed to start — run `aikey proxy start` to debug");
+            // Why: show actionable reason instead of a generic "failed" message.
+            let bin_ok = find_proxy_binary().is_ok();
+            let cfg_ok = resolve_config(None).is_ok();
+            if !bin_ok {
+                eprintln!("  [aikey] proxy binary not found — reinstall with: aikey proxy install");
+            } else if !cfg_ok {
+                eprintln!("  [aikey] proxy config not found — run: aikey proxy start");
+            } else {
+                eprintln!("  [aikey] proxy failed to start — check port conflict or run: aikey proxy start --foreground");
+            }
         }
     } else {
         // Non-interactive, no env var — print a one-line hint.
@@ -320,20 +329,33 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
     cmd.env("AIKEY_MASTER_PASSWORD", password.expose_secret());
 
     if detach {
-        // Background: stdout/stderr go to /dev/null; we just write the PID.
+        // Background: stdout/stderr go to log file; terminal is not blocked.
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
         let child = cmd.spawn()
             .map_err(|e| format!("failed to spawn aikey-proxy: {}", e))?;
         let pid = child.id();
         write_pid(pid)?;
-        eprintln!("proxy started (pid: {})", pid);
-        eprintln!("listen: http://{}", PROXY_HEALTH_ADDR_DEFAULT);
+
+        // Wait for proxy to become healthy before returning (max 3s).
+        let addr = proxy_listen_addr(config.map(std::path::Path::new));
+        let mut healthy = false;
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if port_reachable(&addr, std::time::Duration::from_millis(300)) {
+                healthy = true;
+                break;
+            }
+        }
+        if healthy {
+            eprintln!("\x1b[32m✓\x1b[0m aikey-proxy running (pid: {}, http://{})", pid, addr);
+        } else {
+            eprintln!("aikey-proxy spawned (pid: {}) but not yet reachable at http://{}", pid, addr);
+            eprintln!("  check logs: ~/.aikey/logs/");
+        }
 
         // Quick connectivity check for overseas providers after proxy starts.
         // Only warn when a provider is unreachable — no noise when all is fine.
         std::thread::spawn(|| {
-            // Give the proxy a moment to initialize.
-            std::thread::sleep(std::time::Duration::from_secs(2));
             check_overseas_connectivity();
         });
 

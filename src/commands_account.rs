@@ -451,6 +451,28 @@ fn finish_login(
         control_url,
     )?;
 
+    // Why: after clear-install + login, the vault DB exists (created by session
+    // backend selection) but has no master_salt — meaning vault encryption is not
+    // initialized. Without it, proxy start, key sync, and aikey use all fail.
+    // Auto-initialize here so the user can immediately proceed with `aikey use`.
+    if crate::storage::get_salt().is_err() {
+        if !json_mode {
+            eprintln!();
+            eprint!("  \u{1F512} Set Master Password: ");
+        }
+        let pw = if let Ok(val) = std::env::var("AK_TEST_PASSWORD") {
+            secrecy::SecretString::new(val)
+        } else {
+            secrecy::SecretString::new(crate::prompt_hidden("")?)
+        };
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt)?;
+        crate::storage::initialize_vault(&salt, &pw)?;
+        if !json_mode {
+            eprintln!("  Vault initialized.");
+        }
+    }
+
     // Pull the account's current key snapshot immediately after login.
     // This ensures keys are visible right after `aikey login` without needing
     // a separate `aikey key list` or `aikey key sync` call.
@@ -1881,10 +1903,34 @@ pub fn handle_key_use(
             return Err(reason.into());
         }
         if entry.provider_key_ciphertext.is_none() {
-            return Err(format!(
-                "Key '{}' ({}) has not been delivered yet. Run 'aikey key sync' to download.",
-                entry.alias, entry.virtual_key_id
-            ).into());
+            // Why: key material is NULL when the VK was synced but not yet delivered
+            // (share_status=pending_claim). Auto-trigger a full snapshot sync (which
+            // includes key material download) instead of forcing a separate command.
+            eprintln!("  Key '{}' not yet delivered — syncing...", entry.alias);
+            // Full sync needs the vault master password to decrypt/re-encrypt key material.
+            // Try session cache first, then env var (for automation/testing).
+            let pw = crate::session::try_get()
+                .or_else(|| std::env::var("AK_TEST_PASSWORD").ok().map(secrecy::SecretString::new))
+                .or_else(|| std::env::var("AIKEY_TEST_MASTER_PASSWORD").ok().map(secrecy::SecretString::new));
+            if let Some(ref password) = pw {
+                let _ = run_full_snapshot_sync(password);
+            } else {
+                // Cannot get password — fallback to metadata-only sync.
+                sync_managed_key_metadata();
+            }
+            // Re-read the entry after sync.
+            let refreshed = storage::get_virtual_key_cache(&entry.virtual_key_id)?
+                .or_else(|| storage::get_virtual_key_cache_by_alias(alias_or_id).ok().flatten());
+            if refreshed.as_ref().and_then(|e| e.provider_key_ciphertext.as_ref()).is_none() {
+                return Err(format!(
+                    "Key '{}' could not be delivered. The admin may need to re-issue the key, \
+                     or try again with: aikey key sync",
+                    entry.alias
+                ).into());
+            }
+            // Re-call with the refreshed state.
+            drop(refreshed);
+            return handle_key_use(alias_or_id, no_hook, provider_override, json_mode);
         }
         let display = entry.local_alias.as_deref().unwrap_or(&entry.alias).to_string();
         let providers = if !entry.supported_providers.is_empty() {

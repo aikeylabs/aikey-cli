@@ -239,9 +239,9 @@ enum ProxyAction {
         /// Path to aikey-proxy.yaml (auto-detected if omitted)
         #[arg(long)]
         config: Option<String>,
-        /// Run in background and return immediately
-        #[arg(short, long)]
-        detach: bool,
+        /// Run in foreground (default: start in background and return immediately)
+        #[arg(long)]
+        foreground: bool,
     },
     /// Stop the running aikey-proxy
     Stop,
@@ -506,7 +506,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "version": VERSION
             }));
         } else {
-            println!("aikey {}", VERSION);
+            print_banner();
         }
         return Ok(());
     }
@@ -516,7 +516,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if cli.json {
             json_output::error("No command specified. Use --help for usage information.", 1);
         } else {
-            eprintln!("Error: No command specified. Use --help for usage information.");
+            print_banner();
+            eprintln!();
+            eprintln!("  Run 'aikey --help' for a list of commands.");
             std::process::exit(1);
         }
     }
@@ -2098,14 +2100,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Proxy { action } => {
             match action {
-                ProxyAction::Start { config, detach } => {
+                ProxyAction::Start { config, foreground } => {
                     let password = prompt_vault_password(cli.password_stdin, cli.json)?;
                     // Verify the password is valid before handing it to the proxy.
                     executor::list_secrets(&password)
                         .map_err(|e| format!("vault authentication failed: {}", e))?;
+                    // Why: default is background (detach=true) so the terminal is not blocked.
+                    // Use --foreground for debugging or when running under a process manager.
                     commands_proxy::handle_start(
                         config.as_deref(),
-                        *detach,
+                        !*foreground,  // detach = !foreground
                         &password,
                     )?;
                 }
@@ -2268,6 +2272,28 @@ fn validate_secret_name(name: &str) -> Result<(), String> {
 /// After a successful vault operation the caller should call `session::refresh()`.
 /// Fuzzy similarity in [0.0, 1.0] combining prefix match, edit distance, and bigrams.
 /// Used to suggest close matches for mistyped subcommands.
+fn print_banner() {
+    use colored::Colorize;
+    let version = env!("CARGO_PKG_VERSION");
+    let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+    let aikey_home = format!("{}/.aikey", home);
+
+    // Muted gold: RGB(160, 135, 75) — subtle on dark terminals.
+    let g = |s: &str| s.truecolor(160, 135, 75);
+
+    eprintln!();
+    eprintln!("      {}          {}", g("▄████▄"), g("▄████▄"));
+    eprintln!("    {}", g("▄████████▄▄▄▄▄▄▄▄████████▄"));
+    eprintln!("   {}", g("█████▀▀▀▀██████████▀▀▀▀█████"));
+    eprintln!("   {}       {}       {}      {}   v{}", g("████"), g("▀████▀"), g("████"), "AiKey CLI".bold(), version);
+    eprintln!("   {}  {}   {}   {}  {}      {}", g("████"), g("███"), g("▀██▀"), g("███"), g("████"), "------------------------------------".dimmed());
+    eprintln!("   {}  {}  {}  {}  {}      FinOps & AI Governance Center", g("████"), g("███"), g("▄████▄"), g("███"), g("████"));
+    eprintln!("   {}     {}     {}      {}", g("████▄"), g("▄██▀▀██▄"), g("▄████"), aikey_home);
+    eprintln!("    {}", g("▀████▄▄▄████  ████▄▄▄████▀"));
+    eprintln!("      {}    {}", g("▀▀██████▀"), g("▀██████▀▀"));
+    eprintln!();
+}
+
 fn similarity(a: &str, b: &str) -> f64 {
     if a.is_empty() || b.is_empty() { return 0.0; }
     if a == b { return 1.0; }
