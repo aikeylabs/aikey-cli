@@ -79,7 +79,9 @@ fn compute_inner_w(title: &str, header: &str, items: &[String]) -> usize {
         .unwrap_or(20);
 
     let content_max = header_vis.max(items_max).max(title_vis);
-    content_max + 10 // 2 padding each side + 6 right margin
+    // Cap at terminal width minus box borders and outer margins.
+    let max_inner = crate::ui_frame::term_width().saturating_sub(6);
+    (content_max + 10).min(max_inner) // 2 padding each side + 6 right margin
 }
 
 /// Format one row: `│ > item padded │` or `│   item padded │`

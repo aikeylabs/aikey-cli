@@ -809,10 +809,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     use colored::Colorize;
                     const KNOWN: &[(&str, &str)] = &[
                         ("anthropic", "https://api.anthropic.com"),
-                        ("openai",    "https://api.openai.com"),
+                        ("openai",    "https://api.openai.com/v1"),
                         ("google",    "https://generativelanguage.googleapis.com"),
-                        ("deepseek",  "https://api.deepseek.com"),
-                        ("kimi",      "https://api.moonshot.cn"),
+                        ("deepseek",  "https://api.deepseek.com/v1"),
+                        ("kimi",      "https://api.moonshot.cn/v1"),
                     ];
                     println!();
                     println!("Select provider:");
@@ -1087,6 +1087,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     &rows,
                 );
             }
+
+            // Post-operation: warn if proxy is unreachable (e.g. after kill -9).
+            commands_proxy::warn_if_proxy_down();
         }
         Commands::Update { alias } => {
             let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
@@ -1213,6 +1216,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     return Err(e.into());
                 }
             }
+
+            // Post-operation: warn if proxy is unreachable.
+            commands_proxy::warn_if_proxy_down();
         }
         Commands::Run { provider, logical_model, model, tenant, profile, dry_run, direct, command } => {
             if command.is_empty() {
@@ -1380,6 +1386,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(p) = prev_profile {
                     let _ = global_config::set_current_profile(&p);
                 }
+            }
+
+            // Post-operation: warn if proxy is unreachable (complements proxy_guard
+            // which may have failed to start the proxy after a kill -9).
+            if !*dry_run {
+                commands_proxy::warn_if_proxy_down();
             }
         }
         Commands::ChangePassword => {
@@ -2016,6 +2028,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 KeyAction::Use { alias_or_id, no_hook } => {
                     commands_proxy::ensure_proxy_for_use(cli.password_stdin);
                     commands_account::handle_key_use(alias_or_id, *no_hook, None, cli.json)?;
+                    commands_proxy::warn_if_proxy_down();
                 }
                 KeyAction::Alias { old_alias, new_alias } => {
                     commands_account::handle_key_alias(old_alias, new_alias, cli.json)?;
@@ -2064,6 +2077,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands_account::handle_key_use(
                 &resolved_alias, *no_hook, provider.as_deref(), cli.json,
             )?;
+            // Post-operation: warn if proxy is still unreachable after ensure_proxy_for_use
+            // attempted to start it (e.g. after kill -9 with no env password).
+            commands_proxy::warn_if_proxy_down();
         }
         Commands::Browse { page, port } => {
             commands_account::handle_browse(page.as_deref(), *port, cli.json)?;
@@ -2389,11 +2405,20 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
     let active_cfg = storage::get_active_key_config().ok().flatten();
 
     // Build display rows; keep alias/id parallel for lookup after selection.
-    // Format: TYPE  ALIAS                  PROVIDER / BASE_URL             LOCAL
+    // Format: TYPE  ALIAS  PROVIDER / BASE_URL  [active marker]
     let mut items: Vec<String> = Vec::new();
     let mut aliases: Vec<String> = Vec::new();
     // Track which rows are selectable (false for separator & other-account keys).
     let mut selectable: Vec<bool> = Vec::new();
+
+    // Dynamic column widths based on terminal size.
+    // Layout: "personal  " (10) + alias_w + "  " (2) + provider_w + " ◀ active" (9)
+    let tw = ui_frame::term_width();
+    // Reserve: 10 (type+space) + 2 (gap) + 9 (active marker) + 10 (box borders/margins)
+    let available = tw.saturating_sub(31);
+    // Split available space: ~40% alias, ~60% provider, with minimums.
+    let alias_w = (available * 2 / 5).max(10).min(30);
+    let provider_w = available.saturating_sub(alias_w).max(10).min(40);
 
     for entry in &personal {
         let provider_col = match (&entry.base_url, &entry.provider_code) {
@@ -2405,11 +2430,15 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
             cfg.key_type == "personal" && cfg.key_ref == entry.alias
         });
         let active_marker = if is_active { " ◀ active" } else { "" };
+        let alias_display = if entry.alias.len() > alias_w { &entry.alias[..alias_w] } else { &entry.alias };
+        let prov_display = if provider_col.len() > provider_w { &provider_col[..provider_w] } else { &provider_col };
         let row = format!(
-            "personal  {:<22}  {:<28}{}",
-            if entry.alias.len() > 22 { &entry.alias[..22] } else { &entry.alias },
-            if provider_col.len() > 28 { &provider_col[..28] } else { &provider_col },
+            "personal  {:<aw$}  {:<pw$}{}",
+            alias_display,
+            prov_display,
             active_marker,
+            aw = alias_w,
+            pw = provider_w,
         );
         items.push(row);
         aliases.push(entry.alias.clone());
@@ -2438,11 +2467,15 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
             cfg.key_type == "team" && cfg.key_ref == e.virtual_key_id
         });
         let active_marker = if is_active { " ◀ active" } else { "" };
+        let alias_display = if display_name.len() > alias_w { &display_name[..alias_w] } else { display_name };
+        let prov_display = if e.provider_code.len() > provider_w { &e.provider_code[..provider_w] } else { &e.provider_code };
         let row = format!(
-            "team      {:<22}  {:<28}{}",
-            if display_name.len() > 22 { &display_name[..22] } else { display_name },
-            if e.provider_code.len() > 28 { &e.provider_code[..28] } else { &e.provider_code },
+            "team      {:<aw$}  {:<pw$}{}",
+            alias_display,
+            prov_display,
             active_marker,
+            aw = alias_w,
+            pw = provider_w,
         );
         items.push(row);
         aliases.push(e.virtual_key_id.clone());
@@ -2458,10 +2491,14 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
 
         for e in &other_account_team {
             let display_name = e.local_alias.as_deref().unwrap_or(e.alias.as_str());
+            let alias_display = if display_name.len() > alias_w { &display_name[..alias_w] } else { display_name };
+            let prov_display = if e.provider_code.len() > provider_w { &e.provider_code[..provider_w] } else { &e.provider_code };
             let raw = format!(
-                "team      {:<22}  {:<28}  [other account]",
-                if display_name.len() > 22 { &display_name[..22] } else { display_name },
-                if e.provider_code.len() > 28 { &e.provider_code[..28] } else { &e.provider_code },
+                "team      {:<aw$}  {:<pw$}  [other account]",
+                alias_display,
+                prov_display,
+                aw = alias_w,
+                pw = provider_w,
             );
             items.push(format!("{}", raw.dimmed()));
             aliases.push(e.virtual_key_id.clone());
@@ -2469,7 +2506,7 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
         }
     }
 
-    let header = format!("        {:<22}  {:<28}", "ALIAS", "PROVIDER / BASE_URL");
+    let header = format!("        {:<aw$}  {:<pw$}", "Alias", "Provider / Base URL", aw = alias_w, pw = provider_w);
 
     // Find initial cursor: prefer the currently active key, else first selectable.
     let initial = active_cfg.as_ref()

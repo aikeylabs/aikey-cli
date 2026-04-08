@@ -12,7 +12,7 @@ use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 use std::io;
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -329,6 +329,14 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
         eprintln!("proxy started (pid: {})", pid);
         eprintln!("listen: http://{}", PROXY_HEALTH_ADDR_DEFAULT);
 
+        // Quick connectivity check for overseas providers after proxy starts.
+        // Only warn when a provider is unreachable — no noise when all is fine.
+        std::thread::spawn(|| {
+            // Give the proxy a moment to initialize.
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            check_overseas_connectivity();
+        });
+
         // Record the vault snapshot that this proxy generation was started with.
         if let Ok(seq) = crate::storage::get_vault_change_seq() {
             let _ = crate::storage::set_proxy_loaded_seq(seq);
@@ -521,6 +529,36 @@ fn port_reachable(addr: &str, timeout: Duration) -> bool {
         &addr.parse().unwrap_or_else(|_| PROXY_HEALTH_ADDR_DEFAULT.parse().unwrap()),
         timeout,
     ).is_ok()
+}
+
+/// Quick connectivity check for overseas AI providers.
+/// Called in a background thread after proxy start. Only prints warnings
+/// for providers that are unreachable — no output when all is fine.
+fn check_overseas_connectivity() {
+    const PROVIDERS: &[(&str, &str)] = &[
+        ("OpenAI",    "api.openai.com:443"),
+        ("Anthropic", "api.anthropic.com:443"),
+    ];
+    let timeout = Duration::from_secs(5);
+    let mut unreachable = Vec::new();
+    for &(name, addr) in PROVIDERS {
+        if let Ok(sock_addr) = addr.to_socket_addrs().and_then(|mut it| {
+            it.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no addr"))
+        }) {
+            if TcpStream::connect_timeout(&sock_addr, timeout).is_err() {
+                unreachable.push(name);
+            }
+        } else {
+            unreachable.push(name);
+        }
+    }
+    if !unreachable.is_empty() {
+        eprintln!();
+        eprintln!("  \x1b[33m[warn]\x1b[0m  Cannot reach: {}",
+            unreachable.join(", "));
+        eprintln!("  \x1b[33m[warn]\x1b[0m  If you use these providers, configure HTTP_PROXY / HTTPS_PROXY");
+        eprintln!("          and restart the proxy: aikey proxy restart");
+    }
 }
 
 /// Locate the `aikey-proxy` binary using the following priority order:
@@ -790,6 +828,20 @@ pub fn proxy_port() -> u16 {
     addr.rsplit(':').next()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(27200)
+}
+
+/// Lightweight post-operation check: prints a warning if the proxy is not
+/// reachable.  Does NOT attempt to auto-start — just informs the user.
+///
+/// Intended to be called at the end of commands that depend on the proxy
+/// (`list`, `use`, `run`, `exec`) so the user knows why requests may fail
+/// after an unexpected proxy termination (e.g. `kill -9`).
+pub fn warn_if_proxy_down() {
+    let addr = proxy_listen_addr(None);
+    if !port_reachable(&addr, Duration::from_millis(400)) {
+        eprintln!();
+        eprintln!("  \x1b[33m\u{26A0}\x1b[0m  Proxy is not running. Start it with: aikey proxy start");
+    }
 }
 
 /// Returns `(is_running, pid)` — checks PID file + process alive + port reachable.

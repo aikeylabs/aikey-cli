@@ -71,6 +71,36 @@ pub fn pad_visible(s: &str, target_vis: usize) -> String {
 /// has breathing room and minor measurement errors don't break alignment.
 const RIGHT_MARGIN: usize = 6;
 
+/// Detect terminal width. Falls back to 80 if unavailable.
+pub fn term_width() -> usize {
+    // Try $COLUMNS first (set by most shells).
+    if let Ok(val) = std::env::var("COLUMNS") {
+        if let Ok(w) = val.parse::<usize>() {
+            if w > 0 { return w; }
+        }
+    }
+    // Unix ioctl fallback.
+    #[cfg(unix)]
+    {
+        use std::mem::MaybeUninit;
+        #[repr(C)]
+        struct Winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }
+        unsafe {
+            let mut ws = MaybeUninit::<Winsize>::zeroed();
+            // TIOCGWINSZ = 0x5413 on Linux, 0x40087468 on macOS
+            #[cfg(target_os = "macos")]
+            const TIOCGWINSZ: libc::c_ulong = 0x40087468;
+            #[cfg(not(target_os = "macos"))]
+            const TIOCGWINSZ: libc::c_ulong = 0x5413;
+            if libc::ioctl(libc::STDOUT_FILENO, TIOCGWINSZ, ws.as_mut_ptr()) == 0 {
+                let ws = ws.assume_init();
+                if ws.ws_col > 0 { return ws.ws_col as usize; }
+            }
+        }
+    }
+    80
+}
+
 /// Render a complete box frame to a String.
 ///
 /// - `icon`: leading icon in the title bar (e.g. "🔍", "❓", "📋"), or "" for none
@@ -90,7 +120,9 @@ pub fn render_box(icon: &str, title: &str, rows: &[String]) -> String {
         .unwrap_or(20);
     let title_vis = visible_len(&icon_title);
     // inner_w = widest content + 2 side padding + right margin
-    let inner_w = content_max.max(title_vis) + 4 + RIGHT_MARGIN;
+    // Cap at terminal width minus box borders and outer margins (│ + 2 spaces each side + │ = 6).
+    let max_inner = term_width().saturating_sub(6);
+    let inner_w = (content_max.max(title_vis) + 4 + RIGHT_MARGIN).min(max_inner);
 
     let title_fill = inner_w.saturating_sub(title_vis + 3);
     let border = "\u{2500}".repeat(inner_w);
