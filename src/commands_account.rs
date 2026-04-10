@@ -2108,19 +2108,9 @@ pub fn handle_key_use(
         storage::set_provider_binding(crate::profile_activation::DEFAULT_PROFILE, provider, key_type, &key_ref)?;
     }
 
-    // Legacy compat.
-    storage::set_active_key_config(&storage::ActiveKeyConfig {
-        key_type: key_type.to_string(),
-        key_ref: key_ref.clone(),
-        providers: providers.clone(),
-    })?;
-    let _ = storage::bump_vault_change_seq();
-
-    // ── 4b. Notify the proxy of the config change (if already running) ────────
-    crate::commands_proxy::try_reload_proxy();
-
-    // ── 5. Write ~/.aikey/active.env (proxy sentinel tokens) ──────────────────
-    write_active_env(key_type, &key_ref, &display_name, &providers, proxy_port)?;
+    // ── 3. Refresh active.env from ALL provider bindings ─────────────────────
+    let refresh = crate::profile_activation::refresh_implicit_profile_activation()
+        .map_err(|e| format!("Failed to refresh activation: {}", e))?;
 
     // ── 6. Shell hook (one-time, first use) ───────────────────────────────────
     let hook_msg = if !json_mode { ensure_shell_hook(no_hook) } else { None };
