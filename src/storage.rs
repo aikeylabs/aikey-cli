@@ -19,11 +19,15 @@ pub struct SecretMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
     /// Provider code (e.g. "anthropic", "openai"); None for plain secrets.
+    /// Legacy single-value field — prefer `supported_providers` for new code.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_code: Option<String>,
     /// Custom upstream base URL set by the user; overrides the provider default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Provider codes this key supports (v1.0.2+).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_providers: Option<Vec<String>>,
 }
 
 /// Default vault data directory path (~/.aikey/data/)
@@ -331,6 +335,22 @@ fn apply_migrations(conn: &Connection) -> Result<(), String> {
                 .map_err(|e| format!("Failed to add platform_account.{} column: {}", col, e))?;
         }
     }
+
+    // ---- User profile provider bindings (v1.0.2+) ----
+    // Per-provider key source assignments for a user profile.
+    // Replaces the old single-key active_key_config model.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS user_profile_provider_bindings (
+            profile_id      TEXT    NOT NULL,
+            provider_code   TEXT    NOT NULL,
+            key_source_type TEXT    NOT NULL,
+            key_source_ref  TEXT    NOT NULL,
+            updated_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            PRIMARY KEY (profile_id, provider_code)
+        )",
+        [],
+    )
+    .map_err(|e| format!("Failed to ensure user_profile_provider_bindings table: {}", e))?;
 
     // Migration guards for new event columns on existing databases
     for (col, ddl) in &[
@@ -850,19 +870,24 @@ pub fn list_entries_with_metadata() -> Result<Vec<SecretMetadata>, String> {
 
     let conn = open_connection()?;
 
-    // provider_code and base_url may not exist on older vaults — use ifnull to default to NULL.
+    // provider_code, base_url, supported_providers may not exist on older vaults.
     let mut stmt = conn
-        .prepare("SELECT alias, created_at, provider_code, base_url FROM entries ORDER BY alias")
-        .or_else(|_| conn.prepare("SELECT alias, created_at, NULL, NULL FROM entries ORDER BY alias"))
+        .prepare("SELECT alias, created_at, provider_code, base_url, supported_providers FROM entries ORDER BY alias")
+        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, NULL FROM entries ORDER BY alias"))
+        .or_else(|_| conn.prepare("SELECT alias, created_at, NULL, NULL, NULL FROM entries ORDER BY alias"))
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     let metadata: Vec<SecretMetadata> = stmt
         .query_map([], |row| {
+            let sp_json: Option<String> = row.get(4).ok().flatten();
+            let supported_providers = sp_json
+                .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
             Ok(SecretMetadata {
-                alias:         row.get(0)?,
-                created_at:    row.get(1).ok(),
-                provider_code: row.get(2).ok().flatten(),
-                base_url:      row.get(3).ok().flatten(),
+                alias:               row.get(0)?,
+                created_at:          row.get(1).ok(),
+                provider_code:       row.get(2).ok().flatten(),
+                base_url:            row.get(3).ok().flatten(),
+                supported_providers,
             })
         })
         .map_err(|e| format!("Failed to query entries: {}", e))?
@@ -1960,6 +1985,19 @@ pub fn set_entry_provider_code(alias: &str, provider_code: Option<&str>) -> Resu
     Ok(())
 }
 
+/// Sets the `supported_providers` JSON array for a personal key entry.
+pub fn set_entry_supported_providers(alias: &str, providers: &[String]) -> Result<(), String> {
+    let json = serde_json::to_string(providers)
+        .map_err(|e| format!("Failed to serialize providers: {}", e))?;
+    let conn = open_connection()?;
+    let rows = conn.execute(
+        "UPDATE entries SET supported_providers = ?1 WHERE alias = ?2",
+        params![json, alias],
+    ).map_err(|e| format!("Failed to set supported_providers: {}", e))?;
+    if rows == 0 { return Err(format!("Entry '{}' not found", alias)); }
+    Ok(())
+}
+
 /// Returns the custom upstream `base_url` for a personal key entry.
 /// Returns `None` if not set (proxy or SDK uses provider default).
 pub fn get_entry_base_url(alias: &str) -> Result<Option<String>, String> {
@@ -2039,5 +2077,150 @@ pub fn set_virtual_key_share_status_local(
     )
     .map_err(|e| format!("Failed to update share_status: {}", e))?;
     Ok(())
+}
+
+// ---- User profile provider bindings CRUD ----
+
+/// A per-provider key source binding within a user profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderBinding {
+    pub profile_id: String,
+    pub provider_code: String,
+    pub key_source_type: String,   // "personal" or "team"
+    pub key_source_ref: String,    // alias (personal) or virtual_key_id (team)
+    pub updated_at: Option<i64>,
+}
+
+/// Returns all provider bindings for the given profile, ordered by provider_code.
+pub fn list_provider_bindings(profile_id: &str) -> Result<Vec<ProviderBinding>, String> {
+    let conn = open_connection()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT profile_id, provider_code, key_source_type, key_source_ref, updated_at
+               FROM user_profile_provider_bindings
+              WHERE profile_id = ?1
+              ORDER BY provider_code",
+        )
+        .map_err(|e| format!("Failed to prepare provider bindings query: {}", e))?;
+
+    let rows = stmt
+        .query_map(params![profile_id], |row| {
+            Ok(ProviderBinding {
+                profile_id:      row.get(0)?,
+                provider_code:   row.get(1)?,
+                key_source_type: row.get(2)?,
+                key_source_ref:  row.get(3)?,
+                updated_at:      row.get(4).ok(),
+            })
+        })
+        .map_err(|e| format!("Failed to query provider bindings: {}", e))?
+        .collect::<SqlResult<Vec<ProviderBinding>>>()
+        .map_err(|e| format!("Failed to collect provider bindings: {}", e))?;
+
+    Ok(rows)
+}
+
+/// Returns the binding for a specific provider in a profile, or `None`.
+pub fn get_provider_binding(
+    profile_id: &str,
+    provider_code: &str,
+) -> Result<Option<ProviderBinding>, String> {
+    let conn = open_connection()?;
+    let result = conn.query_row(
+        "SELECT profile_id, provider_code, key_source_type, key_source_ref, updated_at
+           FROM user_profile_provider_bindings
+          WHERE profile_id = ?1 AND provider_code = ?2",
+        params![profile_id, provider_code],
+        |row| {
+            Ok(ProviderBinding {
+                profile_id:      row.get(0)?,
+                provider_code:   row.get(1)?,
+                key_source_type: row.get(2)?,
+                key_source_ref:  row.get(3)?,
+                updated_at:      row.get(4).ok(),
+            })
+        },
+    );
+    match result {
+        Ok(b) => Ok(Some(b)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to get provider binding: {}", e)),
+    }
+}
+
+/// Sets (upserts) a provider binding in a profile.
+pub fn set_provider_binding(
+    profile_id: &str,
+    provider_code: &str,
+    key_source_type: &str,
+    key_source_ref: &str,
+) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "INSERT INTO user_profile_provider_bindings
+            (profile_id, provider_code, key_source_type, key_source_ref, updated_at)
+         VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))
+         ON CONFLICT (profile_id, provider_code) DO UPDATE SET
+            key_source_type = excluded.key_source_type,
+            key_source_ref  = excluded.key_source_ref,
+            updated_at      = excluded.updated_at",
+        params![profile_id, provider_code, key_source_type, key_source_ref],
+    )
+    .map_err(|e| format!("Failed to set provider binding: {}", e))?;
+    Ok(())
+}
+
+/// Removes a provider binding from a profile.
+/// Returns true if a row was actually deleted.
+pub fn remove_provider_binding(
+    profile_id: &str,
+    provider_code: &str,
+) -> Result<bool, String> {
+    let conn = open_connection()?;
+    let rows = conn
+        .execute(
+            "DELETE FROM user_profile_provider_bindings
+              WHERE profile_id = ?1 AND provider_code = ?2",
+            params![profile_id, provider_code],
+        )
+        .map_err(|e| format!("Failed to remove provider binding: {}", e))?;
+    Ok(rows > 0)
+}
+
+/// Removes all bindings that reference a specific key source.
+/// Used when a key is deleted to clean up any dangling bindings.
+/// Returns the list of provider_codes whose bindings were removed.
+pub fn remove_bindings_by_key_source(
+    profile_id: &str,
+    key_source_type: &str,
+    key_source_ref: &str,
+) -> Result<Vec<String>, String> {
+    let conn = open_connection()?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT provider_code FROM user_profile_provider_bindings
+              WHERE profile_id = ?1 AND key_source_type = ?2 AND key_source_ref = ?3",
+        )
+        .map_err(|e| format!("Failed to prepare binding cleanup query: {}", e))?;
+
+    let affected: Vec<String> = stmt
+        .query_map(params![profile_id, key_source_type, key_source_ref], |row| {
+            row.get(0)
+        })
+        .map_err(|e| format!("Failed to query affected bindings: {}", e))?
+        .collect::<SqlResult<Vec<String>>>()
+        .map_err(|e| format!("Failed to collect affected bindings: {}", e))?;
+
+    if !affected.is_empty() {
+        conn.execute(
+            "DELETE FROM user_profile_provider_bindings
+              WHERE profile_id = ?1 AND key_source_type = ?2 AND key_source_ref = ?3",
+            params![profile_id, key_source_type, key_source_ref],
+        )
+        .map_err(|e| format!("Failed to remove bindings for key: {}", e))?;
+    }
+
+    Ok(affected)
 }
 

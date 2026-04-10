@@ -1809,6 +1809,13 @@ fn write_active_env(
         }
     }
 
+    // Ensure localhost proxy traffic bypasses user's HTTP proxy.
+    // Appends to existing no_proxy via shell expansion — does not clobber.
+    if !providers.is_empty() {
+        lines.push(format!("export no_proxy=\"127.0.0.1,localhost,${{no_proxy:-}}\""));
+        lines.push(format!("export NO_PROXY=\"127.0.0.1,localhost,${{NO_PROXY:-}}\""));
+    }
+
     std::fs::write(&env_path, lines.join("\n") + "\n")?;
     Ok(())
 }
@@ -2229,6 +2236,15 @@ fn derive_vault_key(
     let (m, t, p) = storage::get_kdf_params()?;
     let secure_key = crypto::derive_key_with_params(password, &salt, m, t, p)?;
     Ok(*secure_key)
+}
+
+fn resolve_binding_display_name(source_type: &str, source_ref: &str) -> String {
+    if source_type == "team" {
+        if let Ok(Some(entry)) = storage::get_virtual_key_cache(source_ref) {
+            return entry.local_alias.unwrap_or(entry.alias);
+        }
+    }
+    source_ref.to_string()
 }
 
 fn truncate(s: &str, max: usize) -> &str {

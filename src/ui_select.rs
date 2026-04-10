@@ -215,17 +215,26 @@ fn interactive_select(
     Ok(result)
 }
 
-enum Key { Up, Down, Enter, Escape, CtrlC, Other }
+enum Key { Up, Down, Enter, Space, Escape, CtrlC, Other }
 
 #[cfg(unix)]
 fn read_key(tty: &std::fs::File) -> io::Result<Key> {
+    use std::os::unix::io::AsRawFd;
     let mut buf = [0u8; 1];
     let mut reader = tty;
     reader.read_exact(&mut buf)?;
     match buf[0] {
         0x0D | 0x0A => Ok(Key::Enter),
+        0x20 => Ok(Key::Space),
         0x03 => Ok(Key::CtrlC),
         0x1B => {
+            // After ESC, poll 50ms to distinguish standalone Esc from arrow key sequence.
+            let fd = tty.as_raw_fd();
+            let mut poll_fd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, 50) };
+            if ready <= 0 {
+                return Ok(Key::Escape);
+            }
             reader.read_exact(&mut buf)?;
             if buf[0] == b'[' {
                 reader.read_exact(&mut buf)?;
@@ -279,4 +288,246 @@ fn redraw_two(
     write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_row(&items[new], true, inner_w), n)?;
 
     out.flush()
+}
+
+// ============================================================================
+// Multi-select (checkbox style) — used by `aikey add` for provider selection
+// ============================================================================
+
+pub enum MultiSelectResult {
+    Confirmed(Vec<usize>),
+    Cancelled,
+}
+
+pub fn box_multi_select(
+    title: &str, items: &[String], initially_checked: &[bool],
+) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        use std::io::IsTerminal;
+        if io::stderr().is_terminal() {
+            return interactive_multi_select(title, items, initially_checked);
+        }
+    }
+    fallback_multi_select(items)
+}
+
+fn fallback_multi_select(items: &[String]) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
+    eprintln!("Select providers (comma-separated numbers):");
+    for (i, item) in items.iter().enumerate() { eprintln!("  [{}] {}", i + 1, item); }
+    eprint!("Choice: "); io::stderr().flush()?;
+    let mut input = String::new(); io::stdin().read_line(&mut input)?;
+    let indices: Vec<usize> = input.split(',').filter_map(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1 && n <= items.len()).map(|n| n - 1).collect();
+    if indices.is_empty() { Ok(MultiSelectResult::Cancelled) } else { Ok(MultiSelectResult::Confirmed(indices)) }
+}
+
+fn format_multi_row(item: &str, is_cursor: bool, is_checked: bool, inner_w: usize) -> String {
+    let cursor_mark = if is_cursor { "\x1b[36;1m> \x1b[0m" } else { "  " };
+    let check_mark = if is_checked { "\x1b[32m[\x1b[1m*\x1b[0m\x1b[32m]\x1b[0m" } else { "[ ]" };
+    let content = format!("{}{} {}", cursor_mark, check_mark, item);
+    let pad_target = inner_w.saturating_sub(4);
+    format!("  \u{2502}  {}  \u{2502}", pad_visible(&content, pad_target))
+}
+
+#[cfg(unix)]
+fn interactive_multi_select(title: &str, items: &[String], initially_checked: &[bool]) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
+    use std::os::unix::io::AsRawFd;
+    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    let tty_fd = tty.as_raw_fd();
+    let orig = unsafe { let mut t: libc::termios = std::mem::zeroed(); if libc::tcgetattr(tty_fd, &mut t) != 0 { return Err("tcgetattr".into()); } t };
+    let mut raw = orig; raw.c_lflag &= !(libc::ECHO | libc::ICANON); raw.c_cc[libc::VMIN] = 1; raw.c_cc[libc::VTIME] = 0;
+    unsafe { if libc::tcsetattr(tty_fd, libc::TCSANOW, &raw) != 0 { return Err("tcsetattr".into()); } }
+    struct G { fd: i32, o: libc::termios } impl Drop for G { fn drop(&mut self) { unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.o); } } }
+    let _g = G { fd: tty_fd, o: orig };
+
+    let icon_title = format!("\u{2611} {}", title);
+    let items_max = items.iter().map(|s| visible_len(s) + 8).max().unwrap_or(20);
+    let max_inner = crate::ui_frame::term_width().saturating_sub(6);
+    let inner_w = (visible_len(&icon_title) + 4).max(items_max + 10).min(max_inner);
+    let border = "\u{2500}".repeat(inner_w);
+    let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
+    let title_bar = format!("\u{2500} {} {}", icon_title, "\u{2500}".repeat(title_fill));
+
+    let mut out = io::stderr();
+    let mut checked: Vec<bool> = initially_checked.to_vec();
+    let mut cursor: usize = 0;
+    let total = items.len();
+
+    write!(out, "\x1b[?25l")?;
+    write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
+    for (i, item) in items.iter().enumerate() { write!(out, "{}\r\n", format_multi_row(item, i == cursor, checked[i], inner_w))?; }
+    write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
+    write!(out, "  [\u{2191}\u{2193} move, Space toggle, Enter confirm, Esc cancel]")?;
+    out.flush()?;
+
+    let result = loop {
+        match read_key(&tty)? {
+            Key::Up => { if cursor > 0 { let old = cursor; cursor -= 1; redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?; } }
+            Key::Down => { if cursor + 1 < total { let old = cursor; cursor += 1; redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?; } }
+            Key::Space => { checked[cursor] = !checked[cursor]; redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?; }
+            Key::Enter => { break MultiSelectResult::Confirmed(checked.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect()); }
+            Key::Escape | Key::CtrlC => break MultiSelectResult::Cancelled,
+            _ => {}
+        }
+    };
+    write!(out, "\x1b[?25h\r\n\r\n")?; out.flush()?;
+    Ok(result)
+}
+
+#[cfg(unix)]
+fn redraw_multi_two(out: &mut impl Write, old: usize, new: usize, items: &[String], checked: &[bool], inner_w: usize, total: usize) -> io::Result<()> {
+    let up = |i: usize| -> usize { (total - i) + 1 };
+    let n = up(old); write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[old], false, checked[old], inner_w), n)?;
+    let n = up(new); write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[new], true, checked[new], inner_w), n)?;
+    out.flush()
+}
+
+#[cfg(unix)]
+fn redraw_multi_one(out: &mut impl Write, idx: usize, items: &[String], checked: &[bool], inner_w: usize, total: usize) -> io::Result<()> {
+    let n = (total - idx) + 1;
+    write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[idx], true, checked[idx], inner_w), n)?;
+    out.flush()
+}
+
+// ============================================================================
+// Provider-tree select — used by `aikey use` (no args)
+// ============================================================================
+
+#[derive(Clone)]
+pub struct KeyCandidate { pub label: String, pub source_type: String, pub source_ref: String }
+#[derive(Clone)]
+pub struct ProviderGroup { pub provider_code: String, pub candidates: Vec<KeyCandidate>, pub selected: Option<usize>, pub expanded: bool }
+
+pub enum ProviderTreeResult { Confirmed(Vec<ProviderGroup>), Cancelled }
+
+pub fn provider_tree_select(groups: &mut Vec<ProviderGroup>) -> Result<ProviderTreeResult, Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    { use std::io::IsTerminal; if io::stderr().is_terminal() { return interactive_provider_tree(groups); } }
+    fallback_provider_tree(groups)
+}
+
+fn fallback_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<ProviderTreeResult, Box<dyn std::error::Error>> {
+    use std::io::BufRead;
+    for g in groups.iter() {
+        let cur = g.selected.map(|i| g.candidates[i].label.as_str()).unwrap_or("(none)");
+        eprintln!("  {} \u{2192} {}", g.provider_code, cur);
+        for (i, c) in g.candidates.iter().enumerate() {
+            eprintln!("    {} {} [{}]", if g.selected == Some(i) { "(*)" } else { "( )" }, c.label, c.source_type);
+        }
+    }
+    eprintln!("Enter 'provider=number' per line, blank to confirm, 'q' to cancel:");
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line?; let line = line.trim();
+        if line.is_empty() { break; } if line == "q" { return Ok(ProviderTreeResult::Cancelled); }
+        if let Some((prov, num)) = line.split_once('=') {
+            if let Ok(n) = num.trim().parse::<usize>() {
+                if let Some(g) = groups.iter_mut().find(|g| g.provider_code == prov.trim()) {
+                    if n >= 1 && n <= g.candidates.len() { g.selected = Some(n - 1); }
+                }
+            }
+        }
+    }
+    Ok(ProviderTreeResult::Confirmed(groups.clone()))
+}
+
+#[derive(Clone)]
+enum TreeRow { Provider(usize), Candidate(usize, usize), Separator, Confirm, Cancel }
+
+fn build_tree_rows(groups: &[ProviderGroup]) -> Vec<TreeRow> {
+    let mut rows = Vec::new();
+    for (gi, g) in groups.iter().enumerate() {
+        rows.push(TreeRow::Provider(gi));
+        if g.expanded { for ci in 0..g.candidates.len() { rows.push(TreeRow::Candidate(gi, ci)); } }
+    }
+    rows.push(TreeRow::Separator); rows.push(TreeRow::Confirm); rows.push(TreeRow::Cancel); rows
+}
+
+fn is_focusable(row: &TreeRow) -> bool { !matches!(row, TreeRow::Separator) }
+
+fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inner_w: usize) -> String {
+    let cursor_mark = if is_cursor { "\x1b[36;1m> \x1b[0m" } else { "  " };
+    let pad_target = inner_w.saturating_sub(4);
+    let content = match row {
+        TreeRow::Provider(gi) => {
+            let g = &groups[*gi];
+            let arrow = if g.expanded { "\u{25BC}" } else { "\u{25B6}" };
+            let cur = g.selected.map(|i| format!("  \x1b[32m\u{2190} {}\x1b[0m", g.candidates[i].label)).unwrap_or_default();
+            format!("{}{} {}{}", cursor_mark, arrow, g.provider_code, cur)
+        }
+        TreeRow::Candidate(gi, ci) => {
+            let g = &groups[*gi]; let c = &g.candidates[*ci];
+            let radio = if g.selected == Some(*ci) { "\x1b[32m(*)\x1b[0m" } else { "( )" };
+            let active = if g.selected == Some(*ci) { "  \x1b[32mactive\x1b[0m" } else { "" };
+            let label_raw = if is_cursor { format!("\x1b[1m{}\x1b[0m", c.label) } else { c.label.clone() };
+            let label_padded = pad_visible(&label_raw, 24);
+            format!("{}    {} {} \x1b[90m{}\x1b[0m{}", cursor_mark, radio, label_padded, c.source_type, active)
+        }
+        TreeRow::Separator => { format!("  {}", "\u{2500}".repeat(pad_target.saturating_sub(2))) }
+        TreeRow::Confirm => { let s = if is_cursor { "\x1b[1;32m" } else { "\x1b[32m" }; format!("{}{}Confirm\x1b[0m", cursor_mark, s) }
+        TreeRow::Cancel => { let s = if is_cursor { "\x1b[1;33m" } else { "\x1b[33m" }; format!("{}{}Cancel\x1b[0m", cursor_mark, s) }
+    };
+    format!("  \u{2502}  {}  \u{2502}", pad_visible(&content, pad_target))
+}
+
+#[cfg(unix)]
+fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<ProviderTreeResult, Box<dyn std::error::Error>> {
+    use std::os::unix::io::AsRawFd;
+    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    let tty_fd = tty.as_raw_fd();
+    let orig = unsafe { let mut t: libc::termios = std::mem::zeroed(); if libc::tcgetattr(tty_fd, &mut t) != 0 { return Err("tcgetattr".into()); } t };
+    let mut raw = orig; raw.c_lflag &= !(libc::ECHO | libc::ICANON); raw.c_cc[libc::VMIN] = 1; raw.c_cc[libc::VTIME] = 0;
+    unsafe { if libc::tcsetattr(tty_fd, libc::TCSANOW, &raw) != 0 { return Err("tcsetattr".into()); } }
+    struct G { fd: i32, o: libc::termios } impl Drop for G { fn drop(&mut self) { unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.o); } } }
+    let _g = G { fd: tty_fd, o: orig };
+
+    let title = "Provider Key Selection";
+    let icon_title = format!("\u{1F310} {}", title);
+    let mut out = io::stderr();
+    let mut cursor: usize = 0;
+
+    loop {
+        let rows = build_tree_rows(groups);
+        let total = rows.len();
+        let max_inner = crate::ui_frame::term_width().saturating_sub(6);
+        let inner_w = (visible_len(&icon_title) + 4).max(60).min(max_inner);
+        let border = "\u{2500}".repeat(inner_w);
+        let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
+        let title_bar = format!("\u{2500} {} {}", icon_title, "\u{2500}".repeat(title_fill));
+
+        if cursor >= total || !is_focusable(&rows[cursor]) {
+            cursor = rows.iter().position(|r| is_focusable(r)).unwrap_or(0);
+        }
+
+        write!(out, "\x1b[?25l")?;
+        write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
+        for (i, row) in rows.iter().enumerate() { write!(out, "{}\r\n", format_tree_row(row, groups, i == cursor, inner_w))?; }
+        write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
+        write!(out, "  [\u{2191}\u{2193} move, Enter select/expand, Esc cancel]\r\n")?;
+        out.flush()?;
+
+        let key = read_key(&tty)?;
+
+        // Erase: total + 4 lines (blank + top + rows + bottom + hint)
+        let erase_lines = total + 4;
+        for _ in 0..erase_lines { write!(out, "\x1b[A\r\x1b[2K")?; }
+        out.flush()?;
+
+        match key {
+            Key::Up => { let mut n = cursor; loop { if n == 0 { break; } n -= 1; if is_focusable(&rows[n]) { cursor = n; break; } } }
+            Key::Down => { let mut n = cursor; loop { if n + 1 >= total { break; } n += 1; if is_focusable(&rows[n]) { cursor = n; break; } } }
+            Key::Enter | Key::Space => {
+                match &rows[cursor] {
+                    TreeRow::Provider(gi) => { groups[*gi].expanded = !groups[*gi].expanded; }
+                    TreeRow::Candidate(gi, ci) => { groups[*gi].selected = Some(*ci); }
+                    TreeRow::Confirm => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Confirmed(groups.clone())); }
+                    TreeRow::Cancel => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Cancelled); }
+                    TreeRow::Separator => {}
+                }
+            }
+            Key::Escape | Key::CtrlC => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Cancelled); }
+            _ => {}
+        }
+    }
 }

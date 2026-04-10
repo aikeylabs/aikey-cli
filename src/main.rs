@@ -24,6 +24,8 @@ mod events;
 mod observability;
 mod ui_frame;
 mod ui_select;
+mod proxy_env;
+mod profile_activation;
 
 use clap::{Parser, Subcommand};
 use secrecy::{ExposeSecret, SecretString};
@@ -35,7 +37,51 @@ use error_codes::msgs;
 use aikeylabs_aikey_cli::prompt_hidden;
 
 #[derive(Parser)]
-#[command(name = "aikey", about = "AiKey - Secure local-first secret management", version = "0.2.0", disable_version_flag = true)]
+#[command(
+    name = "aikey",
+    about = "AiKey - Secure local-first secret management",
+    version = "0.2.0",
+    disable_version_flag = true,
+    override_usage = "aikey [OPTIONS] [COMMAND]",
+    after_long_help = "",
+    help_template = "\
+{about}
+
+Usage: {usage}
+
+Commands:
+  \x1b[1madd\x1b[0m <alias>              Save a new secret to the vault
+  \x1b[1mlist\x1b[0m                     Show all personal and team keys
+  \x1b[1mtest\x1b[0m <alias>             Test whether a stored API key alias is working
+  \x1b[1muse\x1b[0m [alias]              Select the active key for routing (shortcut for `key use`)
+  \x1b[1mlogin\x1b[0m                    Log in to aikey service (shortcut for `account login`)
+  \x1b[1mbrowse\x1b[0m [page]            Open the User Console in your default browser
+  \x1b[1mdoctor\x1b[0m                   Check system health, connectivity, and configuration
+  \x1b[1menv\x1b[0m [command]            View or set proxy environment variables
+  \x1b[1mproxy\x1b[0m <command>          Manage the local proxy process
+  \x1b[1mwhoami\x1b[0m                   Show your current login, active key, and vault status
+  \x1b[1mget\x1b[0m <alias>              Retrieve a secret and copy it to the clipboard
+  \x1b[1mrun\x1b[0m -- <command>         Run a command with secrets injected as environment variables
+  \x1b[1mkey\x1b[0m <command>            Manage API keys (rotate, list, sync, use)
+  \x1b[1mquickstart\x1b[0m               Initialize vault and set up a new project
+  \x1b[1mproject\x1b[0m <command>        Manage project configuration
+  \x1b[1mlogs\x1b[0m                     Show recent activity logs
+  \x1b[1mupdate\x1b[0m <alias>           Update an existing secret
+  \x1b[1mdelete\x1b[0m <alias>           Delete a secret from the vault
+  \x1b[1mexport\x1b[0m <pattern> <file>  Export secrets to an encrypted backup file
+  \x1b[1mchange-password\x1b[0m          Change the vault master password
+  \x1b[1maccount\x1b[0m <command>        Manage your aikey account session
+  \x1b[1mlogout\x1b[0m                   Log out of the current session (shortcut for `account logout`)
+  \x1b[1msecret\x1b[0m <command>         Manage secrets and platform-backed secret actions
+  \x1b[1mhelp\x1b[0m                     Show this help message or help for a command
+
+Options:
+      --password-stdin  Read password from stdin instead of prompting
+      --json            Output in JSON format (where supported)
+  -V, --version         Print version information
+  -h, --help            Print help
+      --detail          Print detailed help for all commands"
+)]
 struct Cli {
     /// Read password from stdin instead of prompting (for automation/testing)
     #[arg(long, global = true)]
@@ -49,6 +95,10 @@ struct Cli {
     #[arg(short = 'V', long)]
     version: bool,
 
+    /// Print detailed help for all commands
+    #[arg(long)]
+    detail: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -58,6 +108,8 @@ enum Commands {
     /// Initialize the vault (runs automatically on first use)
     #[command(hide = true)]
     Init,
+    /// Save a new secret to the vault
+    #[command(display_order = 1)]
     Add {
         alias: String,
         /// Provider code for proxy routing (e.g. openai, anthropic). Makes this
@@ -65,35 +117,82 @@ enum Commands {
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
     },
+    /// Show all personal and team keys
+    #[command(alias = "ls", display_order = 2)]
+    List,
+    /// Test whether a stored API key alias is working
+    #[command(display_order = 3)]
+    Test {
+        /// Alias of the key to test (omit to test all current Primary keys)
+        alias: Option<String>,
+        /// Provider code to test against (overrides stored provider)
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+    },
+    /// Select the active key for routing (shortcut for `key use`)
+    #[command(display_order = 4)]
+    Use {
+        /// Virtual key alias or ID to activate (omit for interactive picker)
+        alias_or_id: Option<String>,
+        /// Skip installing the shell precmd hook into ~/.zshrc / ~/.bashrc
+        #[arg(long)]
+        no_hook: bool,
+        /// Narrow to a specific provider (e.g. --provider anthropic).
+        /// When given without a value, shows an interactive menu to select one.
+        /// Without this flag, all default providers are injected (generic gateway mode).
+        #[arg(long, value_name = "PROVIDER", num_args = 0..=1, default_missing_value = "")]
+        provider: Option<String>,
+    },
+    /// Log in to aikey service (shortcut for `account login`)
+    #[command(display_order = 5)]
+    Login {
+        /// Control Panel URL (e.g. http://192.168.1.100:3000)
+        #[arg(long = "control-url", alias = "url")]
+        url: Option<String>,
+        /// One-time login token for copy-paste fallback: SESSION_ID:LOGIN_TOKEN
+        #[arg(long)]
+        token: Option<String>,
+        /// Pre-fill email on the browser login page (skips manual entry)
+        #[arg(long)]
+        email: Option<String>,
+    },
+    /// Open the User Console in your default browser
+    #[command(display_order = 6)]
+    Browse {
+        /// Page to open: overview (default), keys, account, usage
+        page: Option<String>,
+        /// Override port for dev mode (e.g. --port 3000 for Vite dev server)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Check system health, connectivity, and configuration
+    #[command(display_order = 7)]
+    Doctor,
+    /// View or set proxy environment variables
+    #[command(display_order = 8)]
+    Env {
+        #[command(subcommand)]
+        action: Option<EnvAction>,
+    },
+    /// Manage the local proxy process
+    #[command(display_order = 9)]
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyAction,
+    },
+    /// Show your current login, active key, and vault status
+    #[command(display_order = 9)]
+    Whoami,
+    /// Retrieve a secret and copy it to the clipboard
+    #[command(display_order = 10)]
     Get {
         alias: String,
         /// Clipboard auto-clear timeout in seconds (default: 30, 0 to disable)
         #[arg(short, long, default_value = "30")]
         timeout: u64,
     },
-    Delete {
-        alias: String,
-    },
-    #[command(alias = "ls")]
-    List,
-    Update {
-        alias: String,
-    },
-    /// Test connectivity of a stored API Key (ping + API probe)
-    Test {
-        /// Alias of the key to test
-        alias: String,
-        /// Provider code to test against (overrides stored provider)
-        #[arg(long, value_name = "PROVIDER")]
-        provider: Option<String>,
-    },
-    Export {
-        /// Pattern to match secrets (e.g., "*", "api_*")
-        pattern: String,
-        /// Output file path (.akb format)
-        output: String,
-    },
-    /// Execute a command with all secrets automatically injected as environment variables
+    /// Run a command with secrets injected as environment variables
+    #[command(display_order = 11)]
     Run {
         /// Resolve a specific provider's key and inject it (e.g. openai, anthropic)
         #[arg(long, value_name = "PROVIDER")]
@@ -130,79 +229,73 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
-    /// Change the master password
-    ChangePassword,
-    /// Secret management commands (Platform API v0.2)
-    Secret {
+    /// Manage API keys (rotate, list, sync, use)
+    #[command(display_order = 12)]
+    Key {
         #[command(subcommand)]
-        action: SecretAction,
+        action: KeyAction,
     },
-    /// Project configuration commands
+    /// Initialize vault and set up a new project
+    #[command(display_order = 13)]
+    Quickstart,
+    /// Manage project configuration
+    #[command(display_order = 14)]
     Project {
         #[command(subcommand)]
         action: ProjectAction,
     },
-    /// Quick setup wizard for new projects
-    Quickstart,
-    /// Show recent run/exec event log
+    /// Show recent activity logs
+    #[command(display_order = 15)]
     Logs {
         /// Number of entries to show (default: 20)
         #[arg(short, long, default_value = "20")]
         limit: u32,
     },
-    /// Manage API keys (rotate, list, sync, use)
-    Key {
-        #[command(subcommand)]
-        action: KeyAction,
+    /// Update an existing secret
+    #[command(display_order = 16)]
+    Update {
+        alias: String,
     },
-    /// Manage your aikey-control-service account session
+    /// Delete a secret from the vault
+    #[command(display_order = 17)]
+    Delete {
+        alias: String,
+    },
+    /// Export secrets to an encrypted backup file
+    #[command(display_order = 18)]
+    Export {
+        /// Pattern to match secrets (e.g., "*", "api_*")
+        pattern: String,
+        /// Output file path (.akb format)
+        output: String,
+    },
+    /// Change the vault master password
+    #[command(display_order = 19)]
+    ChangePassword,
+    /// Manage your aikey account session
+    #[command(display_order = 20)]
     Account {
         #[command(subcommand)]
         action: AccountAction,
     },
-    /// Log in to an aikey-control-service (shortcut for `account login`)
-    Login {
-        /// Control Panel URL (e.g. http://192.168.1.100:3000)
-        #[arg(long = "control-url", alias = "url")]
-        url: Option<String>,
-        /// One-time login token for copy-paste fallback: SESSION_ID:LOGIN_TOKEN
-        #[arg(long)]
-        token: Option<String>,
-        /// Pre-fill email on the browser login page (skips manual entry)
-        #[arg(long)]
-        email: Option<String>,
-    },
-    /// Log out from the current session (shortcut for `account logout`)
+    /// Log out of the current session (shortcut for `account logout`)
+    #[command(display_order = 21)]
     Logout,
-    /// Activate a key for proxy routing (shortcut for `key use`)
-    Use {
-        /// Virtual key alias or ID to activate (omit for interactive picker)
-        alias_or_id: Option<String>,
-        /// Skip installing the shell precmd hook into ~/.zshrc / ~/.bashrc
-        #[arg(long)]
-        no_hook: bool,
-        /// Narrow to a specific provider (e.g. --provider anthropic).
-        /// When given without a value, shows an interactive menu to select one.
-        /// Without this flag, all default providers are injected (generic gateway mode).
-        #[arg(long, value_name = "PROVIDER", num_args = 0..=1, default_missing_value = "")]
-        provider: Option<String>,
-    },
-    /// Open the User Console in the default browser (restores login session)
-    Browse {
-        /// Page to open: overview (default), keys, account, usage
-        page: Option<String>,
-        /// Override port for dev mode (e.g. --port 3000 for Vite dev server)
-        #[arg(long)]
-        port: Option<u16>,
-    },
-    /// Show current identity: login session, active key, and vault state
-    Whoami,
-    /// Run diagnostics and health checks
-    Doctor,
-    /// Manage the local aikey-proxy process
-    Proxy {
+    /// Manage secrets and platform-backed secret actions
+    #[command(display_order = 22)]
+    Secret {
         #[command(subcommand)]
-        action: ProxyAction,
+        action: SecretAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum EnvAction {
+    /// Set proxy environment variables (written to ~/.aikey/proxy.env)
+    Set {
+        /// KEY=VALUE pairs (after --)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -361,6 +454,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Intercept "unrecognized subcommand" errors and show a friendly message
         // with fuzzy suggestions instead of the raw clap output.
         use clap::error::ErrorKind;
+
+        // Intercept top-level --help / -h: use our styled version.
+        // Subcommand help (e.g. `aikey add --help`) still uses clap's default.
+        if matches!(err.kind(), ErrorKind::DisplayHelp) {
+            // Check if this is the top-level help (no subcommand context).
+            // Clap's rendered help for subcommands contains "Usage: aikey <subcmd>",
+            // while top-level contains "Usage: aikey [OPTIONS]".
+            let rendered = err.to_string();
+            if rendered.contains("aikey [OPTIONS]") {
+                print_short_help();
+                std::process::exit(0);
+            }
+            // Subcommand help — print clap's output, then append detailed notes.
+            // Extract command path from "Usage: aikey <cmd> ..." line.
+            let cmd_path = rendered.lines()
+                .find(|l| l.starts_with("Usage: aikey "))
+                .and_then(|l| {
+                    // "Usage: aikey add [OPTIONS] <ALIAS>" → extract "add"
+                    // "Usage: aikey proxy start [OPTIONS]" → extract "proxy start"
+                    let after = l.strip_prefix("Usage: aikey ")?;
+                    let parts: Vec<&str> = after.split_whitespace()
+                        .take_while(|w| !w.starts_with('[') && !w.starts_with('<') && !w.starts_with('-'))
+                        .collect();
+                    if parts.is_empty() { None } else { Some(parts.join(" ")) }
+                });
+
+            // Print clap's rendered help first.
+            eprint!("{}", rendered);
+
+            // Append detailed notes if available.
+            if let Some(ref cmd) = cmd_path {
+                if let Some(notes) = command_detail_notes(cmd) {
+                    eprintln!();
+                    eprintln!("{}", notes);
+                }
+            }
+            std::process::exit(0);
+        }
+
         if matches!(err.kind(), ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument) {
             // Extract the bad token from the error message (clap embeds it in single quotes).
             let bad = err.to_string();
@@ -374,7 +506,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             const KNOWN: &[&str] = &[
                 "add", "get", "delete", "list", "update", "test", "export",
                 "run", "use", "whoami", "login", "logout", "browse",
-                "init", "doctor", "key", "account", "secret",
+                "init", "doctor", "env", "key", "account", "secret",
                 "project", "proxy",
                 "change-password", "quickstart", "logs",
             ];
@@ -409,6 +541,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             print_banner();
         }
+        return Ok(());
+    }
+
+    // Handle --detail flag
+    if cli.detail {
+        print_detailed_help();
         return Ok(());
     }
 
@@ -533,6 +671,7 @@ fn command_name(cmd: Option<&Commands>) -> String {
             }),
             Commands::Login { .. } => "account.login".to_string(),
             Commands::Logout => "account.logout".to_string(),
+            Commands::Env { .. } => "env".to_string(),
             Commands::Browse { .. } => "browse".to_string(),
             Commands::Doctor => "doctor".to_string(),
             Commands::Proxy { action } => format!("proxy.{}", match action {
@@ -667,101 +806,80 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 secret
             };
 
-            // Step 3: resolve provider + base_url (before adding, so we can test connectivity).
-            // --provider flag takes precedence; otherwise prompt interactively on TTY.
-            let (resolved_provider, resolved_base_url): (Option<String>, Option<String>) =
-                if let Some(code) = provider {
-                    // Flag provided — use it, no base_url prompt.
-                    (Some(code.to_lowercase()), None)
-                } else if std::io::stdin().is_terminal() && !cli.json {
-                    // Interactive TTY: show a numbered provider menu.
-                    use colored::Colorize;
-                    const KNOWN: &[(&str, &str)] = &[
-                        ("anthropic", "https://api.anthropic.com"),
-                        ("openai",    "https://api.openai.com/v1"),
-                        ("google",    "https://generativelanguage.googleapis.com"),
-                        ("deepseek",  "https://api.deepseek.com/v1"),
-                        ("kimi",      "https://api.moonshot.cn/v1"),
-                    ];
-                    println!();
-                    println!("Select provider:");
-                    for (i, (name, _)) in KNOWN.iter().enumerate() {
-                        println!("  {}  {}", format!("[{}]", i + 1).dimmed(), name);
-                    }
-                    println!("  {}  other / custom base URL", "[6]".dimmed());
-                    print!("Choice (or press Enter to skip): ");
-                    io::stdout().flush()?;
-                    let mut choice = String::new();
-                    io::stdin().read_line(&mut choice)?;
-                    let choice = choice.trim();
+            // Step 3: resolve providers + base_url.
+            // v1.0.2: multi-provider selection with checkbox TUI.
+            const KNOWN_PROVIDERS: &[(&str, &str)] = &[
+                ("anthropic", "https://api.anthropic.com"),
+                ("openai",    "https://api.openai.com/v1"),
+                ("google",    "https://generativelanguage.googleapis.com"),
+                ("deepseek",  "https://api.deepseek.com/v1"),
+                ("kimi",      "https://api.moonshot.cn/v1"),
+            ];
 
-                    if choice.is_empty() {
-                        (None, None)
-                    } else if let Ok(n) = choice.parse::<usize>() {
-                        if n >= 1 && n <= KNOWN.len() {
-                            let (name, default_url) = KNOWN[n - 1];
-                            println!();
-                            println!("  Using {}  →  {}", name.bold(), default_url.dimmed());
-                            print!("  Custom URL (press Enter to use default): ");
-                            io::stdout().flush()?;
-                            let mut url_input = String::new();
-                            io::stdin().read_line(&mut url_input)?;
-                            let url_input = url_input.trim().to_string();
-                            let base_url = if url_input.is_empty() {
-                                None  // use provider default; proxy falls back automatically
-                            } else {
-                                Some(url_input)
-                            };
-                            (Some(name.to_string()), base_url)
-                        } else if n == KNOWN.len() + 1 {
-                            // Custom — provider code is optional (leave blank for a generic gateway).
-                            print!("Provider code (e.g. openai, leave blank for generic gateway): ");
-                            io::stdout().flush()?;
-                            let mut pcode = String::new();
-                            io::stdin().read_line(&mut pcode)?;
-                            let pcode = pcode.trim().to_lowercase();
-                            print!("Base URL: ");
-                            io::stdout().flush()?;
-                            let mut url = String::new();
-                            io::stdin().read_line(&mut url)?;
-                            let url = url.trim().to_string();
-                            (
-                                if pcode.is_empty() { None } else { Some(pcode) },
-                                if url.is_empty() { None } else { Some(url) },
-                            )
-                        } else {
-                            (None, None)
+            let (resolved_providers, resolved_base_url): (Vec<String>, Option<String>) =
+                if let Some(code) = provider {
+                    (vec![code.to_lowercase()], None)
+                } else if std::io::stdin().is_terminal() && !cli.json {
+                    use colored::Colorize;
+                    let mut items: Vec<String> = KNOWN_PROVIDERS.iter().map(|(n, _)| n.to_string()).collect();
+                    items.push("Custom providers...".to_string());
+                    let custom_idx = KNOWN_PROVIDERS.len();
+                    let mut selected: Vec<String>;
+                    let mut checked_state: Vec<bool> = vec![false; items.len()];
+
+                    loop {
+                        let selected_indices = match ui_select::box_multi_select("Select provider(s)", &items, &checked_state)? {
+                            ui_select::MultiSelectResult::Confirmed(idx) => idx,
+                            ui_select::MultiSelectResult::Cancelled => { eprintln!("  Cancelled."); return Ok(()); }
+                        };
+                        checked_state = vec![false; items.len()];
+                        for &i in &selected_indices { if i < checked_state.len() { checked_state[i] = true; } }
+                        selected = Vec::new();
+                        let mut wants_custom = false;
+                        for &idx in &selected_indices {
+                            if idx < KNOWN_PROVIDERS.len() {
+                                let name = KNOWN_PROVIDERS[idx].0.to_string();
+                                if !selected.contains(&name) { selected.push(name); }
+                            } else if idx == custom_idx { wants_custom = true; }
                         }
-                    } else {
-                        (None, None)
+                        if wants_custom {
+                            print!("  Custom provider(s), comma-separated: ");
+                            io::stdout().flush()?;
+                            let mut custom = String::new();
+                            io::stdin().read_line(&mut custom)?;
+                            for code in custom.split(',').map(|s| s.trim().to_lowercase()) {
+                                if !code.is_empty() && !selected.contains(&code) { selected.push(code); }
+                            }
+                        }
+                        if !selected.is_empty() { break; }
+                        use colored::Colorize;
+                        eprintln!("  {} At least one provider is required.\n", "\u{26A0}".yellow());
                     }
+
+                    print!("  Base URL (press Enter for provider defaults): ");
+                    io::stdout().flush()?;
+                    let mut url_input = String::new();
+                    io::stdin().read_line(&mut url_input)?;
+                    let url_input = url_input.trim().to_string();
+                    let base_url = if url_input.is_empty() { None } else { Some(url_input) };
+
+                    eprintln!("  Providers: {}", selected.join(", ").bold());
+                    if let Some(ref u) = base_url { eprintln!("  Base URL:  {}", u.dimmed()); }
+                    (selected, base_url)
                 } else {
-                    // Non-TTY / JSON: no interactive prompt, provider stays unset.
-                    (None, None)
+                    return Err("--provider is required in non-interactive mode.".into());
                 };
 
-            // Step 4: connectivity test (interactive TTY only, skip for JSON/pipe/test).
+            let resolved_provider = resolved_providers.first().cloned();
+
+            // Step 4: connectivity test.
             if !cli.json && std::io::stdin().is_terminal() && env::var("AK_TEST_SECRET").is_err() {
-                // Build targets — same logic as `aikey test`:
-                // - provider set → test that provider
-                // - no provider + has base_url → test all providers against that URL
-                // - no provider + no base_url → skip
-                let test_targets: Vec<(String, String)> = if let Some(ref code) = resolved_provider {
+                let test_targets: Vec<(String, String)> = resolved_providers.iter().map(|code| {
                     let url = resolved_base_url.as_deref()
                         .or_else(|| commands_project::default_base_url(code))
-                        .unwrap_or("https://unknown")
-                        .to_string();
-                    vec![(code.clone(), url)]
-                } else if let Some(ref url) = resolved_base_url {
-                    let mut t: Vec<(String, String)> = commands_project::PROVIDER_DEFAULTS.iter()
-                        .map(|(c, _)| (c.to_string(), url.clone()))
-                        .collect();
-                    t.push(("custom".to_string(), url.clone()));
-                    t
-                } else {
-                    vec![]
-                };
-
+                        .unwrap_or("https://unknown").to_string();
+                    (code.clone(), url)
+                }).collect();
                 if !test_targets.is_empty() {
                     eprintln!();
                     let suite = commands_project::run_connectivity_test(&test_targets, secret.trim(), false);
@@ -772,8 +890,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let mut input = String::new();
                         io::stdin().read_line(&mut input)?;
                         if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
-                            eprintln!("  Cancelled.");
-                            return Ok(());
+                            eprintln!("  Cancelled."); return Ok(());
                         }
                     }
                     eprintln!();
@@ -783,15 +900,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Step 5: write to vault.
             let result = executor::add_secret(alias, secret.trim(), &password);
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(alias), result.is_ok());
-
             if let Err(e) = result {
-                if cli.json {
-                    json_output::error(&e, 1);
-                } else {
-                    return Err(e.into());
-                }
+                if cli.json { json_output::error(&e, 1); } else { return Err(e.into()); }
             }
 
+            // Persist provider metadata.
+            let _ = storage::set_entry_supported_providers(alias, &resolved_providers);
             if let Some(ref code) = resolved_provider {
                 let _ = storage::set_entry_provider_code(alias, Some(code.as_str()));
             }
@@ -799,22 +913,31 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = storage::set_entry_base_url(alias, Some(url.as_str()));
             }
 
+            // Auto-assign as Primary + refresh active.env.
+            let newly_primary = profile_activation::auto_assign_primaries_for_key(
+                "personal", alias, &resolved_providers,
+            ).unwrap_or_default();
+            if !newly_primary.is_empty() || !resolved_providers.is_empty() {
+                let _ = profile_activation::refresh_implicit_profile_activation();
+            }
+
             if cli.json {
                 json_output::success(serde_json::json!({
                     "alias": alias,
-                    "message": "API Key added successfully",
-                    "provider": resolved_provider,
+                    "message": "Added key and refreshed current default activation.",
+                    "providers": resolved_providers,
+                    "primary_for": newly_primary,
                     "base_url": resolved_base_url,
                 }));
             } else {
                 use colored::Colorize;
                 eprintln!("{} API Key '{}' added.", "\u{2713}".green(), alias.bold());
-                if let Some(ref code) = resolved_provider {
-                    eprintln!("  provider: {}", code.dimmed());
+                eprintln!("  providers: {}", resolved_providers.join(", ").dimmed());
+                if let Some(ref url) = resolved_base_url { eprintln!("  base_url:  {}", url.dimmed()); }
+                if !newly_primary.is_empty() {
+                    eprintln!("  {} Primary for: {}", "\u{2B50}".yellow(), newly_primary.join(", ").bold());
                 }
-                if let Some(ref url) = resolved_base_url {
-                    eprintln!("  base_url: {}", url.dimmed());
-                }
+                eprintln!("  Added key and refreshed current default activation.");
                 commands_proxy::maybe_warn_stale();
             }
         }
@@ -876,11 +999,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(alias), result.is_ok());
 
             if let Err(e) = result {
-                if cli.json {
-                    json_output::error(&e, 1);
-                } else {
-                    return Err(e.into());
-                }
+                if cli.json { json_output::error(&e, 1); } else { return Err(e.into()); }
+            }
+
+            // Reconcile provider bindings after removal.
+            let actions = profile_activation::reconcile_provider_primary_after_key_removal(
+                "personal", alias,
+            ).unwrap_or_default();
+            if !actions.is_empty() {
+                let _ = profile_activation::refresh_implicit_profile_activation();
             }
 
             if cli.json {
@@ -891,6 +1018,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 use colored::Colorize;
                 eprintln!("  {} API Key '{}' deleted.", "\u{2713}".green(), alias);
+                for action in &actions {
+                    match &action.outcome {
+                        profile_activation::ReconcileOutcome::Replaced { new_source_ref, .. } => {
+                            eprintln!("  {} '{}' promoted to Primary for {}",
+                                "\u{2B50}".yellow(), new_source_ref.bold(), action.provider_code);
+                        }
+                        profile_activation::ReconcileOutcome::Cleared => {
+                            eprintln!("  {} No replacement for {} — provider has no Primary",
+                                "\u{26A0}".yellow(), action.provider_code);
+                        }
+                    }
+                }
                 commands_proxy::maybe_warn_stale();
             }
         }
@@ -939,89 +1078,88 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 use colored::Colorize;
 
-                // Read active key config once for LOCAL column.
-                let active_cfg = storage::get_active_key_config().ok().flatten();
+                let bindings = storage::list_provider_bindings(
+                    profile_activation::DEFAULT_PROFILE
+                ).unwrap_or_default();
+
+                // Collect row data for auto-width calculation.
+                struct RowData { alias: String, providers: String, primary_for: String, has_primary: bool, key: String, status: String, created: String, suffix: String }
+                let mut personal_rows: Vec<RowData> = Vec::new();
+                let mut team_rows: Vec<RowData> = Vec::new();
+
+                for entry in &entries {
+                    let providers = if let Some(ref sp) = entry.supported_providers {
+                        if !sp.is_empty() { sp.join(",") } else { entry.provider_code.clone().unwrap_or_default() }
+                    } else { entry.provider_code.clone().unwrap_or_default() };
+                    let pf: Vec<&str> = bindings.iter()
+                        .filter(|b| b.key_source_type == "personal" && b.key_source_ref == entry.alias)
+                        .map(|b| b.provider_code.as_str()).collect();
+                    personal_rows.push(RowData {
+                        alias: entry.alias.clone(), providers,
+                        primary_for: pf.join(","), has_primary: !pf.is_empty(),
+                        key: "\u{2713}".to_string(), status: String::new(),
+                        created: entry.created_at.map(|ts| format_date(ts)).unwrap_or_default(),
+                        suffix: String::new(),
+                    });
+                }
+                for e in &managed {
+                    let display = e.local_alias.as_deref().unwrap_or(e.alias.as_str()).to_string();
+                    let pf: Vec<&str> = bindings.iter()
+                        .filter(|b| b.key_source_type == "team" && b.key_source_ref == e.virtual_key_id)
+                        .map(|b| b.provider_code.as_str()).collect();
+                    let status = match e.local_state.as_str() {
+                        "active" | "synced_inactive" => e.key_status.clone(),
+                        "disabled_by_account_scope" => "other-account".to_string(),
+                        "disabled_by_key_status" => "key-disabled".to_string(),
+                        other => other.to_string(),
+                    };
+                    let suffix = if e.local_alias.is_some() { format!(" (\u{2190} {})", e.alias) } else { String::new() };
+                    team_rows.push(RowData {
+                        alias: display, providers: e.provider_code.clone(),
+                        primary_for: pf.join(","), has_primary: !pf.is_empty(),
+                        key: if e.provider_key_ciphertext.is_some() { "\u{2713}".to_string() } else { String::new() },
+                        status, created: format_date(e.synced_at), suffix,
+                    });
+                }
+
+                let all_data: Vec<&RowData> = personal_rows.iter().chain(team_rows.iter()).collect();
+                let headers = ["ALIAS", "PROVIDERS", "PRIMARY FOR", "KEY", "STATUS", "CREATED"];
+                let pad = 2;
+                let w_alias   = headers[0].len().max(all_data.iter().map(|r| r.alias.len()).max().unwrap_or(0)) + pad;
+                let w_prov    = headers[1].len().max(all_data.iter().map(|r| r.providers.len()).max().unwrap_or(0)) + pad;
+                let w_primary = headers[2].len().max(all_data.iter().map(|r| r.primary_for.len()).max().unwrap_or(0)) + pad;
+                let w_key     = headers[3].len().max(1) + pad;
+                let w_status  = headers[4].len().max(all_data.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
+
+                let fmt_row = |r: &RowData| -> String {
+                    let pf_padded = format!("{:<w$}", r.primary_for, w = w_primary);
+                    let pf_col = if r.has_primary { pf_padded.green().to_string() } else { pf_padded };
+                    let created_col = format!("\x1b[90m{}\x1b[0m", r.created);
+                    let prov_display = if r.providers.len() > w_prov {
+                        format!("{}...", &r.providers[..w_prov - 3])
+                    } else { r.providers.clone() };
+                    format!("{:<wa$}  {:<wp$}  {}  {:<wk$}  {:<ws$}  {}{}",
+                        r.alias, prov_display, pf_col, r.key, r.status, created_col, r.suffix,
+                        wa = w_alias, wp = w_prov, wk = w_key, ws = w_status)
+                };
+                let sep_width = w_alias + 2 + w_prov + 2 + w_primary + 2 + w_key + 2 + w_status + 2 + 10;
 
                 let mut rows: Vec<String> = Vec::new();
+                rows.push(format!("\u{1FAAA} Personal Keys ({})", entries.len()));
+                rows.push(format!("{:<wa$}  {:<wp$}  {:<wf$}  {:<wk$}  {:<ws$}  {}",
+                    headers[0], headers[1], headers[2], headers[3], headers[4], headers[5],
+                    wa = w_alias, wp = w_prov, wf = w_primary, wk = w_key, ws = w_status));
+                rows.push("\u{2500}".repeat(sep_width));
+                if personal_rows.is_empty() { rows.push("(none)".to_string()); }
+                else { for r in &personal_rows { rows.push(fmt_row(r)); } }
 
-                // ── Personal keys section ──────────────────────────────
-                rows.push(format!("\u{1F4CB} Personal Keys ({})", entries.len()));
-                rows.push(format!("{:<20}  {:<28}  {:<10}  {:<4}  {}",
-                    "ALIAS", "PROVIDER / BASE_URL", "LOCAL", "KEY", "CREATED"));
-                rows.push("\u{2500}".repeat(80));
-                if entries.is_empty() {
-                    rows.push("(none)".to_string());
-                } else {
-                    for entry in &entries {
-                        let provider_col = match (&entry.base_url, &entry.provider_code) {
-                            (Some(url), _) if !url.is_empty() => url.as_str().to_string(),
-                            (_, Some(code)) if !code.is_empty() => code.clone(),
-                            _ => String::new(),
-                        };
-                        let is_active = active_cfg.as_ref().map_or(false, |cfg| {
-                            cfg.key_type == "personal" && cfg.key_ref == entry.alias
-                        });
-                        let local_col = if is_active {
-                            format!("{:<10}", "active").green().to_string()
-                        } else {
-                            format!("{:<10}", "")
-                        };
-                        let created = entry.created_at
-                            .map(|ts| format_date(ts).dimmed().to_string())
-                            .unwrap_or_default();
-                        rows.push(format!("{:<20}  {:<28}  {}  {:<4}  {}",
-                            &entry.alias,
-                            if provider_col.len() > 28 { &provider_col[..28] } else { &provider_col },
-                            local_col,
-                            "\u{2713}",
-                            created,
-                        ));
-                    }
-                }
-
-                // ── Blank separator ──────────────────────────────────
                 rows.push(String::new());
-
-                // ── Team keys section ────────────────────────────────
                 rows.push(format!("\u{1F465} Team Keys ({})", managed.len()));
-                rows.push(format!("{:<24}  {:<16}  {:<16}  {:<16}  {:<4}  {}",
-                    "ALIAS", "PROVIDER", "LOCAL", "REMOTE STATUS", "KEY", "CREATED"));
-                rows.push("\u{2500}".repeat(80));
-                if managed.is_empty() {
-                    rows.push("(none)".to_string());
-                } else {
-                    for e in &managed {
-                        let has_key = if e.provider_key_ciphertext.is_some() { "\u{2713}" } else { "" };
-                        let display_name = e.local_alias.as_deref().unwrap_or(e.alias.as_str());
-                        let raw_alias = if display_name.len() > 24 { &display_name[..24] } else { display_name };
-                        let server_alias_hint = if e.local_alias.is_some() {
-                            format!(" (\u{2190} {})", e.alias)
-                        } else {
-                            String::new()
-                        };
-                        let local_str = match e.local_state.as_str() {
-                            "active"                     => format!("{:<16}", "active").green().to_string(),
-                            "synced_inactive"            => format!("{:<16}", "inactive").dimmed().to_string(),
-                            "disabled_by_account_scope"  => format!("{:<16}", "other-account").yellow().to_string(),
-                            "disabled_by_account_status" => format!("{:<16}", "acct-disabled").red().to_string(),
-                            "disabled_by_seat_status"    => format!("{:<16}", "seat-disabled").red().to_string(),
-                            "disabled_by_key_status"     => format!("{:<16}", "key-disabled").red().to_string(),
-                            "prompt_dismissed"           => format!("{:<16}", "dismissed").dimmed().to_string(),
-                            "stale"                      => format!("{:<16}", "stale").dimmed().to_string(),
-                            other                        => format!("{:<16}", other).dimmed().to_string(),
-                        };
-                        let status_str = &e.key_status;
-                        let created = format_date(e.synced_at).dimmed().to_string();
-                        rows.push(format!("{:<24}  {:<16}  {}  {}  {:<4}  {}{}",
-                            raw_alias, &e.provider_code, local_str, status_str, has_key, created, server_alias_hint));
-                    }
-                }
+                rows.push("\u{2500}".repeat(sep_width));
+                if team_rows.is_empty() { rows.push("(none)".to_string()); }
+                else { for r in &team_rows { rows.push(fmt_row(r)); } }
 
-                ui_frame::print_box(
-                    "\u{1F511}",
-                    "Keys",
-                    &rows,
-                );
+                ui_frame::print_box("\u{1F511}", "Keys", &rows);
             }
 
             // Post-operation: warn if proxy is unreachable (e.g. after kill -9).
@@ -1086,72 +1224,117 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Test { alias, provider: test_provider } => {
             let password = prompt_vault_password(cli.password_stdin, cli.json)?;
-            let secret = executor::get_secret(alias, &password);
-            let key_value = match secret {
-                Ok(s) => s,
-                Err(e) => {
-                    if cli.json {
-                        json_output::error(&e, 1);
-                    } else {
-                        return Err(e.into());
-                    }
-                }
-            };
 
-            // Resolve provider and base_url from vault metadata.
-            let meta = storage::list_entries_with_metadata()
-                .unwrap_or_default()
-                .into_iter()
-                .find(|m| m.alias == *alias);
-            // --provider flag overrides stored provider_code.
-            let provider_code = test_provider.as_ref().map(|p| p.to_lowercase())
-                .or_else(|| meta.as_ref().and_then(|m| m.provider_code.clone()));
-            let base_url_override = meta.as_ref().and_then(|m| m.base_url.clone());
+            if let Some(ref alias) = alias {
+                // ── Test a specific key by alias ─────────────────────
+                let key_value = match executor::get_secret(alias, &password) {
+                    Ok(s) => s,
+                    Err(e) => { if cli.json { json_output::error(&e, 1); } else { return Err(e.into()); } }
+                };
+                let meta = storage::list_entries_with_metadata().unwrap_or_default()
+                    .into_iter().find(|m| m.alias == *alias);
+                let provider_code = test_provider.as_ref().map(|p| p.to_lowercase())
+                    .or_else(|| meta.as_ref().and_then(|m| m.provider_code.clone()));
+                let base_url_override = meta.as_ref().and_then(|m| m.base_url.clone());
 
-            // Build list of (provider_code, base_url) to test.
-            // - provider set → test that one provider
-            // - no provider but has base_url → ping + generic HTTP probe (no auth assumption)
-            // - no provider, no base_url → test all known providers
-            let targets: Vec<(String, String)> = if let Some(ref code) = provider_code {
-                let url = base_url_override.as_deref()
-                    .or_else(|| commands_project::default_base_url(code))
-                    .unwrap_or("https://unknown")
-                    .to_string();
-                vec![(code.clone(), url)]
-            } else if let Some(ref url) = base_url_override {
-                // Has custom base_url but no provider code — test all known providers
-                // against this URL (it may be a multi-protocol gateway).
-                let mut t: Vec<(String, String)> = commands_project::PROVIDER_DEFAULTS.iter()
-                    .map(|(c, _)| (c.to_string(), url.clone()))
-                    .collect();
-                // Also test the base URL itself as "custom" (plain HTTP probe).
-                t.push(("custom".to_string(), url.clone()));
-                t
-            } else {
-                // No provider, no base_url — test against all known providers.
-                commands_project::PROVIDER_DEFAULTS.iter()
-                    .map(|(c, u)| (c.to_string(), u.to_string()))
-                    .collect()
-            };
-
-            if cli.json {
-                let suite = commands_project::run_connectivity_test(&targets, key_value.trim(), true);
-                json_output::success(serde_json::json!({ "alias": alias, "results": suite.json_results }));
-            } else {
-                use colored::Colorize;
-                if targets.len() == 1 {
-                    let (code, url) = &targets[0];
-                    eprintln!("  Testing '{}' ({} → {})", alias.bold(), code, url.dimmed());
+                let targets: Vec<(String, String)> = if let Some(ref code) = provider_code {
+                    let url = base_url_override.as_deref()
+                        .or_else(|| commands_project::default_base_url(code))
+                        .unwrap_or("https://unknown").to_string();
+                    vec![(code.clone(), url)]
+                } else if let Some(ref url) = base_url_override {
+                    let mut t: Vec<(String, String)> = commands_project::PROVIDER_DEFAULTS.iter()
+                        .map(|(c, _)| (c.to_string(), url.clone())).collect();
+                    t.push(("custom".to_string(), url.clone())); t
                 } else {
-                    eprintln!("  Testing '{}' against {} providers (no provider set)", alias.bold(), targets.len());
-                    // Show base_url if all targets share the same one.
-                    let first_url = &targets[0].1;
-                    if targets.iter().all(|(_, u)| u == first_url) {
-                        eprintln!("  base_url: {}", first_url.dimmed());
-                    }
+                    commands_project::PROVIDER_DEFAULTS.iter().map(|(c, u)| (c.to_string(), u.to_string())).collect()
+                };
+
+                if cli.json {
+                    let suite = commands_project::run_connectivity_test(&targets, key_value.trim(), true);
+                    json_output::success(serde_json::json!({ "alias": alias, "results": suite.json_results }));
+                } else {
+                    use colored::Colorize;
+                    if targets.len() == 1 { let (code, url) = &targets[0]; eprintln!("  Testing '{}' ({} \u{2192} {})", alias.bold(), code, url.dimmed()); }
+                    else { eprintln!("  Testing '{}' against {} providers", alias.bold(), targets.len()); }
+                    eprintln!();
+                    commands_project::run_connectivity_test(&targets, key_value.trim(), false);
                 }
-                eprintln!();
-                commands_project::run_connectivity_test(&targets, key_value.trim(), false);
+            } else {
+                // ── No alias: test all current Primary keys in one table ─
+                let bindings = storage::list_provider_bindings(profile_activation::DEFAULT_PROFILE).unwrap_or_default();
+                if bindings.is_empty() {
+                    if cli.json { json_output::error("No active provider bindings. Add a key first.", 1); }
+                    else { return Err("No active provider bindings. Add a key with `aikey add` first.".into()); }
+                }
+                use colored::Colorize;
+
+                struct TestItem { provider: String, url: String, key: String, display: String, source_type: String }
+                let mut items: Vec<TestItem> = Vec::new();
+                let mut skipped_team: Vec<(String, String)> = Vec::new();
+
+                for b in &bindings {
+                    let display = resolve_binding_display_name(&b.key_source_type, &b.key_source_ref);
+                    if b.key_source_type == "personal" {
+                        let kv = match executor::get_secret(&b.key_source_ref, &password) {
+                            Ok(s) => s,
+                            Err(e) => { if !cli.json { eprintln!("  {} {} \u{2192} '{}': {}", "\u{2717}".red(), b.provider_code, b.key_source_ref, e); } continue; }
+                        };
+                        let bu = storage::get_entry_base_url(&b.key_source_ref).unwrap_or(None);
+                        let url = bu.as_deref().or_else(|| commands_project::default_base_url(&b.provider_code)).unwrap_or("https://unknown").to_string();
+                        items.push(TestItem { provider: b.provider_code.clone(), url, key: kv.to_string(), display, source_type: b.key_source_type.clone() });
+                    } else { skipped_team.push((b.provider_code.clone(), display)); }
+                }
+
+                if cli.json {
+                    let mut all_json: Vec<serde_json::Value> = Vec::new();
+                    for item in &items {
+                        let r = commands_project::test_provider_connectivity(&item.provider, &item.url, item.key.trim());
+                        all_json.push(serde_json::json!({ "provider": item.provider, "alias": item.display, "source_type": item.source_type, "base_url": item.url,
+                            "ping_ok": r.ping_ok, "ping_ms": r.ping_ms, "api_ok": r.api_ok, "api_ms": r.api_ms, "api_status": r.api_status,
+                            "chat_ok": r.chat_ok, "chat_ms": r.chat_ms, "chat_status": r.chat_status }));
+                    }
+                    json_output::success(serde_json::json!({ "bindings_tested": all_json }));
+                } else {
+                    eprintln!("  Testing {} active provider binding(s)...\n", bindings.len());
+                    const W_PROV: usize = 12; const W_ALIAS: usize = 16; const W_PING: usize = 16; const W_API: usize = 30;
+                    eprintln!("  {:<wp$} {:<wa$} {:<wpi$} {:<wap$} {}", "Provider".dimmed(), "Key".dimmed(), "Ping".dimmed(), "API".dimmed(), "Chat".dimmed(),
+                        wp = W_PROV, wa = W_ALIAS, wpi = W_PING, wap = W_API);
+                    eprintln!("  {}", "\u{2500}".repeat(W_PROV + W_ALIAS + W_PING + W_API + 20).dimmed());
+
+                    let mut any_reachable = false;
+                    for item in &items {
+                        eprint!("  {:<wp$} {:<wa$} ", item.provider.bold(), item.display.dimmed(), wp = W_PROV, wa = W_ALIAS);
+                        let _ = io::stderr().flush();
+                        let r = commands_project::test_provider_connectivity(&item.provider, &item.url, item.key.trim());
+                        let ping_raw = if r.ping_ok { format!("ok ({}ms)", r.ping_ms) } else { format!("fail ({}ms)", r.ping_ms) };
+                        let ping_col = if r.ping_ok { format!("{:<w$}", ping_raw, w = W_PING).green().to_string() } else { format!("{:<w$}", ping_raw, w = W_PING).red().to_string() };
+                        eprint!("{} ", ping_col); let _ = io::stderr().flush();
+                        if !r.ping_ok { eprintln!("{:<w$} {}", "\u{2014}".dimmed(), "\u{2014}".dimmed(), w = W_API); }
+                        else {
+                            any_reachable = true;
+                            let api_raw = if r.api_ok { let h = r.api_status.map(|s| commands_project::api_status_hint(s)).unwrap_or_default(); format!("ok ({}ms, {})", r.api_ms, h) } else { format!("fail ({}ms)", r.api_ms) };
+                            let api_col = if r.api_ok { format!("{:<w$}", api_raw, w = W_API).green().to_string() } else { format!("{:<w$}", api_raw, w = W_API).red().to_string() };
+                            eprint!("{} ", api_col); let _ = io::stderr().flush();
+                            if !r.api_ok { eprintln!("{}", "\u{2014}".dimmed()); }
+                            else if r.chat_ok { let h = r.chat_status.map(|s| commands_project::chat_status_hint(s)).unwrap_or_default(); eprintln!("{}", format!("ok ({}ms, {})", r.chat_ms, h).green()); }
+                            else { eprintln!("{}", format!("fail ({}ms)", r.chat_ms).red()); }
+                        }
+                    }
+                    for (prov, display) in &skipped_team { eprintln!("  {:<wp$} {:<wa$} {}", prov.bold(), display.dimmed(), "skipped [team]".dimmed(), wp = W_PROV, wa = W_ALIAS); }
+
+                    eprintln!();
+                    if !any_reachable { eprintln!("  {:<12} {}", "proxy".bold(), "skipped (all providers unreachable)".dimmed()); }
+                    else if commands_proxy::is_proxy_running() {
+                        let proxy_addr = commands_proxy::doctor_proxy_addr();
+                        if let Some(prov) = items.first().map(|i| i.provider.as_str()) {
+                            eprint!("  {:<12} ", "proxy".bold());
+                            let r = commands_project::test_proxy_connectivity(&proxy_addr, prov);
+                            if r.ok { let h = r.status.map(|s| commands_project::proxy_status_hint(s)).unwrap_or_default(); eprintln!("{} ({} ms, {})", "ok".green(), r.ms, h); }
+                            else { eprintln!("{} ({} ms)", "failed".red(), r.ms); }
+                        }
+                    } else { eprintln!("  {:<12} {}", "proxy".bold(), "not running".dimmed()); }
+                }
             }
         }
         Commands::Export { pattern, output } => {
@@ -1303,8 +1486,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     if let Some(cfg) = project_config.as_ref() {
                         executor::run_with_project_config(cfg, &password, command, cli.json, logical_model.as_deref(), resolved_tenant)
-                    } else if storage::get_active_key_config().ok().flatten().is_some() {
-                        // Active key exists (team or personal) — route via proxy.
+                    } else if !storage::list_provider_bindings("default").unwrap_or_default().is_empty()
+                        || storage::get_active_key_config().ok().flatten().is_some()
+                    {
+                        // Provider bindings exist, or legacy active key — route via proxy.
                         executor::run_with_active_key(command, cli.json)
                     } else {
                         executor::run_from_vault(&password, command, cli.json)
@@ -1802,23 +1987,202 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands_account::handle_logout(cli.json)?;
         }
         Commands::Use { alias_or_id, no_hook, provider } => {
-            // Resolve alias: if omitted, show interactive picker (TTY only).
-            let resolved_alias: String = match alias_or_id {
-                Some(a) => a.clone(),
+            match alias_or_id {
+                Some(a) => {
+                    // `aikey use <alias>` — provider-level promotion via handle_key_use.
+                    commands_proxy::ensure_proxy_for_use(cli.password_stdin);
+                    commands_account::handle_key_use(
+                        a, *no_hook, provider.as_deref(), cli.json,
+                    )?;
+                }
                 None => {
+                    // `aikey use` (no args) — provider-tree interactive editor.
                     if !std::io::stdin().is_terminal() || cli.json {
                         return Err("alias required in non-interactive mode (usage: aikey use <ALIAS>)".into());
                     }
-                    pick_key_interactively()?
+                    commands_proxy::ensure_proxy_for_use(cli.password_stdin);
+                    let changes = pick_providers_interactively()?;
+                    if changes.is_empty() {
+                        eprintln!("  No changes.");
+                    } else {
+                        for (prov, src_type, src_ref) in &changes {
+                            storage::set_provider_binding(
+                                profile_activation::DEFAULT_PROFILE,
+                                prov, src_type, src_ref,
+                            ).map_err(|e| format!("Failed to set binding: {}", e))?;
+                        }
+                        let refresh = profile_activation::refresh_implicit_profile_activation()
+                            .map_err(|e| format!("Failed to refresh activation: {}", e))?;
+                        if !*no_hook {
+                            commands_account::ensure_shell_hook(false);
+                        }
+                        // Print a summary box showing the final state.
+                        use colored::Colorize;
+                        let changed_providers: Vec<&str> = changes.iter()
+                            .map(|(p, _, _)| p.as_str())
+                            .collect();
+                        let mut box_rows: Vec<String> = Vec::new();
+                        for b in &refresh.bindings {
+                            let display_name = resolve_binding_display_name(&b.key_source_type, &b.key_source_ref);
+                            let is_changed = changed_providers.contains(&b.provider_code.as_str());
+                            let value_raw = format!("\u{2192} {}", display_name);
+                            let value_padded = format!("{:<28}", value_raw);
+                            let value_col = if is_changed {
+                                value_padded.green().to_string()
+                            } else {
+                                value_padded
+                            };
+                            box_rows.push(format!("  {:<14} {} \x1b[90m[{}]\x1b[0m",
+                                b.provider_code, value_col, b.key_source_type));
+                        }
+                        box_rows.push(String::new());
+                        box_rows.push(format!("{} Saved provider primary selections and refreshed current activation.",
+                            "\u{2713}".green()));
+                        ui_frame::print_box(
+                            "\u{1F7E2}",
+                            "Provider Key Selection — Confirmed",
+                            &box_rows,
+                        );
+                        println!();
+                    }
                 }
-            };
-            commands_proxy::ensure_proxy_for_use(cli.password_stdin);
-            commands_account::handle_key_use(
-                &resolved_alias, *no_hook, provider.as_deref(), cli.json,
-            )?;
-            // Post-operation: warn if proxy is still unreachable after ensure_proxy_for_use
-            // attempted to start it (e.g. after kill -9 with no env password).
+            }
             commands_proxy::warn_if_proxy_down();
+        }
+        Commands::Env { action } => {
+            match action {
+                None => {
+                    // `aikey env` — read-only display of active.env + proxy.env.
+                    use colored::Colorize;
+                    let active_path = proxy_env::active_env_path().unwrap_or_default();
+                    let proxy_path = proxy_env::proxy_env_path().unwrap_or_default();
+
+                    // Active env section.
+                    eprintln!("{}", "Active env:".bold());
+                    eprintln!("  Path: {}", active_path.display().to_string().dimmed());
+                    if active_path.exists() {
+                        match proxy_env::read_active_env_lines() {
+                            Ok(entries) if entries.is_empty() => {
+                                eprintln!("  (empty)");
+                            }
+                            Ok(entries) => {
+                                for (k, v) in &entries {
+                                    eprintln!("  {}={}", k, proxy_env::mask_value(k, v).dimmed());
+                                }
+                            }
+                            Err(e) => eprintln!("  {}", format!("Error: {}", e).red()),
+                        }
+                    } else {
+                        eprintln!("  {}", "(not found)".dimmed());
+                    }
+                    eprintln!();
+
+                    // Proxy env section.
+                    eprintln!("{}", "Proxy env:".bold());
+                    eprintln!("  Path: {}", proxy_path.display().to_string().dimmed());
+                    if proxy_path.exists() {
+                        match proxy_env::read_proxy_env() {
+                            Ok(map) if map.is_empty() => {
+                                eprintln!("  (empty)");
+                            }
+                            Ok(map) => {
+                                for (k, v) in &map {
+                                    eprintln!("  {}={}", k, proxy_env::mask_value(k, v).dimmed());
+                                }
+                                eprintln!();
+                                eprintln!("  Entries: {}  Hash: {}",
+                                    map.len(), proxy_env::config_hash(&map).dimmed());
+                            }
+                            Err(e) => eprintln!("  {}", format!("Error: {}", e).red()),
+                        }
+                    } else {
+                        eprintln!("  {}", "(not found — use `aikey env set -- KEY=VALUE` to create)".dimmed());
+                    }
+                }
+                Some(EnvAction::Set { args }) => {
+                    // `aikey env set -- KEY=VALUE ...`
+                    // Also supports stdin pipe: echo "K=V" | aikey env set
+                    use colored::Colorize;
+
+                    // Collect input: from args, or from stdin if args empty and stdin is piped.
+                    let effective_args: Vec<String> = if !args.is_empty() {
+                        args.clone()
+                    } else if !std::io::stdin().is_terminal() {
+                        let mut buf = String::new();
+                        io::stdin().read_line(&mut buf)?;
+                        vec![buf]
+                    } else {
+                        return Err(
+                            "Usage: aikey env set -- KEY=VALUE [KEY2=VALUE2 ...]\n\
+                             \n\
+                             Examples:\n  \
+                               aikey env set -- http_proxy=http://127.0.0.1:7890 https_proxy=http://127.0.0.1:7890\n  \
+                               echo 'http_proxy=http://127.0.0.1:7890' | aikey env set\n\
+                             \n\
+                             Note: use spaces (not semicolons) to separate multiple entries,\n\
+                             or quote the entire argument if using semicolons:\n  \
+                               aikey env set -- 'export A=1; export B=2'".into()
+                        );
+                    };
+
+                    // Parse new entries from args.
+                    let new_entries = proxy_env::parse_set_args(&effective_args)
+                        .map_err(|e| format!("Parse error: {}", e))?;
+
+                    if new_entries.is_empty() {
+                        return Err("No valid KEY=VALUE pairs found.".into());
+                    }
+
+                    // Read existing, merge, write back.
+                    // Why explicit error: if the old file is corrupt, we must not
+                    // silently discard it — user should fix it first.
+                    let mut existing = proxy_env::read_proxy_env()
+                        .map_err(|e| format!(
+                            "Cannot parse existing ~/.aikey/proxy.env: {}\n\
+                             Fix or remove the file before setting new values.", e
+                        ))?;
+                    for (k, v) in &new_entries {
+                        existing.insert(k.clone(), v.clone());
+                    }
+                    proxy_env::write_proxy_env(&existing)?;
+
+                    let path = proxy_env::proxy_env_path().unwrap_or_default();
+                    eprintln!("{} Updated {}", "\u{2713}".green(), path.display());
+                    for (k, _) in &new_entries {
+                        eprintln!("  {} {}", "+".green(), k);
+                    }
+
+                    // Auto-restart proxy if running so new env takes effect immediately.
+                    if commands_proxy::is_proxy_running() {
+                        eprintln!();
+                        eprintln!("  Restarting proxy to apply changes...");
+                        let pw = session::try_get()
+                            .or_else(|| std::env::var("AK_TEST_PASSWORD").ok().map(SecretString::new));
+                        match pw {
+                            Some(password) => {
+                                match commands_proxy::handle_restart(None, &password) {
+                                    Ok(()) => {
+                                        eprintln!("  {} Proxy restarted with new env.", "\u{2713}".green());
+                                    }
+                                    Err(e) => {
+                                        eprintln!("  {} Auto-restart failed: {}", "\u{26A0}".yellow(), e);
+                                        eprintln!("  Run manually: {}", "aikey proxy restart".bold());
+                                    }
+                                }
+                            }
+                            None => {
+                                eprintln!("  {} Cannot auto-restart (no cached password).",
+                                    "\u{26A0}".yellow());
+                                eprintln!("  Run manually: {}", "aikey proxy restart".bold());
+                            }
+                        }
+                    } else {
+                        eprintln!();
+                        eprintln!("  Proxy not running. Changes will apply on next {}.",
+                            "aikey proxy start".bold());
+                    }
+                }
+            }
         }
         Commands::Browse { page, port } => {
             commands_account::handle_browse(page.as_deref(), *port, cli.json)?;
@@ -2001,8 +2365,609 @@ fn validate_secret_name(name: &str) -> Result<(), String> {
 /// Returns the master password, using the 30-minute session cache when available.
 /// Use for LOW-sensitivity commands (list, get, run, key sync, proxy start, …).
 /// After a successful vault operation the caller should call `session::refresh()`.
+/// Returns detailed notes for a command path (e.g. "add", "proxy start").
+/// Used to append contextual notes after clap's rendered `--help` output.
+fn command_detail_notes(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        "add" => Some("\
+Notes:
+    - Stores a new local secret under <ALIAS>.
+    - --provider binds the secret to a provider such as openai or anthropic.
+    - On TTY, the secret value is entered interactively.
+    - In non-interactive mode, the secret value is read from stdin.
+    - In interactive mode, AiKey may run connectivity checks before saving."),
+
+        "list" => Some("\
+Notes:
+    - Shows both Personal Keys and Team Keys.
+    - Team keys are filtered to active keys only.
+    - May perform a lightweight sync first.
+    - If server state changed, AiKey may prompt for the vault password to complete a full sync.
+    - If the control service is unreachable, AiKey falls back to local cache."),
+
+        "test" => Some("\
+Notes:
+    - --provider overrides the stored provider for this test only.
+    - The test may include TCP reachability, API probe, chat/completion probe, and proxy probe.
+    - If no provider metadata is stored, AiKey may test multiple known providers."),
+
+        "use" => Some("\
+Notes:
+    - Accepts either a team key alias/ID or a personal key alias.
+    - If ALIAS_OR_ID is omitted on a TTY, AiKey opens an interactive picker.
+    - In non-interactive mode, ALIAS_OR_ID is required.
+    - AiKey ensures the local proxy is running before activation.
+    - --provider <PROVIDER> narrows a personal key to a specific provider.
+    - --provider with no value opens an interactive provider selector.
+    - --no-hook skips shell hook installation."),
+
+        "login" => Some("\
+Notes:
+    - Shortcut for `aikey account login`.
+    - Default flow uses browser + email activation.
+    - --token is the copy-paste fallback for non-completing browser flow.
+    - Control URL precedence:
+      1. --control-url
+      2. AIKEY_CONTROL_URL
+      3. saved local config
+      4. interactive prompt
+    - --email pre-fills the login page."),
+
+        "browse" => Some("\
+Notes:
+    - PAGE: overview | keys | account | usage
+    - In local mode, AiKey can open the local console directly.
+    - In team/trial mode, AiKey requires a valid account session.
+    - If the control URL is local, AiKey may auto-detect common dev ports such as 3000 and 5173.
+    - --port forces a specific local web port."),
+
+        "doctor" => Some("\
+Notes:
+    - Checks include internet reachability, vault presence, session cache, proxy status,
+      provider/proxy connectivity, shell hook state, and vault WAL size.
+    - In interactive mode, AiKey may try to restart the proxy automatically.
+    - In interactive mode, AiKey may also try to install the shell hook if missing."),
+
+        "env" => Some("\
+Notes:
+    - `aikey env` shows both `~/.aikey/active.env` and `~/.aikey/proxy.env`.
+    - `active.env` is the shell-facing derived environment.
+    - `proxy.env` is the user-managed environment file for the `aikey-proxy` process.
+    - Values are masked on display when the variable name looks sensitive.
+    - If `proxy.env` exists and is valid, AiKey also shows entry count and a short config hash."),
+
+        "env set" => Some("\
+Notes:
+    - Writes only `~/.aikey/proxy.env`.
+    - Does not modify `~/.aikey/active.env`.
+    - Merge-updates the existing file instead of replacing it completely.
+    - Accepts `KEY=VALUE`, multiple pairs, optional `export` prefixes, and semicolon-separated input.
+    - If the existing `proxy.env` is invalid, AiKey stops and asks the user to fix it first.
+    - Restart the proxy after changes: `aikey proxy restart`"),
+
+        "proxy start" => Some("\
+Notes:
+    - Starts the proxy with vault authentication.
+    - Starts in background by default.
+    - Use --foreground for debugging."),
+
+        "whoami" => Some("\
+Notes:
+    - Includes vault state, logged-in account, control URL, active key, and sync version.
+    - Useful for confirming the current working context before running or debugging."),
+
+        "get" => Some("\
+Notes:
+    - Default clipboard clear timeout is 30 seconds.
+    - Use --timeout 0 to disable auto-clear.
+    - In JSON mode, AiKey returns the plaintext value instead of using the clipboard."),
+
+        "run" => Some("\
+Notes:
+    - Use -- to separate AiKey flags from the child command.
+    - Resolution path without --provider:
+      1. project config if present
+      2. active key via proxy if configured
+      3. vault-auto fallback
+    - --dry-run prints what would be injected without executing.
+    - --direct bypasses the proxy and injects the real decrypted key directly.
+    - --direct only supports active personal keys."),
+
+        "key list" => Some("\
+Notes:
+    - Lists team-managed virtual keys.
+    - May refresh metadata from server when possible."),
+
+        "key sync" => Some("\
+Notes:
+    - Forces a full metadata refresh and downloads missing key material.
+    - Requires the vault password."),
+
+        "quickstart" => Some("\
+Notes:
+    - Initializes the vault if it does not exist.
+    - Creates `aikey.config.json` if needed.
+    - This is an onboarding wizard, not a required prerequisite for normal commands."),
+
+        "project map" => Some("\
+Notes:
+    - Binds an env var name to a vault alias.
+    - Can also write envMappings entries when the mapping flags are provided.
+    - Requires an existing `aikey.config.json`."),
+
+        "update" => Some("\
+Notes:
+    - In interactive mode, AiKey asks for confirmation first.
+    - If the proxy is already running, AiKey may warn that restart is needed."),
+
+        "delete" => Some("\
+Notes:
+    - In interactive mode, AiKey asks for confirmation first.
+    - If the proxy is already running, AiKey may warn that restart is needed."),
+
+        "export" => Some("\
+Notes:
+    - <PATTERN> supports matching such as '*' or 'api_*'.
+    - Requires both the vault password and a separate export password.
+    - Treat the output file as sensitive material."),
+
+        "change-password" => Some("\
+Notes:
+    - Prompts for old password, new password, and confirmation.
+    - Invalidates the cached local session after success."),
+
+        "logout" => Some("\
+Notes:
+    - Shortcut for `aikey account logout`.
+    - Does not delete local vault contents."),
+
+        "secret set" | "secret upsert" => Some("\
+Notes:
+    - --from-stdin is required for security."),
+
+        "logs" => Some("\
+Notes:
+    - Default limit is 20."),
+
+        _ => None,
+    }
+}
+
 /// Fuzzy similarity in [0.0, 1.0] combining prefix match, edit distance, and bigrams.
-/// Used to suggest close matches for mistyped subcommands.
+fn print_short_help() {
+    let b = "\x1b[1m";
+    let r = "\x1b[0m";
+    println!("\
+AiKey - Secure local-first secret management
+
+Usage: aikey [OPTIONS] [COMMAND]
+
+Commands:
+  {b}add{r} <alias>              Save a new secret to the vault
+  {b}list{r}                     Show all personal and team keys
+  {b}test{r} <alias>             Test whether a stored API key alias is working
+  {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
+  {b}login{r}                    Log in to aikey service (shortcut for `account login`)
+  {b}browse{r} [page]            Open the User Console in your default browser
+  {b}doctor{r}                   Check system health, connectivity, and configuration
+  {b}env{r} [command]            View or set proxy environment variables
+  {b}proxy{r} <command>          Manage the local proxy process
+  {b}whoami{r}                   Show your current login, active key, and vault status
+  {b}get{r} <alias>              Retrieve a secret and copy it to the clipboard
+  {b}run{r} -- <command>         Run a command with secrets injected as environment variables
+  {b}key{r} <command>            Manage API keys (rotate, list, sync, use)
+  {b}quickstart{r}               Initialize vault and set up a new project
+  {b}project{r} <command>        Manage project configuration
+  {b}logs{r}                     Show recent activity logs
+  {b}update{r} <alias>           Update an existing secret
+  {b}delete{r} <alias>           Delete a secret from the vault
+  {b}export{r} <pattern> <file>  Export secrets to an encrypted backup file
+  {b}change-password{r}          Change the vault master password
+  {b}account{r} <command>        Manage your aikey account session
+  {b}logout{r}                   Log out of the current session (shortcut for `account logout`)
+  {b}secret{r} <command>         Manage secrets and platform-backed secret actions
+  {b}help{r}                     Show this help message or help for a command
+
+Options:
+      --password-stdin  Read password from stdin instead of prompting
+      --json            Output in JSON format (where supported)
+  -V, --version         Print version information
+  -h, --help            Print help
+      --detail          Print detailed help for all commands");
+}
+
+fn print_detailed_help() {
+    print!("\
+AiKey - Secure local-first secret management
+
+Usage:
+  aikey [OPTIONS] <COMMAND>
+
+Global options:
+  --password-stdin   Read the vault master password from stdin
+  --json             Output JSON where supported
+  -V, --version      Print version information
+  -h, --help         Print help
+
+Detailed Commands
+
+[1madd[0m
+  Save a new personal key/secret to the local vault.
+
+  Usage:
+    aikey add [--provider <PROVIDER>] <ALIAS>
+
+  Notes:
+    - Stores a new local secret under <ALIAS>.
+    - --provider binds the secret to a provider such as openai or anthropic.
+    - On TTY, the secret value is entered interactively.
+    - In non-interactive mode, the secret value is read from stdin.
+    - In interactive mode, AiKey may run connectivity checks before saving.
+
+[1mlist[0m
+  Show all personal and team keys in one view.
+
+  Usage:
+    aikey list
+
+  Notes:
+    - Shows both Personal Keys and Team Keys.
+    - Team keys are filtered to active keys only.
+    - May perform a lightweight sync first.
+    - If server state changed, AiKey may prompt for the vault password to complete a full sync.
+    - If the control service is unreachable, AiKey falls back to local cache.
+
+[1mtest[0m
+  Test whether a stored API key alias is reachable and usable.
+
+  Usage:
+    aikey test [--provider <PROVIDER>] <ALIAS>
+
+  Notes:
+    - <ALIAS> is the stored key alias.
+    - --provider overrides the stored provider for this test only.
+    - The test may include TCP reachability, API probe, chat/completion probe, and proxy probe.
+    - If no provider metadata is stored, AiKey may test multiple known providers.
+
+[1muse[0m
+  Activate the current key for routing.
+
+  Usage:
+    aikey use [--no-hook] [--provider [<PROVIDER>]] [ALIAS_OR_ID]
+
+  Notes:
+    - Accepts either a team key alias/ID or a personal key alias.
+    - If ALIAS_OR_ID is omitted on a TTY, AiKey opens an interactive picker.
+    - In non-interactive mode, ALIAS_OR_ID is required.
+    - AiKey ensures the local proxy is running before activation.
+    - --provider <PROVIDER> narrows a personal key to a specific provider.
+    - --provider with no value opens an interactive provider selector.
+    - --no-hook skips shell hook installation.
+
+[1mlogin[0m
+  Log in to the control service.
+
+  Usage:
+    aikey login [--control-url <URL>] [--token <TOKEN>] [--email <EMAIL>]
+
+  Notes:
+    - Shortcut for `aikey account login`.
+    - Default flow uses browser + email activation.
+    - --token is the copy-paste fallback for non-completing browser flow.
+    - Control URL precedence:
+      1. --control-url
+      2. AIKEY_CONTROL_URL
+      3. saved local config
+      4. interactive prompt
+    - --email pre-fills the login page.
+
+[1mbrowse[0m
+  Open the User Console in the default browser.
+
+  Usage:
+    aikey browse [--port <PORT>] [PAGE]
+
+  Arguments:
+    PAGE: overview | keys | account | usage
+
+  Notes:
+    - In local mode, AiKey can open the local console directly.
+    - In team/trial mode, AiKey requires a valid account session.
+    - If the control URL is local, AiKey may auto-detect common dev ports such as 3000 and 5173.
+    - --port forces a specific local web port.
+
+[1mdoctor[0m
+  Check system health, connectivity, and configuration.
+
+  Usage:
+    aikey doctor
+
+  Notes:
+    - Checks include internet reachability, vault presence, session cache, proxy status,
+      provider/proxy connectivity, shell hook state, and vault WAL size.
+    - In interactive mode, AiKey may try to restart the proxy automatically.
+    - In interactive mode, AiKey may also try to install the shell hook if missing.
+
+[1menv[0m
+  View or set proxy environment variables.
+
+  Usage:
+    aikey env [COMMAND]
+
+  Notes:
+    - `aikey env` shows both `~/.aikey/active.env` and `~/.aikey/proxy.env`.
+    - `active.env` is the shell-facing derived environment.
+    - `proxy.env` is the user-managed environment file for the `aikey-proxy` process.
+    - Values are masked on display when the variable name looks sensitive.
+    - If `proxy.env` exists and is valid, AiKey also shows entry count and a short config hash.
+
+  Subcommands:
+    [1mset[0m
+      Usage:
+        aikey env set -- KEY=VALUE [KEY2=VALUE2 ...]
+      Notes:
+        - Writes only `~/.aikey/proxy.env`.
+        - Does not modify `~/.aikey/active.env`.
+        - Merge-updates the existing file instead of replacing it completely.
+        - Accepts `KEY=VALUE`, multiple pairs, optional `export` prefixes, and semicolon-separated input.
+        - If the existing `proxy.env` is invalid, AiKey stops and asks the user to fix it first.
+        - Restart the proxy after changes:
+          `aikey proxy restart`
+
+[1mproxy[0m
+  Manage the local aikey-proxy process.
+
+  Usage:
+    aikey proxy <SUBCOMMAND>
+
+  Subcommands:
+    [1mstart[0m
+      Usage:
+        aikey proxy start [--config <CONFIG>] [--foreground]
+      Notes:
+        - Starts the proxy with vault authentication.
+        - Starts in background by default.
+        - Use --foreground for debugging.
+
+    [1mstop[0m
+      Usage:
+        aikey proxy stop
+
+    [1mstatus[0m
+      Usage:
+        aikey proxy status
+
+    [1mrestart[0m
+      Usage:
+        aikey proxy restart [--config <CONFIG>]
+
+    [1mverify[0m
+      Usage:
+        aikey proxy verify
+
+[1mwhoami[0m
+  Show the current local identity summary.
+
+  Usage:
+    aikey whoami
+
+  Notes:
+    - Includes vault state, logged-in account, control URL, active key, and sync version.
+    - Useful for confirming the current working context before running or debugging.
+
+[1mget[0m
+  Retrieve a secret and copy it to the clipboard.
+
+  Usage:
+    aikey get [-t <TIMEOUT>] <ALIAS>
+
+  Notes:
+    - Default clipboard clear timeout is 30 seconds.
+    - Use --timeout 0 to disable auto-clear.
+    - In JSON mode, AiKey returns the plaintext value instead of using the clipboard.
+
+[1mrun[0m
+  Execute a command with resolved secrets injected as environment variables.
+
+  Usage:
+    aikey run [--provider <PROVIDER>] [--logical-model <LOGICAL_MODEL>] [--model <MODEL>] [--tenant <TENANT>] [--profile <PROFILE>] [--dry-run] [--direct] -- <COMMAND>...
+
+  Notes:
+    - Use -- to separate AiKey flags from the child command.
+    - Resolution path without --provider:
+      1. project config if present
+      2. active key via proxy if configured
+      3. vault-auto fallback
+    - --dry-run prints what would be injected without executing.
+    - --direct bypasses the proxy and injects the real decrypted key directly.
+    - --direct only supports active personal keys.
+
+[1mkey[0m
+  Manage team-key lifecycle and local team-key metadata.
+
+  Usage:
+    aikey key <SUBCOMMAND>
+
+  Subcommands:
+    [1mlist[0m
+      Usage:
+        aikey key list
+      Notes:
+        - Lists team-managed virtual keys.
+        - May refresh metadata from server when possible.
+
+    [1msync[0m
+      Usage:
+        aikey key sync
+      Notes:
+        - Forces a full metadata refresh and downloads missing key material.
+        - Requires the vault password.
+
+    [1muse[0m
+      Usage:
+        aikey key use [--no-hook] <ALIAS_OR_ID>
+
+    [1mrotate[0m
+      Usage:
+        aikey key rotate [--from-stdin] <NAME>
+
+    [1malias[0m
+      Usage:
+        aikey key alias <OLD_ALIAS> <NEW_ALIAS>
+
+[1mquickstart[0m
+  Initialize vault and set up a new project.
+
+  Usage:
+    aikey quickstart
+
+  Notes:
+    - Initializes the vault if it does not exist.
+    - Creates `aikey.config.json` if needed.
+    - This is an onboarding wizard, not a required prerequisite for normal commands.
+
+[1mproject[0m
+  Manage optional project configuration.
+
+  Usage:
+    aikey project <SUBCOMMAND>
+
+  Subcommands:
+    [1minit[0m
+      Usage:
+        aikey project init
+
+    [1mstatus[0m
+      Usage:
+        aikey project status
+
+    [1mmap[0m
+      Usage:
+        aikey project map [--env <ENV>] [--provider <PROVIDER>] [--model <MODEL>] [--key-alias <ALIAS>] [--impl-id <IMPL>] <VAR> <ALIAS>
+      Notes:
+        - Binds an env var name to a vault alias.
+        - Can also write envMappings entries when the mapping flags are provided.
+        - Requires an existing `aikey.config.json`.
+
+[1mlogs[0m
+  Show recent local activity events.
+
+  Usage:
+    aikey logs [--limit <LIMIT>]
+
+  Notes:
+    - Default limit is 20.
+
+[1mupdate[0m
+  Replace the value of an existing local secret.
+
+  Usage:
+    aikey update <ALIAS>
+
+  Notes:
+    - In interactive mode, AiKey asks for confirmation first.
+    - If the proxy is already running, AiKey may warn that restart is needed.
+
+[1mdelete[0m
+  Remove a local secret from the vault.
+
+  Usage:
+    aikey delete <ALIAS>
+
+  Notes:
+    - In interactive mode, AiKey asks for confirmation first.
+    - If the proxy is already running, AiKey may warn that restart is needed.
+
+[1mexport[0m
+  Export selected secrets to an encrypted backup file.
+
+  Usage:
+    aikey export <PATTERN> <OUTPUT>
+
+  Notes:
+    - <PATTERN> supports matching such as \"*\" or \"api_*\".
+    - Requires both the vault password and a separate export password.
+    - Treat the output file as sensitive material.
+
+[1mchange-password[0m
+  Change the vault master password.
+
+  Usage:
+    aikey change-password
+
+  Notes:
+    - Prompts for old password, new password, and confirmation.
+    - Invalidates the cached local session after success.
+
+[1maccount[0m
+  Manage the current control-service account session.
+
+  Usage:
+    aikey account <SUBCOMMAND>
+
+  Subcommands:
+    [1mlogin[0m
+      Usage:
+        aikey account login [--control-url <URL>] [--token <TOKEN>] [--email <EMAIL>]
+
+    [1mstatus[0m
+      Usage:
+        aikey account status
+
+    [1mlogout[0m
+      Usage:
+        aikey account logout
+
+    [1mset-url[0m
+      Usage:
+        aikey account set-url <URL>
+
+[1mlogout[0m
+  Log out of the current account session.
+
+  Usage:
+    aikey logout
+
+  Notes:
+    - Shortcut for `aikey account logout`.
+    - Does not delete local vault contents.
+
+[1msecret[0m
+  Low-level secret management commands.
+
+  Usage:
+    aikey secret <SUBCOMMAND>
+
+  Subcommands:
+    [1mset[0m
+      Usage:
+        aikey secret set --from-stdin [--provider <PROVIDER>] <NAME>
+      Notes:
+        - --from-stdin is required for security.
+
+    [1mupsert[0m
+      Usage:
+        aikey secret upsert --from-stdin [--provider <PROVIDER>] <NAME>
+      Notes:
+        - --from-stdin is required for security.
+
+    [1mlist[0m
+      Usage:
+        aikey secret list
+
+    [1mdelete[0m
+      Usage:
+        aikey secret delete <NAME>
+
+[1mhelp[0m
+  Show top-level or command-specific help.
+
+  Usage:
+    aikey help [COMMAND]
+");
+}
+
+
 fn print_banner() {
     use colored::Colorize;
     let version = env!("CARGO_PKG_VERSION");
@@ -2093,6 +3058,16 @@ fn edit_distance(a: &str, b: &str) -> usize {
         }
     }
     dp[m][n]
+}
+
+/// Resolve a binding's key_source_ref to a human-readable display name.
+fn resolve_binding_display_name(source_type: &str, source_ref: &str) -> String {
+    if source_type == "team" {
+        if let Ok(Some(entry)) = storage::get_virtual_key_cache(source_ref) {
+            return entry.local_alias.unwrap_or(entry.alias);
+        }
+    }
+    source_ref.to_string()
 }
 
 fn prompt_vault_password(password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
@@ -2307,5 +3282,139 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
     )? {
         ui_select::SelectResult::Selected(idx) => Ok(aliases[idx].clone()),
         ui_select::SelectResult::Cancelled => Err("Selection cancelled.".into()),
+    }
+}
+
+/// Build provider groups and show the provider-tree interactive editor.
+/// Returns a list of (provider_code, source_type, source_ref) changes to apply.
+fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
+    let personal = storage::list_entries_with_metadata().unwrap_or_default();
+    let team = storage::list_virtual_key_cache().unwrap_or_default();
+
+    if personal.is_empty() && team.is_empty() {
+        return Err("No keys found. Add a personal key with `aikey add` or sync team keys with `aikey key sync`.".into());
+    }
+
+    let bindings = storage::list_provider_bindings(
+        profile_activation::DEFAULT_PROFILE
+    ).unwrap_or_default();
+
+    // Collect all known provider codes.
+    let mut all_providers: Vec<String> = Vec::new();
+    let mut add_prov = |code: &str| {
+        let lc = code.to_lowercase();
+        if !lc.is_empty() && !all_providers.contains(&lc) {
+            all_providers.push(lc);
+        }
+    };
+    for e in &personal {
+        if let Some(ref sp) = e.supported_providers {
+            for p in sp { add_prov(p); }
+        } else if let Some(ref code) = e.provider_code {
+            add_prov(code);
+        }
+    }
+    let usable_team: Vec<_> = team.iter()
+        .filter(|e| e.key_status == "active"
+            && !e.local_state.starts_with("disabled_by_")
+            && e.local_state != "stale"
+            && e.provider_key_ciphertext.is_some())
+        .collect();
+    for e in &usable_team {
+        if !e.supported_providers.is_empty() {
+            for p in &e.supported_providers { add_prov(p); }
+        } else {
+            add_prov(&e.provider_code);
+        }
+    }
+    for b in &bindings {
+        add_prov(&b.provider_code);
+    }
+    all_providers.sort();
+
+    if all_providers.is_empty() {
+        return Err("No providers found on any key.".into());
+    }
+
+    // Build ProviderGroup for each provider.
+    let mut groups: Vec<ui_select::ProviderGroup> = Vec::new();
+
+    for prov in &all_providers {
+        let mut candidates: Vec<ui_select::KeyCandidate> = Vec::new();
+
+        for e in &personal {
+            let providers = if let Some(ref sp) = e.supported_providers {
+                sp.clone()
+            } else if let Some(ref code) = e.provider_code {
+                vec![code.clone()]
+            } else {
+                vec![]
+            };
+            if providers.iter().any(|p| p.to_lowercase() == *prov) {
+                candidates.push(ui_select::KeyCandidate {
+                    label: e.alias.clone(),
+                    source_type: "personal".to_string(),
+                    source_ref: e.alias.clone(),
+                });
+            }
+        }
+
+        for e in &usable_team {
+            let providers = if !e.supported_providers.is_empty() {
+                e.supported_providers.clone()
+            } else {
+                vec![e.provider_code.clone()]
+            };
+            if providers.iter().any(|p| p.to_lowercase() == *prov) {
+                let label = e.local_alias.as_deref().unwrap_or(e.alias.as_str()).to_string();
+                candidates.push(ui_select::KeyCandidate {
+                    label,
+                    source_type: "team".to_string(),
+                    source_ref: e.virtual_key_id.clone(),
+                });
+            }
+        }
+
+        let current_binding = bindings.iter().find(|b| b.provider_code == *prov);
+        let selected = current_binding.and_then(|b| {
+            candidates.iter().position(|c|
+                c.source_type == b.key_source_type && c.source_ref == b.key_source_ref
+            )
+        });
+
+        groups.push(ui_select::ProviderGroup {
+            provider_code: prov.clone(),
+            candidates,
+            selected,
+            expanded: true,
+        });
+    }
+
+    // Snapshot original selections for diffing.
+    let original_selections: Vec<Option<usize>> = groups.iter()
+        .map(|g| g.selected)
+        .collect();
+
+    match ui_select::provider_tree_select(&mut groups)? {
+        ui_select::ProviderTreeResult::Confirmed(updated_groups) => {
+            let mut changes: Vec<(String, String, String)> = Vec::new();
+            for (i, g) in updated_groups.iter().enumerate() {
+                if g.selected != original_selections[i] {
+                    if let Some(sel) = g.selected {
+                        let c = &g.candidates[sel];
+                        changes.push((
+                            g.provider_code.clone(),
+                            c.source_type.clone(),
+                            c.source_ref.clone(),
+                        ));
+                    }
+                }
+            }
+            Ok(changes)
+        }
+        ui_select::ProviderTreeResult::Cancelled => {
+            eprintln!("  Selection cancelled.");
+            Ok(vec![])
+        }
     }
 }

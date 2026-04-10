@@ -97,6 +97,18 @@ fn silently_start_proxy(password: &SecretString) -> bool {
 
     let mut cmd = std::process::Command::new(&proxy_bin);
     cmd.arg("--config").arg(&config_path);
+    // Load proxy.env entries — warn on parse failure but don't block auto-start.
+    match crate::proxy_env::read_proxy_env() {
+        Ok(env_map) => {
+            for (k, v) in &env_map {
+                cmd.env(k, v);
+            }
+        }
+        Err(e) => {
+            eprintln!("[aikey] warning: failed to parse ~/.aikey/proxy.env: {}", e);
+            eprintln!("[aikey] proxy will start without proxy.env settings");
+        }
+    }
     cmd.env("AIKEY_MASTER_PASSWORD", password.expose_secret());
     cmd.stdout(std::process::Stdio::null())
        .stderr(std::process::Stdio::null());
@@ -332,9 +344,31 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
     eprintln!("  config: {}", config_path.display());
     eprintln!("  binary: {}", proxy_bin.display());
 
-    // 4. Build the child command, injecting the password via env.
+    // 4. Build the child command, injecting proxy.env + password via env.
     let mut cmd = Command::new(&proxy_bin);
     cmd.arg("--config").arg(&config_path);
+
+    // Load proxy.env entries into child process environment.
+    // Order: parent env (inherited) → proxy.env → CLI internal vars.
+    match crate::proxy_env::read_proxy_env() {
+        Ok(env_map) if !env_map.is_empty() => {
+            let keys: Vec<&str> = env_map.keys().map(|k| k.as_str()).collect();
+            eprintln!("  proxy.env: {} entries [{}]", env_map.len(), keys.join(", "));
+            for (k, v) in &env_map {
+                cmd.env(k, v);
+            }
+        }
+        Ok(_) => {} // empty or no file — fine
+        Err(e) => {
+            return Err(format!(
+                "Failed to parse ~/.aikey/proxy.env: {}\n\
+                 Fix the file or remove it, then retry.",
+                e
+            ).into());
+        }
+    }
+
+    // AIKEY_MASTER_PASSWORD always set last (cannot be overridden by proxy.env).
     cmd.env("AIKEY_MASTER_PASSWORD", password.expose_secret());
 
     if detach {
@@ -451,26 +485,9 @@ pub fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn handle_restart(config: Option<&str>, password: &SecretString) -> Result<(), Box<dyn std::error::Error>> {
-    // If proxy is running, prefer graceful reload (no port downtime, no stream interruption).
-    if is_proxy_running() {
-        eprintln!("Reloading proxy (graceful)...");
-        match post_admin_reload() {
-            Ok(()) => {
-                // Proxy has written loaded_vault_change_seq internally after the new
-                // generation became active.  The CLI mirrors it so status is consistent.
-                if let Ok(seq) = crate::storage::get_vault_change_seq() {
-                    let _ = crate::storage::set_proxy_loaded_seq(seq);
-                }
-                eprintln!("proxy reloaded successfully");
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!("graceful reload failed ({}), falling back to hard restart", e);
-            }
-        }
-    }
-
-    // Proxy not running or graceful reload failed — hard restart.
+    // Why hard restart instead of graceful reload: restart must reload proxy.env
+    // (process environment variables), which can only take effect via a new process.
+    // Graceful reload only re-reads vault/YAML config within the existing process.
     handle_stop()?;
     std::thread::sleep(Duration::from_millis(300));
     handle_start(config, true, password)

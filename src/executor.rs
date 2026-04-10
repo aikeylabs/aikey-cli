@@ -1064,62 +1064,127 @@ pub fn run_with_provider(
     result
 }
 
-/// Execute a command using the currently active key (team or personal) via proxy.
+/// Build env var map from provider bindings for injection into a child process.
 ///
-/// Reads `active_key_config` to determine which providers are active, then injects
-/// proxy-routed env vars (e.g. `ANTHROPIC_API_KEY=<vk_id>`, `ANTHROPIC_BASE_URL=
-/// http://127.0.0.1:27200/anthropic`) into the child process. This allows
-/// `aikey run -- claude` to work when a team key is active without any project config.
+/// Pure logic extracted from `run_with_active_key` for testability.
+/// Returns `(env_map, injected_provider_codes, used_legacy_fallback)`.
+pub fn build_run_env(
+    bindings: &[crate::storage::ProviderBinding],
+    legacy_cfg: Option<&crate::storage::ActiveKeyConfig>,
+    proxy_port: u16,
+) -> Result<(std::collections::HashMap<String, String>, Vec<String>, bool), String> {
+    use crate::commands_account::{provider_env_vars_pub, provider_proxy_prefix_pub};
+
+    let mut env_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut injected_providers: Vec<String> = Vec::new();
+    let mut used_legacy = false;
+
+    if !bindings.is_empty() {
+        // ---- New model: per-provider bindings ----
+        for binding in bindings {
+            let token = match binding.key_source_type.as_str() {
+                "team" => format!("aikey_vk_{}", binding.key_source_ref),
+                "personal" => format!("aikey_personal_{}", binding.key_source_ref),
+                other => {
+                    return Err(format!(
+                        "Unknown key_source_type '{}' for provider '{}'. Expected 'personal' or 'team'.",
+                        other, binding.provider_code,
+                    ));
+                }
+            };
+
+            if let Some((api_var, base_var)) = provider_env_vars_pub(&binding.provider_code) {
+                env_map.insert(api_var.to_string(), token);
+                let base_url = format!(
+                    "http://127.0.0.1:{}/{}",
+                    proxy_port,
+                    provider_proxy_prefix_pub(&binding.provider_code),
+                );
+                env_map.insert(base_var.to_string(), base_url);
+                injected_providers.push(binding.provider_code.clone());
+            }
+        }
+    } else if let Some(active_cfg) = legacy_cfg {
+        // ---- Fallback: legacy single-key active_key_config (pre-migration compat) ----
+        used_legacy = true;
+        let providers: Vec<String> = if active_cfg.providers.is_empty() {
+            vec!["anthropic", "openai", "google", "deepseek", "kimi"]
+                .into_iter().map(String::from).collect()
+        } else {
+            active_cfg.providers.clone()
+        };
+
+        let token_value = if active_cfg.key_type == "team" {
+            format!("aikey_vk_{}", active_cfg.key_ref)
+        } else {
+            format!("aikey_personal_{}", active_cfg.key_ref)
+        };
+
+        for provider in &providers {
+            if let Some((api_var, base_var)) = provider_env_vars_pub(provider) {
+                env_map.insert(api_var.to_string(), token_value.clone());
+                let base_url = format!(
+                    "http://127.0.0.1:{}/{}",
+                    proxy_port,
+                    provider_proxy_prefix_pub(provider),
+                );
+                env_map.insert(base_var.to_string(), base_url);
+                injected_providers.push(provider.clone());
+            }
+        }
+    }
+
+    Ok((env_map, injected_providers, used_legacy))
+}
+
+/// Execute a command using provider-level key bindings via proxy.
+///
+/// Reads `user_profile_provider_bindings` (profile = "default") to determine
+/// per-provider key sources, then injects proxy-routed env vars (e.g.
+/// `ANTHROPIC_API_KEY=aikey_vk_xxx`, `OPENAI_API_KEY=aikey_personal_yyy`,
+/// `*_BASE_URL=http://127.0.0.1:27200/{provider}`) into the child process.
+///
+/// Fallback: if no provider bindings exist (pre-migration vault), falls back
+/// to the legacy `active_key_config` single-key model for backward compat.
 ///
 /// Returns `(secrets_injected, exit_code)`.
 pub fn run_with_active_key(
     command: &[String],
     json_mode: bool,
 ) -> Result<(usize, i32), String> {
-    use crate::commands_account::{provider_env_vars_pub, provider_proxy_prefix_pub};
+    let bindings = crate::storage::list_provider_bindings("default")
+        .map_err(|e| format!("Failed to read provider bindings: {}", e))?;
 
-    let active_cfg = crate::storage::get_active_key_config()
-        .map_err(|e| format!("Failed to read active key config: {}", e))?
-        .ok_or("No active key. Run `aikey use <alias>` first.")?;
+    let legacy_cfg = crate::storage::get_active_key_config()
+        .map_err(|e| format!("Failed to read active key config: {}", e))?;
 
     let proxy_port: u16 = crate::commands_proxy::proxy_port();
 
-    let providers: Vec<String> = if active_cfg.providers.is_empty() {
-        // Fallback: inject common providers so the child can reach any.
-        vec!["anthropic", "openai", "google", "deepseek", "kimi"]
-            .into_iter().map(String::from).collect()
-    } else {
-        active_cfg.providers.clone()
-    };
+    let (env_map, injected_providers, used_legacy) =
+        build_run_env(&bindings, legacy_cfg.as_ref(), proxy_port)?;
 
-    let token_value = if active_cfg.key_type == "team" {
-        format!("aikey_vk_{}", active_cfg.key_ref)
-    } else {
-        format!("aikey_personal_{}", active_cfg.key_ref)
-    };
+    if injected_providers.is_empty() {
+        return Err("No provider bindings configured. Run `aikey use` to set up provider key bindings.".to_string());
+    }
 
     let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
         std::collections::HashMap::new();
-
-    for provider in &providers {
-        if let Some((api_var, base_var)) = provider_env_vars_pub(provider) {
-            env_secrets.insert(api_var.to_string(), Zeroizing::new(token_value.clone()));
-            let base_url = format!(
-                "http://127.0.0.1:{}/{}",
-                proxy_port,
-                provider_proxy_prefix_pub(provider),
-            );
-            env_secrets.insert(base_var.to_string(), Zeroizing::new(base_url));
-        }
+    for (k, v) in env_map {
+        env_secrets.insert(k, Zeroizing::new(v));
     }
 
-    let secrets_count = env_secrets.len();
     if !json_mode {
-        let display_name = if active_cfg.key_type == "team" { "team key" } else { "personal key" };
-        eprintln!(
-            "Injecting {} env var(s) via proxy for {} '{}'",
-            secrets_count, display_name, active_cfg.key_ref,
-        );
+        eprintln!("Injecting {} provider(s) via proxy:", injected_providers.len());
+        if !used_legacy {
+            for binding in &bindings {
+                if injected_providers.contains(&binding.provider_code) {
+                    eprintln!("  {} -> {}:{}", binding.provider_code, binding.key_source_type, binding.key_source_ref);
+                }
+            }
+        } else {
+            eprintln!("  (legacy active_key_config fallback)");
+        }
     }
 
     spawn_with_env(env_secrets, command, json_mode, None)

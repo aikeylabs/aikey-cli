@@ -24,6 +24,7 @@ pub mod commands_account;
 pub mod commands_proxy;
 pub mod session;
 pub mod ui_frame;
+pub mod proxy_env;
 
 /// Prompts for a hidden input (password / API key), showing a `*` for each
 /// keystroke in real time. Supports backspace and handles paste gracefully.
