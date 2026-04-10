@@ -138,7 +138,7 @@ pub fn render_box(icon: &str, title: &str, rows: &[String]) -> String {
         // Auto-stretch separator lines (pure ─ characters) to fill the content area.
         let is_separator = !row.is_empty() && row.chars().all(|c| c == '\u{2500}');
         if is_separator {
-            out.push_str(&format!("  \u{2502}  {}  \u{2502}\n",
+            out.push_str(&format!("  \u{2502}  \x1b[90m{}\x1b[0m  \u{2502}\n",
                 "\u{2500}".repeat(pad_target)));
         } else {
             out.push_str(&format!("  \u{2502}  {}  \u{2502}\n",

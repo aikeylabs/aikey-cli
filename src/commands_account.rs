@@ -1464,13 +1464,33 @@ pub fn handle_key_sync(
     storage::set_local_seen_sync_version(0);
     let downloaded = run_full_snapshot_sync(password)?;
 
+    // v1.0.2: reconcile provider primaries after sync.
+    let cached = storage::list_virtual_key_cache().unwrap_or_default();
+    let synced_keys: Vec<(String, Vec<String>)> = cached.iter()
+        .filter(|e| e.key_status == "active" && !e.local_state.starts_with("disabled_by_"))
+        .map(|e| {
+            let p = if !e.supported_providers.is_empty() { e.supported_providers.clone() }
+                    else if !e.provider_code.is_empty() { vec![e.provider_code.clone()] }
+                    else { vec![] };
+            (e.virtual_key_id.clone(), p)
+        }).filter(|(_, p)| !p.is_empty()).collect();
+    let reconciled = crate::profile_activation::reconcile_provider_primaries_after_team_key_sync(&synced_keys).unwrap_or_default();
+    if !reconciled.is_empty() { let _ = crate::profile_activation::refresh_implicit_profile_activation(); }
+
     if json_mode {
         crate::json_output::print_json(serde_json::json!({
             "ok": true,
             "downloaded": downloaded,
+            "auto_activated_providers": reconciled.iter().flat_map(|(_, p)| p.clone()).collect::<Vec<String>>(),
         }));
     } else {
+        use colored::Colorize;
         println!("Sync complete: {} key(s) downloaded.", downloaded);
+        for (vk_id, providers) in &reconciled {
+            for p in providers {
+                eprintln!("  {} Team key '{}' auto-activated as Primary for {}", "\u{2B50}".yellow(), vk_id.bold(), p);
+            }
+        }
     }
     Ok(())
 }
@@ -2006,14 +2026,7 @@ pub fn handle_key_use(
         };
         ("team", entry.virtual_key_id.clone(), display, providers)
     } else {
-        // Personal key: look up alias in entries table and check for provider_code.
-        let provider_code = storage::get_entry_provider_code(alias_or_id).map_err(|e| {
-            format!(
-                "Key '{}' not found. Run 'aikey key sync' or check personal keys with 'aikey list'.\nDetail: {}",
-                alias_or_id, e
-            )
-        })?;
-        // Check if the entry exists at all.
+        // Personal key — v1.0.2: use resolve_supported_providers.
         let exists = storage::entry_exists(alias_or_id).unwrap_or(false);
         if !exists {
             return Err(format!(
@@ -2022,64 +2035,12 @@ pub fn handle_key_use(
                 alias_or_id, alias_or_id
             ).into());
         }
-
-        // Default list for generic gateway personal keys (no provider stored).
-        const KNOWN: &[&str] = &["anthropic", "openai", "google", "deepseek", "kimi"];
-
-        // Resolve which providers to activate:
-        //   --provider <code>  → single provider (persist to DB)
-        //   --provider          → show interactive menu, don't persist
-        //   (no flag)           → use stored provider_code, or all defaults if none stored
-        match provider_override {
-            Some(ov) if !ov.is_empty() => {
-                // Explicit --provider <code>: persist and activate that one.
-                let code = ov.to_lowercase();
-                let _ = storage::set_entry_provider_code(alias_or_id, Some(&code));
-                let providers = vec![code];
-                ("personal", alias_or_id.to_string(), alias_or_id.to_string(), providers)
-            }
-            Some(_empty) => {
-                // --provider with no value: show selection menu (not persisted).
-                if !std::io::stdin().is_terminal() || json_mode {
-                    return Err(format!(
-                        "Interactive provider selection requires a TTY.\n\
-                         Specify with: aikey use {} --provider <code>",
-                        alias_or_id
-                    ).into());
-                }
-                use colored::Colorize;
-                println!("Key '{}' has no provider set. Select one:", alias_or_id.bold());
-                for (i, name) in KNOWN.iter().enumerate() {
-                    println!("  {}  {}", format!("[{}]", i + 1).dimmed(), name);
-                }
-                print!("Choice: ");
-                io::stdout().flush()?;
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                let input = input.trim().to_lowercase();
-                let chosen = if let Ok(n) = input.parse::<usize>() {
-                    KNOWN.get(n.saturating_sub(1)).map(|s| s.to_string())
-                } else if !input.is_empty() {
-                    Some(input)
-                } else {
-                    None
-                };
-                let code = chosen.ok_or_else(|| format!(
-                    "No provider selected. Specify with: aikey use {} --provider <code>",
-                    alias_or_id
-                ))?;
-                let providers = vec![code];
-                ("personal", alias_or_id.to_string(), alias_or_id.to_string(), providers)
-            }
-            None => {
-                // No --provider flag: use stored code, or all defaults for generic gateway.
-                let providers = match provider_code {
-                    Some(code) if !code.is_empty() => vec![code],
-                    _ => KNOWN.iter().map(|s| s.to_string()).collect(),
-                };
-                ("personal", alias_or_id.to_string(), alias_or_id.to_string(), providers)
-            }
-        }
+        let stored = storage::resolve_supported_providers(alias_or_id).unwrap_or_default();
+        let providers = if !stored.is_empty() { stored } else {
+            const KNOWN: &[&str] = &["anthropic", "openai", "google", "deepseek", "kimi"];
+            KNOWN.iter().map(|s| s.to_string()).collect()
+        };
+        ("personal", alias_or_id.to_string(), alias_or_id.to_string(), providers)
     };
 
     if providers.is_empty() {
@@ -2090,18 +2051,64 @@ pub fn handle_key_use(
         ).into());
     }
 
-    // ── 2. Global mutex — deactivate all team keys ────────────────────────────
-    storage::set_all_virtual_keys_inactive()?;
-    storage::clear_active_key_config()?;
-
-    // ── 3. Activate the chosen key in the local state store ───────────────────
-    if key_type == "team" {
-        if let Some(ref entry) = team_entry {
-            storage::set_virtual_key_local_state(&entry.virtual_key_id, "active")?;
+    // ── 2. Provider-level primary promotion (v1.0.2) ─────────────────────────
+    let target_providers: Vec<String> = if let Some(ov) = provider_override {
+        if !ov.is_empty() {
+            let code = ov.to_lowercase();
+            if !providers.iter().any(|p| p.to_lowercase() == code) {
+                return Err(format!("Key '{}' does not support provider '{}'. Supported: {}", display_name, code, providers.join(", ")).into());
+            }
+            vec![code]
+        } else if providers.len() == 1 { providers.clone() }
+        else {
+            if !std::io::stdin().is_terminal() || json_mode {
+                return Err(format!("This key supports multiple providers: {}. Please specify --provider or choose interactively.", providers.join(", ")).into());
+            }
+            use colored::Colorize;
+            println!("Key '{}' supports multiple providers:", display_name.bold());
+            for (i, p) in providers.iter().enumerate() { println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p); }
+            print!("Select provider(s) to set as Primary (comma-separated): ");
+            io::stdout().flush()?;
+            let mut input = String::new(); io::stdin().read_line(&mut input)?;
+            let input = input.trim();
+            if input.is_empty() { return Err("No provider selected. Use --provider <code> or select interactively.".into()); }
+            let mut selected = Vec::new();
+            for part in input.split(',').map(|s| s.trim()) {
+                if let Ok(n) = part.parse::<usize>() {
+                    if n >= 1 && n <= providers.len() { let p = providers[n-1].clone(); if !selected.contains(&p) { selected.push(p); } }
+                }
+            }
+            if selected.is_empty() { return Err("Invalid selection. Use --provider <code>.".into()); }
+            selected
         }
+    } else if providers.len() == 1 { providers.clone() }
+    else {
+        if !std::io::stdin().is_terminal() || json_mode {
+            return Err(format!("This key supports multiple providers: {}. Please specify --provider.", providers.join(", ")).into());
+        }
+        use colored::Colorize;
+        println!("Key '{}' supports multiple providers:", display_name.bold());
+        for (i, p) in providers.iter().enumerate() { println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p); }
+        print!("Select provider(s) to set as Primary (comma-separated): ");
+        io::stdout().flush()?;
+        let mut input = String::new(); io::stdin().read_line(&mut input)?;
+        if input.trim().is_empty() { return Err("No provider selected.".into()); }
+        let mut selected = Vec::new();
+        for part in input.trim().split(',').map(|s| s.trim()) {
+            if let Ok(n) = part.parse::<usize>() {
+                if n >= 1 && n <= providers.len() { let p = providers[n-1].clone(); if !selected.contains(&p) { selected.push(p); } }
+            }
+        }
+        if selected.is_empty() { return Err("Invalid selection.".into()); }
+        selected
+    };
+
+    // Write provider bindings.
+    for provider in &target_providers {
+        storage::set_provider_binding(crate::profile_activation::DEFAULT_PROFILE, provider, key_type, &key_ref)?;
     }
 
-    // ── 4. Write active key config (proxy reads this) ─────────────────────────
+    // Legacy compat.
     storage::set_active_key_config(&storage::ActiveKeyConfig {
         key_type: key_type.to_string(),
         key_ref: key_ref.clone(),

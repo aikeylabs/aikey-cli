@@ -82,6 +82,22 @@ pub(crate) fn open_connection() -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// Returns true if the given column exists on the given table.
+fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name=?1", table),
+        [column], |row| row.get::<_, i64>(0),
+    ).map(|c| c > 0).unwrap_or(false)
+}
+
+/// Adds a column to a table if it does not already exist.
+fn ensure_column(conn: &Connection, table: &str, col: &str, ddl: &str) -> Result<(), String> {
+    if !has_column(conn, table, col) {
+        conn.execute(ddl, []).map_err(|e| format!("Failed to add {}.{}: {}", table, col, e))?;
+    }
+    Ok(())
+}
+
 fn apply_migrations(conn: &Connection) -> Result<(), String> {
     // Core tables
     conn.execute(
@@ -315,6 +331,33 @@ fn apply_migrations(conn: &Connection) -> Result<(), String> {
         }
     }
 
+    // v1.0.2: supported_providers JSON array column on entries.
+    ensure_column(conn, "entries", "supported_providers",
+        "ALTER TABLE entries ADD COLUMN supported_providers TEXT")?;
+
+    // v1.0.2: user_profiles + user_profile_provider_bindings.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS user_profiles (
+            id TEXT PRIMARY KEY, is_active INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        )", [],
+    ).map_err(|e| format!("Failed to ensure user_profiles: {}", e))?;
+    conn.execute("INSERT OR IGNORE INTO user_profiles (id, is_active) VALUES ('default', 1)", [])
+        .map_err(|e| format!("Failed to seed default profile: {}", e))?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS user_profile_provider_bindings (
+            profile_id TEXT NOT NULL, provider_code TEXT NOT NULL,
+            key_source_type TEXT NOT NULL, key_source_ref TEXT NOT NULL,
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            PRIMARY KEY (profile_id, provider_code),
+            FOREIGN KEY (profile_id) REFERENCES user_profiles(id)
+        )", [],
+    ).map_err(|e| format!("Failed to ensure user_profile_provider_bindings: {}", e))?;
+
+    migrate_active_key_config_to_default_profile(conn)?;
+
     // Migration guards for platform_account OAuth columns (v0.5+).
     // jwt_token is repurposed as the OAuth access_token; refresh_token and
     // token_expires_at are new columns that allow silent token renewal.
@@ -377,6 +420,52 @@ fn apply_migrations(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// One-time migration: carry legacy active_key_config into provider bindings.
+fn migrate_active_key_config_to_default_profile(conn: &Connection) -> Result<(), String> {
+    const SENTINEL: &str = "v1_profile_migration_done";
+    let done: bool = conn.query_row("SELECT COUNT(*) FROM config WHERE key = ?1", params![SENTINEL], |r| r.get::<_, i64>(0)).map(|c| c > 0).unwrap_or(false);
+    if done { return Ok(()); }
+
+    let key_type: Option<String> = conn.query_row("SELECT CAST(value AS TEXT) FROM config WHERE key = 'active_key_type'", [], |r| r.get(0)).ok();
+    let key_type = match key_type.as_deref() {
+        None | Some("") => { mark_migration(conn, SENTINEL)?; return Ok(()); }
+        Some(t) => t.to_string(),
+    };
+    let key_ref: String = conn.query_row("SELECT CAST(value AS TEXT) FROM config WHERE key = 'active_key_ref'", [], |r| r.get(0)).unwrap_or_default();
+    let pjson: String = conn.query_row("SELECT CAST(value AS TEXT) FROM config WHERE key = 'active_key_providers'", [], |r| r.get(0)).unwrap_or_else(|_| "[]".into());
+    let providers: Vec<String> = serde_json::from_str(&pjson).unwrap_or_default();
+    if key_ref.is_empty() || providers.is_empty() { mark_migration(conn, SENTINEL)?; return Ok(()); }
+    for p in &providers {
+        conn.execute("INSERT OR IGNORE INTO user_profile_provider_bindings (profile_id, provider_code, key_source_type, key_source_ref) VALUES ('default', ?1, ?2, ?3)", params![p, key_type, key_ref])
+            .map_err(|e| format!("migrate binding {}: {}", p, e))?;
+    }
+    mark_migration(conn, SENTINEL)
+}
+
+fn mark_migration(conn: &Connection, sentinel: &str) -> Result<(), String> {
+    conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)", params![sentinel, b"1".to_vec()])
+        .map_err(|e| format!("write sentinel '{}': {}", sentinel, e))?;
+    Ok(())
+}
+
+/// Resolves effective supported providers for a personal key.
+/// Priority: `supported_providers` JSON > single `provider_code` > empty.
+pub fn resolve_supported_providers(alias: &str) -> Result<Vec<String>, String> {
+    let conn = open_connection()?;
+    let row: (Option<String>, Option<String>) = conn.query_row(
+        "SELECT supported_providers, provider_code FROM entries WHERE alias = ?1", params![alias], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => format!("Entry '{}' not found", alias),
+        other => format!("query providers '{}': {}", alias, other),
+    })?;
+    if let Some(json) = row.0 {
+        if let Ok(providers) = serde_json::from_str::<Vec<String>>(&json) {
+            if !providers.is_empty() { return Ok(providers); }
+        }
+    }
+    if let Some(code) = row.1 { if !code.is_empty() { return Ok(vec![code]); } }
+    Ok(vec![])
+}
 
 /// Checks if the vault exists, returns an error if it doesn't
 pub fn ensure_vault_exists() -> Result<(), String> {
