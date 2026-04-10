@@ -615,13 +615,39 @@ pub fn handle_account_status(json_mode: bool) -> Result<(), Box<dyn std::error::
 
 /// `aikey browse [page] [--port PORT]` — open User Console in the default browser with auth.
 ///
-/// Reads the local JWT token, appends it as a URL fragment so the web app can
-/// pick it up from `location.hash` without the token ever hitting server logs.
+/// In local-user mode (personal edition, installed with `--with-console`),
+/// opens the console directly without JWT — reads `install-state.json` to
+/// detect `control_plane_mode == "local"`.
+///
+/// In team/trial mode, reads the local JWT token and appends it as a URL
+/// fragment so the web app can pick it up from `location.hash` without the
+/// token ever hitting server logs.
 ///
 /// When `control_url` points to localhost, automatically probes common dev-server
 /// ports (3000, 5173) and prefers the first one that responds.  This lets
 /// `aikey browse` work in both dev and production without extra flags.
 pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Local-user mode: open console directly without JWT.
+    // Why: personal edition has no login flow — LocalIdentityMiddleware handles
+    // auth server-side, and the SPA is served with authMode:"local_bypass".
+    if port.is_none() {
+        if let Some(url) = try_local_browse_url(page) {
+            if json_mode {
+                crate::json_output::print_json(serde_json::json!({
+                    "ok": true,
+                    "url": &url,
+                    "mode": "local",
+                }));
+            } else {
+                println!("Opening Local Console...");
+                println!("  {}", url);
+            }
+            open_url_silently(&url);
+            return Ok(());
+        }
+    }
+
+    // JWT-based browse (team/trial mode).
     let acc = storage::get_platform_account()?
         .ok_or("Not logged in. Run 'aikey login' first.")?;
 
@@ -658,6 +684,37 @@ pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> 
 
     open_url_silently(&url);
     Ok(())
+}
+
+/// Try to resolve a local-user browse URL from install-state.json.
+///
+/// Returns `Some(full_url)` if `control_plane_mode == "local"` and
+/// `control_panel_url` is set; `None` otherwise (falls through to JWT flow).
+fn try_local_browse_url(page: Option<&str>) -> Option<String> {
+    let home = dirs::home_dir()?;
+    let state_path = home.join(".aikey").join("install-state.json");
+    let content = std::fs::read_to_string(&state_path).ok()?;
+    let state: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let mode = state.get("control_plane_mode")?.as_str()?;
+    if mode != "local" {
+        return None;
+    }
+
+    let base_url = state.get("control_panel_url")?.as_str()?;
+    if base_url.is_empty() {
+        return None;
+    }
+
+    let path = match page {
+        Some("keys" | "virtual-keys") => "/user/virtual-keys",
+        Some("account")               => "/user/account",
+        Some("usage" | "usage-ledger") => "/user/usage-ledger",
+        Some("overview") | None        => "/user/overview",
+        _                              => "/user/overview",
+    };
+
+    Some(format!("{}{}", base_url.trim_end_matches('/'), path))
 }
 
 /// Determine the base URL for `aikey browse`.

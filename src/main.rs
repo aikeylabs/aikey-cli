@@ -11,12 +11,12 @@ mod config;
 mod env_resolver;
 mod env_renderer;
 mod commands_project;
-mod commands_env;
+// mod commands_env; // removed: env commands dropped
 mod commands_proxy;
 mod commands_account;
 mod platform_client;
-mod profiles;
-mod core;
+// mod profiles; // removed: profile commands dropped
+// mod core; // removed: profile-based resolver dropped
 mod global_config;
 mod providers;
 mod resolver;
@@ -79,24 +79,19 @@ enum Commands {
     Update {
         alias: String,
     },
+    /// Test connectivity of a stored API Key (ping + API probe)
+    Test {
+        /// Alias of the key to test
+        alias: String,
+        /// Provider code to test against (overrides stored provider)
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+    },
     Export {
         /// Pattern to match secrets (e.g., "*", "api_*")
         pattern: String,
         /// Output file path (.akb format)
         output: String,
-    },
-    Import {
-        /// Input file path (.akb format)
-        file: String,
-    },
-    /// Execute a command with secrets injected as environment variables
-    Exec {
-        /// Environment variable mappings in the form ENV_VAR=alias
-        #[arg(short, long = "env", value_name = "ENV_VAR=alias")]
-        env_mappings: Vec<String>,
-        /// The command to execute (use -- to separate)
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        command: Vec<String>,
     },
     /// Execute a command with all secrets automatically injected as environment variables
     Run {
@@ -142,30 +137,13 @@ enum Commands {
         #[command(subcommand)]
         action: SecretAction,
     },
-    /// Profile management commands
-    Profile {
-        #[command(subcommand)]
-        action: ProfileAction,
-    },
-    /// Environment variable management commands
-    Env {
-        #[command(subcommand)]
-        action: EnvAction,
-    },
     /// Project configuration commands
     Project {
         #[command(subcommand)]
         action: ProjectAction,
     },
-    /// Provider management commands
-    Provider {
-        #[command(subcommand)]
-        action: ProviderAction,
-    },
     /// Quick setup wizard for new projects
     Quickstart,
-    /// Show local usage statistics
-    Stats,
     /// Show recent run/exec event log
     Logs {
         /// Number of entries to show (default: 20)
@@ -221,10 +199,6 @@ enum Commands {
     Whoami,
     /// Run diagnostics and health checks
     Doctor,
-    /// Show project/env/profile status and resolution summary (no secrets)
-    Status,
-    /// Start an interactive shell with non-sensitive context (advanced mode)
-    Shell,
     /// Manage the local aikey-proxy process
     Proxy {
         #[command(subcommand)]
@@ -349,57 +323,6 @@ enum SecretAction {
 }
 
 #[derive(Subcommand)]
-enum ProfileAction {
-    /// List all profiles
-    List,
-    /// Switch to a different profile
-    Use { name: String },
-    /// Show profile details
-    Show { name: String },
-    /// Show current active profile
-    Current,
-    /// Create a new profile
-    Create { name: String },
-    /// Delete a profile
-    Delete { name: String },
-}
-
-#[derive(Subcommand)]
-enum EnvAction {
-    /// Generate or update .env file from project config
-    Generate {
-        /// Preview changes without writing
-        #[arg(long)]
-        dry_run: bool,
-        /// Override the target .env file path
-        #[arg(long)]
-        env_file: Option<String>,
-    },
-    /// Run a command with secrets injected, or show an injection preview
-    Inject {
-        /// Command to run with secrets injected (use -- to separate)
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
-        /// Logical model name for narrowing injection (e.g. chat-main, embeddings)
-        #[arg(long, value_name = "LOGICAL_MODEL")]
-        logical_model: Option<String>,
-        /// Tenant override for multi-tenant key resolution
-        #[arg(long, value_name = "TENANT")]
-        tenant: Option<String>,
-        /// Show what would be resolved without executing the command
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Check if all required environment variables can be resolved
-    Check,
-    /// Switch the active logical environment (e.g. dev, staging, prod)
-    Use {
-        /// Environment name to activate
-        name: String,
-    },
-}
-
-#[derive(Subcommand)]
 enum ProjectAction {
     /// Initialize a new project configuration
     Init,
@@ -429,28 +352,6 @@ enum ProjectAction {
     },
 }
 
-#[derive(Subcommand)]
-enum ProviderAction {
-    /// Add a provider to the project config
-    Add {
-        /// Provider name (e.g. openai, anthropic)
-        name: String,
-        /// Vault alias for the provider's API key
-        #[arg(long, value_name = "ALIAS")]
-        key_alias: String,
-        /// Default model for this provider
-        #[arg(long, value_name = "MODEL")]
-        default_model: Option<String>,
-    },
-    /// Remove a provider from the profile config
-    Rm {
-        /// Provider name to remove
-        name: String,
-    },
-    /// List providers in the project config
-    Ls,
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialise process-global trace context (trace_id, span_id, command_id).
     // This must be called before any logging or proxy calls.
@@ -471,11 +372,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // All top-level subcommand names for fuzzy matching.
             const KNOWN: &[&str] = &[
-                "add", "get", "delete", "list", "update", "export", "import",
-                "exec", "run", "use", "whoami", "login", "logout", "browse",
-                "init", "status", "doctor", "shell", "key", "account", "secret",
-                "profile", "env", "project", "provider", "proxy",
-                "change-password", "quickstart", "stats", "logs",
+                "add", "get", "delete", "list", "update", "test", "export",
+                "run", "use", "whoami", "login", "logout", "browse",
+                "init", "doctor", "key", "account", "secret",
+                "project", "proxy",
+                "change-password", "quickstart", "logs",
             ];
 
             let suggestion = KNOWN.iter()
@@ -598,9 +499,8 @@ fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Delete { .. } => "delete".to_string(),
             Commands::List => "list".to_string(),
             Commands::Update { .. } => "update".to_string(),
+            Commands::Test { .. } => "test".to_string(),
             Commands::Export { .. } => "export".to_string(),
-            Commands::Import { .. } => "import".to_string(),
-            Commands::Exec { .. } => "exec".to_string(),
             Commands::Run { .. } => "run".to_string(),
             Commands::ChangePassword => "change-password".to_string(),
             Commands::Secret { action } => format!("secret.{}", match action {
@@ -609,32 +509,12 @@ fn command_name(cmd: Option<&Commands>) -> String {
                 SecretAction::List => "list",
                 SecretAction::Delete { .. } => "delete",
             }),
-            Commands::Profile { action } => format!("profile.{}", match action {
-                ProfileAction::List => "list",
-                ProfileAction::Use { .. } => "use",
-                ProfileAction::Show { .. } => "show",
-                ProfileAction::Current => "current",
-                ProfileAction::Create { .. } => "create",
-                ProfileAction::Delete { .. } => "delete",
-            }),
-            Commands::Env { action } => format!("env.{}", match action {
-                EnvAction::Generate { .. } => "generate",
-                EnvAction::Inject { .. } => "inject",
-                EnvAction::Check => "check",
-                EnvAction::Use { .. } => "use",
-            }),
             Commands::Project { action } => format!("project.{}", match action {
                 ProjectAction::Init => "init",
                 ProjectAction::Status => "status",
                 ProjectAction::Map { .. } => "map",
             }),
-            Commands::Provider { action } => format!("provider.{}", match action {
-                ProviderAction::Add { .. } => "add",
-                ProviderAction::Rm { .. } => "rm",
-                ProviderAction::Ls => "ls",
-            }),
             Commands::Quickstart => "quickstart".to_string(),
-            Commands::Stats => "stats".to_string(),
             Commands::Logs { .. } => "logs".to_string(),
             Commands::Key { action } => format!("key.{}", match action {
                 KeyAction::Rotate { .. } => "rotate",
@@ -655,8 +535,6 @@ fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Logout => "account.logout".to_string(),
             Commands::Browse { .. } => "browse".to_string(),
             Commands::Doctor => "doctor".to_string(),
-            Commands::Status => "status".to_string(),
-            Commands::Shell => "shell".to_string(),
             Commands::Proxy { action } => format!("proxy.{}", match action {
                 ProxyAction::Start { .. } => "start",
                 ProxyAction::Stop => "stop",
@@ -789,18 +667,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 secret
             };
 
-            let result = executor::add_secret(alias, secret.trim(), &password);
-            let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(alias), result.is_ok());
-
-            if let Err(e) = result {
-                if cli.json {
-                    json_output::error(&e, 1);
-                } else {
-                    return Err(e.into());
-                }
-            }
-
-            // Step 3: resolve provider + base_url.
+            // Step 3: resolve provider + base_url (before adding, so we can test connectivity).
             // --provider flag takes precedence; otherwise prompt interactively on TTY.
             let (resolved_provider, resolved_base_url): (Option<String>, Option<String>) =
                 if let Some(code) = provider {
@@ -873,6 +740,58 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     (None, None)
                 };
 
+            // Step 4: connectivity test (interactive TTY only, skip for JSON/pipe/test).
+            if !cli.json && std::io::stdin().is_terminal() && env::var("AK_TEST_SECRET").is_err() {
+                // Build targets — same logic as `aikey test`:
+                // - provider set → test that provider
+                // - no provider + has base_url → test all providers against that URL
+                // - no provider + no base_url → skip
+                let test_targets: Vec<(String, String)> = if let Some(ref code) = resolved_provider {
+                    let url = resolved_base_url.as_deref()
+                        .or_else(|| commands_project::default_base_url(code))
+                        .unwrap_or("https://unknown")
+                        .to_string();
+                    vec![(code.clone(), url)]
+                } else if let Some(ref url) = resolved_base_url {
+                    let mut t: Vec<(String, String)> = commands_project::PROVIDER_DEFAULTS.iter()
+                        .map(|(c, _)| (c.to_string(), url.clone()))
+                        .collect();
+                    t.push(("custom".to_string(), url.clone()));
+                    t
+                } else {
+                    vec![]
+                };
+
+                if !test_targets.is_empty() {
+                    eprintln!();
+                    let suite = commands_project::run_connectivity_test(&test_targets, secret.trim(), false);
+                    if !suite.any_chat_ok {
+                        eprintln!();
+                        eprint!("  No chat test passed. Add anyway? [y/N]: ");
+                        io::stdout().flush()?;
+                        let mut input = String::new();
+                        io::stdin().read_line(&mut input)?;
+                        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+                            eprintln!("  Cancelled.");
+                            return Ok(());
+                        }
+                    }
+                    eprintln!();
+                }
+            }
+
+            // Step 5: write to vault.
+            let result = executor::add_secret(alias, secret.trim(), &password);
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(alias), result.is_ok());
+
+            if let Err(e) = result {
+                if cli.json {
+                    json_output::error(&e, 1);
+                } else {
+                    return Err(e.into());
+                }
+            }
+
             if let Some(ref code) = resolved_provider {
                 let _ = storage::set_entry_provider_code(alias, Some(code.as_str()));
             }
@@ -883,13 +802,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             if cli.json {
                 json_output::success(serde_json::json!({
                     "alias": alias,
-                    "message": "Secret added successfully",
+                    "message": "API Key added successfully",
                     "provider": resolved_provider,
                     "base_url": resolved_base_url,
                 }));
             } else {
                 use colored::Colorize;
-                eprintln!("API Key '{}' added.", alias.bold());
+                eprintln!("{} API Key '{}' added.", "\u{2713}".green(), alias.bold());
                 if let Some(ref code) = resolved_provider {
                     eprintln!("  provider: {}", code.dimmed());
                 }
@@ -939,6 +858,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Delete { alias } => {
+            // Confirm before deletion (skip in JSON / non-interactive mode).
+            if !cli.json && std::io::stdin().is_terminal() {
+                use colored::Colorize;
+                eprint!("  Delete API Key '{}'? This cannot be undone. [y/N]: ", alias.bold());
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+                    eprintln!("  Cancelled.");
+                    return Ok(());
+                }
+            }
+
             let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
             let result = executor::delete_secret(alias, &password);
             let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(alias), result.is_ok());
@@ -957,7 +889,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     "message": "API Key deleted successfully"
                 }));
             } else {
-                println!("Secret deleted.");
+                use colored::Colorize;
+                eprintln!("  {} API Key '{}' deleted.", "\u{2713}".green(), alias);
                 commands_proxy::maybe_warn_stale();
             }
         }
@@ -1013,8 +946,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                 // ── Personal keys section ──────────────────────────────
                 rows.push(format!("\u{1F4CB} Personal Keys ({})", entries.len()));
-                rows.push(format!("{:<20}  {:<28}  {:<10}  {}",
-                    "ALIAS", "PROVIDER / BASE_URL", "LOCAL", "KEY"));
+                rows.push(format!("{:<20}  {:<28}  {:<10}  {:<4}  {}",
+                    "ALIAS", "PROVIDER / BASE_URL", "LOCAL", "KEY", "CREATED"));
                 rows.push("\u{2500}".repeat(80));
                 if entries.is_empty() {
                     rows.push("(none)".to_string());
@@ -1033,11 +966,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             format!("{:<10}", "")
                         };
-                        rows.push(format!("{:<20}  {:<28}  {}  {}",
+                        let created = entry.created_at
+                            .map(|ts| format_date(ts).dimmed().to_string())
+                            .unwrap_or_default();
+                        rows.push(format!("{:<20}  {:<28}  {}  {:<4}  {}",
                             &entry.alias,
                             if provider_col.len() > 28 { &provider_col[..28] } else { &provider_col },
                             local_col,
                             "\u{2713}",
+                            created,
                         ));
                     }
                 }
@@ -1048,7 +985,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // ── Team keys section ────────────────────────────────
                 rows.push(format!("\u{1F465} Team Keys ({})", managed.len()));
                 rows.push(format!("{:<24}  {:<16}  {:<16}  {:<16}  {:<4}  {}",
-                    "ALIAS", "PROVIDER", "LOCAL", "REMOTE STATUS", "KEY", "SHARE"));
+                    "ALIAS", "PROVIDER", "LOCAL", "REMOTE STATUS", "KEY", "CREATED"));
                 rows.push("\u{2500}".repeat(80));
                 if managed.is_empty() {
                     rows.push("(none)".to_string());
@@ -1074,12 +1011,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             other                        => format!("{:<16}", other).dimmed().to_string(),
                         };
                         let status_str = &e.key_status;
-                        let share = match e.share_status.as_str() {
-                            "pending_claim" => "pending \u{2190}".yellow().to_string(),
-                            _ => String::new(),
-                        };
+                        let created = format_date(e.synced_at).dimmed().to_string();
                         rows.push(format!("{:<24}  {:<16}  {}  {}  {:<4}  {}{}",
-                            raw_alias, &e.provider_code, local_str, status_str, has_key, share, server_alias_hint));
+                            raw_alias, &e.provider_code, local_str, status_str, has_key, created, server_alias_hint));
                     }
                 }
 
@@ -1094,6 +1028,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands_proxy::warn_if_proxy_down();
         }
         Commands::Update { alias } => {
+            // Confirm before update (skip in JSON / non-interactive / test mode).
+            if !cli.json && std::io::stdin().is_terminal() && env::var("AK_TEST_SECRET").is_err() {
+                use colored::Colorize;
+                eprint!("  Update API Key '{}'? The old value will be overwritten. [y/N]: ", alias.bold());
+                io::stdout().flush()?;
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+                    eprintln!("  Cancelled.");
+                    return Ok(());
+                }
+            }
+
             let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
             // Check for test environment variable first
@@ -1101,13 +1048,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Zeroizing::new(test_secret)
             } else if std::io::stdin().is_terminal() {
                 // Hidden prompt on TTY
-                let val = prompt_hidden("\u{1F511} Enter New Secret: ")
-                    .map_err(|e| format!("Failed to read secret value: {}", e))?;
+                let val = prompt_hidden("\u{1F511} Enter new API Key value: ")
+                    .map_err(|e| format!("Failed to read API Key value: {}", e))?;
                 Zeroizing::new(val)
             } else {
                 // Plain stdin for pipes / automation
                 if !cli.json {
-                    print!("\u{1F511} Enter New Secret: ");
+                    print!("\u{1F511} Enter new API Key value: ");
                     io::stdout().flush()?;
                 }
                 let mut secret = Zeroizing::new(String::new());
@@ -1129,11 +1076,82 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             if cli.json {
                 json_output::success(serde_json::json!({
                     "alias": alias,
-                    "message": "Secret updated successfully"
+                    "message": "API Key updated successfully"
                 }));
             } else {
-                eprintln!("API Key '{}' updated successfully", alias);
+                use colored::Colorize;
+                eprintln!("  {} API Key '{}' updated.", "\u{2713}".green(), alias);
                 commands_proxy::maybe_warn_stale();
+            }
+        }
+        Commands::Test { alias, provider: test_provider } => {
+            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+            let secret = executor::get_secret(alias, &password);
+            let key_value = match secret {
+                Ok(s) => s,
+                Err(e) => {
+                    if cli.json {
+                        json_output::error(&e, 1);
+                    } else {
+                        return Err(e.into());
+                    }
+                }
+            };
+
+            // Resolve provider and base_url from vault metadata.
+            let meta = storage::list_entries_with_metadata()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|m| m.alias == *alias);
+            // --provider flag overrides stored provider_code.
+            let provider_code = test_provider.as_ref().map(|p| p.to_lowercase())
+                .or_else(|| meta.as_ref().and_then(|m| m.provider_code.clone()));
+            let base_url_override = meta.as_ref().and_then(|m| m.base_url.clone());
+
+            // Build list of (provider_code, base_url) to test.
+            // - provider set → test that one provider
+            // - no provider but has base_url → ping + generic HTTP probe (no auth assumption)
+            // - no provider, no base_url → test all known providers
+            let targets: Vec<(String, String)> = if let Some(ref code) = provider_code {
+                let url = base_url_override.as_deref()
+                    .or_else(|| commands_project::default_base_url(code))
+                    .unwrap_or("https://unknown")
+                    .to_string();
+                vec![(code.clone(), url)]
+            } else if let Some(ref url) = base_url_override {
+                // Has custom base_url but no provider code — test all known providers
+                // against this URL (it may be a multi-protocol gateway).
+                let mut t: Vec<(String, String)> = commands_project::PROVIDER_DEFAULTS.iter()
+                    .map(|(c, _)| (c.to_string(), url.clone()))
+                    .collect();
+                // Also test the base URL itself as "custom" (plain HTTP probe).
+                t.push(("custom".to_string(), url.clone()));
+                t
+            } else {
+                // No provider, no base_url — test against all known providers.
+                commands_project::PROVIDER_DEFAULTS.iter()
+                    .map(|(c, u)| (c.to_string(), u.to_string()))
+                    .collect()
+            };
+
+            if cli.json {
+                let suite = commands_project::run_connectivity_test(&targets, key_value.trim(), true);
+                json_output::success(serde_json::json!({ "alias": alias, "results": suite.json_results }));
+            } else {
+                use colored::Colorize;
+                if targets.len() == 1 {
+                    let (code, url) = &targets[0];
+                    eprintln!("  Testing '{}' ({} → {})", alias.bold(), code, url.dimmed());
+                } else {
+                    eprintln!("  Testing '{}' against {} providers (no provider set)", alias.bold(), targets.len());
+                    // Show base_url if all targets share the same one.
+                    let first_url = &targets[0].1;
+                    if targets.iter().all(|(_, u)| u == first_url) {
+                        eprintln!("  base_url: {}", first_url.dimmed());
+                    }
+                }
+                eprintln!();
+                commands_project::run_connectivity_test(&targets, key_value.trim(), false);
             }
         }
         Commands::Export { pattern, output } => {
@@ -1164,63 +1182,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 println!("Exported {} secret(s) to {}", count, output);
             }
-        }
-        Commands::Import { file } => {
-            let export_password = prompt_password_secure("\u{1F512} Enter Export Password: ", cli.password_stdin, cli.json)?;
-            let vault_password = prompt_password_secure("\u{1F512} Enter Master Password: ", cli.password_stdin, cli.json)?;
-            let input_path = std::path::Path::new(file);
-
-            let result = synapse::import_vault(input_path, &export_password, &vault_password);
-            let _ = audit::log_audit_event(&vault_password, audit::AuditOperation::Import, Some(file), result.is_ok());
-
-            let import_result = match result {
-                Ok(r) => r,
-                Err(e) => {
-                    if cli.json {
-                        json_output::error(&e.to_string(), 1);
-                    } else {
-                        return Err(e.into());
-                    }
-                }
-            };
-
-            if cli.json {
-                json_output::success(serde_json::json!({
-                    "added": import_result.added,
-                    "updated": import_result.updated,
-                    "skipped": import_result.skipped
-                }));
-            } else {
-                eprintln!("Import complete:");
-                eprintln!("  Added: {}", import_result.added);
-                eprintln!("  Updated: {}", import_result.updated);
-                eprintln!("  Skipped: {}", import_result.skipped);
-            }
-        }
-        Commands::Exec { env_mappings, command } => {
-            if command.is_empty() {
-                let err_msg = "No command specified. Use -- to separate command from flags.";
-                if cli.json {
-                    json_output::error(err_msg, 1);
-                } else {
-                    return Err(err_msg.into());
-                }
-            }
-
-            let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
-
-            let result = executor::exec_with_env(env_mappings, &password, command);
-
-            if let Err(e) = result {
-                if cli.json {
-                    json_output::error(&e, 1);
-                } else {
-                    return Err(e.into());
-                }
-            }
-
-            // Post-operation: warn if proxy is unreachable.
-            commands_proxy::warn_if_proxy_down();
         }
         Commands::Run { provider, logical_model, model, tenant, profile, dry_run, direct, command } => {
             if command.is_empty() {
@@ -1715,214 +1676,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Profile { action } => {
-            match action {
-                ProfileAction::List => {
-                    let profiles = storage::get_all_profiles()
-                        .map(|ps| ps.into_iter().map(|p| p.name).collect::<Vec<_>>());
-                    match profiles {
-                        Ok(profiles) => {
-                            if cli.json {
-                                let profiles_json: Vec<_> = profiles
-                                    .iter()
-                                    .map(|name| serde_json::json!({
-                                        "name": name,
-                                        "description": serde_json::Value::Null
-                                    }))
-                                    .collect();
-                                json_output::print_json(serde_json::Value::Array(profiles_json));
-                            } else {
-                                if profiles.is_empty() {
-                                    println!("No profiles configured.");
-                                } else {
-                                    println!("Profiles:");
-                                    for profile in profiles {
-                                        println!("  {}", profile);
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if cli.json {
-                                json_output::print_json_exit(serde_json::json!({
-                                    "ok": false,
-                                    "message": e
-                                }), 1);
-                            } else {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-                ProfileAction::Use { name } => {
-                    match storage::set_active_profile(name) {
-                        Ok(profile) => {
-                            let _ = global_config::set_current_profile(&profile.name);
-                            if cli.json {
-                                json_output::print_json(serde_json::json!({
-                                    "ok": true,
-                                    "profile": profile.name
-                                }));
-                            } else {
-                                println!("Switched to profile: {}", profile.name);
-                            }
-                        }
-                        Err(e) => {
-                            if cli.json {
-                                json_output::print_json_exit(serde_json::json!({
-                                    "ok": false,
-                                    "message": e
-                                }), 1);
-                            } else {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-                ProfileAction::Show { name } => {
-                    let profiles = storage::get_all_profiles()
-                        .map(|ps| ps.into_iter().map(|p| p.name).collect::<Vec<_>>());
-                    match profiles {
-                        Ok(profiles) => {
-                            if profiles.contains(name) {
-                                if cli.json {
-                                    json_output::success(serde_json::json!({
-                                        "profile": name
-                                    }));
-                                } else {
-                                    println!("Profile: {}", name);
-                                }
-                            } else {
-                                let err_msg = format!("Profile '{}' not found", name);
-                                if cli.json {
-                                    json_output::error(&err_msg, 1);
-                                } else {
-                                    return Err(err_msg.into());
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if cli.json {
-                                json_output::error(&e, 1);
-                            } else {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-                ProfileAction::Current => {
-                    match global_config::get_current_profile() {
-                        Ok(Some(profile_name)) => {
-                            if cli.json {
-                                json_output::print_json(serde_json::json!({
-                                    "ok": true,
-                                    "profile": profile_name
-                                }));
-                            } else {
-                                println!("Current profile: {}", profile_name);
-                            }
-                        }
-                        Ok(None) => {
-                            if cli.json {
-                                json_output::print_json_exit(serde_json::json!({
-                                    "ok": false,
-                                    "profile": serde_json::Value::Null,
-                                    "code": error_codes::ErrorCode::NoActiveProfile.as_str()
-                                }), 1);
-                            } else {
-                                return Err("No active profile set".into());
-                            }
-                        }
-                        Err(e) => {
-                            if cli.json {
-                                json_output::print_json_exit(serde_json::json!({
-                                    "ok": false,
-                                    "message": e
-                                }), 1);
-                            } else {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-                ProfileAction::Create { name } => {
-                    match storage::create_profile(name) {
-                        Ok(profile) => {
-                            if cli.json {
-                                json_output::success(serde_json::json!({
-                                    "ok": true,
-                                    "profile": profile.name
-                                }));
-                            } else {
-                                println!("Profile '{}' created successfully", profile.name);
-                            }
-                        }
-                        Err(e) => {
-                            if cli.json {
-                                json_output::error(&e, 1);
-                            } else {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-                ProfileAction::Delete { name } => {
-                    match storage::delete_profile(name) {
-                        Ok(_) => {
-                            if cli.json {
-                                json_output::success(serde_json::json!({
-                                    "ok": true,
-                                    "message": format!("Profile '{}' deleted", name)
-                                }));
-                            } else {
-                                println!("Profile '{}' deleted successfully", name);
-                            }
-                        }
-                        Err(e) => {
-                            if cli.json {
-                                json_output::error(&e, 1);
-                            } else {
-                                return Err(e.into());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Commands::Env { action } => {
-            match action {
-                EnvAction::Generate { dry_run, env_file } => {
-                    commands_env::handle_env_generate(*dry_run, env_file.as_deref(), cli.json)?;
-                }
-                EnvAction::Inject { command, logical_model, tenant, dry_run } => {
-                    if command.is_empty() {
-                        commands_env::handle_env_inject(cli.json)?;
-                    } else {
-                        // P0-B1: env inject -- <cmd> MUST be equivalent to run -- <cmd>
-                        // Apply same tenant precedence: --tenant > AIKEY_TENANT env var
-                        let env_tenant = std::env::var("AIKEY_TENANT").ok();
-                        let resolved_tenant = tenant.as_deref().or(env_tenant.as_deref());
-
-                        commands_env::handle_env_run(command, cli.json, logical_model.as_deref(), resolved_tenant, *dry_run)?;
-                    }
-                }
-                EnvAction::Check => {
-                    commands_env::handle_env_check(cli.json)?;
-                }
-                EnvAction::Use { name } => {
-                    global_config::set_current_env(name)
-                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                    if cli.json {
-                        json_output::print_json(serde_json::json!({
-                            "ok": true,
-                            "env": name
-                        }));
-                    } else {
-                        println!("Switched to environment: {}", name);
-                    }
-                }
-            }
-        }
         Commands::Project { action } => {
             match action {
                 ProjectAction::Init => {
@@ -1936,24 +1689,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Provider { action } => {
-            match action {
-                ProviderAction::Add { name, key_alias, default_model } => {
-                    commands_project::handle_provider_add(name, key_alias, default_model.as_deref(), cli.json)?;
-                }
-                ProviderAction::Rm { name } => {
-                    commands_project::handle_provider_rm(name, cli.json)?;
-                }
-                ProviderAction::Ls => {
-                    commands_project::handle_provider_ls(cli.json)?;
-                }
-            }
-        }
         Commands::Quickstart => {
             commands_project::handle_quickstart(cli.json)?;
-        }
-        Commands::Stats => {
-            handle_stats(cli.json)?;
         }
         Commands::Key { action } => {
             match action {
@@ -2091,12 +1828,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Doctor => {
             commands_project::handle_doctor(cli.json)?;
-        }
-        Commands::Status => {
-            commands_project::handle_project_status(cli.json)?;
-        }
-        Commands::Shell => {
-            handle_shell_command(cli.json)?;
         }
         Commands::Proxy { action } => {
             match action {
@@ -2282,16 +2013,37 @@ fn print_banner() {
     let g = |s: &str| s.truecolor(160, 135, 75);
 
     eprintln!();
-    eprintln!("      {}          {}", g("▄████▄"), g("▄████▄"));
-    eprintln!("    {}", g("▄████████▄▄▄▄▄▄▄▄████████▄"));
-    eprintln!("   {}", g("█████▀▀▀▀██████████▀▀▀▀█████"));
-    eprintln!("   {}       {}       {}      {}   v{}", g("████"), g("▀████▀"), g("████"), "AiKey CLI".bold(), version);
-    eprintln!("   {}  {}   {}   {}  {}      {}", g("████"), g("███"), g("▀██▀"), g("███"), g("████"), "------------------------------------".dimmed());
-    eprintln!("   {}  {}  {}  {}  {}      FinOps & AI Governance Center", g("████"), g("███"), g("▄████▄"), g("███"), g("████"));
-    eprintln!("   {}     {}     {}      {}", g("████▄"), g("▄██▀▀██▄"), g("▄████"), aikey_home);
-    eprintln!("    {}", g("▀████▄▄▄████  ████▄▄▄████▀"));
-    eprintln!("      {}    {}", g("▀▀██████▀"), g("▀██████▀▀"));
+    eprintln!("     {}        {}", g("▄███▄"), g("▄███▄"));
+    eprintln!("   {}", g("▄████████▄▄▄▄████████▄"));
+    eprintln!("  {}", g("████▀▀▀▀████████▀▀▀▀████"));
+    eprintln!("  {}      {}      {}      {}   v{}", g("███"), g("▀████▀"), g("███"), "AiKey CLI".bold(), version);
+    eprintln!("  {}  {}   {}   {}  {}      {}", g("███"), g("██"), g("▀██▀"), g("██"), g("███"), "------------------------------------".dimmed());
+    eprintln!("  {}  {}  {}  {}  {}      FinOps & AI Governance Center", g("███"), g("██"), g("▄████▄"), g("██"), g("███"));
+    eprintln!("  {}    {}    {}      {}", g("███▄"), g("▄██▀▀██▄"), g("▄███"), aikey_home);
+    eprintln!("   {}", g("▀███▄▄▄███  ███▄▄▄███▀"));
+    eprintln!("     {}    {}", g("▀▀████▀"), g("▀████▀▀"));
     eprintln!();
+}
+
+/// Format a unix timestamp as YYYY/MM/DD.
+fn format_date(ts: i64) -> String {
+    use std::time::{UNIX_EPOCH, Duration};
+    let d = UNIX_EPOCH + Duration::from_secs(ts as u64);
+    let secs = d.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    // Days since epoch → year/month/day (civil calendar).
+    let days = (secs / 86400) as i64;
+    // Algorithm from Howard Hinnant's chrono-compatible date library.
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}/{:02}/{:02}", y, m, d)
 }
 
 fn similarity(a: &str, b: &str) -> f64 {

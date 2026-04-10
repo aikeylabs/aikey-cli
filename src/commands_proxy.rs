@@ -210,11 +210,20 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
     }
 }
 
-/// Prints a restart hint if the proxy is running and its vault snapshot is stale.
-/// Call this after any vault-write operation.
+/// Auto-restarts the proxy if it is running and its vault snapshot is stale.
+/// Restart is needed (not just reload) because personal keys require a fresh
+/// vault open with the master password to decrypt entries.
+/// Call this after any vault-write operation (add, delete, update, etc.).
 pub fn maybe_warn_stale() {
     if is_proxy_running() && proxy_vault_state() == ProxyVaultState::Stale {
-        eprintln!("restart proxy to apply new keys: aikey proxy restart");
+        if let Some(pw) = crate::session::try_get() {
+            match handle_restart(None, &pw) {
+                Ok(_) => eprintln!("  Proxy restarted with new keys."),
+                Err(_) => eprintln!("  Run 'aikey proxy restart' to apply new keys."),
+            }
+        } else {
+            eprintln!("  Run 'aikey proxy restart' to apply new keys.");
+        }
     }
 }
 
