@@ -2054,6 +2054,39 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         if !*no_hook {
                             commands_account::ensure_shell_hook(false);
                         }
+
+                        // Auto-configure / unconfigure third-party CLI tools.
+                        let proxy_port = commands_proxy::proxy_port();
+                        let all_providers: Vec<String> = refresh.bindings.iter()
+                            .map(|b| b.provider_code.clone())
+                            .collect();
+
+                        let has_kimi = all_providers.iter().any(|p| {
+                            let c = p.to_lowercase();
+                            c == "kimi" || c == "moonshot"
+                        });
+                        if has_kimi {
+                            if let Some(b) = refresh.bindings.iter().find(|b| {
+                                let c = b.provider_code.to_lowercase();
+                                c == "kimi" || c == "moonshot"
+                            }) {
+                                let token = format!("aikey_{}_{}", b.key_source_type, b.key_source_ref);
+                                commands_account::configure_kimi_cli(&token, proxy_port);
+                            }
+                        } else {
+                            commands_account::unconfigure_kimi_cli();
+                        }
+
+                        let has_openai = all_providers.iter().any(|p| {
+                            let c = p.to_lowercase();
+                            c == "openai" || c == "gpt" || c == "chatgpt"
+                        });
+                        if has_openai {
+                            commands_account::configure_codex_cli(proxy_port);
+                        } else {
+                            commands_account::unconfigure_codex_cli();
+                        }
+
                         // Print a summary box showing the final state.
                         use colored::Colorize;
                         let changed_providers: Vec<&str> = changes.iter()

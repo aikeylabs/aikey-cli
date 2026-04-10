@@ -1776,7 +1776,7 @@ pub fn configure_kimi_cli(token_value: &str, proxy_port: u16) {
 /// If a backup exists (`config.aikey_backup.toml`), it is moved back to `config.toml`.
 /// If no backup exists but the config contains our marker, it is left as-is
 /// (the user may have modified it after we configured it).
-fn unconfigure_kimi_cli() {
+pub fn unconfigure_kimi_cli() {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
         Err(_) => return,
@@ -1942,7 +1942,7 @@ fn update_codex_base_url(content: &str, base_url: &str) -> String {
 /// If a backup exists (`config.aikey_backup.toml`), it is moved back.
 /// If no backup but the file was created from scratch by us, remove the
 /// managed line (but keep the rest of the config intact).
-fn unconfigure_codex_cli() {
+pub fn unconfigure_codex_cli() {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
         Err(_) => return,
