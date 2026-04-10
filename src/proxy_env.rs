@@ -136,6 +136,13 @@ pub fn read_proxy_env() -> Result<EnvMap, String> {
     parse_env_file(&content)
 }
 
+/// Read a single variable from `~/.aikey/proxy.env`.
+/// Returns `None` if the file doesn't exist or the key is not found.
+pub fn read_proxy_env_var(key: &str) -> Option<String> {
+    let map = read_proxy_env().ok()?;
+    map.get(key).cloned()
+}
+
 /// Write the env map to `~/.aikey/proxy.env` in stable sorted order.
 pub fn write_proxy_env(map: &EnvMap) -> Result<(), String> {
     let path = proxy_env_path()?;

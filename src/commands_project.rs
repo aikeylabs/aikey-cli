@@ -810,6 +810,30 @@ pub fn default_base_url(provider_code: &str) -> Option<&'static str> {
 /// - **API**: HTTP GET with the real key (validates both network and key).
 ///   Any HTTP response (including 401/403) is treated as "reachable".
 ///   Only connection errors count as failure.
+/// Build a ureq agent that respects proxy.env (https_proxy / http_proxy).
+/// Why: in China and other restricted networks, direct connections to
+/// api.openai.com etc. are blocked. The user's proxy.env configures an
+/// outbound proxy (e.g., socks5://127.0.0.1:7890) that the connectivity
+/// test must use — otherwise TCP ping and HTTP probes time out.
+fn build_proxy_aware_agent(timeout: std::time::Duration) -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new().timeout(timeout);
+
+    // Try https_proxy, then http_proxy, then all_proxy from proxy.env or env.
+    let proxy_url = crate::proxy_env::read_proxy_env_var("https_proxy")
+        .or_else(|| crate::proxy_env::read_proxy_env_var("http_proxy"))
+        .or_else(|| crate::proxy_env::read_proxy_env_var("all_proxy"))
+        .or_else(|| std::env::var("https_proxy").ok())
+        .or_else(|| std::env::var("http_proxy").ok())
+        .or_else(|| std::env::var("all_proxy").ok());
+
+    if let Some(url) = proxy_url {
+        if let Ok(proxy) = ureq::Proxy::new(&url) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder.build()
+}
+
 pub fn test_provider_connectivity(
     provider_code: &str,
     base_url: &str,
@@ -817,7 +841,18 @@ pub fn test_provider_connectivity(
 ) -> ConnectivityResult {
     use std::time::{Duration, Instant};
 
+    // Check if user has a network proxy configured (proxy.env or env vars).
+    let has_proxy = crate::proxy_env::read_proxy_env_var("https_proxy").is_some()
+        || crate::proxy_env::read_proxy_env_var("http_proxy").is_some()
+        || crate::proxy_env::read_proxy_env_var("all_proxy").is_some()
+        || std::env::var("https_proxy").is_ok()
+        || std::env::var("http_proxy").is_ok()
+        || std::env::var("all_proxy").is_ok();
+
     // 1. TCP ping — extract host and port from base_url
+    // Why: skip TCP ping when a network proxy is configured, because direct
+    // TCP connect to the provider host will fail in restricted networks even
+    // though HTTP requests through the proxy succeed fine.
     let is_http = base_url.starts_with("http://");
     let host_port = base_url
         .trim_start_matches("https://")
@@ -832,7 +867,13 @@ pub fn test_provider_connectivity(
     } else {
         (host_port, if is_http { 80 } else { 443 })
     };
-    let (ping_ok, ping_ms) = tcp_ping(host, port, 5);
+
+    let (ping_ok, ping_ms) = if has_proxy {
+        // With a proxy, skip TCP ping and go straight to HTTP probe.
+        (true, 0)
+    } else {
+        tcp_ping(host, port, 5)
+    };
 
     if !ping_ok {
         return ConnectivityResult {
@@ -841,6 +882,8 @@ pub fn test_provider_connectivity(
             chat_ok: false, chat_ms: 0, chat_status: None,
         };
     }
+
+    let agent = build_proxy_aware_agent(Duration::from_secs(10));
 
     // 2. API probe with real key (GET — lightweight, no side effects)
     let test_url = if provider_code == "google" {
@@ -851,8 +894,7 @@ pub fn test_provider_connectivity(
     let (auth_key, auth_val) = probe_auth(provider_code, api_key);
 
     let api_start = Instant::now();
-    let mut api_req = ureq::get(&test_url)
-        .timeout(Duration::from_secs(10));
+    let mut api_req = agent.get(&test_url);
     if provider_code != "google" {
         api_req = api_req.set(auth_key, &auth_val);
     }
@@ -882,10 +924,10 @@ pub fn test_provider_connectivity(
     let (chat_auth_key, chat_auth_val) = probe_auth(provider_code, api_key);
     let body = chat_body(provider_code);
 
+    let chat_agent = build_proxy_aware_agent(Duration::from_secs(15));
     let chat_start = Instant::now();
-    let mut req = ureq::post(&chat_url)
-        .set("Content-Type", "application/json")
-        .timeout(Duration::from_secs(15));
+    let mut req = chat_agent.post(&chat_url)
+        .set("Content-Type", "application/json");
     // Google uses ?key= in URL; skip header auth. Others use header.
     if provider_code != "google" {
         req = req.set(chat_auth_key, &chat_auth_val);
