@@ -791,7 +791,9 @@ pub const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
     ("openai",    "https://api.openai.com"),
     ("google",    "https://generativelanguage.googleapis.com"),
     ("deepseek",  "https://api.deepseek.com"),
-    ("kimi",      "https://api.moonshot.cn"),
+    // Why: Kimi Coding CLI uses api.kimi.com/coding/v1 (not api.moonshot.cn).
+    // Store without /v1 here — the CLI connectivity test appends /v1/... itself.
+    ("kimi",      "https://api.kimi.com/coding"),
     ("glm",       "https://open.bigmodel.cn/api/paas"),
 ];
 

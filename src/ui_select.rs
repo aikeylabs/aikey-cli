@@ -130,7 +130,14 @@ fn interactive_select(
     struct RawGuard { fd: i32, orig: libc::termios }
     impl Drop for RawGuard {
         fn drop(&mut self) {
-            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig); }
+            unsafe {
+                // Why: TCSADRAIN waits for output to flush before restoring.
+                // Also restore stdin (fd 0) — on macOS, /dev/tty and stdin
+                // may be separate fds and only restoring /dev/tty can leave
+                // stdin missing ICRNL, causing read_line to not see newlines.
+                libc::tcsetattr(self.fd, libc::TCSADRAIN, &self.orig);
+                libc::tcsetattr(0, libc::TCSADRAIN, &self.orig);
+            }
         }
     }
     let _guard = RawGuard { fd: tty_fd, orig };
@@ -338,7 +345,15 @@ fn interactive_multi_select(title: &str, items: &[String], initially_checked: &[
     let orig = unsafe { let mut t: libc::termios = std::mem::zeroed(); if libc::tcgetattr(tty_fd, &mut t) != 0 { return Err("tcgetattr".into()); } t };
     let mut raw = orig; raw.c_lflag &= !(libc::ECHO | libc::ICANON); raw.c_cc[libc::VMIN] = 1; raw.c_cc[libc::VTIME] = 0;
     unsafe { if libc::tcsetattr(tty_fd, libc::TCSANOW, &raw) != 0 { return Err("tcsetattr".into()); } }
-    struct G { fd: i32, o: libc::termios } impl Drop for G { fn drop(&mut self) { unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.o); } } }
+    struct G { fd: i32, o: libc::termios }
+    impl Drop for G {
+        fn drop(&mut self) {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSADRAIN, &self.o);
+                libc::tcsetattr(0, libc::TCSADRAIN, &self.o);
+            }
+        }
+    }
     let _g = G { fd: tty_fd, o: orig };
 
     let icon_title = format!("\u{2611} {}", title);
@@ -479,7 +494,15 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
     let orig = unsafe { let mut t: libc::termios = std::mem::zeroed(); if libc::tcgetattr(tty_fd, &mut t) != 0 { return Err("tcgetattr".into()); } t };
     let mut raw = orig; raw.c_lflag &= !(libc::ECHO | libc::ICANON); raw.c_cc[libc::VMIN] = 1; raw.c_cc[libc::VTIME] = 0;
     unsafe { if libc::tcsetattr(tty_fd, libc::TCSANOW, &raw) != 0 { return Err("tcsetattr".into()); } }
-    struct G { fd: i32, o: libc::termios } impl Drop for G { fn drop(&mut self) { unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.o); } } }
+    struct G { fd: i32, o: libc::termios }
+    impl Drop for G {
+        fn drop(&mut self) {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSADRAIN, &self.o);
+                libc::tcsetattr(0, libc::TCSADRAIN, &self.o);
+            }
+        }
+    }
     let _g = G { fd: tty_fd, o: orig };
 
     let title = "Provider Key Selection";

@@ -47,7 +47,17 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
                 provider_proxy_prefix_pub(&b.provider_code)
             );
             env_lines.push(format!("export {}=\"{}\"", api_key_var, token));
-            env_lines.push(format!("export {}=\"{}\"", base_url_var, base_url));
+            // Why: Codex v0.118+ warns when OPENAI_BASE_URL env var is set,
+            // because it now reads openai_base_url from ~/.codex/config.toml.
+            // We inject that config via configure_codex_cli(), so skip the
+            // env var to avoid the deprecation warning.
+            let skip_base_url = matches!(
+                b.provider_code.to_lowercase().as_str(),
+                "openai" | "gpt" | "chatgpt"
+            );
+            if !skip_base_url {
+                env_lines.push(format!("export {}=\"{}\"", base_url_var, base_url));
+            }
             activated_providers.push(b.provider_code.clone());
         }
     }

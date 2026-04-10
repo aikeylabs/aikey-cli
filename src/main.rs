@@ -792,6 +792,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Add { alias, provider } => {
             let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
+            // Early password validation: fail fast before asking for API key,
+            // providers, base URL, etc. Skip for first-time vault init.
+            // Why: without this, users enter wrong password and go through the entire
+            // interactive flow only to fail at the final write step.
+            if storage::get_salt().is_ok() {
+                if let Err(e) = executor::verify_vault_password(&password) {
+                    if cli.json { json_output::error(&e, 1); } else { return Err(e.into()); }
+                }
+            }
+
             // Step 2: read secret value (from env, hidden TTY prompt, or stdin).
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
                 Zeroizing::new(test_secret)
@@ -919,6 +929,27 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             ).unwrap_or_default();
             if !newly_primary.is_empty() || !resolved_providers.is_empty() {
                 let _ = profile_activation::refresh_implicit_profile_activation();
+            }
+
+            // Auto-configure third-party CLI tools when relevant providers are added.
+            if !cli.json {
+                let proxy_port = commands_proxy::proxy_port();
+                let has_openai = resolved_providers.iter().any(|p| {
+                    let c = p.to_lowercase();
+                    c == "openai" || c == "gpt" || c == "chatgpt"
+                });
+                if has_openai {
+                    commands_account::configure_codex_cli(proxy_port);
+                }
+
+                let has_kimi = resolved_providers.iter().any(|p| {
+                    let c = p.to_lowercase();
+                    c == "kimi" || c == "moonshot"
+                });
+                if has_kimi {
+                    let token_value = format!("aikey_personal_{}", alias);
+                    commands_account::configure_kimi_cli(&token_value, proxy_port);
+                }
             }
 
             if cli.json {
@@ -1180,6 +1211,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
+
+            // Early password validation — same reason as `add`.
+            if storage::get_salt().is_ok() {
+                if let Err(e) = executor::verify_vault_password(&password) {
+                    if cli.json { json_output::error(&e, 1); } else { return Err(e.into()); }
+                }
+            }
 
             // Check for test environment variable first
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {

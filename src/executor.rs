@@ -134,6 +134,13 @@ pub fn verify_password(key: &[u8; crypto::KEY_SIZE]) -> Result<(), String> {
     VaultContext::verify_password_internal(&secure_key)
 }
 
+/// Quick password check without creating a full VaultContext.
+/// Used for early validation in `aikey add` before the interactive flow.
+pub fn verify_vault_password(password: &SecretString) -> Result<(), String> {
+    let _ = VaultContext::new(password)?;
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn is_potential_secret(text: &str) -> bool {
     let trimmed = text.trim();

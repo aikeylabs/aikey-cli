@@ -1651,7 +1651,7 @@ pub fn handle_run_direct(
 /// (env vars alone are not enough — it won't select a model without config).
 /// This function ensures the provider block points to the aikey proxy and the
 /// api_key matches the current token. Model entries are added idempotently.
-fn configure_kimi_cli(token_value: &str, proxy_port: u16) {
+pub fn configure_kimi_cli(token_value: &str, proxy_port: u16) {
     use colored::Colorize;
     use std::io::{IsTerminal, Write};
 
@@ -1795,6 +1795,182 @@ fn unconfigure_kimi_cli() {
             // We created this file from scratch (there was no original).
             // Remove it so Kimi CLI returns to its default behavior.
             let _ = std::fs::remove_file(&config_path);
+        }
+    }
+}
+
+// ============================================================================
+// Codex CLI auto-configuration
+// ============================================================================
+
+/// Auto-configure `~/.codex/config.toml` so that Codex CLI routes OpenAI
+/// requests through the aikey local proxy.
+///
+/// Pattern mirrors `configure_kimi_cli`: marker-based idempotent updates,
+/// backup before first modification, interactive prompt on first touch.
+pub fn configure_codex_cli(proxy_port: u16) {
+    use colored::Colorize;
+    use std::io::{IsTerminal, Write};
+
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let config_dir = std::path::PathBuf::from(&home).join(".codex");
+    let config_path = config_dir.join("config.toml");
+
+    // Why: Codex treats openai_base_url as a replacement for
+    // "https://api.openai.com/v1" (including /v1), so paths like /responses
+    // are appended directly. The proxy's providerDefaultBaseURL already includes
+    // /v1, so applyBaseURL() prepends it correctly. No /v1 needed in CLI config.
+    let base_url = format!("http://127.0.0.1:{}/openai", proxy_port);
+    let marker = "# managed by aikey";
+
+    // Read existing config or start empty.
+    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+    // Already configured — silent update (no prompt needed for subsequent switches).
+    if content.contains(marker) {
+        let updated = update_codex_base_url(&content, &base_url);
+        let _ = std::fs::write(&config_path, updated);
+        return;
+    }
+
+    // First time — prompt user before modifying their config.
+    if io::stderr().is_terminal() {
+        let mut rows: Vec<String> = vec![
+            format!("File:    {}", "~/.codex/config.toml"),
+            format!("Add:     openai_base_url = {}", base_url),
+        ];
+        if !content.is_empty() {
+            rows.push(format!("Backup:  {}", "~/.codex/config.aikey_backup.toml"));
+        }
+        crate::ui_frame::eprint_box("\u{2753}", "Configure Codex CLI", &rows);
+        eprint!("  Proceed? [Y/n]: ");
+        io::stderr().flush().ok();
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_ok() {
+            if input.trim().to_lowercase() == "n" {
+                eprintln!("  {}", "Skipped. Run 'aikey use' again to retry.".dimmed());
+                return;
+            }
+        }
+    }
+
+    // Backup original config before first modification.
+    let backup_path = config_dir.join("config.aikey_backup.toml");
+    if !content.is_empty() && !backup_path.exists() {
+        let _ = std::fs::copy(&config_path, &backup_path);
+    }
+
+    let _ = std::fs::create_dir_all(&config_dir);
+
+    // Inject openai_base_url at the top level of the TOML.
+    // Why: Codex v0.118+ deprecated the OPENAI_BASE_URL env var and reads
+    // openai_base_url from config.toml instead.
+    let new_line = format!("openai_base_url = \"{}\"  {}", base_url, marker);
+
+    let updated = if content.contains("openai_base_url") {
+        // Replace existing (non-managed) openai_base_url line.
+        let mut result = String::new();
+        for line in content.lines() {
+            if line.trim_start().starts_with("openai_base_url") {
+                result.push_str(&new_line);
+            } else {
+                result.push_str(line);
+            }
+            result.push('\n');
+        }
+        result
+    } else if content.is_empty() {
+        // No config file existed — create a minimal one.
+        format!("{}\n", new_line)
+    } else {
+        // Append after the first top-level key (e.g. model = "...").
+        // Insert right after line 1 so it stays at the top level.
+        let mut result = String::new();
+        let mut inserted = false;
+        for line in content.lines() {
+            result.push_str(line);
+            result.push('\n');
+            // Insert after the first non-comment, non-empty top-level line.
+            if !inserted && !line.is_empty() && !line.starts_with('#') && !line.starts_with('[') {
+                result.push_str(&new_line);
+                result.push('\n');
+                inserted = true;
+            }
+        }
+        if !inserted {
+            result.push_str(&new_line);
+            result.push('\n');
+        }
+        result
+    };
+
+    match std::fs::write(&config_path, &updated) {
+        Ok(_) => {
+            eprintln!("  {} Codex CLI auto-configured: {}",
+                "\u{2713}".green().bold(),
+                config_path.display().to_string().dimmed());
+        }
+        Err(e) => {
+            eprintln!("  {} Could not configure Codex CLI: {}",
+                "!".yellow(), e);
+        }
+    }
+}
+
+/// Update `openai_base_url` in an already-managed Codex config.
+fn update_codex_base_url(content: &str, base_url: &str) -> String {
+    let marker = "# managed by aikey";
+    let mut result = String::new();
+    for line in content.lines() {
+        if line.trim_start().starts_with("openai_base_url") && line.contains(marker) {
+            result.push_str(&format!("openai_base_url = \"{}\"  {}", base_url, marker));
+        } else {
+            result.push_str(line);
+        }
+        result.push('\n');
+    }
+    result
+}
+
+/// Restore `~/.codex/config.toml` from the backup created by `configure_codex_cli`.
+///
+/// Called when `aikey use` switches to a key that does not include openai.
+/// If a backup exists (`config.aikey_backup.toml`), it is moved back.
+/// If no backup but the file was created from scratch by us, remove the
+/// managed line (but keep the rest of the config intact).
+fn unconfigure_codex_cli() {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let config_dir = std::path::PathBuf::from(&home).join(".codex");
+    let config_path = config_dir.join("config.toml");
+    let backup_path = config_dir.join("config.aikey_backup.toml");
+
+    if backup_path.exists() {
+        // Restore the original config from backup.
+        let _ = std::fs::rename(&backup_path, &config_path);
+    } else if config_path.exists() {
+        // No backup — remove just the managed line(s) rather than deleting
+        // the whole file (user may have added other settings after us).
+        let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+        if content.contains("# managed by aikey") {
+            let cleaned: String = content
+                .lines()
+                .filter(|line| !line.contains("# managed by aikey"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            // If only whitespace remains, remove the file.
+            if cleaned.trim().is_empty() {
+                let _ = std::fs::remove_file(&config_path);
+            } else {
+                let _ = std::fs::write(&config_path, cleaned);
+            }
         }
     }
 }
@@ -2132,6 +2308,19 @@ pub fn handle_key_use(
             // Switching away from kimi — restore Kimi CLI to standalone mode.
             unconfigure_kimi_cli();
         }
+
+        // Codex CLI: inject openai_base_url when openai provider is active.
+        // Why: Codex v0.118+ deprecated OPENAI_BASE_URL env var and reads
+        // openai_base_url from ~/.codex/config.toml instead.
+        let has_openai = providers.iter().any(|p| {
+            let c = p.to_lowercase();
+            c == "openai" || c == "gpt" || c == "chatgpt"
+        });
+        if has_openai {
+            configure_codex_cli(proxy_port);
+        } else {
+            unconfigure_codex_cli();
+        }
     }
 
     // ── 7. Output ─────────────────────────────────────────────────────────────
@@ -2159,7 +2348,17 @@ pub fn handle_key_use(
                 };
                 let base_url = format!("http://127.0.0.1:{}/{}", proxy_port, provider_proxy_prefix(provider));
                 env_lines.push(format!("{:<24} = {}", api_key_var, token_value));
-                env_lines.push(format!("{:<24} = {}", base_url_var, base_url));
+                // Skip OPENAI_BASE_URL display — Codex reads from config.toml instead.
+                let is_openai = matches!(
+                    provider.to_lowercase().as_str(),
+                    "openai" | "gpt" | "chatgpt"
+                );
+                if is_openai {
+                    env_lines.push(format!("{:<24} = {} (via ~/.codex/config.toml)",
+                        "openai_base_url", base_url));
+                } else {
+                    env_lines.push(format!("{:<24} = {}", base_url_var, base_url));
+                }
             }
         }
 
