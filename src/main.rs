@@ -928,7 +928,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  {} At least one provider is required.\n", "\u{26A0}".yellow());
                     }
 
-                    print!("  Base URL (press Enter for provider defaults): ");
+                    // Show default base URLs for selected providers so the user
+                    // knows what they're accepting when pressing Enter.
+                    let default_urls: Vec<String> = selected.iter()
+                        .filter_map(|code| commands_project::default_base_url(code)
+                            .map(|u| format!("{}: {}", code, u)))
+                        .collect();
+                    if !default_urls.is_empty() {
+                        eprintln!("  Default Base URLs:");
+                        for u in &default_urls { eprintln!("    {}", u); }
+                    }
+                    print!("  Base URL (press Enter to use defaults above): ");
                     io::stdout().flush()?;
                     let mut url_input = String::new();
                     io::stdin().read_line(&mut url_input)?;
@@ -1031,6 +1041,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("  {} Primary for: {}", "\u{2B50}".yellow(), newly_primary.join(", ").bold());
                 }
                 eprintln!("  Added key and refreshed current default activation.");
+
+                // Auto-start proxy after adding a key so the user can immediately
+                // use AI CLIs. Without this, `claude` / `cursor` would fail because
+                // the proxy isn't running to route requests.
+                if !commands_proxy::is_proxy_running() {
+                    eprintln!();
+                    commands_proxy::ensure_proxy_for_use(cli.password_stdin);
+                }
                 commands_proxy::maybe_warn_stale();
             }
         }

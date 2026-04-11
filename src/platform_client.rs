@@ -325,7 +325,17 @@ impl PlatformClient {
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
-            .map_err(|e| format!("token refresh failed: {}", e))?;
+            .map_err(|e| {
+                // Why: distinguish auth rejection (login expired, need re-login)
+                // from transient failures (network, server error, DNS) so the CLI
+                // can give the user the correct next step.
+                match e {
+                    ureq::Error::Status(status, _) if status == 401 || status == 403 => {
+                        format!("login expired (HTTP {})", status)
+                    }
+                    _ => format!("token refresh failed: {}", e),
+                }
+            })?;
         resp.into_json::<RefreshResponse>()
             .map_err(|e| format!("failed to parse refresh response: {}", e))
     }

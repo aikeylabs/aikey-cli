@@ -106,8 +106,30 @@ impl VaultContext {
                 Ok(())
             }
             Err(_) => {
-                // Password hash doesn't exist (old database), create it for future use
-                // This is a migration path for databases created before password verification was added
+                // Password hash doesn't exist (old database or migration).
+                // Why not just accept: a wrong password would be stored as the real hash,
+                // locking the user out permanently. Instead, verify by trying to decrypt
+                // an existing entry. If no entries exist (empty vault), accept and store.
+                let has_entries: bool = conn
+                    .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get::<_, i64>(0))
+                    .map(|n| n > 0)
+                    .unwrap_or(false);
+
+                if has_entries {
+                    // Vault has data — try to decrypt the first entry to verify password
+                    let (nonce, ciphertext): (Vec<u8>, Vec<u8>) = conn
+                        .query_row(
+                            "SELECT nonce, ciphertext FROM entries LIMIT 1",
+                            [],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .map_err(|_| msgs::INVALID_PASSWORD.to_string())?;
+
+                    crypto::decrypt(key, &nonce, &ciphertext)
+                        .map_err(|_| msgs::INVALID_PASSWORD.to_string())?;
+                }
+
+                // Password verified (or empty vault) — store hash for future checks
                 conn.execute(
                     "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
                     params!["password_hash", &**key],

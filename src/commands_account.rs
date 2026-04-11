@@ -94,11 +94,9 @@ fn configure_proxy_collector(control_url: &str, json_mode: bool) {
             let pw = if let Some(cached) = crate::session::try_get() {
                 cached
             } else {
-                // No cached password — prompt inline.
+                // No cached password — prompt inline with star echo.
                 eprintln!("    Restart proxy to apply.");
-                eprint!("    \u{1F512} Enter Master Password: ");
-                let _ = io::Write::flush(&mut io::stderr());
-                match rpassword::read_password() {
+                match crate::prompt_hidden("    \u{1F512} Enter Master Password: ") {
                     Ok(p) => SecretString::new(p),
                     Err(_) => {
                         eprintln!("\n    Run {} manually.", "'aikey proxy restart'".bold());
@@ -548,10 +546,19 @@ fn try_refresh_if_needed(acc: &storage::PlatformAccount) -> Result<String, Strin
     })?;
 
     let resp = PlatformClient::do_refresh_token(&acc.control_url, refresh_token).map_err(|e| {
-        format!(
-            "Token refresh failed: {}. Run 'aikey account login' to re-authenticate.",
-            e
-        )
+        let msg = e.to_string();
+        if msg.contains("login expired") {
+            format!(
+                "{}. Run 'aikey login' to re-authenticate.",
+                msg
+            )
+        } else {
+            format!(
+                "Token refresh failed: {}. Check your network or server, then retry. \
+                 If the problem persists, run 'aikey login' to re-authenticate.",
+                msg
+            )
+        }
     })?;
 
     let new_expires_at = {
