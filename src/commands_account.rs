@@ -2346,10 +2346,13 @@ pub fn handle_key_use(
         let mut rows: Vec<String> = Vec::new();
         for b in &refresh.bindings {
             if let Some((api_key_var, _)) = provider_env_vars(&b.provider_code) {
-                let marker = if target_providers.contains(&b.provider_code) { "\u{2B50}" } else { " " };
                 let display_ref = resolve_binding_display_name(&b.key_source_type, &b.key_source_ref);
-                rows.push(format!("{} {:<12} \u{2192} {:<20} \x1b[90m[{}]\x1b[0m",
-                    marker, b.provider_code, display_ref, b.key_source_type));
+                let is_changed = target_providers.contains(&b.provider_code);
+                let arrow_ref = format!("\u{2192} {}", display_ref);
+                let arrow_padded = format!("{:<22}", arrow_ref);
+                let arrow_col = if is_changed { format!("\x1b[32m{}\x1b[0m", arrow_padded) } else { arrow_padded };
+                rows.push(format!("  {:<14} {} \x1b[90m[{}]\x1b[0m",
+                    b.provider_code, arrow_col, b.key_source_type));
                 let _ = api_key_var;
             }
         }
