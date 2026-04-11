@@ -1873,13 +1873,35 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     match result {
                         Ok(_) => {
+                            // Reconcile provider bindings after removal.
+                            let actions = profile_activation::reconcile_provider_primary_after_key_removal(
+                                "personal", name,
+                            ).unwrap_or_default();
+                            if !actions.is_empty() {
+                                let _ = profile_activation::refresh_implicit_profile_activation();
+                            }
+
                             if cli.json {
                                 json_output::print_json(serde_json::json!({
                                     "ok": true,
-                                    "name": name
+                                    "name": name,
+                                    "reconciled_providers": actions.iter().map(|a| &a.provider_code).collect::<Vec<_>>(),
                                 }));
                             } else {
+                                use colored::Colorize;
                                 println!("API Key '{}' deleted successfully", name);
+                                for action in &actions {
+                                    match &action.outcome {
+                                        profile_activation::ReconcileOutcome::Replaced { new_source_ref, .. } => {
+                                            eprintln!("  {} '{}' promoted to Primary for {}",
+                                                "\u{2B50}".yellow(), new_source_ref.bold(), action.provider_code);
+                                        }
+                                        profile_activation::ReconcileOutcome::Cleared => {
+                                            eprintln!("  {} No replacement for {} — provider has no Primary",
+                                                "\u{26A0}".yellow(), action.provider_code);
+                                        }
+                                    }
+                                }
                                 commands_proxy::maybe_warn_stale();
                             }
                         }

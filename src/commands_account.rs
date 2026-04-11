@@ -2323,46 +2323,19 @@ pub fn handle_key_use(
         }
     }
 
-    // ── 7. Output ─────────────────────────────────────────────────────────────
-    let primary_provider = providers.first().map(String::as_str).unwrap_or("unknown");
+    // ── 5. Output ─────────────────────────────────────────────────────────────
     if json_mode {
         crate::json_output::print_json(serde_json::json!({
             "ok": true,
             "key_type": key_type,
             "key_ref": key_ref,
             "display_name": display_name,
-            "providers": providers,
+            "promoted_providers": target_providers,
+            "all_active_providers": refresh.activated_providers,
             "active_env_written": true,
         }));
     } else {
         use colored::Colorize;
-
-        // Collect env var lines.
-        let mut env_lines: Vec<String> = Vec::new();
-        for provider in &providers {
-            if let Some((api_key_var, base_url_var)) = provider_env_vars(provider) {
-                let token_value = if key_type == "team" {
-                    format!("aikey_vk_{}", key_ref)
-                } else {
-                    format!("aikey_personal_{}", key_ref)
-                };
-                let base_url = format!("http://127.0.0.1:{}/{}", proxy_port, provider_proxy_prefix(provider));
-                env_lines.push(format!("{:<24} = {}", api_key_var, token_value));
-                // Skip OPENAI_BASE_URL display — Codex reads from config.toml instead.
-                let is_openai = matches!(
-                    provider.to_lowercase().as_str(),
-                    "openai" | "gpt" | "chatgpt"
-                );
-                if is_openai {
-                    env_lines.push(format!("{:<24} = {} (via ~/.codex/config.toml)",
-                        "openai_base_url", base_url));
-                } else {
-                    env_lines.push(format!("{:<24} = {}", base_url_var, base_url));
-                }
-            }
-        }
-
-        let proxy_url = format!("http://127.0.0.1:{}/{}", proxy_port, provider_proxy_prefix(primary_provider));
 
         let status = if hook_msg.is_some() {
             "\u{2192} Shell hook just installed. Open a new terminal or: source ~/.aikey/active.env"
@@ -2371,15 +2344,20 @@ pub fn handle_key_use(
         };
 
         let mut rows: Vec<String> = Vec::new();
-        for line in &env_lines {
-            rows.push(line.clone());
+        for b in &refresh.bindings {
+            if let Some((api_key_var, _)) = provider_env_vars(&b.provider_code) {
+                let marker = if target_providers.contains(&b.provider_code) { "\u{2B50}" } else { " " };
+                let display_ref = resolve_binding_display_name(&b.key_source_type, &b.key_source_ref);
+                rows.push(format!("{} {:<12} \u{2192} {:<20} \x1b[90m[{}]\x1b[0m",
+                    marker, b.provider_code, display_ref, b.key_source_type));
+                let _ = api_key_var;
+            }
         }
-        rows.push(String::new()); // blank separator
+        rows.push(String::new());
         rows.push(status.to_string());
-        rows.push(format!("\u{2192} Proxy: {}", proxy_url));
 
-        let title = format!("'{}' [{}] is now active", display_name, primary_provider);
-        crate::ui_frame::print_box("\u{2705}", &title, &rows);
+        let title = format!("Set '{}' as Primary for {}", display_name, target_providers.join(", "));
+        crate::ui_frame::print_box("\u{1F7E2}", &title, &rows);
         println!();
     }
     Ok(())
