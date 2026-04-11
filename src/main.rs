@@ -56,7 +56,8 @@ Commands:
   \x1b[1mtest\x1b[0m <alias>             Test whether a stored API key alias is working
   \x1b[1muse\x1b[0m [alias]              Select the active key for routing (shortcut for `key use`)
   \x1b[1mlogin\x1b[0m                    Log in to aikey service (shortcut for `account login`)
-  \x1b[1mbrowse\x1b[0m [page]            Open the User Console in your default browser
+  \x1b[1mweb\x1b[0m [page]               Open the User Console in your default browser
+  \x1b[1mmaster\x1b[0m [page]            Open the Master Console (admin) in your default browser
   \x1b[1mdoctor\x1b[0m                   Check system health, connectivity, and configuration
   \x1b[1menv\x1b[0m [command]            View or set proxy environment variables
   \x1b[1mproxy\x1b[0m <command>          Manage the local proxy process
@@ -165,16 +166,25 @@ enum Commands {
         email: Option<String>,
     },
     /// Open the User Console in your default browser
-    #[command(display_order = 6)]
-    Browse {
+    #[command(alias = "browse", display_order = 6)]
+    Web {
         /// Page to open: overview (default), keys, account, usage
         page: Option<String>,
         /// Override port for dev mode (e.g. --port 3000 for Vite dev server)
         #[arg(long)]
         port: Option<u16>,
     },
-    /// Check system health, connectivity, and configuration
+    /// Open the Master Console (admin) in your default browser
     #[command(display_order = 7)]
+    Master {
+        /// Page to open: dashboard (default), seats, virtual-keys, bindings, providers, events, usage
+        page: Option<String>,
+        /// Override port for dev mode (e.g. --port 3000 for Vite dev server)
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Check system health, connectivity, and configuration
+    #[command(display_order = 8)]
     Doctor,
     /// View or set proxy environment variables
     #[command(display_order = 8)]
@@ -528,7 +538,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // All top-level subcommand names for fuzzy matching.
             const KNOWN: &[&str] = &[
                 "add", "get", "delete", "list", "update", "test", "export",
-                "run", "use", "whoami", "login", "logout", "browse",
+                "run", "use", "whoami", "login", "logout", "web", "browse", "master",
                 "init", "doctor", "env", "key", "account", "secret",
                 "project", "proxy",
                 "change-password", "quickstart", "logs",
@@ -700,7 +710,8 @@ fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Login { .. } => "account.login".to_string(),
             Commands::Logout => "account.logout".to_string(),
             Commands::Env { .. } => "env".to_string(),
-            Commands::Browse { .. } => "browse".to_string(),
+            Commands::Web { .. } => "web".to_string(),
+            Commands::Master { .. } => "master".to_string(),
             Commands::Doctor => "doctor".to_string(),
             Commands::Proxy { action } => format!("proxy.{}", match action {
                 ProxyAction::Start { .. } => "start",
@@ -861,6 +872,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             if storage::get_salt().is_ok() {
                 if let Err(e) = executor::verify_vault_password(&password) {
                     if cli.json { json_output::error(&e, 1); } else { return Err(e.into()); }
+                }
+
+                // Early alias check: fail fast before asking for API key, provider, etc.
+                // Why: without this, users go through the entire interactive flow (API key,
+                // provider selection, connectivity test, confirmation) only to get
+                // "already exists" at the final write step.
+                if let Ok(true) = storage::entry_exists(alias) {
+                    let msg = format!("API Key '{}' already exists. Use 'aikey update {}' to modify it.", alias, alias);
+                    if cli.json { json_output::error(&msg, 1); } else { return Err(msg.into()); }
                 }
             }
 
@@ -2357,8 +2377,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Browse { page, port } => {
+        Commands::Web { page, port } => {
             commands_account::handle_browse(page.as_deref(), *port, cli.json)?;
+        }
+        Commands::Master { page, port } => {
+            commands_account::handle_master_browse(page.as_deref(), *port, cli.json)?;
         }
         Commands::Status => {
             commands_account::handle_status_overview(cli.json)?;
@@ -2589,13 +2612,14 @@ Notes:
       4. interactive prompt
     - --email pre-fills the login page."),
 
-        "browse" => Some("\
+        "web" | "browse" => Some("\
 Notes:
     - PAGE: overview | keys | account | usage
-    - In local mode, AiKey can open the local console directly.
-    - In team/trial mode, AiKey requires a valid account session.
+    - In local/trial mode, opens the local console directly.
+    - In team mode, requires a valid account session.
     - If the control URL is local, AiKey may auto-detect common dev ports such as 3000 and 5173.
-    - --port forces a specific local web port."),
+    - --port forces a specific local web port.
+    - `aikey browse` is an alias for `aikey web`."),
 
         "doctor" => Some("\
 Notes:
@@ -2724,7 +2748,8 @@ Commands:
   {b}test{r} <alias>             Test whether a stored API key alias is working
   {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
   {b}login{r}                    Log in to aikey service (shortcut for `account login`)
-  {b}browse{r} [page]            Open the User Console in your default browser
+  {b}web{r} [page]               Open the User Console in your default browser
+  {b}master{r} [page]            Open the Master Console (admin) in your default browser
   {b}doctor{r}                   Check system health, connectivity, and configuration
   {b}env{r} [command]            View or set proxy environment variables
   {b}proxy{r} <command>          Manage the local proxy process
@@ -2838,19 +2863,36 @@ Detailed Commands
       4. interactive prompt
     - --email pre-fills the login page.
 
-[1mbrowse[0m
+[1mweb[0m
   Open the User Console in the default browser.
 
   Usage:
-    aikey browse [--port <PORT>] [PAGE]
+    aikey web [--port <PORT>] [PAGE]
+
+  Aliases:
+    aikey browse
 
   Arguments:
     PAGE: overview | keys | account | usage
 
   Notes:
-    - In local mode, AiKey can open the local console directly.
-    - In team/trial mode, AiKey requires a valid account session.
+    - In local/trial mode, opens the local console directly.
+    - In team mode, requires a valid account session.
     - If the control URL is local, AiKey may auto-detect common dev ports such as 3000 and 5173.
+    - --port forces a specific local web port.
+
+[1mmaster[0m
+  Open the Master Console (admin) in the default browser.
+
+  Usage:
+    aikey master [--port <PORT>] [PAGE]
+
+  Arguments:
+    PAGE: dashboard | seats | virtual-keys | bindings | providers | events | usage
+
+  Notes:
+    - The Master Console requires admin login (handled by the web frontend).
+    - URL is resolved from install-state.json, stored account, or --port.
     - --port forces a specific local web port.
 
 [1mdoctor[0m
@@ -3283,16 +3325,38 @@ fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Res
     let vault_exists = storage::get_vault_path()
         .map(|p| p.exists())
         .unwrap_or(false);
-    let prompt = if vault_exists {
-        "\u{1F512} Enter Master Password: "
+
+    // Check if vault has a salt (= previously initialized with a password).
+    // A vault file may exist but be empty (e.g., session backend created it before init).
+    let vault_initialized = vault_exists && storage::get_salt().is_ok();
+
+    if vault_initialized {
+        // Existing vault — just ask for the password
+        prompt_password_secure("\u{1F512} Enter Master Password: ", password_stdin, json_mode)
     } else {
+        // No vault or empty vault (fresh install / --clear-install / no keys yet)
+        // Why confirm: prevent typos from locking the user out permanently.
         if !json_mode && !password_stdin && std::env::var("AK_TEST_PASSWORD").is_err() {
-            eprintln!("Welcome to aikey! No vault found — setting up for the first time.");
-            eprintln!("Choose a master password to protect your API Keys (you cannot recover it if lost).");
+            eprintln!();
+            eprintln!("  \u{1F510} No vault found — setting up for the first time.");
+            eprintln!("  Choose a master password to protect your API Keys.");
+            eprintln!("  \u{26A0}\u{FE0F}  This password cannot be recovered if lost.");
+            eprintln!();
+
+            // Confirm password to prevent typo lockout
+            loop {
+                let pw1 = prompt_password_secure("\u{1F512} Set Master Password: ", false, false)?;
+                let pw2 = prompt_password_secure("\u{1F512} Confirm Master Password: ", false, false)?;
+                if pw1.expose_secret() == pw2.expose_secret() {
+                    return Ok(pw1);
+                }
+                eprintln!("  Passwords do not match. Please try again.\n");
+            }
+        } else {
+            // Non-interactive or test mode — single prompt, no confirm
+            prompt_password_secure("\u{1F512} Set Master Password: ", password_stdin, json_mode)
         }
-        "\u{1F512} Set Master Password: "
-    };
-    prompt_password_secure(prompt, password_stdin, json_mode)
+    }
 }
 
 fn prompt_password_secure(prompt: &str, password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {

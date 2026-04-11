@@ -620,7 +620,7 @@ pub fn handle_account_status(json_mode: bool) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// `aikey browse [page] [--port PORT]` — open User Console in the default browser with auth.
+/// `aikey web [page] [--port PORT]` — open User Console in the default browser with auth.
 ///
 /// In local-user mode (personal edition, installed with `--with-console`),
 /// opens the console directly without JWT — reads `install-state.json` to
@@ -632,7 +632,7 @@ pub fn handle_account_status(json_mode: bool) -> Result<(), Box<dyn std::error::
 ///
 /// When `control_url` points to localhost, automatically probes common dev-server
 /// ports (3000, 5173) and prefers the first one that responds.  This lets
-/// `aikey browse` work in both dev and production without extra flags.
+/// `aikey web` work in both dev and production without extra flags.
 pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Local-user mode: open console directly without JWT.
     // Why: personal edition has no login flow — LocalIdentityMiddleware handles
@@ -693,6 +693,65 @@ pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> 
     Ok(())
 }
 
+/// `aikey master [page] [--port PORT]` — open Master Console in the default browser.
+///
+/// Resolves the control panel URL from install-state.json or the stored
+/// platform account, then opens `/master/<page>` in the browser.
+/// Master console always requires admin login (handled by the web frontend).
+pub fn handle_master_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let path = match page {
+        Some("seats")                          => "/master/orgs/default/seats",
+        Some("keys" | "virtual-keys")          => "/master/orgs/default/virtual-keys",
+        Some("bindings")                       => "/master/orgs/default/bindings",
+        Some("providers" | "provider-accounts") => "/master/orgs/default/provider-accounts",
+        Some("events" | "control-events")      => "/master/orgs/default/control-events",
+        Some("usage" | "usage-ledger")         => "/master/orgs/default/usage-ledger",
+        Some("dashboard") | None               => "/master/dashboard",
+        Some(other) => {
+            return Err(format!(
+                "Unknown page '{}'. Available: dashboard, seats, virtual-keys, bindings, providers, events, usage",
+                other
+            ).into());
+        }
+    };
+
+    // Resolve base URL: --port flag > install-state > stored account > error.
+    let base_url = if let Some(p) = port {
+        format!("http://localhost:{}", p)
+    } else if let Some(url) = try_local_control_url() {
+        url
+    } else if let Ok(Some(acc)) = storage::get_platform_account() {
+        acc.control_url.clone()
+    } else {
+        return Err("No control panel URL found. Run 'aikey login' or use --port.".into());
+    };
+
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+
+    if json_mode {
+        crate::json_output::print_json(serde_json::json!({
+            "ok": true,
+            "url": &url,
+        }));
+    } else {
+        println!("Opening Master Console...");
+        println!("  {}", url);
+    }
+
+    open_url_silently(&url);
+    Ok(())
+}
+
+/// Returns the `control_panel_url` from install-state.json if available.
+fn try_local_control_url() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let state_path = home.join(".aikey").join("install-state.json");
+    let content = std::fs::read_to_string(&state_path).ok()?;
+    let state: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let url = state.get("control_panel_url")?.as_str()?;
+    if url.is_empty() { None } else { Some(url.to_string()) }
+}
+
 /// Try to resolve a local-user browse URL from install-state.json.
 ///
 /// Returns `Some(full_url)` if `control_plane_mode == "local"` and
@@ -704,7 +763,10 @@ fn try_local_browse_url(page: Option<&str>) -> Option<String> {
     let state: serde_json::Value = serde_json::from_str(&content).ok()?;
 
     let mode = state.get("control_plane_mode")?.as_str()?;
-    if mode != "local" {
+    // Why: "local" and "trial" both run the control panel on the same machine.
+    // Open the browser directly and let the web frontend handle auth — the CLI
+    // should not gatekeep when the server is local.
+    if mode != "local" && mode != "trial" {
         return None;
     }
 
@@ -724,7 +786,7 @@ fn try_local_browse_url(page: Option<&str>) -> Option<String> {
     Some(format!("{}{}", base_url.trim_end_matches('/'), path))
 }
 
-/// Determine the base URL for `aikey browse`.
+/// Determine the base URL for `aikey web`.
 ///
 /// Priority:
 ///   1. Explicit `--port` flag  →  `http://localhost:<port>`

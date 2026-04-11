@@ -182,7 +182,7 @@ fn interactive_select(
     write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
 
     // Hint line (no trailing newline — cursor stays here).
-    write!(out, "  [\u{2191}\u{2193} move, Enter select, Esc cancel]")?;
+    write!(out, "  [\u{2191}\u{2193} move, \x1b[1;33mEnter\x1b[0m select, Esc cancel]")?;
     out.flush()?;
 
     // Layout:
@@ -222,7 +222,7 @@ fn interactive_select(
     Ok(result)
 }
 
-enum Key { Up, Down, Enter, Space, Escape, CtrlC, Other }
+enum Key { Up, Down, Enter, Space, Escape, CtrlC, Char(char), Other }
 
 #[cfg(unix)]
 fn read_key(tty: &std::fs::File) -> io::Result<Key> {
@@ -254,6 +254,7 @@ fn read_key(tty: &std::fs::File) -> io::Result<Key> {
                 Ok(Key::Escape)
             }
         }
+        c if c.is_ascii_graphic() => Ok(Key::Char(c as char)),
         _ => Ok(Key::Other),
     }
 }
@@ -373,7 +374,9 @@ fn interactive_multi_select(title: &str, items: &[String], initially_checked: &[
     write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
     for (i, item) in items.iter().enumerate() { write!(out, "{}\r\n", format_multi_row(item, i == cursor, checked[i], inner_w))?; }
     write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
-    write!(out, "  [\u{2191}\u{2193} move, Space toggle, Enter confirm, Esc cancel]")?;
+    // Why bold+yellow for Space/Enter: they are the primary action keys that
+    // users need to notice — Space to toggle selection, Enter to confirm.
+    write!(out, "  [\u{2191}\u{2193} move, \x1b[1;33mSpace\x1b[0m toggle, \x1b[1;33mEnter\x1b[0m confirm, Esc cancel]")?;
     out.flush()?;
 
     let result = loop {
@@ -480,8 +483,20 @@ fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inn
             format!("{}    {} {} \x1b[90m{}\x1b[0m{}", cursor_mark, radio, label_padded, c.source_type, active)
         }
         TreeRow::Separator => { format!("  {}", "\u{2500}".repeat(pad_target.saturating_sub(2))) }
-        TreeRow::Confirm => { let s = if is_cursor { "\x1b[1;32m" } else { "\x1b[32m" }; format!("{}{}Confirm\x1b[0m", cursor_mark, s) }
-        TreeRow::Cancel => { let s = if is_cursor { "\x1b[1;33m" } else { "\x1b[33m" }; format!("{}{}Cancel\x1b[0m", cursor_mark, s) }
+        TreeRow::Confirm => {
+            if is_cursor {
+                format!("{}\x1b[1;32mConfirm\x1b[0m \x1b[90m(press Enter to confirm)\x1b[0m", cursor_mark)
+            } else {
+                format!("{}\x1b[32mConfirm \x1b[33m(Y)\x1b[0m", cursor_mark)
+            }
+        }
+        TreeRow::Cancel => {
+            if is_cursor {
+                format!("{}\x1b[1;33mCancel\x1b[0m \x1b[90m(press Enter to cancel)\x1b[0m", cursor_mark)
+            } else {
+                format!("{}\x1b[33mCancel \x1b[33m(N)\x1b[0m", cursor_mark)
+            }
+        }
     };
     format!("  \u{2502}  {}  \u{2502}", pad_visible(&content, pad_target))
 }
@@ -527,7 +542,7 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
         write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
         for (i, row) in rows.iter().enumerate() { write!(out, "{}\r\n", format_tree_row(row, groups, i == cursor, inner_w))?; }
         write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
-        write!(out, "  [\u{2191}\u{2193} move, Enter select/expand, Esc cancel]\r\n")?;
+        write!(out, "  [\u{2191}\u{2193} move, \x1b[1;33mSpace\x1b[0m select/expand, \x1b[1;33mY\x1b[0m confirm, \x1b[1;33mN\x1b[0m cancel]\r\n")?;
         out.flush()?;
 
         let key = read_key(&tty)?;
@@ -540,13 +555,36 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
         match key {
             Key::Up => { let mut n = cursor; loop { if n == 0 { break; } n -= 1; if is_focusable(&rows[n]) { cursor = n; break; } } }
             Key::Down => { let mut n = cursor; loop { if n + 1 >= total { break; } n += 1; if is_focusable(&rows[n]) { cursor = n; break; } } }
-            Key::Enter | Key::Space => {
+            Key::Space => {
+                // Space: select/expand on items; confirm/cancel on action rows
                 match &rows[cursor] {
                     TreeRow::Provider(gi) => { groups[*gi].expanded = !groups[*gi].expanded; }
                     TreeRow::Candidate(gi, ci) => { groups[*gi].selected = Some(*ci); }
                     TreeRow::Confirm => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Confirmed(groups.clone())); }
                     TreeRow::Cancel => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Cancelled); }
                     TreeRow::Separator => {}
+                }
+            }
+            Key::Enter => {
+                // Enter: only activates Confirm/Cancel when focused on them;
+                // on item rows, behaves same as Space (select/expand)
+                match &rows[cursor] {
+                    TreeRow::Provider(gi) => { groups[*gi].expanded = !groups[*gi].expanded; }
+                    TreeRow::Candidate(gi, ci) => { groups[*gi].selected = Some(*ci); }
+                    TreeRow::Confirm => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Confirmed(groups.clone())); }
+                    TreeRow::Cancel => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Cancelled); }
+                    TreeRow::Separator => {}
+                }
+            }
+            // Y/N shortcuts: jump cursor to Confirm/Cancel row
+            Key::Char('y') | Key::Char('Y') => {
+                if let Some(pos) = rows.iter().position(|r| matches!(r, TreeRow::Confirm)) {
+                    cursor = pos;
+                }
+            }
+            Key::Char('n') | Key::Char('N') => {
+                if let Some(pos) = rows.iter().position(|r| matches!(r, TreeRow::Cancel)) {
+                    cursor = pos;
                 }
             }
             Key::Escape | Key::CtrlC => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Cancelled); }
