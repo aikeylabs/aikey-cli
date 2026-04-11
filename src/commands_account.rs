@@ -698,7 +698,7 @@ pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> 
 /// Resolves the control panel URL from install-state.json or the stored
 /// platform account, then opens `/master/<page>` in the browser.
 /// Master console always requires admin login (handled by the web frontend).
-pub fn handle_master_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_master_browse(page: Option<&str>, url_override: Option<&str>, port: Option<u16>, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     let path = match page {
         Some("seats")                          => "/master/orgs/default/seats",
         Some("keys" | "virtual-keys")          => "/master/orgs/default/virtual-keys",
@@ -715,15 +715,27 @@ pub fn handle_master_browse(page: Option<&str>, port: Option<u16>, json_mode: bo
         }
     };
 
-    // Resolve base URL: --port flag > install-state > stored account > error.
-    let base_url = if let Some(p) = port {
+    // Resolve base URL: --url > --port > install-state > stored account > interactive prompt.
+    let base_url = if let Some(u) = url_override {
+        u.to_string()
+    } else if let Some(p) = port {
         format!("http://localhost:{}", p)
     } else if let Some(url) = try_local_control_url() {
         url
     } else if let Ok(Some(acc)) = storage::get_platform_account() {
         acc.control_url.clone()
+    } else if !json_mode && std::io::stdin().is_terminal() {
+        // Interactive prompt with a sensible default
+        use std::io::Write;
+        let default = "http://localhost:8090";
+        print!("Control Panel URL [{}]: ", default);
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+        if input.is_empty() { default.to_string() } else { input.to_string() }
     } else {
-        return Err("No control panel URL found. Run 'aikey login' or use --port.".into());
+        return Err("No control panel URL found. Use --url <url> or --port <port>.".into());
     };
 
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);

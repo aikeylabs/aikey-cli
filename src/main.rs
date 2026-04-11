@@ -179,7 +179,10 @@ enum Commands {
     Master {
         /// Page to open: dashboard (default), seats, virtual-keys, bindings, providers, events, usage
         page: Option<String>,
-        /// Override port for dev mode (e.g. --port 3000 for Vite dev server)
+        /// Control panel URL (e.g. --url http://192.168.1.100:3000)
+        #[arg(long)]
+        url: Option<String>,
+        /// Override port on localhost (e.g. --port 8090 for trial)
         #[arg(long)]
         port: Option<u16>,
     },
@@ -2380,8 +2383,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Web { page, port } => {
             commands_account::handle_browse(page.as_deref(), *port, cli.json)?;
         }
-        Commands::Master { page, port } => {
-            commands_account::handle_master_browse(page.as_deref(), *port, cli.json)?;
+        Commands::Master { page, url, port } => {
+            commands_account::handle_master_browse(page.as_deref(), url.as_deref(), *port, cli.json)?;
         }
         Commands::Status => {
             commands_account::handle_status_overview(cli.json)?;

@@ -502,6 +502,8 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     let mut any_failed = false;
     // Deferred connectivity test — run after emit closure is dropped.
     let mut deferred_connectivity: Option<(Vec<(String, String)>, String)> = None;
+    // Per-provider keys for multi-binding doctor tests.
+    let mut deferred_keys: Option<Vec<(String, String)>> = None;
 
     // Helper: print one check row, collect for JSON.
     // label is left-padded to 18 chars; detail is the right-hand info string.
@@ -527,12 +529,20 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // ── 1. Internet connectivity ─────────────────────────────
+    // Why HTTP GET instead of TCP ping: users behind an HTTP proxy (e.g.
+    // upstream_proxy in proxy config) can reach the internet via HTTP but
+    // direct TCP to 1.1.1.1:443 is blocked, causing a false "unreachable".
     {
-        let r = tcp_ping("1.1.1.1", 443, 3);
+        let start = Instant::now();
+        let ok = build_proxy_aware_agent(std::time::Duration::from_secs(5))
+            .head("https://www.gstatic.com/generate_204")
+            .call()
+            .is_ok();
+        let ms = start.elapsed().as_millis();
         emit("internet",
-            r.0,
-            &if r.0 { format!("reachable  ({} ms)", r.1) } else { "unreachable".to_string() },
-            if r.0 { None } else { Some("check network connection or VPN") });
+            ok,
+            &if ok { format!("reachable  ({} ms)", ms) } else { "unreachable".to_string() },
+            if ok { None } else { Some("check network connection or VPN") });
     }
 
     // ── 2. Vault ─────────────────────────────────────────────
@@ -596,51 +606,63 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // ── 5. Provider + proxy connectivity ────────────────────
+    // Why: reuses the same all-bindings approach as `aikey test` (no alias)
+    // so that doctor shows every configured provider, not just the active key.
     if proxy_up {
-        let base = format!("http://{}", proxy_addr);
+        let bindings = storage::list_provider_bindings(
+            crate::profile_activation::DEFAULT_PROFILE,
+        ).unwrap_or_default();
 
-        // Fetch the active key's provider list from proxy metadata.
-        let targets: Vec<(String, String)> = ureq::get(&format!("{}/health/provider-targets", base))
-            .call()
-            .ok()
-            .and_then(|r| r.into_json::<serde_json::Value>().ok())
-            .and_then(|j| {
-                j["targets"].as_array().map(|arr| {
-                    arr.iter()
-                        .filter_map(|t| {
-                            let p = t["provider"].as_str()?.to_string();
-                            let u = t["base_url"].as_str()?.to_string();
-                            Some((p, u))
-                        })
-                        .collect()
-                })
-            })
-            .unwrap_or_default();
-
-        if targets.is_empty() {
+        if bindings.is_empty() {
             if !json_mode {
                 println!("  {} {:<18} {}",
                     "·".dimmed(), "providers",
-                    "no active key — run 'aikey use' first".dimmed());
+                    "no provider bindings — run 'aikey add' first".dimmed());
             }
         } else {
-            // Try to decrypt the active personal key for direct API probes.
-            // Uses session-cached password if available; skips API probe otherwise
-            // (ping + proxy test still run).
-            let api_key = crate::session::try_get()
-                .and_then(|pw| {
-                    let cfg = crate::storage::get_active_key_config().ok()??;
-                    if cfg.key_type == "personal" {
-                        crate::executor::get_secret(&cfg.key_ref, &pw).ok()
-                            .map(|z| z.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default();
+            struct DoctorItem { provider: String, url: String, key: String }
+            let mut items: Vec<DoctorItem> = Vec::new();
 
-            // Deferred: run after emit closure is dropped (borrow conflict).
-            deferred_connectivity = Some((targets, api_key));
+            let pw = crate::session::try_get();
+            for b in &bindings {
+                if b.key_source_type == "personal" {
+                    if let Some(ref pw) = pw {
+                        if let Ok(kv) = crate::executor::get_secret(&b.key_source_ref, pw) {
+                            let bu = storage::get_entry_base_url(&b.key_source_ref)
+                                .unwrap_or(None);
+                            let url = bu.as_deref()
+                                .or_else(|| default_base_url(&b.provider_code))
+                                .unwrap_or("https://unknown")
+                                .to_string();
+                            items.push(DoctorItem {
+                                provider: b.provider_code.clone(),
+                                url,
+                                key: kv.to_string(),
+                            });
+                        }
+                    }
+                }
+                // team keys: tested via proxy only (no decryption needed here)
+            }
+
+            if items.is_empty() {
+                if !json_mode {
+                    println!("  {} {:<18} {}",
+                        "·".dimmed(), "providers",
+                        "no decryptable keys (password not cached?)".dimmed());
+                }
+            } else {
+                let targets: Vec<(String, String)> = items.iter()
+                    .map(|i| (i.provider.clone(), i.url.clone()))
+                    .collect();
+                // For multi-key doctor: test each provider with its own key.
+                // Deferred: run after emit closure is dropped (borrow conflict).
+                deferred_connectivity = Some((targets, String::new()));
+                // Store per-provider keys for deferred use.
+                deferred_keys = Some(items.into_iter()
+                    .map(|i| (i.provider, i.key))
+                    .collect());
+            }
         }
     }
 
@@ -722,10 +744,15 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // Drop emit to release &mut results, then run deferred connectivity test.
     drop(emit);
 
-    if let Some((targets, api_key)) = deferred_connectivity {
-        let suite = run_connectivity_test(&targets, &api_key, json_mode);
-        if json_mode {
-            results.extend(suite.json_results);
+    if let Some((targets, _)) = deferred_connectivity {
+        if let Some(keys) = deferred_keys {
+            // Multi-binding mode: test each provider with its own key.
+            run_multi_key_connectivity_test(&targets, &keys, json_mode, &mut results);
+        } else {
+            let suite = run_connectivity_test(&targets, "", json_mode);
+            if json_mode {
+                results.extend(suite.json_results);
+            }
         }
     }
 
@@ -934,6 +961,14 @@ pub fn test_provider_connectivity(
     }
     if provider_code == "anthropic" {
         req = req.set("anthropic-version", "2023-06-01");
+    }
+    // Why: KIMI Coding API (api.kimi.com/coding/v1) requires a User-Agent
+    // matching its coding-agent whitelist (e.g. "claude-code", "kimi-cli").
+    // Without it, KIMI returns access_terminated_error (HTTP 403).
+    // We use "claude-code/1.0 (aikey)" to satisfy the whitelist while
+    // identifying ourselves. This only affects the connectivity probe.
+    if provider_code == "kimi" {
+        req = req.set("User-Agent", "claude-code/1.0");
     }
     let chat_result = req.send_string(&body.to_string());
     let chat_ms = chat_start.elapsed().as_millis();
@@ -1245,4 +1280,89 @@ pub fn run_connectivity_test(
     }
 
     TestSuiteResult { json_results: Vec::new(), any_chat_ok }
+}
+
+/// Run connectivity tests with per-provider API keys (used by `aikey doctor`).
+/// Each target is tested with its own key from the `keys` map.
+fn run_multi_key_connectivity_test(
+    targets: &[(String, String)],
+    keys: &[(String, String)],
+    json_mode: bool,
+    results: &mut Vec<serde_json::Value>,
+) {
+    use colored::Colorize;
+    use std::io::Write;
+
+    let key_map: std::collections::HashMap<&str, &str> = keys.iter()
+        .map(|(p, k)| (p.as_str(), k.as_str()))
+        .collect();
+
+    if json_mode {
+        for (code, url) in targets {
+            let api_key = key_map.get(code.as_str()).copied().unwrap_or("");
+            let r = test_provider_connectivity(code, url, api_key);
+            results.push(serde_json::json!({
+                "provider": code, "base_url": url,
+                "ping_ok": r.ping_ok, "ping_ms": r.ping_ms,
+                "api_ok": r.api_ok, "api_ms": r.api_ms, "api_status": r.api_status,
+                "chat_ok": r.chat_ok, "chat_ms": r.chat_ms, "chat_status": r.chat_status,
+            }));
+        }
+        return;
+    }
+
+    // Interactive table — same layout as run_connectivity_test / aikey test.
+    const W_PROV: usize = 12; const W_PING: usize = 16; const W_API: usize = 30;
+    eprintln!("  {:<wp$} {:<wpi$} {:<wap$} {}",
+        "Provider".dimmed(), "Ping".dimmed(), "API".dimmed(), "Chat".dimmed(),
+        wp = W_PROV, wpi = W_PING, wap = W_API);
+    eprintln!("  {}", "\u{2500}".repeat(W_PROV + W_PING + W_API + 20).dimmed());
+
+    let mut any_reachable = false;
+    for (code, url) in targets {
+        let api_key = key_map.get(code.as_str()).copied().unwrap_or("");
+        eprint!("  {:<wp$} ", code.bold(), wp = W_PROV);
+        let _ = std::io::stderr().flush();
+        let r = test_provider_connectivity(code, url, api_key);
+
+        // Ping column
+        let ping_raw = if r.ping_ok { format!("ok ({}ms)", r.ping_ms) } else { format!("fail ({}ms)", r.ping_ms) };
+        let ping_col = if r.ping_ok { format!("{:<w$}", ping_raw, w = W_PING).green().to_string() } else { format!("{:<w$}", ping_raw, w = W_PING).red().to_string() };
+        eprint!("{} ", ping_col); let _ = std::io::stderr().flush();
+
+        if !r.ping_ok {
+            eprintln!("{:<w$} {}", "\u{2014}".dimmed(), "\u{2014}".dimmed(), w = W_API);
+        } else {
+            any_reachable = true;
+            // API column
+            let api_raw = if r.api_ok { let h = r.api_status.map(|s| api_status_hint(s)).unwrap_or_default(); format!("ok ({}ms, {})", r.api_ms, h) } else { format!("fail ({}ms)", r.api_ms) };
+            let api_col = if r.api_ok { format!("{:<w$}", api_raw, w = W_API).green().to_string() } else { format!("{:<w$}", api_raw, w = W_API).red().to_string() };
+            eprint!("{} ", api_col); let _ = std::io::stderr().flush();
+            // Chat column
+            if !r.api_ok {
+                eprintln!("{}", "\u{2014}".dimmed());
+            } else if r.chat_ok {
+                let hint = r.chat_status.map(|s| chat_status_hint(s)).unwrap_or_default();
+                eprintln!("{}", format!("ok ({}ms, {})", r.chat_ms, hint).green());
+            } else {
+                eprintln!("{}", format!("fail ({}ms)", r.chat_ms).red());
+            }
+        }
+    }
+
+    // Proxy test
+    eprintln!();
+    if !any_reachable {
+        eprintln!("  {:<12} {}", "proxy".bold(), "skipped (all providers unreachable)".dimmed());
+    } else if crate::commands_proxy::is_proxy_running() {
+        let proxy_addr = crate::commands_proxy::doctor_proxy_addr();
+        if let Some(prov) = targets.iter().find(|(c, _)| c != "custom").map(|(c, _)| c.as_str()) {
+            eprint!("  {:<12} ", "proxy".bold());
+            let r = test_proxy_connectivity(&proxy_addr, prov);
+            if r.ok { let h = r.status.map(|s| proxy_status_hint(s)).unwrap_or_default(); eprintln!("{} ({} ms, {})", "ok".green(), r.ms, h); }
+            else { eprintln!("{} ({} ms)", "failed".red(), r.ms); }
+        }
+    } else {
+        eprintln!("  {:<12} {}", "proxy".bold(), "not running".dimmed());
+    }
 }
