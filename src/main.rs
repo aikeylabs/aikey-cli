@@ -1171,19 +1171,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Version-gated sync: only prompt for Master Password when the
             // server has changes (new keys, status updates, etc.).
             // No password needed when version is unchanged (most common case).
-            match commands_account::check_sync_version_changed() {
-                Ok(true) => {
-                    // Server has new data — need password for full sync (claim + encrypt).
-                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
-                    let _ = commands_account::run_full_snapshot_sync(&password);
-                }
-                Ok(false) => {
-                    // Already up-to-date — no sync needed, no password.
-                }
-                Err(_) => {
-                    // Server unreachable (timeout / network error) — skip sync,
-                    // show local cache as-is.
-                }
+            // Force sync when local cache is empty but user is logged in —
+            // version match alone is insufficient (cache may have been cleared
+            // or previously synced under the wrong identity).
+            let cache_empty = storage::list_virtual_key_cache().map(|c| c.is_empty()).unwrap_or(true);
+            let logged_in = storage::get_platform_account().ok().flatten().is_some();
+            let needs_sync = if cache_empty && logged_in {
+                true
+            } else {
+                commands_account::check_sync_version_changed().unwrap_or(false)
+            };
+            if needs_sync {
+                let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+                let _ = commands_account::run_full_snapshot_sync(&password);
             }
 
             // Only active keys are shown; revoked / recycled / expired keys
