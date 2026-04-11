@@ -14,6 +14,7 @@ mod commands_project;
 // mod commands_env; // removed: env commands dropped
 mod commands_proxy;
 mod commands_account;
+mod migrations;
 mod platform_client;
 // mod profiles; // removed: profile commands dropped
 // mod core; // removed: profile-based resolver dropped
@@ -59,6 +60,7 @@ Commands:
   \x1b[1mdoctor\x1b[0m                   Check system health, connectivity, and configuration
   \x1b[1menv\x1b[0m [command]            View or set proxy environment variables
   \x1b[1mproxy\x1b[0m <command>          Manage the local proxy process
+  \x1b[1mstatus\x1b[0m                   Show a summary of gateway, login, keys, and providers
   \x1b[1mwhoami\x1b[0m                   Show your current login, active key, and vault status
   \x1b[1mget\x1b[0m <alias>              Retrieve a secret and copy it to the clipboard
   \x1b[1mrun\x1b[0m -- <command>         Run a command with secrets injected as environment variables
@@ -108,6 +110,12 @@ enum Commands {
     /// Initialize the vault (runs automatically on first use)
     #[command(hide = true)]
     Init,
+    /// Internal: database rollback for upgrade recovery (not shown in help)
+    #[command(hide = true)]
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
+    },
     /// Save a new secret to the vault
     #[command(display_order = 1)]
     Add {
@@ -180,6 +188,9 @@ enum Commands {
         #[command(subcommand)]
         action: ProxyAction,
     },
+    /// Show a summary of gateway, login, keys, and providers
+    #[command(display_order = 9)]
+    Status,
     /// Show your current login, active key, and vault status
     #[command(display_order = 9)]
     Whoami,
@@ -286,6 +297,18 @@ enum Commands {
     Secret {
         #[command(subcommand)]
         action: SecretAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbAction {
+    /// Apply pending schema upgrades for the current version
+    Upgrade,
+    /// Rollback database schema to a previous version
+    Rollback {
+        /// Target version to roll back to (e.g. v1.0.1-alpha)
+        #[arg(long)]
+        to: String,
     },
 }
 
@@ -632,6 +655,10 @@ fn command_name(cmd: Option<&Commands>) -> String {
         None => "unknown".to_string(),
         Some(c) => match c {
             Commands::Init => "init".to_string(),
+            Commands::Db { action } => format!("db.{}", match action {
+                DbAction::Upgrade => "upgrade",
+                DbAction::Rollback { .. } => "rollback",
+            }),
             Commands::Add { .. } => "add".to_string(),
             Commands::Get { .. } => "get".to_string(),
             Commands::Delete { .. } => "delete".to_string(),
@@ -662,6 +689,7 @@ fn command_name(cmd: Option<&Commands>) -> String {
                 KeyAction::Alias { .. } => "alias",
             }),
             Commands::Use { .. } => "key.use".to_string(),
+            Commands::Status => "status".to_string(),
             Commands::Whoami => "whoami".to_string(),
             Commands::Account { action } => format!("account.{}", match action {
                 AccountAction::Login { .. } => "login",
@@ -746,7 +774,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // is available in the environment.  Skipped for proxy lifecycle commands which
     // manage the process themselves, and for version/init which predate the proxy.
     match command {
-        Commands::Proxy { .. } | Commands::Init => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } => {}
         _ => { commands_proxy::try_auto_start_from_env(); }
     }
 
@@ -755,7 +783,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // lifecycle and init commands which either predate the vault or manage the
     // process themselves.
     match command {
-        Commands::Proxy { .. } | Commands::Init => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } => {}
         _ => { commands_account::try_background_snapshot_sync(); }
     }
 
@@ -787,6 +815,40 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }));
             } else {
                 println!("Vault initialized successfully!");
+            }
+        }
+        // Internal: database upgrade/rollback for schema management.
+        // Why hidden: operational tool for install scripts and rollback automation,
+        // not for end-user daily use. rollback.sh calls `aikey db rollback --to <ver>`
+        // using the CURRENT binary BEFORE restoring the old binary from backup.
+        Commands::Db { action } => {
+            match action {
+                DbAction::Upgrade => {
+                    eprintln!("[db upgrade] Applying pending vault schema upgrades...");
+                    let vault_path = storage::get_vault_path()
+                        .map_err(|e| format!("Failed to resolve vault path: {}", e))?;
+                    if !vault_path.exists() {
+                        eprintln!("[db upgrade] No vault.db found — nothing to upgrade");
+                        return Ok(());
+                    }
+                    let conn = rusqlite::Connection::open(&vault_path)
+                        .map_err(|e| format!("Failed to open vault: {}", e))?;
+                    migrations::upgrade_all(&conn)?;
+                    eprintln!("[db upgrade] Done");
+                }
+                DbAction::Rollback { to } => {
+                    eprintln!("[db rollback] Rolling back vault schema to {}", to);
+                    let vault_path = storage::get_vault_path()
+                        .map_err(|e| format!("Failed to resolve vault path: {}", e))?;
+                    if !vault_path.exists() {
+                        eprintln!("[db rollback] No vault.db found — nothing to rollback");
+                        return Ok(());
+                    }
+                    let conn = rusqlite::Connection::open(&vault_path)
+                        .map_err(|e| format!("Failed to open vault: {}", e))?;
+                    migrations::rollback_to(&conn, &to)?;
+                    eprintln!("[db rollback] Vault schema rolled back to {}", to);
+                }
             }
         }
         Commands::Add { alias, provider } => {
@@ -2280,6 +2342,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Browse { page, port } => {
             commands_account::handle_browse(page.as_deref(), *port, cli.json)?;
         }
+        Commands::Status => {
+            commands_account::handle_status_overview(cli.json)?;
+        }
         Commands::Whoami => {
             commands_account::handle_whoami(cli.json)?;
         }
@@ -2645,6 +2710,7 @@ Commands:
   {b}doctor{r}                   Check system health, connectivity, and configuration
   {b}env{r} [command]            View or set proxy environment variables
   {b}proxy{r} <command>          Manage the local proxy process
+  {b}status{r}                   Show a summary of gateway, login, keys, and providers
   {b}whoami{r}                   Show your current login, active key, and vault status
   {b}get{r} <alias>              Retrieve a secret and copy it to the clipboard
   {b}run{r} -- <command>         Run a command with secrets injected as environment variables
@@ -2837,6 +2903,18 @@ Detailed Commands
     [1mverify[0m
       Usage:
         aikey proxy verify
+
+[1mstatus[0m
+  Show a combined dashboard: gateway, login, keys, and providers.
+
+  Usage:
+    aikey status
+
+  Notes:
+    - Gateway section reuses `aikey proxy status` output.
+    - Keys section shows personal count, team count (total/active), and active key.
+    - Providers section lists all providers discovered from personal and team keys.
+    - Supports --json for structured output.
 
 [1mwhoami[0m
   Show the current local identity summary.

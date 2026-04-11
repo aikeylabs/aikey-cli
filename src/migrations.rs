@@ -1,0 +1,154 @@
+//! Database migrations for the CLI vault.
+//!
+//! Each version module has upgrade() and rollback() functions.
+//! Registry is ordered oldest → newest. Rollback walks newest → oldest.
+//!
+//! Adding a new version:
+//!   1. Create a `pub mod v1_0_3_alpha { ... }` with upgrade() + rollback()
+//!   2. Add it to VERSIONS array below
+//!   3. Call it from upgrade_all()
+
+use rusqlite::Connection;
+
+/// Version entry for the migration registry.
+struct VersionMigration {
+    version: &'static str,
+    upgrade: fn(&Connection) -> Result<(), String>,
+    rollback: fn(&Connection) -> Result<(), String>,
+}
+
+/// Ordered registry: oldest to newest. Each entry's rollback undoes its upgrade.
+static VERSIONS: &[VersionMigration] = &[
+    // v1.0.1-alpha is baseline — no migration needed (tables created by storage.rs init)
+    VersionMigration {
+        version: "1.0.2-alpha",
+        upgrade: v1_0_2_alpha::upgrade,
+        rollback: v1_0_2_alpha::rollback,
+    },
+    // Future versions:
+    // VersionMigration { version: "1.0.3-alpha", upgrade: v1_0_3_alpha::upgrade, rollback: v1_0_3_alpha::rollback },
+];
+
+/// Run all upgrades up to the current binary version.
+pub fn upgrade_all(conn: &Connection) -> Result<(), String> {
+    for v in VERSIONS {
+        (v.upgrade)(conn)?;
+    }
+    Ok(())
+}
+
+/// Rollback vault schema from current state down to target version.
+/// Walks the registry in reverse, calling rollback() for each version
+/// that is AFTER the target. Supports crossing multiple versions.
+///
+/// Example: current=v1.0.4, target=v1.0.1
+///   → rollback v1.0.4, v1.0.3, v1.0.2 (in that order)
+///   → stop (v1.0.1 is the target, not rolled back)
+pub fn rollback_to(conn: &Connection, target: &str) -> Result<(), String> {
+    let target_norm = target.strip_prefix('v').unwrap_or(target);
+
+    // Find the index of the target version (-1 means "before all versions" = rollback everything)
+    let target_idx = VERSIONS.iter().position(|v| v.version == target_norm);
+
+    // Collect versions to rollback: everything after target_idx, in reverse order
+    let start = match target_idx {
+        Some(idx) => idx + 1, // don't rollback the target itself
+        None => {
+            // Target not in registry — could be a baseline version (v1.0.1)
+            // or an unknown version. Rollback everything if target looks older.
+            // Why: v1.0.1-alpha is baseline (no entry in VERSIONS), rolling back
+            // to it means undoing ALL version migrations.
+            0
+        }
+    };
+
+    if start >= VERSIONS.len() {
+        eprintln!("[db rollback] Nothing to rollback (target={} is current or newer)", target);
+        return Ok(());
+    }
+
+    // Walk newest → oldest
+    for i in (start..VERSIONS.len()).rev() {
+        let v = &VERSIONS[i];
+        eprintln!("[db rollback] Rolling back {}", v.version);
+        (v.rollback)(conn)?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.2-alpha migrations
+// ---------------------------------------------------------------------------
+
+pub mod v1_0_2_alpha {
+    use rusqlite::Connection;
+
+    /// Forward migration: add user_profiles, user_profile_provider_bindings tables,
+    /// and refresh_token / token_expires_at columns to platform_account.
+    pub fn upgrade(conn: &Connection) -> Result<(), String> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS user_profiles (
+                id TEXT PRIMARY KEY,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )", [],
+        ).map_err(|e| format!("user_profiles: {}", e))?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO user_profiles (id, is_active) VALUES ('default', 1)", [],
+        ).map_err(|e| format!("seed default profile: {}", e))?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS user_profile_provider_bindings (
+                profile_id TEXT NOT NULL,
+                provider_code TEXT NOT NULL,
+                key_source_type TEXT NOT NULL,
+                key_source_ref TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                PRIMARY KEY (profile_id, provider_code),
+                FOREIGN KEY (profile_id) REFERENCES user_profiles(id)
+            )", [],
+        ).map_err(|e| format!("user_profile_provider_bindings: {}", e))?;
+
+        // Add OAuth columns to platform_account (idempotent via pragma check)
+        for (col, ddl) in &[
+            ("refresh_token", "ALTER TABLE platform_account ADD COLUMN refresh_token TEXT"),
+            ("token_expires_at", "ALTER TABLE platform_account ADD COLUMN token_expires_at INTEGER"),
+        ] {
+            let has_col: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('platform_account') WHERE name=?1",
+                    [col],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            if !has_col {
+                conn.execute(ddl, []).map_err(|e| format!("{}: {}", col, e))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reverse migration: drop tables added in v1.0.2.
+    /// platform_account columns cannot be dropped (SQLite limitation) — they stay
+    /// but are safely ignored by the v1.0.1 binary.
+    pub fn rollback(conn: &Connection) -> Result<(), String> {
+        let sqls = [
+            "DROP TABLE IF EXISTS user_profile_provider_bindings",
+            "DROP TABLE IF EXISTS user_profiles",
+        ];
+        for sql in &sqls {
+            match conn.execute(sql, []) {
+                Ok(_) => eprintln!("[db rollback] OK: {}", sql),
+                Err(e) => eprintln!("[db rollback] WARN: {} — {}", sql, e),
+            }
+        }
+        eprintln!("[db rollback] SKIP: platform_account.refresh_token (SQLite no DROP COLUMN)");
+        eprintln!("[db rollback] SKIP: platform_account.token_expires_at (SQLite no DROP COLUMN)");
+        Ok(())
+    }
+}

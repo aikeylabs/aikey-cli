@@ -860,6 +860,140 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `aikey status` — combined overview dashboard
+// ---------------------------------------------------------------------------
+
+pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeSet;
+
+    let vault_exists = storage::get_vault_path().map(|p| p.exists()).unwrap_or(false);
+    let account = storage::get_platform_account().ok().flatten();
+
+    // Collect key counts.
+    let personal_count = if vault_exists {
+        storage::list_entries().map(|v| v.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    let team_keys = storage::list_virtual_key_cache().unwrap_or_default();
+    let active_team = team_keys.iter().filter(|k| k.local_state == "active").count();
+    let team_total = team_keys.len();
+
+    // Collect unique providers from personal keys + team keys + bindings.
+    let mut providers = BTreeSet::new();
+    if vault_exists {
+        if let Ok(entries) = storage::list_entries_with_metadata() {
+            for e in &entries {
+                if let Some(ref pc) = e.provider_code {
+                    if !pc.is_empty() {
+                        providers.insert(pc.clone());
+                    }
+                }
+                if let Some(ref sp) = e.supported_providers {
+                    for p in sp {
+                        if !p.is_empty() {
+                            providers.insert(p.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for k in &team_keys {
+        if !k.provider_code.is_empty() {
+            providers.insert(k.provider_code.clone());
+        }
+        for p in &k.supported_providers {
+            if !p.is_empty() {
+                providers.insert(p.clone());
+            }
+        }
+    }
+
+    // Active key config.
+    let active_cfg = storage::get_active_key_config().ok().flatten();
+
+    if json_mode {
+        let active_json = active_cfg.as_ref().map(|cfg| serde_json::json!({
+            "key_type": cfg.key_type,
+            "key_ref":  cfg.key_ref,
+            "providers": cfg.providers,
+        }));
+        crate::json_output::print_json(serde_json::json!({
+            "gateway": {
+                "running": crate::commands_proxy::is_proxy_running(),
+            },
+            "login": {
+                "logged_in": account.is_some(),
+                "email": account.as_ref().map(|a| &a.email),
+                "control_url": account.as_ref().map(|a| &a.control_url),
+            },
+            "keys": {
+                "personal": personal_count,
+                "team_total": team_total,
+                "team_active": active_team,
+            },
+            "active_key": active_json,
+            "providers": providers.iter().collect::<Vec<_>>(),
+        }));
+        return Ok(());
+    }
+
+    // ── Gateway ─────────────────────────────────────────────────────────────
+    println!("{}", "Gateway".bold().underline());
+    crate::commands_proxy::handle_status()?;
+    println!();
+
+    // ── Login ───────────────────────────────────────────────────────────────
+    println!("{}", "Login".bold().underline());
+    match &account {
+        Some(a) => {
+            println!("status:  {}", "logged in".green());
+            println!("email:   {}", a.email.bold());
+            println!("server:  {}", a.control_url.dimmed());
+        }
+        None => {
+            println!("status:  {}", "not logged in".dimmed());
+            println!("hint:    run `aikey login` to connect to your team");
+        }
+    }
+    println!();
+
+    // ── Keys ────────────────────────────────────────────────────────────────
+    println!("{}", "Keys".bold().underline());
+    println!("personal:  {}", personal_count);
+    println!("team:      {} total, {} active", team_total, active_team);
+    match &active_cfg {
+        Some(cfg) => {
+            let prov_str = if cfg.providers.is_empty() {
+                "—".to_string()
+            } else {
+                cfg.providers.join(", ")
+            };
+            println!("active:    {} ({}) [{}]",
+                cfg.key_ref.bold(),
+                cfg.key_type.dimmed(),
+                prov_str.cyan());
+        }
+        None => {
+            println!("active:    {}", "none".dimmed());
+        }
+    }
+    println!();
+
+    // ── Providers ───────────────────────────────────────────────────────────
+    println!("{}", "Providers".bold().underline());
+    if providers.is_empty() {
+        println!("{}", "no providers configured".dimmed());
+        println!("hint:    add a key with `aikey add <alias> --provider <code>`");
+    } else {
+        println!("{}", providers.iter().cloned().collect::<Vec<_>>().join(", "));
+    }
+
+    Ok(())
+}
+
 pub fn handle_logout(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Scope-disable all team keys so the proxy stops routing them immediately.
     // Passing "" disables every row regardless of owner_account_id, since no
