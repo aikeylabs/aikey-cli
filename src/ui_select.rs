@@ -321,7 +321,7 @@ pub fn box_multi_select(
 }
 
 fn fallback_multi_select(items: &[String]) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
-    eprintln!("Select providers (comma-separated numbers):");
+    eprintln!("Select provider types (comma-separated numbers):");
     for (i, item) in items.iter().enumerate() { eprintln!("  [{}] {}", i + 1, item); }
     eprint!("Choice: "); io::stderr().flush()?;
     let mut input = String::new(); io::stdin().read_line(&mut input)?;
@@ -330,10 +330,11 @@ fn fallback_multi_select(items: &[String]) -> Result<MultiSelectResult, Box<dyn 
     if indices.is_empty() { Ok(MultiSelectResult::Cancelled) } else { Ok(MultiSelectResult::Confirmed(indices)) }
 }
 
-fn format_multi_row(item: &str, is_cursor: bool, is_checked: bool, inner_w: usize) -> String {
+fn format_multi_row(item: &str, index: usize, is_cursor: bool, is_checked: bool, inner_w: usize) -> String {
     let cursor_mark = if is_cursor { "\x1b[36;1m> \x1b[0m" } else { "  " };
     let check_mark = if is_checked { "\x1b[32m[\x1b[1m*\x1b[0m\x1b[32m]\x1b[0m" } else { "[ ]" };
-    let content = format!("{}{} {}", cursor_mark, check_mark, item);
+    let num = format!("\x1b[90m{}\x1b[0m", index + 1); // dim number
+    let content = format!("{}{} {} {}", cursor_mark, num, check_mark, item);
     let pad_target = inner_w.saturating_sub(4);
     format!("  \u{2502}  {}  \u{2502}", pad_visible(&content, pad_target))
 }
@@ -370,21 +371,82 @@ fn interactive_multi_select(title: &str, items: &[String], initially_checked: &[
     let mut cursor: usize = 0;
     let total = items.len();
 
+    // Hint states:
+    //   1. Nothing selected                     → guide first selection
+    //   2. Has selection, just selected (no move) → "toggle" (may want to undo)
+    //   3. Has selection, cursor on unselected   → "select" (guide adding more)
+    //   4. Has selection, cursor on selected     → "toggle" (guide deselect)
+    const HINT_INITIAL: &str =
+        "  \x1b[1;33mEnter\x1b[0m select \u{2022} \u{2191}\u{2193} move \u{2022} 1\u{2013}9 jump \u{2022} Esc cancel";
+    const HINT_TOGGLE: &str =
+        "  \x1b[1;33mEnter\x1b[0m to confirm \u{2022} \u{2191}\u{2193} select more \u{2022} Space/1\u{2013}9 toggle \u{2022} Esc cancel";
+    const HINT_SELECT_MORE: &str =
+        "  \x1b[1;33mEnter\x1b[0m to confirm \u{2022} Space/1\u{2013}9 select \u{2022} \u{2191}\u{2193} select more \u{2022} Esc cancel";
+
+    let mut has_moved = false;
+    let pick_hint = |checked: &[bool], cursor: usize, moved: bool| -> &'static str {
+        if !checked.iter().any(|&c| c) { return HINT_INITIAL; }
+        if !moved { return HINT_TOGGLE; }
+        if checked[cursor] { HINT_TOGGLE } else { HINT_SELECT_MORE }
+    };
+
     write!(out, "\x1b[?25l")?;
     write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
-    for (i, item) in items.iter().enumerate() { write!(out, "{}\r\n", format_multi_row(item, i == cursor, checked[i], inner_w))?; }
+    for (i, item) in items.iter().enumerate() { write!(out, "{}\r\n", format_multi_row(item, i, i == cursor, checked[i], inner_w))?; }
     write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
-    // Why bold+yellow for Space/Enter: they are the primary action keys that
-    // users need to notice — Space to toggle selection, Enter to confirm.
-    write!(out, "  [\u{2191}\u{2193} move, \x1b[1;33mSpace\x1b[0m toggle, \x1b[1;33mEnter\x1b[0m confirm, Esc cancel]")?;
+    write!(out, "{}", pick_hint(&checked, cursor, has_moved))?;
     out.flush()?;
 
     let result = loop {
         match read_key(&tty)? {
-            Key::Up => { if cursor > 0 { let old = cursor; cursor -= 1; redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?; } }
-            Key::Down => { if cursor + 1 < total { let old = cursor; cursor += 1; redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?; } }
-            Key::Space => { checked[cursor] = !checked[cursor]; redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?; }
-            Key::Enter => { break MultiSelectResult::Confirmed(checked.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect()); }
+            Key::Up => {
+                if cursor > 0 {
+                    has_moved = true;
+                    let old = cursor; cursor -= 1;
+                    redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?;
+                    write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?; out.flush()?;
+                }
+            }
+            Key::Down => {
+                if cursor + 1 < total {
+                    has_moved = true;
+                    let old = cursor; cursor += 1;
+                    redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?;
+                    write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?; out.flush()?;
+                }
+            }
+            Key::Space => {
+                checked[cursor] = !checked[cursor];
+                redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?;
+                write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?; out.flush()?;
+            }
+            Key::Enter => {
+                if checked.iter().any(|&c| c) {
+                    break MultiSelectResult::Confirmed(
+                        checked.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect()
+                    );
+                } else {
+                    // Nothing selected → select current item first.
+                    checked[cursor] = true;
+                    redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?;
+                    write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?; out.flush()?;
+                }
+            }
+            // Number keys: toggle item directly (1-9).
+            Key::Char(c) if c.is_ascii_digit() && c != '0' => {
+                let idx = (c as usize) - ('1' as usize);
+                if idx < total {
+                    has_moved = true; // number jump counts as move
+                    checked[idx] = !checked[idx];
+                    if cursor != idx {
+                        let old = cursor; cursor = idx;
+                        redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?;
+                    } else {
+                        redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?;
+                    }
+                    write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?; out.flush()?;
+                }
+            }
             Key::Escape | Key::CtrlC => break MultiSelectResult::Cancelled,
             _ => {}
         }
@@ -396,15 +458,15 @@ fn interactive_multi_select(title: &str, items: &[String], initially_checked: &[
 #[cfg(unix)]
 fn redraw_multi_two(out: &mut impl Write, old: usize, new: usize, items: &[String], checked: &[bool], inner_w: usize, total: usize) -> io::Result<()> {
     let up = |i: usize| -> usize { (total - i) + 1 };
-    let n = up(old); write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[old], false, checked[old], inner_w), n)?;
-    let n = up(new); write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[new], true, checked[new], inner_w), n)?;
+    let n = up(old); write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[old], old, false, checked[old], inner_w), n)?;
+    let n = up(new); write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[new], new, true, checked[new], inner_w), n)?;
     out.flush()
 }
 
 #[cfg(unix)]
 fn redraw_multi_one(out: &mut impl Write, idx: usize, items: &[String], checked: &[bool], inner_w: usize, total: usize) -> io::Result<()> {
     let n = (total - idx) + 1;
-    write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[idx], true, checked[idx], inner_w), n)?;
+    write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[idx], idx, true, checked[idx], inner_w), n)?;
     out.flush()
 }
 

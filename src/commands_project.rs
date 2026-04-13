@@ -813,14 +813,14 @@ pub struct ConnectivityResult {
 }
 
 /// Default base URLs for known providers.
+/// Default base URLs for known providers — always use the official recommended URL.
+/// chat_suffix() / probe_suffix() detect trailing /v1 to avoid double /v1/v1.
 pub const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
     ("anthropic", "https://api.anthropic.com"),
-    ("openai",    "https://api.openai.com"),
+    ("openai",    "https://api.openai.com/v1"),
     ("google",    "https://generativelanguage.googleapis.com"),
-    ("deepseek",  "https://api.deepseek.com"),
-    // Why: Kimi Coding CLI uses api.kimi.com/coding/v1 (not api.moonshot.cn).
-    // Store without /v1 here — the CLI connectivity test appends /v1/... itself.
-    ("kimi",      "https://api.kimi.com/coding"),
+    ("deepseek",  "https://api.deepseek.com/v1"),
+    ("kimi",      "https://api.kimi.com/coding/v1"),
     ("glm",       "https://open.bigmodel.cn/api/paas"),
 ];
 

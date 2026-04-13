@@ -1926,7 +1926,7 @@ pub fn configure_kimi_cli(token_value: &str, proxy_port: u16) {
             rows.push(format!("Backup:  {}", "~/.kimi/config.aikey_backup.toml"));
         }
         crate::ui_frame::eprint_box("\u{2753}", "Configure Kimi CLI", &rows);
-        eprint!("  Proceed? [Y/n]: ");
+        eprint!("  Proceed? [Y/n] (default Y): ");
         io::stderr().flush().ok();
 
         let mut input = String::new();
@@ -2061,7 +2061,7 @@ pub fn configure_codex_cli(proxy_port: u16) {
             rows.push(format!("Backup:  {}", "~/.codex/config.aikey_backup.toml"));
         }
         crate::ui_frame::eprint_box("\u{2753}", "Configure Codex CLI", &rows);
-        eprint!("  Proceed? [Y/n]: ");
+        eprint!("  Proceed? [Y/n] (default Y): ");
         io::stderr().flush().ok();
 
         let mut input = String::new();
@@ -2302,7 +2302,7 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
             format!("Add:    {} \u{2192} source ~/.aikey/active.env", hook_desc),
         ];
         crate::ui_frame::eprint_box("\u{2753}", "Install Shell Hook", &rows);
-        eprint!("  Proceed? [Y/n]: ");
+        eprint!("  Proceed? [Y/n] (default Y): ");
         io::stderr().flush().ok();
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_ok() {

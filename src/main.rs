@@ -908,7 +908,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ("openai",    "https://api.openai.com/v1"),
                 ("google",    "https://generativelanguage.googleapis.com"),
                 ("deepseek",  "https://api.deepseek.com/v1"),
-                ("kimi",      "https://api.moonshot.cn/v1"),
+                ("kimi",      "https://api.kimi.com/coding/v1"),
             ];
 
             let (resolved_providers, resolved_base_url): (Vec<String>, Option<String>) =
@@ -917,13 +917,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 } else if std::io::stdin().is_terminal() && !cli.json {
                     use colored::Colorize;
                     let mut items: Vec<String> = KNOWN_PROVIDERS.iter().map(|(n, _)| n.to_string()).collect();
-                    items.push("Custom providers...".to_string());
+                    items.push("Other provider types...".to_string());
                     let custom_idx = KNOWN_PROVIDERS.len();
                     let mut selected: Vec<String>;
                     let mut checked_state: Vec<bool> = vec![false; items.len()];
 
                     loop {
-                        let selected_indices = match ui_select::box_multi_select("Select provider(s)", &items, &checked_state)? {
+                        let selected_indices = match ui_select::box_multi_select("Select provider type(s)", &items, &checked_state)? {
                             ui_select::MultiSelectResult::Confirmed(idx) => idx,
                             ui_select::MultiSelectResult::Cancelled => { eprintln!("  Cancelled."); return Ok(()); }
                         };
@@ -938,7 +938,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             } else if idx == custom_idx { wants_custom = true; }
                         }
                         if wants_custom {
-                            print!("  Custom provider(s), comma-separated: ");
+                            print!("  Other provider type(s), comma-separated: ");
                             io::stdout().flush()?;
                             let mut custom = String::new();
                             io::stdin().read_line(&mut custom)?;
@@ -990,7 +990,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let suite = commands_project::run_connectivity_test(&test_targets, secret.trim(), false);
                     if !suite.any_chat_ok {
                         eprintln!();
-                        eprint!("  No chat test passed. Add anyway? [y/N]: ");
+                        eprint!("  No chat test passed. Add anyway? [y/N] (default N): ");
                         io::stdout().flush()?;
                         let mut input = String::new();
                         io::stdin().read_line(&mut input)?;
@@ -1118,7 +1118,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Confirm before deletion (skip in JSON / non-interactive mode).
             if !cli.json && std::io::stdin().is_terminal() {
                 use colored::Colorize;
-                eprint!("  Delete API Key '{}'? This cannot be undone. [y/N]: ", alias.bold());
+                eprint!("  Delete API Key '{}'? This cannot be undone. [y/N] (default N): ", alias.bold());
                 io::stdout().flush()?;
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
@@ -1303,7 +1303,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Confirm before update (skip in JSON / non-interactive / test mode).
             if !cli.json && std::io::stdin().is_terminal() && env::var("AK_TEST_SECRET").is_err() {
                 use colored::Colorize;
-                eprint!("  Update API Key '{}'? The old value will be overwritten. [y/N]: ", alias.bold());
+                eprint!("  Update API Key '{}'? The old value will be overwritten. [y/N] (default N): ", alias.bold());
                 io::stdout().flush()?;
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;

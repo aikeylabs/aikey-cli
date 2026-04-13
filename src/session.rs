@@ -327,21 +327,29 @@ pub fn maybe_configure_backend() {
 
     eprintln!();
     eprintln!("  Session cache: avoid re-entering your master password for 30 minutes.");
-    eprintln!("  [k] macOS Keychain  (secure; macOS may occasionally prompt for its own password)");
-    eprintln!("  [f] Encrypted file  (no system prompts; stored in ~/.aikey, chmod 600)");
-    eprintln!("  [n] Disabled        (always prompt)");
-    eprint!("  Choice [k/F/n]: ");
+    let is_macos = cfg!(target_os = "macos");
+    if is_macos {
+        eprintln!("  [k] macOS Keychain  (secure; macOS may occasionally prompt for its own password)");
+        eprintln!("  [f] Encrypted file  (no system prompts; stored in ~/.aikey, chmod 600)");
+        eprintln!("  [n] Disabled        (always prompt)");
+        eprint!("  Choice [K/f/n] (default K): ");
+    } else {
+        eprintln!("  [f] Encrypted file  (no system prompts; stored in ~/.aikey, chmod 600)");
+        eprintln!("  [n] Disabled        (always prompt)");
+        eprint!("  Choice [F/n] (default F): ");
+    }
 
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).is_err() {
-        crate::storage::set_session_backend_pref("file");
+        crate::storage::set_session_backend_pref(if is_macos { "keychain" } else { "file" });
         return;
     }
 
     let pref = match line.trim().to_lowercase().as_str() {
-        "k" | "keychain" => "keychain",
+        "k" | "keychain" if is_macos => "keychain",
+        "f" | "file" => "file",
         "n" | "no" | "disabled" => "disabled",
-        _ => "file", // default (Enter or "f")
+        _ => if is_macos { "keychain" } else { "file" }, // default (Enter)
     };
     crate::storage::set_session_backend_pref(pref);
     eprintln!("  Session backend set to '{}'. You can change this with: aikey config session-backend", pref);
