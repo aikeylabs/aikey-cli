@@ -334,7 +334,8 @@ fn format_multi_row(item: &str, index: usize, is_cursor: bool, is_checked: bool,
     let cursor_mark = if is_cursor { "\x1b[36;1m> \x1b[0m" } else { "  " };
     let check_mark = if is_checked { "\x1b[32m[\x1b[1m*\x1b[0m\x1b[32m]\x1b[0m" } else { "[ ]" };
     let num = format!("\x1b[90m{}\x1b[0m", index + 1); // dim number
-    let content = format!("{}{} {} {}", cursor_mark, num, check_mark, item);
+    let label = if is_cursor { format!("\x1b[1m{}\x1b[0m", item) } else { item.to_string() };
+    let content = format!("{}{} {} {}", cursor_mark, num, check_mark, label);
     let pad_target = inner_w.saturating_sub(4);
     format!("  \u{2502}  {}  \u{2502}", pad_visible(&content, pad_target))
 }
