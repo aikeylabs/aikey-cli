@@ -25,8 +25,11 @@ static VERSIONS: &[VersionMigration] = &[
         upgrade: v1_0_2_alpha::upgrade,
         rollback: v1_0_2_alpha::rollback,
     },
-    // Future versions:
-    // VersionMigration { version: "1.0.3-alpha", upgrade: v1_0_3_alpha::upgrade, rollback: v1_0_3_alpha::rollback },
+    VersionMigration {
+        version: "1.0.3-alpha",
+        upgrade: v1_0_3_alpha::upgrade,
+        rollback: v1_0_3_alpha::rollback,
+    },
 ];
 
 /// Run all upgrades up to the current binary version.
@@ -149,6 +152,75 @@ pub mod v1_0_2_alpha {
         }
         eprintln!("[db rollback] SKIP: platform_account.refresh_token (SQLite no DROP COLUMN)");
         eprintln!("[db rollback] SKIP: platform_account.token_expires_at (SQLite no DROP COLUMN)");
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.3-alpha migrations — Provider OAuth account management
+// ---------------------------------------------------------------------------
+
+pub mod v1_0_3_alpha {
+    use rusqlite::Connection;
+
+    /// Forward migration: add provider_accounts and provider_account_tokens tables
+    /// for OAuth account management (Claude, Codex, Kimi).
+    ///
+    /// Design decisions:
+    ///   D3:  Token storage uses vault AES-256-GCM encryption (same as API Keys)
+    ///   D10: Setup Token mode — access_token 1yr, refresh_token as fallback
+    ///   D13: Kimi identity uses user_id (no email), display_identity set by user
+    ///
+    /// No new bindings table — route bindings reuse user_profile_provider_bindings
+    /// (v1.0.2-alpha) with key_source_type = "personal_oauth_account".
+    pub fn upgrade(conn: &Connection) -> Result<(), String> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS provider_accounts (
+                provider_account_id  TEXT PRIMARY KEY,
+                provider             TEXT NOT NULL,
+                auth_type            TEXT NOT NULL,
+                credential_type      TEXT NOT NULL DEFAULT 'personal_oauth_account',
+                status               TEXT NOT NULL DEFAULT 'active',
+                external_id          TEXT,
+                display_identity     TEXT,
+                org_uuid             TEXT,
+                account_tier         TEXT,
+                created_at           INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                last_used_at         INTEGER,
+                owner_type           TEXT NOT NULL DEFAULT 'local_user',
+                UNIQUE(provider, external_id)
+            )", [],
+        ).map_err(|e| format!("provider_accounts: {}", e))?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS provider_account_tokens (
+                provider_account_id      TEXT PRIMARY KEY,
+                access_token_nonce       BLOB,
+                access_token_ciphertext  BLOB,
+                refresh_token_nonce      BLOB,
+                refresh_token_ciphertext BLOB,
+                token_expires_at         INTEGER,
+                token_metadata           TEXT,
+                updated_at               INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (provider_account_id) REFERENCES provider_accounts(provider_account_id)
+            )", [],
+        ).map_err(|e| format!("provider_account_tokens: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Reverse migration: drop tables added in v1.0.3.
+    pub fn rollback(conn: &Connection) -> Result<(), String> {
+        let sqls = [
+            "DROP TABLE IF EXISTS provider_account_tokens",
+            "DROP TABLE IF EXISTS provider_accounts",
+        ];
+        for sql in &sqls {
+            match conn.execute(sql, []) {
+                Ok(_) => eprintln!("[db rollback] OK: {}", sql),
+                Err(e) => eprintln!("[db rollback] WARN: {} — {}", sql, e),
+            }
+        }
         Ok(())
     }
 }

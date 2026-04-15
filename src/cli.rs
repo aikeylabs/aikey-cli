@@ -275,6 +275,43 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: SecretAction,
     },
+    /// Authenticate with provider OAuth accounts (Claude, Codex, Kimi)
+    #[command(display_order = 23)]
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AuthAction {
+    /// Login to a provider OAuth account
+    Login {
+        /// Provider name: claude, codex, kimi
+        provider: String,
+    },
+    /// Logout from a provider account
+    Logout {
+        /// Provider name or account ID
+        target: String,
+    },
+    /// List all provider OAuth accounts
+    List,
+    /// Set a provider account as active for routing
+    Use {
+        /// Account ID or display identity (email)
+        account: String,
+    },
+    /// Show provider account health and token status
+    Status {
+        /// Specific account ID (optional, default: all)
+        account: Option<String>,
+    },
+    /// Diagnose provider account connectivity
+    Doctor {
+        /// Specific provider (optional, default: all)
+        provider: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -506,6 +543,14 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 ProxyAction::Status => "status",
                 ProxyAction::Restart { .. } => "restart",
                 ProxyAction::Verify => "verify",
+            }),
+            Commands::Auth { action } => format!("auth.{}", match action {
+                AuthAction::Login { .. } => "login",
+                AuthAction::Logout { .. } => "logout",
+                AuthAction::List => "list",
+                AuthAction::Use { .. } => "use",
+                AuthAction::Status { .. } => "status",
+                AuthAction::Doctor { .. } => "doctor",
             }),
         },
     }

@@ -2,6 +2,7 @@
 //!
 //! This library provides the core functionality for the AK CLI tool.
 
+pub mod credential_type;
 pub mod crypto;
 pub mod storage;
 pub mod synapse;

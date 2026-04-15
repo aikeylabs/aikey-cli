@@ -625,7 +625,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
 
             let pw = crate::session::try_get();
             for b in &bindings {
-                if b.key_source_type == "personal" {
+                if b.key_source_type == crate::credential_type::CredentialType::PersonalApiKey {
                     if let Some(ref pw) = pw {
                         if let Ok(kv) = crate::executor::get_secret(&b.key_source_ref, pw) {
                             let bu = storage::get_entry_base_url(&b.key_source_ref)
@@ -1012,7 +1012,7 @@ pub fn test_proxy_connectivity(proxy_addr: &str, provider_code: &str) -> ProxyPr
     let active_cfg = crate::storage::get_active_key_config().ok().flatten();
     let bearer = active_cfg.as_ref()
         .map(|cfg| {
-            if cfg.key_type == "team" {
+            if cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey {
                 format!("aikey_vk_{}", cfg.key_ref)
             } else {
                 format!("aikey_personal_{}", cfg.key_ref)

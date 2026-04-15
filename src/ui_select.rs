@@ -476,7 +476,12 @@ fn redraw_multi_one(out: &mut impl Write, idx: usize, items: &[String], checked:
 // ============================================================================
 
 #[derive(Clone)]
-pub struct KeyCandidate { pub label: String, pub source_type: String, pub source_ref: String }
+pub struct KeyCandidate {
+    pub label: String,
+    pub source_type: String,       // DB value: "personal", "team", "personal_oauth_account"
+    pub source_ref: String,
+    pub display_type: Option<String>, // UI display override (e.g., "oauth(f)"). None → auto from source_type.
+}
 #[derive(Clone)]
 pub struct ProviderGroup { pub provider_code: String, pub candidates: Vec<KeyCandidate>, pub selected: Option<usize>, pub expanded: bool }
 
@@ -527,7 +532,17 @@ fn build_tree_rows(groups: &[ProviderGroup]) -> Vec<TreeRow> {
 
 fn is_focusable(row: &TreeRow) -> bool { !matches!(row, TreeRow::Separator) }
 
-fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inner_w: usize) -> String {
+/// Compute the maximum visible label width across all candidates in all groups.
+fn max_candidate_label_width(groups: &[ProviderGroup]) -> usize {
+    groups.iter()
+        .flat_map(|g| g.candidates.iter())
+        .map(|c| visible_len(&c.label))
+        .max()
+        .unwrap_or(20)
+        .max(20) // minimum 20
+}
+
+fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inner_w: usize, label_col_w: usize) -> String {
     let cursor_mark = if is_cursor { "\x1b[36;1m> \x1b[0m" } else { "  " };
     let pad_target = inner_w.saturating_sub(4);
     let content = match row {
@@ -542,8 +557,14 @@ fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inn
             let radio = if g.selected == Some(*ci) { "\x1b[32m(*)\x1b[0m" } else { "( )" };
             let active = if g.selected == Some(*ci) { "  \x1b[32mactive\x1b[0m" } else { "" };
             let label_raw = if is_cursor { format!("\x1b[1m{}\x1b[0m", c.label) } else { c.label.clone() };
-            let label_padded = pad_visible(&label_raw, 24);
-            format!("{}    {} {} \x1b[90m{}\x1b[0m{}", cursor_mark, radio, label_padded, c.source_type, active)
+            let label_padded = pad_visible(&label_raw, label_col_w);
+            let display_type = c.display_type.as_deref().unwrap_or_else(|| {
+                match c.source_type.as_str() {
+                    "personal_oauth_account" => "oauth",
+                    other => other,
+                }
+            });
+            format!("{}    {} {} \x1b[90m{}\x1b[0m{}", cursor_mark, radio, label_padded, display_type, active)
         }
         TreeRow::Separator => { format!("  {}", "\u{2500}".repeat(pad_target.saturating_sub(2))) }
         TreeRow::Confirm => {
@@ -592,7 +613,18 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
         let rows = build_tree_rows(groups);
         let total = rows.len();
         let max_inner = crate::ui_frame::term_width().saturating_sub(6);
-        let inner_w = (visible_len(&icon_title) + 4).max(60).min(max_inner);
+        // Dynamic label column: adapt to longest candidate label + 2 padding
+        let label_col_w = max_candidate_label_width(groups) + 2;
+        // Candidate row visible width:
+        //   cursor(2) + indent(4) + radio+space(4) + label_col_w + space(1) + type(~8) + "  active"(8)
+        let max_type_w = groups.iter()
+            .flat_map(|g| g.candidates.iter())
+            .map(|c| c.display_type.as_deref().unwrap_or(
+                if c.source_type == "personal_oauth_account" { "oauth" } else { &c.source_type }
+            ).len())
+            .max().unwrap_or(8);
+        let content_min_w = 2 + 4 + 4 + label_col_w + 1 + max_type_w + 8;
+        let inner_w = (visible_len(&icon_title) + 4).max(content_min_w).min(max_inner);
         let border = "\u{2500}".repeat(inner_w);
         let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
         let title_bar = format!("\u{2500} {} {}", icon_title, "\u{2500}".repeat(title_fill));
@@ -603,7 +635,7 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
 
         write!(out, "\x1b[?25l")?;
         write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
-        for (i, row) in rows.iter().enumerate() { write!(out, "{}\r\n", format_tree_row(row, groups, i == cursor, inner_w))?; }
+        for (i, row) in rows.iter().enumerate() { write!(out, "{}\r\n", format_tree_row(row, groups, i == cursor, inner_w, label_col_w))?; }
         write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
         write!(out, "  [\u{2191}\u{2193} move, \x1b[1;33mSpace\x1b[0m select/expand, \x1b[1;33mY\x1b[0m confirm, \x1b[1;33mN\x1b[0m cancel]\r\n")?;
         out.flush()?;

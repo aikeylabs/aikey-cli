@@ -417,7 +417,23 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
     for rc in &rc_candidates {
         if let Ok(contents) = std::fs::read_to_string(rc) {
             if contents.contains(hook_marker) {
-                return None; // already installed
+                // Current version: precmd sources active.env + auto-loads preexec.zsh
+                if contents.contains("preexec.zsh") || contents.contains("preexec.bash") {
+                    // Ensure preexec file exists (may have been deleted)
+                    if is_zsh { write_preexec_zsh(&home); }
+                    else { write_preexec_bash(&home); }
+                    return None; // current version already installed
+                }
+                // Old hook detected — ask user to manually replace it.
+                eprintln!();
+                eprintln!("  \x1b[33m!\x1b[0m Old aikey shell hook detected in {}", rc);
+                eprintln!("    Please manually replace the old hook block with:");
+                eprintln!();
+                eprintln!("    1. Open {} in an editor", rc);
+                eprintln!("    2. Find and delete the block starting with '# aikey shell hook'");
+                eprintln!("    3. Run 'aikey use' again to install the new hook");
+                eprintln!();
+                return None;
             }
         }
     }
@@ -429,17 +445,53 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         .or_else(|| rc_candidates.first())
         .cloned()?;
 
+    // Why two hooks:
+    //   precmd  → sources active.env (refreshes env vars before each prompt)
+    //   preexec → prints active key/account when running AI CLI tools
+    //             (fires before command execution, $1 = the command line)
+    //
+    // AIKEY_ACTIVE_KEYS format: "anthropic=alice@x.com,openai=office-key,kimi=crpn..."
+    // Mapping: claude→anthropic, codex→openai, kimi→kimi
+    // Why: preexec function is defined in a separate file (~/.aikey/preexec.zsh / preexec.bash)
+    // so that precmd can source it on-the-fly. This avoids requiring `source ~/.zshrc` —
+    // the next prompt after `aikey use` will auto-load the preexec hook.
+    let preexec_file = if is_zsh {
+        write_preexec_zsh(&home)?
+    } else {
+        write_preexec_bash(&home)?
+    };
+
     let hook_block = if is_zsh {
         format!(
-            "\n{}\n_aikey_precmd() {{ [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env; }}\nprecmd_functions+=(_aikey_precmd)\n",
+            concat!(
+                "\n{}\n",
+                "_aikey_precmd() {{\n",
+                "  [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env\n",
+                "  # Auto-load preexec hook if not yet loaded\n",
+                "  if ! (( ${{+functions[_aikey_preexec]}} )); then\n",
+                "    [[ -f ~/.aikey/preexec.zsh ]] && source ~/.aikey/preexec.zsh\n",
+                "  fi\n",
+                "}}\n",
+                "precmd_functions+=(_aikey_precmd)\n",
+            ),
             hook_marker
         )
     } else {
         format!(
-            "\n{}\nPROMPT_COMMAND='[[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env'\n",
+            concat!(
+                "\n{}\n",
+                "_aikey_precmd_bash() {{\n",
+                "  [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env\n",
+                "  if ! type -t _aikey_preexec_bash &>/dev/null; then\n",
+                "    [[ -f ~/.aikey/preexec.bash ]] && source ~/.aikey/preexec.bash\n",
+                "  fi\n",
+                "}}\n",
+                "PROMPT_COMMAND='_aikey_precmd_bash'\n",
+            ),
             hook_marker
         )
     };
+    let _ = preexec_file; // used above in write_preexec_*
 
     // Prompt the user before writing.
     use std::io::{IsTerminal, Write};
@@ -473,4 +525,51 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         }
         Err(_) => Some(format!("  Could not write to {}. Run: source ~/.aikey/active.env", rc_file)),
     }
+}
+
+/// Write `~/.aikey/preexec.zsh` — the preexec hook sourced on-the-fly by precmd.
+/// This file is always overwritten (idempotent), so upgrades take effect immediately
+/// on the next prompt without requiring `source ~/.zshrc`.
+fn write_preexec_zsh(home: &str) -> Option<String> {
+    let path = format!("{}/.aikey/preexec.zsh", home);
+    let content = r#"# aikey preexec hook — auto-generated, do not edit manually
+# Prints active key/account when running AI CLI tools.
+_aikey_preexec() {
+  [[ -z "$AIKEY_ACTIVE_KEYS" ]] && return
+  local cmd="${1%% *}" prov
+  case "$cmd" in
+    claude) prov=anthropic ;;
+    codex)  prov=openai ;;
+    kimi)   prov=kimi ;;
+    *)      return ;;
+  esac
+  local id=$(echo "$AIKEY_ACTIVE_KEYS" | tr ',' '\n' | grep "^${prov}=" | cut -d= -f2-)
+  [[ -n "$id" ]] && printf '\033[90m[aikey] %s → %s\033[0m\n' "$cmd" "$id"
+}
+preexec_functions+=(_aikey_preexec)
+"#;
+    std::fs::write(&path, content).ok()?;
+    Some(path)
+}
+
+/// Write `~/.aikey/preexec.bash` — the preexec hook for bash (DEBUG trap).
+fn write_preexec_bash(home: &str) -> Option<String> {
+    let path = format!("{}/.aikey/preexec.bash", home);
+    let content = r#"# aikey preexec hook — auto-generated, do not edit manually
+_aikey_preexec_bash() {
+  [[ -z "$AIKEY_ACTIVE_KEYS" ]] && return
+  local cmd="${BASH_COMMAND%% *}" prov
+  case "$cmd" in
+    claude) prov=anthropic ;;
+    codex)  prov=openai ;;
+    kimi)   prov=kimi ;;
+    *)      return ;;
+  esac
+  local id=$(echo "$AIKEY_ACTIVE_KEYS" | tr ',' '\n' | grep "^${prov}=" | cut -d= -f2-)
+  [[ -n "$id" ]] && printf '\033[90m[aikey] %s → %s\033[0m\n' "$cmd" "$id"
+}
+trap '_aikey_preexec_bash' DEBUG
+"#;
+    std::fs::write(&path, content).ok()?;
+    Some(path)
 }

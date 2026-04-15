@@ -1529,14 +1529,14 @@ mod tests {
         assert!(get_active_key_config().unwrap().is_none());
 
         let cfg = ActiveKeyConfig {
-            key_type: "personal".to_string(),
+            key_type: crate::credential_type::CredentialType::PersonalApiKey,
             key_ref: "my-key".to_string(),
             providers: vec!["openai".to_string()],
         };
         set_active_key_config(&cfg).expect("set");
 
         let got = get_active_key_config().unwrap().expect("should exist");
-        assert_eq!(got.key_type, "personal");
+        assert_eq!(got.key_type, crate::credential_type::CredentialType::PersonalApiKey);
         assert_eq!(got.key_ref, "my-key");
         assert_eq!(got.providers, vec!["openai".to_string()]);
 

@@ -427,7 +427,7 @@ fn finish_login(
         // Clear active key config — it may reference an old team key.
         // Personal keys are vault-scoped and remain usable by any account.
         if let Ok(Some(cfg)) = storage::get_active_key_config() {
-            if cfg.key_type == "team" {
+            if cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey {
                 // Deactivate team key — it belongs to the old account.
                 // Personal keys are vault-local and remain valid for the new account.
                 let _ = storage::clear_active_key_config();
@@ -1054,7 +1054,7 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
             };
             println!("active:    {} ({}) [{}]",
                 cfg.key_ref.bold(),
-                cfg.key_type.dimmed(),
+                cfg.key_type.as_str().dimmed(),
                 prov_str.cyan());
         }
         None => {
@@ -1084,7 +1084,7 @@ pub fn handle_logout(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // Clear the active key config if it references a team key — a logged-out
     // session has no valid account to own team keys.
     if let Ok(Some(cfg)) = storage::get_active_key_config() {
-        if cfg.key_type == "team" {
+        if cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey {
             let _ = storage::clear_active_key_config();
         }
     }
@@ -1202,7 +1202,7 @@ fn apply_snapshot_to_cache(
         // proxy picks up any updated provider list without requiring a restart.
         if !entry.supported_providers.is_empty() {
             if let Ok(Some(active_cfg)) = crate::storage::get_active_key_config() {
-                if active_cfg.key_type == "team" && active_cfg.key_ref == entry.virtual_key_id {
+                if active_cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey && active_cfg.key_ref == entry.virtual_key_id {
                     let display = entry.local_alias.as_deref().unwrap_or(entry.alias.as_str());
                     let _ = write_active_env(
                         "team", &entry.virtual_key_id, display,
@@ -1227,7 +1227,7 @@ fn apply_snapshot_to_cache(
                 // so the proxy stops routing it on next reload.
                 if entry.local_state == "active" {
                     if let Ok(Some(cfg)) = storage::get_active_key_config() {
-                        if cfg.key_type == "team" && cfg.key_ref == entry.virtual_key_id {
+                        if cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey && cfg.key_ref == entry.virtual_key_id {
                             let _ = storage::clear_active_key_config();
                         }
                     }
@@ -1559,7 +1559,7 @@ pub fn sync_managed_key_metadata() -> bool {
         // Handles the case where sync adds new providers to an already-active key.
         if !entry.supported_providers.is_empty() {
             if let Ok(Some(active_cfg)) = crate::storage::get_active_key_config() {
-                if active_cfg.key_type == "team" && active_cfg.key_ref == entry.virtual_key_id {
+                if active_cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey && active_cfg.key_ref == entry.virtual_key_id {
                     let display = entry.local_alias.as_deref().unwrap_or(entry.alias.as_str());
                     let _ = write_active_env("team", &entry.virtual_key_id, display, &entry.supported_providers, crate::commands_proxy::proxy_port());
                 }
@@ -1790,7 +1790,7 @@ pub fn handle_run_direct(
     let active_cfg = storage::get_active_key_config()?
         .ok_or("No active key. Run `aikey use <alias>` first.")?;
 
-    if active_cfg.key_type != "personal" {
+    if active_cfg.key_type != crate::credential_type::CredentialType::PersonalApiKey {
         return Err(format!(
             "--direct only supports personal keys (current active key is type '{}').\n\
              Switch to a personal key first: aikey use <alias>",
@@ -1953,7 +1953,7 @@ pub fn handle_key_use(
         } else {
             vec![]
         };
-        ("team", entry.virtual_key_id.clone(), display, providers)
+        (crate::credential_type::CredentialType::ManagedVirtualKey, entry.virtual_key_id.clone(), display, providers)
     } else {
         // Personal key — v1.0.2: use resolve_supported_providers.
         let exists = storage::entry_exists(alias_or_id).unwrap_or(false);
@@ -1969,7 +1969,7 @@ pub fn handle_key_use(
             const KNOWN: &[&str] = &["anthropic", "openai", "google", "deepseek", "kimi"];
             KNOWN.iter().map(|s| s.to_string()).collect()
         };
-        ("personal", alias_or_id.to_string(), alias_or_id.to_string(), providers)
+        (crate::credential_type::CredentialType::PersonalApiKey, alias_or_id.to_string(), alias_or_id.to_string(), providers)
     };
 
     if providers.is_empty() {
@@ -2034,7 +2034,7 @@ pub fn handle_key_use(
 
     // Write provider bindings.
     for provider in &target_providers {
-        storage::set_provider_binding(crate::profile_activation::DEFAULT_PROFILE, provider, key_type, &key_ref)?;
+        storage::set_provider_binding(crate::profile_activation::DEFAULT_PROFILE, provider, key_type.as_str(), &key_ref)?;
     }
 
     // ── 3. Refresh active.env from ALL provider bindings ─────────────────────
@@ -2051,10 +2051,10 @@ pub fn handle_key_use(
             c == "kimi" || c == "moonshot"
         });
         if has_kimi {
-            let token_value = if key_type == "team" {
-                format!("aikey_vk_{}", key_ref)
-            } else {
-                format!("aikey_personal_{}", key_ref)
+            let token_value = match &key_type {
+                crate::credential_type::CredentialType::ManagedVirtualKey => format!("aikey_vk_{}", key_ref),
+                crate::credential_type::CredentialType::PersonalOAuthAccount => format!("aikey_oauth_{}", key_ref),
+                _ => format!("aikey_personal_{}", key_ref),
             };
             configure_kimi_cli(&token_value, proxy_port);
         } else {
@@ -2099,7 +2099,7 @@ pub fn handle_key_use(
         let mut rows: Vec<String> = Vec::new();
         for b in &refresh.bindings {
             if let Some((api_key_var, _)) = provider_env_vars(&b.provider_code) {
-                let display_ref = resolve_binding_display_name(&b.key_source_type, &b.key_source_ref);
+                let display_ref = resolve_binding_display_name(b.key_source_type.as_str(), &b.key_source_ref);
                 let is_changed = target_providers.contains(&b.provider_code);
                 let arrow_ref = format!("\u{2192} {}", display_ref);
                 let arrow_padded = format!("{:<22}", arrow_ref);

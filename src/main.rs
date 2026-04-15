@@ -1,3 +1,4 @@
+mod credential_type;
 mod storage;
 mod crypto;
 mod session;
@@ -27,6 +28,7 @@ mod ui_frame;
 mod ui_select;
 mod proxy_env;
 mod profile_activation;
+mod commands_auth;
 mod cli;
 
 use cli::*;
@@ -718,7 +720,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         if !sp.is_empty() { sp.join(",") } else { entry.provider_code.clone().unwrap_or_default() }
                     } else { entry.provider_code.clone().unwrap_or_default() };
                     let pf: Vec<&str> = bindings.iter()
-                        .filter(|b| b.key_source_type == "personal" && b.key_source_ref == entry.alias)
+                        .filter(|b| b.key_source_type == credential_type::CredentialType::PersonalApiKey && b.key_source_ref == entry.alias)
                         .map(|b| b.provider_code.as_str()).collect();
                     personal_rows.push(RowData {
                         alias: entry.alias.clone(), providers,
@@ -731,7 +733,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 for e in &managed {
                     let display = e.local_alias.as_deref().unwrap_or(e.alias.as_str()).to_string();
                     let pf: Vec<&str> = bindings.iter()
-                        .filter(|b| b.key_source_type == "team" && b.key_source_ref == e.virtual_key_id)
+                        .filter(|b| b.key_source_type == credential_type::CredentialType::ManagedVirtualKey && b.key_source_ref == e.virtual_key_id)
                         .map(|b| b.provider_code.as_str()).collect();
                     let status = match e.local_state.as_str() {
                         "active" | "synced_inactive" => e.key_status.clone(),
@@ -749,7 +751,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let all_data: Vec<&RowData> = personal_rows.iter().chain(team_rows.iter()).collect();
-                let headers = ["ALIAS", "PROVIDERS", "PRIMARY FOR", "KEY", "STATUS", "CREATED"];
+                let headers = ["ALIAS", "PROVIDERS", "USE FOR", "KEY", "STATUS", "CREATED"];
                 let pad = 2;
                 let w_alias   = headers[0].len().max(all_data.iter().map(|r| r.alias.len()).max().unwrap_or(0)) + pad;
                 let w_prov    = headers[1].len().max(all_data.iter().map(|r| r.providers.len()).max().unwrap_or(0)) + pad;
@@ -784,6 +786,72 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 rows.push("\u{2500}".repeat(sep_width));
                 if team_rows.is_empty() { rows.push("(none)".to_string()); }
                 else { for r in &team_rows { rows.push(fmt_row(r)); } }
+
+                // D7: OAuth accounts section
+                let oauth_accounts = storage::list_provider_accounts().unwrap_or_default();
+                if !oauth_accounts.is_empty() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let active_cfg = storage::get_active_key_config().ok().flatten();
+
+                    // Build row data for dynamic width calculation
+                    struct OAuthRow { identity: String, provider: String, use_for: String, has_use: bool, status: String, tier: String, expires: String, marker: String }
+                    let oauth_rows: Vec<OAuthRow> = oauth_accounts.iter().map(|acct| {
+                        let identity = acct.display_identity.as_deref()
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| acct.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
+                            .unwrap_or("-").to_string();
+                        let is_active = active_cfg.as_ref().map_or(false, |cfg|
+                            cfg.key_type == credential_type::CredentialType::PersonalOAuthAccount
+                            && cfg.key_ref == acct.provider_account_id);
+                        let uf: Vec<&str> = bindings.iter()
+                            .filter(|b| b.key_source_type == credential_type::CredentialType::PersonalOAuthAccount && b.key_source_ref == acct.provider_account_id)
+                            .map(|b| b.provider_code.as_str()).collect();
+                        let expires = storage::get_provider_token_expires_at(&acct.provider_account_id)
+                            .ok().flatten()
+                            .map(|exp| {
+                                let rem = exp - now;
+                                if rem <= 0 { "expired".to_string() }
+                                else if rem > 86400 { format!("{}d", rem / 86400) }
+                                else if rem > 3600 { format!("{}h", rem / 3600) }
+                                else { format!("{}m", rem / 60) }
+                            }).unwrap_or_else(|| "-".to_string());
+                        OAuthRow {
+                            identity,
+                            provider: acct.provider.clone(),
+                            use_for: uf.join(","), has_use: !uf.is_empty(),
+                            status: acct.status.clone(),
+                            tier: acct.account_tier.as_deref().unwrap_or("-").to_string(),
+                            expires,
+                            marker: if is_active { " \u{25cf}".to_string() } else { String::new() },
+                        }
+                    }).collect();
+
+                    // Dynamic column widths
+                    let pad = 2;
+                    let w_id   = "IDENTITY".len().max(oauth_rows.iter().map(|r| r.identity.len()).max().unwrap_or(0)) + pad;
+                    let w_prov = "PROVIDER".len().max(oauth_rows.iter().map(|r| r.provider.len()).max().unwrap_or(0)) + pad;
+                    let w_uf   = "USE FOR".len().max(oauth_rows.iter().map(|r| r.use_for.len()).max().unwrap_or(0)) + pad;
+                    let w_st   = "STATUS".len().max(oauth_rows.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
+                    let w_tier = "TIER".len().max(oauth_rows.iter().map(|r| r.tier.len()).max().unwrap_or(0)) + pad;
+                    let _w_exp = "EXPIRES".len().max(oauth_rows.iter().map(|r| r.expires.len()).max().unwrap_or(0)) + pad;
+
+                    rows.push(String::new());
+                    rows.push(format!("\u{1F517} Provider Accounts - OAuth ({})", oauth_accounts.len()));
+                    rows.push(format!("{:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}",
+                        "IDENTITY", "PROVIDER", "USE FOR", "STATUS", "TIER", "EXPIRES",
+                        wi = w_id, wp = w_prov, wu = w_uf, ws = w_st, wt = w_tier));
+                    rows.push("\u{2500}".repeat(sep_width));
+                    for r in &oauth_rows {
+                        let uf_padded = format!("{:<w$}", r.use_for, w = w_uf);
+                        let uf_col = if r.has_use { uf_padded.green().to_string() } else { uf_padded };
+                        rows.push(format!("{:<wi$}{:<wp$}  {}  {:<ws$}  {:<wt$}  {}{}",
+                            r.identity, r.provider, uf_col, r.status, r.tier, r.expires, r.marker,
+                            wi = w_id, wp = w_prov, ws = w_st, wt = w_tier));
+                    }
+                }
 
                 ui_frame::print_box("\u{1F511}", "Keys", &rows);
             }
@@ -907,15 +975,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let mut skipped_team: Vec<(String, String)> = Vec::new();
 
                 for b in &bindings {
-                    let display = resolve_binding_display_name(&b.key_source_type, &b.key_source_ref);
-                    if b.key_source_type == "personal" {
+                    let display = resolve_binding_display_name(b.key_source_type.as_str(), &b.key_source_ref);
+                    if b.key_source_type == credential_type::CredentialType::PersonalApiKey {
                         let kv = match executor::get_secret(&b.key_source_ref, &password) {
                             Ok(s) => s,
                             Err(e) => { if !cli.json { eprintln!("  {} {} \u{2192} '{}': {}", "\u{2717}".red(), b.provider_code, b.key_source_ref, e); } continue; }
                         };
                         let bu = storage::get_entry_base_url(&b.key_source_ref).unwrap_or(None);
                         let url = bu.as_deref().or_else(|| commands_project::default_base_url(&b.provider_code)).unwrap_or("https://unknown").to_string();
-                        items.push(TestItem { provider: b.provider_code.clone(), url, key: kv.to_string(), display, source_type: b.key_source_type.clone() });
+                        items.push(TestItem { provider: b.provider_code.clone(), url, key: kv.to_string(), display, source_type: b.key_source_type.as_str().to_string() });
                     } else { skipped_team.push((b.provider_code.clone(), display)); }
                 }
 
@@ -1711,7 +1779,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             .collect();
                         let mut box_rows: Vec<String> = Vec::new();
                         for b in &refresh.bindings {
-                            let display_name = resolve_binding_display_name(&b.key_source_type, &b.key_source_ref);
+                            let display_name = resolve_binding_display_name(b.key_source_type.as_str(), &b.key_source_ref);
                             let is_changed = changed_providers.contains(&b.provider_code.as_str());
                             let value_raw = format!("\u{2192} {}", display_name);
                             let value_padded = format!("{:<28}", value_raw);
@@ -1731,6 +1799,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             "Provider Key Selection — Confirmed",
                             &box_rows,
                         );
+
+                        // Check if the shell hook is active: if AIKEY_ACTIVE_KEYS is set
+                        // in the parent shell, precmd is working and will auto-refresh.
+                        // If not, the user needs to source manually (first time or new terminal).
+                        if std::env::var("AIKEY_ACTIVE_KEYS").is_err() {
+                            eprintln!("  \x1b[33m!\x1b[0m Run: \x1b[1msource ~/.zshrc\x1b[0m  (or open a new terminal)");
+                        }
                         println!();
                     }
                 }
@@ -1785,6 +1860,33 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     } else {
                         eprintln!("  {}", "(not found — use `aikey env set -- KEY=VALUE` to create)".dimmed());
+                    }
+
+                    // Shell env (inherited): show proxy-related env vars from the current shell.
+                    // These are inherited by the aikey-proxy process when it starts.
+                    eprintln!();
+                    eprintln!("{}", "Shell env (inherited by proxy):".bold());
+                    let inherited_keys = [
+                        "http_proxy", "https_proxy", "all_proxy",
+                        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                        "no_proxy", "NO_PROXY",
+                    ];
+                    let mut found_any = false;
+                    for key in &inherited_keys {
+                        if let Ok(val) = std::env::var(key) {
+                            if !val.is_empty() {
+                                let display = if val.len() > 60 {
+                                    format!("{}... ({} chars)", &val[..40], val.len())
+                                } else {
+                                    val
+                                };
+                                eprintln!("  {}={}", key, display.dimmed());
+                                found_any = true;
+                            }
+                        }
+                    }
+                    if !found_any {
+                        eprintln!("  {}", "(no proxy env vars detected)".dimmed());
                     }
                 }
                 Some(EnvAction::Set { args }) => {
@@ -1947,6 +2049,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Commands::Auth { action } => {
+            let proxy_port = commands_proxy::proxy_port();
+            commands_auth::handle_auth_command(action, proxy_port, cli.json)?;
+        }
     }
     Ok(())
 }
@@ -2037,7 +2143,34 @@ fn resolve_binding_display_name(source_type: &str, source_ref: &str) -> String {
             return entry.local_alias.unwrap_or(entry.alias);
         }
     }
+    // OAuth accounts: show email identity instead of opaque provider_account_id
+    if source_type == "personal_oauth_account" {
+        if let Ok(Some(acct)) = storage::get_provider_account(source_ref) {
+            if let Some(id) = acct.display_identity.as_deref().filter(|s: &&str| !s.is_empty()) {
+                return id.to_string();
+            }
+            if let Some(id) = acct.external_id.as_deref().filter(|s: &&str| !s.is_empty()) {
+                return id.to_string();
+            }
+        }
+    }
     source_ref.to_string()
+}
+
+/// Truncate email username part if it exceeds `max_user_len`, keeping domain intact.
+/// e.g. truncate_email("eFOreadeblakeE96j@muslim.com", 7) → "eFOread...@muslim.com"
+/// Non-email strings are truncated at `max_user_len + 10` with trailing "...".
+fn truncate_email(email: &str, max_user_len: usize) -> String {
+    if let Some(at_pos) = email.find('@') {
+        let user = &email[..at_pos];
+        let domain = &email[at_pos..]; // includes '@'
+        if user.len() > max_user_len {
+            return format!("{}...{}", &user[..max_user_len], domain);
+        }
+    } else if email.len() > max_user_len + 10 {
+        return format!("{}...", &email[..max_user_len + 10]);
+    }
+    email.to_string()
 }
 
 /// Prompt for the vault master password, adapting the message to whether the
@@ -2177,7 +2310,7 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
             _ => String::new(),
         };
         let is_active = active_cfg.as_ref().map_or(false, |cfg| {
-            cfg.key_type == "personal" && cfg.key_ref == entry.alias
+            cfg.key_type == credential_type::CredentialType::PersonalApiKey && cfg.key_ref == entry.alias
         });
         let active_marker = if is_active { " ◀ active" } else { "" };
         let alias_display = if entry.alias.len() > alias_w { &entry.alias[..alias_w] } else { &entry.alias };
@@ -2214,7 +2347,7 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
     for e in &own_team {
         let display_name = e.local_alias.as_deref().unwrap_or(e.alias.as_str());
         let is_active = active_cfg.as_ref().map_or(false, |cfg| {
-            cfg.key_type == "team" && cfg.key_ref == e.virtual_key_id
+            cfg.key_type == credential_type::CredentialType::ManagedVirtualKey && cfg.key_ref == e.virtual_key_id
         });
         let active_marker = if is_active { " ◀ active" } else { "" };
         let alias_display = if display_name.len() > alias_w { &display_name[..alias_w] } else { display_name };
@@ -2262,8 +2395,8 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
     let initial = active_cfg.as_ref()
         .and_then(|cfg| {
             aliases.iter().position(|a| {
-                (cfg.key_type == "team" && *a == cfg.key_ref)
-                    || (cfg.key_type == "personal" && *a == cfg.key_ref)
+                (cfg.key_type == credential_type::CredentialType::ManagedVirtualKey && *a == cfg.key_ref)
+                    || (cfg.key_type == credential_type::CredentialType::PersonalApiKey && *a == cfg.key_ref)
             })
         })
         .and_then(|i| if selectable[i] { Some(i) } else { None })
@@ -2287,9 +2420,10 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
 fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
     let personal = storage::list_entries_with_metadata().unwrap_or_default();
     let team = storage::list_virtual_key_cache().unwrap_or_default();
+    let oauth_accounts = storage::list_provider_accounts().unwrap_or_default();
 
-    if personal.is_empty() && team.is_empty() {
-        return Err("No keys found. Add a personal key with `aikey add` or sync team keys with `aikey key sync`.".into());
+    if personal.is_empty() && team.is_empty() && oauth_accounts.is_empty() {
+        return Err("No keys found. Add a key with `aikey add`, sync team keys with `aikey key sync`, or login with `aikey auth login <provider>`.".into());
     }
 
     let bindings = storage::list_provider_bindings(
@@ -2325,12 +2459,27 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
         }
     }
     for b in &bindings {
-        add_prov(&b.provider_code);
+        // Map OAuth provider names in bindings to canonical codes
+        // (older aikey auth use may have written "claude" instead of "anthropic")
+        let canonical = match b.provider_code.as_str() {
+            "claude" => "anthropic",
+            "codex" => "openai",
+            _ => b.provider_code.as_str(),
+        };
+        add_prov(canonical);
+    }
+    // Add OAuth account providers (mapped to canonical)
+    for acct in &oauth_accounts {
+        match acct.provider.as_str() {
+            "claude" => add_prov("anthropic"),
+            "codex" => add_prov("openai"),
+            _ => add_prov(&acct.provider),
+        }
     }
     all_providers.sort();
 
     if all_providers.is_empty() {
-        return Err("No providers found on any key.".into());
+        return Err("No keys or accounts found.".into());
     }
 
     // Build ProviderGroup for each provider.
@@ -2352,6 +2501,7 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
                     label: e.alias.clone(),
                     source_type: "personal".to_string(),
                     source_ref: e.alias.clone(),
+                    display_type: None,
                 });
             }
         }
@@ -2368,14 +2518,62 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
                     label,
                     source_type: "team".to_string(),
                     source_ref: e.virtual_key_id.clone(),
+                    display_type: None,
                 });
             }
         }
 
-        let current_binding = bindings.iter().find(|b| b.provider_code == *prov);
+        // OAuth accounts — match by canonical provider (claude→anthropic, codex→openai)
+        for acct in &oauth_accounts {
+            let canonical = match acct.provider.as_str() {
+                "claude" => "anthropic",
+                "codex" => "openai",
+                _ => acct.provider.as_str(),
+            };
+            if canonical == *prov {
+                let identity = acct.display_identity.as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| acct.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
+                    .unwrap_or(&acct.provider_account_id);
+                // Truncate long email username for picker display
+                // e.g. "eFOreadeblakeE96j@muslim.com" → "eFOread...@muslim.com"
+                // Why: long emails overflow the interactive picker box width.
+                let identity_truncated = truncate_email(identity, 10);
+                let label = format!("{} ({})", identity_truncated, acct.provider);
+                // Tier suffix: p=pro, f=free, m=max, etc.
+                let tier_tag = match acct.account_tier.as_deref() {
+                    Some("pro") => "p",
+                    Some("max") => "m",
+                    Some("free") => "f",
+                    Some(t) if !t.is_empty() && t != "-" => &t[..1],
+                    _ => "",
+                };
+                let source_display = if tier_tag.is_empty() {
+                    "oauth".to_string()
+                } else {
+                    format!("oauth({})", tier_tag)
+                };
+                candidates.push(ui_select::KeyCandidate {
+                    label,
+                    source_type: "personal_oauth_account".to_string(), // DB value
+                    source_ref: acct.provider_account_id.clone(),
+                    display_type: Some(source_display), // UI: "oauth" or "oauth(f)"
+                });
+            }
+        }
+
+        // Match binding by canonical provider code (claude→anthropic, codex→openai)
+        let current_binding = bindings.iter().find(|b| {
+            let b_canonical = match b.provider_code.as_str() {
+                "claude" => "anthropic",
+                "codex" => "openai",
+                _ => b.provider_code.as_str(),
+            };
+            b_canonical == *prov || b.provider_code == *prov
+        });
         let selected = current_binding.and_then(|b| {
             candidates.iter().position(|c|
-                c.source_type == b.key_source_type && c.source_ref == b.key_source_ref
+                c.source_type == b.key_source_type.as_str() && c.source_ref == b.key_source_ref
             )
         });
 

@@ -92,6 +92,40 @@ If you're building integrations or automation, see `docs/cli-platform-contract.m
 
 For security vulnerability reporting, see `SECURITY.md`.
 
+## Provider OAuth Accounts (`aikey auth`)
+
+Use subscription plans (Claude Pro/Max, ChatGPT Plus, Kimi Code) instead of API Keys.
+OAuth tokens are managed by [aikey-auth-broker](../aikey-auth-broker/README.md) via the proxy.
+
+```bash
+# Login to a provider (opens browser for OAuth authorization)
+aikey auth login claude    # Claude Pro/Max — paste code from callback page
+aikey auth login codex     # ChatGPT Plus/Pro — auto callback
+aikey auth login kimi      # Kimi Code — enter device code in browser
+
+# List OAuth accounts
+aikey auth list
+
+# Set an OAuth account as active (replaces API Key for that provider)
+aikey auth use <account_id>
+
+# Check account health
+aikey auth status <account_id>
+
+# Logout
+aikey auth logout <account_id>
+```
+
+Supported providers:
+
+| Provider | Flow | Token Lifetime | Subscription |
+|----------|------|---------------|-------------|
+| Claude (Anthropic) | Setup Token (manual paste) | 1 year | Pro/Max required |
+| Codex (ChatGPT) | Auth Code (auto callback) | 10 days | Plus/Pro (free works too) |
+| Kimi (Moonshot) | Device Code (polling) | 15 minutes | Coding Plan |
+
+OAuth and API Key are mutually exclusive per provider — `aikey auth use` replaces `aikey use` for the same provider, and vice versa.
+
 ## Additional Notes
 
 - Historical daemon/prototype subsystems have been removed; Stage 0 focuses on the single blessed path (`aikey run -- <cmd>`)

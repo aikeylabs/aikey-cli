@@ -243,7 +243,7 @@ pub fn maybe_warn_stale() {
 /// Injects the current trace context via the W3C `traceparent` header so the
 /// reload operation can be correlated with CLI log records by trace_id.
 /// Returns Ok(()) when the proxy confirms a successful graceful reload.
-fn post_admin_reload() -> Result<(), Box<dyn std::error::Error>> {
+pub fn post_admin_reload() -> Result<(), Box<dyn std::error::Error>> {
     let stream = TcpStream::connect(PROXY_HEALTH_ADDR_DEFAULT)
         .map_err(|e| format!("cannot connect to proxy at {}: {}", PROXY_HEALTH_ADDR_DEFAULT, e))?;
     stream.set_read_timeout(Some(Duration::from_secs(35)))?;

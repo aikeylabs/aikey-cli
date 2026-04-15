@@ -4,6 +4,7 @@
 //! by the parent module so existing callers are unaffected.
 
 use super::{open_connection, get_vault_path};
+use crate::credential_type::CredentialType;
 use rusqlite::{params, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 
@@ -161,7 +162,7 @@ pub fn clear_platform_account() -> Result<(), String> {
 /// `providers` = JSON array of provider codes the active key supports
 #[derive(Debug, Clone)]
 pub struct ActiveKeyConfig {
-    pub key_type: String,
+    pub key_type: CredentialType,
     pub key_ref: String,
     pub providers: Vec<String>,
 }
@@ -210,7 +211,7 @@ pub fn get_active_key_config() -> Result<Option<ActiveKeyConfig>, String> {
     let providers: Vec<String> = serde_json::from_str(&providers_json).unwrap_or_default();
 
     Ok(Some(ActiveKeyConfig {
-        key_type: key_type.unwrap_or_default(),
+        key_type: CredentialType::from_db_str(&key_type.unwrap_or_default()),
         key_ref,
         providers,
     }))
@@ -808,9 +809,17 @@ pub fn set_virtual_key_share_status_local(
 pub struct ProviderBinding {
     pub profile_id: String,
     pub provider_code: String,
-    pub key_source_type: String,   // "personal" or "team"
-    pub key_source_ref: String,    // alias (personal) or virtual_key_id (team)
+    pub key_source_type: CredentialType,
+    pub key_source_ref: String,    // alias (personal), virtual_key_id (team), or provider_account_id (oauth)
     pub updated_at: Option<i64>,
+}
+
+impl ProviderBinding {
+    /// Returns key_source_type as a string for backward-compatible comparisons.
+    /// Existing callers can use this during incremental migration from string to enum.
+    pub fn key_source_type_str(&self) -> &str {
+        self.key_source_type.as_str()
+    }
 }
 
 /// Returns all provider bindings for the given profile, ordered by provider_code.
@@ -827,10 +836,11 @@ pub fn list_provider_bindings(profile_id: &str) -> Result<Vec<ProviderBinding>, 
 
     let rows = stmt
         .query_map(params![profile_id], |row| {
+            let raw_type: String = row.get(2)?;
             Ok(ProviderBinding {
                 profile_id:      row.get(0)?,
                 provider_code:   row.get(1)?,
-                key_source_type: row.get(2)?,
+                key_source_type: CredentialType::from_db_str(&raw_type),
                 key_source_ref:  row.get(3)?,
                 updated_at:      row.get(4).ok(),
             })
@@ -854,10 +864,11 @@ pub fn get_provider_binding(
           WHERE profile_id = ?1 AND provider_code = ?2",
         params![profile_id, provider_code],
         |row| {
+            let raw_type: String = row.get(2)?;
             Ok(ProviderBinding {
                 profile_id:      row.get(0)?,
                 provider_code:   row.get(1)?,
-                key_source_type: row.get(2)?,
+                key_source_type: CredentialType::from_db_str(&raw_type),
                 key_source_ref:  row.get(3)?,
                 updated_at:      row.get(4).ok(),
             })
@@ -944,4 +955,167 @@ pub fn remove_bindings_by_key_source(
     }
 
     Ok(affected)
+}
+
+// ---------------------------------------------------------------------------
+// Provider OAuth accounts (read-only from CLI side; proxy manages tokens)
+// ---------------------------------------------------------------------------
+
+/// Provider account metadata (no token data — tokens are managed by proxy).
+#[derive(Debug, Clone)]
+pub struct ProviderAccountInfo {
+    pub provider_account_id: String,
+    pub provider: String,
+    pub auth_type: String,
+    pub credential_type: CredentialType,
+    pub status: String,
+    pub external_id: Option<String>,
+    pub display_identity: Option<String>,
+    pub org_uuid: Option<String>,
+    pub account_tier: Option<String>,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
+fn row_to_provider_account(row: &rusqlite::Row) -> rusqlite::Result<ProviderAccountInfo> {
+    let raw_ctype: String = row.get(3)?;
+    Ok(ProviderAccountInfo {
+        provider_account_id: row.get(0)?,
+        provider:            row.get(1)?,
+        auth_type:           row.get(2)?,
+        credential_type:     CredentialType::from_db_str(&raw_ctype),
+        status:              row.get(4)?,
+        external_id:         row.get(5)?,
+        display_identity:    row.get(6)?,
+        org_uuid:            row.get(7)?,
+        account_tier:        row.get(8)?,
+        created_at:          row.get(9)?,
+        last_used_at:        row.get(10)?,
+    })
+}
+
+const PROVIDER_ACCOUNT_COLUMNS: &str =
+    "provider_account_id, provider, auth_type, credential_type, status, \
+     external_id, display_identity, org_uuid, account_tier, created_at, last_used_at";
+
+/// List all provider OAuth accounts.
+pub fn list_provider_accounts() -> Result<Vec<ProviderAccountInfo>, String> {
+    let conn = open_connection()?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
+            PROVIDER_ACCOUNT_COLUMNS
+        ))
+        .map_err(|e| format!("Failed to prepare provider accounts query: {}", e))?;
+
+    let rows = stmt
+        .query_map([], |row| row_to_provider_account(row))
+        .map_err(|e| format!("Failed to query provider accounts: {}", e))?
+        .collect::<SqlResult<Vec<ProviderAccountInfo>>>()
+        .map_err(|e| format!("Failed to collect provider accounts: {}", e))?;
+
+    Ok(rows)
+}
+
+/// Get a specific provider account by ID.
+pub fn get_provider_account(id: &str) -> Result<Option<ProviderAccountInfo>, String> {
+    let conn = open_connection()?;
+    let result = conn.query_row(
+        &format!(
+            "SELECT {} FROM provider_accounts WHERE provider_account_id = ?1",
+            PROVIDER_ACCOUNT_COLUMNS
+        ),
+        params![id],
+        |row| row_to_provider_account(row),
+    );
+    match result {
+        Ok(info) => Ok(Some(info)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to get provider account: {}", e)),
+    }
+}
+
+/// Find provider accounts by provider code (e.g., "claude", "codex", "kimi").
+pub fn get_provider_accounts_by_provider(provider: &str) -> Result<Vec<ProviderAccountInfo>, String> {
+    let conn = open_connection()?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {} FROM provider_accounts WHERE provider = ?1 ORDER BY created_at",
+            PROVIDER_ACCOUNT_COLUMNS
+        ))
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let rows = stmt
+        .query_map(params![provider], |row| row_to_provider_account(row))
+        .map_err(|e| format!("Failed to query: {}", e))?
+        .collect::<SqlResult<Vec<ProviderAccountInfo>>>()
+        .map_err(|e| format!("Failed to collect: {}", e))?;
+
+    Ok(rows)
+}
+
+/// Find a provider account by external_id (for dedup on re-login).
+pub fn get_provider_account_by_external_id(
+    provider: &str,
+    external_id: &str,
+) -> Result<Option<ProviderAccountInfo>, String> {
+    let conn = open_connection()?;
+    let result = conn.query_row(
+        &format!(
+            "SELECT {} FROM provider_accounts WHERE provider = ?1 AND external_id = ?2",
+            PROVIDER_ACCOUNT_COLUMNS
+        ),
+        params![provider, external_id],
+        |row| row_to_provider_account(row),
+    );
+    match result {
+        Ok(info) => Ok(Some(info)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to get provider account by external_id: {}", e)),
+    }
+}
+
+/// Delete a provider account and its tokens (cascade not enforced by SQLite,
+/// so we delete both explicitly).
+pub fn delete_provider_account(id: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "DELETE FROM provider_account_tokens WHERE provider_account_id = ?1",
+        params![id],
+    )
+    .map_err(|e| format!("Failed to delete provider account tokens: {}", e))?;
+
+    conn.execute(
+        "DELETE FROM provider_accounts WHERE provider_account_id = ?1",
+        params![id],
+    )
+    .map_err(|e| format!("Failed to delete provider account: {}", e))?;
+
+    Ok(())
+}
+
+/// Get the token expiry timestamp for a provider account (no decryption needed).
+pub fn get_provider_token_expires_at(account_id: &str) -> Result<Option<i64>, String> {
+    let conn = open_connection()?;
+    let result = conn.query_row(
+        "SELECT token_expires_at FROM provider_account_tokens WHERE provider_account_id = ?1",
+        params![account_id],
+        |row| row.get::<_, Option<i64>>(0),
+    );
+    match result {
+        Ok(v) => Ok(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to get token expiry: {}", e)),
+    }
+}
+
+/// Update the status of a provider account.
+pub fn update_provider_account_status(id: &str, status: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE provider_accounts SET status = ?2 WHERE provider_account_id = ?1",
+        params![id, status],
+    )
+    .map_err(|e| format!("Failed to update provider account status: {}", e))?;
+    Ok(())
 }

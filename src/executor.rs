@@ -1112,15 +1112,10 @@ pub fn build_run_env(
     if !bindings.is_empty() {
         // ---- New model: per-provider bindings ----
         for binding in bindings {
-            let token = match binding.key_source_type.as_str() {
-                "team" => format!("aikey_vk_{}", binding.key_source_ref),
-                "personal" => format!("aikey_personal_{}", binding.key_source_ref),
-                other => {
-                    return Err(format!(
-                        "Unknown key_source_type '{}' for provider '{}'. Expected 'personal' or 'team'.",
-                        other, binding.provider_code,
-                    ));
-                }
+            let token = match &binding.key_source_type {
+                crate::credential_type::CredentialType::ManagedVirtualKey => format!("aikey_vk_{}", binding.key_source_ref),
+                crate::credential_type::CredentialType::PersonalApiKey => format!("aikey_personal_{}", binding.key_source_ref),
+                crate::credential_type::CredentialType::PersonalOAuthAccount => format!("aikey_oauth_{}", binding.key_source_ref),
             };
 
             if let Some((api_var, base_var)) = provider_env_vars_pub(&binding.provider_code) {
@@ -1144,7 +1139,7 @@ pub fn build_run_env(
             active_cfg.providers.clone()
         };
 
-        let token_value = if active_cfg.key_type == "team" {
+        let token_value = if active_cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey {
             format!("aikey_vk_{}", active_cfg.key_ref)
         } else {
             format!("aikey_personal_{}", active_cfg.key_ref)

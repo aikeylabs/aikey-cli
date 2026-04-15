@@ -13,6 +13,7 @@
 
 use crate::commands_account::{provider_env_vars_pub, provider_proxy_prefix_pub};
 use crate::commands_proxy;
+use crate::credential_type;
 use crate::storage::{self, ProviderBinding};
 
 /// Default profile id used throughout v1.0.2 (implicit unique profile).
@@ -40,7 +41,7 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
 
     for b in &bindings {
         if let Some((api_key_var, base_url_var)) = provider_env_vars_pub(&b.provider_code) {
-            let token = sentinel_token(&b.key_source_type, &b.key_source_ref);
+            let token = sentinel_token(b.key_source_type.as_str(), &b.key_source_ref);
             let base_url = format!(
                 "http://127.0.0.1:{}/{}",
                 proxy_port,
@@ -66,15 +67,51 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
     // user's HTTP proxy (http_proxy / all_proxy).  We append 127.0.0.1 and
     // localhost to the existing no_proxy — the user's proxy for external
     // sites remains fully intact.
-    // Why shell expansion: `active.env` is sourced in a shell context, so
-    // `${no_proxy:-}` safely reads the current value (empty if unset).
+    //
+    // Why idempotent guard: active.env is sourced on every prompt (precmd).
+    // Without the guard, `no_proxy` would accumulate duplicates indefinitely.
+    // The case/esac check ensures 127.0.0.1 is added exactly once.
     if !activated_providers.is_empty() {
-        env_lines.push(format!(
-            "export no_proxy=\"127.0.0.1,localhost,${{no_proxy:-}}\""
-        ));
-        env_lines.push(format!(
-            "export NO_PROXY=\"127.0.0.1,localhost,${{NO_PROXY:-}}\""
-        ));
+        env_lines.push(
+            "case \",$no_proxy,\" in *,127.0.0.1,*) ;; *) export no_proxy=\"127.0.0.1,localhost,${no_proxy:-}\" ;; esac".to_string()
+        );
+        env_lines.push(
+            "case \",$NO_PROXY,\" in *,127.0.0.1,*) ;; *) export NO_PROXY=\"127.0.0.1,localhost,${NO_PROXY:-}\" ;; esac".to_string()
+        );
+    }
+
+    // Active key mapping: provider=display_name pairs for preexec display.
+    // Allows the shell hook to print which key/account is active for each CLI tool.
+    // Covers all credential types: personal API key (alias), team key (alias), OAuth (email).
+    let mut active_pairs: Vec<String> = Vec::new();
+    for b in &bindings {
+        let display = match b.key_source_type {
+            credential_type::CredentialType::PersonalOAuthAccount => {
+                if let Ok(Some(acct)) = storage::get_provider_account(&b.key_source_ref) {
+                    acct.display_identity.as_deref()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| acct.external_id.as_deref().filter(|s| !s.is_empty()))
+                        .unwrap_or(&b.key_source_ref)
+                        .to_string()
+                } else {
+                    b.key_source_ref.clone()
+                }
+            }
+            credential_type::CredentialType::ManagedVirtualKey => {
+                // Team key: try to resolve local alias, fallback to virtual_key_id
+                storage::get_virtual_key_cache(&b.key_source_ref)
+                    .ok().flatten()
+                    .map(|e| e.local_alias.unwrap_or(e.alias))
+                    .unwrap_or_else(|| b.key_source_ref.clone())
+            }
+            _ => b.key_source_ref.clone(), // Personal API key: alias is the ref
+        };
+        active_pairs.push(format!("{}={}", b.provider_code, display));
+    }
+    if !active_pairs.is_empty() {
+        env_lines.push(format!("export AIKEY_ACTIVE_KEYS=\"{}\"", active_pairs.join(",")));
+    } else {
+        env_lines.push("unset AIKEY_ACTIVE_KEYS 2>/dev/null".to_string());
     }
 
     // Write active.env
@@ -242,7 +279,7 @@ fn sync_active_key_config_from_bindings(bindings: &[ProviderBinding]) -> Result<
     if bindings.is_empty() {
         // Clear legacy config.
         let _ = storage::set_active_key_config(&storage::ActiveKeyConfig {
-            key_type: String::new(),
+            key_type: crate::credential_type::CredentialType::PersonalApiKey, // default when clearing
             key_ref: String::new(),
             providers: vec![],
         });
