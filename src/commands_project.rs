@@ -502,8 +502,8 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     let mut any_failed = false;
     // Deferred connectivity test — run after emit closure is dropped.
     let mut deferred_connectivity: Option<(Vec<(String, String)>, String)> = None;
-    // Per-provider keys for multi-binding doctor tests.
-    let mut deferred_keys: Option<Vec<(String, String)>> = None;
+    // Per-provider keys for multi-binding doctor tests: (provider_code, key, is_oauth).
+    let mut deferred_keys: Option<Vec<(String, String, bool)>> = None;
 
     // Helper: print one check row, collect for JSON.
     // label is left-padded to 18 chars; detail is the right-hand info string.
@@ -620,10 +620,11 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                     "no provider bindings — run 'aikey add' first".dimmed());
             }
         } else {
-            struct DoctorItem { provider: String, url: String, key: String }
+            struct DoctorItem { provider: String, url: String, key: String, is_oauth: bool }
             let mut items: Vec<DoctorItem> = Vec::new();
 
             let pw = crate::session::try_get();
+            let proxy_port = crate::commands_proxy::proxy_port();
             for b in &bindings {
                 if b.key_source_type == crate::credential_type::CredentialType::PersonalApiKey {
                     if let Some(ref pw) = pw {
@@ -638,9 +639,25 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                                 provider: b.provider_code.clone(),
                                 url,
                                 key: kv.to_string(),
+                                is_oauth: false,
                             });
                         }
                     }
+                } else if b.key_source_type == crate::credential_type::CredentialType::PersonalOAuthAccount {
+                    // OAuth: test connectivity through proxy (ping + API reachable).
+                    // Why not full chat probe: OAuth providers require provider-specific
+                    // persona headers (?beta=true, metadata.user_id, originator, etc.)
+                    // that differ per provider. Full chat validation should use
+                    // `aikey auth doctor` which tests the actual CLI→proxy→provider chain.
+                    let prefix = crate::commands_account::provider_proxy_prefix_pub(&b.provider_code);
+                    let url = format!("http://127.0.0.1:{}/{}", proxy_port, prefix);
+                    let sentinel = format!("aikey_personal_{}", b.key_source_ref);
+                    items.push(DoctorItem {
+                        provider: b.provider_code.clone(),
+                        url,
+                        key: sentinel,
+                        is_oauth: true,
+                    });
                 }
                 // team keys: tested via proxy only (no decryption needed here)
             }
@@ -649,18 +666,18 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 if !json_mode {
                     println!("  {} {:<18} {}",
                         "·".dimmed(), "providers",
-                        "no decryptable keys (password not cached?)".dimmed());
+                        "no provider bindings configured".dimmed());
                 }
             } else {
                 let targets: Vec<(String, String)> = items.iter()
                     .map(|i| (i.provider.clone(), i.url.clone()))
                     .collect();
-                // For multi-key doctor: test each provider with its own key.
                 // Deferred: run after emit closure is dropped (borrow conflict).
                 deferred_connectivity = Some((targets, String::new()));
                 // Store per-provider keys for deferred use.
+                // Display label uses provider + (oauth) suffix for visual distinction.
                 deferred_keys = Some(items.into_iter()
-                    .map(|i| (i.provider, i.key))
+                    .map(|i| (i.provider.clone(), i.key, i.is_oauth))
                     .collect());
             }
         }
@@ -741,7 +758,21 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             if ok { None } else { Some("check network or try 'aikey login' again") });
     }
 
-    // Drop emit to release &mut results, then run deferred connectivity test.
+    // ── 10. Usage pipeline health ─────────────────────────────
+    // Queries proxy /status for reporter delivery state and canary result.
+    if proxy_up {
+        let url = format!("http://{}/status", proxy_addr);
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(3))
+            .build();
+        if let Ok(resp) = agent.get(&url).call() {
+            if let Ok(body) = resp.into_string() {
+                check_usage_pipeline(&body, &mut emit);
+            }
+        }
+    }
+
+    // Drop emit to release &mut results, then run deferred tests.
     drop(emit);
 
     if let Some((targets, _)) = deferred_connectivity {
@@ -943,13 +974,37 @@ pub fn test_provider_connectivity(
     }
 
     // 3. Chat probe — send a minimal completion request with max_tokens=1
-    let chat_url = if provider_code == "google" {
-        format!("{}{}?key={}", base_url.trim_end_matches('/'), chat_suffix(provider_code, base_url), api_key)
+    // Why ?beta=true: Claude OAuth API requires this query param. Without it,
+    // Anthropic returns 429 business rejection (not real rate limit).
+    // When going through proxy, the proxy forwards the query params to upstream.
+    // OAuth accounts go through the proxy (base_url is localhost).
+    // Provider-specific adjustments are needed for OAuth persona requirements.
+    let is_via_proxy = base_url.contains("127.0.0.1") || base_url.contains("localhost");
+
+    let (chat_url, body) = if provider_code == "openai" && is_via_proxy {
+        // Codex OAuth: uses Responses API (not Chat Completions).
+        // Endpoint: /responses (proxy prepends base URL → api.openai.com/v1/responses)
+        // Format: {"model":"gpt-4o-mini","input":"Say hi"} (NOT messages array)
+        // Ref: workflow/CI/researchs/oauth-codex-test/main.go
+        let url = format!("{}/responses", base_url.trim_end_matches('/'));
+        let body = serde_json::json!({"model": "gpt-4o-mini", "input": "Say hi"});
+        (url, body)
+    } else if provider_code == "anthropic" && is_via_proxy {
+        // Claude OAuth: requires ?beta=true + metadata.user_id
+        let url = format!("{}{}?beta=true", base_url.trim_end_matches('/'), chat_suffix(provider_code, base_url));
+        let mut body = chat_body(provider_code);
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("metadata".to_string(), serde_json::json!({"user_id": "aikey_doctor_probe"}));
+        }
+        (url, body)
+    } else if provider_code == "google" {
+        let url = format!("{}{}?key={}", base_url.trim_end_matches('/'), chat_suffix(provider_code, base_url), api_key);
+        (url, chat_body(provider_code))
     } else {
-        format!("{}{}", base_url.trim_end_matches('/'), chat_suffix(provider_code, base_url))
+        let url = format!("{}{}", base_url.trim_end_matches('/'), chat_suffix(provider_code, base_url));
+        (url, chat_body(provider_code))
     };
     let (chat_auth_key, chat_auth_val) = probe_auth(provider_code, api_key);
-    let body = chat_body(provider_code);
 
     let chat_agent = build_proxy_aware_agent(Duration::from_secs(15));
     let chat_start = Instant::now();
@@ -976,12 +1031,18 @@ pub fn test_provider_connectivity(
     let (chat_ok, chat_status) = match chat_result {
         Ok(r) => {
             let s = r.status();
-            // Only 2xx means the chat actually completed.
             (s >= 200 && s < 300, Some(s))
         }
         Err(ureq::Error::Status(code, _)) => {
-            // Server responded but chat failed (auth error, model not found, etc.)
-            (false, Some(code))
+            // 429 = auth passed but rate limited → treat as connectivity OK.
+            // Why: Claude OAuth returns 429 as business rejection when persona
+            // headers are incomplete, but also for genuine rate limits. Either way,
+            // the key is valid and the provider is reachable.
+            //
+            // 404 for openai via proxy = Codex uses Responses API, not Chat Completions.
+            // The probe endpoint doesn't exist, but the provider is reachable (API probe passed).
+            let ok = code == 429;
+            (ok, Some(code))
         }
         Err(_) => (false, None),
     };
@@ -1077,7 +1138,9 @@ fn chat_suffix(provider_code: &str, base_url: &str) -> String {
 /// Default model name per provider for the chat probe.
 fn probe_model(provider_code: &str) -> &'static str {
     match provider_code {
-        "anthropic" => "claude-sonnet-4-20250514",
+        // Why haiku: sonnet/opus hit rate limits on OAuth accounts (429 business rejection).
+        // Haiku is lighter and skips stricter quota checks. Verified in research.
+        "anthropic" => "claude-haiku-4-5-20251001",
         "openai"    => "gpt-4o-mini",
         "deepseek"  => "deepseek-chat",
         "kimi"      => "moonshot-v1-8k",
@@ -1131,7 +1194,7 @@ pub fn chat_status_hint(status: u16) -> String {
         403 => "forbidden".to_string(),
         404 => "not found".to_string(),
         422 => "invalid request".to_string(),
-        429 => "rate limited".to_string(),
+        429 => "rate limited, key valid".to_string(),
         _ if status >= 500 => format!("server error ({})", status),
         _ => format!("HTTP {}", status),
     }
@@ -1286,23 +1349,23 @@ pub fn run_connectivity_test(
 /// Each target is tested with its own key from the `keys` map.
 fn run_multi_key_connectivity_test(
     targets: &[(String, String)],
-    keys: &[(String, String)],
+    keys: &[(String, String, bool)],  // (provider_code, key, is_oauth)
     json_mode: bool,
     results: &mut Vec<serde_json::Value>,
 ) {
     use colored::Colorize;
     use std::io::Write;
 
-    let key_map: std::collections::HashMap<&str, &str> = keys.iter()
-        .map(|(p, k)| (p.as_str(), k.as_str()))
+    let key_map: std::collections::HashMap<&str, (&str, bool)> = keys.iter()
+        .map(|(p, k, oauth)| (p.as_str(), (k.as_str(), *oauth)))
         .collect();
 
     if json_mode {
         for (code, url) in targets {
-            let api_key = key_map.get(code.as_str()).copied().unwrap_or("");
+            let (api_key, is_oauth) = key_map.get(code.as_str()).copied().unwrap_or(("", false));
             let r = test_provider_connectivity(code, url, api_key);
             results.push(serde_json::json!({
-                "provider": code, "base_url": url,
+                "provider": code, "base_url": url, "is_oauth": is_oauth,
                 "ping_ok": r.ping_ok, "ping_ms": r.ping_ms,
                 "api_ok": r.api_ok, "api_ms": r.api_ms, "api_status": r.api_status,
                 "chat_ok": r.chat_ok, "chat_ms": r.chat_ms, "chat_status": r.chat_status,
@@ -1312,16 +1375,18 @@ fn run_multi_key_connectivity_test(
     }
 
     // Interactive table — same layout as run_connectivity_test / aikey test.
-    const W_PROV: usize = 12; const W_PING: usize = 16; const W_API: usize = 30;
+    const W_PROV: usize = 18; const W_PING: usize = 16; const W_API: usize = 30;
     eprintln!("  {:<wp$} {:<wpi$} {:<wap$} {}",
         "Provider".dimmed(), "Ping".dimmed(), "API".dimmed(), "Chat".dimmed(),
         wp = W_PROV, wpi = W_PING, wap = W_API);
     eprintln!("  {}", "\u{2500}".repeat(W_PROV + W_PING + W_API + 20).dimmed());
 
     let mut any_reachable = false;
+    let mut failed_hints: Vec<String> = Vec::new();
     for (code, url) in targets {
-        let api_key = key_map.get(code.as_str()).copied().unwrap_or("");
-        eprint!("  {:<wp$} ", code.bold(), wp = W_PROV);
+        let (api_key, is_oauth) = key_map.get(code.as_str()).copied().unwrap_or(("", false));
+        let display_name = if is_oauth { format!("{} (oauth)", code) } else { code.clone() };
+        eprint!("  {:<wp$} ", display_name.bold(), wp = W_PROV);
         let _ = std::io::stderr().flush();
         let r = test_provider_connectivity(code, url, api_key);
 
@@ -1332,6 +1397,7 @@ fn run_multi_key_connectivity_test(
 
         if !r.ping_ok {
             eprintln!("{:<w$} {}", "\u{2014}".dimmed(), "\u{2014}".dimmed(), w = W_API);
+            failed_hints.push(format!("{}: ping failed — check network, VPN, or firewall", display_name));
         } else {
             any_reachable = true;
             // API column
@@ -1341,12 +1407,34 @@ fn run_multi_key_connectivity_test(
             // Chat column
             if !r.api_ok {
                 eprintln!("{}", "\u{2014}".dimmed());
+                failed_hints.push(format!("{}: API unreachable — check proxy config or provider URL", display_name));
             } else if r.chat_ok {
                 let hint = r.chat_status.map(|s| chat_status_hint(s)).unwrap_or_default();
                 eprintln!("{}", format!("ok ({}ms, {})", r.chat_ms, hint).green());
             } else {
-                eprintln!("{}", format!("fail ({}ms)", r.chat_ms).red());
+                let hint = r.chat_status.map(|s| format!(", HTTP {}: {}", s, chat_status_hint(s))).unwrap_or_default();
+                eprintln!("{}", format!("fail ({}ms{})", r.chat_ms, hint).red());
+                // Actionable hint based on HTTP status + context
+                let suggestion = match (r.chat_status, is_oauth, code.as_str()) {
+                    (Some(404), true, "openai") => format!("{}: Codex uses Responses API (not Chat Completions) — probe skipped; actual usage works", display_name),
+                    (Some(400), _, _) => format!("{}: chat 400 — missing header or invalid body", display_name),
+                    (Some(401), _, _) => format!("{}: chat 401 — invalid key or token expired. Run: aikey auth login {}", display_name, code),
+                    (Some(403), _, _) => format!("{}: chat 403 — access denied. Check subscription status", display_name),
+                    (Some(429), _, _) => format!("{}: chat 429 — rate limited (key is valid, try again later)", display_name),
+                    (Some(s), _, _) if s >= 500 => format!("{}: chat {} — provider server error; try again later", display_name, s),
+                    (None, _, _) => format!("{}: chat failed — network error. Check: ~/.aikey/logs/aikey-proxy/current.jsonl", display_name),
+                    (Some(s), _, _) => format!("{}: chat HTTP {} — unexpected error", display_name, s),
+                };
+                failed_hints.push(suggestion);
             }
+        }
+    }
+
+    // Print actionable hints for failures
+    if !failed_hints.is_empty() && !json_mode {
+        eprintln!();
+        for hint in &failed_hints {
+            eprintln!("  {} {}", "\u{2192}".dimmed(), hint.dimmed());
         }
     }
 
@@ -1364,5 +1452,131 @@ fn run_multi_key_connectivity_test(
         }
     } else {
         eprintln!("  {:<12} {}", "proxy".bold(), "not running".dimmed());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Usage pipeline health check for `aikey doctor`
+// ---------------------------------------------------------------------------
+
+/// Parses proxy /status JSON and emits usage-pipeline check results.
+/// Looks for the `reporter` and `canary` fields within the status response.
+fn check_usage_pipeline(
+    status_json: &str,
+    emit: &mut dyn FnMut(&str, bool, &str, Option<&str>),
+) {
+    let parsed: serde_json::Value = match serde_json::from_str(status_json) {
+        Ok(v) => v,
+        Err(_) => {
+            emit("usage-pipeline", false, "cannot parse proxy /status", None);
+            return;
+        }
+    };
+
+    // Check reporter metrics (may be nested under "reporter" in /metrics or flat in /status)
+    let reporter = parsed.get("reporter")
+        .or_else(|| parsed.get("usage_pipeline").and_then(|p| p.get("reporter")));
+
+    if let Some(r) = reporter {
+        let consecutive = r.get("consecutive_failures")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let terminal = r.get("terminal_fail_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let last_status = r.get("last_upload_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let last_upload = r.get("last_upload_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Show last upload time — extract time portion from RFC3339 (no chrono dependency).
+        let upload_ago = if !last_upload.is_empty() {
+            if let Some(t_part) = last_upload.split('T').nth(1) {
+                t_part.trim_end_matches('Z').to_string()
+            } else {
+                last_upload.to_string()
+            }
+        } else {
+            "never".to_string()
+        };
+
+        let ok = consecutive < 5 && last_status != "terminal_failed";
+        let detail = if ok {
+            format!("reporter ok, last upload {}", upload_ago)
+        } else {
+            format!("{} consecutive failures, last: {}",
+                consecutive, if last_status.is_empty() { "unknown" } else { last_status })
+        };
+
+        let hint = if terminal > 0 {
+            Some("terminal failures detected — check dead_letter.jsonl")
+        } else if consecutive >= 5 {
+            Some("check collector_token matches service_token")
+        } else {
+            None
+        };
+
+        // Use a static string for the hint since we need 'static or owned
+        let hint_str: Option<String> = hint.map(|s| s.to_string());
+        emit("usage-pipeline", ok, &detail, hint_str.as_deref());
+
+        // Terminal failures sub-check
+        if terminal > 0 {
+            emit("  dead-letters", false,
+                &format!("{} events in dead_letter.jsonl", terminal),
+                Some("review ~/.aikey/data/usage-wal/dead_letter.jsonl"));
+        }
+    } else {
+        // No reporter data — reporter might be disabled (no collector_url)
+        emit("usage-pipeline", true, "reporter not enabled (standalone mode)", None);
+    }
+
+    // Check canary result if available
+    let canary = parsed.get("canary")
+        .or_else(|| parsed.get("usage_pipeline").and_then(|p| p.get("canary")));
+
+    if let Some(c) = canary {
+        let status = c.get("last_result")
+            .or_else(|| c.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let round_trip = c.get("round_trip_ms")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let failed_stage = c.get("last_failed_stage")
+            .or_else(|| c.get("failed_stage"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let ods = c.get("ods_received").and_then(|v| v.as_bool()).unwrap_or(false);
+        let dwd = c.get("dwd_projected").and_then(|v| v.as_bool()).unwrap_or(false);
+        let query = c.get("query_visible").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let ok = status == "ok";
+        let stage_icons = format!("ODS {} DWD {} Query {}",
+            if ods { "✓" } else { "✗" },
+            if dwd { "✓" } else { "✗" },
+            if query { "✓" } else { "✗" });
+
+        let detail = if ok {
+            format!("ok ({:.1}s round-trip)  {}", round_trip as f64 / 1000.0, stage_icons)
+        } else {
+            format!("{} — stuck at: {}  {}", status, failed_stage, stage_icons)
+        };
+
+        let hint = if !ok && !failed_stage.is_empty() {
+            Some(match failed_stage {
+                "ingest" => "events not reaching ODS — check reporter + collector connectivity",
+                "projection" => "ODS has data but DWD projection stalled — check projector worker",
+                "query" => "DWD has data but query layer can't see it — check query-service",
+                _ => "check pipeline diagnostics: curl http://127.0.0.1:8090/v1/diagnostics/pipeline",
+            })
+        } else {
+            None
+        };
+
+        emit("usage-canary", ok, &detail, hint);
     }
 }

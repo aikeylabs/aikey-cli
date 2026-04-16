@@ -37,6 +37,7 @@ const VAULT_DIR: &str = ".aikey/data";
 const DB_NAME: &str = "vault.db";
 
 /// Default binding domain
+#[allow(dead_code)]
 const DEFAULT_BINDING_DOMAIN: &str = "default";
 
 /// Returns the full path to the vault database

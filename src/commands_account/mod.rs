@@ -579,6 +579,7 @@ fn try_refresh_if_needed(acc: &storage::PlatformAccount) -> Result<String, Strin
 ///
 /// Automatically renews the token via refresh if it is close to expiry.
 /// Returns `Err` if the user is not logged in or token renewal fails.
+#[allow(dead_code)]
 fn get_authenticated_client() -> Result<PlatformClient, Box<dyn std::error::Error>> {
     let acc = storage::get_platform_account()?
         .ok_or("Not logged in. Run 'aikey account login' first.")?;
@@ -2088,8 +2089,6 @@ pub fn handle_key_use(
             "active_env_written": true,
         }));
     } else {
-        use colored::Colorize;
-
         let status = if hook_msg.is_some() {
             "\u{2192} Shell hook just installed. Open a new terminal or: source ~/.aikey/active.env"
         } else {

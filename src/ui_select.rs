@@ -519,18 +519,19 @@ fn fallback_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<ProviderTre
 }
 
 #[derive(Clone)]
-enum TreeRow { Provider(usize), Candidate(usize, usize), Separator, Confirm, Cancel }
+enum TreeRow { Provider(usize), Candidate(usize, usize), Blank, Separator, Confirm, Cancel }
 
 fn build_tree_rows(groups: &[ProviderGroup]) -> Vec<TreeRow> {
     let mut rows = Vec::new();
     for (gi, g) in groups.iter().enumerate() {
+        if gi > 0 { rows.push(TreeRow::Blank); } // visual spacing between groups
         rows.push(TreeRow::Provider(gi));
         if g.expanded { for ci in 0..g.candidates.len() { rows.push(TreeRow::Candidate(gi, ci)); } }
     }
-    rows.push(TreeRow::Separator); rows.push(TreeRow::Confirm); rows.push(TreeRow::Cancel); rows
+    rows
 }
 
-fn is_focusable(row: &TreeRow) -> bool { !matches!(row, TreeRow::Separator) }
+fn is_focusable(row: &TreeRow) -> bool { !matches!(row, TreeRow::Separator | TreeRow::Blank) }
 
 /// Compute the maximum visible label width across all candidates in all groups.
 fn max_candidate_label_width(groups: &[ProviderGroup]) -> usize {
@@ -549,13 +550,11 @@ fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inn
         TreeRow::Provider(gi) => {
             let g = &groups[*gi];
             let arrow = if g.expanded { "\u{25BC}" } else { "\u{25B6}" };
-            let cur = g.selected.map(|i| format!("  \x1b[32m\u{2190} {}\x1b[0m", g.candidates[i].label)).unwrap_or_default();
-            format!("{}{} {}{}", cursor_mark, arrow, g.provider_code, cur)
+            format!("{}{} \x1b[1m{}\x1b[0m", cursor_mark, arrow, g.provider_code)
         }
         TreeRow::Candidate(gi, ci) => {
             let g = &groups[*gi]; let c = &g.candidates[*ci];
             let radio = if g.selected == Some(*ci) { "\x1b[32m(*)\x1b[0m" } else { "( )" };
-            let active = if g.selected == Some(*ci) { "  \x1b[32mactive\x1b[0m" } else { "" };
             let label_raw = if is_cursor { format!("\x1b[1m{}\x1b[0m", c.label) } else { c.label.clone() };
             let label_padded = pad_visible(&label_raw, label_col_w);
             let display_type = c.display_type.as_deref().unwrap_or_else(|| {
@@ -564,8 +563,15 @@ fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inn
                     other => other,
                 }
             });
-            format!("{}    {} {} \x1b[90m{}\x1b[0m{}", cursor_mark, radio, label_padded, display_type, active)
+            // Combine type + dot into one column so pad_visible accounts for total width
+            let type_col = if g.selected == Some(*ci) {
+                format!("\x1b[90m{}\x1b[0m \x1b[32m\u{25cf}\x1b[0m", display_type)
+            } else {
+                format!("\x1b[90m{}\x1b[0m", display_type)
+            };
+            format!("{}    {} {} {}", cursor_mark, radio, label_padded, type_col)
         }
+        TreeRow::Blank => { String::new() }
         TreeRow::Separator => { format!("  {}", "\u{2500}".repeat(pad_target.saturating_sub(2))) }
         TreeRow::Confirm => {
             if is_cursor {
@@ -616,14 +622,14 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
         // Dynamic label column: adapt to longest candidate label + 2 padding
         let label_col_w = max_candidate_label_width(groups) + 2;
         // Candidate row visible width:
-        //   cursor(2) + indent(4) + radio+space(4) + label_col_w + space(1) + type(~8) + "  active"(8)
+        //   cursor(2) + indent(4) + radio+space(4) + label_col_w + space(1) + type(~8) + " ●"(2)
         let max_type_w = groups.iter()
             .flat_map(|g| g.candidates.iter())
             .map(|c| c.display_type.as_deref().unwrap_or(
                 if c.source_type == "personal_oauth_account" { "oauth" } else { &c.source_type }
             ).len())
             .max().unwrap_or(8);
-        let content_min_w = 2 + 4 + 4 + label_col_w + 1 + max_type_w + 8;
+        let content_min_w = 2 + 4 + 4 + label_col_w + 1 + max_type_w + 4;
         let inner_w = (visible_len(&icon_title) + 4).max(content_min_w).min(max_inner);
         let border = "\u{2500}".repeat(inner_w);
         let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
@@ -637,7 +643,7 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
         write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
         for (i, row) in rows.iter().enumerate() { write!(out, "{}\r\n", format_tree_row(row, groups, i == cursor, inner_w, label_col_w))?; }
         write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
-        write!(out, "  [\u{2191}\u{2193} move, \x1b[1;33mSpace\x1b[0m select/expand, \x1b[1;33mY\x1b[0m confirm, \x1b[1;33mN\x1b[0m cancel]\r\n")?;
+        write!(out, "  [\u{2191}\u{2193} move \u{2022} \x1b[1;33mSpace\x1b[0m select/expand \u{2022} \x1b[1;33mEnter\x1b[0m confirm \u{2022} \x1b[1;33mEsc\x1b[0m cancel]\r\n")?;
         out.flush()?;
 
         let key = read_key(&tty)?;
@@ -651,36 +657,16 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
             Key::Up => { let mut n = cursor; loop { if n == 0 { break; } n -= 1; if is_focusable(&rows[n]) { cursor = n; break; } } }
             Key::Down => { let mut n = cursor; loop { if n + 1 >= total { break; } n += 1; if is_focusable(&rows[n]) { cursor = n; break; } } }
             Key::Space => {
-                // Space: select/expand on items; confirm/cancel on action rows
                 match &rows[cursor] {
                     TreeRow::Provider(gi) => { groups[*gi].expanded = !groups[*gi].expanded; }
                     TreeRow::Candidate(gi, ci) => { groups[*gi].selected = Some(*ci); }
-                    TreeRow::Confirm => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Confirmed(groups.clone())); }
-                    TreeRow::Cancel => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Cancelled); }
-                    TreeRow::Separator => {}
+                    _ => {}
                 }
             }
             Key::Enter => {
-                // Enter: only activates Confirm/Cancel when focused on them;
-                // on item rows, behaves same as Space (select/expand)
-                match &rows[cursor] {
-                    TreeRow::Provider(gi) => { groups[*gi].expanded = !groups[*gi].expanded; }
-                    TreeRow::Candidate(gi, ci) => { groups[*gi].selected = Some(*ci); }
-                    TreeRow::Confirm => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Confirmed(groups.clone())); }
-                    TreeRow::Cancel => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Cancelled); }
-                    TreeRow::Separator => {}
-                }
-            }
-            // Y/N shortcuts: jump cursor to Confirm/Cancel row
-            Key::Char('y') | Key::Char('Y') => {
-                if let Some(pos) = rows.iter().position(|r| matches!(r, TreeRow::Confirm)) {
-                    cursor = pos;
-                }
-            }
-            Key::Char('n') | Key::Char('N') => {
-                if let Some(pos) = rows.iter().position(|r| matches!(r, TreeRow::Cancel)) {
-                    cursor = pos;
-                }
+                // Enter confirms the current selection
+                write!(out, "\x1b[?25h")?; out.flush()?;
+                return Ok(ProviderTreeResult::Confirmed(groups.clone()));
             }
             Key::Escape | Key::CtrlC => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Cancelled); }
             _ => {}

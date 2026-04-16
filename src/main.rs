@@ -1,33 +1,33 @@
-mod credential_type;
-mod storage;
+#[allow(dead_code)] mod credential_type;
+#[allow(dead_code)] mod storage;
 mod crypto;
 mod session;
 mod executor;
-mod synapse;
-mod audit;
+#[allow(dead_code)] mod synapse;
+#[allow(dead_code)] mod audit;
 mod ratelimit;
-mod json_output;
-mod error_codes;
+#[allow(dead_code)] mod json_output;
+#[allow(dead_code)] mod error_codes;
 mod config;
-mod env_resolver;
-mod env_renderer;
-mod commands_project;
+#[allow(dead_code)] mod env_resolver;
+#[allow(dead_code)] mod env_renderer;
+#[allow(dead_code)] mod commands_project;
 // mod commands_env; // removed: env commands dropped
 mod commands_proxy;
-mod commands_account;
+#[allow(dead_code)] mod commands_account;
 mod migrations;
-mod platform_client;
+#[allow(dead_code)] mod platform_client;
 // mod profiles; // removed: profile commands dropped
 // mod core; // removed: profile-based resolver dropped
-mod global_config;
+#[allow(dead_code)] mod global_config;
 mod providers;
 mod resolver;
-mod events;
-mod observability;
+#[allow(dead_code)] mod events;
+#[allow(dead_code)] mod observability;
 mod ui_frame;
-mod ui_select;
+#[allow(dead_code)] mod ui_select;
 mod proxy_env;
-mod profile_activation;
+#[allow(dead_code)] mod profile_activation;
 mod commands_auth;
 mod cli;
 
@@ -37,8 +37,6 @@ use secrecy::{ExposeSecret, SecretString};
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use zeroize::Zeroizing;
-use error_codes::msgs;
-
 use aikeylabs_aikey_cli::prompt_hidden;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -129,11 +127,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle --version flag
     if cli.version {
-        const VERSION: &str = env!("CARGO_PKG_VERSION");
         if cli.json {
-            json_output::success(serde_json::json!({
-                "version": VERSION
-            }));
+            json_output::success(cli::build_version_json());
         } else {
             print_banner();
         }
@@ -222,6 +217,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Handle `aikey stats` command
+#[allow(dead_code)]
 fn handle_stats(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Count project configs
     let mut project_count = 0;
@@ -282,7 +278,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // is available in the environment.  Skipped for proxy lifecycle commands which
     // manage the process themselves, and for version/init which predate the proxy.
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version => {}
         _ => { commands_proxy::try_auto_start_from_env(); }
     }
 
@@ -291,11 +287,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // lifecycle and init commands which either predate the vault or manage the
     // process themselves.
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version => {}
         _ => { commands_account::try_background_snapshot_sync(); }
     }
 
     match command {
+        Commands::Version => {
+            if cli.json {
+                json_output::success(cli::build_version_json());
+            } else {
+                cli::print_version_detail();
+            }
+            return Ok(());
+        }
         Commands::Init => {
             let password = prompt_password_secure("\u{1F512} Set Master Password: ", cli.password_stdin, cli.json)?;
             let mut salt = [0u8; 16];
@@ -751,7 +755,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let all_data: Vec<&RowData> = personal_rows.iter().chain(team_rows.iter()).collect();
-                let headers = ["ALIAS", "PROVIDERS", "USE FOR", "KEY", "STATUS", "CREATED"];
+                let headers = ["ALIAS", "PROVIDERS", "USING FOR", "KEY", "STATUS", "CREATED"];
                 let pad = 2;
                 let w_alias   = headers[0].len().max(all_data.iter().map(|r| r.alias.len()).max().unwrap_or(0)) + pad;
                 let w_prov    = headers[1].len().max(all_data.iter().map(|r| r.providers.len()).max().unwrap_or(0)) + pad;
@@ -833,7 +837,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let pad = 2;
                     let w_id   = "IDENTITY".len().max(oauth_rows.iter().map(|r| r.identity.len()).max().unwrap_or(0)) + pad;
                     let w_prov = "PROVIDER".len().max(oauth_rows.iter().map(|r| r.provider.len()).max().unwrap_or(0)) + pad;
-                    let w_uf   = "USE FOR".len().max(oauth_rows.iter().map(|r| r.use_for.len()).max().unwrap_or(0)) + pad;
+                    let w_uf   = "USING FOR".len().max(oauth_rows.iter().map(|r| r.use_for.len()).max().unwrap_or(0)) + pad;
                     let w_st   = "STATUS".len().max(oauth_rows.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
                     let w_tier = "TIER".len().max(oauth_rows.iter().map(|r| r.tier.len()).max().unwrap_or(0)) + pad;
                     let _w_exp = "EXPIRES".len().max(oauth_rows.iter().map(|r| r.expires.len()).max().unwrap_or(0)) + pad;
@@ -841,7 +845,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     rows.push(String::new());
                     rows.push(format!("\u{1F517} Provider Accounts - OAuth ({})", oauth_accounts.len()));
                     rows.push(format!("{:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}",
-                        "IDENTITY", "PROVIDER", "USE FOR", "STATUS", "TIER", "EXPIRES",
+                        "IDENTITY", "PROVIDER", "USING FOR", "STATUS", "TIER", "EXPIRES",
                         wi = w_id, wp = w_prov, wu = w_uf, ws = w_st, wt = w_tier));
                     rows.push("\u{2500}".repeat(sep_width));
                     for r in &oauth_rows {
@@ -2064,6 +2068,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 /// P1-Q3: Handle aikey shell command
 /// Starts an interactive subshell with non-sensitive context only.
 /// Secrets are NOT exported as long-lived env vars; each command uses aikey run injection.
+#[allow(dead_code)]
 fn handle_shell_command(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     if json_mode {
         return Err("Shell mode is not supported in JSON mode".into());
@@ -2272,6 +2277,7 @@ fn prompt_password_secure(prompt: &str, password_stdin: bool, json_mode: bool) -
 
 /// Show an interactive arrow-key picker with all available personal + team keys.
 /// Returns the alias/id that the user selected.
+#[allow(dead_code)]
 fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
     use colored::Colorize;
 
@@ -2539,7 +2545,7 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
                 // e.g. "eFOreadeblakeE96j@muslim.com" → "eFOread...@muslim.com"
                 // Why: long emails overflow the interactive picker box width.
                 let identity_truncated = truncate_email(identity, 10);
-                let label = format!("{} ({})", identity_truncated, acct.provider);
+                let label = identity_truncated;
                 // Tier suffix: p=pro, f=free, m=max, etc.
                 let tier_tag = match acct.account_tier.as_deref() {
                     Some("pro") => "p",

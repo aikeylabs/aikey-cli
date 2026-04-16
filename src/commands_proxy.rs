@@ -7,7 +7,6 @@
 //! A lightweight `proxy_guard` is exported for use by other commands (e.g. `run`)
 //! so the proxy is automatically started in the background when needed.
 
-use rpassword;
 use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 use std::io;

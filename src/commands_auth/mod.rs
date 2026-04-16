@@ -143,8 +143,9 @@ fn login_device_code(
         eprintln!("Waiting for authorization...");
     }
 
-    // Poll for completion
-    poll_login_status(base, session_id, provider, json_mode)
+    // Device Code: use POST /oauth/poll (triggers provider poll on each call).
+    // Why not GET /oauth/status: status is read-only and won't drive device-code progress.
+    poll_device_code(base, session_id, provider, json_mode)
 }
 
 /// Submit code#state and handle the result (used by setup_token flow).
@@ -234,6 +235,80 @@ fn poll_login_status(
                     eprint!(".");
                     io::stderr().flush()?;
                 }
+            }
+        }
+    }
+}
+
+/// Poll POST /oauth/poll for device-code flows (Kimi).
+/// Each call triggers one poll attempt against the provider's token endpoint.
+/// Returns when the user authorizes in browser or timeout is reached.
+fn poll_device_code(
+    base: &str, session_id: &str, provider: &str, json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let timeout = std::time::Duration::from_secs(300); // Device code flows allow longer timeout
+    let start = std::time::Instant::now();
+    // Kimi device code interval is typically 5s; respect provider's rate limit.
+    let poll_interval = std::time::Duration::from_secs(5);
+
+    loop {
+        std::thread::sleep(poll_interval);
+
+        if start.elapsed() > timeout {
+            return Err("Device code expired (5min timeout). Run `aikey auth login` again.".into());
+        }
+
+        let resp_result = ureq::post(&format!("{}/oauth/poll", base))
+            .set("Content-Type", "application/json")
+            .send_string(&serde_json::json!({
+                "session_id": session_id,
+            }).to_string());
+
+        match resp_result {
+            Ok(r) => {
+                // 200 = success (LoginResult with account_id, display_identity, etc.)
+                let resp: serde_json::Value = r.into_json()?;
+                let account_id = resp["account_id"].as_str().unwrap_or("");
+                let display = resp["display_identity"].as_str().unwrap_or(account_id);
+
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                } else {
+                    eprintln!();
+                    eprintln!("{} Logged in as {} ({})", "[OK]".green(), display.bold(), provider);
+
+                    // D13: prompt for display name if no email
+                    if display.is_empty() || !display.contains('@') {
+                        prompt_display_identity(base, account_id)?;
+                    }
+                }
+                return Ok(());
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                // 4xx error from broker
+                let body: serde_json::Value = resp.into_json().unwrap_or_default();
+                let retry = body["retry"].as_bool().unwrap_or(false);
+
+                if retry {
+                    // Still pending — provider hasn't seen user authorization yet
+                    if !json_mode {
+                        eprint!(".");
+                        io::stderr().flush()?;
+                    }
+                    continue;
+                }
+
+                // Non-retryable error (session expired, flow failed, etc.)
+                let msg = body["message"].as_str().unwrap_or("Device code login failed");
+                if !json_mode {
+                    eprintln!();
+                    eprintln!("{} {} (HTTP {})", "[X]".red(), msg, code);
+                }
+                return Err(msg.to_string().into());
+            }
+            Err(_) => {
+                // Network error — retry silently
+                continue;
             }
         }
     }
@@ -337,7 +412,7 @@ fn handle_list(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
 // aikey auth use <account>
 // ============================================================================
 
-fn handle_use(account: &str, proxy_port: u16, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_use(account: &str, _proxy_port: u16, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Match account: exact ID or fuzzy display_identity
     let target = find_account(account)?;
 

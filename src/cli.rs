@@ -72,6 +72,9 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
+    /// Show version info (CLI + local proxy if running)
+    #[command(display_order = 100)]
+    Version,
     /// Initialize the vault (runs automatically on first use)
     #[command(hide = true)]
     Init,
@@ -276,7 +279,7 @@ pub(crate) enum Commands {
         action: SecretAction,
     },
     /// Authenticate with provider OAuth accounts (Claude, Codex, Kimi)
-    #[command(display_order = 23)]
+    #[command(display_order = 2)]
     Auth {
         #[command(subcommand)]
         action: AuthAction,
@@ -552,6 +555,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 AuthAction::Status { .. } => "status",
                 AuthAction::Doctor { .. } => "doctor",
             }),
+            Commands::Version => "version".to_string(),
         },
     }
 }
@@ -755,6 +759,7 @@ Usage: aikey [OPTIONS] [COMMAND]
 
 Commands:
   {b}add{r} <alias>              Save a new secret to the vault
+  {b}auth{r} <command>           Manage provider OAuth accounts (Claude, Codex, Kimi)
   {b}list{r}                     Show all personal and team keys
   {b}test{r} <alias>             Test whether a stored API key alias is working
   {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
@@ -1141,6 +1146,94 @@ Detailed Commands
     - Prompts for old password, new password, and confirmation.
     - Invalidates the cached local session after success.
 
+[1mauth[0m
+  Manage provider OAuth accounts. Supports Claude (Setup Token), Codex (Auth Code),
+  and Kimi (Device Code) OAuth flows. OAuth accounts are an alternative to API keys —
+  they use your existing provider subscription (Claude Pro, ChatGPT Plus, Kimi, etc.)
+  and are managed alongside personal/team keys in `aikey use`.
+
+  Usage:
+    aikey auth <SUBCOMMAND>
+
+  Subcommands:
+    [1mlogin[0m
+      Authenticate with a provider OAuth account.
+
+      Usage:
+        aikey auth login <PROVIDER>
+
+      Arguments:
+        PROVIDER: claude, codex, kimi
+
+      Notes:
+        - Claude: opens browser for Setup Token, paste the code back into the terminal.
+        - Codex: opens browser for OAuth authorization, callback received automatically.
+        - Kimi: displays a device code, open the URL and enter the code in browser.
+        - If the account already exists, tokens are refreshed (no duplicate accounts).
+        - Proxy must be running (auto-started if needed).
+
+      Examples:
+        aikey auth login claude
+        aikey auth login codex
+        aikey auth login kimi
+
+    [1mlogout[0m
+      Remove a provider OAuth account and its tokens from the local vault.
+
+      Usage:
+        aikey auth logout <TARGET>
+
+      Arguments:
+        TARGET: provider name (e.g. claude) or account ID
+
+      Notes:
+        - If the account is currently active (via `aikey use`), the binding is also removed.
+        - Prompts for confirmation in interactive mode.
+
+    [1mlist[0m
+      Show all registered provider OAuth accounts.
+
+      Usage:
+        aikey auth list
+
+      Notes:
+        - Shows identity (email), provider, status, tier, and token expiry.
+        - Equivalent to the OAuth section in `aikey list`.
+
+    [1muse[0m
+      Set a provider OAuth account as the active key for its provider.
+
+      Usage:
+        aikey auth use <ACCOUNT>
+
+      Arguments:
+        ACCOUNT: account ID or display identity (email)
+
+      Notes:
+        - Mutual exclusion: activating an OAuth account deactivates any API key for the
+          same provider, and vice versa.
+        - Equivalent to selecting the account in `aikey use` interactive picker.
+
+    [1mstatus[0m
+      Show health and token status for provider accounts.
+
+      Usage:
+        aikey auth status [ACCOUNT]
+
+      Notes:
+        - Without ACCOUNT, shows all accounts.
+        - Displays token validity, refresh status, and upstream connectivity.
+
+    [1mdoctor[0m
+      Diagnose provider account connectivity end-to-end.
+
+      Usage:
+        aikey auth doctor [PROVIDER]
+
+      Notes:
+        - Tests: token freshness → proxy injection → upstream API reachability.
+        - Without PROVIDER, checks all registered accounts.
+
 [1maccount[0m
   Manage the current control-service account session.
 
@@ -1210,9 +1303,80 @@ Detailed Commands
 }
 
 
+// Build-time constants injected by build.rs.
+const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_REVISION: &str = env!("AIKEY_BUILD_REVISION");
+const BUILD_ID: &str = env!("AIKEY_BUILD_ID");
+const BUILD_TIME: &str = env!("AIKEY_BUILD_TIME");
+
+/// Returns structured version info as a JSON value (for --json and version --json).
+pub(crate) fn build_version_json() -> serde_json::Value {
+    serde_json::json!({
+        "version": BUILD_VERSION,
+        "revision": BUILD_REVISION,
+        "dirty": BUILD_REVISION.ends_with("-dirty"),
+        "build_id": BUILD_ID,
+        "build_time": BUILD_TIME,
+    })
+}
+
+/// Print detailed version information (for `aikey version` subcommand).
+pub(crate) fn print_version_detail() {
+    use colored::Colorize;
+    eprintln!("{}", "AiKey CLI".bold());
+    eprintln!("  Version:   {}", BUILD_VERSION);
+    eprintln!("  Revision:  {}", BUILD_REVISION);
+    eprintln!("  BuildID:   {}", BUILD_ID);
+    eprintln!("  Built:     {}", BUILD_TIME);
+
+    // Probe local proxy for its version (best effort, silent on failure).
+    if let Some(proxy_info) = probe_proxy_version() {
+        eprintln!();
+        eprintln!("{}", "AiKey Proxy (127.0.0.1:27200)".bold());
+        if let Some(v) = proxy_info.get("version").and_then(|v| v.as_str()) {
+            eprintln!("  Version:   {}", v);
+        }
+        if let Some(r) = proxy_info.get("revision").and_then(|v| v.as_str()) {
+            eprintln!("  Revision:  {}", r);
+        }
+        if let Some(b) = proxy_info.get("build_id").and_then(|v| v.as_str()) {
+            eprintln!("  BuildID:   {}", b);
+        }
+        if let Some(t) = proxy_info.get("build_time").and_then(|v| v.as_str()) {
+            eprintln!("  Built:     {}", t);
+        }
+    }
+}
+
+/// Try to fetch version info from the local proxy via GET http://127.0.0.1:27200/version.
+/// Returns None on any failure (proxy not running, timeout, parse error).
+fn probe_proxy_version() -> Option<serde_json::Value> {
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let mut stream = TcpStream::connect_timeout(
+        &"127.0.0.1:27200".parse().ok()?,
+        Duration::from_millis(500),
+    ).ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(1000))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_millis(500))).ok()?;
+
+    use std::io::Write;
+    stream.write_all(b"GET /version HTTP/1.1\r\nHost: 127.0.0.1:27200\r\nConnection: close\r\n\r\n").ok()?;
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let response = String::from_utf8_lossy(&buf);
+
+    // Find the JSON body after the HTTP headers (separated by \r\n\r\n).
+    let body = response.split("\r\n\r\n").nth(1)?;
+    serde_json::from_str(body.trim()).ok()
+}
+
 pub(crate) fn print_banner() {
     use colored::Colorize;
-    let version = env!("CARGO_PKG_VERSION");
+    let version = BUILD_VERSION;
     let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
     let aikey_home = format!("{}/.aikey", home);
 
