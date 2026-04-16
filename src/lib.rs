@@ -66,6 +66,11 @@ fn read_password_with_stars() -> std::io::Result<String> {
         .open("/dev/tty")?;
     let tty_fd = tty.as_raw_fd();
 
+    // Why: flush any stale bytes left in the kernel tty input queue by a
+    // previous raw-mode session (e.g. the interactive picker). Without this,
+    // leftover escape sequences get prepended to the user's paste.
+    unsafe { libc::tcflush(tty_fd, libc::TCIFLUSH); }
+
     // Save original terminal settings.
     let orig = unsafe {
         let mut t: libc::termios = std::mem::zeroed();
@@ -86,17 +91,50 @@ fn read_password_with_stars() -> std::io::Result<String> {
         }
     }
 
+    // Why: disable bracketed paste mode so terminals don't wrap pasted text in
+    // \x1b[200~ ... \x1b[201~ sequences that corrupt the value.
+    {
+        use std::os::unix::io::FromRawFd;
+        let mut tty_w = unsafe { std::fs::File::from_raw_fd(libc::dup(tty_fd)) };
+        let _ = tty_w.write_all(b"\x1b[?2004l");
+        let _ = tty_w.flush();
+    }
+
     let mut password = String::new();
     let mut buf = [0u8; 1];
+    // Track ESC sequences to skip non-printable terminal control bytes.
+    let mut in_esc: u8 = 0; // 0=normal, 1=got ESC, 2=got ESC+[
 
     loop {
         let n = (&tty).read(&mut buf)?;
         if n == 0 {
             break;
         }
+
+        // Skip bracketed paste and other escape sequences silently.
+        // ESC [ <params> <final> — final byte is 0x40..0x7E.
+        if in_esc == 2 {
+            // Inside CSI sequence: consume until final byte (@ through ~).
+            if (0x40..=0x7E).contains(&buf[0]) {
+                in_esc = 0;
+            }
+            continue;
+        }
+        if in_esc == 1 {
+            if buf[0] == b'[' {
+                in_esc = 2;
+                continue;
+            }
+            // ESC + non-[ : two-byte sequence, done.
+            in_esc = 0;
+            continue;
+        }
+
         match buf[0] {
             // Enter (LF or CR)
             b'\n' | b'\r' => break,
+            // ESC — start of escape sequence
+            0x1B => { in_esc = 1; }
             // Backspace or DEL
             0x7f | 0x08 => {
                 if !password.is_empty() {
@@ -110,12 +148,14 @@ fn read_password_with_stars() -> std::io::Result<String> {
                 unsafe { libc::tcsetattr(tty_fd, libc::TCSANOW, &orig); }
                 return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "interrupted"));
             }
-            // Printable character (or pasted text byte)
-            c => {
+            // Only accept printable ASCII characters.
+            c if c >= 0x20 && c < 0x7F => {
                 password.push(c as char);
                 eprint!("*");
                 let _ = std::io::stderr().flush();
             }
+            // Silently skip other control bytes.
+            _ => {}
         }
     }
 
