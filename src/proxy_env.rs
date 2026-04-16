@@ -192,16 +192,34 @@ const SENSITIVE_FRAGMENTS: &[&str] = &[
     "key", "token", "secret", "password", "authorization", "cookie",
 ];
 
+/// Keys that match SENSITIVE_FRAGMENTS but are NOT sensitive (display values, labels).
+const NON_SENSITIVE_KEYS: &[&str] = &[
+    "aikey_active_keys",     // provider=identity mapping, not a secret
+    "aikey_active_label",    // display label for shell prompt
+];
+
 /// Returns true if the key name suggests a sensitive value.
 fn is_sensitive_key(key: &str) -> bool {
     let lower = key.to_lowercase();
+    if NON_SENSITIVE_KEYS.iter().any(|k| lower == *k) {
+        return false;
+    }
     SENSITIVE_FRAGMENTS.iter().any(|f| lower.contains(f))
 }
 
-/// Mask a value for display.  Sensitive values become `***`.
+/// Mask a value for display. Sensitive values show first 12 chars + "...".
 pub fn mask_value(key: &str, value: &str) -> String {
-    if is_sensitive_key(key) {
-        "***".to_string()
+    let lower = key.to_lowercase();
+    let is_known_safe = NON_SENSITIVE_KEYS.iter().any(|k| lower == *k);
+    if is_known_safe {
+        // Known non-sensitive: always show full value.
+        value.to_string()
+    } else if is_sensitive_key(key) {
+        if value.len() <= 12 {
+            value.to_string()
+        } else {
+            format!("{}...", &value[..12])
+        }
     } else if value.len() > 40 {
         // Long values may contain tokens even if key name is innocent.
         format!("{}...", &value[..20])

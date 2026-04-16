@@ -59,8 +59,22 @@ pub fn get_vault_path() -> Result<PathBuf, String> {
     Ok(vault_dir.join(DB_NAME))
 }
 
-/// Opens a connection to the vault database with security pragmas enabled
+/// Opens a connection to the vault database with security pragmas + idempotent migrations.
+/// Used by all write-path commands.
 pub(crate) fn open_connection() -> Result<Connection, String> {
+    let conn = open_connection_raw()?;
+    apply_migrations(&conn)?;
+    Ok(conn)
+}
+
+/// Opens a read-only connection: security pragmas only, NO migrations.
+/// Prefer `with_readonly()` for scoping an entire command as read-only.
+pub(crate) fn open_connection_readonly() -> Result<Connection, String> {
+    open_connection_raw()
+}
+
+/// Shared connection setup: open DB + security pragmas. No migrations.
+fn open_connection_raw() -> Result<Connection, String> {
     let db_path = get_vault_path()?;
     let conn = Connection::open(&db_path)
         .map_err(|e| format!("Failed to open database: {}", e))?;
@@ -76,9 +90,6 @@ pub(crate) fn open_connection() -> Result<Connection, String> {
     // Enforce foreign key constraints
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|e| format!("Failed to enable foreign keys: {}", e))?;
-
-    // Ensure required tables exist (idempotent migrations)
-    apply_migrations(&conn)?;
 
     Ok(conn)
 }
@@ -974,16 +985,25 @@ pub fn list_entries() -> Result<Vec<String>, String> {
     Ok(aliases)
 }
 
-/// List all entries with metadata (for JSON output)
+/// List all entries with metadata (uses write connection with migrations).
 pub fn list_entries_with_metadata() -> Result<Vec<SecretMetadata>, String> {
     let db_path = get_vault_path()?;
-
     if !db_path.exists() {
         return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
     }
+    query_entries_with_metadata(&open_connection()?)
+}
 
-    let conn = open_connection()?;
+/// List all entries with metadata (read-only, no migrations).
+pub fn list_entries_with_metadata_readonly() -> Result<Vec<SecretMetadata>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(vec![]);
+    }
+    query_entries_with_metadata(&open_connection_readonly()?)
+}
 
+fn query_entries_with_metadata(conn: &Connection) -> Result<Vec<SecretMetadata>, String> {
     // provider_code, base_url, supported_providers may not exist on older vaults.
     let mut stmt = conn
         .prepare("SELECT alias, created_at, provider_code, base_url, supported_providers FROM entries ORDER BY alias")
@@ -1427,11 +1447,19 @@ pub fn set_entry_route_token(alias: &str, token: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Gets the route_token for a personal key entry.
+/// Gets the route_token for a personal key entry (write connection with migrations).
 pub fn get_entry_route_token(alias: &str) -> Result<Option<String>, String> {
-    let conn = open_connection()?;
-    // Graceful degradation: if route_token column doesn't exist, return None.
-    if !has_column(&conn, "entries", "route_token") {
+    query_entry_route_token(&open_connection()?, alias)
+}
+
+/// Gets the route_token for a personal key entry (read-only, no migrations).
+/// Returns Ok(None) if the column doesn't exist (old vault).
+pub fn get_entry_route_token_readonly(alias: &str) -> Result<Option<String>, String> {
+    query_entry_route_token(&open_connection_readonly()?, alias)
+}
+
+fn query_entry_route_token(conn: &Connection, alias: &str) -> Result<Option<String>, String> {
+    if !has_column(conn, "entries", "route_token") {
         return Ok(None);
     }
     match conn.query_row(
@@ -1471,10 +1499,18 @@ pub fn set_provider_account_route_token(account_id: &str, token: &str) -> Result
     Ok(())
 }
 
-/// Gets the route_token for a provider (OAuth) account.
+/// Gets the route_token for a provider (OAuth) account (write connection with migrations).
 pub fn get_provider_account_route_token(account_id: &str) -> Result<Option<String>, String> {
-    let conn = open_connection()?;
-    if !has_column(&conn, "provider_accounts", "route_token") {
+    query_provider_account_route_token(&open_connection()?, account_id)
+}
+
+/// Gets the route_token for a provider (OAuth) account (read-only, no migrations).
+pub fn get_provider_account_route_token_readonly(account_id: &str) -> Result<Option<String>, String> {
+    query_provider_account_route_token(&open_connection_readonly()?, account_id)
+}
+
+fn query_provider_account_route_token(conn: &Connection, account_id: &str) -> Result<Option<String>, String> {
+    if !has_column(conn, "provider_accounts", "route_token") {
         return Ok(None);
     }
     match conn.query_row(

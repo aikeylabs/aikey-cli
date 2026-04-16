@@ -309,13 +309,50 @@ fn sentinel_token(key_source_type: &str, key_source_ref: &str) -> String {
 
 /// Writes the env lines to `~/.aikey/active.env`.
 fn write_active_env_file(lines: &[String]) -> Result<(), String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let aikey_dir = std::path::PathBuf::from(&home).join(".aikey");
+    // Use resolve_aikey_dir for consistent HOME → USERPROFILE → "." fallback.
+    let aikey_dir = crate::commands_account::resolve_aikey_dir();
     std::fs::create_dir_all(&aikey_dir)
         .map_err(|e| format!("Failed to create ~/.aikey: {}", e))?;
     let env_path = aikey_dir.join("active.env");
-    std::fs::write(&env_path, lines.join("\n") + "\n")
+
+    let mut content = lines.join("\n") + "\n";
+
+    // Append activate-hook source lines for live upgrade of the shell wrapper.
+    // Why: when `aikey use` upgrades the shell hook from v1→v2, the current terminal
+    // still has old function definitions. These lines inject the new wrapper + sentinel
+    // on the very next prompt via the existing precmd → source active.env chain.
+    // The hook files are idempotent; re-sourcing them just redefines functions.
+    content.push_str("# Live-load activate wrapper (idempotent)\n");
+    content.push_str("[[ -f ~/.aikey/activate-hook.zsh ]] && source ~/.aikey/activate-hook.zsh\n");
+    content.push_str("[[ -f ~/.aikey/activate-hook.bash ]] && source ~/.aikey/activate-hook.bash\n");
+
+    std::fs::write(&env_path, content)
         .map_err(|e| format!("Failed to write active.env: {}", e))?;
+
+    // Also write active.env.flat (plain KEY=VALUE, no shell syntax) for Windows.
+    // PowerShell/cmd deactivate reads this file instead of parsing sh-style active.env.
+    let flat_path = aikey_dir.join("active.env.flat");
+    let flat_lines: Vec<String> = lines.iter()
+        .filter_map(|line| {
+            // Extract KEY="VALUE" from `export KEY="VALUE"` lines.
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("export ") {
+                if let Some(eq) = rest.find('=') {
+                    let key = &rest[..eq];
+                    let val = rest[eq + 1..].trim_matches('"');
+                    // Skip shell-expansion lines (${...}) — not valid for flat file.
+                    if !val.contains("${") {
+                        return Some(format!("{}={}", key, val));
+                    }
+                }
+            }
+            None
+        })
+        .collect();
+    if !flat_lines.is_empty() {
+        let _ = std::fs::write(&flat_path, flat_lines.join("\n") + "\n");
+    }
+
     Ok(())
 }
 

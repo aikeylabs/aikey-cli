@@ -2156,10 +2156,9 @@ fn handle_route(
     let proxy_port = commands_proxy::proxy_port();
     let mut entries: Vec<RouteEntry> = Vec::new();
     let mut missing_token_count = 0usize;
-    let mut missing_column = false;
 
     // Collect active bindings for "●" marker.
-    let bindings = storage::list_provider_bindings("default").unwrap_or_default();
+    let bindings = storage::list_provider_bindings_readonly("default").unwrap_or_default();
     let is_active = |source_type: &str, source_ref: &str| -> bool {
         bindings.iter().any(|b| {
             b.key_source_ref == source_ref && match source_type {
@@ -2172,8 +2171,10 @@ fn handle_route(
     };
 
     // 1. Team managed keys
-    for vk in storage::list_virtual_key_cache().unwrap_or_default() {
-        if vk.local_state != "active" && vk.local_state != "synced_inactive" {
+    for vk in storage::list_virtual_key_cache_readonly().unwrap_or_default() {
+        // Only show team keys that the proxy will actually register in Registry.
+        // synced_inactive keys exist in vault but are NOT loaded by proxy.
+        if vk.local_state != "active" {
             continue;
         }
         let display_alias = vk.local_alias.as_deref().unwrap_or(&vk.alias);
@@ -2201,11 +2202,11 @@ fn handle_route(
     }
 
     // 2. OAuth accounts
-    for acct in storage::list_provider_accounts().unwrap_or_default() {
+    for acct in storage::list_provider_accounts_readonly().unwrap_or_default() {
         if acct.status != "active" { continue; }
         let label_str = acct.display_identity.as_deref()
             .unwrap_or(&acct.provider_account_id);
-        match storage::get_provider_account_route_token(&acct.provider_account_id) {
+        match storage::get_provider_account_route_token_readonly(&acct.provider_account_id) {
             Ok(Some(token)) => {
                 entries.push(RouteEntry {
                     provider: canonical_provider(&acct.provider).to_string(),
@@ -2217,18 +2218,17 @@ fn handle_route(
                 });
             }
             Ok(None) => { missing_token_count += 1; }
-            Err(e) if e.contains("route_token") => { missing_column = true; }
             Err(_) => { missing_token_count += 1; }
         }
     }
 
     // 3. Personal keys
-    for meta in storage::list_entries_with_metadata().unwrap_or_default() {
+    for meta in storage::list_entries_with_metadata_readonly().unwrap_or_default() {
         // Skip entries without a provider (plain secrets, not API keys).
         if meta.provider_code.is_none() && meta.supported_providers.is_none() {
             continue;
         }
-        match storage::get_entry_route_token(&meta.alias) {
+        match storage::get_entry_route_token_readonly(&meta.alias) {
             Ok(Some(token)) => {
                 let providers = meta.supported_providers.as_deref()
                     .unwrap_or_else(|| meta.provider_code.as_ref()
@@ -2246,7 +2246,6 @@ fn handle_route(
                 }
             }
             Ok(None) => { missing_token_count += 1; }
-            Err(e) if e.contains("route_token") => { missing_column = true; }
             Err(_) => { missing_token_count += 1; }
         }
     }
@@ -2261,7 +2260,7 @@ fn handle_route(
             if json_mode { json_output::error(&msg, 1); } else { return Err(msg.into()); }
         }
         if json_mode {
-            json_output::success(serde_json::to_value(&matched)?);
+            json_output::success(serde_json::json!({ "routes": matched }));
         } else {
             let first = matched[0];
             eprintln!("  # Configuration for: {} ({}, {})\n", first.label, first.key_type, first.provider);
@@ -2282,10 +2281,10 @@ fn handle_route(
 
     // No label — list all routes.
     if json_mode {
-        json_output::success(serde_json::to_value(&entries)?);
+        json_output::success(serde_json::json!({ "routes": entries }));
     }
 
-    if entries.is_empty() && !missing_column {
+    if entries.is_empty() {
         eprintln!("  No routes available. Add keys with `aikey add` or `aikey auth login`.");
         return Ok(());
     }
@@ -2294,6 +2293,7 @@ fn handle_route(
     eprintln!();
     eprintln!("  {:<13} {:<10} {:<22} {:<38} {}",
         "PROVIDER", "TYPE", "LABEL", "API_KEY", "BASE URL");
+    eprintln!("  {}", "\u{2500}".repeat(95));
 
     for entry in &entries {
         let token_display = if full || entry.api_key.len() <= 24 {
@@ -2316,14 +2316,13 @@ fn handle_route(
     eprintln!("  {} = active (set by `aikey use`)", "\u{25cf}".green());
     eprintln!("  {} providers, {} routes available", providers.len(), entries.len());
     eprintln!();
-    eprintln!("  Copy-paste config: aikey route <LABEL>  (e.g. aikey route {})",
-        entries.first().map(|e| e.label.as_str()).unwrap_or("my-key"));
+    let example_label = entries.first().map(|e| e.label.as_str()).unwrap_or("my-key");
+    eprintln!("  {} {} {}",
+        "\u{27a4}".cyan(),
+        "Copy-paste config:".bold(),
+        format!("aikey route {}", example_label).cyan());
 
-    if missing_column {
-        eprintln!();
-        eprintln!("  {} Vault not migrated. Run `aikey use` or `aikey add` to complete setup.", "\u{26a0}".yellow());
-        eprintln!("    Personal and OAuth route tokens will be available after migration.");
-    } else if missing_token_count > 0 {
+    if missing_token_count > 0 {
         eprintln!();
         eprintln!("  {} {} keys missing route token. Run `aikey use` or `aikey add` to complete setup.",
             "\u{26a0}".yellow(), missing_token_count);
@@ -2989,7 +2988,7 @@ fn resolve_activate_key(
     }
 
     // ── 2. Try OAuth accounts ───────────────────────────────────────────────
-    for acct in storage::list_provider_accounts().unwrap_or_default() {
+    for acct in storage::list_provider_accounts_readonly().unwrap_or_default() {
         if acct.status != "active" { continue; }
         let identity = acct.display_identity.as_deref()
             .unwrap_or(&acct.provider_account_id);
@@ -2997,7 +2996,8 @@ fn resolve_activate_key(
             && !acct.provider_account_id.eq_ignore_ascii_case(alias) {
             continue;
         }
-        let token = storage::ensure_provider_account_route_token(&acct.provider_account_id)?;
+        let token = storage::get_provider_account_route_token_readonly(&acct.provider_account_id)?
+            .ok_or_else(|| format!("No route token for '{}'. Run `aikey use` first to generate tokens.", identity))?;
         let providers = vec![acct.provider.clone()];
         let target = resolve_single_provider(identity, &providers, provider_override)?;
         return Ok((identity.to_string(), token, target));
@@ -3012,7 +3012,8 @@ fn resolve_activate_key(
                 alias, alias
             ).into());
         }
-        let token = storage::ensure_entry_route_token(alias)?;
+        let token = storage::get_entry_route_token_readonly(alias)?
+            .ok_or_else(|| format!("No route token for '{}'. Run `aikey use` first to generate tokens.", alias))?;
         let target = resolve_single_provider(alias, &providers, provider_override)?;
         return Ok((alias.to_string(), token, target));
     }
@@ -3049,24 +3050,57 @@ fn resolve_single_provider(
     ).into())
 }
 
-/// `aikey activate <alias> --shell <shell>` — output eval-safe export statements.
+/// Auto-detect the current shell from the SHELL environment variable.
+/// Returns "zsh", "bash", "powershell", or None if unrecognized.
+fn detect_shell() -> Option<&'static str> {
+    let shell_env = std::env::var("SHELL").unwrap_or_default();
+    if shell_env.contains("zsh") { return Some("zsh"); }
+    if shell_env.contains("bash") { return Some("bash"); }
+    // Windows: PSModulePath is set in PowerShell sessions.
+    if std::env::var("PSModulePath").is_ok() { return Some("powershell"); }
+    // Windows cmd: PROMPT env var is typically set.
+    if std::env::var("PROMPT").is_ok() && cfg!(windows) { return Some("cmd"); }
+    None
+}
+
+/// `aikey activate <alias> [--shell <shell>]` — output eval-safe export statements.
 ///
 /// Stdout: only eval-safe shell statements (captured by wrapper function).
 /// Stderr: all human-readable messages (flows through to terminal).
+/// When `--shell` is omitted, auto-detects from the SHELL env var.
 fn handle_activate(
     alias: &str,
     provider_override: Option<&str>,
     shell: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let shell = shell.ok_or(
-        "Missing --shell flag. Usage: eval $(aikey activate <alias> --shell zsh)\n\
-         The shell wrapper function passes this automatically."
-    )?;
-
-    // Ensure route tokens exist (same backfill as `aikey use`).
-    let _ = storage::backfill_route_tokens();
+    let detected;
+    let (shell, via_wrapper) = match shell {
+        Some(s) => (s, true),
+        None => {
+            detected = detect_shell().ok_or(
+                "Could not detect shell type. Pass --shell explicitly, e.g.:\n\
+                 eval $(aikey activate <alias> --shell zsh)"
+            )?;
+            // When user calls binary directly (no wrapper), remind them to eval.
+            eprintln!("\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m", detected);
+            eprintln!("\x1b[90m  eval $(aikey activate {} --shell {})\x1b[0m", alias, detected);
+            (detected, false)
+        }
+    };
+    // When called directly (not via wrapper), stdout is visible on terminal.
+    // Dim it so it doesn't distract — the user can't eval it anyway.
+    let dim = if via_wrapper { "" } else { "\x1b[90m" };
+    let reset = if via_wrapper { "" } else { "\x1b[0m" };
 
     let (label, token, provider) = resolve_activate_key(alias, provider_override)?;
+
+    // Why: resolve_activate_key may generate a new route token (first activate of a
+    // personal/OAuth key). The proxy's in-memory Registry won't know about it until
+    // the vault change-seq is bumped and a reload is triggered. Without this, the
+    // token we just output would hit TOKEN_INVALID on the running proxy.
+    let _ = storage::bump_vault_change_seq();
+    commands_proxy::try_reload_proxy();
+
     let proxy_port = commands_proxy::proxy_port();
     let (api_key_var, base_url_var) = commands_account::provider_env_vars_pub(&provider)
         .ok_or_else(|| format!("Unknown provider '{}' — no env var mapping.", provider))?;
@@ -3076,10 +3110,13 @@ fn handle_activate(
         commands_account::provider_proxy_prefix_pub(&provider)
     );
 
+    // When called directly (not via wrapper), dim stdout so shell statements
+    // don't visually distract — the user can't eval them from a direct call anyway.
+    if !via_wrapper { print!("{}", dim); }
+
     match shell {
         "zsh" => {
             let prompt_label = zsh_prompt_escape(&label);
-            // Unset all known provider vars first to avoid cross-provider residuals.
             let unset_vars: Vec<&str> = ALL_PROVIDER_ENV_PAIRS.iter()
                 .flat_map(|(k, v)| [*k, *v])
                 .collect();
@@ -3133,6 +3170,7 @@ fn handle_activate(
             println!("prompt (%_AIKEY_PROMPT_LABEL%) $P$G");
         }
         other => {
+            if !via_wrapper { print!("{}", reset); }
             return Err(format!(
                 "Unsupported shell '{}'. Supported: zsh, bash, powershell, cmd.",
                 other
@@ -3140,19 +3178,31 @@ fn handle_activate(
         }
     }
 
+    if !via_wrapper { println!("{}", reset); }
+
     // Human-readable confirmation on stderr (not captured by wrapper).
-    eprintln!("  Activated: {} → {} ({})", label, provider, shell);
+    eprintln!("\x1b[90m  Activated: {} \u{2192} {} ({})\x1b[0m", label, provider, shell);
     Ok(())
 }
 
-/// `aikey deactivate --shell <shell>` — output eval-safe unset statements.
+/// `aikey deactivate [--shell <shell>]` — output eval-safe unset statements.
+/// When `--shell` is omitted, auto-detects from the SHELL env var.
 fn handle_deactivate(
     shell: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let shell = shell.ok_or(
-        "Missing --shell flag. Usage: eval $(aikey deactivate --shell zsh)\n\
-         The shell wrapper function passes this automatically."
-    )?;
+    let detected;
+    let shell = match shell {
+        Some(s) => s,
+        None => {
+            detected = detect_shell().ok_or(
+                "Could not detect shell type. Pass --shell explicitly, e.g.:\n\
+                 eval $(aikey deactivate --shell zsh)"
+            )?;
+            eprintln!("\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m", detected);
+            eprintln!("\x1b[90m  eval $(aikey deactivate --shell {})\x1b[0m", detected);
+            detected
+        }
+    };
 
     match shell {
         "zsh" => {
@@ -3182,8 +3232,12 @@ fn handle_deactivate(
                 println!("Remove-Item Env:\\{} -ErrorAction SilentlyContinue", var);
             }
             println!("if ($env:_AIKEY_ORIG_PROMPT_FN) {{ function global:prompt {{ Invoke-Expression $env:_AIKEY_ORIG_PROMPT_FN }}; Remove-Item Env:\\_AIKEY_ORIG_PROMPT_FN -ErrorAction SilentlyContinue }}");
-            // PowerShell has no direct equivalent of `source active.env`.
-            // The next proxy command will pick up active.env settings.
+            // Restore global settings from active.env.flat (plain KEY=VALUE, no sh syntax).
+            // Why .flat instead of .env: active.env contains sh-expansion like ${NO_PROXY:-}
+            // which PowerShell would import as literal text, breaking proxy bypass config.
+            // active.env.flat is generated alongside active.env with pure literal values.
+            println!("$_af = if ($env:HOME) {{ Join-Path $env:HOME '.aikey' 'active.env.flat' }} else {{ Join-Path $env:USERPROFILE '.aikey' 'active.env.flat' }}");
+            println!("if (Test-Path $_af) {{ Get-Content $_af | ForEach-Object {{ if ($_ -match '^(\\w+)=(.*)$') {{ [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }} }} }}");
         }
         "cmd" => {
             let all_vars: Vec<&str> = ALL_PROVIDER_ENV_PAIRS.iter()
@@ -3194,6 +3248,17 @@ fn handle_deactivate(
                 println!("set {}=", var);
             }
             println!("prompt $P$G");
+            // Restore global settings from active.env.flat (plain KEY=VALUE).
+            // Why .flat: active.env has sh-expansion syntax that cmd can't parse correctly.
+            // Why usebackq: without it, `in ("path")` treats the path as a literal string
+            // instead of a filename, so for /f would parse the path text, not file contents.
+            // Why %HOME% fallback: resolve_aikey_dir() uses HOME→USERPROFILE→"." priority;
+            // cmd must match by checking %HOME% first, then falling back to %USERPROFILE%.
+            println!("set \"_AF=\"");
+            println!("if defined HOME (set \"_AF=%HOME%\\.aikey\\active.env.flat\")");
+            println!("if not defined _AF if defined USERPROFILE (set \"_AF=%USERPROFILE%\\.aikey\\active.env.flat\")");
+            println!("if defined _AF if exist \"%_AF%\" (for /f \"usebackq tokens=1,* delims==\" %%A in (\"%_AF%\") do set \"%%A=%%B\")");
+            println!("set \"_AF=\"");
         }
         other => {
             return Err(format!(
@@ -3203,7 +3268,7 @@ fn handle_deactivate(
         }
     }
 
-    eprintln!("  Deactivated: restored global settings ({})", shell);
+    eprintln!("\x1b[90m  Deactivated: restored global settings ({})\x1b[0m", shell);
     Ok(())
 }
 

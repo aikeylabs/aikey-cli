@@ -459,14 +459,10 @@ fn handle_list(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|s| !s.is_empty())
                 .or_else(|| a.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
                 .unwrap_or("-").to_string();
-            let status_display = match a.status.as_str() {
-                "active" => format!("\u{25cf} {}", a.status),
-                "reauth_required" => format!("\u{2717} {}", a.status),
-                _ => format!("  {}", a.status),
-            };
             let tier = a.account_tier.as_deref().unwrap_or("-").to_string();
-            let expires = storage::get_provider_token_expires_at(&a.provider_account_id)
-                .ok().flatten()
+            let token_expires = storage::get_provider_token_expires_at(&a.provider_account_id)
+                .ok().flatten();
+            let expires = token_expires
                 .map(|exp| {
                     let rem = exp - now;
                     if rem <= 0 { "expired".to_string() }
@@ -474,6 +470,18 @@ fn handle_list(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
                     else if rem > 3600 { format!("{}h", rem / 3600) }
                     else { format!("{}m", rem / 60) }
                 }).unwrap_or_else(|| "-".to_string());
+            // Unified status: valid (empty), expired, invalid — same as `aikey list`
+            let status_display = match a.status.as_str() {
+                "active" | "idle" => {
+                    if token_expires.map_or(false, |exp| exp <= now) {
+                        "expired".to_string()
+                    } else {
+                        String::new() // valid → not displayed
+                    }
+                }
+                "reauth_required" | "expired" => "expired".to_string(),
+                _ => "invalid".to_string(),
+            };
             (identity, a.provider.clone(), status_display, tier, expires)
         }).collect();
 

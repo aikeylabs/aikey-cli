@@ -3,9 +3,9 @@
 //! Extracted from `storage.rs` for maintainability — all items are re-exported
 //! by the parent module so existing callers are unaffected.
 
-use super::{open_connection, get_vault_path};
+use super::{open_connection, open_connection_readonly, get_vault_path};
 use crate::credential_type::CredentialType;
-use rusqlite::{params, Result as SqlResult};
+use rusqlite::{params, Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -497,13 +497,21 @@ fn parse_base_urls_json(json: Option<String>) -> std::collections::HashMap<Strin
     json.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
-/// Returns all cached virtual key entries.
+/// Returns all cached virtual key entries (write connection with migrations).
 pub fn list_virtual_key_cache() -> Result<Vec<VirtualKeyCacheEntry>, String> {
     let db_path = get_vault_path()?;
-    if !db_path.exists() {
-        return Ok(vec![]);
-    }
-    let conn = open_connection()?;
+    if !db_path.exists() { return Ok(vec![]); }
+    query_virtual_key_cache(&open_connection()?)
+}
+
+/// Returns all cached virtual key entries (read-only, no migrations).
+pub fn list_virtual_key_cache_readonly() -> Result<Vec<VirtualKeyCacheEntry>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() { return Ok(vec![]); }
+    query_virtual_key_cache(&open_connection_readonly()?)
+}
+
+fn query_virtual_key_cache(conn: &Connection) -> Result<Vec<VirtualKeyCacheEntry>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT virtual_key_id, org_id, seat_id, alias,
@@ -822,9 +830,17 @@ impl ProviderBinding {
     }
 }
 
-/// Returns all provider bindings for the given profile, ordered by provider_code.
+/// Returns all provider bindings for the given profile (write connection with migrations).
 pub fn list_provider_bindings(profile_id: &str) -> Result<Vec<ProviderBinding>, String> {
-    let conn = open_connection()?;
+    query_provider_bindings(&open_connection()?, profile_id)
+}
+
+/// Returns all provider bindings for the given profile (read-only, no migrations).
+pub fn list_provider_bindings_readonly(profile_id: &str) -> Result<Vec<ProviderBinding>, String> {
+    query_provider_bindings(&open_connection_readonly()?, profile_id)
+}
+
+fn query_provider_bindings(conn: &Connection, profile_id: &str) -> Result<Vec<ProviderBinding>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT profile_id, provider_code, key_source_type, key_source_ref, updated_at
@@ -998,15 +1014,27 @@ const PROVIDER_ACCOUNT_COLUMNS: &str =
     "provider_account_id, provider, auth_type, credential_type, status, \
      external_id, display_identity, org_uuid, account_tier, created_at, last_used_at";
 
-/// List all provider OAuth accounts.
+/// List all provider OAuth accounts (write connection with migrations).
 pub fn list_provider_accounts() -> Result<Vec<ProviderAccountInfo>, String> {
-    let conn = open_connection()?;
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
-            PROVIDER_ACCOUNT_COLUMNS
-        ))
-        .map_err(|e| format!("Failed to prepare provider accounts query: {}", e))?;
+    query_provider_accounts(&open_connection()?)
+}
+
+/// List all provider OAuth accounts (read-only, no migrations).
+pub fn list_provider_accounts_readonly() -> Result<Vec<ProviderAccountInfo>, String> {
+    match open_connection_readonly() {
+        Ok(conn) => query_provider_accounts(&conn),
+        Err(_) => Ok(vec![]), // vault doesn't exist or can't open — no accounts
+    }
+}
+
+fn query_provider_accounts(conn: &Connection) -> Result<Vec<ProviderAccountInfo>, String> {
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
+        PROVIDER_ACCOUNT_COLUMNS
+    )) {
+        Ok(s) => s,
+        Err(_) => return Ok(vec![]), // table doesn't exist on old vault
+    };
 
     let rows = stmt
         .query_map([], |row| row_to_provider_account(row))
