@@ -543,7 +543,7 @@ fn max_candidate_label_width(groups: &[ProviderGroup]) -> usize {
         .max(20) // minimum 20
 }
 
-fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inner_w: usize, label_col_w: usize) -> String {
+fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inner_w: usize, label_col_w: usize, type_col_w: usize) -> String {
     let cursor_mark = if is_cursor { "\x1b[36;1m> \x1b[0m" } else { "  " };
     let pad_target = inner_w.saturating_sub(4);
     let content = match row {
@@ -563,13 +563,11 @@ fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inn
                     other => other,
                 }
             });
-            // Combine type + dot into one column so pad_visible accounts for total width
-            let type_col = if g.selected == Some(*ci) {
-                format!("\x1b[90m{}\x1b[0m \x1b[32m\u{25cf}\x1b[0m", display_type)
-            } else {
-                format!("\x1b[90m{}\x1b[0m", display_type)
-            };
-            format!("{}    {} {} {}", cursor_mark, radio, label_padded, type_col)
+            // Pad type to fixed width, then append dot for selected items.
+            // This ensures the dot column is aligned regardless of type length.
+            let type_padded = pad_visible(&format!("\x1b[90m{}\x1b[0m", display_type), type_col_w);
+            let dot = if g.selected == Some(*ci) { " \x1b[32m\u{25cf}\x1b[0m" } else { "" };
+            format!("{}    {} {} {}{}", cursor_mark, radio, label_padded, type_padded, dot)
         }
         TreeRow::Blank => { String::new() }
         TreeRow::Separator => { format!("  {}", "\u{2500}".repeat(pad_target.saturating_sub(2))) }
@@ -629,7 +627,9 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
                 if c.source_type == "personal_oauth_account" { "oauth" } else { &c.source_type }
             ).len())
             .max().unwrap_or(8);
-        let content_min_w = 2 + 4 + 4 + label_col_w + 1 + max_type_w + 4;
+        // Candidate content visible width = cursor(2) + indent(4) + radio(4) + label + space(1) + type + " ●"(2) = 13 + L + T
+        // pad_target = inner_w - 4, so inner_w needs to be ≥ 13 + L + T + 4 = 17 + L + T
+        let content_min_w = 17 + label_col_w + max_type_w;
         let inner_w = (visible_len(&icon_title) + 4).max(content_min_w).min(max_inner);
         let border = "\u{2500}".repeat(inner_w);
         let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
@@ -641,7 +641,7 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
 
         write!(out, "\x1b[?25l")?;
         write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
-        for (i, row) in rows.iter().enumerate() { write!(out, "{}\r\n", format_tree_row(row, groups, i == cursor, inner_w, label_col_w))?; }
+        for (i, row) in rows.iter().enumerate() { write!(out, "{}\r\n", format_tree_row(row, groups, i == cursor, inner_w, label_col_w, max_type_w))?; }
         write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
         write!(out, "  [\u{2191}\u{2193} move \u{2022} \x1b[1;33mSpace\x1b[0m select/expand \u{2022} \x1b[1;33mEnter\x1b[0m confirm \u{2022} \x1b[1;33mEsc\x1b[0m cancel]\r\n")?;
         out.flush()?;

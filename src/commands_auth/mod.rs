@@ -12,6 +12,27 @@ use colored::Colorize;
 use std::io::{self, BufRead, Write};
 use std::process::Command as ProcessCommand;
 
+/// Interactive provider picker for `aikey auth login` (no provider argument).
+/// Shows user-friendly names (Claude, Codex, Kimi) and returns the broker code.
+fn pick_oauth_provider() -> Result<String, Box<dyn std::error::Error>> {
+    use crate::ui_select::{box_select, SelectResult};
+
+    // Display name → broker provider code
+    let choices = [
+        ("Claude    (Anthropic) — requires Pro or Max subscription", "claude"),
+        ("Codex     (OpenAI)    — requires ChatGPT Pro/Plus", "codex"),
+        ("Kimi      (Moonshot AI)", "kimi"),
+    ];
+
+    let items: Vec<String> = choices.iter().map(|(label, _)| label.to_string()).collect();
+    let selectable = vec![true; items.len()];
+
+    match box_select("Select provider", "", &items, &selectable, 0)? {
+        SelectResult::Selected(idx) => Ok(choices[idx].1.to_string()),
+        SelectResult::Cancelled => Err("Cancelled.".into()),
+    }
+}
+
 /// Dispatch `aikey auth <action>` to the appropriate handler.
 pub fn handle_auth_command(
     action: &AuthAction,
@@ -19,7 +40,13 @@ pub fn handle_auth_command(
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
-        AuthAction::Login { provider } => handle_login(provider, proxy_port, json_mode),
+        AuthAction::Login { provider } => {
+            let provider = match provider {
+                Some(p) => p.clone(),
+                None => pick_oauth_provider()?,
+            };
+            handle_login(&provider, proxy_port, json_mode)
+        }
         AuthAction::Logout { target } => handle_logout(target, proxy_port, json_mode),
         AuthAction::List => handle_list(json_mode),
         AuthAction::Use { account } => handle_use(account, proxy_port, json_mode),
@@ -36,30 +63,40 @@ fn handle_login(provider: &str, proxy_port: u16, json_mode: bool) -> Result<(), 
     // 1. Check proxy is running
     check_proxy_running(proxy_port)?;
 
+    // Normalize provider alias → broker provider code.
+    // Why: broker uses "claude"/"codex"/"kimi", users may type canonical names.
+    let provider = match provider.to_lowercase().as_str() {
+        "anthropic" | "claude" => "claude",
+        "openai" | "codex" | "chatgpt" => "codex",
+        "kimi" | "moonshot" => "kimi",
+        _ => provider,
+    };
+
     // 2. Start login (Phase 1)
     let base = proxy_base(proxy_port);
-    let resp: serde_json::Value = ureq::post(&format!("{}/oauth/login", base))
+    let http_result = ureq::post(&format!("{}/oauth/login", base))
         .set("Content-Type", "application/json")
-        .send_string(&serde_json::json!({"provider": provider}).to_string())
-        .map_err(|e| format!("Failed to start login: {}", e))?
-        .into_json()?;
+        .send_string(&serde_json::json!({"provider": provider}).to_string());
+
+    let resp: serde_json::Value = match http_result {
+        Ok(r) => r.into_json()?,
+        Err(ureq::Error::Status(code, response)) => {
+            let body: serde_json::Value = response.into_json().unwrap_or_default();
+            let msg = body["message"].as_str().unwrap_or("Failed to start login");
+            let hint = body["hint"].as_str().unwrap_or("");
+            if !json_mode {
+                eprintln!("  {} {} (HTTP {})", "\u{25c6}".red(), msg, code);
+                if !hint.is_empty() {
+                    eprintln!("  \u{2502} {}", hint);
+                }
+            }
+            return Err(msg.to_string().into());
+        }
+        Err(e) => return Err(format!("Failed to start login: {}", e).into()),
+    };
 
     let session_id = resp["id"].as_str().unwrap_or("").to_string();
     let flow_type = resp["flow_type"].as_str().unwrap_or("");
-    let status = resp["status"].as_str().unwrap_or("");
-
-    if status == "failed" || resp.get("error").is_some() {
-        let err_msg = resp["error"].as_str()
-            .or_else(|| resp["message"].as_str())
-            .unwrap_or("Unknown error");
-        if !json_mode {
-            eprintln!("{} {}", "[X]".red(), err_msg);
-            if let Some(hint) = resp["hint"].as_str() {
-                eprintln!("    {}", hint);
-            }
-        }
-        return Err(err_msg.to_string().into());
-    }
 
     match flow_type {
         "setup_token" => login_setup_token(&base, &session_id, &resp, provider, proxy_port, json_mode),
@@ -77,26 +114,40 @@ fn login_setup_token(
     let auth_url = resp["auth_url"].as_str().unwrap_or("");
 
     if !json_mode {
-        eprintln!("{} Note: Claude OAuth requires a Pro or Max subscription.", "[i]".cyan());
-        eprintln!("{} Open this URL and click 'Authorize':", "[i]".cyan());
-        eprintln!("\n  {}\n", auth_url);
+        eprintln!();
+        eprintln!("  {} Note: Claude OAuth requires a Pro or Max subscription.", "\u{25c6}".cyan());
+        eprintln!("  {} Open this URL and click 'Authorize':", "\u{2502}".dimmed());
+        eprintln!("  {}", "\u{2502}".dimmed());
+        eprintln!("  {}   {}", "\u{2502}".dimmed(), auth_url);
+        eprintln!("  {}", "\u{2502}".dimmed());
     }
 
     // Try to open browser
     let _ = open_browser(auth_url);
 
-    if !json_mode {
-        eprint!("{} Paste the code from the callback page (format: authCode#state): ", "[i]".cyan());
-        io::stderr().flush()?;
-    }
-
-    // Read code#state from stdin
-    let mut code_state = String::new();
-    io::stdin().lock().read_line(&mut code_state)?;
+    // Read code#state with masked input (shows **** like Master Password).
+    let code_state = crate::prompt_hidden("  \u{25c6} Paste the code (format: code#state): ")
+        .map_err(|e| format!("Failed to read code: {}", e))?;
     let code_state = code_state.trim().to_string();
 
     if code_state.is_empty() {
         return Err("No code provided. Login cancelled.".into());
+    }
+
+    // Client-side state validation: warn if the pasted state doesn't match.
+    // Extract expected state from auth_url query param.
+    if !json_mode {
+        if let Some(expected_state) = auth_url.split("state=").nth(1).map(|s| s.split('&').next().unwrap_or(s)) {
+            let pasted_state = code_state.split('#').nth(1).unwrap_or("");
+            if !expected_state.is_empty() && pasted_state != expected_state {
+                if pasted_state.is_empty() {
+                    eprintln!("  {} state missing from pasted code — expected code#state format", "\u{25c6}".yellow());
+                } else {
+                    eprintln!("  {} state mismatch (CSRF warning) — pasted state differs from expected", "\u{25c6}".yellow());
+                }
+                eprintln!("  {} proceeding anyway (local-only, low CSRF risk)", "\u{2502}".dimmed());
+            }
+        }
     }
 
     // Phase 2: submit code
@@ -111,12 +162,14 @@ fn login_auth_code(
     let auth_url = resp["auth_url"].as_str().unwrap_or("");
 
     if !json_mode {
-        eprintln!("{} Opening browser for {} login...", "[i]".cyan(), provider);
+        eprintln!();
+        eprintln!("  {} Opening browser for {} login...", "\u{25c6}".cyan(), provider);
+        eprintln!("  {}", "\u{2502}".dimmed());
     }
     let _ = open_browser(auth_url);
 
     if !json_mode {
-        eprintln!("Waiting for authorization... (Ctrl+C to cancel)");
+        eprintln!("  {} Waiting for authorization... (Ctrl+C to cancel)", "\u{2502}".dimmed());
     }
 
     // Poll for completion (proxy handles the callback)
@@ -132,15 +185,17 @@ fn login_device_code(
     let verify_url = resp["verification_url"].as_str().unwrap_or("");
 
     if !json_mode {
-        eprintln!("{} Open this URL and enter the code:", "[i]".cyan());
-        eprintln!("  URL:  {}", verify_url);
-        eprintln!("  Code: {}", user_code.bold());
+        eprintln!();
+        eprintln!("  {} Open this URL and enter the code:", "\u{25c6}".cyan());
+        eprintln!("  {}   URL:  {}", "\u{2502}".dimmed(), verify_url);
+        eprintln!("  {}   Code: {}", "\u{2502}".dimmed(), user_code.bold());
+        eprintln!("  {}", "\u{2502}".dimmed());
     }
 
     let _ = open_browser(verify_url);
 
     if !json_mode {
-        eprintln!("Waiting for authorization...");
+        eprintln!("  {} Waiting for authorization...", "\u{2502}".dimmed());
     }
 
     // Device Code: use POST /oauth/poll (triggers provider poll on each call).
@@ -153,15 +208,35 @@ fn submit_code_and_finish(
     base: &str, session_id: &str, code_state: &str,
     provider: &str, json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let resp: serde_json::Value = ureq::post(&format!("{}/oauth/login", base))
+    let http_result = ureq::post(&format!("{}/oauth/login", base))
         .set("Content-Type", "application/json")
         .send_string(&serde_json::json!({
             "provider": provider,
             "code": code_state,
             "session_id": session_id,
-        }).to_string())
-        .map_err(|e| format!("Token exchange failed: {}", e))?
-        .into_json()?;
+        }).to_string());
+
+    let resp: serde_json::Value = match http_result {
+        Ok(r) => r.into_json()?,
+        Err(ureq::Error::Status(code, response)) => {
+            // Extract detailed error from broker response body.
+            let body: serde_json::Value = response.into_json().unwrap_or_default();
+            let msg = body["message"].as_str().unwrap_or("Token exchange failed");
+            let hint = body["hint"].as_str().unwrap_or("");
+            let err_code = body["error"].as_str().unwrap_or("");
+            if !json_mode {
+                eprintln!("  {} {} (HTTP {})", "\u{25c6}".red(), msg, code);
+                if !hint.is_empty() {
+                    eprintln!("  \u{2502} {}", hint);
+                }
+                if !err_code.is_empty() {
+                    eprintln!("  \u{2502} error: {}", err_code);
+                }
+            }
+            return Err(msg.to_string().into());
+        }
+        Err(e) => return Err(format!("Token exchange failed: {}", e).into()),
+    };
 
     let account_id = resp["account_id"].as_str().unwrap_or("");
     let display = resp["display_identity"].as_str().unwrap_or(account_id);
@@ -171,8 +246,8 @@ fn submit_code_and_finish(
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
         let days = expires_in / 86400;
-        eprintln!("{} Logged in as {} ({}), expires in {} days",
-            "[OK]".green(), display.bold(), provider, days);
+        eprintln!("  {} Logged in as {} ({}), expires in {} days",
+            "\u{25c6}".green(), display.bold(), provider, days);
 
         // D13: Kimi has no email — prompt for display name
         if display.is_empty() || !display.contains('@') {
@@ -213,7 +288,7 @@ fn poll_login_status(
                 if json_mode {
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                 } else {
-                    eprintln!("{} Logged in as {} ({})", "[OK]".green(), display.bold(), provider);
+                    eprintln!("{} Logged in as {} ({})", "\u{25c6}".green(), display.bold(), provider);
 
                     // D13: prompt for display name if no email
                     if display.is_empty() || !display.contains('@') {
@@ -225,7 +300,7 @@ fn poll_login_status(
             "failed" => {
                 let err = resp["error"].as_str().unwrap_or("Login failed");
                 if !json_mode {
-                    eprintln!("{} {}", "[X]".red(), err);
+                    eprintln!("{} {}", "\u{25c6}".red(), err);
                 }
                 return Err(err.to_string().into());
             }
@@ -275,7 +350,7 @@ fn poll_device_code(
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                 } else {
                     eprintln!();
-                    eprintln!("{} Logged in as {} ({})", "[OK]".green(), display.bold(), provider);
+                    eprintln!("{} Logged in as {} ({})", "\u{25c6}".green(), display.bold(), provider);
 
                     // D13: prompt for display name if no email
                     if display.is_empty() || !display.contains('@') {
@@ -302,7 +377,7 @@ fn poll_device_code(
                 let msg = body["message"].as_str().unwrap_or("Device code login failed");
                 if !json_mode {
                     eprintln!();
-                    eprintln!("{} {} (HTTP {})", "[X]".red(), msg, code);
+                    eprintln!("{} {} (HTTP {})", "\u{25c6}".red(), msg, code);
                 }
                 return Err(msg.to_string().into());
             }
@@ -327,7 +402,7 @@ fn prompt_display_identity(base: &str, account_id: &str) -> Result<(), Box<dyn s
         let _ = ureq::post(&format!("{}/oauth/accounts/{}/display-identity", base, account_id))
             .set("Content-Type", "application/json")
             .send_string(&serde_json::json!({"display_identity": input}).to_string());
-        eprintln!("{} Display name set: {}", "[OK]".green(), input);
+        eprintln!("{} Display name set: {}", "\u{25c6}".green(), input);
     }
     Ok(())
 }
@@ -460,7 +535,7 @@ fn handle_use(account: &str, _proxy_port: u16, json_mode: bool) -> Result<(), Bo
         }));
     } else {
         eprintln!("{} Now using {}/{} (OAuth) for {}",
-            "[OK]".green(), target.provider, display.bold(), canonical);
+            "\u{25c6}".green(), target.provider, display.bold(), canonical);
         if let Some(old) = old_binding {
             if old.key_source_ref != target.provider_account_id {
                 eprintln!("     Replaced: {} ({})", old.key_source_ref, old.key_source_type);
@@ -517,7 +592,7 @@ fn handle_logout(target: &str, proxy_port: u16, json_mode: bool) -> Result<(), B
     if json_mode {
         println!("{}", serde_json::json!({"ok": true}));
     } else {
-        eprintln!("{} Logged out from {}/{}", "[OK]".green(), acct.provider, display);
+        eprintln!("{} Logged out from {}/{}", "\u{25c6}".green(), acct.provider, display);
     }
     Ok(())
 }
@@ -581,7 +656,7 @@ fn handle_doctor(provider: Option<&str>, proxy_port: u16) -> Result<(), Box<dyn 
     // [2] OAuth accounts
     let accounts = storage::list_provider_accounts().unwrap_or_default();
     if accounts.is_empty() {
-        eprintln!("  {} No OAuth accounts", "[i]".cyan());
+        eprintln!("  {} No OAuth accounts", "\u{25c6}".cyan());
     } else {
         eprintln!("  {} {} OAuth account(s) found", "\u{2713}".green(), accounts.len());
         for a in &accounts {

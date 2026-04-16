@@ -389,7 +389,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
                 Zeroizing::new(test_secret)
             } else if std::io::stdin().is_terminal() {
-                let val = prompt_hidden("\u{1F511} Enter API Key: ")
+                let val = prompt_hidden("  \u{25c6} Enter API Key: ")
                     .map_err(|e| format!("Failed to read API Key value: {}", e))?;
                 Zeroizing::new(val)
             } else {
@@ -436,7 +436,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             } else if idx == custom_idx { wants_custom = true; }
                         }
                         if wants_custom {
-                            print!("  Other provider type(s), comma-separated: ");
+                            print!("  \u{25c6} Other provider type(s), comma-separated: ");
                             io::stdout().flush()?;
                             let mut custom = String::new();
                             io::stdin().read_line(&mut custom)?;
@@ -446,7 +446,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if !selected.is_empty() { break; }
                         use colored::Colorize;
-                        eprintln!("  {} At least one provider is required.\n", "\u{26A0}".yellow());
+                        eprintln!("  {} At least one provider is required.\n", "\u{25c6}".yellow());
                     }
 
                     // Show default base URLs for selected providers so the user
@@ -456,18 +456,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             .map(|u| format!("{}: {}", code, u)))
                         .collect();
                     if !default_urls.is_empty() {
-                        eprintln!("  Default Base URLs:");
-                        for u in &default_urls { eprintln!("    {}", u); }
+                        eprintln!("  \u{2502} Default Base URLs:");
+                        for u in &default_urls { eprintln!("  \u{2502}   {}", u); }
                     }
-                    print!("  Base URL (press Enter to use defaults above): ");
+                    print!("  \u{25c6} Base URL (press Enter to use defaults above): ");
                     io::stdout().flush()?;
                     let mut url_input = String::new();
                     io::stdin().read_line(&mut url_input)?;
                     let url_input = url_input.trim().to_string();
                     let base_url = if url_input.is_empty() { None } else { Some(url_input) };
 
-                    eprintln!("  Providers: {}", selected.join(", ").bold());
-                    if let Some(ref u) = base_url { eprintln!("  Base URL:  {}", u.dimmed()); }
+                    eprintln!("  \u{2502} Providers: {}", selected.join(", ").bold());
+                    if let Some(ref u) = base_url { eprintln!("  \u{2502} Base URL:  {}", u.dimmed()); }
                     (selected, base_url)
                 } else {
                     return Err("--provider is required in non-interactive mode.".into());
@@ -488,7 +488,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let suite = commands_project::run_connectivity_test(&test_targets, secret.trim(), false);
                     if !suite.any_chat_ok {
                         eprintln!();
-                        eprint!("  No chat test passed. Add anyway? [y/N] (default N): ");
+                        eprint!("  \u{25c6} No chat test passed. Add anyway? [y/N] (default N): ");
                         io::stdout().flush()?;
                         let mut input = String::new();
                         io::stdin().read_line(&mut input)?;
@@ -555,13 +555,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }));
             } else {
                 use colored::Colorize;
-                eprintln!("{} API Key '{}' added.", "\u{2713}".green(), alias.bold());
-                eprintln!("  providers: {}", resolved_providers.join(", ").dimmed());
-                if let Some(ref url) = resolved_base_url { eprintln!("  base_url:  {}", url.dimmed()); }
+                eprintln!("  {} API Key '{}' added.", "\u{25c6}".green(), alias.bold());
+                eprintln!("  \u{2502} providers: {}", resolved_providers.join(", ").dimmed());
+                if let Some(ref url) = resolved_base_url { eprintln!("  \u{2502} base_url:  {}", url.dimmed()); }
                 if !newly_primary.is_empty() {
-                    eprintln!("  {} Primary for: {}", "\u{2B50}".yellow(), newly_primary.join(", ").bold());
+                    eprintln!("  \u{2502} {} Primary for: {}", "\u{2B50}".yellow(), newly_primary.join(", ").bold());
                 }
-                eprintln!("  Added key and refreshed current default activation.");
+                eprintln!("  \u{2502} Added key and refreshed current default activation.");
 
                 // Auto-start proxy after adding a key so the user can immediately
                 // use AI CLIs. Without this, `claude` / `cursor` would fail because
@@ -715,7 +715,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ).unwrap_or_default();
 
                 // Collect row data for auto-width calculation.
-                struct RowData { alias: String, providers: String, primary_for: String, has_primary: bool, key: String, status: String, created: String, suffix: String }
+                struct RowData { alias: String, providers: String, primary_for: String, has_primary: bool, status: String, created: String, suffix: String }
                 let mut personal_rows: Vec<RowData> = Vec::new();
                 let mut team_rows: Vec<RowData> = Vec::new();
 
@@ -729,7 +729,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     personal_rows.push(RowData {
                         alias: entry.alias.clone(), providers,
                         primary_for: pf.join(","), has_primary: !pf.is_empty(),
-                        key: "\u{2713}".to_string(), status: String::new(),
+                        status: String::new(), // valid → not displayed
                         created: entry.created_at.map(|ts| format_date(ts)).unwrap_or_default(),
                         suffix: String::new(),
                     });
@@ -739,29 +739,36 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let pf: Vec<&str> = bindings.iter()
                         .filter(|b| b.key_source_type == credential_type::CredentialType::ManagedVirtualKey && b.key_source_ref == e.virtual_key_id)
                         .map(|b| b.provider_code.as_str()).collect();
-                    let status = match e.local_state.as_str() {
-                        "active" | "synced_inactive" => e.key_status.clone(),
-                        "disabled_by_account_scope" => "other-account".to_string(),
-                        "disabled_by_key_status" => "key-disabled".to_string(),
-                        other => other.to_string(),
+                    // Unified status display: valid (hidden), expired, invalid, pending.
+                    let status = if e.provider_key_ciphertext.is_none() {
+                        "pending".to_string() // key not yet delivered to local vault
+                    } else {
+                        match e.local_state.as_str() {
+                            "active" | "synced_inactive" => match e.key_status.as_str() {
+                                "active" => String::new(), // valid → not displayed
+                                "expired" => "expired".to_string(),
+                                _ => "invalid".to_string(), // revoked, recycled, etc.
+                            },
+                            "disabled_by_account_scope" | "disabled_by_account_status"
+                            | "disabled_by_seat_status" | "disabled_by_key_status" => "invalid".to_string(),
+                            _ => "invalid".to_string(),
+                        }
                     };
                     let suffix = if e.local_alias.is_some() { format!(" (\u{2190} {})", e.alias) } else { String::new() };
                     team_rows.push(RowData {
                         alias: display, providers: e.provider_code.clone(),
                         primary_for: pf.join(","), has_primary: !pf.is_empty(),
-                        key: if e.provider_key_ciphertext.is_some() { "\u{2713}".to_string() } else { String::new() },
                         status, created: format_date(e.synced_at), suffix,
                     });
                 }
 
                 let all_data: Vec<&RowData> = personal_rows.iter().chain(team_rows.iter()).collect();
-                let headers = ["ALIAS", "PROVIDERS", "USING FOR", "KEY", "STATUS", "CREATED"];
+                let headers = ["ALIAS", "PROVIDERS", "USING FOR", "STATUS", "CREATED"];
                 let pad = 2;
                 let w_alias   = headers[0].len().max(all_data.iter().map(|r| r.alias.len()).max().unwrap_or(0)) + pad;
                 let w_prov    = headers[1].len().max(all_data.iter().map(|r| r.providers.len()).max().unwrap_or(0)) + pad;
                 let w_primary = headers[2].len().max(all_data.iter().map(|r| r.primary_for.len()).max().unwrap_or(0)) + pad;
-                let w_key     = headers[3].len().max(1) + pad;
-                let w_status  = headers[4].len().max(all_data.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
+                let w_status  = headers[3].len().max(all_data.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
 
                 let fmt_row = |r: &RowData| -> String {
                     let pf_padded = format!("{:<w$}", r.primary_for, w = w_primary);
@@ -770,17 +777,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let prov_display = if r.providers.len() > w_prov {
                         format!("{}...", &r.providers[..w_prov - 3])
                     } else { r.providers.clone() };
-                    format!("{:<wa$}  {:<wp$}  {}  {:<wk$}  {:<ws$}  {}{}",
-                        r.alias, prov_display, pf_col, r.key, r.status, created_col, r.suffix,
-                        wa = w_alias, wp = w_prov, wk = w_key, ws = w_status)
+                    format!("{:<wa$}  {:<wp$}  {}  {:<ws$}  {}{}",
+                        r.alias, prov_display, pf_col, r.status, created_col, r.suffix,
+                        wa = w_alias, wp = w_prov, ws = w_status)
                 };
-                let sep_width = w_alias + 2 + w_prov + 2 + w_primary + 2 + w_key + 2 + w_status + 2 + 10;
+                let sep_width = w_alias + 2 + w_prov + 2 + w_primary + 2 + w_status + 2 + 10;
 
                 let mut rows: Vec<String> = Vec::new();
                 rows.push(format!("\u{1FAAA} Personal Keys ({})", entries.len()));
-                rows.push(format!("{:<wa$}  {:<wp$}  {:<wf$}  {:<wk$}  {:<ws$}  {}",
-                    headers[0], headers[1], headers[2], headers[3], headers[4], headers[5],
-                    wa = w_alias, wp = w_prov, wf = w_primary, wk = w_key, ws = w_status));
+                rows.push(format!("\x1b[2m{:<wa$}  {:<wp$}  {:<wf$}  {:<ws$}  {}\x1b[0m",
+                    headers[0], headers[1], headers[2], headers[3], headers[4],
+                    wa = w_alias, wp = w_prov, wf = w_primary, ws = w_status));
                 rows.push("\u{2500}".repeat(sep_width));
                 if personal_rows.is_empty() { rows.push("(none)".to_string()); }
                 else { for r in &personal_rows { rows.push(fmt_row(r)); } }
@@ -798,23 +805,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs() as i64;
-                    let active_cfg = storage::get_active_key_config().ok().flatten();
-
                     // Build row data for dynamic width calculation
-                    struct OAuthRow { identity: String, provider: String, use_for: String, has_use: bool, status: String, tier: String, expires: String, marker: String }
+                    struct OAuthRow { identity: String, provider: String, use_for: String, has_use: bool, status: String, tier: String, expires: String }
                     let oauth_rows: Vec<OAuthRow> = oauth_accounts.iter().map(|acct| {
                         let identity = acct.display_identity.as_deref()
                             .filter(|s| !s.is_empty())
                             .or_else(|| acct.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
                             .unwrap_or("-").to_string();
-                        let is_active = active_cfg.as_ref().map_or(false, |cfg|
-                            cfg.key_type == credential_type::CredentialType::PersonalOAuthAccount
-                            && cfg.key_ref == acct.provider_account_id);
                         let uf: Vec<&str> = bindings.iter()
                             .filter(|b| b.key_source_type == credential_type::CredentialType::PersonalOAuthAccount && b.key_source_ref == acct.provider_account_id)
                             .map(|b| b.provider_code.as_str()).collect();
-                        let expires = storage::get_provider_token_expires_at(&acct.provider_account_id)
-                            .ok().flatten()
+                        let token_expires = storage::get_provider_token_expires_at(&acct.provider_account_id)
+                            .ok().flatten();
+                        let expires = token_expires
                             .map(|exp| {
                                 let rem = exp - now;
                                 if rem <= 0 { "expired".to_string() }
@@ -822,14 +825,26 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 else if rem > 3600 { format!("{}h", rem / 3600) }
                                 else { format!("{}m", rem / 60) }
                             }).unwrap_or_else(|| "-".to_string());
+                        // Unified status display: valid (hidden), expired, invalid.
+                        let status = match acct.status.as_str() {
+                            "active" | "idle" => {
+                                // Check token expiry for more precise status
+                                if token_expires.map_or(false, |exp| exp <= now) {
+                                    "expired".to_string() // token expired, needs refresh
+                                } else {
+                                    String::new() // valid → not displayed
+                                }
+                            }
+                            "reauth_required" | "expired" => "expired".to_string(),
+                            _ => "invalid".to_string(), // revoked, subscription_required, etc.
+                        };
                         OAuthRow {
                             identity,
                             provider: acct.provider.clone(),
                             use_for: uf.join(","), has_use: !uf.is_empty(),
-                            status: acct.status.clone(),
+                            status,
                             tier: acct.account_tier.as_deref().unwrap_or("-").to_string(),
                             expires,
-                            marker: if is_active { " \u{25cf}".to_string() } else { String::new() },
                         }
                     }).collect();
 
@@ -844,16 +859,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     rows.push(String::new());
                     rows.push(format!("\u{1F517} Provider Accounts - OAuth ({})", oauth_accounts.len()));
-                    rows.push(format!("{:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}",
+                    rows.push(format!("\x1b[2m{:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}\x1b[0m",
                         "IDENTITY", "PROVIDER", "USING FOR", "STATUS", "TIER", "EXPIRES",
                         wi = w_id, wp = w_prov, wu = w_uf, ws = w_st, wt = w_tier));
                     rows.push("\u{2500}".repeat(sep_width));
                     for r in &oauth_rows {
                         let uf_padded = format!("{:<w$}", r.use_for, w = w_uf);
                         let uf_col = if r.has_use { uf_padded.green().to_string() } else { uf_padded };
-                        rows.push(format!("{:<wi$}{:<wp$}  {}  {:<ws$}  {:<wt$}  {}{}",
-                            r.identity, r.provider, uf_col, r.status, r.tier, r.expires, r.marker,
-                            wi = w_id, wp = w_prov, ws = w_st, wt = w_tier));
+                        let tier_dim = format!("\x1b[90m{:<w$}\x1b[0m", r.tier, w = w_tier);
+                        let expires_dim = format!("\x1b[90m{}\x1b[0m", r.expires);
+                        rows.push(format!("{:<wi$}{:<wp$}  {}  {:<ws$}  {}  {}",
+                            r.identity, r.provider, uf_col, r.status, tier_dim, expires_dim,
+                            wi = w_id, wp = w_prov, ws = w_st));
                     }
                 }
 

@@ -528,6 +528,90 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         println!("{}", "─".repeat(52).dimmed());
     }
 
+    // ── 0. Version info ─────────────────────────────────────
+    {
+        let cli_rev = env!("AIKEY_BUILD_REVISION");
+        let cli_bid = env!("AIKEY_BUILD_ID");
+        let cli_ver = env!("CARGO_PKG_VERSION");
+        let cli_str = if cli_bid == "unknown" {
+            format!("{}+{}", cli_ver, cli_rev)
+        } else {
+            format!("{}+{}.{}", cli_ver, cli_rev, cli_bid)
+        };
+        emit("cli version", true, &cli_str, None);
+
+        // Probe proxy /version
+        let proxy_port = crate::commands_proxy::proxy_port();
+        let proxy_url = format!("http://127.0.0.1:{}/version", proxy_port);
+        match ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+            .get(&proxy_url).call()
+        {
+            Ok(resp) => {
+                if let Ok(body) = resp.into_string() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                        let ver = v.get("version").and_then(|x| x.as_str()).unwrap_or("?");
+                        let rev = v.get("revision").and_then(|x| x.as_str()).unwrap_or("?");
+                        let bid = v.get("build_id").and_then(|x| x.as_str()).unwrap_or("?");
+                        let proxy_str = if bid == "unknown" {
+                            format!("{}+{}", ver, rev)
+                        } else {
+                            format!("{}+{}.{}", ver, rev, bid)
+                        };
+                        let matched = cli_bid != "unknown" && bid != "unknown" && cli_bid == bid;
+                        let mismatch_hint = if cli_bid != "unknown" && bid != "unknown" && cli_bid != bid {
+                            Some("BuildID mismatch — CLI and proxy from different builds. Run: make restart")
+                        } else { None };
+                        emit("proxy version", true, &proxy_str, mismatch_hint);
+                        if matched {
+                            emit("build match", true, &format!("BuildID={}", bid), None);
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                emit("proxy version", false, "proxy not reachable", Some("proxy /version check will retry after proxy starts"));
+            }
+        }
+
+        // Probe backend services (docker or native).
+        // control/collector/query = server-mode docker services.
+        // trial-server = local-server or full-trial on :8090.
+        for (name, port) in &[
+            ("control", 8080u16), ("collector", 27300), ("query", 27310),
+            ("trial-server", 8090),
+        ] {
+            let url = format!("http://127.0.0.1:{}/version", port);
+            match ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_millis(500))
+                .build()
+                .get(&url).call()
+            {
+                Ok(resp) => {
+                    if let Ok(body) = resp.into_string() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                            let ver = v.get("version").and_then(|x| x.as_str()).unwrap_or("?");
+                            let rev = v.get("revision").and_then(|x| x.as_str()).unwrap_or("?");
+                            let bid = v.get("build_id").and_then(|x| x.as_str()).unwrap_or("?");
+                            let svc_str = if bid == "unknown" {
+                                format!("{}+{}", ver, rev)
+                            } else {
+                                format!("{}+{}.{}", ver, rev, bid)
+                            };
+                            emit(&format!("{} version", name), true, &svc_str, None);
+                        }
+                    }
+                }
+                Err(_) => {} // Silently skip — docker services are optional
+            }
+        }
+
+        if !json_mode {
+            println!("{}", "─".repeat(52).dimmed());
+        }
+    }
+
     // ── 1. Internet connectivity ─────────────────────────────
     // Why HTTP GET instead of TCP ping: users behind an HTTP proxy (e.g.
     // upstream_proxy in proxy config) can reach the internet via HTTP but
@@ -623,7 +707,21 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             struct DoctorItem { provider: String, url: String, key: String, is_oauth: bool }
             let mut items: Vec<DoctorItem> = Vec::new();
 
-            let pw = crate::session::try_get();
+            // Try session cache first; if expired and there are API key bindings,
+            // prompt for Master Password so we can decrypt and test them.
+            let has_api_key_bindings = bindings.iter().any(|b|
+                b.key_source_type == crate::credential_type::CredentialType::PersonalApiKey
+                || b.key_source_type == crate::credential_type::CredentialType::ManagedVirtualKey);
+            let pw = crate::session::try_get().or_else(|| {
+                use std::io::IsTerminal;
+                if has_api_key_bindings && !json_mode && std::io::stdin().is_terminal() {
+                    crate::prompt_hidden("  \u{25c6} Enter Master Password to test API keys: ")
+                        .ok()
+                        .map(|p| secrecy::SecretString::new(p))
+                } else {
+                    None
+                }
+            });
             let proxy_port = crate::commands_proxy::proxy_port();
             for b in &bindings {
                 if b.key_source_type == crate::credential_type::CredentialType::PersonalApiKey {
@@ -665,7 +763,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             if items.is_empty() {
                 if !json_mode {
                     println!("  {} {:<18} {}",
-                        "·".dimmed(), "providers",
+                        "\u{b7}".dimmed(), "providers",
                         "no provider bindings configured".dimmed());
                 }
             } else {
@@ -759,9 +857,11 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // ── 10. Usage pipeline health ─────────────────────────────
-    // Queries proxy /status for reporter delivery state and canary result.
+    // Queries proxy /metrics for reporter delivery state (includes reporter field).
+    // Why /metrics not /status: /status returns statusResponse without reporter;
+    // /metrics returns metricsResponse with the optional reporter field.
     if proxy_up {
-        let url = format!("http://{}/status", proxy_addr);
+        let url = format!("http://{}/metrics", proxy_addr);
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(3))
             .build();
@@ -1459,124 +1559,151 @@ fn run_multi_key_connectivity_test(
 // Usage pipeline health check for `aikey doctor`
 // ---------------------------------------------------------------------------
 
-/// Parses proxy /status JSON and emits usage-pipeline check results.
-/// Looks for the `reporter` and `canary` fields within the status response.
+/// Parses proxy /metrics JSON and emits usage-pipeline check results as an
+/// expanded section with detailed diagnostics.
 fn check_usage_pipeline(
-    status_json: &str,
+    metrics_json: &str,
     emit: &mut dyn FnMut(&str, bool, &str, Option<&str>),
 ) {
-    let parsed: serde_json::Value = match serde_json::from_str(status_json) {
+    let parsed: serde_json::Value = match serde_json::from_str(metrics_json) {
         Ok(v) => v,
         Err(_) => {
-            emit("usage-pipeline", false, "cannot parse proxy /status", None);
+            emit("usage-pipeline", false, "cannot parse proxy /metrics", None);
             return;
         }
     };
 
-    // Check reporter metrics (may be nested under "reporter" in /metrics or flat in /status)
     let reporter = parsed.get("reporter")
         .or_else(|| parsed.get("usage_pipeline").and_then(|p| p.get("reporter")));
 
     if let Some(r) = reporter {
-        let consecutive = r.get("consecutive_failures")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let terminal = r.get("terminal_fail_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let last_status = r.get("last_upload_status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let last_upload = r.get("last_upload_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        // Extract all metrics
+        let generated = r.get("usage_events_generated_total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let uploaded = r.get("usage_events_upload_success_total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let failed = r.get("usage_events_upload_failed_total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let dropped = r.get("usage_events_dropped_total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let queue_depth = r.get("usage_queue_depth").and_then(|v| v.as_i64()).unwrap_or(0);
+        let wal_fail = r.get("usage_wal_append_failed_total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let consecutive = r.get("consecutive_failures").and_then(|v| v.as_i64()).unwrap_or(0);
+        let terminal = r.get("terminal_fail_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        let last_status = r.get("last_upload_status").and_then(|v| v.as_str()).unwrap_or("");
+        let last_upload = r.get("last_upload_at").and_then(|v| v.as_str()).unwrap_or("");
+        let last_error_code = r.get("last_error_code").and_then(|v| v.as_i64()).unwrap_or(0);
+        let last_biz = r.get("latest_business_event_at").and_then(|v| v.as_str()).unwrap_or("");
+        let last_canary = r.get("latest_canary_event_at").and_then(|v| v.as_str()).unwrap_or("");
 
-        // Show last upload time — extract time portion from RFC3339 (no chrono dependency).
-        let upload_ago = if !last_upload.is_empty() {
-            if let Some(t_part) = last_upload.split('T').nth(1) {
-                t_part.trim_end_matches('Z').to_string()
-            } else {
-                last_upload.to_string()
-            }
-        } else {
-            "never".to_string()
-        };
-
+        // Determine overall health
         let ok = consecutive < 5 && last_status != "terminal_failed";
-        let detail = if ok {
-            format!("reporter ok, last upload {}", upload_ago)
-        } else {
-            format!("{} consecutive failures, last: {}",
-                consecutive, if last_status.is_empty() { "unknown" } else { last_status })
-        };
+        let health_label = if consecutive == 0 && terminal == 0 { "healthy" }
+            else if consecutive >= 5 || last_status == "terminal_failed" { "degraded" }
+            else { "warning" };
 
-        let hint = if terminal > 0 {
-            Some("terminal failures detected — check dead_letter.jsonl")
-        } else if consecutive >= 5 {
-            Some("check collector_token matches service_token")
-        } else {
-            None
-        };
+        // Header line
+        emit("usage-pipeline", ok, health_label, if !ok {
+            Some("run: curl http://127.0.0.1:8090/v1/diagnostics/pipeline")
+        } else { None });
 
-        // Use a static string for the hint since we need 'static or owned
-        let hint_str: Option<String> = hint.map(|s| s.to_string());
-        emit("usage-pipeline", ok, &detail, hint_str.as_deref());
+        // Sub-lines: reporter stats
+        let upload_time = format_time_short(last_upload);
+        let status_display = if last_status.is_empty() { "idle" } else { last_status };
+        emit("  reporter", true,
+            &format!("{} generated, {} uploaded, {} failed, {} dropped",
+                generated, uploaded, failed, dropped),
+            None);
+        let upload_hint = if consecutive > 0 {
+            Some(format!("{} consecutive failures, last HTTP {}", consecutive, last_error_code))
+        } else { None };
+        emit("  last upload", ok,
+            &format!("{} ({})", upload_time, status_display),
+            upload_hint.as_deref());
 
-        // Terminal failures sub-check
+        // Sub-line: queue + WAL
+        if queue_depth > 0 || wal_fail > 0 {
+            let mut parts = Vec::new();
+            if queue_depth > 0 { parts.push(format!("{} queued", queue_depth)); }
+            if wal_fail > 0 { parts.push(format!("{} WAL write failures", wal_fail)); }
+            emit("  queue/WAL", wal_fail == 0, &parts.join(", "), None);
+        }
+
+        // Sub-line: dead letters
         if terminal > 0 {
-            emit("  dead-letters", false,
-                &format!("{} events in dead_letter.jsonl", terminal),
+            emit("  dead letters", false,
+                &format!("{} events", terminal),
                 Some("review ~/.aikey/data/usage-wal/dead_letter.jsonl"));
         }
+
+        // Sub-line: event freshness (business vs canary)
+        let biz_time = format_time_short(last_biz);
+        let canary_time = format_time_short(last_canary);
+        if biz_time != "never" || canary_time != "never" {
+            emit("  freshness", true,
+                &format!("business: {}, canary: {}", biz_time, canary_time),
+                None);
+        }
     } else {
-        // No reporter data — reporter might be disabled (no collector_url)
         emit("usage-pipeline", true, "reporter not enabled (standalone mode)", None);
     }
 
-    // Check canary result if available
+    // Canary probe result
     let canary = parsed.get("canary")
         .or_else(|| parsed.get("usage_pipeline").and_then(|p| p.get("canary")));
 
     if let Some(c) = canary {
-        let status = c.get("last_result")
-            .or_else(|| c.get("status"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let round_trip = c.get("round_trip_ms")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let failed_stage = c.get("last_failed_stage")
-            .or_else(|| c.get("failed_stage"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
+        let status = c.get("last_result").or_else(|| c.get("status"))
+            .and_then(|v| v.as_str()).unwrap_or("unknown");
+        let round_trip = c.get("round_trip_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+        let failed_stage = c.get("last_failed_stage").or_else(|| c.get("failed_stage"))
+            .and_then(|v| v.as_str()).unwrap_or("");
         let ods = c.get("ods_received").and_then(|v| v.as_bool()).unwrap_or(false);
         let dwd = c.get("dwd_projected").and_then(|v| v.as_bool()).unwrap_or(false);
         let query = c.get("query_visible").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let ok = status == "ok";
-        let stage_icons = format!("ODS {} DWD {} Query {}",
+        let stages = format!("ODS {} DWD {} Query {}",
             if ods { "✓" } else { "✗" },
             if dwd { "✓" } else { "✗" },
             if query { "✓" } else { "✗" });
 
         let detail = if ok {
-            format!("ok ({:.1}s round-trip)  {}", round_trip as f64 / 1000.0, stage_icons)
+            format!("ok ({:.1}s)  {}", round_trip as f64 / 1000.0, stages)
         } else {
-            format!("{} — stuck at: {}  {}", status, failed_stage, stage_icons)
+            format!("{} — stuck at: {}  {}", status, failed_stage, stages)
         };
 
         let hint = if !ok && !failed_stage.is_empty() {
             Some(match failed_stage {
-                "ingest" => "events not reaching ODS — check reporter + collector connectivity",
-                "projection" => "ODS has data but DWD projection stalled — check projector worker",
-                "query" => "DWD has data but query layer can't see it — check query-service",
-                _ => "check pipeline diagnostics: curl http://127.0.0.1:8090/v1/diagnostics/pipeline",
+                "ingest" => "events not reaching ODS — check reporter + collector",
+                "projection" => "ODS ok but DWD stalled — check projector worker",
+                "query" => "DWD ok but query layer can't see it — check query-service",
+                _ => "run: curl http://127.0.0.1:8090/v1/diagnostics/pipeline",
             })
-        } else {
-            None
-        };
+        } else { None };
 
-        emit("usage-canary", ok, &detail, hint);
+        emit("  canary", ok, &detail, hint);
+    }
+}
+
+/// Extract a short time display from an RFC3339-ish timestamp.
+/// "2026-04-16T16:43:07Z" → "16:43:07"
+/// Zero time or empty → "never"
+fn format_time_short(ts: &str) -> String {
+    if ts.is_empty() || ts.starts_with("0001-") {
+        return "never".to_string();
+    }
+    if let Some(t_part) = ts.split('T').nth(1) {
+        let clean = t_part.trim_end_matches('Z');
+        // Truncate to HH:MM:SS — drop sub-seconds, timezone offset
+        let base = clean.split('+').next().unwrap_or(clean);
+        let base = if let Some(p) = base.rfind('-') {
+            if p > 0 { &base[..p] } else { base }
+        } else { base };
+        // Drop fractional seconds (everything after first '.')
+        if let Some(dot) = base.find('.') {
+            base[..dot].to_string()
+        } else {
+            base.to_string()
+        }
+    } else {
+        ts.to_string()
     }
 }

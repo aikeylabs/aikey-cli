@@ -13,7 +13,10 @@ BUILD_ID     ?= $(shell head -c 2 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null 
 BUILD_TIME    = $(shell date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
                   || powershell -NoProfile -C "(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')" 2>/dev/null \
                   || echo "unknown")
-BUILD_ENV  := AIKEY_BUILD_REVISION=$(GIT_REVISION)$(GIT_DIRTY) AIKEY_BUILD_ID=$(BUILD_ID) AIKEY_BUILD_TIME=$(BUILD_TIME)
+# Why `=` (deferred) not `:=` (immediate): BUILD_ID uses ?= so it can be
+# overridden by the parent CI Makefile via env var. With :=, $(BUILD_ID) would
+# be evaluated at parse time before the env override takes effect.
+BUILD_ENV   = AIKEY_BUILD_REVISION=$(GIT_REVISION)$(GIT_DIRTY) AIKEY_BUILD_ID=$(BUILD_ID) AIKEY_BUILD_TIME=$(BUILD_TIME)
 
 .PHONY: all release dev rebuild run test test-integration test-unit test-verbose \
         lint fmt fmt-check install uninstall cross-compile clean help

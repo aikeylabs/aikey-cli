@@ -289,9 +289,18 @@ pub(crate) enum Commands {
 #[derive(Subcommand)]
 pub(crate) enum AuthAction {
     /// Login to a provider OAuth account
+    #[command(after_help = "\x1b[1mSupported providers:\x1b[0m
+  claude    Claude (Anthropic) — requires Pro or Max subscription
+  codex     Codex / ChatGPT (OpenAI) — requires ChatGPT Pro/Plus
+  kimi      Kimi (Moonshot AI)
+
+\x1b[1mExamples:\x1b[0m
+  aikey auth login claude
+  aikey auth login codex
+  aikey auth login kimi")]
     Login {
-        /// Provider name: claude, codex, kimi
-        provider: String,
+        /// Provider name: claude, codex, kimi (omit for interactive picker)
+        provider: Option<String>,
     },
     /// Logout from a provider account
     Logout {
