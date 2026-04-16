@@ -378,11 +378,127 @@ pub(super) fn write_active_env(
 }
 
 // ---------------------------------------------------------------------------
-// Shell hook installer
+// Shell hook installer (v2: begin/end markers, activate wrapper, sentinel precmd)
 // ---------------------------------------------------------------------------
+
+const V1_MARKER: &str = "# aikey shell hook";
+const V2_BEGIN: &str = "# aikey shell hook v2 begin";
+const V2_END: &str = "# aikey shell hook v2 end";
+
+/// Known v1 hook templates for precise matching during auto-upgrade.
+/// If the v1 block in the user's rc file matches one of these exactly,
+/// we can safely replace it. Otherwise we fall back to manual instructions.
+fn v1_zsh_template() -> String {
+    concat!(
+        "# aikey shell hook\n",
+        "_aikey_precmd() {\n",
+        "  [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env\n",
+        "  # Auto-load preexec hook if not yet loaded\n",
+        "  if ! (( ${+functions[_aikey_preexec]} )); then\n",
+        "    [[ -f ~/.aikey/preexec.zsh ]] && source ~/.aikey/preexec.zsh\n",
+        "  fi\n",
+        "}\n",
+        "precmd_functions+=(_aikey_precmd)\n",
+    ).to_string()
+}
+
+fn v1_bash_template() -> String {
+    concat!(
+        "# aikey shell hook\n",
+        "_aikey_precmd_bash() {\n",
+        "  [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env\n",
+        "  if ! type -t _aikey_preexec_bash &>/dev/null; then\n",
+        "    [[ -f ~/.aikey/preexec.bash ]] && source ~/.aikey/preexec.bash\n",
+        "  fi\n",
+        "}\n",
+        "PROMPT_COMMAND='_aikey_precmd_bash'\n",
+    ).to_string()
+}
+
+/// Generate v2 hook block for zsh.
+fn v2_zsh_hook() -> String {
+    format!(
+        concat!(
+            "{}\n",
+            "aikey() {{\n",
+            "    case \"$1\" in\n",
+            "        activate|deactivate)\n",
+            "            local _output\n",
+            "            _output=$(command aikey \"$@\" --shell zsh)\n",
+            "            local _rc=$?\n",
+            "            if [ $_rc -eq 0 ]; then eval \"$_output\"; else return $_rc; fi\n",
+            "            ;;\n",
+            "        *) command aikey \"$@\" ;;\n",
+            "    esac\n",
+            "}}\n",
+            "_aikey_precmd() {{\n",
+            "    if [ -n \"$AIKEY_ACTIVE_LABEL\" ]; then return; fi\n",
+            "    [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env\n",
+            "    if ! (( ${{+functions[_aikey_preexec]}} )); then\n",
+            "        [[ -f ~/.aikey/preexec.zsh ]] && source ~/.aikey/preexec.zsh\n",
+            "    fi\n",
+            "}}\n",
+            "precmd_functions+=(_aikey_precmd)\n",
+            "{}\n",
+        ),
+        V2_BEGIN, V2_END,
+    )
+}
+
+/// Generate v2 hook block for bash.
+fn v2_bash_hook() -> String {
+    format!(
+        concat!(
+            "{}\n",
+            "aikey() {{\n",
+            "    case \"$1\" in\n",
+            "        activate|deactivate)\n",
+            "            local _output\n",
+            "            _output=$(command aikey \"$@\" --shell bash)\n",
+            "            local _rc=$?\n",
+            "            if [ $_rc -eq 0 ]; then eval \"$_output\"; else return $_rc; fi\n",
+            "            ;;\n",
+            "        *) command aikey \"$@\" ;;\n",
+            "    esac\n",
+            "}}\n",
+            "_aikey_precmd_bash() {{\n",
+            "    if [ -n \"$AIKEY_ACTIVE_LABEL\" ]; then return; fi\n",
+            "    [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env\n",
+            "    if ! type -t _aikey_preexec_bash &>/dev/null; then\n",
+            "        [[ -f ~/.aikey/preexec.bash ]] && source ~/.aikey/preexec.bash\n",
+            "    fi\n",
+            "}}\n",
+            "PROMPT_COMMAND='_aikey_precmd_bash'\n",
+            "{}\n",
+        ),
+        V2_BEGIN, V2_END,
+    )
+}
+
+/// Replace the text between `begin` and `end` markers (inclusive) in `contents`.
+/// Returns the replaced content, or None if markers not found.
+fn replace_between_markers(contents: &str, begin: &str, end: &str, replacement: &str) -> Option<String> {
+    let start_idx = contents.find(begin)?;
+    let end_idx = contents.find(end)?;
+    if end_idx <= start_idx { return None; }
+    let end_line_end = contents[end_idx..].find('\n')
+        .map(|i| end_idx + i + 1)
+        .unwrap_or(contents.len());
+    let mut result = String::with_capacity(contents.len());
+    result.push_str(&contents[..start_idx]);
+    result.push_str(replacement);
+    if !replacement.ends_with('\n') { result.push('\n'); }
+    result.push_str(&contents[end_line_end..]);
+    Some(result)
+}
 
 /// Installs the shell precmd hook into ~/.zshrc or ~/.bashrc on first `aikey use`.
 /// Returns the hook lines written, or `None` if no hook is needed / supported.
+///
+/// Hook versioning:
+/// - v1: `# aikey shell hook` (no end marker, no wrapper function)
+/// - v2: `# aikey shell hook v2 begin` ... `# aikey shell hook v2 end`
+///        (wrapper function for activate/deactivate, sentinel precmd, preexec)
 ///
 /// Skipped with `--no-hook` flag or when `AIKEY_NO_HOOK=1` is set.
 pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
@@ -396,13 +512,13 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
     let is_bash = shell.contains("bash");
 
     if !is_zsh && !is_bash {
-        // Unknown shell — print manual instruction.
-        return Some(format!(
-            "  Add to your shell config: source ~/.aikey/active.env"
-        ));
+        return Some("  Add to your shell config: source ~/.aikey/active.env".to_string());
     }
 
-    // Determine the rc file to check/write.
+    // Ensure preexec file exists (always overwritten — idempotent).
+    if is_zsh { write_preexec_zsh(&home); }
+    else { write_preexec_bash(&home); }
+
     let rc_candidates: Vec<String> = if is_zsh {
         vec![format!("{}/.zshrc", home)]
     } else {
@@ -412,96 +528,69 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         ]
     };
 
-    // Check if hook is already installed in any candidate.
-    let hook_marker = "# aikey shell hook";
+    let new_hook = if is_zsh { v2_zsh_hook() } else { v2_bash_hook() };
+
+    // ── Check existing hooks in all rc candidates ───────────────────────────
     for rc in &rc_candidates {
-        if let Ok(contents) = std::fs::read_to_string(rc) {
-            if contents.contains(hook_marker) {
-                // Current version: precmd sources active.env + auto-loads preexec.zsh
-                if contents.contains("preexec.zsh") || contents.contains("preexec.bash") {
-                    // Ensure preexec file exists (may have been deleted)
-                    if is_zsh { write_preexec_zsh(&home); }
-                    else { write_preexec_bash(&home); }
-                    return None; // current version already installed
-                }
-                // Old hook detected — ask user to manually replace it.
-                eprintln!();
-                eprintln!("  \x1b[33m!\x1b[0m Old aikey shell hook detected in {}", rc);
-                eprintln!("    Please manually replace the old hook block with:");
-                eprintln!();
-                eprintln!("    1. Open {} in an editor", rc);
-                eprintln!("    2. Find and delete the block starting with '# aikey shell hook'");
-                eprintln!("    3. Run 'aikey use' again to install the new hook");
-                eprintln!();
+        let contents = match std::fs::read_to_string(rc) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Case 1: v2 already installed — replace in-place (hotfix upgrade).
+        if contents.contains(V2_BEGIN) {
+            if let Some(updated) = replace_between_markers(&contents, V2_BEGIN, V2_END, &new_hook) {
+                let _ = std::fs::write(rc, updated);
+            }
+            return None; // v2 present, up to date
+        }
+
+        // Case 2: v1 detected — try auto-upgrade via precise template matching.
+        if contents.contains(V1_MARKER) && !contents.contains(V2_BEGIN) {
+            let v1_template = if is_zsh { v1_zsh_template() } else { v1_bash_template() };
+
+            if let Some(idx) = contents.find(&v1_template) {
+                // Precise match: replace v1 block with v2.
+                let mut updated = String::with_capacity(contents.len());
+                updated.push_str(&contents[..idx]);
+                updated.push_str(&new_hook);
+                updated.push_str(&contents[idx + v1_template.len()..]);
+                let _ = std::fs::write(rc, updated);
+                eprintln!(
+                    "  \x1b[32m\u{2713}\x1b[0m Shell hook upgraded to v2 (activate support) in {}",
+                    rc
+                );
                 return None;
             }
+
+            // v1 present but modified — can't auto-upgrade safely.
+            eprintln!();
+            eprintln!("  \x1b[33m!\x1b[0m Old aikey shell hook detected in {}", rc);
+            eprintln!("    Cannot auto-upgrade (hook was modified). Please:");
+            eprintln!();
+            eprintln!("    1. Open {} in an editor", rc);
+            eprintln!("    2. Delete the block starting with '{}'", V1_MARKER);
+            eprintln!("    3. Run 'aikey use' again to install the new hook");
+            eprintln!();
+            return None;
         }
     }
 
-    // Write to the first candidate that exists or the first one if none exist.
+    // ── No hook found — fresh install ───────────────────────────────────────
     let rc_file = rc_candidates
         .iter()
         .find(|rc| std::path::Path::new(rc).exists())
         .or_else(|| rc_candidates.first())
         .cloned()?;
 
-    // Why two hooks:
-    //   precmd  → sources active.env (refreshes env vars before each prompt)
-    //   preexec → prints active key/account when running AI CLI tools
-    //             (fires before command execution, $1 = the command line)
-    //
-    // AIKEY_ACTIVE_KEYS format: "anthropic=alice@x.com,openai=office-key,kimi=crpn..."
-    // Mapping: claude→anthropic, codex→openai, kimi→kimi
-    // Why: preexec function is defined in a separate file (~/.aikey/preexec.zsh / preexec.bash)
-    // so that precmd can source it on-the-fly. This avoids requiring `source ~/.zshrc` —
-    // the next prompt after `aikey use` will auto-load the preexec hook.
-    let preexec_file = if is_zsh {
-        write_preexec_zsh(&home)?
-    } else {
-        write_preexec_bash(&home)?
-    };
-
-    let hook_block = if is_zsh {
-        format!(
-            concat!(
-                "\n{}\n",
-                "_aikey_precmd() {{\n",
-                "  [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env\n",
-                "  # Auto-load preexec hook if not yet loaded\n",
-                "  if ! (( ${{+functions[_aikey_preexec]}} )); then\n",
-                "    [[ -f ~/.aikey/preexec.zsh ]] && source ~/.aikey/preexec.zsh\n",
-                "  fi\n",
-                "}}\n",
-                "precmd_functions+=(_aikey_precmd)\n",
-            ),
-            hook_marker
-        )
-    } else {
-        format!(
-            concat!(
-                "\n{}\n",
-                "_aikey_precmd_bash() {{\n",
-                "  [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env\n",
-                "  if ! type -t _aikey_preexec_bash &>/dev/null; then\n",
-                "    [[ -f ~/.aikey/preexec.bash ]] && source ~/.aikey/preexec.bash\n",
-                "  fi\n",
-                "}}\n",
-                "PROMPT_COMMAND='_aikey_precmd_bash'\n",
-            ),
-            hook_marker
-        )
-    };
-    let _ = preexec_file; // used above in write_preexec_*
-
     // Prompt the user before writing.
     use std::io::{IsTerminal, Write};
     if io::stderr().is_terminal() {
         let shell_name = if is_zsh { "zsh" } else { "bash" };
-        let hook_desc = if is_zsh { "precmd hook" } else { "PROMPT_COMMAND" };
         let rows = vec![
             format!("Shell:  {}", shell_name),
             format!("File:   {}", rc_file),
-            format!("Add:    {} \u{2192} source ~/.aikey/active.env", hook_desc),
+            format!("Add:    precmd + activate wrapper (v2)"),
         ];
         crate::ui_frame::eprint_box("\u{2753}", "Install Shell Hook", &rows);
         eprint!("  Proceed? [Y/n] (default Y): ");
@@ -510,7 +599,7 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         if io::stdin().read_line(&mut input).is_ok() {
             match input.trim().to_lowercase().as_str() {
                 "n" | "no" => {
-                    return Some(format!("  Run: source ~/.aikey/active.env  (to apply once)"));
+                    return Some("  Run: source ~/.aikey/active.env  (to apply once)".to_string());
                 }
                 _ => {}
             }
@@ -520,7 +609,8 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
     match std::fs::OpenOptions::new().append(true).open(&rc_file) {
         Ok(mut f) => {
             use std::io::Write as _;
-            let _ = f.write_all(hook_block.as_bytes());
+            let block = format!("\n{}", new_hook);
+            let _ = f.write_all(block.as_bytes());
             Some(format!("  Shell hook installed in {}", rc_file))
         }
         Err(_) => Some(format!("  Could not write to {}. Run: source ~/.aikey/active.env", rc_file)),
@@ -572,4 +662,121 @@ trap '_aikey_preexec_bash' DEBUG
 "#;
     std::fs::write(&path, content).ok()?;
     Some(path)
+}
+
+#[cfg(test)]
+mod hook_tests {
+    use super::*;
+
+    // ── v2 hook block structure ─────────────────────────────────────────────
+
+    #[test]
+    fn v2_zsh_hook_has_markers() {
+        let hook = v2_zsh_hook();
+        assert!(hook.starts_with(V2_BEGIN));
+        assert!(hook.trim_end().ends_with(V2_END));
+    }
+
+    #[test]
+    fn v2_bash_hook_has_markers() {
+        let hook = v2_bash_hook();
+        assert!(hook.starts_with(V2_BEGIN));
+        assert!(hook.trim_end().ends_with(V2_END));
+    }
+
+    #[test]
+    fn v2_zsh_hook_contains_wrapper_and_sentinel() {
+        let hook = v2_zsh_hook();
+        assert!(hook.contains("aikey()"));
+        assert!(hook.contains("activate|deactivate"));
+        assert!(hook.contains("--shell zsh"));
+        assert!(hook.contains("AIKEY_ACTIVE_LABEL"));
+    }
+
+    #[test]
+    fn v2_bash_hook_contains_wrapper_and_sentinel() {
+        let hook = v2_bash_hook();
+        assert!(hook.contains("aikey()"));
+        assert!(hook.contains("--shell bash"));
+        assert!(hook.contains("AIKEY_ACTIVE_LABEL"));
+    }
+
+    // ── replace_between_markers ─────────────────────────────────────────────
+
+    #[test]
+    fn replace_markers_basic() {
+        let input = "before\n# BEGIN\nold content\n# END\nafter\n";
+        let result = replace_between_markers(input, "# BEGIN", "# END", "new content\n");
+        assert_eq!(result.unwrap(), "before\nnew content\nafter\n");
+    }
+
+    #[test]
+    fn replace_markers_preserves_surrounding() {
+        let input = "line1\nline2\n# BEGIN\nstuff\n# END\nline3\nline4\n";
+        let result = replace_between_markers(input, "# BEGIN", "# END", "replaced\n");
+        let out = result.unwrap();
+        assert!(out.starts_with("line1\nline2\n"));
+        assert!(out.ends_with("line3\nline4\n"));
+        assert!(out.contains("replaced"));
+        assert!(!out.contains("stuff"));
+    }
+
+    #[test]
+    fn replace_markers_not_found() {
+        let input = "no markers here\n";
+        assert!(replace_between_markers(input, "# BEGIN", "# END", "x").is_none());
+    }
+
+    // ── v1 template matching & upgrade simulation ───────────────────────────
+
+    #[test]
+    fn v1_zsh_template_structure() {
+        let template = v1_zsh_template();
+        assert!(template.starts_with(V1_MARKER));
+        assert!(template.contains("_aikey_precmd()"));
+        assert!(template.contains("preexec.zsh"));
+    }
+
+    #[test]
+    fn v1_bash_template_structure() {
+        let template = v1_bash_template();
+        assert!(template.starts_with(V1_MARKER));
+        assert!(template.contains("_aikey_precmd_bash()"));
+        assert!(template.contains("preexec.bash"));
+    }
+
+    #[test]
+    fn v1_upgrade_simulation_zsh() {
+        let v1 = v1_zsh_template();
+        let rc = format!("export FOO=bar\n\n{}\n# user code\n", v1);
+
+        assert!(rc.contains(V1_MARKER));
+        assert!(!rc.contains(V2_BEGIN));
+
+        let idx = rc.find(&v1).unwrap();
+        let mut upgraded = String::new();
+        upgraded.push_str(&rc[..idx]);
+        upgraded.push_str(&v2_zsh_hook());
+        upgraded.push_str(&rc[idx + v1.len()..]);
+
+        assert!(upgraded.contains(V2_BEGIN));
+        assert!(upgraded.contains(V2_END));
+        assert!(upgraded.contains("AIKEY_ACTIVE_LABEL"));
+        assert!(upgraded.contains("export FOO=bar"));
+        assert!(upgraded.contains("# user code"));
+    }
+
+    #[test]
+    fn v2_hotfix_replacement() {
+        let old_v2 = v2_zsh_hook();
+        let rc = format!("export FOO=bar\n{}\n# user code\n", old_v2);
+
+        // Simulate hotfix: replace v2 block with a new v2.
+        let new_v2 = v2_zsh_hook(); // same content in this test
+        let result = replace_between_markers(&rc, V2_BEGIN, V2_END, &new_v2);
+        let out = result.unwrap();
+        assert!(out.contains(V2_BEGIN));
+        assert!(out.contains("export FOO=bar"));
+        assert!(out.contains("# user code"));
+    }
 }

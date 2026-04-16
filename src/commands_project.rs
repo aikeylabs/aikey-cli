@@ -857,19 +857,42 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // ── 10. Usage pipeline health ─────────────────────────────
-    // Queries proxy /metrics for reporter delivery state (includes reporter field).
-    // Why /metrics not /status: /status returns statusResponse without reporter;
-    // /metrics returns metricsResponse with the optional reporter field.
-    if proxy_up {
-        let url = format!("http://{}/metrics", proxy_addr);
+    // ── 10. Usage pipeline health ─────────────────────────────
+    // Two data sources:
+    //   a) Proxy /metrics — reporter delivery state (generated/uploaded/failed/dropped)
+    //   b) Control /v1/diagnostics/pipeline — full-chain watermarks + canary health
+    //
+    // Why both: proxy /metrics shows the "sender side" (is reporter working?),
+    // diagnostics shows the "receiver side" (did data arrive and get projected?).
+    if !json_mode {
+        println!("{}", "─".repeat(52).dimmed());
+    }
+    {
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(3))
             .build();
-        if let Ok(resp) = agent.get(&url).call() {
-            if let Ok(body) = resp.into_string() {
-                check_usage_pipeline(&body, &mut emit);
-            }
-        }
+
+        // a) Proxy reporter metrics
+        let proxy_metrics = if proxy_up {
+            let url = format!("http://{}/metrics", proxy_addr);
+            agent.get(&url).call().ok()
+                .and_then(|r| r.into_string().ok())
+        } else { None };
+
+        // b) Control diagnostics (if control service is reachable)
+        let diag_json = storage::get_platform_account().ok().flatten()
+            .and_then(|acct| {
+                let url = format!("{}/v1/diagnostics/pipeline",
+                    acct.control_url.trim_end_matches('/'));
+                agent.get(&url).call().ok()
+                    .and_then(|r| r.into_string().ok())
+            });
+
+        check_usage_pipeline(
+            proxy_metrics.as_deref(),
+            diag_json.as_deref(),
+            &mut emit,
+        );
     }
 
     // Drop emit to release &mut results, then run deferred tests.
@@ -1082,12 +1105,19 @@ pub fn test_provider_connectivity(
     let is_via_proxy = base_url.contains("127.0.0.1") || base_url.contains("localhost");
 
     let (chat_url, body) = if provider_code == "openai" && is_via_proxy {
-        // Codex OAuth: uses Responses API (not Chat Completions).
-        // Endpoint: /responses (proxy prepends base URL → api.openai.com/v1/responses)
-        // Format: {"model":"gpt-4o-mini","input":"Say hi"} (NOT messages array)
-        // Ref: workflow/CI/researchs/oauth-codex-test/main.go
+        // Codex OAuth: uses Responses API via chatgpt.com/backend-api/codex.
+        // Required fields: model=gpt-5.4, instructions, input=array, store=false, stream=true
+        // Why gpt-5.4: ChatGPT accounts only support Codex-specific models (not gpt-4o-mini).
+        // Why stream=true + store=false: Codex API enforces these for ChatGPT accounts.
+        // Ref: verified 2026-04-16 against chatgpt.com/backend-api/codex/responses
         let url = format!("{}/responses", base_url.trim_end_matches('/'));
-        let body = serde_json::json!({"model": "gpt-4o-mini", "input": "Say hi"});
+        let body = serde_json::json!({
+            "model": "gpt-5.4",
+            "instructions": "Say hi.",
+            "input": [{"role": "user", "content": "hi"}],
+            "store": false,
+            "stream": true
+        });
         (url, body)
     } else if provider_code == "anthropic" && is_via_proxy {
         // Claude OAuth: requires ?beta=true + metadata.user_id
@@ -1559,65 +1589,133 @@ fn run_multi_key_connectivity_test(
 // Usage pipeline health check for `aikey doctor`
 // ---------------------------------------------------------------------------
 
-/// Parses proxy /metrics JSON and emits usage-pipeline check results as an
-/// expanded section with detailed diagnostics.
+/// Parses proxy /metrics and control /v1/diagnostics/pipeline to emit a
+/// comprehensive usage-pipeline section in `aikey doctor`.
+///
+/// Two data sources:
+///   - proxy_metrics: reporter delivery state (sender side)
+///   - diag_json: full-chain watermarks + canary-driven health (receiver side)
 fn check_usage_pipeline(
-    metrics_json: &str,
+    proxy_metrics: Option<&str>,
+    diag_json: Option<&str>,
     emit: &mut dyn FnMut(&str, bool, &str, Option<&str>),
 ) {
-    let parsed: serde_json::Value = match serde_json::from_str(metrics_json) {
-        Ok(v) => v,
-        Err(_) => {
-            emit("usage-pipeline", false, "cannot parse proxy /metrics", None);
-            return;
+    let metrics: Option<serde_json::Value> = proxy_metrics
+        .and_then(|s| serde_json::from_str(s).ok());
+    let diag: Option<serde_json::Value> = diag_json
+        .and_then(|s| serde_json::from_str(s).ok());
+
+    // --- Header: use diagnostics health if available, fall back to reporter state ---
+    let diag_health = diag.as_ref()
+        .and_then(|d| d.get("watermark_health").and_then(|v| v.as_str()));
+    let diag_stale = diag.as_ref()
+        .and_then(|d| d.get("stale_stage").and_then(|v| v.as_str()));
+
+    let reporter = metrics.as_ref()
+        .and_then(|m| m.get("reporter"));
+
+    // If neither source is available
+    if reporter.is_none() && diag.is_none() {
+        emit("usage-pipeline", true, "reporter not enabled (standalone mode)", None);
+        return;
+    }
+
+    // Determine overall health: worst-of-both from diagnostics watermarks AND
+    // proxy canary probe result. Why not trust diagnostics health alone: diagnostics
+    // only sees watermark freshness (DWD has recent canary → healthy), but misses
+    // canary probe failures at the query stage. Doctor has both data sources and
+    // must combine them to avoid "healthy overall but canary probe failed" contradiction.
+    let canary_status = metrics.as_ref()
+        .and_then(|m| m.get("canary"))
+        .and_then(|c| c.get("status").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let canary_stage = metrics.as_ref()
+        .and_then(|m| m.get("canary"))
+        .and_then(|c| c.get("failed_stage").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    // "unavailable" = diagnostics endpoint missing (server-mode), not a pipeline fault.
+    // Only "failed" or "partial" should degrade the overall health.
+    let canary_is_failure = canary_status == "failed" || canary_status == "partial";
+
+    let (pipeline_ok, health_label) = if canary_is_failure && !canary_stage.is_empty() {
+        // Canary probe failure overrides watermark health
+        (false, format!("degraded — canary failed at {}", canary_stage))
+    } else {
+        match diag_health {
+            Some("healthy") => (true, "healthy".to_string()),
+            Some("degraded") => {
+                let label = if let Some(stage) = diag_stale {
+                    format!("degraded — stale at {}", stage)
+                } else {
+                    "degraded".to_string()
+                };
+                (false, label)
+            }
+            _ => {
+                // Fall back to reporter consecutive failures
+                let consecutive = reporter.and_then(|r| r.get("consecutive_failures"))
+                    .and_then(|v| v.as_i64()).unwrap_or(0);
+                if consecutive >= 5 { (false, "degraded".to_string()) }
+                else { (true, "healthy".to_string()) }
+            }
         }
     };
 
-    let reporter = parsed.get("reporter")
-        .or_else(|| parsed.get("usage_pipeline").and_then(|p| p.get("reporter")));
+    // Override label to "idle" if reporter exists but no events have flowed yet.
+    // Avoids showing "healthy" when nothing has been verified.
+    let reporter_idle = reporter
+        .and_then(|r| r.get("usage_events_generated_total").and_then(|v| v.as_i64()))
+        .map(|g| g == 0)
+        .unwrap_or(false);
+    let (pipeline_ok, health_label) = if pipeline_ok && reporter_idle {
+        (true, "idle (awaiting first event)".to_string())
+    } else {
+        (pipeline_ok, health_label)
+    };
 
+    let hint = if !pipeline_ok {
+        Some("run: curl http://127.0.0.1:8090/v1/diagnostics/pipeline")
+    } else { None };
+    emit("usage-pipeline", pipeline_ok, &health_label, hint);
+
+    // --- Reporter stats (from proxy /metrics) ---
     if let Some(r) = reporter {
-        // Extract all metrics
         let generated = r.get("usage_events_generated_total").and_then(|v| v.as_i64()).unwrap_or(0);
         let uploaded = r.get("usage_events_upload_success_total").and_then(|v| v.as_i64()).unwrap_or(0);
         let failed = r.get("usage_events_upload_failed_total").and_then(|v| v.as_i64()).unwrap_or(0);
         let dropped = r.get("usage_events_dropped_total").and_then(|v| v.as_i64()).unwrap_or(0);
-        let queue_depth = r.get("usage_queue_depth").and_then(|v| v.as_i64()).unwrap_or(0);
-        let wal_fail = r.get("usage_wal_append_failed_total").and_then(|v| v.as_i64()).unwrap_or(0);
         let consecutive = r.get("consecutive_failures").and_then(|v| v.as_i64()).unwrap_or(0);
         let terminal = r.get("terminal_fail_count").and_then(|v| v.as_i64()).unwrap_or(0);
         let last_status = r.get("last_upload_status").and_then(|v| v.as_str()).unwrap_or("");
         let last_upload = r.get("last_upload_at").and_then(|v| v.as_str()).unwrap_or("");
         let last_error_code = r.get("last_error_code").and_then(|v| v.as_i64()).unwrap_or(0);
-        let last_biz = r.get("latest_business_event_at").and_then(|v| v.as_str()).unwrap_or("");
-        let last_canary = r.get("latest_canary_event_at").and_then(|v| v.as_str()).unwrap_or("");
+        let queue_depth = r.get("usage_queue_depth").and_then(|v| v.as_i64()).unwrap_or(0);
+        let wal_fail = r.get("usage_wal_append_failed_total").and_then(|v| v.as_i64()).unwrap_or(0);
 
-        // Determine overall health
-        let ok = consecutive < 5 && last_status != "terminal_failed";
-        let health_label = if consecutive == 0 && terminal == 0 { "healthy" }
-            else if consecutive >= 5 || last_status == "terminal_failed" { "degraded" }
-            else { "warning" };
-
-        // Header line
-        emit("usage-pipeline", ok, health_label, if !ok {
-            Some("run: curl http://127.0.0.1:8090/v1/diagnostics/pipeline")
-        } else { None });
-
-        // Sub-lines: reporter stats
         let upload_time = format_time_short(last_upload);
         let status_display = if last_status.is_empty() { "idle" } else { last_status };
-        emit("  reporter", true,
+
+        // Reporter is ok if currently healthy (consecutive < 5 and last status not terminal).
+        // Historical failures with last_status=ok means it recovered — show ✓ with hint.
+        let reporter_ok = consecutive < 5 && last_status != "terminal_failed";
+        let reporter_hint = if terminal > 0 && last_status == "ok" {
+            Some("recovered, but has terminal failures in dead_letter.jsonl")
+        } else if terminal > 0 {
+            Some("terminal failures — check collector_token")
+        } else if failed > 0 {
+            Some("retryable failures detected")
+        } else { None };
+        emit("  reporter", reporter_ok,
             &format!("{} generated, {} uploaded, {} failed, {} dropped",
                 generated, uploaded, failed, dropped),
-            None);
+            reporter_hint);
         let upload_hint = if consecutive > 0 {
             Some(format!("{} consecutive failures, last HTTP {}", consecutive, last_error_code))
         } else { None };
-        emit("  last upload", ok,
+        emit("  last upload", reporter_ok,
             &format!("{} ({})", upload_time, status_display),
             upload_hint.as_deref());
 
-        // Sub-line: queue + WAL
         if queue_depth > 0 || wal_fail > 0 {
             let mut parts = Vec::new();
             if queue_depth > 0 { parts.push(format!("{} queued", queue_depth)); }
@@ -1625,61 +1723,88 @@ fn check_usage_pipeline(
             emit("  queue/WAL", wal_fail == 0, &parts.join(", "), None);
         }
 
-        // Sub-line: dead letters
         if terminal > 0 {
             emit("  dead letters", false,
                 &format!("{} events", terminal),
                 Some("review ~/.aikey/data/usage-wal/dead_letter.jsonl"));
         }
-
-        // Sub-line: event freshness (business vs canary)
-        let biz_time = format_time_short(last_biz);
-        let canary_time = format_time_short(last_canary);
-        if biz_time != "never" || canary_time != "never" {
-            emit("  freshness", true,
-                &format!("business: {}, canary: {}", biz_time, canary_time),
-                None);
-        }
-    } else {
-        emit("usage-pipeline", true, "reporter not enabled (standalone mode)", None);
     }
 
-    // Canary probe result
-    let canary = parsed.get("canary")
-        .or_else(|| parsed.get("usage_pipeline").and_then(|p| p.get("canary")));
+    // --- Watermarks (from diagnostics) ---
+    if let Some(ref d) = diag {
+        let biz = d.get("business_watermarks");
+        let canary_wm = d.get("canary_watermarks");
+
+        let biz_ods = biz.and_then(|w| w.get("ods_latest_ingested_at")).and_then(|v| v.as_str()).unwrap_or("");
+        let biz_dwd = biz.and_then(|w| w.get("dwd_latest_projected_at")).and_then(|v| v.as_str()).unwrap_or("");
+        let can_ods = canary_wm.and_then(|w| w.get("ods_latest_ingested_at")).and_then(|v| v.as_str()).unwrap_or("");
+        let can_dwd = canary_wm.and_then(|w| w.get("dwd_latest_projected_at")).and_then(|v| v.as_str()).unwrap_or("");
+
+        let biz_ods_t = format_time_short(biz_ods);
+        let biz_dwd_t = format_time_short(biz_dwd);
+        let can_dwd_t = format_time_short(can_dwd);
+
+        // Show watermarks if there's any data.
+        // Why "(UTC)": watermarks come from SQLite datetime('now') which is UTC,
+        // while proxy reporter timestamps are local time. Label prevents confusion.
+        if biz_ods_t != "never" || biz_dwd_t != "never" {
+            emit("  watermarks", true,
+                &format!("ODS: {}, DWD: {} (UTC)", biz_ods_t, biz_dwd_t),
+                None);
+        }
+
+        // Show canary watermark
+        if can_dwd_t != "never" {
+            emit("  canary last seen", true,
+                &format!("ODS: {}, DWD: {} (UTC)", format_time_short(can_ods), can_dwd_t),
+                None);
+        }
+
+        // Show lag if present
+        if let Some(lag) = d.get("lag").and_then(|l| l.get("ods_to_dwd_seconds")).and_then(|v| v.as_i64()) {
+            if lag > 60 {
+                emit("  lag", false,
+                    &format!("ODS→DWD: {}s", lag),
+                    Some("projector may be stalled"));
+            }
+        }
+    }
+
+    // --- Canary probe result (from proxy /metrics) ---
+    let canary = metrics.as_ref().and_then(|m| m.get("canary"));
 
     if let Some(c) = canary {
-        let status = c.get("last_result").or_else(|| c.get("status"))
-            .and_then(|v| v.as_str()).unwrap_or("unknown");
+        let status = c.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
         let round_trip = c.get("round_trip_ms").and_then(|v| v.as_i64()).unwrap_or(0);
-        let failed_stage = c.get("last_failed_stage").or_else(|| c.get("failed_stage"))
-            .and_then(|v| v.as_str()).unwrap_or("");
+        let failed_stage = c.get("failed_stage").and_then(|v| v.as_str()).unwrap_or("");
         let ods = c.get("ods_received").and_then(|v| v.as_bool()).unwrap_or(false);
         let dwd = c.get("dwd_projected").and_then(|v| v.as_bool()).unwrap_or(false);
-        let query = c.get("query_visible").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let ok = status == "ok";
-        let stages = format!("ODS {} DWD {} Query {}",
+        // Canary checks ODS and DWD only (no query-stage check yet — P2/P3).
+        let stages = format!("ODS {} DWD {}",
             if ods { "✓" } else { "✗" },
-            if dwd { "✓" } else { "✗" },
-            if query { "✓" } else { "✗" });
+            if dwd { "✓" } else { "✗" });
 
-        let detail = if ok {
+        let detail = if status == "unavailable" {
+            format!("diagnostics endpoint not available  ({})", failed_stage)
+        } else if ok {
             format!("ok ({:.1}s)  {}", round_trip as f64 / 1000.0, stages)
         } else {
             format!("{} — stuck at: {}  {}", status, failed_stage, stages)
         };
 
-        let hint = if !ok && !failed_stage.is_empty() {
+        let hint = if status == "unavailable" {
+            Some("diagnostics not registered on this server — canary limited to reporter metrics")
+        } else if !ok && !failed_stage.is_empty() {
             Some(match failed_stage {
                 "ingest" => "events not reaching ODS — check reporter + collector",
                 "projection" => "ODS ok but DWD stalled — check projector worker",
-                "query" => "DWD ok but query layer can't see it — check query-service",
                 _ => "run: curl http://127.0.0.1:8090/v1/diagnostics/pipeline",
             })
         } else { None };
 
-        emit("  canary", ok, &detail, hint);
+        emit("  canary probe", ok, &detail, hint);
     }
 }
 

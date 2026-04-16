@@ -19,6 +19,9 @@ Commands:
   \x1b[1mlist\x1b[0m                     Show all personal and team keys
   \x1b[1mtest\x1b[0m <alias>             Test whether a stored API key alias is working
   \x1b[1muse\x1b[0m [alias]              Select the active key for routing (shortcut for `key use`)
+  \x1b[1mactivate\x1b[0m <alias>          Temporarily activate a key in the current terminal
+  \x1b[1mdeactivate\x1b[0m               Restore global settings in the current terminal
+  \x1b[1mroute\x1b[0m [label]            Show proxy route tokens for third-party AI clients
   \x1b[1mlogin\x1b[0m                    Log in to aikey service (shortcut for `account login`)
   \x1b[1mweb\x1b[0m [page]               Open the User Console in your default browser
   \x1b[1mmaster\x1b[0m [page]            Open the Master Console (admin) in your default browser
@@ -119,8 +122,38 @@ pub(crate) enum Commands {
         #[arg(long, value_name = "PROVIDER", num_args = 0..=1, default_missing_value = "")]
         provider: Option<String>,
     },
-    /// Log in to aikey service (shortcut for `account login`)
+    /// Temporarily activate a key in the current terminal (does not write active.env)
+    #[command(display_order = 4)]
+    Activate {
+        /// Key alias, team display alias, or OAuth identity to activate
+        alias: String,
+        /// Target provider (required when key supports multiple providers)
+        #[arg(long, value_name = "PROVIDER")]
+        provider: Option<String>,
+        /// Target shell for eval-safe output (zsh, bash, powershell, cmd).
+        /// Passed automatically by the shell wrapper; required.
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
+    },
+    /// Restore global active.env settings in the current terminal
+    #[command(display_order = 4)]
+    Deactivate {
+        /// Target shell for eval-safe output (zsh, bash, powershell, cmd).
+        /// Passed automatically by the shell wrapper; required.
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
+    },
+    /// Show proxy route tokens for third-party AI clients (Cursor, OpenCode, etc.)
     #[command(display_order = 5)]
+    Route {
+        /// Key label to show configuration for (alias, team display alias, or OAuth email)
+        label: Option<String>,
+        /// Show full (untruncated) route tokens in list view
+        #[arg(long)]
+        full: bool,
+    },
+    /// Log in to aikey service (shortcut for `account login`)
+    #[command(display_order = 6)]
     Login {
         /// Control Panel URL (e.g. http://192.168.1.100:3000)
         #[arg(long = "control-url", alias = "url")]
@@ -535,6 +568,9 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 KeyAction::Alias { .. } => "alias",
             }),
             Commands::Use { .. } => "key.use".to_string(),
+            Commands::Activate { .. } => "activate".to_string(),
+            Commands::Deactivate { .. } => "deactivate".to_string(),
+            Commands::Route { .. } => "route".to_string(),
             Commands::Status => "status".to_string(),
             Commands::Whoami => "whoami".to_string(),
             Commands::Account { action } => format!("account.{}", match action {
@@ -623,6 +659,32 @@ Notes:
     - --provider <PROVIDER> narrows a personal key to a specific provider.
     - --provider with no value opens an interactive provider selector.
     - --no-hook skips shell hook installation."),
+
+        "activate" => Some("\
+Notes:
+    - Temporarily sets API key environment variables in the current terminal.
+    - Does not write to active.env or modify provider bindings.
+    - Closing the terminal automatically reverts to global settings.
+    - --provider is required when the key supports multiple providers.
+    - --shell is passed automatically by the aikey() shell wrapper.
+    - Use `aikey deactivate` to restore global settings in the same terminal."),
+
+        "deactivate" => Some("\
+Notes:
+    - Restores global active.env settings in the current terminal.
+    - Undoes the effect of `aikey activate`.
+    - --shell is passed automatically by the aikey() shell wrapper."),
+
+        "route" => Some("\
+Notes:
+    - Shows route tokens for configuring third-party AI clients (Cursor, OpenCode, etc.).
+    - Each key/account gets a random aikey_vk_ token used as the API_KEY in client config.
+    - `aikey route` lists all available routes (tokens truncated by default).
+    - `aikey route <label>` shows full token + base_url for copy-paste configuration.
+    - `aikey route --json` outputs all routes as JSON with full tokens (for scripts).
+    - `aikey route --full` shows full tokens in the list view.
+    - This command is read-only; it does not modify the vault or proxy state.
+    - If tokens are missing, run `aikey use` or `aikey add` to trigger migration."),
 
         "login" => Some("\
 Notes:
@@ -772,6 +834,9 @@ Commands:
   {b}list{r}                     Show all personal and team keys
   {b}test{r} <alias>             Test whether a stored API key alias is working
   {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
+  {b}activate{r} <alias>          Temporarily activate a key in the current terminal
+  {b}deactivate{r}               Restore global settings in the current terminal
+  {b}route{r} [label]            Show proxy route tokens for third-party AI clients
   {b}login{r}                    Log in to aikey service (shortcut for `account login`)
   {b}web{r} [page]               Open the User Console in your default browser
   {b}master{r} [page]            Open the Master Console (admin) in your default browser
@@ -870,6 +935,48 @@ Detailed Commands
     - --provider <PROVIDER> narrows a personal key to a specific provider.
     - --provider with no value opens an interactive provider selector.
     - --no-hook skips shell hook installation.
+
+[1mactivate[0m
+  Temporarily activate a key in the current terminal.
+
+  Usage:
+    aikey activate [--provider <PROVIDER>] [--shell <SHELL>] <ALIAS>
+
+  Notes:
+    - Sets environment variables in the current shell only (does not write active.env).
+    - Closing the terminal reverts to global settings.
+    - --provider is required when the key supports multiple providers.
+    - --shell is passed automatically by the shell wrapper function.
+    - Use `aikey deactivate` to restore global settings without closing the terminal.
+
+[1mdeactivate[0m
+  Restore global active.env settings in the current terminal.
+
+  Usage:
+    aikey deactivate [--shell <SHELL>]
+
+  Notes:
+    - Undoes `aikey activate` — restores environment variables from active.env.
+    - --shell is passed automatically by the shell wrapper function.
+
+[1mroute[0m
+  Show proxy route tokens for third-party AI clients (Cursor, OpenCode, etc.).
+
+  Usage:
+    aikey route [--full] [--json] [LABEL]
+
+  Notes:
+    - Each key/account gets a random aikey_vk_ token used as API_KEY in client config.
+    - Without LABEL: lists all routes (tokens truncated; use --full for complete tokens).
+    - With LABEL: shows full base_url + api_key ready to copy-paste.
+    - --json outputs all routes as JSON with full tokens (for scripts).
+    - Read-only command — does not modify vault or proxy.
+
+  Example:
+    $ aikey route my-key
+    # Configuration for: my-key (personal, anthropic)
+    base_url:  http://127.0.0.1:27200/anthropic
+    api_key:   aikey_vk_b82ef1d49c3a7e08...
 
 [1mlogin[0m
   Log in to the control service.

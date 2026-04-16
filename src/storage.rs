@@ -336,6 +336,30 @@ fn apply_migrations(conn: &Connection) -> Result<(), String> {
     ensure_column(conn, "entries", "supported_providers",
         "ALTER TABLE entries ADD COLUMN supported_providers TEXT")?;
 
+    // v1.0.4: route_token for per-request API gateway routing.
+    // Each personal key gets a random aikey_vk_ token that third-party clients
+    // (Cursor, OpenCode, etc.) use as their API_KEY via the local proxy.
+    ensure_column(conn, "entries", "route_token",
+        "ALTER TABLE entries ADD COLUMN route_token TEXT")?;
+    // Unique index: route_token must be globally unique across all entries.
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_route_token \
+         ON entries(route_token) WHERE route_token IS NOT NULL",
+        [],
+    ).map_err(|e| format!("Failed to create idx_entries_route_token: {}", e))?;
+
+    // v1.0.4: route_token for provider_accounts (OAuth accounts).
+    if has_column(conn, "provider_accounts", "provider_account_id") {
+        // Table exists (created by v1.0.3 migration) — add route_token column.
+        ensure_column(conn, "provider_accounts", "route_token",
+            "ALTER TABLE provider_accounts ADD COLUMN route_token TEXT")?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_accounts_route_token \
+             ON provider_accounts(route_token) WHERE route_token IS NOT NULL",
+            [],
+        ).map_err(|e| format!("Failed to create idx_provider_accounts_route_token: {}", e))?;
+    }
+
     // v1.0.2: user_profiles + user_profile_provider_bindings.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS user_profiles (
@@ -1373,6 +1397,157 @@ pub fn get_proxy_loaded_seq() -> Result<u64, String> {
 /// Called by the CLI immediately after confirming proxy start / graceful reload.
 pub fn set_proxy_loaded_seq(seq: u64) -> Result<(), String> {
     write_u64_config(PROXY_LOADED_SEQ_KEY, seq)
+}
+
+// ---------------------------------------------------------------------------
+// Route token generation and backfill
+// ---------------------------------------------------------------------------
+
+/// Generates a random route token: "aikey_vk_" + 64 hex chars (256 bits).
+/// Used as the API_KEY identifier for per-request proxy routing.
+pub fn generate_route_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!("aikey_vk_{}", hex::encode(bytes))
+}
+
+/// Sets the route_token for a personal key entry.
+pub fn set_entry_route_token(alias: &str, token: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    let rows = conn
+        .execute(
+            "UPDATE entries SET route_token = ?1 WHERE alias = ?2",
+            params![token, alias],
+        )
+        .map_err(|e| format!("Failed to set route_token for '{}': {}", alias, e))?;
+    if rows == 0 {
+        return Err(format!("Entry '{}' not found", alias));
+    }
+    Ok(())
+}
+
+/// Gets the route_token for a personal key entry.
+pub fn get_entry_route_token(alias: &str) -> Result<Option<String>, String> {
+    let conn = open_connection()?;
+    // Graceful degradation: if route_token column doesn't exist, return None.
+    if !has_column(&conn, "entries", "route_token") {
+        return Ok(None);
+    }
+    match conn.query_row(
+        "SELECT route_token FROM entries WHERE alias = ?1",
+        params![alias],
+        |row| row.get::<_, Option<String>>(0),
+    ) {
+        Ok(token) => Ok(token),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to get route_token for '{}': {}", alias, e)),
+    }
+}
+
+/// Ensures a personal key entry has a route_token. Generates one if missing.
+/// Returns the route_token (existing or newly generated).
+pub fn ensure_entry_route_token(alias: &str) -> Result<String, String> {
+    if let Some(token) = get_entry_route_token(alias)? {
+        return Ok(token);
+    }
+    let token = generate_route_token();
+    set_entry_route_token(alias, &token)?;
+    Ok(token)
+}
+
+/// Sets the route_token for a provider (OAuth) account.
+pub fn set_provider_account_route_token(account_id: &str, token: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    let rows = conn
+        .execute(
+            "UPDATE provider_accounts SET route_token = ?1 WHERE provider_account_id = ?2",
+            params![token, account_id],
+        )
+        .map_err(|e| format!("Failed to set route_token for account '{}': {}", account_id, e))?;
+    if rows == 0 {
+        return Err(format!("Provider account '{}' not found", account_id));
+    }
+    Ok(())
+}
+
+/// Gets the route_token for a provider (OAuth) account.
+pub fn get_provider_account_route_token(account_id: &str) -> Result<Option<String>, String> {
+    let conn = open_connection()?;
+    if !has_column(&conn, "provider_accounts", "route_token") {
+        return Ok(None);
+    }
+    match conn.query_row(
+        "SELECT route_token FROM provider_accounts WHERE provider_account_id = ?1",
+        params![account_id],
+        |row| row.get::<_, Option<String>>(0),
+    ) {
+        Ok(token) => Ok(token),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to get route_token for account '{}': {}", account_id, e)),
+    }
+}
+
+/// Ensures a provider account has a route_token. Generates one if missing.
+pub fn ensure_provider_account_route_token(account_id: &str) -> Result<String, String> {
+    if let Some(token) = get_provider_account_route_token(account_id)? {
+        return Ok(token);
+    }
+    let token = generate_route_token();
+    set_provider_account_route_token(account_id, &token)?;
+    Ok(token)
+}
+
+/// One-time backfill: generate route_tokens for all entries and provider_accounts
+/// that are missing one. Called from ensure_schema() in write-path CLI commands.
+/// Returns the number of tokens generated (0 if nothing to do).
+pub fn backfill_route_tokens() -> Result<usize, String> {
+    let conn = open_connection()?;
+    let mut count = 0;
+
+    // Backfill entries
+    if has_column(&conn, "entries", "route_token") {
+        let mut stmt = conn
+            .prepare("SELECT alias FROM entries WHERE route_token IS NULL")
+            .map_err(|e| format!("backfill query entries: {}", e))?;
+        let aliases: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| format!("backfill iter entries: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for alias in &aliases {
+            let token = generate_route_token();
+            conn.execute(
+                "UPDATE entries SET route_token = ?1 WHERE alias = ?2 AND route_token IS NULL",
+                params![token, alias],
+            )
+            .map_err(|e| format!("backfill set entries.route_token '{}': {}", alias, e))?;
+            count += 1;
+        }
+    }
+
+    // Backfill provider_accounts
+    if has_column(&conn, "provider_accounts", "route_token") {
+        let mut stmt = conn
+            .prepare("SELECT provider_account_id FROM provider_accounts WHERE route_token IS NULL")
+            .map_err(|e| format!("backfill query provider_accounts: {}", e))?;
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| format!("backfill iter provider_accounts: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for id in &ids {
+            let token = generate_route_token();
+            conn.execute(
+                "UPDATE provider_accounts SET route_token = ?1 WHERE provider_account_id = ?2 AND route_token IS NULL",
+                params![token, id],
+            )
+            .map_err(|e| format!("backfill set provider_accounts.route_token '{}': {}", id, e))?;
+            count += 1;
+        }
+    }
+
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod storage;
 pub mod synapse;
 pub mod executor;
+pub mod migrations;
 pub mod audit;
 pub mod ratelimit;
 pub mod config;

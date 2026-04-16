@@ -242,6 +242,11 @@ fn submit_code_and_finish(
     let display = resp["display_identity"].as_str().unwrap_or(account_id);
     let expires_in = resp["expires_in"].as_i64().unwrap_or(0);
 
+    // Generate route token for per-request proxy routing (API gateway).
+    if !account_id.is_empty() {
+        let _ = crate::storage::ensure_provider_account_route_token(account_id);
+    }
+
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
@@ -284,6 +289,11 @@ fn poll_login_status(
             "success" => {
                 let account_id = resp["account_id"].as_str().unwrap_or("");
                 let display = resp["display_identity"].as_str().unwrap_or(account_id);
+
+                // Generate route token for per-request proxy routing (API gateway).
+                if !account_id.is_empty() {
+                    let _ = crate::storage::ensure_provider_account_route_token(account_id);
+                }
 
                 if json_mode {
                     println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -345,6 +355,11 @@ fn poll_device_code(
                 let resp: serde_json::Value = r.into_json()?;
                 let account_id = resp["account_id"].as_str().unwrap_or("");
                 let display = resp["display_identity"].as_str().unwrap_or(account_id);
+
+                // Generate route token for per-request proxy routing (API gateway).
+                if !account_id.is_empty() {
+                    let _ = crate::storage::ensure_provider_account_route_token(account_id);
+                }
 
                 if json_mode {
                     println!("{}", serde_json::to_string_pretty(&resp)?);

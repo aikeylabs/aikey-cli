@@ -76,6 +76,14 @@ impl VaultContext {
             Ok(_) => {
                 // Success - reset rate limiter
                 rate_limiter.record_success()?;
+
+                // Apply pending version migrations (idempotent).
+                // Why here: after password is verified and before any vault operation,
+                // ensure the schema is up to date. CREATE TABLE IF NOT EXISTS and
+                // ALTER TABLE ADD COLUMN are safe to run on every open.
+                let conn = storage::open_connection()?;
+                let _ = super::migrations::upgrade_all(&conn);
+
                 Ok(VaultContext { key, salt })
             }
             Err(e) => {

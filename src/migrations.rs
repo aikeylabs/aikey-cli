@@ -30,6 +30,11 @@ static VERSIONS: &[VersionMigration] = &[
         upgrade: v1_0_3_alpha::upgrade,
         rollback: v1_0_3_alpha::rollback,
     },
+    VersionMigration {
+        version: "1.0.4-alpha",
+        upgrade: v1_0_4_alpha::upgrade,
+        rollback: v1_0_4_alpha::rollback,
+    },
 ];
 
 /// Run all upgrades up to the current binary version.
@@ -221,6 +226,78 @@ pub mod v1_0_3_alpha {
                 Err(e) => eprintln!("[db rollback] WARN: {} — {}", sql, e),
             }
         }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.4-alpha migrations — Route token for per-request API gateway routing
+// ---------------------------------------------------------------------------
+
+pub mod v1_0_4_alpha {
+    use rusqlite::Connection;
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name=?1", table),
+            [column],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false)
+    }
+
+    /// Forward migration: add route_token columns to entries and provider_accounts.
+    /// Route tokens are random aikey_vk_ tokens used by third-party clients
+    /// (Cursor, OpenCode, etc.) as their API_KEY when routing through the local proxy.
+    pub fn upgrade(conn: &Connection) -> Result<(), String> {
+        // entries.route_token
+        if !has_column(conn, "entries", "route_token") {
+            conn.execute("ALTER TABLE entries ADD COLUMN route_token TEXT", [])
+                .map_err(|e| format!("entries.route_token: {}", e))?;
+        }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_route_token \
+             ON entries(route_token) WHERE route_token IS NOT NULL",
+            [],
+        )
+        .map_err(|e| format!("idx_entries_route_token: {}", e))?;
+
+        // provider_accounts.route_token (table may not exist if v1.0.3 was skipped)
+        if has_column(conn, "provider_accounts", "provider_account_id") {
+            if !has_column(conn, "provider_accounts", "route_token") {
+                conn.execute(
+                    "ALTER TABLE provider_accounts ADD COLUMN route_token TEXT",
+                    [],
+                )
+                .map_err(|e| format!("provider_accounts.route_token: {}", e))?;
+            }
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_accounts_route_token \
+                 ON provider_accounts(route_token) WHERE route_token IS NOT NULL",
+                [],
+            )
+            .map_err(|e| format!("idx_provider_accounts_route_token: {}", e))?;
+        }
+
+        Ok(())
+    }
+
+    /// Reverse migration: columns cannot be dropped in SQLite — they stay
+    /// but are safely ignored by older binaries.
+    pub fn rollback(conn: &Connection) -> Result<(), String> {
+        // Drop indexes (safe, older versions don't use them)
+        for sql in &[
+            "DROP INDEX IF EXISTS idx_entries_route_token",
+            "DROP INDEX IF EXISTS idx_provider_accounts_route_token",
+        ] {
+            match conn.execute(sql, []) {
+                Ok(_) => eprintln!("[db rollback] OK: {}", sql),
+                Err(e) => eprintln!("[db rollback] WARN: {} — {}", sql, e),
+            }
+        }
+        eprintln!("[db rollback] SKIP: entries.route_token (SQLite no DROP COLUMN)");
+        eprintln!("[db rollback] SKIP: provider_accounts.route_token (SQLite no DROP COLUMN)");
         Ok(())
     }
 }
