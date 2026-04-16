@@ -2964,9 +2964,11 @@ fn resolve_activate_key(
                 vk.alias, vk.key_status
             ).into());
         }
-        if vk.local_state.starts_with("disabled_by_") {
+        // Why: must match the same filter used by `aikey route` (local_state == "active")
+        // so users never activate a key that is invisible in the route table.
+        if vk.local_state != "active" {
             return Err(format!(
-                "Key '{}' is unavailable (state: {}). Run 'aikey key sync' to refresh.",
+                "Key '{}' is not available (state: {}). Run 'aikey key sync' to refresh.",
                 vk.alias, vk.local_state
             ).into());
         }

@@ -243,8 +243,11 @@ pub fn maybe_warn_stale() {
 /// reload operation can be correlated with CLI log records by trace_id.
 /// Returns Ok(()) when the proxy confirms a successful graceful reload.
 pub fn post_admin_reload() -> Result<(), Box<dyn std::error::Error>> {
-    let stream = TcpStream::connect(PROXY_HEALTH_ADDR_DEFAULT)
-        .map_err(|e| format!("cannot connect to proxy at {}: {}", PROXY_HEALTH_ADDR_DEFAULT, e))?;
+    // Why: use configured listen address instead of hardcoded default, so reload
+    // works when the user/deployment overrides the proxy port in config YAML.
+    let addr = proxy_listen_addr(None);
+    let stream = TcpStream::connect(&addr)
+        .map_err(|e| format!("cannot connect to proxy at {}: {}", addr, e))?;
     stream.set_read_timeout(Some(Duration::from_secs(35)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
@@ -254,8 +257,8 @@ pub fn post_admin_reload() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
 
     let request = format!(
-        "POST /admin/reload HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n{}\r\n",
-        traceparent_header
+        "POST /admin/reload HTTP/1.0\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n{}\r\n",
+        addr, traceparent_header
     );
     {
         let mut w = stream.try_clone()?;

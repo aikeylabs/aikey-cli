@@ -293,10 +293,13 @@ mod tests {
 
     #[test]
     fn mask_sensitive() {
-        assert_eq!(mask_value("OPENAI_API_KEY", "sk-xxx"), "***");
-        assert_eq!(mask_value("MY_TOKEN", "abc"), "***");
-        assert_eq!(mask_value("MY_SECRET", "abc"), "***");
-        assert_eq!(mask_value("DB_PASSWORD", "abc"), "***");
+        // Short values (<= 12 chars): shown as-is (too short to partially mask)
+        assert_eq!(mask_value("OPENAI_API_KEY", "sk-xxx"), "sk-xxx");
+        assert_eq!(mask_value("MY_TOKEN", "abc"), "abc");
+        assert_eq!(mask_value("MY_SECRET", "abc"), "abc");
+        assert_eq!(mask_value("DB_PASSWORD", "abc"), "abc");
+        // Long values (> 12 chars): first 12 chars + "..."
+        assert_eq!(mask_value("OPENAI_API_KEY", "sk-1234567890abcdef"), "sk-123456789...");
     }
 
     #[test]
