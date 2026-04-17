@@ -1781,7 +1781,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Activate { alias, provider, shell } => {
-            handle_activate(alias, provider.as_deref(), shell.as_deref())?;
+            handle_activate(alias.as_deref(), provider.as_deref(), shell.as_deref())?;
         }
         Commands::Deactivate { shell } => {
             handle_deactivate(shell.as_deref())?;
@@ -2811,9 +2811,9 @@ fn prompt_password_secure(prompt: &str, password_stdin: bool, json_mode: bool) -
     Ok(SecretString::new(trimmed))
 }
 
-/// Show an interactive arrow-key picker with all available personal + team keys.
-/// Returns the alias/id that the user selected.
-#[allow(dead_code)]
+/// Show an interactive arrow-key picker with all activatable credentials.
+/// Returns the alias / virtual_key_id / OAuth identity that the user selected,
+/// which can be fed back into `resolve_activate_key` unchanged.
 fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
     use colored::Colorize;
 
@@ -2821,57 +2821,49 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
     let personal = storage::list_entries_with_metadata().unwrap_or_default();
     // Gather team keys
     let team = storage::list_virtual_key_cache().unwrap_or_default();
+    // Gather OAuth accounts — activate supports these too.
+    let oauth_accounts = storage::list_provider_accounts().unwrap_or_default();
 
-    if personal.is_empty() && team.is_empty() {
-        return Err("No keys found. Add a personal key with `aikey add` or sync team keys with `aikey key sync`.".into());
+    if personal.is_empty() && team.is_empty() && oauth_accounts.is_empty() {
+        return Err("No credentials found. Add a personal key with `aikey add`, sync team keys with `aikey key sync`, or login with `aikey auth login <provider>`.".into());
     }
 
-    // Active key for LOCAL column
+    // Active key for LOCAL column.
+    //
+    // `AIKEY_ACTIVE_LABEL` is the terminal-scoped active marker set by
+    // `aikey activate` — that's what the picker cares about here, since the
+    // picker itself drives activate. `active_cfg` (persistent primary set via
+    // `aikey use`) is intentionally NOT used: in a shell where activate ran
+    // kimi-local, the primary might still point at an OAuth account, which
+    // would show a misleading ◀ marker on the wrong row.
+    let active_label = std::env::var("AIKEY_ACTIVE_LABEL").unwrap_or_default();
     let active_cfg = storage::get_active_key_config().ok().flatten();
 
+    // Provider bindings drive the persistent ● (in-use) marker — any key that
+    // a binding routes through is "in use", matching `aikey list` / `aikey route`.
+    let bindings = storage::list_provider_bindings(profile_activation::DEFAULT_PROFILE)
+        .unwrap_or_default();
+
     // Build display rows; keep alias/id parallel for lookup after selection.
-    // Format: TYPE  ALIAS  PROVIDER / BASE_URL  [active marker]
+    // Layout per leaf row (inside the box):
+    //   "> "(cursor,2) + "● "(in-use,2) + "├─ "(connector,3) + alias(alias_w) +
+    //   "  "(2) + provider(provider_w) + " ◀ active"(9, optional)
     let mut items: Vec<String> = Vec::new();
     let mut aliases: Vec<String> = Vec::new();
-    // Track which rows are selectable (false for separator & other-account keys).
+    // Track which rows are selectable (false for group headers & other-account keys).
     let mut selectable: Vec<bool> = Vec::new();
 
     // Dynamic column widths based on terminal size.
-    // Layout: "personal  " (10) + alias_w + "  " (2) + provider_w + " ◀ active" (9)
+    // Fixed chrome around the data columns ≈ 32:
+    //   outer(2) + │(1) + inner(2) + cursor(2) + ● (2) + connector(3) +
+    //   gap(2) + marker(9) + inner(2) + │(1) + right-margin(6) = 32.
     let tw = ui_frame::term_width();
-    // Reserve: 10 (type+space) + 2 (gap) + 9 (active marker) + 10 (box borders/margins)
-    let available = tw.saturating_sub(31);
+    let available = tw.saturating_sub(32);
     // Split available space: ~40% alias, ~60% provider, with minimums.
     let alias_w = (available * 2 / 5).max(10).min(30);
     let provider_w = available.saturating_sub(alias_w).max(10).min(40);
 
-    for entry in &personal {
-        let provider_col = match (&entry.base_url, &entry.provider_code) {
-            (Some(url), _) if !url.is_empty() => url.clone(),
-            (_, Some(code)) if !code.is_empty() => code.clone(),
-            _ => String::new(),
-        };
-        let is_active = active_cfg.as_ref().map_or(false, |cfg| {
-            cfg.key_type == credential_type::CredentialType::PersonalApiKey && cfg.key_ref == entry.alias
-        });
-        let active_marker = if is_active { " ◀ active" } else { "" };
-        let alias_display = if entry.alias.len() > alias_w { &entry.alias[..alias_w] } else { &entry.alias };
-        let prov_display = if provider_col.len() > provider_w { &provider_col[..provider_w] } else { &provider_col };
-        let row = format!(
-            "personal  {:<aw$}  {:<pw$}{}",
-            alias_display,
-            prov_display,
-            active_marker,
-            aw = alias_w,
-            pw = provider_w,
-        );
-        items.push(row);
-        aliases.push(entry.alias.clone());
-        selectable.push(true);
-    }
-
-    // Filter out unusable team keys (revoked, expired, stale, etc.).
-    // Only show keys that are either usable or belong to another account (for visibility).
+    // Filter team keys into usable / other-account as before.
     let visible_team: Vec<_> = team.iter()
         .filter(|e| {
             e.key_status == "active"
@@ -2881,33 +2873,100 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
                 && e.local_state != "disabled_by_account_status"
         })
         .collect();
-
-    // Partition: current account (selectable) vs other account (view-only).
     let (own_team, other_account_team): (Vec<_>, Vec<_>) = visible_team.into_iter()
         .partition(|e| e.local_state != "disabled_by_account_scope");
+    let oauth_usable: Vec<_> = oauth_accounts.iter()
+        .filter(|a| a.status == "active")
+        .collect();
 
-    for e in &own_team {
-        let display_name = e.local_alias.as_deref().unwrap_or(e.alias.as_str());
-        let is_active = active_cfg.as_ref().map_or(false, |cfg| {
-            cfg.key_type == credential_type::CredentialType::ManagedVirtualKey && cfg.key_ref == e.virtual_key_id
-        });
-        let active_marker = if is_active { " ◀ active" } else { "" };
-        let alias_display = if display_name.len() > alias_w { &display_name[..alias_w] } else { display_name };
-        let prov_display = if e.provider_code.len() > provider_w { &e.provider_code[..provider_w] } else { &e.provider_code };
-        let row = format!(
-            "team      {:<aw$}  {:<pw$}{}",
-            alias_display,
-            prov_display,
-            active_marker,
-            aw = alias_w,
-            pw = provider_w,
-        );
-        items.push(row);
-        aliases.push(e.virtual_key_id.clone());
-        selectable.push(true);
+    // Helper: build a leaf row. `in_use` renders ●, `is_active` renders ◀ active.
+    let fmt_leaf = |in_use: bool, connector: &str, alias_disp: &str, prov_disp: &str, is_active: bool| -> String {
+        let use_mark = if in_use { "\u{25CF}".green().to_string() } else { " ".to_string() };
+        let active_mk = if is_active { " \u{25C0} active" } else { "" };
+        format!(
+            "{} {} {:<aw$}  {:<pw$}{}",
+            use_mark,
+            connector.to_string().dimmed(),
+            alias_disp, prov_disp, active_mk,
+            aw = alias_w, pw = provider_w,
+        )
+    };
+
+    // Personal group
+    if !personal.is_empty() {
+        items.push(format!("{}", "personal".bold().cyan()));
+        aliases.push(String::new());
+        selectable.push(false);
+
+        let n = personal.len();
+        for (i, entry) in personal.iter().enumerate() {
+            let connector = if i + 1 == n { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
+            let provider_col = match (&entry.base_url, &entry.provider_code) {
+                (Some(url), _) if !url.is_empty() => url.clone(),
+                (_, Some(code)) if !code.is_empty() => code.clone(),
+                _ => String::new(),
+            };
+            let in_use = bindings.iter().any(|b|
+                b.key_source_type == credential_type::CredentialType::PersonalApiKey
+                && b.key_source_ref == entry.alias);
+            let is_active = !active_label.is_empty() && active_label == entry.alias;
+            let alias_disp = if entry.alias.len() > alias_w { &entry.alias[..alias_w] } else { &entry.alias };
+            let prov_disp = if provider_col.len() > provider_w { &provider_col[..provider_w] } else { &provider_col };
+            items.push(fmt_leaf(in_use, connector, alias_disp, prov_disp, is_active));
+            aliases.push(entry.alias.clone());
+            selectable.push(true);
+        }
     }
 
-    // Other-account keys: shown at the bottom, dimmed, not selectable.
+    // Team (own) group
+    if !own_team.is_empty() {
+        items.push(format!("{}", "team".bold().cyan()));
+        aliases.push(String::new());
+        selectable.push(false);
+
+        let n = own_team.len();
+        for (i, e) in own_team.iter().enumerate() {
+            let connector = if i + 1 == n { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
+            let display_name = e.local_alias.as_deref().unwrap_or(e.alias.as_str());
+            let in_use = bindings.iter().any(|b|
+                b.key_source_type == credential_type::CredentialType::ManagedVirtualKey
+                && b.key_source_ref == e.virtual_key_id);
+            let is_active = !active_label.is_empty() && active_label == display_name;
+            let alias_disp = if display_name.len() > alias_w { &display_name[..alias_w] } else { display_name };
+            let prov_disp = if e.provider_code.len() > provider_w { &e.provider_code[..provider_w] } else { &e.provider_code };
+            items.push(fmt_leaf(in_use, connector, alias_disp, prov_disp, is_active));
+            aliases.push(e.virtual_key_id.clone());
+            selectable.push(true);
+        }
+    }
+
+    // OAuth group — `resolve_activate_key` accepts display_identity or
+    // provider_account_id, so feed back whichever is more human-readable.
+    if !oauth_usable.is_empty() {
+        items.push(format!("{}", "oauth".bold().cyan()));
+        aliases.push(String::new());
+        selectable.push(false);
+
+        let n = oauth_usable.len();
+        for (i, acct) in oauth_usable.iter().enumerate() {
+            let connector = if i + 1 == n { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
+            let identity = acct.display_identity.as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&acct.provider_account_id);
+            let in_use = bindings.iter().any(|b|
+                b.key_source_type == credential_type::CredentialType::PersonalOAuthAccount
+                && b.key_source_ref == acct.provider_account_id);
+            let is_active = !active_label.is_empty()
+                && (active_label == identity || active_label == acct.provider_account_id);
+            let id_disp = if identity.len() > alias_w { &identity[..alias_w] } else { identity };
+            let prov_disp = if acct.provider.len() > provider_w { &acct.provider[..provider_w] } else { &acct.provider };
+            items.push(fmt_leaf(in_use, connector, id_disp, prov_disp, is_active));
+            aliases.push(identity.to_string());
+            selectable.push(true);
+        }
+    }
+
+    // Other-account team keys: shown at the bottom, dimmed, not selectable.
     if !other_account_team.is_empty() {
         let sep = format!("{}", "───── Other accounts (not selectable) ─────".dimmed());
         items.push(sep);
@@ -2919,7 +2978,7 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
             let alias_display = if display_name.len() > alias_w { &display_name[..alias_w] } else { display_name };
             let prov_display = if e.provider_code.len() > provider_w { &e.provider_code[..provider_w] } else { &e.provider_code };
             let raw = format!(
-                "team      {:<aw$}  {:<pw$}  [other account]",
+                "     {:<aw$}  {:<pw$}  [other account]",
                 alias_display,
                 prov_display,
                 aw = alias_w,
@@ -2931,17 +2990,36 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
         }
     }
 
-    let header = format!("        {:<aw$}  {:<pw$}", "Alias", "Provider / Base URL", aw = alias_w, pw = provider_w);
+    // Header aligns under the alias column: 5 chars of leaf-row prefix
+    // (●/space + space + connector + space) stand in for the label-less header.
+    let header = format!("     {:<aw$}  {:<pw$}", "Alias", "Provider / Base URL", aw = alias_w, pw = provider_w);
 
-    // Find initial cursor: prefer the currently active key, else first selectable.
-    let initial = active_cfg.as_ref()
-        .and_then(|cfg| {
-            aliases.iter().position(|a| {
-                (cfg.key_type == credential_type::CredentialType::ManagedVirtualKey && *a == cfg.key_ref)
-                    || (cfg.key_type == credential_type::CredentialType::PersonalApiKey && *a == cfg.key_ref)
-            })
+    // Find initial cursor. Precedence:
+    //   1. Terminal-active key (AIKEY_ACTIVE_LABEL env var) — the one the
+    //      picker just marked ◀ active; jumping the cursor there lets the user
+    //      confirm with Enter to re-activate or arrow-key to switch.
+    //   2. Persistent primary (active_cfg, set by `aikey use`).
+    //   3. First selectable row.
+    let by_label = if active_label.is_empty() {
+        None
+    } else {
+        // Row's `aliases[i]` holds the same value used as `label` when
+        // activate ran: personal alias, team display name, or OAuth identity.
+        (0..aliases.len()).find(|&i| selectable[i] && aliases[i] == active_label)
+    };
+    let by_cfg = active_cfg.as_ref().and_then(|cfg| {
+        aliases.iter().position(|a| {
+            (cfg.key_type == credential_type::CredentialType::ManagedVirtualKey && *a == cfg.key_ref)
+                || (cfg.key_type == credential_type::CredentialType::PersonalApiKey && *a == cfg.key_ref)
+                || (cfg.key_type == credential_type::CredentialType::PersonalOAuthAccount
+                    && oauth_usable.iter().any(|o|
+                        o.provider_account_id == cfg.key_ref
+                        && (o.display_identity.as_deref() == Some(a.as_str())
+                            || o.provider_account_id == *a)))
         })
-        .and_then(|i| if selectable[i] { Some(i) } else { None })
+    }).and_then(|i| if selectable[i] { Some(i) } else { None });
+    let initial = by_label
+        .or(by_cfg)
         .or_else(|| selectable.iter().position(|&s| s))
         .unwrap_or(0);
 
@@ -3419,10 +3497,26 @@ fn shell_detection_error() -> String {
 /// Stderr: all human-readable messages (flows through to terminal).
 /// When `--shell` is omitted, auto-detects from the SHELL env var.
 fn handle_activate(
-    alias: &str,
+    alias: Option<&str>,
     provider_override: Option<&str>,
     shell: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Resolve alias: either explicit arg, or interactive pick when omitted.
+    let picked: String;
+    let alias: &str = match alias {
+        Some(a) => a,
+        None => {
+            use std::io::IsTerminal;
+            if !std::io::stderr().is_terminal() {
+                return Err(
+                    "alias required in non-interactive mode (usage: aikey activate <ALIAS>)".into()
+                );
+            }
+            picked = pick_key_interactively()?;
+            picked.as_str()
+        }
+    };
+
     let detected;
     let shell = match shell {
         Some(s) => s,
@@ -3486,9 +3580,43 @@ fn handle_activate(
                 "if [ -z \"${op}\" ]; then {op}=\"${pv}\"; fi",
                 op = orig_prompt_var, pv = prompt_var
             );
+            // Activate replaces the prompt with a minimal template that omits
+            // user@host — keeps the focus on the active key + working directory.
+            // The original prompt is saved above, so `aikey deactivate` restores
+            // full customization. Advanced users who want their starship /
+            // powerlevel10k prompt preserved can set AIKEY_PROMPT_MODE=prepend.
+            //
+            // Label is rendered in cyan to match the CLI's accent color. For
+            // bash, `\[...\]` marks non-printing escape bytes so readline
+            // line-length math stays correct.
+            // The working-dir portion shows only the basename (zsh `%1~`,
+            // bash `\W`); `\\$ ` in bash renders `$` for users / `#` for root.
+            let (label_block, minimal_rest) = if shell == "zsh" {
+                ("%F{cyan}($_AIKEY_PROMPT_LABEL)%f", "%1~ %# ")
+            } else {
+                (
+                    "\\[\\e[36m\\]($_AIKEY_PROMPT_LABEL)\\[\\e[0m\\]",
+                    "\\W\\\\$ ",
+                )
+            };
             println!(
-                "{pv}=\"($_AIKEY_PROMPT_LABEL) ${op}\"",
-                pv = prompt_var, op = orig_prompt_var
+                "if [ \"$AIKEY_PROMPT_MODE\" = prepend ]; then {pv}=\"{lbl} ${op}\"; else {pv}=\"{lbl} {rest}\"; fi",
+                pv = prompt_var, lbl = label_block, op = orig_prompt_var, rest = minimal_rest
+            );
+
+            // Define `quit` as a shell-local command that undoes activate
+            // without closing the terminal. Earlier versions hooked EXIT so
+            // `exit` would deactivate, but `exit` also kills the terminal —
+            // `quit` lets users drop back to their original prompt in-place.
+            //
+            // `command aikey` bypasses the installed `aikey()` shell wrapper —
+            // if we called `aikey deactivate` directly, the wrapper would
+            // append `--shell zsh` a second time and clap rejects the
+            // duplicate flag, silently breaking `quit`. The function
+            // self-unsets so a later activate installs a fresh definition.
+            println!(
+                "quit() {{ eval \"$(command aikey deactivate --shell {sh} 2>/dev/null)\" 2>/dev/null; unset -f quit 2>/dev/null; }}",
+                sh = shell
             );
         }
         "powershell" => {
@@ -3512,6 +3640,11 @@ fn handle_activate(
             // prompt helpers (oh-my-posh, starship).
             println!("if (-not (Get-Variable -Scope Global -Name _aikeyOrigPrompt -ErrorAction SilentlyContinue)) {{ Set-Variable -Scope Global -Name _aikeyOrigPrompt -Value (Get-Item function:prompt).ScriptBlock }}");
             println!("function global:prompt {{ \"($env:_AIKEY_PROMPT_LABEL) \" + (& $global:_aikeyOrigPrompt) }}");
+            // `quit` deactivates in-place without closing the PowerShell host.
+            // Resolve the binary via `Get-Command -CommandType Application` so
+            // any user-defined `aikey` function wrapper is bypassed (same
+            // rationale as the POSIX `command` prefix above).
+            println!("function global:quit {{ $_akbin = (Get-Command aikey -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1).Source; if ($_akbin) {{ Invoke-Expression (& $_akbin deactivate --shell powershell 2>$null) }}; Remove-Item function:\\quit -ErrorAction SilentlyContinue }}");
         }
         "cmd" => {
             let safe_label = cmd_escape(&label)?;

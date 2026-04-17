@@ -125,8 +125,9 @@ pub(crate) enum Commands {
     /// Temporarily activate a key in the current terminal (does not write active.env)
     #[command(display_order = 4)]
     Activate {
-        /// Key alias, team display alias, or OAuth identity to activate
-        alias: String,
+        /// Key alias, team display alias, or OAuth identity.
+        /// Omit to pick from an interactive list (TTY only).
+        alias: Option<String>,
         /// Target provider (required when key supports multiple providers)
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
@@ -1508,8 +1509,8 @@ pub(crate) fn print_banner() {
         g("\u{256D}\u{2588}\u{2588}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2588}\u{2588}\u{256E}"),
         "AiKey CLI".bold(),
         version);
-    eprintln!("  {}       {}",
-        g("\u{2590}\u{2588} \u{00B7}\u{27E8}\u{29BF}\u{27E9} \u{27E8}\u{29BF}\u{27E9}\u{00B7} \u{2588}\u{258C}"),
+    eprintln!(" {}       {}",
+        g("\u{00B7}\u{2590}\u{2588}  \u{27E8}\u{29BF}\u{27E9} \u{27E8}\u{29BF}\u{27E9}  \u{2588}\u{258C}\u{00B7}"),
         "------------------------------------".dimmed());
     eprintln!("  {}        FinOps & AI Governance Center",
         g("\u{2590}\u{2588}     \u{25BC}     \u{2588}\u{258C}"));

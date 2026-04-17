@@ -84,13 +84,19 @@ fn compute_inner_w(title: &str, header: &str, items: &[String]) -> usize {
     (content_max + 10).min(max_inner) // 2 padding each side + 6 right margin
 }
 
-/// Format one row: `│ > item padded │` or `│   item padded │`
-/// Layout: `│` + space + content(padded to inner_w-4) + 2 spaces + `│`
+/// Format one row. Wide layout: `│  > item-padded  │` with the vertical
+/// walls; narrow layout: drop the walls so content can spread across the
+/// reclaimed ~6 columns. Cursor marker + padding stay the same so the
+/// interactive redraw math is identical in both modes.
 fn format_row(item: &str, is_cursor: bool, inner_w: usize) -> String {
     let marker = if is_cursor { "\x1b[36;1m> \x1b[0m" } else { "  " }; // cyan bold ">"
     let content = format!("{}{}", marker, item);
     let pad_target = inner_w.saturating_sub(4);
-    format!("  \u{2502}  {}  \u{2502}", pad_visible(&content, pad_target))
+    if crate::ui_frame::is_narrow() {
+        format!("  {}", content)
+    } else {
+        format!("  \u{2502}  {}  \u{2502}", pad_visible(&content, pad_target))
+    }
 }
 
 #[cfg(unix)]
@@ -144,6 +150,7 @@ fn interactive_select(
 
     let inner_w = compute_inner_w(title, header, items);
     let border = "\u{2500}".repeat(inner_w);
+    let narrow = crate::ui_frame::is_narrow();
 
     // Title with icon.
     let icon_title = format!("\u{1F50D} {}", title);
@@ -155,17 +162,27 @@ fn interactive_select(
     // Hide cursor.
     write!(out, "\x1b[?25l")?;
 
-    // Top border.
-    write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
-
-    // Header row — same padding as content rows: inner_w - 4 visible cols.
+    // Header assembly differs only at the box edges — content rows go through
+    // `format_row`, which already returns a narrow-aware string.
     let pad_target = inner_w.saturating_sub(4);
-    write!(out, "  \u{2502}  {}  \u{2502}\r\n",
-        pad_visible(header, pad_target))?;
-
-    // Separator.
-    let sep = "\u{2500}".repeat(pad_target + 2); // fills content + right margin
-    write!(out, "  \u{2502} {} \u{2502}\r\n", sep)?;
+    if narrow {
+        // Compact header: title on its own line, a thin horizontal rule, then
+        // the column labels. No vertical walls, no corner glyphs.
+        let rule = "\u{2500}".repeat(pad_target);
+        write!(out, "\r\n  {}\r\n", icon_title)?;
+        write!(out, "  {}\r\n", rule)?;
+        write!(out, "  {}\r\n", header)?;
+        write!(out, "  \x1b[90m{}\x1b[0m\r\n", rule)?;
+    } else {
+        // Top border.
+        write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
+        // Header row — same padding as content rows: inner_w - 4 visible cols.
+        write!(out, "  \u{2502}  {}  \u{2502}\r\n",
+            pad_visible(header, pad_target))?;
+        // Separator.
+        let sep = "\u{2500}".repeat(pad_target + 2); // fills content + right margin
+        write!(out, "  \u{2502} {} \u{2502}\r\n", sep)?;
+    }
 
     // Cursor init.
     let mut cursor = initial;
@@ -179,7 +196,12 @@ fn interactive_select(
     }
 
     // Bottom border.
-    write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
+    if narrow {
+        let rule = "\u{2500}".repeat(pad_target);
+        write!(out, "  {}\r\n", rule)?;
+    } else {
+        write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
+    }
 
     // Hint line (no trailing newline — cursor stays here).
     write!(out, "  [\u{2191}\u{2193} move, \x1b[1;33mEnter\x1b[0m select, Esc cancel]")?;

@@ -101,6 +101,20 @@ pub fn term_width() -> usize {
     80
 }
 
+/// True when the terminal is too narrow to comfortably fit the boxed layout.
+/// `AIKEY_COMPACT` forces the decision: `1`/`true`/`yes` → always narrow,
+/// `0`/`false`/`no` → always wide. Otherwise auto-detect below 90 columns.
+pub fn is_narrow() -> bool {
+    if let Ok(v) = std::env::var("AIKEY_COMPACT") {
+        match v.as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    term_width() < 90
+}
+
 /// Render a complete box frame to a String.
 ///
 /// - `icon`: leading icon in the title bar (e.g. "🔍", "❓", "📋"), or "" for none
@@ -134,6 +148,28 @@ pub fn render_box(icon: &str, title: &str, rows: &[String]) -> String {
     const RESET: &str = "\x1b[0m";
 
     let mut out = String::new();
+    let pad_target = inner_w.saturating_sub(4);
+
+    if is_narrow() {
+        // Compact layout: skip the vertical `│` walls and corner glyphs to
+        // reclaim ~12 cols on a tight terminal. Title + horizontal rules
+        // still fence the section visually.
+        let rule = "\u{2500}".repeat(pad_target);
+        out.push_str(&format!("  {}\n", icon_title));
+        out.push_str(&format!("  {f}{}{r}\n", rule, f = FRAME, r = RESET));
+        for row in rows {
+            let is_separator = !row.is_empty() && row.chars().all(|c| c == '\u{2500}');
+            if is_separator {
+                out.push_str(&format!("  \x1b[90m{}\x1b[0m\n", rule));
+            } else {
+                out.push_str(&format!("  {}\n", row));
+            }
+        }
+        out.push_str(&format!("  {f}{}{r}", rule, f = FRAME, r = RESET));
+        return out;
+    }
+
+    // Wide layout: full boxed rendering.
     // Top border with title. Only the frame glyphs are colored — the title
     // text keeps whatever color the caller passed in.
     out.push_str(&format!("  {f}\u{250C}\u{2500}{r} {} {f}{}\u{2510}{r}\n",
@@ -141,7 +177,6 @@ pub fn render_box(icon: &str, title: &str, rows: &[String]) -> String {
         f = FRAME, r = RESET));
     // Content rows: format is `│  {content}  │`
     // Left margin = 2 spaces, right margin = 2 spaces → content width = inner_w - 4
-    let pad_target = inner_w.saturating_sub(4);
     for row in rows {
         // Auto-stretch separator lines (pure ─ characters) to fill the content area.
         let is_separator = !row.is_empty() && row.chars().all(|c| c == '\u{2500}');
