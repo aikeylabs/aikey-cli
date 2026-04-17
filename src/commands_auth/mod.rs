@@ -134,18 +134,25 @@ fn login_setup_token(
         return Err("No code provided. Login cancelled.".into());
     }
 
-    // Client-side state validation: warn if the pasted state doesn't match.
+    // Client-side state validation: broker will hard-reject on mismatch, but we
+    // also confirm with the user to give them a chance to re-paste.
     // Extract expected state from auth_url query param.
     if !json_mode {
-        if let Some(expected_state) = auth_url.split("state=").nth(1).map(|s| s.split('&').next().unwrap_or(s)) {
+        if let Some(expected_state) = extract_state_param(auth_url) {
             let pasted_state = code_state.split('#').nth(1).unwrap_or("");
             if !expected_state.is_empty() && pasted_state != expected_state {
                 if pasted_state.is_empty() {
                     eprintln!("  {} state missing from pasted code — expected code#state format", "\u{25c6}".yellow());
                 } else {
-                    eprintln!("  {} state mismatch (CSRF warning) — pasted state differs from expected", "\u{25c6}".yellow());
+                    eprintln!("  {} state mismatch — pasted state differs from expected (CSRF risk)", "\u{25c6}".yellow());
                 }
-                eprintln!("  {} proceeding anyway (local-only, low CSRF risk)", "\u{2502}".dimmed());
+                eprint!("  {} Continue anyway? [y/N] ", "\u{25c6}".yellow());
+                io::stderr().flush()?;
+                let mut confirm = String::new();
+                io::stdin().lock().read_line(&mut confirm)?;
+                if !confirm.trim().eq_ignore_ascii_case("y") && !confirm.trim().eq_ignore_ascii_case("yes") {
+                    return Err("Login cancelled due to state mismatch.".into());
+                }
             }
         }
     }
@@ -277,7 +284,9 @@ fn poll_login_status(
             return Err("Login session expired (120s timeout). Try again.".into());
         }
 
+        // Per-request timeout prevents hanging on network issues.
         let resp: serde_json::Value = match ureq::get(&format!("{}/oauth/status?session_id={}", base, session_id))
+            .timeout(std::time::Duration::from_secs(10))
             .call()
         {
             Ok(r) => r.into_json()?,
@@ -335,6 +344,15 @@ fn poll_device_code(
     let start = std::time::Instant::now();
     // Kimi device code interval is typically 5s; respect provider's rate limit.
     let poll_interval = std::time::Duration::from_secs(5);
+    // Per-request timeout prevents hanging on network issues.
+    let request_timeout = std::time::Duration::from_secs(10);
+
+    // Network error backoff: start at 5s, double up to 60s max. Reset on success.
+    // Bail out after MAX_CONSECUTIVE_NET_ERRORS to prevent infinite loops when
+    // the network is persistently broken.
+    const MAX_CONSECUTIVE_NET_ERRORS: u32 = 6;
+    let mut net_error_count: u32 = 0;
+    let mut backoff = std::time::Duration::from_secs(5);
 
     loop {
         std::thread::sleep(poll_interval);
@@ -344,6 +362,7 @@ fn poll_device_code(
         }
 
         let resp_result = ureq::post(&format!("{}/oauth/poll", base))
+            .timeout(request_timeout)
             .set("Content-Type", "application/json")
             .send_string(&serde_json::json!({
                 "session_id": session_id,
@@ -351,6 +370,9 @@ fn poll_device_code(
 
         match resp_result {
             Ok(r) => {
+                // Ok path returns below, so no need to reset net_error_count/backoff here.
+                // Err(Status) below handles the reset because it may loop back via `continue`.
+
                 // 200 = success (LoginResult with account_id, display_identity, etc.)
                 let resp: serde_json::Value = r.into_json()?;
                 let account_id = resp["account_id"].as_str().unwrap_or("");
@@ -375,7 +397,10 @@ fn poll_device_code(
                 return Ok(());
             }
             Err(ureq::Error::Status(code, resp)) => {
-                // 4xx error from broker
+                // Broker responded → network is fine, reset backoff counters.
+                net_error_count = 0;
+                backoff = std::time::Duration::from_secs(5);
+
                 let body: serde_json::Value = resp.into_json().unwrap_or_default();
                 let retry = body["retry"].as_bool().unwrap_or(false);
 
@@ -396,8 +421,25 @@ fn poll_device_code(
                 }
                 return Err(msg.to_string().into());
             }
-            Err(_) => {
-                // Network error — retry silently
+            Err(e) => {
+                // Network error: exponential backoff + bail out after N consecutive failures.
+                net_error_count += 1;
+                if net_error_count >= MAX_CONSECUTIVE_NET_ERRORS {
+                    if !json_mode {
+                        eprintln!();
+                        eprintln!("  {} Network errors during polling ({} in a row): {}",
+                            "\u{25c6}".red(), net_error_count, e);
+                        eprintln!("  \u{2502} Check: proxy is running, network is reachable");
+                    }
+                    return Err(format!("Polling aborted after {} network errors: {}", net_error_count, e).into());
+                }
+                if !json_mode {
+                    eprintln!();
+                    eprintln!("  {} network error ({}), retrying in {}s... [{}/{}]",
+                        "\u{25c6}".yellow(), e, backoff.as_secs(), net_error_count, MAX_CONSECUTIVE_NET_ERRORS);
+                }
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(60));
                 continue;
             }
         }
@@ -405,21 +447,62 @@ fn poll_device_code(
 }
 
 /// D13: Prompt user for display identity (Kimi accounts have no email).
+/// Extract the `state=` query parameter from an OAuth authorization URL.
+/// Handles multiple occurrences and URL encoding; returns None if not present.
+fn extract_state_param(auth_url: &str) -> Option<String> {
+    let query = auth_url.split('?').nth(1)?;
+    for pair in query.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        if kv.next() == Some("state") {
+            if let Some(v) = kv.next() {
+                // Decode %XX sequences minimally (state is base64url, usually no %).
+                return Some(v.replace("%3D", "=").replace("%23", "#"));
+            }
+        }
+    }
+    None
+}
+
 fn prompt_display_identity(base: &str, account_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprint!("\nEnter a display name for this account (e.g. email or alias): ");
+    const MAX_DISPLAY_LEN: usize = 256;
+
+    eprint!("\nEnter a display name for this account (e.g. email or alias, Enter to skip): ");
     io::stderr().flush()?;
 
     let mut input = String::new();
     io::stdin().lock().read_line(&mut input)?;
     let input = input.trim();
 
-    if !input.is_empty() {
-        let _ = ureq::post(&format!("{}/oauth/accounts/{}/display-identity", base, account_id))
-            .set("Content-Type", "application/json")
-            .send_string(&serde_json::json!({"display_identity": input}).to_string());
-        eprintln!("{} Display name set: {}", "\u{25c6}".green(), input);
+    // Validation: skip empty, reject too-long, reject whitespace-only (already trimmed).
+    if input.is_empty() {
+        eprintln!("  {} Skipped. Update later via API.", "\u{2502}".dimmed());
+        return Ok(());
     }
-    Ok(())
+    if input.len() > MAX_DISPLAY_LEN {
+        return Err(format!("Display name too long ({} chars, max {}).", input.len(), MAX_DISPLAY_LEN).into());
+    }
+    // Reject control chars that would corrupt logs/display.
+    if input.chars().any(|c| c.is_control()) {
+        return Err("Display name contains control characters.".into());
+    }
+
+    let resp = ureq::post(&format!("{}/oauth/accounts/{}/display-identity", base, account_id))
+        .timeout(std::time::Duration::from_secs(10))
+        .set("Content-Type", "application/json")
+        .send_string(&serde_json::json!({"display_identity": input}).to_string());
+
+    match resp {
+        Ok(_) => {
+            eprintln!("{} Display name set: {}", "\u{25c6}".green(), input);
+            Ok(())
+        }
+        Err(e) => {
+            // Server rejected or network error — surface it instead of silent "success".
+            eprintln!("  {} Failed to save display name: {}", "\u{25c6}".red(), e);
+            eprintln!("  \u{2502} Account created; you can retry via API later.");
+            Ok(()) // Don't fail the login flow — account creation already succeeded.
+        }
+    }
 }
 
 // ============================================================================
@@ -711,32 +794,65 @@ fn check_proxy_running(port: u16) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn find_account(id_or_display: &str) -> Result<storage::ProviderAccountInfo, Box<dyn std::error::Error>> {
-    // Try exact ID match first
+    // Try exact ID match first (fastest path).
     if let Ok(Some(acct)) = storage::get_provider_account(id_or_display) {
         return Ok(acct);
     }
 
-    // Fuzzy match by display_identity or provider
+    // Match by priority: exact > prefix > substring.
+    // Why prioritized: substring `alice` matches both `alice@x.com` AND `malice@x.com`,
+    // which can silently target the wrong account on logout/use.
     let all = storage::list_provider_accounts()?;
-    let matches: Vec<_> = all.into_iter().filter(|a| {
-        a.display_identity.as_deref().map_or(false, |d| d.contains(id_or_display))
-            || a.provider == id_or_display
-            || a.provider_account_id.contains(id_or_display)
-    }).collect();
 
-    match matches.len() {
-        0 => Err(format!("Account '{}' not found. Run: aikey auth list", id_or_display).into()),
-        1 => Ok(matches.into_iter().next().unwrap()),
-        _ => {
-            // Multiple matches — show them and ask user to be more specific
-            eprintln!("Multiple accounts match '{}':", id_or_display);
-            for a in &matches {
-                let display = a.display_identity.as_deref().unwrap_or("-");
-                eprintln!("  {} — {}/{}", a.provider_account_id, a.provider, display);
-            }
-            Err("Please specify the full account ID.".into())
-        }
+    // Tier 1: exact match on display_identity or provider_account_id.
+    let exact: Vec<_> = all.iter()
+        .filter(|a|
+            a.display_identity.as_deref() == Some(id_or_display)
+            || a.provider_account_id == id_or_display
+        )
+        .cloned()
+        .collect();
+    if exact.len() == 1 {
+        return Ok(exact.into_iter().next().unwrap());
     }
+    if exact.len() > 1 {
+        return Err(ambiguous_match_err(id_or_display, &exact));
+    }
+
+    // Tier 2: exact provider match (e.g. `claude` matches all Claude accounts).
+    let by_provider: Vec<_> = all.iter()
+        .filter(|a| a.provider == id_or_display)
+        .cloned()
+        .collect();
+    if by_provider.len() == 1 {
+        return Ok(by_provider.into_iter().next().unwrap());
+    }
+    if by_provider.len() > 1 {
+        return Err(ambiguous_match_err(id_or_display, &by_provider));
+    }
+
+    // Tier 3: prefix match on display_identity or provider_account_id.
+    // Safer than contains — `alice` matches `alice@x.com` but NOT `malice@x.com`.
+    let prefix: Vec<_> = all.into_iter()
+        .filter(|a|
+            a.display_identity.as_deref().map_or(false, |d| d.starts_with(id_or_display))
+            || a.provider_account_id.starts_with(id_or_display)
+        )
+        .collect();
+    match prefix.len() {
+        0 => Err(format!("Account '{}' not found. Run: aikey auth list", id_or_display).into()),
+        1 => Ok(prefix.into_iter().next().unwrap()),
+        _ => Err(ambiguous_match_err(id_or_display, &prefix)),
+    }
+}
+
+fn ambiguous_match_err(needle: &str, matches: &[storage::ProviderAccountInfo]) -> Box<dyn std::error::Error> {
+    eprintln!("Multiple accounts match '{}':", needle);
+    for a in matches {
+        let display = a.display_identity.as_deref().unwrap_or("-");
+        eprintln!("  {} — {}/{}", a.provider_account_id, a.provider, display);
+    }
+    "Please specify the full account ID or unique prefix.".into()
 }
 
 /// Map OAuth provider name to canonical provider code used in bindings.

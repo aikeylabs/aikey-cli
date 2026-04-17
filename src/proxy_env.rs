@@ -174,15 +174,58 @@ pub fn read_active_env_lines() -> Result<Vec<(String, String)>, String> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        // Parse "export KEY=VALUE" or "KEY=VALUE".
+        // Skip shell conditional/guard syntax (e.g. `case "$no_proxy" in ...`)
+        // that leaks into display as a pseudo KEY=VALUE with an unparseable key.
+        // We only want clean `[export] KEY=VALUE` assignments.
         let stripped = trimmed.strip_prefix("export ").unwrap_or(trimmed);
         if let Some(eq_pos) = stripped.find('=') {
             let key = stripped[..eq_pos].to_string();
+            // A valid shell identifier is [A-Za-z_][A-Za-z0-9_]*. Anything else
+            // (spaces, punctuation, `$`, `(`, etc.) is a shell control line —
+            // skip it rather than display shell internals to the user.
+            let is_ident = !key.is_empty()
+                && key.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !is_ident { continue; }
             let value = strip_quotes(&stripped[eq_pos + 1..]);
             entries.push((key, value));
         }
     }
     Ok(entries)
+}
+
+/// Extract the effective no_proxy bypass list from active.env, even when
+/// it's expressed as a `case` guard (`case ",$no_proxy," in *,X,*) ;; *) export no_proxy="X,..."`).
+/// Returns the comma-joined bypass tokens, or None if active.env is missing/unparsable.
+pub fn read_active_bypass_summary() -> Option<String> {
+    let path = active_env_path().ok()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut tokens: Vec<String> = Vec::new();
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if !line.starts_with("case ") { continue; }
+        // The export clause carries the full bypass list, e.g.
+        //   ... *) export no_proxy="127.0.0.1,localhost,${no_proxy}"
+        let export_key = if line.contains("no_proxy=") { "no_proxy=" }
+                         else if line.contains("NO_PROXY=") { "NO_PROXY=" }
+                         else { continue; };
+        if let Some(pos) = line.find(export_key) {
+            let after = &line[pos + export_key.len()..];
+            let after = after.trim_start_matches('"');
+            // Take up to the closing quote.
+            let value = after.split('"').next().unwrap_or("");
+            // Drop shell var expansions like ${no_proxy} / $no_proxy.
+            for tok in value.split(',') {
+                let t = tok.trim();
+                if t.is_empty() { continue; }
+                if t.starts_with('$') || t.starts_with("${") { continue; }
+                if !tokens.iter().any(|s| s == t) {
+                    tokens.push(t.to_string());
+                }
+            }
+        }
+    }
+    if tokens.is_empty() { None } else { Some(tokens.join(",")) }
 }
 
 // ── Masking ──────────────────────────────────────────────────────────────────

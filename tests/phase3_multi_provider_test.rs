@@ -81,10 +81,14 @@ fn e2e_add_multi_provider_keys_writes_all_env_vars() {
     assert!(content.contains("OPENAI_API_KEY"), "should contain OPENAI_API_KEY");
     assert!(content.contains("GOOGLE_API_KEY"), "should contain GOOGLE_API_KEY");
 
-    // All three should have base URLs pointing to local proxy.
+    // Anthropic and Google get BASE_URL; OpenAI deliberately omits it because
+    // Codex v0.118+ warns on OPENAI_BASE_URL (reads openai_base_url from
+    // ~/.codex/config.toml instead). See profile_activation.rs:51-61 for the
+    // skip_base_url rationale.
     assert!(content.contains("ANTHROPIC_BASE_URL"), "should contain ANTHROPIC_BASE_URL");
-    assert!(content.contains("OPENAI_BASE_URL"), "should contain OPENAI_BASE_URL");
     assert!(content.contains("GOOGLE_BASE_URL"), "should contain GOOGLE_BASE_URL");
+    assert!(!content.contains("OPENAI_BASE_URL"),
+        "OPENAI_BASE_URL should be omitted (Codex compat), got:\n{}", content);
 }
 
 // ============================================================================

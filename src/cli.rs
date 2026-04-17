@@ -33,7 +33,7 @@ Commands:
   \x1b[1mget\x1b[0m <alias>              Retrieve a secret and copy it to the clipboard
   \x1b[1mrun\x1b[0m -- <command>         Run a command with secrets injected as environment variables
   \x1b[1mkey\x1b[0m <command>            Manage API keys (rotate, list, sync, use)
-  \x1b[1mquickstart\x1b[0m               Initialize vault and set up a new project
+  \x1b[1mquickstart\x1b[0m               Show a state-aware landing page with the next most useful commands
   \x1b[1mproject\x1b[0m <command>        Manage project configuration
   \x1b[1mlogs\x1b[0m                     Show recent activity logs
   \x1b[1mupdate\x1b[0m <alias>           Update an existing secret
@@ -259,7 +259,7 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: KeyAction,
     },
-    /// Initialize vault and set up a new project
+    /// Show a state-aware landing page with the next most useful commands
     #[command(display_order = 13)]
     Quickstart,
     /// Manage project configuration
@@ -488,7 +488,7 @@ pub(crate) enum SecretAction {
         #[arg(long)]
         from_stdin: bool,
     },
-    /// List all secrets (metadata only)
+    /// [DEPRECATED] List all secrets — use `aikey list` for unified view
     List,
     /// Delete a secret
     Delete {
@@ -771,9 +771,10 @@ Notes:
 
         "quickstart" => Some("\
 Notes:
-    - Initializes the vault if it does not exist.
-    - Creates `aikey.config.json` if needed.
-    - This is an onboarding wizard, not a required prerequisite for normal commands."),
+    - Prints a state-aware landing page showing the most useful next steps.
+    - Read-only: does not change the vault, config, or proxy state.
+    - Safe to re-run at any time — the output adapts to what you've already set up.
+    - For per-project env management, see `aikey project init`."),
 
         "project map" => Some("\
 Notes:
@@ -848,7 +849,7 @@ Commands:
   {b}get{r} <alias>              Retrieve a secret and copy it to the clipboard
   {b}run{r} -- <command>         Run a command with secrets injected as environment variables
   {b}key{r} <command>            Manage API keys (rotate, list, sync, use)
-  {b}quickstart{r}               Initialize vault and set up a new project
+  {b}quickstart{r}               Show a state-aware landing page with the next most useful commands
   {b}project{r} <command>        Manage project configuration
   {b}logs{r}                     Show recent activity logs
   {b}update{r} <alias>           Update an existing secret
@@ -1179,15 +1180,15 @@ Detailed Commands
         aikey key alias <OLD_ALIAS> <NEW_ALIAS>
 
 [1mquickstart[0m
-  Initialize vault and set up a new project.
+  Show a state-aware landing page with the next most useful commands.
 
   Usage:
     aikey quickstart
 
   Notes:
-    - Initializes the vault if it does not exist.
-    - Creates `aikey.config.json` if needed.
-    - This is an onboarding wizard, not a required prerequisite for normal commands.
+    - Read-only: does not change the vault, config, or proxy state.
+    - Safe to re-run at any time — the output adapts to what you've already set up.
+    - For per-project env management, see `aikey project init`.
 
 [1mproject[0m
   Manage optional project configuration.
@@ -1499,16 +1500,23 @@ pub(crate) fn print_banner() {
     // Muted gold: RGB(160, 135, 75) — subtle on dark terminals.
     let g = |s: &str| s.truecolor(160, 135, 75);
 
+    // Lines 2–5 of the icon carry side labels (title/divider/tagline/home).
+    // Lines 1 and 6 are purely decorative.
     eprintln!();
-    eprintln!("     {}        {}", g("▄███▄"), g("▄███▄"));
-    eprintln!("   {}", g("▄████████▄▄▄▄████████▄"));
-    eprintln!("  {}", g("████▀▀▀▀████████▀▀▀▀████"));
-    eprintln!("  {}      {}      {}      {}   v{}", g("███"), g("▀████▀"), g("███"), "AiKey CLI".bold(), version);
-    eprintln!("  {}  {}   {}   {}  {}      {}", g("███"), g("██"), g("▀██▀"), g("██"), g("███"), "------------------------------------".dimmed());
-    eprintln!("  {}  {}  {}  {}  {}      FinOps & AI Governance Center", g("███"), g("██"), g("▄████▄"), g("██"), g("███"));
-    eprintln!("  {}    {}    {}      {}", g("███▄"), g("▄██▀▀██▄"), g("▄███"), aikey_home);
-    eprintln!("   {}", g("▀███▄▄▄███  ███▄▄▄███▀"));
-    eprintln!("     {}    {}", g("▀▀████▀"), g("▀████▀▀"));
+    eprintln!("   {}", g("\u{25B2}           \u{25B2}"));
+    eprintln!("   {}       {}   v{}",
+        g("\u{256D}\u{2588}\u{2588}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2588}\u{2588}\u{256E}"),
+        "AiKey CLI".bold(),
+        version);
+    eprintln!("  {}       {}",
+        g("\u{2590}\u{2588} \u{00B7}\u{27E8}\u{29BF}\u{27E9} \u{27E8}\u{29BF}\u{27E9}\u{00B7} \u{2588}\u{258C}"),
+        "------------------------------------".dimmed());
+    eprintln!("  {}        FinOps & AI Governance Center",
+        g("\u{2590}\u{2588}     \u{25BC}     \u{2588}\u{258C}"));
+    eprintln!("   {}       {}",
+        g("\u{2570}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2588}\u{2588}\u{256F}"),
+        aikey_home);
+    eprintln!("       {}", g("\u{2579}   \u{2579}"));
     eprintln!();
 }
 

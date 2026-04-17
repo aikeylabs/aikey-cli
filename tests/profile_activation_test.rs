@@ -2,7 +2,17 @@
 //!
 //! Covers: auto_assign_primaries_for_key, reconcile after sync,
 //! reconcile after key removal, and refresh_implicit_profile_activation.
+//!
+//! ## Running
+//!
+//! Must run with `--test-threads=1` because `setup()` mutates global env vars
+//! (`AK_VAULT_PATH`, `HOME`). Parallel test execution races on these vars.
+//!
+//! ```
+//! cargo test --test profile_activation_test -- --test-threads=1
+//! ```
 
+use aikeylabs_aikey_cli::credential_type::CredentialType;
 use aikeylabs_aikey_cli::profile_activation::{self, DEFAULT_PROFILE, ReconcileOutcome};
 use aikeylabs_aikey_cli::storage;
 use secrecy::SecretString;
@@ -47,7 +57,7 @@ fn auto_assign_fills_empty_providers() {
         .unwrap()
         .unwrap();
     assert_eq!(b.key_source_ref, "my-claude");
-    assert_eq!(b.key_source_type, "personal");
+    assert_eq!(b.key_source_type, CredentialType::PersonalApiKey);
 }
 
 #[test]
@@ -92,7 +102,7 @@ fn auto_assign_team_key() {
     let b = storage::get_provider_binding(DEFAULT_PROFILE, "google")
         .unwrap()
         .unwrap();
-    assert_eq!(b.key_source_type, "team");
+    assert_eq!(b.key_source_type, CredentialType::ManagedVirtualKey);
     assert_eq!(b.key_source_ref, "vk_abc");
 }
 
@@ -272,7 +282,13 @@ fn refresh_writes_active_env_for_all_bindings() {
     assert!(contents.contains("ANTHROPIC_API_KEY=\"aikey_personal_my-claude\""));
     assert!(contents.contains("OPENAI_API_KEY=\"aikey_vk_vk_openai\""));
     assert!(contents.contains("ANTHROPIC_BASE_URL="));
-    assert!(contents.contains("OPENAI_BASE_URL="));
+    // OPENAI_BASE_URL is deliberately NOT written: Codex v0.118+ warns when it's
+    // set, because Codex now reads `openai_base_url` from ~/.codex/config.toml
+    // (which aikey injects via configure_codex_cli). See profile_activation.rs
+    // line 51-61 for the skip_base_url rationale.
+    assert!(!contents.contains("OPENAI_BASE_URL="),
+        "OPENAI_BASE_URL should be omitted to avoid Codex deprecation warning, got:\n{}",
+        contents);
 }
 
 #[test]

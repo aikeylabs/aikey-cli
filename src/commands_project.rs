@@ -1,7 +1,7 @@
 use crate::config::{ProjectConfig, ProviderConfig, EnvTemplate, LogicalModelMapping};
 use crate::json_output;
 use crate::global_config;
-use crate::{crypto, storage, audit};
+use crate::storage;
 use secrecy::SecretString;
 use zeroize::Zeroizing;
 use std::io::{self, Write};
@@ -213,100 +213,121 @@ pub fn handle_project_status(json_mode: bool) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Handle `aikey quickstart` command
+/// Handle `aikey quickstart` command.
+///
+/// Prints a state-aware landing page showing the most useful next steps.
+/// Vault initialization is no longer bundled here — `aikey add` / `aikey auth
+/// login` / `aikey login` each handle their own prerequisites when run.
 pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Step 0: initialize vault if it doesn't exist yet
-    let vault_path = storage::get_vault_path()?;
-    if !vault_path.exists() {
-        if json_mode {
-            json_output::print_json(serde_json::json!({
-                "step": "vault_init",
-                "message": "Vault not found. Initializing vault first."
-            }));
-        } else {
-            println!("No vault found. Let's create one first.");
-            println!("You'll set a master password to protect your API Keys.\n");
-        }
+    use colored::Colorize;
 
-        let password = if let Ok(test_pw) = std::env::var("AK_TEST_PASSWORD") {
-            // CI / sandbox mode: bypass interactive prompt via env var.
-            // AK_TEST_PASSWORD is only set in test environments; production never sets it.
-            SecretString::new(test_pw)
-        } else if json_mode {
-            // JSON / scripted mode: read password from stdin (suitable for piped CI).
-            let mut pw = String::new();
-            io::stdin().read_line(&mut pw)?;
-            SecretString::new(pw.trim().to_string().into())
-        } else {
-            let pw = crate::prompt_hidden("\u{1F512} Set Master Password: ")
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            SecretString::new(pw.into())
-        };
-        let mut salt = [0u8; 16];
-        crypto::generate_salt(&mut salt)?;
-        storage::initialize_vault(&salt, &password)
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        audit::initialize_audit_log()?;
-        let _ = audit::log_audit_event(&password, audit::AuditOperation::Init, None, true);
+    // Gather state. All queries tolerate a missing/unreadable vault by
+    // returning empty results — the landing page still works pre-vault.
+    let vault_exists = storage::get_vault_path().map(|p| p.exists()).unwrap_or(false);
+    let personal_count = if vault_exists {
+        storage::list_entries().map(|v| v.len()).unwrap_or(0)
+    } else { 0 };
+    let team_active = storage::list_virtual_key_cache()
+        .map(|v| v.into_iter().filter(|k| k.key_status == "active").count())
+        .unwrap_or(0);
+    let oauth_active = storage::list_provider_accounts()
+        .map(|v| v.into_iter().filter(|a| a.status == "active").count())
+        .unwrap_or(0);
+    let logged_in = storage::get_platform_account().ok().flatten().is_some();
+    let proxy_running = crate::commands_proxy::is_proxy_running();
 
-        if !json_mode {
-            println!("Vault initialized.\n");
-        }
-    }
+    // User-facing categorization:
+    //   key       = personal + team (raw API keys stored in the vault)
+    //   account   = OAuth provider accounts
+    //   login     = team Control Panel session
+    let total_keys = personal_count + team_active;
+    let total_credentials = total_keys + oauth_active;
 
-    let config_path = std::path::Path::new("aikey.config.json");
-
-    // Check if config already exists
-    if config_path.exists() {
-        if json_mode {
-            let response = serde_json::json!({
-                "ok": true,
-                "message": "AiKey project config detected",
-                "config_exists": true
-            });
-            println!("{}", serde_json::to_string_pretty(&response).unwrap());
-        } else {
-            println!("✓ AiKey project config detected");
-            println!("\nYour project is already configured!");
-            println!("\nNext steps:");
-            println!("  • Run 'aikey project status' to check your configuration");
-            println!("  • Run 'aikey env generate' to create/update your .env file (non-sensitive only)");
-            println!("  • Use 'aikey run -- <command>' to run with secrets injected");
-        }
-        return Ok(());
-    }
-
-    // No config exists, guide through project init
-    if !json_mode {
-        println!("Welcome to AiKey!");
-        println!("================");
-        println!("\nThis wizard will help you set up AiKey for your project.");
-        println!("You'll configure which environment variables your project needs,");
-        println!("and AiKey will help you manage them securely.\n");
-    }
-
-    // Reuse project init logic
-    handle_project_init(json_mode)?;
-
-    // Print additional quickstart guidance
     if json_mode {
         json_output::print_json(serde_json::json!({
             "ok": true,
-            "message": "AiKey project initialized",
-            "config_exists": false,
-            "config_path": config_path.display().to_string()
+            "state": {
+                "personal_keys": personal_count,
+                "team_keys_active": team_active,
+                "oauth_accounts_active": oauth_active,
+                "logged_in": logged_in,
+                "proxy_running": proxy_running,
+            }
         }));
-    } else {
-        println!("\nSetup complete!");
-        println!("\nWhat's next?");
-        println!("\n1. Add keys to your local vault:");
-        println!("   $ aikey add <provider>:<alias>");
-        println!("\n2. Generate your .env file (non-sensitive only):");
-        println!("   $ aikey env generate");
-        println!("\n3. Run your app with secrets injected:");
-        println!("   $ aikey run -- <command>");
-        println!("\nTip: Run 'aikey project status' anytime to check your configuration");
+        return Ok(());
     }
+
+    // Helper: print a command + inline description with consistent spacing.
+    let tip = |cmd: &str, desc: &str| {
+        println!("     {}  {}",
+            format!("{:<50}", cmd).cyan(),
+            format!("# {}", desc).dimmed());
+    };
+
+    // --- Banner --------------------------------------------------------
+    println!();
+    println!("  \u{1F680} {}", "AiKey Quickstart".bold());
+    println!("  {}", "Next steps tailored to your current state.".dimmed());
+    println!("  {}", "\u{2500}".repeat(68).dimmed());
+    println!();
+
+    // --- Section 1: no raw key yet → add one -------------------------
+    if total_keys == 0 {
+        println!("  {}", "\u{1F511} Add your first API key".bold());
+        tip("aikey add my-key --provider openai", "or anthropic | kimi");
+        println!();
+    }
+
+    // --- Section 2: has key → activate + review ----------------------
+    if total_keys > 0 {
+        let summary = format!("You have {} key{}",
+            total_keys, if total_keys == 1 { "" } else { "s" });
+        println!("  {} {}", "\u{2713}".green().bold(), summary.bold());
+        tip("aikey use", "pick which key to activate for routing");
+        tip("aikey list", "review every credential");
+        println!();
+    }
+
+    // --- Section 3: no OAuth account → offer to add one ------------
+    if oauth_active == 0 {
+        println!("  {}", "\u{29BF} Add a subscription account".bold());
+        tip("aikey auth login claude", "or codex | kimi");
+        println!();
+    }
+
+    // --- Section 4: not logged into a team → offer team login ------
+    if !logged_in {
+        println!("  {}", "\u{1F465} Join your team".bold());
+        tip("aikey login --control-url https://your.team.host", "team-managed keys auto-sync");
+        println!();
+    }
+
+    // --- Section 5: two or more credentials → show route picker ----
+    if total_credentials >= 2 {
+        println!("  {}", "\u{1F517} Multiple routes available".bold());
+        tip("aikey route", "pick a base_url + api_key for your IDE or CLI");
+        println!();
+    }
+
+    // --- Section 6: logged in → web console shortcut --------------
+    if logged_in {
+        println!("  {}", "\u{1F310} Manage via the User Console".bold());
+        tip("aikey web", "open the web console in your browser");
+        println!();
+    }
+
+    // --- Section 7: proxy not running → nudge to start ------------
+    if !proxy_running {
+        println!("  {}", "\u{26A0}  Proxy is not running".yellow().bold());
+        tip("aikey proxy start", "required for routing to work");
+        println!();
+    }
+
+    // --- Footer --------------------------------------------------
+    println!("  {}", "\u{2500}".repeat(68).dimmed());
+    tip("aikey doctor", "check system health");
+    tip("aikey --help", "all commands");
+    println!();
 
     Ok(())
 }
@@ -508,11 +529,25 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // Helper: print one check row, collect for JSON.
     // label is left-padded to 18 chars; detail is the right-hand info string.
     let mut emit = |label: &str, ok: bool, detail: &str, hint: Option<&str>| {
-        let icon = if ok { "✓".green() } else { "✗".red() };
+        // Sub-detail rows (label starts with whitespace) belong to the most
+        // recent top-level check. Render them as a dim tree branch so the
+        // failure is called out once by its parent instead of stacking ✗ icons.
+        let is_sub = label.starts_with(' ');
         if !json_mode {
-            println!("{} {:<18} {}", icon, label, detail);
-            if let Some(h) = hint {
-                println!("  {}", format!("→ {}", h).dimmed());
+            if is_sub {
+                let trimmed = label.trim_start();
+                println!("    {} {}",
+                    format!("↳ {:<16}", trimmed).dimmed(),
+                    detail.dimmed());
+                if let Some(h) = hint {
+                    println!("      {}", format!("· {}", h).dimmed());
+                }
+            } else {
+                let icon = if ok { "✓".green() } else { "✗".red() };
+                println!("{} {:<18} {}", icon, label, detail);
+                if let Some(h) = hint {
+                    println!("  {}", format!("↳ {}", h).dimmed());
+                }
             }
         }
         results.push(serde_json::json!({
@@ -521,7 +556,9 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             "detail": detail,
             "hint": hint,
         }));
-        if !ok { any_failed = true; }
+        // Only top-level failures bubble up to overall status; sub-rows are
+        // already captured via their parent.
+        if !ok && !is_sub { any_failed = true; }
     };
 
     if !json_mode {
@@ -1506,6 +1543,8 @@ fn run_multi_key_connectivity_test(
 
     // Interactive table — same layout as run_connectivity_test / aikey test.
     const W_PROV: usize = 18; const W_PING: usize = 16; const W_API: usize = 30;
+    eprintln!();
+    eprintln!("  \u{1F50C} {}", "Connectivity Test".bold());
     eprintln!("  {:<wp$} {:<wpi$} {:<wap$} {}",
         "Provider".dimmed(), "Ping".dimmed(), "API".dimmed(), "Chat".dimmed(),
         wp = W_PROV, wpi = W_PING, wap = W_API);

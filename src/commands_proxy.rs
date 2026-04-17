@@ -454,36 +454,44 @@ pub fn handle_stop() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
+    for line in status_rows() {
+        println!("{}", line);
+    }
+    Ok(())
+}
+
+/// Returns the Gateway status as a list of display rows (no box frame).
+/// Used by both `aikey proxy status` (plain) and `aikey status` (boxed overview).
+pub fn status_rows() -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
     match read_pid() {
         None => {
-            println!("status:  stopped");
-            println!("hint:    run `aikey proxy start` to start");
+            rows.push("status:  stopped".to_string());
+            rows.push("hint:    run `aikey proxy start` to start".to_string());
         }
         Some(pid) => {
             if !process_alive(pid) {
-                println!("status:  stopped (stale pid file)");
-                println!("hint:    run `aikey proxy start` to start");
-                let _ = fs::remove_file(pid_path()?);
+                rows.push("status:  stopped (stale pid file)".to_string());
+                rows.push("hint:    run `aikey proxy start` to start".to_string());
+                if let Ok(p) = pid_path() { let _ = fs::remove_file(p); }
             } else {
                 let healthy = port_reachable(PROXY_HEALTH_ADDR_DEFAULT, Duration::from_millis(500));
                 let health_str = if healthy { "healthy" } else { "unreachable" };
-                println!("status:  running ({})", health_str);
-                println!("pid:     {}", pid);
-                println!("listen:  http://{}", PROXY_HEALTH_ADDR_DEFAULT);
-
-                // Vault snapshot staleness check.
+                rows.push(format!("status:  running ({})", health_str));
+                rows.push(format!("pid:     {}", pid));
+                rows.push(format!("listen:  http://{}", PROXY_HEALTH_ADDR_DEFAULT));
                 match proxy_vault_state() {
-                    ProxyVaultState::Current => println!("vault sync: current"),
+                    ProxyVaultState::Current => rows.push("vault sync: current".to_string()),
                     ProxyVaultState::Stale => {
-                        println!("vault sync: stale");
-                        println!("hint:    restart proxy to apply new keys: aikey proxy restart");
+                        rows.push("vault sync: stale".to_string());
+                        rows.push("hint:    restart proxy to apply new keys: aikey proxy restart".to_string());
                     }
-                    ProxyVaultState::Unknown => {} // suppress if no data yet
+                    ProxyVaultState::Unknown => {}
                 }
             }
         }
     }
-    Ok(())
+    rows
 }
 
 pub fn handle_restart(config: Option<&str>, password: &SecretString) -> Result<(), Box<dyn std::error::Error>> {

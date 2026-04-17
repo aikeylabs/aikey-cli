@@ -23,7 +23,7 @@ fn cleanup_sqlite_artifacts(base: &str) {
 }
 
 fn run_ak(args: &[&str], vault_path: &str, socket_path: &str, extra_env: &[(&str, &str)]) -> std::process::Output {
-    let exe = assert_cmd::cargo::cargo_bin!("ak");
+    let exe = assert_cmd::cargo::cargo_bin!("aikey");
 
     let mut cmd = Command::new(exe);
     cmd.args(args);

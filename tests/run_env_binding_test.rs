@@ -2,14 +2,29 @@
 //! introduced when `run_with_active_key` was migrated from the legacy
 //! single-key `active_key_config` model to `user_profile_provider_bindings`.
 
+use aikeylabs_aikey_cli::credential_type::CredentialType;
 use aikeylabs_aikey_cli::executor::build_run_env;
 use aikeylabs_aikey_cli::storage::{ActiveKeyConfig, ProviderBinding};
+
+/// Helper: build a ProviderBinding from string-form `src_type` for readability.
+/// Accepts legacy string labels ("personal", "team", "oauth") and maps them to
+/// the current `CredentialType` enum. Unknown strings return None so the test
+/// author notices typos instead of getting a surprising default.
+fn src_type_from_str(s: &str) -> Option<CredentialType> {
+    match s {
+        "personal" => Some(CredentialType::PersonalApiKey),
+        "team"     => Some(CredentialType::ManagedVirtualKey),
+        "oauth"    => Some(CredentialType::PersonalOAuthAccount),
+        _          => None,
+    }
+}
 
 fn make_binding(provider: &str, src_type: &str, src_ref: &str) -> ProviderBinding {
     ProviderBinding {
         profile_id: "default".to_string(),
         provider_code: provider.to_string(),
-        key_source_type: src_type.to_string(),
+        key_source_type: src_type_from_str(src_type)
+            .unwrap_or_else(|| panic!("unknown src_type '{}' in test fixture", src_type)),
         key_source_ref: src_ref.to_string(),
         updated_at: Some(1000),
     }
@@ -93,7 +108,7 @@ fn no_bindings_no_legacy_returns_empty() {
 #[test]
 fn legacy_fallback_team_key() {
     let legacy = ActiveKeyConfig {
-        key_type: "team".to_string(),
+        key_type: CredentialType::ManagedVirtualKey,
         key_ref: "vk-legacy-1".to_string(),
         providers: vec!["anthropic".to_string(), "openai".to_string()],
     };
@@ -109,7 +124,7 @@ fn legacy_fallback_team_key() {
 #[test]
 fn legacy_fallback_personal_key() {
     let legacy = ActiveKeyConfig {
-        key_type: "personal".to_string(),
+        key_type: CredentialType::PersonalApiKey,
         key_ref: "my-old-key".to_string(),
         providers: vec!["anthropic".to_string()],
     };
@@ -123,7 +138,7 @@ fn legacy_fallback_personal_key() {
 #[test]
 fn legacy_fallback_empty_providers_injects_all_defaults() {
     let legacy = ActiveKeyConfig {
-        key_type: "personal".to_string(),
+        key_type: CredentialType::PersonalApiKey,
         key_ref: "catch-all".to_string(),
         providers: vec![],
     };
@@ -146,7 +161,7 @@ fn legacy_fallback_empty_providers_injects_all_defaults() {
 fn bindings_override_legacy_config() {
     let bindings = vec![make_binding("anthropic", "personal", "new-key")];
     let legacy = ActiveKeyConfig {
-        key_type: "team".to_string(),
+        key_type: CredentialType::ManagedVirtualKey,
         key_ref: "old-vk".to_string(),
         providers: vec!["anthropic".to_string(), "openai".to_string()],
     };
@@ -161,19 +176,14 @@ fn bindings_override_legacy_config() {
 }
 
 // ============================================================================
-// Error: unknown key_source_type
+// (Removed) unknown_key_source_type_returns_error
+//
+// The original test passed a free-form string "magic" to exercise the error
+// path. After the 2026-04 storage migration `key_source_type` became a typed
+// CredentialType enum, so unknown values can no longer be constructed at the
+// type level. This branch is now a compile-time guarantee, so no runtime test
+// is needed. Retained as a comment for archaeologists.
 // ============================================================================
-
-#[test]
-fn unknown_key_source_type_returns_error() {
-    let bindings = vec![make_binding("anthropic", "magic", "bad-ref")];
-    let result = build_run_env(&bindings, None, 27200);
-
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert!(err.contains("Unknown key_source_type 'magic'"));
-    assert!(err.contains("provider 'anthropic'"));
-}
 
 // ============================================================================
 // Unknown provider code is skipped (no env var mapping)

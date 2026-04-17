@@ -127,10 +127,18 @@ pub fn render_box(icon: &str, title: &str, rows: &[String]) -> String {
     let title_fill = inner_w.saturating_sub(title_vis + 3);
     let border = "\u{2500}".repeat(inner_w);
 
+    // Outer frame glyphs use a mid-gray (256-color 245), noticeably brighter
+    // than `\x1b[90m` (which is already used for the inner separator) but
+    // still clearly secondary to the content.
+    const FRAME: &str = "\x1b[38;5;245m";
+    const RESET: &str = "\x1b[0m";
+
     let mut out = String::new();
-    // Top border with title.
-    out.push_str(&format!("  \u{250C}\u{2500} {} {}\u{2510}\n",
-        icon_title, "\u{2500}".repeat(title_fill)));
+    // Top border with title. Only the frame glyphs are colored — the title
+    // text keeps whatever color the caller passed in.
+    out.push_str(&format!("  {f}\u{250C}\u{2500}{r} {} {f}{}\u{2510}{r}\n",
+        icon_title, "\u{2500}".repeat(title_fill),
+        f = FRAME, r = RESET));
     // Content rows: format is `│  {content}  │`
     // Left margin = 2 spaces, right margin = 2 spaces → content width = inner_w - 4
     let pad_target = inner_w.saturating_sub(4);
@@ -138,15 +146,18 @@ pub fn render_box(icon: &str, title: &str, rows: &[String]) -> String {
         // Auto-stretch separator lines (pure ─ characters) to fill the content area.
         let is_separator = !row.is_empty() && row.chars().all(|c| c == '\u{2500}');
         if is_separator {
-            out.push_str(&format!("  \u{2502}  \x1b[90m{}\x1b[0m  \u{2502}\n",
-                "\u{2500}".repeat(pad_target)));
+            out.push_str(&format!("  {f}\u{2502}{r}  \x1b[90m{}\x1b[0m  {f}\u{2502}{r}\n",
+                "\u{2500}".repeat(pad_target),
+                f = FRAME, r = RESET));
         } else {
-            out.push_str(&format!("  \u{2502}  {}  \u{2502}\n",
-                pad_visible(row, pad_target)));
+            out.push_str(&format!("  {f}\u{2502}{r}  {}  {f}\u{2502}{r}\n",
+                pad_visible(row, pad_target),
+                f = FRAME, r = RESET));
         }
     }
     // Bottom border.
-    out.push_str(&format!("  \u{2514}{}\u{2518}", border));
+    out.push_str(&format!("  {f}\u{2514}{}\u{2518}{r}",
+        border, f = FRAME, r = RESET));
     out
 }
 

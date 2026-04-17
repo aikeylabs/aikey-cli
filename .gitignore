@@ -5,6 +5,9 @@
 .claude/
 .env
 .env.*
+# Keep templates — they document the test-env knobs for contributors.
+!.env.example
+!**/.env.example
 *.log
 .DS_Store
 .cargo-target/

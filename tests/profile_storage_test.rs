@@ -3,7 +3,10 @@
 //! Covers: `user_profiles`, `user_profile_provider_bindings`, migration from
 //! legacy `active_key_config`, `resolve_supported_providers`, and the new
 //! entries `supported_providers` column.
+//!
+//! Run with `--test-threads=1` because setup mutates global env vars.
 
+use aikeylabs_aikey_cli::credential_type::CredentialType;
 use aikeylabs_aikey_cli::storage;
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
@@ -77,7 +80,7 @@ fn set_and_get_provider_binding() {
         .expect("should exist");
 
     assert_eq!(b.provider_code, "anthropic");
-    assert_eq!(b.key_source_type, "personal");
+    assert_eq!(b.key_source_type, CredentialType::PersonalApiKey);
     assert_eq!(b.key_source_ref, "my-claude");
 }
 
@@ -91,7 +94,7 @@ fn upsert_provider_binding_overwrites() {
     let b = storage::get_provider_binding("default", "openai")
         .unwrap()
         .unwrap();
-    assert_eq!(b.key_source_type, "team");
+    assert_eq!(b.key_source_type, CredentialType::ManagedVirtualKey);
     assert_eq!(b.key_source_ref, "vk_123");
 }
 
@@ -273,11 +276,11 @@ fn migration_carries_over_legacy_active_key() {
 
     assert_eq!(bindings.len(), 2);
     let anthropic = bindings.iter().find(|b| b.provider_code == "anthropic").unwrap();
-    assert_eq!(anthropic.key_source_type, "personal");
+    assert_eq!(anthropic.key_source_type, CredentialType::PersonalApiKey);
     assert_eq!(anthropic.key_source_ref, "my-claude");
 
     let openai = bindings.iter().find(|b| b.provider_code == "openai").unwrap();
-    assert_eq!(openai.key_source_type, "personal");
+    assert_eq!(openai.key_source_type, CredentialType::PersonalApiKey);
     assert_eq!(openai.key_source_ref, "my-claude");
 }
 

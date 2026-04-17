@@ -33,64 +33,48 @@ impl TestEnv {
         cmd
     }
 
-    /// Initialize vault with test password (non-interactive)
+    /// Prepare the vault directory, then let the CLI lazy-initialize the SQLite
+    /// file + schema on first write. Hand-rolling the schema here used to work
+    /// but the CLI's migrations have since added columns/tables (route_token,
+    /// user_profiles, provider_accounts, etc.) that this stub can't keep in sync
+    /// with. Delegating to the CLI means this helper stays valid across migrations.
     fn init_vault(&self) {
-        // Create vault directory
-        fs::create_dir_all(&self.vault_path).expect("Failed to create vault directory");
+        let data_dir = self.vault_path.join("data");
+        fs::create_dir_all(&data_dir).expect("Failed to create vault data directory");
 
-        // Use the library directly to initialize without interactive prompts
-        use rand::RngCore;
-        let mut salt = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
-
-        // Create database file
-        let db_path = self.vault_path.join("vault.db");
-        let conn = rusqlite::Connection::open(&db_path).expect("Failed to create database");
-
-        // Set strict permissions
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&self.vault_path, fs::Permissions::from_mode(0o700))
                 .expect("Failed to set vault directory permissions");
-            fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600))
-                .expect("Failed to set database permissions");
         }
 
-        // Initialize schema
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS config (
-                key TEXT PRIMARY KEY,
-                value BLOB NOT NULL
-            )",
-            [],
-        ).expect("Failed to create config table");
-
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                alias TEXT NOT NULL UNIQUE,
-                nonce BLOB NOT NULL,
-                ciphertext BLOB NOT NULL,
-                version_tag INTEGER NOT NULL DEFAULT 1,
-                metadata TEXT,
-                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-            )",
-            [],
-        ).expect("Failed to create entries table");
-
-        // Store salt
-        conn.execute(
-            "INSERT INTO config (key, value) VALUES ('salt', ?1)",
-            [&salt[..]],
-        ).expect("Failed to store salt");
+        // Drive the full `initialize_vault` flow (sets file mode 0o600, seeds
+        // the schema + migrations) by adding then deleting a throwaway key.
+        // `list` wouldn't do it — read-only paths skip the init helper.
+        self.cmd()
+            .arg("add")
+            .arg("__init_bootstrap__")
+            .args(["--provider", "openai"])
+            .env("AK_TEST_SECRET", "bootstrap")
+            .assert()
+            .success();
+        self.cmd()
+            .arg("delete")
+            .arg("__init_bootstrap__")
+            .assert()
+            .success();
     }
 
-    /// Add a secret using environment variables
+    /// Add a secret using environment variables.
+    /// `--provider openai` was made required in non-interactive mode (2026-03-31
+    /// 方案). These tests aren't exercising provider logic, so we pick a safe
+    /// default that keeps the CLI happy.
     fn add_secret(&self, alias: &str, secret_value: &str) -> assert_cmd::assert::Assert {
         self.cmd()
             .arg("add")
             .arg(alias)
+            .args(["--provider", "openai"])
             .env("AK_TEST_SECRET", secret_value)
             .assert()
     }
@@ -105,8 +89,11 @@ impl TestEnv {
     }
 
     /// Get vault database path
+    /// Path to the vault SQLite file.
+    /// Current layout: `$HOME/.aikey/data/vault.db` (relocated from `.aikey/vault.db`
+    /// in 2026-04 to keep DB files out of the config/dotfile layer).
     fn db_path(&self) -> PathBuf {
-        self.vault_path.join("vault.db")
+        self.vault_path.join("data").join("vault.db")
     }
 
     /// Create a minimal project config file for testing
@@ -186,16 +173,17 @@ fn test_01_initialization() {
         .expect("Failed to check entries table");
     assert!(entries_exists, "Entries table should exist");
 
-    // Check salt exists
+    // Check salt exists. Column is now `master_salt` (fallback: `salt` for
+    // backward-compat with pre-2026 vaults). Accept either.
     let salt_exists: bool = conn
         .query_row(
-            "SELECT COUNT(*) FROM config WHERE key='salt'",
+            "SELECT COUNT(*) FROM config WHERE key IN ('master_salt', 'salt')",
             [],
             |row| row.get(0),
         )
         .map(|count: i32| count > 0)
         .expect("Failed to check salt");
-    assert!(salt_exists, "Salt should be stored in config");
+    assert!(salt_exists, "Salt should be stored in config (master_salt or legacy salt)");
 }
 
 #[test]
@@ -206,7 +194,7 @@ fn test_02_crud_operations() {
     // Test: Add a secret
     env.add_secret("TEST_API_KEY", "sk-test-1234567890abcdef")
         .success()
-        .stderr(predicate::str::contains("Secret 'TEST_API_KEY' added successfully"));
+        .stderr(predicate::str::contains("API Key 'TEST_API_KEY' added"));
 
     // Test: List secrets
     env.cmd()
@@ -218,7 +206,7 @@ fn test_02_crud_operations() {
     // Test: Add another secret
     env.add_secret("DATABASE_URL", "postgresql://user:pass@localhost/db")
         .success()
-        .stderr(predicate::str::contains("Secret 'DATABASE_URL' added successfully"));
+        .stderr(predicate::str::contains("API Key 'DATABASE_URL' added"));
 
     // Test: List should show both secrets
     let list_output = env.cmd()
@@ -230,13 +218,14 @@ fn test_02_crud_operations() {
         .stdout(predicate::str::contains("TEST_API_KEY"))
         .stdout(predicate::str::contains("DATABASE_URL"));
 
-    // Test: Delete a secret
+    // Test: Delete a secret. Current CLI writes user-facing messages to stderr
+    // (2026-03 unification), and the noun changed Secret → API Key.
     env.cmd()
         .arg("delete")
         .arg("TEST_API_KEY")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Secret deleted"));
+        .stderr(predicate::str::contains("API Key 'TEST_API_KEY' deleted"));
 
     // Test: List should only show remaining secret
     env.cmd()
@@ -309,6 +298,7 @@ fn test_04_security_auth_failure() {
         .env("AK_TEST_SECRET", "some_value")
         .arg("add")
         .arg("ANOTHER_SECRET")
+        .args(["--provider", "openai"])
         .assert()
         .failure()
         .code(1)
@@ -382,12 +372,16 @@ fn test_06_empty_vault_operations() {
     let env = TestEnv::new();
     env.init_vault();
 
-    // Test: List empty vault
+    // Test: List empty vault. Current CLI renders a bordered table with
+    // "(none)" placeholders in both Personal and Team sections.
     env.cmd()
         .arg("list")
         .assert()
         .success()
-        .stdout(predicate::str::contains("No secrets stored"));
+        .stdout(predicate::str::contains("Personal "))
+        .stdout(predicate::str::contains("Team "))
+        .stdout(predicate::str::contains("(0)"))
+        .stdout(predicate::str::contains("(none)"));
 
     // Test: Run with empty vault and empty config (no required vars)
     env.create_test_config(vec![]);
@@ -479,12 +473,12 @@ fn test_09_update_secret() {
     // Test: Add initial secret
     env.add_secret("UPDATE_TEST", "initial_value")
         .success()
-        .stderr(predicate::str::contains("Secret 'UPDATE_TEST' added successfully"));
+        .stderr(predicate::str::contains("API Key 'UPDATE_TEST' added"));
 
     // Test: Update the secret with new value
     env.update_secret("UPDATE_TEST", "updated_value")
         .success()
-        .stderr(predicate::str::contains("Secret 'UPDATE_TEST' updated successfully"));
+        .stderr(predicate::str::contains("API Key 'UPDATE_TEST' updated"));
 
     // Test: Verify the updated value via run command
     let output = env.cmd()
@@ -505,7 +499,8 @@ fn test_09_update_secret() {
         .env("AK_TEST_SECRET", "some_value")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Secret 'NONEXISTENT' not found"));
+        .stderr(predicate::str::contains("API Key 'NONEXISTENT' not found")
+            .or(predicate::str::contains("'NONEXISTENT' not found")));
 
     // Test: Update with wrong password should fail
     let mut cmd = Command::new(cargo_bin("aikey"));

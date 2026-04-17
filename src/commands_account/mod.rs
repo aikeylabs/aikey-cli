@@ -1022,30 +1022,34 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
         return Ok(());
     }
 
+    let mut rows: Vec<String> = Vec::new();
+
     // ── Gateway ─────────────────────────────────────────────────────────────
-    println!("{}", "Gateway".bold().underline());
-    crate::commands_proxy::handle_status()?;
-    println!();
+    rows.push(format!("\u{1F6F0}  {}", "Gateway".bold()));
+    for line in crate::commands_proxy::status_rows() {
+        rows.push(format!("  {}", line));
+    }
+    rows.push(String::new());
 
     // ── Login ───────────────────────────────────────────────────────────────
-    println!("{}", "Login".bold().underline());
+    rows.push(format!("\u{1F464} {}", "Login".bold()));
     match &account {
         Some(a) => {
-            println!("status:  {}", "logged in".green());
-            println!("email:   {}", a.email.bold());
-            println!("server:  {}", a.control_url.dimmed());
+            rows.push(format!("  status:  {}", "logged in".green()));
+            rows.push(format!("  email:   {}", a.email.bold()));
+            rows.push(format!("  server:  {}", a.control_url.dimmed()));
         }
         None => {
-            println!("status:  {}", "not logged in".dimmed());
-            println!("hint:    run `aikey login` to connect to your team");
+            rows.push(format!("  status:  {}", "not logged in".dimmed()));
+            rows.push("  hint:    run `aikey login` to connect to your team".to_string());
         }
     }
-    println!();
+    rows.push(String::new());
 
     // ── Keys ────────────────────────────────────────────────────────────────
-    println!("{}", "Keys".bold().underline());
-    println!("personal:  {}", personal_count);
-    println!("team:      {} total, {} active", team_total, active_team);
+    rows.push(format!("\u{1F511} {}", "Keys".bold()));
+    rows.push(format!("  personal:  {}", personal_count));
+    rows.push(format!("  team:      {} total, {} active", team_total, active_team));
     match &active_cfg {
         Some(cfg) => {
             let prov_str = if cfg.providers.is_empty() {
@@ -1053,25 +1057,50 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
             } else {
                 cfg.providers.join(", ")
             };
-            println!("active:    {} ({}) [{}]",
-                cfg.key_ref.bold(),
-                cfg.key_type.as_str().dimmed(),
-                prov_str.cyan());
+            // Human-friendly label: prefer OAuth display identity / email; for personal
+            // and team keys, key_ref is already a readable alias or virtual_key_id.
+            let (label, type_label) = match cfg.key_type {
+                crate::credential_type::CredentialType::PersonalOAuthAccount => {
+                    let human = storage::list_provider_accounts()
+                        .ok()
+                        .and_then(|accts| {
+                            accts.into_iter().find(|a| a.provider_account_id == cfg.key_ref)
+                                .and_then(|a| a.display_identity
+                                    .filter(|s| !s.is_empty())
+                                    .or(a.external_id))
+                        })
+                        .unwrap_or_else(|| cfg.key_ref.clone());
+                    (human, "OAuth")
+                }
+                crate::credential_type::CredentialType::ManagedVirtualKey => {
+                    (cfg.key_ref.clone(), "team")
+                }
+                crate::credential_type::CredentialType::PersonalApiKey => {
+                    (cfg.key_ref.clone(), "personal")
+                }
+            };
+            rows.push(format!("  active:    {} {} {}",
+                label.bold(),
+                format!("({})", type_label).dimmed(),
+                format!("\u{2192} {}", prov_str).cyan()));
         }
         None => {
-            println!("active:    {}", "none".dimmed());
+            rows.push(format!("  active:    {}", "none".dimmed()));
         }
     }
-    println!();
+    rows.push(String::new());
 
     // ── Providers ───────────────────────────────────────────────────────────
-    println!("{}", "Providers".bold().underline());
+    rows.push(format!("\u{1F50C} {}", "Providers".bold()));
     if providers.is_empty() {
-        println!("{}", "no providers configured".dimmed());
-        println!("hint:    add a key with `aikey add <alias> --provider <code>`");
+        rows.push(format!("  {}", "no providers configured".dimmed()));
+        rows.push("  hint:    add a key with `aikey add <alias> --provider <code>`".to_string());
     } else {
-        println!("{}", providers.iter().cloned().collect::<Vec<_>>().join(", "));
+        rows.push(format!("  {}",
+            providers.iter().cloned().collect::<Vec<_>>().join(", ")));
     }
+
+    crate::ui_frame::print_box("\u{1F4CA}", "Status", &rows);
 
     Ok(())
 }
@@ -1715,54 +1744,102 @@ pub fn handle_key_sync(
 // aikey key use
 // ---------------------------------------------------------------------------
 
-/// Provider code → environment variable names for API key + base URL.
+/// Single source of truth for provider metadata (L5 unification 2026-04-17).
 ///
-/// Accepts both canonical codes ("anthropic") and common brand-name aliases
-/// ("claude", "claude-3", etc.) that servers may use.
-/// Public re-export of `provider_env_vars` for use by `executor::run_with_active_key`.
+/// Consolidates what were previously three parallel match tables:
+///   - main.rs::canonical_provider (alias → canonical code)
+///   - commands_account::provider_env_vars (code → API_KEY/BASE_URL env var pair)
+///   - commands_account::provider_proxy_prefix (code → URL path segment)
+///
+/// Why one struct: keeping them separate let kimi/moonshot drift apart — `route`
+/// was emitting `/kimi` (broken for OpenAI-compatible Kimi SDK), while `activate`
+/// was emitting `/kimi/v1` (working). The single match table prevents future drift.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderInfo {
+    /// Data-model canonical code for vault queries and provider bindings.
+    /// Aliases like "claude" normalize to "anthropic"; "moonshot" shares "kimi".
+    pub canonical_code: &'static str,
+    /// URL path segment registered in the proxy. Must include `/v1` suffix
+    /// for providers whose upstream has no `/v1` prefix AND whose SDK doesn't
+    /// auto-prepend /v1 (kimi/moonshot use OpenAI-compatible SDKs that treat
+    /// base_url as "already has /v1").
+    pub proxy_path: &'static str,
+    /// Provider-specific env var names written by `aikey use`/`aikey activate`.
+    /// Kept distinct per brand even when canonical_code collides (e.g. moonshot
+    /// has MOONSHOT_API_KEY independent from kimi's KIMI_API_KEY).
+    pub env_vars: (&'static str, &'static str),
+}
+
+/// Look up provider metadata by code or alias. Returns `None` for unknown codes.
+pub fn provider_info(code: &str) -> Option<ProviderInfo> {
+    let info = match code.to_lowercase().as_str() {
+        "anthropic" | "claude" => ProviderInfo {
+            canonical_code: "anthropic",
+            proxy_path: "anthropic",
+            env_vars: ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+        },
+        "openai" | "gpt" | "chatgpt" | "codex" => ProviderInfo {
+            canonical_code: "openai",
+            proxy_path: "openai",
+            env_vars: ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+        },
+        "google" | "gemini" => ProviderInfo {
+            canonical_code: "google",
+            proxy_path: "google",
+            env_vars: ("GOOGLE_API_KEY", "GOOGLE_BASE_URL"),
+        },
+        "kimi" => ProviderInfo {
+            canonical_code: "kimi",
+            // Why /v1: Kimi OpenAI-compatible SDK appends /chat/completions
+            // relative to base_url. Kimi's upstream base is /coding (no /v1),
+            // so the proxy-side path MUST carry /v1 for the final URL to hit
+            // /coding/v1/chat/completions.
+            proxy_path: "kimi/v1",
+            env_vars: ("KIMI_API_KEY", "KIMI_BASE_URL"),
+        },
+        "moonshot" => ProviderInfo {
+            // moonshot is a brand alias of kimi at the vault/routing layer,
+            // but kept distinct in env vars so users can wire different tools
+            // to each brand if they prefer.
+            canonical_code: "kimi",
+            proxy_path: "moonshot/v1",
+            env_vars: ("MOONSHOT_API_KEY", "MOONSHOT_BASE_URL"),
+        },
+        "deepseek" => ProviderInfo {
+            canonical_code: "deepseek",
+            // Why no /v1: DeepSeek's upstream already includes /v1, so the
+            // proxy-side path stays bare and the upstream's /v1 prepends during
+            // the final URL build.
+            proxy_path: "deepseek",
+            env_vars: ("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"),
+        },
+        _ => return None,
+    };
+    Some(info)
+}
+
+// ── Back-compat wrappers: existing call sites keep working unchanged. ──
+
+/// Provider code → environment variable names for API key + base URL.
+/// Public re-export for use by `executor::run_with_active_key`.
 pub fn provider_env_vars_pub(provider_code: &str) -> Option<(&'static str, &'static str)> {
     provider_env_vars(provider_code)
 }
 
 pub(crate) fn provider_env_vars(provider_code: &str) -> Option<(&'static str, &'static str)> {
-    match provider_code.to_lowercase().as_str() {
-        "anthropic" | "claude" => Some(("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")),
-        "openai" | "gpt" | "chatgpt" => Some(("OPENAI_API_KEY", "OPENAI_BASE_URL")),
-        "google" | "gemini"   => Some(("GOOGLE_API_KEY", "GOOGLE_BASE_URL")),
-        "kimi"                => Some(("KIMI_API_KEY", "KIMI_BASE_URL")),
-        "deepseek"            => Some(("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL")),
-        "moonshot"            => Some(("MOONSHOT_API_KEY", "MOONSHOT_BASE_URL")),
-        _                     => None,
-    }
+    provider_info(provider_code).map(|i| i.env_vars)
 }
 
-/// Returns the canonical proxy path prefix for a provider code.
-///
-/// The proxy's path-prefix router only recognises the canonical names
-/// (e.g. `/anthropic/v1/...`), so env vars written by `write_active_env`
-/// must use these — even when the server sends a brand alias like "Claude".
-/// Public re-export of `provider_proxy_prefix` for use by `executor::run_with_active_key`.
+/// Provider code → proxy URL path segment. Unknown codes fall back to "openai"
+/// (OpenAI-compatible default) to preserve the previous function's contract.
 pub fn provider_proxy_prefix_pub(provider_code: &str) -> &'static str {
     provider_proxy_prefix(provider_code)
 }
 
 pub(crate) fn provider_proxy_prefix(provider_code: &str) -> &'static str {
-    match provider_code.to_lowercase().as_str() {
-        "anthropic" | "claude" => "anthropic",
-        "openai" | "gpt" | "chatgpt" => "openai",
-        "google" | "gemini"   => "google",
-        "kimi"                => "kimi/v1",
-        "deepseek"            => "deepseek",
-        "moonshot"            => "moonshot/v1",
-        other => {
-            // Unknown provider: pass through as-is (proxy may still handle it
-            // if a matching path prefix is registered in the future).
-            // SAFETY: returning 'static requires leaking; use Box::leak once.
-            // For now fall back to "openai" (OpenAI-compatible default).
-            let _ = other;
-            "openai"
-        }
-    }
+    provider_info(provider_code)
+        .map(|i| i.proxy_path)
+        .unwrap_or("openai")
 }
 
 /// Writes `~/.aikey/active.env` with provider env vars for the active key.
@@ -2181,6 +2258,179 @@ fn truncate(s: &str, max: usize) -> &str {
         s
     } else {
         &s[..max]
+    }
+}
+
+#[cfg(test)]
+mod provider_mapping_tests {
+    //! Pin the current behavior of provider-code → {env vars, URL path} mapping
+    //! BEFORE attempting to consolidate with main.rs::canonical_provider.
+    //! Any refactor (L5) must pass all of these.
+
+    use super::{provider_env_vars, provider_proxy_prefix};
+
+    // ── provider_env_vars: (API_KEY, BASE_URL) per provider ─────────────────
+
+    #[test]
+    fn env_vars_anthropic_and_claude_same() {
+        let expected = Some(("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"));
+        assert_eq!(provider_env_vars("anthropic"), expected);
+        assert_eq!(provider_env_vars("claude"), expected);
+        assert_eq!(provider_env_vars("CLAUDE"), expected); // case insensitive
+    }
+
+    #[test]
+    fn env_vars_openai_aliases() {
+        let expected = Some(("OPENAI_API_KEY", "OPENAI_BASE_URL"));
+        assert_eq!(provider_env_vars("openai"), expected);
+        assert_eq!(provider_env_vars("gpt"), expected);
+        assert_eq!(provider_env_vars("chatgpt"), expected);
+        // L5: codex was previously a canonical-only alias (env_vars returned None).
+        // After unification, codex is a full openai alias across all three fields.
+        assert_eq!(provider_env_vars("codex"), expected);
+    }
+
+    #[test]
+    fn env_vars_google_aliases() {
+        let expected = Some(("GOOGLE_API_KEY", "GOOGLE_BASE_URL"));
+        assert_eq!(provider_env_vars("google"), expected);
+        assert_eq!(provider_env_vars("gemini"), expected);
+    }
+
+    #[test]
+    fn env_vars_kimi_and_moonshot_are_distinct() {
+        // IMPORTANT: kimi and moonshot have SEPARATE env var pairs here, even though
+        // main.rs::canonical_provider remaps moonshot→kimi for URL routing.
+        // A future dedup must preserve this asymmetry or explicitly change the contract.
+        assert_eq!(provider_env_vars("kimi"),
+            Some(("KIMI_API_KEY", "KIMI_BASE_URL")));
+        assert_eq!(provider_env_vars("moonshot"),
+            Some(("MOONSHOT_API_KEY", "MOONSHOT_BASE_URL")));
+    }
+
+    #[test]
+    fn env_vars_deepseek() {
+        assert_eq!(provider_env_vars("deepseek"),
+            Some(("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL")));
+    }
+
+    #[test]
+    fn env_vars_unknown_returns_none() {
+        assert_eq!(provider_env_vars("unknown"), None);
+        assert_eq!(provider_env_vars(""), None);
+    }
+
+    // ── provider_proxy_prefix: URL path per provider ────────────────────────
+
+    #[test]
+    fn proxy_prefix_anthropic_and_claude_same() {
+        assert_eq!(provider_proxy_prefix("anthropic"), "anthropic");
+        assert_eq!(provider_proxy_prefix("claude"), "anthropic");
+    }
+
+    #[test]
+    fn proxy_prefix_openai_aliases() {
+        assert_eq!(provider_proxy_prefix("openai"), "openai");
+        assert_eq!(provider_proxy_prefix("codex"), "openai");
+        assert_eq!(provider_proxy_prefix("gpt"), "openai");
+        assert_eq!(provider_proxy_prefix("chatgpt"), "openai");
+    }
+
+    #[test]
+    fn proxy_prefix_google_aliases() {
+        assert_eq!(provider_proxy_prefix("google"), "google");
+        assert_eq!(provider_proxy_prefix("gemini"), "google");
+    }
+
+    #[test]
+    fn proxy_prefix_kimi_has_v1_suffix() {
+        // IMPORTANT: provider_proxy_prefix includes "/v1" for kimi/moonshot;
+        // main.rs::canonical_provider does NOT. This divergence is documented in
+        // main.rs::route_and_activate_paths_currently_diverge_for_kimi.
+        // Both resolve to the same upstream because proxy strips the /kimi prefix
+        // and OpenAI-SDK clients append /chat/completions after base_url.
+        assert_eq!(provider_proxy_prefix("kimi"), "kimi/v1");
+        assert_eq!(provider_proxy_prefix("moonshot"), "moonshot/v1");
+    }
+
+    #[test]
+    fn proxy_prefix_deepseek() {
+        assert_eq!(provider_proxy_prefix("deepseek"), "deepseek");
+    }
+
+    #[test]
+    fn proxy_prefix_unknown_falls_back_to_openai() {
+        // Unknown providers fall back to "openai" (OpenAI-compatible default).
+        // This preserves the lifetime requirement of returning &'static str.
+        assert_eq!(provider_proxy_prefix("unknown-provider"), "openai");
+        assert_eq!(provider_proxy_prefix(""), "openai");
+    }
+
+    #[test]
+    fn proxy_prefix_case_insensitive() {
+        assert_eq!(provider_proxy_prefix("ANTHROPIC"), "anthropic");
+        assert_eq!(provider_proxy_prefix("Claude"), "anthropic");
+        assert_eq!(provider_proxy_prefix("Kimi"), "kimi/v1");
+    }
+
+    // ── cross-function consistency: same provider → matching env vars AND path ──
+
+    #[test]
+    fn all_known_providers_have_both_env_vars_and_prefix() {
+        // Every provider code that has env vars must also have a proxy prefix.
+        // (provider_proxy_prefix falls back to "openai", so it always succeeds.)
+        // L5: "codex" is now included because it's a full alias of openai.
+        for code in &[
+            "anthropic", "claude",
+            "openai", "codex", "gpt", "chatgpt",
+            "google", "gemini",
+            "kimi", "moonshot", "deepseek",
+        ] {
+            assert!(provider_env_vars(code).is_some(),
+                "provider_env_vars returned None for known code '{}'", code);
+            // Just ensure it returns without panic; the actual value is tested above.
+            let _ = provider_proxy_prefix(code);
+        }
+    }
+
+    // ── ProviderInfo unification (L5 2026-04-17) ────────────────────────────
+
+    #[test]
+    fn provider_info_single_source_of_truth() {
+        // Legacy wrappers must return the SAME values as ProviderInfo for every
+        // known provider. If this fails, the wrappers have drifted from provider_info.
+        for code in &[
+            "anthropic", "claude",
+            "openai", "codex", "gpt", "chatgpt",
+            "google", "gemini",
+            "kimi", "moonshot", "deepseek",
+        ] {
+            let info = super::provider_info(code).unwrap();
+            assert_eq!(provider_env_vars(code), Some(info.env_vars),
+                "env_vars mismatch for '{}'", code);
+            assert_eq!(provider_proxy_prefix(code), info.proxy_path,
+                "proxy_path mismatch for '{}'", code);
+        }
+    }
+
+    #[test]
+    fn provider_info_aliases_point_to_same_canonical() {
+        use super::provider_info;
+        // anthropic/claude
+        assert_eq!(provider_info("anthropic").unwrap().canonical_code,
+                   provider_info("claude").unwrap().canonical_code);
+        // openai family (codex, gpt, chatgpt)
+        let openai = provider_info("openai").unwrap().canonical_code;
+        for alias in &["codex", "gpt", "chatgpt"] {
+            assert_eq!(provider_info(alias).unwrap().canonical_code, openai,
+                "alias '{}' should canonicalize to openai", alias);
+        }
+        // google/gemini
+        assert_eq!(provider_info("google").unwrap().canonical_code,
+                   provider_info("gemini").unwrap().canonical_code);
+        // kimi/moonshot (moonshot canonicalizes to kimi)
+        assert_eq!(provider_info("kimi").unwrap().canonical_code,
+                   provider_info("moonshot").unwrap().canonical_code);
     }
 }
 

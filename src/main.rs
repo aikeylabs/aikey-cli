@@ -147,9 +147,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if cli.json {
             json_output::error("No command specified. Use --help for usage information.", 1);
         } else {
+            use colored::Colorize;
             print_banner();
             eprintln!();
-            eprintln!("  Run 'aikey --help' for a list of commands.");
+            eprintln!("  {}", "Get started:".bold());
+            eprintln!("    aikey quickstart      {}", "See what to do next (state-aware)".dimmed());
+            eprintln!("    aikey login           {}", "Connect to your team Control Panel".dimmed());
+            eprintln!("    aikey list            {}", "Show your keys (personal, team, OAuth)".dimmed());
+            eprintln!("    aikey route           {}", "Print proxy config for AI clients".dimmed());
+            eprintln!();
+            eprintln!("  {}", "Run 'aikey --help' for all commands.".dimmed());
             std::process::exit(1);
         }
     }
@@ -736,7 +743,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ).unwrap_or_default();
 
                 // Collect row data for auto-width calculation.
-                struct RowData { alias: String, providers: String, primary_for: String, has_primary: bool, status: String, created: String, suffix: String }
+                // `active` = has at least one provider binding routing to this key.
+                // Matches the `aikey route` convention: if the proxy is currently
+                // serving some provider via this key, it's considered active.
+                struct RowData { alias: String, providers: String, primary_for: String, has_primary: bool, status: String, created: String, suffix: String, active: bool }
                 let mut personal_rows: Vec<RowData> = Vec::new();
                 let mut team_rows: Vec<RowData> = Vec::new();
 
@@ -747,12 +757,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let pf: Vec<&str> = bindings.iter()
                         .filter(|b| b.key_source_type == credential_type::CredentialType::PersonalApiKey && b.key_source_ref == entry.alias)
                         .map(|b| b.provider_code.as_str()).collect();
+                    let is_active = !pf.is_empty();
                     personal_rows.push(RowData {
                         alias: entry.alias.clone(), providers,
                         primary_for: pf.join(","), has_primary: !pf.is_empty(),
                         status: String::new(), // valid → not displayed
                         created: entry.created_at.map(|ts| format_date(ts)).unwrap_or_default(),
                         suffix: String::new(),
+                        active: is_active,
                     });
                 }
                 for e in &managed {
@@ -776,10 +788,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     let suffix = if e.local_alias.is_some() { format!(" (\u{2190} {})", e.alias) } else { String::new() };
+                    let is_active = !pf.is_empty();
                     team_rows.push(RowData {
                         alias: display, providers: e.provider_code.clone(),
                         primary_for: pf.join(","), has_primary: !pf.is_empty(),
                         status, created: format_date(e.synced_at), suffix,
+                        active: is_active,
                     });
                 }
 
@@ -791,22 +805,27 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let w_primary = headers[2].len().max(all_data.iter().map(|r| r.primary_for.len()).max().unwrap_or(0)) + pad;
                 let w_status  = headers[3].len().max(all_data.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
 
+                // Row format: `● ALIAS ...` when active, `  ALIAS ...` otherwise.
+                // The 2-char prefix (marker + space) is shared with the header so
+                // columns line up across Personal / Team / OAuth sections.
                 let fmt_row = |r: &RowData| -> String {
+                    let marker = if r.active { "●".green().to_string() } else { " ".to_string() };
                     let pf_padded = format!("{:<w$}", r.primary_for, w = w_primary);
                     let pf_col = if r.has_primary { pf_padded.green().to_string() } else { pf_padded };
                     let created_col = format!("\x1b[90m{}\x1b[0m", r.created);
                     let prov_display = if r.providers.len() > w_prov {
                         format!("{}...", &r.providers[..w_prov - 3])
                     } else { r.providers.clone() };
-                    format!("{:<wa$}  {:<wp$}  {}  {:<ws$}  {}{}",
-                        r.alias, prov_display, pf_col, r.status, created_col, r.suffix,
+                    format!("{} {:<wa$}  {:<wp$}  {}  {:<ws$}  {}{}",
+                        marker, r.alias, prov_display, pf_col, r.status, created_col, r.suffix,
                         wa = w_alias, wp = w_prov, ws = w_status)
                 };
-                let sep_width = w_alias + 2 + w_prov + 2 + w_primary + 2 + w_status + 2 + 10;
+                // +2 accounts for the `● ` marker prefix that the row renderer adds.
+                let sep_width = 2 + w_alias + 2 + w_prov + 2 + w_primary + 2 + w_status + 2 + 10;
 
                 let mut rows: Vec<String> = Vec::new();
-                rows.push(format!("\u{1FAAA} Personal Keys ({})", entries.len()));
-                rows.push(format!("\x1b[2m{:<wa$}  {:<wp$}  {:<wf$}  {:<ws$}  {}\x1b[0m",
+                rows.push(format!("\u{1F464} Personal \x1b[90m({})\x1b[0m", entries.len()));
+                rows.push(format!("\x1b[2m  {:<wa$}  {:<wp$}  {:<wf$}  {:<ws$}  {}\x1b[0m",
                     headers[0], headers[1], headers[2], headers[3], headers[4],
                     wa = w_alias, wp = w_prov, wf = w_primary, ws = w_status));
                 rows.push("\u{2500}".repeat(sep_width));
@@ -814,7 +833,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 else { for r in &personal_rows { rows.push(fmt_row(r)); } }
 
                 rows.push(String::new());
-                rows.push(format!("\u{1F465} Team Keys ({})", managed.len()));
+                rows.push(format!("\u{1F465} Team \x1b[90m({})\x1b[0m", managed.len()));
                 rows.push("\u{2500}".repeat(sep_width));
                 if team_rows.is_empty() { rows.push("(none)".to_string()); }
                 else { for r in &team_rows { rows.push(fmt_row(r)); } }
@@ -879,8 +898,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let _w_exp = "EXPIRES".len().max(oauth_rows.iter().map(|r| r.expires.len()).max().unwrap_or(0)) + pad;
 
                     rows.push(String::new());
-                    rows.push(format!("\u{1F517} Provider Accounts - OAuth ({})", oauth_accounts.len()));
-                    rows.push(format!("\x1b[2m{:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}\x1b[0m",
+                    rows.push(format!("\u{1F517} OAuth Accounts \x1b[90m({})\x1b[0m", oauth_accounts.len()));
+                    rows.push(format!("\x1b[2m  {:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}\x1b[0m",
                         "IDENTITY", "PROVIDER", "USING FOR", "STATUS", "TIER", "EXPIRES",
                         wi = w_id, wp = w_prov, wu = w_uf, ws = w_st, wt = w_tier));
                     rows.push("\u{2500}".repeat(sep_width));
@@ -889,13 +908,20 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let uf_col = if r.has_use { uf_padded.green().to_string() } else { uf_padded };
                         let tier_dim = format!("\x1b[90m{:<w$}\x1b[0m", r.tier, w = w_tier);
                         let expires_dim = format!("\x1b[90m{}\x1b[0m", r.expires);
-                        rows.push(format!("{:<wi$}{:<wp$}  {}  {:<ws$}  {}  {}",
-                            r.identity, r.provider, uf_col, r.status, tier_dim, expires_dim,
+                        // Active when this account is currently serving at least
+                        // one provider (matches the `aikey route` convention).
+                        let marker = if r.has_use { "●".green().to_string() } else { " ".to_string() };
+                        rows.push(format!("{} {:<wi$}{:<wp$}  {}  {:<ws$}  {}  {}",
+                            marker, r.identity, r.provider, uf_col, r.status, tier_dim, expires_dim,
                             wi = w_id, wp = w_prov, ws = w_st));
                     }
                 }
 
                 ui_frame::print_box("\u{1F511}", "Keys", &rows);
+                // Legend lives outside the box so the frame stays focused on data.
+                println!("  {} {}",
+                    "●".green(),
+                    "= active (set by `aikey use`)".dimmed());
             }
 
             // Post-operation: warn if proxy is unreachable (e.g. after kill -9).
@@ -1545,14 +1571,23 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             if cli.json {
                                 json_output::print_json(serde_json::json!({
                                     "ok": true,
+                                    "deprecated": true,
+                                    "deprecation_hint": "use `aikey list` for the unified view",
                                     "secrets": secrets
                                 }));
-                            } else if secrets.is_empty() {
-                                println!("No API Keys stored.");
                             } else {
-                                println!("Stored API Keys:");
-                                for secret in secrets {
-                                    println!("  {}", secret.alias);
+                                use colored::Colorize;
+                                eprintln!("{}  {}",
+                                    "deprecated:".yellow().bold(),
+                                    "`aikey secret list` will be removed — use `aikey list` for the unified view (personal / team / OAuth).".dimmed());
+                                eprintln!();
+                                if secrets.is_empty() {
+                                    println!("No API Keys stored.");
+                                } else {
+                                    println!("Stored API Keys:");
+                                    for secret in secrets {
+                                        println!("  {}", secret.alias);
+                                    }
                                 }
                             }
                         }
@@ -1890,6 +1925,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 for (k, v) in &entries {
                                     eprintln!("  {}={}", k, proxy_env::mask_value(k, v).dimmed());
                                 }
+                                // Synthesize a readable bypass summary from the
+                                // conditional `case` blocks (which we hide above).
+                                // The resolved value comes from the file content.
+                                if let Some(bypass) = proxy_env::read_active_bypass_summary() {
+                                    eprintln!("  {}  {}",
+                                        "no_proxy (bypass)".to_string(),
+                                        bypass.dimmed());
+                                }
                             }
                             Err(e) => eprintln!("  {}", format!("Error: {}", e).red()),
                         }
@@ -2134,16 +2177,116 @@ struct RouteEntry {
     active: bool,
 }
 
-/// Maps broker/brand provider codes to canonical codes for proxy path-prefix routing.
-/// "claude" → "anthropic", "codex" → "openai", "moonshot" → "kimi", etc.
-fn canonical_provider(code: &str) -> &str {
-    match code.to_lowercase().as_str() {
-        "claude" => "anthropic",
-        "codex" | "gpt" | "chatgpt" => "openai",
-        "gemini" => "google",
-        "moonshot" => "kimi",
-        _ => code,
+/// Provider code (or brand alias) → canonical data-model code for display.
+/// Unknown codes fall back to the lowercased input. Delegates to the unified
+/// `commands_account::provider_info` table (L5 2026-04-17).
+fn provider_canonical(code: &str) -> String {
+    commands_account::provider_info(code)
+        .map(|i| i.canonical_code.to_string())
+        .unwrap_or_else(|| code.to_lowercase())
+}
+
+/// Provider code → proxy URL path segment used when building `base_url` for
+/// third-party clients. Unknown codes fall back to the lowercased input so new
+/// providers registered server-side keep working before the CLI knows them.
+fn provider_proxy_path(code: &str) -> String {
+    commands_account::provider_info(code)
+        .map(|i| i.proxy_path.to_string())
+        .unwrap_or_else(|| code.to_lowercase())
+}
+
+/// Threshold (in chars) below which a token is shown in full. Above it, the token
+/// is truncated as "first 15 chars + ... + last 4 chars". Keep in sync with the
+/// truncation formula so padding math stays consistent.
+const TOKEN_TRUNCATE_THRESHOLD: usize = 24;
+// Token column width. A truncated `aikey_vk_xxxxxx...yyyy` is 22 chars; +1 pad
+// is enough to keep base_url from touching the token. Previously 38, which left
+// a big visual gap — user reported the API_KEY/BASE URL pairing felt far apart.
+const TOKEN_DISPLAY_WIDTH: usize = 23;
+const PROVIDER_COL_WIDTH: usize = 13;
+const LABEL_COL_WIDTH: usize = 28; // wide enough for most emails; longer labels truncated
+
+/// Truncates a string to a max visual width (by char count), appending "…" when cut.
+/// Why char-based: handles non-ASCII labels (e.g. CJK) without splitting code points.
+fn truncate_to(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
     }
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}\u{2026}", kept) // '…'
+}
+
+/// Category order for the route table. Team first, OAuth next, personal last,
+/// so the user sees organization-wide keys before individual ones.
+fn route_type_order(t: &str) -> u8 {
+    match t {
+        "team" => 0,
+        "oauth" => 1,
+        "personal" => 2,
+        _ => 99,
+    }
+}
+
+/// Render the copy-paste config panel for one or more route entries.
+/// Same layout is used by `aikey route <label>` and the interactive picker
+/// so both surfaces feel consistent.
+fn print_route_config(entries: &[&RouteEntry]) {
+    use colored::Colorize;
+    if entries.is_empty() { return; }
+    let head = entries[0];
+
+    // Title: label + colored [type] badge + provider(s).
+    let providers = {
+        let mut ps: Vec<&str> = entries.iter().map(|e| e.provider.as_str()).collect();
+        ps.sort(); ps.dedup();
+        ps.join(", ")
+    };
+    let type_badge = match head.key_type.as_str() {
+        "team" => "[team]".cyan().bold().to_string(),
+        "oauth" => "[oauth]".magenta().bold().to_string(),
+        "personal" => "[personal]".yellow().bold().to_string(),
+        _ => format!("[{}]", head.key_type),
+    };
+
+    println!();
+    println!("  \u{1F511}  {}  {}  {}",
+        head.label.bold(),
+        type_badge,
+        format!("\u{2192} {}", providers).dimmed());
+    println!("  {}", "\u{2500}".repeat(68).dimmed());
+    println!();
+
+    // Key/value block. Values are plain (no color) so they survive copy-paste.
+    let show_pair = |e: &RouteEntry, prefix: Option<&str>| {
+        if let Some(p) = prefix { println!("  {}", format!("[{}]", p).cyan()); }
+        println!("    {}   {}", "base_url".dimmed(), e.base_url);
+        println!("    {}    {}", "api_key".dimmed(), e.api_key);
+    };
+
+    if entries.len() == 1 {
+        show_pair(head, None);
+    } else {
+        for (i, e) in entries.iter().enumerate() {
+            show_pair(e, Some(&e.provider));
+            if i + 1 < entries.len() { println!(); }
+        }
+    }
+
+    // Shell export snippet — the most common downstream paste target.
+    println!();
+    println!("  {}", "shell snippet:".dimmed());
+    for e in entries {
+        let env_prefix = e.provider.to_uppercase();
+        println!("    export {}_BASE_URL=\"{}\"", env_prefix, e.base_url);
+        println!("    export {}_API_KEY=\"{}\"", env_prefix, e.api_key);
+    }
+    // Or let `aikey activate` set it up in the current terminal session —
+    // handy when the user doesn't want to wire env vars manually.
+    println!();
+    println!("  {}", "or activate for this terminal:".dimmed());
+    println!("    aikey activate {}", head.label.cyan());
+    println!();
 }
 
 fn handle_route(
@@ -2156,25 +2299,31 @@ fn handle_route(
     let proxy_port = commands_proxy::proxy_port();
     let mut entries: Vec<RouteEntry> = Vec::new();
     let mut missing_token_count = 0usize;
+    let mut db_error_count = 0usize;
 
-    // Collect active bindings for "●" marker.
+    // Pre-index active bindings for O(1) lookup instead of O(N*M) linear scan.
     let bindings = storage::list_provider_bindings_readonly("default").unwrap_or_default();
-    let is_active = |source_type: &str, source_ref: &str| -> bool {
-        bindings.iter().any(|b| {
-            b.key_source_ref == source_ref && match source_type {
-                "team" => b.key_source_type == credential_type::CredentialType::ManagedVirtualKey,
-                "personal" => b.key_source_type == credential_type::CredentialType::PersonalApiKey,
-                "oauth" => b.key_source_type == credential_type::CredentialType::PersonalOAuthAccount,
-                _ => false,
-            }
+    let active_set: std::collections::HashSet<(&'static str, String)> = bindings.iter()
+        .map(|b| {
+            let kind: &'static str = match b.key_source_type {
+                credential_type::CredentialType::ManagedVirtualKey => "team",
+                credential_type::CredentialType::PersonalApiKey => "personal",
+                credential_type::CredentialType::PersonalOAuthAccount => "oauth",
+            };
+            (kind, b.key_source_ref.clone())
         })
+        .collect();
+    let is_active = |source_type: &'static str, source_ref: &str| -> bool {
+        active_set.contains(&(source_type, source_ref.to_string()))
     };
 
     // 1. Team managed keys
     for vk in storage::list_virtual_key_cache_readonly().unwrap_or_default() {
-        // Only show team keys that the proxy will actually register in Registry.
-        // synced_inactive keys exist in vault but are NOT loaded by proxy.
-        if vk.local_state != "active" {
+        // Show any team key that's server-side active, so `aikey route` mirrors
+        // `aikey list` (synced_inactive keys are still available — the user can
+        // `aikey use` them). The `●` marker separately distinguishes routes the
+        // proxy is actually serving right now.
+        if vk.key_status != "active" {
             continue;
         }
         let display_alias = vk.local_alias.as_deref().unwrap_or(&vk.alias);
@@ -2195,7 +2344,7 @@ fn handle_route(
                 key_type: "team".to_string(),
                 label: display_alias.to_string(),
                 api_key: token.clone(),
-                base_url: format!("http://127.0.0.1:{}/{}", proxy_port, canonical_provider(prov)),
+                base_url: format!("http://127.0.0.1:{}/{}", proxy_port, provider_proxy_path(prov)),
                 active: is_active("team", &vk.virtual_key_id),
             });
         }
@@ -2209,16 +2358,20 @@ fn handle_route(
         match storage::get_provider_account_route_token_readonly(&acct.provider_account_id) {
             Ok(Some(token)) => {
                 entries.push(RouteEntry {
-                    provider: canonical_provider(&acct.provider).to_string(),
+                    provider: provider_canonical(&acct.provider),
                     key_type: "oauth".to_string(),
                     label: label_str.to_string(),
                     api_key: token,
-                    base_url: format!("http://127.0.0.1:{}/{}", proxy_port, canonical_provider(&acct.provider)),
+                    base_url: format!("http://127.0.0.1:{}/{}", proxy_port, provider_proxy_path(&acct.provider)),
                     active: is_active("oauth", &acct.provider_account_id),
                 });
             }
             Ok(None) => { missing_token_count += 1; }
-            Err(_) => { missing_token_count += 1; }
+            Err(e) => {
+                eprintln!("  {} Failed to read route token for OAuth account '{}': {}",
+                    "\u{26a0}".yellow(), label_str, e);
+                db_error_count += 1;
+            }
         }
     }
 
@@ -2230,27 +2383,41 @@ fn handle_route(
         }
         match storage::get_entry_route_token_readonly(&meta.alias) {
             Ok(Some(token)) => {
-                let providers = meta.supported_providers.as_deref()
-                    .unwrap_or_else(|| meta.provider_code.as_ref()
-                        .map(|p| std::slice::from_ref(p))
-                        .unwrap_or(&[]));
-                for prov in providers {
+                let providers: Vec<String> = match (&meta.supported_providers, &meta.provider_code) {
+                    (Some(list), _) if !list.is_empty() => list.clone(),
+                    (_, Some(p)) => vec![p.clone()],
+                    _ => Vec::new(),
+                };
+                for prov in &providers {
                     entries.push(RouteEntry {
                         provider: prov.clone(),
                         key_type: "personal".to_string(),
                         label: meta.alias.clone(),
                         api_key: token.clone(),
-                        base_url: format!("http://127.0.0.1:{}/{}", proxy_port, canonical_provider(prov)),
+                        base_url: format!("http://127.0.0.1:{}/{}", proxy_port, provider_proxy_path(prov)),
                         active: is_active("personal", &meta.alias),
                     });
                 }
             }
             Ok(None) => { missing_token_count += 1; }
-            Err(_) => { missing_token_count += 1; }
+            Err(e) => {
+                eprintln!("  {} Failed to read route token for personal key '{}': {}",
+                    "\u{26a0}".yellow(), meta.alias, e);
+                db_error_count += 1;
+            }
         }
     }
 
-    // If a specific label was requested, filter and show copy-paste config.
+    // Sort: team first, then OAuth, then personal. Within each group, alphabetical
+    // by label (so multi-provider keys cluster together) and then by provider.
+    entries.sort_by(|a, b| {
+        route_type_order(&a.key_type).cmp(&route_type_order(&b.key_type))
+            .then_with(|| a.label.cmp(&b.label))
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+
+    // If a specific label was requested, filter and show copy-paste config on stdout
+    // so `aikey route my-key | pbcopy` works as documented in the quickstart.
     if let Some(target) = label {
         let matched: Vec<&RouteEntry> = entries.iter()
             .filter(|e| e.label.eq_ignore_ascii_case(target))
@@ -2262,19 +2429,7 @@ fn handle_route(
         if json_mode {
             json_output::success(serde_json::json!({ "routes": matched }));
         } else {
-            let first = matched[0];
-            eprintln!("  # Configuration for: {} ({}, {})\n", first.label, first.key_type, first.provider);
-            if matched.len() == 1 {
-                eprintln!("  base_url:  {}", first.base_url);
-                eprintln!("  api_key:   {}", first.api_key);
-            } else {
-                for entry in &matched {
-                    eprintln!("  [{}]", entry.provider);
-                    eprintln!("  base_url:  {}", entry.base_url);
-                    eprintln!("  api_key:   {}", entry.api_key);
-                    eprintln!();
-                }
-            }
+            print_route_config(&matched);
         }
         return Ok(());
     }
@@ -2289,23 +2444,91 @@ fn handle_route(
         return Ok(());
     }
 
-    // Table header
-    eprintln!();
-    eprintln!("  {:<13} {:<10} {:<22} {:<38} {}",
-        "PROVIDER", "TYPE", "LABEL", "API_KEY", "BASE URL");
-    eprintln!("  {}", "\u{2500}".repeat(95));
+    // Active marker (`●`) lives in a dedicated leftmost column, so the label
+    // column no longer needs to reserve space for it inline.
+    let label_inner = LABEL_COL_WIDTH;
 
-    for entry in &entries {
-        let token_display = if full || entry.api_key.len() <= 24 {
-            entry.api_key.clone()
-        } else {
-            // Truncate: first 15 chars + "..." + last 4 chars
-            format!("{}...{}", &entry.api_key[..15], &entry.api_key[entry.api_key.len()-4..])
-        };
-        eprintln!("  {:<13} {:<10} {:<20}{} {:<38} {}",
-            entry.provider, entry.key_type, entry.label,
-            if entry.active { "\u{25cf}".green().to_string() } else { " ".to_string() },
-            token_display.dimmed(), entry.base_url.dimmed());
+    // Group entries by TYPE so the output reads as a tree:
+    //   team / oauth / personal → provider + label + token + base_url
+    // Entries are already sorted by `route_type_order`, so a simple group-by
+    // on consecutive same-typed rows preserves the intended ordering.
+    // Row number width derives from total count so `10.` and `1.` align on
+    // the dot column. The number sits *inside* the tree branch so the
+    // ordering cue follows the visual indent of each route.
+    let num_width = entries.len().to_string().len();
+    // Base-url column width for header separator sizing. Row layout is:
+    //   indent(2) + marker(1) + sp + connector(2) + sp + num_col(nw+1) + sp +
+    //   provider(pw) + sp + label(li) + sp + token(kw) + sp + base_url
+    let base_url_width = entries.iter()
+        .map(|e| e.base_url.chars().count())
+        .max()
+        .unwrap_or(0);
+    let total_width = 2 + 1 + 1 + 2 + 1 + (num_width + 1) + 1 + PROVIDER_COL_WIDTH
+        + 1 + label_inner + 1 + TOKEN_DISPLAY_WIDTH + 1 + base_url_width;
+
+    // Table header. Spaces stand in for the marker/connector columns so the
+    // data column labels line up with their rows:
+    //   row: "  {marker} {connector(2)} {num(nw+1)} {prov(pw)} {label(li)} {token(kw)} {base_url}"
+    //   hdr: "     {sp(2)}              {#(nw+1)}   {PROVIDER} {LABEL}     {API_KEY}   {BASE URL}"
+    eprintln!();
+    eprintln!("    {:<2} {:>nw$} {:<pw$} {:<li$} {:<kw$} {}",
+        "",
+        "#".dimmed(),
+        "PROVIDER".dimmed(),
+        "LABEL".dimmed(),
+        "API_KEY".dimmed(),
+        "BASE URL".dimmed(),
+        nw = num_width + 1, pw = PROVIDER_COL_WIDTH, li = label_inner,
+        kw = TOKEN_DISPLAY_WIDTH);
+    eprintln!("  {}", "\u{2500}".repeat(total_width.min(120)).dimmed());
+
+    let mut prev_token = String::new();
+    let mut i = 0;
+    while i < entries.len() {
+        let group_type = entries[i].key_type.clone();
+        let group_end = entries[i..].iter()
+            .position(|e| e.key_type != group_type)
+            .map(|p| i + p)
+            .unwrap_or(entries.len());
+
+        // Group header (TYPE is the tree root) — indented past the marker column
+        // so it aligns with the `#` header above.
+        eprintln!("    {}", group_type.bold().cyan());
+
+        let last_in_group = group_end - 1;
+        for (idx, entry) in entries[i..group_end].iter().enumerate() {
+            let real_idx = i + idx;
+            let connector = if real_idx == last_in_group { "└─" } else { "├─" };
+
+            // Collapse duplicate tokens on consecutive rows (same key, different providers).
+            let token_display = if entry.api_key == prev_token {
+                "\u{21b3} (same)".to_string()
+            } else if full || entry.api_key.len() <= TOKEN_TRUNCATE_THRESHOLD {
+                entry.api_key.clone()
+            } else {
+                format!("{}...{}", &entry.api_key[..15], &entry.api_key[entry.api_key.len()-4..])
+            };
+            prev_token = entry.api_key.clone();
+
+            // Pad the plain string BEFORE applying .dimmed(); otherwise ANSI escape codes
+            // inflate the byte count passed to {:<N} and break column alignment.
+            let token_padded = format!("{:<kw$}", token_display, kw = TOKEN_DISPLAY_WIDTH);
+            let active_marker = if entry.active {
+                "\u{25cf}".green().to_string()
+            } else {
+                " ".to_string()
+            };
+            let label_display = truncate_to(&entry.label, label_inner);
+            // 1-based row number, right-aligned with trailing dot.
+            let num_col = format!("{:>nw$}.", real_idx + 1, nw = num_width);
+            eprintln!("  {} {} {} {:<pw$} {:<li$} {} {}",
+                active_marker, connector.dimmed(), num_col.dimmed(),
+                entry.provider, label_display,
+                token_padded.dimmed(), entry.base_url.dimmed(),
+                pw = PROVIDER_COL_WIDTH, li = label_inner);
+        }
+        eprintln!();
+        i = group_end;
     }
 
     // Count unique providers
@@ -2313,24 +2536,64 @@ fn handle_route(
     providers.sort();
     providers.dedup();
     eprintln!();
-    eprintln!("  {} = active (set by `aikey use`)", "\u{25cf}".green());
-    eprintln!("  {} providers, {} routes available", providers.len(), entries.len());
-    eprintln!();
-    let example_label = entries.first().map(|e| e.label.as_str()).unwrap_or("my-key");
-    eprintln!("  {} {} {}",
-        "\u{27a4}".cyan(),
-        "Copy-paste config:".bold(),
-        format!("aikey route {}", example_label).cyan());
+    // Legend + summary are dim: they're secondary context, the data above is
+    // what the user actually came for.
+    eprintln!("  {}",
+        format!("{} = active (set by `aikey use`),  {} = same token as previous row",
+            "\u{25cf}", "\u{21b3}").dimmed());
+    eprintln!("  {}",
+        format!("{} providers, {} routes available",
+            providers.len(), entries.len()).dimmed());
 
     if missing_token_count > 0 {
         eprintln!();
         eprintln!("  {} {} keys missing route token. Run `aikey use` or `aikey add` to complete setup.",
             "\u{26a0}".yellow(), missing_token_count);
     }
+    if db_error_count > 0 {
+        eprintln!();
+        eprintln!("  {} {} database error(s) while reading route tokens — check vault integrity.",
+            "\u{26a0}".red(), db_error_count);
+    }
 
     if !commands_proxy::is_proxy_running() {
         eprintln!();
         eprintln!("  {} Proxy is not running. Start with: aikey proxy start", "\u{26a0}".yellow());
+    }
+
+    // Interactive picker: prompt only in a TTY session (not when output is
+    // piped, redirected, or in automation). Enter with an empty input cancels;
+    // a valid number prints the copy-paste config for that row.
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        eprintln!();
+        eprint!("  {} {} ",
+            "?".cyan().bold(),
+            format!("Show config for route # (1-{}, Enter to cancel):", entries.len()).bold());
+        let _ = std::io::stderr().flush();
+
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            let trimmed = input.trim();
+            if trimmed.is_empty() {
+                return Ok(());
+            }
+            match trimmed.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= entries.len() => {
+                    print_route_config(&[&entries[n - 1]]);
+                }
+                _ => {
+                    eprintln!("  {} Invalid selection — expected a number between 1 and {}.",
+                        "\u{26a0}".yellow(), entries.len());
+                }
+            }
+        }
+    } else {
+        eprintln!();
+        let example_label = entries.first().map(|e| e.label.as_str()).unwrap_or("my-key");
+        eprintln!("  {} {} {}",
+            "\u{27a4}".cyan(),
+            "Copy-paste config:".bold(),
+            format!("aikey route {}", example_label).cyan());
     }
 
     eprintln!();
@@ -2911,27 +3174,46 @@ fn powershell_escape(s: &str) -> String {
 
 /// Escape a string for safe use in cmd.exe `set` statements.
 /// Rejects labels containing characters that could break cmd parsing.
+/// Why `+` allowed: email-tag syntax (alice+work@example.com) is common.
+/// Why not more chars: cmd's `set VAR=VALUE` treats `& | ^ > < ( ) % !` specially.
 fn cmd_escape(s: &str) -> Result<String, String> {
-    // cmd `set VAR=VALUE` is unquoted; reject dangerous characters.
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-')) {
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-' | '+')) {
         Ok(s.to_string())
     } else {
         Err(format!(
             "Label '{}' contains characters unsafe for cmd.exe. \
-             Allowed: [a-zA-Z0-9._@-]",
+             Allowed: [a-zA-Z0-9._@+-]. Use PowerShell (--shell powershell) for broader label support.",
             s
         ))
     }
 }
 
-/// Escape label for safe embedding in zsh PROMPT (prompt expansion: % is special).
-fn zsh_prompt_escape(s: &str) -> String {
-    s.replace('%', "%%")
+/// Sanitize a label for safe embedding in an interactive prompt string.
+/// Rewrites any character that would trigger shell re-expansion (parameter,
+/// command, history, escape sequences) to `_`.
+///
+/// Why sanitize, not escape: bash PS1 with `promptvars` (ON by default) and zsh
+/// PROMPT with `PROMPT_SUBST` (common via oh-my-zsh) re-expand `$(...)`, ``...``,
+/// `$var` during display. Even with backslash escaping, expansion semantics make
+/// true literal display fragile across shell versions. Replacing with `_` yields
+/// a predictable, injection-free cosmetic label.
+fn sanitize_prompt_label(s: &str) -> String {
+    s.chars().map(|c| match c {
+        // Shell re-expansion vectors.
+        '\\' | '$' | '`' | '!' | '\n' | '\r' | '\t' => '_',
+        other => other,
+    }).collect()
 }
 
-/// Escape label for safe embedding in bash PS1 (prompt expansion: \\ is special).
+/// Escape label for safe embedding in zsh PROMPT: strip expansion metacharacters
+/// first, then escape the zsh-specific `%` prompt-expansion marker.
+fn zsh_prompt_escape(s: &str) -> String {
+    sanitize_prompt_label(s).replace('%', "%%")
+}
+
+/// Escape label for safe embedding in bash PS1 with promptvars enabled.
 fn bash_prompt_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
+    sanitize_prompt_label(s)
 }
 
 /// All known provider env var pairs — used by deactivate to unset everything.
@@ -2944,6 +3226,41 @@ const ALL_PROVIDER_ENV_PAIRS: &[(&str, &str)] = &[
     ("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"),
     ("MOONSHOT_API_KEY", "MOONSHOT_BASE_URL"),
 ];
+
+/// All known provider env var names (flattened from ALL_PROVIDER_ENV_PAIRS).
+fn all_provider_vars() -> Vec<&'static str> {
+    ALL_PROVIDER_ENV_PAIRS.iter().flat_map(|(k, v)| [*k, *v]).collect()
+}
+
+/// Probe all three sources (team, OAuth, personal) to check where `alias` exists.
+/// Returns the source labels in priority order (team > oauth > personal).
+/// Used by `aikey activate` to warn about ambiguity before resolving.
+fn probe_alias_sources(alias: &str) -> Vec<&'static str> {
+    let mut sources = Vec::new();
+
+    let team_exists = storage::get_virtual_key_cache(alias).ok().flatten().is_some()
+        || storage::get_virtual_key_cache_by_alias(alias).ok().flatten().is_some();
+    if team_exists {
+        sources.push("team");
+    }
+
+    let oauth_exists = storage::list_provider_accounts_readonly()
+        .unwrap_or_default()
+        .iter()
+        .any(|a| {
+            let id = a.display_identity.as_deref().unwrap_or(&a.provider_account_id);
+            id.eq_ignore_ascii_case(alias) || a.provider_account_id.eq_ignore_ascii_case(alias)
+        });
+    if oauth_exists {
+        sources.push("OAuth");
+    }
+
+    if storage::entry_exists(alias).unwrap_or(false) {
+        sources.push("personal");
+    }
+
+    sources
+}
 
 /// Resolve key alias → (display_label, route_token, target_provider).
 ///
@@ -3037,8 +3354,8 @@ fn resolve_single_provider(
         let code = ov.to_lowercase();
         if !providers.iter().any(|p| p.to_lowercase() == code) {
             return Err(format!(
-                "Key '{}' does not support provider '{}'. Supported: {}",
-                display, code, providers.join(", ")
+                "Key '{}' does not support provider '{}'. Supported: {}.\n  Try: aikey activate {} --provider {}",
+                display, code, providers.join(", "), display, providers[0].to_lowercase()
             ).into());
         }
         return Ok(code);
@@ -3047,13 +3364,13 @@ fn resolve_single_provider(
         return Ok(providers[0].to_lowercase());
     }
     Err(format!(
-        "Key '{}' supports multiple providers: {}. Specify --provider <name>.",
-        display, providers.join(", ")
+        "Key '{}' supports multiple providers: {}. Specify --provider <name>:\n  aikey activate {} --provider {}",
+        display, providers.join(", "), display, providers[0].to_lowercase()
     ).into())
 }
 
 /// Auto-detect the current shell from the SHELL environment variable.
-/// Returns "zsh", "bash", "powershell", or None if unrecognized.
+/// Returns "zsh", "bash", "powershell", "cmd", or None if unrecognized.
 fn detect_shell() -> Option<&'static str> {
     let shell_env = std::env::var("SHELL").unwrap_or_default();
     if shell_env.contains("zsh") { return Some("zsh"); }
@@ -3063,6 +3380,37 @@ fn detect_shell() -> Option<&'static str> {
     // Windows cmd: PROMPT env var is typically set.
     if std::env::var("PROMPT").is_ok() && cfg!(windows) { return Some("cmd"); }
     None
+}
+
+/// Probe whether the user is running a shell we recognise but don't yet support,
+/// so the error message can point them at a concrete workaround instead of a
+/// generic "could not detect" hint.
+fn detect_unsupported_shell() -> Option<&'static str> {
+    let shell_env = std::env::var("SHELL").unwrap_or_default();
+    if shell_env.contains("fish") { return Some("fish"); }
+    // Nushell sets $SHELL to the nu binary; also check $NU_VERSION for robustness.
+    if shell_env.contains("/nu") || std::env::var("NU_VERSION").is_ok() {
+        return Some("nushell");
+    }
+    None
+}
+
+/// Build the error message shown when `--shell` was not provided and auto-detect
+/// couldn't identify the shell. For known-but-unsupported shells (fish, nushell),
+/// point the user at the manual workaround via `aikey route`.
+fn shell_detection_error() -> String {
+    if let Some(unsupp) = detect_unsupported_shell() {
+        format!(
+            "{} shell is not yet supported by `aikey activate`.\n  \
+             Workaround: run `aikey route <alias>` to get the API Key + base URL\n  \
+             and export them manually with your shell's native syntax.",
+            unsupp
+        )
+    } else {
+        "Could not detect shell type. Pass --shell explicitly, e.g.:\n  \
+         eval $(aikey activate <alias> --shell zsh)"
+            .into()
+    }
 }
 
 /// `aikey activate <alias> [--shell <shell>]` — output eval-safe export statements.
@@ -3076,32 +3424,29 @@ fn handle_activate(
     shell: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let detected;
-    let (shell, via_wrapper) = match shell {
-        Some(s) => (s, true),
+    let shell = match shell {
+        Some(s) => s,
         None => {
-            detected = detect_shell().ok_or(
-                "Could not detect shell type. Pass --shell explicitly, e.g.:\n\
-                 eval $(aikey activate <alias> --shell zsh)"
-            )?;
+            detected = detect_shell().ok_or_else(shell_detection_error)?;
             // When user calls binary directly (no wrapper), remind them to eval.
+            // All hints go to stderr — stdout stays pure shell code so the output
+            // is eval-safe even for direct invocations (H1 fix).
             eprintln!("\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m", detected);
             eprintln!("\x1b[90m  eval $(aikey activate {} --shell {})\x1b[0m", alias, detected);
-            (detected, false)
+            detected
         }
     };
-    // When called directly (not via wrapper), stdout is visible on terminal.
-    // Dim it so it doesn't distract — the user can't eval it anyway.
-    let dim = if via_wrapper { "" } else { "\x1b[90m" };
-    let reset = if via_wrapper { "" } else { "\x1b[0m" };
+
+    // M2: warn if alias collides across sources. Priority (team > OAuth > personal)
+    // is preserved by resolve_activate_key, but silent selection can confuse users.
+    let sources = probe_alias_sources(alias);
+    if sources.len() > 1 {
+        eprintln!("\x1b[33m  \u{26a0} Alias '{}' exists in multiple sources: {}. Using {} (priority: team > OAuth > personal).\x1b[0m",
+            alias, sources.join(", "), sources[0]);
+        eprintln!("\x1b[90m    Rename one with `aikey rename` to remove the ambiguity.\x1b[0m");
+    }
 
     let (label, token, provider) = resolve_activate_key(alias, provider_override)?;
-
-    // Why: resolve_activate_key may generate a new route token (first activate of a
-    // personal/OAuth key). The proxy's in-memory Registry won't know about it until
-    // the vault change-seq is bumped and a reload is triggered. Without this, the
-    // token we just output would hit TOKEN_INVALID on the running proxy.
-    let _ = storage::bump_vault_change_seq();
-    commands_proxy::try_reload_proxy();
 
     let proxy_port = commands_proxy::proxy_port();
     let (api_key_var, base_url_var) = commands_account::provider_env_vars_pub(&provider)
@@ -3112,57 +3457,72 @@ fn handle_activate(
         commands_account::provider_proxy_prefix_pub(&provider)
     );
 
-    // When called directly (not via wrapper), dim stdout so shell statements
-    // don't visually distract — the user can't eval them from a direct call anyway.
-    if !via_wrapper { print!("{}", dim); }
+    let provider_vars = all_provider_vars();
 
     match shell {
-        "zsh" => {
-            let prompt_label = zsh_prompt_escape(&label);
-            let unset_vars: Vec<&str> = ALL_PROVIDER_ENV_PAIRS.iter()
-                .flat_map(|(k, v)| [*k, *v])
-                .collect();
-            println!("unset {}", unset_vars.join(" "));
+        "zsh" | "bash" => {
+            let (prompt_var, orig_prompt_var, prompt_label) = if shell == "zsh" {
+                ("PROMPT", "_AIKEY_ORIG_PROMPT", zsh_prompt_escape(&label))
+            } else {
+                ("PS1", "_AIKEY_ORIG_PS1", bash_prompt_escape(&label))
+            };
+
+            // M5: save user's current provider env values (if any) BEFORE unset,
+            // so deactivate can restore them. Guarded by -z check so nested
+            // activates don't overwrite the original save.
+            for var in &provider_vars {
+                println!(
+                    "if [ -n \"${v}\" ] && [ -z \"$_AIKEY_ORIG_{v}\" ]; then _AIKEY_ORIG_{v}=\"${v}\"; fi",
+                    v = var
+                );
+            }
+
+            println!("unset {}", provider_vars.join(" "));
             println!("export AIKEY_ACTIVE_LABEL={}", shell_escape(&label));
             println!("export _AIKEY_PROMPT_LABEL={}", shell_escape(&prompt_label));
             println!("export {}={}", api_key_var, shell_escape(&token));
             println!("export {}={}", base_url_var, shell_escape(&base_url));
-            println!("if [ -z \"$_AIKEY_ORIG_PROMPT\" ]; then _AIKEY_ORIG_PROMPT=\"$PROMPT\"; fi");
-            println!("PROMPT=\"($_AIKEY_PROMPT_LABEL) $_AIKEY_ORIG_PROMPT\"");
-        }
-        "bash" => {
-            let prompt_label = bash_prompt_escape(&label);
-            let unset_vars: Vec<&str> = ALL_PROVIDER_ENV_PAIRS.iter()
-                .flat_map(|(k, v)| [*k, *v])
-                .collect();
-            println!("unset {}", unset_vars.join(" "));
-            println!("export AIKEY_ACTIVE_LABEL={}", shell_escape(&label));
-            println!("export _AIKEY_PROMPT_LABEL={}", shell_escape(&prompt_label));
-            println!("export {}={}", api_key_var, shell_escape(&token));
-            println!("export {}={}", base_url_var, shell_escape(&base_url));
-            println!("if [ -z \"$_AIKEY_ORIG_PS1\" ]; then _AIKEY_ORIG_PS1=\"$PS1\"; fi");
-            println!("PS1=\"($_AIKEY_PROMPT_LABEL) $_AIKEY_ORIG_PS1\"");
+            println!(
+                "if [ -z \"${op}\" ]; then {op}=\"${pv}\"; fi",
+                op = orig_prompt_var, pv = prompt_var
+            );
+            println!(
+                "{pv}=\"($_AIKEY_PROMPT_LABEL) ${op}\"",
+                pv = prompt_var, op = orig_prompt_var
+            );
         }
         "powershell" => {
-            let unset_vars: Vec<&str> = ALL_PROVIDER_ENV_PAIRS.iter()
-                .flat_map(|(k, v)| [*k, *v])
-                .collect();
-            for var in &unset_vars {
+            // M5: save user's current provider env vars (if any) before overwrite.
+            for var in &provider_vars {
+                println!(
+                    "if ($env:{v} -and -not $env:_AIKEY_ORIG_{v}) {{ $env:_AIKEY_ORIG_{v} = $env:{v} }}",
+                    v = var
+                );
+            }
+            for var in &provider_vars {
                 println!("Remove-Item Env:\\{} -ErrorAction SilentlyContinue", var);
             }
             println!("$env:AIKEY_ACTIVE_LABEL = {}", powershell_escape(&label));
             println!("$env:_AIKEY_PROMPT_LABEL = {}", powershell_escape(&label));
             println!("$env:{} = {}", api_key_var, powershell_escape(&token));
             println!("$env:{} = {}", base_url_var, powershell_escape(&base_url));
-            println!("if (-not $env:_AIKEY_ORIG_PROMPT_FN) {{ $env:_AIKEY_ORIG_PROMPT_FN = (Get-Item function:prompt).ScriptBlock.ToString() }}");
-            println!("function global:prompt {{ \"($env:_AIKEY_PROMPT_LABEL) \" + (Invoke-Expression $env:_AIKEY_ORIG_PROMPT_FN) }}");
+            // M4: store the original prompt as a ScriptBlock in a global variable,
+            // not a stringified env var. Avoids Invoke-Expression (arbitrary code
+            // execution from env var) and preserves closure scope for module-defined
+            // prompt helpers (oh-my-posh, starship).
+            println!("if (-not (Get-Variable -Scope Global -Name _aikeyOrigPrompt -ErrorAction SilentlyContinue)) {{ Set-Variable -Scope Global -Name _aikeyOrigPrompt -Value (Get-Item function:prompt).ScriptBlock }}");
+            println!("function global:prompt {{ \"($env:_AIKEY_PROMPT_LABEL) \" + (& $global:_aikeyOrigPrompt) }}");
         }
         "cmd" => {
             let safe_label = cmd_escape(&label)?;
-            let unset_vars: Vec<&str> = ALL_PROVIDER_ENV_PAIRS.iter()
-                .flat_map(|(k, v)| [*k, *v])
-                .collect();
-            for var in &unset_vars {
+            // M5: save user's current provider env vars (if any) before overwrite.
+            for var in &provider_vars {
+                println!(
+                    "if defined {v} if not defined _AIKEY_ORIG_{v} set \"_AIKEY_ORIG_{v}=%{v}%\"",
+                    v = var
+                );
+            }
+            for var in &provider_vars {
                 println!("set {}=", var);
             }
             println!("set AIKEY_ACTIVE_LABEL={}", safe_label);
@@ -3172,15 +3532,12 @@ fn handle_activate(
             println!("prompt (%_AIKEY_PROMPT_LABEL%) $P$G");
         }
         other => {
-            if !via_wrapper { print!("{}", reset); }
             return Err(format!(
                 "Unsupported shell '{}'. Supported: zsh, bash, powershell, cmd.",
                 other
             ).into());
         }
     }
-
-    if !via_wrapper { println!("{}", reset); }
 
     // Human-readable confirmation on stderr (not captured by wrapper).
     eprintln!("\x1b[90m  Activated: {} \u{2192} {} ({})\x1b[0m", label, provider, shell);
@@ -3196,54 +3553,64 @@ fn handle_deactivate(
     let shell = match shell {
         Some(s) => s,
         None => {
-            detected = detect_shell().ok_or(
-                "Could not detect shell type. Pass --shell explicitly, e.g.:\n\
-                 eval $(aikey deactivate --shell zsh)"
-            )?;
+            detected = detect_shell().ok_or_else(shell_detection_error)?;
             eprintln!("\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m", detected);
             eprintln!("\x1b[90m  eval $(aikey deactivate --shell {})\x1b[0m", detected);
             detected
         }
     };
 
+    let provider_vars = all_provider_vars();
+
     match shell {
-        "zsh" => {
-            let unset_vars: Vec<&str> = ALL_PROVIDER_ENV_PAIRS.iter()
-                .flat_map(|(k, v)| [*k, *v])
-                .collect();
+        "zsh" | "bash" => {
+            let (prompt_var, orig_prompt_var) = if shell == "zsh" {
+                ("PROMPT", "_AIKEY_ORIG_PROMPT")
+            } else {
+                ("PS1", "_AIKEY_ORIG_PS1")
+            };
             println!("unset AIKEY_ACTIVE_LABEL _AIKEY_PROMPT_LABEL");
-            println!("unset {}", unset_vars.join(" "));
-            println!("if [ -n \"$_AIKEY_ORIG_PROMPT\" ]; then PROMPT=\"$_AIKEY_ORIG_PROMPT\"; unset _AIKEY_ORIG_PROMPT; fi");
+            println!("unset {}", provider_vars.join(" "));
+            println!(
+                "if [ -n \"${op}\" ]; then {pv}=\"${op}\"; unset {op}; fi",
+                pv = prompt_var, op = orig_prompt_var
+            );
+            // Global defaults from active.env first, then user's pre-activate values
+            // override (M5). User's manual values thus win over any aikey-managed
+            // global settings, matching the state they saw before activate.
             println!("[ -f ~/.aikey/active.env ] && source ~/.aikey/active.env");
-        }
-        "bash" => {
-            let unset_vars: Vec<&str> = ALL_PROVIDER_ENV_PAIRS.iter()
-                .flat_map(|(k, v)| [*k, *v])
-                .collect();
-            println!("unset AIKEY_ACTIVE_LABEL _AIKEY_PROMPT_LABEL");
-            println!("unset {}", unset_vars.join(" "));
-            println!("if [ -n \"$_AIKEY_ORIG_PS1\" ]; then PS1=\"$_AIKEY_ORIG_PS1\"; unset _AIKEY_ORIG_PS1; fi");
-            println!("[ -f ~/.aikey/active.env ] && source ~/.aikey/active.env");
+            for var in &provider_vars {
+                println!(
+                    "if [ -n \"$_AIKEY_ORIG_{v}\" ]; then export {v}=\"$_AIKEY_ORIG_{v}\"; unset _AIKEY_ORIG_{v}; fi",
+                    v = var
+                );
+            }
         }
         "powershell" => {
-            let all_vars: Vec<&str> = ALL_PROVIDER_ENV_PAIRS.iter()
-                .flat_map(|(k, v)| [*k, *v])
+            let all_vars: Vec<&str> = provider_vars.iter().copied()
                 .chain(["AIKEY_ACTIVE_LABEL", "_AIKEY_PROMPT_LABEL"].iter().copied())
                 .collect();
             for var in &all_vars {
                 println!("Remove-Item Env:\\{} -ErrorAction SilentlyContinue", var);
             }
-            println!("if ($env:_AIKEY_ORIG_PROMPT_FN) {{ function global:prompt {{ Invoke-Expression $env:_AIKEY_ORIG_PROMPT_FN }}; Remove-Item Env:\\_AIKEY_ORIG_PROMPT_FN -ErrorAction SilentlyContinue }}");
+            // M4: restore original prompt ScriptBlock (not re-eval a string env var).
+            println!("if (Get-Variable -Scope Global -Name _aikeyOrigPrompt -ErrorAction SilentlyContinue) {{ Set-Item function:global:prompt $global:_aikeyOrigPrompt; Remove-Variable -Scope Global -Name _aikeyOrigPrompt }}");
             // Restore global settings from active.env.flat (plain KEY=VALUE, no sh syntax).
             // Why .flat instead of .env: active.env contains sh-expansion like ${NO_PROXY:-}
             // which PowerShell would import as literal text, breaking proxy bypass config.
             // active.env.flat is generated alongside active.env with pure literal values.
             println!("$_af = if ($env:HOME) {{ Join-Path $env:HOME '.aikey' 'active.env.flat' }} else {{ Join-Path $env:USERPROFILE '.aikey' 'active.env.flat' }}");
             println!("if (Test-Path $_af) {{ Get-Content $_af | ForEach-Object {{ if ($_ -match '^(\\w+)=(.*)$') {{ [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }} }} }}");
+            // M5: user's pre-activate values override the global fallback.
+            for var in &provider_vars {
+                println!(
+                    "if ($env:_AIKEY_ORIG_{v}) {{ $env:{v} = $env:_AIKEY_ORIG_{v}; Remove-Item Env:\\_AIKEY_ORIG_{v} -ErrorAction SilentlyContinue }}",
+                    v = var
+                );
+            }
         }
         "cmd" => {
-            let all_vars: Vec<&str> = ALL_PROVIDER_ENV_PAIRS.iter()
-                .flat_map(|(k, v)| [*k, *v])
+            let all_vars: Vec<&str> = provider_vars.iter().copied()
                 .chain(["AIKEY_ACTIVE_LABEL", "_AIKEY_PROMPT_LABEL"].iter().copied())
                 .collect();
             for var in &all_vars {
@@ -3261,6 +3628,13 @@ fn handle_deactivate(
             println!("if not defined _AF if defined USERPROFILE (set \"_AF=%USERPROFILE%\\.aikey\\active.env.flat\")");
             println!("if defined _AF if exist \"%_AF%\" (for /f \"usebackq tokens=1,* delims==\" %%A in (\"%_AF%\") do set \"%%A=%%B\")");
             println!("set \"_AF=\"");
+            // M5: user's pre-activate values override the global fallback.
+            for var in &provider_vars {
+                println!(
+                    "if defined _AIKEY_ORIG_{v} (set \"{v}=%_AIKEY_ORIG_{v}%\" & set \"_AIKEY_ORIG_{v}=\")",
+                    v = var
+                );
+            }
         }
         other => {
             return Err(format!(
@@ -3275,127 +3649,6 @@ fn handle_deactivate(
 }
 
 #[cfg(test)]
-mod activate_tests {
-    use super::*;
-
-    // ── shell_escape ────────────────────────────────────────────────────────
-
-    #[test]
-    fn shell_escape_plain() {
-        assert_eq!(shell_escape("hello"), "'hello'");
-    }
-
-    #[test]
-    fn shell_escape_single_quote() {
-        assert_eq!(shell_escape("it's"), "'it'\\''s'");
-    }
-
-    #[test]
-    fn shell_escape_dollar_parens() {
-        assert_eq!(shell_escape("$(rm -rf /)"), "'$(rm -rf /)'");
-    }
-
-    #[test]
-    fn shell_escape_backtick() {
-        assert_eq!(shell_escape("`cmd`"), "'`cmd`'");
-    }
-
-    #[test]
-    fn shell_escape_newline() {
-        assert_eq!(shell_escape("a\nb"), "'a\nb'");
-    }
-
-    #[test]
-    fn shell_escape_double_quotes() {
-        assert_eq!(shell_escape(r#"test"key"#), r#"'test"key'"#);
-    }
-
-    // ── powershell_escape ───────────────────────────────────────────────────
-
-    #[test]
-    fn powershell_escape_single_quote() {
-        assert_eq!(powershell_escape("it's"), "'it''s'");
-    }
-
-    #[test]
-    fn powershell_escape_plain() {
-        assert_eq!(powershell_escape("hello"), "'hello'");
-    }
-
-    // ── cmd_escape ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn cmd_escape_safe() {
-        assert!(cmd_escape("my-key_01.test@host").is_ok());
-    }
-
-    #[test]
-    fn cmd_escape_unsafe_ampersand() {
-        assert!(cmd_escape("a&b").is_err());
-    }
-
-    #[test]
-    fn cmd_escape_unsafe_pipe() {
-        assert!(cmd_escape("a|b").is_err());
-    }
-
-    #[test]
-    fn cmd_escape_unsafe_spaces() {
-        assert!(cmd_escape("a b").is_err());
-    }
-
-    // ── prompt escaping ─────────────────────────────────────────────────────
-
-    #[test]
-    fn zsh_prompt_escape_percent() {
-        assert_eq!(zsh_prompt_escape("%F{red}evil%f"), "%%F{red}evil%%f");
-    }
-
-    #[test]
-    fn zsh_prompt_escape_safe_label() {
-        assert_eq!(zsh_prompt_escape("my-key-01"), "my-key-01");
-    }
-
-    #[test]
-    fn bash_prompt_escape_backslash() {
-        assert_eq!(bash_prompt_escape("\\u@\\h"), "\\\\u@\\\\h");
-    }
-
-    #[test]
-    fn bash_prompt_escape_safe_label() {
-        assert_eq!(bash_prompt_escape("my-key-01"), "my-key-01");
-    }
-
-    // ── resolve_single_provider ─────────────────────────────────────────────
-
-    #[test]
-    fn single_provider_no_override() {
-        let providers = vec!["anthropic".to_string()];
-        let result = resolve_single_provider("key1", &providers, None);
-        assert_eq!(result.unwrap(), "anthropic");
-    }
-
-    #[test]
-    fn multi_provider_no_override_errors() {
-        let providers = vec!["anthropic".to_string(), "openai".to_string()];
-        let result = resolve_single_provider("key1", &providers, None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("multiple providers"));
-    }
-
-    #[test]
-    fn multi_provider_with_override() {
-        let providers = vec!["anthropic".to_string(), "openai".to_string()];
-        let result = resolve_single_provider("key1", &providers, Some("openai"));
-        assert_eq!(result.unwrap(), "openai");
-    }
-
-    #[test]
-    fn provider_override_not_supported() {
-        let providers = vec!["anthropic".to_string()];
-        let result = resolve_single_provider("key1", &providers, Some("openai"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("does not support"));
-    }
-}
+#[path = "activate_tests.rs"]
+mod activate_tests;
 

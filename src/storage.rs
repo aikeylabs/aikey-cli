@@ -1537,23 +1537,36 @@ pub fn ensure_provider_account_route_token(account_id: &str) -> Result<String, S
 /// One-time backfill: generate route_tokens for all entries and provider_accounts
 /// that are missing one. Called from ensure_schema() in write-path CLI commands.
 /// Returns the number of tokens generated (0 if nothing to do).
+///
+/// Why transaction: many small UPDATEs wrapped in one transaction avoid per-statement
+/// fsync overhead AND guarantee all-or-nothing semantics if the process is killed mid-loop.
 pub fn backfill_route_tokens() -> Result<usize, String> {
-    let conn = open_connection()?;
+    let mut conn = open_connection()?;
+    let has_entries_col = has_column(&conn, "entries", "route_token");
+    let has_accounts_col = has_column(&conn, "provider_accounts", "route_token");
+    if !has_entries_col && !has_accounts_col {
+        return Ok(0);
+    }
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("backfill begin transaction: {}", e))?;
     let mut count = 0;
 
-    // Backfill entries
-    if has_column(&conn, "entries", "route_token") {
-        let mut stmt = conn
-            .prepare("SELECT alias FROM entries WHERE route_token IS NULL")
-            .map_err(|e| format!("backfill query entries: {}", e))?;
-        let aliases: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .map_err(|e| format!("backfill iter entries: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
+    if has_entries_col {
+        let aliases: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT alias FROM entries WHERE route_token IS NULL")
+                .map_err(|e| format!("backfill query entries: {}", e))?;
+            let rows: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("backfill iter entries: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
         for alias in &aliases {
             let token = generate_route_token();
-            conn.execute(
+            tx.execute(
                 "UPDATE entries SET route_token = ?1 WHERE alias = ?2 AND route_token IS NULL",
                 params![token, alias],
             )
@@ -1562,19 +1575,20 @@ pub fn backfill_route_tokens() -> Result<usize, String> {
         }
     }
 
-    // Backfill provider_accounts
-    if has_column(&conn, "provider_accounts", "route_token") {
-        let mut stmt = conn
-            .prepare("SELECT provider_account_id FROM provider_accounts WHERE route_token IS NULL")
-            .map_err(|e| format!("backfill query provider_accounts: {}", e))?;
-        let ids: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .map_err(|e| format!("backfill iter provider_accounts: {}", e))?
-            .filter_map(|r| r.ok())
-            .collect();
+    if has_accounts_col {
+        let ids: Vec<String> = {
+            let mut stmt = tx
+                .prepare("SELECT provider_account_id FROM provider_accounts WHERE route_token IS NULL")
+                .map_err(|e| format!("backfill query provider_accounts: {}", e))?;
+            let rows: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("backfill iter provider_accounts: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
         for id in &ids {
             let token = generate_route_token();
-            conn.execute(
+            tx.execute(
                 "UPDATE provider_accounts SET route_token = ?1 WHERE provider_account_id = ?2 AND route_token IS NULL",
                 params![token, id],
             )
@@ -1583,6 +1597,8 @@ pub fn backfill_route_tokens() -> Result<usize, String> {
         }
     }
 
+    tx.commit()
+        .map_err(|e| format!("backfill commit transaction: {}", e))?;
     Ok(count)
 }
 

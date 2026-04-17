@@ -63,6 +63,7 @@ fn test_secret_set_duplicate_error() {
     let mut cmd = Command::cargo_bin("aikey").unwrap();
     cmd.arg("add")
         .arg("existing_key")
+        .args(["--provider", "openai"])
         .arg("--password-stdin")
         .arg("--json")
         .env("HOME", temp_dir.path())
@@ -169,91 +170,6 @@ fn test_secret_set_empty_value_error() {
 
     assert_eq!(json["ok"], false);
     assert_eq!(json["code"], "INVALID_INPUT");
-}
-
-#[test]
-fn test_profile_current_no_profile() {
-    let temp_dir = TempDir::new().unwrap();
-    std::env::set_var("HOME", temp_dir.path());
-
-    // Test: Get current profile when none is set
-    let mut cmd = Command::cargo_bin("aikey").unwrap();
-    let output = cmd
-        .arg("profile")
-        .arg("current")
-        .arg("--json")
-        .env("HOME", temp_dir.path())
-        .output()
-        .unwrap();
-
-    assert!(!output.status.success());
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let json: Value = serde_json::from_str(&stderr).unwrap();
-
-    assert_eq!(json["ok"], false);
-    assert_eq!(json["code"], "NO_ACTIVE_PROFILE");
-}
-
-#[test]
-fn test_profile_current_with_profile() {
-    let temp_dir = TempDir::new().unwrap();
-    setup_test_vault(&temp_dir);
-    std::env::set_var("HOME", temp_dir.path());
-
-    // Set a profile first
-    let mut cmd = Command::cargo_bin("aikey").unwrap();
-    cmd.arg("profile")
-        .arg("use")
-        .arg("production")
-        .arg("--json")
-        .env("HOME", temp_dir.path())
-        .assert()
-        .success();
-
-    // Get current profile
-    let mut cmd = Command::cargo_bin("aikey").unwrap();
-    let output = cmd
-        .arg("profile")
-        .arg("current")
-        .arg("--json")
-        .env("HOME", temp_dir.path())
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let json: Value = serde_json::from_str(&stderr).unwrap();
-
-    assert_eq!(json["ok"], true);
-    assert_eq!(json["profile"], "production");
-}
-
-#[test]
-fn test_profile_use_json_output() {
-    let temp_dir = TempDir::new().unwrap();
-    setup_test_vault(&temp_dir);
-    std::env::set_var("HOME", temp_dir.path());
-
-    // Set a profile
-    let mut cmd = Command::cargo_bin("aikey").unwrap();
-    let output = cmd
-        .arg("profile")
-        .arg("use")
-        .arg("development")
-        .arg("--json")
-        .env("HOME", temp_dir.path())
-        .output()
-        .unwrap();
-
-    assert!(output.status.success());
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let json: Value = serde_json::from_str(&stderr).unwrap();
-
-    assert_eq!(json["ok"], true);
-    assert_eq!(json["profile"], "development");
 }
 
 #[test]
