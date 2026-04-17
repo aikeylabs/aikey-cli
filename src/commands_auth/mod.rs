@@ -313,6 +313,14 @@ fn poll_login_status(
                     if display.is_empty() || !display.contains('@') {
                         prompt_display_identity(base, account_id)?;
                     }
+
+                    // Auto-install Claude Code status line integration on first
+                    // successful Claude OAuth login. Idempotent — safe to re-run.
+                    // See 费用小票-实施方案.md §5.6. kimi/codex do not have
+                    // equivalent status-line hooks so we skip them here.
+                    if provider == "claude" {
+                        crate::commands_statusline::ensure_claude_statusline_installed();
+                    }
                 }
                 return Ok(());
             }
@@ -392,6 +400,13 @@ fn poll_device_code(
                     // D13: prompt for display name if no email
                     if display.is_empty() || !display.contains('@') {
                         prompt_display_identity(base, account_id)?;
+                    }
+
+                    // Auto-install Claude Code status line integration on first
+                    // successful Claude OAuth login. Idempotent — safe to re-run.
+                    // See 费用小票-实施方案.md §5.6.
+                    if provider == "claude" {
+                        crate::commands_statusline::ensure_claude_statusline_installed();
                     }
                 }
                 return Ok(());

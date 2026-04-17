@@ -916,13 +916,42 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 .and_then(|r| r.into_string().ok())
         } else { None };
 
-        // b) Control diagnostics (if control service is reachable)
+        // b) Diagnostics — served by collector-service. In trial, control and
+        //    collector live on the same port so {control_url}/v1/diagnostics/
+        //    pipeline works directly. In production, diagnostics are on the
+        //    collector container which is reachable via an endpoint advertised
+        //    by {control_url}/system/status under endpoints.collector.
+        //    Discovery order: system/status → collector → fallback to control.
         let diag_json = storage::get_platform_account().ok().flatten()
             .and_then(|acct| {
-                let url = format!("{}/v1/diagnostics/pipeline",
-                    acct.control_url.trim_end_matches('/'));
-                agent.get(&url).call().ok()
+                let control_base = acct.control_url.trim_end_matches('/').to_string();
+
+                // Probe /system/status for a collector endpoint (production path).
+                let collector_base: String = agent
+                    .get(&format!("{}/system/status", control_base))
+                    .call().ok()
                     .and_then(|r| r.into_string().ok())
+                    .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                    .and_then(|v| v.get("endpoints")
+                        .and_then(|e| e.get("collector"))
+                        .and_then(|c| c.get("url"))
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.trim_end_matches('/').to_string()))
+                    .unwrap_or_else(|| control_base.clone());
+
+                let url = format!("{}/v1/diagnostics/pipeline", collector_base);
+                let resp = agent.get(&url).call().ok()
+                    .and_then(|r| r.into_string().ok());
+                // Fallback: some older deployments serve diagnostics under
+                // control_url. If collector probe failed, try control as a
+                // last resort before giving up.
+                if resp.is_some() || collector_base == control_base {
+                    resp
+                } else {
+                    let fallback = format!("{}/v1/diagnostics/pipeline", control_base);
+                    agent.get(&fallback).call().ok()
+                        .and_then(|r| r.into_string().ok())
+                }
             });
 
         check_usage_pipeline(

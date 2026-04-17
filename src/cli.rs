@@ -43,6 +43,8 @@ Commands:
   \x1b[1maccount\x1b[0m <command>        Manage your aikey account session
   \x1b[1mlogout\x1b[0m                   Log out of the current session (shortcut for `account logout`)
   \x1b[1msecret\x1b[0m <command>         Manage secrets and platform-backed secret actions
+  \x1b[1mstatusline\x1b[0m               Render a one-line usage receipt for Claude Code's status line
+  \x1b[1mwatch\x1b[0m                    Show a top-style dashboard of recent key usage
   \x1b[1mhelp\x1b[0m                     Show this help message or help for a command
 
 Options:
@@ -297,6 +299,16 @@ pub(crate) enum Commands {
     /// Change the vault master password
     #[command(display_order = 19)]
     ChangePassword,
+    /// Render a one-line usage receipt for Claude Code's custom status line
+    /// (wired up automatically by `aikey statusline install`).
+    #[command(display_order = 20)]
+    Statusline {
+        #[command(subcommand)]
+        action: Option<StatuslineAction>,
+    },
+    /// Show a top-style dashboard of recent key usage from the local WAL.
+    #[command(display_order = 21)]
+    Watch,
     /// Manage your aikey account session
     #[command(display_order = 20)]
     Account {
@@ -370,6 +382,23 @@ pub(crate) enum DbAction {
         #[arg(long)]
         to: String,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum StatuslineAction {
+    /// Write `~/.claude/settings.json` statusLine entry to point at aikey.
+    Install {
+        /// Overwrite an existing non-aikey statusLine (the old value is
+        /// backed up to ~/.claude/settings.aikey_backup.json).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove the aikey entry from `~/.claude/settings.json` (restoring the
+    /// backup if one was recorded during install).
+    Uninstall,
+    /// Print whether the Claude Code status line is currently configured
+    /// to call aikey, without making any changes.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -602,6 +631,13 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 AuthAction::Doctor { .. } => "doctor",
             }),
             Commands::Version => "version".to_string(),
+            Commands::Statusline { action } => match action {
+                None => "statusline".to_string(),
+                Some(StatuslineAction::Install { .. }) => "statusline.install".to_string(),
+                Some(StatuslineAction::Uninstall) => "statusline.uninstall".to_string(),
+                Some(StatuslineAction::Status) => "statusline.status".to_string(),
+            },
+            Commands::Watch => "watch".to_string(),
         },
     }
 }
@@ -860,6 +896,8 @@ Commands:
   {b}account{r} <command>        Manage your aikey account session
   {b}logout{r}                   Log out of the current session (shortcut for `account logout`)
   {b}secret{r} <command>         Manage secrets and platform-backed secret actions
+  {b}statusline{r}               Render a one-line usage receipt for Claude Code's status line
+  {b}watch{r}                    Show a top-style dashboard of recent key usage
   {b}help{r}                     Show this help message or help for a command
 
 Options:

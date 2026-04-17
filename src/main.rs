@@ -30,6 +30,9 @@ mod ui_frame;
 mod proxy_env;
 #[allow(dead_code)] mod profile_activation;
 mod commands_auth;
+mod commands_statusline;
+mod commands_watch;
+#[allow(dead_code)] mod usage_wal;
 mod cli;
 
 use cli::*;
@@ -290,7 +293,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // is available in the environment.  Skipped for proxy lifecycle commands which
     // manage the process themselves, and for version/init which predate the proxy.
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Watch => {}
         _ => { commands_proxy::try_auto_start_from_env(); }
     }
 
@@ -299,7 +302,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // lifecycle and init commands which either predate the vault or manage the
     // process themselves.
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Watch => {}
         _ => { commands_account::try_background_snapshot_sync(); }
     }
 
@@ -308,7 +311,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Skipped for init/proxy/db which manage their own lifecycle.
     // Only runs if vault.db exists (no-op on fresh install).
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Watch => {}
         _ => {
             if let Ok(vault_path) = storage::get_vault_path() {
                 if vault_path.exists() {
@@ -2158,6 +2161,26 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let proxy_port = commands_proxy::proxy_port();
             commands_auth::handle_auth_command(action, proxy_port, cli.json)?;
         }
+        Commands::Statusline { action } => match action {
+            None => {
+                // Default: render one-line receipt for Claude Code status line.
+                // Errors are swallowed so a broken WAL never breaks the user's
+                // prompt — worst case the row is empty.
+                let _ = commands_statusline::run();
+            }
+            Some(cli::StatuslineAction::Install { force }) => {
+                let _ = commands_statusline::install(*force)?;
+            }
+            Some(cli::StatuslineAction::Uninstall) => {
+                commands_statusline::uninstall()?;
+            }
+            Some(cli::StatuslineAction::Status) => {
+                commands_statusline::print_status()?;
+            }
+        },
+        Commands::Watch => {
+            commands_watch::run()?;
+        }
     }
     Ok(())
 }
@@ -3695,6 +3718,14 @@ fn handle_activate(
 
     // Human-readable confirmation on stderr (not captured by wrapper).
     eprintln!("\x1b[90m  Activated: {} \u{2192} {} ({})\x1b[0m", label, provider, shell);
+
+    // Auto-install Claude Code status line when activating an anthropic key.
+    // Idempotent — if the user already has the statusLine wired up (or
+    // intentionally opted out with a different entry) this is a no-op.
+    // See 费用小票-实施方案.md §5.6.
+    if provider.eq_ignore_ascii_case("anthropic") {
+        commands_statusline::ensure_claude_statusline_installed();
+    }
     Ok(())
 }
 

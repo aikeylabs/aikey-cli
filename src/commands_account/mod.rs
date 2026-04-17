@@ -2192,6 +2192,14 @@ pub fn handle_key_use(
         crate::ui_frame::print_box("\u{1F7E2}", &title, &rows);
         println!();
     }
+
+    // Auto-install the Claude Code status-line integration when the user
+    // promotes a key that covers the anthropic provider.  Idempotent —
+    // `ensure_claude_statusline_installed` is safe to call every time.
+    // See 费用小票-实施方案.md §5.6 for the trigger matrix.
+    if target_providers.iter().any(|p| p.eq_ignore_ascii_case("anthropic")) {
+        crate::commands_statusline::ensure_claude_statusline_installed();
+    }
     Ok(())
 }
 

@@ -50,6 +50,11 @@ rayon = "1.8"       # Parallel iteration for performance
 dirs = "5.0"        # Home directory detection for config files
 keyring = "2"       # OS keychain access for session password cache (macOS/Windows/Linux)
 atty = "0.2"        # TTY detection to skip interactive prompts in CI/non-interactive contexts
+crossterm = "0.28"  # Cross-platform terminal control for `aikey watch` TUI
+notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
+                    # Filesystem watcher for watch's live WAL tailing.  Only the
+                    # FSEvents backend is compiled in; on Linux we fall back to
+                    # the built-in poll watcher which is activated automatically.
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"        # System calls for mlock (memory pinning)
