@@ -157,6 +157,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("    aikey route           {}", "Print proxy config for AI clients".dimmed());
             eprintln!();
             eprintln!("  {}", "Run 'aikey --help' for all commands.".dimmed());
+            // Blink runs AFTER the full screen is painted so the user sees
+            // banner + hints together instead of being held by the animation.
+            // 8 = blank + "Get started" + 4 commands + blank + hint.
+            cli::animate_banner_blink(8);
             std::process::exit(1);
         }
     }
@@ -3574,6 +3578,17 @@ fn handle_activate(
             println!("unset {}", provider_vars.join(" "));
             println!("export AIKEY_ACTIVE_LABEL={}", shell_escape(&label));
             println!("export _AIKEY_PROMPT_LABEL={}", shell_escape(&prompt_label));
+            // Why: preexec hook (preexec.zsh/preexec.bash) reads AIKEY_ACTIVE_KEYS
+            // to print "[aikey] claude → <label>". Without this override, it keeps
+            // showing the label set by `aikey use` (persisted in active.env), which
+            // is stale once activate has replaced the provider env vars in this shell.
+            // Single-provider pair is correct: activate also unsets all other providers'
+            // env vars above, so no other labels should be displayed in this terminal.
+            // Deactivate/quit/exit restore via precmd re-sourcing active.env (automatic).
+            println!(
+                "export AIKEY_ACTIVE_KEYS={}",
+                shell_escape(&format!("{}={}", provider, label))
+            );
             println!("export {}={}", api_key_var, shell_escape(&token));
             println!("export {}={}", base_url_var, shell_escape(&base_url));
             println!(
@@ -3632,6 +3647,10 @@ fn handle_activate(
             }
             println!("$env:AIKEY_ACTIVE_LABEL = {}", powershell_escape(&label));
             println!("$env:_AIKEY_PROMPT_LABEL = {}", powershell_escape(&label));
+            println!(
+                "$env:AIKEY_ACTIVE_KEYS = {}",
+                powershell_escape(&format!("{}={}", provider, label))
+            );
             println!("$env:{} = {}", api_key_var, powershell_escape(&token));
             println!("$env:{} = {}", base_url_var, powershell_escape(&base_url));
             // M4: store the original prompt as a ScriptBlock in a global variable,
@@ -3660,6 +3679,8 @@ fn handle_activate(
             }
             println!("set AIKEY_ACTIVE_LABEL={}", safe_label);
             println!("set _AIKEY_PROMPT_LABEL={}", safe_label);
+            // provider is a lowercase ASCII identifier; safe_label is cmd-escaped.
+            println!("set AIKEY_ACTIVE_KEYS={}={}", provider, safe_label);
             println!("set {}={}", api_key_var, token);
             println!("set {}={}", base_url_var, base_url);
             println!("prompt (%_AIKEY_PROMPT_LABEL%) $P$G");

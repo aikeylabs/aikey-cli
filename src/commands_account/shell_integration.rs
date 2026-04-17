@@ -491,6 +491,10 @@ fn v2_zsh_hook() -> String {
             "        *) command aikey \"$@\" ;;\n",
             "    esac\n",
             "}}\n",
+            // Why: `ak` is a binary symlink → aikey. Without this wrapper, `ak activate`
+            // bypasses the aikey() function and dumps raw export code to stdout instead
+            // of applying it. Routing through aikey() keeps the eval-capture path.
+            "ak() {{ aikey \"$@\"; }}\n",
             "_aikey_precmd() {{\n",
             "    if [ -n \"$AIKEY_ACTIVE_LABEL\" ]; then return; fi\n",
             "    [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env\n",
@@ -521,6 +525,7 @@ fn v2_bash_hook() -> String {
             "        *) command aikey \"$@\" ;;\n",
             "    esac\n",
             "}}\n",
+            "ak() {{ aikey \"$@\"; }}\n",
             "_aikey_precmd_bash() {{\n",
             "    if [ -n \"$AIKEY_ACTIVE_LABEL\" ]; then return; fi\n",
             "    [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env\n",
@@ -714,6 +719,11 @@ if ! (( ${+functions[aikey]} )); then
     esac
   }
 fi
+if ! (( ${+functions[ak]} )); then
+  # Why: `ak` is a binary symlink → aikey. Route through aikey() so
+  # `ak activate|deactivate` also gets eval-captured.
+  ak() { aikey "$@"; }
+fi
 # Override precmd to add sentinel check (idempotent — redefining is safe
 # because precmd_functions references the function by name).
 _aikey_precmd() {
@@ -746,6 +756,9 @@ if ! type -t aikey | grep -q function 2>/dev/null; then
       *) command aikey "$@" ;;
     esac
   }
+fi
+if ! type -t ak | grep -q function 2>/dev/null; then
+  ak() { aikey "$@"; }
 fi
 # Override precmd to add sentinel check.
 _aikey_precmd_bash() {
@@ -831,6 +844,7 @@ mod hook_tests {
     fn v2_zsh_hook_contains_wrapper_and_sentinel() {
         let hook = v2_zsh_hook();
         assert!(hook.contains("aikey()"));
+        assert!(hook.contains("ak()"), "zsh hook must define ak() short-alias wrapper");
         assert!(hook.contains("activate|deactivate"));
         assert!(hook.contains("--shell zsh"));
         assert!(hook.contains("AIKEY_ACTIVE_LABEL"));
@@ -840,6 +854,7 @@ mod hook_tests {
     fn v2_bash_hook_contains_wrapper_and_sentinel() {
         let hook = v2_bash_hook();
         assert!(hook.contains("aikey()"));
+        assert!(hook.contains("ak()"), "bash hook must define ak() short-alias wrapper");
         assert!(hook.contains("--shell bash"));
         assert!(hook.contains("AIKEY_ACTIVE_LABEL"));
     }

@@ -72,29 +72,35 @@ pub fn pad_visible(s: &str, target_vis: usize) -> String {
 const RIGHT_MARGIN: usize = 6;
 
 /// Detect terminal width. Falls back to 80 if unavailable.
+///
+/// Shell wrappers like `eval $(aikey activate ...)` capture stdout via command
+/// substitution, so `STDOUT_FILENO` is a pipe — ioctl there returns 0 cols.
+/// Try stderr and stdin as fallbacks because pickers render to stderr and
+/// the controlling terminal is almost always connected there.
 pub fn term_width() -> usize {
-    // Try $COLUMNS first (set by most shells).
+    // $COLUMNS is set by interactive shells but usually not exported to
+    // subprocesses; still worth trying first when it is propagated.
     if let Ok(val) = std::env::var("COLUMNS") {
         if let Ok(w) = val.parse::<usize>() {
             if w > 0 { return w; }
         }
     }
-    // Unix ioctl fallback.
     #[cfg(unix)]
     {
         use std::mem::MaybeUninit;
         #[repr(C)]
         struct Winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }
-        unsafe {
-            let mut ws = MaybeUninit::<Winsize>::zeroed();
-            // TIOCGWINSZ = 0x5413 on Linux, 0x40087468 on macOS
-            #[cfg(target_os = "macos")]
-            const TIOCGWINSZ: libc::c_ulong = 0x40087468;
-            #[cfg(not(target_os = "macos"))]
-            const TIOCGWINSZ: libc::c_ulong = 0x5413;
-            if libc::ioctl(libc::STDOUT_FILENO, TIOCGWINSZ, ws.as_mut_ptr()) == 0 {
-                let ws = ws.assume_init();
-                if ws.ws_col > 0 { return ws.ws_col as usize; }
+        #[cfg(target_os = "macos")]
+        const TIOCGWINSZ: libc::c_ulong = 0x40087468;
+        #[cfg(not(target_os = "macos"))]
+        const TIOCGWINSZ: libc::c_ulong = 0x5413;
+        for fd in [libc::STDERR_FILENO, libc::STDOUT_FILENO, libc::STDIN_FILENO] {
+            unsafe {
+                let mut ws = MaybeUninit::<Winsize>::zeroed();
+                if libc::ioctl(fd, TIOCGWINSZ, ws.as_mut_ptr()) == 0 {
+                    let ws = ws.assume_init();
+                    if ws.ws_col > 0 { return ws.ws_col as usize; }
+                }
             }
         }
     }

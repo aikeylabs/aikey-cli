@@ -1492,33 +1492,108 @@ fn probe_proxy_version() -> Option<serde_json::Value> {
     serde_json::from_str(body.trim()).ok()
 }
 
+// Eye row glyphs shared between the initial banner render and the blink
+// animation. Centralizing them keeps the two paths byte-identical — a drift
+// here would make the "reopen" frame look visibly different from the static
+// eyes the banner first printed.
+const BANNER_EYE_OPEN: &str = "\u{254D}\u{2588}  \u{27E8}\u{29BF}\u{27E9} \u{27E8}\u{29BF}\u{27E9}  \u{2588}\u{254D}";
+// Closed eye uses `—` (U+2014 em dash) for a flat, "squint shut" look that
+// reads more as a blink than a filled dot would.
+const BANNER_EYE_SHUT: &str = "\u{254D}\u{2588}  \u{27E8}\u{2014}\u{27E9} \u{27E8}\u{2014}\u{27E9}  \u{2588}\u{254D}";
+const BANNER_EYE_RIGHT: &str = "------------------------------------";
+
+// Muted gold: RGB(160, 135, 75). Defined here so both functions colorize
+// consistently without duplicating the tuple.
+fn banner_gold(s: &str) -> colored::ColoredString {
+    use colored::Colorize;
+    s.truecolor(160, 135, 75)
+}
+
 pub(crate) fn print_banner() {
     use colored::Colorize;
     let version = BUILD_VERSION;
     let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
     let aikey_home = format!("{}/.aikey", home);
 
-    // Muted gold: RGB(160, 135, 75) — subtle on dark terminals.
-    let g = |s: &str| s.truecolor(160, 135, 75);
-
     // Lines 2–5 of the icon carry side labels (title/divider/tagline/home).
-    // Lines 1 and 6 are purely decorative.
+    // Lines 1 and 6 are purely decorative. Initial eyes render OPEN —
+    // `animate_banner_blink` drives the close-and-reopen blink once the
+    // caller has finished all subsequent output.
     eprintln!();
-    eprintln!("   {}", g("\u{25B2}           \u{25B2}"));
+    eprintln!("   {}", banner_gold("\u{25B2}           \u{25B2}"));
     eprintln!("   {}       {}   v{}",
-        g("\u{256D}\u{2588}\u{2588}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2588}\u{2588}\u{256E}"),
+        banner_gold("\u{256D}\u{2588}\u{2588}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2588}\u{2588}\u{256E}"),
         "AiKey CLI".bold(),
         version);
-    eprintln!(" {}       {}",
-        g("\u{00B7}\u{2590}\u{2588}  \u{27E8}\u{29BF}\u{27E9} \u{27E8}\u{29BF}\u{27E9}  \u{2588}\u{258C}\u{00B7}"),
-        "------------------------------------".dimmed());
+    eprintln!("  {}       {}",
+        banner_gold(BANNER_EYE_OPEN),
+        BANNER_EYE_RIGHT.dimmed());
     eprintln!("  {}        FinOps & AI Governance Center",
-        g("\u{2590}\u{2588}     \u{25BC}     \u{2588}\u{258C}"));
+        banner_gold("\u{254D}\u{2588}     \u{25BC}     \u{2588}\u{254D}"));
     eprintln!("   {}       {}",
-        g("\u{2570}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2588}\u{2588}\u{256F}"),
+        banner_gold("\u{2570}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2588}\u{2588}\u{256F}"),
         aikey_home);
-    eprintln!("       {}", g("\u{2579}   \u{2579}"));
+    eprintln!("       {}", banner_gold("\u{2579}   \u{2579}"));
     eprintln!();
+}
+
+/// Run the banner's one-shot eye blink: ⦿ → ● → ⦿. Call AFTER all static
+/// output (banner + whatever the caller prints underneath) has been emitted
+/// so the user sees the full screen first, then the eyes wink.
+///
+/// `extra_lines` is the number of lines the caller printed after
+/// `print_banner()` returned. The eye row sits 5 rows above where
+/// `print_banner` last left the cursor, so the animation steps up
+/// `5 + extra_lines` lines to rewrite it.
+///
+/// No-ops on non-TTY or when `AIKEY_NO_ANIMATION=1`. Uses plain
+/// `\x1b[nA` / `\x1b[nB` (not `\x1b[s` save/restore) because saved
+/// positions become invalid if the banner caused scroll-buffer shifts
+/// during the sleep.
+pub(crate) fn animate_banner_blink(extra_lines: usize) {
+    use colored::Colorize;
+    use std::io::{IsTerminal, Write};
+
+    let enabled = std::io::stderr().is_terminal()
+        && std::env::var("AIKEY_NO_ANIMATION").map_or(true, |v| v != "1" && v != "true");
+    if !enabled { return; }
+
+    let up = 5 + extra_lines;
+    let right = BANNER_EYE_RIGHT.dimmed();
+    let mut err = std::io::stderr().lock();
+
+    // Blink sequence modelled on a real owl's double-wink:
+    //   F1 open 1500ms → long gaze, the dominant visual state
+    //   F2 shut  120ms → crisp snap-closed
+    //   F3 open  180ms → brief reopen between winks
+    //   F4 shut  120ms → second snap-closed
+    //   F1 open  500ms tail → settle back to the static final state
+    // Total ≈ 2.4s, most of which is the initial 1500ms during which the
+    // user is already reading the banner + hints, so it feels like ambient
+    // motion rather than a blocking delay.
+    let render = |eyes: colored::ColoredString| {
+        // Each frame: jump to eye row, clear, rewrite, jump back.
+        format!("\x1b[{n}A\r\x1b[2K  {eyes}       {right}\r\x1b[{n}B",
+            n = up, eyes = eyes, right = right)
+    };
+    let shut = render(banner_gold(BANNER_EYE_SHUT));
+    let open = render(banner_gold(BANNER_EYE_OPEN));
+
+    let frames: [(&str, u64); 5] = [
+        (&shut, 1000),  // F1 pause, then F2 snap shut
+        (&open, 120),   // F3 reopen
+        (&shut, 180),   // F4 snap shut again
+        (&open, 120),   // settle back to open
+        ("",    500),   // tail pause with open eyes before returning
+    ];
+
+    for (frame, pre_sleep_ms) in frames {
+        std::thread::sleep(std::time::Duration::from_millis(pre_sleep_ms));
+        if !frame.is_empty() {
+            let _ = err.write_all(frame.as_bytes());
+            let _ = err.flush();
+        }
+    }
 }
 
 /// Format a unix timestamp as YYYY/MM/DD.
