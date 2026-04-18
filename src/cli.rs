@@ -399,6 +399,11 @@ pub(crate) enum StatuslineAction {
     /// Print whether the Claude Code status line is currently configured
     /// to call aikey, without making any changes.
     Status,
+    /// Print the session_id and model id of the most recent WAL event.
+    /// Useful for debugging Claude Code session divergence (see §14 of
+    /// 费用小票-实施方案.md) or for feeding into shell scripts.
+    #[command(name = "last-active")]
+    LastActive,
 }
 
 #[derive(Subcommand)]
@@ -636,6 +641,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 Some(StatuslineAction::Install { .. }) => "statusline.install".to_string(),
                 Some(StatuslineAction::Uninstall) => "statusline.uninstall".to_string(),
                 Some(StatuslineAction::Status) => "statusline.status".to_string(),
+                Some(StatuslineAction::LastActive) => "statusline.last-active".to_string(),
             },
             Commands::Watch => "watch".to_string(),
         },

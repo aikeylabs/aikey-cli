@@ -99,14 +99,17 @@ fail() {
 # Strip ANSI escapes for simpler greps.
 plain="$(printf '%s' "$OUTPUT" | sed 's/\x1b\[[0-9;]*m//g')"
 
-if ! printf '%s' "$plain" | grep -qF "$PROBE_LABEL"; then
-    fail "output missing expected key_label '$PROBE_LABEL'"
+# render_line shortens long labels (see shorten_label()), so check the
+# @domain suffix which always survives email collapse.
+PROBE_LABEL_DOMAIN="${PROBE_LABEL#*@}"
+if ! printf '%s' "$plain" | grep -qF "@${PROBE_LABEL_DOMAIN}"; then
+    fail "output missing expected key_label domain '@${PROBE_LABEL_DOMAIN}' (PROBE_LABEL=$PROBE_LABEL)"
 fi
-if ! printf '%s' "$plain" | grep -qE '[↑].*1,234'; then
-    fail "output missing expected input_tokens '1,234'"
+if ! printf '%s' "$plain" | grep -qE '[⇡]1,234'; then
+    fail "output missing expected input_tokens '⇡1,234'"
 fi
-if ! printf '%s' "$plain" | grep -qE '[↓].*458'; then
-    fail "output missing expected output_tokens '458'"
+if ! printf '%s' "$plain" | grep -qE '[⇣]458'; then
+    fail "output missing expected output_tokens '⇣458'"
 fi
 
 # ---------------------------------------------------------------------------
@@ -127,8 +130,24 @@ fi
 FALLBACK_STDIN="$(printf '{"session_id":"wrong-session","model":{"id":"%s"}}' "$PROBE_MODEL")"
 FALLBACK_OUT="$(printf '%s' "$FALLBACK_STDIN" | "$AIKEY_BIN" statusline 2>/dev/null || true)"
 fallback_plain="$(printf '%s' "$FALLBACK_OUT" | sed 's/\x1b\[[0-9;]*m//g')"
-if ! printf '%s' "$fallback_plain" | grep -qF "$PROBE_LABEL"; then
+if ! printf '%s' "$fallback_plain" | grep -qF "@${PROBE_LABEL_DOMAIN}"; then
     fail "model.id fallback did not match: output='${FALLBACK_OUT}'"
 fi
 
-echo "probe PASSED — session_id matched, fallback matched, negative case returned empty"
+# ---------------------------------------------------------------------------
+# last-active subcommand: scans WAL and prints newest session+model as
+# "session_id: …", "model: …", "age: …" lines.  Invoked without stdin so
+# the TTY-detect path doesn't trigger (we still want the command to run).
+# ---------------------------------------------------------------------------
+LAST_ACTIVE_OUT="$("$AIKEY_BIN" statusline last-active </dev/null 2>&1 || true)"
+if ! printf '%s' "$LAST_ACTIVE_OUT" | grep -qE "^session_id:[[:space:]]+$PROBE_SESSION$"; then
+    fail "last-active did not report session_id='$PROBE_SESSION': output='${LAST_ACTIVE_OUT}'"
+fi
+if ! printf '%s' "$LAST_ACTIVE_OUT" | grep -qE "^model:[[:space:]]+$PROBE_MODEL$"; then
+    fail "last-active did not report model='$PROBE_MODEL': output='${LAST_ACTIVE_OUT}'"
+fi
+if ! printf '%s' "$LAST_ACTIVE_OUT" | grep -qE "^age:"; then
+    fail "last-active missing age line: output='${LAST_ACTIVE_OUT}'"
+fi
+
+echo "probe PASSED — session_id matched, fallback matched, negative case returned empty, last-active reported newest event"

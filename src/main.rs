@@ -2177,6 +2177,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             Some(cli::StatuslineAction::Status) => {
                 commands_statusline::print_status()?;
             }
+            Some(cli::StatuslineAction::LastActive) => {
+                commands_statusline::last_active()?;
+            }
         },
         Commands::Watch => {
             commands_watch::run()?;

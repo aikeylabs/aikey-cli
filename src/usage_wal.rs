@@ -57,6 +57,16 @@ pub struct UsageEvent {
     #[serde(default)]
     pub total_tokens: Option<i64>,
 
+    /// Cache breakdown — Anthropic prompt caching splits `input_tokens` into
+    /// fresh + read-from-cache + written-to-cache, reported via these two
+    /// optional fields. `input_tokens` already includes both, so consumers
+    /// that don't care about the breakdown can keep ignoring these. Absent
+    /// for providers that don't expose caching (Kimi / generic OpenAI).
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<i64>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<i64>,
+
     #[serde(default)]
     pub request_status: String,
     #[serde(default)]
