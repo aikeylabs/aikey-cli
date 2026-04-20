@@ -386,24 +386,51 @@ pub(crate) enum DbAction {
 
 #[derive(Subcommand)]
 pub(crate) enum StatuslineAction {
-    /// Write `~/.claude/settings.json` statusLine entry to point at aikey.
+    /// Install the receipt display for Claude Code (default) or Kimi CLI.
+    ///
+    /// Targets:
+    ///   claude  — write `~/.claude/settings.json` statusLine entry (default)
+    ///   kimi    — ensure Kimi Stop hook in `~/.kimi/config.toml` managed region
+    ///   (omit target = claude, for backward compat)
     Install {
-        /// Overwrite an existing non-aikey statusLine (the old value is
-        /// backed up to ~/.claude/settings.aikey_backup.json).
+        /// Target CLI: `claude` or `kimi`. Defaults to `claude`.
+        target: Option<String>,
+        /// Install for both targets. Mutually exclusive with `target`.
+        #[arg(long, conflicts_with = "target")]
+        all: bool,
+        /// For claude: overwrite an existing non-aikey statusLine (backup kept).
         #[arg(long)]
         force: bool,
     },
-    /// Remove the aikey entry from `~/.claude/settings.json` (restoring the
-    /// backup if one was recorded during install).
-    Uninstall,
-    /// Print whether the Claude Code status line is currently configured
-    /// to call aikey, without making any changes.
+    /// Remove the aikey install from Claude Code (default) or Kimi CLI.
+    ///
+    /// For kimi, this strips the entire aikey-managed region from
+    /// `~/.kimi/config.toml` — resetting the Kimi provider to its pre-aikey
+    /// state (the Kimi provider block is co-owned with the hook).
+    Uninstall {
+        /// Target CLI: `claude` or `kimi`. Defaults to `claude`.
+        target: Option<String>,
+        /// Uninstall for both targets.
+        #[arg(long, conflicts_with = "target")]
+        all: bool,
+    },
+    /// Print whether the Claude Code + Kimi CLI receipt hooks are currently
+    /// wired up to aikey, without making any changes.
     Status,
     /// Print the session_id and model id of the most recent WAL event.
     /// Useful for debugging Claude Code session divergence (see §14 of
     /// 费用小票-实施方案.md) or for feeding into shell scripts.
     #[command(name = "last-active")]
     LastActive,
+    /// Render a receipt for a specific agent target. Invoked by a CLI hook
+    /// (e.g. Kimi's Stop hook); reads a JSON context from stdin. For Claude
+    /// Code, the bare `aikey statusline` path is the statusLine entry —
+    /// this subcommand is only useful for push-based hosts like Kimi.
+    Render {
+        /// Target CLI: currently only `kimi`. Claude Code uses the stdin
+        /// statusLine path (no subcommand).
+        target: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -638,10 +665,27 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Version => "version".to_string(),
             Commands::Statusline { action } => match action {
                 None => "statusline".to_string(),
-                Some(StatuslineAction::Install { .. }) => "statusline.install".to_string(),
-                Some(StatuslineAction::Uninstall) => "statusline.uninstall".to_string(),
+                Some(StatuslineAction::Install { target, all, .. }) => {
+                    let t = if *all {
+                        "all".to_string()
+                    } else {
+                        target.clone().unwrap_or_else(|| "claude".to_string())
+                    };
+                    format!("statusline.install.{t}")
+                }
+                Some(StatuslineAction::Uninstall { target, all }) => {
+                    let t = if *all {
+                        "all".to_string()
+                    } else {
+                        target.clone().unwrap_or_else(|| "claude".to_string())
+                    };
+                    format!("statusline.uninstall.{t}")
+                }
                 Some(StatuslineAction::Status) => "statusline.status".to_string(),
                 Some(StatuslineAction::LastActive) => "statusline.last-active".to_string(),
+                Some(StatuslineAction::Render { target }) => {
+                    format!("statusline.render.{target}")
+                }
             },
             Commands::Watch => "watch".to_string(),
         },

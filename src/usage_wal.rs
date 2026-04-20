@@ -67,6 +67,15 @@ pub struct UsageEvent {
     #[serde(default)]
     pub cache_creation_input_tokens: Option<i64>,
 
+    /// Raw provider-specific termination reason. Pass-through from proxy,
+    /// not normalized. Values depend on provider: Anthropic emits
+    /// "end_turn"/"tool_use"/"max_tokens"/"stop_sequence"; OpenAI family
+    /// emits "stop"/"tool_calls"/"length"/"content_filter". Empty string
+    /// when the upstream response did not include it (error path, or the
+    /// stream ended before the usage/finish frame arrived).
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+
     #[serde(default)]
     pub request_status: String,
     #[serde(default)]
@@ -94,33 +103,83 @@ impl UsageEvent {
 }
 
 /// WAL envelope — `{"wal_seq":..,"written_at":..,"event_json":{...}}`.
-/// We only care about `event_json`.
+///
+/// `wal_seq` lives at the envelope level (alongside `event_json`), matching
+/// proxy's Go `WALEntry { WALSeq, WrittenAt, EventJSON }`. It's writer-
+/// lifetime monotonic (atomic.Int64 in proxy), resets on proxy restart.
+/// Paired with the WAL file name it gives `(file, seq)` tuple — the
+/// watermark key used by `aikey statusline render kimi` to bound each
+/// Kimi turn.
+///
+/// We DO NOT add `wal_seq` to `UsageEvent` — that struct mirrors proxy's
+/// `ReportableEvent` (the payload), not the envelope. Mixing layers would
+/// confuse future schema migrations.
 #[derive(Debug, Deserialize)]
 struct WalEntry {
+    #[serde(default)]
+    wal_seq: u64,
     event_json: UsageEvent,
+}
+
+/// A matched WAL entry with its physical location (file + envelope seq).
+///
+/// The tuple `(wal_file_name, wal_seq)` is strictly monotonic within a
+/// single proxy lifetime: `wal_seq` increments across hourly file rotation,
+/// and file names sort lexicographically in time order. Use it for
+/// watermark comparisons where `event.event_time`'s second-level parser
+/// would collide on same-second events.
+///
+/// Caveat: proxy restart resets `wal_seq` (in-memory counter) — see the
+/// "Proxy 重启 edge case" section in the Kimi receipt design doc for
+/// the self-healing behavior. Consumers that need strict monotonicity
+/// across restarts should also compare file names, not just seq.
+#[derive(Debug, Clone)]
+pub struct WalHit {
+    pub event: UsageEvent,
+    pub wal_file_name: String,
+    pub wal_seq: u64,
 }
 
 /// Options controlling the backward scan budget.
 ///
 /// The scan trades off between "always find my session's event" and "keep
 /// statusline fast even under heavy load". `max_age` prunes by time first
-/// (stop reading events older than this cutoff), `max_lines` is the hard
-/// cap on total lines parsed so a single pathological file can't block us.
+/// (`Some(d)` = stop reading events older than this cutoff; `None` = no age
+/// bound, rely on `max_lines` only). `max_lines` is the hard cap on total
+/// lines parsed so a single pathological file can't block us.
+///
+/// When `max_age` is `None`, scans are bounded ONLY by `max_lines` — used
+/// by `render_kimi` once a watermark exists, since the watermark tuple is
+/// the semantic lower bound and an arbitrarily long Kimi turn (e.g. 30 min
+/// of tool calls) must not drop early events.
 #[derive(Debug, Clone, Copy)]
 pub struct ScanOptions {
-    pub max_age: Duration,
+    pub max_age: Option<Duration>,
     pub max_lines: usize,
 }
 
 impl Default for ScanOptions {
     fn default() -> Self {
         Self {
-            max_age: Duration::from_secs(300),  // 5 minutes — generous enough
-                                                // to survive noisy mixed-session
-                                                // machines (see §5.1 of design doc)
+            // 5 minutes — generous enough to survive noisy mixed-session
+            // machines (see §5.1 of design doc). Used as the first-turn
+            // fallback when no watermark exists yet.
+            max_age: Some(Duration::from_secs(300)),
             max_lines: 500,
         }
     }
+}
+
+/// Compute the "events older than this are dropped" cutoff (unix seconds).
+/// `None` → sentinel `i64::MIN` so the comparison `ts < cutoff` is never
+/// true; the scan is then bounded purely by `max_lines`. Factored out so
+/// both `scan_wal_backward` and `collect_wal_backward` share the semantics.
+fn compute_cutoff(max_age: Option<Duration>) -> i64 {
+    let Some(max_age) = max_age else { return i64::MIN; };
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 - max_age.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Default WAL directory (`~/.aikey/data/usage-wal`). Kept here so CLI
@@ -149,11 +208,7 @@ pub fn scan_wal_backward<T, F>(
 where
     F: FnMut(&UsageEvent) -> Option<T>,
 {
-    let now = SystemTime::now();
-    let cutoff_secs = now
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64 - opts.max_age.as_secs() as i64)
-        .unwrap_or(0);
+    let cutoff_secs = compute_cutoff(opts.max_age);
 
     let mut files = match list_wal_files(dir) {
         Ok(v) => v,
@@ -289,6 +344,169 @@ where
         }
     }
     match_fn(ev)
+}
+
+// ---------------------------------------------------------------------------
+// collect_wal_backward — multi-hit counterpart to scan_wal_backward.
+// ---------------------------------------------------------------------------
+//
+// Use case: Kimi receipt aggregation needs to fold ALL matching events in a
+// window (one turn = N HTTP requests = N WAL events), not just the latest
+// one. scan_wal_backward returns on first match; collect_wal_backward keeps
+// walking newest-first and accumulates hits until the budget is exhausted.
+//
+// Returns `Vec<WalHit>` in newest-first order: `Vec[0]` is the most recent
+// matching event. Callers that want the "turn's final event" for fields
+// like model/event_time/stop_reason should index `Vec[0]` — NOT "last"
+// (which is the oldest).
+//
+// Each `WalHit` carries the event plus its physical location in the WAL
+// (`wal_file_name` + `wal_seq` from the envelope). The `(file, seq)` tuple
+// is the strictly-monotonic watermark key the Kimi render handler uses to
+// bound turns without depending on event_time's second-level precision.
+
+/// Collect all matching WAL events within the scan window.
+///
+/// `match_fn` receives a `&WalHit` (event + location) and returns true to
+/// include. Budget-bounded by `opts` (`max_lines` / `max_age`); stops early
+/// when either exhausts. Results are in newest-first order.
+pub fn collect_wal_backward<F>(
+    dir: &Path,
+    mut match_fn: F,
+    opts: ScanOptions,
+) -> io::Result<Vec<WalHit>>
+where
+    F: FnMut(&WalHit) -> bool,
+{
+    let cutoff_secs = compute_cutoff(opts.max_age);
+
+    let mut files = match list_wal_files(dir) {
+        Ok(v) => v,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    files.sort_by(|a, b| b.cmp(a)); // newest file first
+
+    let mut out: Vec<WalHit> = Vec::new();
+    let mut lines_scanned = 0usize;
+    for path in files {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let (hit_cutoff, scanned_lines) = collect_file_backward(
+            &path,
+            &file_name,
+            cutoff_secs,
+            opts.max_lines.saturating_sub(lines_scanned),
+            &mut match_fn,
+            &mut out,
+        )?;
+        lines_scanned += scanned_lines;
+        if hit_cutoff || lines_scanned >= opts.max_lines {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Scan a single WAL file newest-first, appending matching entries to `out`.
+/// Returns `(hit_cutoff, lines_scanned)`. Shares chunked backward-read
+/// plumbing with scan_file_backward but accumulates instead of returning.
+fn collect_file_backward<F>(
+    path: &Path,
+    file_name: &str,
+    cutoff_secs: i64,
+    max_lines: usize,
+    match_fn: &mut F,
+    out: &mut Vec<WalHit>,
+) -> io::Result<(bool, usize)>
+where
+    F: FnMut(&WalHit) -> bool,
+{
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((false, 0)),
+        Err(e) => return Err(e),
+    };
+    let size = file.metadata()?.len();
+    if size == 0 {
+        return Ok((false, 0));
+    }
+
+    const CHUNK: usize = 8 * 1024;
+    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK * 2);
+    let mut pos = size;
+    let mut remainder: Vec<u8> = Vec::new();
+    let mut lines_scanned = 0usize;
+    let mut hit_cutoff = false;
+
+    while pos > 0 && lines_scanned < max_lines {
+        let read_size = CHUNK.min(pos as usize);
+        pos -= read_size as u64;
+        buf.resize(read_size, 0);
+        file.seek(SeekFrom::Start(pos))?;
+        file.read_exact(&mut buf)?;
+
+        let mut combined = Vec::with_capacity(buf.len() + remainder.len());
+        combined.extend_from_slice(&buf);
+        combined.extend_from_slice(&remainder);
+        remainder.clear();
+
+        let mut line_end = combined.len();
+        let mut i = combined.len();
+        while i > 0 {
+            i -= 1;
+            if combined[i] == b'\n' {
+                let line = &combined[i + 1..line_end];
+                line_end = i;
+                if line.is_empty() { continue; }
+                process_line_collect(line, file_name, cutoff_secs, match_fn, &mut lines_scanned, &mut hit_cutoff, out);
+                if hit_cutoff || lines_scanned >= max_lines {
+                    return Ok((hit_cutoff, lines_scanned));
+                }
+            }
+        }
+        if line_end > 0 {
+            remainder = combined[..line_end].to_vec();
+        }
+    }
+
+    if !remainder.is_empty() && lines_scanned < max_lines {
+        process_line_collect(&remainder, file_name, cutoff_secs, match_fn, &mut lines_scanned, &mut hit_cutoff, out);
+    }
+
+    Ok((hit_cutoff, lines_scanned))
+}
+
+fn process_line_collect<F>(
+    line: &[u8],
+    file_name: &str,
+    cutoff_secs: i64,
+    match_fn: &mut F,
+    lines_scanned: &mut usize,
+    hit_cutoff: &mut bool,
+    out: &mut Vec<WalHit>,
+) where
+    F: FnMut(&WalHit) -> bool,
+{
+    *lines_scanned += 1;
+    let Ok(entry) = serde_json::from_slice::<WalEntry>(line) else { return; };
+    if let Some(ts) = entry.event_json.finished_at_unix() {
+        if ts < cutoff_secs {
+            *hit_cutoff = true;
+            return;
+        }
+    }
+    let hit = WalHit {
+        event: entry.event_json,
+        wal_file_name: file_name.to_string(),
+        wal_seq: entry.wal_seq,
+    };
+    if match_fn(&hit) {
+        out.push(hit);
+    }
 }
 
 /// Enumerate all `usage-*.jsonl` files under `dir`. Order is unspecified;
@@ -449,15 +667,227 @@ mod tests {
             f.write_all(&make_line("sess-a", "claude-sonnet-4-5", "2026-04-17T15:00:00Z")).unwrap();
         }
 
-        // Infinite age budget so the old (2026-04-17) events aren't pruned.
-        // Production callers use Duration::from_secs(300), but for a stable
-        // offline fixture we accept anything after the fixture timestamps.
-        let opts = ScanOptions { max_age: Duration::from_secs(i32::MAX as u64), max_lines: 500 };
+        // Disable the age filter so the old (2026-04-17) fixture events
+        // aren't pruned. Production callers pick an explicit age bound; the
+        // test needs `None` for a stable offline fixture.
+        let opts = ScanOptions { max_age: None, max_lines: 500 };
         let found: Option<UsageEvent> = scan_wal_backward(tmp.path(), |ev| {
             if ev.session_id.as_deref() == Some("sess-a") { Some(ev.clone()) } else { None }
         }, opts).unwrap();
 
         let ev = found.expect("should find newest sess-a event");
         assert_eq!(ev.event_time, "2026-04-17T15:00:00Z");
+    }
+
+    // -----------------------------------------------------------------
+    // collect_wal_backward tests
+    // -----------------------------------------------------------------
+
+    /// Helper: write a WAL envelope with session_id + provider + wal_seq.
+    fn write_envelope(
+        f: &mut std::fs::File,
+        wal_seq: u64,
+        session_id: &str,
+        provider: &str,
+        event_time: &str,
+        in_tok: i64,
+        out_tok: i64,
+    ) {
+        use std::io::Write;
+        let line = format!(
+            r#"{{"wal_seq":{wal_seq},"written_at":"{event_time}","event_json":{{"event_id":"e-{wal_seq}","event_time":"{event_time}","session_id":"{session_id}","virtual_key_id":"vk","provider_code":"{provider}","route_source":"oauth","input_tokens":{in_tok},"output_tokens":{out_tok},"total_tokens":{t},"request_status":"success","http_status_code":200}}}}"#,
+            t = in_tok + out_tok
+        );
+        writeln!(f, "{line}").unwrap();
+    }
+
+    #[test]
+    fn collect_returns_newest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Build fixed "now" relative timestamps so the scan window covers them
+        let hour_str = chrono_like_hour(&tmp.path().to_path_buf());
+        let path = tmp.path().join(format!("usage-{hour_str}.jsonl"));
+        let mut f = std::fs::File::create(&path).unwrap();
+        let now = rfc3339_now();
+        // seq=1 oldest, seq=3 newest — file is append-only
+        write_envelope(&mut f, 1, "sess-a", "kimi", &now, 10, 5);
+        write_envelope(&mut f, 2, "sess-a", "kimi", &now, 20, 10);
+        write_envelope(&mut f, 3, "sess-a", "kimi", &now, 30, 15);
+        drop(f);
+
+        let hits = collect_wal_backward(tmp.path(), |hit| hit.event.session_id.as_deref() == Some("sess-a"), ScanOptions::default()).unwrap();
+        assert_eq!(hits.len(), 3);
+        // newest-first: Vec[0] is seq=3
+        assert_eq!(hits[0].wal_seq, 3);
+        assert_eq!(hits[1].wal_seq, 2);
+        assert_eq!(hits[2].wal_seq, 1);
+    }
+
+    #[test]
+    fn collect_filters_by_session_and_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hour_str = chrono_like_hour(&tmp.path().to_path_buf());
+        let path = tmp.path().join(format!("usage-{hour_str}.jsonl"));
+        let mut f = std::fs::File::create(&path).unwrap();
+        let now = rfc3339_now();
+        write_envelope(&mut f, 1, "sess-a", "kimi", &now, 10, 5);
+        write_envelope(&mut f, 2, "sess-b", "kimi", &now, 99, 99);   // different session
+        write_envelope(&mut f, 3, "sess-a", "anthropic", &now, 50, 50); // different provider
+        write_envelope(&mut f, 4, "sess-a", "kimi", &now, 20, 10);
+        drop(f);
+
+        let hits = collect_wal_backward(
+            tmp.path(),
+            |hit| {
+                hit.event.session_id.as_deref() == Some("sess-a")
+                    && hit.event.provider_code == "kimi"
+            },
+            ScanOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].wal_seq, 4); // newest sess-a kimi
+        assert_eq!(hits[1].wal_seq, 1);
+    }
+
+    #[test]
+    fn collect_budget_bounds_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hour_str = chrono_like_hour(&tmp.path().to_path_buf());
+        let path = tmp.path().join(format!("usage-{hour_str}.jsonl"));
+        let mut f = std::fs::File::create(&path).unwrap();
+        let now = rfc3339_now();
+        for i in 1..=20 {
+            write_envelope(&mut f, i, "sess-a", "kimi", &now, 1, 1);
+        }
+        drop(f);
+
+        let opts = ScanOptions { max_lines: 5, ..ScanOptions::default() };
+        let hits = collect_wal_backward(tmp.path(), |_| true, opts).unwrap();
+        // We can examine at most 5 lines; some may match, some may be
+        // filtered by budget before examination — so we expect ≤5.
+        assert!(hits.len() <= 5, "got {} hits, expected ≤5", hits.len());
+        // And they should still be newest-first.
+        for w in hits.windows(2) {
+            assert!(w[0].wal_seq > w[1].wal_seq, "hits not newest-first: {:?}", hits.iter().map(|h| h.wal_seq).collect::<Vec<_>>());
+        }
+    }
+
+    /// Watermark tuple monotonicity across files (regression guard for the
+    /// 4th review round Finding 1): two events in consecutive hourly files
+    /// with seq values that would collide within a single file but are
+    /// disambiguated by the file-name component of the tuple.
+    #[test]
+    fn collect_carries_file_name_and_seq_across_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = rfc3339_now();
+        // File 1 (earlier hour) with seq=50
+        let f1 = tmp.path().join("usage-20260418-19.jsonl");
+        let mut w1 = std::fs::File::create(&f1).unwrap();
+        write_envelope(&mut w1, 50, "sess-a", "kimi", &now, 10, 5);
+        drop(w1);
+        // File 2 (later hour) with seq=1 (simulating proxy restart)
+        let f2 = tmp.path().join("usage-20260418-20.jsonl");
+        let mut w2 = std::fs::File::create(&f2).unwrap();
+        write_envelope(&mut w2, 1, "sess-a", "kimi", &now, 20, 10);
+        drop(w2);
+
+        let hits = collect_wal_backward(tmp.path(), |_| true, ScanOptions::default()).unwrap();
+        assert_eq!(hits.len(), 2);
+        // Newest first by file name (lexicographic = time order).
+        assert_eq!(hits[0].wal_file_name, "usage-20260418-20.jsonl");
+        assert_eq!(hits[0].wal_seq, 1);
+        assert_eq!(hits[1].wal_file_name, "usage-20260418-19.jsonl");
+        assert_eq!(hits[1].wal_seq, 50);
+    }
+
+    /// Regression guard for review finding #1: when `max_age` is `None`,
+    /// events older than any default window must still be returned. This
+    /// models a Kimi turn that idles > 5 min mid-turn — the early event
+    /// must be aggregated into the turn, not silently dropped.
+    #[test]
+    fn collect_max_age_none_includes_events_older_than_default_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("usage-20260418-20.jsonl");
+        let mut w = std::fs::File::create(&f).unwrap();
+        // Timestamp 30 minutes before "now" — well past the default 5-min
+        // ScanOptions cutoff.
+        let thirty_min_ago = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 30 * 60;
+        let days_from_epoch = (thirty_min_ago / 86400) as i64;
+        let sec_of_day = thirty_min_ago % 86400;
+        let (y, m, d) = civil_from_days(days_from_epoch);
+        let old_ts = format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            sec_of_day / 3600,
+            (sec_of_day % 3600) / 60,
+            sec_of_day % 60
+        );
+        write_envelope(&mut w, 1, "sess-long", "kimi", &old_ts, 100, 10);
+        drop(w);
+
+        // With the default (5-min) cutoff, the event IS filtered out.
+        let default_hits = collect_wal_backward(
+            tmp.path(),
+            |h| h.event.session_id.as_deref() == Some("sess-long"),
+            ScanOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            default_hits.len(),
+            0,
+            "default cutoff (5 min) must drop the 30-min-old event (baseline)"
+        );
+
+        // With `max_age: None` (post-fix behavior), the event survives.
+        let unbounded_hits = collect_wal_backward(
+            tmp.path(),
+            |h| h.event.session_id.as_deref() == Some("sess-long"),
+            ScanOptions { max_age: None, max_lines: 500 },
+        )
+        .unwrap();
+        assert_eq!(
+            unbounded_hits.len(),
+            1,
+            "max_age=None must include events older than the default window \
+             (long-turn regression guard — review finding #1)"
+        );
+        assert_eq!(unbounded_hits[0].wal_seq, 1);
+    }
+
+    fn rfc3339_now() -> String {
+        // "good enough" RFC3339 string for test fixtures; uses current time.
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        // Approximate — days since epoch for "today" in UTC.
+        let days_from_epoch = (secs / 86400) as i64;
+        let sec_of_day = secs % 86400;
+        let hh = sec_of_day / 3600;
+        let mm = (sec_of_day % 3600) / 60;
+        let ss = sec_of_day % 60;
+        let (y, m, d) = civil_from_days(days_from_epoch);
+        format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+    }
+
+    fn chrono_like_hour(_dir: &std::path::Path) -> String {
+        // Use a fixed name for the single-file tests.
+        "20260418-20".to_string()
+    }
+
+    // days-to-civil inverse of the existing days_from_civil helper above.
+    fn civil_from_days(days: i64) -> (i32, u32, u32) {
+        let z = days + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = (z - era * 146097) as u32;
+        let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+        let y = (yoe as i32) + (era as i32) * 400;
+        let doy = doe - (365*yoe + yoe/4 - yoe/100);
+        let mp = (5*doy + 2) / 153;
+        let d = doy - (153*mp + 2)/5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = y + if m <= 2 { 1 } else { 0 };
+        (y, m, d)
     }
 }

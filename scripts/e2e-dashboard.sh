@@ -381,6 +381,167 @@ fi
 rm -rf "$SANDBOX_E"
 
 # ---------------------------------------------------------------------------
+# 7. Kimi receipt plumbing probe.
+#    Verifies the render_kimi handler reads WAL, aggregates turn events,
+#    writes notification files with targets=["shell"], and advances the
+#    watermark correctly (including idempotent replay and multi-event folds).
+# ---------------------------------------------------------------------------
+header "7. probe-kimi-receipt.sh (Kimi Stop-hook plumbing)"
+
+KIMI_PROBE_LOG=$(mktemp)
+if AIKEY_BIN="$AIKEY_BIN" bash "$CLI_DIR/scripts/probe-kimi-receipt.sh" \
+    >"$KIMI_PROBE_LOG" 2>&1; then
+    pass "probe-kimi-receipt.sh"
+else
+    tail_out=$(tail -20 "$KIMI_PROBE_LOG" | tr '\n' ' ')
+    fail "probe-kimi-receipt.sh" "${tail_out:0:300}"
+    echo "${DIM}  full log: $KIMI_PROBE_LOG${RESET}"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Kimi statusline install/uninstall integration (sandbox HOME).
+#
+# Covers:
+#   - `install kimi` without managed region → clear error, no write
+#   - `install kimi` with existing region → Stop hook present, idempotent
+#   - `uninstall kimi` with backup → backup restored wholesale
+#   - `status` reports the managed region + hook command honestly
+# ---------------------------------------------------------------------------
+header "8. statusline install/uninstall kimi (sandbox HOME)"
+
+run_kimi_install_tests() {
+    local sandbox="$1"
+    local kimi_dir="$sandbox/.kimi"
+    local config="$kimi_dir/config.toml"
+    local backup="$kimi_dir/config.aikey_backup.toml"
+
+    export HOME="$sandbox"
+    mkdir -p "$kimi_dir"
+
+    # Case A: install kimi without any managed region → must refuse.
+    local out_a
+    out_a="$("$AIKEY_BIN" statusline install kimi 2>&1 || true)"
+    [ -f "$config" ] && { echo "case A: config.toml should not be created when region absent"; return 1; }
+    case "$out_a" in
+        *"No aikey-managed"*|*"no aikey"*|*"not configured"*) : ;;
+        *) echo "case A: install kimi should report missing region. got: $out_a"; return 2 ;;
+    esac
+
+    # Case B: seed a managed region (simulating configure_kimi_cli output),
+    # then install kimi → should be idempotent and report hook in place.
+    cat >"$config" <<EOF
+default_model = "kimi-k2-5"
+
+# BEGIN aikey (do not hand-edit between markers)
+[providers.kimi]
+type = "kimi"
+base_url = "http://127.0.0.1:27200/kimi/v1"
+api_key = "probe-token"
+
+[models.kimi-k2-5]
+provider = "kimi"
+model = "kimi-k2.5"
+max_context_size = 131072
+
+[models.moonshot-v1-128k]
+provider = "kimi"
+model = "moonshot-v1-128k"
+max_context_size = 131072
+
+[[hooks]]
+event = "Stop"
+command = "$AIKEY_BIN statusline render kimi"
+timeout = 5
+# END aikey
+EOF
+
+    local out_b
+    out_b="$("$AIKEY_BIN" statusline install kimi 2>&1 || true)"
+    case "$out_b" in
+        *"already points"*|*"already"*|*"installed"*) : ;;
+        *) echo "case B: install kimi should succeed on existing region. got: $out_b"; return 3 ;;
+    esac
+    grep -qF "statusline render kimi" "$config" || {
+        echo "case B: Stop hook command missing from config.toml"
+        return 4
+    }
+    grep -q "# BEGIN aikey" "$config" || {
+        echo "case B: BEGIN aikey marker missing"
+        return 5
+    }
+
+    # Case C: status command mentions Kimi.
+    local out_c
+    out_c="$("$AIKEY_BIN" statusline status 2>&1 || true)"
+    case "$out_c" in
+        *Kimi*) : ;;
+        *) echo "case C: status output should mention Kimi. got: $out_c"; return 6 ;;
+    esac
+
+    # Case D: uninstall kimi with no backup → strip region. default_model
+    # survives, aikey region is gone.
+    "$AIKEY_BIN" statusline uninstall kimi >/dev/null 2>&1 \
+        || { echo "case D: uninstall kimi failed"; return 7; }
+    if [ -f "$config" ]; then
+        grep -q "# BEGIN aikey" "$config" && {
+            echo "case D: region still present after uninstall"
+            return 8
+        }
+        grep -q "default_model" "$config" || {
+            echo "case D: default_model (outside region) should survive uninstall"
+            return 9
+        }
+    fi
+
+    # Case E: install then uninstall with backup → backup restored wholesale.
+    cat >"$config" <<'EOF'
+# user-authored config, pre-aikey
+default_model = "my-custom-model"
+
+[providers.mine]
+api_key = "USER-OWNED"
+EOF
+    cp "$config" "$backup"  # simulate what configure_kimi_cli's first-time backup does
+    # Now append an aikey region (as if configure_kimi_cli had done it).
+    cat >>"$config" <<EOF
+
+# BEGIN aikey (do not hand-edit between markers)
+[providers.kimi]
+api_key = "probe-token"
+base_url = "http://127.0.0.1:27200/kimi/v1"
+[[hooks]]
+event = "Stop"
+command = "$AIKEY_BIN statusline render kimi"
+# END aikey
+EOF
+    "$AIKEY_BIN" statusline uninstall kimi >/dev/null 2>&1 \
+        || { echo "case E: uninstall kimi with backup failed"; return 10; }
+    grep -q "USER-OWNED" "$config" || {
+        echo "case E: backup restore should preserve USER-OWNED provider"
+        return 11
+    }
+    grep -q "# BEGIN aikey" "$config" && {
+        echo "case E: aikey region should be gone after backup restore"
+        return 12
+    }
+    [ -f "$backup" ] && {
+        echo "case E: backup file should be consumed by restore"
+        return 13
+    }
+
+    return 0
+}
+
+SANDBOX_KIMI="$(mktemp -d)"
+KIMI_ERR=""
+if KIMI_ERR=$(run_kimi_install_tests "$SANDBOX_KIMI" 2>&1); then
+    pass "install kimi (refuses without region, idempotent with region) + uninstall restores"
+else
+    fail "statusline install/uninstall kimi" "${KIMI_ERR:0:300}"
+fi
+rm -rf "$SANDBOX_KIMI"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 header "Summary"

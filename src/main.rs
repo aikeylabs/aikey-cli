@@ -293,7 +293,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // is available in the environment.  Skipped for proxy lifecycle commands which
     // manage the process themselves, and for version/init which predate the proxy.
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Watch => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Watch => {}
         _ => { commands_proxy::try_auto_start_from_env(); }
     }
 
@@ -302,7 +302,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // lifecycle and init commands which either predate the vault or manage the
     // process themselves.
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Watch => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Watch => {}
         _ => { commands_account::try_background_snapshot_sync(); }
     }
 
@@ -311,7 +311,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Skipped for init/proxy/db which manage their own lifecycle.
     // Only runs if vault.db exists (no-op on fresh install).
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Watch => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Watch => {}
         _ => {
             if let Ok(vault_path) = storage::get_vault_path() {
                 if vault_path.exists() {
@@ -575,8 +575,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     c == "kimi" || c == "moonshot"
                 });
                 if has_kimi {
-                    let token_value = format!("aikey_personal_{}", alias);
-                    commands_account::configure_kimi_cli(&token_value, proxy_port);
+                    commands_account::configure_kimi_cli(proxy_port);
                 }
             }
 
@@ -1851,13 +1850,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             c == "kimi" || c == "moonshot"
                         });
                         if has_kimi {
-                            if let Some(b) = refresh.bindings.iter().find(|b| {
-                                let c = b.provider_code.to_lowercase();
-                                c == "kimi" || c == "moonshot"
-                            }) {
-                                let token = format!("aikey_{}_{}", b.key_source_type, b.key_source_ref);
-                                commands_account::configure_kimi_cli(&token, proxy_port);
-                            }
+                            commands_account::configure_kimi_cli(proxy_port);
                         } else {
                             commands_account::unconfigure_kimi_cli();
                         }
@@ -2168,17 +2161,25 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // prompt — worst case the row is empty.
                 let _ = commands_statusline::run();
             }
-            Some(cli::StatuslineAction::Install { force }) => {
-                let _ = commands_statusline::install(*force)?;
+            Some(cli::StatuslineAction::Install { target, all, force }) => {
+                commands_statusline::install(target.as_deref(), *all, *force)?;
             }
-            Some(cli::StatuslineAction::Uninstall) => {
-                commands_statusline::uninstall()?;
+            Some(cli::StatuslineAction::Uninstall { target, all }) => {
+                commands_statusline::uninstall(target.as_deref(), *all)?;
             }
             Some(cli::StatuslineAction::Status) => {
                 commands_statusline::print_status()?;
             }
             Some(cli::StatuslineAction::LastActive) => {
                 commands_statusline::last_active()?;
+            }
+            Some(cli::StatuslineAction::Render { target }) => {
+                // Hook-invoked render path. Only `kimi` is wired today; other
+                // targets are silently accepted so that a future Kimi-version
+                // bump or a typo doesn't crash the user's Stop hook.
+                if target == "kimi" {
+                    let _ = commands_statusline::render_kimi();
+                }
             }
         },
         Commands::Watch => {

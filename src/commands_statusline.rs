@@ -21,7 +21,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::usage_wal::{default_wal_dir, scan_wal_backward, ScanOptions, UsageEvent};
+use crate::usage_wal::{
+    collect_wal_backward, default_wal_dir, scan_wal_backward, ScanOptions, UsageEvent,
+};
 
 /// Subset of the Claude Code statusLine stdin payload we actually use.
 /// Serde rejects unknown fields by default — we set `deny_unknown_fields`
@@ -102,9 +104,15 @@ pub fn run() -> io::Result<()> {
         }
     }
 
+    // `[receipt] ` prefix aligns Claude Code's status line with the Kimi
+    // toast, which Kimi shell auto-prepends from the notification `type`
+    // field. We DON'T add this inside render_line() because the Kimi path
+    // would then render `[receipt] [receipt] ❬⦿·⦿❭ …` (Kimi shell still
+    // adds its own). Dimmed so it reads as chrome, not a metric.
+    use colored::Colorize;
     let line = render_line(&ev);
     let mut out = io::stdout().lock();
-    out.write_all(line.as_bytes())?;
+    write!(out, "{} {}", "[receipt]".dimmed(), line)?;
     Ok(())
 }
 
@@ -152,7 +160,7 @@ pub fn last_active() -> io::Result<()> {
     // an idle coffee break. Default ScanOptions (5min) is too narrow
     // for this use case.
     let opts = ScanOptions {
-        max_age: Duration::from_secs(24 * 3600),
+        max_age: Some(Duration::from_secs(24 * 3600)),
         max_lines: 5000,
     };
 
@@ -174,6 +182,354 @@ pub fn last_active() -> io::Result<()> {
     writeln!(out, "model:      {}", model)?;
     writeln!(out, "age:        {}", age_str)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// render_kimi — Stop hook handler for Kimi receipt
+// ---------------------------------------------------------------------------
+//
+// Lifecycle (see 费用小票-Kimi集成 update doc for full story):
+//
+//   1. Kimi agent turn ends → Stop hook fires → runs
+//      `aikey statusline render kimi` with stdin JSON
+//      `{"hook_event_name":"Stop","session_id":"<uuid>","cwd":"/path",…}`
+//   2. We read the watermark file for this session (last turn's max seq)
+//   3. Scan WAL for events matching session_id + provider=kimi + strictly
+//      newer than watermark (tuple compare on (wal_file, wal_seq))
+//   4. Aggregate: sum tokens/cache, take newest event's model/time/stop_reason
+//   5. Render receipt line (shared with Claude path) as the toast title
+//   6. Write event.json + delivery.json to
+//      ~/.kimi/sessions/<md5(cwd)>/<session_id>/notifications/<rand>/
+//   7. Update watermark to the newest hit's (file, seq) tuple
+//
+// All errors are swallowed silently — a failed hook must not block Kimi.
+// On failure the watermark is NOT updated, giving at-least-once semantics:
+// next successful turn picks up the missed events.
+
+/// Stop hook stdin payload. `hook_event_name` and `stop_hook_active` are
+/// present but we ignore them.
+#[derive(Debug, Deserialize)]
+struct KimiStopCtx {
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    cwd: String,
+}
+
+pub fn render_kimi() -> io::Result<()> {
+    // 1. Read stdin JSON (short, non-blocking). Silent on garbage/empty —
+    // Kimi may poke us with unexpected payloads across version upgrades
+    // and we'd rather no-op than crash the hook.
+    let mut buf = String::new();
+    if io::stdin().read_to_string(&mut buf).is_err() {
+        return Ok(());
+    }
+    let Ok(ctx) = serde_json::from_str::<KimiStopCtx>(&buf) else {
+        return Ok(());
+    };
+    if ctx.session_id.is_empty() || ctx.cwd.is_empty() {
+        return Ok(());
+    }
+
+    // 2. Resolve WAL and session_dir paths.
+    let Some(wal_dir) = default_wal_dir() else { return Ok(()); };
+    if !wal_dir.exists() {
+        return Ok(()); // proxy never ran on this machine; nothing to render
+    }
+    let session_dir = kimi_session_dir(&ctx.cwd, &ctx.session_id);
+    if !session_dir.exists() {
+        // Kimi session dir gone (user closed Kimi mid-turn?); skip silently.
+        return Ok(());
+    }
+
+    // 3. Read watermark. Absent → ("", 0) is the minimum tuple, meaning
+    // "include everything in the scan window" — combined with the 5-min
+    // fallback (ScanOptions::default().max_age) this bounds the first
+    // turn of a fresh session so we don't scan historical files.
+    let turns_dir = kimi_turns_dir();
+    let (prev_file, prev_seq) = read_watermark_in(&turns_dir, &ctx.session_id);
+
+    // 4. Collect all kimi events for this session that are strictly newer
+    // than the watermark tuple.
+    //
+    // Why the age budget is watermark-aware: the default 5-min `max_age`
+    // is a FIRST-TURN guard to avoid replaying stale historical WAL for a
+    // fresh session. Once a watermark exists, the watermark IS the lower
+    // bound — a long turn (30-min tool loop, an idle coffee break) must
+    // not silently drop its earliest events just because they fell behind
+    // the 5-min window. `max_age: None` disables the time filter; we lean
+    // on `max_lines` (5000 with watermark, 500 without) to keep the scan
+    // bounded against pathological WAL sizes.
+    let sid = ctx.session_id.clone();
+    let pf = prev_file.clone();
+    let has_watermark = !prev_file.is_empty() || prev_seq != 0;
+    let opts = if has_watermark {
+        ScanOptions { max_age: None, max_lines: 5000 }
+    } else {
+        ScanOptions::default()
+    };
+    let hits = collect_wal_backward(&wal_dir, move |hit| {
+        hit.event.provider_code == "kimi"
+            && hit.event.session_id.as_deref() == Some(sid.as_str())
+            && tuple_gt(&hit.wal_file_name, hit.wal_seq, &pf, prev_seq)
+    }, opts)?;
+
+    if hits.is_empty() {
+        // Nothing to report; do NOT update watermark (at-least-once).
+        return Ok(());
+    }
+
+    // 5. Aggregate. hits is newest-first; `Vec[0]` is this turn's final LLM call.
+    let newest = &hits[0];
+    let mut in_sum: i64 = 0;
+    let mut out_sum: i64 = 0;
+    let mut cache_read_sum: i64 = 0;
+    let mut cache_write_sum: i64 = 0;
+    for h in &hits {
+        in_sum += h.event.input_tokens.unwrap_or(0);
+        out_sum += h.event.output_tokens.unwrap_or(0);
+        cache_read_sum += h.event.cache_read_input_tokens.unwrap_or(0);
+        cache_write_sum += h.event.cache_creation_input_tokens.unwrap_or(0);
+    }
+
+    // Build a synthetic UsageEvent so we can reuse render_line (same format
+    // as Claude path). Only fields render_line reads are filled.
+    let synth = UsageEvent {
+        event_id: format!("kimi-turn-{}", ctx.session_id),
+        event_time: newest.event.event_time.clone(),
+        session_id: Some(ctx.session_id.clone()),
+        key_label: newest.event.key_label.clone(),
+        completion: newest.event.completion.clone(),
+        virtual_key_id: newest.event.virtual_key_id.clone(),
+        provider_code: newest.event.provider_code.clone(),
+        route_source: newest.event.route_source.clone(),
+        model: newest.event.model.clone(),
+        oauth_identity: newest.event.oauth_identity.clone(),
+        input_tokens: Some(in_sum),
+        output_tokens: Some(out_sum),
+        total_tokens: Some(in_sum + out_sum),
+        cache_read_input_tokens: if cache_read_sum > 0 { Some(cache_read_sum) } else { None },
+        cache_creation_input_tokens: if cache_write_sum > 0 { Some(cache_write_sum) } else { None },
+        stop_reason: newest.event.stop_reason.clone(),
+        request_status: newest.event.request_status.clone(),
+        http_status_code: newest.event.http_status_code,
+        error_code: newest.event.error_code.clone(),
+    };
+
+    // 6. Render line (shared with Claude) → use as the notification title.
+    let rendered = render_line(&synth);
+    // Kimi shell's toast renders plain text; strip ANSI to keep it clean.
+    let title = strip_ansi_escapes(&rendered);
+
+    // 7. Write notification files (atomic tmp+rename per file). If either
+    // write fails we leave watermark alone → next turn will retry.
+    if write_kimi_notification(&session_dir, &ctx.session_id, &title, hits.len()).is_err() {
+        return Ok(());
+    }
+
+    // 8. Advance watermark. Any error here is non-fatal: next turn will
+    // re-aggregate these events (at-least-once display).
+    let _ = write_watermark_in(&turns_dir, &ctx.session_id, &newest.wal_file_name, newest.wal_seq);
+
+    // 9. Opportunistic GC (cheap: just stat a few files). Failures ignored.
+    let _ = gc_stale_watermarks_in(&turns_dir);
+
+    Ok(())
+}
+
+/// Tuple comparison `(file_a, seq_a) > (file_b, seq_b)`.
+/// File name precedes seq (lexicographic on file name = hourly-time order),
+/// seq is a tie-breaker within the same file.
+fn tuple_gt(file_a: &str, seq_a: u64, file_b: &str, seq_b: u64) -> bool {
+    use std::cmp::Ordering::*;
+    match file_a.cmp(file_b) {
+        Greater => true,
+        Less => false,
+        Equal => seq_a > seq_b,
+    }
+}
+
+/// Kimi session dir following kimi-cli's `WorkDirMeta.sessions_dir` formula:
+/// `~/.kimi/sessions/<md5(cwd)>/<session_id>/`
+fn kimi_session_dir(cwd: &str, session_id: &str) -> PathBuf {
+    use md5::{Md5, Digest};
+    let digest = Md5::digest(cwd.as_bytes());
+    let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    home.join(".kimi").join("sessions").join(hex).join(session_id)
+}
+
+/// Directory for per-session turn watermarks: `~/.aikey/run/kimi-turns/`.
+/// The `_in` variant takes an explicit base dir so tests can substitute a
+/// tempdir (setting `$HOME` process-wide would collide with parallel tests).
+fn kimi_turns_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    home.join(".aikey").join("run").join("kimi-turns")
+}
+
+/// Read the watermark file. Returns `("", 0)` if absent (== minimum tuple).
+/// File format: `<wal_file_name>\t<wal_seq>` on one line.
+fn read_watermark_in(dir: &Path, session_id: &str) -> (String, u64) {
+    let path = dir.join(format!("{session_id}.watermark"));
+    let Ok(content) = std::fs::read_to_string(&path) else { return (String::new(), 0); };
+    let line = content.lines().next().unwrap_or("");
+    let mut parts = line.splitn(2, '\t');
+    let file = parts.next().unwrap_or("").to_string();
+    let seq = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    (file, seq)
+}
+
+fn write_watermark_in(
+    dir: &Path,
+    session_id: &str,
+    wal_file_name: &str,
+    wal_seq: u64,
+) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let final_path = dir.join(format!("{session_id}.watermark"));
+    let tmp_path = dir.join(format!("{session_id}.watermark.tmp"));
+    std::fs::write(&tmp_path, format!("{wal_file_name}\t{wal_seq}"))?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    Ok(())
+}
+
+/// Purge watermark files older than 7 days. Called opportunistically at
+/// end of render_kimi — cheap (handful of files typically) and avoids a
+/// dedicated daemon.
+fn gc_stale_watermarks_in(dir: &Path) -> io::Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()); };
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(7 * 24 * 3600))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue; };
+        let Ok(mtime) = meta.modified() else { continue; };
+        if mtime < cutoff {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// Write the notification to the Kimi session's notifications directory.
+///
+/// **Directory-atomic publishing** (fixes the half-published race where the
+/// scanner could see `event.json` without its companion `delivery.json`):
+///   1. Build the notification inside a dotted staging directory
+///      `notifications/.<id>.staging/` — Kimi skips dotfiles when
+///      enumerating new notifications, so partial state is invisible.
+///   2. Write `event.json` and `delivery.json` into the staging dir.
+///   3. Single `rename(staging → final)` promotes the dir. On POSIX, a dir
+///      rename is atomic with respect to other readers iterating the
+///      parent: they either see the old name (missing) or the new name
+///      (complete), never a half-filled directory.
+///   4. If any step before the rename fails, leave a `.staging` leftover
+///      and don't advance the watermark — next turn retries with a fresh
+///      id. Stale `.staging` dirs are GC-safe (the rename is all-or-nothing
+///      and we never pick them up again).
+///
+/// Notification id matches Kimi's `^[a-z0-9]{2,20}$` regex: `n` + 8 hex chars.
+fn write_kimi_notification(
+    session_dir: &Path,
+    session_id: &str,
+    title: &str,
+    events_folded: usize,
+) -> io::Result<()> {
+    use rand::RngCore;
+
+    let mut rng_bytes = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut rng_bytes);
+    let notif_id = format!("n{}", hex::encode(rng_bytes));
+
+    let notifs_root = session_dir.join("notifications");
+    std::fs::create_dir_all(&notifs_root)?;
+    let staging_dir = notifs_root.join(format!(".{notif_id}.staging"));
+    let final_dir = notifs_root.join(&notif_id);
+
+    // If a previous attempt left the same-named staging dir behind (extremely
+    // unlikely given the 32-bit random id, but defensive), clean it so
+    // create_dir_all doesn't mix old + new files.
+    if staging_dir.exists() {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    }
+    std::fs::create_dir_all(&staging_dir)?;
+
+    // event.json — critical: targets=["shell"] only; never include "llm".
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let event = serde_json::json!({
+        "version": 1,
+        "id": notif_id,
+        "category": "system",
+        "type": "receipt",
+        "source_kind": "aikey",
+        "source_id": "wal",
+        "title": title,
+        "body": "",
+        "severity": "info",
+        "created_at": now_secs,
+        "payload": {
+            "session_id": session_id,
+            "events_folded": events_folded,
+        },
+        "targets": ["shell"],
+    });
+    std::fs::write(
+        staging_dir.join("event.json"),
+        serde_json::to_string(&event)?,
+    )?;
+
+    let delivery = serde_json::json!({
+        "sinks": {
+            "shell": {
+                "status": "pending",
+                "claimed_at": serde_json::Value::Null,
+                "acked_at": serde_json::Value::Null,
+            }
+        }
+    });
+    std::fs::write(
+        staging_dir.join("delivery.json"),
+        serde_json::to_string(&delivery)?,
+    )?;
+
+    // Atomic publish: the scanner either misses the dir entirely or sees
+    // both files already present.
+    std::fs::rename(&staging_dir, &final_dir)?;
+    Ok(())
+}
+
+/// Strip ANSI CSI escape sequences from a string. Kimi shell's toast
+/// renders plain text; embedded ANSI would show as garbage.
+///
+/// CSI sequences are `ESC [ <params> <final>` where `<final>` is a byte in
+/// 0x40..=0x7E. Naïvely consuming "until a byte in that range" breaks on the
+/// leading `[` itself (0x5B), so we special-case CSI: skip the `[`, then
+/// consume parameter bytes until a true CSI-final byte.
+fn strip_ansi_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            None => break,
+            Some('[') => {
+                // CSI: swallow parameter / intermediate bytes, stop on final (0x40..=0x7E).
+                while let Some(&nc) = chars.peek() {
+                    chars.next();
+                    if ('@'..='~').contains(&nc) { break; }
+                }
+            }
+            // Non-CSI escape (e.g. ESC ]) — drop the one introducer byte.
+            Some(_) => {}
+        }
+    }
+    out
 }
 
 fn format_age(d: Duration) -> String {
@@ -265,7 +621,17 @@ fn render_line(ev: &UsageEvent) -> String {
     if !label.is_empty() { parts.push(format!("{}", label.dimmed())); }
     if !ts.is_empty() { parts.push(format!("{}", format!("({ts})").dimmed())); }
 
-    format!("{prefix}{}", parts.join(&format!("{}", sep)))
+    // Brand prefix — a fixed glyph pair `❬⦿·⦿❭ ∷` prepended to every receipt
+    // (Claude status line + Kimi toast). Purpose: one constant visual anchor
+    // so users can recognise "this line came from aikey" at a glance even
+    // when the host's own chrome (e.g. Kimi's `[receipt]` tag) sits to its
+    // left. Rendered dimmed so it reads as chrome, not a primary metric.
+    // Kept outside the `parts` list so it survives the empty-segment filter
+    // and always lands at position 0 even when `partial`/`error` prefix is
+    // also active.
+    let brand = "❬⦿·⦿❭ ∷ ".dimmed();
+
+    format!("{brand}{prefix}{}", parts.join(&format!("{}", sep)))
 }
 
 /// Extract `HH:MM` from the event's RFC3339-ish timestamp. The proxy writes
@@ -360,9 +726,64 @@ pub enum InstallOutcome {
     RefusedMalformed,
 }
 
-/// `aikey statusline install [--force]` entry point — always verbose.
-pub fn install(force: bool) -> io::Result<InstallOutcome> {
+/// `aikey statusline install [target] [--all] [--force]` — top-level
+/// dispatcher. Defaults to the Claude target for backward compatibility.
+pub fn install(target: Option<&str>, all: bool, force: bool) -> io::Result<()> {
+    if all {
+        install_claude(force)?;
+        install_kimi()?;
+        return Ok(());
+    }
+    match target.unwrap_or("claude") {
+        "claude" => {
+            install_claude(force)?;
+        }
+        "kimi" => {
+            install_kimi()?;
+        }
+        other => {
+            use colored::Colorize;
+            eprintln!(
+                "  {} Unknown statusline target: {} (expected: claude | kimi | --all)",
+                "✗".red(),
+                other
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Claude-specific install — always verbose. `ensure_claude_statusline_installed`
+/// is the quiet variant for auto-triggers.
+pub fn install_claude(force: bool) -> io::Result<InstallOutcome> {
     install_inner(force, /*quiet=*/ false)
+}
+
+/// Ensure the aikey-managed Kimi scaffold exists in `~/.kimi/config.toml`.
+///
+/// In v3 architecture the scaffold is token-agnostic: it contains placeholder
+/// `api_key` and `base_url` that get overridden by `KIMI_API_KEY` / `KIMI_BASE_URL`
+/// env vars at runtime. The only piece that genuinely needs file storage is the
+/// `[[hooks]]` Stop entry (Kimi does not support env-var-configured hooks).
+///
+/// This command is idempotent — re-running after the region exists is a no-op
+/// unless the hook command path has drifted (e.g. after moving the aikey binary).
+pub fn install_kimi() -> io::Result<()> {
+    use colored::Colorize;
+
+    let proxy_port = crate::commands_proxy::proxy_port();
+    crate::commands_account::configure_kimi_cli(proxy_port);
+    eprintln!(
+        "  {} Kimi CLI scaffold ensured at {} (token overrides via KIMI_API_KEY).",
+        "✓".green(),
+        "~/.kimi/config.toml".dimmed()
+    );
+    eprintln!(
+        "    {} {}",
+        "Stop hook:".dimmed(),
+        aikey_statusline_render_kimi_command()
+    );
+    Ok(())
 }
 
 /// Shared install logic. `quiet=true` suppresses the "already points to
@@ -481,8 +902,60 @@ pub fn ensure_claude_statusline_installed() {
     let _ = install_inner(false, true);
 }
 
-/// `aikey statusline uninstall`.
-pub fn uninstall() -> io::Result<()> {
+/// `aikey statusline uninstall [target] [--all]` — top-level dispatcher.
+pub fn uninstall(target: Option<&str>, all: bool) -> io::Result<()> {
+    if all {
+        uninstall_claude()?;
+        uninstall_kimi()?;
+        return Ok(());
+    }
+    match target.unwrap_or("claude") {
+        "claude" => uninstall_claude()?,
+        "kimi" => uninstall_kimi()?,
+        other => {
+            use colored::Colorize;
+            eprintln!(
+                "  {} Unknown statusline target: {} (expected: claude | kimi | --all)",
+                "✗".red(),
+                other
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Remove aikey's Kimi Stop hook (and its co-owned provider/models block —
+/// the whole aikey-managed region is the atomic unit of ownership).
+pub fn uninstall_kimi() -> io::Result<()> {
+    use crate::commands_account::{uninstall_kimi_hook, KimiUninstallOutcome};
+    use colored::Colorize;
+
+    match uninstall_kimi_hook() {
+        KimiUninstallOutcome::Removed => {
+            eprintln!(
+                "  {} Removed aikey-managed region from ~/.kimi/config.toml.",
+                "✓".green()
+            );
+            eprintln!(
+                "    {}",
+                "Note: this also resets the Kimi provider to its pre-aikey state.".dimmed()
+            );
+        }
+        KimiUninstallOutcome::NothingToRemove => {
+            eprintln!(
+                "  {}",
+                "No aikey-managed Kimi config found — nothing to remove.".dimmed()
+            );
+        }
+        KimiUninstallOutcome::HomeMissing => {
+            eprintln!("  {} $HOME not set — cannot locate Kimi config.", "!".yellow());
+        }
+    }
+    Ok(())
+}
+
+/// Claude-specific uninstall.
+pub fn uninstall_claude() -> io::Result<()> {
     use colored::Colorize;
     let Some(settings_path) = claude_settings_path() else {
         eprintln!("  {}", "No Claude Code config directory — nothing to uninstall.".dimmed());
@@ -542,12 +1015,22 @@ pub fn uninstall() -> io::Result<()> {
     Ok(())
 }
 
-/// `aikey statusline status` — print whether aikey owns the Claude Code
-/// statusLine entry, without making any changes.
+/// `aikey statusline status` — print whether aikey owns the receipt hooks
+/// for Claude Code and Kimi CLI, without making any changes.
 pub fn print_status() -> io::Result<()> {
     use colored::Colorize;
+    println!("{}", "Claude Code".bold());
+    print_status_claude()?;
+    println!();
+    println!("{}", "Kimi CLI".bold());
+    print_status_kimi();
+    Ok(())
+}
+
+fn print_status_claude() -> io::Result<()> {
+    use colored::Colorize;
     let Some(settings_path) = claude_settings_path() else {
-        println!("Claude Code config dir not resolvable (HOME unset?).");
+        println!("  {}", "config dir not resolvable (HOME unset?)".yellow());
         return Ok(());
     };
 
@@ -556,7 +1039,7 @@ pub fn print_status() -> io::Result<()> {
         Ok(v) => Some(v),
         Err(ReadError::NotFound) => None,
         Err(ReadError::Malformed(e)) => {
-            println!("settings.json exists but cannot be parsed: {}", e);
+            println!("  {}", format!("settings.json cannot be parsed: {e}").red());
             return Ok(());
         }
         Err(ReadError::Io(e)) => return Err(e),
@@ -573,10 +1056,10 @@ pub fn print_status() -> io::Result<()> {
     match cmd {
         None => println!("  {}: {}", "statusLine".dimmed(), "not configured".dimmed()),
         Some(c) if c.contains("aikey statusline") => {
-            println!("  {}: {}", "statusLine".dimmed(), format!("aikey ({})", c).green());
+            println!("  {}: {}", "statusLine".dimmed(), format!("aikey ({c})").green());
         }
         Some(c) => {
-            println!("  {}: {}", "statusLine".dimmed(), format!("other ({})", c).yellow());
+            println!("  {}: {}", "statusLine".dimmed(), format!("other ({c})").yellow());
         }
     }
     let backup = statusline_backup_path(&settings_path);
@@ -584,6 +1067,51 @@ pub fn print_status() -> io::Result<()> {
         println!("  {}: {}", "backup".dimmed(), backup.display());
     }
     Ok(())
+}
+
+fn print_status_kimi() {
+    use colored::Colorize;
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            println!("  {}", "HOME not set — cannot locate Kimi config.".yellow());
+            return;
+        }
+    };
+    let config_path = PathBuf::from(&home).join(".kimi").join("config.toml");
+    println!("  {}: {}", "file".dimmed(), config_path.display());
+    println!(
+        "  {}: {}",
+        "exists".dimmed(),
+        if config_path.exists() { "yes" } else { "no" }
+    );
+
+    let (region_present, hook_current) = crate::commands_account::kimi_status();
+    let expected_cmd = aikey_statusline_render_kimi_command();
+    match (region_present, hook_current) {
+        (false, _) => println!(
+            "  {}: {}",
+            "Stop hook".dimmed(),
+            "not configured (run `aikey use <kimi-key>`)".dimmed()
+        ),
+        (true, true) => println!(
+            "  {}: {}",
+            "Stop hook".dimmed(),
+            format!("aikey ({expected_cmd})").green()
+        ),
+        (true, false) => println!(
+            "  {}: {}",
+            "Stop hook".dimmed(),
+            "aikey region present but hook path differs (re-run `aikey statusline install kimi`)"
+                .yellow()
+        ),
+    }
+    let backup = PathBuf::from(&home)
+        .join(".kimi")
+        .join("config.aikey_backup.toml");
+    if backup.exists() {
+        println!("  {}: {}", "backup".dimmed(), backup.display());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -659,24 +1187,32 @@ fn write_settings_atomic(settings_path: &Path, value: &serde_json::Value) -> io:
     Ok(())
 }
 
-/// Absolute path to the current binary, quoted as a shell command, falling
-/// back to just "aikey" if we can't resolve the path (e.g. on platforms
-/// where `current_exe()` fails).  Absolute paths are preferred so Claude
-/// Code doesn't depend on the user's PATH at statusline-invocation time.
-fn aikey_statusline_command() -> String {
+/// Absolute path to the current binary, quoted if it contains whitespace, or
+/// bare `aikey` as last resort when `current_exe()` fails (e.g. some unusual
+/// platform). Absolute is preferred so hook invocation doesn't depend on the
+/// user's PATH.
+pub(crate) fn aikey_bin_quoted() -> String {
     match std::env::current_exe() {
         Ok(p) => {
             let s = p.display().to_string();
-            // Wrap in double quotes if the path contains spaces so Claude
-            // Code's shell invocation doesn't split the command by spaces.
             if s.chars().any(char::is_whitespace) {
-                format!("\"{}\" statusline", s.replace('"', "\\\""))
+                format!("\"{}\"", s.replace('"', "\\\""))
             } else {
-                format!("{} statusline", s)
+                s
             }
         }
-        Err(_) => "aikey statusline".to_string(),
+        Err(_) => "aikey".to_string(),
     }
+}
+
+/// Command string for Claude Code `statusLine` entry.
+fn aikey_statusline_command() -> String {
+    format!("{} statusline", aikey_bin_quoted())
+}
+
+/// Command string for Kimi Stop-hook entry.
+pub(crate) fn aikey_statusline_render_kimi_command() -> String {
+    format!("{} statusline render kimi", aikey_bin_quoted())
 }
 
 /// Compact large numbers: 1234 → "1,234", 12345 → "12.3K".
@@ -725,6 +1261,7 @@ mod tests {
             total_tokens: Some(in_tok + out_tok),
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            stop_reason: None,
             request_status: "success".into(),
             http_status_code: Some(200),
             error_code: None,
@@ -867,6 +1404,31 @@ mod tests {
     }
 
     #[test]
+    fn render_line_has_brand_prefix() {
+        // Both Claude and Kimi receipts must start with `❬⦿·⦿❭ ∷` so users
+        // recognise aikey-sourced lines at a glance. Check on a complete
+        // row (no partial/error prefix) and on a partial row (prefix sits
+        // AFTER the brand so the brand is always position 0).
+        let complete = strip_ansi(&render_line(&ev("s", "kimi-k2.5", "complete", 42, 9)));
+        assert!(
+            complete.starts_with("❬⦿·⦿❭ ∷ "),
+            "brand prefix missing on complete row: {complete}"
+        );
+
+        let partial = strip_ansi(&render_line(&ev("s", "kimi-k2.5", "partial", 42, 9)));
+        // Brand is first; partial marker follows.
+        assert!(
+            partial.starts_with("❬⦿·⦿❭ ∷ "),
+            "brand prefix should precede partial marker: {partial}"
+        );
+        let brand_end = "❬⦿·⦿❭ ∷ ".len();
+        assert!(
+            partial[brand_end..].trim_start().starts_with("⚠ partial"),
+            "partial marker should follow brand: {partial}"
+        );
+    }
+
+    #[test]
     fn render_line_tokens_come_first() {
         let rendered = render_line(&ev("s", "claude-sonnet-4-5", "complete", 3, 22));
         let plain: String = rendered.chars().filter(|c| *c >= ' ').collect::<String>()
@@ -897,5 +1459,251 @@ mod tests {
             }
         }
         out
+    }
+
+    // -----------------------------------------------------------------
+    // Kimi Stop-hook helpers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn tuple_gt_orders_file_then_seq() {
+        // Different files → lexicographic on file wins, seq ignored.
+        assert!(tuple_gt("wal-2026041817.jsonl", 1, "wal-2026041816.jsonl", 9999));
+        assert!(!tuple_gt("wal-2026041816.jsonl", 9999, "wal-2026041817.jsonl", 1));
+        // Same file → seq decides.
+        assert!(tuple_gt("wal-2026041817.jsonl", 5, "wal-2026041817.jsonl", 4));
+        assert!(!tuple_gt("wal-2026041817.jsonl", 4, "wal-2026041817.jsonl", 5));
+        // Equal tuple is NOT greater — strict inequality.
+        assert!(!tuple_gt("wal-2026041817.jsonl", 5, "wal-2026041817.jsonl", 5));
+        // Minimum tuple ("", 0) compares less than any real file.
+        assert!(tuple_gt("wal-2026041817.jsonl", 1, "", 0));
+        assert!(!tuple_gt("", 0, "wal-2026041817.jsonl", 1));
+    }
+
+    #[test]
+    fn kimi_session_dir_matches_kimi_cli_formula() {
+        // kimi-cli computes the dir as ~/.kimi/sessions/<md5(cwd)>/<session_id>/.
+        // Lock the md5 bytes we rely on with a known-good fixture.
+        let path = kimi_session_dir("/Users/jake/Projects", "abc-123");
+        let s = path.to_string_lossy();
+        // Ends with the session id and contains /.kimi/sessions/.
+        assert!(s.ends_with("/abc-123"), "missing session suffix: {s}");
+        assert!(s.contains("/.kimi/sessions/"), "missing .kimi/sessions: {s}");
+        // The md5 of "/Users/jake/Projects" must appear as a dir component.
+        // md5("/Users/jake/Projects") computed independently.
+        use md5::{Digest, Md5};
+        let expect_hex: String = Md5::digest(b"/Users/jake/Projects")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(s.contains(&format!("/{expect_hex}/")), "md5 hex missing: {s}");
+    }
+
+    #[test]
+    fn watermark_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "aikey-test-wm-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Absent → minimum tuple.
+        let (f0, s0) = read_watermark_in(&dir, "sess-A");
+        assert_eq!(f0, "");
+        assert_eq!(s0, 0);
+
+        // Write & read back.
+        write_watermark_in(&dir, "sess-A", "wal-2026041817.jsonl", 42).unwrap();
+        let (f1, s1) = read_watermark_in(&dir, "sess-A");
+        assert_eq!(f1, "wal-2026041817.jsonl");
+        assert_eq!(s1, 42);
+
+        // Overwrite keeps atomicity (no .tmp leftover).
+        write_watermark_in(&dir, "sess-A", "wal-2026041818.jsonl", 7).unwrap();
+        let (f2, s2) = read_watermark_in(&dir, "sess-A");
+        assert_eq!(f2, "wal-2026041818.jsonl");
+        assert_eq!(s2, 7);
+        assert!(
+            !dir.join("sess-A.watermark.tmp").exists(),
+            "tmp file should be rename-consumed"
+        );
+
+        // Sessions are isolated by file name.
+        let (fo, so) = read_watermark_in(&dir, "sess-B");
+        assert_eq!(fo, "");
+        assert_eq!(so, 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn watermark_malformed_returns_default() {
+        let dir = std::env::temp_dir().join(format!(
+            "aikey-test-wm-bad-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sess-X.watermark"), "garbage-without-tab").unwrap();
+        let (f, s) = read_watermark_in(&dir, "sess-X");
+        // File name captured verbatim, seq parses as 0 (no second field).
+        assert_eq!(f, "garbage-without-tab");
+        assert_eq!(s, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gc_removes_stale_files_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "aikey-test-gc-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Fresh file — must survive.
+        write_watermark_in(&dir, "fresh", "wal.jsonl", 1).unwrap();
+
+        // Stale file — age mtime to 10 days ago via utimensat (libc).
+        let stale = dir.join("stale.watermark");
+        std::fs::write(&stale, "old\t1").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c_path = std::ffi::CString::new(stale.as_os_str().as_bytes()).unwrap();
+            let ten_days_ago = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - 10 * 24 * 3600;
+            let ts = libc::timespec {
+                tv_sec: ten_days_ago as libc::time_t,
+                tv_nsec: 0,
+            };
+            let times = [ts, ts];
+            // SAFETY: C FFI, path and times are valid for the call duration.
+            unsafe {
+                libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0);
+            }
+        }
+
+        gc_stale_watermarks_in(&dir).unwrap();
+
+        assert!(dir.join("fresh.watermark").exists(), "fresh file should survive GC");
+        #[cfg(unix)]
+        assert!(!stale.exists(), "stale file should be purged by GC");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn strip_ansi_escapes_drops_csi_keeps_text() {
+        let s = "\u{1b}[1;36m⇡42\u{1b}[0m tokens \u{1b}[2m(12:34)\u{1b}[0m";
+        let out = strip_ansi_escapes(s);
+        assert_eq!(out, "⇡42 tokens (12:34)");
+    }
+
+    #[test]
+    fn strip_ansi_escapes_no_escape_is_identity() {
+        assert_eq!(strip_ansi_escapes("plain 1,234 ⇡⇣"), "plain 1,234 ⇡⇣");
+        assert_eq!(strip_ansi_escapes(""), "");
+    }
+
+    #[test]
+    fn notification_publish_is_directory_atomic_no_staging_leftover() {
+        // Fixes the race where Kimi could poll between event.json and
+        // delivery.json renames and see a half-published notification.
+        // With staging-dir publication, the final dir appears atomically
+        // and the `.<id>.staging` leftover must not survive a successful
+        // publish. (Regression guard for review finding #2.)
+        let session_dir = std::env::temp_dir().join(format!(
+            "aikey-test-atomic-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        write_kimi_notification(&session_dir, "sess-atomic", "⇡1 ⇣2 · m", 1).unwrap();
+
+        let notifs_root = session_dir.join("notifications");
+        let entries: Vec<_> = std::fs::read_dir(&notifs_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+
+        // Exactly one entry, and it MUST NOT be the staging form.
+        assert_eq!(entries.len(), 1, "one published dir expected");
+        let name = entries[0].file_name().to_string_lossy().into_owned();
+        assert!(
+            !name.starts_with('.') && !name.ends_with(".staging"),
+            "staging dir should have been renamed to final form, got: {name}"
+        );
+        // And both files must be present in it (proving the rename happened
+        // AFTER both writes, not between them).
+        assert!(entries[0].path().join("event.json").exists());
+        assert!(entries[0].path().join("delivery.json").exists());
+
+        std::fs::remove_dir_all(&session_dir).ok();
+    }
+
+    #[test]
+    fn notification_writes_event_and_delivery_with_shell_only_target() {
+        let session_dir = std::env::temp_dir().join(format!(
+            "aikey-test-notif-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        write_kimi_notification(&session_dir, "sess-7", "⇡42 ⇣9 · sonnet-4-6", 3).unwrap();
+
+        // Exactly one notification dir under notifications/, named n + 8 hex.
+        let notifs_root = session_dir.join("notifications");
+        let mut entries: Vec<_> = std::fs::read_dir(&notifs_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(entries.len(), 1, "one notification dir expected");
+        let entry = entries.pop().unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(
+            name.len() == 9 && name.starts_with('n'),
+            "id should be n + 8 hex: {name}"
+        );
+        assert!(
+            name.chars().skip(1).all(|c| c.is_ascii_hexdigit()),
+            "id body should be hex: {name}"
+        );
+
+        // event.json parses and has targets=["shell"] only (CRITICAL — "llm"
+        // would cause kimi-cli to feed the toast back into the LLM context).
+        let event_raw = std::fs::read_to_string(entry.path().join("event.json")).unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_raw).unwrap();
+        assert_eq!(event["version"], 1);
+        assert_eq!(event["category"], "system");
+        assert_eq!(event["type"], "receipt");
+        assert_eq!(event["source_kind"], "aikey");
+        assert_eq!(event["severity"], "info");
+        assert_eq!(event["title"], "⇡42 ⇣9 · sonnet-4-6");
+        let targets = event["targets"].as_array().expect("targets array");
+        assert_eq!(targets.len(), 1, "exactly one target");
+        assert_eq!(targets[0], "shell", "must be shell (never llm)");
+        assert_eq!(event["payload"]["session_id"], "sess-7");
+        assert_eq!(event["payload"]["events_folded"], 3);
+
+        // delivery.json has a single shell sink in pending state.
+        let delivery_raw =
+            std::fs::read_to_string(entry.path().join("delivery.json")).unwrap();
+        let delivery: serde_json::Value = serde_json::from_str(&delivery_raw).unwrap();
+        assert_eq!(delivery["sinks"]["shell"]["status"], "pending");
+        assert!(delivery["sinks"]["shell"]["claimed_at"].is_null());
+        assert!(delivery["sinks"]["shell"]["acked_at"].is_null());
+
+        // No tmp files left behind.
+        assert!(!entry.path().join("event.json.tmp").exists());
+        assert!(!entry.path().join("delivery.json.tmp").exists());
+
+        std::fs::remove_dir_all(&session_dir).ok();
     }
 }

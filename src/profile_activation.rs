@@ -315,16 +315,10 @@ fn write_active_env_file(lines: &[String]) -> Result<(), String> {
         .map_err(|e| format!("Failed to create ~/.aikey: {}", e))?;
     let env_path = aikey_dir.join("active.env");
 
-    let mut content = lines.join("\n") + "\n";
+    let content = lines.join("\n") + "\n";
 
-    // Append activate-hook source lines for live upgrade of the shell wrapper.
-    // Why: when `aikey use` upgrades the shell hook from v1→v2, the current terminal
-    // still has old function definitions. These lines inject the new wrapper + sentinel
-    // on the very next prompt via the existing precmd → source active.env chain.
-    // The hook files are idempotent; re-sourcing them just redefines functions.
-    content.push_str("# Live-load activate wrapper (idempotent)\n");
-    content.push_str("[[ -f ~/.aikey/activate-hook.zsh ]] && source ~/.aikey/activate-hook.zsh\n");
-    content.push_str("[[ -f ~/.aikey/activate-hook.bash ]] && source ~/.aikey/activate-hook.bash\n");
+    // v3 architecture: active.env contains only env vars (no source statements).
+    // Wrapper functions live in ~/.aikey/hook.{zsh,bash}, loaded once from shell rc.
 
     std::fs::write(&env_path, content)
         .map_err(|e| format!("Failed to write active.env: {}", e))?;

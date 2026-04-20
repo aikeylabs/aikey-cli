@@ -2129,12 +2129,8 @@ pub fn handle_key_use(
             c == "kimi" || c == "moonshot"
         });
         if has_kimi {
-            let token_value = match &key_type {
-                crate::credential_type::CredentialType::ManagedVirtualKey => format!("aikey_vk_{}", key_ref),
-                crate::credential_type::CredentialType::PersonalOAuthAccount => format!("aikey_oauth_{}", key_ref),
-                _ => format!("aikey_personal_{}", key_ref),
-            };
-            configure_kimi_cli(&token_value, proxy_port);
+            // Token-agnostic: writes scaffold once; token comes from KIMI_API_KEY env var.
+            configure_kimi_cli(proxy_port);
         } else {
             // Switching away from kimi — restore Kimi CLI to standalone mode.
             unconfigure_kimi_cli();
