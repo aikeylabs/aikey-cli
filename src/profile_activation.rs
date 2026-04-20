@@ -11,7 +11,7 @@
 //! `commands_account.rs`.  Functions here return results; callers decide
 //! how to present them.
 
-use crate::commands_account::{provider_env_vars_pub, provider_proxy_prefix_pub};
+use crate::commands_account::{provider_env_vars_pub, provider_extra_env_vars_pub, provider_proxy_prefix_pub};
 use crate::commands_proxy;
 use crate::credential_type;
 use crate::storage::{self, ProviderBinding};
@@ -58,6 +58,11 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             );
             if !skip_base_url {
                 env_lines.push(format!("export {}=\"{}\"", base_url_var, base_url));
+            }
+            // Provider-specific extras (e.g. KIMI_MODEL_NAME for the
+            // minimal-scaffold Kimi config — see commands_account docstring).
+            for (extra_var, extra_val) in provider_extra_env_vars_pub(&b.provider_code) {
+                env_lines.push(format!("export {}=\"{}\"", extra_var, extra_val));
             }
             activated_providers.push(b.provider_code.clone());
         }

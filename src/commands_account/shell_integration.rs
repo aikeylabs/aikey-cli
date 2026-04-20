@@ -30,60 +30,74 @@ const AIKEY_BEGIN: &str = "# BEGIN aikey (do not hand-edit between markers)";
 const AIKEY_END: &str = "# END aikey";
 const LEGACY_MARKER: &str = "# managed by aikey";
 
-/// Placeholder token written into the aikey-managed region's `api_key` field.
+/// Build the aikey-managed Kimi config region (hook-only minimal scaffold).
 ///
-/// Why a placeholder instead of a real token:
-/// - Kimi CLI reads `KIMI_API_KEY` env var and **overrides** the config file's
-///   `api_key` at request time ([llm.py augment_provider_with_env_vars]). So
-///   the file value is only a fallback, never the hot path.
-/// - Writing a real token here means every `aikey use <kimi-key>` rewrites the
-///   global file. That's invasive to the user (mtime churn, diff noise) and
-///   prevents per-shell isolation from the file layer.
-/// - Placeholder + self-documenting name → if a request ever escapes to
-///   upstream with the placeholder (because the env var wasn't set), the
-///   upstream auth error points directly at the cause.
-const KIMI_PLACEHOLDER_API_KEY: &str = "aikey-placeholder-override-via-KIMI_API_KEY-env-var";
-
-/// Build the aikey-managed Kimi config region (scaffold only — see Why below).
+/// Why hook-only: Kimi CLI reads `KIMI_API_KEY` / `KIMI_BASE_URL` /
+/// `KIMI_MODEL_NAME` / `KIMI_MODEL_MAX_CONTEXT_SIZE` env vars that override
+/// config file values ([llm.py augment_provider_with_env_vars]). With all four
+/// env vars set by `aikey use`, Kimi's in-code fallback at
+/// [app.py:177-185](https://github.com/MoonshotAI/kimi-cli) creates an empty
+/// LLMModel/LLMProvider and the env vars populate every field — no config
+/// entries needed for providers or models.
 ///
-/// Why a scaffold:
-/// - `[providers.kimi]` block must exist so Kimi CLI's
-///   `augment_provider_with_env_vars` matches `provider.type == "kimi"` and
-///   applies `KIMI_API_KEY` / `KIMI_BASE_URL` overrides. The literal values
-///   inside are placeholders — env vars replace them at runtime.
-/// - `[models.*]` must exist so `default_model` can reference a valid entry.
-/// - `[[hooks]]` Stop cannot be expressed as env vars — must live in config.
-///   This is the only piece that genuinely demands file-backed storage.
-fn build_kimi_managed_region(proxy_port: u16) -> String {
+/// The `[[hooks]]` Stop entry is the ONLY thing that genuinely requires
+/// file-backed storage — Kimi has no env var equivalent for hooks. Everything
+/// else is moved to env vars (see `provider_extra_env_vars` + active.env
+/// writers), giving us the minimum possible write footprint against the
+/// user's `~/.kimi/config.toml`.
+///
+/// Proxy port is carried as a parameter because the hook command resolved at
+/// build time depends on the aikey binary absolute path (which is derived
+/// from `current_exe()` independently of proxy_port). The proxy port is no
+/// longer embedded in this region — it's only referenced via env vars.
+fn build_kimi_managed_region(_proxy_port: u16) -> String {
     let hook_cmd = crate::commands_statusline::aikey_statusline_render_kimi_command();
     format!(
         "{begin}\n\
-[providers.kimi]\n\
-type = \"kimi\"\n\
-base_url = \"http://127.0.0.1:{port}/kimi/v1\"\n\
-api_key = \"{placeholder}\"\n\
-\n\
-[models.kimi-k2-5]\n\
-provider = \"kimi\"\n\
-model = \"kimi-k2.5\"\n\
-max_context_size = 131072\n\
-\n\
-[models.moonshot-v1-128k]\n\
-provider = \"kimi\"\n\
-model = \"moonshot-v1-128k\"\n\
-max_context_size = 131072\n\
-\n\
 [[hooks]]\n\
 event = \"Stop\"\n\
 command = \"{cmd}\"\n\
 timeout = 5\n\
 {end}",
         begin = AIKEY_BEGIN,
-        port = proxy_port,
-        placeholder = KIMI_PLACEHOLDER_API_KEY,
         cmd = hook_cmd,
         end = AIKEY_END,
     )
+}
+
+/// Strip `default_model = "..."` lines at the top-level (outside any table)
+/// that were originally written by old aikey versions when the scaffold still
+/// included `[models.kimi-k2-5]`. After shrinking the region to hooks-only,
+/// a leftover `default_model = "kimi-k2-5"` line would fail Kimi's
+/// cross-validation (Default model not found in models).
+///
+/// Conservative: only strip if the value matches the known aikey defaults
+/// (`kimi-k2-5`, `moonshot-v1-128k`). User-chosen values (e.g. `kimi-dev`)
+/// are preserved — we assume they wrote those themselves.
+fn strip_legacy_kimi_default_model(content: &str) -> String {
+    const AIKEY_LEGACY_DEFAULTS: &[&str] = &["kimi-k2-5", "moonshot-v1-128k"];
+    let mut out = String::with_capacity(content.len());
+    let mut seen_table = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            seen_table = true;
+        }
+        // Only strip if: before any [table] header, AND matches `default_model = "<legacy>"`.
+        // Inside a table, `default_model` could be a sub-key (e.g. `[something]\ndefault_model = ...`)
+        // and we shouldn't touch those.
+        let is_our_legacy = !seen_table
+            && trimmed.starts_with("default_model")
+            && AIKEY_LEGACY_DEFAULTS
+                .iter()
+                .any(|v| trimmed.contains(&format!("= \"{}\"", v)) || trimmed.contains(&format!("=\"{}\"", v)));
+        if is_our_legacy {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Replace the aikey-managed region in place. Returns `None` if no region
@@ -199,13 +213,15 @@ pub fn configure_kimi_cli(proxy_port: u16) {
     let has_region = existing.contains(AIKEY_BEGIN);
     let has_legacy_only = !has_region && existing.contains(LEGACY_MARKER);
 
-    let base_url = format!("http://127.0.0.1:{}/kimi/v1", proxy_port);
-
     // Build the desired file contents for each of the three code paths.
     let (desired, first_time) = if has_region {
         // Managed region already present — in-place replace (no prompt).
+        // Also strip any legacy `default_model = "<old-aikey-default>"` at the
+        // top level. Older aikey versions wrote `default_model = "kimi-k2-5"`
+        // outside the region assuming `[models.kimi-k2-5]` existed inside;
+        // with the hook-only region, that reference would fail Kimi validation.
         match replace_managed_region(&existing, &region) {
-            Some(s) => (s, false),
+            Some(s) => (strip_legacy_kimi_default_model(&s), false),
             None => return, // defensive; should be unreachable because has_region is true
         }
     } else if has_legacy_only {
@@ -253,13 +269,18 @@ pub fn configure_kimi_cli(proxy_port: u16) {
         (out, false)
     } else {
         // First-time install — prompt (TTY only), then backup + append.
+        //
+        // Hook-only region: we no longer write `[providers.kimi]`, `[models.*]`,
+        // or `default_model`. All of those are driven by env vars set in
+        // active.env (see `provider_extra_env_vars` for the KIMI_MODEL_NAME /
+        // KIMI_MODEL_MAX_CONTEXT_SIZE pairs). Only `[[hooks]]` Stop genuinely
+        // requires file-backed storage.
         if io::stderr().is_terminal() {
             let rows: Vec<String> = {
                 let mut r = vec![
                     format!("File:    {}", "~/.kimi/config.toml"),
-                    format!("Add:     provider  base_url={}", base_url),
-                    format!("         models: kimi-k2.5, moonshot-v1-128k"),
-                    format!("         Stop hook → aikey statusline render kimi"),
+                    format!("Add:     Stop hook → aikey statusline render kimi"),
+                    format!("         (provider/models come from env vars)"),
                 ];
                 if !existing.is_empty() {
                     r.push(format!("Backup:  {}", "~/.kimi/config.aikey_backup.toml"));
@@ -284,20 +305,7 @@ pub fn configure_kimi_cli(proxy_port: u16) {
             let _ = std::fs::copy(&config_path, &backup_path);
         }
 
-        // default_model is user-facing (outside managed region). Set it once
-        // if absent or empty; thereafter the user controls the value.
-        let mut base = existing.clone();
-        if !base.contains("default_model") {
-            if !base.trim_end().is_empty() {
-                base = base.trim_end().to_string();
-                base.push('\n');
-            }
-            base.push_str("default_model = \"kimi-k2-5\"\n");
-        } else {
-            base = base.replace("default_model = \"\"", "default_model = \"kimi-k2-5\"");
-        }
-
-        let mut out = base.trim_end().to_string();
+        let mut out = existing.trim_end().to_string();
         if !out.is_empty() {
             out.push_str("\n\n");
         }
@@ -383,11 +391,184 @@ pub fn unconfigure_kimi_cli() {
 // Codex CLI auto-configuration
 // ============================================================================
 
-/// Auto-configure `~/.codex/config.toml` so that Codex CLI routes OpenAI
-/// requests through the aikey local proxy.
+// Codex integration strategy (see workflow/CI/bugfix/2026-04-20-codex-integration-env-var-routing.md):
+//
+// Codex v0.120+ built-in `openai` provider has `env_key: None` — it does NOT
+// read `OPENAI_API_KEY` at request time. Auth goes through `~/.codex/auth.json`
+// (ChatGPT OAuth token or piped API key). Also `OPENAI_BASE_URL` env var is not
+// supported at all (only `openai_base_url` in config.toml).
+//
+// To get true per-shell Kimi-style isolation, we define a custom provider
+// `[model_providers.aikey]` with `env_key = "OPENAI_API_KEY"`. Codex reads the
+// env var at each request, so each shell's `OPENAI_API_KEY` (set by `aikey use` /
+// `aikey activate`) routes independently through the local proxy.
+//
+// File structure we write (three pieces):
+//   1. Line: `openai_base_url = "..."  # managed by aikey`  (legacy back-compat)
+//   2. Line: `model_provider = "aikey"  # managed by aikey`  (conditional — see below)
+//   3. Region at end of file:
+//        # BEGIN aikey (do not hand-edit between markers)
+//        [model_providers.aikey]
+//        name = "aikey"
+//        base_url = "..."
+//        env_key = "OPENAI_API_KEY"
+//        wire_api = "responses"
+//        requires_openai_auth = false
+//        # END aikey
+//
+// Why split across region + two single-line markers: TOML forbids top-level
+// keys from appearing after any `[table]` header. `[model_providers.aikey]`
+// is a table, but `openai_base_url` / `model_provider` are top-level scalars —
+// they must live above all tables. We put the single-line markers near the top
+// of the file (line-level idempotence) and the table in a region at the end.
+//
+// Conditional `model_provider` write: only overwrite if the user hasn't set a
+// non-default, non-aikey provider (e.g. `model_provider = "ollama"`). If a
+// conflict is detected, we skip the line and print a stderr hint so the user
+// can resolve it manually without silently breaking their setup.
+
+const CODEX_LINE_MARKER: &str = "# managed by aikey";
+
+fn build_codex_managed_region(proxy_port: u16) -> String {
+    let base_url = format!("http://127.0.0.1:{}/openai", proxy_port);
+    format!(
+        "{begin}\n\
+[model_providers.aikey]\n\
+name = \"aikey\"\n\
+base_url = \"{base_url}\"\n\
+env_key = \"OPENAI_API_KEY\"\n\
+wire_api = \"responses\"\n\
+requires_openai_auth = false\n\
+{end}",
+        begin = AIKEY_BEGIN,
+        end = AIKEY_END,
+    )
+}
+
+/// Insert or replace a single-line TOML top-level key with an aikey marker.
 ///
-/// Pattern mirrors `configure_kimi_cli`: marker-based idempotent updates,
-/// backup before first modification, interactive prompt on first touch.
+/// Safe to call repeatedly — if the line already exists (with or without our
+/// marker) it's replaced in place. Otherwise inserted at the TOML-safe
+/// position: immediately before the first `[table]` header (or at end of file
+/// if there are no tables), which guarantees the key stays in the top-level
+/// scope.
+fn upsert_codex_managed_line(content: &str, key: &str, value: &str) -> String {
+    let new_line = format!("{} = \"{}\"  {}", key, value, CODEX_LINE_MARKER);
+    let key_prefix = format!("{} ", key);
+    let key_eq = format!("{}=", key);
+
+    // Pass 1: replace in place if the key already exists at top level.
+    //
+    // Note: we don't attempt to detect whether the existing key is inside a
+    // table scope. If the user put `model_provider = "..."` inside some table
+    // (which would actually be a subkey of that table, not our target), we
+    // may replace the wrong line. Accept this as a known limitation —
+    // legitimate Codex configs use top-level-only for these keys.
+    if content
+        .lines()
+        .any(|l| l.trim_start().starts_with(&key_prefix) || l.trim_start().starts_with(&key_eq))
+    {
+        let mut out = String::new();
+        for line in content.lines() {
+            if line.trim_start().starts_with(&key_prefix) || line.trim_start().starts_with(&key_eq)
+            {
+                out.push_str(&new_line);
+            } else {
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        return out;
+    }
+
+    if content.is_empty() {
+        return format!("{}\n", new_line);
+    }
+
+    // Pass 2: insert. Find the first `[table]` header line index; insert at
+    // that position (which places our new line in the top-level scope just
+    // before any tables). If no table exists, append at end — still top-level.
+    let lines: Vec<&str> = content.lines().collect();
+    let insert_at = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+
+    let mut out = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        if idx == insert_at {
+            out.push_str(&new_line);
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if insert_at >= lines.len() {
+        out.push_str(&new_line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Append (or replace) the aikey-managed `[model_providers.aikey]` region at
+/// the END of the content. Must come after all user tables because TOML table
+/// sections don't terminate — anything we append inside a "user table scope"
+/// would bind to the wrong table.
+fn upsert_codex_region(content: &str, new_region: &str) -> String {
+    if content.contains(AIKEY_BEGIN) {
+        return replace_managed_region(content, new_region)
+            .unwrap_or_else(|| content.to_string());
+    }
+    let mut out = content.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(new_region);
+    out.push('\n');
+    out
+}
+
+/// Detect whether the user has set a non-default `model_provider` that we
+/// should NOT overwrite. Returns `Some(value)` if there's a real conflict.
+///
+/// Safe-to-overwrite cases (returns None):
+/// - No `model_provider` line at all
+/// - `model_provider = "openai"` (Codex default — overwriting is a no-op intent change)
+/// - `model_provider = "aikey"` (our own past write)
+/// - Any `model_provider` line with our `# managed by aikey` marker
+fn detect_codex_model_provider_conflict(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with("model_provider") {
+            continue;
+        }
+        let after_key = trimmed["model_provider".len()..].trim_start();
+        let after_eq = match after_key.strip_prefix('=') {
+            Some(s) => s.trim_start(),
+            None => continue,
+        };
+        let rest = match after_eq.strip_prefix('"') {
+            Some(s) => s,
+            None => continue,
+        };
+        let end = match rest.find('"') {
+            Some(i) => i,
+            None => continue,
+        };
+        let value = &rest[..end];
+        if line.contains(CODEX_LINE_MARKER) || value == "openai" || value == "aikey" {
+            return None;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// Auto-configure `~/.codex/config.toml` so Codex routes OpenAI requests
+/// through aikey's local proxy with per-shell token isolation via env var.
+///
+/// Idempotent: repeated calls with no config change are safe (short-circuits
+/// on `desired == existing`).
 pub fn configure_codex_cli(proxy_port: u16) {
     use colored::Colorize;
     use std::io::{IsTerminal, Write};
@@ -398,130 +579,119 @@ pub fn configure_codex_cli(proxy_port: u16) {
     };
     let config_dir = std::path::PathBuf::from(&home).join(".codex");
     let config_path = config_dir.join("config.toml");
+    let backup_path = config_dir.join("config.aikey_backup.toml");
 
-    // Why: Codex treats openai_base_url as a replacement for
-    // "https://api.openai.com/v1" (including /v1), so paths like /responses
-    // are appended directly. The proxy's providerDefaultBaseURL already includes
-    // /v1, so applyBaseURL() prepends it correctly. No /v1 needed in CLI config.
     let base_url = format!("http://127.0.0.1:{}/openai", proxy_port);
-    let marker = "# managed by aikey";
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let region = build_codex_managed_region(proxy_port);
 
-    // Read existing config or start empty.
-    let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let has_region = existing.contains(AIKEY_BEGIN);
+    let has_any_marker = existing.contains(CODEX_LINE_MARKER) || has_region;
 
-    // Already configured — silent update (no prompt needed for subsequent switches).
-    if content.contains(marker) {
-        let updated = update_codex_base_url(&content, &base_url);
-        let _ = std::fs::write(&config_path, updated);
-        return;
-    }
-
-    // First time — prompt user before modifying their config.
-    if io::stderr().is_terminal() {
+    // First-time install → prompt (TTY only) + backup.
+    let first_time = !has_any_marker;
+    if first_time && io::stderr().is_terminal() {
         let mut rows: Vec<String> = vec![
             format!("File:    {}", "~/.codex/config.toml"),
-            format!("Add:     openai_base_url = {}", base_url),
+            format!("Add:     openai_base_url + [model_providers.aikey]"),
+            format!("         env_key = \"OPENAI_API_KEY\" (per-shell token)"),
         ];
-        if !content.is_empty() {
+        if !existing.is_empty() {
             rows.push(format!("Backup:  {}", "~/.codex/config.aikey_backup.toml"));
         }
         crate::ui_frame::eprint_box("\u{2753}", "Configure Codex CLI", &rows);
         eprint!("  Proceed? [Y/n] (default Y): ");
         io::stderr().flush().ok();
-
         let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_ok() {
-            if input.trim().to_lowercase() == "n" {
-                eprintln!("  {}", "Skipped. Run 'aikey use' again to retry.".dimmed());
-                return;
-            }
+        if io::stdin().read_line(&mut input).is_ok()
+            && input.trim().eq_ignore_ascii_case("n")
+        {
+            eprintln!("  {}", "Skipped. Run 'aikey use' again to retry.".dimmed());
+            return;
         }
     }
 
-    // Backup original config before first modification.
-    let backup_path = config_dir.join("config.aikey_backup.toml");
-    if !content.is_empty() && !backup_path.exists() {
+    // Build desired content via the three upsert passes.
+    let mut desired = existing.clone();
+    desired = upsert_codex_managed_line(&desired, "openai_base_url", &base_url);
+
+    // model_provider: conditional on conflict detection. `desired` at this
+    // point already has `openai_base_url` added but model_provider detection
+    // looks at existing-like lines by key, so order is fine.
+    let conflict = detect_codex_model_provider_conflict(&desired);
+    let model_provider_written = if let Some(other) = conflict {
+        // Print the conflict warning unconditionally — stderr, non-TTY-gated.
+        // Rationale: this is operational info the user must see regardless of
+        // whether they ran us from a TTY or piped us into a log. Silent
+        // non-overwrite would be worse than a visible warning.
+        eprintln!(
+            "  {} Detected existing `model_provider = \"{}\"` in ~/.codex/config.toml.",
+            "!".yellow(),
+            other
+        );
+        eprintln!(
+            "    {}",
+            "aikey provider block installed but NOT activated. To route through aikey:"
+                .dimmed()
+        );
+        eprintln!(
+            "    {}",
+            "  • Remove that line (aikey will set `model_provider = \"aikey\"` next run), or"
+                .dimmed()
+        );
+        eprintln!(
+            "    {}",
+            "  • Invoke as: codex --local-provider aikey".dimmed()
+        );
+        false
+    } else {
+        desired = upsert_codex_managed_line(&desired, "model_provider", "aikey");
+        true
+    };
+
+    desired = upsert_codex_region(&desired, &region);
+
+    if desired == existing {
+        return;
+    }
+
+    // Backup once, only on first touch.
+    if first_time && !existing.is_empty() && !backup_path.exists() {
+        let _ = std::fs::create_dir_all(&config_dir);
         let _ = std::fs::copy(&config_path, &backup_path);
     }
 
-    let _ = std::fs::create_dir_all(&config_dir);
-
-    // Inject openai_base_url at the top level of the TOML.
-    // Why: Codex v0.118+ deprecated the OPENAI_BASE_URL env var and reads
-    // openai_base_url from config.toml instead.
-    let new_line = format!("openai_base_url = \"{}\"  {}", base_url, marker);
-
-    let updated = if content.contains("openai_base_url") {
-        // Replace existing (non-managed) openai_base_url line.
-        let mut result = String::new();
-        for line in content.lines() {
-            if line.trim_start().starts_with("openai_base_url") {
-                result.push_str(&new_line);
-            } else {
-                result.push_str(line);
-            }
-            result.push('\n');
-        }
-        result
-    } else if content.is_empty() {
-        // No config file existed — create a minimal one.
-        format!("{}\n", new_line)
-    } else {
-        // Append after the first top-level key (e.g. model = "...").
-        // Insert right after line 1 so it stays at the top level.
-        let mut result = String::new();
-        let mut inserted = false;
-        for line in content.lines() {
-            result.push_str(line);
-            result.push('\n');
-            // Insert after the first non-comment, non-empty top-level line.
-            if !inserted && !line.is_empty() && !line.starts_with('#') && !line.starts_with('[') {
-                result.push_str(&new_line);
-                result.push('\n');
-                inserted = true;
-            }
-        }
-        if !inserted {
-            result.push_str(&new_line);
-            result.push('\n');
-        }
-        result
-    };
-
-    match std::fs::write(&config_path, &updated) {
+    match write_config_atomic(&config_dir, &config_path, &desired) {
         Ok(_) => {
-            eprintln!("  {} Codex CLI auto-configured: {}",
-                "\u{2713}".green().bold(),
-                config_path.display().to_string().dimmed());
+            if first_time && io::stderr().is_terminal() {
+                eprintln!(
+                    "  {} Codex CLI auto-configured: {}",
+                    "\u{2713}".green().bold(),
+                    config_path.display().to_string().dimmed()
+                );
+                if !model_provider_written {
+                    eprintln!(
+                        "    {}",
+                        "Note: your existing `model_provider` was preserved (see warning above)."
+                            .dimmed()
+                    );
+                }
+            }
         }
         Err(e) => {
-            eprintln!("  {} Could not configure Codex CLI: {}",
-                "!".yellow(), e);
+            if first_time && io::stderr().is_terminal() {
+                eprintln!("  {} Could not configure Codex CLI: {}", "!".yellow(), e);
+            }
         }
     }
-}
-
-/// Update `openai_base_url` in an already-managed Codex config.
-fn update_codex_base_url(content: &str, base_url: &str) -> String {
-    let marker = "# managed by aikey";
-    let mut result = String::new();
-    for line in content.lines() {
-        if line.trim_start().starts_with("openai_base_url") && line.contains(marker) {
-            result.push_str(&format!("openai_base_url = \"{}\"  {}", base_url, marker));
-        } else {
-            result.push_str(line);
-        }
-        result.push('\n');
-    }
-    result
 }
 
 /// Restore `~/.codex/config.toml` from the backup created by `configure_codex_cli`.
 ///
-/// Called when `aikey use` switches to a key that does not include openai.
-/// If a backup exists (`config.aikey_backup.toml`), it is moved back.
-/// If no backup but the file was created from scratch by us, remove the
-/// managed line (but keep the rest of the config intact).
+/// Priority: (1) restore `config.aikey_backup.toml` wholesale; (2) failing
+/// that, strip both the AIKEY_BEGIN/END region AND every line carrying the
+/// `# managed by aikey` single-line marker. Never deletes non-aikey user
+/// content.
 pub fn unconfigure_codex_cli() {
     let home = match std::env::var("HOME") {
         Ok(h) => h,
@@ -531,27 +701,32 @@ pub fn unconfigure_codex_cli() {
     let config_path = config_dir.join("config.toml");
     let backup_path = config_dir.join("config.aikey_backup.toml");
 
+    // Path 1: backup exists → restore wholesale.
     if backup_path.exists() {
-        // Restore the original config from backup.
         let _ = std::fs::rename(&backup_path, &config_path);
-    } else if config_path.exists() {
-        // No backup — remove just the managed line(s) rather than deleting
-        // the whole file (user may have added other settings after us).
-        let content = std::fs::read_to_string(&config_path).unwrap_or_default();
-        if content.contains("# managed by aikey") {
-            let cleaned: String = content
-                .lines()
-                .filter(|line| !line.contains("# managed by aikey"))
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n";
-            // If only whitespace remains, remove the file.
-            if cleaned.trim().is_empty() {
-                let _ = std::fs::remove_file(&config_path);
-            } else {
-                let _ = std::fs::write(&config_path, cleaned);
-            }
+        return;
+    }
+
+    let Ok(content) = std::fs::read_to_string(&config_path) else { return };
+
+    // Path 2: strip region + any single-line markers (covers both the new v3
+    // codex format and the legacy per-line-marker-only format from before
+    // Option A).
+    let stripped_region = strip_managed_region(&content).unwrap_or(content.clone());
+    let cleaned: String = stripped_region
+        .lines()
+        .filter(|line| !line.contains(CODEX_LINE_MARKER))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if cleaned.trim().is_empty() {
+        let _ = std::fs::remove_file(&config_path);
+    } else {
+        let mut final_content = cleaned;
+        if !final_content.ends_with('\n') {
+            final_content.push('\n');
         }
+        let _ = std::fs::write(&config_path, final_content);
     }
 }
 
@@ -597,6 +772,11 @@ pub(super) fn write_active_env(
             let base_url = format!("http://127.0.0.1:{}/{}", proxy_port, super::provider_proxy_prefix(provider));
             kv_pairs.push((api_key_var.to_string(), token_value));
             kv_pairs.push((base_url_var.to_string(), base_url));
+            // Provider-specific extras (e.g. KIMI_MODEL_NAME for the
+            // minimal-scaffold Kimi config).
+            for (extra_var, extra_val) in super::provider_extra_env_vars(provider) {
+                kv_pairs.push((extra_var.to_string(), extra_val.to_string()));
+            }
         }
     }
 
@@ -671,113 +851,16 @@ const V2_END: &str = "# aikey shell hook v2 end";
 const V3_BEGIN: &str = "# aikey shell hook v3 begin";
 const V3_END: &str = "# aikey shell hook v3 end";
 
-/// Content of `~/.aikey/hook.zsh`.
+/// Content of `~/.aikey/hook.zsh`. Sourced from `src/templates/hook.zsh` via
+/// `include_str!()` so the template authoring experience is plain .zsh with
+/// editor syntax highlighting rather than Rust escape strings.
 fn hook_zsh_content() -> &'static str {
-    r#"# ~/.aikey/hook.zsh — auto-generated by `aikey use`, do not hand-edit
-# Version: 3
-aikey() {
-    case "$1" in
-        activate|deactivate)
-            local _output
-            _output=$(command aikey "$@" --shell zsh)
-            local _rc=$?
-            if [ $_rc -eq 0 ]; then eval "$_output"; else return $_rc; fi
-            ;;
-        *) command aikey "$@" ;;
-    esac
+    include_str!("../templates/hook.zsh")
 }
 
-# `ak` is a binary symlink → aikey; this wrapper routes it through aikey() so
-# `ak activate|deactivate` also gets eval-captured. Guarded — if the user has
-# already defined `ak` (alias or function) for another tool, respect it.
-#
-# Why `function ak { ... }` (keyword form) not `ak() { ... }`: when the user
-# has `alias ak=...` defined BEFORE this file is sourced, the parenthesis form
-# triggers parse-time alias expansion on the function name (→ parse error).
-# The `function` keyword form bypasses alias expansion on the name.
-if ! (( ${+functions[ak]} )) && ! alias ak >/dev/null 2>&1; then
-    function ak { aikey "$@"; }
-fi
-
-_aikey_precmd() {
-    [ -n "$AIKEY_ACTIVE_LABEL" ] && return
-    [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env
-}
-
-_aikey_preexec() {
-    [[ -z "$AIKEY_ACTIVE_KEYS" ]] && return
-    local cmd="${1%% *}" prov
-    case "$cmd" in
-        claude) prov=anthropic ;;
-        codex)  prov=openai ;;
-        kimi)   prov=kimi ;;
-        *) return ;;
-    esac
-    local id=$(echo "$AIKEY_ACTIVE_KEYS" | tr ',' '\n' | grep "^${prov}=" | cut -d= -f2-)
-    [[ -n "$id" ]] && printf '\033[90m[aikey] %s → %s\033[0m\n' "$cmd" "$id"
-}
-
-# Dedupe-safe registration — re-sourcing this file is harmless.
-(( ${precmd_functions[(I)_aikey_precmd]} )) || precmd_functions+=(_aikey_precmd)
-(( ${preexec_functions[(I)_aikey_preexec]} )) || preexec_functions+=(_aikey_preexec)
-"#
-}
-
-/// Content of `~/.aikey/hook.bash`.
+/// Content of `~/.aikey/hook.bash`. Sourced from `src/templates/hook.bash`.
 fn hook_bash_content() -> &'static str {
-    r#"# ~/.aikey/hook.bash — auto-generated by `aikey use`, do not hand-edit
-# Version: 3
-aikey() {
-    case "$1" in
-        activate|deactivate)
-            local _output
-            _output=$(command aikey "$@" --shell bash)
-            local _rc=$?
-            if [ $_rc -eq 0 ]; then eval "$_output"; else return $_rc; fi
-            ;;
-        *) command aikey "$@" ;;
-    esac
-}
-
-# Guarded: respect a pre-existing ak alias/function (e.g. user's kubectl shortcut).
-if ! type ak >/dev/null 2>&1; then
-    ak() { aikey "$@"; }
-fi
-
-_aikey_precmd_bash() {
-    [ -n "$AIKEY_ACTIVE_LABEL" ] && return
-    [ -f ~/.aikey/active.env ] && source ~/.aikey/active.env
-}
-
-_aikey_preexec_bash() {
-    [ -z "$AIKEY_ACTIVE_KEYS" ] && return
-    local cmd="${BASH_COMMAND%% *}" prov
-    case "$cmd" in
-        claude) prov=anthropic ;;
-        codex)  prov=openai ;;
-        kimi)   prov=kimi ;;
-        *) return ;;
-    esac
-    local id
-    id=$(echo "$AIKEY_ACTIVE_KEYS" | tr ',' '\n' | grep "^${prov}=" | cut -d= -f2-)
-    [ -n "$id" ] && printf '\033[90m[aikey] %s → %s\033[0m\n' "$cmd" "$id"
-}
-
-# Dedupe-safe PROMPT_COMMAND registration. Append-with-check preserves hooks
-# from direnv / pyenv / atuin that may have registered first.
-case ";$PROMPT_COMMAND;" in
-    *\;_aikey_precmd_bash\;*) ;;
-    *) PROMPT_COMMAND="_aikey_precmd_bash${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
-esac
-# bash has no native preexec — fall back to the DEBUG trap. But DEBUG can hold
-# only one handler at a time, so unconditionally setting it would clobber any
-# trap the user (or tools like bash-preexec) already installed. Defer if one
-# exists; we lose the per-command label echo but preserve user plumbing. Users
-# who want the label can integrate via `bash-preexec.sh`'s `preexec_functions`.
-if [ -z "$(trap -p DEBUG 2>/dev/null)" ]; then
-    trap '_aikey_preexec_bash' DEBUG
-fi
-"#
+    include_str!("../templates/hook.bash")
 }
 
 /// Build the v3 rc block: marker + single source line + marker.
@@ -1237,47 +1320,64 @@ mod hook_tests {
     // ── Kimi marker-region helpers ──────────────────────────────────────────
 
     #[test]
-    fn kimi_region_contains_scaffold_and_placeholder_api_key() {
+    fn kimi_region_contains_only_hook_scaffold() {
+        // Minimal scaffold: only the Stop hook lives in config.toml. Providers,
+        // models, and default_model are all env-var-driven (see
+        // provider_extra_env_vars + active.env writers).
         let r = build_kimi_managed_region(27200);
         assert!(r.starts_with(AIKEY_BEGIN));
         assert!(r.trim_end().ends_with(AIKEY_END));
-        // Provider block with correct base_url and PLACEHOLDER api_key (token
-        // comes from KIMI_API_KEY env var at runtime — see docstring).
-        assert!(r.contains("[providers.kimi]"));
-        assert!(r.contains("type = \"kimi\""));
-        assert!(r.contains("base_url = \"http://127.0.0.1:27200/kimi/v1\""));
-        assert!(r.contains(&format!("api_key = \"{}\"", KIMI_PLACEHOLDER_API_KEY)));
-        // Placeholder name self-documents its override mechanism.
-        assert!(KIMI_PLACEHOLDER_API_KEY.contains("KIMI_API_KEY"));
-        // Models.
-        assert!(r.contains("[models.kimi-k2-5]"));
-        assert!(r.contains("[models.moonshot-v1-128k]"));
-        // Stop hook with render-kimi command.
+        // Hook — the only thing that genuinely needs file storage.
         assert!(r.contains("[[hooks]]"));
         assert!(r.contains("event = \"Stop\""));
         assert!(r.contains("statusline render kimi"));
+        // Must NOT contain provider/model scaffolding anymore.
+        assert!(!r.contains("[providers.kimi]"), "region should not include provider block:\n{}", r);
+        assert!(!r.contains("[models."), "region should not include model blocks:\n{}", r);
+        assert!(!r.contains("api_key"), "region should not include api_key:\n{}", r);
+        assert!(!r.contains("base_url"), "region should not include base_url:\n{}", r);
     }
 
     #[test]
-    fn kimi_region_respects_proxy_port() {
-        let r = build_kimi_managed_region(19999);
-        assert!(r.contains("127.0.0.1:19999"));
-        assert!(!r.contains(":27200")); // no stale default leaks through
-    }
-
-    #[test]
-    fn kimi_region_is_token_agnostic() {
-        // The scaffold no longer embeds a real token — repeated calls with the
-        // same port produce identical output. This is what lets `aikey use`
-        // be a no-op after the first installation.
+    fn kimi_region_is_port_agnostic() {
+        // Port no longer appears in the region (base_url is env-var-driven).
         let a = build_kimi_managed_region(27200);
-        let b = build_kimi_managed_region(27200);
-        assert_eq!(a, b);
+        let b = build_kimi_managed_region(19999);
+        assert_eq!(a, b, "region content must not depend on proxy_port:\nA={}\nB={}", a, b);
+        assert!(!a.contains("27200"));
+        assert!(!a.contains("19999"));
+    }
+
+    #[test]
+    fn kimi_strip_legacy_default_model_removes_matching_top_level() {
+        let input = "default_model = \"kimi-k2-5\"\ndefault_thinking = false\n[loop_control]\nmax = 10\n";
+        let out = strip_legacy_kimi_default_model(input);
+        assert!(!out.contains("default_model = \"kimi-k2-5\""));
+        assert!(out.contains("default_thinking = false"));
+        assert!(out.contains("[loop_control]"));
+        assert!(out.contains("max = 10"));
+    }
+
+    #[test]
+    fn kimi_strip_legacy_default_model_preserves_user_custom_value() {
+        // Users who picked a non-aikey-default value must be preserved.
+        let input = "default_model = \"kimi-dev\"\n[loop_control]\n";
+        let out = strip_legacy_kimi_default_model(input);
+        assert!(out.contains("default_model = \"kimi-dev\""));
+    }
+
+    #[test]
+    fn kimi_strip_legacy_default_model_ignores_inside_table() {
+        // A `default_model = ...` line AFTER a [table] header is a sub-key
+        // (e.g. `[some.plugin]\ndefault_model = "..."`), not our target.
+        let input = "[some.plugin]\ndefault_model = \"kimi-k2-5\"\n";
+        let out = strip_legacy_kimi_default_model(input);
+        assert!(out.contains("default_model = \"kimi-k2-5\""));
     }
 
     #[test]
     fn kimi_replace_region_preserves_surrounding_content() {
-        let before = "default_model = \"kimi-k2-5\"\n\n";
+        let before = "default_thinking = false\n\n";
         let old_region = format!("{AIKEY_BEGIN}\n[providers.kimi]\napi_key = \"old\"\n{AIKEY_END}");
         let after = "\n\n# user-added provider below\n[providers.custom]\nkey = \"keep-me\"\n";
         let existing = format!("{before}{old_region}{after}");
@@ -1285,16 +1385,16 @@ mod hook_tests {
         let new_region = build_kimi_managed_region(27200);
         let out = replace_managed_region(&existing, &new_region).unwrap();
 
-        assert!(out.starts_with("default_model = \"kimi-k2-5\"\n\n"));
-        assert!(out.contains(KIMI_PLACEHOLDER_API_KEY));
+        assert!(out.starts_with("default_thinking = false\n\n"));
         assert!(!out.contains("api_key = \"old\""));
+        assert!(out.contains("[[hooks]]"));
         assert!(out.contains("[providers.custom]"));
         assert!(out.contains("keep-me"));
     }
 
     #[test]
     fn kimi_replace_region_returns_none_without_markers() {
-        let plain = "default_model = \"kimi-k2-5\"\n[providers.custom]\nkey = \"k\"\n";
+        let plain = "default_thinking = false\n[providers.custom]\nkey = \"k\"\n";
         let region = build_kimi_managed_region(27200);
         assert!(replace_managed_region(plain, &region).is_none());
     }
@@ -1302,9 +1402,9 @@ mod hook_tests {
     #[test]
     fn kimi_strip_region_removes_region_and_one_trailing_newline() {
         let region = build_kimi_managed_region(27200);
-        let existing = format!("default_model = \"kimi-k2-5\"\n\n{region}\n\n# user\n");
+        let existing = format!("default_thinking = false\n\n{region}\n\n# user\n");
         let out = strip_managed_region(&existing).unwrap();
-        assert!(out.starts_with("default_model = \"kimi-k2-5\"\n\n"));
+        assert!(out.starts_with("default_thinking = false\n\n"));
         assert!(!out.contains(AIKEY_BEGIN));
         assert!(!out.contains(AIKEY_END));
         assert!(out.contains("# user"));
@@ -1328,5 +1428,138 @@ mod hook_tests {
         rebuilt.push_str(&region);
         rebuilt.push('\n');
         assert_eq!(rebuilt, original);
+    }
+
+    // ── Codex managed region (Option A — env-var-driven custom provider) ──
+
+    #[test]
+    fn codex_region_contains_custom_provider_with_env_key() {
+        let r = build_codex_managed_region(27200);
+        assert!(r.starts_with(AIKEY_BEGIN));
+        assert!(r.trim_end().ends_with(AIKEY_END));
+        assert!(r.contains("[model_providers.aikey]"));
+        assert!(r.contains("name = \"aikey\""));
+        assert!(r.contains("base_url = \"http://127.0.0.1:27200/openai\""));
+        // THE critical assertion: per-shell token via env_key.
+        assert!(r.contains("env_key = \"OPENAI_API_KEY\""));
+        assert!(r.contains("wire_api = \"responses\""));
+        // Must bypass the auth.json / ChatGPT login path.
+        assert!(r.contains("requires_openai_auth = false"));
+    }
+
+    #[test]
+    fn codex_region_respects_proxy_port() {
+        let r = build_codex_managed_region(19999);
+        assert!(r.contains("127.0.0.1:19999"));
+        assert!(!r.contains(":27200"));
+    }
+
+    #[test]
+    fn codex_upsert_line_on_empty_file_creates_line() {
+        let out = upsert_codex_managed_line("", "openai_base_url", "http://x/y");
+        assert_eq!(
+            out,
+            "openai_base_url = \"http://x/y\"  # managed by aikey\n"
+        );
+    }
+
+    #[test]
+    fn codex_upsert_line_replaces_existing_in_place() {
+        let existing = "model = \"gpt-5\"\nopenai_base_url = \"OLD\"\n[projects.x]\n";
+        let out = upsert_codex_managed_line(existing, "openai_base_url", "NEW");
+        assert!(out.contains("openai_base_url = \"NEW\"  # managed by aikey"));
+        assert!(!out.contains("\"OLD\""));
+        assert!(out.contains("model = \"gpt-5\""));
+        assert!(out.contains("[projects.x]"));
+    }
+
+    #[test]
+    fn codex_upsert_line_no_duplicate_when_other_keys_exist() {
+        // Regression: when `openai_base_url` already exists AND there's a
+        // different top-level key (`model_provider = "ollama"`) before any
+        // table, upsert must not also prepend a new line — it should JUST
+        // replace the existing one.
+        let existing = "model = \"gpt-5\"\nopenai_base_url = \"OLD\"  # managed by aikey\nmodel_provider = \"ollama\"\n[projects.x]\n";
+        let out = upsert_codex_managed_line(existing, "openai_base_url", "NEW");
+        // Exactly one openai_base_url line
+        let count = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with("openai_base_url"))
+            .count();
+        assert_eq!(count, 1, "got duplicate openai_base_url:\n{}", out);
+        // Exactly one model_provider line (user's, untouched here)
+        let mp_count = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with("model_provider ") || l.trim_start().starts_with("model_provider="))
+            .count();
+        assert_eq!(mp_count, 1, "model_provider duplicated:\n{}", out);
+    }
+
+    #[test]
+    fn codex_upsert_line_inserts_before_first_table() {
+        // TOML constraint: top-level keys must precede any [table] header.
+        let existing = "model = \"gpt-5\"\n[projects.x]\ntrust = \"full\"\n";
+        let out = upsert_codex_managed_line(existing, "model_provider", "aikey");
+        let key_pos = out.find("model_provider").unwrap();
+        let table_pos = out.find("[projects.x]").unwrap();
+        assert!(key_pos < table_pos, "model_provider must come before table header:\n{}", out);
+    }
+
+    #[test]
+    fn codex_upsert_line_prepends_when_file_is_all_tables() {
+        let existing = "[projects.x]\ntrust = \"full\"\n";
+        let out = upsert_codex_managed_line(existing, "model_provider", "aikey");
+        assert!(out.starts_with("model_provider = \"aikey\"  # managed by aikey"));
+    }
+
+    #[test]
+    fn codex_conflict_returns_none_when_no_model_provider() {
+        let content = "model = \"gpt-5\"\n[projects.x]\n";
+        assert_eq!(detect_codex_model_provider_conflict(content), None);
+    }
+
+    #[test]
+    fn codex_conflict_returns_none_for_openai_or_aikey() {
+        let a = "model_provider = \"openai\"\n";
+        let b = "model_provider = \"aikey\"  # managed by aikey\n";
+        assert_eq!(detect_codex_model_provider_conflict(a), None);
+        assert_eq!(detect_codex_model_provider_conflict(b), None);
+    }
+
+    #[test]
+    fn codex_conflict_returns_some_for_custom_provider() {
+        let content = "model = \"x\"\nmodel_provider = \"ollama\"\n[projects.x]\n";
+        assert_eq!(
+            detect_codex_model_provider_conflict(content),
+            Some("ollama".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_conflict_ignores_value_when_own_marker_present() {
+        // Our own write even with value == "custom-thing" must not self-report as conflict.
+        let content = "model_provider = \"anything\"  # managed by aikey\n";
+        assert_eq!(detect_codex_model_provider_conflict(content), None);
+    }
+
+    #[test]
+    fn codex_upsert_region_appends_to_end() {
+        let existing = "model = \"gpt-5\"\n[projects.x]\ntrust = \"full\"\n";
+        let region = build_codex_managed_region(27200);
+        let out = upsert_codex_region(existing, &region);
+        assert!(out.ends_with(&format!("{}\n", AIKEY_END)));
+        assert!(out.contains("model = \"gpt-5\""));
+        assert!(out.contains("[projects.x]"));
+    }
+
+    #[test]
+    fn codex_upsert_region_replaces_existing() {
+        let old_region = format!("{AIKEY_BEGIN}\n[model_providers.aikey]\napi_key = \"old\"\n{AIKEY_END}");
+        let existing = format!("model = \"gpt-5\"\n\n{old_region}\n");
+        let new_region = build_codex_managed_region(27200);
+        let out = upsert_codex_region(&existing, &new_region);
+        assert!(!out.contains("api_key = \"old\""));
+        assert!(out.contains("env_key = \"OPENAI_API_KEY\""));
+        assert!(out.contains("model = \"gpt-5\""));
     }
 }

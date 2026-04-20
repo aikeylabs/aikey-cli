@@ -286,6 +286,249 @@ fn handle_stats(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Shared implementation of `aikey key list` (canonical) and `aikey list` (alias).
+///
+/// Renders a unified view of Personal Keys, Team Keys, and OAuth accounts in
+/// one box — both entry points delegate here so the two commands always agree.
+fn run_unified_list(
+    password_stdin: bool,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Version-gated sync: only prompt for Master Password when the
+    // server has changes (new keys, status updates, etc.).
+    // No password needed when version is unchanged (most common case).
+    // Force sync when local cache is empty but user is logged in —
+    // version match alone is insufficient (cache may have been cleared
+    // or previously synced under the wrong identity).
+    let cache_empty = storage::list_virtual_key_cache().map(|c| c.is_empty()).unwrap_or(true);
+    let logged_in = storage::get_platform_account().ok().flatten().is_some();
+    let needs_sync = if cache_empty && logged_in {
+        true
+    } else {
+        commands_account::check_sync_version_changed().unwrap_or(false)
+    };
+    if needs_sync {
+        let password = prompt_vault_password(password_stdin, json_mode)?;
+        let _ = commands_account::run_full_snapshot_sync(&password);
+    }
+
+    // Only active keys are shown; revoked / recycled / expired keys
+    // are hidden so the output reflects currently usable keys only.
+    let managed: Vec<_> = storage::list_virtual_key_cache()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.key_status == "active")
+        .collect();
+
+    let entries = storage::list_entries_with_metadata().unwrap_or_default();
+
+    if json_mode {
+        json_output::success(serde_json::json!({
+            "secrets": entries,
+            "managed_keys": managed.iter().map(|e| serde_json::json!({
+                "virtual_key_id": e.virtual_key_id,
+                "alias":          e.alias,
+                "provider_code":  e.provider_code,
+                "key_status":     e.key_status,
+                "share_status":   e.share_status,
+                "local_state":    e.local_state,
+                "has_key":        e.provider_key_ciphertext.is_some(),
+            })).collect::<Vec<_>>(),
+        }));
+    } else {
+        use colored::Colorize;
+
+        let bindings = storage::list_provider_bindings(
+            profile_activation::DEFAULT_PROFILE
+        ).unwrap_or_default();
+
+        // Collect row data for auto-width calculation.
+        // `active` = has at least one provider binding routing to this key.
+        // Matches the `aikey route` convention: if the proxy is currently
+        // serving some provider via this key, it's considered active.
+        struct RowData { alias: String, providers: String, primary_for: String, has_primary: bool, status: String, created: String, suffix: String, active: bool }
+        let mut personal_rows: Vec<RowData> = Vec::new();
+        let mut team_rows: Vec<RowData> = Vec::new();
+
+        for entry in &entries {
+            let providers = if let Some(ref sp) = entry.supported_providers {
+                if !sp.is_empty() { sp.join(",") } else { entry.provider_code.clone().unwrap_or_default() }
+            } else { entry.provider_code.clone().unwrap_or_default() };
+            let pf: Vec<&str> = bindings.iter()
+                .filter(|b| b.key_source_type == credential_type::CredentialType::PersonalApiKey && b.key_source_ref == entry.alias)
+                .map(|b| b.provider_code.as_str()).collect();
+            let is_active = !pf.is_empty();
+            personal_rows.push(RowData {
+                alias: entry.alias.clone(), providers,
+                primary_for: pf.join(","), has_primary: !pf.is_empty(),
+                status: String::new(), // valid → not displayed
+                created: entry.created_at.map(|ts| format_date(ts)).unwrap_or_default(),
+                suffix: String::new(),
+                active: is_active,
+            });
+        }
+        for e in &managed {
+            let display = e.local_alias.as_deref().unwrap_or(e.alias.as_str()).to_string();
+            let pf: Vec<&str> = bindings.iter()
+                .filter(|b| b.key_source_type == credential_type::CredentialType::ManagedVirtualKey && b.key_source_ref == e.virtual_key_id)
+                .map(|b| b.provider_code.as_str()).collect();
+            // Unified status display: valid (hidden), expired, invalid, pending.
+            let status = if e.provider_key_ciphertext.is_none() {
+                "pending".to_string() // key not yet delivered to local vault
+            } else {
+                match e.local_state.as_str() {
+                    "active" | "synced_inactive" => match e.key_status.as_str() {
+                        "active" => String::new(), // valid → not displayed
+                        "expired" => "expired".to_string(),
+                        _ => "invalid".to_string(), // revoked, recycled, etc.
+                    },
+                    "disabled_by_account_scope" | "disabled_by_account_status"
+                    | "disabled_by_seat_status" | "disabled_by_key_status" => "invalid".to_string(),
+                    _ => "invalid".to_string(),
+                }
+            };
+            let suffix = if e.local_alias.is_some() { format!(" (\u{2190} {})", e.alias) } else { String::new() };
+            let is_active = !pf.is_empty();
+            team_rows.push(RowData {
+                alias: display, providers: e.provider_code.clone(),
+                primary_for: pf.join(","), has_primary: !pf.is_empty(),
+                status, created: format_date(e.synced_at), suffix,
+                active: is_active,
+            });
+        }
+
+        let all_data: Vec<&RowData> = personal_rows.iter().chain(team_rows.iter()).collect();
+        let headers = ["ALIAS", "PROVIDERS", "USING FOR", "STATUS", "CREATED"];
+        let pad = 2;
+        let w_alias   = headers[0].len().max(all_data.iter().map(|r| r.alias.len()).max().unwrap_or(0)) + pad;
+        let w_prov    = headers[1].len().max(all_data.iter().map(|r| r.providers.len()).max().unwrap_or(0)) + pad;
+        let w_primary = headers[2].len().max(all_data.iter().map(|r| r.primary_for.len()).max().unwrap_or(0)) + pad;
+        let w_status  = headers[3].len().max(all_data.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
+
+        // Row format: `● ALIAS ...` when active, `  ALIAS ...` otherwise.
+        // The 2-char prefix (marker + space) is shared with the header so
+        // columns line up across Personal / Team / OAuth sections.
+        let fmt_row = |r: &RowData| -> String {
+            let marker = if r.active { "●".green().to_string() } else { " ".to_string() };
+            let pf_padded = format!("{:<w$}", r.primary_for, w = w_primary);
+            let pf_col = if r.has_primary { pf_padded.green().to_string() } else { pf_padded };
+            let created_col = format!("\x1b[90m{}\x1b[0m", r.created);
+            let prov_display = if r.providers.len() > w_prov {
+                format!("{}...", &r.providers[..w_prov - 3])
+            } else { r.providers.clone() };
+            format!("{} {:<wa$}  {:<wp$}  {}  {:<ws$}  {}{}",
+                marker, r.alias, prov_display, pf_col, r.status, created_col, r.suffix,
+                wa = w_alias, wp = w_prov, ws = w_status)
+        };
+        // +2 accounts for the `● ` marker prefix that the row renderer adds.
+        let sep_width = 2 + w_alias + 2 + w_prov + 2 + w_primary + 2 + w_status + 2 + 10;
+
+        let mut rows: Vec<String> = Vec::new();
+        rows.push(format!("\u{1F464} Personal \x1b[90m({})\x1b[0m", entries.len()));
+        rows.push(format!("\x1b[2m  {:<wa$}  {:<wp$}  {:<wf$}  {:<ws$}  {}\x1b[0m",
+            headers[0], headers[1], headers[2], headers[3], headers[4],
+            wa = w_alias, wp = w_prov, wf = w_primary, ws = w_status));
+        rows.push("\u{2500}".repeat(sep_width));
+        if personal_rows.is_empty() { rows.push("(none)".to_string()); }
+        else { for r in &personal_rows { rows.push(fmt_row(r)); } }
+
+        rows.push(String::new());
+        rows.push(format!("\u{1F465} Team \x1b[90m({})\x1b[0m", managed.len()));
+        rows.push("\u{2500}".repeat(sep_width));
+        if team_rows.is_empty() { rows.push("(none)".to_string()); }
+        else { for r in &team_rows { rows.push(fmt_row(r)); } }
+
+        // D7: OAuth accounts section
+        let oauth_accounts = storage::list_provider_accounts().unwrap_or_default();
+        if !oauth_accounts.is_empty() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            // Build row data for dynamic width calculation
+            struct OAuthRow { identity: String, provider: String, use_for: String, has_use: bool, status: String, tier: String, expires: String }
+            let oauth_rows: Vec<OAuthRow> = oauth_accounts.iter().map(|acct| {
+                let identity = acct.display_identity.as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| acct.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
+                    .unwrap_or("-").to_string();
+                let uf: Vec<&str> = bindings.iter()
+                    .filter(|b| b.key_source_type == credential_type::CredentialType::PersonalOAuthAccount && b.key_source_ref == acct.provider_account_id)
+                    .map(|b| b.provider_code.as_str()).collect();
+                let token_expires = storage::get_provider_token_expires_at(&acct.provider_account_id)
+                    .ok().flatten();
+                let expires = token_expires
+                    .map(|exp| {
+                        let rem = exp - now;
+                        if rem <= 0 { "expired".to_string() }
+                        else if rem > 86400 { format!("{}d", rem / 86400) }
+                        else if rem > 3600 { format!("{}h", rem / 3600) }
+                        else { format!("{}m", rem / 60) }
+                    }).unwrap_or_else(|| "-".to_string());
+                // Unified status display: valid (hidden), expired, invalid.
+                let status = match acct.status.as_str() {
+                    "active" | "idle" => {
+                        // Check token expiry for more precise status
+                        if token_expires.map_or(false, |exp| exp <= now) {
+                            "expired".to_string() // token expired, needs refresh
+                        } else {
+                            String::new() // valid → not displayed
+                        }
+                    }
+                    "reauth_required" | "expired" => "expired".to_string(),
+                    _ => "invalid".to_string(), // revoked, subscription_required, etc.
+                };
+                OAuthRow {
+                    identity,
+                    provider: acct.provider.clone(),
+                    use_for: uf.join(","), has_use: !uf.is_empty(),
+                    status,
+                    tier: acct.account_tier.as_deref().unwrap_or("-").to_string(),
+                    expires,
+                }
+            }).collect();
+
+            // Dynamic column widths
+            let pad = 2;
+            let w_id   = "IDENTITY".len().max(oauth_rows.iter().map(|r| r.identity.len()).max().unwrap_or(0)) + pad;
+            let w_prov = "PROVIDER".len().max(oauth_rows.iter().map(|r| r.provider.len()).max().unwrap_or(0)) + pad;
+            let w_uf   = "USING FOR".len().max(oauth_rows.iter().map(|r| r.use_for.len()).max().unwrap_or(0)) + pad;
+            let w_st   = "STATUS".len().max(oauth_rows.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
+            let w_tier = "TIER".len().max(oauth_rows.iter().map(|r| r.tier.len()).max().unwrap_or(0)) + pad;
+            let _w_exp = "EXPIRES".len().max(oauth_rows.iter().map(|r| r.expires.len()).max().unwrap_or(0)) + pad;
+
+            rows.push(String::new());
+            rows.push(format!("\u{1F517} OAuth Accounts \x1b[90m({})\x1b[0m", oauth_accounts.len()));
+            rows.push(format!("\x1b[2m  {:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}\x1b[0m",
+                "IDENTITY", "PROVIDER", "USING FOR", "STATUS", "TIER", "EXPIRES",
+                wi = w_id, wp = w_prov, wu = w_uf, ws = w_st, wt = w_tier));
+            rows.push("\u{2500}".repeat(sep_width));
+            for r in &oauth_rows {
+                let uf_padded = format!("{:<w$}", r.use_for, w = w_uf);
+                let uf_col = if r.has_use { uf_padded.green().to_string() } else { uf_padded };
+                let tier_dim = format!("\x1b[90m{:<w$}\x1b[0m", r.tier, w = w_tier);
+                let expires_dim = format!("\x1b[90m{}\x1b[0m", r.expires);
+                // Active when this account is currently serving at least
+                // one provider (matches the `aikey route` convention).
+                let marker = if r.has_use { "●".green().to_string() } else { " ".to_string() };
+                rows.push(format!("{} {:<wi$}{:<wp$}  {}  {:<ws$}  {}  {}",
+                    marker, r.identity, r.provider, uf_col, r.status, tier_dim, expires_dim,
+                    wi = w_id, wp = w_prov, ws = w_st));
+            }
+        }
+
+        ui_frame::print_box("\u{1F511}", "Keys", &rows);
+        // Legend lives outside the box so the frame stays focused on data.
+        println!("  {} {}",
+            "●".green(),
+            "= active (set by `aikey use`)".dimmed());
+    }
+
+    // Post-operation: warn if proxy is unreachable (e.g. after kill -9).
+    commands_proxy::warn_if_proxy_down();
+    Ok(())
+}
+
 fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let command = cli.command.as_ref().unwrap();
 
@@ -700,238 +943,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::List => {
-            // Version-gated sync: only prompt for Master Password when the
-            // server has changes (new keys, status updates, etc.).
-            // No password needed when version is unchanged (most common case).
-            // Force sync when local cache is empty but user is logged in —
-            // version match alone is insufficient (cache may have been cleared
-            // or previously synced under the wrong identity).
-            let cache_empty = storage::list_virtual_key_cache().map(|c| c.is_empty()).unwrap_or(true);
-            let logged_in = storage::get_platform_account().ok().flatten().is_some();
-            let needs_sync = if cache_empty && logged_in {
-                true
-            } else {
-                commands_account::check_sync_version_changed().unwrap_or(false)
-            };
-            if needs_sync {
-                let password = prompt_vault_password(cli.password_stdin, cli.json)?;
-                let _ = commands_account::run_full_snapshot_sync(&password);
-            }
-
-            // Only active keys are shown; revoked / recycled / expired keys
-            // are hidden so the output reflects currently usable keys only.
-            let managed: Vec<_> = storage::list_virtual_key_cache()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|e| e.key_status == "active")
-                .collect();
-
-            let entries = storage::list_entries_with_metadata().unwrap_or_default();
-
-            if cli.json {
-                json_output::success(serde_json::json!({
-                    "secrets": entries,
-                    "managed_keys": managed.iter().map(|e| serde_json::json!({
-                        "virtual_key_id": e.virtual_key_id,
-                        "alias":          e.alias,
-                        "provider_code":  e.provider_code,
-                        "key_status":     e.key_status,
-                        "share_status":   e.share_status,
-                        "local_state":    e.local_state,
-                        "has_key":        e.provider_key_ciphertext.is_some(),
-                    })).collect::<Vec<_>>(),
-                }));
-            } else {
-                use colored::Colorize;
-
-                let bindings = storage::list_provider_bindings(
-                    profile_activation::DEFAULT_PROFILE
-                ).unwrap_or_default();
-
-                // Collect row data for auto-width calculation.
-                // `active` = has at least one provider binding routing to this key.
-                // Matches the `aikey route` convention: if the proxy is currently
-                // serving some provider via this key, it's considered active.
-                struct RowData { alias: String, providers: String, primary_for: String, has_primary: bool, status: String, created: String, suffix: String, active: bool }
-                let mut personal_rows: Vec<RowData> = Vec::new();
-                let mut team_rows: Vec<RowData> = Vec::new();
-
-                for entry in &entries {
-                    let providers = if let Some(ref sp) = entry.supported_providers {
-                        if !sp.is_empty() { sp.join(",") } else { entry.provider_code.clone().unwrap_or_default() }
-                    } else { entry.provider_code.clone().unwrap_or_default() };
-                    let pf: Vec<&str> = bindings.iter()
-                        .filter(|b| b.key_source_type == credential_type::CredentialType::PersonalApiKey && b.key_source_ref == entry.alias)
-                        .map(|b| b.provider_code.as_str()).collect();
-                    let is_active = !pf.is_empty();
-                    personal_rows.push(RowData {
-                        alias: entry.alias.clone(), providers,
-                        primary_for: pf.join(","), has_primary: !pf.is_empty(),
-                        status: String::new(), // valid → not displayed
-                        created: entry.created_at.map(|ts| format_date(ts)).unwrap_or_default(),
-                        suffix: String::new(),
-                        active: is_active,
-                    });
-                }
-                for e in &managed {
-                    let display = e.local_alias.as_deref().unwrap_or(e.alias.as_str()).to_string();
-                    let pf: Vec<&str> = bindings.iter()
-                        .filter(|b| b.key_source_type == credential_type::CredentialType::ManagedVirtualKey && b.key_source_ref == e.virtual_key_id)
-                        .map(|b| b.provider_code.as_str()).collect();
-                    // Unified status display: valid (hidden), expired, invalid, pending.
-                    let status = if e.provider_key_ciphertext.is_none() {
-                        "pending".to_string() // key not yet delivered to local vault
-                    } else {
-                        match e.local_state.as_str() {
-                            "active" | "synced_inactive" => match e.key_status.as_str() {
-                                "active" => String::new(), // valid → not displayed
-                                "expired" => "expired".to_string(),
-                                _ => "invalid".to_string(), // revoked, recycled, etc.
-                            },
-                            "disabled_by_account_scope" | "disabled_by_account_status"
-                            | "disabled_by_seat_status" | "disabled_by_key_status" => "invalid".to_string(),
-                            _ => "invalid".to_string(),
-                        }
-                    };
-                    let suffix = if e.local_alias.is_some() { format!(" (\u{2190} {})", e.alias) } else { String::new() };
-                    let is_active = !pf.is_empty();
-                    team_rows.push(RowData {
-                        alias: display, providers: e.provider_code.clone(),
-                        primary_for: pf.join(","), has_primary: !pf.is_empty(),
-                        status, created: format_date(e.synced_at), suffix,
-                        active: is_active,
-                    });
-                }
-
-                let all_data: Vec<&RowData> = personal_rows.iter().chain(team_rows.iter()).collect();
-                let headers = ["ALIAS", "PROVIDERS", "USING FOR", "STATUS", "CREATED"];
-                let pad = 2;
-                let w_alias   = headers[0].len().max(all_data.iter().map(|r| r.alias.len()).max().unwrap_or(0)) + pad;
-                let w_prov    = headers[1].len().max(all_data.iter().map(|r| r.providers.len()).max().unwrap_or(0)) + pad;
-                let w_primary = headers[2].len().max(all_data.iter().map(|r| r.primary_for.len()).max().unwrap_or(0)) + pad;
-                let w_status  = headers[3].len().max(all_data.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
-
-                // Row format: `● ALIAS ...` when active, `  ALIAS ...` otherwise.
-                // The 2-char prefix (marker + space) is shared with the header so
-                // columns line up across Personal / Team / OAuth sections.
-                let fmt_row = |r: &RowData| -> String {
-                    let marker = if r.active { "●".green().to_string() } else { " ".to_string() };
-                    let pf_padded = format!("{:<w$}", r.primary_for, w = w_primary);
-                    let pf_col = if r.has_primary { pf_padded.green().to_string() } else { pf_padded };
-                    let created_col = format!("\x1b[90m{}\x1b[0m", r.created);
-                    let prov_display = if r.providers.len() > w_prov {
-                        format!("{}...", &r.providers[..w_prov - 3])
-                    } else { r.providers.clone() };
-                    format!("{} {:<wa$}  {:<wp$}  {}  {:<ws$}  {}{}",
-                        marker, r.alias, prov_display, pf_col, r.status, created_col, r.suffix,
-                        wa = w_alias, wp = w_prov, ws = w_status)
-                };
-                // +2 accounts for the `● ` marker prefix that the row renderer adds.
-                let sep_width = 2 + w_alias + 2 + w_prov + 2 + w_primary + 2 + w_status + 2 + 10;
-
-                let mut rows: Vec<String> = Vec::new();
-                rows.push(format!("\u{1F464} Personal \x1b[90m({})\x1b[0m", entries.len()));
-                rows.push(format!("\x1b[2m  {:<wa$}  {:<wp$}  {:<wf$}  {:<ws$}  {}\x1b[0m",
-                    headers[0], headers[1], headers[2], headers[3], headers[4],
-                    wa = w_alias, wp = w_prov, wf = w_primary, ws = w_status));
-                rows.push("\u{2500}".repeat(sep_width));
-                if personal_rows.is_empty() { rows.push("(none)".to_string()); }
-                else { for r in &personal_rows { rows.push(fmt_row(r)); } }
-
-                rows.push(String::new());
-                rows.push(format!("\u{1F465} Team \x1b[90m({})\x1b[0m", managed.len()));
-                rows.push("\u{2500}".repeat(sep_width));
-                if team_rows.is_empty() { rows.push("(none)".to_string()); }
-                else { for r in &team_rows { rows.push(fmt_row(r)); } }
-
-                // D7: OAuth accounts section
-                let oauth_accounts = storage::list_provider_accounts().unwrap_or_default();
-                if !oauth_accounts.is_empty() {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64;
-                    // Build row data for dynamic width calculation
-                    struct OAuthRow { identity: String, provider: String, use_for: String, has_use: bool, status: String, tier: String, expires: String }
-                    let oauth_rows: Vec<OAuthRow> = oauth_accounts.iter().map(|acct| {
-                        let identity = acct.display_identity.as_deref()
-                            .filter(|s| !s.is_empty())
-                            .or_else(|| acct.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
-                            .unwrap_or("-").to_string();
-                        let uf: Vec<&str> = bindings.iter()
-                            .filter(|b| b.key_source_type == credential_type::CredentialType::PersonalOAuthAccount && b.key_source_ref == acct.provider_account_id)
-                            .map(|b| b.provider_code.as_str()).collect();
-                        let token_expires = storage::get_provider_token_expires_at(&acct.provider_account_id)
-                            .ok().flatten();
-                        let expires = token_expires
-                            .map(|exp| {
-                                let rem = exp - now;
-                                if rem <= 0 { "expired".to_string() }
-                                else if rem > 86400 { format!("{}d", rem / 86400) }
-                                else if rem > 3600 { format!("{}h", rem / 3600) }
-                                else { format!("{}m", rem / 60) }
-                            }).unwrap_or_else(|| "-".to_string());
-                        // Unified status display: valid (hidden), expired, invalid.
-                        let status = match acct.status.as_str() {
-                            "active" | "idle" => {
-                                // Check token expiry for more precise status
-                                if token_expires.map_or(false, |exp| exp <= now) {
-                                    "expired".to_string() // token expired, needs refresh
-                                } else {
-                                    String::new() // valid → not displayed
-                                }
-                            }
-                            "reauth_required" | "expired" => "expired".to_string(),
-                            _ => "invalid".to_string(), // revoked, subscription_required, etc.
-                        };
-                        OAuthRow {
-                            identity,
-                            provider: acct.provider.clone(),
-                            use_for: uf.join(","), has_use: !uf.is_empty(),
-                            status,
-                            tier: acct.account_tier.as_deref().unwrap_or("-").to_string(),
-                            expires,
-                        }
-                    }).collect();
-
-                    // Dynamic column widths
-                    let pad = 2;
-                    let w_id   = "IDENTITY".len().max(oauth_rows.iter().map(|r| r.identity.len()).max().unwrap_or(0)) + pad;
-                    let w_prov = "PROVIDER".len().max(oauth_rows.iter().map(|r| r.provider.len()).max().unwrap_or(0)) + pad;
-                    let w_uf   = "USING FOR".len().max(oauth_rows.iter().map(|r| r.use_for.len()).max().unwrap_or(0)) + pad;
-                    let w_st   = "STATUS".len().max(oauth_rows.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
-                    let w_tier = "TIER".len().max(oauth_rows.iter().map(|r| r.tier.len()).max().unwrap_or(0)) + pad;
-                    let _w_exp = "EXPIRES".len().max(oauth_rows.iter().map(|r| r.expires.len()).max().unwrap_or(0)) + pad;
-
-                    rows.push(String::new());
-                    rows.push(format!("\u{1F517} OAuth Accounts \x1b[90m({})\x1b[0m", oauth_accounts.len()));
-                    rows.push(format!("\x1b[2m  {:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}\x1b[0m",
-                        "IDENTITY", "PROVIDER", "USING FOR", "STATUS", "TIER", "EXPIRES",
-                        wi = w_id, wp = w_prov, wu = w_uf, ws = w_st, wt = w_tier));
-                    rows.push("\u{2500}".repeat(sep_width));
-                    for r in &oauth_rows {
-                        let uf_padded = format!("{:<w$}", r.use_for, w = w_uf);
-                        let uf_col = if r.has_use { uf_padded.green().to_string() } else { uf_padded };
-                        let tier_dim = format!("\x1b[90m{:<w$}\x1b[0m", r.tier, w = w_tier);
-                        let expires_dim = format!("\x1b[90m{}\x1b[0m", r.expires);
-                        // Active when this account is currently serving at least
-                        // one provider (matches the `aikey route` convention).
-                        let marker = if r.has_use { "●".green().to_string() } else { " ".to_string() };
-                        rows.push(format!("{} {:<wi$}{:<wp$}  {}  {:<ws$}  {}  {}",
-                            marker, r.identity, r.provider, uf_col, r.status, tier_dim, expires_dim,
-                            wi = w_id, wp = w_prov, ws = w_st));
-                    }
-                }
-
-                ui_frame::print_box("\u{1F511}", "Keys", &rows);
-                // Legend lives outside the box so the frame stays focused on data.
-                println!("  {} {}",
-                    "●".green(),
-                    "= active (set by `aikey use`)".dimmed());
-            }
-
-            // Post-operation: warn if proxy is unreachable (e.g. after kill -9).
-            commands_proxy::warn_if_proxy_down();
+            // `aikey list` is a shortcut for `aikey key list` — both render the
+            // same unified view (Personal + Team + OAuth).
+            run_unified_list(cli.password_stdin, cli.json)?;
         }
         Commands::Update { alias } => {
             // Confirm before update (skip in JSON / non-interactive / test mode).
@@ -1749,7 +1763,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 KeyAction::List => {
-                    commands_account::handle_key_list(cli.json)?;
+                    run_unified_list(cli.password_stdin, cli.json)?;
                 }
                 KeyAction::Sync => {
                     let password = prompt_vault_password(cli.password_stdin, cli.json)?;

@@ -401,11 +401,15 @@ fi
 # ---------------------------------------------------------------------------
 # 8. Kimi statusline install/uninstall integration (sandbox HOME).
 #
-# Covers:
-#   - `install kimi` without managed region → clear error, no write
-#   - `install kimi` with existing region → Stop hook present, idempotent
-#   - `uninstall kimi` with backup → backup restored wholesale
-#   - `status` reports the managed region + hook command honestly
+# Contract (post 2026-04-20 token-agnostic refactor — see shell_integration.rs):
+#   - `install kimi` is unconditional and idempotent: writes/refreshes the
+#     aikey-managed region in ~/.kimi/config.toml. The scaffold uses
+#     KIMI_API_KEY env-var override at runtime, so we don't need a prior
+#     `aikey use <kimi-key>` step.
+#   - Stop hook is always inside the managed region pointing at the current
+#     aikey binary.
+#   - `uninstall kimi` strips the region (or restores backup if present).
+#   - `status` reports the managed region + hook command honestly.
 # ---------------------------------------------------------------------------
 header "8. statusline install/uninstall kimi (sandbox HOME)"
 
@@ -418,14 +422,21 @@ run_kimi_install_tests() {
     export HOME="$sandbox"
     mkdir -p "$kimi_dir"
 
-    # Case A: install kimi without any managed region → must refuse.
+    # Case A: fresh install — no prior config. Must create scaffold with
+    # managed region + Stop hook. (The old contract "refuse until user
+    # runs aikey use" was retired when configure_kimi_cli became token-
+    # agnostic; the region is now self-sufficient via KIMI_API_KEY env.)
     local out_a
     out_a="$("$AIKEY_BIN" statusline install kimi 2>&1 || true)"
-    [ -f "$config" ] && { echo "case A: config.toml should not be created when region absent"; return 1; }
-    case "$out_a" in
-        *"No aikey-managed"*|*"no aikey"*|*"not configured"*) : ;;
-        *) echo "case A: install kimi should report missing region. got: $out_a"; return 2 ;;
-    esac
+    [ -f "$config" ] || { echo "case A: config.toml not created. out=$out_a"; return 1; }
+    grep -q "# BEGIN aikey" "$config" || {
+        echo "case A: managed region missing from fresh install. out=$out_a"
+        return 2
+    }
+    grep -qF "statusline render kimi" "$config" || {
+        echo "case A: Stop hook command missing. out=$out_a"
+        return 3
+    }
 
     # Case B: seed a managed region (simulating configure_kimi_cli output),
     # then install kimi → should be idempotent and report hook in place.
@@ -457,17 +468,21 @@ EOF
 
     local out_b
     out_b="$("$AIKEY_BIN" statusline install kimi 2>&1 || true)"
+    # New contract: success is signalled by "scaffold ensured" / "Stop
+    # hook" in the output (configure_kimi_cli refreshes the region on
+    # every call; true idempotency at the file level is checked by the
+    # grep assertions below, not by the stdout text).
     case "$out_b" in
-        *"already points"*|*"already"*|*"installed"*) : ;;
-        *) echo "case B: install kimi should succeed on existing region. got: $out_b"; return 3 ;;
+        *scaffold*|*"Stop hook"*|*"ensured"*|*"installed"*) : ;;
+        *) echo "case B: install kimi should report success. got: $out_b"; return 4 ;;
     esac
     grep -qF "statusline render kimi" "$config" || {
         echo "case B: Stop hook command missing from config.toml"
-        return 4
+        return 5
     }
     grep -q "# BEGIN aikey" "$config" || {
         echo "case B: BEGIN aikey marker missing"
-        return 5
+        return 6
     }
 
     # Case C: status command mentions Kimi.
@@ -535,7 +550,7 @@ EOF
 SANDBOX_KIMI="$(mktemp -d)"
 KIMI_ERR=""
 if KIMI_ERR=$(run_kimi_install_tests "$SANDBOX_KIMI" 2>&1); then
-    pass "install kimi (refuses without region, idempotent with region) + uninstall restores"
+    pass "install kimi (fresh scaffold + idempotent refresh) + uninstall restores"
 else
     fail "statusline install/uninstall kimi" "${KIMI_ERR:0:300}"
 fi

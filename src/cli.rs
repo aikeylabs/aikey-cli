@@ -16,7 +16,7 @@ Usage: {usage}
 
 Commands:
   \x1b[1madd\x1b[0m <alias>              Save a new secret to the vault
-  \x1b[1mlist\x1b[0m                     Show all personal and team keys
+  \x1b[1mlist\x1b[0m                     Show all personal, team, and OAuth keys (alias for `key list`)
   \x1b[1mtest\x1b[0m <alias>             Test whether a stored API key alias is working
   \x1b[1muse\x1b[0m [alias]              Select the active key for routing (shortcut for `key use`)
   \x1b[1mactivate\x1b[0m <alias>          Temporarily activate a key in the current terminal
@@ -98,7 +98,7 @@ pub(crate) enum Commands {
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
     },
-    /// Show all personal and team keys
+    /// Show all personal, team, and OAuth keys (alias for `aikey key list`)
     #[command(alias = "ls", display_order = 2)]
     List,
     /// Test whether a stored API key alias is working
@@ -478,7 +478,7 @@ pub(crate) enum KeyAction {
         #[arg(long)]
         from_stdin: bool,
     },
-    /// List all team-managed virtual keys (fetches from server if logged in)
+    /// Show all personal, team, and OAuth keys (alias: `aikey list`)
     List,
     /// Sync all team key metadata from the control service
     Sync,
@@ -848,8 +848,10 @@ Notes:
 
         "key list" => Some("\
 Notes:
-    - Lists team-managed virtual keys.
-    - May refresh metadata from server when possible."),
+    - Shows Personal Keys, Team Keys, and OAuth Accounts in one view.
+    - `aikey list` is a shortcut for this command.
+    - May refresh metadata from server when possible.
+    - If server state changed, AiKey may prompt for the vault password to complete a full sync."),
 
         "key sync" => Some("\
 Notes:
@@ -919,7 +921,7 @@ Usage: aikey [OPTIONS] [COMMAND]
 Commands:
   {b}add{r} <alias>              Save a new secret to the vault
   {b}auth{r} <command>           Manage provider OAuth accounts (Claude, Codex, Kimi)
-  {b}list{r}                     Show all personal and team keys
+  {b}list{r}                     Show all personal, team, and OAuth keys (alias for `key list`)
   {b}test{r} <alias>             Test whether a stored API key alias is working
   {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
   {b}activate{r} <alias>          Temporarily activate a key in the current terminal
@@ -987,13 +989,13 @@ Detailed Commands
     - In interactive mode, AiKey may run connectivity checks before saving.
 
 [1mlist[0m
-  Show all personal and team keys in one view.
+  Show all personal, team, and OAuth keys in one view (alias for `aikey key list`).
 
   Usage:
     aikey list
 
   Notes:
-    - Shows both Personal Keys and Team Keys.
+    - Shows Personal Keys, Team Keys, and OAuth Accounts.
     - Team keys are filtered to active keys only.
     - May perform a lightweight sync first.
     - If server state changed, AiKey may prompt for the vault password to complete a full sync.
@@ -1246,7 +1248,8 @@ Detailed Commands
       Usage:
         aikey key list
       Notes:
-        - Lists team-managed virtual keys.
+        - Shows Personal Keys, Team Keys, and OAuth Accounts in one view.
+        - `aikey list` is a shortcut for this command.
         - May refresh metadata from server when possible.
 
     [1msync[0m

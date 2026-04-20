@@ -2,9 +2,11 @@
 //!
 //! Covers:
 //!  - `aikey account login` / `aikey account status` / `aikey account logout`
-//!  - `aikey key list`  — show cached + server keys
 //!  - `aikey key sync`  — refresh metadata from server
 //!  - `aikey key use <id>` — activate a key for proxy routing
+//!
+//! Note: `aikey key list` and its alias `aikey list` share a single renderer
+//! in `main.rs::run_unified_list` (unified Personal + Team + OAuth view).
 
 use colored::Colorize;
 use secrecy::SecretString;
@@ -486,7 +488,7 @@ fn finish_login(
     } else {
         println!();
         println!("  {} Logged in as {}", "✓".green().bold(), account.email.bold());
-        println!("    Run {} to view your team keys.", "'aikey key list'".bold());
+        println!("    Run {} to view your team keys.", "'aikey list'".bold());
     }
 
     // Persist control URL to config.json so future logins skip the prompt.
@@ -1500,8 +1502,8 @@ pub fn try_background_snapshot_sync() {
 /// - Network/auth failures are silently ignored; the caller falls back to stale cache.
 ///
 /// Returns `true` if the server was reachable, `false` otherwise.
-/// Called by both `handle_key_list` (aikey key list) and the `aikey list` command
-/// so both always display fresh metadata without a separate sync step.
+/// Called by the shared key-list renderer (`run_unified_list` in main.rs)
+/// so the list command always displays fresh metadata without a separate sync step.
 pub fn sync_managed_key_metadata() -> bool {
     let acc = match storage::get_platform_account().ok().flatten() {
         Some(a) => a,
@@ -1598,98 +1600,6 @@ pub fn sync_managed_key_metadata() -> bool {
     }
 
     true
-}
-
-// ---------------------------------------------------------------------------
-// aikey key list
-// ---------------------------------------------------------------------------
-
-/// `aikey key list`
-///
-/// Fetches all team keys from the control service (if logged in) and merges
-/// with local cache, then displays a table.  No master password required —
-/// key material stays encrypted; only metadata is shown.
-pub fn handle_key_list(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let logged_in = storage::get_platform_account()?.is_some();
-
-    // Sync key state from server using the snapshot path; warn on failure only in
-    // interactive mode.  run_snapshot_sync() is a no-op when the server version
-    // matches local_seen, so it's fast after the background sync has already run.
-    let server_ok = run_snapshot_sync().is_ok();
-    if !server_ok && !json_mode && logged_in {
-        eprintln!("Warning: could not reach control service. Showing local cache.");
-    }
-
-    let maybe_client: Option<()> = if logged_in { Some(()) } else { None };
-
-    // Read (now-refreshed) local cache.
-    // Only surface active keys — revoked / recycled / expired keys are hidden
-    // from all list output so users are not misled about usable keys.
-    let cached: Vec<_> = storage::list_virtual_key_cache()?
-        .into_iter()
-        .filter(|e| e.key_status == "active")
-        .collect();
-
-    if json_mode {
-        crate::json_output::print_json(serde_json::json!({
-            "ok": true,
-            "keys": cached.iter().map(|e| serde_json::json!({
-                "virtual_key_id": e.virtual_key_id,
-                "alias": e.alias,
-                "local_alias": e.local_alias,
-                "provider_code": e.provider_code,
-                "key_status": e.key_status,
-                "share_status": e.share_status,
-                "local_state": e.local_state,
-                "has_key": e.provider_key_ciphertext.is_some(),
-            })).collect::<Vec<_>>(),
-        }));
-        return Ok(());
-    }
-
-    if cached.is_empty() {
-        if maybe_client.is_none() {
-            println!("Not logged in. Run 'aikey account login' to connect.");
-        } else if server_ok {
-            println!("No team keys assigned yet.");
-        } else {
-            println!("No keys in local cache.");
-        }
-        return Ok(());
-    }
-
-    // Table header.
-    println!("{:<36}  {:<20}  {:<12}  {:<10}  {:<14}  {}",
-        "ID", "ALIAS", "PROVIDER", "STATUS", "SHARE", "LOCAL");
-    println!("{}", "─".repeat(110));
-
-    for e in &cached {
-        let has_key = if e.provider_key_ciphertext.is_some() { "✓" } else { "" };
-        let share = match e.share_status.as_str() {
-            "pending_claim" => "pending  ←",
-            other => other,
-        };
-        println!("{:<36}  {:<20}  {:<12}  {:<10}  {:<14}  {:<14}  {}",
-            &e.virtual_key_id,
-            truncate(&e.alias, 20),
-            &e.provider_code,
-            &e.key_status,
-            share,
-            &e.local_state,
-            has_key,
-        );
-    }
-
-    let pending_count = cached.iter().filter(|e|
-        e.provider_key_ciphertext.is_none() && e.key_status == "active"
-        && !e.local_state.starts_with("disabled_by_")
-    ).count();
-    if pending_count > 0 {
-        println!();
-        println!("  {} key(s) not yet synced. Run 'aikey key sync' to download.", pending_count);
-    }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1826,8 +1736,35 @@ pub fn provider_env_vars_pub(provider_code: &str) -> Option<(&'static str, &'sta
     provider_env_vars(provider_code)
 }
 
+/// Public re-export of `provider_extra_env_vars` for use across crates.
+pub fn provider_extra_env_vars_pub(provider_code: &str) -> Vec<(&'static str, &'static str)> {
+    provider_extra_env_vars(provider_code)
+}
+
 pub(crate) fn provider_env_vars(provider_code: &str) -> Option<(&'static str, &'static str)> {
     provider_info(provider_code).map(|i| i.env_vars)
+}
+
+/// Provider-specific extra env vars beyond (api_key, base_url).
+///
+/// Used by active.env writers to populate provider-specific hints that the
+/// third-party CLI reads at runtime. Returns `Vec` (not fixed tuple) so a
+/// provider can declare multiple extras as needed.
+///
+/// Why Kimi has extras: we radically simplified `~/.kimi/config.toml` to
+/// contain only the Stop hook (no `[providers.kimi]` / `[models.*]` / top-level
+/// `default_model`). Kimi CLI's fallback logic at [app.py:177-185] constructs
+/// an empty LLMModel/LLMProvider when config lacks those, then
+/// `augment_provider_with_env_vars` populates fields from env vars. Without
+/// `KIMI_MODEL_NAME`, `model.model` stays empty and Kimi rejects the request.
+pub(crate) fn provider_extra_env_vars(provider_code: &str) -> Vec<(&'static str, &'static str)> {
+    match provider_code.to_lowercase().as_str() {
+        "kimi" | "moonshot" => vec![
+            ("KIMI_MODEL_NAME", "kimi-k2.5"),
+            ("KIMI_MODEL_MAX_CONTEXT_SIZE", "131072"),
+        ],
+        _ => Vec::new(),
+    }
 }
 
 /// Provider code → proxy URL path segment. Unknown codes fall back to "openai"
@@ -2257,21 +2194,13 @@ fn resolve_binding_display_name(source_type: &str, source_ref: &str) -> String {
     source_ref.to_string()
 }
 
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
-    }
-}
-
 #[cfg(test)]
 mod provider_mapping_tests {
     //! Pin the current behavior of provider-code → {env vars, URL path} mapping
     //! BEFORE attempting to consolidate with main.rs::canonical_provider.
     //! Any refactor (L5) must pass all of these.
 
-    use super::{provider_env_vars, provider_proxy_prefix};
+    use super::{provider_env_vars, provider_extra_env_vars, provider_proxy_prefix};
 
     // ── provider_env_vars: (API_KEY, BASE_URL) per provider ─────────────────
 
@@ -2435,6 +2364,25 @@ mod provider_mapping_tests {
         // kimi/moonshot (moonshot canonicalizes to kimi)
         assert_eq!(provider_info("kimi").unwrap().canonical_code,
                    provider_info("moonshot").unwrap().canonical_code);
+    }
+
+    #[test]
+    fn provider_extra_env_vars_kimi_has_model_name_and_context_size() {
+        // Minimal-scaffold Kimi requires KIMI_MODEL_NAME so Kimi's empty-model
+        // fallback can populate the model. Max context size is a convenience
+        // default matching kimi-k2.5 / moonshot-v1-128k (both 131072).
+        let kimi = provider_extra_env_vars("kimi");
+        assert!(kimi.iter().any(|(k, _)| *k == "KIMI_MODEL_NAME"));
+        assert!(kimi.iter().any(|(k, _)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE"));
+        // Alias moonshot must return same extras.
+        assert_eq!(kimi, provider_extra_env_vars("moonshot"));
+    }
+
+    #[test]
+    fn provider_extra_env_vars_returns_empty_for_non_kimi() {
+        for p in &["anthropic", "openai", "google", "deepseek"] {
+            assert!(provider_extra_env_vars(p).is_empty(), "{} must have no extras", p);
+        }
     }
 }
 

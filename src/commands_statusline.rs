@@ -367,16 +367,45 @@ fn kimi_turns_dir() -> PathBuf {
     home.join(".aikey").join("run").join("kimi-turns")
 }
 
-/// Read the watermark file. Returns `("", 0)` if absent (== minimum tuple).
-/// File format: `<wal_file_name>\t<wal_seq>` on one line.
+/// Read the watermark file. **Fail-closed** in every error / corruption
+/// mode — returns `("", 0)` (the minimum tuple, equivalent to "no
+/// watermark") whenever content can't be fully trusted:
+///   - file absent / unreadable
+///   - empty file
+///   - missing tab separator
+///   - seq portion doesn't parse as u64
+///   - file name portion is empty (seq without name is nonsensical)
+///
+/// Why fail-closed: a partially-trusted watermark can skew `tuple_gt`
+/// against legitimate WAL hits. E.g. a garbage file-name string could
+/// sort lexicographically past all real `usage-YYYYMMDD-HH.jsonl`
+/// names and suppress every future receipt until the file is manually
+/// removed. The cost of "no watermark" is one extra turn of
+/// at-least-once replay, which is always safe; the cost of "poisoned
+/// watermark" is silent permanent data loss. So we bias towards the
+/// former.
+///
+/// File format (when well-formed): `<wal_file_name>\t<wal_seq>` on a
+/// single line.
 fn read_watermark_in(dir: &Path, session_id: &str) -> (String, u64) {
     let path = dir.join(format!("{session_id}.watermark"));
-    let Ok(content) = std::fs::read_to_string(&path) else { return (String::new(), 0); };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return (String::new(), 0);
+    };
     let line = content.lines().next().unwrap_or("");
-    let mut parts = line.splitn(2, '\t');
-    let file = parts.next().unwrap_or("").to_string();
-    let seq = parts.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-    (file, seq)
+    let Some((file_part, seq_part)) = line.split_once('\t') else {
+        // No tab → can't distinguish file from seq. Treat as absent.
+        return (String::new(), 0);
+    };
+    if file_part.is_empty() {
+        // Seq without a file name is meaningless for tuple_gt.
+        return (String::new(), 0);
+    }
+    let Ok(seq) = seq_part.parse::<u64>() else {
+        // Tab present but seq isn't numeric — corrupted file.
+        return (String::new(), 0);
+    };
+    (file_part.to_string(), seq)
 }
 
 fn write_watermark_in(
@@ -584,15 +613,27 @@ fn render_line(ev: &UsageEvent) -> String {
     // a bidirectional "flow" — both fields are input-side counts (already
     // included in the main ↑ total), the split is about provenance and
     // pricing, not traffic direction.
-    //   ↺ (cyclic) for cache-read "hits"  → tokens replayed from server cache
-    //   + (plus)   for cache-creation     → tokens newly added to the cache
+    //   ↺ (cyclic)    for cache-read  → tokens replayed from server cache
+    //   ⊕ (circled +) for cache-write → tokens newly added to the cache
+    //
+    // Why `⊕` not bare `+`: inside a `·`-joined segment like `↺12K ⊕61K` a
+    // bare `+` reads as arithmetic ("12K + 61K"). The circled form breaks
+    // that illusion by being visually a single glyph, not a binary operator.
+    //
+    // Why no more parens / no more "hit"/"cache" words: the symbols alone
+    // are self-explanatory after a moment of pattern recognition, and
+    // dropping the enclosure lets cache align as a peer `·` segment with
+    // model / label instead of a parenthetical aside. This also halves
+    // the visual width of the segment on cache-heavy Claude turns where
+    // most of the line is already tokens.
+    //
     // Rendered one brightness tier dimmer than the main tokens since it's
     // supplementary detail, not a primary metric.
     let cache_read = ev.cache_read_input_tokens.unwrap_or(0);
     let cache_write = ev.cache_creation_input_tokens.unwrap_or(0);
     let cache_seg = if cache_read > 0 || cache_write > 0 {
         let body = format!(
-            "(↺{} hit · +{} cache)",
+            "↺{} ⊕{}",
             format_number(cache_read),
             format_number(cache_write),
         );
@@ -610,28 +651,39 @@ fn render_line(ev: &UsageEvent) -> String {
     // reads as metadata, not another metric.
     let ts = event_time_hm(&ev.event_time);
 
-    // Assemble with separators only between non-empty segments so we never
-    // get "↑3 ↓22 ·  · sonnet-4-6" when a section is missing. Timestamp
-    // uses the same `·` glyph as the other boundaries so the tail doesn't
-    // appear orphaned by a bare space.
+    // Layout (reviewed 2026-04-20):
+    //   {prefix}tokens · [cache] · model · label · ❬⦿·⦿❭ HH:MM
+    //
+    // - Timestamp moves to the far tail as bare `HH:MM` (no parens) so the
+    //   right edge reads as a clock, not another data segment.
+    // - Brand `❬⦿·⦿❭` sits between the last data segment and the timestamp,
+    //   joined with `·` on the left (as a regular segment) and a plain
+    //   space on the right (so the clock "floats" off the brand).
+    // - `partial` / `error` warning stays in FRONT — buried warnings are
+    //   worse than redundant leading chrome.
+    //
+    // Assemble data segments first, with `·` separators only between
+    // non-empty entries so a missing segment never produces "↑3 ↓22 ·  · m".
     let mut parts: Vec<String> = Vec::with_capacity(5);
     parts.push(format!("{up}{in_s} {down}{out_s}"));
     if !cache_seg.is_empty() { parts.push(cache_seg); }
     if !model.is_empty() { parts.push(format!("{}", model.dimmed())); }
     if !label.is_empty() { parts.push(format!("{}", label.dimmed())); }
-    if !ts.is_empty() { parts.push(format!("{}", format!("({ts})").dimmed())); }
 
-    // Brand prefix — a fixed glyph pair `❬⦿·⦿❭ ∷` prepended to every receipt
-    // (Claude status line + Kimi toast). Purpose: one constant visual anchor
-    // so users can recognise "this line came from aikey" at a glance even
-    // when the host's own chrome (e.g. Kimi's `[receipt]` tag) sits to its
-    // left. Rendered dimmed so it reads as chrome, not a primary metric.
-    // Kept outside the `parts` list so it survives the empty-segment filter
-    // and always lands at position 0 even when `partial`/`error` prefix is
-    // also active.
-    let brand = "❬⦿·⦿❭ ∷ ".dimmed();
+    let brand = "❬⦿·⦿❭".dimmed();
+    // Brand becomes the final `·`-joined segment so it aligns visually
+    // with model/label and doesn't look like a ragged appendix.
+    parts.push(format!("{}", brand));
 
-    format!("{brand}{prefix}{}", parts.join(&format!("{}", sep)))
+    let body = parts.join(&format!("{}", sep));
+    // Clock tail: plain `HH:MM`, dim, separated from brand by a single
+    // space. Omitted entirely when event_time parse failed so we never
+    // render a lone space at the end.
+    if ts.is_empty() {
+        format!("{prefix}{body}")
+    } else {
+        format!("{prefix}{body} {}", ts.dimmed())
+    }
 }
 
 /// Extract `HH:MM` from the event's RFC3339-ish timestamp. The proxy writes
@@ -1092,7 +1144,7 @@ fn print_status_kimi() {
         (false, _) => println!(
             "  {}: {}",
             "Stop hook".dimmed(),
-            "not configured (run `aikey use <kimi-key>`)".dimmed()
+            "not configured (run `aikey statusline install kimi`)".dimmed()
         ),
         (true, true) => println!(
             "  {}: {}",
@@ -1376,55 +1428,89 @@ mod tests {
     #[test]
     fn render_line_appends_refresh_timestamp() {
         let rendered = strip_ansi(&render_line(&ev("s", "claude-sonnet-4-6", "complete", 10, 5)));
-        // The default ev() uses "2026-04-17T15:23:45Z" — tag shows HH:MM only.
-        assert!(rendered.contains("(15:23)"), "missing timestamp tag: {rendered}");
-        assert!(!rendered.contains("(15:23:45)"), "seconds should be dropped: {rendered}");
+        // The default ev() uses "2026-04-17T15:23:45Z" — clock is now a
+        // bare `HH:MM` at the tail (no parens; parens were dropped in the
+        // 2026-04-20 layout change so the clock reads as a clock, not a
+        // parenthetical aside). Seconds are still dropped at source.
+        assert!(rendered.ends_with("15:23"), "clock tail missing: {rendered}");
+        assert!(!rendered.contains("(15:23)"), "parens around clock were removed: {rendered}");
+        assert!(!rendered.contains("15:23:45"), "seconds should be dropped: {rendered}");
     }
 
     #[test]
     fn render_line_shows_cache_breakdown_when_present() {
+        // Layout (post 2026-04-20 cache reformat):
+        //   ⇡70.1K ⇣153 · ↺53.1K ⊕32 · sonnet-4-6 · … · ❬⦿·⦿❭ 15:23
+        // Parens and "hit"/"cache" words removed; `+` → `⊕` to avoid
+        // misreading the segment as arithmetic `53.1K + 32`.
         let mut e = ev("s", "claude-sonnet-4-6", "complete", 70_100, 153);
         e.cache_read_input_tokens = Some(53_100);
         e.cache_creation_input_tokens = Some(32);
         let rendered = strip_ansi(&render_line(&e));
         assert!(rendered.contains("⇡70.1K"), "missing total input: {rendered}");
         assert!(rendered.contains("⇣153"), "missing output: {rendered}");
-        // Cache glyphs chosen to NOT imply bidirectional flow (both fields
-        // are input-side counts; ↺ = replayed, + = newly stored).
-        assert!(rendered.contains("↺53.1K hit"), "missing cache-read (hit): {rendered}");
-        assert!(rendered.contains("+32 cache"), "missing cache-creation: {rendered}");
+        // New compact form.
+        assert!(rendered.contains("↺53.1K"), "missing cache-read: {rendered}");
+        assert!(rendered.contains("⊕32"), "missing cache-creation: {rendered}");
+        // Old form must not regress.
+        assert!(!rendered.contains(" hit"), "word 'hit' was dropped: {rendered}");
+        assert!(!rendered.contains(" cache)"), "'cache)' suffix was dropped: {rendered}");
+        assert!(!rendered.contains("(↺"), "leading '(' around cache was dropped: {rendered}");
+        assert!(!rendered.contains("+32 "), "bare '+' was replaced by '⊕': {rendered}");
     }
 
     #[test]
     fn render_line_omits_cache_segment_when_zero() {
-        // Kimi-style event: cache fields absent → no parenthetical.
+        // Kimi-style event: cache fields absent → cache segment fully
+        // omitted (no zero-filled `↺0 ⊕0` noise).
         let rendered = strip_ansi(&render_line(&ev("s", "kimi-k2.5", "complete", 8377, 11)));
-        assert!(!rendered.contains(" hit"), "should omit cache segment: {rendered}");
         assert!(!rendered.contains("↺"), "should omit cache segment: {rendered}");
+        assert!(!rendered.contains("⊕"), "should omit cache segment: {rendered}");
     }
 
     #[test]
-    fn render_line_has_brand_prefix() {
-        // Both Claude and Kimi receipts must start with `❬⦿·⦿❭ ∷` so users
-        // recognise aikey-sourced lines at a glance. Check on a complete
-        // row (no partial/error prefix) and on a partial row (prefix sits
-        // AFTER the brand so the brand is always position 0).
+    fn render_line_layout_brand_then_clock() {
+        // Layout contract: brand `❬⦿·⦿❭` sits between the last data
+        // segment (label) and the clock tail. The absolute last characters
+        // on the line are the `HH:MM` clock (no parens, no trailing
+        // chrome). Warnings (`⚠ partial` / `⚠ error`) stay at the head.
+        //
+        // These invariants are load-bearing:
+        //   - A refactor that puts brand at tail must fail here.
+        //   - A refactor that re-prepends brand (pre-Y2) must fail here.
+        //   - A refactor that re-introduces parens around the clock must
+        //     fail on `render_line_appends_refresh_timestamp`.
         let complete = strip_ansi(&render_line(&ev("s", "kimi-k2.5", "complete", 42, 9)));
+        // Clock is the tail: "15:23" (seconds-dropped default event_time).
         assert!(
-            complete.starts_with("❬⦿·⦿❭ ∷ "),
-            "brand prefix missing on complete row: {complete}"
+            complete.ends_with("15:23"),
+            "clock must be the true tail: {complete}"
+        );
+        // Brand appears before the clock and after the last `·` segment.
+        let brand_idx = complete.find("❬⦿·⦿❭").expect("brand present");
+        let clock_idx = complete.rfind("15:23").unwrap();
+        assert!(
+            brand_idx < clock_idx,
+            "brand must precede clock: {complete}"
+        );
+        // Brand is not leading any more.
+        assert!(
+            !complete.starts_with("❬⦿·⦿❭"),
+            "brand must not lead the line: {complete}"
         );
 
         let partial = strip_ansi(&render_line(&ev("s", "kimi-k2.5", "partial", 42, 9)));
-        // Brand is first; partial marker follows.
         assert!(
-            partial.starts_with("❬⦿·⦿❭ ∷ "),
-            "brand prefix should precede partial marker: {partial}"
+            partial.starts_with("⚠ partial"),
+            "partial warning must be at the very front: {partial}"
         );
-        let brand_end = "❬⦿·⦿❭ ∷ ".len();
         assert!(
-            partial[brand_end..].trim_start().starts_with("⚠ partial"),
-            "partial marker should follow brand: {partial}"
+            partial.ends_with("15:23"),
+            "clock stays at tail even on partial row: {partial}"
+        );
+        assert!(
+            partial.contains("❬⦿·⦿❭"),
+            "brand must still appear between warning and clock: {partial}"
         );
     }
 
@@ -1538,18 +1624,51 @@ mod tests {
     }
 
     #[test]
-    fn watermark_malformed_returns_default() {
+    fn watermark_malformed_fail_closes_to_default() {
+        // Fail-closed contract (review finding #2, 2026-04-20): every
+        // corruption mode must return ("", 0). Previously we partially
+        // trusted broken content, which could poison tuple_gt and
+        // silently suppress future receipts. The worst case with the
+        // new contract is one extra at-least-once replay — always safe.
         let dir = std::env::temp_dir().join(format!(
             "aikey-test-wm-bad-{}-{}",
             std::process::id(),
             rand::random::<u64>()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("sess-X.watermark"), "garbage-without-tab").unwrap();
-        let (f, s) = read_watermark_in(&dir, "sess-X");
-        // File name captured verbatim, seq parses as 0 (no second field).
-        assert_eq!(f, "garbage-without-tab");
-        assert_eq!(s, 0);
+
+        let cases: &[(&str, &str)] = &[
+            ("no-tab", "garbage-without-tab"),
+            ("empty-file", ""),
+            ("tab-only", "\t"),
+            ("missing-seq", "wal-2026042017.jsonl\t"),
+            ("non-numeric-seq", "wal-2026042017.jsonl\tnot-a-number"),
+            ("negative-seq", "wal-2026042017.jsonl\t-5"),
+            ("empty-file-name", "\t42"),
+            ("float-seq", "wal-2026042017.jsonl\t3.14"),
+        ];
+
+        for (label, content) in cases {
+            let path = dir.join(format!("sess-{label}.watermark"));
+            std::fs::write(&path, content).unwrap();
+            let got = read_watermark_in(&dir, &format!("sess-{label}"));
+            assert_eq!(
+                got,
+                (String::new(), 0),
+                "malformed watermark {label:?} ({content:?}) must fail-close to default, got {got:?}"
+            );
+        }
+
+        // Positive control: a well-formed file still round-trips.
+        std::fs::write(
+            dir.join("sess-good.watermark"),
+            "wal-2026042017.jsonl\t42",
+        )
+        .unwrap();
+        let (f, s) = read_watermark_in(&dir, "sess-good");
+        assert_eq!(f, "wal-2026042017.jsonl");
+        assert_eq!(s, 42);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
