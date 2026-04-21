@@ -12,6 +12,7 @@ mod config;
 #[allow(dead_code)] mod env_resolver;
 #[allow(dead_code)] mod env_renderer;
 #[allow(dead_code)] mod commands_project;
+#[allow(dead_code)] mod connectivity;
 // mod commands_env; // removed: env commands dropped
 mod commands_proxy;
 #[allow(dead_code)] mod commands_account;
@@ -780,18 +781,25 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             let resolved_provider = resolved_providers.first().cloned();
 
-            // Step 4: connectivity test.
+            // Step 4: connectivity test — routed through the unified suite so
+            // `aikey add` shares one code path with doctor / test.
             if !cli.json && std::io::stdin().is_terminal() && env::var("AK_TEST_SECRET").is_err() {
-                let test_targets: Vec<(String, String)> = resolved_providers.iter().map(|code| {
-                    let url = resolved_base_url.as_deref()
-                        .or_else(|| commands_project::default_base_url(code))
-                        .unwrap_or("https://unknown").to_string();
-                    (code.clone(), url)
-                }).collect();
-                if !test_targets.is_empty() {
+                let targets = commands_project::targets_from_new_personal_key(
+                    alias,
+                    secret.trim(),
+                    &resolved_providers,
+                    resolved_base_url.as_deref(),
+                );
+                if !targets.is_empty() {
                     eprintln!();
-                    let suite = commands_project::run_connectivity_test(&test_targets, secret.trim(), false);
-                    if !suite.any_chat_ok {
+                    let opts = commands_project::SuiteOptions {
+                        show_proxy_row: true,
+                        header_label:   None,
+                        password:       None,
+                        proxy_port:     commands_proxy::proxy_port(),
+                    };
+                    let outcome = commands_project::run_connectivity_suite(targets, opts, false);
+                    if !outcome.any_chat_ok {
                         eprintln!();
                         eprint!("  \u{25c6} No chat test passed. Add anyway? [y/N] (default N): ");
                         io::stdout().flush()?;
@@ -1043,116 +1051,89 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Test { alias, provider: test_provider } => {
             let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+            let proxy_port = commands_proxy::proxy_port();
 
             if let Some(ref alias) = alias {
-                // ── Test a specific key by alias ─────────────────────
-                let key_value = match executor::get_secret(alias, &password) {
-                    Ok(s) => s,
-                    Err(e) => { if cli.json { json_output::error(&e, 1); } else { return Err(e.into()); } }
-                };
-                let meta = storage::list_entries_with_metadata().unwrap_or_default()
-                    .into_iter().find(|m| m.alias == *alias);
-                let provider_code = test_provider.as_ref().map(|p| p.to_lowercase())
-                    .or_else(|| meta.as_ref().and_then(|m| m.provider_code.clone()));
-                let base_url_override = meta.as_ref().and_then(|m| m.base_url.clone());
+                // ── Single-alias mode: resolve across personal/team/OAuth ──
+                // Why `targets_from_alias` instead of `executor::get_secret`:
+                // the old code only looked at personal vault entries and
+                // returned "Entry not found" for team keys or OAuth accounts.
+                // The resolver now scans all three sources with fixed
+                // priority (personal > team > OAuth).
+                let targets = commands_project::targets_from_alias(
+                    alias,
+                    test_provider.as_deref(),
+                    Some(&password),
+                    proxy_port,
+                );
+                if targets.is_empty() {
+                    let msg = format!(
+                        "Alias '{}' not found in personal keys, team keys, or OAuth accounts.\n\
+                         \n\
+                         Hints:\n\
+                         - run `aikey list` to see all known aliases\n\
+                         - for team keys, run `aikey key sync` first in case the cache is stale\n\
+                         - for team / OAuth: make sure the proxy is running (`aikey proxy start`)",
+                        alias);
+                    if cli.json { json_output::error(&msg, 1); }
+                    else { return Err(msg.into()); }
+                }
 
-                let targets: Vec<(String, String)> = if let Some(ref code) = provider_code {
-                    let url = base_url_override.as_deref()
-                        .or_else(|| commands_project::default_base_url(code))
-                        .unwrap_or("https://unknown").to_string();
-                    vec![(code.clone(), url)]
-                } else if let Some(ref url) = base_url_override {
-                    let mut t: Vec<(String, String)> = commands_project::PROVIDER_DEFAULTS.iter()
-                        .map(|(c, _)| (c.to_string(), url.clone())).collect();
-                    t.push(("custom".to_string(), url.clone())); t
-                } else {
-                    commands_project::PROVIDER_DEFAULTS.iter().map(|(c, u)| (c.to_string(), u.to_string())).collect()
+                let opts = commands_project::SuiteOptions {
+                    show_proxy_row: false,
+                    header_label:   None,
+                    password:       None,
+                    proxy_port,
                 };
-
                 if cli.json {
-                    let suite = commands_project::run_connectivity_test(&targets, key_value.trim(), true);
-                    json_output::success(serde_json::json!({ "alias": alias, "results": suite.json_results }));
+                    let outcome = commands_project::run_connectivity_suite(targets, opts, true);
+                    json_output::success(serde_json::json!({
+                        "alias":   alias,
+                        "results": outcome.json_results,
+                    }));
                 } else {
                     use colored::Colorize;
-                    if targets.len() == 1 { let (code, url) = &targets[0]; eprintln!("  Testing '{}' ({} \u{2192} {})", alias.bold(), code, url.dimmed()); }
-                    else { eprintln!("  Testing '{}' against {} providers", alias.bold(), targets.len()); }
+                    if targets.len() == 1 {
+                        let t = &targets[0];
+                        eprintln!("  Testing '{}' ({} \u{2192} {})",
+                            alias.bold(), t.display_label(), t.base_url.dimmed());
+                    } else {
+                        eprintln!("  Testing '{}' across {} provider(s)",
+                            alias.bold(), targets.len());
+                    }
                     eprintln!();
-                    commands_project::run_connectivity_test(&targets, key_value.trim(), false);
+                    commands_project::run_connectivity_suite(targets, opts, false);
                 }
             } else {
-                // ── No alias: test all current Primary keys in one table ─
-                let bindings = storage::list_provider_bindings(profile_activation::DEFAULT_PROFILE).unwrap_or_default();
-                if bindings.is_empty() {
+                // ── No alias: test all active bindings (personal/team/OAuth) ──
+                let (targets, build_errors) =
+                    commands_project::targets_from_active_bindings(Some(&password), proxy_port);
+
+                if targets.is_empty() && build_errors.is_empty() {
                     if cli.json { json_output::error("No active provider bindings. Add a key first.", 1); }
                     else { return Err("No active provider bindings. Add a key with `aikey add` first.".into()); }
                 }
-                use colored::Colorize;
 
-                struct TestItem { provider: String, url: String, key: String, display: String, source_type: String }
-                let mut items: Vec<TestItem> = Vec::new();
-                let mut skipped_team: Vec<(String, String)> = Vec::new();
-
-                for b in &bindings {
-                    let display = resolve_binding_display_name(b.key_source_type.as_str(), &b.key_source_ref);
-                    if b.key_source_type == credential_type::CredentialType::PersonalApiKey {
-                        let kv = match executor::get_secret(&b.key_source_ref, &password) {
-                            Ok(s) => s,
-                            Err(e) => { if !cli.json { eprintln!("  {} {} \u{2192} '{}': {}", "\u{2717}".red(), b.provider_code, b.key_source_ref, e); } continue; }
-                        };
-                        let bu = storage::get_entry_base_url(&b.key_source_ref).unwrap_or(None);
-                        let url = bu.as_deref().or_else(|| commands_project::default_base_url(&b.provider_code)).unwrap_or("https://unknown").to_string();
-                        items.push(TestItem { provider: b.provider_code.clone(), url, key: kv.to_string(), display, source_type: b.key_source_type.as_str().to_string() });
-                    } else { skipped_team.push((b.provider_code.clone(), display)); }
-                }
-
+                let opts = commands_project::SuiteOptions {
+                    show_proxy_row: true,
+                    header_label:   None,
+                    password:       None,
+                    proxy_port,
+                };
                 if cli.json {
-                    let mut all_json: Vec<serde_json::Value> = Vec::new();
-                    for item in &items {
-                        let r = commands_project::test_provider_connectivity(&item.provider, &item.url, item.key.trim());
-                        all_json.push(serde_json::json!({ "provider": item.provider, "alias": item.display, "source_type": item.source_type, "base_url": item.url,
-                            "ping_ok": r.ping_ok, "ping_ms": r.ping_ms, "api_ok": r.api_ok, "api_ms": r.api_ms, "api_status": r.api_status,
-                            "chat_ok": r.chat_ok, "chat_ms": r.chat_ms, "chat_status": r.chat_status }));
-                    }
-                    json_output::success(serde_json::json!({ "bindings_tested": all_json }));
+                    let outcome = commands_project::run_connectivity_suite(targets, opts, true);
+                    json_output::success(serde_json::json!({
+                        "bindings_tested": outcome.json_results,
+                        "build_errors": build_errors.iter().map(|e| serde_json::json!({
+                            "label":  e.label(),
+                            "reason": e.reason(),
+                        })).collect::<Vec<_>>(),
+                    }));
                 } else {
-                    eprintln!("  Testing {} active provider binding(s)...\n", bindings.len());
-                    const W_PROV: usize = 12; const W_ALIAS: usize = 16; const W_PING: usize = 16; const W_API: usize = 30;
-                    eprintln!("  {:<wp$} {:<wa$} {:<wpi$} {:<wap$} {}", "Provider".dimmed(), "Key".dimmed(), "Ping".dimmed(), "API".dimmed(), "Chat".dimmed(),
-                        wp = W_PROV, wa = W_ALIAS, wpi = W_PING, wap = W_API);
-                    eprintln!("  {}", "\u{2500}".repeat(W_PROV + W_ALIAS + W_PING + W_API + 20).dimmed());
-
-                    let mut any_reachable = false;
-                    for item in &items {
-                        eprint!("  {:<wp$} {:<wa$} ", item.provider.bold(), item.display.dimmed(), wp = W_PROV, wa = W_ALIAS);
-                        let _ = io::stderr().flush();
-                        let r = commands_project::test_provider_connectivity(&item.provider, &item.url, item.key.trim());
-                        let ping_raw = if r.ping_ok { format!("ok ({}ms)", r.ping_ms) } else { format!("fail ({}ms)", r.ping_ms) };
-                        let ping_col = if r.ping_ok { format!("{:<w$}", ping_raw, w = W_PING).green().to_string() } else { format!("{:<w$}", ping_raw, w = W_PING).red().to_string() };
-                        eprint!("{} ", ping_col); let _ = io::stderr().flush();
-                        if !r.ping_ok { eprintln!("{:<w$} {}", "\u{2014}".dimmed(), "\u{2014}".dimmed(), w = W_API); }
-                        else {
-                            any_reachable = true;
-                            let api_raw = if r.api_ok { let h = r.api_status.map(|s| commands_project::api_status_hint(s)).unwrap_or_default(); format!("ok ({}ms, {})", r.api_ms, h) } else { format!("fail ({}ms)", r.api_ms) };
-                            let api_col = if r.api_ok { format!("{:<w$}", api_raw, w = W_API).green().to_string() } else { format!("{:<w$}", api_raw, w = W_API).red().to_string() };
-                            eprint!("{} ", api_col); let _ = io::stderr().flush();
-                            if !r.api_ok { eprintln!("{}", "\u{2014}".dimmed()); }
-                            else if r.chat_ok { let h = r.chat_status.map(|s| commands_project::chat_status_hint(s)).unwrap_or_default(); eprintln!("{}", format!("ok ({}ms, {})", r.chat_ms, h).green()); }
-                            else { eprintln!("{}", format!("fail ({}ms)", r.chat_ms).red()); }
-                        }
-                    }
-                    for (prov, display) in &skipped_team { eprintln!("  {:<wp$} {:<wa$} {}", prov.bold(), display.dimmed(), "skipped [team]".dimmed(), wp = W_PROV, wa = W_ALIAS); }
-
-                    eprintln!();
-                    if !any_reachable { eprintln!("  {:<12} {}", "proxy".bold(), "skipped (all providers unreachable)".dimmed()); }
-                    else if commands_proxy::is_proxy_running() {
-                        let proxy_addr = commands_proxy::doctor_proxy_addr();
-                        if let Some(prov) = items.first().map(|i| i.provider.as_str()) {
-                            eprint!("  {:<12} ", "proxy".bold());
-                            let r = commands_project::test_proxy_connectivity(&proxy_addr, prov);
-                            if r.ok { let h = r.status.map(|s| commands_project::proxy_status_hint(s)).unwrap_or_default(); eprintln!("{} ({} ms, {})", "ok".green(), r.ms, h); }
-                            else { eprintln!("{} ({} ms)", "failed".red(), r.ms); }
-                        }
-                    } else { eprintln!("  {:<12} {}", "proxy".bold(), "not running".dimmed()); }
+                    eprintln!("  Testing {} active provider binding(s)...\n",
+                        targets.len() + build_errors.len());
+                    let _ = commands_project::run_connectivity_suite(targets, opts, false);
+                    commands_project::render_cannot_test_block(&build_errors, false);
                 }
             }
         }

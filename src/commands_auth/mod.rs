@@ -870,15 +870,10 @@ fn ambiguous_match_err(needle: &str, matches: &[storage::ProviderAccountInfo]) -
     "Please specify the full account ID or unique prefix.".into()
 }
 
-/// Map OAuth provider name to canonical provider code used in bindings.
-/// OAuth uses "claude"/"codex"/"kimi", but proxy routing uses "anthropic"/"openai"/"kimi".
-fn oauth_provider_to_canonical(provider: &str) -> &str {
-    match provider {
-        "claude" => "anthropic",
-        "codex" => "openai",
-        _ => provider,
-    }
-}
+/// Re-export from commands_account so existing call sites in this file stay
+/// unchanged. The helper itself lives in the lib-accessible module because
+/// connectivity-suite resolvers (lib scope) need the same normalization.
+use crate::commands_account::oauth_provider_to_canonical;
 
 /// Open a URL in the default browser (cross-platform).
 fn open_browser(url: &str) -> Result<(), Box<dyn std::error::Error>> {

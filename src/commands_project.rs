@@ -6,7 +6,12 @@ use secrecy::SecretString;
 use zeroize::Zeroizing;
 use std::io::{self, Write};
 
-/// Handle `aikey project init` command
+
+// Connectivity test code moved to `crate::connectivity` in 2026-04-21. The
+// `pub use` below preserves callsite paths (`commands_project::TestTarget`
+// etc.) while the canonical home is now `crate::connectivity::*`.
+pub use crate::connectivity::*;
+
 pub fn handle_project_init(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = std::path::Path::new("aikey.config.json");
 
@@ -521,10 +526,10 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // Accumulates results for --json mode.
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut any_failed = false;
-    // Deferred connectivity test — run after emit closure is dropped.
-    let mut deferred_connectivity: Option<(Vec<(String, String)>, String)> = None;
-    // Per-provider keys for multi-binding doctor tests: (provider_code, key, is_oauth).
-    let mut deferred_keys: Option<Vec<(String, String, bool)>> = None;
+    // Deferred suite — run after the emit closure is dropped (borrow conflict).
+    // (targets, build_errors) — targets flow into run_connectivity_suite;
+    // build_errors drive the "cannot test" block beneath the table.
+    let mut deferred_suite: Option<(Vec<TestTarget>, Vec<BuildTargetError>)> = None;
 
     // Helper: print one check row, collect for JSON.
     // label is left-padded to 18 chars; detail is the right-hand info string.
@@ -655,7 +660,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // direct TCP to 1.1.1.1:443 is blocked, causing a false "unreachable".
     {
         let start = Instant::now();
-        let ok = build_proxy_aware_agent(std::time::Duration::from_secs(5))
+        let ok = crate::connectivity::runtime::build_proxy_aware_agent(std::time::Duration::from_secs(5))
             .head("https://www.gstatic.com/generate_204")
             .call()
             .is_ok();
@@ -727,8 +732,10 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // ── 5. Provider + proxy connectivity ────────────────────
-    // Why: reuses the same all-bindings approach as `aikey test` (no alias)
-    // so that doctor shows every configured provider, not just the active key.
+    // Build targets via the unified helper so Personal / Team / OAuth go
+    // through the same code path as `aikey test` and `aikey add`. Deferred
+    // execution happens below the emit closure to avoid the &mut results
+    // borrow conflict that predates this refactor.
     if proxy_up {
         let bindings = storage::list_provider_bindings(
             crate::profile_activation::DEFAULT_PROFILE,
@@ -741,17 +748,13 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                     "no provider bindings — run 'aikey add' first".dimmed());
             }
         } else {
-            struct DoctorItem { provider: String, url: String, key: String, is_oauth: bool }
-            let mut items: Vec<DoctorItem> = Vec::new();
-
-            // Try session cache first; if expired and there are API key bindings,
-            // prompt for Master Password so we can decrypt and test them.
-            let has_api_key_bindings = bindings.iter().any(|b|
-                b.key_source_type == crate::credential_type::CredentialType::PersonalApiKey
-                || b.key_source_type == crate::credential_type::CredentialType::ManagedVirtualKey);
+            // Try session cache first; if expired and there are bindings
+            // that need decryption (PersonalApi), prompt for Master Password.
+            let has_personal = bindings.iter().any(|b|
+                b.key_source_type == crate::credential_type::CredentialType::PersonalApiKey);
             let pw = crate::session::try_get().or_else(|| {
                 use std::io::IsTerminal;
-                if has_api_key_bindings && !json_mode && std::io::stdin().is_terminal() {
+                if has_personal && !json_mode && std::io::stdin().is_terminal() {
                     crate::prompt_hidden("  \u{25c6} Enter Master Password to test API keys: ")
                         .ok()
                         .map(|p| secrecy::SecretString::new(p))
@@ -760,60 +763,17 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 }
             });
             let proxy_port = crate::commands_proxy::proxy_port();
-            for b in &bindings {
-                if b.key_source_type == crate::credential_type::CredentialType::PersonalApiKey {
-                    if let Some(ref pw) = pw {
-                        if let Ok(kv) = crate::executor::get_secret(&b.key_source_ref, pw) {
-                            let bu = storage::get_entry_base_url(&b.key_source_ref)
-                                .unwrap_or(None);
-                            let url = bu.as_deref()
-                                .or_else(|| default_base_url(&b.provider_code))
-                                .unwrap_or("https://unknown")
-                                .to_string();
-                            items.push(DoctorItem {
-                                provider: b.provider_code.clone(),
-                                url,
-                                key: kv.to_string(),
-                                is_oauth: false,
-                            });
-                        }
-                    }
-                } else if b.key_source_type == crate::credential_type::CredentialType::PersonalOAuthAccount {
-                    // OAuth: test connectivity through proxy (ping + API reachable).
-                    // Why not full chat probe: OAuth providers require provider-specific
-                    // persona headers (?beta=true, metadata.user_id, originator, etc.)
-                    // that differ per provider. Full chat validation should use
-                    // `aikey auth doctor` which tests the actual CLI→proxy→provider chain.
-                    let prefix = crate::commands_account::provider_proxy_prefix_pub(&b.provider_code);
-                    let url = format!("http://127.0.0.1:{}/{}", proxy_port, prefix);
-                    let sentinel = format!("aikey_personal_{}", b.key_source_ref);
-                    items.push(DoctorItem {
-                        provider: b.provider_code.clone(),
-                        url,
-                        key: sentinel,
-                        is_oauth: true,
-                    });
-                }
-                // team keys: tested via proxy only (no decryption needed here)
-            }
+            let (targets, build_errors) = targets_from_active_bindings(pw.as_ref(), proxy_port);
 
-            if items.is_empty() {
+            if targets.is_empty() && build_errors.is_empty() {
                 if !json_mode {
                     println!("  {} {:<18} {}",
                         "\u{b7}".dimmed(), "providers",
                         "no provider bindings configured".dimmed());
                 }
             } else {
-                let targets: Vec<(String, String)> = items.iter()
-                    .map(|i| (i.provider.clone(), i.url.clone()))
-                    .collect();
                 // Deferred: run after emit closure is dropped (borrow conflict).
-                deferred_connectivity = Some((targets, String::new()));
-                // Store per-provider keys for deferred use.
-                // Display label uses provider + (oauth) suffix for visual distinction.
-                deferred_keys = Some(items.into_iter()
-                    .map(|i| (i.provider.clone(), i.key, i.is_oauth))
-                    .collect());
+                deferred_suite = Some((targets, build_errors));
             }
         }
     }
@@ -961,18 +921,24 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         );
     }
 
-    // Drop emit to release &mut results, then run deferred tests.
+    // Drop emit to release &mut results, then run the deferred suite.
     drop(emit);
 
-    if let Some((targets, _)) = deferred_connectivity {
-        if let Some(keys) = deferred_keys {
-            // Multi-binding mode: test each provider with its own key.
-            run_multi_key_connectivity_test(&targets, &keys, json_mode, &mut results);
+    if let Some((targets, build_errors)) = deferred_suite {
+        let outcome = run_connectivity_suite(
+            targets,
+            SuiteOptions {
+                show_proxy_row: true,
+                header_label: Some("Connectivity Test"),
+                password: None,   // PersonalApi plaintext is already baked into each target
+                proxy_port: crate::commands_proxy::proxy_port(),
+            },
+            json_mode,
+        );
+        if json_mode {
+            results.extend(outcome.json_results);
         } else {
-            let suite = run_connectivity_test(&targets, "", json_mode);
-            if json_mode {
-                results.extend(suite.json_results);
-            }
+            render_cannot_test_block(&build_errors, json_mode);
         }
     }
 
@@ -993,665 +959,6 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Provider connectivity test (reused by `aikey add` and `aikey doctor`)
-// ---------------------------------------------------------------------------
-
-/// TCP ping: connect to host:port with a timeout. Returns (ok, latency_ms).
-/// Supports both IP addresses and hostnames (DNS resolution included).
-pub fn tcp_ping(host: &str, port: u16, timeout_secs: u64) -> (bool, u128) {
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::{Duration, Instant};
-
-    let addr_str = format!("{}:{}", host, port);
-    let start = Instant::now();
-
-    // Resolve hostname to socket address (includes DNS lookup).
-    let resolved = match addr_str.to_socket_addrs() {
-        Ok(mut addrs) => addrs.next(),
-        Err(_) => return (false, start.elapsed().as_millis()),
-    };
-    let sock_addr = match resolved {
-        Some(a) => a,
-        None => return (false, start.elapsed().as_millis()),
-    };
-
-    let ok = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(timeout_secs)).is_ok();
-    (ok, start.elapsed().as_millis())
-}
-
-/// Result of a provider connectivity test.
-pub struct ConnectivityResult {
-    pub ping_ok: bool,
-    pub ping_ms: u128,
-    pub api_ok: bool,
-    pub api_ms: u128,
-    pub api_status: Option<u16>,
-    pub chat_ok: bool,
-    pub chat_ms: u128,
-    pub chat_status: Option<u16>,
-}
-
-/// Default base URLs for known providers.
-/// Default base URLs for known providers — always use the official recommended URL.
-/// chat_suffix() / probe_suffix() detect trailing /v1 to avoid double /v1/v1.
-pub const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
-    ("anthropic", "https://api.anthropic.com"),
-    ("openai",    "https://api.openai.com/v1"),
-    ("google",    "https://generativelanguage.googleapis.com"),
-    ("deepseek",  "https://api.deepseek.com/v1"),
-    ("kimi",      "https://api.kimi.com/coding/v1"),
-    ("glm",       "https://open.bigmodel.cn/api/paas"),
-];
-
-/// Resolve the default base URL for a provider code.
-pub fn default_base_url(provider_code: &str) -> Option<&'static str> {
-    PROVIDER_DEFAULTS.iter()
-        .find(|(c, _)| *c == provider_code)
-        .map(|(_, u)| *u)
-}
-
-/// Test connectivity to a provider: first TCP ping, then API probe.
-///
-/// - **Ping**: TCP connect to the provider host on port 443 (fast, no auth).
-/// - **API**: HTTP GET with the real key (validates both network and key).
-///   Any HTTP response (including 401/403) is treated as "reachable".
-///   Only connection errors count as failure.
-/// Build a ureq agent that respects proxy.env (https_proxy / http_proxy).
-/// Why: in China and other restricted networks, direct connections to
-/// api.openai.com etc. are blocked. The user's proxy.env configures an
-/// outbound proxy (e.g., socks5://127.0.0.1:7890) that the connectivity
-/// test must use — otherwise TCP ping and HTTP probes time out.
-fn build_proxy_aware_agent(timeout: std::time::Duration) -> ureq::Agent {
-    let mut builder = ureq::AgentBuilder::new().timeout(timeout);
-
-    // Try https_proxy, then http_proxy, then all_proxy from proxy.env or env.
-    let proxy_url = crate::proxy_env::read_proxy_env_var("https_proxy")
-        .or_else(|| crate::proxy_env::read_proxy_env_var("http_proxy"))
-        .or_else(|| crate::proxy_env::read_proxy_env_var("all_proxy"))
-        .or_else(|| std::env::var("https_proxy").ok())
-        .or_else(|| std::env::var("http_proxy").ok())
-        .or_else(|| std::env::var("all_proxy").ok());
-
-    if let Some(url) = proxy_url {
-        if let Ok(proxy) = ureq::Proxy::new(&url) {
-            builder = builder.proxy(proxy);
-        }
-    }
-    builder.build()
-}
-
-pub fn test_provider_connectivity(
-    provider_code: &str,
-    base_url: &str,
-    api_key: &str,
-) -> ConnectivityResult {
-    use std::time::{Duration, Instant};
-
-    // Check if user has a network proxy configured (proxy.env or env vars).
-    let has_proxy = crate::proxy_env::read_proxy_env_var("https_proxy").is_some()
-        || crate::proxy_env::read_proxy_env_var("http_proxy").is_some()
-        || crate::proxy_env::read_proxy_env_var("all_proxy").is_some()
-        || std::env::var("https_proxy").is_ok()
-        || std::env::var("http_proxy").is_ok()
-        || std::env::var("all_proxy").is_ok();
-
-    // 1. TCP ping — extract host and port from base_url
-    // Why: skip TCP ping when a network proxy is configured, because direct
-    // TCP connect to the provider host will fail in restricted networks even
-    // though HTTP requests through the proxy succeed fine.
-    let is_http = base_url.starts_with("http://");
-    let host_port = base_url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or(base_url);
-    let (host, port) = if let Some(idx) = host_port.rfind(':') {
-        let h = &host_port[..idx];
-        let p = host_port[idx+1..].parse::<u16>().unwrap_or(if is_http { 80 } else { 443 });
-        (h, p)
-    } else {
-        (host_port, if is_http { 80 } else { 443 })
-    };
-
-    let (ping_ok, ping_ms) = if has_proxy {
-        // With a proxy, skip TCP ping and go straight to HTTP probe.
-        (true, 0)
-    } else {
-        tcp_ping(host, port, 5)
-    };
-
-    if !ping_ok {
-        return ConnectivityResult {
-            ping_ok: false, ping_ms,
-            api_ok: false, api_ms: 0, api_status: None,
-            chat_ok: false, chat_ms: 0, chat_status: None,
-        };
-    }
-
-    let agent = build_proxy_aware_agent(Duration::from_secs(10));
-
-    // 2. API probe with real key (GET — lightweight, no side effects)
-    let test_url = if provider_code == "google" {
-        format!("{}{}?key={}", base_url.trim_end_matches('/'), probe_suffix(provider_code, base_url), api_key)
-    } else {
-        format!("{}{}", base_url.trim_end_matches('/'), probe_suffix(provider_code, base_url))
-    };
-    let (auth_key, auth_val) = probe_auth(provider_code, api_key);
-
-    let api_start = Instant::now();
-    let mut api_req = agent.get(&test_url);
-    if provider_code != "google" {
-        api_req = api_req.set(auth_key, &auth_val);
-    }
-    let api_result = api_req.call();
-    let api_ms = api_start.elapsed().as_millis();
-
-    let (api_ok, api_status) = match api_result {
-        Ok(r) => (true, Some(r.status())),
-        Err(ureq::Error::Status(code, _)) => (true, Some(code)),
-        Err(_) => (false, None),
-    };
-
-    if !api_ok {
-        return ConnectivityResult {
-            ping_ok, ping_ms,
-            api_ok, api_ms, api_status,
-            chat_ok: false, chat_ms: 0, chat_status: None,
-        };
-    }
-
-    // 3. Chat probe — send a minimal completion request with max_tokens=1
-    // Why ?beta=true: Claude OAuth API requires this query param. Without it,
-    // Anthropic returns 429 business rejection (not real rate limit).
-    // When going through proxy, the proxy forwards the query params to upstream.
-    // OAuth accounts go through the proxy (base_url is localhost).
-    // Provider-specific adjustments are needed for OAuth persona requirements.
-    let is_via_proxy = base_url.contains("127.0.0.1") || base_url.contains("localhost");
-
-    let (chat_url, body) = if provider_code == "openai" && is_via_proxy {
-        // Codex OAuth: uses Responses API via chatgpt.com/backend-api/codex.
-        // Required fields: model=gpt-5.4, instructions, input=array, store=false, stream=true
-        // Why gpt-5.4: ChatGPT accounts only support Codex-specific models (not gpt-4o-mini).
-        // Why stream=true + store=false: Codex API enforces these for ChatGPT accounts.
-        // Ref: verified 2026-04-16 against chatgpt.com/backend-api/codex/responses
-        let url = format!("{}/responses", base_url.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": "gpt-5.4",
-            "instructions": "Say hi.",
-            "input": [{"role": "user", "content": "hi"}],
-            "store": false,
-            "stream": true
-        });
-        (url, body)
-    } else if provider_code == "anthropic" && is_via_proxy {
-        // Claude OAuth: requires ?beta=true + metadata.user_id
-        let url = format!("{}{}?beta=true", base_url.trim_end_matches('/'), chat_suffix(provider_code, base_url));
-        let mut body = chat_body(provider_code);
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("metadata".to_string(), serde_json::json!({"user_id": "aikey_doctor_probe"}));
-        }
-        (url, body)
-    } else if provider_code == "google" {
-        let url = format!("{}{}?key={}", base_url.trim_end_matches('/'), chat_suffix(provider_code, base_url), api_key);
-        (url, chat_body(provider_code))
-    } else {
-        let url = format!("{}{}", base_url.trim_end_matches('/'), chat_suffix(provider_code, base_url));
-        (url, chat_body(provider_code))
-    };
-    let (chat_auth_key, chat_auth_val) = probe_auth(provider_code, api_key);
-
-    let chat_agent = build_proxy_aware_agent(Duration::from_secs(15));
-    let chat_start = Instant::now();
-    let mut req = chat_agent.post(&chat_url)
-        .set("Content-Type", "application/json");
-    // Google uses ?key= in URL; skip header auth. Others use header.
-    if provider_code != "google" {
-        req = req.set(chat_auth_key, &chat_auth_val);
-    }
-    if provider_code == "anthropic" {
-        req = req.set("anthropic-version", "2023-06-01");
-    }
-    // Why: KIMI Coding API (api.kimi.com/coding/v1) requires a User-Agent
-    // matching its coding-agent whitelist (e.g. "claude-code", "kimi-cli").
-    // Without it, KIMI returns access_terminated_error (HTTP 403).
-    // We use "claude-code/1.0 (aikey)" to satisfy the whitelist while
-    // identifying ourselves. This only affects the connectivity probe.
-    if provider_code == "kimi" {
-        req = req.set("User-Agent", "claude-code/1.0");
-    }
-    let chat_result = req.send_string(&body.to_string());
-    let chat_ms = chat_start.elapsed().as_millis();
-
-    let (chat_ok, chat_status) = match chat_result {
-        Ok(r) => {
-            let s = r.status();
-            (s >= 200 && s < 300, Some(s))
-        }
-        Err(ureq::Error::Status(code, _)) => {
-            // 429 = auth passed but rate limited → treat as connectivity OK.
-            // Why: Claude OAuth returns 429 as business rejection when persona
-            // headers are incomplete, but also for genuine rate limits. Either way,
-            // the key is valid and the provider is reachable.
-            //
-            // 404 for openai via proxy = Codex uses Responses API, not Chat Completions.
-            // The probe endpoint doesn't exist, but the provider is reachable (API probe passed).
-            let ok = code == 429;
-            (ok, Some(code))
-        }
-        Err(_) => (false, None),
-    };
-
-    ConnectivityResult {
-        ping_ok, ping_ms,
-        api_ok, api_ms, api_status,
-        chat_ok, chat_ms, chat_status,
-    }
-}
-
-/// Result of a proxy connectivity probe.
-pub struct ProxyProbeResult {
-    pub ok: bool,
-    pub ms: u128,
-    pub status: Option<u16>,
-}
-
-/// Test a key through the proxy (full chain: CLI → proxy → provider).
-/// Uses the active key's token for authentication.
-pub fn test_proxy_connectivity(proxy_addr: &str, provider_code: &str) -> ProxyProbeResult {
-    use std::time::{Duration, Instant};
-
-    // Proxy strips the provider prefix and forwards to the real provider.
-    // The proxy's upstream base_url never ends with /v1, so use full /v1/... paths.
-    let proxy_base = format!("http://{}/{}", proxy_addr, provider_code);
-    let proxy_url = format!("{}{}", proxy_base, probe_suffix(provider_code, &proxy_base));
-    let active_cfg = crate::storage::get_active_key_config().ok().flatten();
-    let bearer = active_cfg.as_ref()
-        .map(|cfg| {
-            if cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey {
-                format!("aikey_vk_{}", cfg.key_ref)
-            } else {
-                format!("aikey_personal_{}", cfg.key_ref)
-            }
-        })
-        .unwrap_or_else(|| "aikey_test_probe".to_string());
-
-    let (auth_key, auth_val) = probe_auth(provider_code, &bearer);
-    let start = Instant::now();
-    let result = ureq::get(&proxy_url)
-        .set(auth_key, &auth_val)
-        .timeout(Duration::from_secs(10))
-        .call();
-    let ms = start.elapsed().as_millis();
-
-    let (ok, status) = match result {
-        Ok(r) => (true, Some(r.status())),
-        Err(ureq::Error::Status(code, _)) => (true, Some(code)),
-        Err(_) => (false, None),
-    };
-    ProxyProbeResult { ok, ms, status }
-}
-
-/// Format a proxy probe status code into a human-readable hint.
-pub fn proxy_status_hint(status: u16) -> String {
-    match status {
-        200 => "routing ok, key valid".to_string(),
-        400 | 404 | 405 => "routing ok".to_string(),
-        401 | 403 => "routing ok, key rejected by provider".to_string(),
-        503 => "proxy has no active key for this provider".to_string(),
-        _ => format!("HTTP {}", status),
-    }
-}
-
-/// Build the probe URL suffix for a provider.
-/// Checks if base_url already ends with /v1 to avoid double /v1/v1.
-fn probe_suffix(provider_code: &str, base_url: &str) -> String {
-    let base_has_v1 = base_url.trim_end_matches('/').ends_with("/v1");
-    match provider_code {
-        "anthropic" if base_has_v1 => "/messages".to_string(),
-        "anthropic" => "/v1/messages".to_string(),
-        "google" => "/v1beta/models".to_string(),
-        "custom" => String::new(),
-        _ if base_has_v1 => "/models".to_string(),
-        _ => "/v1/models".to_string(),
-    }
-}
-
-/// Build the chat completion URL suffix for a provider.
-/// Checks if base_url already ends with /v1 to avoid double /v1/v1.
-fn chat_suffix(provider_code: &str, base_url: &str) -> String {
-    let base_has_v1 = base_url.trim_end_matches('/').ends_with("/v1");
-    match provider_code {
-        "anthropic" if base_has_v1 => "/messages".to_string(),
-        "anthropic" => "/v1/messages".to_string(),
-        "google" => "/v1beta/models/gemini-2.0-flash:generateContent".to_string(),
-        _ if base_has_v1 => "/chat/completions".to_string(),
-        _ => "/v1/chat/completions".to_string(),
-    }
-}
-
-/// Default model name per provider for the chat probe.
-fn probe_model(provider_code: &str) -> &'static str {
-    match provider_code {
-        // Why haiku: sonnet/opus hit rate limits on OAuth accounts (429 business rejection).
-        // Haiku is lighter and skips stricter quota checks. Verified in research.
-        "anthropic" => "claude-haiku-4-5-20251001",
-        "openai"    => "gpt-4o-mini",
-        "deepseek"  => "deepseek-chat",
-        "kimi"      => "moonshot-v1-8k",
-        "google"    => "gemini-2.0-flash",
-        "glm" | "zhipu" => "glm-4-flash",
-        "yi"        => "yi-lightning",
-        "qwen" | "dashscope" => "qwen-turbo",
-        "mistral"   => "mistral-small-latest",
-        _           => "gpt-4o-mini", // fallback: most gateways understand this
-    }
-}
-
-/// Build a minimal chat request body for a provider.
-fn chat_body(provider_code: &str) -> serde_json::Value {
-    let model = probe_model(provider_code);
-    match provider_code {
-        "anthropic" => serde_json::json!({
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "hi"}]
-        }),
-        "google" => serde_json::json!({
-            "contents": [{"parts": [{"text": "hi"}]}],
-            "generationConfig": {"maxOutputTokens": 1}
-        }),
-        _ => serde_json::json!({
-            "model": model,
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "hi"}]
-        }),
-    }
-}
-
-/// Build the auth header (key, value) for a provider probe.
-fn probe_auth(provider_code: &str, api_key: &str) -> (&'static str, String) {
-    match provider_code {
-        "anthropic" => ("x-api-key", api_key.to_string()),
-        // Google uses ?key= query param, but we pass it as header too for proxy compatibility.
-        // The actual URL builder appends ?key= for direct calls.
-        "google"    => ("x-goog-api-key", api_key.to_string()),
-        _           => ("Authorization", format!("Bearer {}", api_key)),
-    }
-}
-
-/// Format a chat probe status code into a human-readable hint.
-pub fn chat_status_hint(status: u16) -> String {
-    match status {
-        200 => "valid".to_string(),
-        400 => "bad request".to_string(),
-        401 => "invalid key".to_string(),
-        403 => "forbidden".to_string(),
-        404 => "not found".to_string(),
-        422 => "invalid request".to_string(),
-        429 => "rate limited, key valid".to_string(),
-        _ if status >= 500 => format!("server error ({})", status),
-        _ => format!("HTTP {}", status),
-    }
-}
-
-/// Format an API probe status code into a human-readable hint.
-pub fn api_status_hint(status: u16) -> String {
-    match status {
-        200 => "valid key".to_string(),
-        401 | 403 => "reachable, key rejected".to_string(),
-        404 => "reachable".to_string(),
-        _ => format!("HTTP {}", status),
-    }
-}
-
-/// Result of a full connectivity test suite.
-pub struct TestSuiteResult {
-    /// JSON results (populated only in json_mode).
-    pub json_results: Vec<serde_json::Value>,
-    /// Whether at least one provider's chat probe succeeded.
-    pub any_chat_ok: bool,
-}
-
-/// Run a full connectivity test suite: direct provider tests + proxy test.
-/// Prints results to stderr. Returns test suite result with `any_chat_ok`.
-///
-/// Used by `aikey test`, `aikey add`, and `aikey doctor`.
-pub fn run_connectivity_test(
-    targets: &[(String, String)],
-    api_key: &str,
-    json_mode: bool,
-) -> TestSuiteResult {
-    use colored::Colorize;
-
-    if json_mode {
-        let mut any_chat = false;
-        let mut results: Vec<serde_json::Value> = targets.iter().map(|(code, url)| {
-            let r = test_provider_connectivity(code, url, api_key);
-            if r.chat_ok { any_chat = true; }
-            serde_json::json!({
-                "provider": code, "base_url": url,
-                "ping_ok": r.ping_ok, "ping_ms": r.ping_ms,
-                "api_ok": r.api_ok, "api_ms": r.api_ms, "api_status": r.api_status,
-                "chat_ok": r.chat_ok, "chat_ms": r.chat_ms, "chat_status": r.chat_status,
-            })
-        }).collect();
-
-        // Proxy test
-        if crate::commands_proxy::is_proxy_running() {
-            let proxy_addr = crate::commands_proxy::doctor_proxy_addr();
-            let prov = targets.iter().find(|(c, _)| c != "custom").map(|(c, _)| c.as_str());
-            if let Some(prov) = prov {
-                let r = test_proxy_connectivity(&proxy_addr, prov);
-                results.push(serde_json::json!({
-                    "provider": "proxy", "proxy_addr": proxy_addr,
-                    "ok": r.ok, "ms": r.ms, "status": r.status,
-                }));
-            }
-        }
-        return TestSuiteResult { json_results: results, any_chat_ok: any_chat };
-    }
-
-    // Interactive output — table, rows appended as each test completes.
-    const W_PROV: usize = 12;
-    const W_PING: usize = 16;
-    const W_API:  usize = 30;
-
-    let mut any_reachable = false;
-    let mut any_chat_ok = false;
-
-    // Header
-    eprintln!("  {:<W_PROV$} {:<W_PING$} {:<W_API$} {}",
-        "Provider".dimmed(), "Ping".dimmed(), "API".dimmed(), "Chat".dimmed(),
-        W_PROV = W_PROV, W_PING = W_PING, W_API = W_API);
-    eprintln!("  {}", "─".repeat(W_PROV + W_PING + W_API + 20).dimmed());
-
-    for (code, url) in targets {
-        // Print provider name immediately so user sees progress.
-        eprint!("  {:<W_PROV$} ", code.bold(), W_PROV = W_PROV);
-        use std::io::Write;
-        let _ = std::io::stderr().flush();
-
-        let r = test_provider_connectivity(code, url, api_key);
-
-        // Ping column
-        let ping_raw = if r.ping_ok { format!("ok ({}ms)", r.ping_ms) } else { format!("fail ({}ms)", r.ping_ms) };
-        let ping_col = if r.ping_ok { format!("{:<W$}", ping_raw, W = W_PING).green().to_string() }
-                       else         { format!("{:<W$}", ping_raw, W = W_PING).red().to_string() };
-        eprint!("{} ", ping_col);
-        let _ = std::io::stderr().flush();
-
-        if !r.ping_ok {
-            // API + Chat columns: skip
-            eprintln!("{:<W_API$} {}", "—".dimmed(), "—".dimmed(), W_API = W_API);
-        } else {
-            any_reachable = true;
-
-            // API column
-            let api_raw = if r.api_ok {
-                let hint = r.api_status.map(|s| api_status_hint(s)).unwrap_or_default();
-                format!("ok ({}ms, {})", r.api_ms, hint)
-            } else {
-                format!("fail ({}ms)", r.api_ms)
-            };
-            let api_col = if r.api_ok { format!("{:<W$}", api_raw, W = W_API).green().to_string() }
-                          else         { format!("{:<W$}", api_raw, W = W_API).red().to_string() };
-            eprint!("{} ", api_col);
-            let _ = std::io::stderr().flush();
-
-            // Chat column
-            if !r.api_ok {
-                eprintln!("{}", "—".dimmed());
-            } else if r.chat_ok {
-                any_chat_ok = true;
-                let hint = r.chat_status.map(|s| chat_status_hint(s)).unwrap_or_default();
-                eprintln!("{}", format!("ok ({}ms, {})", r.chat_ms, hint).green());
-            } else {
-                eprintln!("{}", format!("fail ({}ms)", r.chat_ms).red());
-            }
-        }
-    }
-
-    // Proxy test
-    eprintln!();
-    if !any_reachable {
-        eprintln!("  {:<12} {}", "proxy".bold(), "skipped (all providers unreachable)".dimmed());
-    } else if crate::commands_proxy::is_proxy_running() {
-        let proxy_addr = crate::commands_proxy::doctor_proxy_addr();
-        eprint!("  {:<12} ", "proxy".bold());
-        let proxy_provider = targets.iter()
-            .find(|(c, _)| c != "custom")
-            .map(|(c, _)| c.as_str());
-        if let Some(prov) = proxy_provider {
-            let r = test_proxy_connectivity(&proxy_addr, prov);
-            if r.ok {
-                let hint = r.status.map(|s| proxy_status_hint(s)).unwrap_or_default();
-                eprintln!("{} ({} ms, {})", "ok".green(), r.ms, hint);
-            } else {
-                eprintln!("{} ({} ms)", "failed".red(), r.ms);
-            }
-        } else {
-            eprintln!("{}", "skipped — use --provider <code> to test proxy routing".dimmed());
-        }
-    } else {
-        eprintln!("  {:<12} {}", "proxy".bold(), "not running".dimmed());
-    }
-
-    TestSuiteResult { json_results: Vec::new(), any_chat_ok }
-}
-
-/// Run connectivity tests with per-provider API keys (used by `aikey doctor`).
-/// Each target is tested with its own key from the `keys` map.
-fn run_multi_key_connectivity_test(
-    targets: &[(String, String)],
-    keys: &[(String, String, bool)],  // (provider_code, key, is_oauth)
-    json_mode: bool,
-    results: &mut Vec<serde_json::Value>,
-) {
-    use colored::Colorize;
-    use std::io::Write;
-
-    let key_map: std::collections::HashMap<&str, (&str, bool)> = keys.iter()
-        .map(|(p, k, oauth)| (p.as_str(), (k.as_str(), *oauth)))
-        .collect();
-
-    if json_mode {
-        for (code, url) in targets {
-            let (api_key, is_oauth) = key_map.get(code.as_str()).copied().unwrap_or(("", false));
-            let r = test_provider_connectivity(code, url, api_key);
-            results.push(serde_json::json!({
-                "provider": code, "base_url": url, "is_oauth": is_oauth,
-                "ping_ok": r.ping_ok, "ping_ms": r.ping_ms,
-                "api_ok": r.api_ok, "api_ms": r.api_ms, "api_status": r.api_status,
-                "chat_ok": r.chat_ok, "chat_ms": r.chat_ms, "chat_status": r.chat_status,
-            }));
-        }
-        return;
-    }
-
-    // Interactive table — same layout as run_connectivity_test / aikey test.
-    const W_PROV: usize = 18; const W_PING: usize = 16; const W_API: usize = 30;
-    eprintln!();
-    eprintln!("  \u{1F50C} {}", "Connectivity Test".bold());
-    eprintln!("  {:<wp$} {:<wpi$} {:<wap$} {}",
-        "Provider".dimmed(), "Ping".dimmed(), "API".dimmed(), "Chat".dimmed(),
-        wp = W_PROV, wpi = W_PING, wap = W_API);
-    eprintln!("  {}", "\u{2500}".repeat(W_PROV + W_PING + W_API + 20).dimmed());
-
-    let mut any_reachable = false;
-    let mut failed_hints: Vec<String> = Vec::new();
-    for (code, url) in targets {
-        let (api_key, is_oauth) = key_map.get(code.as_str()).copied().unwrap_or(("", false));
-        let display_name = if is_oauth { format!("{} (oauth)", code) } else { code.clone() };
-        eprint!("  {:<wp$} ", display_name.bold(), wp = W_PROV);
-        let _ = std::io::stderr().flush();
-        let r = test_provider_connectivity(code, url, api_key);
-
-        // Ping column
-        let ping_raw = if r.ping_ok { format!("ok ({}ms)", r.ping_ms) } else { format!("fail ({}ms)", r.ping_ms) };
-        let ping_col = if r.ping_ok { format!("{:<w$}", ping_raw, w = W_PING).green().to_string() } else { format!("{:<w$}", ping_raw, w = W_PING).red().to_string() };
-        eprint!("{} ", ping_col); let _ = std::io::stderr().flush();
-
-        if !r.ping_ok {
-            eprintln!("{:<w$} {}", "\u{2014}".dimmed(), "\u{2014}".dimmed(), w = W_API);
-            failed_hints.push(format!("{}: ping failed — check network, VPN, or firewall", display_name));
-        } else {
-            any_reachable = true;
-            // API column
-            let api_raw = if r.api_ok { let h = r.api_status.map(|s| api_status_hint(s)).unwrap_or_default(); format!("ok ({}ms, {})", r.api_ms, h) } else { format!("fail ({}ms)", r.api_ms) };
-            let api_col = if r.api_ok { format!("{:<w$}", api_raw, w = W_API).green().to_string() } else { format!("{:<w$}", api_raw, w = W_API).red().to_string() };
-            eprint!("{} ", api_col); let _ = std::io::stderr().flush();
-            // Chat column
-            if !r.api_ok {
-                eprintln!("{}", "\u{2014}".dimmed());
-                failed_hints.push(format!("{}: API unreachable — check proxy config or provider URL", display_name));
-            } else if r.chat_ok {
-                let hint = r.chat_status.map(|s| chat_status_hint(s)).unwrap_or_default();
-                eprintln!("{}", format!("ok ({}ms, {})", r.chat_ms, hint).green());
-            } else {
-                let hint = r.chat_status.map(|s| format!(", HTTP {}: {}", s, chat_status_hint(s))).unwrap_or_default();
-                eprintln!("{}", format!("fail ({}ms{})", r.chat_ms, hint).red());
-                // Actionable hint based on HTTP status + context
-                let suggestion = match (r.chat_status, is_oauth, code.as_str()) {
-                    (Some(404), true, "openai") => format!("{}: Codex uses Responses API (not Chat Completions) — probe skipped; actual usage works", display_name),
-                    (Some(400), _, _) => format!("{}: chat 400 — missing header or invalid body", display_name),
-                    (Some(401), _, _) => format!("{}: chat 401 — invalid key or token expired. Run: aikey auth login {}", display_name, code),
-                    (Some(403), _, _) => format!("{}: chat 403 — access denied. Check subscription status", display_name),
-                    (Some(429), _, _) => format!("{}: chat 429 — rate limited (key is valid, try again later)", display_name),
-                    (Some(s), _, _) if s >= 500 => format!("{}: chat {} — provider server error; try again later", display_name, s),
-                    (None, _, _) => format!("{}: chat failed — network error. Check: ~/.aikey/logs/aikey-proxy/current.jsonl", display_name),
-                    (Some(s), _, _) => format!("{}: chat HTTP {} — unexpected error", display_name, s),
-                };
-                failed_hints.push(suggestion);
-            }
-        }
-    }
-
-    // Print actionable hints for failures
-    if !failed_hints.is_empty() && !json_mode {
-        eprintln!();
-        for hint in &failed_hints {
-            eprintln!("  {} {}", "\u{2192}".dimmed(), hint.dimmed());
-        }
-    }
-
-    // Proxy test
-    eprintln!();
-    if !any_reachable {
-        eprintln!("  {:<12} {}", "proxy".bold(), "skipped (all providers unreachable)".dimmed());
-    } else if crate::commands_proxy::is_proxy_running() {
-        let proxy_addr = crate::commands_proxy::doctor_proxy_addr();
-        if let Some(prov) = targets.iter().find(|(c, _)| c != "custom").map(|(c, _)| c.as_str()) {
-            eprint!("  {:<12} ", "proxy".bold());
-            let r = test_proxy_connectivity(&proxy_addr, prov);
-            if r.ok { let h = r.status.map(|s| proxy_status_hint(s)).unwrap_or_default(); eprintln!("{} ({} ms, {})", "ok".green(), r.ms, h); }
-            else { eprintln!("{} ({} ms)", "failed".red(), r.ms); }
-        }
-    } else {
-        eprintln!("  {:<12} {}", "proxy".bold(), "not running".dimmed());
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Usage pipeline health check for `aikey doctor`
@@ -1900,3 +1207,13 @@ fn format_time_short(ts: &str) -> String {
         ts.to_string()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Connectivity-suite unit tests (2026-04-21)
+//
+// Scope: exercise the pure parts of the target builders + the display-layer
+// helpers. Network-bound probes (test_provider_connectivity, tcp_ping) are
+// not tested here — they require a running proxy / upstream and belong in
+// tests/e2e_*.
+// ---------------------------------------------------------------------------
+

@@ -1848,6 +1848,28 @@ pub fn provider_proxy_prefix_pub(provider_code: &str) -> &'static str {
     provider_proxy_prefix(provider_code)
 }
 
+/// Map OAuth provider name to canonical provider code used in bindings.
+///
+/// OAuth accounts store provider as `"claude"` / `"codex"` / `"kimi"` (broker
+/// vocabulary) but everything else — bindings, proxy routing, persona header
+/// selection in `test_provider_connectivity` — keys on the canonical
+/// `"anthropic"` / `"openai"` / `"kimi"`. Any code that holds a raw
+/// `ProviderAccountInfo.provider` **must** normalize via this before using
+/// the value for URL/routing/persona decisions — otherwise provider-specific
+/// tweaks (Claude's `?beta=true`, Codex's Responses API path) silently fail
+/// and the chat probe 404s.
+///
+/// Lives here (lib-accessible) so the connectivity suite resolvers in
+/// `commands_project` can share the same mapping `auth use` / `auth doctor`
+/// already rely on.
+pub fn oauth_provider_to_canonical(provider: &str) -> &str {
+    match provider {
+        "claude" => "anthropic",
+        "codex"  => "openai",
+        _        => provider,
+    }
+}
+
 pub(crate) fn provider_proxy_prefix(provider_code: &str) -> &'static str {
     provider_info(provider_code)
         .map(|i| i.proxy_path)
