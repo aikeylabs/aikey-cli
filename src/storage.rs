@@ -4,7 +4,7 @@
 //! with proper file permissions and schema initialization.
 
 use rusqlite::{params, Connection, Result as SqlResult};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -1060,6 +1060,14 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
         return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
     }
 
+    // Why: short-circuit when new == old. Running the full flow would still
+    // generate a new salt and re-encrypt every entry without changing what the
+    // user remembers — pure I/O for no security benefit — and any bug in the
+    // post-write verification path would brick the vault for no reason.
+    if old_password.expose_secret() == new_password.expose_secret() {
+        return Err("New password must differ from the current password.".to_string());
+    }
+
     // Get salt and KDF parameters
     let salt = get_salt()?;
     let (m_cost, t_cost, p_cost) = get_kdf_params()?;
@@ -1068,20 +1076,37 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
     let old_key = crate::crypto::derive_key_with_params(old_password, &salt, m_cost, t_cost, p_cost)
         .map_err(|e| format!("Failed to derive old key: {}", e))?;
 
-    // Verify old password by attempting to decrypt an entry
+    // Verify old password against the stored password_hash first (authoritative
+    // source). Fall back to entry decryption for legacy vaults that predate
+    // password_hash being written.
     let conn = open_connection()?;
+    let stored_hash: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params!["password_hash"],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .ok();
 
-    // Get first entry to test decryption
-    let test_result: Result<(Vec<u8>, Vec<u8>), rusqlite::Error> = conn.query_row(
-        "SELECT nonce, ciphertext FROM entries LIMIT 1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    );
-
-    if let Ok((nonce, ciphertext)) = test_result {
-        // Try to decrypt with old key to verify password
-        crate::crypto::decrypt(&old_key, &nonce, &ciphertext)
-            .map_err(|_| "Incorrect password".to_string())?;
+    match stored_hash {
+        Some(hash) => {
+            if old_key.as_slice() != hash.as_slice() {
+                return Err("Incorrect password".to_string());
+            }
+        }
+        None => {
+            // Legacy vault: verify by decrypting the first entry (same fallback
+            // as executor::verify_password_internal).
+            let test_result: Result<(Vec<u8>, Vec<u8>), rusqlite::Error> = conn.query_row(
+                "SELECT nonce, ciphertext FROM entries LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            );
+            if let Ok((nonce, ciphertext)) = test_result {
+                crate::crypto::decrypt(&old_key, &nonce, &ciphertext)
+                    .map_err(|_| "Incorrect password".to_string())?;
+            }
+        }
     }
 
     // Generate new salt for new password
@@ -1099,23 +1124,30 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
     )
     .map_err(|e| format!("Failed to derive new key: {}", e))?;
 
-    // Get all entries
-    let mut stmt = conn
-        .prepare("SELECT id, alias, nonce, ciphertext FROM entries")
-        .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+    // Why wrap everything below in a transaction: re-encrypting entries,
+    // rotating the salt, and updating password_hash must be atomic. A crash
+    // between steps previously bricked the vault (entries used new_key while
+    // password_hash still matched the old key — no password could unlock it).
+    let mut conn = conn;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
-    let entries: Vec<(i64, String, Vec<u8>, Vec<u8>)> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-            ))
-        })
-        .map_err(|e| format!("Failed to query entries: {}", e))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to collect entries: {}", e))?;
+    // Get all entries
+    let entries: Vec<(i64, String, Vec<u8>, Vec<u8>)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, alias, nonce, ciphertext FROM entries")
+            .map_err(|e| format!("Failed to prepare statement: {}", e))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .map_err(|e| format!("Failed to query entries: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect entries: {}", e))?;
+        rows
+    };
 
     // Re-encrypt all entries with new key
     for (id, alias, old_nonce, old_ciphertext) in entries {
@@ -1128,7 +1160,7 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
             .map_err(|e| format!("Failed to encrypt entry '{}': {}", alias, e))?;
 
         // Update entry in database
-        conn.execute(
+        tx.execute(
             "UPDATE entries SET nonce = ?, ciphertext = ? WHERE id = ?",
             params![new_nonce, new_ciphertext, id],
         )
@@ -1136,30 +1168,43 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
     }
 
     // Update salt in config
-    conn.execute(
-        "UPDATE config SET value = ? WHERE key = ?",
-        params![&new_salt[..], "master_salt"],
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params!["master_salt", &new_salt[..]],
     )
     .map_err(|e| format!("Failed to update salt: {}", e))?;
 
     // Update KDF parameters to default values (stored as binary)
-    conn.execute(
-        "UPDATE config SET value = ? WHERE key = ?",
-        params![&crate::crypto::ARGON2_M_COST.to_le_bytes()[..], "kdf_m_cost"],
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params!["kdf_m_cost", &crate::crypto::ARGON2_M_COST.to_le_bytes()[..]],
     )
     .map_err(|e| format!("Failed to update m_cost: {}", e))?;
 
-    conn.execute(
-        "UPDATE config SET value = ? WHERE key = ?",
-        params![&crate::crypto::ARGON2_T_COST.to_le_bytes()[..], "kdf_t_cost"],
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params!["kdf_t_cost", &crate::crypto::ARGON2_T_COST.to_le_bytes()[..]],
     )
     .map_err(|e| format!("Failed to update t_cost: {}", e))?;
 
-    conn.execute(
-        "UPDATE config SET value = ? WHERE key = ?",
-        params![&crate::crypto::ARGON2_P_COST.to_le_bytes()[..], "kdf_p_cost"],
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params!["kdf_p_cost", &crate::crypto::ARGON2_P_COST.to_le_bytes()[..]],
     )
     .map_err(|e| format!("Failed to update p_cost: {}", e))?;
+
+    // Why: password_hash is the authoritative check in executor::verify_password_internal
+    // and in aikey-proxy's vault.go. Before this fix it was left at the old-key
+    // value, so after a password change neither the new nor old password could
+    // unlock the vault — a silent brick. Writing the new hash here closes that.
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params!["password_hash", &*new_key],
+    )
+    .map_err(|e| format!("Failed to update password_hash: {}", e))?;
+
+    tx.commit()
+        .map_err(|e| format!("Failed to commit password change: {}", e))?;
 
     Ok(())
 }
@@ -1819,6 +1864,100 @@ mod tests {
         assert_eq!(get_local_seen_sync_version(), 0);
         set_local_seen_sync_version(42);
         assert_eq!(get_local_seen_sync_version(), 42);
+    }
+
+    // ── change_password ──────────────────────────────────────────────────
+    // Regression guards for the 2026-04-20 password-hash-not-updated bug.
+    // Ref: workflow/CI/bugfix/2026-04-20-change-password-bricks-vault.md
+
+    fn read_config_blob(conn: &Connection, key: &str) -> Option<Vec<u8>> {
+        conn.query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params![key],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .ok()
+    }
+
+    #[test]
+    fn change_password_updates_password_hash_and_salt() {
+        let (_dir, db_path, _lock) = setup_vault();
+        // Empty vault: the re-encrypt loop is a no-op, which is fine for this
+        // test. A dedicated end-to-end test (tests/) covers the re-encrypt path
+        // with real ciphertext produced via the CLI.
+        let old = SecretString::new("test_password".to_string());
+        let new = SecretString::new("new_password_xyz".to_string());
+
+        let salt_before = read_config_blob(
+            &rusqlite::Connection::open(&db_path).unwrap(),
+            "master_salt",
+        ).expect("salt present");
+        let hash_before = read_config_blob(
+            &rusqlite::Connection::open(&db_path).unwrap(),
+            "password_hash",
+        ).expect("hash present");
+
+        change_password(&old, &new).expect("change_password ok");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let salt_after = read_config_blob(&conn, "master_salt").expect("salt after");
+        let hash_after = read_config_blob(&conn, "password_hash").expect("hash after");
+
+        assert_ne!(salt_before, salt_after, "salt must rotate");
+        assert_ne!(hash_before, hash_after,
+            "password_hash MUST rotate — leaving it at the old value bricks the vault");
+
+        // password_hash must equal derive(new_password, new_salt) with default params.
+        let expected = crate::crypto::derive_key_with_params(
+            &new,
+            &salt_after,
+            crate::crypto::ARGON2_M_COST,
+            crate::crypto::ARGON2_T_COST,
+            crate::crypto::ARGON2_P_COST,
+        ).expect("derive new");
+        assert_eq!(hash_after.as_slice(), expected.as_slice(),
+            "password_hash must match derive(new_password, new_salt) so \
+             executor::verify_password_internal / aikey-proxy vault.go can \
+             open the vault with the new password");
+    }
+
+    #[test]
+    fn change_password_rejects_same_password() {
+        let (_dir, _, _lock) = setup_vault();
+        let same = SecretString::new("test_password".to_string());
+
+        let err = change_password(&same, &same)
+            .expect_err("same-password change must be rejected");
+        assert!(err.to_lowercase().contains("differ") || err.to_lowercase().contains("same"),
+            "rejection message should explain why, got: {}", err);
+    }
+
+    #[test]
+    fn change_password_rejects_wrong_old_password() {
+        let (_dir, db_path, _lock) = setup_vault();
+
+        let wrong = SecretString::new("not-the-real-password".to_string());
+        let new = SecretString::new("new_password_xyz".to_string());
+
+        let err = change_password(&wrong, &new)
+            .expect_err("wrong old password must be rejected");
+        assert!(err.to_lowercase().contains("incorrect") || err.to_lowercase().contains("invalid"),
+            "rejection message should mention password validity, got: {}", err);
+
+        // Hash must NOT have been touched by a failed attempt.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let hash_after = read_config_blob(&conn, "password_hash").expect("hash present");
+        let correct = SecretString::new("test_password".to_string());
+        let salt = read_config_blob(&conn, "master_salt").expect("salt present");
+        let expected = crate::crypto::derive_key_with_params(
+            &correct,
+            &salt,
+            crate::crypto::ARGON2_M_COST,
+            crate::crypto::ARGON2_T_COST,
+            crate::crypto::ARGON2_P_COST,
+        ).expect("derive");
+        assert_eq!(hash_after.as_slice(), expected.as_slice(),
+            "failed change attempt must not mutate password_hash");
     }
 }
 

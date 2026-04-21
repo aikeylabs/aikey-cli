@@ -69,7 +69,19 @@ pub fn is_proxy_running() -> bool {
 pub fn try_reload_proxy() {
     if is_proxy_running() {
         if let Err(e) = post_admin_reload() {
-            eprintln!("[aikey] proxy reload hint failed (non-fatal): {}", e);
+            let msg = e.to_string();
+            // Why: after `aikey change-password`, the proxy process still has
+            // the old AIKEY_MASTER_PASSWORD in its env; reload then fails with
+            // "invalid master password" from aikey-proxy/vault.go and users
+            // have no actionable hint. Detect that specific path and tell them
+            // to restart the proxy so the new password is picked up.
+            if msg.contains("invalid master password") {
+                eprintln!("[aikey] proxy reload failed: vault password mismatch.");
+                eprintln!("        The proxy is still holding the old AIKEY_MASTER_PASSWORD.");
+                eprintln!("        Run `aikey proxy restart` to pick up the new password.");
+            } else {
+                eprintln!("[aikey] proxy reload hint failed (non-fatal): {}", msg);
+            }
         }
     }
 }

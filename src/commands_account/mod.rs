@@ -22,6 +22,50 @@ use crate::storage::{self, VirtualKeyCacheEntry};
 // Helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Login throttle
+// ---------------------------------------------------------------------------
+
+/// Minimum seconds between two `aikey login` attempts before we block with a
+/// friendly "check your inbox" nudge. Kept intentionally short so the user
+/// is never stuck for long; --resend overrides it.
+const LOGIN_THROTTLE_SECS: u64 = 60;
+
+/// Path to the throttle marker file. Absent file ⇒ no prior attempt.
+fn login_throttle_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(std::path::PathBuf::from(home).join(".aikey").join(".login_throttle.json"))
+}
+
+/// Returns the unix-seconds timestamp of the last recorded login attempt,
+/// or None if the file is missing, unreadable, or malformed. Best-effort:
+/// never returns an error — a missing/bad marker simply means "no throttle".
+fn read_login_throttle() -> Option<u64> {
+    let path = login_throttle_path()?;
+    let data = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    v.get("session_started_at").and_then(|n| n.as_u64())
+}
+
+/// Writes the current unix-seconds timestamp to the throttle file.
+/// Best-effort: I/O errors are swallowed so the login flow is never blocked
+/// by marker-file problems.
+fn write_login_throttle() -> std::io::Result<()> {
+    let path = match login_throttle_path() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let body = format!("{{\"session_started_at\":{}}}\n", now);
+    std::fs::write(&path, body)
+}
+
 /// Read `controlPanelUrl` from `~/.aikey/config/config.json` (if present).
 fn read_control_url_from_config() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
@@ -211,6 +255,7 @@ pub fn handle_login(
     flag_url: Option<String>,
     flag_token: Option<String>,
     flag_email: Option<String>,
+    flag_resend: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve default URL: env var → config file → hardcoded fallback.
     let default_url = std::env::var("AIKEY_CONTROL_URL")
@@ -243,6 +288,32 @@ pub fn handle_login(
         return exchange_combined_token(&control_url, &combined, json_mode);
     }
 
+    // --- Throttle: suppress rapid re-triggers of the email flow ---
+    // Why: users who don't see an activation email often re-run `aikey login`
+    // within seconds. Each re-run creates a fresh session and (when the user
+    // hits "Send Login Link") another email — inflating the anti-spam rate
+    // at QQ/Gmail. We block the second attempt within `LOGIN_THROTTLE_SECS`
+    // unless --resend is passed. The file is advisory-only; concurrent
+    // writes and missing files silently fall through.
+    if !flag_resend {
+        if let Some(last_started) = read_login_throttle() {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            if now > 0 && now >= last_started && now - last_started < LOGIN_THROTTLE_SECS {
+                let elapsed = now - last_started;
+                let remaining = LOGIN_THROTTLE_SECS - elapsed;
+                if !json_mode {
+                    eprintln!();
+                    eprintln!("  {}", format!("A login email was just sent ({}s ago).", elapsed).yellow());
+                    eprintln!("  • Check your inbox — and your spam folder.");
+                    eprintln!("  • Add {} to your whitelist to avoid future filtering.", "invite@aikeylabs.com".bold());
+                    eprintln!("  • To force a new email, wait {}s or run: {}", remaining, "aikey login --resend".bold());
+                    eprintln!();
+                }
+                return Ok(());
+            }
+        }
+    }
+
     // --- OAuth device flow via browser ---
     let client_version = env!("CARGO_PKG_VERSION");
     let os_platform = std::env::consts::OS;
@@ -253,6 +324,10 @@ pub fn handle_login(
         os_platform,
     )
     .map_err(|e| format!("Login failed: {}", e))?;
+
+    // Record this attempt for the throttle window. Best-effort — any I/O
+    // failure is silently ignored (the throttle is a UX nudge, not security).
+    let _ = write_login_throttle();
 
     // Browser URL: in production nginx serves both Web and API on the same
     // origin (control_url), so use it directly for the browser login page.
@@ -2144,12 +2219,36 @@ pub fn handle_key_alias(old_alias: &str, new_alias: &str, json_mode: bool) -> Re
     use colored::Colorize;
 
     // Resolve by virtual_key_id first, then alias (local or server).
-    let entry = storage::get_virtual_key_cache(old_alias)?
+    let entry = match storage::get_virtual_key_cache(old_alias)?
         .or_else(|| storage::get_virtual_key_cache_by_alias(old_alias).ok().flatten())
-        .ok_or_else(|| format!(
-            "Key '{}' not found in local cache. Run 'aikey key sync' first.",
-            old_alias
-        ))?;
+    {
+        Some(e) => e,
+        None => {
+            // Why the extra branch: `aikey key alias` only renames team
+            // (virtual) keys, but users naturally try it on personal keys.
+            // Before this, the error told them to run `aikey key sync` —
+            // which never helps, because sync only pulls team keys. Detect
+            // the personal-key case and point to `aikey update` instead.
+            let is_personal = storage::list_entries().ok()
+                .map(|v| v.iter().any(|a| a == old_alias))
+                .unwrap_or(false);
+            if is_personal {
+                return Err(format!(
+                    "'{}' is a personal key. `aikey key alias` only renames team keys.\n\
+                     To rename a personal key, delete and re-add it under the new name:\n  \
+                     aikey delete {}\n  \
+                     aikey add <NEW_NAME> --provider <PROVIDER>",
+                    old_alias, old_alias
+                ).into());
+            }
+            return Err(format!(
+                "Key '{}' not found in local cache. If it is a team key, run \
+                 'aikey key sync' first; personal keys cannot be renamed with \
+                 this command.",
+                old_alias
+            ).into());
+        }
+    };
 
     storage::set_virtual_key_local_alias(&entry.virtual_key_id, Some(new_alias))?;
 

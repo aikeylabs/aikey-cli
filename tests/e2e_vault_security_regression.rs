@@ -228,3 +228,53 @@ fn db_upgrade_then_add_leaves_vault_usable() {
     assert!(stdout.contains("k1") && stdout.contains("k2"),
         "list should show both keys after upgrade:\n{}", stdout);
 }
+
+// ── 2026-04-20: change-password left password_hash at the old key ───────
+// Ref: workflow/CI/bugfix/2026-04-20-change-password-bricks-vault.md
+//
+// Before the fix: `change-password` rotated master_salt and re-encrypted
+// every entry under a new key but never rewrote `password_hash`. That left
+// the stored hash equal to derive(old_password, old_salt), which no future
+// password could reproduce — both get/update/add failed with "Invalid
+// master password", silently bricking the vault.
+//
+// These tests use AK_TEST_PASSWORD (which returns the same value for every
+// prompt in the same process) to stress the change-password flow. With the
+// fix, the operation must be REJECTED when new==old rather than silently
+// corrupting state.
+
+#[test]
+fn change_password_same_as_old_is_rejected() {
+    let env = Env::new("changepw-same");
+    env.add_key("samepw", "k1", "openai", "sk-1");
+
+    let out = env
+        .cmd_with_password("samepw")
+        .arg("change-password")
+        .output()
+        .expect("spawn change-password");
+
+    assert!(!out.status.success(),
+        "running change-password with AK_TEST_PASSWORD set (which makes all \
+         three prompts return the same value) must fail — otherwise the flow \
+         would rotate salt + password_hash for no reason and any lingering \
+         atomicity bug could brick the vault.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr));
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.to_lowercase().contains("differ") || stderr.to_lowercase().contains("same"),
+        "rejection message should explain why, got:\n{}", stderr);
+
+    // Post-condition: the original password still works.
+    let get = env
+        .cmd_with_password("samepw")
+        .args(["get", "k1"])
+        .output()
+        .expect("spawn get");
+    assert!(get.status.success(),
+        "after a rejected same-password change, the original password must \
+         still unlock the vault.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&get.stdout),
+        String::from_utf8_lossy(&get.stderr));
+}

@@ -121,6 +121,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!();
                 eprintln!("  Did you mean '{}'?  Try: aikey {} --help", hint, hint);
             }
+
+            // Why: `auth logout`, `auth use`, `auth status` each take a single
+            // positional. When a user types `aikey auth logout kimi account3`
+            // (OAuth display name with a space), the shell splits it into two
+            // argv entries; the first is absorbed and the second surfaces here
+            // as an "unrecognized command". Detect that shape and coach the
+            // user to quote or use an account ID, which is far more actionable
+            // than the generic fuzzy hint above.
+            let argv: Vec<String> = std::env::args().skip(1).collect();
+            if let Some(pos) = argv.iter().position(|a| a == "auth") {
+                let rest = &argv[pos + 1..];
+                let sub = rest.first().map(String::as_str);
+                let takes_single_positional = matches!(sub, Some("logout") | Some("use") | Some("status"));
+                // Count positional args after the sub (stop at first flag).
+                let positionals = rest.iter().skip(1)
+                    .take_while(|a| !a.starts_with('-'))
+                    .count();
+                if takes_single_positional && positionals >= 2 {
+                    let joined = rest.iter().skip(1)
+                        .take_while(|a| !a.starts_with('-'))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    eprintln!();
+                    eprintln!("  Hint: if this is an OAuth account display name with spaces, quote it:");
+                    eprintln!("      aikey auth {} \"{}\"", sub.unwrap(), joined);
+                    eprintln!("  Or pass the account ID (see `aikey auth list`) which never has spaces.");
+                }
+            }
+
             eprintln!();
             eprintln!("  Run 'aikey --help' for a list of all commands.");
             std::process::exit(2);
@@ -1702,16 +1732,40 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 KeyAction::Rotate { name, from_stdin } => {
                     let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
-                    let new_value = if *from_stdin {
+                    // Why the four-way fork: before this, `key rotate` called
+                    // prompt_hidden unconditionally when --from-stdin was off.
+                    // In pipelines or CI that gives "Device not configured
+                    // (os error 6)" from the /dev/tty open, with no actionable
+                    // hint. Mirror `aikey update`: AK_TEST_SECRET wins, then
+                    // explicit --from-stdin, then TTY, then plain stdin with
+                    // a clear prompt instead of a cryptic open() error.
+                    let new_value = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
+                        Zeroizing::new(test_secret)
+                    } else if *from_stdin {
                         eprint!("Enter new value for '{}' (then press Enter): ", name);
                         let _ = io::stderr().flush();
                         let mut buf = Zeroizing::new(String::new());
                         io::stdin().read_line(&mut buf)?;
                         buf
-                    } else {
+                    } else if std::io::stdin().is_terminal() {
                         let val = prompt_hidden(&format!("\u{1F511} New value for '{}': ", name))
-                            .map_err(|e| format!("Failed to read new key value: {}", e))?;
+                            .map_err(|e| format!(
+                                "Failed to read new key value: {}.\n\
+                                 Tip: in non-interactive mode pass --from-stdin and pipe the value in, \
+                                 or set AK_TEST_SECRET for scripted runs.",
+                                e))?;
                         Zeroizing::new(val)
+                    } else {
+                        // Non-TTY, no flag, no env — accept piped stdin rather
+                        // than erroring out. Quietly annotate on stderr so the
+                        // caller knows what happened in case they expected a
+                        // prompt.
+                        if !cli.json {
+                            eprintln!("(reading new value for '{}' from stdin; pass --from-stdin to silence this hint)", name);
+                        }
+                        let mut buf = Zeroizing::new(String::new());
+                        io::stdin().read_line(&mut buf)?;
+                        buf
                     };
                     let new_value_str = new_value.trim();
 
@@ -1781,12 +1835,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Account { action } => {
             match action {
-                AccountAction::Login { url, token, email } => {
+                AccountAction::Login { url, token, email, resend } => {
                     commands_account::handle_login(
                         cli.json,
                         url.clone(),
                         token.clone(),
                         email.clone(),
+                        *resend,
                     )?;
                 }
                 AccountAction::Status => {
@@ -1809,8 +1864,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Route { label, full } => {
             handle_route(label.as_deref(), *full, cli.json)?;
         }
-        Commands::Login { url, token, email } => {
-            commands_account::handle_login(cli.json, url.clone(), token.clone(), email.clone())?;
+        Commands::Login { url, token, email, resend } => {
+            commands_account::handle_login(cli.json, url.clone(), token.clone(), email.clone(), *resend)?;
         }
         Commands::Logout => {
             commands_account::handle_logout(cli.json)?;

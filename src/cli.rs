@@ -167,6 +167,9 @@ pub(crate) enum Commands {
         /// Pre-fill email on the browser login page (skips manual entry)
         #[arg(long)]
         email: Option<String>,
+        /// Force a new activation email even if one was sent within the last 60 seconds
+        #[arg(long)]
+        resend: bool,
     },
     /// Open the User Console in your default browser
     #[command(alias = "browse", display_order = 6)]
@@ -513,6 +516,9 @@ pub(crate) enum AccountAction {
         /// Pre-fill email on the browser login page (skips manual entry)
         #[arg(long)]
         email: Option<String>,
+        /// Force a new activation email even if one was sent within the last 60 seconds
+        #[arg(long)]
+        resend: bool,
     },
     /// Show current login status
     Status,
@@ -1870,7 +1876,7 @@ mod tests {
 
     #[test]
     fn test_command_name_nested() {
-        let cmd = Commands::Account { action: AccountAction::Login { url: None, token: None, email: None } };
+        let cmd = Commands::Account { action: AccountAction::Login { url: None, token: None, email: None, resend: false } };
         assert_eq!(command_name(Some(&cmd)), "account.login");
 
         let cmd = Commands::Key { action: KeyAction::Sync };
