@@ -589,4 +589,42 @@ mod connectivity_suite_tests {
         assert_eq!(t.bearer, "sk-padded",
             "factory must trim so the Authorization header is valid");
     }
+
+    // ── ConnectivityResult shape (Stage 2, 2026-04-22) ──────────────────
+    //
+    // The 4-phase redesign split Ping into Ping(DIRECT) and Ping(PROXY).
+    // These tests pin the struct shape so a future edit can't silently
+    // drop a field.
+
+    #[test]
+    fn connectivity_result_has_both_ping_kinds() {
+        // Build a zero result just to force the compiler to evaluate field
+        // names. If someone renames/drops ping_direct_ok this test fails to
+        // compile — early warning.
+        let r = ConnectivityResult {
+            ping_direct_ok: false, ping_direct_ms: 0,
+            ping_ok: false, ping_ms: 0,
+            api_ok: false, api_ms: 0, api_status: None,
+            chat_ok: false, chat_ms: 0, chat_status: None,
+        };
+        // Ping(DIRECT) must not participate in success bookkeeping —
+        // it's informational only. Main overall-success logic keys on API.
+        assert!(!r.api_ok,
+            "zero result should not accidentally report API success");
+    }
+
+    #[test]
+    fn connectivity_result_ping_direct_independent_of_ping_proxy() {
+        // The user can legitimately have Ping(D) ok + Ping(PROXY) fail
+        // (laptop can reach upstream; proxy is broken) or vice-versa.
+        // The struct must let both states coexist.
+        let r = ConnectivityResult {
+            ping_direct_ok: true, ping_direct_ms: 10,
+            ping_ok: false, ping_ms: 3000,
+            api_ok: false, api_ms: 0, api_status: None,
+            chat_ok: false, chat_ms: 0, chat_status: None,
+        };
+        assert!(r.ping_direct_ok && !r.ping_ok,
+            "struct must represent 'laptop ok, proxy broken' as a valid state");
+    }
 }

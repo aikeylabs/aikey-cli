@@ -89,6 +89,12 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: DbAction,
     },
+    /// Internal: stdin-json IPC 子命令组，供 aikey-local-server (Go) spawn 调用
+    #[command(hide = true, name = "_internal")]
+    Internal {
+        #[command(subcommand)]
+        action: crate::commands_internal::InternalAction,
+    },
     /// Save a new secret to the vault
     #[command(display_order = 1)]
     Add {
@@ -605,6 +611,12 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Db { action } => format!("db.{}", match action {
                 DbAction::Upgrade => "upgrade",
                 DbAction::Rollback { .. } => "rollback",
+            }),
+            Commands::Internal { action } => format!("_internal.{}", match action {
+                crate::commands_internal::InternalAction::VaultOp(_) => "vault-op",
+                crate::commands_internal::InternalAction::Query(_) => "query",
+                crate::commands_internal::InternalAction::UpdateAlias(_) => "update-alias",
+                crate::commands_internal::InternalAction::Parse(_) => "parse",
             }),
             Commands::Add { .. } => "add".to_string(),
             Commands::Get { .. } => "get".to_string(),

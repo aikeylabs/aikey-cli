@@ -35,6 +35,14 @@ static VERSIONS: &[VersionMigration] = &[
         upgrade: v1_0_4_alpha::upgrade,
         rollback: v1_0_4_alpha::rollback,
     },
+    // v1.0.5-alpha: 批量导入审计表（Stage 2 Phase F）
+    // import_jobs  — 每次批量导入的聚合记录
+    // import_items — 每个被导入凭证的明细审计
+    VersionMigration {
+        version: "1.0.5-alpha",
+        upgrade: v1_0_5_alpha::upgrade,
+        rollback: v1_0_5_alpha::rollback,
+    },
 ];
 
 /// Run all upgrades up to the current binary version.
@@ -298,6 +306,84 @@ pub mod v1_0_4_alpha {
         }
         eprintln!("[db rollback] SKIP: entries.route_token (SQLite no DROP COLUMN)");
         eprintln!("[db rollback] SKIP: provider_accounts.route_token (SQLite no DROP COLUMN)");
+        Ok(())
+    }
+}
+
+pub mod v1_0_5_alpha {
+    //! v1.0.5-alpha: 批量导入审计表（Stage 2 Phase F）
+    //!
+    //! 新增 2 张表：
+    //! - `import_jobs`：每次批量导入的聚合记录（job_id 由 Go local-server 生成 UUID）
+    //! - `import_items`：每条被导入凭证的明细（FK 到 job_id）
+    //!
+    //! Why：原 audit_log 只记"what happened"，不关联"哪次 import"。批量导入一次 50 条时
+    //! audit_log 会产生 50 条 Add 事件，没有 grouping key。import_jobs/items 提供"以 job 为单位"
+    //! 的视角，便于前端在 /user/import/history 展示"某次导入" + 明细展开。
+
+    use rusqlite::Connection;
+
+    pub fn upgrade(conn: &Connection) -> Result<(), String> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS import_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL UNIQUE,
+                source_type TEXT,
+                source_hash TEXT,
+                created_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                total_items INTEGER NOT NULL DEFAULT 0,
+                inserted_count INTEGER NOT NULL DEFAULT 0,
+                replaced_count INTEGER NOT NULL DEFAULT 0,
+                skipped_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'in_progress'
+            )",
+            [],
+        )
+        .map_err(|e| format!("create import_jobs: {}", e))?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_import_jobs_created_at \
+             ON import_jobs(created_at DESC)",
+            [],
+        )
+        .map_err(|e| format!("idx_import_jobs_created_at: {}", e))?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS import_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                action TEXT NOT NULL,
+                provider_code TEXT,
+                created_at INTEGER NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| format!("create import_items: {}", e))?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_import_items_job_id \
+             ON import_items(job_id)",
+            [],
+        )
+        .map_err(|e| format!("idx_import_items_job_id: {}", e))?;
+
+        Ok(())
+    }
+
+    pub fn rollback(conn: &Connection) -> Result<(), String> {
+        for sql in &[
+            "DROP INDEX IF EXISTS idx_import_items_job_id",
+            "DROP INDEX IF EXISTS idx_import_jobs_created_at",
+            "DROP TABLE IF EXISTS import_items",
+            "DROP TABLE IF EXISTS import_jobs",
+        ] {
+            match conn.execute(sql, []) {
+                Ok(_) => eprintln!("[db rollback] OK: {}", sql),
+                Err(e) => eprintln!("[db rollback] WARN: {} — {}", sql, e),
+            }
+        }
         Ok(())
     }
 }

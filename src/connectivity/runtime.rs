@@ -41,7 +41,22 @@ pub fn tcp_ping(host: &str, port: u16, timeout_secs: u64) -> (bool, u128) {
 }
 
 /// Result of a provider connectivity test.
+///
+/// Four phases since 2026-04-22:
+///
+///   - **Ping(DIRECT)**: CLI → upstream host. Independent baseline — does
+///     NOT gate downstream phases. Appears as the "Ping(D)" column.
+///   - **Ping(PROXY) → API → Chat**: cascaded through aikey-proxy, each
+///     short-circuits on failure. Protects against hammering upstream with
+///     invalid auth when the route is down.
 pub struct ConnectivityResult {
+    /// Ping(DIRECT): CLI measures upstream reachability from its own network
+    /// context. Does not affect API/Chat — informational column only.
+    pub ping_direct_ok: bool,
+    pub ping_direct_ms: u128,
+
+    /// Ping(PROXY): aikey-proxy measures upstream reachability from ITS
+    /// network context (the one real traffic uses at runtime). Gates API+Chat.
     pub ping_ok: bool,
     pub ping_ms: u128,
     pub api_ok: bool,
@@ -124,6 +139,7 @@ pub fn test_provider_connectivity(
     let provider_code = crate::commands_account::oauth_provider_to_canonical(provider_code);
 
     // Check if user has a network proxy configured (proxy.env or env vars).
+    // Used by Ping(DIRECT) to decide TCP vs HTTP-HEAD-through-proxy.
     let has_proxy = crate::proxy_env::read_proxy_env_var("https_proxy").is_some()
         || crate::proxy_env::read_proxy_env_var("http_proxy").is_some()
         || crate::proxy_env::read_proxy_env_var("all_proxy").is_some()
@@ -131,34 +147,43 @@ pub fn test_provider_connectivity(
         || std::env::var("http_proxy").is_ok()
         || std::env::var("all_proxy").is_ok();
 
-    // 1. TCP ping — extract host and port from base_url
-    // Why: skip TCP ping when a network proxy is configured, because direct
-    // TCP connect to the provider host will fail in restricted networks even
-    // though HTTP requests through the proxy succeed fine.
-    let is_http = base_url.starts_with("http://");
-    let host_port = base_url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or(base_url);
-    let (host, port) = if let Some(idx) = host_port.rfind(':') {
-        let h = &host_port[..idx];
-        let p = host_port[idx+1..].parse::<u16>().unwrap_or(if is_http { 80 } else { 443 });
-        (h, p)
+    // Determine the REAL upstream host for Ping(DIRECT). If base_url is a
+    // localhost URL (team/OAuth TestTargets routed via aikey-proxy), fall
+    // back to the provider's canonical upstream so we still measure what
+    // the user intuitively expects ("can my laptop reach anthropic?").
+    let ping_target_url: String = if base_url.contains("127.0.0.1") || base_url.contains("localhost") {
+        default_base_url(provider_code)
+            .unwrap_or("https://unknown")
+            .to_string()
     } else {
-        (host_port, if is_http { 80 } else { 443 })
+        base_url.to_string()
+    };
+    let (upstream_host, upstream_port) = parse_host_port(&ping_target_url);
+
+    // ── Phase 1: Ping(DIRECT) — CLI → upstream. Independent. ─────────────
+    // Never short-circuits the other phases. Surfaces as the "Ping(D)"
+    // column and gives users a "my laptop's path to upstream" baseline.
+    let (ping_direct_ok, ping_direct_ms) = if has_proxy {
+        // With a network proxy, TCP won't work — use HTTP HEAD through the
+        // same proxy the CLI uses for real requests. Any response (incl.
+        // 4xx/5xx) proves reachability.
+        probe_http_head_direct(&ping_target_url, Duration::from_secs(5))
+    } else {
+        tcp_ping(&upstream_host, upstream_port, 5)
     };
 
-    let (ping_ok, ping_ms) = if has_proxy {
-        // With a proxy, skip TCP ping and go straight to HTTP probe.
-        (true, 0)
-    } else {
-        tcp_ping(host, port, 5)
-    };
+    // ── Phase 2: Ping(PROXY) — CLI → aikey-proxy → upstream. ─────────────
+    // Uses the new POST /admin/probe/ping endpoint. aikey-proxy handles
+    // its own HTTPS_PROXY / NO_PROXY semantics internally.
+    let (ping_ok, ping_ms) = probe_via_aikey_proxy_ping(provider_code, &ping_target_url);
 
+    // Short-circuit: if proxy can't reach upstream, skip API + Chat.
+    // Critical: probing auth against a known-unreachable upstream wastes
+    // the user's rate-limit budget (and inflates OAuth error counters
+    // server-side, which can trigger refresh-loop anomalies).
     if !ping_ok {
         return ConnectivityResult {
+            ping_direct_ok, ping_direct_ms,
             ping_ok: false, ping_ms,
             api_ok: false, api_ms: 0, api_status: None,
             chat_ok: false, chat_ms: 0, chat_status: None,
@@ -167,7 +192,16 @@ pub fn test_provider_connectivity(
 
     let agent = build_proxy_aware_agent(Duration::from_secs(10));
 
-    // 2. API probe with real key (GET — lightweight, no side effects)
+    // Is this probe flowing through our own local aikey-proxy? If so the
+    // X-Aikey-Probe header suppresses usage-event logging on the proxy side
+    // (see proxy/middleware.go::isAikeyProbe). Tagging the header for
+    // upstream-direct probes would be harmless but misleading, so gate it.
+    let via_aikey_proxy = base_url.contains("127.0.0.1") || base_url.contains("localhost");
+
+    // ── Phase 3: API probe ───────────────────────────────────────────────
+    // GET — lightweight, no side effects. Treats ANY HTTP response
+    // (incl. 401/403) as "reachable" since the question here is auth
+    // transport, not auth success.
     let test_url = if provider_code == "google" {
         format!("{}{}?key={}", base_url.trim_end_matches('/'), probe_suffix(provider_code, base_url), api_key)
     } else {
@@ -180,6 +214,9 @@ pub fn test_provider_connectivity(
     if provider_code != "google" {
         api_req = api_req.set(auth_key, &auth_val);
     }
+    if via_aikey_proxy {
+        api_req = api_req.set("X-Aikey-Probe", "1");
+    }
     let api_result = api_req.call();
     let api_ms = api_start.elapsed().as_millis();
 
@@ -191,19 +228,22 @@ pub fn test_provider_connectivity(
 
     if !api_ok {
         return ConnectivityResult {
+            ping_direct_ok, ping_direct_ms,
             ping_ok, ping_ms,
             api_ok, api_ms, api_status,
             chat_ok: false, chat_ms: 0, chat_status: None,
         };
     }
 
-    // 3. Chat probe — send a minimal completion request with max_tokens=1
+    // ── Phase 4: Chat probe ──────────────────────────────────────────────
+    // Minimal completion request (max_tokens=1). Short-circuit on API
+    // failure prevents this from hammering an upstream that just rejected
+    // our auth — some providers count that against rate limits.
     // Why ?beta=true: Claude OAuth API requires this query param. Without it,
     // Anthropic returns 429 business rejection (not real rate limit).
-    // When going through proxy, the proxy forwards the query params to upstream.
-    // OAuth accounts go through the proxy (base_url is localhost).
-    // Provider-specific adjustments are needed for OAuth persona requirements.
-    let is_via_proxy = base_url.contains("127.0.0.1") || base_url.contains("localhost");
+    // `is_via_proxy` is the same determination as `via_aikey_proxy` above;
+    // kept as a local for readability where it drives persona tweaks.
+    let is_via_proxy = via_aikey_proxy;
 
     let (chat_url, body) = if provider_code == "openai" && is_via_proxy {
         // Codex OAuth: uses Responses API via chatgpt.com/backend-api/codex.
@@ -248,6 +288,9 @@ pub fn test_provider_connectivity(
     if provider_code == "anthropic" {
         req = req.set("anthropic-version", "2023-06-01");
     }
+    if via_aikey_proxy {
+        req = req.set("X-Aikey-Probe", "1");
+    }
     // Why: KIMI Coding API (api.kimi.com/coding/v1) requires a User-Agent
     // matching its coding-agent whitelist (e.g. "claude-code", "kimi-cli").
     // Without it, KIMI returns access_terminated_error (HTTP 403).
@@ -279,10 +322,86 @@ pub fn test_provider_connectivity(
     };
 
     ConnectivityResult {
+        ping_direct_ok, ping_direct_ms,
         ping_ok, ping_ms,
         api_ok, api_ms, api_status,
         chat_ok, chat_ms, chat_status,
     }
+}
+
+/// Parse an "https://host:port/…" or "host:port" string into (host, port).
+/// Defaults to 443 (https) / 80 (http).
+fn parse_host_port(url_or_authority: &str) -> (String, u16) {
+    let is_http = url_or_authority.starts_with("http://");
+    let stripped = url_or_authority
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host_port = stripped.split('/').next().unwrap_or(stripped);
+    if let Some(idx) = host_port.rfind(':') {
+        let host = host_port[..idx].to_string();
+        let port = host_port[idx+1..]
+            .parse::<u16>()
+            .unwrap_or(if is_http { 80 } else { 443 });
+        (host, port)
+    } else {
+        (host_port.to_string(), if is_http { 80 } else { 443 })
+    }
+}
+
+/// Ping(DIRECT) when a network proxy is configured: HTTP HEAD to the
+/// upstream URL via the same proxy-aware agent used for everything else.
+/// Any response (including 4xx/5xx) proves reachability.
+fn probe_http_head_direct(target_url: &str, timeout: std::time::Duration) -> (bool, u128) {
+    use std::time::Instant;
+    let agent = build_proxy_aware_agent(timeout);
+    let start = Instant::now();
+    let ok = match agent.head(target_url).call() {
+        Ok(_) => true,
+        Err(ureq::Error::Status(_, _)) => true, // HEAD may 405; still reached upstream
+        Err(_) => false,
+    };
+    (ok, start.elapsed().as_millis())
+}
+
+/// Ping(PROXY): ask the local aikey-proxy to TCP-ping (or HTTP-HEAD via
+/// its own outbound proxy) the upstream on our behalf. This is what tells
+/// us "can the proxy itself reach upstream" — the question the CLI
+/// actually cares about for runtime traffic.
+///
+/// Returns `(false, elapsed_ms)` on any transport error, unknown provider,
+/// or aikey-proxy unreachability. Short-circuits the rest of the suite.
+fn probe_via_aikey_proxy_ping(provider_code: &str, upstream_url: &str) -> (bool, u128) {
+    use std::time::Instant;
+    let proxy_port = crate::commands_proxy::proxy_port();
+    let endpoint = format!("http://127.0.0.1:{}/admin/probe/ping", proxy_port);
+    let body = serde_json::json!({
+        "provider": provider_code,
+        "base_url": upstream_url,
+    });
+    // 4s cap — the proxy itself uses 3s internally so we allow a bit of
+    // slack for request overhead.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(4))
+        .build();
+    let start = Instant::now();
+    let resp = match agent.post(&endpoint)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+    {
+        Ok(r) => r,
+        Err(_) => return (false, start.elapsed().as_millis()),
+    };
+    // Proxy always returns 200 with a structured JSON body — even on
+    // upstream failure. If the proxy says ok:false, we propagate that.
+    let parsed: serde_json::Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(_) => return (false, start.elapsed().as_millis()),
+    };
+    let proxy_ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let proxy_ms = parsed.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128;
+    // Report proxy's own measured latency (host → upstream), not our RTT
+    // to localhost (which is ~0ms and meaningless).
+    (proxy_ok, proxy_ms)
 }
 
 /// Result of a proxy connectivity probe.
@@ -313,10 +432,23 @@ pub fn test_proxy_connectivity(proxy_addr: &str, provider_code: &str) -> ProxyPr
         .unwrap_or_else(|| "aikey_test_probe".to_string());
 
     let (auth_key, auth_val) = probe_auth(provider_code, &bearer);
-    let start = Instant::now();
-    let result = ureq::get(&proxy_url)
-        .set(auth_key, &auth_val)
+    // Explicit no-proxy agent. Must NOT use `ureq::get()` shortcut — it
+    // inherits the user's `https_proxy` / `http_proxy` env, which routes
+    // localhost (127.0.0.1:<proxy>) through Clash / corporate proxies and
+    // produces a bogus "failed (10 ms)" bottom row. Regression history:
+    // workflow/CI/bugfix/2026-04-22-connectivity-probe-through-proxy.md.
+    //
+    // X-Aikey-Probe: 1 suppresses usage-event emission on the proxy side
+    // (see aikey-proxy/internal/proxy/middleware.go::isAikeyProbe). Without
+    // this header every `aikey test` run pollutes the collector with a
+    // billing event for the synthetic probe.
+    let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
+        .build();
+    let start = Instant::now();
+    let result = agent.get(&proxy_url)
+        .set(auth_key, &auth_val)
+        .set("X-Aikey-Probe", "1")
         .call();
     let ms = start.elapsed().as_millis();
 
@@ -535,17 +667,22 @@ pub fn run_connectivity_suite(
         .max()
         .unwrap_or(12)
         .max("Provider".len()) + 2;
-    const W_PING: usize = 16;
+    // 5 columns: Provider | Ping(D) | Ping | API | Chat
+    //   Ping(D) = CLI → upstream (independent baseline).
+    //   Ping    = CLI → aikey-proxy → upstream (gates API+Chat).
+    const W_PD:   usize = 14;   // "Ping(D)" column, short latency (+" (Xms)")
+    const W_PING: usize = 14;   // Ping(PROXY)
     const W_API:  usize = 34;
 
     if let Some(header) = opts.header_label {
         eprintln!();
         eprintln!("  \u{1F50C} {}", header.bold());
     }
-    eprintln!("  {:<wp$} {:<wpi$} {:<wap$} {}",
-        "Provider".dimmed(), "Ping".dimmed(), "API".dimmed(), "Chat".dimmed(),
-        wp = label_w, wpi = W_PING, wap = W_API);
-    eprintln!("  {}", "\u{2500}".repeat(label_w + W_PING + W_API + 20).dimmed());
+    eprintln!("  {:<wp$} {:<wpd$} {:<wpi$} {:<wap$} {}",
+        "Provider".dimmed(), "Ping(D)".dimmed(), "Ping".dimmed(),
+        "API".dimmed(), "Chat".dimmed(),
+        wp = label_w, wpd = W_PD, wpi = W_PING, wap = W_API);
+    eprintln!("  {}", "\u{2500}".repeat(label_w + W_PD + W_PING + W_API + 22).dimmed());
 
     let mut failed_hints: Vec<String> = Vec::new();
     for t in &targets {
@@ -555,7 +692,21 @@ pub fn run_connectivity_suite(
 
         let r = test_provider_connectivity(&t.provider_code, &t.base_url, &t.bearer);
 
-        // Ping column.
+        // Ping(DIRECT) column — informational, never gates.
+        let pd_raw = if r.ping_direct_ok { format!("ok ({}ms)", r.ping_direct_ms) }
+                     else { format!("fail ({}ms)", r.ping_direct_ms) };
+        let pd_col = if r.ping_direct_ok {
+            format!("{:<w$}", pd_raw, w = W_PD).green().to_string()
+        } else {
+            // Dimmed (not red) — Ping(D) failure on its own isn't a blocker,
+            // just a diagnostic ("your laptop can't reach upstream, but the
+            // proxy might").
+            format!("{:<w$}", pd_raw, w = W_PD).dimmed().to_string()
+        };
+        eprint!("{} ", pd_col);
+        let _ = io::stderr().flush();
+
+        // Ping(PROXY) column — gates API + Chat.
         let ping_raw = if r.ping_ok { format!("ok ({}ms)", r.ping_ms) }
                        else { format!("fail ({}ms)", r.ping_ms) };
         let ping_col = if r.ping_ok { format!("{:<w$}", ping_raw, w = W_PING).green().to_string() }
@@ -565,7 +716,16 @@ pub fn run_connectivity_suite(
 
         if !r.ping_ok {
             eprintln!("{:<w$} {}", "\u{2014}".dimmed(), "\u{2014}".dimmed(), w = W_API);
-            failed_hints.push(format!("{}: ping failed — check network / VPN / firewall", display));
+            // If Ping(DIRECT) passed while Ping(PROXY) failed, the proxy
+            // itself (not the network) is the problem — actionable hint.
+            let hint = if r.ping_direct_ok {
+                format!("{}: proxy can't reach upstream (but your laptop can). \
+                         Is `aikey proxy` configured with HTTPS_PROXY / \
+                         config.upstream_proxy if your network requires it?", display)
+            } else {
+                format!("{}: both paths failed — check network / VPN / firewall", display)
+            };
+            failed_hints.push(hint);
             rows.push((t.clone(), r));
             continue;
         }
@@ -685,3 +845,107 @@ pub fn render_cannot_test_block(errors: &[BuildTargetError], json_mode: bool) {
     }
 }
 
+#[cfg(test)]
+mod proxy_probe_regression_tests {
+    //! Regression guard for 2026-04-22 test_proxy_connectivity fix.
+    //!
+    //! The original bug: `ureq::get()` shortcut was inheriting the user's
+    //! `http_proxy` / `https_proxy` env vars, which routed every 127.0.0.1
+    //! probe through Clash / a corporate proxy and reported "failed (10 ms)"
+    //! even though the local aikey-proxy was running. Additionally the probe
+    //! did not set `X-Aikey-Probe: 1`, so every invocation polluted the
+    //! collector with a synthetic usage event.
+    //!
+    //! We can't test the real function end-to-end without standing up a full
+    //! proxy, but we can stand up a minimal mock HTTP server on 127.0.0.1
+    //! that records the incoming request headers, then verify (a) the probe
+    //! reaches it even when `HTTPS_PROXY` env points at a black hole and
+    //! (b) it carries the `X-Aikey-Probe: 1` header. Both assertions must
+    //! hold or the user-facing "failed bottom row" / "collector polluted"
+    //! regressions return.
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    /// Minimal one-shot HTTP/1.1 server on 127.0.0.1:<random>. Captures the
+    /// raw request bytes so the test can assert on headers, then replies
+    /// with a 200. Returns (port, captured-request handle, join handle).
+    fn spawn_capture_server() -> (u16, Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_cl = Arc::clone(&captured);
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                let mut buf = [0u8; 4096];
+                // One read is enough for HEAD-sized requests; good enough
+                // for the assertions we need.
+                if let Ok(n) = stream.read(&mut buf) {
+                    captured_cl.lock().unwrap().extend_from_slice(&buf[..n]);
+                }
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+        (port, captured, handle)
+    }
+
+    #[test]
+    fn probe_sets_x_aikey_probe_header() {
+        let (port, captured, handle) = spawn_capture_server();
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(2))
+            .build();
+        let url = format!("http://127.0.0.1:{}/anthropic/v1/models", port);
+        let _ = agent.get(&url).set("X-Aikey-Probe", "1").call();
+        handle.join().ok();
+
+        let req = captured.lock().unwrap();
+        let text = String::from_utf8_lossy(&req);
+        assert!(text.to_lowercase().contains("x-aikey-probe: 1"),
+            "probe must set X-Aikey-Probe: 1 to suppress collector usage events; \
+             got request: {}", text);
+    }
+
+    #[test]
+    fn probe_agent_ignores_https_proxy_env() {
+        // Point HTTPS_PROXY at a port nobody is listening on. If the probe
+        // agent inherits env, it tries to tunnel through this dead port and
+        // fails. With an explicit no-proxy agent it connects straight to
+        // our 127.0.0.1 capture server and succeeds.
+        //
+        // `std::env::set_var` mutates process-global state, so this test
+        // cannot run in parallel with anything else touching HTTPS_PROXY.
+        // cargo test runs tests within the same binary in parallel by
+        // default — we accept that risk here because (a) this binary's other
+        // tests don't touch HTTPS_PROXY and (b) the capture-server URL is
+        // unique per test so we won't collide on the port either.
+        //
+        // SAFETY: set_var is unsafe in Rust edition 2024 because non-test
+        // threads may read env concurrently. In this cfg(test) context only
+        // the test thread exists meaningfully.
+        unsafe { std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:1"); }
+        unsafe { std::env::set_var("https_proxy", "http://127.0.0.1:1"); }
+
+        let (port, _captured, handle) = spawn_capture_server();
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(2))
+            .build();
+        let url = format!("http://127.0.0.1:{}/anthropic/v1/models", port);
+        let result = agent.get(&url).call();
+        handle.join().ok();
+
+        unsafe { std::env::remove_var("HTTPS_PROXY"); }
+        unsafe { std::env::remove_var("https_proxy"); }
+
+        // If env-proxy was inherited, the call goes to 127.0.0.1:1 (dead)
+        // and errors out. Explicit no-proxy agent must reach our capture
+        // server and get the 200.
+        assert!(result.is_ok(),
+            "probe agent must NOT inherit HTTPS_PROXY env var — the runtime \
+             proxy is on 127.0.0.1 and routing that through Clash/corporate \
+             proxies produces bogus 'failed (10 ms)' bottom row");
+    }
+}

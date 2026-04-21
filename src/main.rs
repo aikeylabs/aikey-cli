@@ -33,6 +33,7 @@ mod proxy_env;
 mod commands_auth;
 mod commands_statusline;
 mod commands_watch;
+mod commands_internal;
 #[allow(dead_code)] mod usage_wal;
 mod cli;
 
@@ -253,7 +254,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 eprintln!("Error: {}", e);
                 if is_auth_error {
-                    eprintln!("  Hint: Session cache cleared — next command will prompt for your password.");
+                    // Why split: when the rejected password came from AK_TEST_PASSWORD
+                    // / AIKEY_MASTER_PASSWORD in the caller's environment, clearing the
+                    // session cache does NOT unblock the user — the next invocation
+                    // re-reads the same wrong env value and fails identically
+                    // ("make restart stuck in auth-fail loop"). Tell the user that
+                    // directly so they know env is the culprit, not the cache.
+                    let from_env = std::env::var("AK_TEST_PASSWORD").is_ok()
+                        || std::env::var("AIKEY_MASTER_PASSWORD").is_ok();
+                    if from_env {
+                        eprintln!("  Hint: rejected password came from AK_TEST_PASSWORD /");
+                        eprintln!("        AIKEY_MASTER_PASSWORD in your environment.");
+                        eprintln!("        Clearing the session cache will NOT help — either:");
+                        eprintln!("          • unset the env var so the next command prompts you:");
+                        eprintln!("              unset AK_TEST_PASSWORD AIKEY_MASTER_PASSWORD");
+                        eprintln!("          • or set AIKEY_MASTER_PASSWORD to the correct password.");
+                    } else {
+                        eprintln!("  Hint: Session cache cleared — next command will prompt for your password.");
+                    }
                 }
                 std::process::exit(1);
             }
@@ -669,6 +687,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        // `_internal` IPC 子命令组：Go local-server spawn 调用，stdin-json 协议
+        // 永远返回 Ok(()) —— 成功/失败都通过 stdout JSON 表达（见 commands_internal::dispatch 文档）
+        Commands::Internal { action } => {
+            commands_internal::dispatch(&action);
+        }
         Commands::Add { alias, provider } => {
             let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
@@ -1050,16 +1073,56 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Test { alias, provider: test_provider } => {
+            // Structured exit codes so shell wrappers (claude/codex/kimi) can
+            // branch without parsing output:
+            //
+            //   0  API(PROXY) passed — key/account is usable
+            //   1  Ping(PROXY) failed — proxy can't reach upstream
+            //   2  API(PROXY) failed — key rejected / account expired
+            //   3  alias not found in any source
+            //   5  aikey-proxy not running
+            //
+            // Ping(DIRECT) is informational only — never participates in the
+            // exit-code decision.
+            const EXIT_OK:                i32 = 0;
+            const EXIT_PING_FAIL:         i32 = 1;
+            const EXIT_API_FAIL:          i32 = 2;
+            const EXIT_ALIAS_NOT_FOUND:   i32 = 3;
+            const EXIT_PROXY_NOT_RUNNING: i32 = 5;
+
+            // Pre-flight: the probe pipeline now ALWAYS goes through the
+            // local proxy for API/Chat/ping-proxy. If the proxy is down we
+            // can't even start — fail fast with a dedicated exit code so
+            // wrappers don't misinterpret it as "key invalid".
+            if !commands_proxy::is_proxy_running() {
+                let msg = "aikey-proxy is not running. Run `aikey proxy start` and retry.";
+                if cli.json { json_output::error(msg, EXIT_PROXY_NOT_RUNNING); }
+                else { eprintln!("{}", msg); std::process::exit(EXIT_PROXY_NOT_RUNNING); }
+            }
+
             let password = prompt_vault_password(cli.password_stdin, cli.json)?;
             let proxy_port = commands_proxy::proxy_port();
 
+            // Derive exit code from a suite outcome. Rules:
+            //   - any row with api_ok → 0 (at least one target usable)
+            //   - else any ping_ok → 2 (reached but all keys rejected)
+            //   - else → 1 (couldn't reach upstream via proxy)
+            //
+            // Across multiple rows (e.g. a personal key bound to N providers),
+            // success on ANY counts as overall success — matches the
+            // `any_chat_ok` semantics used by `aikey add`.
+            fn exit_code_from_outcome(outcome: &commands_project::SuiteOutcome) -> i32 {
+                if outcome.rows.iter().any(|(_, r)| r.api_ok) { return EXIT_OK; }
+                if outcome.rows.iter().any(|(_, r)| r.ping_ok) { return EXIT_API_FAIL; }
+                EXIT_PING_FAIL
+            }
+            // Name inside the closure-esque fn needs the consts visible — Rust
+            // fn scope inside a match arm is a regular item, so consts above
+            // are accessible via their bindings at call time. (Kept local to
+            // avoid leaking these into the module's public surface.)
+
             if let Some(ref alias) = alias {
                 // ── Single-alias mode: resolve across personal/team/OAuth ──
-                // Why `targets_from_alias` instead of `executor::get_secret`:
-                // the old code only looked at personal vault entries and
-                // returned "Entry not found" for team keys or OAuth accounts.
-                // The resolver now scans all three sources with fixed
-                // priority (personal > team > OAuth).
                 let targets = commands_project::targets_from_alias(
                     alias,
                     test_provider.as_deref(),
@@ -1072,11 +1135,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                          \n\
                          Hints:\n\
                          - run `aikey list` to see all known aliases\n\
-                         - for team keys, run `aikey key sync` first in case the cache is stale\n\
-                         - for team / OAuth: make sure the proxy is running (`aikey proxy start`)",
+                         - for team keys, run `aikey key sync` first in case the cache is stale",
                         alias);
-                    if cli.json { json_output::error(&msg, 1); }
-                    else { return Err(msg.into()); }
+                    if cli.json { json_output::error(&msg, EXIT_ALIAS_NOT_FOUND); }
+                    else { eprintln!("{}", msg); std::process::exit(EXIT_ALIAS_NOT_FOUND); }
                 }
 
                 let opts = commands_project::SuiteOptions {
@@ -1085,12 +1147,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     password:       None,
                     proxy_port,
                 };
-                if cli.json {
-                    let outcome = commands_project::run_connectivity_suite(targets, opts, true);
-                    json_output::success(serde_json::json!({
-                        "alias":   alias,
-                        "results": outcome.json_results,
-                    }));
+                let outcome = if cli.json {
+                    commands_project::run_connectivity_suite(targets, opts, true)
                 } else {
                     use colored::Colorize;
                     if targets.len() == 1 {
@@ -1102,15 +1160,27 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             alias.bold(), targets.len());
                     }
                     eprintln!();
-                    commands_project::run_connectivity_suite(targets, opts, false);
+                    commands_project::run_connectivity_suite(targets, opts, false)
+                };
+                // Emit JSON BEFORE the exit; json_output::success exits with
+                // code 0, which would clobber our structured exit code —
+                // print raw JSON then exit with the right code instead.
+                if cli.json {
+                    let payload = serde_json::json!({
+                        "status":  if exit_code_from_outcome(&outcome) == EXIT_OK { "success" } else { "failed" },
+                        "alias":   alias,
+                        "results": outcome.json_results,
+                    });
+                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
+                std::process::exit(exit_code_from_outcome(&outcome));
             } else {
                 // ── No alias: test all active bindings (personal/team/OAuth) ──
                 let (targets, build_errors) =
                     commands_project::targets_from_active_bindings(Some(&password), proxy_port);
 
                 if targets.is_empty() && build_errors.is_empty() {
-                    if cli.json { json_output::error("No active provider bindings. Add a key first.", 1); }
+                    if cli.json { json_output::error("No active provider bindings. Add a key first.", EXIT_ALIAS_NOT_FOUND); }
                     else { return Err("No active provider bindings. Add a key with `aikey add` first.".into()); }
                 }
 
@@ -1120,21 +1190,27 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     password:       None,
                     proxy_port,
                 };
+                let outcome = if cli.json {
+                    commands_project::run_connectivity_suite(targets, opts, true)
+                } else {
+                    eprintln!("  Testing {} active provider binding(s)...\n",
+                        targets.len() + build_errors.len());
+                    let outcome = commands_project::run_connectivity_suite(targets, opts, false);
+                    commands_project::render_cannot_test_block(&build_errors, false);
+                    outcome
+                };
                 if cli.json {
-                    let outcome = commands_project::run_connectivity_suite(targets, opts, true);
-                    json_output::success(serde_json::json!({
+                    let payload = serde_json::json!({
+                        "status": if exit_code_from_outcome(&outcome) == EXIT_OK { "success" } else { "failed" },
                         "bindings_tested": outcome.json_results,
                         "build_errors": build_errors.iter().map(|e| serde_json::json!({
                             "label":  e.label(),
                             "reason": e.reason(),
                         })).collect::<Vec<_>>(),
-                    }));
-                } else {
-                    eprintln!("  Testing {} active provider binding(s)...\n",
-                        targets.len() + build_errors.len());
-                    let _ = commands_project::run_connectivity_suite(targets, opts, false);
-                    commands_project::render_cannot_test_block(&build_errors, false);
+                    });
+                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
+                std::process::exit(exit_code_from_outcome(&outcome));
             }
         }
         Commands::Export { pattern, output } => {

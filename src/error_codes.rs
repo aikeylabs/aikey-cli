@@ -22,6 +22,23 @@ pub enum ErrorCode {
     Timeout,
     VaultNotInitialized,
     ProfileNotFound,
+
+    // ===== `_internal` IPC 错误码（I_ 前缀）=====
+    // 用于 `aikey _internal *` 子命令组的 stdin-json 协议。
+    // 这些错误码通过 stdout JSON 返回给 Go local-server（不是 exit code）。
+    // 新增时：同步更新 as_str() / code() 映射 + docs/VAULT_SPEC.md 错误码表。
+    InternalStdinInvalidJson,       // I_STDIN_INVALID_JSON
+    InternalStdinReadFailed,        // I_STDIN_READ_FAILED
+    InternalVaultKeyMalformed,      // I_VAULT_KEY_MALFORMED（hex 长度/格式错）
+    InternalVaultKeyInvalid,        // I_VAULT_KEY_INVALID（key 不匹配 vault）
+    InternalVaultNotInitialized,    // I_VAULT_NOT_INITIALIZED
+    InternalVaultOpenFailed,        // I_VAULT_OPEN_FAILED
+    InternalUnknownAction,          // I_UNKNOWN_ACTION（envelope.action 不认识）
+    InternalNotImplemented,         // I_NOT_IMPLEMENTED（Phase 占位）
+    InternalCredentialNotFound,     // I_CREDENTIAL_NOT_FOUND
+    InternalCredentialConflict,     // I_CREDENTIAL_CONFLICT（add 时 alias 已存在）
+    InternalParseFailed,            // I_PARSE_FAILED（解析引擎三层流水失败）
+    InternalIo,                     // I_INTERNAL（serialize/io 等意外内部错误）
 }
 
 impl ErrorCode {
@@ -41,6 +58,19 @@ impl ErrorCode {
             ErrorCode::Timeout => "TIMEOUT",
             ErrorCode::VaultNotInitialized => "VAULT_NOT_INITIALIZED",
             ErrorCode::ProfileNotFound => "PROFILE_NOT_FOUND",
+            // _internal IPC 错误码
+            ErrorCode::InternalStdinInvalidJson => "I_STDIN_INVALID_JSON",
+            ErrorCode::InternalStdinReadFailed => "I_STDIN_READ_FAILED",
+            ErrorCode::InternalVaultKeyMalformed => "I_VAULT_KEY_MALFORMED",
+            ErrorCode::InternalVaultKeyInvalid => "I_VAULT_KEY_INVALID",
+            ErrorCode::InternalVaultNotInitialized => "I_VAULT_NOT_INITIALIZED",
+            ErrorCode::InternalVaultOpenFailed => "I_VAULT_OPEN_FAILED",
+            ErrorCode::InternalUnknownAction => "I_UNKNOWN_ACTION",
+            ErrorCode::InternalNotImplemented => "I_NOT_IMPLEMENTED",
+            ErrorCode::InternalCredentialNotFound => "I_CREDENTIAL_NOT_FOUND",
+            ErrorCode::InternalCredentialConflict => "I_CREDENTIAL_CONFLICT",
+            ErrorCode::InternalParseFailed => "I_PARSE_FAILED",
+            ErrorCode::InternalIo => "I_INTERNAL",
         }
     }
 
@@ -60,6 +90,19 @@ impl ErrorCode {
             ErrorCode::Timeout => -32005,
             ErrorCode::VaultNotInitialized => -32006,
             ErrorCode::ProfileNotFound => -32007,
+            // _internal IPC: 负数区间（与其他 internal 保持一致）
+            ErrorCode::InternalStdinInvalidJson => -32101,
+            ErrorCode::InternalStdinReadFailed => -32102,
+            ErrorCode::InternalVaultKeyMalformed => -32103,
+            ErrorCode::InternalVaultKeyInvalid => -32104,
+            ErrorCode::InternalVaultNotInitialized => -32105,
+            ErrorCode::InternalVaultOpenFailed => -32106,
+            ErrorCode::InternalUnknownAction => -32107,
+            ErrorCode::InternalNotImplemented => -32108,
+            ErrorCode::InternalCredentialNotFound => -32109,
+            ErrorCode::InternalCredentialConflict => -32110,
+            ErrorCode::InternalParseFailed => -32111,
+            ErrorCode::InternalIo => -32199,
         }
     }
 

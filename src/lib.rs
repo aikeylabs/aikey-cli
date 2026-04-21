@@ -25,6 +25,7 @@ pub mod observability;
 pub mod platform_client;
 pub mod commands_account;
 pub mod commands_proxy;
+pub mod commands_internal;
 pub mod session;
 pub mod ui_frame;
 pub mod proxy_env;
