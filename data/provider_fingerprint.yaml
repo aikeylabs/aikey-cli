@@ -1,0 +1,199 @@
+# Provider Fingerprint Registry (POC)
+#
+# 用途：对已抽取的 secret token 做 provider 软性分类 + 二次校验
+# Why YAML：ControlPanel 可下发热更，新 provider 出现无需改代码发版
+#
+# tier 含义：
+#   confirmed  —— 前缀极具特异性，FP 几乎为 0（sk-ant-api03 / AKIA / gsk_ 等）
+#   likely     —— 前缀有特征但可能与别的 provider 共享（sk-or-v1 OpenRouter vs sk-or 其他）
+#   ambiguous  —— 无特异前缀，需要 URL / title 上下文辅助（Kimi/DeepSeek 共享 sk-）
+#   warn       —— 形态像 credential 但大概率不是（UUID / pure hex 短串）
+#
+# 来源：
+#   - Anthropic 官方文档 + GitGuardian detector
+#   - GitHub odomojuli/regextokens 仓库
+#   - 各 provider 官方 quickstart (openai.com / groq.com / x.ai / etc.)
+#   - 2026-04 web 检索
+
+version: 1
+
+providers:
+  # ============ Tier: confirmed（前缀高特异性，直接打上provider标签） ============
+
+  - id: anthropic_api
+    display: "Anthropic Claude (API key)"
+    # 2024 Q4 起 Claude key 可能为 60-130 字符尾段，取宽容范围
+    regex: '^sk-ant-api03-[A-Za-z0-9_\-]{40,150}$'
+    length_range: [53, 165]
+    tier: confirmed
+
+  - id: anthropic_oauth
+    display: "Anthropic Claude (OAuth setup token)"
+    regex: '^sk-ant-oat01-[A-Za-z0-9_\-]{20,}$'
+    tier: confirmed
+
+  - id: openai_project
+    display: "OpenAI (Project key)"
+    regex: '^sk-proj-[A-Za-z0-9_\-]{40,200}$'
+    length_range: [50, 210]
+    tier: confirmed
+
+  - id: openai_admin
+    display: "OpenAI (Admin key)"
+    regex: '^sk-admin-[A-Za-z0-9_\-]{100,150}$'
+    tier: confirmed
+
+  - id: openai_svcacct
+    display: "OpenAI (Service Account)"
+    regex: '^sk-svcacct-[A-Za-z0-9_\-]+$'
+    tier: confirmed
+
+  - id: openrouter
+    display: "OpenRouter"
+    # 真实 key 是 64 hex，但允许更宽字符集以兼容未来格式变化 + 合成样本
+    regex: '^sk-or-v1-[A-Za-z0-9]{50,80}$'
+    length_range: [59, 90]
+    tier: confirmed
+
+  - id: google_gemini
+    display: "Google Gemini / Google Cloud API"
+    regex: '^AIza[0-9A-Za-z_\-]{35}$'
+    length_range: [39, 39]
+    tier: confirmed
+
+  - id: groq
+    display: "Groq"
+    regex: '^gsk_[A-Za-z0-9]{48,64}$'
+    length_range: [52, 68]
+    tier: confirmed
+
+  - id: xai_grok
+    display: "xAI Grok"
+    regex: '^xai-[A-Za-z0-9]{60,100}$'
+    length_range: [64, 104]
+    tier: confirmed
+
+  - id: github_classic
+    display: "GitHub (Classic PAT)"
+    regex: '^ghp_[a-zA-Z0-9]{36}$'
+    length_range: [40, 40]
+    tier: confirmed
+
+  - id: github_fine_grained
+    display: "GitHub (Fine-grained PAT)"
+    regex: '^github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59}$'
+    length_range: [93, 93]
+    tier: confirmed
+
+  - id: aws_access_key
+    display: "AWS Access Key ID"
+    regex: '^AKIA[0-9A-Z]{16}$'
+    length_range: [20, 20]
+    tier: confirmed
+
+  - id: stripe_live
+    display: "Stripe (Live Secret Key)"
+    regex: '^sk_live_[0-9a-zA-Z]{24}$'
+    length_range: [32, 32]
+    tier: confirmed
+
+  - id: stripe_restricted
+    display: "Stripe (Restricted Key)"
+    regex: '^rk_live_[0-9a-zA-Z]{99}$'
+    length_range: [107, 107]
+    tier: confirmed
+
+  - id: sendgrid
+    display: "SendGrid"
+    # 真实 key: SG.{22}.{43} 共 69；合成样本允许更宽长度
+    regex: '^SG\.[A-Za-z0-9_\-]{10,30}\.[A-Za-z0-9_\-]{20,60}$'
+    length_range: [34, 94]
+    tier: confirmed
+
+  - id: slack_bot
+    display: "Slack Bot Token"
+    regex: '^xoxb-[0-9]+-[0-9]+-[0-9a-zA-Z]+$'
+    tier: confirmed
+
+  - id: slack_user
+    display: "Slack User Token"
+    regex: '^xoxp-[0-9]+-[0-9]+-[0-9]+-[0-9a-zA-Z]+$'
+    tier: confirmed
+
+  - id: huggingface
+    display: "Hugging Face"
+    regex: '^hf_[A-Za-z]{30,40}$'
+    length_range: [33, 45]
+    tier: confirmed
+
+  - id: perplexity
+    display: "Perplexity AI"
+    regex: '^pplx-[A-Za-z0-9]{40,}$'
+    tier: confirmed
+
+  - id: generic_jwt
+    display: "JWT (generic, multiple providers)"
+    regex: '^eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$'
+    tier: confirmed
+
+  - id: pem_block
+    display: "PEM private key block (SSH / TLS / PGP)"
+    regex: '^-----BEGIN [A-Z ]+-----[\s\S]+-----END [A-Z ]+-----$'
+    tier: confirmed
+
+  # ============ Tier: ambiguous（sk- 通用前缀，需上下文补强） ============
+
+  - id: zhipu_glm
+    display: "Zhipu AI / GLM (BigModel)"
+    # 两段 id.secret 格式
+    regex: '^[A-Za-z0-9]{20,}\.[A-Za-z0-9]{20,}$'
+    tier: ambiguous
+    hint: "Zhipu 格式为 {id}.{secret}，但其他 provider 也可能使用 dot-separated"
+    # M3 新增
+    siblings:
+      - zhipu_glm
+      - bigmodel
+      - generic_other
+
+  - id: generic_sk
+    display: "Generic sk- key (Kimi / DeepSeek / 云雾 / 0011 / Mistral 等)"
+    regex: '^sk-[A-Za-z0-9]{40,80}$'
+    length_range: [43, 83]
+    tier: ambiguous
+    hint: "通用 sk- 前缀，需结合同文档 URL/title 判定具体 provider"
+    disambiguators:
+      - url_domain: "platform.moonshot.cn"
+        suggest: "moonshot_kimi"
+      - url_domain: "platform.moonshot.ai"
+        suggest: "moonshot_kimi"
+      - url_domain: "platform.deepseek.com"
+        suggest: "deepseek"
+      - url_domain: "yunwu.ai"
+        suggest: "yunwu"
+      - url_domain: "0011.ai"
+        suggest: "zeroeleven"
+    # M3 新增：URL 消歧失败时，UI 手选下拉优先展示的候选 provider id
+    siblings:
+      - moonshot_kimi
+      - deepseek
+      - yunwu
+      - zeroeleven
+      - mistral
+      - siliconflow
+      - generic_other
+
+  # ============ Tier: warn（形态可疑，UI 需标警示） ============
+
+  - id: uuid
+    display: "UUID (通常不是 API KEY)"
+    regex: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    length_range: [36, 36]
+    tier: warn
+    hint: "看起来像 UUID（订单号/会话ID/资源标识），用户需确认是否为凭证"
+
+  - id: short_hex_raw
+    display: "Short raw hex（可能是 file hash / 版本号 / 资源 ID）"
+    regex: '^[a-fA-F0-9]{16,27}$'
+    length_range: [16, 27]
+    tier: warn
+    hint: "短 hex 串，可能是 commit hash / file hash / 资源 ID，请确认"

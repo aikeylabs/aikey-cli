@@ -27,6 +27,30 @@ fi
 _aikey_precmd() {
     [ -n "$AIKEY_ACTIVE_LABEL" ] && return
     [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env
+    _aikey_hook_check_once
+}
+
+# One-shot drift detector: compare the `# Hook-Template-Hash:` header of
+# ~/.aikey/hook.zsh against the hash embedded in the `aikey` binary
+# (`aikey _hook-hash zsh`). A mismatch means the binary was upgraded but
+# the on-disk hook wasn't regenerated (the 2026-04-22 root cause — user
+# sees old wrapper behaviour despite a newer binary being installed).
+#
+# Why once-per-shell: the comparison involves a file read + one binary
+# invocation; doing it on every prompt would be wasteful. The
+# `_AIKEY_HOOK_CHECKED` flag scopes it to first prompt, then silence.
+_aikey_hook_check_once() {
+    [ -n "$_AIKEY_HOOK_CHECKED" ] && return
+    _AIKEY_HOOK_CHECKED=1
+    local file_hash bin_hash
+    file_hash=$(grep -m1 -oE 'Hook-Template-Hash: [a-f0-9]+' ~/.aikey/hook.zsh 2>/dev/null | cut -d' ' -f2)
+    bin_hash=$(command aikey _hook-hash zsh 2>/dev/null)
+    # If either side is missing (pre-hash binary, stripped hook file),
+    # stay silent — the drift detector is strictly best-effort.
+    [[ -z "$file_hash" || -z "$bin_hash" ]] && return
+    if [[ "$file_hash" != "$bin_hash" ]]; then
+        printf '\033[33m[aikey] hook.zsh is outdated (file=%s, binary=%s).\n    run: aikey use   # regenerates ~/.aikey/hook.zsh, then re-source\n\033[0m' "$file_hash" "$bin_hash" >&2
+    fi
 }
 
 _aikey_preexec() {
@@ -45,3 +69,71 @@ _aikey_preexec() {
 # Dedupe-safe registration — re-sourcing this file is harmless.
 (( ${precmd_functions[(I)_aikey_precmd]} )) || precmd_functions+=(_aikey_precmd)
 (( ${preexec_functions[(I)_aikey_preexec]} )) || preexec_functions+=(_aikey_preexec)
+
+# ── Wrapper preflight (claude / codex) ────────────────────────────────────
+#
+# Runs `aikey test <alias>` before the real claude/codex binary to catch
+# "proxy down / key expired / wrong env" cases instead of letting the user
+# hit them as an opaque CLI error 30 seconds in. On failure, prompts the
+# user interactively — default answer is "no" so typos don't silently fall
+# through into a broken session.
+#
+# Escape hatch: `AIKEY_PREFLIGHT=off` (any shell) skips the probe entirely.
+#
+# Password handling: `aikey test` calls `prompt_vault_password` which
+# consults the session cache first. If the user ran `aikey activate <alias>`
+# earlier in this shell (or keychain backend is enabled), cache hits and no
+# prompt appears. We redirect stdin from /dev/null so a cache-miss turns
+# into a graceful non-zero exit rather than a blocking password prompt —
+# wrapper then treats that like any other preflight failure (warn + ask).
+_aikey_preflight() {
+    [[ "$AIKEY_PREFLIGHT" == "off" ]] && return 0
+    # No active binding in this shell — can't tell what to probe. Emit one
+    # advisory line so first-time users see the missing step instead of a
+    # raw `claude` error 30s in. Silent no-op would be defensible but the
+    # hint costs one line and saves a support round-trip.
+    if [[ -z "$AIKEY_ACTIVE_KEYS" ]]; then
+        printf '\033[90m[aikey] no active binding — run `aikey use <alias>` first (preflight skipped)\033[0m\n' >&2
+        return 0
+    fi
+    local prov="$1"
+    local id=$(echo "$AIKEY_ACTIVE_KEYS" | tr ',' '\n' | grep "^${prov}=" | cut -d= -f2-)
+    # No active binding for this provider — don't block; let the real CLI
+    # surface its own "no credentials" error (more specific than ours).
+    [[ -z "$id" ]] && return 0
+    # Let stderr through so the user sees the Ping/API/Chat table (that's
+    # real feedback, not noise) — a silent 1-2s pause before claude looks
+    # like the shell hanging. Stdin still redirected from /dev/null so any
+    # interactive prompt from aikey test (shouldn't happen post plan D,
+    # belt-and-suspenders against a regression) can't block the wrapper.
+    command aikey test "$id" </dev/null
+    local rc=$?
+    [[ $rc -eq 0 ]] && return 0
+    # Exit codes from `aikey test` (see main.rs Commands::Test):
+    #   1 = Ping(PROXY) fail · 2 = API fail · 3 = alias not found
+    #   5 = proxy not running · other = unexpected
+    local reason
+    case "$rc" in
+        1) reason="proxy can't reach upstream" ;;
+        2) reason="API rejected the key" ;;
+        3) reason="alias not found" ;;
+        5) reason="aikey-proxy not running" ;;
+        *) reason="exit=$rc" ;;
+    esac
+    printf '\033[33m[aikey] preflight failed for %s (%s): %s. Continue anyway? [y/N] \033[0m' "$prov" "$id" "$reason"
+    local reply
+    read -r reply
+    case "$reply" in
+        y|Y|yes|YES) return 0 ;;
+        *) printf '\033[90m[aikey] aborted — run: aikey test %s\033[0m\n' "$id"; return 1 ;;
+    esac
+}
+
+# Wrap claude + codex. Guarded so the user's own function/alias (if any)
+# wins — respects the same convention as the `ak` wrapper above.
+if ! (( ${+functions[claude]} )) && ! alias claude >/dev/null 2>&1; then
+    function claude { _aikey_preflight anthropic || return $?; command claude "$@"; }
+fi
+if ! (( ${+functions[codex]} )) && ! alias codex >/dev/null 2>&1; then
+    function codex { _aikey_preflight openai || return $?; command codex "$@"; }
+fi

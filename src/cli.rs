@@ -95,6 +95,19 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: crate::commands_internal::InternalAction,
     },
+    /// Internal: print the FNV-1a-64 hash of the embedded hook template.
+    ///
+    /// Consumed by `_aikey_hook_check_once` in hook.zsh / hook.bash to detect
+    /// an outdated `~/.aikey/hook.{zsh,bash}` (user upgraded the `aikey`
+    /// binary without re-running `aikey use`, so the on-disk hook lags
+    /// behind the binary's embedded template). Output format is a bare
+    /// 16-hex-digit hash on stdout — kept minimal so the shell can compare
+    /// it with a trivial `[[ "$a" == "$b" ]]`.
+    #[command(hide = true, name = "_hook-hash")]
+    HookHash {
+        /// Which shell template to hash: zsh | bash
+        shell: String,
+    },
     /// Save a new secret to the vault
     #[command(display_order = 1)]
     Add {
@@ -706,6 +719,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 }
             },
             Commands::Watch => "watch".to_string(),
+            Commands::HookHash { .. } => "_hook-hash".to_string(),
         },
     }
 }

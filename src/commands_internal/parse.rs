@@ -1,17 +1,21 @@
 //! `_internal parse`：文本解析入口（三层流水：规则 v2 + CRF + Provider Fingerprint）
 //!
-//! # Stage 2 范围（本 Phase E）
-//! - 协议契约定稿（input payload + output schema）
-//! - **Layer 1-lite**：仅基础 regex（email / URL / 已知 provider 前缀 / 长 hex）
-//! - 不做 CRF / shape filter / H 层 Fingerprint（Stage 3 填充）
-//! - 不做 tokenize_line / anchored / label=value / PEM 多层（Stage 3 填充）
-//! - 不做 grouper（drafts 为空，候选全部作为 orphans）
+//! # Phase 2 （本 revision）
+//! - ✅ 规则层 v2：基础 regex + label=value + PEM + 邮箱/secret 锚点（4 层）
+//! - ⏸ CRF：Phase 4 接入
+//! - ⏸ Fingerprint：Phase 3 接入
 //!
-//! # Stage 3 迁移点
-//! 1. 从 `workflow/CI/research/ablation-spike/src/` 迁移完整 rule_extract + anchored + labeled + PEM
-//! 2. 接入 `commands_internal::parse::crf::extract_with_crf` (Stage 3.5 新增模块)
-//! 3. 接入 `commands_internal::parse::fingerprint::classify_all` (Stage 3.9 新增模块)
-//! 4. 加 `grouper::build_drafts` 做图归组
+//! # 模块结构
+//! ```
+//! commands_internal/parse.rs    ← 本文件，handle() 入口 + 响应组装
+//! commands_internal/parse/
+//! ├── candidate.rs   ← Candidate / Kind / Tier / ProviderGuess
+//! ├── tokenize.rs    ← tokenize_line 扩展分隔符 + markdown 清理
+//! ├── rule.rs        ← Layer 1 协调器 + 基础 regex + dash/pipe/label password 启发式
+//! ├── rule_labeled.rs ← Layer 2 label=value 通用提取
+//! ├── rule_pem.rs    ← Layer 3 PEM 多行块
+//! └── rule_anchored.rs ← Layer 4 邮箱/secret 锚点 password 召回（B 方案）
+//! ```
 //!
 //! # 协议
 //! 见 `protocol.rs` StdinEnvelope + 本模块响应 schema（参考 批量导入-最终方案-v2.md §5.3）
@@ -20,7 +24,15 @@
 //! parse 对 vault **零操作**（不读不写不解密）。但仍然要求 stdin 包含 vault_key_hex（协议一致性）。
 //! 只校验 vault_key_hex 格式合法，不校验是否匹配 vault（parse 不需要解锁）。
 
-use regex::Regex;
+pub mod candidate;
+pub mod tokenize;
+pub mod rule;
+pub mod rule_labeled;
+pub mod rule_pem;
+pub mod rule_anchored;
+pub mod provider_fingerprint;
+pub mod crf;
+
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -49,32 +61,6 @@ struct ParsePayload {
 
 fn default_max_candidates() -> usize { 5000 }
 
-/// 从 `text` 用 `re` 抽取匹配，去重后追加到 `candidates`。
-fn extract_matches(
-    text: &str,
-    re: &Regex,
-    kind: &str,
-    max: usize,
-    candidates: &mut Vec<serde_json::Value>,
-    seen: &mut std::collections::HashSet<String>,
-) {
-    for m in re.find_iter(text) {
-        if candidates.len() >= max { return; }
-        let value = m.as_str();
-        let dedup_key = format!("{}\x00{}", kind, value);
-        if !seen.insert(dedup_key) { continue; }
-        let prefix_char = kind.chars().next().unwrap_or('x');
-        let id = format!("c-{}-{}", prefix_char, candidates.len() + 1);
-        candidates.push(json!({
-            "id": id,
-            "kind": kind,
-            "value": value,
-            "tier": "confirmed",
-            "source_span": [m.start(), m.end()],
-        }));
-    }
-}
-
 // ========== dispatch ==========
 
 pub fn handle(env: StdinEnvelope) {
@@ -95,82 +81,115 @@ pub fn handle(env: StdinEnvelope) {
         return;
     }
 
-    match run_parse_stage2_lite(&payload) {
+    match run_parse_v2_rules(&payload) {
         Ok(result) => emit(&ResultEnvelope::ok(req_id, result)),
         Err((c, m)) => emit_error(req_id, c, m),
     }
 }
 
-// ========== Layer 1-lite regex extraction (Stage 2 skeleton) ==========
+// ========== v2 rules pipeline (Phase 2) ==========
 
-/// Stage 2 简化版三层流水：只跑基础 regex，输出候选列表
+/// Phase 2 实现：规则层 4 子层全部启用；CRF / Fingerprint 仍 disabled。
 ///
-/// Stage 3 替换点：
-/// - 接 rule_extract_anchored (B 方案) / rule_extract_secret_labeled / rule_extract_pem_block
-/// - 接 CRF + shape filter → 输出 suggested tier 候选
-/// - 接 Fingerprint classifier → 为每个 secret 打 provider tag
-/// - 接 grouper → 输出 drafts + weak_drafts
-fn run_parse_stage2_lite(payload: &ParsePayload) -> Result<serde_json::Value, (&'static str, String)> {
+/// Stage 3 Phase 3/4 会逐步替换：
+/// - Phase 3: 对每个 `secret_like` 候选跑 H 层 Fingerprint classifier → 填 `provider` 字段 + 调整 tier
+/// - Phase 4: 加 CRF + shape filter 层 → 补 `suggested` tier 候选
+fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'static str, String)> {
     let text = &payload.text;
-
-    let re_email = Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-        .map_err(|e| ("I_PARSE_FAILED", format!("email regex: {}", e)))?;
-    let re_url = Regex::new(r#"https?://[^\s"',}\])]+"#)
-        .map_err(|e| ("I_PARSE_FAILED", format!("url regex: {}", e)))?;
-    let re_sk_ant = Regex::new(r"sk-ant-[A-Za-z0-9\-_]{10,}")
-        .map_err(|e| ("I_PARSE_FAILED", format!("sk-ant regex: {}", e)))?;
-    let re_sk_generic = Regex::new(r"\bsk-[A-Za-z0-9\-_]{10,}\b")
-        .map_err(|e| ("I_PARSE_FAILED", format!("sk regex: {}", e)))?;
-    let re_xai = Regex::new(r"\bxai-[A-Za-z0-9]{10,}\b")
-        .map_err(|e| ("I_PARSE_FAILED", format!("xai regex: {}", e)))?;
-    let re_rk = Regex::new(r"\brk-[A-Za-z0-9\-_]{10,}\b")
-        .map_err(|e| ("I_PARSE_FAILED", format!("rk regex: {}", e)))?;
-    let re_ghp = Regex::new(r"\bghp_[A-Za-z0-9]{16,}\b")
-        .map_err(|e| ("I_PARSE_FAILED", format!("ghp regex: {}", e)))?;
-    let re_hex_long = Regex::new(r"\b[a-fA-F0-9]{28,}\b")
-        .map_err(|e| ("I_PARSE_FAILED", format!("hex regex: {}", e)))?;
-
-    let mut candidates: Vec<serde_json::Value> = Vec::new();
-    // 用 HashSet<String> 做"精确值去重"；kind 编进 key 前缀避免跨类碰撞。
-    // Why dedup: 同一值可能被多条 regex 同时命中（sk-ant 也匹配 sk-），避免重复候选
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
     let max = payload.max_candidates;
 
-    // 展开式扫描：每个 regex 独立循环，避免 Rust 对 tuple-of-(&str, &Regex) 的 lifetime 推断困难
-    extract_matches(text, &re_email, "email", max, &mut candidates, &mut seen);
-    extract_matches(text, &re_url, "url", max, &mut candidates, &mut seen);
-    // secret 按优先级：更具体的前缀先插入，dedup 保证不重复
-    extract_matches(text, &re_sk_ant, "secret_like", max, &mut candidates, &mut seen);
-    extract_matches(text, &re_sk_generic, "secret_like", max, &mut candidates, &mut seen);
-    extract_matches(text, &re_xai, "secret_like", max, &mut candidates, &mut seen);
-    extract_matches(text, &re_rk, "secret_like", max, &mut candidates, &mut seen);
-    extract_matches(text, &re_ghp, "secret_like", max, &mut candidates, &mut seen);
-    extract_matches(text, &re_hex_long, "secret_like", max, &mut candidates, &mut seen);
+    // === 四层规则 ===
+    let mut all = rule::rule_extract(text);
+
+    // === CRF Phase 4 补充层：长尾 shape 候选（suggested tier，UI 默认不勾选）===
+    // CRF 对"规则漏检的混合 hex secret"（如 `d853aXYZ999`）有补救作用；
+    // 命中 shape filter 才保留，避免 narrative 里 UUID 误判成 key。
+    //
+    // 去重策略：同 (kind, value) 已被规则抓到则跳过 —— confirmed tier 优先保留。
+    let rule_seen: std::collections::HashSet<String> = all.iter()
+        .map(|c| format!("{}\x00{}", c.kind.as_str(), c.value))
+        .collect();
+    for crf_cand in crf::extract(text) {
+        let key = format!("{}\x00{}", crf_cand.kind.as_str(), crf_cand.value);
+        if rule_seen.contains(&key) { continue; }
+        if all.len() >= max { break; }
+        all.push(crf_cand);
+    }
+
+    // 限流（超大文本 DoS 防护）
+    if all.len() > max { all.truncate(max); }
+
+    // 重新编号 id（规则内部的 seq 和最终顺序可能不同，保证 id 稳定）
+    for (i, c) in all.iter_mut().enumerate() {
+        c.id = candidate::make_id(c.kind, i + 1);
+    }
+
+    // === H 层 Provider Fingerprint（Phase 3）===
+    // 对每个 secret_like 候选跑分类器，填 provider 字段 + 调整 tier。
+    // 用同文档 URL 域名做 ambiguous 消歧（比如 sk-* + moonshot.cn → moonshot_kimi）。
+    let url_domains: Vec<String> = all.iter()
+        .filter(|c| c.kind == candidate::Kind::Url)
+        .filter_map(|c| extract_url_domain(&c.value))
+        .collect();
+
+    let classifier = provider_fingerprint::instance();
+    for c in all.iter_mut() {
+        if c.kind != candidate::Kind::SecretLike { continue; }
+        let (entry, suggest) = classifier.classify_with_context(&c.value, &url_domains);
+        if let Some(e) = entry {
+            let final_id = suggest.clone().unwrap_or_else(|| e.id.clone());
+            // Tier 映射：warn tier 的 secret（UUID / 短 hex）候选升级为 Warn
+            // 避免 UI 默认勾选导入一个 UUID 当作凭证
+            if e.tier == provider_fingerprint::Tier::Warn {
+                c.tier = candidate::Tier::Warn;
+            }
+            c.provider = Some(candidate::ProviderGuess {
+                id: final_id,
+                display: e.display.clone(),
+                tier: match e.tier {
+                    provider_fingerprint::Tier::Confirmed => candidate::ProviderTier::Confirmed,
+                    provider_fingerprint::Tier::Likely    => candidate::ProviderTier::Confirmed,
+                    provider_fingerprint::Tier::Ambiguous => candidate::ProviderTier::Ambiguous,
+                    provider_fingerprint::Tier::Warn      => candidate::ProviderTier::Warn,
+                },
+                hint: e.hint.clone(),
+                siblings: e.siblings.clone(),
+            });
+        }
+        // 未命中 → provider 保持 None，UI 展示 "unknown, 请手动选择"
+    }
 
     let source_hash = {
-        let mut hasher = Sha256::new();
-        hasher.update(text.as_bytes());
-        format!("sha256:{}", hex::encode(hasher.finalize()))
+        let mut h = Sha256::new();
+        h.update(text.as_bytes());
+        format!("sha256:{}", hex::encode(h.finalize()))
     };
 
-    // Stage 2：每个 candidate 单独作为 orphan（无 grouping）
-    let orphans: Vec<String> = candidates.iter()
-        .map(|c| c["id"].as_str().unwrap_or("").to_string())
-        .collect();
+    // Stage 3 Phase 3：无 grouping → 每个 candidate 单独作为 orphan
+    let orphans: Vec<String> = all.iter().map(|c| c.id.clone()).collect();
+
+    let candidates_json: Vec<serde_json::Value> = all.iter().map(|c| serde_json::to_value(c).unwrap()).collect();
 
     Ok(json!({
         "source_hash": source_hash,
-        "candidates": candidates,
-        "drafts": [],             // Stage 3: grouper 输出
-        "weak_drafts": [],        // Stage 3
-        "orphans": orphans,       // Stage 2 所有候选都作为 orphan
-        "warnings": ["stage-2-parse-skeleton"],
+        "candidates": candidates_json,
+        "drafts": [],
+        "weak_drafts": [],
+        "orphans": orphans,
+        "warnings": ["stage-3-phase-4-with-crf"],
         "layer_versions": {
-            "rules": "1.0-lite",  // Stage 3 升级到 "2.0-full"
-            "crf": "disabled",
-            "fingerprint": "disabled",
-            "grouper": "disabled",
+            "rules": "2.0-full",       // Phase 2
+            "crf": "1.0",              // Phase 4 接入（shape filter + suggested tier）
+            "fingerprint": "1.0",      // Phase 3 接入
+            "grouper": "disabled",     // Phase 5+ (grouper 尚未规划)
         },
     }))
+}
+
+/// 从 URL 抽 domain（`https://platform.moonshot.cn/x/y` → `platform.moonshot.cn`）
+fn extract_url_domain(url: &str) -> Option<String> {
+    let after_scheme = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let end = after_scheme.find(['/', '?', '#', ':']).unwrap_or(after_scheme.len());
+    let domain = &after_scheme[..end];
+    if domain.is_empty() { None } else { Some(domain.to_string()) }
 }

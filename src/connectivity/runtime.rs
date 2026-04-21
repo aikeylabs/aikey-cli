@@ -473,11 +473,21 @@ pub fn proxy_status_hint(status: u16) -> String {
 
 /// Build the probe URL suffix for a provider.
 /// Checks if base_url already ends with /v1 to avoid double /v1/v1.
+///
+/// Why anthropic falls through to `/v1/models` (was `/v1/messages`):
+/// `/v1/messages` is POST-only, so a GET probe always returned 405. That's
+/// semantically "reachable but wrong method" — technically fine, but the
+/// user-visible `HTTP 405` read as a bug ("is 405 normal?", 2026-04-22).
+/// `/v1/models` accepts GET and returns 200 (with a valid key) or 401
+/// (rejected), mapping cleanly onto api_status_hint's existing cases.
+/// Verified live via the aikey-proxy OAuth route: 200 with full models
+/// list. The proxy auto-injects `anthropic-version`, so the header we set
+/// below is only load-bearing for direct-to-api.anthropic.com probes.
+/// Third-party gateways that don't implement `/v1/models` still land in
+/// the 404/405 → "reachable" safety net, so no regression.
 fn probe_suffix(provider_code: &str, base_url: &str) -> String {
     let base_has_v1 = base_url.trim_end_matches('/').ends_with("/v1");
     match provider_code {
-        "anthropic" if base_has_v1 => "/messages".to_string(),
-        "anthropic" => "/v1/messages".to_string(),
         "google" => "/v1beta/models".to_string(),
         "custom" => String::new(),
         _ if base_has_v1 => "/models".to_string(),
@@ -568,7 +578,16 @@ pub fn api_status_hint(status: u16) -> String {
     match status {
         200 => "valid key".to_string(),
         401 | 403 => "reachable, key rejected".to_string(),
-        404 => "reachable".to_string(),
+        // Why 405 is treated like 404 (both = "reachable"):
+        // The API probe does a GET against each provider's base path to
+        // minimise side effects. Anthropic's `/v1/messages` is POST-only,
+        // so every probe against it returns 405 — that's a proof the
+        // endpoint is reachable, not a failure. Showing the raw "HTTP 405"
+        // read as a bug to users ("is 405 normal?"); folding it into
+        // "reachable" keeps Anthropic's row visually consistent with
+        // OpenAI/Kimi (which return 200/404). The actual auth verdict is
+        // decided by the Chat column, not this one.
+        404 | 405 => "reachable".to_string(),
         _ => format!("HTTP {}", status),
     }
 }

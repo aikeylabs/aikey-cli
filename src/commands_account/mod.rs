@@ -1975,11 +1975,31 @@ pub fn handle_run_direct(
 mod shell_integration;
 pub use shell_integration::*;
 
+/// Resolve an OAuth account by `provider_account_id` OR `display_identity`
+/// (email). Returns `None` when no match — caller treats that as "not
+/// OAuth, try next lookup kind".
+///
+/// Case-insensitive on both keys: account_id is a UUID-ish random string
+/// so case doesn't practically matter, but emails are routinely typed
+/// with varying case. Mirrors the lookup in
+/// `connectivity::targets::targets_from_alias` so behaviour stays
+/// symmetric between `aikey test` and `aikey use`.
+fn resolve_oauth_account(alias_or_id: &str) -> Option<storage::ProviderAccountInfo> {
+    let accounts = storage::list_provider_accounts_readonly().ok()?;
+    accounts.into_iter().find(|a| {
+        a.provider_account_id.eq_ignore_ascii_case(alias_or_id)
+            || a.display_identity.as_deref()
+                .map(|d| d.eq_ignore_ascii_case(alias_or_id))
+                .unwrap_or(false)
+    })
+}
+
 /// `aikey key use <alias-or-id>` / `aikey use <alias-or-id>`
 ///
 /// Global mutex: deactivates ALL keys (personal + team), then activates the target.
 /// Writes `~/.aikey/active.env` with provider env vars; installs shell hook on first use.
-/// Accepts either virtual_key_id (exact) or alias (local_alias preferred, then server alias).
+/// Accepts virtual_key_id, alias (local_alias preferred, then server alias),
+/// or OAuth account (by provider_account_id or display_identity / email).
 pub fn handle_key_use(
     alias_or_id: &str,
     no_hook: bool,
@@ -1988,7 +2008,7 @@ pub fn handle_key_use(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let proxy_port: u16 = crate::commands_proxy::proxy_port();
 
-    // ── 1. Resolve key — try team keys first, then personal ──────────────────
+    // ── 1. Resolve key — try team keys, then personal, then OAuth ────────────
     let team_entry = storage::get_virtual_key_cache(alias_or_id)?
         .or_else(|| storage::get_virtual_key_cache_by_alias(alias_or_id).ok().flatten());
 
@@ -2066,22 +2086,49 @@ pub fn handle_key_use(
             vec![]
         };
         (crate::credential_type::CredentialType::ManagedVirtualKey, entry.virtual_key_id.clone(), display, providers)
-    } else {
+    } else if storage::entry_exists(alias_or_id).unwrap_or(false) {
         // Personal key — v1.0.2: use resolve_supported_providers.
-        let exists = storage::entry_exists(alias_or_id).unwrap_or(false);
-        if !exists {
-            return Err(format!(
-                "Key '{}' not found in team keys or personal keys.\n\
-                 If this is a personal key, re-add it with: aikey add {}",
-                alias_or_id, alias_or_id
-            ).into());
-        }
         let stored = storage::resolve_supported_providers(alias_or_id).unwrap_or_default();
         let providers = if !stored.is_empty() { stored } else {
             const KNOWN: &[&str] = &["anthropic", "openai", "google", "deepseek", "kimi"];
             KNOWN.iter().map(|s| s.to_string()).collect()
         };
         (crate::credential_type::CredentialType::PersonalApiKey, alias_or_id.to_string(), alias_or_id.to_string(), providers)
+    } else if let Some(acct) = resolve_oauth_account(alias_or_id) {
+        // OAuth account — lookup by account_id or display_identity (email).
+        //
+        // Why this branch exists (2026-04-22): users reading their
+        // `AIKEY_ACTIVE_KEYS` env see `anthropic=<email>` and reasonably
+        // expect `aikey use <email>` to re-activate that OAuth account.
+        // Before this branch they got "not found in team keys or personal
+        // keys" — which was technically true but silently excluded the
+        // third credential kind.
+        if !matches!(acct.status.as_str(), "active" | "idle") {
+            return Err(format!(
+                "OAuth account '{}' is in state '{}' and cannot be activated.\n\
+                 Run: aikey auth login {}",
+                acct.display_identity.as_deref().unwrap_or(&acct.provider_account_id),
+                acct.status,
+                acct.provider,
+            ).into());
+        }
+        let display = acct.display_identity.clone()
+            .unwrap_or_else(|| acct.provider_account_id.clone());
+        // OAuth accounts are single-provider by definition (Claude OAuth
+        // → anthropic; Codex OAuth → openai; etc.). `provider_override`
+        // would be redundant here; we carry the provider through the
+        // normal binding flow for uniformity.
+        let providers = vec![acct.provider.clone()];
+        (crate::credential_type::CredentialType::PersonalOAuthAccount, acct.provider_account_id.clone(), display, providers)
+    } else {
+        return Err(format!(
+            "Key '{}' not found in team keys, personal keys, or OAuth accounts.\n\
+             Hints:\n\
+             - run `aikey list` to see all known aliases / accounts\n\
+             - for team keys, run `aikey key sync` if the cache may be stale\n\
+             - for personal keys, re-add with: aikey add {}",
+            alias_or_id, alias_or_id
+        ).into());
     };
 
     if providers.is_empty() {

@@ -1,0 +1,234 @@
+//! 规则引擎 v2 主入口
+//!
+//! 协调 4 个子规则层：
+//! 1. **基础 regex**：email / URL / 已知 provider 前缀（sk-ant / sk- / xai- / rk- / ghp_ / 长 hex）+ 高特异性 shape（AWS AKIA / SendGrid SG. / JWT eyJ.）
+//! 2. **`rule_labeled`**（label=value 通用提取）：`api_key` / `bearer` / `accesskey` / `accountkey` / `private_key_id` / `token` / `key` 等
+//! 3. **`rule_pem`**（PEM 多行块）：SSH / TLS / PGP 私钥
+//! 4. **`rule_anchored`**（B 方案邮箱/secret 锚点）：未被上述覆盖的 OOD 排版下的 password-shape token
+//!
+//! 调用顺序关键：1 → 2 → 3 → 4。前 3 步产出"已认领"候选，第 4 步用这些作为 anchor 拓展召回。
+
+use regex::Regex;
+
+use super::candidate::{make_id, Candidate, Kind, Tier};
+
+/// 从原文抽取所有候选（已 dedup + 合并四层）
+pub fn rule_extract(text: &str) -> Vec<Candidate> {
+    let re_email = Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap();
+    // URL 停在 " ' , } ] ): 覆盖 JSON 嵌入 / Markdown 链接 [text](url) 场景
+    let re_url = Regex::new(r#"https?://[^\s"',}\])]+"#).unwrap();
+
+    // 已知 provider 前缀（按特异性降序匹配，dedup 保证不重复）
+    let re_sk_ant = Regex::new(r"sk-ant-[A-Za-z0-9\-_]{10,}").unwrap();
+    let re_sk = Regex::new(r"\bsk-[A-Za-z0-9\-_]{10,}\b").unwrap();
+    let re_xai = Regex::new(r"\bxai-[A-Za-z0-9]{10,}\b").unwrap();
+    let re_rk = Regex::new(r"\brk-[A-Za-z0-9\-_]{10,}\b").unwrap();
+    let re_ghp = Regex::new(r"\bghp_[A-Za-z0-9]{16,}\b").unwrap();
+    let re_hex_long = Regex::new(r"\b[a-fA-F0-9]{28,}\b").unwrap();
+
+    // 高特异性 shape（几乎不会在普通文本中误命中）
+    let re_aws = Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap();
+    let re_sendgrid = Regex::new(
+        r"\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\b"
+    ).unwrap();
+    let re_jwt = Regex::new(
+        r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"
+    ).unwrap();
+
+    let mut cands: Vec<Candidate> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Why dedup by (kind, value): 同 value 可能被多条 regex 同时命中（sk-ant-xxx 也匹配 sk-），避免重复
+
+    // === Layer 1a: 基础 email / URL ===
+    push_matches(text, &re_email, Kind::Email, &mut cands, &mut seen);
+    push_matches(text, &re_url, Kind::Url, &mut cands, &mut seen);
+
+    // === Layer 1b: 已知 provider 前缀 → secret ===
+    // 优先级：更具体的前缀先
+    push_matches(text, &re_sk_ant, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches(text, &re_sk, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches(text, &re_xai, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches(text, &re_rk, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches(text, &re_ghp, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches(text, &re_hex_long, Kind::SecretLike, &mut cands, &mut seen);
+
+    // === Layer 1c: 高特异性 shape（AWS / SendGrid / JWT）===
+    push_matches(text, &re_aws, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches(text, &re_sendgrid, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches(text, &re_jwt, Kind::SecretLike, &mut cands, &mut seen);
+
+    // === Legacy `----` 分隔的 password 启发式 ===
+    // Why 保留：in-dist 样本（claude2/claude3 风格）大量使用这种格式
+    dash_separated_password_heuristic(text, &re_email, &mut cands, &mut seen);
+
+    // === Legacy `|` 分隔的中段 password 启发式 ===
+    pipe_separated_password_heuristic(text, &re_email, &mut cands, &mut seen);
+
+    // === 显式标签启发式（password: / 密码: 等）===
+    // 注意：这条负责 password 字段；secret 字段由 Layer 2 label=value 负责
+    explicit_label_password_heuristic(text, &mut cands, &mut seen);
+
+    // === Layer 2: label=value 通用提取（api_key / bearer / accesskey / private_key_id 等）===
+    super::rule_labeled::extract(text, &mut cands, &mut seen);
+
+    // === Layer 3: PEM 多行块 ===
+    super::rule_pem::extract(text, &mut cands, &mut seen);
+
+    // === Layer 4: email/secret 锚点 password 召回（B 方案）===
+    super::rule_anchored::extract(text, &mut cands, &mut seen);
+
+    cands
+}
+
+/// 把一条 regex 的所有 match 作为 Candidate push 进去，按 (kind, value) dedup
+fn push_matches(
+    text: &str,
+    re: &Regex,
+    kind: Kind,
+    cands: &mut Vec<Candidate>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    for m in re.find_iter(text) {
+        try_push(cands, seen, kind, m.as_str(), Some([m.start(), m.end()]));
+    }
+}
+
+/// 试着 push 一个候选；已见过则跳过
+pub(super) fn try_push(
+    cands: &mut Vec<Candidate>,
+    seen: &mut std::collections::HashSet<String>,
+    kind: Kind,
+    value: &str,
+    span: Option<[usize; 2]>,
+) -> bool {
+    let dedup_key = format!("{}\x00{}", kind.as_str(), value);
+    if !seen.insert(dedup_key) {
+        return false;
+    }
+    cands.push(Candidate {
+        id: make_id(kind, cands.len() + 1),
+        kind,
+        value: value.to_string(),
+        tier: Tier::Confirmed,
+        source_span: span,
+        provider: None,
+    });
+    true
+}
+
+/// 帮助：判断一个字符串是否是"已知 secret-like"（会被 re_sk_ant / re_sk / 等命中）
+/// rule_anchored / rule_labeled 用它过滤"已被 Layer 1 抓走"的 token
+pub(super) fn looks_like_known_secret(s: &str) -> bool {
+    let lc = s.to_lowercase();
+    lc.starts_with("sk-") || lc.starts_with("xai-") || lc.starts_with("rk-")
+        || lc.starts_with("ghp_") || lc.starts_with("akia")
+        || lc.starts_with("sg.") || lc.starts_with("eyj")
+}
+
+// ============ `----` 分隔 password 启发式 ============
+
+fn dash_separated_password_heuristic(
+    text: &str,
+    re_email: &Regex,
+    cands: &mut Vec<Candidate>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    for line in text.lines() {
+        if !line.contains("----") { continue; }
+        let parts: Vec<&str> = line.split("----").map(str::trim).collect();
+
+        // email----password[----secret[----url]]
+        for n in &[2usize, 3, 4] {
+            if parts.len() == *n && re_email.is_match(parts[0]) {
+                let pwd = parts[1];
+                if is_plausible_password(pwd) {
+                    try_push(cands, seen, Kind::PasswordLike, pwd, None);
+                }
+            }
+        }
+    }
+}
+
+fn pipe_separated_password_heuristic(
+    text: &str,
+    re_email: &Regex,
+    cands: &mut Vec<Candidate>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    for line in text.lines() {
+        if !line.contains(" | ") { continue; }
+        let parts: Vec<&str> = line.split(" | ").map(str::trim).collect();
+        if parts.len() < 3 { continue; }
+        for (i, p) in parts.iter().enumerate() {
+            if re_email.is_match(p) && i + 1 < parts.len() {
+                let pwd = parts[i + 1];
+                if is_plausible_password(pwd) {
+                    try_push(cands, seen, Kind::PasswordLike, pwd, None);
+                }
+            }
+        }
+    }
+}
+
+fn explicit_label_password_heuristic(
+    text: &str,
+    cands: &mut Vec<Candidate>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    // label 后紧跟冒号 / 等号的形态
+    let labels_with_punct: &[&str] = &[
+        "\u{5BC6}\u{7801}:", "\u{5BC6}\u{7801}\u{FF1A}",
+        "password:", "pass:", "passwd:", "pwd:", "pw:",
+        "pw=", "pass=", "password=", "passwd=", "pwd=",
+        "login:",
+    ];
+    // label 后紧跟空格的形态
+    let labels_with_space: &[&str] = &[
+        "\u{5BC6}\u{7801} ", "password ", "pwd ", "pass ",
+    ];
+
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        for label in labels_with_punct {
+            if let Some(idx) = lower.find(label) {
+                let rest = &line[idx + label.len()..];
+                if let Some(tok) = first_token_stripped(rest) {
+                    if is_plausible_password(&tok) {
+                        try_push(cands, seen, Kind::PasswordLike, &tok, None);
+                    }
+                }
+            }
+        }
+        for label in labels_with_space {
+            if let Some(idx) = lower.find(label) {
+                let rest = &line[idx + label.len()..];
+                if let Some(tok) = first_token_stripped(rest) {
+                    if is_plausible_password(&tok) {
+                        try_push(cands, seen, Kind::PasswordLike, &tok, None);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 取字符串首个非空 token，并剥除两端常见 markdown / csv 边缘符
+fn first_token_stripped(s: &str) -> Option<String> {
+    let tok = s.trim().split_whitespace().next()?.to_string();
+    let tok = tok.trim_matches(|c: char| {
+        c == '*' || c == '`' || c == '"' || c == '\''
+            || c == ',' || c == '.' || c == ';' || c == '|' || c == ':' || c == '~'
+            || c == '[' || c == ']' || c == '(' || c == ')'
+    });
+    if tok.is_empty() { None } else { Some(tok.to_string()) }
+}
+
+/// 判断一个字符串是否形态上像 password（非已知 secret、长度合理、含字母）
+fn is_plausible_password(s: &str) -> bool {
+    let len = s.chars().count();
+    if len < 3 || len > 64 { return false; }
+    if looks_like_known_secret(s) { return false; }
+    if s.contains('@') { return false; } // 不是 email
+    if s.starts_with("http") { return false; } // 不是 URL
+    true
+}

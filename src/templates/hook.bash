@@ -20,6 +20,20 @@ fi
 _aikey_precmd_bash() {
     [ -n "$AIKEY_ACTIVE_LABEL" ] && return
     [ -f ~/.aikey/active.env ] && source ~/.aikey/active.env
+    _aikey_hook_check_once
+}
+
+# Drift detector — see hook.zsh for rationale.
+_aikey_hook_check_once() {
+    [ -n "$_AIKEY_HOOK_CHECKED" ] && return
+    _AIKEY_HOOK_CHECKED=1
+    local file_hash bin_hash
+    file_hash=$(grep -m1 -oE 'Hook-Template-Hash: [a-f0-9]+' ~/.aikey/hook.bash 2>/dev/null | cut -d' ' -f2)
+    bin_hash=$(command aikey _hook-hash bash 2>/dev/null)
+    [ -z "$file_hash" ] || [ -z "$bin_hash" ] && return
+    if [ "$file_hash" != "$bin_hash" ]; then
+        printf '\033[33m[aikey] hook.bash is outdated (file=%s, binary=%s).\n    run: aikey use   # regenerates ~/.aikey/hook.bash, then re-source\n\033[0m' "$file_hash" "$bin_hash" >&2
+    fi
 }
 
 _aikey_preexec_bash() {
@@ -49,4 +63,59 @@ esac
 # who want the label can integrate via `bash-preexec.sh`'s `preexec_functions`.
 if [ -z "$(trap -p DEBUG 2>/dev/null)" ]; then
     trap '_aikey_preexec_bash' DEBUG
+fi
+
+# ── Wrapper preflight (claude / codex) ────────────────────────────────────
+#
+# See hook.zsh for the full rationale. Same contract here:
+#   - AIKEY_PREFLIGHT=off disables the probe.
+#   - stdin </dev/null so password prompts turn into graceful non-zero exits
+#     (session-cache hits stay silent, cache misses become a preflight fail
+#     rather than a hanging prompt).
+#   - On non-zero exit, warn + prompt, default "no".
+_aikey_preflight() {
+    [ "$AIKEY_PREFLIGHT" = "off" ] && return 0
+    # No active binding in this shell — emit an advisory line instead of
+    # silently passing through. See hook.zsh for the full rationale.
+    if [ -z "$AIKEY_ACTIVE_KEYS" ]; then
+        printf '\033[90m[aikey] no active binding — run `aikey use <alias>` first (preflight skipped)\033[0m\n' >&2
+        return 0
+    fi
+    local prov="$1"
+    local id
+    id=$(echo "$AIKEY_ACTIVE_KEYS" | tr ',' '\n' | grep "^${prov}=" | cut -d= -f2-)
+    [ -z "$id" ] && return 0
+    # Let stderr through — see hook.zsh for rationale. Silent success
+    # looked like a hang to users, so the full Ping/API/Chat table now
+    # shows up every time.
+    command aikey test "$id" </dev/null
+    local rc=$?
+    [ $rc -eq 0 ] && return 0
+    local reason
+    case "$rc" in
+        1) reason="proxy can't reach upstream" ;;
+        2) reason="API rejected the key" ;;
+        3) reason="alias not found" ;;
+        5) reason="aikey-proxy not running" ;;
+        *) reason="exit=$rc" ;;
+    esac
+    printf '\033[33m[aikey] preflight failed for %s (%s): %s. Continue anyway? [y/N] \033[0m' "$prov" "$id" "$reason"
+    local reply
+    read -r reply
+    case "$reply" in
+        y|Y|yes|YES) return 0 ;;
+        *) printf '\033[90m[aikey] aborted — run: aikey test %s\033[0m\n' "$id"; return 1 ;;
+    esac
+}
+
+# Wrap claude + codex. Guarded: only install if the user doesn't already
+# have a function/alias by the same name. `type` checks functions, aliases,
+# builtins, and PATH — we only want to skip when the first three match (PATH
+# is the real binary we'll call via `command`). Shell grammar limitation:
+# there's no clean one-liner to split that, so use `declare -F` + alias.
+if ! declare -F claude >/dev/null 2>&1 && ! alias claude >/dev/null 2>&1; then
+    claude() { _aikey_preflight anthropic || return $?; command claude "$@"; }
+fi
+if ! declare -F codex >/dev/null 2>&1 && ! alias codex >/dev/null 2>&1; then
+    codex() { _aikey_preflight openai || return $?; command codex "$@"; }
 fi

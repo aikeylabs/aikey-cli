@@ -96,10 +96,11 @@ impl CredentialKind {
         }
     }
 
-    /// Whether this credential kind is tested through the local proxy rather
-    /// than hitting the upstream provider directly. Used when picking
-    /// actionable hints (e.g. "run `aikey proxy start`" only applies here).
-    pub fn via_proxy(self) -> bool { !matches!(self, CredentialKind::PersonalApi) }
+    /// Post-plan-D (2026-04-22) all three credential kinds route through
+    /// the local proxy — personal via alias sentinel, team via vk sentinel,
+    /// OAuth via account sentinel. Kept as a function in case a future
+    /// kind reintroduces a direct path.
+    pub fn via_proxy(self) -> bool { true }
 }
 
 /// One (provider, URL, bearer) triple ready for `test_provider_connectivity`.
@@ -146,12 +147,33 @@ impl TestTarget {
 //      doorway where raw `acct.provider` becomes `TestTarget.provider_code`.
 // ---------------------------------------------------------------------------
 
-/// Build a PersonalApi target: plaintext bearer, direct upstream URL.
+/// Build a PersonalApi target routed through the local proxy using the
+/// `aikey_personal_alias_<alias>` sentinel bearer.
 ///
-/// `base_url_override` takes precedence over the provider default. The
-/// bearer is trimmed because callers usually hand us `SecretString::expose`
-/// output that may carry a trailing newline.
+/// Plan D (2026-04-22): CLI never touches plaintext. Proxy already holds
+/// the vault derived key from its own startup and decrypts on demand when
+/// it sees the sentinel bearer. Per-entry custom base URLs are respected
+/// server-side via `GetPersonalKeyByAlias`.
 pub fn personal_target(
+    source_ref: &str,
+    provider_code: &str,
+    proxy_port: u16,
+) -> TestTarget {
+    let prefix = crate::commands_account::provider_proxy_prefix_pub(provider_code);
+    TestTarget {
+        provider_code: provider_code.to_string(),
+        base_url:      format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
+        bearer:        format!("aikey_personal_alias_{}", source_ref),
+        kind:          CredentialKind::PersonalApi,
+        source_ref:    source_ref.to_string(),
+    }
+}
+
+/// PersonalApi target hitting upstream directly with plaintext. **Only for
+/// the `aikey add` pre-save probe** — the alias row doesn't exist in the
+/// vault yet, so the sentinel route would 503. The only legitimate caller
+/// is `targets_from_new_personal_key`.
+pub fn personal_target_direct(
     source_ref: &str,
     plaintext: &str,
     provider_code: &str,
@@ -308,13 +330,18 @@ mod connectivity_suite_tests {
     }
 
     #[test]
-    fn credential_kind_via_proxy() {
-        assert!(!CredentialKind::PersonalApi.via_proxy(),
-            "personal API keys hit upstream directly — not via proxy");
+    fn credential_kind_via_proxy_all_true_after_plan_d() {
+        // Plan D (2026-04-22): personal keys now route through the local
+        // proxy using the aikey_personal_alias_<alias> sentinel, matching
+        // how team and OAuth already worked. `via_proxy()` is `true` for
+        // every variant — pinned so a future refactor can't silently
+        // reintroduce a direct-upstream path for any kind.
+        assert!(CredentialKind::PersonalApi.via_proxy(),
+            "personal keys now route via proxy (aikey_personal_alias_ sentinel)");
         assert!(CredentialKind::ManagedTeam.via_proxy(),
-            "team keys must route via proxy so the sentinel gets swapped for real credential");
+            "team keys route via proxy so the sentinel gets swapped for real credential");
         assert!(CredentialKind::OAuth.via_proxy(),
-            "OAuth must route via proxy so token refresh + persona headers apply");
+            "OAuth routes via proxy so token refresh + persona headers apply");
     }
 
     #[test]
@@ -573,19 +600,31 @@ mod connectivity_suite_tests {
     }
 
     #[test]
-    fn personal_target_hits_upstream_with_plaintext() {
-        let t = personal_target("my-key", "sk-plaintext", "kimi", None);
+    fn personal_target_routes_via_proxy_with_sentinel() {
+        // Plan D (2026-04-22): bearer is the sentinel, URL is local proxy.
+        let t = personal_target("my-key", "kimi", 27200);
         assert_eq!(t.kind, CredentialKind::PersonalApi);
-        assert_eq!(t.bearer, "sk-plaintext");
-        assert!(t.base_url.starts_with("https://api.kimi.com"),
-            "personal keys hit upstream directly — no proxy URL");
+        assert_eq!(t.bearer, "aikey_personal_alias_my-key",
+            "bearer must be the sentinel, not plaintext — CLI never decrypts");
+        assert!(t.base_url.starts_with("http://127.0.0.1:27200/"),
+            "personal keys route through local proxy, got: {}", t.base_url);
         assert_eq!(t.display_label(), "kimi");
     }
 
     #[test]
-    fn personal_target_trims_bearer_whitespace() {
-        // Common pitfall: SecretString → String may carry trailing newline.
-        let t = personal_target("x", "  sk-padded\n", "openai", None);
+    fn personal_target_direct_still_uses_plaintext() {
+        // Direct variant reserved for `aikey add` pre-save probe. Pinned so
+        // a refactor can't silently redirect to the sentinel (which would 503
+        // because the alias row doesn't exist in vault yet).
+        let t = personal_target_direct("my-key", "sk-plaintext", "kimi", None);
+        assert_eq!(t.bearer, "sk-plaintext");
+        assert!(t.base_url.starts_with("https://api.kimi.com"),
+            "direct variant must hit upstream, not proxy");
+    }
+
+    #[test]
+    fn personal_target_direct_trims_bearer_whitespace() {
+        let t = personal_target_direct("x", "  sk-padded\n", "openai", None);
         assert_eq!(t.bearer, "sk-padded",
             "factory must trim so the Authorization header is valid");
     }

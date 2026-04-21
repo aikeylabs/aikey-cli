@@ -5,19 +5,26 @@
 //! module, which keeps the `TestTarget.provider_code` canonicalization
 //! invariant honest in one place.
 
-use secrecy::SecretString;
-
 use crate::storage;
 
 use super::{
     BuildTargetError, TestTarget,
-    personal_target, team_target, oauth_target,
+    personal_target, personal_target_direct, team_target, oauth_target,
     PROVIDER_DEFAULTS,
 };
 
+/// Build a TestTarget for a single provider binding.
+///
+/// `_password_unused` is kept in the signature as `Option<&SecretString>` so
+/// external callers still pass through their existing handle but it is
+/// **no longer read**. Plan D (2026-04-22) moved personal-key decryption
+/// to the proxy side via the aikey_personal_alias_ sentinel, so CLI-side
+/// password access is no longer required for any probe path. Removing
+/// the parameter entirely would be a breaking API change for no gain —
+/// callers are free to stop passing a password whenever convenient.
 pub fn target_from_binding(
     binding: &crate::storage::ProviderBinding,
-    password: Option<&SecretString>,
+    _password_unused: Option<&secrecy::SecretString>,
     proxy_port: u16,
 ) -> Result<TestTarget, BuildTargetError> {
     use crate::credential_type::CredentialType;
@@ -30,23 +37,17 @@ pub fn target_from_binding(
     let row_label = format!("{}{}", binding.provider_code, label_suffix);
 
     match binding.key_source_type {
-        // ── Personal API key: decrypt locally, hit upstream directly. ─────
+        // ── Personal API key: route via proxy with the alias sentinel. ────
+        // Post-2026-04-22 (plan D) this path matches team/OAuth: CLI never
+        // touches the plaintext. Proxy decrypts on its side.
         CredentialType::PersonalApiKey => {
-            let pw = password.ok_or_else(|| BuildTargetError::PasswordRequired {
-                alias: binding.key_source_ref.clone(),
-            })?;
-            let plaintext = crate::executor::get_secret(&binding.key_source_ref, pw)
-                .map_err(|e| BuildTargetError::DecryptFailed {
-                    alias:  binding.key_source_ref.clone(),
-                    detail: e,
-                })?;
-            let entry_base = storage::get_entry_base_url(&binding.key_source_ref)
-                .unwrap_or(None);
+            if !crate::commands_proxy::is_proxy_running() {
+                return Err(BuildTargetError::ProxyNotRunning { label: row_label });
+            }
             Ok(personal_target(
                 &binding.key_source_ref,
-                plaintext.trim(),
                 &binding.provider_code,
-                entry_base.as_deref(),
+                proxy_port,
             ))
         }
 
@@ -107,7 +108,7 @@ pub fn target_from_binding(
 /// and build errors suitable for the "cannot test" block beneath the table.
 /// Callers may mutate either list freely (e.g. add extra targets, drop rows).
 pub fn targets_from_active_bindings(
-    password: Option<&SecretString>,
+    _password_unused: Option<&secrecy::SecretString>,
     proxy_port: u16,
 ) -> (Vec<TestTarget>, Vec<BuildTargetError>) {
     let bindings = storage::list_provider_bindings(crate::profile_activation::DEFAULT_PROFILE)
@@ -116,7 +117,7 @@ pub fn targets_from_active_bindings(
     let mut targets = Vec::with_capacity(bindings.len());
     let mut errors  = Vec::new();
     for b in &bindings {
-        match target_from_binding(b, password, proxy_port) {
+        match target_from_binding(b, None, proxy_port) {
             Ok(t)  => targets.push(t),
             Err(e) => errors.push(e),
         }
@@ -140,31 +141,24 @@ pub fn targets_from_active_bindings(
 pub fn targets_from_alias(
     alias: &str,
     provider_override: Option<&str>,
-    password: Option<&SecretString>,
+    _password_unused: Option<&secrecy::SecretString>,
     proxy_port: u16,
 ) -> Vec<TestTarget> {
     use crate::credential_type::CredentialType;
 
     // ── 1. Personal vault entry (highest priority). ──────────────────────
     if storage::entry_exists(alias).unwrap_or(false) {
-        let pw = match password {
-            Some(p) => p,
-            // Without a password we can't decrypt; surface as empty and let
-            // callers fall through to the "not found / not testable" path.
-            None    => return Vec::new(),
-        };
-        let plaintext = match crate::executor::get_secret(alias, pw) {
-            Ok(s)  => s,
-            Err(_) => return Vec::new(),
-        };
+        // Plan D (2026-04-22): no decryption here — proxy does it server-
+        // side via the aikey_personal_alias_ sentinel. We just need the
+        // provider list (metadata, unencrypted) and the proxy running.
+        if !crate::commands_proxy::is_proxy_running() {
+            return Vec::new();
+        }
 
-        // Resolve provider list: explicit --provider > stored provider_code >
-        // supported_providers metadata > default list across all known providers.
         let meta = storage::list_entries_with_metadata()
             .unwrap_or_default()
             .into_iter()
             .find(|m| m.alias == alias);
-        let stored_url = meta.as_ref().and_then(|m| m.base_url.clone());
 
         let providers: Vec<String> = if let Some(p) = provider_override {
             vec![p.to_lowercase()]
@@ -188,7 +182,7 @@ pub fn targets_from_alias(
         };
 
         return providers.into_iter().map(|code| {
-            personal_target(alias, &plaintext, &code, stored_url.as_deref())
+            personal_target(alias, &code, proxy_port)
         }).collect();
     }
 
@@ -256,7 +250,7 @@ pub fn targets_from_new_personal_key(
     base_url_override: Option<&str>,
 ) -> Vec<TestTarget> {
     providers.iter()
-        .map(|code| personal_target(alias, plaintext, code, base_url_override))
+        .map(|code| personal_target_direct(alias, plaintext, code, base_url_override))
         .collect()
 }
 

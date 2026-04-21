@@ -19,6 +19,7 @@ BUILD_TIME    = $(shell date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
 BUILD_ENV   = AIKEY_BUILD_REVISION=$(GIT_REVISION)$(GIT_DIRTY) AIKEY_BUILD_ID=$(BUILD_ID) AIKEY_BUILD_TIME=$(BUILD_TIME)
 
 .PHONY: all release dev rebuild run test test-integration test-unit test-verbose \
+        test-import-recall \
         lint fmt fmt-check install uninstall cross-compile clean help
 
 # Default: release build (production-ready)
@@ -64,6 +65,18 @@ test-unit:
 ## Run tests with output visible
 test-verbose:
 	$(CARGO) test -- --nocapture
+
+## Import-recall regression suite (Stage 3 parse engine)
+##   - rule v2 recall gates (in_dist / ood_layouts / ood_apikey / ood_realworld)
+##   - CRF rescue layer (in_dist 100%, adversarial FP<=1)
+##   - Provider fingerprint accuracy (ood_apikey / ood_realworld)
+##   - Pipeline E2E golden (all 56 positive samples, full recall)
+##   - Fingerprint coverage audit (22 providers)
+##
+##   Release mode to exercise the same binary path CLI users hit.
+##   Prints per-test [rule-v2] / [crf] / [fingerprint] summary lines.
+test-import-recall:
+	@$(BUILD_ENV) $(CARGO) test --release --test import_recall -- --nocapture --test-threads=1
 
 # ---------------------------------------------------------------------------
 # Code quality
@@ -147,6 +160,7 @@ help:
 	@printf "  %-22s %s\n" "make test-unit"      "Unit tests only"
 	@printf "  %-22s %s\n" "make test-integration" "Integration tests only"
 	@printf "  %-22s %s\n" "make test-verbose"   "Tests with stdout visible"
+	@printf "  %-22s %s\n" "make test-import-recall" "Stage 3 parse engine recall + fingerprint gates"
 	@echo ""
 	@echo "Quality:"
 	@printf "  %-22s %s\n" "make lint"           "Clippy (warnings as errors)"

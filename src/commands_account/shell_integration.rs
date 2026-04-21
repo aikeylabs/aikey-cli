@@ -863,6 +863,67 @@ fn hook_bash_content() -> &'static str {
     include_str!("../templates/hook.bash")
 }
 
+/// Stable 16-hex-digit FNV-1a-64 hash of the raw template content.
+///
+/// Why this exists: the hook file on disk is a *snapshot* of the template
+/// taken at the time `aikey use` last ran. After an `aikey` binary upgrade
+/// the user keeps running the old snapshot until a command refreshes it.
+/// Every past drift bug in this module (2026-04-22 stdin-suppression, 2026-
+/// 04-22 wrapper preflight not installing) shares that root cause.
+///
+/// By embedding the hash both in the binary AND in the written file's
+/// header, the precmd hook can detect the mismatch in O(1) and tell the
+/// user exactly what to run. FNV-1a-64 is non-cryptographic but stable
+/// across rustc versions (unlike std's `DefaultHasher`) — operator output
+/// stays consistent so the user sees the same short id the binary
+/// reports.
+pub fn hook_template_hash(kind: HookKind) -> String {
+    let content = match kind {
+        HookKind::Zsh  => hook_zsh_content(),
+        HookKind::Bash => hook_bash_content(),
+    };
+    let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
+    for b in content.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3); // FNV prime
+    }
+    format!("{:016x}", h)
+}
+
+/// Shell dialect selector used by the hook-hash + write helpers.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HookKind { Zsh, Bash }
+
+/// Prepend a `# Hook-Template-Hash: <hex>` header to the raw template so a
+/// running shell can compare its disk copy against the binary's embedded
+/// hash. The header sits BELOW the template's existing `# auto-generated`
+/// banner (line 1) but ABOVE any code, so naive parsers that read the
+/// first few lines pick it up without descending into the body.
+fn hook_content_with_hash_header(kind: HookKind) -> String {
+    let raw = match kind {
+        HookKind::Zsh  => hook_zsh_content(),
+        HookKind::Bash => hook_bash_content(),
+    };
+    let hash = hook_template_hash(kind);
+    // Stable format: the hook-check script greps `^# Hook-Template-Hash: `.
+    // Keep this literal — tests pin it, and so does _aikey_hook_check_once.
+    let header = format!("# Hook-Template-Hash: {}\n", hash);
+    // Insert after the first `# ~/.aikey/...` banner line so the header
+    // stays near the top but doesn't displace the do-not-hand-edit warning.
+    let mut out = String::with_capacity(raw.len() + header.len() + 8);
+    let mut lines = raw.lines();
+    if let Some(first) = lines.next() {
+        out.push_str(first);
+        out.push('\n');
+    }
+    out.push_str(&header);
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Build the v3 rc block: marker + single source line + marker.
 fn v3_rc_block(hook_filename: &str) -> String {
     format!(
@@ -876,12 +937,13 @@ fn v3_rc_block(hook_filename: &str) -> String {
 /// Atomically write `~/.aikey/hook.{zsh,bash}` (write to tmp + rename).
 fn write_hook_file(home: &str, is_zsh: bool) -> io::Result<std::path::PathBuf> {
     let filename = if is_zsh { "hook.zsh" } else { "hook.bash" };
-    let content = if is_zsh { hook_zsh_content() } else { hook_bash_content() };
+    let kind = if is_zsh { HookKind::Zsh } else { HookKind::Bash };
+    let content = hook_content_with_hash_header(kind);
     let aikey_dir = std::path::PathBuf::from(home).join(".aikey");
     std::fs::create_dir_all(&aikey_dir)?;
     let target = aikey_dir.join(filename);
     let tmp = aikey_dir.join(format!("{}.aikey.tmp", filename));
-    std::fs::write(&tmp, content)?;
+    std::fs::write(&tmp, &content)?;
     std::fs::rename(&tmp, &target)?;
     Ok(target)
 }
@@ -1200,6 +1262,142 @@ mod hook_tests {
             c.contains("trap -p DEBUG"),
             "bash hook must probe existing DEBUG trap before installing"
         );
+    }
+
+    // ── Preflight wrapper (2026-04-22) ──────────────────────────────────────
+    //
+    // Context: the 2026-04-22 connectivity-probe bugfix doc listed wrapper
+    // preflight as a follow-up. Users kept getting opaque "proxy down" errors
+    // 30 seconds into a claude/codex session. The wrapper now runs
+    // `aikey test <id>` before handing off, and prompts (default No) if the
+    // probe fails. These tests pin the contract so a future hook rewrite
+    // can't silently drop it. See:
+    // workflow/CI/bugfix/2026-04-22-connectivity-probe-through-proxy.md
+
+    #[test]
+    fn hook_zsh_defines_claude_and_codex_preflight_wrappers() {
+        let c = hook_zsh_content();
+        assert!(c.contains("_aikey_preflight"),
+            "zsh hook must define _aikey_preflight helper function");
+        // stdin redirect /dev/null is still required — it's a safety belt
+        // against any regression that would reintroduce a password prompt
+        // under the wrapper (plan D eliminated the normal path; this
+        // guards the edge case).
+        assert!(c.contains("command aikey test") && c.contains("</dev/null"),
+            "preflight must invoke `command aikey test ... </dev/null` so \
+             any future interactive prompt fails fast, not hangs");
+        // Stderr MUST NOT be redirected — users need to see the
+        // Ping/API/Chat table (both on success and failure); a silent
+        // 1-2s pause before claude starts looks like a shell hang.
+        assert!(!c.contains("command aikey test \"$id\" </dev/null >/dev/null")
+             && !c.contains("command aikey test \"$id\" </dev/null 2>/dev/null"),
+            "preflight must NOT suppress aikey test output — users need the \
+             table rendered both for success confirmation and failure diagnosis");
+        // Wrappers must be guarded same as `ak` — never overwrite a user's
+        // own claude/codex function or alias.
+        assert!(c.contains("${+functions[claude]}") && c.contains("alias claude"),
+            "zsh hook must guard claude() behind function+alias existence check");
+        assert!(c.contains("${+functions[codex]}") && c.contains("alias codex"),
+            "zsh hook must guard codex() behind function+alias existence check");
+        // Must use the `function` keyword form for parse-time alias safety.
+        assert!(c.contains("function claude"),
+            "zsh claude wrapper must use `function` keyword form");
+        assert!(c.contains("function codex"),
+            "zsh codex wrapper must use `function` keyword form");
+        // Must delegate to the real binary via `command` to avoid recursion.
+        assert!(c.contains("command claude \"$@\""),
+            "claude wrapper must call `command claude \"$@\"` to reach the real binary");
+        assert!(c.contains("command codex \"$@\""),
+            "codex wrapper must call `command codex \"$@\"` to reach the real binary");
+    }
+
+    #[test]
+    fn hook_bash_defines_claude_and_codex_preflight_wrappers() {
+        let c = hook_bash_content();
+        assert!(c.contains("_aikey_preflight"),
+            "bash hook must define _aikey_preflight helper function");
+        assert!(c.contains("command aikey test") && c.contains("</dev/null"),
+            "bash preflight must invoke `command aikey test ... </dev/null`");
+        // Stderr must not be redirected — table output is the user-visible
+        // feedback. See zsh test for rationale.
+        assert!(!c.contains("command aikey test \"$id\" </dev/null >/dev/null")
+             && !c.contains("command aikey test \"$id\" </dev/null 2>/dev/null"),
+            "bash preflight must NOT suppress aikey test output");
+        assert!(c.contains("declare -F claude") && c.contains("alias claude"),
+            "bash hook must guard claude() behind declare -F + alias check");
+        assert!(c.contains("declare -F codex") && c.contains("alias codex"),
+            "bash hook must guard codex() behind declare -F + alias check");
+        assert!(c.contains("command claude \"$@\""),
+            "claude wrapper must delegate to real binary via `command`");
+        assert!(c.contains("command codex \"$@\""),
+            "codex wrapper must delegate to real binary via `command`");
+    }
+
+    #[test]
+    fn hook_preflight_honours_aikey_preflight_off_escape_hatch() {
+        // Users on CI or low-bandwidth networks need an opt-out. Contract:
+        // `AIKEY_PREFLIGHT=off` makes the preflight a no-op. This is the
+        // only env-var knob on the wrapper — keep the surface small.
+        for c in [hook_zsh_content(), hook_bash_content()] {
+            assert!(c.contains("AIKEY_PREFLIGHT") && c.contains("\"off\""),
+                "hook must honour AIKEY_PREFLIGHT=off escape hatch — CI / \
+                 offline users can't afford an interactive prompt before \
+                 every claude invocation");
+        }
+    }
+
+    #[test]
+    fn hook_preflight_default_answer_is_no() {
+        // Critical UX invariant: typing Enter (or anything that isn't y/Y)
+        // must NOT proceed into claude/codex. If someone accidentally makes
+        // the default Yes, a proxy-down situation drops users into an
+        // unusable session with no obvious signal. Pin the contract.
+        for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
+            // The prompt text must signal default=No (the "[y/N]" convention
+            // — capital N indicating default).
+            assert!(c.contains("[y/N]"),
+                "{}: prompt must show [y/N] to signal default=No", label);
+            // The affirmative branch must match only y/Y/yes/YES, never an
+            // empty reply or anything else.
+            assert!(c.contains("y|Y|yes|YES"),
+                "{}: only y/Y/yes/YES must proceed — empty reply is NOT a \
+                 proceed signal (would defeat the whole safety purpose)", label);
+        }
+    }
+
+    #[test]
+    fn hook_preflight_hints_when_no_active_binding() {
+        // Missing AIKEY_ACTIVE_KEYS means the user hasn't run `aikey use`
+        // yet. Silently passing through would leave first-time users staring
+        // at `claude`'s native "no BASE_URL" error with no breadcrumb to
+        // `aikey use`. The wrapper emits one stderr line naming the fix.
+        // Pinned so a future simplification can't quietly drop it.
+        for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
+            assert!(c.contains("no active binding"),
+                "{}: preflight must print an advisory when AIKEY_ACTIVE_KEYS is empty", label);
+            assert!(c.contains("aikey use"),
+                "{}: advisory must name the command to run (`aikey use <alias>`)", label);
+            assert!(c.contains("preflight skipped"),
+                "{}: advisory must state the preflight was skipped (so the user \
+                 knows why claude/codex still starts despite no binding)", label);
+        }
+    }
+
+    #[test]
+    fn hook_preflight_does_not_shadow_kimi() {
+        // The 2026-04-22 requirement names claude and codex only. Kimi is
+        // deliberately NOT wrapped — it has its own per-binding health
+        // semantics (subscription status checks that differ from the
+        // anthropic/openai probe paths), and the preflight's blanket
+        // approach could false-positive on a valid kimi setup. If this
+        // ever changes, update the requirement first, then this test.
+        for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
+            // There should be no `function kimi { _aikey_preflight ... }`
+            // or `kimi() { _aikey_preflight ... }` in the template.
+            assert!(!c.contains("_aikey_preflight kimi"),
+                "{}: kimi is intentionally out of scope for the 2026-04-22 \
+                 preflight requirement — see the bugfix record before adding", label);
+        }
     }
 
     #[test]

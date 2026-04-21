@@ -1,0 +1,10 @@
+{"id":"ADV-01","type":"ADV_uuid_in_narrative","text":"订单号 550e8400-e29b-41d4-a716-446655440000 已确认发货\n请耐心等待快递","expected":{"drafts":[]}}
+{"id":"ADV-02","type":"ADV_sku","text":"产品 SKU: ABC-123-XYZ-789\n库存充足 可立即下单","expected":{"drafts":[]}}
+{"id":"ADV-03","type":"ADV_version","text":"版本号 1.2.3.4567890 已发布\n请升级","expected":{"drafts":[]}}
+{"id":"ADV-04","type":"ADV_file_hash","text":"文件 SHA256: a1b2c3d4e5f6789012345678\n已完成校验","expected":{"drafts":[]}}
+{"id":"ADV-05","type":"ADV_phone","text":"联系方式：+1-555-123-4567 或 186-1234-5678\n工作时间 9:00-18:00","expected":{"drafts":[]}}
+{"id":"ADV-06","type":"ADV_error_code","text":"错误码 ERR-5678-ABCDEF\n请联系管理员","expected":{"drafts":[]}}
+{"id":"ADV-07","type":"ADV_narrative_token","text":"你的 session token 已过期\n请重新登录后再访问 API","expected":{"drafts":[]}}
+{"id":"ADV-08","type":"ADV_narrative_apikey","text":"The api key from the docs says you should rotate it every 90 days for best practice","expected":{"drafts":[]}}
+{"id":"ADV-09","type":"ADV_commit_hash","text":"git commit a1b2c3d4 merged to branch main\n作者: Alice","expected":{"drafts":[]}}
+{"id":"ADV-10","type":"ADV_meeting_datetime","text":"会议安排 2024-04-15 15:30~17:00\n地点：会议室B","expected":{"drafts":[]}}

@@ -692,6 +692,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Internal { action } => {
             commands_internal::dispatch(&action);
         }
+        // Hidden: print the embedded hook-template hash so the precmd
+        // drift-check can compare against the on-disk hook file header.
+        Commands::HookHash { shell } => {
+            let kind = match shell.as_str() {
+                "zsh"  => commands_account::HookKind::Zsh,
+                "bash" => commands_account::HookKind::Bash,
+                other  => return Err(format!(
+                    "unknown shell '{}' — expected 'zsh' or 'bash'", other
+                ).into()),
+            };
+            println!("{}", commands_account::hook_template_hash(kind));
+        }
         Commands::Add { alias, provider } => {
             let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
@@ -1100,7 +1112,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 else { eprintln!("{}", msg); std::process::exit(EXIT_PROXY_NOT_RUNNING); }
             }
 
-            let password = prompt_vault_password(cli.password_stdin, cli.json)?;
+            // Plan D (2026-04-22): personal keys probe via proxy using the
+            // aikey_personal_alias_ sentinel; proxy does decryption server-
+            // side. CLI no longer prompts for vault password, which is the
+            // precondition for the `claude()` / `codex()` wrapper preflight
+            // to run silently before every invocation.
             let proxy_port = commands_proxy::proxy_port();
 
             // Derive exit code from a suite outcome. Rules:
@@ -1126,7 +1142,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let targets = commands_project::targets_from_alias(
                     alias,
                     test_provider.as_deref(),
-                    Some(&password),
+                    None,
                     proxy_port,
                 );
                 if targets.is_empty() {
@@ -1177,7 +1193,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 // ── No alias: test all active bindings (personal/team/OAuth) ──
                 let (targets, build_errors) =
-                    commands_project::targets_from_active_bindings(Some(&password), proxy_port);
+                    commands_project::targets_from_active_bindings(None, proxy_port);
 
                 if targets.is_empty() && build_errors.is_empty() {
                     if cli.json { json_output::error("No active provider bindings. Add a key first.", EXIT_ALIAS_NOT_FOUND); }

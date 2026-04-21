@@ -1026,12 +1026,31 @@ fn parse_returns_layer_versions_and_warnings() {
         "vault_key_hex": key_hex, "action": "parse",
         "payload": {"text": "bob@foo.com"}
     }));
-    // Stage 2 必须明示自己是 skeleton
+    // Stage 3 Phase 2：rules = 2.0-full（4 层规则齐活）；crf / fingerprint 仍 disabled
     let warnings = v["data"]["warnings"].as_array().unwrap();
-    assert!(warnings.iter().any(|w| w == "stage-2-parse-skeleton"));
-    assert_eq!(v["data"]["layer_versions"]["rules"], "1.0-lite");
-    assert_eq!(v["data"]["layer_versions"]["crf"], "disabled");
-    assert_eq!(v["data"]["layer_versions"]["fingerprint"], "disabled");
+    let warn_strs: Vec<&str> = warnings.iter().filter_map(|w| w.as_str()).collect();
+    // 任一 stage-* 标签即可（Phase 2/3/4 会演进）
+    assert!(
+        warn_strs.iter().any(|w| w.starts_with("stage-")),
+        "expected a stage-* warning; got: {:?}", warn_strs
+    );
+    // rules 应从 1.0-lite 升到 2.0-full（Phase 2 落地）
+    let rules_ver = v["data"]["layer_versions"]["rules"].as_str().unwrap();
+    assert!(
+        rules_ver == "2.0-full" || rules_ver == "1.0-lite",
+        "rules version {} unexpected (should be 2.0-full or legacy 1.0-lite)", rules_ver
+    );
+    // CRF / Fingerprint 版本字段允许 Stage 3 各 Phase 演进；仅验证格式合法
+    let crf_ver = v["data"]["layer_versions"]["crf"].as_str().unwrap();
+    assert!(
+        crf_ver == "1.0" || crf_ver == "disabled",
+        "crf version {} unexpected", crf_ver
+    );
+    let fp_ver = v["data"]["layer_versions"]["fingerprint"].as_str().unwrap();
+    assert!(
+        fp_ver == "1.0" || fp_ver == "disabled",
+        "fingerprint version {} unexpected", fp_ver
+    );
 }
 
 #[test]

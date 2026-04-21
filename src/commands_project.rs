@@ -748,22 +748,13 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                     "no provider bindings — run 'aikey add' first".dimmed());
             }
         } else {
-            // Try session cache first; if expired and there are bindings
-            // that need decryption (PersonalApi), prompt for Master Password.
-            let has_personal = bindings.iter().any(|b|
-                b.key_source_type == crate::credential_type::CredentialType::PersonalApiKey);
-            let pw = crate::session::try_get().or_else(|| {
-                use std::io::IsTerminal;
-                if has_personal && !json_mode && std::io::stdin().is_terminal() {
-                    crate::prompt_hidden("  \u{25c6} Enter Master Password to test API keys: ")
-                        .ok()
-                        .map(|p| secrecy::SecretString::new(p))
-                } else {
-                    None
-                }
-            });
+            // Plan D (2026-04-22): all probes (including personal) go via
+            // proxy with a sentinel bearer. Proxy holds vault derived key
+            // server-side, so CLI no longer needs the master password —
+            // neither from session cache nor an interactive prompt. This
+            // makes `aikey doctor` zero-prompt, matching `aikey test`.
             let proxy_port = crate::commands_proxy::proxy_port();
-            let (targets, build_errors) = targets_from_active_bindings(pw.as_ref(), proxy_port);
+            let (targets, build_errors) = targets_from_active_bindings(None, proxy_port);
 
             if targets.is_empty() && build_errors.is_empty() {
                 if !json_mode {
