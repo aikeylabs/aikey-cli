@@ -23,7 +23,7 @@ _aikey_precmd_bash() {
     _aikey_hook_check_once
 }
 
-# Drift detector — see hook.zsh for rationale.
+# Drift detector — see hook.zsh for full rationale (both layers).
 _aikey_hook_check_once() {
     [ -n "$_AIKEY_HOOK_CHECKED" ] && return
     _AIKEY_HOOK_CHECKED=1
@@ -31,6 +31,21 @@ _aikey_hook_check_once() {
     file_hash=$(grep -m1 -oE 'Hook-Template-Hash: [a-f0-9]+' ~/.aikey/hook.bash 2>/dev/null | cut -d' ' -f2)
     bin_hash=$(command aikey _hook-hash bash 2>/dev/null)
     [ -z "$file_hash" ] || [ -z "$bin_hash" ] && return
+
+    # M1 (2026-04-22): in-memory vs on-disk drift → auto-reload (plan C).
+    # See hook.zsh comment for full rationale.
+    if [ -n "$_AIKEY_HOOK_LOADED_HASH" ] && [ "$_AIKEY_HOOK_LOADED_HASH" != "$file_hash" ]; then
+        local _old_hash="$_AIKEY_HOOK_LOADED_HASH"
+        source ~/.aikey/hook.bash 2>/dev/null
+        if [ "$_AIKEY_HOOK_LOADED_HASH" = "$file_hash" ]; then
+            printf '\033[90m[aikey] hook reloaded in this shell (%s → %s)\033[0m\n' "$_old_hash" "$file_hash" >&2
+            _AIKEY_HOOK_CHECKED=
+        else
+            printf '\033[33m[aikey] hook drift detected but auto-reload failed.\n    run manually: source ~/.aikey/hook.bash\033[0m\n' >&2
+        fi
+        return
+    fi
+
     if [ "$file_hash" != "$bin_hash" ]; then
         printf '\033[33m[aikey] hook.bash is outdated (file=%s, binary=%s).\n    run: aikey use   # regenerates ~/.aikey/hook.bash, then re-source\n\033[0m' "$file_hash" "$bin_hash" >&2
     fi

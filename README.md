@@ -38,11 +38,26 @@ This creates `aikey.config.json` - a committable declaration file that specifies
 
 ### 3. Add API Keys to Vault
 
+Two paths, pick whichever matches your situation:
+
+**Single key — CLI prompt:**
 ```bash
 aikey add anthropic:default
 ```
 
-API Keys are stored encrypted in your local vault, never in project files.
+**Many keys from unstructured notes — Web UI:**
+```bash
+aikey import ~/my-keys.txt   # or just: aikey import
+```
+This opens `http://127.0.0.1:<port>/user/import` in your browser. Paste any
+mixed-format text (credentials copied from 1Password, team onboarding emails,
+`.env` fragments, Keychain exports — anything); the parser extracts API keys,
+email/password pairs, and OAuth handoffs into a review list. You check which
+drafts to import and click **Import N records**. See the "Bulk Import" section
+below for details and the full supported provider list.
+
+Either way: API Keys are stored encrypted in your local vault, never in
+project files.
 
 ### 4. Run Commands (the blessed path)
 
@@ -125,6 +140,46 @@ Supported providers:
 | Kimi (Moonshot) | Device Code (polling) | 15 minutes | Coding Plan |
 
 OAuth and API Key are mutually exclusive per provider — `aikey auth use` replaces `aikey use` for the same provider, and vice versa.
+
+## Bulk Import
+
+Opens a local-only Web UI (`/user/import`) for bringing credentials in from
+unstructured text. The parser is three layers (rule v2 → CRF + shape filter →
+Provider Fingerprint) and runs **entirely offline** — no telemetry, no
+network calls for parsing.
+
+### Prerequisites
+- `local-install.sh` (or `trial-install.sh`) has run. The installer writes the
+  console port to `~/.aikey/config/local-server.port` and starts the server.
+- `aikey status` shows a `local-server: running on port <p>` line.
+
+If the server is not running:
+- **macOS:** `launchctl start com.aikey.local-server`
+- **Linux:** `systemctl --user start aikey-local-server`
+- **Anywhere:** `~/.aikey/bin/aikey-local-server --config ~/.aikey/config/control-trial.yaml &`
+
+### Usage
+```bash
+aikey import                         # open empty paste page
+aikey import ~/notes.txt             # open page primed to re-parse that file
+aikey import --json                  # print the URL as JSON, no browser
+```
+
+### Recognized formats
+- API keys with known prefixes: `sk-ant-api03-`, `sk-proj-`, `AIza`, `gsk_`,
+  `ghp_`, `AKIA`, `SG.`, `eyJ…`, plus 15 more providers (openrouter, stripe,
+  slack, huggingface, perplexity, xai, …)
+- Email + password pairs (English or Chinese field labels: `email:` `邮箱:`
+  `password:` `密码:`)
+- OAuth handoff rows (Claude / Codex / Kimi) — the UI emits the exact
+  `aikey auth login <provider>` command for you to copy-paste to a terminal
+- Third-party gateway `base_url` (e.g. OpenAI-compatible endpoints)
+
+### Privacy
+The page runs `OFFLINE · NOTHING LEAVES` across the top strip. The textarea
+content stays in the browser and in the local server process; it is never
+sent to any cloud. The vault stays locked until you explicitly unlock via the
+inline banner.
 
 ## Additional Notes
 

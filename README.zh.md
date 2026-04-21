@@ -7,8 +7,12 @@
 ## 快速开始
 
 ```bash
-# 添加 API Key（vault 会在首次使用时自动初始化）
+# 添加单条 API Key（vault 会在首次使用时自动初始化）
 aikey add my-claude --provider anthropic
+
+# 从零散文本批量导入（浏览器 Web UI，完全本地）
+aikey import                         # 打开空白粘贴页
+aikey import ~/my-keys.txt           # 打开并预填文件路径
 
 # 选择当前使用的 Key
 aikey use my-claude
@@ -16,6 +20,36 @@ aikey use my-claude
 # 通过代理运行命令
 aikey run -- claude
 ```
+
+## 批量导入（`aikey import`）
+
+一个本地 Web UI，把任意排版的凭证文本解析成草稿列表供你勾选入库。全程**离线**，
+解析引擎（规则 v2 + CRF + Provider Fingerprint 三层）在本地运行，**不上传任何数据**。
+
+### 前置条件
+- 已执行 `local-install.sh` 或 `trial-install.sh`。安装脚本会写入端口文件
+  `~/.aikey/config/local-server.port` 并启动 console 进程。
+- `aikey status` 末尾显示 `local-server: running on port <p>` 一行即为正常。
+
+如果 console 没有运行：
+- **macOS**: `launchctl start com.aikey.local-server`
+- **Linux**: `systemctl --user start aikey-local-server`
+- **兜底**: `~/.aikey/bin/aikey-local-server --config ~/.aikey/config/control-trial.yaml &`
+
+> 注：`aikey serve` / `aikey stop` 已移除，服务生命周期交给 launchctl / systemd 管理。
+
+### 支持识别的格式
+- 主流 provider 的 API Key 前缀：`sk-ant-api03-`、`sk-proj-`、`AIza`、`gsk_`、
+  `ghp_`、`AKIA`、`SG.`、`eyJ…` 等 22 种 provider
+- 邮箱 + 密码对（支持中英文字段标签：`email:` `邮箱:` `password:` `密码:`）
+- OAuth handoff（Claude / Codex / Kimi）— UI 生成对应的
+  `aikey auth login <provider>` 命令供你粘贴到 Terminal 执行
+- 第三方网关的 `base_url`（比如 OpenAI 兼容端点）
+
+### 隐私
+页面顶部会持续显示 `OFFLINE · NOTHING LEAVES`。粘贴框里的原文只在浏览器和本地服务
+进程内处理，不会发送到任何外网。vault 默认锁定，只有你点顶部 banner "Unlock"
+输入主密码之后才能执行 Import。
 
 ## Provider OAuth 账号 (`aikey auth`)
 

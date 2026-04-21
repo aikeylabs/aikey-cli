@@ -793,6 +793,14 @@ pub fn run_connectivity_suite(
         rows.push((t.clone(), r));
     }
 
+    // Closing rule — visually terminates the provider table so the
+    // subsequent "failed hints" block and "proxy" row don't look like
+    // more table data. Uses the same width + character as the header
+    // underline; keep them in lockstep.
+    if !rows.is_empty() {
+        eprintln!("  {}", "\u{2500}".repeat(label_w + W_PD + W_PING + W_API + 22).dimmed());
+    }
+
     if !failed_hints.is_empty() {
         eprintln!();
         for hint in &failed_hints {

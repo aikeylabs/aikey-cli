@@ -48,6 +48,40 @@ _aikey_hook_check_once() {
     # If either side is missing (pre-hash binary, stripped hook file),
     # stay silent — the drift detector is strictly best-effort.
     [[ -z "$file_hash" || -z "$bin_hash" ]] && return
+
+    # M1 (2026-04-22): in-memory vs on-disk drift → auto-reload (plan C).
+    #
+    # `$_AIKEY_HOOK_LOADED_HASH` is set by the hook file itself at source
+    # time. If it differs from the current on-disk hash, the user has
+    # regenerated the hook file AFTER this shell sourced it — wrapper
+    # defs in memory are stale.
+    #
+    # We auto-reload in-place (matches zsh's norm — direnv/pyenv do this)
+    # and print a single dim line so the event is visible without being
+    # noisy. Re-check AFTER source: if `source` somehow didn't take
+    # effect (interrupted file write, permission issue, concurrent edit
+    # racing), fall back to warning the user manually.
+    #
+    # Checked BEFORE the on-disk-vs-binary check: fixing in-shell drift
+    # is usually what the user actually wants right now.
+    if [[ -n "$_AIKEY_HOOK_LOADED_HASH" && "$_AIKEY_HOOK_LOADED_HASH" != "$file_hash" ]]; then
+        local _old_hash="$_AIKEY_HOOK_LOADED_HASH"
+        source ~/.aikey/hook.zsh 2>/dev/null
+        # After a successful source, `_AIKEY_HOOK_LOADED_HASH` was reassigned
+        # by the top-of-file assignment. Verify the reload actually took.
+        if [[ "$_AIKEY_HOOK_LOADED_HASH" == "$file_hash" ]]; then
+            printf '\033[90m[aikey] hook reloaded in this shell (%s → %s)\033[0m\n' "$_old_hash" "$file_hash" >&2
+            # Reset the one-shot guard so if another drift happens later in
+            # this shell (e.g. user runs `aikey use` again), it's detected
+            # on the next prompt. Normal stable-state still costs only one
+            # check per shell.
+            _AIKEY_HOOK_CHECKED=
+        else
+            printf '\033[33m[aikey] hook drift detected but auto-reload failed.\n    run manually: source ~/.aikey/hook.zsh\033[0m\n' >&2
+        fi
+        return
+    fi
+
     if [[ "$file_hash" != "$bin_hash" ]]; then
         printf '\033[33m[aikey] hook.zsh is outdated (file=%s, binary=%s).\n    run: aikey use   # regenerates ~/.aikey/hook.zsh, then re-source\n\033[0m' "$file_hash" "$bin_hash" >&2
     fi

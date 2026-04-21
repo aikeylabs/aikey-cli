@@ -89,6 +89,7 @@ pub fn handle(env: StdinEnvelope) {
     let req_id = env.request_id.clone();
     match env.action.as_str() {
         "verify" => handle_verify(env),
+        "metadata" => handle_metadata(env),
         "add" => handle_add(env),
         "batch_import" => handle_batch_import(env),
         "update_secret" => handle_update_secret(env),
@@ -208,6 +209,90 @@ fn handle_verify(env: StdinEnvelope) {
     emit(&ResultEnvelope::ok(
         req_id,
         json!({"verified": true, "method": "password_hash"}),
+    ));
+}
+
+// ========== metadata ==========
+//
+// Pre-unlock metadata query used by Go local-server: returns the vault's KDF
+// salt + Argon2id parameters so the caller can derive `vault_key_hex` locally
+// before invoking `verify`. No secret is exposed; only rekey-inert public
+// params. Follows the same "format-check only" pattern as `parse`: the stdin
+// `vault_key_hex` field is required by protocol but not matched against the
+// vault (the caller doesn't have it yet).
+//
+// Why a separate action (not an unlock-that-takes-password): keeps the
+// password off stdin, so the only place the password lives is the Go
+// process handling the unlock HTTP request, and only for the Argon2id call.
+// Envelope contract stays action-agnostic (all actions still carry
+// vault_key_hex).
+fn handle_metadata(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+
+    // Format-validate only (placeholder 64-char hex is fine; real hex also fine).
+    if let Err((code, msg)) = decode_vault_key(&env.vault_key_hex) {
+        emit_error(req_id, code, msg);
+        return;
+    }
+
+    if let Err(e) = storage::ensure_vault_exists() {
+        emit_error(req_id, "I_VAULT_NOT_INITIALIZED", format!("{}", e));
+        return;
+    }
+    let conn = match storage::open_connection() {
+        Ok(c) => c,
+        Err(e) => {
+            emit_error(req_id, "I_VAULT_OPEN_FAILED", format!("{}", e));
+            return;
+        }
+    };
+
+    // Salt: canonical key is `master_salt`; fall back to legacy `salt`.
+    let salt: Vec<u8> = match conn.query_row(
+        "SELECT value FROM config WHERE key = 'master_salt'",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(v) => v,
+        Err(_) => match conn.query_row(
+            "SELECT value FROM config WHERE key = 'salt'",
+            [],
+            |r| r.get(0),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                emit_error(req_id, "I_VAULT_NOT_INITIALIZED",
+                    format!("vault missing master_salt: {}", e));
+                return;
+            }
+        },
+    };
+
+    // KDF params: stored as 4-byte LE uint32, default to Argon2id params if absent.
+    let read_u32 = |k: &str, default: u32| -> u32 {
+        conn.query_row("SELECT value FROM config WHERE key = ?", [k], |r| r.get::<_, Vec<u8>>(0))
+            .ok()
+            .filter(|v| v.len() == 4)
+            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+            .unwrap_or(default)
+    };
+    let m_cost = read_u32("kdf_m_cost", 65536);
+    let t_cost = read_u32("kdf_t_cost", 3);
+    let p_cost = read_u32("kdf_p_cost", 4);
+    let key_len = 32u32;
+
+    emit(&ResultEnvelope::ok(
+        req_id,
+        json!({
+            "salt_hex": hex::encode(&salt),
+            "kdf": {
+                "algorithm": "argon2id",
+                "m_cost": m_cost,
+                "t_cost": t_cost,
+                "p_cost": p_cost,
+                "key_len": key_len,
+            },
+        }),
     ));
 }
 

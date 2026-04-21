@@ -34,6 +34,7 @@ mod commands_auth;
 mod commands_statusline;
 mod commands_watch;
 mod commands_internal;
+mod commands_import;
 #[allow(dead_code)] mod usage_wal;
 mod cli;
 
@@ -962,11 +963,37 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Delete { alias } => {
-            // Confirm before deletion (skip in JSON / non-interactive mode).
+        Commands::Delete { aliases } => {
+            // Batch delete. Design (2026-04-22):
+            //   - Single confirmation for the whole batch (N prompts for N
+            //     aliases would be terrible UX — see CLAUDE.md 交互简洁性优先)
+            //   - Single vault password prompt (same reason)
+            //   - Per-alias outcome reported; partial failures do NOT abort
+            //     the batch — user would rather know which one failed than
+            //     re-type N-1 args after a single bad alias
+            //   - Binding reconcile runs ONCE after all deletes, using the
+            //     union of affected provider-codes, instead of N reconciles
+            //   - Single-alias invocation (`ak delete x`) is unchanged
+            //     behaviourally — same prompts, same exit code
+            use colored::Colorize;
+
+            // Dedupe while preserving order (user might type the same alias twice).
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let ordered: Vec<String> = aliases.iter()
+                .filter(|a| seen.insert((*a).clone()))
+                .cloned()
+                .collect();
+            let batch = ordered.len();
+
+            // Confirm once — batched prompt. Skip in JSON / non-interactive modes.
             if !cli.json && std::io::stdin().is_terminal() {
-                use colored::Colorize;
-                eprint!("  Delete API Key '{}'? This cannot be undone. [y/N] (default N): ", alias.bold());
+                if batch == 1 {
+                    eprint!("  Delete API Key '{}'? This cannot be undone. [y/N] (default N): ",
+                        ordered[0].bold());
+                } else {
+                    eprint!("  Delete {} API Keys ({})? This cannot be undone. [y/N] (default N): ",
+                        batch, ordered.join(", ").bold());
+                }
                 io::stdout().flush()?;
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
@@ -976,43 +1003,86 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Single password prompt for the whole batch.
             let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
-            let result = executor::delete_secret(alias, &password);
-            let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(alias), result.is_ok());
 
-            if let Err(e) = result {
-                if cli.json { json_output::error(&e, 1); } else { return Err(e.into()); }
+            // Run per-alias deletes + collect outcomes. Don't short-circuit
+            // on error — user wants to know which one failed and still have
+            // the others removed.
+            let mut per_alias: Vec<(String, Result<(), String>, Vec<profile_activation::ReconcileAction>)>
+                = Vec::with_capacity(batch);
+            for alias in &ordered {
+                let result = executor::delete_secret(alias, &password);
+                let _ = audit::log_audit_event(
+                    &password, audit::AuditOperation::Delete, Some(alias), result.is_ok(),
+                );
+                let actions: Vec<profile_activation::ReconcileAction> = if result.is_ok() {
+                    profile_activation::reconcile_provider_primary_after_key_removal(
+                        "personal", alias,
+                    ).unwrap_or_default()
+                } else { Vec::new() };
+                per_alias.push((alias.clone(), result, actions));
             }
 
-            // Reconcile provider bindings after removal.
-            let actions = profile_activation::reconcile_provider_primary_after_key_removal(
-                "personal", alias,
-            ).unwrap_or_default();
-            if !actions.is_empty() {
+            // One activation refresh at the end if ANY delete produced reconcile actions.
+            let any_reconciled = per_alias.iter().any(|(_, _, a)| !a.is_empty());
+            if any_reconciled {
                 let _ = profile_activation::refresh_implicit_profile_activation();
             }
 
+            let ok_count = per_alias.iter().filter(|(_, r, _)| r.is_ok()).count();
+            let fail_count = batch - ok_count;
+
             if cli.json {
-                json_output::success(serde_json::json!({
-                    "alias": alias,
-                    "message": "API Key deleted successfully"
-                }));
+                let items: Vec<serde_json::Value> = per_alias.iter().map(|(a, r, _)| {
+                    match r {
+                        Ok(_)  => serde_json::json!({"alias": a, "ok": true}),
+                        Err(e) => serde_json::json!({"alias": a, "ok": false, "error": e}),
+                    }
+                }).collect();
+                let payload = serde_json::json!({
+                    "deleted": ok_count,
+                    "failed":  fail_count,
+                    "items":   items,
+                });
+                if fail_count == 0 {
+                    json_output::success(payload);
+                } else {
+                    // Partial/total failure: emit JSON + non-zero exit.
+                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                    std::process::exit(if ok_count > 0 { 2 } else { 1 });
+                }
             } else {
-                use colored::Colorize;
-                eprintln!("  {} API Key '{}' deleted.", "\u{2713}".green(), alias);
-                for action in &actions {
-                    match &action.outcome {
-                        profile_activation::ReconcileOutcome::Replaced { new_source_ref, .. } => {
-                            eprintln!("  {} '{}' promoted to Primary for {}",
-                                "\u{2B50}".yellow(), new_source_ref.bold(), action.provider_code);
+                for (alias, result, actions) in &per_alias {
+                    match result {
+                        Ok(()) => {
+                            eprintln!("  {} API Key '{}' deleted.", "\u{2713}".green(), alias);
+                            for action in actions {
+                                match &action.outcome {
+                                    profile_activation::ReconcileOutcome::Replaced { new_source_ref, .. } => {
+                                        eprintln!("    {} '{}' promoted to Primary for {}",
+                                            "\u{2B50}".yellow(), new_source_ref.bold(), action.provider_code);
+                                    }
+                                    profile_activation::ReconcileOutcome::Cleared => {
+                                        eprintln!("    {} No replacement for {} — provider has no Primary",
+                                            "\u{26A0}".yellow(), action.provider_code);
+                                    }
+                                }
+                            }
                         }
-                        profile_activation::ReconcileOutcome::Cleared => {
-                            eprintln!("  {} No replacement for {} — provider has no Primary",
-                                "\u{26A0}".yellow(), action.provider_code);
+                        Err(e) => {
+                            eprintln!("  {} '{}': {}", "\u{2717}".red(), alias, e);
                         }
                     }
                 }
+                if batch > 1 {
+                    eprintln!("  {} deleted, {} failed (of {} requested).", ok_count, fail_count, batch);
+                }
                 commands_proxy::maybe_warn_stale();
+                // Partial failure → exit 2, total failure → 1, all ok → 0.
+                if fail_count > 0 {
+                    std::process::exit(if ok_count > 0 { 2 } else { 1 });
+                }
             }
         }
         Commands::List => {
@@ -2223,8 +2293,24 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Master { page, url, port } => {
             commands_account::handle_master_browse(page.as_deref(), url.as_deref(), *port, cli.json)?;
         }
+        Commands::Import { file, non_interactive, yes, provider } => {
+            commands_import::handle(
+                file.as_deref(),
+                *non_interactive,
+                *yes,
+                provider.as_deref(),
+                cli.json,
+            )?;
+        }
         Commands::Status => {
             commands_account::handle_status_overview(cli.json)?;
+            // Mode A addendum: append a local-server status line so users have
+            // a single command for "is my console reachable". See
+            // roadmap20260320/技术实现/update/20260422-批量导入-aikey-serve-命令移除.md
+            if !cli.json {
+                println!();
+                println!("{}", commands_import::local_server_status_line());
+            }
         }
         Commands::Whoami => {
             commands_account::handle_whoami(cli.json)?;

@@ -907,7 +907,18 @@ fn hook_content_with_hash_header(kind: HookKind) -> String {
     let hash = hook_template_hash(kind);
     // Stable format: the hook-check script greps `^# Hook-Template-Hash: `.
     // Keep this literal — tests pin it, and so does _aikey_hook_check_once.
-    let header = format!("# Hook-Template-Hash: {}\n", hash);
+    //
+    // Second line (`_AIKEY_HOOK_LOADED_HASH=...`) is a shell assignment
+    // (M1, 2026-04-22): when the file is sourced, this records the hash
+    // that this shell's in-memory wrapper functions came from. The drift
+    // check in `_aikey_hook_check_once` compares this var against the
+    // on-disk `# Hook-Template-Hash:` — if they diverge, the user has
+    // regenerated the hook file AFTER this shell sourced it, so the
+    // claude/codex wrapper defs in memory are stale. Prompts a re-source.
+    let header = format!(
+        "# Hook-Template-Hash: {hash}\n_AIKEY_HOOK_LOADED_HASH=\"{hash}\"\n",
+        hash = hash,
+    );
     // Insert after the first `# ~/.aikey/...` banner line so the header
     // stays near the top but doesn't displace the do-not-hand-edit warning.
     let mut out = String::with_capacity(raw.len() + header.len() + 8);

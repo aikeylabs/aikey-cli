@@ -20,6 +20,8 @@ BUILD_ENV   = AIKEY_BUILD_REVISION=$(GIT_REVISION)$(GIT_DIRTY) AIKEY_BUILD_ID=$(
 
 .PHONY: all release dev rebuild run test test-integration test-unit test-verbose \
         test-import-recall \
+        e2e-import-personal e2e-import-trial e2e-import-production \
+        security-check-batch-import \
         lint fmt fmt-check install uninstall cross-compile clean help
 
 # Default: release build (production-ready)
@@ -65,6 +67,61 @@ test-unit:
 ## Run tests with output visible
 test-verbose:
 	$(CARGO) test -- --nocapture
+
+## Stage 6 — end-to-end Quick Import smoke (per edition).
+##
+## These targets assume the corresponding installer has been run already
+## (local-install.sh / trial-install.sh / server-install.sh) so that the
+## port file at ~/.aikey/config/local-server.port exists. They spawn a
+## subprocess of the release binary and drive it through:
+##    aikey status         (asserts local-server reachable)
+##    aikey import <fixt>  (asserts browser URL printed / headless path exits)
+## The full UI flow (paste → parse → confirm) is out of scope for these
+## smoke targets; that is covered by the browser-click checklist in
+## workflow/CD/checklist.md §5.
+e2e-import-personal: release
+	@echo "→ Personal edition smoke"
+	@./target/release/aikey status > /tmp/aikey-e2e-status.out 2>&1 || true
+	@grep -E 'local-server: running on port' /tmp/aikey-e2e-status.out \
+	    || { echo "FAIL: local-server status line missing"; cat /tmp/aikey-e2e-status.out; exit 1; }
+	@echo "test_fixture" > /tmp/aikey-e2e-import-input.txt
+	@./target/release/aikey import /tmp/aikey-e2e-import-input.txt --json > /tmp/aikey-e2e-import.out 2>&1 || true
+	@grep -E '"status":"ok"' /tmp/aikey-e2e-import.out \
+	    || { echo "FAIL: import did not print ok envelope"; cat /tmp/aikey-e2e-import.out; exit 1; }
+	@rm -f /tmp/aikey-e2e-import-input.txt /tmp/aikey-e2e-import.out /tmp/aikey-e2e-status.out
+	@echo "✓ Personal edition smoke passed"
+
+e2e-import-trial: release
+	@echo "→ Team-Trial edition smoke (reuses personal path — same CLI binary)"
+	@$(MAKE) e2e-import-personal
+
+e2e-import-production: release
+	@echo "→ Production edition smoke (CLI still runs locally, API may 503 in server deployment)"
+	@./target/release/aikey status > /tmp/aikey-e2e-status.out 2>&1 || true
+	@grep -E 'local-server' /tmp/aikey-e2e-status.out \
+	    || { echo "FAIL: status command did not mention local-server"; exit 1; }
+	@rm -f /tmp/aikey-e2e-status.out
+	@echo "✓ Production edition smoke passed (status only)"
+
+## Stage 6 — static security checks for the batch-import surface.
+##
+## Verifies the "Go does no AES" boundary (implementation plan §6.7). Runs as
+## plain grep; any hit = reject. Intended to run in CI on every PR that
+## touches internal/api/user/importpkg or aikey-cli/src/commands_import.
+security-check-batch-import:
+	@echo "→ importpkg must not import crypto/aes or crypto/cipher"
+	@! grep -rE '"crypto/aes"|"crypto/cipher"' \
+	    ../aikey-control/service/internal/api/user/importpkg/ 2>/dev/null \
+	    || { echo "FAIL: AES import found in importpkg"; exit 1; }
+	@echo "→ importpkg must not import aikey-proxy vault package"
+	@! grep -r 'aikey-proxy/internal/vault' \
+	    ../aikey-control/service/internal/api/user/importpkg/ 2>/dev/null \
+	    || { echo "FAIL: importpkg leaks proxy vault coupling"; exit 1; }
+	@echo "→ cli must not log vault_key_hex / password plaintext"
+	@! grep -rnE 'eprintln!.*vault_key|println!.*vault_key|eprintln!.*password|println!.*password' \
+	    src/commands_import.rs src/commands_internal/ 2>/dev/null \
+	    || { echo "FAIL: vault key / password logged"; exit 1; }
+	@echo "✓ Static security checks pass"
 
 ## Import-recall regression suite (Stage 3 parse engine)
 ##   - rule v2 recall gates (in_dist / ood_layouts / ood_apikey / ood_realworld)
@@ -161,6 +218,10 @@ help:
 	@printf "  %-22s %s\n" "make test-integration" "Integration tests only"
 	@printf "  %-22s %s\n" "make test-verbose"   "Tests with stdout visible"
 	@printf "  %-22s %s\n" "make test-import-recall" "Stage 3 parse engine recall + fingerprint gates"
+	@printf "  %-22s %s\n" "make e2e-import-personal" "Stage 6 e2e: status + aikey import smoke"
+	@printf "  %-22s %s\n" "make e2e-import-trial" "  (alias — same binary as personal)"
+	@printf "  %-22s %s\n" "make e2e-import-production" "Stage 6 e2e: status only (no local API)"
+	@printf "  %-22s %s\n" "make security-check-batch-import" "Stage 6 static security gate (AES / vault key)"
 	@echo ""
 	@echo "Quality:"
 	@printf "  %-22s %s\n" "make lint"           "Clippy (warnings as errors)"

@@ -199,6 +199,26 @@ pub(crate) enum Commands {
         #[arg(long)]
         port: Option<u16>,
     },
+    /// Bulk-import credentials from unstructured text via the Web UI
+    ///
+    /// Opens the local-server `/user/import` page in the default browser. If a
+    /// FILE path is given, its contents are pre-parsed so the Web UI can skip
+    /// the empty state. Requires the local-server to be running (managed by
+    /// launchctl on macOS / systemctl on Linux — installer registers it).
+    #[command(display_order = 7)]
+    Import {
+        /// Optional file path to seed the import with
+        file: Option<std::path::PathBuf>,
+        /// Skip browser; run the full parse+confirm flow headlessly
+        #[arg(long)]
+        non_interactive: bool,
+        /// With --non-interactive: auto-accept all high-confidence drafts
+        #[arg(long)]
+        yes: bool,
+        /// With --non-interactive: force provider for all drafts
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// Open the Master Console (admin) in your default browser
     #[command(display_order = 7)]
     Master {
@@ -305,10 +325,17 @@ pub(crate) enum Commands {
     Update {
         alias: String,
     },
-    /// Delete a secret from the vault
+    /// Delete one or more API Keys from the vault
+    ///
+    /// Batch mode: pass multiple aliases at once — `ak delete alias1 alias2 alias3`.
+    /// A single confirmation is asked for the whole batch, and the vault
+    /// password is prompted only once. Per-alias outcome is reported at the
+    /// end; partial failures do not abort the batch.
     #[command(display_order = 17)]
     Delete {
-        alias: String,
+        /// One or more aliases to delete. At least one is required.
+        #[arg(required = true, num_args = 1..)]
+        aliases: Vec<String>,
     },
     /// Export secrets to an encrypted backup file
     #[command(display_order = 18)]
@@ -677,6 +704,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Env { .. } => "env".to_string(),
             Commands::Web { .. } => "web".to_string(),
             Commands::Master { .. } => "master".to_string(),
+            Commands::Import { .. } => "import".to_string(),
             Commands::Doctor => "doctor".to_string(),
             Commands::Proxy { action } => format!("proxy.{}", match action {
                 ProxyAction::Start { .. } => "start",
