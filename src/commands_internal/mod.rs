@@ -24,6 +24,7 @@ pub mod vault_op;
 pub mod query;
 pub mod update_alias;
 pub mod parse;
+pub mod internal_log;
 
 #[cfg(test)]
 mod tests;
@@ -65,13 +66,28 @@ pub fn dispatch(action: &InternalAction) {
     // 注意：所有 action 接收同一 envelope；action 名称通过 envelope.action 字段传
     // —— 这与子命令名（vault-op/query/...）**不冲突**：subcommand 选择模块，envelope.action 选择 action
     // （例如 `_internal vault-op --stdin-json` 下 envelope.action 可以是 "verify"/"add"/...）
+    let action_name = match action {
+        InternalAction::VaultOp(_)     => "vault-op",
+        InternalAction::Query(_)       => "query",
+        InternalAction::UpdateAlias(_) => "update-alias",
+        InternalAction::Parse(_)       => "parse",
+    };
     let env = match stdin_json::read_envelope() {
         Ok(e) => e,
         Err((code, msg)) => {
+            // Stage logging before emit: even read-failures deserve a trace
+            // in internal.jsonl so an operator can see "request arrived but
+            // the envelope was malformed" without guessing.
+            internal_log::log_dispatch_error(action_name, None, code, &msg, 0);
             stdin_json::emit_error(None, code, msg);
             return;
         }
     };
+
+    // Record the "in" event now; matching "ok" / "err" is emitted from
+    // `stdin_json::emit` / `emit_error` once the handler returns.
+    internal_log::log_dispatch_start(action_name, &env);
+    stdin_json::set_dispatch_context(action_name, env.request_id.clone());
 
     match action {
         InternalAction::VaultOp(_) => vault_op::handle(env),

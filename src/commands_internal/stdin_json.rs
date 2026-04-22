@@ -1,8 +1,48 @@
 //! stdin-json IPC 工具：读 stdin → 解析 JSON → emit stdout JSON
+//!
+//! 2026-04-22 L2 observability: every `emit` / `emit_error` also writes a
+//! structured outcome line to `~/.aikey/logs/aikey-cli/internal.jsonl`.
+//! The dispatch context (action name, request_id, dispatch_start_at) is
+//! set by `commands_internal::dispatch` right after envelope parse so
+//! `emit` can stamp duration + action onto the outcome event without
+//! threading extra params through every action handler.
 
 use std::io::{self, Read, Write};
+use std::sync::Mutex;
+use std::time::Instant;
 
+use super::internal_log;
 use super::protocol::{ResultEnvelope, StdinEnvelope};
+
+/// Per-process dispatch context set by `commands_internal::dispatch`. The
+/// `_internal` CLI runs exactly one subcommand per process, so a single
+/// global slot is safe — no concurrency. Kept under a `Mutex` purely to
+/// satisfy `Sync` without unsafe.
+struct DispatchCtx {
+    action: &'static str,
+    request_id: Option<String>,
+    started_at: Instant,
+}
+static DISPATCH_CTX: Mutex<Option<DispatchCtx>> = Mutex::new(None);
+
+/// Called by `commands_internal::dispatch` once the envelope has parsed
+/// successfully. Records the action name + request_id + start time so
+/// `emit` / `emit_error` can emit the outcome log line.
+pub fn set_dispatch_context(action: &'static str, request_id: Option<String>) {
+    if let Ok(mut g) = DISPATCH_CTX.lock() {
+        *g = Some(DispatchCtx {
+            action,
+            request_id,
+            started_at: Instant::now(),
+        });
+    }
+}
+
+fn take_dispatch_context() -> Option<(&'static str, Option<String>, u128)> {
+    let mut g = DISPATCH_CTX.lock().ok()?;
+    let ctx = g.take()?;
+    Some((ctx.action, ctx.request_id, ctx.started_at.elapsed().as_millis()))
+}
 
 /// 从 stdin 读全部字节并解析为 `StdinEnvelope`
 ///
@@ -40,6 +80,28 @@ pub fn read_envelope() -> Result<StdinEnvelope, (&'static str, String)> {
 
 /// 把 ResultEnvelope 序列化并写到 stdout，刷新并换行
 pub fn emit(env: &ResultEnvelope) {
+    // Log the outcome BEFORE writing to stdout. That way if stdout is
+    // closed (Go parent crashed) we still have the observation.
+    //
+    // `take_dispatch_context` returns None for the "context never set"
+    // path — e.g. envelope parse failed before dispatch could mark
+    // start. In that case we skip the structured outcome log; the
+    // error-path log from `emit_error` on the read-fail branch already
+    // covers it.
+    if let Some((action, req_id, duration_ms)) = take_dispatch_context() {
+        match env.status {
+            "ok" => {
+                let data = env.data.clone().unwrap_or(serde_json::Value::Null);
+                internal_log::log_dispatch_success(action, req_id.as_deref(), &data, duration_ms);
+            }
+            _ => {
+                let code = env.error_code.unwrap_or("I_UNKNOWN");
+                let msg = env.error_message.clone().unwrap_or_default();
+                internal_log::log_dispatch_error(action, req_id.as_deref(), code, &msg, duration_ms);
+            }
+        }
+    }
+
     let out = serde_json::to_string(env).unwrap_or_else(|_| {
         // Fallback: 即使序列化失败也要给 caller 一个合法 JSON
         r#"{"status":"error","error_code":"I_INTERNAL","error_message":"failed to serialize result"}"#
