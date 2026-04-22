@@ -15,6 +15,7 @@ use regex::Regex;
 
 use super::candidate::Kind;
 use super::rule::try_push;
+use super::v41_guards::is_comment_at_offset;
 
 pub fn extract(
     text: &str,
@@ -26,6 +27,8 @@ pub fn extract(
         r"(-----BEGIN [A-Z ]+-----[\s\S]+?-----END [A-Z ]+-----)"
     ).unwrap();
     for m in re.find_iter(text) {
+        // v4.1 ISSUE-4: 注释块起始行的 PEM block 不抽（教程 / 示例 / 已轮换 key 的 // 标记）
+        if is_comment_at_offset(text, m.start()) { continue; }
         try_push(cands, seen, Kind::SecretLike, m.as_str(), Some([m.start(), m.end()]));
     }
 }

@@ -19,8 +19,10 @@
 use regex::Regex;
 
 use super::candidate::Kind;
+use super::line_class::{line_class, LineFlags};
 use super::rule::{looks_like_known_secret, try_push};
 use super::tokenize::tokenize_line;
+use super::v41_guards::is_placeholder_token;
 
 pub fn extract(
     text: &str,
@@ -63,6 +65,11 @@ pub fn extract(
 
     // === Step 2: 在锚点行 tokenize，挑 password-shape ===
     for i in idxs {
+        // v4.1 ISSUE-6: rule_extract_* 家族最后一处 IS_COMMENT 守门补漏
+        //   注释行的 token 不参与 anchored password 召回
+        if line_class(lines[i]).flags.contains(LineFlags::IS_COMMENT) {
+            continue;
+        }
         let tokens = tokenize_line(lines[i]);
         for tok in tokens {
             if !is_password_shape(&tok, &stopwords) { continue; }
@@ -85,6 +92,22 @@ fn is_password_shape(
     if tok.contains('@') { return false; }
     if lc.starts_with("http") { return false; }
     if looks_like_known_secret(tok) { return false; }
+
+    // v4.1 anchored path 的 CJK 拒识比 label/dash/pipe 路径宽松 ——
+    //   仅拒"纯非 ASCII"（`chars().all(|c| !c.is_ascii())`），
+    //   而非任意含 CJK（那是 rule::is_plausible_password 的职责）
+    //   Why: CLI 测试用例 H-K-01 有 `CnPwd测试99` 这类 mixed-ASCII-CJK password，
+    //   V4.1 spike 在 anchored 层会通过（通过 rule_extract_anchored::non_ascii_only 检查），
+    //   只在 label/dash/pipe 路径上严格拒（避免中文描述文字碎片作 password FP）
+    if tok.chars().all(|c| !c.is_ascii()) { return false; }
+    // v4.1 placeholder denylist
+    if is_placeholder_token(tok) { return false; }
+    // v4.1 M4 post-fix: trailing `_-` 几乎必是 ellipsis 截断 (`LTAI5t_doubao_` 类 fragment)
+    if tok.ends_with('_') || tok.ends_with('-') { return false; }
+    // v4.1 ISSUE-3 补丁: `email/password` 类 slash token 不是 password
+    if tok.contains('/') { return false; }
+    // v4.1 Method B shell var ref: `$OPENAI_API_KEY` / `${VAR}`
+    if tok.starts_with('$') { return false; }
 
     // 停用词
     if stopwords.contains(lc.as_str()) { return false; }

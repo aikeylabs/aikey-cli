@@ -19,6 +19,7 @@ use regex::Regex;
 
 use super::candidate::Kind;
 use super::rule::{looks_like_known_secret, try_push};
+use super::v41_guards::{is_comment_at_offset, is_placeholder_token};
 
 pub fn extract(
     text: &str,
@@ -34,7 +35,11 @@ authorization|bearer|token)["']?\s*[:=]\s*["']?([A-Za-z0-9+/_\-\.=]{10,})["']?"#
 
     for cap in re.captures_iter(text) {
         let Some(val) = cap.get(2) else { continue };
+        // v4.1 ISSUE-4: 注释行的 `api_key: xxx` 类 label 不抽
+        if is_comment_at_offset(text, val.start()) { continue; }
         let v = val.as_str();
+        // v4.1 placeholder denylist
+        if is_placeholder_token(v) { continue; }
         // 过滤：纯字母且长度短（很可能是标签词本身或英文词）
         if v.len() < 10 { continue; }
         if v.chars().all(|c| c.is_alphabetic()) && v.len() < 20 { continue; }
@@ -49,7 +54,9 @@ authorization|bearer|token)["']?\s*[:=]\s*["']?([A-Za-z0-9+/_\-\.=]{10,})["']?"#
     let re_bearer = Regex::new(r"(?i)\bBearer\s+([A-Za-z0-9+/_\-\.=]{10,})\b").unwrap();
     for cap in re_bearer.captures_iter(text) {
         let Some(val) = cap.get(1) else { continue };
+        if is_comment_at_offset(text, val.start()) { continue; }
         let v = val.as_str();
+        if is_placeholder_token(v) { continue; }
         if v.len() < 10 { continue; }
         try_push(cands, seen, Kind::SecretLike, v, Some([val.start(), val.end()]));
     }
@@ -63,7 +70,9 @@ authorization|bearer|token)["']?\s*[:=]\s*["']?([A-Za-z0-9+/_\-\.=]{10,})["']?"#
     ).unwrap();
     for cap in re_key_label.captures_iter(text) {
         let Some(val) = cap.get(2) else { continue };
+        if is_comment_at_offset(text, val.start()) { continue; }
         let v = val.as_str();
+        if is_placeholder_token(v) { continue; }
         let has_digit = v.chars().any(|c| c.is_ascii_digit());
         let has_alpha = v.chars().any(|c| c.is_ascii_alphabetic());
         if !(has_digit && has_alpha) { continue; }

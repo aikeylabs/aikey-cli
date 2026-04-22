@@ -35,6 +35,8 @@ pub mod crf;
 // v4.1 spike migration (Stage 1): line_class 基础设施 —— LineKind 6 类 + LineFlags 9 bit
 // 现阶段未被 rule/candidate 主干消费；Stage 2-3 并入。
 pub mod line_class;
+// v4.1 Stage 2a 守门工具集: ISSUE-4 IS_COMMENT / ISSUE-3 CJK / Placeholder denylist
+pub mod v41_guards;
 // Stage 0 placeholder for v4.1 spike migration (L2 grouper + L3 cluster)
 // Actual code lands in Stage 3/4. See tests/fixtures/v41_spike_baseline.json.
 pub mod grouping;

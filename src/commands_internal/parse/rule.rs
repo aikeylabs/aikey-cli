@@ -11,12 +11,15 @@
 use regex::Regex;
 
 use super::candidate::{make_id, Candidate, Kind, Tier};
+use super::v41_guards::{is_comment_at_offset, is_placeholder_token};
 
 /// 从原文抽取所有候选（已 dedup + 合并四层）
 pub fn rule_extract(text: &str) -> Vec<Candidate> {
     let re_email = Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap();
     // URL 停在 " ' , } ] ): 覆盖 JSON 嵌入 / Markdown 链接 [text](url) 场景
-    let re_url = Regex::new(r#"https?://[^\s"',}\])]+"#).unwrap();
+    //   v4.1 ISSUE-3: 补全角右括号 `）】」〕` —— 避免桃子中文行
+    //   `http://taozi-nas.local:3000/v1）` 把 `）` 吞入 URL 造成畸形 base_url
+    let re_url = Regex::new(r#"https?://[^\s"',}\])）】」〕]+"#).unwrap();
 
     // 已知 provider 前缀（按特异性降序匹配，dedup 保证不重复）
     let re_sk_ant = Regex::new(r"sk-ant-[A-Za-z0-9\-_]{10,}").unwrap();
@@ -40,22 +43,25 @@ pub fn rule_extract(text: &str) -> Vec<Candidate> {
     // Why dedup by (kind, value): 同 value 可能被多条 regex 同时命中（sk-ant-xxx 也匹配 sk-），避免重复
 
     // === Layer 1a: 基础 email / URL ===
-    push_matches(text, &re_email, Kind::Email, &mut cands, &mut seen);
-    push_matches(text, &re_url, Kind::Url, &mut cands, &mut seen);
+    //   v4.1 ISSUE-4: IS_COMMENT 行的 email / URL 一律不抽（注释掉的邮箱 / curl 示例）
+    push_matches_guarded(text, &re_email, Kind::Email, &mut cands, &mut seen);
+    push_matches_guarded(text, &re_url, Kind::Url, &mut cands, &mut seen);
 
     // === Layer 1b: 已知 provider 前缀 → secret ===
     // 优先级：更具体的前缀先
-    push_matches(text, &re_sk_ant, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches(text, &re_sk, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches(text, &re_xai, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches(text, &re_rk, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches(text, &re_ghp, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches(text, &re_hex_long, Kind::SecretLike, &mut cands, &mut seen);
+    //   v4.1 ISSUE-4: 注释行废弃 key（// sk-ant-api03-OldKey_rotated）不抽
+    //   v4.1 placeholder denylist: `sk-example-xxx` / `sk-ant-api03-your_key` 等占位不抽
+    push_matches_guarded(text, &re_sk_ant, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, &re_sk, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, &re_xai, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, &re_rk, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, &re_ghp, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, &re_hex_long, Kind::SecretLike, &mut cands, &mut seen);
 
     // === Layer 1c: 高特异性 shape（AWS / SendGrid / JWT）===
-    push_matches(text, &re_aws, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches(text, &re_sendgrid, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches(text, &re_jwt, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, &re_aws, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, &re_sendgrid, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, &re_jwt, Kind::SecretLike, &mut cands, &mut seen);
 
     // === Legacy `----` 分隔的 password 启发式 ===
     // Why 保留：in-dist 样本（claude2/claude3 风格）大量使用这种格式
@@ -81,6 +87,7 @@ pub fn rule_extract(text: &str) -> Vec<Candidate> {
 }
 
 /// 把一条 regex 的所有 match 作为 Candidate push 进去，按 (kind, value) dedup
+#[allow(dead_code)] // 保留原 API；Stage 2a 之后统一走 push_matches_guarded
 fn push_matches(
     text: &str,
     re: &Regex,
@@ -89,6 +96,23 @@ fn push_matches(
     seen: &mut std::collections::HashSet<String>,
 ) {
     for m in re.find_iter(text) {
+        try_push(cands, seen, kind, m.as_str(), Some([m.start(), m.end()]));
+    }
+}
+
+/// v4.1 Stage 2a: push_matches 的守门版 ——
+///   IS_COMMENT 行的 match 跳过（ISSUE-4）
+///   + placeholder token 跳过（sk-example / your_key 等诱饵）
+fn push_matches_guarded(
+    text: &str,
+    re: &Regex,
+    kind: Kind,
+    cands: &mut Vec<Candidate>,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    for m in re.find_iter(text) {
+        if is_comment_at_offset(text, m.start()) { continue; }
+        if is_placeholder_token(m.as_str()) { continue; }
         try_push(cands, seen, kind, m.as_str(), Some([m.start(), m.end()]));
     }
 }
@@ -135,6 +159,10 @@ fn dash_separated_password_heuristic(
 ) {
     for line in text.lines() {
         if !line.contains("----") { continue; }
+        // v4.1 ISSUE-4: 注释行的 dash_split password 启发式跳过
+        if super::line_class::line_class(line).flags.contains(super::line_class::LineFlags::IS_COMMENT) {
+            continue;
+        }
         let parts: Vec<&str> = line.split("----").map(str::trim).collect();
 
         // email----password[----secret[----url]]
@@ -157,6 +185,10 @@ fn pipe_separated_password_heuristic(
 ) {
     for line in text.lines() {
         if !line.contains(" | ") { continue; }
+        // v4.1 ISSUE-4: 注释行跳过
+        if super::line_class::line_class(line).flags.contains(super::line_class::LineFlags::IS_COMMENT) {
+            continue;
+        }
         let parts: Vec<&str> = line.split(" | ").map(str::trim).collect();
         if parts.len() < 3 { continue; }
         for (i, p) in parts.iter().enumerate() {
@@ -188,6 +220,10 @@ fn explicit_label_password_heuristic(
     ];
 
     for line in text.lines() {
+        // v4.1 ISSUE-4: 注释行跳过 label password 启发式
+        if super::line_class::line_class(line).flags.contains(super::line_class::LineFlags::IS_COMMENT) {
+            continue;
+        }
         let lower = line.to_lowercase();
         for label in labels_with_punct {
             if let Some(idx) = lower.find(label) {
@@ -225,10 +261,19 @@ fn first_token_stripped(s: &str) -> Option<String> {
 
 /// 判断一个字符串是否形态上像 password（非已知 secret、长度合理、含字母）
 fn is_plausible_password(s: &str) -> bool {
+    use super::v41_guards::{is_placeholder_token, token_has_cjk_or_fullwidth};
     let len = s.chars().count();
     if len < 3 || len > 64 { return false; }
     if looks_like_known_secret(s) { return false; }
     if s.contains('@') { return false; } // 不是 email
     if s.starts_with("http") { return false; } // 不是 URL
+    // v4.1 ISSUE-3: CJK / 全角标点 不是真 password（中文描述文字被误抓的 FP 源头）
+    if token_has_cjk_or_fullwidth(s) { return false; }
+    // v4.1 placeholder denylist: changeme / your_api_key / sk-example 等占位不算 password
+    if is_placeholder_token(s) { return false; }
+    // v4.1 ISSUE-3 补丁: `email/password` 类描述性 slash token 不是 password
+    if s.contains('/') { return false; }
+    // v4.1 M4 post-fix: trailing `_-` 几乎必是 `...truncated_...` ellipsis 截断
+    if s.ends_with('_') || s.ends_with('-') { return false; }
     true
 }
