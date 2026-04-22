@@ -239,8 +239,22 @@ pub fn extract(text: &str) -> Vec<Candidate> {
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // v4.1 Stage 2d: 预计算行首 offset，用于 is_in_reject_context / is_comment_at_offset
+    let mut line_start_offsets: Vec<usize> = Vec::new();
+    let mut cur = 0usize;
     for line in text.lines() {
+        line_start_offsets.push(cur);
+        cur += line.len() + 1;
+    }
+
+    for (line_idx, line) in text.lines().enumerate() {
         if line_label(line) != "candidate_line" { continue; }
+        // v4.1 Stage 2a: IS_COMMENT 行跳过 CRF 推理（ISSUE-4 对 CRF 路径补漏）
+        let lc = super::line_class::line_class(line);
+        if lc.flags.contains(super::line_class::LineFlags::IS_COMMENT) { continue; }
+        // v4.1 Stage 2d: context_reject 上下文行跳过（git commit / docker digest / SHA）
+        let off = line_start_offsets.get(line_idx).copied().unwrap_or(0);
+        if super::v41_guards::is_in_reject_context(text, off) { continue; }
         let tokens = tokenize_line(line);
         if tokens.is_empty() { continue; }
 

@@ -11,7 +11,7 @@
 use regex::Regex;
 
 use super::candidate::{make_id, Candidate, Kind, Tier};
-use super::v41_guards::{is_comment_at_offset, is_placeholder_token};
+use super::v41_guards::{is_comment_at_offset, is_in_reject_context, is_placeholder_token};
 
 /// 从原文抽取所有候选（已 dedup + 合并四层）
 pub fn rule_extract(text: &str) -> Vec<Candidate> {
@@ -100,9 +100,14 @@ fn push_matches(
     }
 }
 
-/// v4.1 Stage 2a: push_matches 的守门版 ——
-///   IS_COMMENT 行的 match 跳过（ISSUE-4）
-///   + placeholder token 跳过（sk-example / your_key 等诱饵）
+/// v4.1 Stage 2a + 2d: push_matches 的守门版 ——
+///   - IS_COMMENT 行的 match 跳过（ISSUE-4）
+///   - placeholder token 跳过（sk-example / your_key 等诱饵）
+///   - context_reject_labels v2 上下文跳过（git commit / docker digest / SHA hash，Stage 2d）
+///
+/// Why 对所有 provider regex 都守门:
+/// CLI 用硬编码 provider regex，commit/docker SHA 可能被 re_hex_long / re_sk 等误认。
+/// 统一守门简化 bookkeeping，和 v4.1 spike YAML `context_reject_labels` 效果等价。
 fn push_matches_guarded(
     text: &str,
     re: &Regex,
@@ -112,6 +117,7 @@ fn push_matches_guarded(
 ) {
     for m in re.find_iter(text) {
         if is_comment_at_offset(text, m.start()) { continue; }
+        if is_in_reject_context(text, m.start()) { continue; }
         if is_placeholder_token(m.as_str()) { continue; }
         try_push(cands, seen, kind, m.as_str(), Some([m.start(), m.end()]));
     }

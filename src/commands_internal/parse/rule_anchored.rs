@@ -22,7 +22,7 @@ use super::candidate::Kind;
 use super::line_class::{line_class, LineFlags};
 use super::rule::{looks_like_known_secret, try_push};
 use super::tokenize::tokenize_line;
-use super::v41_guards::is_placeholder_token;
+use super::v41_guards::{is_in_reject_context, is_placeholder_token};
 
 pub fn extract(
     text: &str,
@@ -63,11 +63,25 @@ pub fn extract(
     let mut idxs: Vec<usize> = anchor_lines.into_iter().collect();
     idxs.sort();
 
+    // 预算行首 byte offset，用于 is_in_reject_context 检查
+    let mut line_start_offsets: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut cur = 0usize;
+    for line in &lines {
+        line_start_offsets.push(cur);
+        cur += line.len() + 1; // +1 for \n
+    }
+
     // === Step 2: 在锚点行 tokenize，挑 password-shape 或 anchored_secret-shape ===
     for i in idxs {
         // v4.1 ISSUE-6: rule_extract_* 家族最后一处 IS_COMMENT 守门补漏
         //   注释行的 token 不参与 anchored password 召回
         if line_class(lines[i]).flags.contains(LineFlags::IS_COMMENT) {
+            continue;
+        }
+        // v4.1 Stage 2d: context_reject 上下文行整行跳过 ——
+        //   `commit f3a8b9c0...` / `docker pull ...@sha256:...` 等 hash-context 行
+        //   不产生 anchored_password / anchored_secret 候选
+        if is_in_reject_context(text, line_start_offsets[i]) {
             continue;
         }
         let tokens = tokenize_line(lines[i]);

@@ -34,6 +34,59 @@ pub fn is_comment_at_offset(text: &str, byte_off: usize) -> bool {
     }
 }
 
+/// v4.1 Stage 2d · context_reject_labels v2：检查 byte_off 所在行是否是
+/// git commit / docker digest / SHA hash 的上下文，是则拒识（防长 hex 被当 api_key）。
+///
+/// 三种形态任一触发:
+///   1. **行首 label + 分隔符**: `commit:` / `sha256=` / `sha-1 : ...`
+///   2. **行首 label + 空格 + alnum**: `commit abc123` (git log) / `sha 7a8b...`
+///   3. **任意位置 `@label:`**: `openai/gpt-proxy@sha256:7a8b...` (docker digest)
+///
+/// Why 不绑定 provider:
+/// CLI 的 rule.rs 用硬编码 regex（sk-/sk-ant-/ghp_/hex_long 等）而非 YAML-driven
+/// 抽取；v4.1 spike 的 context_reject 是 per-provider 的 YAML config。CLI 在这里
+/// 做全局拒识，保 `long-hex` / `short-prefix-secret` 两条路都被 cover 到。
+/// 完整 YAML-driven 的实现留给 v1.1+ 迁移。
+///
+/// 对应 V4.1: `provider_fingerprint.rs::is_context_rejected` 实现。
+pub fn is_in_reject_context(text: &str, byte_off: usize) -> bool {
+    let Some(line) = locate_line_by_offset(text, byte_off) else { return false; };
+    let trimmed_lc = line.trim().to_lowercase();
+
+    // 与 v4.1 spike YAML `generic_hex_long.context_reject_labels` 对齐
+    const REJECT_LABELS: &[&str] = &[
+        "commit", "sha", "sha-1", "sha1",
+        "sha-256", "sha256", "sha-512",
+    ];
+
+    for lbl in REJECT_LABELS {
+        // 形态 1+2: 行首 label
+        if let Some(rest) = trimmed_lc.strip_prefix(lbl) {
+            let next = rest.chars().next();
+            match next {
+                Some(':') | Some('=') => return true,
+                Some(ch) if ch.is_whitespace() => {
+                    let after = rest.trim_start();
+                    let nx = after.chars().next();
+                    // 形态 1 变体: `label : value` / `label = value`
+                    if matches!(nx, Some(':') | Some('=')) { return true; }
+                    // 形态 2: `commit abc123` —— 空格后直接 alnum（hash-like）
+                    if nx.map(|c| c.is_ascii_alphanumeric()).unwrap_or(false) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // 形态 3: 任意位置 `@<label>:`（docker digest）
+        let needle = format!("@{}:", lbl);
+        if trimmed_lc.contains(&needle) {
+            return true;
+        }
+    }
+    false
+}
+
 /// ISSUE-3 守门：token 含 CJK 字符或全角标点
 /// Why 激进：ASCII password 本身不含 CJK；用户用中文当 password 极罕见
 pub fn token_has_cjk_or_fullwidth(s: &str) -> bool {
@@ -123,6 +176,35 @@ mod tests {
         assert!(token_has_cjk_or_fullwidth("test\u{FF09}"));       // test）
         assert!(!token_has_cjk_or_fullwidth("password"));
         assert!(!token_has_cjk_or_fullwidth("Str0ng_P@ss!"));
+    }
+
+    #[test]
+    fn reject_context_git_commit() {
+        // 形态 2: `commit <hash>`
+        let text = "commit f3a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6";
+        let hash_off = text.find("f3a8").unwrap();
+        assert!(is_in_reject_context(text, hash_off));
+    }
+
+    #[test]
+    fn reject_context_docker_digest() {
+        // 形态 3: `@sha256:<hash>` 中间位置
+        let text = "docker pull openai/gpt-proxy@sha256:7a8b9c0d1e2f3a4b5c6d7e8f";
+        let hash_off = text.find("7a8b").unwrap();
+        assert!(is_in_reject_context(text, hash_off));
+    }
+
+    #[test]
+    fn reject_context_colon_label() {
+        // 形态 1: `sha256: <hash>`
+        let text = "sha256: abcd1234";
+        assert!(is_in_reject_context(text, text.find("abcd").unwrap()));
+    }
+
+    #[test]
+    fn no_reject_context_for_normal_secret_line() {
+        let text = "sk-ant-api03-RealProduction_Key_xyz";
+        assert!(!is_in_reject_context(text, 0));
     }
 
     #[test]
