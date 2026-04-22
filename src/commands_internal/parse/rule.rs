@@ -136,6 +136,10 @@ pub(super) fn try_push(
         tier: Tier::Confirmed,
         source_span: span,
         provider: None,
+        // v4.1 Method B 字段 (Stage 2b)：Active 是隐式默认；Stage 2c+ 按路径填 source
+        source: None,
+        status: None,
+        suppress_reason: None,
     });
     true
 }

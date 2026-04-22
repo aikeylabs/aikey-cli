@@ -274,6 +274,10 @@ pub fn extract(text: &str) -> Vec<Candidate> {
                 tier: Tier::Suggested, // CRF 输出默认 suggested（UI 不默认勾选）
                 source_span: None, // tokenize 路径丢失 byte offset；UI 可用 value 反查
                 provider: None,    // 由 H 层 Fingerprint 填
+                // v4.1 Method B: CRF 命中等同 Review tier + crf_arbiter source
+                source: Some(super::candidate::Source::CrfArbiter),
+                status: Some(super::candidate::Status::Review),
+                suppress_reason: None,
             });
         }
     }
