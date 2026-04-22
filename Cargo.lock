@@ -90,6 +90,7 @@ dependencies = [
  "atty",
  "base64 0.21.7",
  "bincode",
+ "bitflags 2.10.0",
  "clap",
  "colored",
  "crfs",

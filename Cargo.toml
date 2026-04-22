@@ -38,6 +38,7 @@ rpassword = "7.3"   # Secure password input without echo
 hmac = "0.12"       # HMAC for integrity verification
 sha2 = "0.10"       # SHA-256 for HMAC
 regex = "1.11"      # Text pattern matching (commands_internal/parse.rs)
+bitflags = "2"      # LineFlags 属性矩阵 (parse/line_class.rs, v4.1 spike 迁移 Stage 1)
 crfs = "0.4"        # Pure-Rust CRFsuite port (Stage 3 parse Layer 2; ablation-spike verified determinism)
 serde_yaml = "0.9"  # Provider fingerprint registry (Stage 3 parse Layer 3; embedded via include_str!)
 md-5 = "0.10"       # MD5 for Kimi session_dir lookup (matches kimi-cli's WorkDirMeta hash)
