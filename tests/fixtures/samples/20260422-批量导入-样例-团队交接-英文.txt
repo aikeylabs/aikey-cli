@@ -1,0 +1,136 @@
+# AI Platform Credentials — On-Call Handoff
+# Author: Priya Venkataraman <priya.v@acme.io>
+# Rotation: 2026-04-20  |  Next review: 2026-07-20
+# Audience: platform-oncall (weekly rotation)
+# NOTE: Auto-exported from Notion; do NOT edit in place.
+
+
+## 1. Primary LLM keys (quick reference)
+
+| Provider    | Key                                                                                                      | Base URL                               | Owner     |
+|-------------|----------------------------------------------------------------------------------------------------------|----------------------------------------|-----------|
+| OpenAI      | sk-proj-HANDOFF01aaaa1111bbbb2222cccc3333dddd4444eeee5555ff                                              | https://api.openai.com/v1              | data-team |
+| OpenRouter  | sk-or-v1-HANDOFF02xxxx1111yyyy2222zzzz3333wwww4444vvvv5555uuuu6666tt                                     | https://openrouter.ai/api/v1           | ml-team   |
+| Perplexity  | pplx-HANDOFF03kkkk1111mmmm2222nnnn3333oooo4444pppp5555qq                                                 | https://api.perplexity.ai              | research  |
+| Groq        | gsk_HANDOFF04aaaabbbbccccddddeeeeffffgggghhhhiiiijjjjkkkkllllmmmm                                        | https://api.groq.com/openai/v1         | ml-team   |
+| xAI Grok    | xai-HANDOFF05aaaabbbbccccddddeeeeffffgggghhhhiiiijjjjkkkkllllmmmmnnnnooooppppqqqq                        | https://api.x.ai/v1                    | data-team |
+| Anthropic   | sk-ant-api03-HANDOFF06aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee                                           | https://api.anthropic.com/v1           | ml-team   |
+| HuggingFace | hf_HANDOFFhfhfhfhfhfhfhfhfhfhfhfhfhfhfhfhf                                                               | https://api-inference.huggingface.co   | research  |
+
+
+## 2. Azure OpenAI — multi-deployment (same resource)
+
+```json
+{
+  "AZURE_OPENAI_RESOURCE": "acme-prod-eastus",
+  "AZURE_OPENAI_KEY": "a1b2c3d4e5f6789001234567890abcdefa1b2c3d4e5f6789001234567890abcd",
+  "deployments": {
+    "gpt-4o": {
+      "base_url": "https://acme-prod-eastus.openai.azure.com/openai/deployments/gpt4o-chat/chat/completions?api-version=2024-10-21"
+    },
+    "text-embedding-3-large": {
+      "base_url": "https://acme-prod-eastus.openai.azure.com/openai/deployments/te3-large/embeddings?api-version=2024-10-21"
+    }
+  }
+}
+```
+
+
+## 3. Gateway infrastructure (prod / stg / dev)
+
+Prod gateway (region: us-east-1)
+  base_url: https://gw-prod.acme.io/v1
+  sk-proj-GWPROD01aaaa1111bbbb2222cccc3333dddd4444eeee5555ffffgggg
+
+Staging gateway
+  sk-proj-GWSTG001aaaa1111bbbb2222cccc3333dddd4444eeee5555gggghhhh
+  base_url: https://gw-stg.acme.io/v1
+
+Dev gateway (localhost SSH tunnel; spin up via `tsh proxy app dev-gw`)
+  base_url: http://127.0.0.1:8787/v1
+  sk-proj-GWDEV001aaaa1111bbbb2222cccc3333dddd4444eeee5555hhhhiiiii
+
+
+## 4. Community routers (YAML)
+
+```yaml
+routers:
+  openrouter:
+    api_key: sk-or-v1-ROUTER01aaaabbbbccccddddeeeeffffgggghhhhiiiijjjjkkkkllllmmmmnn
+    hint: Use for model fallback; rate-limited to 1000/hr.
+  perplexity:
+    api_key: pplx-ROUTER02aaaabbbbccccddddeeeeffffgggghhhhiiiijjjjkk
+  huggingface:
+    api_key: hf_ROUTERaaaabbbbccccddddeeeeffffgg
+    hint: Inference Endpoints only; serverless calls billed separately.
+```
+
+
+## 5. Signing key (tracing service, Ed25519)
+
+Used by internal telemetry ingest; rotate quarterly.
+
+-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtz
+c2gtZWQyNTUxOQAAACAhnFaDRZLH+GJK9i8aqm5lGeScS4qBr3Dm3H8rNNw5gAAAA
+JhHANDOFFpemexamplekeynotrealbutshapedcorrectlyDOFFpemexamplekeyn
+otrealbutshapedcorrectlyAAAAC3NzaC10cHJvZ3JhbQECAwQFBg==
+-----END OPENSSH PRIVATE KEY-----
+
+
+## 6. Telemetry ingest (service JWT via curl)
+
+Pulled from on-call playbook §4.2:
+
+    curl -s https://telemetry.acme.io/v1/ingest \
+      -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdmMtdGVsZW1ldHJ5IiwiaWF0IjoxNjcxOTk5OTk5fQ.ZXhhbXBsZS1oYW5kb2ZmLWp3dC1zaWduYXR1cmUtdG9rZW4tZXhhbXBsZS1wbGFjZWhvbGRlcg" \
+      -H "Content-Type: application/json" \
+      -d '{"event":"handoff","level":"info"}'
+
+
+## 7. Forwarded from #ai-ops (Slack)
+
+> from: Marcus Chen, 2026-04-18 14:22 PST
+>
+> Claude account for customer demos — DO NOT use for production.
+> email: demo-claude@acme.io
+> password: D3m0@Cl@ude_2026!
+> key: sk-ant-api03-SLACK01aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee
+>
+> Please delete this message from the channel after import.
+
+
+## 8. Key rotation log
+
+~~OLD (revoked 2026-04-15): sk-proj-REVOKED000aaaa1111bbbb2222cccc3333dddd4444eeee5555~~
+NEW (active 2026-04-16):   sk-proj-ACTIVE00aaaa1111bbbb2222cccc3333dddd4444eeee5555xx
+
+~~OLD GitHub PAT (revoked): ghp_OLDrevokedAAAAAAAAAAAAAAAAAAAAAA~~
+NEW GitHub PAT: ghp_ACTIVE1234567890abcdefABCDEF123456
+Fine-grained PAT (CI only): github_pat_11AAAAAA1234567890abcd_ABCDEFabcdef1234567890ABCDEFabcdef1234567890ABCDEFabcdef123
+
+
+## 9. Azure Storage (telemetry blob sink)
+
+DefaultEndpointsProtocol=https;AccountName=acmetelemetry;AccountKey=YWNtZWFjbWVhY21lYWNtZWFjbWVhY21lYWNtZWFjbWVhY21lYWNtZXRl==;EndpointSuffix=core.windows.net
+
+
+## 10. Transactional + email providers
+
+AWS_ACCESS_KEY_ID=AKIAHANDOFFEXAMPLE01
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIHANDOFFexampleK7MDENGbPxRfiCYEXAMPLEK
+STRIPE_LIVE=sk_FAKE_HANDOFF01abcdefABCDEF123
+STRIPE_RESTRICTED=rk_FAKE_HANDOFF02abcdefABCDEF123456abcdefABCDEF123456abcdefABCDEF123456abcdefABCDEF123456abcdefABCDEF123456
+SENDGRID_KEY=SG.HANDOFFsendgridexample01.HANDOFFsendgridexampleSignatureValue0123456789
+
+
+## 11. Reference footer — NOT credentials
+
+Release:  v2.3.14-rc1
+Commit:   a1b2c3d4e5f67890abcdef1234567890abcdef12
+Ticket:   AIOPS-4521
+SHA-256:  3f4a7b2e8c9d1f5a6b0e4c2d9f8a1b7c3e6d0f2a5b8c1d4e7f0a3b6c9d2e5f8a
+Build ID: 2026.04.22.1537
+Compliance scan: passed (2026-04-20T09:15:00Z)
+
+-- end of handoff --

@@ -1,0 +1,145 @@
+（这是我陆续从群里 / 私聊 / 网页收的，没整理过，先倒出来让工具自己认一下）
+
+
+
+Kimi77
+https://platform.moonshot.cn/console/api-keys
+sk-moonshotFake77_xYz0123456789aBcDeFgHiJkLmNoPqRsTuV
+
+
+kimi99 （这个快过期了 6月中 🔥）
+sk-moonshotFake99_MnOpQrStUvWxYz012345aBcDeFgHiJkLm
+# URL 忘贴了，应该还是 moonshot.cn
+
+
+sk-deepseek_FakeMessKey_xY9wZ7vX5tU3sR1qP9oN7mL5kJ3iH1gF9eD
+// deepseek 的，URL 自己找吧
+
+
+
+https://api.gpts.cc/console/keys
+sk-gptscc-fakeMess_aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV_xYz
+# ↑ 这个是 URL 先 name 后，粘反了，懒得改
+
+
+OpenRouter   sk-or-v1-FakeMerged_a83bcd9f7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c2b1a09f8e7d6c5b4a3f2
+   ↑ 和小王一起买的，用量互算
+
+
+
+claude分享号1
+YukiHarrisonbng@cowriter.com----zXcVbN7mKp3----
+c5e7f1a3b5c7e9f1a3b5c7e9f1a3b5c7e9f1a3b5c7e9f1a3b5c7e9f1a3b5c7
+（pro-06/18）
+登录网址 mail.com，老规矩别乱搞
+
+
+==========================
+
+
+硅基流动
+# 记得是注册送额度的
+https://cloud.siliconflow.cn/account/ak
+sk-siFake_Pq0Rr9Ss8Tt7Uu6Vv5Ww4Xx3Yy2Zz1Aa0Bb9Cc8Dd7
+余额：19.88  （2026-03-22 看的，已用一半）
+
+
+哎对了还有个 gemini 的：
+AIzaSyMessFake_Gemini_aBcDeFgHiJkLmNoPqRsTuVwXy
+
+
+——————————————————————
+
+
+claude官方（我自己买的，不是分享号）
+api token:  sk-ant-api03-FakeMessVariant_aBcDeFgHiJkLmNoPqRsTuVwXyZ012345_xYz-mess-ed-but-long-enough-now
+
+// sk-ant-api03-OldFakeKey_deprecated_20260401_rotatedAway_mrhUkCrOQxyShouldNotImport
+// ↑ 4 月轮换了，这条作废，别提取
+
+
+claude3  (pro-08/10)  ZZ
+MarcusLyonjkp@ponymail.com----kP5XzQ7bNm9----
+d8e2f0a4b6c8d0e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6e8f0a2b4c6d8
+群里老张给的，先放着
+
+
+---
+
+
+openai 两个号
+主号  sk-proj-messMain_M1LVcN2qT3fG4hS5kY6wX7pZ8aB9cD0eF_jH3iK4lM5nO6pQ7rS8tU3wT3BlbFAKE-mess
+备号  sk-proj-messBackup_R9sT0uV1wX2yZ3aB4cD5eF6gH7iJ8kL9mN_xY2zA3bC4dE5fG6hI7wT3BlbFAKE-mess
+base 都是 https://api.openai.com/v1
+
+
+新加的硅基备号 （和上面不是同一个账号）
+sk-siFake2_Zz1Yy2Xx3Ww4Vv5Uu6Tt7Ss8Rr9Qq0Pp1Oo2Nn3Mm4Ll5Kk6Jj7Ii
+
+
+---
+
+
+email: tester_01@tempmail.io
+密码：Hello_World_123!
+（key 没给，就一个账号，等对方补发）
+
+
+
+忘了哪来的：
+sk-cL9vK8jH7gF6dS5aQ4wE3rT2yU1iO0pL9mN8bV7cX6zA5_MessOrphanKey
+估计是某个倒卖群的，对不上号
+
+
+
+claude分享号2   PP  (pro-09/30)
+
+BeatriceHolloway@mailnull.com----vN4JmK9PqR----
+b0f7c2e5a8d3f6c1b4e7a0d3f6c9b2e5a8d1f4c7b0e3a6d9f2c5b8e1a4d7c0
+
+
+
+kimi77
+https://platform.moonshot.cn/console/api-keys
+sk-moonshotFake77_xYz0123456789aBcDeFgHiJkLmNoPqRsTuV
+# 和最上面那个 Kimi77 是同一个 key，粘了两遍，应该 dedup
+
+
+
+gpt-4o 专用
+sk-proj-messGpt4o_Gpt4oSpecificKey_aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV_wT3BlbFAKE-gpt4o-mess
+（只给 gpt-4o 用，别跑 o1）
+
+
+
+==== 下面是从 yaml 粘过来的一段，当时随手存的 ====
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: openai-api-key
+  namespace: ai-service
+stringData:
+  OPENAI_API_KEY: "sk-proj-messK8s_K8sSecretFake_aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV_messK8s"
+  ANTHROPIC_API_KEY: "sk-ant-api03-messK8s_K8sAnthropic_aBcDeFgHiJkLmNoPqRs_messK8sEnd"
+
+
+
+==== git log 残片（上周调 bug 时复制进来的，忽略）====
+
+commit f3a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6
+Author: myself <me@xxx.com>
+Date:   Fri Apr 11 14:32:18 2026 +0800
+
+    fix: rotate old api keys
+
+docker pull openai/gpt-proxy@sha256:7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b
+
+
+
+claude EL   （再补一个，群友刚发的）
+ElenaVoughnkp@adsmail.net----mR7zQ2bXwT----
+f1a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1
+
+
+

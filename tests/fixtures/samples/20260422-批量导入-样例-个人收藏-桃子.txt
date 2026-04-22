@@ -1,0 +1,321 @@
+===============================================================
+ 桃子的 AI 工具收藏本（准备导入 AIKey 批量导入）
+ 最后整理：2026-04-18  周六  家里
+ 来源：微信 / 邮件 / Notion / Excel / 1Password / 公众号 / 便签
+ 备注：乱得要死，先倒出来让工具认一下，不认的再手工补
+===============================================================
+
+
+# ===========  1. 主力号（自己花钱买的）  ===========
+
+🔑 OpenAI 正账号
+# 2025-12-28 绑了招行 visa，一直续
+API Key:  sk-proj-Taozi_MainAcct_N0v8kM2pQ7rW1xZ4yA6bC9dF3gH5jL8mS_vXy_jake
+Endpoint: https://api.openai.com/v1
+余额：$38.42（2026-04-15 看的）
+用途：日常 coding / 写周报
+
+
+🔑 Anthropic Claude（也是自己的，4 月新买）
+sk-ant-api03-Taozi_Claude_xLpQm3nRv4wXy7_kB9_dE2fG5hJ8zA_1bC4_vMn_wDeR_AbCdEf012
+base_url: https://api.anthropic.com
+买于 2026-04-05，Pro 订阅
+* 注：CLI 登录过一次，Web 也 OK
+
+
+# ===========  2. 微信朋友给的 key（截图 + 文字都有）  ===========
+
+------ 对话：AI 互助群 · @大树 2026-04-10 ------
+大树  22:47
+    "这个 Kimi key 给你用，我多开了一个号"
+    moonshot: sk-taozi_from_dashu_mnopqrstuvwx0123456789ABCDEFghij
+    "有效期到年底"
+    "密码懒得给了，你 API 直接用吧"
+大树  22:48
+    "哦对，base 是 https://api.moonshot.cn/v1"
+    "别对外转哦 😂"
+我  22:50
+    "收到谢啦🙏"
+-------------------------------------------------
+
+
+------ 对话：独立开发者群 · @小桔 2026-03-22 ------
+小桔 转发了一条消息：
+    「DeepSeek 活动 key 分享」
+    新注册送 $5 额度
+    账号: taozi.dev+ds@gmail.com
+    密码: Sunny_2026!Spring
+    key: sk-ds_taozi_aB12cD34eF56gH78iJ90kL12mN34oP56qR78sT90uV
+    官网: https://platform.deepseek.com/
+    api:  https://api.deepseek.com/v1
+好的，收下了
+-----------------------------------------------
+
+
+# ===========  3. 转发邮件（Gmail 复制过来的）  ===========
+
+From: no-reply@zhipu.ai
+To: taozi.dev+zhipu@gmail.com
+Subject: [智谱AI] 您的 API Key 已创建
+Date: Wed, 20 Mar 2026 10:32:18 +0800
+
+> 尊敬的用户您好，您已成功创建 API Key：
+>
+>     Key:      1a2b3c4d5e6f7g8h9i0j.AbCdEfGhIjKlMnOp
+>     名称:     taozi-dev
+>     创建时间: 2026-03-20 10:32
+>
+> >> 请妥善保管，本 Key 仅显示一次。
+> >> 调用示例见：https://open.bigmodel.cn/dev/api
+>
+> 如非本人操作请立即忽略本邮件。
+
+-- 
+ZhipuAI 团队
+
+
+
+# ===========  4. 从 Notion 页面粘过来（带 emoji 和缩进）  ===========
+
+🧠 AI 工具汇总
+  ├─ 🤖 阿里通义千问
+  │   • API Key: sk-qwen_taozi_xY2mN4pQ6rS8tU0vW2xY4zA6bC8dE0fG2hI4jK6lM
+  │   • Base:    https://dashscope.aliyuncs.com/compatible-mode/v1
+  │   • 赠送额度 100万 token，有效期 6 个月
+  │
+  ├─ 🌊 硅基流动（SiliconFlow）
+  │   • key:  sk-siliconflow_taozi_pQrStUvWxYz0123456789abcdef0123456789
+  │   • url:  https://api.siliconflow.cn/v1
+  │   • 注册送 ￥14 免费额度
+  │
+  └─ 🎨 字节豆包（Doubao，还在测试）
+      • Access Key: LTAI5t_doubao_taozi_mnopqrst
+      • Secret:     zXyWvUtSrQpOnMlKjIhGfEdCbA9876543210
+      • endpoint:   https://ark.cn-beijing.volces.com/api/v3
+      • 注: 这是 AK/SK 不是 bearer，手动添加吧
+
+
+
+# ===========  5. Excel 粘贴（Tab 分隔，表头保留）  ===========
+
+Provider	Email	Password	APIKey	Note
+openai-sub	taozi.sub1@outlook.com	Tz_sub1#4321	sk-proj-SubAcct_1_xLmKnJoPqRsTuVwXyZ_abc_def_ghi_123_jake	备用号
+openai-sub2	taozi.sub2@outlook.com	Tz_sub2#8765	sk-proj-SubAcct_2_pQrStUvWxYzAbCdEfGhIjKlMnOpQrStUvWxYz_jake	备用号2
+claude-sub	taozi.sub3@outlook.com	Tz_sub3!9999	sk-ant-api03-SubAcct_3_mNoPqRsTuVwXyZaBcDeFgHiJ_kL_MnOp_12345_ok	备用 Claude
+gemini-sub	taozi.sub4@outlook.com	Tz_sub4*1111	AIzaSyTaozi_Gemini_Sub4_xYz_AbCdEf_GhIjKlMnOpQr		备用 Gemini（Google 的）
+
+
+
+# ===========  6. 自建网关（我家 NAS 跑的 oneapi，4 个 key 共用 base）  ===========
+
+> gw-taozi-home 网关部署在群晖 NAS 上，可访问外网
+> base_url = http://taozi-nas.local:3000/v1
+> 下面 4 个 key 都走这个 base
+
+* key-home-01:   sk-gw-taozi-home-01-abcdefghij0123456789
+* key-home-02:   sk-gw-taozi-home-02-KLMNOPQRST9876543210
+* key-home-03:   sk-gw-taozi-home-03-xyz0987654321abcdef
+* key-home-04:   sk-gw-taozi-home-04-QWERTYUIOP1234567890
+
+
+
+# ===========  7. 1Password 导出片段（CSV，已脱敏部分字段）  ===========
+
+name,website,username,password,notes
+"GitHub","https://github.com","taozi-dev","Gh_Taozi_Pwd_2026!","PAT: ghp_TaoziGitHubPAT1234567890AbCdEfGhIjKlMn"
+"Supabase","https://app.supabase.com","taozi.dev@gmail.com","Sb_Taozi_2026#","project: taozi-notes-db"
+"HuggingFace","https://huggingface.co","taozi","Hf_Taozi_PwdX9","access token: hf_TaoziAccessToken_xYz012345678ABCDEFghij"
+
+
+
+# ===========  8. 公众号文章抄录（"白嫖 AI" 那篇）  ===========
+
+文章原文开头：
+"今天教大家白嫖 xx 的 key，只需要注册就送..."
+
+抄录：
+- 体验账号     demo@example.com      密码  demo1234     (这个应该是文章举例，别导入)
+- 注册送 1 个月: https://www.xxai.cn/register
+- 作者自己的 key 示例：sk-example-PLEASE-REPLACE-WITH-YOUR-OWN
+- ❌ 上面那条是示例占位符，不是真 key
+
+评论区有人晒：
+@张同学：我的 groq 不错，gsk_TaoziGrpqKeyFromZhangSan0123456789abcdefGHIJKL
+            base: https://api.groq.com/openai/v1
+            免费 30 req/min 够玩了
+
+
+
+# ===========  9. rotation 记录（旧的用 ~~划掉~~）  ===========
+
+# DeepSeek 4 月 1 日轮换过一次
+~~旧 key: sk-ds_OLD_taozi_DeprecatedKey_should_not_import_1234567890abcdefGHIJ~~
+新 key:   sk-ds_NEW_taozi_RotatedOn20260401_xYz0987654321abcdefGHIJklmnop
+base_url: https://api.deepseek.com/v1      ← 和第 2 段同一 base（应进同一 EndpointGroup）
+
+说明：旧的是被盗过，已作废；新的才是当前有效。
+
+
+
+# ===========  10. 草稿（写一半的，先放着）  ===========
+
+* Perplexity 
+  想申请但还没注册... (TODO)
+
+* Azure OpenAI endpoint，等公司同事发我
+  base: https://?.openai.azure.com/
+  key: ???
+
+* 某个 fine-tune 专用
+  email:  taozi.ft@somecompany.com
+  密码:    还没想好
+  key:    ........
+
+
+
+# ===========  11. 日常废话（应该识别为 Orphan / 不是 key）  ===========
+
+上周六去山姆会员店：
+- 订单号 202604130087654321
+- 付款 ￥487.50
+- 取件码 8472
+- 客服电话 400-830-5888
+
+3 月手机号验证码短信记录：
+【微信】验证码 482165，请勿泄露
+【支付宝】您尾号 8812 的账户登录验证 937428
+
+身份证复印件已托管到保险柜（身份证号类似 11010519900101****）
+驾驶证号： S12345678  （应该 11/28 到期）
+
+Docker 镜像：
+  sha256:9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a
+  版本 v4.2.0-beta.3
+  发布时间 2026-04-17T14:30:00+08:00
+
+git log 片段：
+  commit 7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b
+  Author: taozi <taozi@gmail.com>
+  Date:   Fri Apr 17 2026
+
+
+
+# ===========  12. 重复粘贴（手滑贴了两次，应该 dedup）  ===========
+
+sk-ant-api03-Taozi_Claude_xLpQm3nRv4wXy7_kB9_dE2fG5hJ8zA_1bC4_vMn_wDeR_AbCdEf012
+↑ 这条和第 1 节 Claude 是同一个 key，分组时不应该分成两张卡
+
+
+
+===============================================================
+ 预期（人工答案 · 用来对齐 import 工具输出）
+===============================================================
+
+【DraftRecord 期望数量：约 16 条】
+
+ 1. openai 主力 sk-proj-Taozi_MainAcct_...（+base_url）
+ 2. anthropic sk-ant-api03-Taozi_Claude_...（+base_url）  ← 第 1 节与第 12 节合并同一条
+ 3. moonshot sk-taozi_from_dashu_... （+base_url，+来自 note 的 email/password 无）
+ 4. deepseek sk-ds_taozi_aB12... （+email + password + base_url）
+ 5. zhipu    1a2b3c4d...AbCdEfGhIjKlMnOp（+email from header）
+ 6. qwen     sk-qwen_taozi_... （+base_url）
+ 7. siliconflow sk-siliconflow_taozi_... （+base_url）
+ 8. doubao  LTAI5t_doubao_... + secret zXyWvU...（AK/SK 组合，可合并也可留 2 条）
+ 9. openai-sub1  email + password + sk-proj-SubAcct_1_...
+10. openai-sub2  email + password + sk-proj-SubAcct_2_...
+11. claude-sub   email + password + sk-ant-api03-SubAcct_3_...
+12. gemini-sub   email + password + AIzaSyTaozi_Gemini_Sub4_...
+13. gw-home #1   sk-gw-taozi-home-01-... （+ shared base http://taozi-nas.local:3000/v1）
+14. gw-home #2   sk-gw-taozi-home-02-...
+15. gw-home #3   sk-gw-taozi-home-03-...
+16. gw-home #4   sk-gw-taozi-home-04-...
+17. github PAT   ghp_TaoziGitHubPAT... （+ account username）
+18. supabase 账号（无 key，只有邮箱 + 密码）
+19. huggingface  hf_TaoziAccessToken_... （+ account）
+20. groq    gsk_TaoziGrpqKey_... （+ base）
+21. deepseek 新 key（rotation）sk-ds_NEW_taozi_... （+base_url 应并入 #4 同组）
+
+（实际应在 16~21 之间浮动，B2 multiplicity 和 rotation 处理会影响具体数字）
+
+【EndpointGroup 期望数量：约 6 组】
+
+ A. https://api.openai.com/v1       → #1
+ B. https://api.anthropic.com       → #2, #11
+ C. https://api.deepseek.com/v1     → #4, #21（rotation 新旧合并到 Default 或同组）
+ D. http://taozi-nas.local:3000/v1  → #13, #14, #15, #16（本地网关 4 把 key 共享）
+ E. https://api.groq.com/openai/v1  → #20
+ F. Default（无 URL 或其它单条）    → 其余
+
+【期望 orphans / 孤立项：约 5-8 项】
+- 第 8 段"体验账号 demo@example.com / demo1234"（低置信度）
+- 第 8 段 "sk-example-PLEASE-REPLACE-WITH-YOUR-OWN"（占位符，应 shape-filter 拒）
+- 第 10 段 "key: ???" / "密码: 还没想好" / "key: ........"（不完整草稿）
+- rotation 被划掉的旧 key ~~sk-ds_OLD_...~~（若支持 strike-through → REVOKED；不支持则 orphan）
+- 第 11 段所有废话行（时间戳 / 订单号 / sha256 / commit hash / 身份证 / 手机号 / 版本号）
+
+【期望对抗 FP 目标：0 ~ 2】
+真实容易误命中的：
+- 订单号 202604130087654321              （18 位数字，接近 sk- 长度但无前缀）
+- sha256:9f8a...9f8a                     （64 位 hex，触发 generic_hex_long）
+- commit 7a8b9c0d...5a6b                 （40 位 hex，commit hash）
+- 身份证  11010519900101****              （被 `*` 脱敏，应被拒）
+- 支付宝验证码 937428                     （6 位数字，不应提）
+- 手机号 400-830-5888                     （kebab 10 位，应被 is_label_shape 拒）
+- 版本号 v4.2.0-beta.3                    （点 + 横，应拒）
+- 时间戳 2026-04-17T14:30:00+08:00         （应拒，非 secret）
+- 示例占位 sk-example-PLEASE-REPLACE-WITH-YOUR-OWN（prefix 是 sk- 但整体是占位，shape-filter 应拒）
+
+
+===============================================================
+ 本样本对 v3.1 代码特别的覆盖点（与前两份的差异）
+===============================================================
+
+与 20260422-批量导入-样例-用户笔记.txt 的差异：
+  + 首次覆盖 【微信聊天多轮粘贴】（昵称 + 时间戳 + 缩进引号）
+  + 首次覆盖 【Gmail 转发邮件头 + `>` + `>>` 多层引用】
+  + 首次覆盖 【Notion 树形结构粘贴】（`├─` `└─` `•` unicode 字符 + 两空格缩进）
+  + 首次覆盖 【Excel 真正的 Tab 分隔表格】（不是 Markdown pipe，需 tokenize 识别 `\t`）
+  + 首次覆盖 【1Password CSV 导出】（带引号的 CSV header + 字段）
+  + 首次覆盖 【公众号占位符文章】（"sk-example-PLEASE-REPLACE" 此类诱饵）
+  + 首次覆盖 【AK/SK 双 secret 组合】（豆包的 LTAI5t... + Secret）
+  + 首次覆盖 【身份证 / 手机号 / 订单号 / 验证码 / 取件码】PII-非 secret 区分
+
+与 20260422-批量导入-样例-团队交接-英文.txt 的差异：
+  + 中文为主，emoji + 全角标点高密度
+  + 场景是【个人爱好者长期积累】，不是【团队 SRE 一次性交接】
+  + provider 覆盖中国本土 ecosystem（通义 / DeepSeek / Kimi / 智谱 / 硅基 / 豆包 / 智谱）
+  + 包含未规范化 rotation（~~划掉~~旧 key + 新 key 并列）
+  + 结尾废话段更现实（山姆会员店购物、手机号短信）
+  + 草稿段（第 10 节）模拟"写一半没写完"—— 实际用户最常见的信息缺口
+
+
+===============================================================
+ 已知对 v3.1 代码暴露的已知问题（见 v3.1 code review C1/C2/M1~M6）
+===============================================================
+
+- C1 Separator 过窄：`# =========== N. XXX ===========` 装饰行应被识别为 Separator 切 block，
+   当前代码只认纯符号行 → 整个 12 节可能被合并成过大的 blocks（失败）
+
+- M1 IS_COMMENT 缺失：每段最前的 `#` 注释行、第 8 节占位符注释 `# ❌ 上面...不是真 key`
+   都会被解析成 candidate，污染 orphans 或误进 draft
+
+- M2 STARTS_BULLET 设而不用：第 6 节的 4 行 `* key-home-XX:` 每行 1 个 key，
+   当前代码因未消费 STARTS_BULLET，可能合并成 1 Draft（应该是 4 Draft 共享 base）
+
+- M2 HAS_PWD_LABEL 设而不用：第 4 节 Excel 的 Password 列、第 7 节 CSV 的 password 列，
+   有明确 `Password` header 但未被用于 password 装配正权重
+
+- M4 多 password 丢失：第 8 节评论区的 `gsk_...` + 第 4 节 Excel 每行的 password
+   若位于同一 block 将只取一个 password
+
+- N9 Strike-through 无语义：第 9 节 ~~sk-ds_OLD_...~~ 会被当正常 key 提取
+   （期望 revoked/REVOKED 标记）
+
+- N7 Markdown 表格未一等公民：第 4 节 Tab 分隔的行可能被 tokenize_line 正确切，
+   但若来源是 Markdown pipe 表格则只剥 `|` 边，不按 cell 切
+
+- 对抗：第 11 节 `sha256:9f8a...` 和 `commit 7a8b9c0d...` 必然触发 long-hex FP
+   （N10：无上下文 label 降级保护）
+
+
+-- end of 桃子的收藏本 --

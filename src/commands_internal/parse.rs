@@ -32,6 +32,9 @@ pub mod rule_pem;
 pub mod rule_anchored;
 pub mod provider_fingerprint;
 pub mod crf;
+// Stage 0 placeholder for v4.1 spike migration (L2 grouper + L3 cluster)
+// Actual code lands in Stage 3/4. See tests/fixtures/v41_spike_baseline.json.
+pub mod grouping;
 
 use serde::Deserialize;
 use serde_json::json;

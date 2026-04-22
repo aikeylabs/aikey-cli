@@ -1,0 +1,147 @@
+# AI API Keys - 阿明的工作用
+# 最后更新: 2026-04-15
+# 用于: code review / 翻译 / 偶尔给公司项目加 AI 功能
+
+
+# --- 个人常用 (.env 直接 source) ---
+
+# OpenAI 主账号
+export OPENAI_API_KEY=sk-proj-AmingMainAcct_x1y2z3a4b5c6d7e8f9g0h1i2j3k4l5_aming_personal
+export OPENAI_BASE_URL=https://api.openai.com/v1
+
+# Claude (Anthropic)
+export ANTHROPIC_API_KEY=sk-ant-api03-Aming_Personal_mNpQrStUvWxYz0123456789_aBcDeFgHiJ_klmn_123
+# 直连官方，没用代理
+
+
+# --- 备用 / 国内 provider ---
+
+kimi-api:
+  key: sk-aming_moonshot_Pq2Rs4Tu6Vw8Xy0Za2Bc4De6Fg8Hi0Jk2Lm
+  base: https://api.moonshot.cn/v1
+
+deepseek-api:
+  key: sk-aming_deepseek_Xy9Wv8Tr7Uq6Ol5Nk4Mj3Ih2Gf1Ed0Cb_aming
+  base: https://api.deepseek.com/v1
+
+# Gemini (Google) - 有时候用它翻译
+AIzaSyAming_Gemini_Working_Key_abc123DEFghi456JKL
+
+
+# --- 公司项目 (通过内网网关) ---
+# 说明: 公司 SRE 起了 one-api 网关在 10.1.2.3，分配给我 2 个 key
+#       一个给 prod 用，一个给 dev 用
+
+base_url: http://ai-gateway.internal.company.com:3000/v1
+  - prod:  sk-company-gw-prod-aming-4f3a2b1c0d9e8f7g6h5i4j3k2l1m0n
+  - dev:   sk-company-gw-dev-aming-9z8y7x6w5v4u3t2s1r0q9p8o7n6m5l
+
+
+# --- GitHub / OAuth ---
+
+# GitHub 个人 access token (只开了 repo 和 workflow 权限)
+github-pat: ghp_AmingGitHubPAT_abcDEF1234567890xyzABCDEFghij
+
+# Claude Code CLI (OAuth 登录过一次，token 存在 ~/.config 里)
+# 就不复制出来了
+
+
+# --- 上次轮换 (2 月底) ---
+
+# OpenAI 之前泄漏过一次，2026-02-28 轮换
+# 旧的: sk-proj-AmingOLD_shouldNotImportAgain_deprecated_xxxxxxxxxx
+# 新的就是上面个人常用那条
+
+
+# --- TODO ---
+
+# 申请 Perplexity API key  (还没注册)
+# 公司可能要引入 Mistral，看情况
+# Azure OpenAI endpoint 同事会发我，暂时空着
+
+
+# --- 调试脚本片段 (无效占位符，别导入) ---
+
+# curl 测试:
+#   curl https://api.openai.com/v1/chat/completions \
+#     -H "Authorization: Bearer $OPENAI_API_KEY" \
+#     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+
+# docker-compose.yml 片段:
+#   environment:
+#     - OPENAI_API_KEY=${OPENAI_API_KEY}
+#     - REDIS_PASSWORD=changeme
+
+
+
+# ======================================================
+# 预期答案 (给 AIKey 导入工具对齐用)
+# ======================================================
+
+# DraftRecord 期望: 8 条
+#   1. openai 个人主       sk-proj-AmingMainAcct_...       + base https://api.openai.com/v1
+#   2. anthropic 个人       sk-ant-api03-Aming_Personal_... + base https://api.anthropic.com (默认)
+#   3. kimi                 sk-aming_moonshot_...           + base https://api.moonshot.cn/v1
+#   4. deepseek             sk-aming_deepseek_...           + base https://api.deepseek.com/v1
+#   5. gemini               AIzaSyAming_Gemini_...          + (无 base)
+#   6. 公司网关 prod         sk-company-gw-prod-aming-...    + base http://ai-gateway.internal...
+#   7. 公司网关 dev          sk-company-gw-dev-aming-...     + base http://ai-gateway.internal...
+#   8. github PAT           ghp_AmingGitHubPAT_...          + (无 base)
+
+# EndpointGroup 期望: 5 组
+#   A. https://api.openai.com/v1                           -> #1
+#   B. https://api.anthropic.com (默认)                    -> #2
+#   C. https://api.moonshot.cn/v1                          -> #3
+#   D. https://api.deepseek.com/v1                         -> #4
+#   E. http://ai-gateway.internal.company.com:3000/v1      -> #6, #7  (共享 base)
+#   F. Default (无 URL)                                    -> #5, #8
+
+# orphans 期望: 1-2 条
+#   - 旧 OpenAI key sk-proj-AmingOLD_... (被标注为 rotation 旧版，应 orphan 或 REVOKED)
+#   - curl 示例里的 "$OPENAI_API_KEY" (shell 变量，应 shape-filter 拒)
+#   - "changeme" (docker-compose 占位符密码，应 shape-filter 拒)
+
+# 对抗 FP 目标: 0
+
+
+
+# ======================================================
+# 覆盖点 (相对前 3 份样本的差异)
+# ======================================================
+
+# 与 桃子.txt (322 行) 的差异:
+#   - 规模小很多 (90 行 vs 322 行)
+#   - 格式干净: shell export / YAML-ish / 分段注释，没有聊天记录和 emoji
+#   - 场景是【工作日常】，不是【爱好者长期堆积】
+#   - 几乎不用全角标点，英文为主少量中文
+
+# 与 团队交接-英文.txt (137 行) 的差异:
+#   - 个人视角而非团队 SRE 视角
+#   - 没有 Markdown 表格 / JSON-YAML 大块 / PEM / Slack 引用
+#   - provider 更常见 (7 家主流)，不测 Azure/Stripe/JWT 等长尾
+
+# 与 用户笔记.txt (124 行) 的差异:
+#   - 结构更明显 (每段都有清晰的 # --- xxx --- 分隔)
+#   - 注释风格统一 (#)，不混用 // ; 等多种
+#   - 有明确的预期答案表，便于自动化 assertion
+
+
+# ======================================================
+# 对 v3.1 代码特别 stress 的点 (简化版)
+# ======================================================
+
+# 1. shell `export KEY=VALUE` 格式能否识别为 key+ 标签
+#    (前 3 份都没重点覆盖这个主流开发者格式)
+
+# 2. YAML-ish `key:` / `base:` 层级关系的缩进解析
+#    (第 2 段 kimi-api 和 deepseek-api 的缩进)
+
+# 3. 注释行 # 开头是否被正确 skip
+#    - M1 IS_COMMENT 缺失 -> 旧 key sk-proj-AmingOLD_... 可能被误当有效导入
+#    - curl 示例里的 $OPENAI_API_KEY 可能被解析
+
+# 4. base_url 在块首 + 2 个 key 走 shared base (L3 共享场景，简化版)
+#    比桃子的 4 个共享简单，但 core pattern 一致
+
+# 5. docker-compose 里的 REDIS_PASSWORD=changeme 是否被当 password
+#    (实际是占位符，应拒)

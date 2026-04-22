@@ -1,0 +1,123 @@
+============================================================
+  AI 账号 & KEY 备份    更新于 2026-04-20
+  (别外传！导完记得从钉钉撤回)
+============================================================
+
+
+## Claude
+
+claude-main: SF (Pro 年付 04/2026)
+ml.ops@acme.cn
+----Cl@ude_Prod_2024!----sk-ant-api03-9xKpQrstuVWXyz0123456789AaBbCcDdEeFfGgHhIi
+
+claude-backup (同事借的号，5/1 前还)
+li.xiao@acme.cn / xiao1234
+sk-ant-api03-pLoKiJuHyGtFrDeSwAqZmNbVcXzL0987654321MnOpQr
+
+
+# claude-old 已删，不用:
+# dev-old@acme.cn / oldpwd / sk-ant-api03-dddddd...ignore
+
+
+claude oauth 备用号 (要浏览器登录)
+账号: ops-oauth@acme.cn
+登录后粘 token 到 vault
+
+
+---
+
+
+## OpenAI (公司走内部网关)
+
+base_url: https://openai-gw.infra.acme.cn/v1
+
+sk-proj-prod01-ABcdEf12GhIjKl34MnOpQr56StUvWx78YzAbCd90EfGhIj
+sk-proj-prod02-ZzYyXxWwVvUuTtSsRrQqPpOoNnMmLlKkJjIiHhGgFfEe
+sk-proj-staging-1122334455667788990011223344556677889900aabb
+
+
+OpenAI 个人号 (只用于周末折腾)
+  apikey = sk-proj-perSonAL11223344556677889900AAbbCCddEEffGGhh
+
+
+---
+
+
+## Gemini
+
+# 免费额度，用完换号
+apikey: AIzaSyDEMOkEy1122334455667788990011223344_ABC
+
+gemini-2   AIzaSyDEMOkEy9988776655443322110099887766_XYZ
+gemini-3   AIzaSyDEMOkEy5544332211009988776655443322_ZZZ
+
+
+---
+
+
+## Moonshot / Kimi  (走官方 endpoint)
+
+Moonshot: sk-KIMI1122334455667788990011223344556677889900AAbbCC
+
+
+---
+
+
+## Groq (跑 llama3-70b 很快)
+
+gsk_1a2b3c4d5e6f7g8h9i0jKlMnOpQrStUvWxYz0123456789AbCdEf
+
+
+---
+
+
+## xAI Grok
+
+xai-1234567890abcdefGHIJKLmnopqrSTUVWXyz1234567890abcdefGHIJKLmnopqrSTUVWXyz12
+
+
+---
+
+
+## [公司代理] 统一网关 (兼容 openai 协议)
+   https://ai-gateway.sre.acme.cn/v1
+
+   gw-key-1: sk-proj-GW111aaaa2222bbbb3333cccc4444dddd5555eeee66
+   gw-key-2: sk-proj-GW222aaaa2222bbbb3333cccc4444dddd5555eeee66
+
+
+---
+
+
+export CLAUDE_KEY="sk-ant-api03-SHELLexp0987654321abcdef0987654321abcdef0987"
+export OPENAI_KEY="sk-proj-SHELLexp1234567890abcdef1234567890abcdef12345"
+export GEMINI_KEY="AIzaSyShellExport0011223344556677889900_QWE"
+
+
+---
+
+
+【临时】朋友发的一批号 (2026-04-18 微信接龙)
+
+1) claude1  aaa@mail.com  ----pwd-aaa-001----  sk-ant-api03-AAAA1111AAAA1111AAAA1111AAAA1111AAAA1111AAAA
+2) claude2  bbb@mail.com  ----pwd-bbb-002----  sk-ant-api03-BBBB2222BBBB2222BBBB2222BBBB2222BBBB2222BBBB
+3) claude3  ccc@mail.com  ----pwd-ccc-003----  sk-ant-api03-CCCC3333CCCC3333CCCC3333CCCC3333CCCC3333CCCC
+
+
+---
+
+
+# 零散一行 (不记得哪来的，先丢这里)
+
+sk-proj-ORPHAN00000000000000000000000000000000000000000000
+AIzaSyLooseKey99999999999999999999999999999_XX
+
+
+---
+
+
+# note: f47ac10b-58cc-4372-a567-0e02b2c3d479  (那个 case id，不是 key)
+# note: https://dashboard.example.com/keys  (页面，不是 base_url)
+
+
+END OF FILE

@@ -1,0 +1,80 @@
+{
+  "_description": "V4.1 ablation spike canary 的 drafts/groups/orphans 基线数字，用于 CLI 迁移后对齐回归。",
+  "_source": "aikeylabs/workflow/CI/research/ablation-spike-v4.1/",
+  "_captured_at": "2026-04-22",
+  "_capture_git_ref": "see workflow/CI/research/ablation-spike-v4.1/ latest commit at capture time",
+  "_notes": [
+    "arbiter = CRF arbiter 默认启用模式 (v4.1 S1 决策#2)",
+    "off = WITH_CRF=off 禁用 CRF",
+    "所有样本文件位于 workflow/CI/research/samples/scenarios/ (*.txt) 和 /tmp/*.jsonl (预处理)",
+    "数字格式: [drafts, groups, orphans]",
+    "CLI 完成 Stage 2-4 迁移后必须 bit-for-bit 对齐；Stage 5+ 可加 SUPPRESSED BY REASON 明细但不改主干"
+  ],
+
+  "canaries": {
+    "user": {
+      "source": "/tmp/user-notes.jsonl",
+      "arbiter": [22, 8, 0],
+      "off": [22, 8, 0]
+    },
+    "handoff": {
+      "source": "/tmp/handoff-en.jsonl",
+      "arbiter": [28, 24, 0],
+      "off": [28, 24, 2],
+      "note": "arbiter 清理了 2 个 orphans (CRF 精度守门生效)"
+    },
+    "aming": {
+      "source": "/tmp/aming-zh.jsonl",
+      "arbiter": [9, 8, 0],
+      "off": [9, 8, 0]
+    },
+    "taozi": {
+      "source": "/tmp/taozi-zh.jsonl",
+      "arbiter": [33, 23, 2],
+      "off": [33, 23, 3],
+      "note": "taozi 有 4 条 CJK FP 被 ISSUE-3 过滤掉；arbiter 对比 off 多清 1 个 orphan"
+    },
+    "real": {
+      "source": "/tmp/user-real-sanitized.jsonl",
+      "arbiter": [13, 10, 0],
+      "off": [13, 10, 0],
+      "note": "real canary 12 providers 100% 识别 (含 Phase 4 anchored-secret 抓到的 921aa571 / d853a86f / 7345c83a)"
+    },
+    "community-mess": {
+      "source": "/tmp/community-mess.jsonl",
+      "arbiter": [21, 12, 0],
+      "off": [21, 12, 0],
+      "note": "ISSUE-4/6 注释守门清理了 OldFakeKey_deprecated; ISSUE-5 context_reject v2 清理了 commit/docker SHA"
+    }
+  },
+
+  "multi_pwd": {
+    "source": "/tmp/multi-pwd.jsonl",
+    "description": "M4 canary - 10 样本 × 22 expected passwords",
+    "arbiter_per_sample": [
+      {"id": "M4-01", "drafts": 2, "groups": 2, "orphans": 0},
+      {"id": "M4-02", "drafts": 2, "groups": 2, "orphans": 0},
+      {"id": "M4-03", "drafts": 2, "groups": 1, "orphans": 0},
+      {"id": "M4-04", "drafts": 2, "groups": 2, "orphans": 0, "note": "Winter2024!sec 漏抓 (anchor_lines 窗口过严，ISSUE-Winter 跟进)"},
+      {"id": "M4-05", "drafts": 4, "groups": 3, "orphans": 0},
+      {"id": "M4-06", "drafts": 2, "groups": 2, "orphans": 0},
+      {"id": "M4-07", "drafts": 6, "groups": 1, "orphans": 0},
+      {"id": "M4-08", "drafts": 6, "groups": 2, "orphans": 0},
+      {"id": "M4-09", "drafts": 3, "groups": 1, "orphans": 0},
+      {"id": "M4-10", "drafts": 2, "groups": 2, "orphans": 0}
+    ],
+    "aggregate": {
+      "total_drafts": 31,
+      "unique_passwords_captured": 21,
+      "expected_passwords": 22,
+      "recall": "21/22 = 95.5%"
+    }
+  },
+
+  "known_residuals": {
+    "C2_value_to_line": "V4.1 spike 仍使用 text.find(value) 首匹配；产品化需 source_span 重构；CLI 继承同款问题",
+    "ISSUE-Winter_multi_pwd_miss": "M4-04 sample 中 'Winter2024!sec' 因 anchor_lines 窗口过严未进 candidate，M2 HAS_PWD_LABEL 扩展可解",
+    "ISSUE-1_aming_DS": "DeepSeek base_url 串到 Moonshot group (trace v41-trace-aming-11.log d-4)",
+    "ISSUE-2_Azure": "Azure AccountKey 误标 github (trace v41-trace-handoff-12.log d-23)"
+  }
+}
