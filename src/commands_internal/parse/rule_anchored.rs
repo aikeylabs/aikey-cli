@@ -63,7 +63,7 @@ pub fn extract(
     let mut idxs: Vec<usize> = anchor_lines.into_iter().collect();
     idxs.sort();
 
-    // === Step 2: 在锚点行 tokenize，挑 password-shape ===
+    // === Step 2: 在锚点行 tokenize，挑 password-shape 或 anchored_secret-shape ===
     for i in idxs {
         // v4.1 ISSUE-6: rule_extract_* 家族最后一处 IS_COMMENT 守门补漏
         //   注释行的 token 不参与 anchored password 召回
@@ -72,10 +72,67 @@ pub fn extract(
         }
         let tokens = tokenize_line(lines[i]);
         for tok in tokens {
+            // v4.1 Method B Phase 4: anchored_secret 路径优先级高于 anchored_password
+            //   len 33-80 pure alnum+alpha+digit  OR  len 28-32 hex-dominant ≥ 0.70
+            //   解 `7345c83a9033813209gnfdi30204992bd6` (len=34) /
+            //       `921aa571f132a2154249g9bd0b1e3b7c` (len=32 mixed-hex) 类漏抓
+            //   Why 优先:32 位 hex-dominant 往往是 API token / session key 形态，
+            //     与同 block 的明文 password 竞争 Draft 字段槽时走 secret 道不冲突
+            if is_anchored_secret_shape(&tok) && passes_shape_filters(&tok, &stopwords) {
+                try_push(cands, seen, Kind::SecretLike, &tok, None);
+                continue;
+            }
             if !is_password_shape(&tok, &stopwords) { continue; }
             try_push(cands, seen, Kind::PasswordLike, &tok, None);
         }
     }
+}
+
+/// v4.1 Method B Phase 4: anchored_secret 形态
+///
+/// 两种触发条件任一成立：
+/// - (a) len ∈ (32, 80]，pure alnum + alpha + digit
+/// - (b) len ∈ [28, 32]，pure alnum + alpha + digit，且 hex-ratio ≥ 0.70
+///
+/// Why 上限 80：远长于 YAML 最长 family（gsk ~56）防无 fence 乱抓
+/// Why 下限 28：短于 28 字符的 hex 形 secret 很可能是普通 password / UUID 片段，不走此路径
+fn is_anchored_secret_shape(tok: &str) -> bool {
+    let len = tok.chars().count();
+    if len < 28 || len > 80 { return false; }
+    let is_pure_alnum = tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && tok.chars().any(|c| c.is_ascii_alphabetic())
+        && tok.chars().any(|c| c.is_ascii_digit());
+    if !is_pure_alnum { return false; }
+    if len > 32 { return true; }  // 33-80 带内：纯 alnum+alpha+digit 即可
+    // 28-32 带内：要求 hex-dominant
+    let hex_ratio = tok.chars().filter(|c| c.is_ascii_hexdigit()).count() as f32 / len as f32;
+    hex_ratio >= 0.70
+}
+
+/// anchored_secret 路径的 shape filter（不查 len / alpha / digit，那些 `is_anchored_secret_shape`
+/// 已经校验了；这里只补"共用"的形态拒识：注释/email/provider_prefix/placeholder/slash/truncation）
+fn passes_shape_filters(
+    tok: &str,
+    stopwords: &std::collections::HashSet<&str>,
+) -> bool {
+    let lc = tok.to_lowercase();
+    // email / URL / 已知 secret 前缀
+    if tok.contains('@') { return false; }
+    if lc.starts_with("http") { return false; }
+    if looks_like_known_secret(tok) { return false; }
+    // stopwords
+    if stopwords.contains(lc.as_str()) { return false; }
+    // v4.1 placeholder denylist
+    if is_placeholder_token(tok) { return false; }
+    // v4.1 M4 post-fix: trailing _- 截断
+    if tok.ends_with('_') || tok.ends_with('-') { return false; }
+    // 全非 ASCII（CJK only）
+    if tok.chars().all(|c| !c.is_ascii()) { return false; }
+    // contains slash
+    if tok.contains('/') { return false; }
+    // shell var ref
+    if tok.starts_with('$') { return false; }
+    true
 }
 
 fn is_password_shape(
