@@ -151,6 +151,7 @@ pub fn group_candidates(
                     inference_evidence: Vec::new(),
                     protocol_types: Vec::new(),
                     login_url: None,
+                    official_base_url: None,
                 });
             }
         }
@@ -246,6 +247,7 @@ pub fn group_candidates(
                     inference_evidence: Vec::new(),
                     protocol_types: Vec::new(),
                     login_url: None,
+                    official_base_url: None,
                 });
                 stage2_fired = true;
             }
@@ -345,6 +347,7 @@ pub fn group_candidates(
             inference_evidence: Vec::new(),
             protocol_types: Vec::new(),
             login_url: None,
+            official_base_url: None,
         });
 
         // v4.1 M4: 额外合法 password 展开独立 Draft
@@ -374,6 +377,7 @@ pub fn group_candidates(
                 inference_evidence: Vec::new(),
                 protocol_types: Vec::new(),
                 login_url: None,
+                official_base_url: None,
             });
         }
     }

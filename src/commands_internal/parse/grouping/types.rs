@@ -199,6 +199,15 @@ pub struct DraftRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub login_url: Option<String>,
+    /// v4.2: 推断出的 provider 对应的官方 API base_url。
+    ///
+    /// 由 parse handler 从 `FingerprintClassifier::base_url_for_family` 填充;
+    /// 未推断 / yaml 未配时为 None。UI "use official" 按钮消费此字段填入
+    /// `fields.base_url`。之前硬编码在前端 PROVIDER_DEFAULT_BASE_URL Record,
+    /// 现挪 YAML —— ControlPanel 可热更新,新聚合网关出现无需前端发版。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub official_base_url: Option<String>,
 }
 
 /// L2 grouper 内部 block 数据 (从 V4.1 spike `grouping.rs:338-343` 迁移)

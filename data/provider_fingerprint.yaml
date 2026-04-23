@@ -35,6 +35,7 @@ version: 1
 #   - xAI: https://console.x.ai
 #   - Zhipu/BigModel: https://bigmodel.cn/login
 #   - Doubao (Volcengine Ark): https://console.volcengine.com/ark
+#   - Qwen/Tongyi (Alibaba DashScope): https://dashscope.console.aliyun.com/apiKey
 #   - SiliconFlow: https://cloud.siliconflow.cn/
 #   - Hugging Face: https://huggingface.co/login
 #   - Perplexity: https://www.perplexity.ai
@@ -51,12 +52,60 @@ family_login_urls:
   xai_grok:      "https://console.x.ai"
   zhipu:         "https://bigmodel.cn/login"
   doubao:        "https://console.volcengine.com/ark"
+  qwen:          "https://dashscope.console.aliyun.com/apiKey"
   siliconflow:   "https://cloud.siliconflow.cn"
   huggingface:   "https://huggingface.co/login"
   perplexity:    "https://www.perplexity.ai"
   openrouter:    "https://openrouter.ai/sign-in"
   yunwu:         "https://yunwu.ai"
   zeroeleven:    "https://0011.ai"
+
+# v4.2: family → 官方 base_url (API endpoint)
+#
+# UI "use official" 按钮点击后,把对应 family 的 base_url 填入 draft.fields.base_url。
+# parse handler 为每个 draft 的 inferred_provider 查此表,写入 DraftRecord.official_base_url。
+#
+# 与 family_login_urls 的区别:
+#   family_login_urls    → 浏览器打开的登录 / API key 管理页面 (https://..../login)
+#   family_base_urls     → API 请求发往的 endpoint (https://api..../v1)
+#
+# 挪进 YAML 的 Why: ControlPanel 可热更新,新聚合网关出现不用前端发版;
+# 原本这张表硬编码在 aikey-control/web PROVIDER_DEFAULT_BASE_URL Record 里。
+#
+# 数据来源 (2026-04 校对):
+#   - Anthropic:    官方 https://api.anthropic.com
+#   - OpenAI:       官方 v1
+#   - Kimi:         Moonshot v1
+#   - DeepSeek:     官方 v1
+#   - Gemini:       Google generativelanguage
+#   - Groq:         OpenAI-兼容 v1
+#   - XAI Grok:     官方 v1
+#   - Zhipu GLM:    bigmodel.cn (智谱 PAAS)
+#   - Doubao:       Volcengine Ark v3
+#   - Qwen:         DashScope OpenAI-compat v1 (阿里通义千问)
+#   - SiliconFlow:  siliconflow.cn v1
+#   - HuggingFace:  inference v1
+#   - Perplexity:   perplexity.ai v1
+#   - OpenRouter:   聚合 v1
+#   - Yunwu:        云雾 聚合 v1
+#   - Zeroeleven:   0011 聚合 (2026-04 迁至 aicoding.2233.ai)
+family_base_urls:
+  anthropic:     "https://api.anthropic.com"
+  openai:        "https://api.openai.com/v1"
+  kimi:          "https://api.moonshot.cn/v1"
+  deepseek:      "https://api.deepseek.com/v1"
+  google_gemini: "https://generativelanguage.googleapis.com"
+  groq:          "https://api.groq.com/openai/v1"
+  xai_grok:      "https://api.x.ai/v1"
+  zhipu:         "https://open.bigmodel.cn/api/paas"
+  doubao:        "https://ark.cn-beijing.volces.com/api/v3"
+  qwen:          "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  siliconflow:   "https://api.siliconflow.cn/v1"
+  huggingface:   "https://api-inference.huggingface.co/v1"
+  perplexity:    "https://api.perplexity.ai/v1"
+  openrouter:    "https://openrouter.ai/api/v1"
+  yunwu:         "https://yunwu.ai/v1"
+  zeroeleven:    "https://aicoding.2233.ai"
 
 # v4.1 Stage 5+: 聚合网关 family 清单 (UI Provider 字段 multi-select 设计驱动)
 #

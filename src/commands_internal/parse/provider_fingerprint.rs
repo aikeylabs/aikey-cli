@@ -74,6 +74,10 @@ struct Registry {
     /// UI "Open login page" 按钮消费此字段(window.open)
     #[serde(default)]
     family_login_urls: std::collections::HashMap<String, String>,
+    /// v4.2: family → 官方 API endpoint base_url
+    /// UI "use official" 按钮点击填入 draft.fields.base_url 消费此表
+    #[serde(default)]
+    family_base_urls: std::collections::HashMap<String, String>,
 }
 
 // ========== Classifier ==========
@@ -84,6 +88,8 @@ pub struct FingerprintClassifier {
     aggregator_families: std::collections::HashSet<String>,
     /// v4.1 Stage 10+: family → 登录页 URL 映射(从 yaml 加载)
     family_login_urls: std::collections::HashMap<String, String>,
+    /// v4.2: family → 官方 API base_url 映射(从 yaml 加载)
+    family_base_urls: std::collections::HashMap<String, String>,
 }
 
 impl FingerprintClassifier {
@@ -102,7 +108,8 @@ impl FingerprintClassifier {
         let aggregator_families: std::collections::HashSet<String> =
             reg.aggregator_families.into_iter().collect();
         let family_login_urls = reg.family_login_urls;
-        Self { entries, aggregator_families, family_login_urls }
+        let family_base_urls = reg.family_base_urls;
+        Self { entries, aggregator_families, family_login_urls, family_base_urls }
     }
 
     /// v4.1 Stage 5+: 从 inferred provider family 派生 protocol_types 列表。
@@ -120,6 +127,11 @@ impl FingerprintClassifier {
     /// v4.1 Stage 10+: 查 family 的登录页 URL (UI "Open login page" 用)
     pub fn login_url_for_family(&self, family: &str) -> Option<String> {
         self.family_login_urls.get(family).cloned()
+    }
+
+    /// v4.2: 查 family 的官方 API base_url (UI "use official" 按钮填入)
+    pub fn base_url_for_family(&self, family: &str) -> Option<String> {
+        self.family_base_urls.get(family).cloned()
     }
 
     /// 直接分类（不用上下文）

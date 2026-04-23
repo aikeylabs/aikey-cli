@@ -268,8 +268,10 @@ fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'st
         d.alias = candidate;
 
         // v4.1 Stage 10+: 填 login_url (UI "Open login page" 按钮用)
+        // v4.2: 同时填 official_base_url (UI "use official" 按钮用)
         if let Some(family) = &d.inferred_provider {
             d.login_url = classifier.login_url_for_family(family);
+            d.official_base_url = classifier.base_url_for_family(family);
         }
     }
 

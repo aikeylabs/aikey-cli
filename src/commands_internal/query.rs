@@ -18,15 +18,47 @@
 //!   代价是能访问 local-server 端口的进程不需主密码就能枚举 alias。实际风险边界几乎不变 ——
 //!   同机攻击者本就可直读 vault.db 明文列。生产版 Web 本身不挂 /user/vault，不影响。
 
+use std::collections::HashSet;
+
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::credential_type::CredentialType;
 use crate::crypto;
 use crate::storage;
 // storage_platform is a submodule re-exported via `pub use storage_platform::*`
 // on storage. Call its functions through `storage::...` directly.
 use super::protocol::{ResultEnvelope, StdinEnvelope};
 use super::stdin_json::{decode_vault_key, emit, emit_error};
+
+// ========== in-use detection ==========
+//
+// Loads the set of `key_source_ref` values that are currently bound in the
+// default profile, partitioned by credential type so personal aliases and
+// oauth `provider_account_id`s cannot collide. Used by the three vault list
+// builders to emit `in_use: bool` per record (green-dot UI hint).
+//
+// Readonly connection: the list builders already either verified the vault
+// key (unlocked path) or called `ensure_vault_exists()` (locked path); a
+// second migration-bearing open would be redundant. If the readonly open
+// or query fails (e.g. old vault without `user_profile_provider_bindings`),
+// we degrade to empty sets — in_use comes back false everywhere, no error.
+fn load_active_binding_refs() -> (HashSet<String>, HashSet<String>) {
+    let mut personal: HashSet<String> = HashSet::new();
+    let mut oauth: HashSet<String> = HashSet::new();
+    if let Ok(bindings) = storage::list_provider_bindings_readonly("default") {
+        for b in bindings {
+            match b.key_source_type {
+                CredentialType::PersonalApiKey => { personal.insert(b.key_source_ref); }
+                CredentialType::PersonalOAuthAccount => { oauth.insert(b.key_source_ref); }
+                // Team (ManagedVirtualKey) bindings reference virtual_key_id, not
+                // anything we render in the Vault Web list today — skip.
+                _ => {}
+            }
+        }
+    }
+    (personal, oauth)
+}
 
 // ========== payload types ==========
 
@@ -320,6 +352,8 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
         }
     };
 
+    let (active_personal, _active_oauth) = load_active_binding_refs();
+
     let mut out = Vec::with_capacity(metas.len());
     for m in metas {
         let (nonce, ciphertext) = match storage::get_entry(&m.alias) {
@@ -353,6 +387,7 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
             "route_token": m.route_token,
             "last_used_at": m.last_used_at,
             "use_count": m.use_count.unwrap_or(0),
+            "in_use": active_personal.contains(&m.alias),
             "secret_prefix": prefix,
             "secret_suffix": suffix,
             "secret_len": len,
@@ -433,6 +468,7 @@ fn handle_list_oauth(env: StdinEnvelope) {
     // blobs but we project only the expires_at timestamp, never the tokens
     // themselves (D3 rule: OAuth session tokens never leave cli → Go).
     let expires_map = load_oauth_expires_map().unwrap_or_default();
+    let (_active_personal, active_oauth) = load_active_binding_refs();
 
     let arr: Vec<_> = accounts.iter().map(|a| json!({
         "target": "oauth",
@@ -450,6 +486,7 @@ fn handle_list_oauth(env: StdinEnvelope) {
         "created_at": a.created_at,
         "last_used_at": a.last_used_at,
         "use_count": a.use_count.unwrap_or(0),
+        "in_use": active_oauth.contains(&a.provider_account_id),
         "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
     })).collect();
 
@@ -520,6 +557,7 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
     }
 
     let mut out: Vec<serde_json::Value> = Vec::new();
+    let (active_personal, active_oauth) = load_active_binding_refs();
 
     // Personal entries: plaintext metadata only. We go through the same
     // `list_entries_with_metadata` helper that the unlocked path uses —
@@ -539,6 +577,7 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "route_token": m.route_token,
                     "last_used_at": m.last_used_at,
                     "use_count": m.use_count.unwrap_or(0),
+                    "in_use": active_personal.contains(&m.alias),
                     // Null sentinel — front end uses this to render a
                     // fully-masked (no prefix, no suffix) secret pill.
                     "secret_prefix": serde_json::Value::Null,
@@ -580,6 +619,7 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "created_at": a.created_at,
                     "last_used_at": a.last_used_at,
                     "use_count": a.use_count.unwrap_or(0),
+                    "in_use": active_oauth.contains(&a.provider_account_id),
                     "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
                 }));
             }
