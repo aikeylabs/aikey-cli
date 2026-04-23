@@ -17,6 +17,20 @@
 
 version: 1
 
+# v4.1 Stage 5+: 聚合网关 family 清单 (UI Provider 字段 multi-select 设计驱动)
+#
+# 含义:这些 family 同时支持多种底层 API 协议 (例如 0011/zeroeleven 同时挂 anthropic + openai),
+# 因此 fingerprint 推断不出"严格协议类型",`protocol_types` 字段输出 `[]` 而非 `[family]`,
+# 让 UI multi-select 由用户手选实际启用的协议。
+#
+# 派生规则 (FingerprintClassifier::protocol_types_for_family):
+#   family ∈ aggregator_families  → []        (UI 让用户手选)
+#   其他 family (官方厂商)         → [family]  (单元素)
+aggregator_families:
+  - openrouter
+  - yunwu        # 云雾 yunwu.ai
+  - zeroeleven   # 0011.ai
+
 providers:
   # ============ Tier: confirmed（前缀高特异性，直接打上provider标签） ============
 
@@ -161,11 +175,13 @@ providers:
     length_range: [43, 83]
     tier: ambiguous
     hint: "通用 sk- 前缀，需结合同文档 URL/title 判定具体 provider"
+    # v4.1 family rename: 'moonshot_kimi' → 'kimi' 与 connectivity/runtime PROVIDER_DEFAULTS 字典对齐
+    # (CLI 其他地方一律叫 'kimi';UI Provider 字段直接消费此值,避免名词分裂)
     disambiguators:
       - url_domain: "platform.moonshot.cn"
-        suggest: "moonshot_kimi"
+        suggest: "kimi"
       - url_domain: "platform.moonshot.ai"
-        suggest: "moonshot_kimi"
+        suggest: "kimi"
       - url_domain: "platform.deepseek.com"
         suggest: "deepseek"
       - url_domain: "yunwu.ai"
@@ -174,7 +190,7 @@ providers:
         suggest: "zeroeleven"
     # M3 新增：URL 消歧失败时，UI 手选下拉优先展示的候选 provider id
     siblings:
-      - moonshot_kimi
+      - kimi
       - deepseek
       - yunwu
       - zeroeleven

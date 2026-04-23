@@ -705,7 +705,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             println!("{}", commands_account::hook_template_hash(kind));
         }
-        Commands::Add { alias, provider } => {
+        Commands::Add { alias, provider, providers } => {
             let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
             // Early password validation: fail fast before asking for API key,
@@ -751,8 +751,22 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ("kimi",      "https://api.kimi.com/coding/v1"),
             ];
 
+            // v4.1 Stage 5+: --providers (multi) 优先级最高,然后是 --provider (single shorthand),
+            // 都没给且 TTY 时进入交互式 multi-select。clap 的 `conflicts_with` 已保证 --provider /
+            // --providers 不会同时给。
             let (resolved_providers, resolved_base_url): (Vec<String>, Option<String>) =
-                if let Some(code) = provider {
+                if !providers.is_empty() {
+                    // dedupe + lowercase,保持用户输入顺序
+                    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    let cleaned: Vec<String> = providers.iter()
+                        .map(|p| p.trim().to_lowercase())
+                        .filter(|p| !p.is_empty() && seen.insert(p.clone()))
+                        .collect();
+                    if cleaned.is_empty() {
+                        return Err("--providers given but all entries were empty after trim.".into());
+                    }
+                    (cleaned, None)
+                } else if let Some(code) = provider {
                     (vec![code.to_lowercase()], None)
                 } else if std::io::stdin().is_terminal() && !cli.json {
                     use colored::Colorize;
@@ -812,7 +826,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(ref u) = base_url { eprintln!("  \u{2502} Base URL:  {}", u.dimmed()); }
                     (selected, base_url)
                 } else {
-                    return Err("--provider is required in non-interactive mode.".into());
+                    return Err("--provider <CODE> or --providers <c1,c2,...> is required in non-interactive mode.".into());
                 };
 
             let resolved_provider = resolved_providers.first().cloned();

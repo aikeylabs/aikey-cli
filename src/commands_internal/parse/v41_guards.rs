@@ -98,6 +98,51 @@ pub fn token_has_cjk_or_fullwidth(s: &str) -> bool {
     })
 }
 
+/// V4.1 label_shape 拒识 —— token 是"标签"形态 (vs value)
+///
+/// 典型:`claude2: SF (pro-04/15)` 行里 `claude2` 是标签,不该当 password。
+/// V4.1 spike `main.rs::is_label_shape` 迁移 (L722-767)。
+///
+/// 三档(任一命中即是 label,不该入 password 候选):
+/// (a) 纯 kebab-case:全 `[a-z0-9-]` 且 ≥1 `-` (如 `claude-main`)
+/// (b) token 紧跟 `:` / `：` / `=` 且长度 < 16 (如 `claude2:` → `claude2` 是 label)
+/// (c) provider keyword 前缀 + 纯数字/dash 后缀 (如 `openai-1`, `claude-2`)
+///
+/// `line` 参数:token 所在完整行,用于查 token 尾部紧跟字符。
+pub fn is_label_shape(tok: &str, line: &str) -> bool {
+    // (a) 纯 kebab-case
+    let is_kebab = tok.contains('-')
+        && tok.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if is_kebab { return true; }
+
+    // (b) token + `:` / `=` (短 token)
+    if tok.chars().count() < 16 {
+        if let Some(tok_start) = line.find(tok) {
+            let tok_end = tok_start + tok.len();
+            let rest = line[tok_end..].chars().find(|c| !c.is_whitespace());
+            if matches!(rest, Some(':') | Some('\u{FF1A}') | Some('=')) {
+                return true;
+            }
+        }
+    }
+
+    // (c) provider keyword 前缀 + 数字/dash 后缀
+    const PROVIDER_KEYWORDS: &[&str] = &[
+        "claude", "anthropic", "openai", "gpt", "kimi", "moonshot",
+        "gemini", "groq", "deepseek", "xai", "grok", "zhipu", "glm",
+        "doubao", "silicon", "huggingface", "perplexity", "openrouter",
+    ];
+    let lc = tok.to_lowercase();
+    for kw in PROVIDER_KEYWORDS {
+        if !lc.starts_with(kw) || lc.len() == kw.len() { continue; }
+        let suffix = &lc[kw.len()..];
+        let all_digits = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+        let dashed = suffix.starts_with('-');
+        if all_digits || dashed { return true; }
+    }
+    false
+}
+
 /// Placeholder / 占位符 / 示例诱饵拒识
 ///
 /// 典型:`changeme` / `your_key_here` / `PLEASE-REPLACE-WITH-YOUR-OWN` / `sk-example-xxx`

@@ -22,7 +22,7 @@ use super::candidate::Kind;
 use super::line_class::{line_class, LineFlags};
 use super::rule::{looks_like_known_secret, try_push};
 use super::tokenize::tokenize_line;
-use super::v41_guards::{is_in_reject_context, is_placeholder_token};
+use super::v41_guards::{is_in_reject_context, is_label_shape, is_placeholder_token};
 
 pub fn extract(
     text: &str,
@@ -84,19 +84,15 @@ pub fn extract(
         if is_in_reject_context(text, line_start_offsets[i]) {
             continue;
         }
-        let tokens = tokenize_line(lines[i]);
+        let line_text = lines[i];
+        let tokens = tokenize_line(line_text);
         for tok in tokens {
             // v4.1 Method B Phase 4: anchored_secret 路径优先级高于 anchored_password
-            //   len 33-80 pure alnum+alpha+digit  OR  len 28-32 hex-dominant ≥ 0.70
-            //   解 `7345c83a9033813209gnfdi30204992bd6` (len=34) /
-            //       `921aa571f132a2154249g9bd0b1e3b7c` (len=32 mixed-hex) 类漏抓
-            //   Why 优先:32 位 hex-dominant 往往是 API token / session key 形态，
-            //     与同 block 的明文 password 竞争 Draft 字段槽时走 secret 道不冲突
-            if is_anchored_secret_shape(&tok) && passes_shape_filters(&tok, &stopwords) {
+            if is_anchored_secret_shape(&tok) && passes_shape_filters(&tok, line_text, &stopwords) {
                 try_push(cands, seen, Kind::SecretLike, &tok, None);
                 continue;
             }
-            if !is_password_shape(&tok, &stopwords) { continue; }
+            if !is_password_shape(&tok, line_text, &stopwords) { continue; }
             try_push(cands, seen, Kind::PasswordLike, &tok, None);
         }
     }
@@ -127,6 +123,7 @@ fn is_anchored_secret_shape(tok: &str) -> bool {
 /// 已经校验了；这里只补"共用"的形态拒识：注释/email/provider_prefix/placeholder/slash/truncation）
 fn passes_shape_filters(
     tok: &str,
+    line: &str,
     stopwords: &std::collections::HashSet<&str>,
 ) -> bool {
     let lc = tok.to_lowercase();
@@ -138,6 +135,8 @@ fn passes_shape_filters(
     if stopwords.contains(lc.as_str()) { return false; }
     // v4.1 placeholder denylist
     if is_placeholder_token(tok) { return false; }
+    // v4.1 Post-Stage4: label_shape (kebab / token: / provider-prefix+digits)
+    if is_label_shape(tok, line) { return false; }
     // v4.1 M4 post-fix: trailing _- 截断
     if tok.ends_with('_') || tok.ends_with('-') { return false; }
     // 全非 ASCII（CJK only）
@@ -151,6 +150,7 @@ fn passes_shape_filters(
 
 fn is_password_shape(
     tok: &str,
+    line: &str,
     stopwords: &std::collections::HashSet<&str>,
 ) -> bool {
     let lc = tok.to_lowercase();
@@ -182,6 +182,10 @@ fn is_password_shape(
 
     // 停用词
     if stopwords.contains(lc.as_str()) { return false; }
+
+    // v4.1 Post-Stage4: label_shape 拒识 (claude2: SF → claude2 是 label;
+    //   kebab-case 别名;provider keyword + 数字/dash 后缀)
+    if is_label_shape(tok, line) { return false; }
 
     // 排除纯 hex 长串（secret 残影，应该已被 Layer 1 hex_long 抓走）
     if len >= 28 && tok.chars().all(|c| c.is_ascii_hexdigit()) { return false; }

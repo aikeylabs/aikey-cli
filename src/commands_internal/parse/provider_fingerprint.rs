@@ -66,12 +66,18 @@ struct Registry {
     #[allow(dead_code)]
     version: u32,
     providers: Vec<ProviderEntry>,
+    /// v4.1 Stage 5+: 聚合网关 family 清单(openrouter / yunwu / zeroeleven 等)
+    /// 见 yaml 顶部 `aggregator_families` 段落。
+    #[serde(default)]
+    aggregator_families: Vec<String>,
 }
 
 // ========== Classifier ==========
 
 pub struct FingerprintClassifier {
     entries: Vec<(ProviderEntry, Regex)>,
+    /// v4.1 Stage 5+: 聚合网关 family 集合(从 yaml 加载)
+    aggregator_families: std::collections::HashSet<String>,
 }
 
 impl FingerprintClassifier {
@@ -87,7 +93,21 @@ impl FingerprintClassifier {
                 .unwrap_or_else(|e| panic!("bad regex for provider '{}': {}", p.id, e));
             entries.push((p, compiled));
         }
-        Self { entries }
+        let aggregator_families: std::collections::HashSet<String> =
+            reg.aggregator_families.into_iter().collect();
+        Self { entries, aggregator_families }
+    }
+
+    /// v4.1 Stage 5+: 从 inferred provider family 派生 protocol_types 列表。
+    ///
+    /// - family ∈ aggregator_families   → vec![]        (聚合网关,UI multi-select 让用户手选)
+    /// - 其他 family (官方厂商)          → vec![family]  (单元素)
+    pub fn protocol_types_for_family(&self, family: &str) -> Vec<String> {
+        if self.aggregator_families.contains(family) {
+            Vec::new()
+        } else {
+            vec![family.to_string()]
+        }
     }
 
     /// 直接分类（不用上下文）
@@ -133,6 +153,163 @@ pub fn instance() -> &'static FingerprintClassifier {
     INSTANCE.get_or_init(FingerprintClassifier::new_embedded)
 }
 
+// ─── v4.1 Stage 3 L3 enrich 扩展 ────────────────────────────────────────
+//
+// V4.1 spike 在 YAML 里为每个 provider 增加了 `provider_family` /
+// `provider_label_keywords` / `shell_var_patterns` / `url_host_patterns` 字段。
+// CLI 为最小改动,用硬编码映射表达同样信息,保持 YAML schema 向后兼容。
+//
+// family 是 provider 的"家族"(比如 anthropic_api / anthropic_oauth 都属 family=anthropic),
+// 下游 enrich 5 证据投票时按 family 累加权重。
+
+/// provider_id → family 映射 (V4.1 spike YAML provider_family 等价)
+pub fn provider_family_of(id: &str) -> Option<&'static str> {
+    match id {
+        "anthropic_api" | "anthropic_oauth" => Some("anthropic"),
+        "openai_project" | "openai_admin" | "openai_svcacct" => Some("openai"),
+        "openrouter" => Some("openrouter"),
+        "google_gemini" => Some("google_gemini"),
+        "groq" => Some("groq"),
+        "xai_grok" => Some("xai_grok"),
+        "github_classic" | "github_fine_grained" => Some("github"),
+        "aws_access_key" => Some("aws"),
+        "stripe_live" | "stripe_restricted" => Some("stripe"),
+        "sendgrid" => Some("sendgrid"),
+        "slack_bot" | "slack_user" => Some("slack"),
+        "huggingface" => Some("huggingface"),
+        "perplexity" => Some("perplexity"),
+        "generic_jwt" => Some("generic_jwt"),
+        "pem_block" => Some("pem_block"),
+        "zhipu_glm" => Some("zhipu"),
+        // ambiguous / warn 档不参与 family 归属 (evidence 不采纳)
+        _ => None,
+    }
+}
+
+/// 文本关键词 → family (E2 InlineTitleKeyword + E3 SectionHeadingKeyword 用)
+///
+/// 返回 (family, matched_keyword)。与 V4.1 spike
+/// `registry.text_keyword_family_and_keyword(text)` 行为一致:
+/// case-insensitive substring 匹配,返回首匹配。
+pub fn text_keyword_family_and_keyword(text: &str) -> Option<(String, String)> {
+    let lc = text.to_lowercase();
+    // 按 family 粒度声明 (不一定每个都有),匹配优先级:长 → 短,特异 → 通用
+    const MAP: &[(&str, &str)] = &[
+        ("anthropic",     "anthropic"),
+        ("claude",        "anthropic"),
+        ("openrouter",    "openrouter"),
+        ("openai",        "openai"),
+        ("gpt-4o",        "openai"),
+        ("gpt4o",         "openai"),
+        ("gpt-4",         "openai"),
+        ("gemini",        "google_gemini"),
+        ("google ai",     "google_gemini"),
+        // v4.1 family rename: kimi/moonshot → "kimi" (与 connectivity/runtime PROVIDER_DEFAULTS 字典对齐;
+        // 旧 family 名 "moonshot_kimi" 与 CLI 其他地方一律叫 "kimi" 不一致,UI Provider 字段直接消费此值)
+        ("moonshot",      "kimi"),
+        ("kimi",          "kimi"),
+        ("groq",          "groq"),
+        ("deepseek",      "deepseek"),
+        ("xai",           "xai_grok"),
+        ("grok",          "xai_grok"),
+        ("zhipu",         "zhipu"),
+        ("glm",           "zhipu"),
+        ("\u{8C46}\u{5305}", "doubao"),       // 豆包
+        ("doubao",        "doubao"),
+        ("volces",        "doubao"),
+        ("silicon",       "siliconflow"),
+        ("\u{7845}\u{57FA}",   "siliconflow"), // 硅基
+        ("huggingface",   "huggingface"),
+        ("perplexity",    "perplexity"),
+        ("sendgrid",      "sendgrid"),
+        ("stripe",        "stripe"),
+        ("slack",         "slack"),
+        ("github",        "github"),
+        ("aws",           "aws"),
+    ];
+    for (kw, family) in MAP {
+        if lc.contains(kw) {
+            return Some((family.to_string(), kw.to_string()));
+        }
+    }
+    None
+}
+
+/// shell var 名 → family (E4 ShellVarPattern)
+///
+/// 如 `OPENAI_API_KEY` → family="openai" / pattern="OPENAI_*"
+pub fn shell_var_family_and_pattern(var_name: &str) -> Option<(String, String)> {
+    let uc = var_name.to_uppercase();
+    const MAP: &[(&str, &str, &str)] = &[
+        ("ANTHROPIC",  "anthropic",     "ANTHROPIC_*"),
+        ("CLAUDE",     "anthropic",     "CLAUDE_*"),
+        ("OPENAI",     "openai",        "OPENAI_*"),
+        ("OPENROUTER", "openrouter",    "OPENROUTER_*"),
+        ("GEMINI",     "google_gemini", "GEMINI_*"),
+        ("GOOGLE_AI",  "google_gemini", "GOOGLE_AI_*"),
+        ("MOONSHOT",   "kimi",          "MOONSHOT_*"),
+        ("KIMI",       "kimi",          "KIMI_*"),
+        ("GROQ",       "groq",          "GROQ_*"),
+        ("DEEPSEEK",   "deepseek",      "DEEPSEEK_*"),
+        ("XAI",        "xai_grok",      "XAI_*"),
+        ("HUGGINGFACE", "huggingface",  "HUGGINGFACE_*"),
+        ("HF_TOKEN",   "huggingface",   "HF_TOKEN"),
+        ("PERPLEXITY", "perplexity",    "PERPLEXITY_*"),
+        ("SENDGRID",   "sendgrid",      "SENDGRID_*"),
+        ("STRIPE",     "stripe",        "STRIPE_*"),
+        ("SLACK",      "slack",         "SLACK_*"),
+        ("GITHUB",     "github",        "GITHUB_*"),
+        ("AWS_ACCESS", "aws",           "AWS_ACCESS_*"),
+    ];
+    for (prefix, family, pattern) in MAP {
+        if uc.starts_with(prefix) {
+            return Some((family.to_string(), pattern.to_string()));
+        }
+    }
+    None
+}
+
+/// URL host → family (E5 UrlHostPattern)
+///
+/// 从 URL 抽 host,匹配 substring → 返回 (family, matched_pattern)
+pub fn url_host_family_and_pattern(url: &str) -> Option<(String, String)> {
+    let host = url
+        .strip_prefix("https://").or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host_lc = host.split(['/', '?', '#', ':']).next().unwrap_or("").to_lowercase();
+    if host_lc.is_empty() { return None; }
+    const MAP: &[(&str, &str)] = &[
+        ("anthropic.com",        "anthropic"),
+        ("claude.com",           "anthropic"),
+        ("claude.ai",            "anthropic"),
+        ("openai.com",           "openai"),
+        ("openrouter.ai",        "openrouter"),
+        ("generativelanguage.googleapis.com", "google_gemini"),
+        ("aistudio.google.com",  "google_gemini"),
+        ("moonshot.cn",          "kimi"),
+        ("moonshot.ai",          "kimi"),
+        ("groq.com",             "groq"),
+        ("deepseek.com",         "deepseek"),
+        ("x.ai",                 "xai_grok"),
+        ("huggingface.co",       "huggingface"),
+        ("perplexity.ai",        "perplexity"),
+        ("sendgrid.com",         "sendgrid"),
+        ("stripe.com",           "stripe"),
+        ("slack.com",            "slack"),
+        ("github.com",           "github"),
+        ("amazonaws.com",        "aws"),
+        ("bigmodel.cn",          "zhipu"),
+        ("volces.com",           "doubao"),
+        ("siliconflow.cn",       "siliconflow"),
+    ];
+    for (needle, family) in MAP {
+        if host_lc.contains(needle) {
+            return Some((family.to_string(), (*needle).to_string()));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,7 +351,7 @@ mod tests {
         let tok = "sk-genericABC123DEF456ghi789jkl012mno345pqr678STU";
         let e = c.classify(tok).expect("sk-generic");
         assert_eq!(e.tier, Tier::Ambiguous);
-        // siblings 至少含 moonshot_kimi / deepseek 等（M3 评审要求）
+        // siblings 至少含 kimi / deepseek 等（M3 评审要求）
         assert!(!e.siblings.is_empty(), "generic_sk must have siblings");
     }
 

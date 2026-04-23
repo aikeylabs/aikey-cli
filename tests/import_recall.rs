@@ -470,7 +470,7 @@ fn evaluate_fingerprint(path: &std::path::Path) -> FingerprintEval {
             // POC 两轨判定：
             // - 直接命中：actual == expected
             // - ambiguous 精化：expected 是 ambiguous 基类（如 generic_sk），
-            //   而 classifier 用 URL 上下文精化到了它的 siblings 之一（如 moonshot_kimi），
+            //   而 classifier 用 URL 上下文精化到了它的 siblings 之一（如 kimi），
             //   应判为 correct —— URL 上下文提供了更具体的 provider 信息，UI 展示更准
             //   （对应 POC `classify_with_context` 两轨：direct vs with_ctx）
             if is_valid_classification(expected, &actual) {
@@ -495,7 +495,7 @@ fn is_valid_classification(expected: &str, actual: &str) -> bool {
     // generic_sk 可被 URL 上下文精化为具体 provider（与 YAML siblings 字段对齐）
     if expected == "generic_sk" {
         return [
-            "moonshot_kimi", "deepseek", "yunwu", "zeroeleven",
+            "kimi", "deepseek", "yunwu", "zeroeleven",
             "mistral", "siliconflow", "generic_other",
         ].contains(&actual);
     }

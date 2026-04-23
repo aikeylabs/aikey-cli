@@ -114,8 +114,24 @@ pub(crate) enum Commands {
         alias: String,
         /// Provider code for proxy routing (e.g. openai, anthropic). Makes this
         /// key selectable via `aikey use` with path-prefix routing in the proxy.
-        #[arg(long, value_name = "PROVIDER")]
+        ///
+        /// Single-protocol shorthand. For multi-protocol (aggregator gateway like
+        /// 0011 / openrouter that supports both Anthropic and OpenAI protocols),
+        /// use `--providers anthropic,openai` instead.
+        #[arg(long, value_name = "PROVIDER", conflicts_with = "providers")]
         provider: Option<String>,
+        /// v4.1 Stage 5+: Multi-protocol binding for one KEY (comma-separated).
+        ///
+        /// Use this when a KEY supports several API protocols (typical for
+        /// aggregator gateways: 0011 / openrouter / yunwu accept both Anthropic
+        /// and OpenAI). Stored to `entries.supported_providers` as a JSON array.
+        ///
+        /// Example: `--providers anthropic,openai` or `--providers anthropic --providers openai`
+        ///
+        /// Mutually exclusive with `--provider`. If neither is given, the entry
+        /// has no provider binding (legacy behavior).
+        #[arg(long, value_name = "PROVIDERS", value_delimiter = ',', num_args = 1..)]
+        providers: Vec<String>,
     },
     /// Show all personal, team, and OAuth keys (alias for `aikey key list`)
     #[command(alias = "ls", display_order = 2)]

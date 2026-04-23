@@ -134,7 +134,7 @@ fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'st
 
     // === H 层 Provider Fingerprint（Phase 3）===
     // 对每个 secret_like 候选跑分类器，填 provider 字段 + 调整 tier。
-    // 用同文档 URL 域名做 ambiguous 消歧（比如 sk-* + moonshot.cn → moonshot_kimi）。
+    // 用同文档 URL 域名做 ambiguous 消歧（比如 sk-* + moonshot.cn → kimi）。
     let url_domains: Vec<String> = all.iter()
         .filter(|c| c.kind == candidate::Kind::Url)
         .filter_map(|c| extract_url_domain(&c.value))
@@ -173,23 +173,41 @@ fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'st
         format!("sha256:{}", hex::encode(h.finalize()))
     };
 
-    // Stage 3 Phase 3：无 grouping → 每个 candidate 单独作为 orphan
-    let orphans: Vec<String> = all.iter().map(|c| c.id.clone()).collect();
+    // === Stage 3 Phase D + Stage 4: L2 grouper + L3 endpoint cluster ===
+    // L2:扁平 candidates → DraftRecord
+    // L3:Draft → EndpointGroup (按 provider+base_url 聚合)
+    //
+    // 合约:
+    //   - drafts[].fields 字段名与 V4.1 spike 对齐 (email/password/api_key/base_url/extra_secrets)
+    //   - groups[] 每组含 member_draft_ids[] 指回 drafts。UI 可按 group 分层渲染
+    //   - 老客户端不消费 drafts/groups 字段仍工作
+    let (drafts, groups, orphan_cands) = grouping::group_and_cluster(text, &all);
+
+    // orphans schema: 既保留原 candidate id 列表 (老 UI 兼容),
+    // 也暴露候选本身 (每个 orphan 是完整 Candidate JSON 的子集),新 UI 可选择消费。
+    let orphan_ids: Vec<String> = orphan_cands.iter().map(|c| c.id.clone()).collect();
+    let orphans_json: Vec<serde_json::Value> = orphan_cands.iter()
+        .map(|c| json!({ "id": c.id, "kind": c.kind.as_str(), "value": c.value }))
+        .collect();
 
     let candidates_json: Vec<serde_json::Value> = all.iter().map(|c| serde_json::to_value(c).unwrap()).collect();
+    let drafts_json: Vec<serde_json::Value> = drafts.iter().map(|d| serde_json::to_value(d).unwrap()).collect();
+    let groups_json: Vec<serde_json::Value> = groups.iter().map(|g| serde_json::to_value(g).unwrap()).collect();
 
     Ok(json!({
         "source_hash": source_hash,
         "candidates": candidates_json,
-        "drafts": [],
-        "weak_drafts": [],
-        "orphans": orphans,
-        "warnings": ["stage-3-phase-4-with-crf"],
+        "drafts": drafts_json,                 // Stage 3 Phase D: DraftRecord 数组
+        "groups": groups_json,                 // Stage 4: EndpointGroup 数组 (按 provider+base_url 聚合)
+        "weak_drafts": [],                     // 保留字段,v1.1+ 可装 confidence<0.5 的 Draft
+        "orphans": orphan_ids,                 // 向后兼容:老 UI 只用 id 列表
+        "orphan_candidates": orphans_json,     // v4.1 新增:完整 orphan cand (kind+value)
+        "warnings": ["stage-4-grouping-l2-plus-l3-cluster"],
         "layer_versions": {
             "rules": "2.0-full",       // Phase 2
-            "crf": "1.0",              // Phase 4 接入（shape filter + suggested tier）
+            "crf": "1.0",              // Phase 4 接入 (shape filter + suggested tier)
             "fingerprint": "1.0",      // Phase 3 接入
-            "grouper": "disabled",     // Phase 5+ (grouper 尚未规划)
+            "grouper": "2.1-l3",       // Stage 4: L2 + L3 (sticky + EndpointGroup) 全启用
         },
     }))
 }

@@ -159,6 +159,13 @@ fn line_label(line: &str) -> &'static str {
 pub(super) fn b_key_accepted(token: &str, line: &str, line_tokens: &[String], idx: usize) -> bool {
     let lc = token.to_lowercase();
 
+    // v4.1 Post-Stage4: URL 形 token 永不作 secret
+    //   CRF 可能把 `https://...` 标 B-KEY (如用户样本 my-gateway.company.com/v1 case);
+    //   URL 由 rule_url 独立抽为 kind=Url,CRF 不应覆盖为 SecretLike。
+    if lc.starts_with("http://") || lc.starts_with("https://") {
+        return false;
+    }
+
     // Rule 1: 已知 provider 前缀
     if lc.starts_with("sk-") || lc.starts_with("xai-") || lc.starts_with("rk-")
         || lc.starts_with("ghp_") || lc.starts_with("akia")
