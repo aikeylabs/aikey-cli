@@ -35,14 +35,9 @@ static VERSIONS: &[VersionMigration] = &[
         upgrade: v1_0_4_alpha::upgrade,
         rollback: v1_0_4_alpha::rollback,
     },
-    // v1.0.5-alpha: 批量导入审计表（Stage 2 Phase F）
-    // import_jobs  — 每次批量导入的聚合记录
-    // import_items — 每个被导入凭证的明细审计
-    VersionMigration {
-        version: "1.0.5-alpha",
-        upgrade: v1_0_5_alpha::upgrade,
-        rollback: v1_0_5_alpha::rollback,
-    },
+    // v1.0.5-alpha and v1.0.6-alpha were collapsed into v1.0.4-alpha before
+    // either migration shipped — see module comment on `v1_0_4_alpha`. No
+    // registry entries for these versions. (2026-04-23)
 ];
 
 /// Run all upgrades up to the current binary version.
@@ -239,7 +234,23 @@ pub mod v1_0_3_alpha {
 }
 
 // ---------------------------------------------------------------------------
-// v1.0.4-alpha migrations — Route token for per-request API gateway routing
+// v1.0.4-alpha migrations — route_token (per-request gateway routing) +
+//                           per-key usage telemetry (last_used_at, use_count)
+//
+// 2026-04-23 collapse: absorbed two un-shipped successor modules.
+//   - v1.0.5-alpha (batch-import audit tables `import_jobs` / `import_items`)
+//     was rolled back entirely — the feature never surfaced in UI, the only
+//     consumer that would have justified a separate table (source_hash
+//     dedupe / G-4) was cancelled, and alias-level conflict preflight already
+//     covers "don't re-import the same thing". Idempotent DROP here so any
+//     dev vault that had already run v1.0.5 gets cleaned.
+//   - v1.0.6-alpha (entries.last_used_at / entries.use_count /
+//     provider_accounts.use_count) merged into this module's upgrade so the
+//     VERSIONS registry stays dense (no 1.0.5 gap).
+//
+// Result: three un-shipped ALTERs become part of v1.0.4 and there's no
+// 1.0.5 / 1.0.6 module left.  Safe only because v1.0.2 is the highest
+// published version (workflow/versions/current.md).
 // ---------------------------------------------------------------------------
 
 pub mod v1_0_4_alpha {
@@ -255,11 +266,24 @@ pub mod v1_0_4_alpha {
         .unwrap_or(false)
     }
 
-    /// Forward migration: add route_token columns to entries and provider_accounts.
-    /// Route tokens are random aikey_vk_ tokens used by third-party clients
-    /// (Cursor, OpenCode, etc.) as their API_KEY when routing through the local proxy.
+    /// Forward migration.
+    ///
+    /// 1. **route_token** columns (`entries.route_token` +
+    ///    `provider_accounts.route_token`) + unique partial indexes. Random
+    ///    aikey_vk_ tokens used by third-party clients (Cursor, OpenCode,
+    ///    etc.) as their API_KEY when routing through the local proxy.
+    ///
+    /// 2. **Usage telemetry** columns (`entries.last_used_at`,
+    ///    `entries.use_count`, `provider_accounts.use_count`). Populated by
+    ///    `_internal vault-op record_usage` which proxy calls after every
+    ///    successful credential resolution. Feeds the User Vault Web page's
+    ///    "Last Used" column + "Activity" metric.
+    ///
+    /// 3. **Cleanup of un-shipped v1.0.5 schema**: `import_jobs` /
+    ///    `import_items`. Idempotent DROP (runs on every vault) — safe
+    ///    because these tables never made it into a published version.
     pub fn upgrade(conn: &Connection) -> Result<(), String> {
-        // entries.route_token
+        // --- 1. route_token ---
         if !has_column(conn, "entries", "route_token") {
             conn.execute("ALTER TABLE entries ADD COLUMN route_token TEXT", [])
                 .map_err(|e| format!("entries.route_token: {}", e))?;
@@ -271,7 +295,6 @@ pub mod v1_0_4_alpha {
         )
         .map_err(|e| format!("idx_entries_route_token: {}", e))?;
 
-        // provider_accounts.route_token (table may not exist if v1.0.3 was skipped)
         if has_column(conn, "provider_accounts", "provider_account_id") {
             if !has_column(conn, "provider_accounts", "route_token") {
                 conn.execute(
@@ -288,13 +311,50 @@ pub mod v1_0_4_alpha {
             .map_err(|e| format!("idx_provider_accounts_route_token: {}", e))?;
         }
 
+        // --- 2. Usage telemetry (merged from former v1.0.6-alpha) ---
+        if !has_column(conn, "entries", "last_used_at") {
+            conn.execute("ALTER TABLE entries ADD COLUMN last_used_at INTEGER", [])
+                .map_err(|e| format!("entries.last_used_at: {}", e))?;
+        }
+        if !has_column(conn, "entries", "use_count") {
+            conn.execute(
+                "ALTER TABLE entries ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("entries.use_count: {}", e))?;
+        }
+        if has_column(conn, "provider_accounts", "provider_account_id")
+            && !has_column(conn, "provider_accounts", "use_count")
+        {
+            conn.execute(
+                "ALTER TABLE provider_accounts ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| format!("provider_accounts.use_count: {}", e))?;
+        }
+
+        // --- 3. Cleanup un-shipped v1.0.5 tables (idempotent; no-op if absent) ---
+        for sql in &[
+            "DROP INDEX IF EXISTS idx_import_items_job_id",
+            "DROP INDEX IF EXISTS idx_import_jobs_created_at",
+            "DROP TABLE IF EXISTS import_items",
+            "DROP TABLE IF EXISTS import_jobs",
+        ] {
+            conn.execute(sql, [])
+                .map_err(|e| format!("cleanup un-shipped import tables ({}): {}", sql, e))?;
+        }
+
         Ok(())
     }
 
-    /// Reverse migration: columns cannot be dropped in SQLite — they stay
-    /// but are safely ignored by older binaries.
+    /// Reverse migration.
+    ///
+    /// - Indexes are dropped (safe).
+    /// - Added columns stay (SQLite pre-3.35 can't DROP COLUMN; older binaries
+    ///   ignore unknown columns safely).
+    /// - Un-shipped import tables are NOT re-created (they were reverse-only
+    ///   cleanup, with no consumers to restore).
     pub fn rollback(conn: &Connection) -> Result<(), String> {
-        // Drop indexes (safe, older versions don't use them)
         for sql in &[
             "DROP INDEX IF EXISTS idx_entries_route_token",
             "DROP INDEX IF EXISTS idx_provider_accounts_route_token",
@@ -304,86 +364,20 @@ pub mod v1_0_4_alpha {
                 Err(e) => eprintln!("[db rollback] WARN: {} — {}", sql, e),
             }
         }
-        eprintln!("[db rollback] SKIP: entries.route_token (SQLite no DROP COLUMN)");
-        eprintln!("[db rollback] SKIP: provider_accounts.route_token (SQLite no DROP COLUMN)");
-        Ok(())
-    }
-}
-
-pub mod v1_0_5_alpha {
-    //! v1.0.5-alpha: 批量导入审计表（Stage 2 Phase F）
-    //!
-    //! 新增 2 张表：
-    //! - `import_jobs`：每次批量导入的聚合记录（job_id 由 Go local-server 生成 UUID）
-    //! - `import_items`：每条被导入凭证的明细（FK 到 job_id）
-    //!
-    //! Why：原 audit_log 只记"what happened"，不关联"哪次 import"。批量导入一次 50 条时
-    //! audit_log 会产生 50 条 Add 事件，没有 grouping key。import_jobs/items 提供"以 job 为单位"
-    //! 的视角，便于前端在 /user/import/history 展示"某次导入" + 明细展开。
-
-    use rusqlite::Connection;
-
-    pub fn upgrade(conn: &Connection) -> Result<(), String> {
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS import_jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_id TEXT NOT NULL UNIQUE,
-                source_type TEXT,
-                source_hash TEXT,
-                created_at INTEGER NOT NULL,
-                completed_at INTEGER,
-                total_items INTEGER NOT NULL DEFAULT 0,
-                inserted_count INTEGER NOT NULL DEFAULT 0,
-                replaced_count INTEGER NOT NULL DEFAULT 0,
-                skipped_count INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'in_progress'
-            )",
-            [],
-        )
-        .map_err(|e| format!("create import_jobs: {}", e))?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_import_jobs_created_at \
-             ON import_jobs(created_at DESC)",
-            [],
-        )
-        .map_err(|e| format!("idx_import_jobs_created_at: {}", e))?;
-
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS import_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                job_id TEXT NOT NULL,
-                alias TEXT NOT NULL,
-                action TEXT NOT NULL,
-                provider_code TEXT,
-                created_at INTEGER NOT NULL
-            )",
-            [],
-        )
-        .map_err(|e| format!("create import_items: {}", e))?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_import_items_job_id \
-             ON import_items(job_id)",
-            [],
-        )
-        .map_err(|e| format!("idx_import_items_job_id: {}", e))?;
-
-        Ok(())
-    }
-
-    pub fn rollback(conn: &Connection) -> Result<(), String> {
-        for sql in &[
-            "DROP INDEX IF EXISTS idx_import_items_job_id",
-            "DROP INDEX IF EXISTS idx_import_jobs_created_at",
-            "DROP TABLE IF EXISTS import_items",
-            "DROP TABLE IF EXISTS import_jobs",
+        for msg in &[
+            "[db rollback] SKIP: entries.route_token (SQLite no DROP COLUMN)",
+            "[db rollback] SKIP: provider_accounts.route_token (SQLite no DROP COLUMN)",
+            "[db rollback] SKIP: entries.last_used_at (SQLite no DROP COLUMN)",
+            "[db rollback] SKIP: entries.use_count (SQLite no DROP COLUMN)",
+            "[db rollback] SKIP: provider_accounts.use_count (SQLite no DROP COLUMN)",
         ] {
-            match conn.execute(sql, []) {
-                Ok(_) => eprintln!("[db rollback] OK: {}", sql),
-                Err(e) => eprintln!("[db rollback] WARN: {} — {}", sql, e),
-            }
+            eprintln!("{}", msg);
         }
         Ok(())
     }
 }
+
+// v1.0.5-alpha (batch-import audit tables) and v1.0.6-alpha (per-key usage
+// telemetry) were collapsed into v1.0.4-alpha on 2026-04-23 before either
+// shipped — see the module comment at the top of `v1_0_4_alpha`. Intentionally
+// left blank so the file tree matches the VERSIONS registry.

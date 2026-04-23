@@ -582,6 +582,17 @@ fn run_unified_list(
 fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let command = cli.command.as_ref().unwrap();
 
+    // Quarantine a corrupt vault file before anything else reads from it.
+    // Why up here: `run_unified_list`, `whoami`, `status`, etc. all call
+    // `storage::list_entries_with_metadata().unwrap_or_default()` which would
+    // silently swallow a vault-open error and render an empty view — a
+    // data-loss-looking UX that misleads users into thinking their keys are
+    // gone. Quarantining before any command touches storage forces the issue
+    // to surface (the user sees the ⚠ banner) and lets the follow-up init
+    // proceed from a clean slate. Safe for db/init/version commands too —
+    // helper is a no-op when the vault is fine.
+    let _ = executor::ensure_vault_integrity_or_quarantine();
+
     // Auto-start proxy silently when AIKEY_MASTER_PASSWORD (or AK_TEST_PASSWORD)
     // is available in the environment.  Skipped for proxy lifecycle commands which
     // manage the process themselves, and for version/init which predate the proxy.
@@ -706,6 +717,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", commands_account::hook_template_hash(kind));
         }
         Commands::Add { alias, provider, providers } => {
+            // Reject empty / whitespace-only alias before any interactive prompt.
+            // Why: an empty alias writes a ghost entry that is hard to target with
+            // later commands (`get ""`, `delete ""`) and pollutes `list --json`.
+            if alias.trim().is_empty() {
+                let msg = "alias must not be empty";
+                if cli.json { json_output::error(msg, 1); }
+                return Err(msg.into());
+            }
             let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
             // Early password validation: fail fast before asking for API key,
@@ -828,6 +847,36 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     return Err("--provider <CODE> or --providers <c1,c2,...> is required in non-interactive mode.".into());
                 };
+
+            // Warn (not reject) when the user passed a provider code via
+            // --provider / --providers that is not one of the built-in ones.
+            // Why warn instead of reject: providers::Provider has a Custom(String)
+            // variant — self-hosted LLMs and aggregator gateways are a first-class
+            // feature. A hard reject would break that use case. But an unguarded
+            // accept lets a typo like `openia` silently sail through and route
+            // requests at a non-existent provider. The warning surfaces the typo
+            // without blocking the custom case. Skipped for the interactive
+            // picker branch because that flow has an explicit "Other provider
+            // types..." option and thus no typo risk.
+            let from_cli_flag = !providers.is_empty() || provider.is_some();
+            if from_cli_flag && !cli.json {
+                let known: Vec<&str> = KNOWN_PROVIDERS.iter().map(|(n, _)| *n).collect();
+                let unknown: Vec<&String> = resolved_providers.iter()
+                    .filter(|p| !known.contains(&p.as_str()))
+                    .collect();
+                if !unknown.is_empty() {
+                    use colored::Colorize;
+                    let unk_list = unknown.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", ");
+                    eprintln!(
+                        "  {} {} is not a built-in provider code.",
+                        "warning:".yellow().bold(), unk_list
+                    );
+                    eprintln!("  built-in: {}", known.join(", "));
+                    eprintln!("  If this is a custom provider / gateway, this is fine — continuing.");
+                    eprintln!("  If it was a typo, Ctrl+C and retry with --provider <built-in>.");
+                    eprintln!();
+                }
+            }
 
             let resolved_provider = resolved_providers.first().cloned();
 
@@ -2301,8 +2350,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Web { page, port } => {
-            commands_account::handle_browse(page.as_deref(), *port, cli.json)?;
+        Commands::Web { page, import, port } => {
+            // `--import` is shorthand for positional `import`. When set it
+            // overrides any explicit positional page — most users will type
+            // one or the other, not both.
+            let effective_page: Option<&str> = if *import { Some("import") } else { page.as_deref() };
+            commands_account::handle_browse(effective_page, *port, cli.json)?;
         }
         Commands::Master { page, url, port } => {
             commands_account::handle_master_browse(page.as_deref(), url.as_deref(), *port, cli.json)?;

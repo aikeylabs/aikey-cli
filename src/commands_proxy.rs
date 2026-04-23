@@ -341,7 +341,7 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
     if let Some(pid) = read_pid() {
         if process_alive(pid) {
             eprintln!("proxy already running (pid: {})", pid);
-            eprintln!("listen: http://{}", PROXY_HEALTH_ADDR_DEFAULT);
+            eprintln!("listen: http://{}", proxy_listen_addr(config.map(std::path::Path::new)));
             return Ok(());
         }
         // Stale PID file — remove it.
@@ -353,6 +353,24 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
 
     // 3. Resolve config: cwd → ~/.aikey/
     let config_path = resolve_config(config)?;
+
+    // 4. Pre-check: is the configured listen port already in use by someone else?
+    // Why: a post-spawn port_reachable() check cannot distinguish "our proxy bound
+    // successfully" from "someone else was already listening". In the collision
+    // case, our child dies on bind but port_reachable still returns true —
+    // producing a false "running" report. We have already cleared any stale pid
+    // file from a previous aikey proxy, so any live listener at this point is
+    // unrelated to us.
+    let listen_addr = proxy_listen_addr(Some(&config_path));
+    if port_reachable(&listen_addr, std::time::Duration::from_millis(250)) {
+        let port = listen_addr.rsplit(':').next().unwrap_or("?");
+        return Err(format!(
+            "address {} is already in use by another process.\n  \
+             Stop the other listener or change listen.port in {}.\n  \
+             Check: lsof -nP -iTCP:{} -sTCP:LISTEN",
+            listen_addr, config_path.display(), port
+        ).into());
+    }
 
     eprintln!("Starting aikey-proxy...");
     eprintln!("  config: {}", config_path.display());
@@ -394,10 +412,23 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
         write_pid(pid)?;
 
         // Wait for proxy to become healthy before returning (max 3s).
+        // Check BOTH conditions per tick:
+        //   (a) our spawned child is still alive (process_alive)
+        //   (b) the listen address is reachable (port_reachable)
+        // Why both: port_reachable alone is insufficient. If the port is
+        // already held by *another* process (e.g. a stale proxy from a
+        // previous session or an unrelated service), our child crashes on
+        // bind but port_reachable still returns true — producing a false
+        // "running" report. Requiring process_alive closes that hole.
         let addr = proxy_listen_addr(config.map(std::path::Path::new));
         let mut healthy = false;
+        let mut spawn_died = false;
         for _ in 0..6 {
             std::thread::sleep(std::time::Duration::from_millis(500));
+            if !process_alive(pid) {
+                spawn_died = true;
+                break;
+            }
             if port_reachable(&addr, std::time::Duration::from_millis(300)) {
                 healthy = true;
                 break;
@@ -405,6 +436,18 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
         }
         if healthy {
             eprintln!("\x1b[32m✓\x1b[0m aikey-proxy running (pid: {}, http://{})", pid, addr);
+        } else if spawn_died {
+            // Clean up the pid file now so the next `aikey proxy start` does
+            // not go through the "stale pid" path with a confusing message.
+            let _ = fs::remove_file(pid_path()?);
+            let port = addr.rsplit(':').next().unwrap_or("27200");
+            return Err(format!(
+                "aikey-proxy (pid: {}) exited shortly after starting.\n  \
+                 Likely cause: address {} is already in use by another process, or the config is invalid.\n  \
+                 Check:  lsof -nP -iTCP:{} -sTCP:LISTEN\n  \
+                 Logs:   ~/.aikey/logs/",
+                pid, addr, port
+            ).into());
         } else {
             eprintln!("aikey-proxy spawned (pid: {}) but not yet reachable at http://{}", pid, addr);
             eprintln!("  check logs: ~/.aikey/logs/");
@@ -487,11 +530,16 @@ pub fn status_rows() -> Vec<String> {
                 rows.push("hint:    run `aikey proxy start` to start".to_string());
                 if let Ok(p) = pid_path() { let _ = fs::remove_file(p); }
             } else {
-                let healthy = port_reachable(PROXY_HEALTH_ADDR_DEFAULT, Duration::from_millis(500));
+                // Resolve the listen address from aikey-proxy.yaml (falls back to
+                // 127.0.0.1:27200 if the config cannot be parsed). Reading from
+                // config — rather than a hardcoded constant — keeps the displayed
+                // `listen:` line truthful when the user has customised the port.
+                let addr = proxy_listen_addr(None);
+                let healthy = port_reachable(&addr, Duration::from_millis(500));
                 let health_str = if healthy { "healthy" } else { "unreachable" };
                 rows.push(format!("status:  running ({})", health_str));
                 rows.push(format!("pid:     {}", pid));
-                rows.push(format!("listen:  http://{}", PROXY_HEALTH_ADDR_DEFAULT));
+                rows.push(format!("listen:  http://{}", addr));
                 match proxy_vault_state() {
                     ProxyVaultState::Current => rows.push("vault sync: current".to_string()),
                     ProxyVaultState::Stale => {

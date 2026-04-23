@@ -51,6 +51,9 @@ pub enum Kind {
     SecretLike,
     #[allow(dead_code)] // Phase 3/4 grouper 可能输出 base_url 分类
     BaseUrl,
+    /// v4.2: block 首行"自然语言短文本",用户手写的 Draft 卡片标题。
+    /// 由 rule_title 抽取,grouper 回挂到对应 block 的 draft。
+    Title,
 }
 
 impl Kind {
@@ -61,6 +64,7 @@ impl Kind {
             Kind::PasswordLike => "password_like",
             Kind::SecretLike => "secret_like",
             Kind::BaseUrl => "base_url",
+            Kind::Title => "title",
         }
     }
     pub fn id_prefix(&self) -> char {
@@ -70,6 +74,7 @@ impl Kind {
             Kind::PasswordLike => 'p',
             Kind::SecretLike => 's',
             Kind::BaseUrl => 'b',
+            Kind::Title => 't',
         }
     }
 }

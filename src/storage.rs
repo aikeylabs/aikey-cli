@@ -28,6 +28,23 @@ pub struct SecretMetadata {
     /// Provider codes this key supports (v1.0.2+).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supported_providers: Option<Vec<String>>,
+    /// Route token (`aikey_vk_...`) — stable public id for this entry.
+    /// Added 2026-04-23 so the User Vault Web page can render a
+    /// secondary id line under each alias without needing a second
+    /// per-row query. Old callers ignore the new field via
+    /// `skip_serializing_if` + `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_token: Option<String>,
+    /// Unix seconds of the last recorded usage (bumped by
+    /// `_internal vault-op record_usage`). Null until the key has been
+    /// used. Added v1.0.6-alpha.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<i64>,
+    /// Monotonic counter of recorded usages. Defaults to 0; old vaults
+    /// without the column report None (which the UI treats as 0).
+    /// Added v1.0.6-alpha.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_count: Option<i64>,
 }
 
 /// Default vault data directory path (~/.aikey/data/)
@@ -929,13 +946,32 @@ pub fn store_entry(alias: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<(), S
 
     migrate_database(&conn)?;
 
+    store_entry_on_conn(&conn, alias, nonce, ciphertext)
+}
+
+/// G-5 fix (2026-04-23): transactional variant of `store_entry`. Callers that
+/// need to group multiple entry writes atomically (e.g. batch_import) open
+/// their own `Connection` / `Transaction` and drive all writes through these
+/// `*_on_conn` helpers so rollback can undo every side-effect on failure.
+///
+/// The plain `store_entry` wrapper above is kept for all single-write
+/// callsites (which remain self-contained, one execute per command).
+///
+/// Migrations and vault-existence checks live with the wrapper; the inner
+/// helper assumes the connection is already initialised (open_connection
+/// applies migrations).
+pub(crate) fn store_entry_on_conn(
+    conn: &rusqlite::Connection,
+    alias: &str,
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<(), String> {
     conn.execute(
         "INSERT INTO entries (alias, nonce, ciphertext, version_tag) VALUES (?1, ?2, ?3, 1)
         ON CONFLICT(alias) DO UPDATE SET nonce = ?2, ciphertext = ?3, version_tag = version_tag + 1",
         params![alias, nonce, ciphertext],
     )
     .map_err(|e| format!("Failed to store entry: {}", e))?;
-
     Ok(())
 }
 
@@ -1005,10 +1041,15 @@ pub fn list_entries_with_metadata_readonly() -> Result<Vec<SecretMetadata>, Stri
 
 fn query_entries_with_metadata(conn: &Connection) -> Result<Vec<SecretMetadata>, String> {
     // provider_code, base_url, supported_providers may not exist on older vaults.
+    // route_token (v1.0.4+) and last_used_at/use_count (v1.0.6+) are selected
+    // in the preferred path; older DDL fallbacks project NULL / 0 so the
+    // parse path stays uniform regardless of vault age.
     let mut stmt = conn
-        .prepare("SELECT alias, created_at, provider_code, base_url, supported_providers FROM entries ORDER BY alias")
-        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, NULL FROM entries ORDER BY alias"))
-        .or_else(|_| conn.prepare("SELECT alias, created_at, NULL, NULL, NULL FROM entries ORDER BY alias"))
+        .prepare("SELECT alias, created_at, provider_code, base_url, supported_providers, route_token, last_used_at, use_count FROM entries ORDER BY alias")
+        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, supported_providers, route_token, NULL, 0 FROM entries ORDER BY alias"))
+        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, supported_providers, NULL, NULL, 0 FROM entries ORDER BY alias"))
+        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, NULL, NULL, NULL, 0 FROM entries ORDER BY alias"))
+        .or_else(|_| conn.prepare("SELECT alias, created_at, NULL, NULL, NULL, NULL, NULL, 0 FROM entries ORDER BY alias"))
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     let metadata: Vec<SecretMetadata> = stmt
@@ -1022,6 +1063,9 @@ fn query_entries_with_metadata(conn: &Connection) -> Result<Vec<SecretMetadata>,
                 provider_code:       row.get(2).ok().flatten(),
                 base_url:            row.get(3).ok().flatten(),
                 supported_providers,
+                route_token:         row.get(5).ok().flatten(),
+                last_used_at:        row.get(6).ok().flatten(),
+                use_count:           row.get(7).ok(),
             })
         })
         .map_err(|e| format!("Failed to query entries: {}", e))?
@@ -1029,6 +1073,24 @@ fn query_entries_with_metadata(conn: &Connection) -> Result<Vec<SecretMetadata>,
         .map_err(|e| format!("Failed to collect results: {}", e))?;
 
     Ok(metadata)
+}
+
+/// Atomically bump usage telemetry on a Personal entry: set `last_used_at`
+/// to the caller-supplied unix seconds, increment `use_count`. Returns
+/// the row-count affected — 0 if the alias doesn't exist (caller surfaces
+/// I_CREDENTIAL_NOT_FOUND), 1 on success. Idempotent with respect to
+/// repeated invocations (each call is a distinct recorded usage).
+///
+/// `last_used_at` is accepted as a parameter so the caller (CLI
+/// `record_usage` action, which is in turn called from proxy) can pin
+/// timestamps to the request time, not the db write time.
+pub fn bump_entry_usage(alias: &str, ts: i64) -> Result<usize, String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE entries SET last_used_at = ?1, use_count = COALESCE(use_count, 0) + 1 WHERE alias = ?2",
+        rusqlite::params![ts, alias],
+    )
+    .map_err(|e| format!("bump_entry_usage UPDATE: {}", e))
 }
 
 /// Deletes an entry from the vault

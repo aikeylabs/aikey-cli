@@ -19,7 +19,7 @@
 
 use serde::Serialize;
 
-/// Draft 的字段集合 (email/password/api_key/base_url + extra_secrets)
+/// Draft 的字段集合 (email/password/api_key/base_url + extra_secrets + title)
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct DraftFields {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -34,6 +34,18 @@ pub struct DraftFields {
     /// 前端 Draft 卡片可选择展示为 "+ N extra secrets" 提示。
     #[serde(default)]
     pub extra_secrets: Vec<String>,
+    /// v4.2: 用户手写的 Draft 标题 (block 首行的"自然语言短文本"),
+    /// UI 卡片预览优先用它。由 `rule_title::rule_extract_title` 抽取,
+    /// grouper 按 block line_range 回挂。
+    ///
+    /// Why 不放 provider_hint 里:provider_hint 是推断 provider 的提示词
+    /// (如 "kimi" "anthropic"),title 是用户取的卡片名 (如 "Kimitest8"
+    /// "工作号"),两者语义不同。
+    ///
+    /// Ablation 证据: `workflow/CI/research/ablation-spike-v4.1/TITLE_
+    /// ABLATION_REPORT.md` — 现有 5 字段 R/P/FP 零回归,R_title 91.2%。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// v4.1 Draft 类型:区分以账号为主的 OAuth 凭证与纯 API KEY 凭证
@@ -111,6 +123,12 @@ pub enum InferenceSource {
     ShellVarPattern      { var_name: String, pattern: String },
     /// E5: Draft 自带 base_url 的 host 匹配 url_host_patterns
     UrlHostPattern       { url: String, pattern: String },
+    /// E6 (BUG-04 fix): Draft 自己 line_range 内某行的 "label 区"（首 secret 前缀之前 /
+    /// 首 40 字符）含 provider keyword。
+    /// 触发场景:单行 Complex（`🔑 kimi: sk-moonshot_... 邮箱: ...`）— block.provider_hint
+    /// 取首 token 丢了 kimi,E2/E3 都打不上;E6 直接扫 label 区兜底。
+    /// Why 限定 label zone:防止匹配到 secret 值内部(如 `sk-kimi_...` 的 "kimi")误作 heading 证据。
+    InlineLabelKeyword   { line: usize, keyword: String },
 }
 
 impl InferenceSource {
@@ -123,6 +141,7 @@ impl InferenceSource {
             InferenceSource::SectionHeadingKeyword{..} => 0.8,
             InferenceSource::ShellVarPattern{..}      => 0.85,
             InferenceSource::UrlHostPattern{..}       => 0.6,
+            InferenceSource::InlineLabelKeyword{..}   => 0.75,
         }
     }
 }
@@ -132,6 +151,14 @@ impl InferenceSource {
 pub struct DraftRecord {
     /// 稳定 id,`d-{N}` 形态 (UI 用它做 expand/select 状态键)
     pub id: String,
+    /// v4.1 Stage 6+: 建议 alias (vault 写入时的 key 名)。由 parse handler 在
+    /// group 之后填充:基于 inferred_provider / provider_hint 生成,并与 vault 现有
+    /// aliases + 本 batch 其他 draft aliases 做 dedupe(`-2`/`-3`/... 后缀)。
+    ///
+    /// UI 合约:默认值即本字段;用户可在卡片里手改(mutate `record.alias` 即可)。
+    /// 初始状态(group_and_cluster 返回时)为空字符串,由 parse handler 填充。
+    #[serde(default)]
+    pub alias: String,
     /// Block 的 provider 提示 (来自 Title 行的首 token,如 `claude3:` 的 "claude3")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_hint: Option<String>,
@@ -164,6 +191,14 @@ pub struct DraftRecord {
     /// `data/provider_fingerprint.yaml::aggregator_families`。
     #[serde(default)]
     pub protocol_types: Vec<String>,
+    /// v4.1 Stage 10+: 推断出的 provider 对应的官方登录/API Key 页面 URL
+    ///
+    /// 由 parse handler 从 `FingerprintClassifier::login_url_for_family` 填充;
+    /// 未推断出 provider 或 yaml 未配时为 None。UI "Open login page" 按钮消费此字段,
+    /// window.open() 让用户直接到官方登录页完成 OAuth / 申请 API Key。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub login_url: Option<String>,
 }
 
 /// L2 grouper 内部 block 数据 (从 V4.1 spike `grouping.rs:338-343` 迁移)

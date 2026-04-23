@@ -17,6 +17,47 @@
 
 version: 1
 
+# v4.1 Stage 10+: family → 官方登录/API Key 页面 URL 清单
+#
+# UI "Open login page" 按钮消费此字段,window.open() 跳到 provider 登录态。
+#
+# URL 选择原则:
+#   - OAuth-capable provider (aikey auth login 支持的 3 家) → 站点根登录页
+#   - 其他 provider → 常用的 "API Key 管理" 页面(用户看完教程能直接申请 key)
+#
+# 数据来源(2026-04 校对):
+#   - Anthropic: https://claude.ai/login (Claude Pro/Team OAuth 登录首页)
+#   - OpenAI / Codex: https://chatgpt.com (ChatGPT 登录后会流转到 OAuth 授权)
+#   - Kimi / Moonshot: https://www.kimi.com (Moonshot 账号登录)
+#   - Google Gemini: https://aistudio.google.com/app/apikey (AI Studio 的 API Key 页面)
+#   - Groq: https://console.groq.com/login
+#   - DeepSeek: https://platform.deepseek.com/sign_in
+#   - xAI: https://console.x.ai
+#   - Zhipu/BigModel: https://bigmodel.cn/login
+#   - Doubao (Volcengine Ark): https://console.volcengine.com/ark
+#   - SiliconFlow: https://cloud.siliconflow.cn/
+#   - Hugging Face: https://huggingface.co/login
+#   - Perplexity: https://www.perplexity.ai
+#   - OpenRouter (聚合网关): https://openrouter.ai/sign-in
+#   - Yunwu (云雾,聚合网关): https://yunwu.ai
+#   - 0011 (Zeroeleven,聚合网关): https://0011.ai
+family_login_urls:
+  anthropic:     "https://claude.ai/login"
+  openai:        "https://chatgpt.com"
+  kimi:          "https://www.kimi.com"
+  google_gemini: "https://aistudio.google.com/app/apikey"
+  groq:          "https://console.groq.com/login"
+  deepseek:      "https://platform.deepseek.com/sign_in"
+  xai_grok:      "https://console.x.ai"
+  zhipu:         "https://bigmodel.cn/login"
+  doubao:        "https://console.volcengine.com/ark"
+  siliconflow:   "https://cloud.siliconflow.cn"
+  huggingface:   "https://huggingface.co/login"
+  perplexity:    "https://www.perplexity.ai"
+  openrouter:    "https://openrouter.ai/sign-in"
+  yunwu:         "https://yunwu.ai"
+  zeroeleven:    "https://0011.ai"
+
 # v4.1 Stage 5+: 聚合网关 family 清单 (UI Provider 字段 multi-select 设计驱动)
 #
 # 含义:这些 family 同时支持多种底层 API 协议 (例如 0011/zeroeleven 同时挂 anthropic + openai),

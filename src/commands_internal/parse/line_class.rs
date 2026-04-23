@@ -28,6 +28,32 @@
 
 use bitflags::bitflags;
 use regex::Regex;
+use std::sync::OnceLock;
+
+// R-5 P2-A (2026-04-23): hot-path regexes cached in OnceLock to skip
+// recompilation on every line_class() call (called per-line for whole text).
+fn re_email() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap())
+}
+fn re_any_secret() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(
+        r"sk-ant-[A-Za-z0-9\-_]{10,}|\bsk-[A-Za-z0-9\-_]{10,}\b|\bxai-[A-Za-z0-9]{10,}\b|\brk-[A-Za-z0-9\-_]{10,}\b|\bghp_[A-Za-z0-9]{16,}\b|\b[a-fA-F0-9]{28,}\b|\bAKIA[0-9A-Z]{16}\b|\bAIza[0-9A-Za-z_\-]{35}\b|\bgsk_[A-Za-z0-9]{48,64}\b|\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"
+    ).unwrap())
+}
+fn re_url() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r#"https?://[^\s"',}\])]+"#).unwrap())
+}
+fn re_pure_sep() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"^[-=#*\s]+$").unwrap())
+}
+fn re_banner_sep() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"^[-=#*]{2,}\s+\S[^\n]{0,40}?\S\s+[-=#*]{2,}\s*$").unwrap())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
@@ -75,14 +101,9 @@ pub fn line_class(line: &str) -> LineClass {
         return LineClass { kind: LineKind::Empty, flags };
     }
 
-    let re_email = Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap();
-    let re_any_secret = Regex::new(
-        r"sk-ant-[A-Za-z0-9\-_]{10,}|\bsk-[A-Za-z0-9\-_]{10,}\b|\bxai-[A-Za-z0-9]{10,}\b|\brk-[A-Za-z0-9\-_]{10,}\b|\bghp_[A-Za-z0-9]{16,}\b|\b[a-fA-F0-9]{28,}\b|\bAKIA[0-9A-Z]{16}\b|\bAIza[0-9A-Za-z_\-]{35}\b|\bgsk_[A-Za-z0-9]{48,64}\b|\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"
-    ).unwrap();
-    let re_url = Regex::new(r#"https?://[^\s"',}\])]+"#).unwrap();
-    let has_email = re_email.is_match(t);
-    let has_secret = re_any_secret.is_match(t);
-    let has_url = re_url.is_match(t);
+    let has_email = re_email().is_match(t);
+    let has_secret = re_any_secret().is_match(t);
+    let has_url = re_url().is_match(t);
 
     if has_email { flags |= LineFlags::HAS_EMAIL; }
     if has_secret { flags |= LineFlags::HAS_SECRET; }
@@ -129,21 +150,17 @@ pub fn line_class(line: &str) -> LineClass {
     //   (a) 纯符号 `---` / `===` / `***`
     //   (b) banner `---- PROD ----` / `=== DEV ===`
     //   (c) 注释包裹 banner `# --- 公司项目 ---` —— kind 升 Separator, flags 保留 IS_COMMENT
-    let re_pure_sep = Regex::new(r"^[-=#*\s]+$").unwrap();
-    if re_pure_sep.is_match(t) {
+    if re_pure_sep().is_match(t) {
         return LineClass { kind: LineKind::Separator, flags };
     }
-    let re_banner_sep = Regex::new(
-        r"^[-=#*]{2,}\s+\S[^\n]{0,40}?\S\s+[-=#*]{2,}\s*$"
-    ).unwrap();
-    if re_banner_sep.is_match(t) {
+    if re_banner_sep().is_match(t) {
         return LineClass { kind: LineKind::Separator, flags };
     }
     // (c) 注释包裹 banner
     if flags.contains(LineFlags::IS_COMMENT) {
         let body = t.trim_start_matches(|c: char| c == '#' || c == '/' || c == ';').trim();
         if !body.is_empty() {
-            if re_pure_sep.is_match(body) || re_banner_sep.is_match(body) {
+            if re_pure_sep().is_match(body) || re_banner_sep().is_match(body) {
                 return LineClass { kind: LineKind::Separator, flags };
             }
         }

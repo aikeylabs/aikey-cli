@@ -698,7 +698,34 @@ pub fn handle_account_status(json_mode: bool) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// `aikey web [page] [--port PORT]` — open User Console in the default browser with auth.
+/// Canonical alias for the CLI-side `aikey web [page]` command.
+///
+/// The CLI deliberately does NOT know the real paths (`/user/...`). Every
+/// recognised page name is normalised to an alias here, and the URL is
+/// then built as `<base>/go/<alias>`. The real alias → path mapping lives
+/// in `aikey-control/web/src/app/router/go-alias.tsx` — letting the web
+/// team reorganise routes without a CLI release.
+///
+/// Unknown names bubble up as an error so typos get caught at the CLI
+/// boundary rather than silently landing on the fallback page.
+fn web_page_alias(page: Option<&str>) -> Result<&'static str, String> {
+    match page {
+        None                                                     => Ok("overview"),
+        Some("overview")                                         => Ok("overview"),
+        Some("keys" | "virtual-keys" | "team-keys")              => Ok("keys"),
+        Some("account" | "profile")                              => Ok("account"),
+        Some("usage" | "usage-ledger")                           => Ok("usage"),
+        Some("import" | "bulk-import" | "quick-import")          => Ok("import"),
+        Some("referrals")                                        => Ok("referrals"),
+        Some(other) => Err(format!(
+            "Unknown page '{}'. Available: overview, keys, account, usage, import, referrals",
+            other
+        )),
+    }
+}
+
+/// `aikey web [page] [--import] [--port PORT]` — open User Console in the
+/// default browser with auth.
 ///
 /// In local-user mode (personal edition, installed with `--with-console`),
 /// opens the console directly without JWT — reads `install-state.json` to
@@ -712,11 +739,17 @@ pub fn handle_account_status(json_mode: bool) -> Result<(), Box<dyn std::error::
 /// ports (3000, 5173) and prefers the first one that responds.  This lets
 /// `aikey web` work in both dev and production without extra flags.
 pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the page name at the CLI boundary. Doing it here (before
+    // the local/JWT branch) means typos fail fast with a clear error
+    // regardless of which mode the user is in — instead of silently
+    // opening the overview page.
+    let alias = web_page_alias(page)?;
+
     // Local-user mode: open console directly without JWT.
     // Why: personal edition has no login flow — LocalIdentityMiddleware handles
     // auth server-side, and the SPA is served with authMode:"local_bypass".
     if port.is_none() {
-        if let Some(url) = try_local_browse_url(page) {
+        if let Some(url) = try_local_browse_url(alias) {
             if json_mode {
                 crate::json_output::print_json(serde_json::json!({
                     "ok": true,
@@ -740,18 +773,9 @@ pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> 
         e.into()
     })?;
 
-    let path = match page {
-        Some("keys" | "virtual-keys") => "/user/virtual-keys",
-        Some("account")               => "/user/account",
-        Some("usage" | "usage-ledger") => "/user/usage-ledger",
-        Some("overview") | None        => "/user/overview",
-        Some(other) => {
-            return Err(format!(
-                "Unknown page '{}'. Available: overview, keys, account, usage",
-                other
-            ).into());
-        }
-    };
+    // Build `/go/<alias>` rather than `/user/<page>` so we don't freeze
+    // user-facing route paths into CLI binaries.
+    let path = format!("/go/{}", alias);
 
     let base_url = resolve_browse_base_url(&acc.control_url, port);
 
@@ -846,7 +870,10 @@ fn try_local_control_url() -> Option<String> {
 ///
 /// Returns `Some(full_url)` if `control_plane_mode == "local"` and
 /// `control_panel_url` is set; `None` otherwise (falls through to JWT flow).
-fn try_local_browse_url(page: Option<&str>) -> Option<String> {
+/// Build a local-mode browse URL, taking a pre-validated alias
+/// (produced by `web_page_alias`). Returning `None` means "not in
+/// local/trial mode — caller should fall back to the JWT path".
+fn try_local_browse_url(alias: &str) -> Option<String> {
     let home = dirs::home_dir()?;
     let state_path = home.join(".aikey").join("install-state.json");
     let content = std::fs::read_to_string(&state_path).ok()?;
@@ -865,15 +892,9 @@ fn try_local_browse_url(page: Option<&str>) -> Option<String> {
         return None;
     }
 
-    let path = match page {
-        Some("keys" | "virtual-keys") => "/user/virtual-keys",
-        Some("account")               => "/user/account",
-        Some("usage" | "usage-ledger") => "/user/usage-ledger",
-        Some("overview") | None        => "/user/overview",
-        _                              => "/user/overview",
-    };
-
-    Some(format!("{}{}", base_url.trim_end_matches('/'), path))
+    // Both branches go through `/go/<alias>` so the web router owns
+    // every real route. The alias is already validated by the caller.
+    Some(format!("{}/go/{}", base_url.trim_end_matches('/'), alias))
 }
 
 /// Determine the base URL for `aikey web`.

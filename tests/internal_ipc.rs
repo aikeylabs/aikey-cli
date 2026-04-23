@@ -1065,8 +1065,22 @@ fn parse_fills_orphans_from_every_candidate_stage2() {
     }));
     let cands = v["data"]["candidates"].as_array().unwrap();
     let orphans = v["data"]["orphans"].as_array().unwrap();
-    // Stage 2: 所有候选都是 orphan，无 grouping
-    assert_eq!(cands.len(), orphans.len());
+    let drafts = v["data"]["drafts"].as_array().unwrap();
+    // Stage 2 原断言 `cands.len() == orphans.len()` 假设没有 L2 grouping —— 现在
+    // Stage 3+ 已上线 grouper,大多数 candidates 被 drafts 持有,orphans 接近 0。
+    // 更新断言:验证核心语义 —— parse 管道产出 3 个候选(email/url/api_key),
+    // 每个 candidate 要么被 draft 持有要么落 orphans(并集覆盖所有 cand)。
+    assert_eq!(cands.len(), 3, "should parse email + url + api_key (got: {:?})", cands);
+    assert!(
+        orphans.len() + drafts.iter().map(|d| {
+            let f = &d["fields"];
+            [ "email", "api_key", "password", "base_url" ]
+                .iter()
+                .filter(|k| !f.get(*k).unwrap_or(&serde_json::Value::Null).is_null())
+                .count()
+        }).sum::<usize>() >= cands.len(),
+        "drafts + orphans should cover every candidate"
+    );
 }
 
 #[test]
@@ -1125,47 +1139,19 @@ fn parse_respects_max_candidates_cap() {
     assert!(cands.len() <= 5, "cap should be enforced, got {}", cands.len());
 }
 
-// ========== Phase F: audit + import_jobs wiring ==========
+// ========== Phase F: audit_log wiring ==========
+//
+// 2026-04-23: removed `import_jobs` / `import_items` table tests together
+// with the tables themselves (collapsed out of v1.0.4-alpha migration).
+// `count_table` kept — still used by audit_log assertions below.
 
-/// 统计 audit_log / import_jobs / import_items 表行数（sqlite 直读）
+/// 统计单张表的行数（sqlite 直读）
 fn count_table(env: &InternalTestEnv, table: &str) -> i64 {
     use rusqlite::Connection;
     let db = env.vault_path.join("data").join("vault.db");
     let conn = Connection::open(&db).expect("open");
     conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |r| r.get(0))
         .unwrap_or(0)
-}
-
-fn read_import_job(env: &InternalTestEnv, job_id: &str) -> Option<Value> {
-    use rusqlite::Connection;
-    let db = env.vault_path.join("data").join("vault.db");
-    let conn = Connection::open(&db).ok()?;
-    conn.query_row(
-        "SELECT job_id, source_type, source_hash, total_items, inserted_count, replaced_count, \
-         skipped_count, status FROM import_jobs WHERE job_id = ?",
-        [job_id],
-        |r| {
-            Ok(serde_json::json!({
-                "job_id": r.get::<_, String>(0)?,
-                "source_type": r.get::<_, Option<String>>(1)?,
-                "source_hash": r.get::<_, Option<String>>(2)?,
-                "total_items": r.get::<_, i64>(3)?,
-                "inserted_count": r.get::<_, i64>(4)?,
-                "replaced_count": r.get::<_, i64>(5)?,
-                "skipped_count": r.get::<_, i64>(6)?,
-                "status": r.get::<_, String>(7)?,
-            }))
-        },
-    ).ok()
-}
-
-#[test]
-fn migrations_create_import_tables() {
-    let env = InternalTestEnv::new();
-    env.init_vault();
-    // migration v1.0.5-alpha 应该在 init_vault 的第一次 add 就跑完
-    assert_eq!(count_table(&env, "import_jobs"), 0, "table exists and empty");
-    assert_eq!(count_table(&env, "import_items"), 0);
 }
 
 #[test]
@@ -1236,232 +1222,11 @@ fn update_alias_actions_write_audit() {
     assert!(count_table(&env, "audit_log") > before);
 }
 
-#[test]
-fn batch_import_with_job_id_writes_import_tables() {
-    let env = InternalTestEnv::new();
-    env.init_vault();
-    let key_hex = env.vault_key_hex();
-    let jid = "job-test-aaa";
-    assert!(read_import_job(&env, jid).is_none(), "job shouldn't exist yet");
-
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "batch_import",
-        "payload": {
-            "job_id": jid,
-            "source_type": "paste",
-            "source_hash": "sha256:fake",
-            "items": [
-                {"alias": "imp-1", "secret_plaintext": "x1", "provider": "anthropic"},
-                {"alias": "imp-2", "secret_plaintext": "x2"},
-            ]
-        }
-    }));
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["data"]["job_id"], jid);
-    assert_eq!(v["data"]["audit_logged"], true);
-
-    let job = read_import_job(&env, jid).expect("job row should exist");
-    assert_eq!(job["status"], "completed");
-    assert_eq!(job["total_items"], 2);
-    assert_eq!(job["inserted_count"], 2);
-    assert_eq!(job["replaced_count"], 0);
-    assert_eq!(job["source_type"], "paste");
-    assert_eq!(job["source_hash"], "sha256:fake");
-    // import_items 应该有 2 行与该 job 关联
-    use rusqlite::Connection;
-    let db = env.vault_path.join("data").join("vault.db");
-    let conn = Connection::open(&db).unwrap();
-    let items_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM import_items WHERE job_id = ?",
-        [jid], |r| r.get(0),
-    ).unwrap();
-    assert_eq!(items_count, 2);
-}
-
-#[test]
-fn batch_import_duplicate_job_id_rejected() {
-    let env = InternalTestEnv::new();
-    env.init_vault();
-    let key_hex = env.vault_key_hex();
-    let jid = "job-dup";
-    // 第一次 ok
-    run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "batch_import",
-        "payload": {"job_id": jid, "items": [{"alias":"a","secret_plaintext":"x"}]}
-    }));
-    // 第二次同 job_id → 冲突
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "batch_import",
-        "payload": {"job_id": jid, "items": [{"alias":"b","secret_plaintext":"y"}]}
-    }));
-    assert_eq!(v["status"], "error");
-    assert_eq!(v["error_code"], "I_CREDENTIAL_CONFLICT");
-}
-
-#[test]
-fn batch_import_without_job_id_skips_import_tables() {
-    let env = InternalTestEnv::new();
-    env.init_vault();
-    let key_hex = env.vault_key_hex();
-    let jobs_before = count_table(&env, "import_jobs");
-    let items_before = count_table(&env, "import_items");
-
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "batch_import",
-        "payload": {
-            "items": [{"alias": "no-job-1", "secret_plaintext": "x"}]
-        }
-    }));
-    assert_eq!(v["status"], "ok");
-    // 未传 job_id → import_jobs/items 不变
-    assert_eq!(count_table(&env, "import_jobs"), jobs_before);
-    assert_eq!(count_table(&env, "import_items"), items_before);
-}
-
-// ========== Phase G: list_import_jobs / get_import_job_items query actions ==========
-
-#[test]
-fn list_import_jobs_returns_recent_first() {
-    let env = InternalTestEnv::new();
-    env.init_vault();
-    let key_hex = env.vault_key_hex();
-
-    // 种 3 个 job
-    for i in 1..=3 {
-        run_vault_op(&env, serde_json::json!({
-            "vault_key_hex": key_hex, "action": "batch_import",
-            "payload": {
-                "job_id": format!("job-list-{}", i),
-                "items": [{"alias": format!("la-{}", i), "secret_plaintext": "x"}]
-            }
-        }));
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-    }
-
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "list_import_jobs",
-    }));
-    assert_eq!(v["status"], "ok", "{}", v);
-    let jobs = v["data"]["jobs"].as_array().unwrap();
-    assert!(jobs.len() >= 3, "should have at least 3 jobs, got {}", jobs.len());
-
-    // 最近创建的应该在最前（DESC）
-    let ts_first = jobs[0]["created_at"].as_i64().unwrap();
-    let ts_last = jobs[jobs.len() - 1]["created_at"].as_i64().unwrap();
-    assert!(ts_first >= ts_last, "created_at DESC: first {} < last {}", ts_first, ts_last);
-}
-
-#[test]
-fn list_import_jobs_respects_limit() {
-    let env = InternalTestEnv::new();
-    env.init_vault();
-    let key_hex = env.vault_key_hex();
-    for i in 1..=4 {
-        run_vault_op(&env, serde_json::json!({
-            "vault_key_hex": key_hex, "action": "batch_import",
-            "payload": {
-                "job_id": format!("job-lim-{}", i),
-                "items": [{"alias": format!("lim-{}", i), "secret_plaintext": "x"}]
-            }
-        }));
-    }
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "list_import_jobs",
-        "payload": {"limit": 2}
-    }));
-    let jobs = v["data"]["jobs"].as_array().unwrap();
-    assert_eq!(jobs.len(), 2);
-}
-
-#[test]
-fn list_import_jobs_filters_by_status() {
-    let env = InternalTestEnv::new();
-    env.init_vault();
-    let key_hex = env.vault_key_hex();
-    run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "batch_import",
-        "payload": {
-            "job_id": "job-st-1",
-            "items": [{"alias": "st-1", "secret_plaintext": "x"}]
-        }
-    }));
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "list_import_jobs",
-        "payload": {"status": "completed"}
-    }));
-    let jobs = v["data"]["jobs"].as_array().unwrap();
-    assert!(!jobs.is_empty());
-    for j in jobs {
-        assert_eq!(j["status"], "completed");
-    }
-    // 不存在的 status → 空
-    let v2 = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "list_import_jobs",
-        "payload": {"status": "aborted"}
-    }));
-    assert_eq!(v2["data"]["count"], 0);
-}
-
-#[test]
-fn get_import_job_items_returns_item_details() {
-    let env = InternalTestEnv::new();
-    env.init_vault();
-    let key_hex = env.vault_key_hex();
-    let jid = "job-items-test";
-    run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "batch_import",
-        "payload": {
-            "job_id": jid,
-            "items": [
-                {"alias": "item-1", "secret_plaintext": "a", "provider": "anthropic"},
-                {"alias": "item-2", "secret_plaintext": "b"},
-                {"alias": "item-3", "secret_plaintext": "c", "provider": "openai"},
-            ]
-        }
-    }));
-
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "get_import_job_items",
-        "payload": {"job_id": jid}
-    }));
-    assert_eq!(v["status"], "ok", "{}", v);
-    assert_eq!(v["data"]["count"], 3);
-    let items = v["data"]["items"].as_array().unwrap();
-    let aliases: Vec<&str> = items.iter().map(|i| i["alias"].as_str().unwrap()).collect();
-    assert!(aliases.contains(&"item-1"));
-    assert!(aliases.contains(&"item-2"));
-    assert!(aliases.contains(&"item-3"));
-    // 验证 action + provider_code 字段
-    let i1 = items.iter().find(|i| i["alias"] == "item-1").unwrap();
-    assert_eq!(i1["action"], "inserted");
-    assert_eq!(i1["provider_code"], "anthropic");
-}
-
-#[test]
-fn get_import_job_items_not_found() {
-    let env = InternalTestEnv::new();
-    env.init_vault();
-    let key_hex = env.vault_key_hex();
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "get_import_job_items",
-        "payload": {"job_id": "does-not-exist"}
-    }));
-    assert_eq!(v["status"], "error");
-    assert_eq!(v["error_code"], "I_CREDENTIAL_NOT_FOUND");
-}
-
-#[test]
-fn list_import_jobs_rejects_wrong_key() {
-    let env = InternalTestEnv::new();
-    env.init_vault();
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": "0".repeat(64),
-        "action": "list_import_jobs",
-    }));
-    assert_eq!(v["status"], "error");
-    assert_eq!(v["error_code"], "I_VAULT_KEY_INVALID");
-}
+// 2026-04-23: removed 8 `batch_import_*_job_id` / `list_import_jobs_*` /
+// `get_import_job_items_*` / `migrations_create_import_tables` tests along
+// with the import_jobs / import_items tables. `batch_import_inserts_multiple`,
+// `batch_import_error_on_conflict_aborts`, and `batch_import_skip_on_conflict`
+// earlier in the file still cover the functional contract.
 
 #[test]
 fn mutating_actions_reject_wrong_key() {

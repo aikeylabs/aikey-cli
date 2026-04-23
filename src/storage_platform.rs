@@ -718,9 +718,19 @@ pub fn set_entry_provider_code(alias: &str, provider_code: Option<&str>) -> Resu
 
 /// Sets the `supported_providers` JSON array for a personal key entry.
 pub fn set_entry_supported_providers(alias: &str, providers: &[String]) -> Result<(), String> {
+    let conn = open_connection()?;
+    set_entry_supported_providers_on_conn(&conn, alias, providers)
+}
+
+/// G-5 fix (2026-04-23): connection-scoped variant so batch_import can include
+/// provider metadata writes in the same transaction as the entry insert.
+pub(crate) fn set_entry_supported_providers_on_conn(
+    conn: &rusqlite::Connection,
+    alias: &str,
+    providers: &[String],
+) -> Result<(), String> {
     let json = serde_json::to_string(providers)
         .map_err(|e| format!("Failed to serialize providers: {}", e))?;
-    let conn = open_connection()?;
     let rows = conn.execute(
         "UPDATE entries SET supported_providers = ?1 WHERE alias = ?2",
         params![json, alias],
@@ -753,6 +763,16 @@ pub fn get_entry_base_url(alias: &str) -> Result<Option<String>, String> {
 /// Pass `None` to clear (proxy will fall back to the provider default).
 pub fn set_entry_base_url(alias: &str, base_url: Option<&str>) -> Result<(), String> {
     let conn = open_connection()?;
+    set_entry_base_url_on_conn(&conn, alias, base_url)
+}
+
+/// G-5 fix (2026-04-23): connection-scoped variant so batch_import can include
+/// base_url writes in the same transaction as the entry insert.
+pub(crate) fn set_entry_base_url_on_conn(
+    conn: &rusqlite::Connection,
+    alias: &str,
+    base_url: Option<&str>,
+) -> Result<(), String> {
     let rows = conn.execute(
         "UPDATE entries SET base_url = ?1 WHERE alias = ?2",
         params![base_url, alias],
@@ -991,6 +1011,10 @@ pub struct ProviderAccountInfo {
     pub account_tier: Option<String>,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
+    /// Monotonic counter of recorded usages, bumped by
+    /// `_internal vault-op record_usage`. Added v1.0.6-alpha; old vaults
+    /// default to 0 (NOT NULL DEFAULT 0 on the column).
+    pub use_count: Option<i64>,
 }
 
 fn row_to_provider_account(row: &rusqlite::Row) -> rusqlite::Result<ProviderAccountInfo> {
@@ -1007,12 +1031,22 @@ fn row_to_provider_account(row: &rusqlite::Row) -> rusqlite::Result<ProviderAcco
         account_tier:        row.get(8)?,
         created_at:          row.get(9)?,
         last_used_at:        row.get(10)?,
+        use_count:           row.get(11).ok(),
     })
 }
 
-const PROVIDER_ACCOUNT_COLUMNS: &str =
+// Two column lists to tolerate vaults that predate v1.0.6-alpha (where
+// `use_count` doesn't exist). Every query tries FULL first and falls back
+// to LEGACY on prepare failure. The fallback projects a literal 0 so
+// row_to_provider_account's row.get(11) always has a sensible value.
+const PROVIDER_ACCOUNT_COLUMNS_FULL: &str =
     "provider_account_id, provider, auth_type, credential_type, status, \
-     external_id, display_identity, org_uuid, account_tier, created_at, last_used_at";
+     external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
+     use_count";
+const PROVIDER_ACCOUNT_COLUMNS_LEGACY: &str =
+    "provider_account_id, provider, auth_type, credential_type, status, \
+     external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
+     0";
 
 /// List all provider OAuth accounts (write connection with migrations).
 pub fn list_provider_accounts() -> Result<Vec<ProviderAccountInfo>, String> {
@@ -1028,12 +1062,22 @@ pub fn list_provider_accounts_readonly() -> Result<Vec<ProviderAccountInfo>, Str
 }
 
 fn query_provider_accounts(conn: &Connection) -> Result<Vec<ProviderAccountInfo>, String> {
-    let mut stmt = match conn.prepare(&format!(
-        "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
-        PROVIDER_ACCOUNT_COLUMNS
-    )) {
+    // Try v1.0.6+ columns first; fall back to legacy (literal 0 for
+    // use_count) on prepare failure. If BOTH fail, the table itself
+    // doesn't exist yet (old vault) — return empty, same as before.
+    let mut stmt = match conn
+        .prepare(&format!(
+            "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
+            PROVIDER_ACCOUNT_COLUMNS_FULL
+        ))
+        .or_else(|_| {
+            conn.prepare(&format!(
+                "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
+                PROVIDER_ACCOUNT_COLUMNS_LEGACY
+            ))
+        }) {
         Ok(s) => s,
-        Err(_) => return Ok(vec![]), // table doesn't exist on old vault
+        Err(_) => return Ok(vec![]),
     };
 
     let rows = stmt
@@ -1048,14 +1092,26 @@ fn query_provider_accounts(conn: &Connection) -> Result<Vec<ProviderAccountInfo>
 /// Get a specific provider account by ID.
 pub fn get_provider_account(id: &str) -> Result<Option<ProviderAccountInfo>, String> {
     let conn = open_connection()?;
-    let result = conn.query_row(
-        &format!(
-            "SELECT {} FROM provider_accounts WHERE provider_account_id = ?1",
-            PROVIDER_ACCOUNT_COLUMNS
-        ),
-        params![id],
-        |row| row_to_provider_account(row),
-    );
+    let result = conn
+        .query_row(
+            &format!(
+                "SELECT {} FROM provider_accounts WHERE provider_account_id = ?1",
+                PROVIDER_ACCOUNT_COLUMNS_FULL
+            ),
+            params![id],
+            |row| row_to_provider_account(row),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &format!(
+                    "SELECT {} FROM provider_accounts WHERE provider_account_id = ?1",
+                    PROVIDER_ACCOUNT_COLUMNS_LEGACY
+                ),
+                params![id],
+                |row| row_to_provider_account(row),
+            ),
+        });
     match result {
         Ok(info) => Ok(Some(info)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1069,8 +1125,14 @@ pub fn get_provider_accounts_by_provider(provider: &str) -> Result<Vec<ProviderA
     let mut stmt = conn
         .prepare(&format!(
             "SELECT {} FROM provider_accounts WHERE provider = ?1 ORDER BY created_at",
-            PROVIDER_ACCOUNT_COLUMNS
+            PROVIDER_ACCOUNT_COLUMNS_FULL
         ))
+        .or_else(|_| {
+            conn.prepare(&format!(
+                "SELECT {} FROM provider_accounts WHERE provider = ?1 ORDER BY created_at",
+                PROVIDER_ACCOUNT_COLUMNS_LEGACY
+            ))
+        })
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     let rows = stmt
@@ -1088,19 +1150,45 @@ pub fn get_provider_account_by_external_id(
     external_id: &str,
 ) -> Result<Option<ProviderAccountInfo>, String> {
     let conn = open_connection()?;
-    let result = conn.query_row(
-        &format!(
-            "SELECT {} FROM provider_accounts WHERE provider = ?1 AND external_id = ?2",
-            PROVIDER_ACCOUNT_COLUMNS
-        ),
-        params![provider, external_id],
-        |row| row_to_provider_account(row),
-    );
+    let result = conn
+        .query_row(
+            &format!(
+                "SELECT {} FROM provider_accounts WHERE provider = ?1 AND external_id = ?2",
+                PROVIDER_ACCOUNT_COLUMNS_FULL
+            ),
+            params![provider, external_id],
+            |row| row_to_provider_account(row),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &format!(
+                    "SELECT {} FROM provider_accounts WHERE provider = ?1 AND external_id = ?2",
+                    PROVIDER_ACCOUNT_COLUMNS_LEGACY
+                ),
+                params![provider, external_id],
+                |row| row_to_provider_account(row),
+            ),
+        });
     match result {
         Ok(info) => Ok(Some(info)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(format!("Failed to get provider account by external_id: {}", e)),
     }
+}
+
+/// Atomically bump usage telemetry on an OAuth provider account: set
+/// `last_used_at` to the caller-supplied unix seconds, increment
+/// `use_count`. Returns rows affected (0 if id is unknown). Proxy calls
+/// this via `_internal vault-op record_usage` after a successful
+/// credential resolution.
+pub fn bump_oauth_usage(id: &str, ts: i64) -> Result<usize, String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE provider_accounts SET last_used_at = ?1, use_count = COALESCE(use_count, 0) + 1 WHERE provider_account_id = ?2",
+        params![ts, id],
+    )
+    .map_err(|e| format!("bump_oauth_usage UPDATE: {}", e))
 }
 
 /// Delete a provider account and its tokens (cascade not enforced by SQLite,

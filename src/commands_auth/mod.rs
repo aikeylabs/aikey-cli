@@ -40,12 +40,12 @@ pub fn handle_auth_command(
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match action {
-        AuthAction::Login { provider } => {
+        AuthAction::Login { provider, alias } => {
             let provider = match provider {
                 Some(p) => p.clone(),
                 None => pick_oauth_provider()?,
             };
-            handle_login(&provider, proxy_port, json_mode)
+            handle_login(&provider, alias.as_deref(), proxy_port, json_mode)
         }
         AuthAction::Logout { target } => handle_logout(target, proxy_port, json_mode),
         AuthAction::List => handle_list(json_mode),
@@ -59,7 +59,7 @@ pub fn handle_auth_command(
 // aikey auth login <provider>
 // ============================================================================
 
-fn handle_login(provider: &str, proxy_port: u16, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_login(provider: &str, alias: Option<&str>, proxy_port: u16, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Check proxy is running
     check_proxy_running(proxy_port)?;
 
@@ -99,9 +99,9 @@ fn handle_login(provider: &str, proxy_port: u16, json_mode: bool) -> Result<(), 
     let flow_type = resp["flow_type"].as_str().unwrap_or("");
 
     match flow_type {
-        "setup_token" => login_setup_token(&base, &session_id, &resp, provider, proxy_port, json_mode),
-        "auth_code" => login_auth_code(&base, &session_id, &resp, provider, proxy_port, json_mode),
-        "device_code" => login_device_code(&base, &session_id, &resp, provider, proxy_port, json_mode),
+        "setup_token" => login_setup_token(&base, &session_id, &resp, provider, alias, proxy_port, json_mode),
+        "auth_code" => login_auth_code(&base, &session_id, &resp, provider, alias, proxy_port, json_mode),
+        "device_code" => login_device_code(&base, &session_id, &resp, provider, alias, proxy_port, json_mode),
         _ => Err(format!("Unknown flow type: {}", flow_type).into()),
     }
 }
@@ -109,7 +109,7 @@ fn handle_login(provider: &str, proxy_port: u16, json_mode: bool) -> Result<(), 
 /// Claude: Setup Token — open browser, user pastes code#state
 fn login_setup_token(
     base: &str, session_id: &str, resp: &serde_json::Value,
-    provider: &str, _proxy_port: u16, json_mode: bool,
+    provider: &str, alias: Option<&str>, _proxy_port: u16, json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_url = resp["auth_url"].as_str().unwrap_or("");
 
@@ -158,13 +158,13 @@ fn login_setup_token(
     }
 
     // Phase 2: submit code
-    submit_code_and_finish(base, session_id, &code_state, provider, json_mode)
+    submit_code_and_finish(base, session_id, &code_state, provider, alias, json_mode)
 }
 
 /// Codex: Auth Code — open browser, localhost callback auto-receives code
 fn login_auth_code(
     base: &str, session_id: &str, resp: &serde_json::Value,
-    provider: &str, _proxy_port: u16, json_mode: bool,
+    provider: &str, alias: Option<&str>, _proxy_port: u16, json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_url = resp["auth_url"].as_str().unwrap_or("");
 
@@ -180,13 +180,13 @@ fn login_auth_code(
     }
 
     // Poll for completion (proxy handles the callback)
-    poll_login_status(base, session_id, provider, json_mode)
+    poll_login_status(base, session_id, provider, alias, json_mode)
 }
 
 /// Kimi: Device Code — show user_code, poll for completion
 fn login_device_code(
     base: &str, session_id: &str, resp: &serde_json::Value,
-    provider: &str, _proxy_port: u16, json_mode: bool,
+    provider: &str, alias: Option<&str>, _proxy_port: u16, json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let user_code = resp["user_code"].as_str().unwrap_or("");
     let verify_url = resp["verification_url"].as_str().unwrap_or("");
@@ -207,13 +207,13 @@ fn login_device_code(
 
     // Device Code: use POST /oauth/poll (triggers provider poll on each call).
     // Why not GET /oauth/status: status is read-only and won't drive device-code progress.
-    poll_device_code(base, session_id, provider, json_mode)
+    poll_device_code(base, session_id, provider, alias, json_mode)
 }
 
 /// Submit code#state and handle the result (used by setup_token flow).
 fn submit_code_and_finish(
     base: &str, session_id: &str, code_state: &str,
-    provider: &str, json_mode: bool,
+    provider: &str, alias: Option<&str>, json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let http_result = ureq::post(&format!("{}/oauth/login", base))
         .set("Content-Type", "application/json")
@@ -261,9 +261,9 @@ fn submit_code_and_finish(
         eprintln!("  {} Logged in as {} ({}), expires in {} days",
             "\u{25c6}".green(), display.bold(), provider, days);
 
-        // D13: Kimi has no email — prompt for display name
-        if display.is_empty() || !display.contains('@') {
-            prompt_display_identity(base, account_id)?;
+        // Stage 11+: --alias 非空则直接写;否则旧逻辑(display 为空/非 email 时 prompt)
+        if alias.is_some() || display.is_empty() || !display.contains('@') {
+            resolve_display_identity(base, account_id, alias)?;
         }
     }
 
@@ -272,7 +272,7 @@ fn submit_code_and_finish(
 
 /// Poll GET /oauth/status until success or failure (for auth_code and device_code flows).
 fn poll_login_status(
-    base: &str, session_id: &str, provider: &str, json_mode: bool,
+    base: &str, session_id: &str, provider: &str, alias: Option<&str>, json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = std::time::Duration::from_secs(120);
     let start = std::time::Instant::now();
@@ -309,9 +309,9 @@ fn poll_login_status(
                 } else {
                     eprintln!("{} Logged in as {} ({})", "\u{25c6}".green(), display.bold(), provider);
 
-                    // D13: prompt for display name if no email
-                    if display.is_empty() || !display.contains('@') {
-                        prompt_display_identity(base, account_id)?;
+                    // Stage 11+: --alias 非空则直接写;否则旧逻辑
+                    if alias.is_some() || display.is_empty() || !display.contains('@') {
+                        resolve_display_identity(base, account_id, alias)?;
                     }
 
                     // Auto-install Claude Code status line integration on first
@@ -346,7 +346,7 @@ fn poll_login_status(
 /// Each call triggers one poll attempt against the provider's token endpoint.
 /// Returns when the user authorizes in browser or timeout is reached.
 fn poll_device_code(
-    base: &str, session_id: &str, provider: &str, json_mode: bool,
+    base: &str, session_id: &str, provider: &str, alias: Option<&str>, json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = std::time::Duration::from_secs(300); // Device code flows allow longer timeout
     let start = std::time::Instant::now();
@@ -397,9 +397,9 @@ fn poll_device_code(
                     eprintln!();
                     eprintln!("{} Logged in as {} ({})", "\u{25c6}".green(), display.bold(), provider);
 
-                    // D13: prompt for display name if no email
-                    if display.is_empty() || !display.contains('@') {
-                        prompt_display_identity(base, account_id)?;
+                    // Stage 11+: --alias 非空则直接写;否则旧逻辑
+                    if alias.is_some() || display.is_empty() || !display.contains('@') {
+                        resolve_display_identity(base, account_id, alias)?;
                     }
 
                     // Auto-install Claude Code status line integration on first
@@ -476,6 +476,53 @@ fn extract_state_param(auth_url: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// v4.1 Stage 11+: Resolve display name — 有 CLI `--alias` 参数则直接用,否则交互 prompt。
+///
+/// 被 3 个 OAuth flow(setup_token / auth_code / device_code)共用,取代旧的
+/// `prompt_display_identity` 调用位置。non-interactive 模式下可以完全免交互。
+fn resolve_display_identity(
+    base: &str,
+    account_id: &str,
+    alias: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(a) = alias {
+        return set_display_identity(base, account_id, a);
+    }
+    prompt_display_identity(base, account_id)
+}
+
+/// 写入 display_identity 到 broker(alias 已确定,跳过交互 prompt)
+fn set_display_identity(base: &str, account_id: &str, alias: &str) -> Result<(), Box<dyn std::error::Error>> {
+    const MAX_DISPLAY_LEN: usize = 256;
+    let input = alias.trim();
+    if input.is_empty() {
+        return Err("--alias is empty after trim.".into());
+    }
+    if input.len() > MAX_DISPLAY_LEN {
+        return Err(format!("--alias too long ({} chars, max {}).", input.len(), MAX_DISPLAY_LEN).into());
+    }
+    if input.chars().any(|c| c.is_control()) {
+        return Err("--alias contains control characters.".into());
+    }
+
+    let resp = ureq::post(&format!("{}/oauth/accounts/{}/display-identity", base, account_id))
+        .timeout(std::time::Duration::from_secs(10))
+        .set("Content-Type", "application/json")
+        .send_string(&serde_json::json!({"display_identity": input}).to_string());
+
+    match resp {
+        Ok(_) => {
+            eprintln!("{} Display name set: {}", "\u{25c6}".green(), input);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("  {} Failed to save display name: {}", "\u{25c6}".red(), e);
+            eprintln!("  \u{2502} Account created; you can retry via API later.");
+            Ok(()) // Don't fail the login flow — account creation already succeeded.
+        }
+    }
 }
 
 fn prompt_display_identity(base: &str, account_id: &str) -> Result<(), Box<dyn std::error::Error>> {

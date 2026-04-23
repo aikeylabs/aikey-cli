@@ -89,6 +89,25 @@ commands_internal/parse.rs::handle:
 
 选项 A 的 arbiter 改造列入 v1.1+ backlog,见 `KNOWN_ISSUES.md` 或继任迁移计划。
 
+## v1.0 正式决策(2026-04-23, owner 拍板)
+
+**决策**:v1.0 **保持 additive**;arbiter 改造列入 v1.1+ backlog,**后续先做试验再决定是否切换**。
+
+背景:2026-04-22 生产代码评审([`20260422-批量导入-评审-生产代码-v1.md`](../../../../../roadmap20260320/技术实现/update/20260422-批量导入-评审-生产代码-v1.md))R-6 建议切 arbiter,理由是 precision 上限会提升。
+
+不采纳的理由:
+1. 生产 E2E 测试(2026-04-23 会话)显示 additive 的 recall 满足、precision 没有到达需要 arbiter 才能缓解的程度(FP 本来就不多);**arbiter 收益小、切换风险大**(重标 fixture + 重调阈值 + 重跑 5 holdout suite)
+2. v1.0 节奏优先(2-3 天 arbiter 改造对 RC 阻塞风险高)
+3. 真正评估 arbiter 价值应该基于 **pilot 真实用户 paste 数据**,而不是合成 fixture;
+   v1.1 有了 pilot 真实分布再决定是否切不迟
+
+### v1.1+ backlog 追踪项
+
+- [ ] 收集 pilot 粘贴样本(去敏感化后进 sample 库),扩 holdout 多样性
+- [ ] 在 ablation-spike 里做 additive-vs-arbiter A/B 实验,对比 5 suite recall/precision
+- [ ] 若 arbiter 在真实分布里 precision 提升 ≥ 3pp 且 recall 退化 < 1pp,切 arbiter;否则继续 additive
+- [ ] arbiter 改造成本估算:spike 侧 1 day + CLI propagation 1 day + 测试 fixture 调整 0.5 day
+
 ---
 
 **相关文件**:

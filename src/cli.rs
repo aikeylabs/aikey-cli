@@ -209,8 +209,13 @@ pub(crate) enum Commands {
     /// Open the User Console in your default browser
     #[command(alias = "browse", display_order = 6)]
     Web {
-        /// Page to open: overview (default), keys, account, usage
+        /// Page to open: overview (default), keys, account, usage, import.
+        /// Also accepts aliases (virtual-keys, team-keys, profile,
+        /// usage-ledger, bulk-import, quick-import) — resolved by the web UI.
         page: Option<String>,
+        /// Shortcut for `aikey web import` — opens the Import page directly.
+        #[arg(long)]
+        import: bool,
         /// Override port for dev mode (e.g. --port 3000 for Vite dev server)
         #[arg(long)]
         port: Option<u16>,
@@ -407,11 +412,22 @@ pub(crate) enum AuthAction {
 
 \x1b[1mExamples:\x1b[0m
   aikey auth login claude
-  aikey auth login codex
-  aikey auth login kimi")]
+  aikey auth login codex --alias dev@acme.io
+  aikey auth login kimi --alias my-kimi")]
     Login {
         /// Provider name: claude, codex, kimi (omit for interactive picker)
         provider: Option<String>,
+        /// Display name/alias for the account (non-interactive mode).
+        ///
+        /// When given, `aikey auth login` skips the post-login prompt that asks
+        /// for a display name, and uses this value directly. Typical use cases:
+        ///   - Bulk-import Done page generates `aikey auth login <p> --alias <email>`
+        ///     so the user can finish each OAuth flow with zero keyboard input.
+        ///   - CI / scripted login where stdin is unavailable.
+        ///
+        /// Accepts up to 256 chars, no control characters.
+        #[arg(long, value_name = "ALIAS")]
+        alias: Option<String>,
     },
     /// Logout from a provider account
     Logout {
@@ -1167,13 +1183,17 @@ Detailed Commands
   Open the User Console in the default browser.
 
   Usage:
-    aikey web [--port <PORT>] [PAGE]
+    aikey web [--port <PORT>] [--import] [PAGE]
 
   Aliases:
     aikey browse
 
   Arguments:
-    PAGE: overview | keys | account | usage
+    PAGE: overview | keys | account | usage | import | referrals
+
+  Flags:
+    --import   Shortcut for `aikey web import` — jumps straight to the
+               Import page so pasted credentials can be landed in one step.
 
   Notes:
     - In local/trial mode, opens the local console directly.

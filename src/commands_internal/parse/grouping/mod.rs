@@ -74,6 +74,16 @@ pub fn group_candidates(
     let mut cross_orphans: Vec<Candidate> = Vec::new();
     let lines: Vec<&str> = text.lines().collect();
 
+    // v4.2 Layer 5: block 首行 title — 每 block 最多 1 条 Kind::Title 候选。
+    // 由 rule_title::extract 放进 cands,assign_candidates 按首行行号分派到 block。
+    // Stage 1/2/3 pipeline 不消费 Title (它们按 Email/Password/Secret/Url 过滤),
+    // 所以 Title 会悬在 per_block 里;下面记录每 block 的 title,循环结束后按
+    // draft 归属的 block 回挂。每 block 有多个 draft 时 (Stage 2 per-secret / M4)
+    // 每条都挂同一 title —— UI 卡片共享同一标题。
+    let block_titles: Vec<Option<String>> = per_block.iter().map(|bc| {
+        bc.iter().find(|c| c.kind == Kind::Title).map(|c| c.value.clone())
+    }).collect();
+
     // v4.1 Stage 3 P1 perf: 预计算 value→line_index 一次,O(|text| + N_cands),
     //   Stage 2 pick / Stage 3 sort 原本各自调 value_to_line(text.find) 呈 O(N×|text|)。
     //   HashMap 键去重:多候选同 value(如重粘贴)只记首匹配,与 dedup_candidates 语义一致。
@@ -125,10 +135,12 @@ pub fn group_candidates(
                     email: row_email, password: row_pwd,
                     api_key: row_key, base_url: row_url,
                     extra_secrets: vec![],
+                    title: None,
                 };
                 let draft_type = DraftType::classify(&fields);
                 drafts.push(DraftRecord {
                     id: String::new(),
+                    alias: String::new(),
                     provider_hint: block.provider_hint.clone(),
                     fields,
                     line_range: (li, li),
@@ -138,6 +150,7 @@ pub fn group_candidates(
                     inference_confidence: 0.0,
                     inference_evidence: Vec::new(),
                     protocol_types: Vec::new(),
+                    login_url: None,
                 });
             }
         }
@@ -217,10 +230,12 @@ pub fn group_candidates(
                     api_key: Some(sec.value.clone()),
                     base_url: pair_url,
                     extra_secrets: vec![],
+                    title: None,
                 };
                 let draft_type = DraftType::classify(&fields);
                 drafts.push(DraftRecord {
                     id: String::new(),
+                    alias: String::new(),
                     provider_hint: block.provider_hint.clone(),
                     fields,
                     line_range: (sec_line, sec_line),
@@ -230,6 +245,7 @@ pub fn group_candidates(
                     inference_confidence: 0.0,
                     inference_evidence: Vec::new(),
                     protocol_types: Vec::new(),
+                    login_url: None,
                 });
                 stage2_fired = true;
             }
@@ -313,10 +329,12 @@ pub fn group_candidates(
         let reason = determine_reason(block);
         let fields = DraftFields {
             email, password, api_key, base_url, extra_secrets,
+            title: None,
         };
         let draft_type = DraftType::classify(&fields);
         drafts.push(DraftRecord {
             id: String::new(),
+            alias: String::new(),
             provider_hint: block.provider_hint.clone(),
             fields,
             line_range: (block.start_line, block.end_line),
@@ -326,6 +344,7 @@ pub fn group_candidates(
             inference_confidence: 0.0,
             inference_evidence: Vec::new(),
             protocol_types: Vec::new(),
+            login_url: None,
         });
 
         // v4.1 M4: 额外合法 password 展开独立 Draft
@@ -339,10 +358,12 @@ pub fn group_candidates(
                 api_key: None,
                 base_url: None,
                 extra_secrets: Vec::new(),
+                title: None,
             };
             let extra_type = DraftType::classify(&extra_fields);
             drafts.push(DraftRecord {
                 id: String::new(),
+                alias: String::new(),
                 provider_hint: block.provider_hint.clone(),
                 fields: extra_fields,
                 line_range: (safe_ln, safe_ln),
@@ -352,7 +373,23 @@ pub fn group_candidates(
                 inference_confidence: 0.0,
                 inference_evidence: Vec::new(),
                 protocol_types: Vec::new(),
+                login_url: None,
             });
+        }
+    }
+
+    // v4.2 Layer 5: 给每个 draft 回挂它所属 block 的 title (若有)。
+    // Why 在这里而非 per-block 循环内部:Stage 1/2/3 有多条 continue 路径,
+    // 集中在这里一次性扫描 drafts × blocks 更简洁。用 line_range.0 命中归属 block。
+    // 同 block 多 draft (Stage 2 per-secret / M4 MultiPasswordExpand) 共享同 title。
+    for d in drafts.iter_mut() {
+        for (bi, block) in blocks.iter().enumerate() {
+            if d.line_range.0 >= block.start_line && d.line_range.0 <= block.end_line {
+                if let Some(t) = &block_titles[bi] {
+                    d.fields.title = Some(t.clone());
+                }
+                break;
+            }
         }
     }
 
@@ -635,6 +672,43 @@ mod tests {
         let (d, o) = group_candidates("", &[]);
         assert_eq!(d.len(), 0);
         assert_eq!(o.len(), 0);
+    }
+
+    #[test]
+    fn title_attaches_to_draft_in_same_block() {
+        // v4.2 Layer 5: block 首行 title → draft.fields.title
+        // 走完整 rule_extract,验证 title 候选通过 assign_candidates 落入 per_block
+        // 并在 draft 构建后回挂成功。
+        let text = "Kimitest8\nhttps://platform.moonshot.cn/x\nsk-Kh8bEwSPBs1234567890abcdefghij";
+        let cands = crate::commands_internal::parse::rule::rule_extract(text);
+        let (drafts, _) = group_candidates(text, &cands);
+        assert_eq!(drafts.len(), 1, "expected one draft, got {}: {:?}", drafts.len(), drafts);
+        assert_eq!(drafts[0].fields.title.as_deref(), Some("Kimitest8"));
+        assert!(drafts[0].fields.api_key.is_some());
+    }
+
+    #[test]
+    fn title_shared_across_multi_drafts_in_same_block() {
+        // M4 partition 里多条 draft 共享同一 block → 都挂同一 title
+        let text = "WorkAccounts\nops@acme.io\npwd: h4n7er_A\npwd: h4n7er_B\nsk-ant-api03-XYZ_YYY_ZZZ_1234567890abcdef";
+        let cands = crate::commands_internal::parse::rule::rule_extract(text);
+        let (drafts, _) = group_candidates(text, &cands);
+        assert!(drafts.len() >= 2, "expected ≥2 drafts, got {}", drafts.len());
+        for d in &drafts {
+            assert_eq!(d.fields.title.as_deref(), Some("WorkAccounts"),
+                "draft {} should carry title: {:?}", d.id, d);
+        }
+    }
+
+    #[test]
+    fn title_not_emitted_on_secret_first_line_block() {
+        // block 首行就是 secret → rule_title 跳过 → draft 无 title
+        let text = "sk-ant-api03-AAA_BBB_CCC_ddd_eee\nalice@acme.io";
+        let cands = crate::commands_internal::parse::rule::rule_extract(text);
+        let (drafts, _) = group_candidates(text, &cands);
+        assert_eq!(drafts.len(), 1);
+        assert!(drafts[0].fields.title.is_none(),
+            "secret-first-line block must not get a title, got {:?}", drafts[0].fields.title);
     }
 
     #[test]

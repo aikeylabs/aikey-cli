@@ -29,6 +29,17 @@
 use std::collections::HashMap;
 
 use regex::Regex;
+use std::sync::OnceLock;
+
+// R-5 P2-A (2026-04-23): cached regexes (collect_url_anchors runs per-line).
+fn re_url() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r#"https?://[^\s"',}\])）】」〕]+"#).unwrap())
+}
+fn label_re() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r#"(?i)\b(base[_\s\-]?url|endpoint|host|api)\s*[:=]"#).unwrap())
+}
 
 use super::super::line_class::{classify_line, LineKind};
 use super::super::provider_fingerprint::{
@@ -50,19 +61,16 @@ struct UrlAnchor {
 }
 
 fn collect_url_anchors(text: &str, blocks: &[Block]) -> Vec<UrlAnchor> {
-    let re_url = Regex::new(r#"https?://[^\s"',}\])）】」〕]+"#).unwrap();
-    let label_re =
-        Regex::new(r#"(?i)\b(base[_\s\-]?url|endpoint|host|api)\s*[:=]"#).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     let mut anchors = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        for m in re_url.find_iter(line) {
+        for m in re_url().find_iter(line) {
             let url = m.as_str().to_string();
             let bi = blocks
                 .iter()
                 .position(|b| i >= b.start_line && i <= b.end_line)
                 .unwrap_or(usize::MAX);
-            let labeled = label_re.is_match(line);
+            let labeled = label_re().is_match(line);
             anchors.push(UrlAnchor {
                 url,
                 line: i,

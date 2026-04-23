@@ -25,6 +25,13 @@
 
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+// R-5 P2-A (2026-04-23): cached shell-var regex (E4 evidence runs per-draft).
+fn re_var() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"(?:^|\s)([A-Z][A-Z0-9_]{2,})\s*=").unwrap())
+}
 
 use super::super::line_class::{line_class, LineKind};
 use super::super::provider_fingerprint::{
@@ -34,6 +41,34 @@ use super::super::provider_fingerprint::{
 use super::types::{Block, DraftRecord, InferenceSource};
 
 const THRESHOLD: f32 = 0.5;
+
+/// BUG-04 fix helper: 取 line 的 "label 区" —— 首个已知 secret 前缀之前 / 或首 40 字符。
+/// 用于 E6 keyword scan,防止误匹配到 secret 值内部的字符串。
+///
+/// Why 列这些前缀:provider_fingerprint.yaml 里 confirmed tier 的 secret 基本都有特异性前缀。
+/// 一旦 label 区里出现 keyword,E6 就触发;secret 本身的内容不参与 keyword 匹配。
+///
+/// 与 research spike `workflow/CI/research/ablation-spike-v4.1/src/grouping.rs::line_label_zone`
+/// 保持一致。任何修改请先在 spike 验证(CLAUDE.md "Import 解析流改动强制走 research 验证")。
+fn line_label_zone(line: &str) -> &str {
+    const SECRET_PREFIXES: &[&str] = &[
+        "sk-ant-", "sk-proj-", "sk-admin-", "sk-svcacct-", "sk-or-v1-", "sk-",
+        "AIza", "AKIA", "xai-", "gsk_", "eyJ", "ghp_", "github_pat", "hf_",
+        "pplx-", "SG.", "rk_live_", "sk_live_", "xoxb-", "xoxp-",
+    ];
+    let mut cut: Option<usize> = None;
+    for prefix in SECRET_PREFIXES {
+        if let Some(idx) = line.find(prefix) {
+            cut = Some(cut.map(|c| c.min(idx)).unwrap_or(idx));
+        }
+    }
+    if let Some(idx) = cut {
+        return &line[..idx];
+    }
+    // 无 secret 前缀 → 取首 40 char (多语言 safe 用 char_indices)
+    let end = line.char_indices().nth(40).map(|(i, _)| i).unwrap_or(line.len());
+    &line[..end]
+}
 
 /// 主入口:对 drafts 做就地 enrich (填 inferred_provider / confidence / evidence)
 pub fn enrich_drafts(
@@ -175,11 +210,35 @@ fn collect_evidence(
         }
     }
 
+    // E6 (BUG-04 fix): fallback label-zone 扫描
+    //   当 E2 (block.provider_hint) + E3 (section heading) 都没命中时,扫描 draft 自己的
+    //   line_range 每行的 "label 区"(首 secret 前缀之前 / 首 40 字符)找 provider keyword。
+    //   示例生效场景:`🔑 kimi: sk-moonshot_... 邮箱: ...` 单行 Complex,block.provider_hint 取
+    //   首 token "🔑" 丢了 kimi;E3 scan 也因为 line.kind=Credential 立即 break。
+    //   Why 限定 label zone:防止匹配到 secret 值内部的子串(如 `sk-kimi_` 会把 "kimi"
+    //   当成 label keyword,但实际是 secret 值的一部分,不应作 heading 证据)。
+    //   与 spike `grouping.rs::collect_evidence` E6 段语义一致(CLAUDE.md 强制同步改动)。
+    if !heading_fired {
+        for ln in draft.line_range.0..=draft.line_range.1 {
+            if ln >= lines.len() { continue; }
+            let zone = line_label_zone(lines[ln]);
+            if let Some((family, keyword)) = text_keyword_family_and_keyword(zone) {
+                out.push((
+                    family,
+                    InferenceSource::InlineLabelKeyword {
+                        line: ln,
+                        keyword,
+                    },
+                ));
+                break; // 每 draft 只打一次 E6
+            }
+        }
+    }
+
     // E4: shell var 名 `export FOO_KEY=` / `FOO=value`
-    let re_var = Regex::new(r"(?:^|\s)([A-Z][A-Z0-9_]{2,})\s*=").unwrap();
     for ln in draft.line_range.0..=draft.line_range.1 {
         if ln >= lines.len() { continue; }
-        for cap in re_var.captures_iter(lines[ln]) {
+        for cap in re_var().captures_iter(lines[ln]) {
             if let Some(var) = cap.get(1) {
                 let var_name = var.as_str();
                 if let Some((family, pattern)) = shell_var_family_and_pattern(var_name) {
@@ -281,6 +340,63 @@ mod tests {
         // 实际: openai E1=1.0 + anthropic E5=0.6 → openai wins 1.0 vs 0.6
         // 这里 openai wins 是 spike 的预期行为 (API key fingerprint 强于 URL host)
         assert!(drafts[0].inferred_provider.is_some());
+    }
+
+    #[test]
+    fn e6_inline_label_keyword_emoji_prefix_kimi() {
+        // BUG-04 regression guard: 单行 Complex `🔑 kimi: sk-moonshot_...` —
+        // block.provider_hint 取首 token "🔑"(丢 keyword),E3 scan block 内遇 Credential 即 break。
+        // 无 E6 的话 inferred_provider = None(spike 验证过)。E6 InlineLabelKeyword 兜底 → kimi。
+        let text = "\u{1F511} kimi: sk-moonshot_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO";
+        let cands = vec![
+            cand(Kind::SecretLike, "sk-moonshot_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO"),
+        ];
+        let (mut drafts, _) = group_candidates(text, &cands);
+        let blocks = split_into_blocks(text);
+        enrich_drafts(&mut drafts, text, &blocks, provider_fingerprint::instance());
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("kimi"));
+        // 0.75 (E6) alone ≥ THRESHOLD 0.5
+        assert!(drafts[0].inference_confidence >= 0.75);
+    }
+
+    #[test]
+    fn e6_inline_label_keyword_yunwu_aggregator() {
+        // BUG-05 regression guard: `🔑 yunwu: sk-...` 行内 label 识别 aggregator family。
+        // 合约:yunwu ∈ aggregator_families → protocol_types = [](UI 让用户手选)。
+        let text = "\u{1F511} yunwu: sk-yunwugenericAAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLL";
+        let cands = vec![
+            cand(Kind::SecretLike, "sk-yunwugenericAAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLL"),
+        ];
+        let (mut drafts, _) = group_candidates(text, &cands);
+        let blocks = split_into_blocks(text);
+        enrich_drafts(&mut drafts, text, &blocks, provider_fingerprint::instance());
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("yunwu"));
+        // aggregator → protocol_types 空
+        assert!(drafts[0].protocol_types.is_empty());
+    }
+
+    #[test]
+    fn e6_label_zone_ignores_keyword_inside_secret() {
+        // 保底反例:secret 值内部的 "kimi" 不应触发 E6(label_zone 截断到 secret 前缀)。
+        // `sk-kimi_...` 前没有任何 label text,label_zone 只剩空串 → 不命中。
+        let text = "sk-kimi_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOOPPP";
+        let cands = vec![
+            cand(Kind::SecretLike, "sk-kimi_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOOPPP"),
+        ];
+        let (mut drafts, _) = group_candidates(text, &cands);
+        let blocks = split_into_blocks(text);
+        enrich_drafts(&mut drafts, text, &blocks, provider_fingerprint::instance());
+        assert_eq!(drafts.len(), 1);
+        // 无 E2/E3/E6 命中,仅 ambiguous generic_sk(不作证据)→ None(或 URL/shell 兜底无)
+        // 期望:E6 不被 secret 值内 "kimi" 误触发
+        // 此处允许 None 或别的 family,只要不是 "kimi" 源自 E6
+        for ev in &drafts[0].inference_evidence {
+            if let InferenceSource::InlineLabelKeyword { keyword, .. } = ev {
+                panic!("E6 incorrectly fired on secret-internal keyword: {}", keyword);
+            }
+        }
     }
 
     #[test]

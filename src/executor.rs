@@ -43,10 +43,16 @@ impl VaultContext {
     fn new(password: &SecretString) -> Result<Self, String> {
         // Auto-initialize vault on first use so the user never needs a separate
         // initialization step before using any vault command.
-        // Check for master_salt (not just file existence) because session backend
-        // selection may have created the DB file before vault init runs.
+        //
+        // Integrity check is delegated to `ensure_vault_integrity_or_quarantine`
+        // so callers that bypass VaultContext (e.g. `aikey list` via
+        // storage::list_entries_with_metadata) still benefit — the same helper
+        // is invoked from run_command's dispatch prelude.
+        ensure_vault_integrity_or_quarantine()?;
         let vault_path = storage::get_vault_path()?;
         let needs_init = if vault_path.exists() {
+            // Size-0 or post-quarantine path both surface as "salt missing",
+            // which means this is a fresh/reset vault that needs init.
             storage::get_salt().is_err()
         } else {
             true
@@ -156,6 +162,76 @@ impl VaultContext {
         crypto::decrypt(&self.key, nonce, ciphertext)
             .map_err(|_| msgs::INVALID_PASSWORD.to_string())
     }
+}
+
+/// If the vault file exists, is non-empty, and `get_salt()` fails, move it to
+/// `<.aikey>/backups/vault-corrupt-<epoch>.db` so the next call can safely
+/// re-initialise from scratch. Never deletes data — always a `rename`, so the
+/// user can diagnose the corruption or restore manually.
+///
+/// Called from both:
+///   • run_command's dispatch prelude (so list/status/whoami — which bypass
+///     VaultContext — still trigger quarantine instead of silently returning
+///     empty),
+///   • VaultContext::new (defence in depth).
+///
+/// Returns Ok even when the vault was fine or was just quarantined — callers
+/// should proceed as usual; re-init happens inside VaultContext::new or on the
+/// next command.
+pub fn ensure_vault_integrity_or_quarantine() -> Result<(), String> {
+    let vault_path = storage::get_vault_path()?;
+    if !vault_path.exists() {
+        return Ok(());
+    }
+    let size = std::fs::metadata(&vault_path).map(|m| m.len()).unwrap_or(0);
+    if size == 0 {
+        // Empty placeholder file (e.g. created by the session backend before
+        // vault init). Let the init path overwrite it.
+        return Ok(());
+    }
+    if storage::get_salt().is_ok() {
+        return Ok(());
+    }
+    // salt missing but file non-empty: could be either
+    //   (a) a real SQLite file whose tables/salt were not yet written (e.g.
+    //       `rusqlite::Connection::open` in migrations::upgrade_all created
+    //       the shell file but VaultContext::new has not run yet), or
+    //   (b) a truly corrupt / truncated file whose header is not a SQLite
+    //       database at all.
+    // Only (b) warrants quarantine — (a) will self-heal on the next
+    // password-bearing command via VaultContext::new → initialize_vault.
+    // Distinguish by sniffing the SQLite magic header; anything else goes
+    // to the backups dir.
+    {
+        use std::io::Read;
+        let mut header = [0u8; 16];
+        let looks_like_sqlite = std::fs::File::open(&vault_path)
+            .and_then(|mut f| f.read_exact(&mut header).map(|_| header))
+            .map(|h| &h == b"SQLite format 3\0")
+            .unwrap_or(false);
+        if looks_like_sqlite {
+            return Ok(());
+        }
+    }
+    // Not a SQLite file — corrupted / truncated / garbage. Quarantine.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup_dir = vault_path.parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("backups"))
+        .ok_or_else(|| "vault path has no parent — cannot quarantine".to_string())?;
+    std::fs::create_dir_all(&backup_dir)
+        .map_err(|e| format!("could not create backups dir {}: {}", backup_dir.display(), e))?;
+    let quarantine_path = backup_dir.join(format!("vault-corrupt-{}.db", ts));
+    std::fs::rename(&vault_path, &quarantine_path)
+        .map_err(|e| format!("could not quarantine corrupt vault: {}", e))?;
+    eprintln!(
+        "\n  \u{26A0}  Vault at {} appeared corrupted and was moved to:\n      {}\n  A fresh empty vault has been created in its place.\n  To restore data, use `aikey import` with your last backup, or copy the\n  quarantined file back once the corruption is diagnosed.\n",
+        vault_path.display(), quarantine_path.display()
+    );
+    Ok(())
 }
 
 #[allow(dead_code)]

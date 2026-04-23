@@ -17,6 +17,19 @@
 //!   —— 单纯 alpha+special 短 token（如 `[Moonshot`）一律拒绝，避免 markdown 残留当 password
 
 use regex::Regex;
+use std::sync::OnceLock;
+
+// R-5 P2-A (2026-04-23): cached regexes (called per-line over whole text).
+fn re_email() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap())
+}
+fn re_any_secret() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(
+        r"sk-ant-[A-Za-z0-9\-_]{10,}|\bsk-[A-Za-z0-9\-_]{10,}\b|\bxai-[A-Za-z0-9]{10,}\b|\brk-[A-Za-z0-9\-_]{10,}\b|\bghp_[A-Za-z0-9]{16,}\b|\b[a-fA-F0-9]{28,}\b|\bAKIA[0-9A-Z]{16}\b"
+    ).unwrap())
+}
 
 use super::candidate::Kind;
 use super::line_class::{line_class, LineFlags};
@@ -29,12 +42,6 @@ pub fn extract(
     cands: &mut Vec<super::candidate::Candidate>,
     seen: &mut std::collections::HashSet<String>,
 ) {
-    let re_email = Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap();
-    // 任何可识别 secret 形态（用于标记锚点行；不关心具体值）
-    let re_any_secret = Regex::new(
-        r"sk-ant-[A-Za-z0-9\-_]{10,}|\bsk-[A-Za-z0-9\-_]{10,}\b|\bxai-[A-Za-z0-9]{10,}\b|\brk-[A-Za-z0-9\-_]{10,}\b|\bghp_[A-Za-z0-9]{16,}\b|\b[a-fA-F0-9]{28,}\b|\bAKIA[0-9A-Z]{16}\b"
-    ).unwrap();
-
     let stopwords: std::collections::HashSet<&str> = [
         "is", "the", "for", "as", "and", "use", "my", "new", "set",
         "login", "email", "password", "passwd", "pass", "pwd",
@@ -51,8 +58,8 @@ pub fn extract(
     let lines: Vec<&str> = text.lines().collect();
     let mut anchor_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (i, line) in lines.iter().enumerate() {
-        let has_email = re_email.is_match(line);
-        let has_secret = re_any_secret.is_match(line);
+        let has_email = re_email().is_match(line);
+        let has_secret = re_any_secret().is_match(line);
         if has_email || has_secret {
             anchor_lines.insert(i);
             if i > 0 { anchor_lines.insert(i - 1); }

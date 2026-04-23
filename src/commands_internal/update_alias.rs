@@ -17,6 +17,8 @@ use serde_json::json;
 
 use crate::audit::{self, AuditOperation};
 use crate::storage;
+// storage_platform is a submodule re-exported via `pub use storage::*`
+// on storage. Call its functions through `storage::...` directly.
 use super::protocol::{ResultEnvelope, StdinEnvelope};
 use super::stdin_json::{decode_vault_key, emit, emit_error};
 
@@ -70,6 +72,7 @@ pub fn handle(env: StdinEnvelope) {
     let req_id = env.request_id.clone();
     match env.action.as_str() {
         "rename_alias" => handle_rename_alias(env),
+        "rename_target" => handle_rename_target(env),
         "set_provider" => handle_set_provider(env),
         "set_base_url" => handle_set_base_url(env),
         "set_supported_providers" => handle_set_supported_providers(env),
@@ -379,5 +382,146 @@ fn must_alias_exist(conn: &rusqlite::Connection, req_id: &Option<String>, alias:
             false
         }
         Err((c, m)) => { emit_error(req_id.clone(), c, m); false }
+    }
+}
+
+// ========== rename_target ==========
+//
+// Target-aware rename for the unified User Vault Web protocol (§2.0).
+// Payload: `{ "target": "personal" | "oauth" | "team", "id": "...", "new_value": "..." }`
+//
+// - personal: id == old alias. Renames entries.alias. UNIQUE conflict →
+//   I_CREDENTIAL_CONFLICT (Go side retries with -2/-3 suffix per D7).
+// - oauth: id == provider_account_id. Updates display_identity. No UNIQUE
+//   constraint on display_identity, so conflicts are not possible — but we
+//   still verify the row exists (404-equivalent).
+// - team: reserved for future use; returns I_UNKNOWN_TARGET.
+//
+// Why a separate action (not overload `rename_alias`): `rename_alias` has a
+// stable payload shape used by existing callers. Keeping them distinct lets
+// the unified-target contract evolve independently.
+fn handle_rename_target(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        target: String,
+        id: String,
+        new_value: String,
+    }
+    let payload: Payload = match serde_json::from_value(env.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_error(req_id, "I_STDIN_INVALID_JSON", format!("rename_target payload: {}", e));
+            return;
+        }
+    };
+    if payload.id.trim().is_empty() {
+        emit_error(req_id, "I_STDIN_INVALID_JSON", "id must be non-empty");
+        return;
+    }
+    if payload.new_value.trim().is_empty() {
+        emit_error(req_id, "I_STDIN_INVALID_JSON", "new_value must be non-empty");
+        return;
+    }
+
+    let (key, conn) = match prepare(&env) { Some(p) => p, None => return };
+
+    match payload.target.as_str() {
+        "personal" => {
+            // id == old alias
+            if payload.id == payload.new_value {
+                emit_error(req_id, "I_STDIN_INVALID_JSON", "id and new_value are identical");
+                return;
+            }
+            match alias_exists(&conn, &payload.id) {
+                Ok(false) => {
+                    emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
+                        format!("alias '{}' not found", payload.id));
+                    return;
+                }
+                Err((c, m)) => { emit_error(req_id, c, m); return; }
+                Ok(true) => {}
+            }
+            // Pre-check: the new alias must not already exist. Go side catches
+            // I_CREDENTIAL_CONFLICT and retries with -2/-3/... suffix.
+            match alias_exists(&conn, &payload.new_value) {
+                Ok(true) => {
+                    emit_error(req_id, "I_CREDENTIAL_CONFLICT",
+                        format!("alias '{}' already exists", payload.new_value));
+                    return;
+                }
+                Err((c, m)) => { emit_error(req_id, c, m); return; }
+                Ok(false) => {}
+            }
+            match conn.execute(
+                "UPDATE entries SET alias = ?1 WHERE alias = ?2",
+                rusqlite::params![&payload.new_value, &payload.id],
+            ) {
+                Ok(1) => {
+                    let audit_logged = try_log_audit(&key, AuditOperation::Update, Some(&payload.new_value), true);
+                    emit(&ResultEnvelope::ok(
+                        req_id,
+                        json!({
+                            "target": "personal",
+                            "id": payload.new_value,
+                            "old_id": payload.id,
+                            "action_taken": "renamed",
+                            "audit_logged": audit_logged,
+                        }),
+                    ));
+                }
+                Ok(_) => emit_error(req_id, "I_INTERNAL", "UPDATE affected unexpected row count"),
+                // Race window: two concurrent renames race past the pre-check.
+                Err(e) if format!("{}", e).contains("UNIQUE") => emit_error(
+                    req_id, "I_CREDENTIAL_CONFLICT",
+                    format!("UNIQUE constraint: {}", e)),
+                Err(e) => emit_error(req_id, "I_INTERNAL", format!("rename UPDATE: {}", e)),
+            }
+        }
+        "oauth" => {
+            // id == provider_account_id. Verify row exists first (precise 404).
+            match storage::get_provider_account(&payload.id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
+                        format!("provider_account_id '{}' not found", payload.id));
+                    return;
+                }
+                Err(e) => { emit_error(req_id, "I_INTERNAL", format!("get_provider_account: {}", e)); return; }
+            }
+            // provider_accounts.display_identity has no UNIQUE constraint —
+            // users might legitimately want two accounts to share a label
+            // (e.g. same email, different providers). No conflict retry.
+            let affected = conn.execute(
+                "UPDATE provider_accounts SET display_identity = ?1 WHERE provider_account_id = ?2",
+                rusqlite::params![&payload.new_value, &payload.id],
+            );
+            match affected {
+                Ok(1) => {
+                    let audit_logged = try_log_audit(&key, AuditOperation::Update, Some(&payload.id), true);
+                    emit(&ResultEnvelope::ok(
+                        req_id,
+                        json!({
+                            "target": "oauth",
+                            "id": payload.id,
+                            "display_identity": payload.new_value,
+                            "action_taken": "renamed",
+                            "audit_logged": audit_logged,
+                        }),
+                    ));
+                }
+                Ok(_) => emit_error(req_id, "I_INTERNAL", "UPDATE affected unexpected row count"),
+                Err(e) => emit_error(req_id, "I_INTERNAL", format!("rename oauth UPDATE: {}", e)),
+            }
+        }
+        "team" => {
+            emit_error(req_id, "I_UNKNOWN_TARGET",
+                "target 'team' is reserved for future use and not implemented in v1.0");
+        }
+        other => {
+            emit_error(req_id, "I_UNKNOWN_TARGET",
+                format!("unknown target '{}' (expected personal|oauth|team)", other));
+        }
     }
 }

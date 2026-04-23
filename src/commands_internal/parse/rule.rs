@@ -9,34 +9,68 @@
 //! 调用顺序关键：1 → 2 → 3 → 4。前 3 步产出"已认领"候选，第 4 步用这些作为 anchor 拓展召回。
 
 use regex::Regex;
+use std::sync::OnceLock;
 
 use super::candidate::{make_id, Candidate, Kind, Tier};
 use super::v41_guards::{is_comment_at_offset, is_in_reject_context, is_placeholder_token};
 
-/// 从原文抽取所有候选（已 dedup + 合并四层）
-pub fn rule_extract(text: &str) -> Vec<Candidate> {
-    let re_email = Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap();
+// R-5 P2-A (2026-04-23): per-call `Regex::new(...)` recompilation removed.
+// Each pattern lives in a `OnceLock<Regex>` initialized on first use; subsequent
+// `re_*()` calls are O(1) reference lookups. Aligns with the existing
+// `crf.rs` / `provider_fingerprint.rs` OnceLock model.
+
+fn re_email() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").unwrap())
+}
+fn re_url() -> &'static Regex {
     // URL 停在 " ' , } ] ): 覆盖 JSON 嵌入 / Markdown 链接 [text](url) 场景
     //   v4.1 ISSUE-3: 补全角右括号 `）】」〕` —— 避免桃子中文行
     //   `http://taozi-nas.local:3000/v1）` 把 `）` 吞入 URL 造成畸形 base_url
-    let re_url = Regex::new(r#"https?://[^\s"',}\])）】」〕]+"#).unwrap();
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r#"https?://[^\s"',}\])）】」〕]+"#).unwrap())
+}
+fn re_sk_ant() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"sk-ant-[A-Za-z0-9\-_]{10,}").unwrap())
+}
+fn re_sk() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\bsk-[A-Za-z0-9\-_]{10,}\b").unwrap())
+}
+fn re_xai() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\bxai-[A-Za-z0-9]{10,}\b").unwrap())
+}
+fn re_rk() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\brk-[A-Za-z0-9\-_]{10,}\b").unwrap())
+}
+fn re_ghp() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\bghp_[A-Za-z0-9]{16,}\b").unwrap())
+}
+fn re_hex_long() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\b[a-fA-F0-9]{28,}\b").unwrap())
+}
+fn re_aws() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap())
+}
+fn re_sendgrid() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\b").unwrap())
+}
+fn re_jwt() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b").unwrap()
+    })
+}
 
-    // 已知 provider 前缀（按特异性降序匹配，dedup 保证不重复）
-    let re_sk_ant = Regex::new(r"sk-ant-[A-Za-z0-9\-_]{10,}").unwrap();
-    let re_sk = Regex::new(r"\bsk-[A-Za-z0-9\-_]{10,}\b").unwrap();
-    let re_xai = Regex::new(r"\bxai-[A-Za-z0-9]{10,}\b").unwrap();
-    let re_rk = Regex::new(r"\brk-[A-Za-z0-9\-_]{10,}\b").unwrap();
-    let re_ghp = Regex::new(r"\bghp_[A-Za-z0-9]{16,}\b").unwrap();
-    let re_hex_long = Regex::new(r"\b[a-fA-F0-9]{28,}\b").unwrap();
-
-    // 高特异性 shape（几乎不会在普通文本中误命中）
-    let re_aws = Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap();
-    let re_sendgrid = Regex::new(
-        r"\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\b"
-    ).unwrap();
-    let re_jwt = Regex::new(
-        r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"
-    ).unwrap();
+/// 从原文抽取所有候选（已 dedup + 合并四层）
+pub fn rule_extract(text: &str) -> Vec<Candidate> {
 
     let mut cands: Vec<Candidate> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -44,31 +78,31 @@ pub fn rule_extract(text: &str) -> Vec<Candidate> {
 
     // === Layer 1a: 基础 email / URL ===
     //   v4.1 ISSUE-4: IS_COMMENT 行的 email / URL 一律不抽（注释掉的邮箱 / curl 示例）
-    push_matches_guarded(text, &re_email, Kind::Email, &mut cands, &mut seen);
-    push_matches_guarded(text, &re_url, Kind::Url, &mut cands, &mut seen);
+    push_matches_guarded(text, re_email(), Kind::Email, &mut cands, &mut seen);
+    push_matches_guarded(text, re_url(), Kind::Url, &mut cands, &mut seen);
 
     // === Layer 1b: 已知 provider 前缀 → secret ===
     // 优先级：更具体的前缀先
     //   v4.1 ISSUE-4: 注释行废弃 key（// sk-ant-api03-OldKey_rotated）不抽
     //   v4.1 placeholder denylist: `sk-example-xxx` / `sk-ant-api03-your_key` 等占位不抽
-    push_matches_guarded(text, &re_sk_ant, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches_guarded(text, &re_sk, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches_guarded(text, &re_xai, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches_guarded(text, &re_rk, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches_guarded(text, &re_ghp, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches_guarded(text, &re_hex_long, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, re_sk_ant(), Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, re_sk(), Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, re_xai(), Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, re_rk(), Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, re_ghp(), Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, re_hex_long(), Kind::SecretLike, &mut cands, &mut seen);
 
     // === Layer 1c: 高特异性 shape（AWS / SendGrid / JWT）===
-    push_matches_guarded(text, &re_aws, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches_guarded(text, &re_sendgrid, Kind::SecretLike, &mut cands, &mut seen);
-    push_matches_guarded(text, &re_jwt, Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, re_aws(), Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, re_sendgrid(), Kind::SecretLike, &mut cands, &mut seen);
+    push_matches_guarded(text, re_jwt(), Kind::SecretLike, &mut cands, &mut seen);
 
     // === Legacy `----` 分隔的 password 启发式 ===
     // Why 保留：in-dist 样本（claude2/claude3 风格）大量使用这种格式
-    dash_separated_password_heuristic(text, &re_email, &mut cands, &mut seen);
+    dash_separated_password_heuristic(text, re_email(), &mut cands, &mut seen);
 
     // === Legacy `|` 分隔的中段 password 启发式 ===
-    pipe_separated_password_heuristic(text, &re_email, &mut cands, &mut seen);
+    pipe_separated_password_heuristic(text, re_email(), &mut cands, &mut seen);
 
     // === 显式标签启发式（password: / 密码: 等）===
     // 注意：这条负责 password 字段；secret 字段由 Layer 2 label=value 负责
@@ -82,6 +116,12 @@ pub fn rule_extract(text: &str) -> Vec<Candidate> {
 
     // === Layer 4: email/secret 锚点 password 召回（B 方案）===
     super::rule_anchored::extract(text, &mut cands, &mut seen);
+
+    // === Layer 5 (v4.2): block 首行"自然语言"title 抽取 ===
+    // Why 放 PEM/锚点之后：title 不是 credential，run 完整 credential 层再跑它，不影响
+    // 原有 dedup 次序。emit Kind::Title；grouper 按 line_range 贴到对应 draft。
+    // 零回归验证见 workflow/CI/research/ablation-spike-v4.1/TITLE_ABLATION_REPORT.md。
+    super::rule_title::extract(text, &mut cands, &mut seen);
 
     cands
 }

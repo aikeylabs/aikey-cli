@@ -70,6 +70,10 @@ struct Registry {
     /// 见 yaml 顶部 `aggregator_families` 段落。
     #[serde(default)]
     aggregator_families: Vec<String>,
+    /// v4.1 Stage 10+: family → 官方登录/API Key 页面 URL
+    /// UI "Open login page" 按钮消费此字段(window.open)
+    #[serde(default)]
+    family_login_urls: std::collections::HashMap<String, String>,
 }
 
 // ========== Classifier ==========
@@ -78,6 +82,8 @@ pub struct FingerprintClassifier {
     entries: Vec<(ProviderEntry, Regex)>,
     /// v4.1 Stage 5+: 聚合网关 family 集合(从 yaml 加载)
     aggregator_families: std::collections::HashSet<String>,
+    /// v4.1 Stage 10+: family → 登录页 URL 映射(从 yaml 加载)
+    family_login_urls: std::collections::HashMap<String, String>,
 }
 
 impl FingerprintClassifier {
@@ -95,7 +101,8 @@ impl FingerprintClassifier {
         }
         let aggregator_families: std::collections::HashSet<String> =
             reg.aggregator_families.into_iter().collect();
-        Self { entries, aggregator_families }
+        let family_login_urls = reg.family_login_urls;
+        Self { entries, aggregator_families, family_login_urls }
     }
 
     /// v4.1 Stage 5+: 从 inferred provider family 派生 protocol_types 列表。
@@ -108,6 +115,11 @@ impl FingerprintClassifier {
         } else {
             vec![family.to_string()]
         }
+    }
+
+    /// v4.1 Stage 10+: 查 family 的登录页 URL (UI "Open login page" 用)
+    pub fn login_url_for_family(&self, family: &str) -> Option<String> {
+        self.family_login_urls.get(family).cloned()
     }
 
     /// 直接分类（不用上下文）
@@ -194,6 +206,9 @@ pub fn provider_family_of(id: &str) -> Option<&'static str> {
 pub fn text_keyword_family_and_keyword(text: &str) -> Option<(String, String)> {
     let lc = text.to_lowercase();
     // 按 family 粒度声明 (不一定每个都有),匹配优先级:长 → 短,特异 → 通用
+    // BUG-05 fix: 补齐聚合网关 / 次级官方 family (yunwu / zeroeleven / mistral),
+    // 让行首 label "🔑 yunwu:" 经 E6 InlineLabelKeyword 通路推断到正确 family。
+    // 与 spike `provider_fingerprint.yaml::keyword_to_family` 保持一致。
     const MAP: &[(&str, &str)] = &[
         ("anthropic",     "anthropic"),
         ("claude",        "anthropic"),
@@ -210,6 +225,10 @@ pub fn text_keyword_family_and_keyword(text: &str) -> Option<(String, String)> {
         ("kimi",          "kimi"),
         ("groq",          "groq"),
         ("deepseek",      "deepseek"),
+        ("mistral",       "mistral"),
+        ("yunwu",         "yunwu"),
+        ("zeroeleven",    "zeroeleven"),
+        ("0011",          "zeroeleven"),
         ("xai",           "xai_grok"),
         ("grok",          "xai_grok"),
         ("zhipu",         "zhipu"),
@@ -251,6 +270,8 @@ pub fn shell_var_family_and_pattern(var_name: &str) -> Option<(String, String)> 
         ("KIMI",       "kimi",          "KIMI_*"),
         ("GROQ",       "groq",          "GROQ_*"),
         ("DEEPSEEK",   "deepseek",      "DEEPSEEK_*"),
+        ("MISTRAL",    "mistral",       "MISTRAL_*"),
+        ("YUNWU",      "yunwu",         "YUNWU_*"),
         ("XAI",        "xai_grok",      "XAI_*"),
         ("HUGGINGFACE", "huggingface",  "HUGGINGFACE_*"),
         ("HF_TOKEN",   "huggingface",   "HF_TOKEN"),
@@ -290,6 +311,9 @@ pub fn url_host_family_and_pattern(url: &str) -> Option<(String, String)> {
         ("moonshot.ai",          "kimi"),
         ("groq.com",             "groq"),
         ("deepseek.com",         "deepseek"),
+        ("mistral.ai",           "mistral"),
+        ("yunwu.ai",             "yunwu"),
+        ("0011.ai",              "zeroeleven"),
         ("x.ai",                 "xai_grok"),
         ("huggingface.co",       "huggingface"),
         ("perplexity.ai",        "perplexity"),
