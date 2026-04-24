@@ -292,6 +292,22 @@ pub fn add_secret(alias: &str, secret: &str, password: &SecretString) -> Result<
     Ok(())
 }
 
+/// Derives the raw 32-byte vault key from the user's password after running
+/// the full VaultContext::new pipeline (integrity check, auto-init if needed,
+/// rate-limiting, password verification, pending migrations). Callers that
+/// need the raw key to pass into `commands_account::apply_add_core_on_conn`
+/// (or any other `crypto::encrypt` / canonical-write path) should use this
+/// helper instead of calling `crypto::derive_key` directly — otherwise they
+/// skip integrity + rate-limiting + migration guards. Returns the raw key
+/// bytes by value to keep ownership transfer cheap; memory zeroization of
+/// the returned array is the caller's responsibility (wrap with `Zeroizing`).
+pub fn derive_vault_key(password: &SecretString) -> Result<[u8; crypto::KEY_SIZE], String> {
+    let ctx = VaultContext::new(password)?;
+    let mut out = [0u8; crypto::KEY_SIZE];
+    out.copy_from_slice(ctx.key.as_slice());
+    Ok(out)
+}
+
 pub fn get_secret(alias: &str, password: &SecretString) -> Result<Zeroizing<String>, String> {
     let ctx = VaultContext::new(password)?;
     let (nonce, ciphertext) = storage::get_entry(alias)?;

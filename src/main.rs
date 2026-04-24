@@ -878,7 +878,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let resolved_provider = resolved_providers.first().cloned();
+            // (`resolved_provider` — the first-provider shorthand — used to
+            // live here; apply_add_core_on_conn takes `resolved_providers`
+            // whole and writes provider_code = providers[0] internally.)
 
             // Step 4: connectivity test — routed through the unified suite so
             // `aikey add` shares one code path with doctor / test.
@@ -912,24 +914,52 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Step 5: write to vault.
-            let result = executor::add_secret(alias, secret.trim(), &password);
-            let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(alias), result.is_ok());
-            if let Err(e) = result {
-                if cli.json { json_output::error(&e, 1); } else { return Err(e.into()); }
-            }
-
-            // Persist provider metadata.
-            let _ = storage::set_entry_supported_providers(alias, &resolved_providers);
-            if let Some(ref code) = resolved_provider {
-                let _ = storage::set_entry_provider_code(alias, Some(code.as_str()));
-            }
-            if let Some(ref url) = resolved_base_url {
-                let _ = storage::set_entry_base_url(alias, Some(url.as_str()));
-            }
+            // Step 5: write to vault via the shared core.
+            //
+            // Funnels to `commands_account::apply_add_core_on_conn` — the same
+            // helper used by `_internal vault-op add` and `_internal vault-op
+            // batch_import`, so alias validation / canonical provider
+            // normalization / ciphertext write / supported_providers +
+            // provider_code + base_url metadata all land identically no matter
+            // which caller wrote the row (2026-04-24 `_internal must reuse
+            // public command core` rule — see `.claude/CLAUDE.md`).
+            let vault_key = match executor::derive_vault_key(&password) {
+                Ok(k) => k,
+                Err(e) => {
+                    if cli.json { json_output::error(&e, 1); }
+                    return Err(e.into());
+                }
+            };
+            let conn = match storage::open_connection() {
+                Ok(c) => c,
+                Err(e) => {
+                    if cli.json { json_output::error(&e, 1); }
+                    return Err(e.into());
+                }
+            };
+            let outcome = match commands_account::apply_add_core_on_conn(
+                &conn,
+                &vault_key,
+                alias,
+                secret.trim().as_bytes(),
+                &resolved_providers,
+                resolved_base_url.as_deref(),
+                commands_account::OnConflict::Error,
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(alias), false);
+                    if cli.json { json_output::error(&e, 1); }
+                    return Err(e.into());
+                }
+            };
+            let _ = storage::bump_vault_change_seq();
+            let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(&outcome.alias), true);
 
             // Generate route token for per-request proxy routing (API gateway).
-            let _ = storage::ensure_entry_route_token(alias);
+            // Outside the core because `ensure_entry_route_token` opens its
+            // own connection — safe to run post-write on the same DB.
+            let _ = storage::ensure_entry_route_token(&outcome.alias);
 
             // Auto-assign as Primary + refresh active.env.
             let newly_primary = profile_activation::auto_assign_primaries_for_key(
@@ -2102,10 +2132,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if changes.is_empty() {
                         eprintln!("  No changes.");
                     } else {
+                        // Canonical-write (2026-04-24 rule) — interactive
+                        // `aikey use` picker's selected bindings go through
+                        // the same helper as every other write path.
                         for (prov, src_type, src_ref) in &changes {
-                            storage::set_provider_binding(
-                                profile_activation::DEFAULT_PROFILE,
-                                prov, src_type, src_ref,
+                            commands_account::write_bindings_canonical(
+                                &[prov.clone()],
+                                src_type,
+                                src_ref,
                             ).map_err(|e| format!("Failed to set binding: {}", e))?;
                         }
                         let refresh = profile_activation::refresh_implicit_profile_activation()

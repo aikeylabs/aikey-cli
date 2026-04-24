@@ -1718,16 +1718,25 @@ pub fn backfill_route_tokens() -> Result<usize, String> {
 mod storage_platform;
 pub use storage_platform::*;
 
+/// Process-global lock that serializes every test touching `AK_VAULT_PATH`.
+///
+/// Tests across different modules must share the SAME mutex instance; if
+/// each module defines its own, parallel `cargo test` threads stomp on each
+/// other's env var while one is mid-initialization. Elevated from a
+/// module-private static inside `mod tests` (2026-04-24) so `commands_account::
+/// core_tests` and future cross-module vault tests can all `.lock()` the
+/// same guard.
+#[cfg(test)]
+pub(crate) static TEST_VAULT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use secrecy::SecretString;
     use tempfile::TempDir;
 
-    use std::sync::Mutex;
-
-    /// Serialize storage tests that share AK_VAULT_PATH env var.
-    static VAULT_LOCK: Mutex<()> = Mutex::new(());
+    /// Local alias to the crate-level TEST_VAULT_LOCK.
+    static VAULT_LOCK: &std::sync::Mutex<()> = &super::TEST_VAULT_LOCK;
 
     /// Sets up an isolated vault DB via `AK_VAULT_PATH`.
     /// Returns the TempDir guard (must stay alive), the DB path, and the mutex guard.

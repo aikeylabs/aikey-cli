@@ -155,7 +155,19 @@ pub struct RefreshResult {
 /// After a key is added (personal or team), check each of its providers.
 /// If the provider has no current binding, assign this key as the Primary.
 ///
-/// Returns the list of providers where this key became the new Primary.
+/// Returns the list of providers where this key became the new Primary
+/// (reported in their canonical form — claude → anthropic, codex → openai —
+/// matching what actually got written to the bindings table).
+///
+/// # Canonical normalization
+/// As of 2026-04-24 (per CLAUDE.md §"`_internal` 隐藏命令必须复用公开命令的
+/// 非交互 core"), every binding write must go through
+/// `commands_account::write_bindings_canonical` — otherwise the bindings
+/// table can drift into a state with both raw (e.g. "codex") and canonical
+/// (e.g. "openai") rows for the same routing target, which the vault UI
+/// would correctly show as "two in_use in one family". Callers can pass
+/// raw OAuth-vocabulary provider codes ("claude" / "codex") here; the
+/// helper normalizes + cleans stale alias rows on write.
 pub fn auto_assign_primaries_for_key(
     key_source_type: &str,
     key_source_ref: &str,
@@ -163,16 +175,21 @@ pub fn auto_assign_primaries_for_key(
 ) -> Result<Vec<String>, String> {
     let mut newly_assigned: Vec<String> = Vec::new();
 
-    for provider in providers {
-        let existing = storage::get_provider_binding(DEFAULT_PROFILE, provider)?;
+    for raw in providers {
+        let canonical = crate::commands_account::oauth_provider_to_canonical(
+            &raw.to_lowercase()
+        ).to_string();
+        let existing = storage::get_provider_binding(DEFAULT_PROFILE, &canonical)?;
         if existing.is_none() {
-            storage::set_provider_binding(
-                DEFAULT_PROFILE,
-                provider,
+            // Funnels through the shared canonical-write helper so any
+            // stale non-canonical alias row (e.g. a prior "codex" row from
+            // a pre-fix CLI) is cleaned up as a side effect.
+            crate::commands_account::write_bindings_canonical(
+                &[canonical.clone()],
                 key_source_type,
                 key_source_ref,
             )?;
-            newly_assigned.push(provider.clone());
+            newly_assigned.push(canonical);
         }
     }
 
@@ -226,9 +243,11 @@ pub fn reconcile_provider_primary_after_key_removal(
         let replacement = find_replacement_candidate(provider, key_source_type, key_source_ref)?;
         match replacement {
             Some((src_type, src_ref)) => {
-                storage::set_provider_binding(
-                    DEFAULT_PROFILE,
-                    provider,
+                // Canonical-write (2026-04-24 rule) — replacement bindings
+                // go through the same helper as every other write path so
+                // stale alias rows self-heal.
+                crate::commands_account::write_bindings_canonical(
+                    &[provider.clone()],
                     &src_type,
                     &src_ref,
                 )?;

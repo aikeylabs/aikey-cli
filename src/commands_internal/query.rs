@@ -23,6 +23,8 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::commands_account::oauth_provider_to_canonical;
+use crate::connectivity::default_base_url;
 use crate::credential_type::CredentialType;
 use crate::crypto;
 use crate::storage;
@@ -43,6 +45,21 @@ use super::stdin_json::{decode_vault_key, emit, emit_error};
 // second migration-bearing open would be redundant. If the readonly open
 // or query fails (e.g. old vault without `user_profile_provider_bindings`),
 // we degrade to empty sets — in_use comes back false everywhere, no error.
+// Protocol-family classifier for UI grouping. Credentials that speak the
+// same upstream API are placed in one group regardless of which client
+// (claude.ai / chatgpt.com / anthropic API key) issued them. See
+// `oauth_provider_to_canonical` for the authoritative mapping (claude →
+// anthropic, codex → openai). Personal keys' provider_code is already
+// canonical at write-time, so we just pass it through the same normalizer
+// to survive any pre-normalization drift and to keep the single source
+// of truth in one place.
+fn protocol_family_of(raw: Option<&str>) -> String {
+    match raw {
+        Some(s) if !s.is_empty() => oauth_provider_to_canonical(&s.to_lowercase()).to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
 fn load_active_binding_refs() -> (HashSet<String>, HashSet<String>) {
     let mut personal: HashSet<String> = HashSet::new();
     let mut oauth: HashSet<String> = HashSet::new();
@@ -232,11 +249,17 @@ fn handle_get(env: StdinEnvelope) {
         }
     };
 
+    let official_base_url =
+        meta.provider_code.as_deref().and_then(default_base_url);
     let mut data = json!({
         "alias": meta.alias,
         "created_at": meta.created_at,
         "provider_code": meta.provider_code,
         "base_url": meta.base_url,
+        // Mirror of list_personal_with_masked — same rationale: let
+        // callers know the real URL that gets used when base_url is
+        // null, without having to embed PROVIDER_DEFAULTS client-side.
+        "official_base_url": official_base_url,
         "supported_providers": meta.supported_providers,
         "has_secret": true,
     });
@@ -375,12 +398,27 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
         };
         let secret = String::from_utf8_lossy(&plaintext);
         let (prefix, suffix, len) = extract_prefix_suffix(&secret);
+        // `official_base_url`: the provider's recommended URL when the
+        // user didn't set a custom `base_url` (stored value is NULL).
+        // Resolved from the canonical PROVIDER_DEFAULTS table in
+        // `connectivity::runtime`, which is the single source of truth
+        // the rest of the CLI uses for connectivity probes. Exposing
+        // it here lets the vault Web drawer show the real URL instead
+        // of the opaque "provider default" placeholder + a one-click
+        // copy button. Why surface it via the existing list response
+        // rather than a new /v1/registry endpoint: "慎重新建 API" —
+        // extending an existing payload is lower blast radius than
+        // adding a new endpoint for a 6-row lookup table.
+        let official_base_url =
+            m.provider_code.as_deref().and_then(default_base_url);
         out.push(json!({
             "target": "personal",
             "id": m.alias,
             "alias": m.alias,
             "provider_code": m.provider_code,
+            "protocol_family": protocol_family_of(m.provider_code.as_deref()),
             "base_url": m.base_url,
+            "official_base_url": official_base_url,
             "supported_providers": m.supported_providers,
             "created_at": m.created_at,
             "status": "active",
@@ -475,6 +513,7 @@ fn handle_list_oauth(env: StdinEnvelope) {
         "id": a.provider_account_id,
         "provider_account_id": a.provider_account_id,
         "provider": a.provider,
+        "protocol_family": protocol_family_of(Some(&a.provider)),
         "auth_type": a.auth_type,
         "credential_type": a.credential_type.as_str(),
         "display_identity": a.display_identity,
@@ -565,12 +604,21 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
     match storage::list_entries_with_metadata() {
         Ok(metas) => {
             for m in metas {
+                // Same rationale as list_personal_with_masked: surface
+                // the resolved default URL so the Web drawer can show
+                // the real provider endpoint in locked mode too (the
+                // locked view is still the page users see before they
+                // unlock, and copying the default URL is read-only).
+                let official_base_url =
+                    m.provider_code.as_deref().and_then(default_base_url);
                 out.push(json!({
                     "target": "personal",
                     "id": m.alias,
                     "alias": m.alias,
                     "provider_code": m.provider_code,
+                    "protocol_family": protocol_family_of(m.provider_code.as_deref()),
                     "base_url": m.base_url,
+                    "official_base_url": official_base_url,
                     "supported_providers": m.supported_providers,
                     "created_at": m.created_at,
                     "status": "active",
@@ -608,6 +656,7 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "id": a.provider_account_id,
                     "provider_account_id": a.provider_account_id,
                     "provider": a.provider,
+                    "protocol_family": protocol_family_of(Some(&a.provider)),
                     "auth_type": a.auth_type,
                     "credential_type": a.credential_type.as_str(),
                     "display_identity": a.display_identity,

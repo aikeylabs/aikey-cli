@@ -1891,6 +1891,449 @@ pub fn oauth_provider_to_canonical(provider: &str) -> &str {
     }
 }
 
+// ============================================================================
+// Shared add-secret core (2026-04-24)
+//
+// Single source of truth for "write a personal key entry to vault.db". Used
+// by three callers:
+//   - `aikey add` (CLI, interactive / batch-friendly single add)
+//   - `_internal vault-op add`  (single-add via Web "Add key" modal)
+//   - `_internal vault-op batch_import` (Web paste-import, N items in a tx)
+//
+// Rationale — see `.claude/CLAUDE.md` §"_internal 隐藏命令必须复用公开命令的
+// 非交互 core（强制执行）". Previously each path reimplemented the same
+// four-step write (validate → encrypt → store_entry → metadata), with
+// subtle divergences: `vault-op add` skipped supported_providers + base_url;
+// `batch_import` had its own alias validator; neither did canonical
+// provider normalization. All three now funnel through `apply_add_core_on_conn`.
+// ============================================================================
+
+/// Personal-key alias length cap — shared by all add paths.
+const MAX_ALIAS_LEN: usize = 128;
+
+/// How to respond when the target alias already exists in vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnConflict {
+    /// Reject with an error (CLI default + batch strict mode).
+    Error,
+    /// Overwrite the existing entry's ciphertext + metadata.
+    Replace,
+    /// No-op this item and return `AddAction::Skipped` (batch lenient mode).
+    Skip,
+}
+
+/// Result variant from `apply_add_core_on_conn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddAction {
+    Inserted,
+    Replaced,
+    Skipped,
+}
+
+impl AddAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AddAction::Inserted => "inserted",
+            AddAction::Replaced => "replaced",
+            AddAction::Skipped  => "skipped",
+        }
+    }
+}
+
+/// Structured outcome of an `apply_add_core_on_conn` call.
+#[derive(Debug, Clone)]
+pub struct AddOutcome {
+    /// The alias as it was actually written (post trim/validate). Callers
+    /// should prefer this over the input `alias` for downstream references.
+    pub alias: String,
+    pub action: AddAction,
+    /// Provider codes after canonical normalization + dedup. Empty if the
+    /// caller passed no providers (stored unassigned; `aikey use` later
+    /// errors out until at least one provider is set).
+    pub providers: Vec<String>,
+    /// First canonical provider, also written to `entries.provider_code`
+    /// for legacy-single-provider callers. `None` when providers is empty.
+    pub primary_provider: Option<String>,
+}
+
+/// Validates a personal-key alias. Returns the trimmed form on success.
+///
+/// Rules (single-source-of-truth; previously split between `aikey add`'s
+/// empty-string check and `batch_import`'s char/length checks):
+///   - Must be non-empty after trim
+///   - Must be ≤ 128 chars (MAX_ALIAS_LEN)
+///   - Must not contain ASCII control characters (0x00-0x1F + 0x7F)
+pub fn validate_alias(alias: &str) -> Result<String, String> {
+    let trimmed = alias.trim();
+    if trimmed.is_empty() {
+        return Err("alias must not be empty".to_string());
+    }
+    if trimmed.chars().count() > MAX_ALIAS_LEN {
+        return Err(format!("alias exceeds {} characters", MAX_ALIAS_LEN));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("alias contains control characters".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Normalizes a list of raw provider strings into canonical, deduplicated,
+/// order-preserving form. Runs each value through:
+///   1. `trim()` + `to_lowercase()` (user typo tolerance)
+///   2. drop empty strings
+///   3. `oauth_provider_to_canonical` (claude → anthropic, codex → openai)
+///   4. dedup (preserve first-seen order)
+///
+/// Single source of truth for "what goes into `entries.supported_providers`
+/// and `entries.provider_code` at add-time". Write-side counterpart of the
+/// read-side `protocol_family_of` (`commands_internal/query.rs`).
+pub fn normalize_providers(raw: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for p in raw {
+        let lower = p.trim().to_lowercase();
+        if lower.is_empty() { continue; }
+        let canonical = oauth_provider_to_canonical(&lower).to_string();
+        if seen.insert(canonical.clone()) {
+            out.push(canonical);
+        }
+    }
+    out
+}
+
+/// Core personal-key add logic. Connection-bound so it participates cleanly
+/// in both single-add (direct connection) and batch-import (Transaction,
+/// which derefs to `&Connection`) scenarios.
+///
+/// This function does NOT:
+///   - Open a DB connection (caller provides one)
+///   - Bump vault_change_seq (caller's responsibility; batch bumps once
+///     post-commit rather than per item)
+///   - Generate route_token (requires its own connection — caller issues
+///     `storage::ensure_entry_route_token(&outcome.alias)` AFTER this
+///     returns, outside any transaction on the same DB)
+///   - Write audit log (caller decides; uses different audit key paths
+///     for password-derived vs vault_key paths)
+///   - Refresh active.env / auto-assign profiles (CLI-UX side effects)
+pub(crate) fn apply_add_core_on_conn(
+    conn: &rusqlite::Connection,
+    vault_key: &[u8; 32],
+    alias: &str,
+    secret_plaintext: &[u8],
+    providers: &[String],
+    base_url: Option<&str>,
+    on_conflict: OnConflict,
+) -> Result<AddOutcome, String> {
+    let validated = validate_alias(alias)?;
+    let normalized = normalize_providers(providers);
+
+    // Conflict check
+    let exists = conn
+        .query_row(
+            "SELECT COUNT(*) FROM entries WHERE alias = ?1",
+            rusqlite::params![&validated],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .map_err(|e| format!("check alias exists '{}': {}", validated, e))?;
+
+    let action = if exists {
+        match on_conflict {
+            OnConflict::Error => {
+                return Err(format!("alias '{}' already exists", validated));
+            }
+            OnConflict::Skip => {
+                return Ok(AddOutcome {
+                    alias: validated,
+                    action: AddAction::Skipped,
+                    providers: normalized.clone(),
+                    primary_provider: normalized.first().cloned(),
+                });
+            }
+            OnConflict::Replace => AddAction::Replaced,
+        }
+    } else {
+        AddAction::Inserted
+    };
+
+    // Encrypt with provided vault_key (caller owns key lifetime).
+    let (nonce, ciphertext) = crate::crypto::encrypt(vault_key, secret_plaintext)
+        .map_err(|e| format!("encrypt '{}': {}", validated, e))?;
+
+    // Vault ciphertext row (UPSERT semantics at storage layer).
+    storage::store_entry_on_conn(conn, &validated, &nonce, &ciphertext)
+        .map_err(|e| format!("store_entry '{}': {}", validated, e))?;
+
+    // Provider metadata — only touch when caller provided providers. An
+    // add with no providers leaves supported_providers + provider_code
+    // untouched (defensive for Replace path where caller might intentionally
+    // refuse to overwrite existing metadata).
+    if !normalized.is_empty() {
+        storage::set_entry_supported_providers_on_conn(conn, &validated, &normalized)
+            .map_err(|e| format!("set_supported_providers '{}': {}", validated, e))?;
+        // Legacy single-value column — set to the primary (first canonical).
+        // Kept in sync so old `aikey use` / proxy consumers that read
+        // provider_code still work alongside the v1.0.2+ supported_providers.
+        conn.execute(
+            "UPDATE entries SET provider_code = ?1 WHERE alias = ?2",
+            rusqlite::params![&normalized[0], &validated],
+        )
+        .map_err(|e| format!("set provider_code '{}': {}", validated, e))?;
+    }
+
+    // Base URL (optional)
+    if let Some(url) = base_url.map(str::trim).filter(|u| !u.is_empty()) {
+        storage::set_entry_base_url_on_conn(conn, &validated, Some(url))
+            .map_err(|e| format!("set_base_url '{}': {}", validated, e))?;
+    }
+
+    let primary = normalized.first().cloned();
+    Ok(AddOutcome {
+        alias: validated,
+        action,
+        providers: normalized,
+        primary_provider: primary,
+    })
+}
+
+// ============================================================================
+// Shared rename core (2026-04-24)
+//
+// Unified rename path for all three vault row types. Callers:
+//   - `aikey key alias <old> <new>` (CLI, all three targets now)
+//   - `_internal update-alias rename_alias` (personal-only legacy contract)
+//   - `_internal update-alias rename_target` (target-aware Web §2.0 protocol)
+//
+// Rationale — see `.claude/CLAUDE.md` §"_internal 隐藏命令必须复用公开命令的
+// 非交互 core（强制执行）". Previously: public CLI rejected personal rename
+// entirely (pointing user at delete+re-add), while hidden CLI accepted it —
+// users could land the vault in a state where one tool refused what the
+// other permitted. Single core + CLI unblocks personal rename, both ends now
+// agree on semantics, validation, and conflict handling.
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameTarget {
+    /// Personal key entry — renames `entries.alias` (UNIQUE column).
+    Personal,
+    /// Team (virtual) key — renames `managed_virtual_keys_cache.local_alias`
+    /// (server alias stays untouched).
+    Team,
+    /// OAuth account — renames `provider_accounts.display_identity` (no
+    /// UNIQUE; two accounts may legitimately share a label).
+    Oauth,
+}
+
+impl RenameTarget {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RenameTarget::Personal => "personal",
+            RenameTarget::Team => "team",
+            RenameTarget::Oauth => "oauth",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RenameOutcome {
+    pub target: &'static str,
+    /// The row's stable identifier post-rename:
+    ///   - personal → the NEW alias (alias IS the id)
+    ///   - team → virtual_key_id (unchanged by rename)
+    ///   - oauth → provider_account_id (unchanged by rename)
+    pub id: String,
+    /// The pre-rename identifier (alias for personal; vkid/account_id
+    /// otherwise — unchanged).
+    pub old_id: String,
+    /// The human-facing new label actually applied:
+    ///   - personal → new alias (same as `id`)
+    ///   - team → new local_alias
+    ///   - oauth → new display_identity
+    pub new_value: String,
+}
+
+/// Core rename logic. Validates, performs existence check, conflict check
+/// (personal only — UNIQUE column), and the UPDATE. Error strings follow
+/// the same "NotFound" / "already exists" / "empty"/"identical"/"control"
+/// markers that `apply_add_core_on_conn` uses so callers can reuse the
+/// same error-code mapping.
+///
+/// Does NOT:
+///   - Write audit log (caller does, with its own audit key path)
+///   - Bump vault_change_seq (caller's responsibility; personal rename
+///     should bump, team/oauth may not need to)
+///   - Refresh active.env (rename doesn't change routing identity)
+pub fn apply_rename_core(
+    target: RenameTarget,
+    id: &str,
+    new_value: &str,
+) -> Result<RenameOutcome, String> {
+    if id.trim().is_empty() {
+        return Err("id must not be empty".to_string());
+    }
+    if new_value.trim().is_empty() {
+        return Err("new_value must not be empty".to_string());
+    }
+
+    match target {
+        RenameTarget::Personal => {
+            let validated = validate_alias(new_value)?;
+            if id == validated {
+                return Err("old and new alias are identical".to_string());
+            }
+            let conn = storage::open_connection()
+                .map_err(|e| format!("open vault: {}", e))?;
+
+            // Existence check on old
+            let old_exists = conn.query_row(
+                "SELECT COUNT(*) FROM entries WHERE alias = ?1",
+                rusqlite::params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .map_err(|e| format!("check old alias '{}': {}", id, e))?;
+            if !old_exists {
+                return Err(format!("alias '{}' not found", id));
+            }
+
+            // Pre-check conflict on new (UNIQUE column — UPDATE would fail)
+            let new_exists = conn.query_row(
+                "SELECT COUNT(*) FROM entries WHERE alias = ?1",
+                rusqlite::params![&validated],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .map_err(|e| format!("check new alias '{}': {}", validated, e))?;
+            if new_exists {
+                return Err(format!("alias '{}' already exists", validated));
+            }
+
+            let n = conn.execute(
+                "UPDATE entries SET alias = ?1 WHERE alias = ?2",
+                rusqlite::params![&validated, id],
+            )
+            .map_err(|e| {
+                // Race window: concurrent renames can land between our
+                // pre-check and the UPDATE. SQLite surfaces this as UNIQUE
+                // constraint — translate to the same "already exists"
+                // marker as the pre-check.
+                if format!("{}", e).contains("UNIQUE") {
+                    format!("alias '{}' already exists (UNIQUE)", validated)
+                } else {
+                    format!("UPDATE entries: {}", e)
+                }
+            })?;
+            if n == 0 {
+                return Err(format!("alias '{}' not found (race)", id));
+            }
+
+            let _ = storage::bump_vault_change_seq();
+            Ok(RenameOutcome {
+                target: "personal",
+                id: validated.clone(),
+                old_id: id.to_string(),
+                new_value: validated,
+            })
+        }
+
+        RenameTarget::Team => {
+            let new_trimmed = new_value.trim().to_string();
+            let entry = storage::get_virtual_key_cache(id)
+                .map_err(|e| format!("get team key '{}': {}", id, e))?
+                .or_else(|| storage::get_virtual_key_cache_by_alias(id).ok().flatten())
+                .ok_or_else(|| format!("team key '{}' not found", id))?;
+            storage::set_virtual_key_local_alias(&entry.virtual_key_id, Some(&new_trimmed))
+                .map_err(|e| format!("set_virtual_key_local_alias: {}", e))?;
+            Ok(RenameOutcome {
+                target: "team",
+                id: entry.virtual_key_id,
+                old_id: id.to_string(),
+                new_value: new_trimmed,
+            })
+        }
+
+        RenameTarget::Oauth => {
+            let new_trimmed = new_value.trim().to_string();
+            // Existence check for precise 404
+            match storage::get_provider_account(id)
+                .map_err(|e| format!("get_provider_account '{}': {}", id, e))?
+            {
+                Some(_) => {}
+                None => return Err(format!("provider_account_id '{}' not found", id)),
+            }
+            let conn = storage::open_connection()
+                .map_err(|e| format!("open vault: {}", e))?;
+            let n = conn.execute(
+                "UPDATE provider_accounts SET display_identity = ?1 WHERE provider_account_id = ?2",
+                rusqlite::params![&new_trimmed, id],
+            )
+            .map_err(|e| format!("UPDATE provider_accounts: {}", e))?;
+            if n == 0 {
+                return Err(format!("provider_account_id '{}' not found (race)", id));
+            }
+            Ok(RenameOutcome {
+                target: "oauth",
+                id: id.to_string(),
+                old_id: id.to_string(),
+                new_value: new_trimmed,
+            })
+        }
+    }
+}
+
+/// Writes provider bindings for one key across `providers`, normalizing
+/// every provider_code to its canonical API-protocol form (claude →
+/// anthropic, codex → openai) and cleaning any pre-fix stale alias row
+/// left over from older CLI versions.
+///
+/// # Why this is the single write-path for `user_profile_provider_bindings`
+///
+/// The bindings table PRIMARY KEY is `(profile_id, provider_code)`. Before
+/// this helper existed, `aikey use <codex-oauth>` wrote a row with
+/// provider_code="codex" and `aikey use <openai-key>` wrote one with
+/// provider_code="openai" — two distinct rows, both legal per the schema.
+/// At runtime both rows would then race to write OPENAI_API_KEY into
+/// active.env (last-writer-wins silently), and the vault Web UI's "in use"
+/// indicator would light up on BOTH rows under the same protocol family,
+/// violating the one-active-per-family rule users expect.
+///
+/// Funneling all binding writes through this helper guarantees the table
+/// only ever holds rows keyed by canonical codes, so the same rule is
+/// enforced structurally via the PRIMARY KEY constraint (UPSERT replaces
+/// the prior in-family active automatically).
+///
+/// Moonshot/Kimi are intentionally left distinct here — they have
+/// different env var tuples (MOONSHOT_API_KEY vs KIMI_API_KEY) and
+/// different proxy paths, so their routes don't collide and
+/// `oauth_provider_to_canonical` correctly passes both through unchanged.
+pub(crate) fn write_bindings_canonical(
+    providers: &[String],
+    key_type_str: &str,
+    key_ref: &str,
+) -> Result<(), String> {
+    for raw_provider in providers {
+        let raw = raw_provider.to_lowercase();
+        let canonical = oauth_provider_to_canonical(&raw);
+        if canonical != raw.as_str() {
+            // Best-effort cleanup of any stale non-canonical row. Silent
+            // on error — worst case the stale row lingers until the next
+            // activation UPSERTs over it via the canonical primary key.
+            let _ = storage::remove_provider_binding(
+                crate::profile_activation::DEFAULT_PROFILE,
+                &raw,
+            );
+        }
+        storage::set_provider_binding(
+            crate::profile_activation::DEFAULT_PROFILE,
+            canonical,
+            key_type_str,
+            key_ref,
+        )
+        .map_err(|e| format!("set_provider_binding: {}", e))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn provider_proxy_prefix(provider_code: &str) -> &'static str {
     provider_info(provider_code)
         .map(|i| i.proxy_path)
@@ -2212,10 +2655,9 @@ pub fn handle_key_use(
         selected
     };
 
-    // Write provider bindings.
-    for provider in &target_providers {
-        storage::set_provider_binding(crate::profile_activation::DEFAULT_PROFILE, provider, key_type.as_str(), &key_ref)?;
-    }
+    // Write provider bindings via the shared core helper (normalizes
+    // provider_code to canonical form + cleans any stale alias rows).
+    write_bindings_canonical(&target_providers, key_type.as_str(), &key_ref)?;
 
     // ── 3. Refresh active.env from ALL provider bindings ─────────────────────
     let refresh = crate::profile_activation::refresh_implicit_profile_activation()
@@ -2303,58 +2745,70 @@ pub fn handle_key_use(
 
 /// `aikey key alias <old-alias> <new-alias>`
 ///
-/// Sets a local display name for a team key without touching the server alias.
-/// The server alias is always preserved and shown alongside the local alias in `aikey list`.
+/// Renames a vault row. As of 2026-04-24 this supports **both** personal
+/// and team keys (previously only team). Dispatch:
+///   - If `old_alias` matches a personal entry → RenameTarget::Personal
+///   - If it matches a team virtual_key_id / local_alias / server alias →
+///     RenameTarget::Team
+///   - Otherwise returns "not found"
+///
+/// Routes through `apply_rename_core`, same helper used by `_internal
+/// update-alias rename_alias` / `rename_target` (single-source-of-truth
+/// rule — `.claude/CLAUDE.md`).
 pub fn handle_key_alias(old_alias: &str, new_alias: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
-    // Resolve by virtual_key_id first, then alias (local or server).
-    let entry = match storage::get_virtual_key_cache(old_alias)?
-        .or_else(|| storage::get_virtual_key_cache_by_alias(old_alias).ok().flatten())
-    {
-        Some(e) => e,
-        None => {
-            // Why the extra branch: `aikey key alias` only renames team
-            // (virtual) keys, but users naturally try it on personal keys.
-            // Before this, the error told them to run `aikey key sync` —
-            // which never helps, because sync only pulls team keys. Detect
-            // the personal-key case and point to `aikey update` instead.
-            let is_personal = storage::list_entries().ok()
-                .map(|v| v.iter().any(|a| a == old_alias))
-                .unwrap_or(false);
-            if is_personal {
-                return Err(format!(
-                    "'{}' is a personal key. `aikey key alias` only renames team keys.\n\
-                     To rename a personal key, delete and re-add it under the new name:\n  \
-                     aikey delete {}\n  \
-                     aikey add <NEW_NAME> --provider <PROVIDER>",
-                    old_alias, old_alias
-                ).into());
-            }
-            return Err(format!(
-                "Key '{}' not found in local cache. If it is a team key, run \
-                 'aikey key sync' first; personal keys cannot be renamed with \
-                 this command.",
-                old_alias
-            ).into());
-        }
+    // Decide target. Personal check is fast (single query); only fall
+    // through to team resolution if the alias isn't personal.
+    let is_personal = storage::list_entries().ok()
+        .map(|v| v.iter().any(|a| a == old_alias))
+        .unwrap_or(false);
+
+    let target = if is_personal {
+        RenameTarget::Personal
+    } else {
+        // Try to resolve as team key first (covers vkid + local_alias +
+        // server alias). If not found the core will return a clean error.
+        RenameTarget::Team
     };
 
-    storage::set_virtual_key_local_alias(&entry.virtual_key_id, Some(new_alias))?;
+    let outcome = apply_rename_core(target, old_alias, new_alias)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     if json_mode {
-        crate::json_output::print_json(serde_json::json!({
+        let mut body = serde_json::json!({
             "ok": true,
-            "virtual_key_id": entry.virtual_key_id,
-            "server_alias": entry.alias,
-            "local_alias": new_alias,
-        }));
+            "target": outcome.target,
+            "id": outcome.id,
+            "old_id": outcome.old_id,
+            "new_value": outcome.new_value,
+        });
+        // Keep backward-compat field names for the team-key JSON shape
+        // that existing scripts may depend on.
+        if matches!(target, RenameTarget::Team) {
+            if let Ok(Some(entry)) = storage::get_virtual_key_cache(&outcome.id) {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("virtual_key_id".into(), serde_json::json!(entry.virtual_key_id));
+                    obj.insert("server_alias".into(), serde_json::json!(entry.alias));
+                    obj.insert("local_alias".into(), serde_json::json!(outcome.new_value));
+                }
+            }
+        }
+        crate::json_output::print_json(body);
     } else {
+        let suffix = match target {
+            RenameTarget::Team => {
+                storage::get_virtual_key_cache(&outcome.id).ok().flatten()
+                    .map(|e| format!(" (server alias: {})", e.alias))
+                    .unwrap_or_default()
+            }
+            _ => String::new(),
+        };
         println!("{} Renamed {} → {}  {}",
             "✓".green().bold(),
             format!("'{}'", old_alias).dimmed(),
-            format!("'{}'", new_alias).bold(),
-            format!("(server alias: {})", entry.alias).dimmed());
+            format!("'{}'", outcome.new_value).bold(),
+            suffix.dimmed());
     }
     Ok(())
 }
@@ -2678,5 +3132,359 @@ mod sync_tests {
             compute_local_state_from_effective("active", "", "synced_inactive"),
             "synced_inactive"
         );
+    }
+}
+
+// ============================================================================
+// Tests for the shared cores (apply_add_core / apply_rename_core /
+// validate_alias / normalize_providers / write_bindings_canonical).
+//
+// These exercise the logic that `aikey add` / `aikey key alias` /
+// `_internal vault-op add` / `_internal vault-op batch_import` /
+// `_internal update-alias rename_*` all share. A regression here would
+// surface as a drift between the CLI and Web paths — exactly the class
+// of bug the 2026-04-24 `_internal must reuse public command core` rule
+// is designed to prevent.
+// ============================================================================
+#[cfg(test)]
+mod core_tests {
+    use super::*;
+    use secrecy::SecretString;
+    use tempfile::TempDir;
+
+    fn setup_vault() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
+        // Share the crate-level TEST_VAULT_LOCK with storage::tests so
+        // parallel cargo threads don't race on AK_VAULT_PATH. See
+        // storage.rs::TEST_VAULT_LOCK docstring.
+        let guard = crate::storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).expect("salt");
+        let pw = SecretString::new("test_password".to_string());
+        storage::initialize_vault(&salt, &pw).expect("init vault");
+        (dir, guard)
+    }
+
+    fn dummy_vault_key() -> [u8; 32] {
+        // Any 32-byte key works for apply_add_core tests — it's used purely
+        // for AES-GCM encryption. Decryption round-trips aren't tested here.
+        [0x42u8; 32]
+    }
+
+    // ── validate_alias ────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_alias_rejects_empty() {
+        assert!(validate_alias("").is_err());
+        assert!(validate_alias("   ").is_err());
+        assert!(validate_alias("\t\n").is_err());
+    }
+
+    #[test]
+    fn validate_alias_accepts_normal() {
+        assert_eq!(validate_alias("my-key").unwrap(), "my-key");
+        assert_eq!(validate_alias("  trim-me  ").unwrap(), "trim-me");
+        assert_eq!(validate_alias("user@gmail.com").unwrap(), "user@gmail.com");
+    }
+
+    #[test]
+    fn validate_alias_rejects_over_max_length() {
+        let ok = "a".repeat(128);
+        let bad = "a".repeat(129);
+        assert!(validate_alias(&ok).is_ok());
+        assert!(validate_alias(&bad).is_err());
+    }
+
+    #[test]
+    fn validate_alias_rejects_control_chars() {
+        assert!(validate_alias("foo\nbar").is_err());
+        assert!(validate_alias("foo\0bar").is_err());
+        assert!(validate_alias("foo\x7fbar").is_err());
+    }
+
+    // ── normalize_providers ───────────────────────────────────────────────
+
+    #[test]
+    fn normalize_providers_maps_claude_codex_to_canonical() {
+        assert_eq!(
+            normalize_providers(&["claude".to_string()]),
+            vec!["anthropic".to_string()],
+        );
+        assert_eq!(
+            normalize_providers(&["codex".to_string()]),
+            vec!["openai".to_string()],
+        );
+    }
+
+    #[test]
+    fn normalize_providers_case_insensitive() {
+        assert_eq!(
+            normalize_providers(&["CLAUDE".to_string(), "Codex".to_string()]),
+            vec!["anthropic".to_string(), "openai".to_string()],
+        );
+    }
+
+    #[test]
+    fn normalize_providers_dedups_after_canonicalization() {
+        // claude + anthropic both canonicalize to "anthropic" → single entry.
+        assert_eq!(
+            normalize_providers(&["claude".to_string(), "anthropic".to_string()]),
+            vec!["anthropic".to_string()],
+        );
+    }
+
+    #[test]
+    fn normalize_providers_preserves_first_seen_order() {
+        assert_eq!(
+            normalize_providers(&["openai".to_string(), "anthropic".to_string()]),
+            vec!["openai".to_string(), "anthropic".to_string()],
+        );
+        assert_eq!(
+            normalize_providers(&["anthropic".to_string(), "openai".to_string()]),
+            vec!["anthropic".to_string(), "openai".to_string()],
+        );
+    }
+
+    #[test]
+    fn normalize_providers_filters_empty_strings() {
+        assert_eq!(
+            normalize_providers(&["".to_string(), "  ".to_string(), "claude".to_string()]),
+            vec!["anthropic".to_string()],
+        );
+    }
+
+    #[test]
+    fn normalize_providers_leaves_moonshot_distinct_from_kimi() {
+        // oauth_provider_to_canonical deliberately does NOT map moonshot → kimi
+        // (their env vars and proxy paths differ even though canonical_code
+        // in provider_info says they're the same family).
+        assert_eq!(
+            normalize_providers(&["moonshot".to_string(), "kimi".to_string()]),
+            vec!["moonshot".to_string(), "kimi".to_string()],
+        );
+    }
+
+    // ── apply_add_core_on_conn ────────────────────────────────────────────
+
+    #[test]
+    fn apply_add_core_writes_entry_with_canonical_providers() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = dummy_vault_key();
+
+        let outcome = apply_add_core_on_conn(
+            &conn,
+            &key,
+            "my-codex",
+            b"sk-fake-secret",
+            &["codex".to_string()], // raw broker vocab
+            None,
+            OnConflict::Error,
+        )
+        .expect("add core ok");
+
+        assert_eq!(outcome.action, AddAction::Inserted);
+        assert_eq!(outcome.alias, "my-codex");
+        // Canonical normalization: codex → openai
+        assert_eq!(outcome.providers, vec!["openai".to_string()]);
+        assert_eq!(outcome.primary_provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn apply_add_core_respects_on_conflict_error() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = dummy_vault_key();
+        apply_add_core_on_conn(&conn, &key, "dup", b"s1", &["openai".to_string()], None, OnConflict::Error).unwrap();
+
+        let err = apply_add_core_on_conn(&conn, &key, "dup", b"s2", &[], None, OnConflict::Error).unwrap_err();
+        assert!(err.contains("already exists"), "err was: {}", err);
+    }
+
+    #[test]
+    fn apply_add_core_on_conflict_replace_overwrites() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = dummy_vault_key();
+
+        apply_add_core_on_conn(&conn, &key, "rep", b"s1", &["openai".to_string()], None, OnConflict::Error).unwrap();
+        let outcome = apply_add_core_on_conn(
+            &conn, &key, "rep", b"s2", &["anthropic".to_string()], None, OnConflict::Replace,
+        ).expect("replace ok");
+        assert_eq!(outcome.action, AddAction::Replaced);
+        assert_eq!(outcome.primary_provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn apply_add_core_on_conflict_skip_noops() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = dummy_vault_key();
+
+        apply_add_core_on_conn(&conn, &key, "keep", b"s1", &["openai".to_string()], None, OnConflict::Error).unwrap();
+        let outcome = apply_add_core_on_conn(&conn, &key, "keep", b"s2", &[], None, OnConflict::Skip).expect("skip ok");
+        assert_eq!(outcome.action, AddAction::Skipped);
+        // Verify original provider was NOT overwritten.
+        let metas = storage::list_entries_with_metadata().unwrap();
+        let entry = metas.iter().find(|m| m.alias == "keep").unwrap();
+        assert_eq!(entry.provider_code.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn apply_add_core_writes_base_url() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = dummy_vault_key();
+        apply_add_core_on_conn(
+            &conn, &key, "with-url", b"s",
+            &["openai".to_string()],
+            Some("https://api.example.com/v1"),
+            OnConflict::Error,
+        )
+        .unwrap();
+        let metas = storage::list_entries_with_metadata().unwrap();
+        let entry = metas.iter().find(|m| m.alias == "with-url").unwrap();
+        assert_eq!(entry.base_url.as_deref(), Some("https://api.example.com/v1"));
+    }
+
+    #[test]
+    fn apply_add_core_rejects_invalid_alias() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = dummy_vault_key();
+        let err = apply_add_core_on_conn(
+            &conn, &key, "  ", b"s", &[], None, OnConflict::Error,
+        )
+        .unwrap_err();
+        assert!(err.contains("empty"), "err was: {}", err);
+
+        let err2 = apply_add_core_on_conn(
+            &conn, &key, "bad\nalias", b"s", &[], None, OnConflict::Error,
+        )
+        .unwrap_err();
+        assert!(err2.contains("control"), "err was: {}", err2);
+    }
+
+    // ── apply_rename_core ─────────────────────────────────────────────────
+
+    #[test]
+    fn apply_rename_core_personal_happy_path() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = dummy_vault_key();
+        apply_add_core_on_conn(&conn, &key, "old-name", b"s", &[], None, OnConflict::Error).unwrap();
+        drop(conn);
+
+        let outcome = apply_rename_core(RenameTarget::Personal, "old-name", "new-name")
+            .expect("rename ok");
+        assert_eq!(outcome.target, "personal");
+        assert_eq!(outcome.id, "new-name");
+        assert_eq!(outcome.old_id, "old-name");
+        assert!(!storage::entry_exists("old-name").unwrap());
+        assert!(storage::entry_exists("new-name").unwrap());
+    }
+
+    #[test]
+    fn apply_rename_core_personal_not_found_errors() {
+        let (_dir, _lock) = setup_vault();
+        let err = apply_rename_core(RenameTarget::Personal, "ghost", "something")
+            .unwrap_err();
+        assert!(err.contains("not found"), "err was: {}", err);
+    }
+
+    #[test]
+    fn apply_rename_core_personal_conflict_errors() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = dummy_vault_key();
+        apply_add_core_on_conn(&conn, &key, "a", b"s1", &[], None, OnConflict::Error).unwrap();
+        apply_add_core_on_conn(&conn, &key, "b", b"s2", &[], None, OnConflict::Error).unwrap();
+        drop(conn);
+
+        let err = apply_rename_core(RenameTarget::Personal, "a", "b").unwrap_err();
+        assert!(err.contains("already exists"), "err was: {}", err);
+    }
+
+    #[test]
+    fn apply_rename_core_personal_identical_errors() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = dummy_vault_key();
+        apply_add_core_on_conn(&conn, &key, "same", b"s", &[], None, OnConflict::Error).unwrap();
+        drop(conn);
+
+        let err = apply_rename_core(RenameTarget::Personal, "same", "same").unwrap_err();
+        assert!(err.contains("identical"), "err was: {}", err);
+    }
+
+    #[test]
+    fn apply_rename_core_personal_rejects_invalid_new_alias() {
+        let (_dir, _lock) = setup_vault();
+        let conn = storage::open_connection().expect("open");
+        let key = dummy_vault_key();
+        apply_add_core_on_conn(&conn, &key, "source", b"s", &[], None, OnConflict::Error).unwrap();
+        drop(conn);
+
+        let err = apply_rename_core(RenameTarget::Personal, "source", "bad\ncontrol").unwrap_err();
+        assert!(err.contains("control"), "err was: {}", err);
+    }
+
+    // ── write_bindings_canonical ──────────────────────────────────────────
+
+    #[test]
+    fn write_bindings_canonical_normalizes_claude_to_anthropic() {
+        let (_dir, _lock) = setup_vault();
+        write_bindings_canonical(&["claude".to_string()], "personal_oauth_account", "acct-xyz")
+            .expect("write ok");
+        let bindings = storage::list_provider_bindings_readonly("default").unwrap();
+        let row = bindings.iter().find(|b| b.provider_code == "anthropic").expect("anthropic row");
+        assert_eq!(row.key_source_ref, "acct-xyz");
+        // The raw "claude" provider_code row must NOT exist.
+        assert!(bindings.iter().all(|b| b.provider_code != "claude"));
+    }
+
+    #[test]
+    fn write_bindings_canonical_cleans_stale_alias_row() {
+        let (_dir, _lock) = setup_vault();
+        // Simulate a pre-fix CLI version that wrote a raw "codex" binding.
+        storage::set_provider_binding("default", "codex", "personal_oauth_account", "stale-uuid").unwrap();
+        assert!(storage::list_provider_bindings_readonly("default").unwrap()
+            .iter().any(|b| b.provider_code == "codex"));
+
+        // Now write canonical via the shared helper.
+        write_bindings_canonical(&["codex".to_string()], "personal_oauth_account", "fresh-uuid").unwrap();
+
+        let bindings = storage::list_provider_bindings_readonly("default").unwrap();
+        // Stale raw-alias row must be gone.
+        assert!(bindings.iter().all(|b| b.provider_code != "codex"),
+            "expected no 'codex' row after canonical write, got: {:?}", bindings);
+        // Canonical row must exist with the new ref.
+        let row = bindings.iter().find(|b| b.provider_code == "openai").expect("openai row");
+        assert_eq!(row.key_source_ref, "fresh-uuid");
+    }
+
+    #[test]
+    fn write_bindings_canonical_leaves_moonshot_kimi_distinct() {
+        let (_dir, _lock) = setup_vault();
+        write_bindings_canonical(&["moonshot".to_string()], "personal", "k-moonshot").unwrap();
+        write_bindings_canonical(&["kimi".to_string()], "personal", "k-kimi").unwrap();
+        let bindings = storage::list_provider_bindings_readonly("default").unwrap();
+        assert!(bindings.iter().any(|b| b.provider_code == "moonshot"));
+        assert!(bindings.iter().any(|b| b.provider_code == "kimi"));
+    }
+
+    #[test]
+    fn write_bindings_canonical_upserts_same_canonical() {
+        let (_dir, _lock) = setup_vault();
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "first").unwrap();
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "second").unwrap();
+        let bindings = storage::list_provider_bindings_readonly("default").unwrap();
+        let anthropic_rows: Vec<_> = bindings.iter().filter(|b| b.provider_code == "anthropic").collect();
+        assert_eq!(anthropic_rows.len(), 1, "UPSERT should leave exactly one row per canonical");
+        assert_eq!(anthropic_rows[0].key_source_ref, "second");
     }
 }

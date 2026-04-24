@@ -672,10 +672,11 @@ fn handle_use(account: &str, _proxy_port: u16, json_mode: bool) -> Result<(), Bo
     // Get old binding for the provider (for replacement notice)
     let old_binding = storage::get_provider_binding("default", canonical).ok().flatten();
 
-    // Update per-provider binding (D8: same provider mutual exclusion)
-    storage::set_provider_binding(
-        "default",
-        canonical,
+    // Update per-provider binding via the shared canonical-write helper
+    // (2026-04-24 rule — single source of truth for `user_profile_provider_
+    // bindings` writes, handles stale alias cleanup as a side effect).
+    crate::commands_account::write_bindings_canonical(
+        &[target.provider.clone()], // raw — helper normalizes internally
         CredentialType::PersonalOAuthAccount.as_str(),
         &target.provider_account_id,
     )?;

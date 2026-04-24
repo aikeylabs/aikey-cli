@@ -16,7 +16,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::audit::{self, AuditOperation};
+use crate::credential_type::CredentialType;
 use crate::crypto;
+use crate::profile_activation;
 use crate::storage;
 // storage_platform is a submodule re-exported via `pub use storage::*`
 // on storage. Call its functions through `storage::...` directly.
@@ -40,8 +42,17 @@ fn try_log_audit(key: &[u8; 32], op: AuditOperation, alias: Option<&str>, succes
 struct AddPayload {
     alias: String,
     secret_plaintext: String,
+    /// Single-protocol shorthand (backward compat with older callers).
+    /// If both `provider` and `providers` are given, `providers` wins.
     #[serde(default)]
     provider: Option<String>,
+    /// Multi-protocol set (aligned with batch_import + `aikey add --providers`).
+    /// 2026-04-24: added so Web "Add key" no longer silently drops this field.
+    #[serde(default)]
+    providers: Option<Vec<String>>,
+    /// Optional per-entry base URL override.
+    #[serde(default)]
+    base_url: Option<String>,
     /// "error" (default) | "replace"
     #[serde(default = "default_on_conflict")]
     on_conflict: String,
@@ -109,6 +120,7 @@ pub fn handle(env: StdinEnvelope) {
         "delete" => handle_delete(env),
         "delete_target" => handle_delete_target(env),
         "record_usage" => handle_record_usage(env),
+        "use" => handle_use(env),
         other => {
             emit_error(
                 req_id,
@@ -322,65 +334,68 @@ fn handle_add(env: StdinEnvelope) {
             return;
         }
     };
-    if payload.alias.trim().is_empty() {
-        emit_error(req_id, "I_STDIN_INVALID_JSON", "alias must be non-empty");
-        return;
-    }
 
     let (key, conn) = match prepare_vault(&env) {
         Some(pair) => pair,
         None => return,
     };
 
-    // on_conflict 检查
-    let exists = match alias_exists(&conn, &payload.alias) {
-        Ok(b) => b,
-        Err((c, m)) => { emit_error(req_id, c, m); return; }
-    };
-    if exists && payload.on_conflict == "error" {
-        emit_error(
-            req_id,
-            "I_CREDENTIAL_CONFLICT",
-            format!("alias '{}' already exists (use on_conflict=replace to overwrite)", payload.alias),
-        );
-        return;
-    }
+    // Resolve providers: `providers` (multi, preferred) > `provider` (single, legacy)
+    let providers_input: Vec<String> = payload.providers.clone()
+        .or_else(|| payload.provider.clone().map(|p| vec![p]))
+        .unwrap_or_default();
 
-    // 加密
-    let (nonce, ciphertext) = match encrypt_with_key(&key, payload.secret_plaintext.as_bytes()) {
-        Ok(t) => t,
-        Err((c, m)) => { emit_error(req_id, c, m); return; }
+    // Decode on_conflict string → typed enum.
+    let on_conflict = match payload.on_conflict.as_str() {
+        "replace" => crate::commands_account::OnConflict::Replace,
+        "skip" => crate::commands_account::OnConflict::Skip,
+        _ => crate::commands_account::OnConflict::Error,
     };
 
-    // 写 entries（UPSERT —— store_entry 原生行为）
-    if let Err(e) = storage::store_entry(&payload.alias, &nonce, &ciphertext) {
-        emit_error(req_id, "I_INTERNAL", format!("store_entry failed: {}", e));
-        return;
-    }
-
-    // 写 provider_code（可选）
-    if let Some(provider) = &payload.provider {
-        if let Err(e) = conn.execute(
-            "UPDATE entries SET provider_code = ?1 WHERE alias = ?2",
-            rusqlite::params![provider, &payload.alias],
-        ) {
-            emit_error(
-                req_id,
-                "I_INTERNAL",
-                format!("set provider_code failed: {}", e),
-            );
+    // Delegate to the shared core. Handles alias validation, canonical
+    // provider normalization, encryption, entries write, supported_providers
+    // + provider_code + base_url metadata writes in a single place.
+    let outcome = match crate::commands_account::apply_add_core_on_conn(
+        &conn,
+        &key,
+        &payload.alias,
+        payload.secret_plaintext.as_bytes(),
+        &providers_input,
+        payload.base_url.as_deref(),
+        on_conflict,
+    ) {
+        Ok(o) => o,
+        Err(msg) => {
+            // Map a handful of well-known error strings to stable error_codes
+            // so the Go layer / front-end can key off them without parsing
+            // human text. Everything else falls through as I_INTERNAL.
+            let code = if msg.contains("already exists") {
+                "I_CREDENTIAL_CONFLICT"
+            } else if msg.contains("alias") && (msg.contains("empty") || msg.contains("exceeds") || msg.contains("control")) {
+                "I_STDIN_INVALID_JSON"
+            } else {
+                "I_INTERNAL"
+            };
+            emit_error(req_id, code, msg);
             return;
         }
-    }
+    };
 
-    let audit_logged = try_log_audit(&key, AuditOperation::Add, Some(&payload.alias), true);
+    // Route token — outside core because it opens its own connection
+    // (can't live in a transaction). Single-add here isn't in a tx so it's
+    // fine. Best-effort: missing route_token isn't a hard failure, the
+    // entry is still usable until a later `ensure_entry_route_token` fills it.
+    let _ = storage::ensure_entry_route_token(&outcome.alias);
+
+    let audit_logged = try_log_audit(&key, AuditOperation::Add, Some(&outcome.alias), true);
 
     emit(&ResultEnvelope::ok(
         req_id,
         json!({
-            "alias": payload.alias,
-            "action_taken": if exists { "replaced" } else { "inserted" },
-            "provider": payload.provider,
+            "alias": outcome.alias,
+            "action_taken": outcome.action.as_str(),
+            "provider": outcome.primary_provider,
+            "providers": outcome.providers,
             "audit_logged": audit_logged,
         }),
     ));
@@ -402,33 +417,10 @@ fn handle_batch_import(env: StdinEnvelope) {
         return;
     }
 
-    // v4.1 Stage 14+ (BUG-01 fix): alias 校验
-    //   - 空字符串 / 空白 → 拒收(之前存入 vault 后 `aikey use ""` 等行为未定义)
-    //   - 长度上限 128 字符(与 display_identity 256 对齐,但 alias 语义更窄 → 更严格)
-    //   - 控制字符 / NUL → 拒收(防日志 / 终端显示破坏)
-    const MAX_ALIAS_LEN: usize = 128;
-    for (i, it) in payload.items.iter().enumerate() {
-        let t = it.alias.trim();
-        if t.is_empty() {
-            emit_error(req_id, "I_INVALID_ALIAS",
-                format!("items[{}] alias is empty (trim blanks must still leave a name)", i));
-            return;
-        }
-        if it.alias.chars().count() > MAX_ALIAS_LEN {
-            emit_error(req_id, "I_INVALID_ALIAS",
-                format!("items[{}] alias exceeds {} chars (got {})", i, MAX_ALIAS_LEN, it.alias.chars().count()));
-            return;
-        }
-        if it.alias.chars().any(|c| c.is_control()) {
-            emit_error(req_id, "I_INVALID_ALIAS",
-                format!("items[{}] alias contains control characters", i));
-            return;
-        }
-    }
-
-    // v4.1 Stage 14+ (BUG-01 fix): batch 内部 alias 重复检测(fail-fast with on_conflict=error)
-    // 旧逻辑只 `alias_exists(&conn, ...)` 查 vault,不查 batch 内部 → 两个同 alias items
-    // 会走 upsert 静默覆盖(precheck 放过 + loop 内 exists=true 时 fallthrough 到 store)。
+    // Batch-scope dedup check (items[i].alias duplicated within this call).
+    // This can't be delegated to apply_add_core — it needs the full item
+    // list in scope. Per-item validation + conflict-against-DB checks ARE
+    // delegated (see below). Matches v4.1 Stage 14+ BUG-01 fix.
     if payload.on_conflict == "error" {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for it in &payload.items {
@@ -448,34 +440,19 @@ fn handle_batch_import(env: StdinEnvelope) {
         None => return,
     };
 
-    // 预检：on_conflict=error 时，先扫一遍看有没有 vault 内冲突
-    if payload.on_conflict == "error" {
-        for it in &payload.items {
-            match alias_exists(&conn, &it.alias) {
-                Ok(true) => {
-                    emit_error(
-                        req_id,
-                        "I_CREDENTIAL_CONFLICT",
-                        format!("alias '{}' already exists (set on_conflict=skip|replace)", it.alias),
-                    );
-                    return;
-                }
-                Ok(false) => {}
-                Err((c, m)) => { emit_error(req_id, c, m); return; }
-            }
-        }
-    }
+    // Typed on_conflict for the shared core.
+    let on_conflict = match payload.on_conflict.as_str() {
+        "replace" => crate::commands_account::OnConflict::Replace,
+        "skip" => crate::commands_account::OnConflict::Skip,
+        _ => crate::commands_account::OnConflict::Error,
+    };
 
-    // G-5 P0 review fix (2026-04-23): entire batch write set runs in a single
-    // IMMEDIATE transaction. Any failure mid-batch triggers ROLLBACK via
-    // `Transaction::Drop` (no explicit rollback call needed on the return
-    // paths below); callers see either "all items committed" or "no items
-    // committed" — never the half-written vault state that prompted the
-    // review finding.
+    // G-5 P0 review fix (2026-04-23): entire batch write set runs in a
+    // single IMMEDIATE transaction. Any failure mid-batch triggers ROLLBACK
+    // via Transaction::Drop — callers see either "all committed" or "none
+    // committed", never half-written vault state.
     //
-    // Audit log writes stay outside the transaction (best-effort, as before):
-    // audit failures should not abort the primary vault write, and the audit
-    // store has its own ACID via the chained HMAC file.
+    // Audit log writes stay outside the transaction (best-effort, as before).
     let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
         Ok(t) => t,
         Err(e) => {
@@ -484,10 +461,6 @@ fn handle_batch_import(env: StdinEnvelope) {
         }
     };
 
-    // Per-item execution. 2026-04-23: removed side-writes to the un-shipped
-    // `import_jobs` / `import_items` tables (collapsed out of v1.0.4-alpha
-    // migration). Audit coverage is entirely via the chained HMAC `audit_log`
-    // (one Import event per alias, post-commit fan-out).
     let mut inserted = 0usize;
     let mut replaced = 0usize;
     let mut skipped = 0usize;
@@ -495,82 +468,69 @@ fn handle_batch_import(env: StdinEnvelope) {
     let mut per_item_audit: Vec<String> = Vec::with_capacity(payload.items.len());
 
     for it in &payload.items {
-        let exists = match alias_exists(&tx, &it.alias) {
-            Ok(b) => b,
-            Err((c, m)) => { emit_error(req_id, c, m); return; }
+        // Resolve providers: `providers` (multi, preferred) > `provider` (single).
+        let providers_input: Vec<String> = match &it.providers {
+            Some(ps) if !ps.is_empty() => ps.clone(),
+            _ => it.provider.clone().map(|p| vec![p]).unwrap_or_default(),
         };
 
-        if exists && payload.on_conflict == "skip" {
-            skipped += 1;
-            item_reports.push(json!({"alias": it.alias, "action": "skipped"}));
-            continue;
-        }
-
-        let (nonce, ciphertext) = match encrypt_with_key(&key, it.secret_plaintext.as_bytes()) {
-            Ok(t) => t,
-            Err((c, m)) => { emit_error(req_id, c, m); return; }
+        // Delegate per-item write to the shared core (same helper as single
+        // `aikey add` and `_internal vault-op add`). Handles alias validation,
+        // canonical provider normalization, conflict policy, encryption,
+        // and all three metadata writes atomically inside this transaction.
+        let outcome = match crate::commands_account::apply_add_core_on_conn(
+            &tx,
+            &key,
+            &it.alias,
+            it.secret_plaintext.as_bytes(),
+            &providers_input,
+            it.base_url.as_deref(),
+            on_conflict,
+        ) {
+            Ok(o) => o,
+            Err(msg) => {
+                let code = if msg.contains("already exists") {
+                    "I_CREDENTIAL_CONFLICT"
+                } else if msg.contains("alias")
+                    && (msg.contains("empty") || msg.contains("exceeds") || msg.contains("control"))
+                {
+                    "I_INVALID_ALIAS"
+                } else {
+                    "I_INTERNAL"
+                };
+                emit_error(req_id, code, format!("item '{}': {}", it.alias, msg));
+                return; // tx drops → ROLLBACK
+            }
         };
-        if let Err(e) = storage::store_entry_on_conn(&tx, &it.alias, &nonce, &ciphertext) {
-            emit_error(req_id, "I_INTERNAL", format!("store_entry failed for '{}': {}", it.alias, e));
-            return; // tx drops → ROLLBACK
-        }
-        // v4.1 Stage 5+: providers (multi) 优先；没给就退化到 provider (single);都没给 → 无绑定
-        // 写两张字段(与 `aikey add` handler 一致,见 main.rs Commands::Add):
-        //   - `supported_providers` JSON array (multi-protocol source-of-truth)
-        //   - `provider_code` 单值 (routing default,取 providers[0])
-        let effective_providers: Vec<String> = match &it.providers {
-            Some(ps) if !ps.is_empty() => ps.iter()
-                .map(|s| s.trim().to_lowercase())
-                .filter(|s| !s.is_empty())
-                .collect(),
-            _ => it.provider.as_ref()
-                .map(|p| vec![p.trim().to_lowercase()])
-                .filter(|v| !v.is_empty() && !v[0].is_empty())
-                .unwrap_or_default(),
-        };
-        if !effective_providers.is_empty() {
-            if let Err(e) = storage::set_entry_supported_providers_on_conn(
-                &tx, &it.alias, &effective_providers,
-            ) {
-                emit_error(req_id, "I_INTERNAL",
-                    format!("set supported_providers for '{}' failed: {}", it.alias, e));
-                return;
-            }
-            // routing-default provider_code = providers[0]
-            if let Err(e) = tx.execute(
-                "UPDATE entries SET provider_code = ?1 WHERE alias = ?2",
-                rusqlite::params![&effective_providers[0], &it.alias],
-            ) {
-                emit_error(req_id, "I_INTERNAL",
-                    format!("set provider_code for '{}' failed: {}", it.alias, e));
-                return;
-            }
-        }
-        // v4.1 Stage 7+: per-entry base_url override.
-        // 空字符串 / None 都视为 "没给",落库不写 (保留 NULL = 用默认 provider URL)。
-        let trimmed_base_url = it.base_url.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty());
-        if let Some(url) = trimmed_base_url {
-            if let Err(e) = storage::set_entry_base_url_on_conn(
-                &tx, &it.alias, Some(url),
-            ) {
-                emit_error(req_id, "I_INTERNAL",
-                    format!("set base_url for '{}' failed: {}", it.alias, e));
-                return;
-            }
-        }
-        let action = if exists { "replaced" } else { "inserted" };
-        if exists { replaced += 1 } else { inserted += 1 };
-        item_reports.push(json!({"alias": it.alias, "action": action}));
 
-        // Audit log writes defer to after commit (best-effort; a tx rollback
-        // should NOT leave audit entries claiming a write that never landed).
-        per_item_audit.push(it.alias.clone());
+        match outcome.action {
+            crate::commands_account::AddAction::Inserted => {
+                inserted += 1;
+                per_item_audit.push(outcome.alias.clone());
+            }
+            crate::commands_account::AddAction::Replaced => {
+                replaced += 1;
+                per_item_audit.push(outcome.alias.clone());
+            }
+            crate::commands_account::AddAction::Skipped => {
+                skipped += 1;
+            }
+        }
+        item_reports.push(json!({"alias": outcome.alias, "action": outcome.action.as_str()}));
     }
 
     // Commit — all writes land atomically.
     if let Err(e) = tx.commit() {
         emit_error(req_id, "I_INTERNAL", format!("commit batch transaction: {}", e));
         return;
+    }
+
+    // Route token generation (post-commit — each call opens its own
+    // connection, can't live in the transaction). Best-effort per item;
+    // failures log and continue (entry still usable, route_token fills
+    // in on next ensure_entry_route_token call).
+    for alias in &per_item_audit {
+        let _ = storage::ensure_entry_route_token(alias);
     }
 
     // Post-commit audit fan-out (best-effort; matches single-entry add handler).
@@ -877,4 +837,147 @@ fn handle_record_usage(env: StdinEnvelope) {
         )),
         Err(e) => emit_error(req_id, "I_INTERNAL", format!("record_usage: {}", e)),
     }
+}
+
+// ========== use (provider-binding switch) ==========
+//
+// Non-interactive counterpart of the `aikey use <alias>` CLI command. Writes
+// `user_profile_provider_bindings` for every provider the target key serves,
+// then refreshes `~/.aikey/active.env` so the shell precmd hook picks it up.
+//
+// Payload: `{ "target": "personal" | "oauth", "id": "..." }`
+//   - personal → id is the alias
+//   - oauth    → id is the provider_account_id
+//   - team is rejected (reserved for future use, same rule as delete_target)
+//
+// Per-provider semantics: one binding per provider_code. Activating a personal
+// key that supports multiple providers writes one binding per provider. OAuth
+// accounts are always single-provider by construction.
+//
+// Interactive pieces from `commands_account::handle_key_use` that are
+// deliberately omitted here (belong to the CLI, not the Web API):
+//   - provider-selection prompt when `supported_providers` has > 1 entry —
+//     Web path binds ALL supported providers (matches `aikey use` non-interactive
+//     mode). A future UI refinement can add a provider_override field.
+//   - shell hook install / Codex / Kimi / statusline auto-configuration —
+//     those modify the user's home dir outside vault and are Web-UI-inappropriate.
+//     If the user later runs `aikey use` from CLI those get installed on-demand.
+//
+// Why not "unset": the Web UI contract is "one active per provider, swap to
+// replace" — there's no unset button. If a future requirement needs "clear
+// routing for provider X", that's a distinct `use_unset` action, not an
+// overload of this one.
+fn handle_use(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        target: String,
+        id: String,
+    }
+    let payload: Payload = match serde_json::from_value(env.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_error(req_id, "I_STDIN_INVALID_JSON", format!("use payload invalid: {}", e));
+            return;
+        }
+    };
+    if payload.id.trim().is_empty() {
+        emit_error(req_id, "I_STDIN_INVALID_JSON", "id must be non-empty");
+        return;
+    }
+
+    let (key, _conn) = match prepare_vault(&env) {
+        Some(pair) => pair,
+        None => return,
+    };
+
+    // Resolve providers + key_source_type based on target.
+    let (source_type, providers): (CredentialType, Vec<String>) = match payload.target.as_str() {
+        "personal" => {
+            let metas = match storage::list_entries_with_metadata() {
+                Ok(v) => v,
+                Err(e) => {
+                    emit_error(req_id, "I_INTERNAL", format!("list_entries_with_metadata: {}", e));
+                    return;
+                }
+            };
+            let meta = match metas.into_iter().find(|m| m.alias == payload.id) {
+                Some(m) => m,
+                None => {
+                    emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
+                        format!("alias '{}' does not exist", payload.id));
+                    return;
+                }
+            };
+            // Prefer the v1.0.2+ multi-provider list; fall back to the legacy
+            // single provider_code. An entry with neither is unbindable —
+            // refuse rather than silently no-op.
+            let providers: Vec<String> = meta.supported_providers
+                .clone()
+                .filter(|v| !v.is_empty())
+                .or_else(|| meta.provider_code.clone().map(|p| vec![p]))
+                .unwrap_or_default();
+            if providers.is_empty() {
+                emit_error(req_id, "I_KEY_NO_PROVIDER",
+                    format!("key '{}' has no provider assignment; add one with `aikey secret set --provider`", payload.id));
+                return;
+            }
+            (CredentialType::PersonalApiKey, providers)
+        }
+        "oauth" => {
+            let acct = match storage::get_provider_account(&payload.id) {
+                Ok(Some(a)) => a,
+                Ok(None) => {
+                    emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
+                        format!("provider_account_id '{}' does not exist", payload.id));
+                    return;
+                }
+                Err(e) => {
+                    emit_error(req_id, "I_INTERNAL", format!("get_provider_account: {}", e));
+                    return;
+                }
+            };
+            (CredentialType::PersonalOAuthAccount, vec![acct.provider])
+        }
+        "team" => {
+            emit_error(req_id, "I_UNKNOWN_TARGET",
+                "target 'team' is reserved for future use and not implemented in v1.0");
+            return;
+        }
+        other => {
+            emit_error(req_id, "I_UNKNOWN_TARGET",
+                format!("unknown target '{}' (expected personal|oauth)", other));
+            return;
+        }
+    };
+
+    // Write bindings via the shared helper in commands_account — keeps the
+    // canonical-code normalization + stale-alias cleanup in lockstep with
+    // `aikey use` (single source of truth for provider_code writes).
+    if let Err(e) = crate::commands_account::write_bindings_canonical(
+        &providers,
+        source_type.as_str(),
+        &payload.id,
+    ) {
+        emit_error(req_id, "I_INTERNAL", e);
+        return;
+    }
+
+    // Refresh active.env + nudge proxy. Failure here is recoverable (the DB
+    // write already landed) — surface as warning, not hard error.
+    let refresh_ok = profile_activation::refresh_implicit_profile_activation().is_ok();
+
+    let audit_logged = try_log_audit(&key, AuditOperation::Exec, Some(&payload.id), true);
+
+    emit(&ResultEnvelope::ok(
+        req_id,
+        json!({
+            "target": payload.target,
+            "id": payload.id,
+            "activated_providers": providers,
+            "active_env_refreshed": refresh_ok,
+            "audit_logged": audit_logged,
+        }),
+    ));
 }

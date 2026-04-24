@@ -10,8 +10,18 @@
 //! deserialize the subset of fields that drive the receipt / aggregator
 //! and tolerate unknown fields so the proxy can grow the schema without
 //! breaking older CLI builds.
+//!
+//! ## event_time wire format
+//!
+//! Post proxy v1.0.3-alpha (bugfix 20260424) the proxy writes
+//! `event_time` as **int64 Unix epoch milliseconds** (UTC). Previous
+//! builds wrote an RFC3339 string. This module tolerates **both** so
+//! statusline doesn't break during a mixed-version window — hourly
+//! WAL files written by an older proxy may still be on disk and
+//! readable for up to 24h after upgrade before hourly rotation ages
+//! them out.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
