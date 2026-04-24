@@ -68,7 +68,15 @@ struct DimStats {
     samples: usize,
     expected_total: usize,
     hits: usize,
+    /// 总 FP (rule + CRF 合并层), 等同于旧版单一 `fp` 字段。
     fp: usize,
+    /// v4.2.1 per-layer 拆分:
+    ///   - fp_rule:      规则层 (rule::rule_extract 含 title/anchored 等所有 sub-layers) 产出的 FP
+    ///   - fp_crf_only:  CRF 独有的 FP (rule 层未命中,CRF 额外命中的)
+    /// Why 要拆: adversarial FP 退化时能精确定位是规则 regex / title layer 改坏,
+    /// 还是 CRF 模型退化;不拆时 baseline 只看得见总数,debug 很难回溯。
+    fp_rule: usize,
+    fp_crf_only: usize,
 }
 
 fn main() {
@@ -138,8 +146,8 @@ fn main() {
             "null".to_string()
         };
         format!(
-            r#""{}":{{"samples":{},"expected":{},"hits":{},"recall":{},"fp":{}}}"#,
-            name, st.samples, st.expected_total, st.hits, recall, st.fp
+            r#""{}":{{"samples":{},"expected":{},"hits":{},"recall":{},"fp":{},"fp_rule":{},"fp_crf_only":{}}}"#,
+            name, st.samples, st.expected_total, st.hits, recall, st.fp, st.fp_rule, st.fp_crf_only
         )
     }).collect();
 
@@ -202,30 +210,36 @@ fn eval_dimension(path: &Path, is_adversarial: bool) -> DimStats {
         stats.expected_total += expected_values.len();
 
         // 跑生产路径 = rule::rule_extract + crf::extract (同 parse.rs::run_parse_v2_rules)
-        let mut cands = rule::rule_extract(&sample.text);
-        // crf 候选单独来(去重策略同 parse.rs:137-145)
-        let rule_seen: HashSet<String> = cands.iter()
+        let rule_cands = rule::rule_extract(&sample.text);
+        let rule_values: HashSet<String> = rule_cands.iter().map(|c| c.value.clone()).collect();
+        // CRF 候选单独来(去重策略同 parse.rs:137-145);记录 rule 未命中的 CRF-only 子集
+        let rule_seen_kv: HashSet<String> = rule_cands.iter()
             .map(|c| format!("{}\x00{}", c.kind.as_str(), c.value))
             .collect();
+        let mut crf_only_values: HashSet<String> = HashSet::new();
+        let mut all_values: HashSet<String> = rule_values.clone();
         for cc in crf::extract(&sample.text) {
             let key = format!("{}\x00{}", cc.kind.as_str(), cc.value);
-            if !rule_seen.contains(&key) {
-                cands.push(cc);
+            if !rule_seen_kv.contains(&key) {
+                all_values.insert(cc.value.clone());
+                if !rule_values.contains(&cc.value) {
+                    crf_only_values.insert(cc.value.clone());
+                }
             }
         }
 
-        let predicted_values: HashSet<String> = cands.iter().map(|c| c.value.clone()).collect();
-
         if is_adversarial {
-            // Adversarial 样本 expected.drafts == [] → 任何 candidate 都是 FP
-            // (与 spike TITLE_ABLATION_REPORT §3.2 的 "adversarial-FP" 语义对齐)
-            stats.fp += predicted_values.len();
+            // Adversarial 样本 expected.drafts == [] → 任何 predicted 都是 FP。
+            // 拆 rule/crf 维度:rule_values 是规则层贡献,crf_only 是 CRF 额外带入。
+            // 注:同值被两层都命中时归规则层 (rule 优先级高)。
+            let crf_only_fp = crf_only_values.len();
+            let rule_fp = all_values.len().saturating_sub(crf_only_fp);
+            stats.fp += all_values.len();
+            stats.fp_rule += rule_fp;
+            stats.fp_crf_only += crf_only_fp;
         } else {
-            let hits = expected_values.intersection(&predicted_values).count();
-            let misses = expected_values.len().saturating_sub(hits);
+            let hits = expected_values.intersection(&all_values).count();
             stats.hits += hits;
-            // FP 只在 adversarial 口径下算,holdout 这类主要看 recall
-            let _ = misses;
         }
     }
 
