@@ -2945,27 +2945,63 @@ fn handle_route(
     // Interactive picker: prompt only in a TTY session (not when output is
     // piped, redirected, or in automation). Enter with an empty input cancels;
     // a valid number prints the copy-paste config for that row.
+    //
+    // Why the 10s timeout + reader thread:
+    //   A plain `stdin().read_line()` blocks forever, so `aikey route` left
+    //   behind a process that never exited when the user walked away or
+    //   ran the command inside a non-interactive wrapper that happened to
+    //   pass the TTY check. The reader thread is detached — if the timer
+    //   fires first, the thread stays blocked on `read_line` until the
+    //   process exits (the OS reclaims it on `std::process::exit` /
+    //   return-from-main). We accept the detach because (a) this is the
+    //   very last action of `aikey route`, so we're seconds from exit
+    //   anyway, and (b) bringing in `mio`/`tokio` just for a prompt timeout
+    //   is disproportionate.
     if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        const PICKER_TIMEOUT: Duration = Duration::from_secs(10);
+
         eprintln!();
         eprint!("  {} {} ",
             "?".cyan().bold(),
-            format!("Show config for route # (1-{}, Enter to cancel):", entries.len()).bold());
+            format!("Show config for route # (1-{}, Enter or 10s to cancel):", entries.len()).bold());
         let _ = std::io::stderr().flush();
 
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_ok() {
-            let trimmed = input.trim();
-            if trimmed.is_empty() {
-                return Ok(());
+        let (tx, rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            let mut buf = String::new();
+            if std::io::stdin().read_line(&mut buf).is_ok() {
+                let _ = tx.send(buf);
             }
-            match trimmed.parse::<usize>() {
-                Ok(n) if n >= 1 && n <= entries.len() => {
-                    print_route_config(&[&entries[n - 1]]);
+        });
+
+        match rx.recv_timeout(PICKER_TIMEOUT) {
+            Ok(input) => {
+                let trimmed = input.trim();
+                if trimmed.is_empty() {
+                    return Ok(());
                 }
-                _ => {
-                    eprintln!("  {} Invalid selection — expected a number between 1 and {}.",
-                        "\u{26a0}".yellow(), entries.len());
+                match trimmed.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= entries.len() => {
+                        print_route_config(&[&entries[n - 1]]);
+                    }
+                    _ => {
+                        eprintln!("  {} Invalid selection — expected a number between 1 and {}.",
+                            "\u{26a0}".yellow(), entries.len());
+                    }
                 }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!();
+                eprintln!("  {} No selection within {}s — exiting.",
+                    "\u{23f1}".dimmed(), PICKER_TIMEOUT.as_secs());
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Reader thread errored before sending (EOF / closed stdin).
+                // Treat as "no selection" and exit cleanly.
             }
         }
     } else {
