@@ -48,7 +48,7 @@ const THRESHOLD: f32 = 0.5;
 /// Why 列这些前缀:provider_fingerprint.yaml 里 confirmed tier 的 secret 基本都有特异性前缀。
 /// 一旦 label 区里出现 keyword,E6 就触发;secret 本身的内容不参与 keyword 匹配。
 ///
-/// 与 research spike `workflow/CI/research/ablation-spike-v4.1/src/grouping.rs::line_label_zone`
+/// 与 research spike `workflow/CI/research/ablation/ablation-spike-v4.1/src/grouping.rs::line_label_zone`
 /// 保持一致。任何修改请先在 spike 验证(CLAUDE.md "Import 解析流改动强制走 research 验证")。
 fn line_label_zone(line: &str) -> &str {
     const SECRET_PREFIXES: &[&str] = &[

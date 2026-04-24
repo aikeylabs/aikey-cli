@@ -7,8 +7,12 @@
 //! # 模型
 //! - `crfs 0.4`（纯 Rust LBFGS），POC 实测跨进程确定性（fastText 被否决的核心原因；crfs 不受影响）
 //! - 12 维 token features（与 ablation-spike 1:1 对齐）
-//! - **训练数据编译期嵌入**：`include_str!("../../../../tests/testdata/train.jsonl")`（30 样本，~15 KB）
-//! - **首次调用懒训练**（~300ms on M-series），用 `OnceLock` 缓存模型字节
+//! - **预训练模型编译期嵌入**：`include_bytes!("../../../data/crf-phase1.bin")`（~30 KB）
+//!   - v4.2 前是 `include_str!(train.jsonl) + OnceLock 懒训练`,每进程首次 parse 吃 ~300ms
+//!   - v4.2 起改为发版时预训练 → `.bin` commit 到仓库 → 运行时零训练成本
+//!   - 更新流程:改 `tests/testdata/train.jsonl` → `cargo run --bin train-crf` → commit
+//!     新的 `data/crf-phase1.bin` → 重新发版
+//!   - 训练函数 `train_from_embedded()` 保留给 `src/bin/train_crf.rs` 调用
 //! - Stage 3 Phase 2 rule 已把 in-dist R=89.7%，CRF Phase 4 目标把 C3 in-dist R=100%
 //!
 //! # Shape Filter（关键：避免 narrative 文本 FP）
@@ -19,26 +23,40 @@
 //!
 //! 这是 ablation-spike adversarial FP 从 2 降到 ≤ 1 的核心机制（对应 v2 §3.3）。
 
-use std::sync::OnceLock;
-
 use crfs::{Attribute, Model, Trainer};
 use serde::Deserialize;
 
 use super::candidate::{Candidate, Kind, Tier, make_id};
 use super::tokenize::tokenize_line;
 
-/// 编译期嵌入的训练样本（30 条 JSONL）
-const EMBEDDED_TRAIN_JSONL: &str = include_str!("../../../tests/testdata/train.jsonl");
+/// 编译期嵌入的训练样本（30 条 JSONL）— 由 `src/bin/train_crf.rs` 消费。
+pub(crate) const EMBEDDED_TRAIN_JSONL: &str = include_str!("../../../tests/testdata/train.jsonl");
 
-// ========== 模型缓存（OnceLock 懒训练） ==========
+// ========== 预训练模型加载 ==========
 
-/// 全局模型字节单例。首次调用训练 CRF（~300ms），后续返回已缓存。
+/// 预训练 CRF 模型字节,编译期嵌入,零运行时训练成本。
+///
+/// 生成路径:release.sh 在构建时跑 `cargo run --release --bin train-crf` →
+/// 写 `aikey-cli/data/crf-phase1.bin` → `cargo run --release --bin validate-crf`
+/// 对比基线(`workflow/CI/research/ablation/baselines/crf-training-history.yaml`)
+/// → 通过则 `cargo build --release --bin aikey` 把字节烙进最终二进制。
+///
+/// Why `include_bytes!`:`crfs::Model::new(&[u8])` 支持 borrowed 字节零拷贝加载
+/// (见 crfs 0.4 官方 API: `pub fn new(buf: &'a [u8]) -> Result<Self>`)。
+const EMBEDDED_MODEL_BYTES: &[u8] = include_bytes!("../../../data/crf-phase1.bin");
+
 fn model_bytes() -> &'static [u8] {
-    static MODEL: OnceLock<Vec<u8>> = OnceLock::new();
-    MODEL.get_or_init(train_from_embedded).as_slice()
+    EMBEDDED_MODEL_BYTES
 }
 
-fn train_from_embedded() -> Vec<u8> {
+/// v4.2: 把训练数据 → CRF 模型字节。由 `src/bin/train_crf.rs` 调用生成
+/// `data/crf-phase1.bin`;生产路径 (`model_bytes()`) 不再调此函数。
+///
+/// Why 还保留:
+/// 1. train.jsonl 和 feature/label schema 都在这个文件里,训练代码放这儿保持
+///    "schema 和特征一次定义,两处(训练 bin + 推理 lib)共用"
+/// 2. 更新模型只需跑 `cargo run --bin train-crf`,不必在 spike/主干之间 copy
+pub fn train_from_embedded() -> Vec<u8> {
     // 解析嵌入的 train.jsonl → 训练 CRF → 序列化到临时文件 → 读回 bytes
     // Why 临时文件：crfs::Trainer::train 只支持写文件，不支持返回 bytes
     let samples = parse_train_jsonl(EMBEDDED_TRAIN_JSONL);

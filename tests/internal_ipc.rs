@@ -603,7 +603,13 @@ fn query_get_metadata_only_by_default() {
 }
 
 #[test]
-fn query_get_with_include_secret_true_decrypts() {
+fn query_get_ignores_include_secret_flag_and_returns_metadata_only() {
+    // 2026-04-24 security review round 2: `include_secret` was removed from
+    // GetPayload because the Go RevealHandler pipeline is gone (plaintext
+    // must not travel CLI → Go → browser). A stale payload that still sets
+    // `include_secret: true` must be silently downgraded to a metadata-only
+    // response — no secret_plaintext key, no error. This guards against a
+    // future regression that re-introduces the field.
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
@@ -615,8 +621,11 @@ fn query_get_with_include_secret_true_decrypts() {
         "payload": {"alias": "q-claude", "include_secret": true},
     }));
     assert_eq!(v["status"], "ok");
-    assert_eq!(v["data"]["secret_plaintext"], "sk-ant-api03-SECRET-A");
     assert_eq!(v["data"]["provider_code"], "anthropic");
+    assert!(
+        v["data"].get("secret_plaintext").is_none(),
+        "secret_plaintext must never appear in _internal query get output",
+    );
 }
 
 #[test]

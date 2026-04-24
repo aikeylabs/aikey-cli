@@ -1,8 +1,8 @@
 {
   "_description": "V4.1 ablation spike canary 的 drafts/groups/orphans 基线数字，用于 CLI 迁移后对齐回归。",
-  "_source": "aikeylabs/workflow/CI/research/ablation-spike-v4.1/",
+  "_source": "aikeylabs/workflow/CI/research/ablation/ablation-spike-v4.1/",
   "_captured_at": "2026-04-22",
-  "_capture_git_ref": "see workflow/CI/research/ablation-spike-v4.1/ latest commit at capture time",
+  "_capture_git_ref": "see workflow/CI/research/ablation/ablation-spike-v4.1/ latest commit at capture time",
   "_notes": [
     "arbiter = CRF arbiter 默认启用模式 (v4.1 S1 决策#2)",
     "off = WITH_CRF=off 禁用 CRF",

@@ -7,7 +7,7 @@
 //!
 //! # 对应 V4.1 源码
 //!
-//! `workflow/CI/research/ablation-spike-v4.1/src/main.rs`:
+//! `workflow/CI/research/ablation/ablation-spike-v4.1/src/main.rs`:
 //! - `is_comment_at_offset` / `locate_line_by_offset`: L175-193
 //! - `is_placeholder_token`: L558-650
 //! - `token_has_cjk_or_fullwidth`: L266-275 (inline in rule_extract)

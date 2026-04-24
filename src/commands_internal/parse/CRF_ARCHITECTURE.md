@@ -5,7 +5,7 @@
 
 ## 两种 CRF 接入方式
 
-### V4.1 spike (`workflow/CI/research/ablation-spike-v4.1/`)
+### V4.1 spike (`workflow/CI/research/ablation/ablation-spike-v4.1/`)
 
 **架构**:**arbiter tie-break** (精度守门员)
 

@@ -1,6 +1,6 @@
 //! DraftRecord / DraftFields / GroupReason — L2 grouper 数据模型
 //!
-//! 从 V4.1 spike `workflow/CI/research/ablation-spike-v4.1/src/grouping.rs:77-168`
+//! 从 V4.1 spike `workflow/CI/research/ablation/ablation-spike-v4.1/src/grouping.rs:77-168`
 //! 迁移而来,保留 spike 的字段名与语义,**额外加 `#[derive(Serialize)]`** 以供 HTTP
 //! 响应序列化(CLI 之外;spike 只用内部 debug 打印)。
 //!
@@ -42,7 +42,7 @@ pub struct DraftFields {
     /// (如 "kimi" "anthropic"),title 是用户取的卡片名 (如 "Kimitest8"
     /// "工作号"),两者语义不同。
     ///
-    /// Ablation 证据: `workflow/CI/research/ablation-spike-v4.1/TITLE_
+    /// Ablation 证据: `workflow/CI/research/ablation/ablation-spike-v4.1/TITLE_
     /// ABLATION_REPORT.md` — 现有 5 字段 R/P/FP 零回归,R_title 91.2%。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,

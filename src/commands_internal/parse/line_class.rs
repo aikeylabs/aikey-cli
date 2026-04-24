@@ -23,7 +23,7 @@
 //!
 //! # 对应 V4.1 源码
 //!
-//! `workflow/CI/research/ablation-spike-v4.1/src/grouping.rs:41-332`
+//! `workflow/CI/research/ablation/ablation-spike-v4.1/src/grouping.rs:41-332`
 //! (LineKind enum + LineFlags bitflags + classify_line + line_class)
 
 use bitflags::bitflags;

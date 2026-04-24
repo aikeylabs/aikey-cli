@@ -12,7 +12,7 @@
 //! - pipeline_e2e_golden：跑完整流水断言每条样本的 expected 字段
 //!
 //! # 资产
-//! testdata/*.jsonl 从 `workflow/CI/research/ablation-spike/samples/` 1:1 迁移
+//! testdata/*.jsonl 从 `workflow/CI/research/ablation/ablation-spike/samples/` 1:1 迁移
 //! - train.jsonl      — 30 条 CRF 训练样本（Stage 3 Phase 4 训练入口用）
 //! - in_dist.jsonl    — 11 条同分布基线（源自 ablation-spike/holdout.jsonl）
 //! - ood_layouts.jsonl — 12 条未见过排版泛化

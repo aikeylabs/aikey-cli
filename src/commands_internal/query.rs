@@ -23,7 +23,8 @@ use std::collections::HashSet;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::commands_account::oauth_provider_to_canonical;
+use crate::commands_account::{oauth_provider_to_canonical, provider_info};
+use crate::commands_proxy::proxy_port;
 use crate::connectivity::default_base_url;
 use crate::credential_type::CredentialType;
 use crate::crypto;
@@ -32,6 +33,22 @@ use crate::storage;
 // on storage. Call its functions through `storage::...` directly.
 use super::protocol::{ResultEnvelope, StdinEnvelope};
 use super::stdin_json::{decode_vault_key, emit, emit_error};
+
+/// Fully-qualified proxy URL clients should point their SDK at when using
+/// this record (e.g. `http://127.0.0.1:27200/anthropic`). Built from the
+/// running proxy port + the provider's proxy path (registered in
+/// `provider_registry.yaml`). Returns None when the provider code is
+/// unknown or has no proxy routing entry — callers should fall back to
+/// the provider's own `base_url` / `official_base_url` in that case.
+///
+/// Factored out because three JSON-emitting handlers (`handle_get`,
+/// `handle_list_personal_with_masked`, `handle_list_metadata_locked`)
+/// all need the same computation and the result flows through to the
+/// vault Web drawer as `route_url`.
+fn route_url_for(provider_code: &str) -> Option<String> {
+    let info = provider_info(provider_code)?;
+    Some(format!("http://127.0.0.1:{}/{}", proxy_port(), info.proxy_path))
+}
 
 // ========== in-use detection ==========
 //
@@ -82,9 +99,13 @@ fn load_active_binding_refs() -> (HashSet<String>, HashSet<String>) {
 #[derive(Debug, Deserialize, Default)]
 struct GetPayload {
     alias: String,
-    /// 默认 false：仅返回 metadata；true 时解密并返回 plaintext
-    #[serde(default)]
-    include_secret: bool,
+    // include_secret was removed 2026-04-24 (security review round 2): the
+    // Go web server used this to power the /api/user/vault/reveal endpoint,
+    // which has been removed entirely. Plaintext secrets no longer travel
+    // CLI → Go → browser. Users who need the plaintext run `aikey get
+    // <alias>` directly in a terminal (clipboard-only, auto-clears). Any
+    // stdin-JSON payload that still carries `include_secret: true` is
+    // silently ignored because the field is no longer deserialized.
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -224,12 +245,17 @@ fn handle_get(env: StdinEnvelope) {
         return;
     }
 
-    let key = match verify_key(&env) {
-        Ok(k) => k,
-        Err((c, m)) => { emit_error(req_id, c, m); return; }
-    };
+    // Verify vault_key matches password_hash even though we no longer decrypt.
+    // Why still verify: a locked / wrong-password caller must not receive
+    // metadata either. The previous `include_secret: true` branch — which
+    // powered the Go RevealHandler → browser pipeline — was removed on
+    // 2026-04-24 so plaintext never leaves the terminal subprocess; users
+    // run `aikey get <alias>` directly in a terminal for the actual plaintext.
+    if let Err((c, m)) = verify_key(&env) {
+        emit_error(req_id, c, m);
+        return;
+    }
 
-    // 先查 metadata（即使 include_secret=false 也返回）
     let all = match storage::list_entries_with_metadata() {
         Ok(v) => v,
         Err(e) => {
@@ -251,7 +277,7 @@ fn handle_get(env: StdinEnvelope) {
 
     let official_base_url =
         meta.provider_code.as_deref().and_then(default_base_url);
-    let mut data = json!({
+    let data = json!({
         "alias": meta.alias,
         "created_at": meta.created_at,
         "provider_code": meta.provider_code,
@@ -260,30 +286,10 @@ fn handle_get(env: StdinEnvelope) {
         // callers know the real URL that gets used when base_url is
         // null, without having to embed PROVIDER_DEFAULTS client-side.
         "official_base_url": official_base_url,
+        "route_url": meta.provider_code.as_deref().and_then(route_url_for),
         "supported_providers": meta.supported_providers,
         "has_secret": true,
     });
-
-    if payload.include_secret {
-        let (nonce, ciphertext) = match storage::get_entry(&payload.alias) {
-            Ok(t) => t,
-            Err(e) => {
-                emit_error(req_id, "I_INTERNAL", format!("get_entry failed: {}", e));
-                return;
-            }
-        };
-        let plaintext = match crypto::decrypt(&key, &nonce, &ciphertext) {
-            Ok(p) => p,
-            Err(e) => {
-                emit_error(req_id, "I_INTERNAL", format!("decrypt failed: {}", e));
-                return;
-            }
-        };
-        let s = String::from_utf8_lossy(&plaintext).to_string();
-        if let serde_json::Value::Object(ref mut m) = data {
-            m.insert("secret_plaintext".to_string(), json!(s));
-        }
-    }
 
     emit(&ResultEnvelope::ok(req_id, data));
 }
@@ -419,6 +425,7 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
             "protocol_family": protocol_family_of(m.provider_code.as_deref()),
             "base_url": m.base_url,
             "official_base_url": official_base_url,
+        "route_url": m.provider_code.as_deref().and_then(route_url_for),
             "supported_providers": m.supported_providers,
             "created_at": m.created_at,
             "status": "active",
@@ -611,6 +618,17 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                 // unlock, and copying the default URL is read-only).
                 let official_base_url =
                     m.provider_code.as_deref().and_then(default_base_url);
+                // route_token is blanked in the locked-state response. It is
+                // an `aikey_vk_...` bearer accepted directly by aikey-proxy;
+                // exposing the real value to anonymous local_bypass callers
+                // (personal/trial editions) would let a malicious page issue
+                // authenticated proxy calls without ever unlocking the vault.
+                // The unlocked list (`list_personal_with_masked`) continues
+                // to return the real token for in-UI copy flows. Emitting
+                // null (rather than omitting the key) keeps the TS shape
+                // contract `route_token: string | null` satisfied so the
+                // drawer's `{personal.route_token && ...}` guard still works.
+                // 2026-04-24 security review.
                 out.push(json!({
                     "target": "personal",
                     "id": m.alias,
@@ -619,10 +637,11 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "protocol_family": protocol_family_of(m.provider_code.as_deref()),
                     "base_url": m.base_url,
                     "official_base_url": official_base_url,
+                    "route_url": m.provider_code.as_deref().and_then(route_url_for),
                     "supported_providers": m.supported_providers,
                     "created_at": m.created_at,
                     "status": "active",
-                    "route_token": m.route_token,
+                    "route_token": serde_json::Value::Null,
                     "last_used_at": m.last_used_at,
                     "use_count": m.use_count.unwrap_or(0),
                     "in_use": active_personal.contains(&m.alias),

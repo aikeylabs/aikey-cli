@@ -1,7 +1,7 @@
 //! Tokenizer：把一行文本切成候选 token（供 anchored / labeled rules 和 Phase 4 CRF 共用）
 //!
 //! # 扩展分隔符（相对原方案）
-//! 从 `workflow/CI/research/ablation-spike/src/main.rs` 1:1 移植 + 补充真实用户场景验证过的边界：
+//! 从 `workflow/CI/research/ablation/ablation-spike/src/main.rs` 1:1 移植 + 补充真实用户场景验证过的边界：
 //! - `----`（dash-separated）/ `|`（pipe-sep）/ `~~`（tilde）/ `===`（triple equals）/ `::`（double colon）
 //! - `;`（Azure connection string）
 //! - `：`（中文全角冒号，Feishu/Notion 粘贴）

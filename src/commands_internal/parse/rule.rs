@@ -120,7 +120,7 @@ pub fn rule_extract(text: &str) -> Vec<Candidate> {
     // === Layer 5 (v4.2): block 首行"自然语言"title 抽取 ===
     // Why 放 PEM/锚点之后：title 不是 credential，run 完整 credential 层再跑它，不影响
     // 原有 dedup 次序。emit Kind::Title；grouper 按 line_range 贴到对应 draft。
-    // 零回归验证见 workflow/CI/research/ablation-spike-v4.1/TITLE_ABLATION_REPORT.md。
+    // 零回归验证见 workflow/CI/research/ablation/ablation-spike-v4.1/TITLE_ABLATION_REPORT.md。
     super::rule_title::extract(text, &mut cands, &mut seen);
 
     cands
