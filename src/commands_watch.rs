@@ -1326,10 +1326,14 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// `ts` is an RFC3339 string for test readability; we parse it into
+    /// int64 millis (the post-v1.0.3-alpha storage format) so the test
+    /// fixtures remain human-auditable.
     fn ev(ts: &str, sid: &str, kid: &str, model: &str, in_tok: i64, out_tok: i64) -> UsageEvent {
+        let ts_ms = rfc3339_to_ms(ts);
         UsageEvent {
             event_id: format!("e-{}", sid),
-            event_time: ts.into(),
+            event_time: ts_ms,
             session_id: Some(sid.into()),
             key_label: Some(kid.into()),
             completion: Some("complete".into()),
@@ -1455,10 +1459,9 @@ mod tests {
     fn now_ts() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() }
 
     fn make_event(ts_secs: u64, label: &str, i: i64, o: i64) -> UsageEvent {
-        let iso = iso_for(ts_secs);
         UsageEvent {
             event_id: format!("e-{}", label),
-            event_time: iso,
+            event_time: (ts_secs as i64).saturating_mul(1000),
             session_id: None,
             key_label: Some(label.into()),
             completion: None,
@@ -1488,5 +1491,66 @@ mod tests {
         let mi = (hms % 3600) / 60;
         let s = hms % 60;
         format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, h, mi, s)
+    }
+
+    /// Convert an RFC3339 UTC literal to Unix millis for test fixtures.
+    /// Keeps tests readable (you write a wall-clock string) while the
+    /// struct is typed int64 post v1.0.3-alpha. Handles only the
+    /// trailing `Z` / `+HH:MM` / `-HH:MM` forms that our test data uses.
+    fn rfc3339_to_ms(s: &str) -> i64 {
+        let bytes = s.as_bytes();
+        if bytes.len() < 19 {
+            panic!("rfc3339_to_ms: too short: {s}");
+        }
+        let parse_num = |range: std::ops::Range<usize>| -> i64 {
+            std::str::from_utf8(&bytes[range])
+                .unwrap()
+                .parse()
+                .unwrap_or(0)
+        };
+        let y = parse_num(0..4) as i32;
+        let mo = parse_num(5..7) as u32;
+        let d = parse_num(8..10) as u32;
+        let h = parse_num(11..13);
+        let mi = parse_num(14..16);
+        let sec = parse_num(17..19);
+        let days = civil_from_days_inv(y, mo, d);
+        let mut utc_secs = days * 86400 + h * 3600 + mi * 60 + sec;
+        // Consume optional fractional and tz suffix.
+        let mut idx = 19;
+        if idx < bytes.len() && bytes[idx] == b'.' {
+            idx += 1;
+            while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+                idx += 1;
+            }
+        }
+        if idx < bytes.len() {
+            match bytes[idx] {
+                b'Z' | b'z' => {}
+                b'+' | b'-' => {
+                    if idx + 6 <= bytes.len() && bytes[idx + 3] == b':' {
+                        let hh = parse_num(idx + 1..idx + 3);
+                        let mm = parse_num(idx + 4..idx + 6);
+                        let sign = if bytes[idx] == b'+' { -1 } else { 1 };
+                        utc_secs += sign * (hh * 3600 + mm * 60);
+                    }
+                }
+                _ => {}
+            }
+        }
+        utc_secs.saturating_mul(1000)
+    }
+
+    /// Inverse of the Hinnant days_from_civil — copy-paste with the same
+    /// name (civil_from_days already exists on the read side), kept
+    /// local to the test module.
+    fn civil_from_days_inv(y: i32, m: u32, d: u32) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
+        let yoe = (y - era * 400) as i64;
+        let mu = m as i64;
+        let doy = (153 * (if mu > 2 { mu - 3 } else { mu + 9 }) + 2) / 5 + d as i64 - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era as i64 * 146097 + doe - 719468
     }
 }

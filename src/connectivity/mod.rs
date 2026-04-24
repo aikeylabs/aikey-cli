@@ -34,7 +34,7 @@ pub use targets::{
 #[allow(unused_imports)]
 pub use runtime::{
     ConnectivityResult, ProxyProbeResult,
-    PROVIDER_DEFAULTS, default_base_url,
+    provider_defaults, default_base_url,
     tcp_ping,
     test_provider_connectivity, test_proxy_connectivity,
     api_status_hint, chat_status_hint, proxy_status_hint,

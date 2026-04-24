@@ -1,0 +1,189 @@
+# Provider Registry — single source of truth for provider capability.
+#
+# This file is the ONLY place that declares:
+#   - env var names (hook / activate writes to ~/.aikey/active.env)
+#   - proxy path prefix (aikey-proxy routes /<path>/* to the upstream)
+#   - default base URL (for connectivity probes + drawer "official URL" hint)
+#   - picker visibility (shown in `aikey add` interactive provider select)
+#   - oauth broker aliases (claude→anthropic normalization at binding write)
+#   - protocol family (vault Web UI grouping key — merged with aliases)
+#   - extra env vars (e.g. KIMI_MODEL_NAME for SDKs that need it)
+#
+# Consumers (all Rust-side, loaded via src/provider_registry.rs):
+#   - commands_account::provider_info / provider_env_vars / provider_proxy_prefix
+#   - commands_account::oauth_provider_to_canonical  (alias table)
+#   - connectivity::PROVIDER_DEFAULTS / default_base_url
+#   - main.rs `aikey add` KNOWN_PROVIDERS picker
+#   - commands_internal::query::protocol_family_of  (protocol family helper)
+#
+# aikey-proxy (Go side) has a parallel table in internal/proxy/middleware.go
+# that MUST be kept in sync until we codegen a shared JSON at build time.
+# See Go comment there for the cross-language drift risk.
+#
+# Adding a new provider = add one entry here + mirror default_base_url +
+# proxy_path + canonical_code mapping into the Go middleware.go table.
+#
+# Field reference:
+#   code              (required)  canonical provider_code stored in bindings
+#   family            (optional)  protocol family for UI grouping (default = code)
+#   oauth_aliases     (optional)  names that oauth_provider_to_canonical → code
+#   proxy_path        (required)  URL path segment in aikey-proxy (e.g. "groq/openai/v1")
+#   env_api_key       (required)  API key env var name (e.g. "GROQ_API_KEY")
+#   env_base_url      (required)  base URL env var name (e.g. "GROQ_BASE_URL")
+#   default_base_url  (required)  upstream default URL (used in drawer hint, probe)
+#   picker            (required)  true to appear in `aikey add` interactive list
+#   display           (optional)  human label shown in picker (default = code)
+#   extra_env_vars    (optional)  extras written alongside api_key/base_url
+#                                 list of {var, value}
+
+providers:
+  # ──────────────────────────────────────────────────────────────────
+  # Core Western providers (originally in KNOWN_PROVIDERS / provider_info)
+  # ──────────────────────────────────────────────────────────────────
+  - code: anthropic
+    oauth_aliases: [claude]
+    proxy_path: anthropic
+    env_api_key: ANTHROPIC_API_KEY
+    env_base_url: ANTHROPIC_BASE_URL
+    default_base_url: https://api.anthropic.com
+    picker: true
+    display: anthropic
+
+  - code: openai
+    oauth_aliases: [gpt, chatgpt, codex]
+    proxy_path: openai
+    env_api_key: OPENAI_API_KEY
+    env_base_url: OPENAI_BASE_URL
+    default_base_url: https://api.openai.com/v1
+    picker: true
+    display: openai
+
+  - code: google
+    oauth_aliases: [gemini]
+    proxy_path: google
+    env_api_key: GOOGLE_API_KEY
+    env_base_url: GOOGLE_BASE_URL
+    default_base_url: https://generativelanguage.googleapis.com
+    picker: true
+    display: google
+
+  - code: deepseek
+    # DeepSeek upstream already contains /v1 → proxy path bare.
+    proxy_path: deepseek
+    env_api_key: DEEPSEEK_API_KEY
+    env_base_url: DEEPSEEK_BASE_URL
+    default_base_url: https://api.deepseek.com/v1
+    picker: true
+    display: deepseek
+
+  - code: kimi
+    # Why /v1: Kimi OpenAI-compatible SDK appends /chat/completions relative
+    # to base_url. Kimi's upstream base is /coding (no /v1), so the proxy-
+    # side path MUST carry /v1 for the final URL to hit /coding/v1/...
+    proxy_path: kimi/v1
+    env_api_key: KIMI_API_KEY
+    env_base_url: KIMI_BASE_URL
+    default_base_url: https://api.kimi.com/coding/v1
+    picker: true
+    display: kimi
+    extra_env_vars:
+      - {var: KIMI_MODEL_NAME, value: "kimi-k2.5"}
+      - {var: KIMI_MODEL_MAX_CONTEXT_SIZE, value: "131072"}
+
+  - code: moonshot
+    # Same protocol family as kimi but kept distinct at env-var level so
+    # tools can wire to different brands independently.
+    family: kimi
+    proxy_path: moonshot/v1
+    env_api_key: MOONSHOT_API_KEY
+    env_base_url: MOONSHOT_BASE_URL
+    default_base_url: https://api.moonshot.cn/v1
+    picker: false   # users prefer the "kimi" label; moonshot kept for compat
+    display: moonshot
+    extra_env_vars:
+      - {var: KIMI_MODEL_NAME, value: "kimi-k2.5"}
+      - {var: KIMI_MODEL_MAX_CONTEXT_SIZE, value: "131072"}
+
+  # ──────────────────────────────────────────────────────────────────
+  # P0 additions (2026-04-24) — widely-adopted OpenAI-compatible Western
+  # providers, already recognized in provider_fingerprint.yaml.
+  # ──────────────────────────────────────────────────────────────────
+  - code: groq
+    proxy_path: groq/openai/v1
+    env_api_key: GROQ_API_KEY
+    env_base_url: GROQ_BASE_URL
+    default_base_url: https://api.groq.com/openai/v1
+    picker: true
+    display: groq
+
+  - code: xai
+    # Parse-fingerprint uses "xai_grok" family; alias maps it to canonical.
+    oauth_aliases: [grok, xai_grok]
+    proxy_path: xai/v1
+    env_api_key: XAI_API_KEY
+    env_base_url: XAI_BASE_URL
+    default_base_url: https://api.x.ai/v1
+    picker: true
+    display: xai (grok)
+
+  - code: openrouter
+    proxy_path: openrouter/api/v1
+    env_api_key: OPENROUTER_API_KEY
+    env_base_url: OPENROUTER_BASE_URL
+    default_base_url: https://openrouter.ai/api/v1
+    picker: true
+    display: openrouter
+
+  - code: perplexity
+    oauth_aliases: [pplx]
+    proxy_path: perplexity/v1
+    env_api_key: PERPLEXITY_API_KEY
+    env_base_url: PERPLEXITY_BASE_URL
+    default_base_url: https://api.perplexity.ai/v1
+    picker: true
+    display: perplexity
+
+  # ──────────────────────────────────────────────────────────────────
+  # P1 additions (2026-04-24) — China-market providers, important for 2B.
+  # ──────────────────────────────────────────────────────────────────
+  - code: zhipu
+    # Brand aliases: "glm" (previously in PROVIDER_DEFAULTS) and "zhipuai"
+    # (民间命名) both canonicalize to "zhipu" at binding write.
+    oauth_aliases: [glm, zhipuai]
+    proxy_path: zhipu/api/paas/v4
+    # Env var name follows the widespread SDK convention (ZHIPUAI_*), not
+    # our canonical code.
+    env_api_key: ZHIPUAI_API_KEY
+    env_base_url: ZHIPUAI_BASE_URL
+    default_base_url: https://open.bigmodel.cn/api/paas/v4
+    picker: true
+    display: zhipu (GLM)
+
+  - code: qwen
+    oauth_aliases: [dashscope, tongyi]
+    proxy_path: qwen/compatible-mode/v1
+    # Alibaba DashScope SDKs universally use DASHSCOPE_API_KEY.
+    env_api_key: DASHSCOPE_API_KEY
+    env_base_url: DASHSCOPE_BASE_URL
+    default_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    picker: true
+    display: qwen (DashScope)
+
+  - code: doubao
+    # User-decided 2026-04-24: canonical code = "doubao" (用户心智里是豆包),
+    # env vars = ARK_* (Volcengine SDK convention).
+    oauth_aliases: [ark, volcengine]
+    proxy_path: doubao/api/v3
+    env_api_key: ARK_API_KEY
+    env_base_url: ARK_BASE_URL
+    default_base_url: https://ark.cn-beijing.volces.com/api/v3
+    picker: true
+    display: doubao (ARK)
+
+  - code: siliconflow
+    proxy_path: siliconflow/v1
+    env_api_key: SILICONFLOW_API_KEY
+    env_base_url: SILICONFLOW_BASE_URL
+    default_base_url: https://api.siliconflow.cn/v1
+    picker: true
+    display: siliconflow

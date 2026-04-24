@@ -1,5 +1,6 @@
 #[allow(dead_code)] mod credential_type;
 #[allow(dead_code)] mod storage;
+#[allow(dead_code)] mod provider_registry;
 mod crypto;
 mod session;
 mod executor;
@@ -762,13 +763,20 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Step 3: resolve providers + base_url.
             // v1.0.2: multi-provider selection with checkbox TUI.
-            const KNOWN_PROVIDERS: &[(&str, &str)] = &[
-                ("anthropic", "https://api.anthropic.com"),
-                ("openai",    "https://api.openai.com/v1"),
-                ("google",    "https://generativelanguage.googleapis.com"),
-                ("deepseek",  "https://api.deepseek.com/v1"),
-                ("kimi",      "https://api.kimi.com/coding/v1"),
-            ];
+            //
+            // Picker list is now driven by the provider registry (2026-04-24
+            // — provider_registry.yaml). Entries with `picker: true` appear
+            // here, in YAML declaration order. Adding a new provider = add
+            // one YAML entry, not a `KNOWN_PROVIDERS` const edit.
+            let picker_entries = provider_registry::picker_entries();
+            let known_providers: Vec<(&'static str, &'static str)> = picker_entries
+                .iter()
+                .map(|e| (e.display, e.default_base_url))
+                .collect();
+            // Parallel map for downstream lookup by display label (the user
+            // sees `display`, but the stored `provider_code` is `e.code`).
+            let display_to_code: std::collections::HashMap<&'static str, &'static str> =
+                picker_entries.iter().map(|e| (e.display, e.code)).collect();
 
             // v4.1 Stage 5+: --providers (multi) 优先级最高,然后是 --provider (single shorthand),
             // 都没给且 TTY 时进入交互式 multi-select。clap 的 `conflicts_with` 已保证 --provider /
@@ -789,9 +797,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     (vec![code.to_lowercase()], None)
                 } else if std::io::stdin().is_terminal() && !cli.json {
                     use colored::Colorize;
-                    let mut items: Vec<String> = KNOWN_PROVIDERS.iter().map(|(n, _)| n.to_string()).collect();
+                    let mut items: Vec<String> = known_providers.iter().map(|(n, _)| n.to_string()).collect();
                     items.push("Other provider types...".to_string());
-                    let custom_idx = KNOWN_PROVIDERS.len();
+                    let custom_idx = known_providers.len();
                     let mut selected: Vec<String>;
                     let mut checked_state: Vec<bool> = vec![false; items.len()];
 
@@ -805,9 +813,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         selected = Vec::new();
                         let mut wants_custom = false;
                         for &idx in &selected_indices {
-                            if idx < KNOWN_PROVIDERS.len() {
-                                let name = KNOWN_PROVIDERS[idx].0.to_string();
-                                if !selected.contains(&name) { selected.push(name); }
+                            if idx < known_providers.len() {
+                                // Translate the picker's display label back to canonical code
+                                // via the display_to_code map built above. Users see "doubao
+                                // (ARK)" but the vault stores "doubao".
+                                let display_label = known_providers[idx].0;
+                                let canonical_code = display_to_code
+                                    .get(display_label)
+                                    .copied()
+                                    .unwrap_or(display_label)
+                                    .to_string();
+                                if !selected.contains(&canonical_code) { selected.push(canonical_code); }
                             } else if idx == custom_idx { wants_custom = true; }
                         }
                         if wants_custom {
@@ -860,9 +876,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // types..." option and thus no typo risk.
             let from_cli_flag = !providers.is_empty() || provider.is_some();
             if from_cli_flag && !cli.json {
-                let known: Vec<&str> = KNOWN_PROVIDERS.iter().map(|(n, _)| *n).collect();
+                // "Known" = any provider that resolves in the registry (by code
+                // or OAuth alias). The registry is broader than the picker list
+                // — e.g. "claude" aliases "anthropic" so both are considered
+                // known and skip the typo warning.
                 let unknown: Vec<&String> = resolved_providers.iter()
-                    .filter(|p| !known.contains(&p.as_str()))
+                    .filter(|p| provider_registry::lookup(p.as_str()).is_none())
                     .collect();
                 if !unknown.is_empty() {
                     use colored::Colorize;
@@ -871,7 +890,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "  {} {} is not a built-in provider code.",
                         "warning:".yellow().bold(), unk_list
                     );
-                    eprintln!("  built-in: {}", known.join(", "));
+                    let known_codes: Vec<&'static str> = provider_registry::entries()
+                        .iter().map(|e| e.code).collect();
+                    eprintln!("  built-in: {}", known_codes.join(", "));
                     eprintln!("  If this is a custom provider / gateway, this is fine — continuing.");
                     eprintln!("  If it was a typo, Ctrl+C and retry with --provider <built-in>.");
                     eprintln!();

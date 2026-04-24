@@ -67,24 +67,29 @@ pub struct ConnectivityResult {
     pub chat_status: Option<u16>,
 }
 
-/// Default base URLs for known providers.
 /// Default base URLs for known providers — always use the official recommended URL.
 /// chat_suffix() / probe_suffix() detect trailing /v1 to avoid double /v1/v1.
-pub const PROVIDER_DEFAULTS: &[(&str, &str)] = &[
-    ("anthropic", "https://api.anthropic.com"),
-    ("openai",    "https://api.openai.com/v1"),
-    ("google",    "https://generativelanguage.googleapis.com"),
-    ("deepseek",  "https://api.deepseek.com/v1"),
-    ("kimi",      "https://api.kimi.com/coding/v1"),
-    ("glm",       "https://open.bigmodel.cn/api/paas"),
-];
-
-/// Resolve the default base URL for a provider code.
-pub fn default_base_url(provider_code: &str) -> Option<&'static str> {
-    PROVIDER_DEFAULTS.iter()
-        .find(|(c, _)| *c == provider_code)
-        .map(|(_, u)| *u)
+///
+/// Backed by `provider_registry::entries()` as of 2026-04-24. Callers that
+/// previously iterated `PROVIDER_DEFAULTS.iter()` now iterate this lazily-
+/// materialized slice; the registry's YAML-declared order is preserved.
+pub fn provider_defaults() -> &'static [(&'static str, &'static str)] {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Vec<(&'static str, &'static str)>> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        crate::provider_registry::entries()
+            .iter()
+            .map(|e| (e.code, e.default_base_url))
+            .collect()
+    })
 }
+
+/// Resolve the default base URL for a provider code. Handles OAuth aliases
+/// via the registry (claude → anthropic, codex → openai, etc.).
+pub fn default_base_url(provider_code: &str) -> Option<&'static str> {
+    crate::provider_registry::lookup(provider_code).map(|e| e.default_base_url)
+}
+
 
 /// Test connectivity to a provider: first TCP ping, then API probe.
 ///

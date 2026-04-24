@@ -4,6 +4,7 @@
 
 pub mod credential_type;
 pub mod crypto;
+pub mod provider_registry;
 pub mod storage;
 pub mod synapse;
 pub mod executor;

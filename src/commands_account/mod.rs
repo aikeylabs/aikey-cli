@@ -1777,51 +1777,22 @@ pub struct ProviderInfo {
 }
 
 /// Look up provider metadata by code or alias. Returns `None` for unknown codes.
+///
+/// Delegates to `provider_registry::lookup` (2026-04-24 refactor — the
+/// hand-coded match table was externalized to `data/provider_registry.yaml`
+/// as part of the provider-expansion effort). See that module for the full
+/// schema and lookup semantics (including OAuth alias resolution).
 pub fn provider_info(code: &str) -> Option<ProviderInfo> {
-    let info = match code.to_lowercase().as_str() {
-        "anthropic" | "claude" => ProviderInfo {
-            canonical_code: "anthropic",
-            proxy_path: "anthropic",
-            env_vars: ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
-        },
-        "openai" | "gpt" | "chatgpt" | "codex" => ProviderInfo {
-            canonical_code: "openai",
-            proxy_path: "openai",
-            env_vars: ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
-        },
-        "google" | "gemini" => ProviderInfo {
-            canonical_code: "google",
-            proxy_path: "google",
-            env_vars: ("GOOGLE_API_KEY", "GOOGLE_BASE_URL"),
-        },
-        "kimi" => ProviderInfo {
-            canonical_code: "kimi",
-            // Why /v1: Kimi OpenAI-compatible SDK appends /chat/completions
-            // relative to base_url. Kimi's upstream base is /coding (no /v1),
-            // so the proxy-side path MUST carry /v1 for the final URL to hit
-            // /coding/v1/chat/completions.
-            proxy_path: "kimi/v1",
-            env_vars: ("KIMI_API_KEY", "KIMI_BASE_URL"),
-        },
-        "moonshot" => ProviderInfo {
-            // moonshot is a brand alias of kimi at the vault/routing layer,
-            // but kept distinct in env vars so users can wire different tools
-            // to each brand if they prefer.
-            canonical_code: "kimi",
-            proxy_path: "moonshot/v1",
-            env_vars: ("MOONSHOT_API_KEY", "MOONSHOT_BASE_URL"),
-        },
-        "deepseek" => ProviderInfo {
-            canonical_code: "deepseek",
-            // Why no /v1: DeepSeek's upstream already includes /v1, so the
-            // proxy-side path stays bare and the upstream's /v1 prepends during
-            // the final URL build.
-            proxy_path: "deepseek",
-            env_vars: ("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"),
-        },
-        _ => return None,
-    };
-    Some(info)
+    let entry = crate::provider_registry::lookup(code)?;
+    Some(ProviderInfo {
+        // `canonical_code` historically meant "protocol family" — the code
+        // that multiple brand-distinct entries (kimi + moonshot) share at
+        // the vault-query grouping level. The registry's `family` field
+        // captures exactly this; default-to-self for entries without one.
+        canonical_code: entry.family,
+        proxy_path: entry.proxy_path,
+        env_vars: entry.env_vars,
+    })
 }
 
 // ── Back-compat wrappers: existing call sites keep working unchanged. ──
@@ -1854,12 +1825,11 @@ pub(crate) fn provider_env_vars(provider_code: &str) -> Option<(&'static str, &'
 /// `augment_provider_with_env_vars` populates fields from env vars. Without
 /// `KIMI_MODEL_NAME`, `model.model` stays empty and Kimi rejects the request.
 pub(crate) fn provider_extra_env_vars(provider_code: &str) -> Vec<(&'static str, &'static str)> {
-    match provider_code.to_lowercase().as_str() {
-        "kimi" | "moonshot" => vec![
-            ("KIMI_MODEL_NAME", "kimi-k2.5"),
-            ("KIMI_MODEL_MAX_CONTEXT_SIZE", "131072"),
-        ],
-        _ => Vec::new(),
+    // Delegates to registry so Kimi's extras (+ any future provider's) stay
+    // in the single YAML source of truth.
+    match crate::provider_registry::lookup(provider_code) {
+        Some(e) => e.extra_env_vars.to_vec(),
+        None => Vec::new(),
     }
 }
 
@@ -1883,12 +1853,13 @@ pub fn provider_proxy_prefix_pub(provider_code: &str) -> &'static str {
 /// Lives here (lib-accessible) so the connectivity suite resolvers in
 /// `commands_project` can share the same mapping `auth use` / `auth doctor`
 /// already rely on.
-pub fn oauth_provider_to_canonical(provider: &str) -> &str {
-    match provider {
-        "claude" => "anthropic",
-        "codex"  => "openai",
-        _        => provider,
-    }
+pub fn oauth_provider_to_canonical(provider: &str) -> &'static str {
+    // Delegates to the registry's alias resolution. Unknown codes pass
+    // through via the registry's cached-leak mechanism — preserves the old
+    // helper's "custom provider names still work" contract while keeping
+    // the claude↔anthropic / codex↔openai / glm↔zhipu / ark↔doubao / etc.
+    // alias tables in a single YAML file.
+    crate::provider_registry::canonical(provider)
 }
 
 // ============================================================================

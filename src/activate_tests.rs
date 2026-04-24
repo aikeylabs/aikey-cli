@@ -342,11 +342,25 @@ fn provider_info_moonshot_canonical_is_kimi_but_env_vars_distinct() {
 #[test]
 fn provider_info_all_known_have_env_vars_and_path() {
     // Full coverage sweep: every known code yields Some(info) with non-empty fields.
+    // Expanded 2026-04-24 after the registry refactor added P0+P1 providers
+    // (groq / xai / openrouter / perplexity / zhipu / qwen / doubao / siliconflow).
+    // The aliases section below keeps the old hand-picked list covered too.
     for code in &[
+        // Original 6 canonical + 5 aliases
         "anthropic", "claude",
         "openai", "codex", "gpt", "chatgpt",
         "google", "gemini",
         "kimi", "moonshot", "deepseek",
+        // P0 (2026-04-24)
+        "groq",
+        "xai", "grok", "xai_grok",
+        "openrouter",
+        "perplexity", "pplx",
+        // P1 (2026-04-24)
+        "zhipu", "glm", "zhipuai",
+        "qwen", "dashscope", "tongyi",
+        "doubao", "ark", "volcengine",
+        "siliconflow",
     ] {
         let info = commands_account::provider_info(code)
             .unwrap_or_else(|| panic!("provider_info('{}') returned None", code));

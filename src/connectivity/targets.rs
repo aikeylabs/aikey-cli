@@ -10,7 +10,7 @@ use crate::storage;
 use super::{
     BuildTargetError, TestTarget,
     personal_target, personal_target_direct, team_target, oauth_target,
-    PROVIDER_DEFAULTS,
+    provider_defaults,
 };
 
 /// Build a TestTarget for a single provider binding.
@@ -170,15 +170,15 @@ pub fn targets_from_alias(
                     // Unknown provider + no explicit list: fall back to the
                     // well-known set so the user can see which upstreams the
                     // key reaches.
-                    PROVIDER_DEFAULTS.iter().map(|(c, _)| c.to_string()).collect()
+                    provider_defaults().iter().map(|(c, _)| c.to_string()).collect()
                 }
             } else if let Some(ref code) = m.provider_code {
                 vec![code.clone()]
             } else {
-                PROVIDER_DEFAULTS.iter().map(|(c, _)| c.to_string()).collect()
+                provider_defaults().iter().map(|(c, _)| c.to_string()).collect()
             }
         } else {
-            PROVIDER_DEFAULTS.iter().map(|(c, _)| c.to_string()).collect()
+            provider_defaults().iter().map(|(c, _)| c.to_string()).collect()
         };
 
         return providers.into_iter().map(|code| {

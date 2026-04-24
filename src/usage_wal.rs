@@ -35,8 +35,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub struct UsageEvent {
     #[serde(default)]
     pub event_id: String,
-    #[serde(default)]
-    pub event_time: String, // RFC3339 string; parsed lazily
+    /// Unix epoch **milliseconds** (UTC). 0 = unknown / absent.
+    ///
+    /// Deserializer accepts both a JSON number (the current proxy wire
+    /// format) and a JSON string in RFC3339 or numeric-string form
+    /// (pre-v1.0.3-alpha WAL files still on disk during a mixed-version
+    /// window). See `deserialize_event_time_ms` for the tolerance rules.
+    #[serde(default, deserialize_with = "deserialize_event_time_ms")]
+    pub event_time: i64,
 
     /// Newest (v5) anchor fields. omitempty on the proxy side, so absent
     /// on events written by pre-v5 binaries.
@@ -95,11 +101,15 @@ pub struct UsageEvent {
 }
 
 impl UsageEvent {
-    /// Returns seconds since the unix epoch for `event_time`, or None when
-    /// the field is absent or unparsable. Kept lazy so hot-path callers
-    /// (statusline) only parse when they actually need the timestamp.
+    /// Returns seconds since the unix epoch for `event_time`, or None
+    /// when the field is absent / zero. Kept lazy so hot-path callers
+    /// (statusline) don't pay the divide unless they actually need it.
     pub fn finished_at_unix(&self) -> Option<i64> {
-        parse_rfc3339_secs(&self.event_time)
+        if self.event_time <= 0 {
+            None
+        } else {
+            Some(self.event_time / 1000)
+        }
     }
 
     /// Age compared to `now`; None when the timestamp can't be parsed.
@@ -109,6 +119,49 @@ impl UsageEvent {
         let delta = now_secs.saturating_sub(ev_secs);
         if delta < 0 { return None; }
         Some(Duration::from_secs(delta as u64))
+    }
+}
+
+/// Accept JSON number (millis) or string (numeric or RFC3339) for
+/// `event_time`. All outputs are normalised to epoch millis.
+///
+/// Why tolerant: proxy writes int64 after v1.0.3-alpha, but a just-
+/// upgraded machine may still have hourly WAL files on disk that were
+/// written by the previous build with RFC3339 strings — the statusline
+/// must keep working against them until natural rotation ages them
+/// out (~24h).
+fn deserialize_event_time_ms<'de, D>(d: D) -> Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Int(i64),
+        Str(String),
+        Null,
+    }
+    match Raw::deserialize(d)? {
+        Raw::Int(n) => Ok(n),
+        Raw::Null => Ok(0),
+        Raw::Str(s) => {
+            if s.is_empty() {
+                return Ok(0);
+            }
+            // Numeric string (e.g. "1777041000000") — proxy never emits
+            // this but keep the path for hand-crafted fixtures.
+            if let Ok(n) = s.parse::<i64>() {
+                return Ok(n);
+            }
+            // RFC3339 legacy path.
+            if let Some(secs) = parse_rfc3339_secs(&s) {
+                return Ok(secs.saturating_mul(1000));
+            }
+            Err(D::Error::custom(format!(
+                "event_time: unrecognised format {s:?} — expected int64 millis or RFC3339"
+            )))
+        }
     }
 }
 
@@ -686,7 +739,8 @@ mod tests {
         }, opts).unwrap();
 
         let ev = found.expect("should find newest sess-a event");
-        assert_eq!(ev.event_time, "2026-04-17T15:00:00Z");
+        // 2026-04-17T15:00:00Z → 1776438000 s → 1776438000000 ms.
+        assert_eq!(ev.event_time, 1776438000000);
     }
 
     // -----------------------------------------------------------------

@@ -296,7 +296,7 @@ pub fn render_kimi() -> io::Result<()> {
     // as Claude path). Only fields render_line reads are filled.
     let synth = UsageEvent {
         event_id: format!("kimi-turn-{}", ctx.session_id),
-        event_time: newest.event.event_time.clone(),
+        event_time: newest.event.event_time,
         session_id: Some(ctx.session_id.clone()),
         key_label: newest.event.key_label.clone(),
         completion: newest.event.completion.clone(),
@@ -649,7 +649,7 @@ fn render_line(ev: &UsageEvent) -> String {
     // user can't tell "nothing happened" from "aikey stalled". A trailing
     // HH:MM:SS tag proves the receipt is fresh. Dim + parenthesised so it
     // reads as metadata, not another metric.
-    let ts = event_time_hm(&ev.event_time);
+    let ts = event_time_hm(ev.event_time);
 
     // Layout (reviewed 2026-04-20):
     //   {prefix}tokens · [cache] · model · label · ❬⦿·⦿❭ HH:MM
@@ -696,15 +696,35 @@ fn render_line(ev: &UsageEvent) -> String {
 /// "is this still fresh" signal. `HH:MM` gives ~60s freshness resolution and
 /// reads cleaner in the tag.
 ///
-/// Returns "" when the input doesn't look like RFC3339 — the caller then
-/// omits the tag rather than showing garbage.
-fn event_time_hm(ts: &str) -> String {
-    if ts.len() < 16 { return String::new(); }
-    let bytes = ts.as_bytes();
-    // Sanity-check separators so "garbage-long-enough-to-pass" doesn't sneak through.
-    if bytes[10] != b'T' && bytes[10] != b' ' { return String::new(); }
-    if bytes[13] != b':' { return String::new(); }
-    ts[11..16].to_string()
+/// Returns "" when the timestamp is absent / zero.
+///
+/// Post proxy v1.0.3-alpha (bugfix 20260424) `event_time` is int64
+/// millis instead of RFC3339. The output is rendered in the user's
+/// **local** timezone so the statusline tag matches wall-clock
+/// expectation ("just refreshed at 12:49" on a +08:00 machine should
+/// read 12:49, not 04:49 UTC). We use the OS/libc local-time
+/// conversion via `chrono` where available, but to keep the CLI's
+/// binary size honest we do a small manual local-offset tweak using
+/// `libc::timezone` / `tm_gmtoff` — no extra deps.
+///
+/// The offset probe runs once per call and is cheap (syscall-free on
+/// macOS/Linux after the initial tzset).
+fn event_time_hm(event_time_ms: i64) -> String {
+    if event_time_ms <= 0 {
+        return String::new();
+    }
+    let secs = event_time_ms / 1000;
+    // Resolve local offset via the standard `time_t → struct tm` path.
+    // `libc::localtime_r` populates `tm_gmtoff` which encodes the
+    // effective offset (DST-aware) for that specific instant.
+    let mut tm = unsafe { std::mem::zeroed::<libc::tm>() };
+    let t = secs as libc::time_t;
+    let rc = unsafe { libc::localtime_r(&t, &mut tm) };
+    if rc.is_null() {
+        return String::new();
+    }
+    // tm_hour / tm_min already in local time.
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
 /// Abbreviate model IDs so they fit comfortably in the receipt.
@@ -1299,7 +1319,8 @@ mod tests {
     fn ev(session_id: &str, model: &str, completion: &str, in_tok: i64, out_tok: i64) -> UsageEvent {
         UsageEvent {
             event_id: "e1".into(),
-            event_time: "2026-04-17T15:23:45Z".into(),
+            // 2026-04-17T15:23:45Z in Unix millis = 1776439425000
+            event_time: 1776439425000,
             session_id: if session_id.is_empty() { None } else { Some(session_id.into()) },
             key_label: Some("aikeyfounder@gmail.com".into()),
             completion: Some(completion.into()),
@@ -1413,28 +1434,42 @@ mod tests {
     }
 
     #[test]
-    fn event_time_hm_extracts_clock_segment() {
-        assert_eq!(event_time_hm("2026-04-18T12:49:25.009699+08:00"), "12:49");
-        assert_eq!(event_time_hm("2026-04-18T00:00:00Z"), "00:00");
-        assert_eq!(event_time_hm("2026-04-18 23:59:59"), "23:59");
-        assert_eq!(event_time_hm("2026-04-18T12:49"), "12:49");  // minimum length
-        // Malformed / too short → empty, caller omits the tag.
-        assert_eq!(event_time_hm(""), "");
-        assert_eq!(event_time_hm("not-a-time"), "");
-        assert_eq!(event_time_hm("2026-04-18X12:49:25Z"), "");  // bad separator
-        assert_eq!(event_time_hm("2026-04-18T12-49:25Z"), "");  // bad colon
+    fn event_time_hm_renders_local_clock_from_millis() {
+        // event_time_hm now takes int64 millis and renders in the process's
+        // local timezone (post bugfix 20260424). Exact "HH:MM" output depends
+        // on the machine's TZ, so we assert the shape and the zero/edge cases.
+        //
+        // 2026-04-17T15:23:45Z = 1776439425000ms.
+        let hm = event_time_hm(1776439425000);
+        assert_eq!(hm.len(), 5, "expected HH:MM, got {hm:?}");
+        assert_eq!(hm.as_bytes()[2], b':');
+        assert!(hm[..2].chars().all(|c| c.is_ascii_digit()));
+        assert!(hm[3..].chars().all(|c| c.is_ascii_digit()));
+
+        // Zero / negative → empty (caller omits the tag).
+        assert_eq!(event_time_hm(0), "");
+        assert_eq!(event_time_hm(-1), "");
     }
 
     #[test]
     fn render_line_appends_refresh_timestamp() {
         let rendered = strip_ansi(&render_line(&ev("s", "claude-sonnet-4-6", "complete", 10, 5)));
-        // The default ev() uses "2026-04-17T15:23:45Z" — clock is now a
-        // bare `HH:MM` at the tail (no parens; parens were dropped in the
-        // 2026-04-20 layout change so the clock reads as a clock, not a
-        // parenthetical aside). Seconds are still dropped at source.
-        assert!(rendered.ends_with("15:23"), "clock tail missing: {rendered}");
-        assert!(!rendered.contains("(15:23)"), "parens around clock were removed: {rendered}");
-        assert!(!rendered.contains("15:23:45"), "seconds should be dropped: {rendered}");
+        // The default ev() uses 1776439425000 millis (= 2026-04-17T15:23:45Z).
+        // Post v1.0.3-alpha, event_time_hm renders in the test machine's
+        // **local** timezone, so the exact HH:MM depends on TZ. We assert
+        // the shape (5 chars, HH:MM, trailing the line) + the invariants
+        // that parens are absent and seconds are dropped — the render
+        // contract this test was protecting.
+        // Extract last 5 chars safely (avoids slicing into multi-byte glyphs
+        // like the ❬⦿·⦿❭ brand earlier in the line).
+        let tail: String = rendered.chars().rev().take(5).collect::<Vec<char>>().into_iter().rev().collect();
+        assert_eq!(tail.len(), 5, "render too short: {rendered}");
+        let tb = tail.as_bytes();
+        assert_eq!(tb[2], b':', "clock tail shape HH:MM: {rendered}");
+        assert!(tb[0].is_ascii_digit() && tb[1].is_ascii_digit(), "clock HH digits: {rendered}");
+        assert!(tb[3].is_ascii_digit() && tb[4].is_ascii_digit(), "clock MM digits: {rendered}");
+        assert!(!rendered.contains("(:"), "no parens around clock");
+        assert!(!rendered.contains(":45"), "seconds should be dropped");
     }
 
     #[test]
@@ -1481,14 +1516,20 @@ mod tests {
         //   - A refactor that re-introduces parens around the clock must
         //     fail on `render_line_appends_refresh_timestamp`.
         let complete = strip_ansi(&render_line(&ev("s", "kimi-k2.5", "complete", 42, 9)));
-        // Clock is the tail: "15:23" (seconds-dropped default event_time).
-        assert!(
-            complete.ends_with("15:23"),
-            "clock must be the true tail: {complete}"
-        );
+        // Clock is the tail — shape HH:MM, exact value depends on the test
+        // machine's local timezone (event_time_hm now renders locally).
+        let tail: String = complete.chars().rev().take(5).collect::<Vec<char>>().into_iter().rev().collect();
+        assert!(tail.len() == 5, "render too short: {complete}");
+        let tb = tail.as_bytes();
+        assert_eq!(tb[2], b':', "clock must be the true tail (HH:MM): {complete}");
+        assert!(tb[0].is_ascii_digit() && tb[1].is_ascii_digit(), "HH digits: {complete}");
+        assert!(tb[3].is_ascii_digit() && tb[4].is_ascii_digit(), "MM digits: {complete}");
         // Brand appears before the clock and after the last `·` segment.
+        // Clock's exact HH:MM depends on local tz (renderer is now local),
+        // so we anchor on the "HH:MM\0" shape at the end instead of a fixed
+        // literal.
         let brand_idx = complete.find("❬⦿·⦿❭").expect("brand present");
-        let clock_idx = complete.rfind("15:23").unwrap();
+        let clock_idx = complete.len() - 5;
         assert!(
             brand_idx < clock_idx,
             "brand must precede clock: {complete}"
@@ -1504,10 +1545,10 @@ mod tests {
             partial.starts_with("⚠ partial"),
             "partial warning must be at the very front: {partial}"
         );
-        assert!(
-            partial.ends_with("15:23"),
-            "clock stays at tail even on partial row: {partial}"
-        );
+        // Tail is a HH:MM (local tz) — shape check only.
+        let partial_tail: String = partial.chars().rev().take(5).collect::<Vec<char>>().into_iter().rev().collect();
+        assert_eq!(partial_tail.len(), 5);
+        assert_eq!(partial_tail.as_bytes()[2], b':', "clock stays at tail even on partial row: {partial}");
         assert!(
             partial.contains("❬⦿·⦿❭"),
             "brand must still appear between warning and clock: {partial}"
