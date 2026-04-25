@@ -2468,8 +2468,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Whoami => {
             commands_account::handle_whoami(cli.json)?;
         }
-        Commands::Doctor => {
+        Commands::Doctor { detail } => {
             commands_project::handle_doctor(cli.json)?;
+            if *detail && !cli.json {
+                commands_project::handle_doctor_detail()?;
+            }
         }
         Commands::Proxy { action } => {
             match action {

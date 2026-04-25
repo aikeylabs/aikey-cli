@@ -257,7 +257,14 @@ pub(crate) enum Commands {
     },
     /// Check system health, connectivity, and configuration
     #[command(display_order = 8)]
-    Doctor,
+    Doctor {
+        /// Show extended diagnostics: recent failed events, schema drift
+        /// signals from trial-server log, and captured 4xx bodies (when
+        /// AIKEY_PROXY_DEBUG_4XX_BODIES was on). All sources are local
+        /// files / SQLite; no network calls beyond the existing checks.
+        #[arg(long)]
+        detail: bool,
+    },
     /// View or set proxy environment variables
     #[command(display_order = 8)]
     Env {
@@ -740,7 +747,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Web { .. } => "web".to_string(),
             Commands::Master { .. } => "master".to_string(),
             Commands::Import { .. } => "import".to_string(),
-            Commands::Doctor => "doctor".to_string(),
+            Commands::Doctor { .. } => "doctor".to_string(),
             Commands::Proxy { action } => format!("proxy.{}", match action {
                 ProxyAction::Start { .. } => "start",
                 ProxyAction::Stop => "stop",

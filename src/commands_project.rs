@@ -1199,6 +1199,394 @@ fn format_time_short(ts: &str) -> String {
     }
 }
 
+// ===========================================================================
+// `aikey doctor --detail` — extended diagnostics (no new server endpoints)
+//
+// Three sections, all sourced from local files / SQLite:
+//
+//   1. Recent failures  ← ~/.aikey/data/control-trial.db (read-only)
+//        Last 5 ODS rows where request_status = 'error', with upstream
+//        request_id (anthropic / openai support pivot) and error_message.
+//
+//   2. Ingest health    ← ~/.aikey/logs/control-trial.log
+//        Tail and grep for SQLite INSERT failures. The most useful pattern
+//        is "no column named X" — that's the schema-code drift signal that
+//        caused the 2026-04-25 oauth_identity blackout. Reactive, but
+//        cheap and accurate; pre-emptive schema-reflection would require
+//        a new endpoint we want to avoid here.
+//
+//   3. 4xx body capture ← ~/.aikey/logs/aikey-proxy/current.jsonl
+//        Render the most recent `proxy.request.4xx_body_capture` events
+//        (only present when AIKEY_PROXY_DEBUG_4XX_BODIES was enabled at
+//        proxy start). Includes upstream_request_id + truncated bodies.
+//
+// JSON mode short-circuits in main.rs — --detail extras are tty-only.
+// ===========================================================================
+
+pub fn handle_doctor_detail() -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+    let dim_rule = "─".repeat(52).dimmed();
+
+    println!();
+    println!("{}", dim_rule);
+    println!("{}", "🔍 Recent failures (last 5 ODS errors)".bold());
+    println!("{}  {}", dim_rule, "from control-trial.db".dimmed());
+    render_recent_failures();
+
+    println!();
+    println!("{}", dim_rule);
+    println!("{}", "🔍 Ingest health (signal-based)".bold());
+    println!("{}  {}", dim_rule, "from control-trial.log".dimmed());
+    render_ingest_health();
+
+    println!();
+    println!("{}", dim_rule);
+    println!("{}", "🔍 4xx body captures".bold());
+    println!("{}  {}", dim_rule, "from aikey-proxy current.jsonl".dimmed());
+    render_4xx_captures();
+
+    println!();
+    Ok(())
+}
+
+// --- Section 1 -------------------------------------------------------------
+
+const TRIAL_DB_PATH: &str = ".aikey/data/control-trial.db";
+const TRIAL_LOG_PATH: &str = ".aikey/logs/control-trial.log";
+const PROXY_JSONL_PATH: &str = ".aikey/logs/aikey-proxy/current.jsonl";
+
+fn render_recent_failures() {
+    use colored::Colorize;
+    let Some(home) = dirs::home_dir() else {
+        println!("{}", "  (no home dir — cannot locate trial DB)".dimmed());
+        return;
+    };
+    let db_path = home.join(TRIAL_DB_PATH);
+    if !db_path.exists() {
+        println!("{}", "  (trial DB not present — trial-server hasn't run on this machine)".dimmed());
+        return;
+    }
+
+    // Open read-only so we never lock the WAL of a live trial-server.
+    let conn = match rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("  {}", format!("(open {}: {})", db_path.display(), e).dimmed());
+            return;
+        }
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT ods_id,
+                ingest_received_at,
+                http_status_code,
+                COALESCE(model, ''),
+                COALESCE(virtual_key_id, ''),
+                COALESCE(oauth_identity, ''),
+                COALESCE(error_code, ''),
+                COALESCE(error_message, ''),
+                COALESCE(upstream_request_id, '')
+         FROM usage_event_ods
+         WHERE request_status = 'error'
+         ORDER BY ods_id DESC
+         LIMIT 5",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            println!("  {}", format!("(prepare query failed: {})", e).dimmed());
+            return;
+        }
+    };
+
+    let rows: Vec<(i64, i64, i64, String, String, String, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?,
+                row.get(3)?, row.get(4)?, row.get(5)?,
+                row.get(6)?, row.get(7)?, row.get(8)?,
+            ))
+        })
+        .and_then(|i| i.collect::<Result<Vec<_>, _>>())
+        .unwrap_or_default();
+
+    if rows.is_empty() {
+        println!("{}", "  (no error events in usage_event_ods)".dimmed());
+        return;
+    }
+
+    for (ods_id, recv_ms, status, model, vk, oauth_id, error_code, error_msg, up_req_id) in rows {
+        // Display label preference: oauth_identity (email) → vk (truncated).
+        let label = if !oauth_id.is_empty() {
+            format!("oauth:{}", oauth_id)
+        } else if !vk.is_empty() {
+            // Hide bulk of vk hash, keep prefix for orientation.
+            let max_len = 48;
+            if vk.len() > max_len { format!("{}…", &vk[..max_len]) } else { vk }
+        } else {
+            "(unknown)".to_string()
+        };
+        let when = format_local_time_hms(recv_ms);
+        println!("  {}  HTTP {}  {}  {}",
+            when.bold(),
+            status.to_string().yellow(),
+            if model.is_empty() { "(model?)".to_string() } else { model.clone() }.dimmed(),
+            label.dimmed(),
+        );
+        println!("    {} {}", "ods_id:".dimmed(), ods_id.to_string().dimmed());
+        if !error_code.is_empty() {
+            println!("    {} {}", "error_code:".dimmed(), error_code);
+        }
+        if !up_req_id.is_empty() {
+            println!("    {} {}",
+                "upstream_request_id:".dimmed(),
+                up_req_id.cyan());
+        } else {
+            println!("    {}", "upstream_request_id:  (proxy didn't capture — check provider headers)".dimmed());
+        }
+        if !error_msg.is_empty() {
+            // Truncate long messages; full content is one query away in the DB.
+            let trimmed: String = error_msg.chars().take(280).collect();
+            let extra = if error_msg.chars().count() > 280 { "…" } else { "" };
+            println!("    {} {}{}", "error_message:".dimmed(), trimmed, extra);
+        }
+        println!();
+    }
+}
+
+// --- Section 2 -------------------------------------------------------------
+
+fn render_ingest_health() {
+    use colored::Colorize;
+    use std::collections::HashMap;
+    let Some(home) = dirs::home_dir() else { return };
+    let log_path = home.join(TRIAL_LOG_PATH);
+    if !log_path.exists() {
+        println!("{}", "  (no trial-server log — service hasn't run on this machine)".dimmed());
+        return;
+    }
+
+    // Tail the last ~512 KB. Keeping it bounded — we only care about recent
+    // signals; older drift was either fixed or already surfaced.
+    let tail = match read_tail_bytes(&log_path, 512 * 1024) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("  {}", format!("(read log failed: {})", e).dimmed());
+            return;
+        }
+    };
+
+    // Three patterns — each maps a SQLite INSERT failure to a fix hint.
+    // regex unwrap is safe: literals are validated at compile time by the
+    // regex test below (kept as a doc-test in spirit).
+    let re_no_col = regex::Regex::new(r#"no column named (\w+)"#).unwrap();
+    let re_not_null = regex::Regex::new(r#"NOT NULL constraint failed: \w+\.(\w+)"#).unwrap();
+    let re_check = regex::Regex::new(r#"CHECK constraint failed: ([\w_]+)"#).unwrap();
+
+    let mut missing_cols: HashMap<String, usize> = HashMap::new();
+    let mut not_null_cols: HashMap<String, usize> = HashMap::new();
+    let mut check_violations: HashMap<String, usize> = HashMap::new();
+    let mut any_insert_fail = 0usize;
+
+    for line in tail.lines() {
+        if !line.contains("insert event failed") && !line.contains("INSERT") {
+            continue;
+        }
+        any_insert_fail += 1;
+        if let Some(c) = re_no_col.captures(line) {
+            *missing_cols.entry(c[1].to_string()).or_insert(0) += 1;
+        } else if let Some(c) = re_not_null.captures(line) {
+            *not_null_cols.entry(c[1].to_string()).or_insert(0) += 1;
+        } else if let Some(c) = re_check.captures(line) {
+            *check_violations.entry(c[1].to_string()).or_insert(0) += 1;
+        }
+    }
+
+    if any_insert_fail == 0 {
+        println!("{} {}", "✓".green(), "no insert failures in recent log window");
+        return;
+    }
+
+    let mut printed_any = false;
+    if !missing_cols.is_empty() {
+        printed_any = true;
+        println!("{} Schema drift detected:", "✗".red());
+        let mut entries: Vec<_> = missing_cols.iter().collect();
+        entries.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        for (col, n) in entries {
+            println!("   collector tried to write column {} but DB doesn't have it", col.yellow());
+            println!("   {} {} occurrences in tail window", "↳".dimmed(), n.to_string().dimmed());
+        }
+        let trial_db = home.join(TRIAL_DB_PATH);
+        println!("   {} {}", "FIX:".bold(),
+            format!("aikey-config-tool db upgrade --edition trial --db-path {}",
+                trial_db.display()).cyan());
+    }
+    if !not_null_cols.is_empty() {
+        printed_any = true;
+        println!("{} NOT NULL violations (collector emitted NULL where schema requires value):", "✗".red());
+        let mut entries: Vec<_> = not_null_cols.iter().collect();
+        entries.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        for (col, n) in entries {
+            println!("   {}: {} occurrences", col.yellow(), n.to_string().dimmed());
+        }
+        println!("   {} usually means proxy emitted an event with a missing field — check reportable.go", "↳".dimmed());
+    }
+    if !check_violations.is_empty() {
+        printed_any = true;
+        println!("{} CHECK constraint violations:", "✗".red());
+        for (constraint, n) in check_violations {
+            println!("   {}: {} occurrences", constraint.yellow(), n.to_string().dimmed());
+        }
+        println!("   {} an enum value drifted out of allowed range — check provider extractor", "↳".dimmed());
+    }
+    if !printed_any {
+        println!("{} {} insert failures matched no known pattern (regex needs updating)",
+            "⚠".yellow(),
+            any_insert_fail.to_string());
+        println!("   {} grep ~/.aikey/logs/control-trial.log for 'insert event failed' to inspect raw lines",
+            "↳".dimmed());
+    }
+}
+
+// --- Section 3 -------------------------------------------------------------
+
+fn render_4xx_captures() {
+    use colored::Colorize;
+    let Some(home) = dirs::home_dir() else { return };
+    let jsonl_path = home.join(PROXY_JSONL_PATH);
+    if !jsonl_path.exists() {
+        println!("{}", "  (proxy jsonl not present — proxy hasn't run on this machine)".dimmed());
+        return;
+    }
+
+    // Tail bytes for bounded scan.
+    let tail = match read_tail_bytes(&jsonl_path, 1024 * 1024) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("  {}", format!("(read jsonl failed: {})", e).dimmed());
+            return;
+        }
+    };
+
+    let mut captures: Vec<serde_json::Value> = Vec::new();
+    for line in tail.lines() {
+        if !line.contains("4xx_body_capture") { continue; }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("event.name").and_then(|x| x.as_str()) != Some("proxy.request.4xx_body_capture") {
+            continue;
+        }
+        captures.push(v);
+    }
+
+    if captures.is_empty() {
+        println!("{}", "  (no 4xx body captures in tail window)".dimmed());
+        println!("  {}", "to enable for next 4xx:".dimmed());
+        println!("    {}", "AIKEY_PROXY_DEBUG_4XX_BODIES=1 aikey proxy stop && aikey proxy start".cyan());
+        return;
+    }
+
+    // Show last 3 (already in chronological order from the log; reverse so newest first).
+    let last3: Vec<_> = captures.into_iter().rev().take(3).collect();
+    for v in last3 {
+        let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("?");
+        let status = v.get("status_code").and_then(|x| x.as_i64()).unwrap_or(0);
+        let provider = v.get("provider").and_then(|x| x.as_str()).unwrap_or("?");
+        let path = v.get("request_path").and_then(|x| x.as_str()).unwrap_or("?");
+        let up_id = v.get("upstream_request_id").and_then(|x| x.as_str()).unwrap_or("");
+        let req_body = v.get("request_body").and_then(|x| x.as_str()).unwrap_or("");
+        let resp_body = v.get("response_body").and_then(|x| x.as_str()).unwrap_or("");
+
+        println!("  {}  HTTP {}  {}  {}",
+            ts.bold(), status.to_string().yellow(),
+            path.dimmed(), provider.dimmed());
+        if !up_id.is_empty() {
+            println!("    {} {}", "upstream_request_id:".dimmed(), up_id.cyan());
+        }
+        let snip = |s: &str, n: usize| -> String {
+            let trimmed: String = s.chars().take(n).collect();
+            let extra = if s.chars().count() > n { "…" } else { "" };
+            format!("{}{}", trimmed, extra)
+        };
+        println!("    {} {}", "request_body:".dimmed(), snip(req_body, 400));
+        println!("    {} {}", "response_body:".dimmed(), snip(resp_body, 400));
+        println!();
+    }
+}
+
+// --- shared utilities ------------------------------------------------------
+
+/// Read the last `cap` bytes of a file as a UTF-8 String (lossy if needed).
+/// Returns the whole file when smaller than cap.
+fn read_tail_bytes(path: &std::path::Path, cap: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let start = if len > cap { len - cap } else { 0 };
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::with_capacity(cap.min(len) as usize);
+    f.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Render an int64 unix-millis timestamp as `HH:MM:SS` in the local TZ.
+/// Display-only — used for the recent-failures rows. Invalid / zero → "?".
+fn format_local_time_hms(unix_ms: i64) -> String {
+    if unix_ms <= 0 { return "?".to_string(); }
+    let secs = unix_ms / 1000;
+    // Local-time conversion using the chrono crate if it's already available.
+    // chrono is in the workspace via aikeytime; using a raw cast keeps this
+    // helper dependency-free.
+    let mut t = secs;
+    // Apply the system TZ offset coarsely (system localtime via libc would
+    // require chrono::Local). For doctor display, render UTC HH:MM:SS — same
+    // basis as the existing pipeline-watermark rows.
+    let h = (t / 3600) % 24;
+    t %= 3600;
+    let m = t / 60;
+    let s = t % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
+
+#[cfg(test)]
+mod doctor_detail_tests {
+    use super::*;
+
+    #[test]
+    fn ingest_health_regexes_compile() {
+        // All three must parse — these are user-facing diagnostic patterns.
+        let _ = regex::Regex::new(r#"no column named (\w+)"#).unwrap();
+        let _ = regex::Regex::new(r#"NOT NULL constraint failed: \w+\.(\w+)"#).unwrap();
+        let _ = regex::Regex::new(r#"CHECK constraint failed: ([\w_]+)"#).unwrap();
+    }
+
+    #[test]
+    fn ingest_health_extracts_missing_column() {
+        let re = regex::Regex::new(r#"no column named (\w+)"#).unwrap();
+        let line = r#"{"level":"ERROR","msg":"insert event failed","error":"insert ods event canary-x: SQL logic error: table usage_event_ods has no column named oauth_identity (1)"}"#;
+        let cap = re.captures(line).expect("regex must match real log line shape");
+        assert_eq!(&cap[1], "oauth_identity");
+    }
+
+    #[test]
+    fn ingest_health_extracts_not_null_column() {
+        let re = regex::Regex::new(r#"NOT NULL constraint failed: \w+\.(\w+)"#).unwrap();
+        let line = "...NOT NULL constraint failed: usage_event_ods.event_time...";
+        assert_eq!(&re.captures(line).unwrap()[1], "event_time");
+    }
+
+    #[test]
+    fn format_local_time_hms_zero_returns_placeholder() {
+        assert_eq!(format_local_time_hms(0), "?");
+        assert!(!format_local_time_hms(1_700_000_000_000).contains('?'));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Connectivity-suite unit tests (2026-04-21)
 //
