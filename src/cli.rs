@@ -209,13 +209,16 @@ pub(crate) enum Commands {
     /// Open the User Console in your default browser
     #[command(alias = "browse", display_order = 6)]
     Web {
-        /// Page to open: overview (default), keys, account, usage, import.
-        /// Also accepts aliases (virtual-keys, team-keys, profile,
+        /// Page to open: overview (default), keys, vault, account, usage, import.
+        /// Also accepts aliases (virtual-keys, team-keys, secrets, profile,
         /// usage-ledger, bulk-import, quick-import) — resolved by the web UI.
         page: Option<String>,
         /// Shortcut for `aikey web import` — opens the Import page directly.
         #[arg(long)]
         import: bool,
+        /// Shortcut for `aikey web vault` — opens the Personal Vault page directly.
+        #[arg(long)]
+        vault: bool,
         /// Override port for dev mode (e.g. --port 3000 for Vite dev server)
         #[arg(long)]
         port: Option<u16>,
@@ -879,7 +882,8 @@ Notes:
 
         "web" | "browse" => Some("\
 Notes:
-    - PAGE: overview | keys | account | usage
+    - PAGE: overview | keys | vault | account | usage | import | referrals
+    - --vault and --import are shortcut flags for opening those pages directly.
     - In local/trial mode, opens the local console directly.
     - In team mode, requires a valid account session.
     - If the control URL is local, AiKey may auto-detect common dev ports such as 3000 and 5173.
@@ -1183,15 +1187,20 @@ Detailed Commands
   Open the User Console in the default browser.
 
   Usage:
-    aikey web [--port <PORT>] [--import] [PAGE]
+    aikey web [--port <PORT>] [--vault] [--import] [PAGE]
 
   Aliases:
     aikey browse
 
   Arguments:
-    PAGE: overview | keys | account | usage | import | referrals
+    PAGE: overview | keys | vault | account | usage | import | referrals
+          (also: virtual-keys, team-keys, secrets, my-vault, profile,
+          usage-ledger, bulk-import, quick-import — resolved by the web UI)
 
   Flags:
+    --vault    Shortcut for `aikey web vault` — opens the Personal Vault
+               page directly so users can review / edit / route stored
+               credentials without remembering the page name.
     --import   Shortcut for `aikey web import` — jumps straight to the
                Import page so pasted credentials can be landed in one step.
 

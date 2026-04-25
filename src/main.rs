@@ -573,6 +573,28 @@ fn run_unified_list(
         println!("  {} {}",
             "●".green(),
             "= active (set by `aikey use`)".dimmed());
+
+        // Web console deeplink. URL is taken from the logged-in
+        // platform_account (control_url) and falls back to the trial-
+        // server default 127.0.0.1:8090 — same default the import
+        // flow assumes (see commands_import.rs:168). Path /user/vault
+        // opens this same table inside the web console for a richer
+        // view. OSC-8 terminal-hyperlink wrapping was tried 2026-04-25
+        // and dropped — the user's terminal didn't render it as
+        // clickable, plain text is the universally-supported form.
+        let vault_url = storage::get_platform_account()
+            .ok()
+            .flatten()
+            .map(|acc| acc.control_url.trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:8090".to_string());
+        let vault_url = format!("{}/user/vault", vault_url);
+        println!("  {} {}",
+            "↗".dimmed(),
+            format!("Open in browser: {}", vault_url).dimmed());
+        println!("  {} {}",
+            "↗".dimmed(),
+            "or run `aikey web --vault`".dimmed());
     }
 
     // Post-operation: warn if proxy is unreachable (e.g. after kill -9).
@@ -2405,11 +2427,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Web { page, import, port } => {
-            // `--import` is shorthand for positional `import`. When set it
-            // overrides any explicit positional page — most users will type
-            // one or the other, not both.
-            let effective_page: Option<&str> = if *import { Some("import") } else { page.as_deref() };
+        Commands::Web { page, import, vault, port } => {
+            // Shortcut flags override the positional page. `--vault` and
+            // `--import` are mutually informative — `--vault` wins when
+            // both are passed (alphabetical fallback, intentional choice;
+            // not worth surfacing a hard error for a typo combo).
+            let effective_page: Option<&str> = if *vault {
+                Some("vault")
+            } else if *import {
+                Some("import")
+            } else {
+                page.as_deref()
+            };
             commands_account::handle_browse(effective_page, *port, cli.json)?;
         }
         Commands::Master { page, url, port } => {

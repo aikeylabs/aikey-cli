@@ -713,12 +713,13 @@ fn web_page_alias(page: Option<&str>) -> Result<&'static str, String> {
         None                                                     => Ok("overview"),
         Some("overview")                                         => Ok("overview"),
         Some("keys" | "virtual-keys" | "team-keys")              => Ok("keys"),
+        Some("vault" | "secrets" | "my-vault")                   => Ok("vault"),
         Some("account" | "profile")                              => Ok("account"),
         Some("usage" | "usage-ledger")                           => Ok("usage"),
         Some("import" | "bulk-import" | "quick-import")          => Ok("import"),
         Some("referrals")                                        => Ok("referrals"),
         Some(other) => Err(format!(
-            "Unknown page '{}'. Available: overview, keys, account, usage, import, referrals",
+            "Unknown page '{}'. Available: overview, keys, vault, account, usage, import, referrals",
             other
         )),
     }
