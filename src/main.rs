@@ -188,16 +188,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_banner();
             eprintln!();
             eprintln!("  {}", "Get started:".bold());
-            eprintln!("    aikey quickstart      {}", "See what to do next (state-aware)".dimmed());
-            eprintln!("    aikey login           {}", "Connect to your team Control Panel".dimmed());
-            eprintln!("    aikey list            {}", "Show your keys (personal, team, OAuth)".dimmed());
-            eprintln!("    aikey route           {}", "Print proxy config for AI clients".dimmed());
+            eprintln!("    aikey quickstart                       {}", "See what to do next (state-aware)".dimmed());
+            eprintln!("    aikey add                              {}", "Add a personal API key to the local vault".dimmed());
+            eprintln!("    aikey auth login <claude|codex|kimi>   {}", "Sign in with an OAuth provider account".dimmed());
+            eprintln!("    aikey list                             {}", "Show your keys (personal, team, OAuth)".dimmed());
+            eprintln!("    aikey route                            {}", "Print proxy config for AI clients".dimmed());
+            eprintln!("    aikey web                              {}", "Open the User Console in the browser".dimmed());
             eprintln!();
             eprintln!("  {}", "Run 'aikey --help' for all commands.".dimmed());
             // Blink runs AFTER the full screen is painted so the user sees
             // banner + hints together instead of being held by the animation.
-            // 8 = blank + "Get started" + 4 commands + blank + hint.
-            cli::animate_banner_blink(8);
+            // 10 = blank + "Get started" + 6 commands + blank + hint.
+            cli::animate_banner_blink(10);
             std::process::exit(1);
         }
     }
@@ -3869,27 +3871,34 @@ fn resolve_activate_key(
 }
 
 /// Narrow to a single provider. Errors if multi-provider and no override given.
+///
+/// Returns the **canonical** provider code (e.g. `anthropic`, not `claude`).
+/// Why: downstream the result becomes `AIKEY_ACTIVE_KEYS=<provider>=<label>`,
+/// and the shell hook's preflight wrapper greps `^anthropic=` / `^openai=`
+/// hard-coded. A non-canonical raw OAuth value (`claude` / `codex`) would
+/// silently miss that lookup → preflight skipped with no output (bugfix
+/// 2026-04-25-activate-provider-canonicalization).
 fn resolve_single_provider(
     display: &str,
     providers: &[String],
     provider_override: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(ov) = provider_override {
-        let code = ov.to_lowercase();
-        if !providers.iter().any(|p| p.to_lowercase() == code) {
+        let code = provider_canonical(ov);
+        if !providers.iter().any(|p| provider_canonical(p) == code) {
             return Err(format!(
                 "Key '{}' does not support provider '{}'. Supported: {}.\n  Try: aikey activate {} --provider {}",
-                display, code, providers.join(", "), display, providers[0].to_lowercase()
+                display, code, providers.join(", "), display, provider_canonical(&providers[0])
             ).into());
         }
         return Ok(code);
     }
     if providers.len() == 1 {
-        return Ok(providers[0].to_lowercase());
+        return Ok(provider_canonical(&providers[0]));
     }
     Err(format!(
         "Key '{}' supports multiple providers: {}. Specify --provider <name>:\n  aikey activate {} --provider {}",
-        display, providers.join(", "), display, providers[0].to_lowercase()
+        display, providers.join(", "), display, provider_canonical(&providers[0])
     ).into())
 }
 

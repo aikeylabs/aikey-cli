@@ -162,6 +162,52 @@ fn multi_provider_error_includes_example_command() {
         "error should include full command example, got: {}", err);
 }
 
+// ── Canonicalization regression (bugfix 2026-04-25) ─────────────────────
+//
+// OAuth accounts persist `provider` as the broker vocabulary `claude`/`codex`,
+// but `AIKEY_ACTIVE_KEYS` and the shell hook's preflight wrapper key on the
+// canonical `anthropic`/`openai`. Without canonicalization here, `activate`
+// emits `AIKEY_ACTIVE_KEYS=claude=...` and the wrapper's `grep '^anthropic='`
+// silently misses → preflight skipped with no output (the user-visible bug).
+// These tests lock the canonical-output contract so the regression can't sneak
+// back in via "let's just use to_lowercase()" cleanups.
+
+#[test]
+fn single_provider_oauth_claude_canonicalized() {
+    let providers = vec!["claude".to_string()];
+    let result = resolve_single_provider("user@example.com", &providers, None);
+    assert_eq!(result.unwrap(), "anthropic",
+        "OAuth `claude` provider must canonicalize to `anthropic` so the \
+         shell hook's preflight wrapper finds it in AIKEY_ACTIVE_KEYS");
+}
+
+#[test]
+fn single_provider_oauth_codex_canonicalized() {
+    let providers = vec!["codex".to_string()];
+    let result = resolve_single_provider("user@example.com", &providers, None);
+    assert_eq!(result.unwrap(), "openai",
+        "OAuth `codex` provider must canonicalize to `openai`");
+}
+
+#[test]
+fn provider_override_canonicalizes_user_input() {
+    // User passes `--provider claude` against an OAuth account whose providers
+    // list contains `claude` — should succeed and return canonical `anthropic`.
+    let providers = vec!["claude".to_string()];
+    let result = resolve_single_provider("user@example.com", &providers, Some("claude"));
+    assert_eq!(result.unwrap(), "anthropic");
+}
+
+#[test]
+fn provider_override_accepts_canonical_against_oauth_alias() {
+    // User passes `--provider anthropic` against an OAuth account whose
+    // providers list still contains the raw `claude`. Membership check must
+    // canonicalize both sides so this matches.
+    let providers = vec!["claude".to_string()];
+    let result = resolve_single_provider("user@example.com", &providers, Some("anthropic"));
+    assert_eq!(result.unwrap(), "anthropic");
+}
+
 // ── provider_canonical / provider_proxy_path (L5 unified 2026-04-17) ─────
 //
 // These replace the old `canonical_provider` fn. provider_canonical returns the

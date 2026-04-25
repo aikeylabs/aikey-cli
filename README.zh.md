@@ -21,6 +21,22 @@ aikey use my-claude
 aikey run -- claude
 ```
 
+## Web UI（`aikey web`）
+
+在默认浏览器中打开本地 User Console（由 `aikey-local-server` 提供服务，安装脚本
+已自动启动）。Console 聚合了 vault 管理、OAuth 账号、Virtual Key、用量账本、
+批量导入等页面，全程 `localhost`，不调外网。
+
+```bash
+aikey web                  # 打开默认首页
+aikey web vault            # 跳转到 Personal Vault
+aikey web import           # 跳转到 Bulk Import
+aikey web --port 18090     # 强制指定本地端口
+aikey web --json           # 仅输出 URL JSON，不启动浏览器
+```
+
+前置条件与下面的"批量导入"相同（`aikey-local-server` 需在运行）。
+
 ## 批量导入（`aikey import`）
 
 一个本地 Web UI，把任意排版的凭证文本解析成草稿列表供你勾选入库。全程**离线**，

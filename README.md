@@ -141,6 +141,24 @@ Supported providers:
 
 OAuth and API Key are mutually exclusive per provider — `aikey auth use` replaces `aikey use` for the same provider, and vice versa.
 
+## Web UI (`aikey web`)
+
+Opens the local-only User Console in your default browser. The console is
+served by `aikey-local-server` (started by the installer) and aggregates the
+vault, OAuth accounts, virtual keys, usage ledger, and bulk-import pages —
+all over `localhost`, no cloud calls.
+
+```bash
+aikey web                  # open the default landing page
+aikey web vault            # → Personal Vault page
+aikey web import           # → Bulk Import page
+aikey web --port 18090     # force a specific local port
+aikey web --json           # print the URL as JSON, don't launch the browser
+```
+
+Prerequisites are the same as Bulk Import below (`aikey-local-server` must
+be running).
+
 ## Bulk Import
 
 Opens a local-only Web UI (`/user/import`) for bringing credentials in from
