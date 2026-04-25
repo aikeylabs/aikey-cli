@@ -1279,21 +1279,59 @@ fn render_recent_failures() {
         }
     };
 
-    let mut stmt = match conn.prepare(
-        "SELECT ods_id,
-                ingest_received_at,
-                http_status_code,
-                COALESCE(model, ''),
-                COALESCE(virtual_key_id, ''),
-                COALESCE(oauth_identity, ''),
-                COALESCE(error_code, ''),
-                COALESCE(error_message, ''),
-                COALESCE(upstream_request_id, '')
+    // Probe actual columns so the SELECT survives schema drift — the very
+    // condition this tool is here to surface. Without this guard the prepare
+    // step crashes when (e.g.) `oauth_identity` is missing, which is exactly
+    // when the user most needs the recent-failures view to be readable.
+    // Section 2 (ingest health) will still call out the drift; Section 1
+    // gracefully degrades by substituting '' for any absent optional column.
+    let cols: std::collections::HashSet<String> = match conn.prepare(
+        "SELECT name FROM pragma_table_info('usage_event_ods')",
+    ) {
+        Ok(mut stmt) => stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(|it| it.collect::<Result<std::collections::HashSet<_>, _>>())
+            .unwrap_or_default(),
+        Err(_) => {
+            println!("  {}", "(usage_event_ods table not found — trial-server never bootstrapped)".dimmed());
+            return;
+        }
+    };
+    if !cols.contains("ods_id") || !cols.contains("request_status") {
+        println!("  {}", "(usage_event_ods missing required columns — schema not initialized)".dimmed());
+        return;
+    }
+
+    // Build SELECT dynamically. Required columns are referenced as-is; each
+    // optional column is `COALESCE(<col>, '')` if the column exists, or just
+    // `''` if it doesn't. Order is stable so the row tuple reads the same
+    // positions regardless of which optionals were present.
+    let opt = |c: &str| -> String {
+        if cols.contains(c) { format!("COALESCE({}, '')", c) } else { "''".to_string() }
+    };
+    let absent: Vec<&str> = ["model", "virtual_key_id", "oauth_identity", "error_code", "error_message", "upstream_request_id"]
+        .iter().copied().filter(|c| !cols.contains(*c)).collect();
+    if !absent.is_empty() {
+        println!("  {}",
+            format!("(schema partial: {} absent — see Ingest health below for fix)", absent.join(", "))
+                .yellow());
+    }
+
+    let sql = format!(
+        "SELECT ods_id, ingest_received_at, http_status_code,
+                {model}, {vk}, {oauth}, {ec}, {em}, {urid}
          FROM usage_event_ods
          WHERE request_status = 'error'
          ORDER BY ods_id DESC
          LIMIT 5",
-    ) {
+        model = opt("model"),
+        vk    = opt("virtual_key_id"),
+        oauth = opt("oauth_identity"),
+        ec    = opt("error_code"),
+        em    = opt("error_message"),
+        urid  = opt("upstream_request_id"),
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(e) => {
             println!("  {}", format!("(prepare query failed: {})", e).dimmed());
