@@ -384,6 +384,16 @@ fn find_replacement_candidate(
     excluded_type: &str,
     excluded_ref: &str,
 ) -> Result<Option<(String, String)>, String> {
+    // Canonicalize the target on entry, then canonicalize each candidate's
+    // provider on comparison. Why both sides: bindings rows go through
+    // `write_bindings_canonical`, but personal entries / VK cache rows from
+    // earlier code paths or server payloads can still hold raw OAuth /
+    // broker vocabulary (`claude` / `codex` / `moonshot`). A naïve `==`
+    // would silently miss a perfectly valid replacement and the user
+    // would see "no candidate" despite having one — same family as the
+    // 2026-04-25 activate canonicalization bug.
+    let target = crate::commands_account::oauth_provider_to_canonical(provider_code);
+
     // Search personal keys, sorted by created_at (oldest first) for
     // deterministic "earliest added" backfill order.
     let mut entries = storage::list_entries_with_metadata()
@@ -394,7 +404,9 @@ fn find_replacement_candidate(
             continue;
         }
         let providers = resolve_providers_for_entry(entry);
-        if providers.iter().any(|p| p == provider_code) {
+        if providers.iter().any(|p|
+            crate::commands_account::oauth_provider_to_canonical(p) == target
+        ) {
             return Ok(Some(("personal".to_string(), entry.alias.clone())));
         }
     }
@@ -416,14 +428,16 @@ fn find_replacement_candidate(
             &vk.supported_providers
         } else if !vk.provider_code.is_empty() {
             // Borrow a temporary vec — just check inline.
-            if vk.provider_code == provider_code {
+            if crate::commands_account::oauth_provider_to_canonical(&vk.provider_code) == target {
                 return Ok(Some(("team".to_string(), vk.virtual_key_id.clone())));
             }
             continue;
         } else {
             continue;
         };
-        if providers.iter().any(|p| p == provider_code) {
+        if providers.iter().any(|p|
+            crate::commands_account::oauth_provider_to_canonical(p) == target
+        ) {
             return Ok(Some(("team".to_string(), vk.virtual_key_id.clone())));
         }
     }

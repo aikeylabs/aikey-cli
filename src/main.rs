@@ -3528,21 +3528,16 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
     }
     for b in &bindings {
         // Map OAuth provider names in bindings to canonical codes
-        // (older aikey auth use may have written "claude" instead of "anthropic")
-        let canonical = match b.provider_code.as_str() {
-            "claude" => "anthropic",
-            "codex" => "openai",
-            _ => b.provider_code.as_str(),
-        };
-        add_prov(canonical);
+        // (older aikey auth use may have written "claude" instead of "anthropic").
+        // Delegates to provider_canonical so a new alias added to provider_registry.yaml
+        // (e.g. grok→xai) lights up here without touching this file — the prior inline
+        // match was the kind of duplicated-canonicalization landmine flagged in
+        // CLAUDE.md "禁止偷懒默认 → 重复代码".
+        add_prov(&provider_canonical(&b.provider_code));
     }
     // Add OAuth account providers (mapped to canonical)
     for acct in &oauth_accounts {
-        match acct.provider.as_str() {
-            "claude" => add_prov("anthropic"),
-            "codex" => add_prov("openai"),
-            _ => add_prov(&acct.provider),
-        }
+        add_prov(&provider_canonical(&acct.provider));
     }
     all_providers.sort();
 
@@ -3591,14 +3586,11 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
             }
         }
 
-        // OAuth accounts — match by canonical provider (claude→anthropic, codex→openai)
+        // OAuth accounts — match by canonical provider (claude→anthropic, codex→openai).
+        // Same family as the bindings loop above: delegate to provider_canonical
+        // instead of duplicating the alias map inline.
         for acct in &oauth_accounts {
-            let canonical = match acct.provider.as_str() {
-                "claude" => "anthropic",
-                "codex" => "openai",
-                _ => acct.provider.as_str(),
-            };
-            if canonical == *prov {
+            if provider_canonical(&acct.provider) == *prov {
                 let identity = acct.display_identity.as_deref()
                     .filter(|s| !s.is_empty())
                     .or_else(|| acct.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
@@ -3630,15 +3622,14 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
             }
         }
 
-        // Match binding by canonical provider code (claude→anthropic, codex→openai)
-        let current_binding = bindings.iter().find(|b| {
-            let b_canonical = match b.provider_code.as_str() {
-                "claude" => "anthropic",
-                "codex" => "openai",
-                _ => b.provider_code.as_str(),
-            };
-            b_canonical == *prov || b.provider_code == *prov
-        });
+        // Match binding by canonical provider code (claude→anthropic, codex→openai).
+        // The `|| b.provider_code == *prov` tail keeps the legacy raw-equality path
+        // for any future bindings row that's already canonical: provider_canonical
+        // is idempotent, so the OR is belt-and-suspenders against an in-flight
+        // migration where canonicalization status varies row-to-row.
+        let current_binding = bindings.iter().find(|b|
+            provider_canonical(&b.provider_code) == *prov || b.provider_code == *prov
+        );
         let selected = current_binding.and_then(|b| {
             candidates.iter().position(|c|
                 c.source_type == b.key_source_type.as_str() && c.source_ref == b.key_source_ref
@@ -4146,6 +4137,17 @@ fn handle_activate(
 
     // Human-readable confirmation on stderr (not captured by wrapper).
     eprintln!("\x1b[90m  Activated: {} \u{2192} {} ({})\x1b[0m", label, provider, shell);
+
+    // Show how to undo. The `quit` shell-local function is defined above for
+    // zsh / bash / powershell (it eval's `aikey deactivate` in-place); cmd
+    // has no equivalent so we skip the hint there.
+    //
+    // Why hint at all: users hit `Ctrl-D` or close the terminal to exit,
+    // unaware there's a softer "stay in shell, drop the active key" path.
+    // Surfacing it once at activate time costs one dim line.
+    if shell != "cmd" {
+        eprintln!("\x1b[90m  Run \x1b[36m`quit`\x1b[0m\x1b[90m to deactivate this shell.\x1b[0m");
+    }
 
     // Auto-install Claude Code status line when activating an anthropic key.
     // Idempotent — if the user already has the statusLine wired up (or

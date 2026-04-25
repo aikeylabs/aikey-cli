@@ -255,6 +255,48 @@ fn removal_of_multi_provider_key_reconciles_each_provider() {
     assert!(matches!(anthropic_action.outcome, ReconcileOutcome::Cleared));
 }
 
+// Canonicalization regression (bugfix 2026-04-25, audit follow-up):
+// When a personal/team key's supported_providers list still carries the raw
+// OAuth vocabulary (`claude` / `codex` / `moonshot`) but the binding being
+// reconciled keys on the canonical (`anthropic` / `openai` / `kimi`),
+// find_replacement_candidate must canonicalize both sides before comparing —
+// otherwise a perfectly valid replacement is silently skipped.
+#[test]
+fn replacement_search_finds_personal_entry_with_raw_oauth_provider_code() {
+    let _dir = setup();
+
+    // Two keys: the primary (anthropic, canonical) and a backup whose
+    // supported_providers row still says raw "claude" (older add path
+    // before write_bindings_canonical). Both should be eligible.
+    storage::store_entry("primary", &[0u8; 12], &[1u8; 32]).unwrap();
+    storage::set_entry_supported_providers("primary", &["anthropic".into()]).unwrap();
+
+    storage::store_entry("legacy-claude", &[0u8; 12], &[1u8; 32]).unwrap();
+    storage::set_entry_supported_providers("legacy-claude", &["claude".into()]).unwrap();
+
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "primary")
+        .unwrap();
+
+    let actions = profile_activation::reconcile_provider_primary_after_key_removal(
+        "personal",
+        "primary",
+    )
+    .unwrap();
+
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].provider_code, "anthropic");
+    match &actions[0].outcome {
+        ReconcileOutcome::Replaced { new_source_type, new_source_ref } => {
+            assert_eq!(new_source_type, "personal");
+            assert_eq!(new_source_ref, "legacy-claude",
+                "raw `claude` provider on the candidate must be canonicalized to \
+                 `anthropic` for the match — otherwise the replacement is silently \
+                 missed (same family as the 2026-04-25 activate bug)");
+        }
+        other => panic!("Expected Replaced, got {:?}", other),
+    }
+}
+
 // ============================================================================
 // refresh_implicit_profile_activation
 // ============================================================================

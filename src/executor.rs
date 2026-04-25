@@ -1366,7 +1366,18 @@ pub fn run_from_vault(
         std::collections::HashMap::new();
 
     for (provider_name, key_alias) in &provider_alias {
-        let env_var = Provider::parse(provider_name).env_var();
+        // Canonicalize before env-var lookup. `provider_name` is the prefix of
+        // an `<provider>:alias` storage key. Most write paths route through
+        // `apply_add_core` (which canonicalizes), so the prefix is usually
+        // already `anthropic` / `openai`. But legacy entries / direct vault
+        // imports / migrations from older versions may still carry the raw
+        // OAuth vocabulary (`claude` / `codex` / `gemini`). Without this
+        // step `Provider::parse("claude")` falls into the `Custom` arm and
+        // emits `AIKEY_CLAUDE_API_KEY` instead of `ANTHROPIC_API_KEY`, so the
+        // SDK in the spawned process sees nothing. Same family as the
+        // 2026-04-25 activate canonicalization bug.
+        let canonical = crate::commands_account::oauth_provider_to_canonical(provider_name);
+        let env_var = Provider::parse(canonical).env_var();
         match storage::get_entry(key_alias) {
             Ok((nonce, ciphertext)) => {
                 match ctx.decrypt(&nonce, &ciphertext) {

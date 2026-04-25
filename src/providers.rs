@@ -79,6 +79,36 @@ mod tests {
         assert_eq!(p.env_var(), "AIKEY_MYSERVICE_API_KEY");
     }
 
+    // Canonicalization regression (bugfix 2026-04-25, audit follow-up):
+    // Provider::parse only handles canonical names — feeding it a raw OAuth
+    // alias (`claude` / `codex` / `gemini`) falls through to Custom() and
+    // emits a wrong env-var name (`AIKEY_CLAUDE_API_KEY` instead of
+    // `ANTHROPIC_API_KEY`). The contract is "callers MUST canonicalize
+    // first"; the executor and active.env writers do, but anyone touching
+    // this enum needs to know the failure mode. These tests document it.
+    #[test]
+    fn parse_oauth_alias_falls_into_custom_arm() {
+        // Documented (mis)behaviour: parse() doesn't know about OAuth aliases.
+        // Callers (executor.rs / active.env writers) MUST canonicalize first.
+        assert_eq!(Provider::parse("claude"), Provider::Custom("claude".into()));
+        assert_eq!(Provider::parse("codex"),  Provider::Custom("codex".into()));
+        assert_eq!(Provider::parse("gemini"), Provider::Custom("gemini".into()));
+    }
+
+    #[test]
+    fn parse_after_canonicalization_yields_correct_env_var() {
+        // The fix path: canonicalize → then parse → correct env var.
+        // Mirrors the executor.rs fix: anyone constructing a Provider from
+        // a raw value must route through `oauth_provider_to_canonical`.
+        use crate::commands_account::oauth_provider_to_canonical as canon;
+        assert_eq!(Provider::parse(canon("claude")).env_var(), "ANTHROPIC_API_KEY");
+        assert_eq!(Provider::parse(canon("codex")).env_var(),  "OPENAI_API_KEY");
+        assert_eq!(Provider::parse(canon("gemini")).env_var(), "GOOGLE_API_KEY");
+        // Idempotence: canonical input passes through unchanged.
+        assert_eq!(Provider::parse(canon("anthropic")).env_var(), "ANTHROPIC_API_KEY");
+        assert_eq!(Provider::parse(canon("openai")).env_var(),    "OPENAI_API_KEY");
+    }
+
     #[test]
     fn test_from_str_case_insensitive() {
         assert_eq!(Provider::parse("OpenAI"),    Provider::OpenAI);
