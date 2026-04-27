@@ -107,6 +107,26 @@ If you're building integrations or automation, see `docs/cli-platform-contract.m
 
 For security vulnerability reporting, see `SECURITY.md`.
 
+## Per-user configuration
+
+Beyond the vault, aikey installs split runtime config into a system layer
+(rendered by the installer) and a user layer (`aikey-user.yaml`). The user
+file holds trial secrets + admin email and lives in:
+
+- Linux / macOS: `~/.aikey/config/aikey-user.yaml`
+- Windows: `%LOCALAPPDATA%\Aikey\config\aikey-user.yaml`
+
+It is created on first trial install (`trial-install.sh`) or when running
+`local-install.sh --with-console`. CLI-only / personal installs do not
+write a user file.
+
+To adjust log verbosity without editing yaml:
+
+- `AIKEY_LOG_LEVEL=debug` for the trial server
+- `AIKEY_PROXY_LOG_LEVEL=debug` for the proxy
+
+Full design: `roadmap20260320/技术实现/开源版本方案/config-split-system-user.md`.
+
 ## Provider OAuth Accounts (`aikey auth`)
 
 Use subscription plans (Claude Pro/Max, ChatGPT Plus, Kimi Code) instead of API Keys.

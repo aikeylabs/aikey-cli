@@ -67,6 +67,22 @@ aikey web --json           # 仅输出 URL JSON，不启动浏览器
 进程内处理，不会发送到任何外网。vault 默认锁定，只有你点顶部 banner "Unlock"
 输入主密码之后才能执行 Import。
 
+## 用户配置文件
+
+vault 之外，aikey 把运行时配置拆成系统态（installer 渲染）+ 用户态（`aikey-user.yaml`）两层。user 文件存放 trial 秘密 + admin email：
+
+- Linux / macOS：`~/.aikey/config/aikey-user.yaml`
+- Windows：`%LOCALAPPDATA%\Aikey\config\aikey-user.yaml`
+
+仅首次 trial 安装（`trial-install.sh`）或 `local-install.sh --with-console` 时会创建。CLI / 纯 personal 安装不写 user 文件。
+
+调整日志级别（不需要改 yaml）：
+
+- `AIKEY_LOG_LEVEL=debug` —— trial server
+- `AIKEY_PROXY_LOG_LEVEL=debug` —— aikey-proxy
+
+完整设计：`roadmap20260320/技术实现/开源版本方案/config-split-system-user.md`
+
 ## Provider OAuth 账号 (`aikey auth`)
 
 使用订阅套餐（Claude Pro/Max、ChatGPT Plus、Kimi Code）替代 API Key，通过 OAuth 授权登录。
