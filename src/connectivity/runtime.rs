@@ -333,7 +333,16 @@ where
             state_changed = true;
         }
 
-        if state_changed {
+        // Skip the in-loop paint when the loop is about to exit (all_done).
+        // The unconditional final paint below will draw the same finalized
+        // state once. Why: when every phase finishes inside a single drain
+        // iteration (fast-failing rows like a key-rejected chat that returns
+        // 0ms), painting both here AND at the final-paint site fires two
+        // \x1b8 cursor restores back-to-back. If the row is wider than the
+        // terminal and soft-wraps, the second restore lands at a stale
+        // position on some terminals, visibly duplicating the row.
+        // Bugfix record: 2026-04-27 — qwen row duplicated in `aikey doctor`.
+        if state_changed && !all_done {
             paint(&rendered, current_col, frame_idx);
         }
 
