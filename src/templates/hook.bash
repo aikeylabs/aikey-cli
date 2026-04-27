@@ -123,14 +123,50 @@ _aikey_preflight() {
     esac
 }
 
+# Clear-before-handoff for terminals with broken alt-screen (2026-04-27).
+# See hook.zsh's matching helper for the full rationale and override
+# env vars (AIKEY_PREFLIGHT_NO_CLEAR / AIKEY_PREFLIGHT_FORCE_CLEAR).
+_aikey_clear_before_tui_handoff() {
+    [ "$AIKEY_PREFLIGHT_NO_CLEAR" = "1" ] && return 0
+    if [ "$AIKEY_PREFLIGHT_FORCE_CLEAR" = "1" ]; then
+        printf '\033[H\033[2J' >&2
+        return 0
+    fi
+    [ ! -t 2 ] && return 0
+    [ -n "$TMUX" ] && return 0
+    [ -n "$STY"  ] && return 0
+    case "$TERM" in
+        screen*|tmux*) return 0 ;;
+        dumb|unknown|"") printf '\033[H\033[2J' >&2; return 0 ;;
+    esac
+    if [ "$TERM_PROGRAM" = "Apple_Terminal" ]; then
+        local build="${TERM_PROGRAM_VERSION:-0}"
+        build=$(printf '%s' "$build" | tr -dc 0-9)
+        [ -z "$build" ] && build=0
+        if [ "$build" -lt 433 ]; then
+            printf '\033[H\033[2J' >&2
+        fi
+        return 0
+    fi
+    return 0
+}
+
 # Wrap claude + codex. Guarded: only install if the user doesn't already
 # have a function/alias by the same name. `type` checks functions, aliases,
 # builtins, and PATH — we only want to skip when the first three match (PATH
 # is the real binary we'll call via `command`). Shell grammar limitation:
 # there's no clean one-liner to split that, so use `declare -F` + alias.
 if ! declare -F claude >/dev/null 2>&1 && ! alias claude >/dev/null 2>&1; then
-    claude() { _aikey_preflight anthropic || return $?; command claude "$@"; }
+    claude() {
+        _aikey_preflight anthropic || return $?
+        _aikey_clear_before_tui_handoff
+        command claude "$@"
+    }
 fi
 if ! declare -F codex >/dev/null 2>&1 && ! alias codex >/dev/null 2>&1; then
-    codex() { _aikey_preflight openai || return $?; command codex "$@"; }
+    codex() {
+        _aikey_preflight openai || return $?
+        _aikey_clear_before_tui_handoff
+        command codex "$@"
+    }
 fi

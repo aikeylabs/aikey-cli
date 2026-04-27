@@ -49,6 +49,15 @@ pub fn tcp_ping(host: &str, port: u16, timeout_secs: u64) -> (bool, u128) {
 ///   - **Ping(PROXY) → API → Chat**: cascaded through aikey-proxy, each
 ///     short-circuits on failure. Protects against hammering upstream with
 ///     invalid auth when the route is down.
+///
+/// `Clone + Default` (added 2026-04-27): the per-column animation pipeline
+/// (`test_provider_connectivity_with_progress` → `animate_blinking_while`)
+/// builds this struct incrementally and ships a snapshot through an mpsc
+/// channel on every phase boundary, so the renderer can paint each column
+/// the instant its phase completes (instead of waiting for all 4 phases to
+/// finish). Channels move owned values, so a snapshot must be cloneable;
+/// the initial empty struct (before any phase finishes) needs Default.
+#[derive(Debug, Clone, Default)]
 pub struct ConnectivityResult {
     /// Ping(DIRECT): CLI measures upstream reachability from its own network
     /// context. Does not affect API/Chat — informational column only.
@@ -124,11 +133,265 @@ pub(crate) fn build_proxy_aware_agent(timeout: std::time::Duration) -> ureq::Age
     builder.build()
 }
 
+// ── Probe progress callbacks (2026-04-27) ────────────────────────────────
+//
+// Plan A from the "blinking eyes column animation" thread: every connectivity
+// test surface (`aikey test`, `aikey doctor`, `aikey add` post-add probe, the
+// claude/codex wrapper preflight that calls `aikey test <id>`, and the
+// proxy-row probe at the bottom of the suite table) runs through one of two
+// primitives:
+//
+//   1. test_provider_connectivity_with_progress  — 4-phase per-target probe
+//   2. test_proxy_connectivity                   — 1-shot probe (proxy row)
+//
+// Both are wrapped at the rendering call site by `animate_blinking_while`,
+// which hides the synchronous network blocking under a per-column blink. The
+// reusability invariant: NEW connectivity probes only need to emit Started /
+// Finished events — the animation primitive handles cursor management,
+// terminal detection, and frame timing identically across surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbePhase {
+    PingDirect,
+    PingProxy,
+    Api,
+    Chat,
+}
+
+impl ProbePhase {
+    /// Map a phase to its column index in the per-target row.
+    /// Centralised so the 4-column layout in `run_connectivity_suite` and
+    /// the animation helper agree on ordering without each site hard-coding it.
+    pub fn column_index(self) -> usize {
+        match self {
+            ProbePhase::PingDirect => 0,
+            ProbePhase::PingProxy => 1,
+            ProbePhase::Api => 2,
+            ProbePhase::Chat => 3,
+        }
+    }
+}
+
+/// Lifecycle event for a single probe phase.
+///
+/// `Finished` carries a borrowed snapshot of the cumulative
+/// `ConnectivityResult` so the rendering layer can format the just-completed
+/// column without waiting for the rest of the probe to run. The borrow is
+/// the probe function's local accumulator — callers that need to ferry it
+/// across threads (e.g. an mpsc channel) must `.clone()` it before sending.
+#[derive(Debug)]
+pub enum ProbeStage<'a> {
+    Started,
+    Finished(&'a ConnectivityResult),
+}
+
+/// 4-frame blinking-eyes animation matching the user-supplied storyboard
+/// (2026-04-27): a 1.5-second resting gaze followed by a quick double-blink
+/// (sharp / brief reopen / sharp). The asymmetric 130/180/130 ms cadence
+/// reads as alive rather than mechanical — short enough that probe-level
+/// jitter (typical Ping-D / Ping-PROXY ~500 ms) catches the user mid-frame
+/// instead of leaving them staring at a frozen open-eye glyph.
+const BLINK_FRAMES: &[(&str, u64)] = &[
+    ("\u{276C}\u{29BF}\u{B7}\u{29BF}\u{276D}", 1500), // ❬⦿·⦿❭
+    ("\u{276C}-\u{B7}-\u{276D}", 130),                // ❬-·-❭
+    ("\u{276C}\u{29BF}\u{B7}\u{29BF}\u{276D}", 180),  // ❬⦿·⦿❭
+    ("\u{276C}-\u{B7}-\u{276D}", 130),                // ❬-·-❭
+];
+
+/// Internal animation event — `Started(col)` moves the blink, `Finished(col, S)`
+/// freezes the just-completed column to its formatted result and the blink
+/// advances to the next column on the NEXT `Started` event. Generic over the
+/// snapshot type `S` so the same primitive serves the 4-phase provider probe
+/// (snapshot = `ConnectivityResult`) and the 1-phase proxy probe (snapshot =
+/// `ProxyProbeResult`).
+enum AnimEvent<S> {
+    Started,
+    Finished(S),
+}
+
+/// Run `work` on a background thread while animating a "blinking eyes" cell
+/// across the row's columns. As each phase finishes the helper invokes
+/// `cell_formatter(col, &snapshot)` to PIN that column to its real value;
+/// subsequent frames keep the finalized cells visible while the blink
+/// continues into the next un-finished column. The whole row stays
+/// painted at function exit — the caller only needs to print `eprintln!()`
+/// to advance to the next line.
+///
+/// Cursor protocol:
+///   Caller positions cursor at the first column's start before calling.
+///   `ESC 7` saves on entry; each redraw uses `ESC 8` (restore) + `ESC [K`
+///   (erase to end of line) + paint(rendered cells, blink in current col).
+///   The exit paint leaves rendered cells visible — caller prints `\n`.
+///
+/// Non-TTY fallback: when stderr is not a terminal (CI / piped output) we
+/// skip animation entirely (escape codes would pollute logs) AND skip the
+/// final paint — caller is expected to render the result row itself in
+/// that path. Helper just runs `work` synchronously and returns its value.
+///
+/// Reusability:
+///   * Multi-phase probe → caller maps phase enum to column index. Each
+///     `Finished(snapshot)` pins a single column. `S = ConnectivityResult`.
+///   * Single-phase probe → caller sends Started(0) + Finished(0, snap).
+///     `S = ProxyProbeResult`.
+///   * Future probes only declare column widths + a per-column formatter;
+///     the helper owns terminal manipulation, threading, frame timing.
+fn animate_blinking_while<S, F, FFmt, R>(
+    col_widths: &[usize],
+    cell_formatter: FFmt,
+    work: F,
+) -> R
+where
+    S: Send + 'static,
+    F: FnOnce(std::sync::mpsc::Sender<(usize, AnimEvent<S>)>) -> R + Send + 'static,
+    FFmt: Fn(usize, &S) -> String,
+    R: Send + 'static,
+{
+    use std::io::IsTerminal;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    // Non-TTY: pass a Sender that drops events silently. Caller's render
+    // path is responsible for printing the row when it doesn't get column-
+    // by-column callbacks back from us.
+    if !io::stderr().is_terminal() || col_widths.is_empty() {
+        let (tx, _rx) = mpsc::channel::<(usize, AnimEvent<S>)>();
+        return work(tx);
+    }
+
+    let (tx, rx) = mpsc::channel::<(usize, AnimEvent<S>)>();
+    let widths = col_widths.to_vec();
+    let total_cols = widths.len();
+    let handle = thread::spawn(move || work(tx));
+
+    eprint!("\x1b7"); // save cursor at columns area entry
+    let _ = io::stderr().flush();
+
+    // Per-column rendered text — set when a phase completes. Stays painted
+    // for every subsequent redraw so columns fill in left-to-right exactly
+    // when their phase finishes (rather than all-at-once at the end).
+    let mut rendered: Vec<Option<String>> = (0..total_cols).map(|_| None).collect();
+    let mut current_col: Option<usize> = None;
+    let mut frame_idx: usize = 0;
+    let mut frame_start = Instant::now();
+    let mut all_done = false;
+
+    let paint = |rendered: &Vec<Option<String>>,
+                 current_col: Option<usize>,
+                 frame_idx: usize| {
+        let (frame_text, _) = BLINK_FRAMES[frame_idx % BLINK_FRAMES.len()];
+        eprint!("\x1b8\x1b[K");
+        for (i, &w) in widths.iter().enumerate() {
+            if let Some(s) = &rendered[i] {
+                // Already finalized: keep the real result on screen.
+                eprint!("{} ", s);
+            } else if Some(i) == current_col {
+                // Active phase: draw the blink frame.
+                eprint!("{:<w$} ", frame_text, w = w);
+            } else {
+                // Pending phase: empty cell, padded to width.
+                eprint!("{:<w$} ", "", w = w);
+            }
+        }
+        let _ = io::stderr().flush();
+    };
+
+    while !all_done {
+        let mut state_changed = false;
+
+        // Drain any queued events. `Finished(col, snap)` finalises that
+        // column via the formatter; advancing the blink is implicit — it
+        // moves on the NEXT `Started` event.
+        loop {
+            match rx.try_recv() {
+                Ok((col, AnimEvent::Started)) => {
+                    current_col = Some(col);
+                    state_changed = true;
+                }
+                Ok((col, AnimEvent::Finished(snapshot))) => {
+                    if col < total_cols {
+                        rendered[col] = Some(cell_formatter(col, &snapshot));
+                    }
+                    if col + 1 >= total_cols {
+                        all_done = true;
+                        break;
+                    }
+                    state_changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    all_done = true;
+                    break;
+                }
+            }
+        }
+
+        // Advance frame on dwell timeout.
+        let (_, frame_dur) = BLINK_FRAMES[frame_idx % BLINK_FRAMES.len()];
+        if frame_start.elapsed() >= Duration::from_millis(frame_dur) {
+            frame_idx += 1;
+            frame_start = Instant::now();
+            state_changed = true;
+        }
+
+        if state_changed {
+            paint(&rendered, current_col, frame_idx);
+        }
+
+        if !all_done {
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // Drain stragglers — including the LAST `Finished` if the work fn
+    // pushed it after we set all_done.
+    while let Ok((col, ev)) = rx.try_recv() {
+        if let AnimEvent::Finished(snapshot) = ev {
+            if col < total_cols {
+                rendered[col] = Some(cell_formatter(col, &snapshot));
+            }
+        }
+    }
+
+    // Final paint — every finalised column shows its real value; any phase
+    // that didn't fire Finished (panic / disconnected work) is left empty.
+    // Cursor lands just after the last cell so caller can `eprintln!()`.
+    paint(&rendered, None, frame_idx);
+
+    match handle.join() {
+        Ok(r) => r,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Backward-compatible wrapper: the original synchronous probe with no
+/// progress callback, used by callers (tests, `aikey doctor` JSON path,
+/// any non-rendering caller) that don't need per-phase events.
 pub fn test_provider_connectivity(
     provider_code: &str,
     base_url: &str,
     api_key: &str,
 ) -> ConnectivityResult {
+    test_provider_connectivity_with_progress(provider_code, base_url, api_key, |_, _| {})
+}
+
+/// Same probe pipeline as `test_provider_connectivity` but emits a
+/// (`ProbePhase`, `ProbeStage`) event on every phase boundary — including
+/// instant Started→Finished pairs for phases that are SKIPPED by the early
+/// short-circuit logic (Ping-PROXY fail → no API/Chat; API fail → no Chat).
+/// Why: the per-column animation needs to "step through" all 4 columns
+/// even when a probe short-circuits, otherwise the blink would freeze on
+/// the column where the failure happened. Emitting trivial Started/Finished
+/// pairs for skipped phases lets the renderer immediately move on and
+/// land the cursor cleanly.
+pub fn test_provider_connectivity_with_progress<F>(
+    provider_code: &str,
+    base_url: &str,
+    api_key: &str,
+    mut on_phase: F,
+) -> ConnectivityResult
+where
+    F: FnMut(ProbePhase, ProbeStage),
+{
     use std::time::{Duration, Instant};
 
     // Defense-in-depth canonicalization.
@@ -165,9 +428,15 @@ pub fn test_provider_connectivity(
     };
     let (upstream_host, upstream_port) = parse_host_port(&ping_target_url);
 
+    // Cumulative result that grows as each phase completes. We pass `&result`
+    // back through the `Finished` callback so renderers can format the cell
+    // for the just-completed phase before the next phase even starts.
+    let mut result = ConnectivityResult::default();
+
     // ── Phase 1: Ping(DIRECT) — CLI → upstream. Independent. ─────────────
     // Never short-circuits the other phases. Surfaces as the "Ping(D)"
     // column and gives users a "my laptop's path to upstream" baseline.
+    on_phase(ProbePhase::PingDirect, ProbeStage::Started);
     let (ping_direct_ok, ping_direct_ms) = if has_proxy {
         // With a network proxy, TCP won't work — use HTTP HEAD through the
         // same proxy the CLI uses for real requests. Any response (incl.
@@ -176,23 +445,34 @@ pub fn test_provider_connectivity(
     } else {
         tcp_ping(&upstream_host, upstream_port, 5)
     };
+    result.ping_direct_ok = ping_direct_ok;
+    result.ping_direct_ms = ping_direct_ms;
+    on_phase(ProbePhase::PingDirect, ProbeStage::Finished(&result));
 
     // ── Phase 2: Ping(PROXY) — CLI → aikey-proxy → upstream. ─────────────
     // Uses the new POST /admin/probe/ping endpoint. aikey-proxy handles
     // its own HTTPS_PROXY / NO_PROXY semantics internally.
+    on_phase(ProbePhase::PingProxy, ProbeStage::Started);
     let (ping_ok, ping_ms) = probe_via_aikey_proxy_ping(provider_code, &ping_target_url);
+    result.ping_ok = ping_ok;
+    result.ping_ms = ping_ms;
+    on_phase(ProbePhase::PingProxy, ProbeStage::Finished(&result));
 
     // Short-circuit: if proxy can't reach upstream, skip API + Chat.
     // Critical: probing auth against a known-unreachable upstream wastes
     // the user's rate-limit budget (and inflates OAuth error counters
     // server-side, which can trigger refresh-loop anomalies).
+    //
+    // Why we still fire trivial Started/Finished for the skipped phases:
+    // the per-column animation walks col-by-col; without these events
+    // the blink would stay frozen on the failing column instead of
+    // landing on the line so caller can render the "—" placeholders.
     if !ping_ok {
-        return ConnectivityResult {
-            ping_direct_ok, ping_direct_ms,
-            ping_ok: false, ping_ms,
-            api_ok: false, api_ms: 0, api_status: None,
-            chat_ok: false, chat_ms: 0, chat_status: None,
-        };
+        on_phase(ProbePhase::Api, ProbeStage::Started);
+        on_phase(ProbePhase::Api, ProbeStage::Finished(&result));
+        on_phase(ProbePhase::Chat, ProbeStage::Started);
+        on_phase(ProbePhase::Chat, ProbeStage::Finished(&result));
+        return result;
     }
 
     let agent = build_proxy_aware_agent(Duration::from_secs(10));
@@ -214,6 +494,7 @@ pub fn test_provider_connectivity(
     };
     let (auth_key, auth_val) = probe_auth(provider_code, api_key);
 
+    on_phase(ProbePhase::Api, ProbeStage::Started);
     let api_start = Instant::now();
     let mut api_req = agent.get(&test_url);
     if provider_code != "google" {
@@ -230,14 +511,18 @@ pub fn test_provider_connectivity(
         Err(ureq::Error::Status(code, _)) => (true, Some(code)),
         Err(_) => (false, None),
     };
+    result.api_ok = api_ok;
+    result.api_ms = api_ms;
+    result.api_status = api_status;
+    on_phase(ProbePhase::Api, ProbeStage::Finished(&result));
 
     if !api_ok {
-        return ConnectivityResult {
-            ping_direct_ok, ping_direct_ms,
-            ping_ok, ping_ms,
-            api_ok, api_ms, api_status,
-            chat_ok: false, chat_ms: 0, chat_status: None,
-        };
+        // Same skip-phase bookkeeping as the Ping(PROXY) early return: emit
+        // a trivial Chat Started/Finished pair so the column animation can
+        // step out of the API column and land on the line cleanly.
+        on_phase(ProbePhase::Chat, ProbeStage::Started);
+        on_phase(ProbePhase::Chat, ProbeStage::Finished(&result));
+        return result;
     }
 
     // ── Phase 4: Chat probe ──────────────────────────────────────────────
@@ -304,6 +589,7 @@ pub fn test_provider_connectivity(
     if provider_code == "kimi" {
         req = req.set("User-Agent", "claude-code/1.0");
     }
+    on_phase(ProbePhase::Chat, ProbeStage::Started);
     let chat_result = req.send_string(&body.to_string());
     let chat_ms = chat_start.elapsed().as_millis();
 
@@ -325,13 +611,12 @@ pub fn test_provider_connectivity(
         }
         Err(_) => (false, None),
     };
+    result.chat_ok = chat_ok;
+    result.chat_ms = chat_ms;
+    result.chat_status = chat_status;
+    on_phase(ProbePhase::Chat, ProbeStage::Finished(&result));
 
-    ConnectivityResult {
-        ping_direct_ok, ping_direct_ms,
-        ping_ok, ping_ms,
-        api_ok, api_ms, api_status,
-        chat_ok, chat_ms, chat_status,
-    }
+    result
 }
 
 /// Parse an "https://host:port/…" or "host:port" string into (host, port).
@@ -410,6 +695,12 @@ fn probe_via_aikey_proxy_ping(provider_code: &str, upstream_url: &str) -> (bool,
 }
 
 /// Result of a proxy connectivity probe.
+///
+/// `Clone` (added 2026-04-27): proxy-row rendering pipes the result through
+/// `animate_blinking_while`'s mpsc channel for the per-column finalisation
+/// callback. Owned snapshots are required by the channel, so the work
+/// closure clones before sending.
+#[derive(Debug, Clone)]
 pub struct ProxyProbeResult {
     pub ok: bool,
     pub ms: u128,
@@ -690,8 +981,8 @@ pub fn run_connectivity_suite(
         .map(|t| t.display_label().len())
         .max()
         .unwrap_or(12)
-        .max("Provider".len()) + 2;
-    // 5 columns: Provider | Ping(D) | Ping | API | Chat
+        .max("Protocol".len()) + 2;
+    // 5 columns: Protocol | Ping(D) | Ping | API | Chat
     //   Ping(D) = CLI → upstream (independent baseline).
     //   Ping    = CLI → aikey-proxy → upstream (gates API+Chat).
     const W_PD:   usize = 14;   // "Ping(D)" column, short latency (+" (Xms)")
@@ -703,43 +994,131 @@ pub fn run_connectivity_suite(
         eprintln!("  \u{1F50C} {}", header.bold());
     }
     eprintln!("  {:<wp$} {:<wpd$} {:<wpi$} {:<wap$} {}",
-        "Provider".dimmed(), "Ping(D)".dimmed(), "Ping".dimmed(),
+        "Protocol".dimmed(), "Ping(D)".dimmed(), "Ping".dimmed(),
         "API".dimmed(), "Chat".dimmed(),
         wp = label_w, wpd = W_PD, wpi = W_PING, wap = W_API);
     eprintln!("  {}", "\u{2500}".repeat(label_w + W_PD + W_PING + W_API + 22).dimmed());
 
     let mut failed_hints: Vec<String> = Vec::new();
+    // Animation column widths must match the printed-result widths so each
+    // cell's blink frame occupies the exact slot the formatted result will
+    // pin. W_CHAT_ANIM keeps the blink frame compact while the chat result
+    // is allowed to bleed past — it's the last column.
+    const W_CHAT_ANIM: usize = 10;
     for t in &targets {
         let display = t.display_label();
         eprint!("  {:<wp$} ", display.bold(), wp = label_w);
         let _ = io::stderr().flush();
 
-        let r = test_provider_connectivity(&t.provider_code, &t.base_url, &t.bearer);
-
-        // Ping(DIRECT) column — informational, never gates.
-        let pd_raw = if r.ping_direct_ok { format!("ok ({}ms)", r.ping_direct_ms) }
-                     else { format!("fail ({}ms)", r.ping_direct_ms) };
-        let pd_col = if r.ping_direct_ok {
-            format!("{:<w$}", pd_raw, w = W_PD).green().to_string()
-        } else {
-            // Dimmed (not red) — Ping(D) failure on its own isn't a blocker,
-            // just a diagnostic ("your laptop can't reach upstream, but the
-            // proxy might").
-            format!("{:<w$}", pd_raw, w = W_PD).dimmed().to_string()
+        // Per-column formatter: invoked by `animate_blinking_while` the
+        // moment each phase finishes, so the just-completed cell takes its
+        // real value while the blink advances to the next column. Centralised
+        // here (instead of post-hoc after the probe returns) is what makes
+        // "results land left-to-right as phases complete" work.
+        let format_cell = |col: usize, r: &ConnectivityResult| -> String {
+            match col {
+                0 => {
+                    // Ping(DIRECT) — dimmed on fail (not a hard error: the
+                    // proxy may still reach upstream when the laptop can't).
+                    let raw = if r.ping_direct_ok { format!("ok ({}ms)", r.ping_direct_ms) }
+                              else { format!("fail ({}ms)", r.ping_direct_ms) };
+                    if r.ping_direct_ok {
+                        format!("{:<w$}", raw, w = W_PD).green().to_string()
+                    } else {
+                        format!("{:<w$}", raw, w = W_PD).dimmed().to_string()
+                    }
+                }
+                1 => {
+                    // Ping(PROXY) — red on fail (gates API + Chat).
+                    let raw = if r.ping_ok { format!("ok ({}ms)", r.ping_ms) }
+                              else { format!("fail ({}ms)", r.ping_ms) };
+                    if r.ping_ok {
+                        format!("{:<w$}", raw, w = W_PING).green().to_string()
+                    } else {
+                        format!("{:<w$}", raw, w = W_PING).red().to_string()
+                    }
+                }
+                2 => {
+                    // API — em-dash placeholder when ping short-circuited;
+                    // otherwise normal ok/fail with status hint.
+                    if !r.ping_ok {
+                        format!("{:<w$}", "\u{2014}", w = W_API).dimmed().to_string()
+                    } else {
+                        let raw = if r.api_ok {
+                            let h = r.api_status.map(|s| api_status_hint(s)).unwrap_or_default();
+                            format!("ok ({}ms, {})", r.api_ms, h)
+                        } else {
+                            format!("fail ({}ms)", r.api_ms)
+                        };
+                        if r.api_ok {
+                            format!("{:<w$}", raw, w = W_API).green().to_string()
+                        } else {
+                            format!("{:<w$}", raw, w = W_API).red().to_string()
+                        }
+                    }
+                }
+                3 => {
+                    // Chat — em-dash if ping or api failed; otherwise green
+                    // ok with chat hint or red fail with HTTP-status hint.
+                    if !r.ping_ok || !r.api_ok {
+                        "\u{2014}".dimmed().to_string()
+                    } else if r.chat_ok {
+                        let h = r.chat_status.map(|s| chat_status_hint(s)).unwrap_or_default();
+                        format!("ok ({}ms, {})", r.chat_ms, h).green().to_string()
+                    } else {
+                        let hint = r.chat_status
+                            .map(|s| format!(", HTTP {}: {}", s, chat_status_hint(s)))
+                            .unwrap_or_default();
+                        format!("fail ({}ms{})", r.chat_ms, hint).red().to_string()
+                    }
+                }
+                _ => String::new(),
+            }
         };
-        eprint!("{} ", pd_col);
-        let _ = io::stderr().flush();
 
-        // Ping(PROXY) column — gates API + Chat.
-        let ping_raw = if r.ping_ok { format!("ok ({}ms)", r.ping_ms) }
-                       else { format!("fail ({}ms)", r.ping_ms) };
-        let ping_col = if r.ping_ok { format!("{:<w$}", ping_raw, w = W_PING).green().to_string() }
-                       else { format!("{:<w$}", ping_raw, w = W_PING).red().to_string() };
-        eprint!("{} ", ping_col);
-        let _ = io::stderr().flush();
+        let provider_code = t.provider_code.clone();
+        let base_url = t.base_url.clone();
+        let bearer = t.bearer.clone();
+        let r = animate_blinking_while(
+            &[W_PD, W_PING, W_API, W_CHAT_ANIM],
+            format_cell,
+            move |tx| {
+                test_provider_connectivity_with_progress(
+                    &provider_code,
+                    &base_url,
+                    &bearer,
+                    |phase, stage| {
+                        let col = phase.column_index();
+                        match stage {
+                            ProbeStage::Started => {
+                                let _ = tx.send((col, AnimEvent::Started));
+                            }
+                            ProbeStage::Finished(snap) => {
+                                // Clone the borrowed snapshot so it can move
+                                // through the channel. ConnectivityResult is
+                                // small (5 bools / u128 / Option<u16>) — the
+                                // copy cost is negligible vs. the network I/O
+                                // each phase already paid for.
+                                let _ = tx.send((col, AnimEvent::Finished(snap.clone())));
+                            }
+                        }
+                    },
+                )
+            },
+        );
+
+        // Helper has painted the entire row. End the line so the next
+        // target (or the trailing hints / proxy row) starts cleanly.
+        eprintln!();
+
+        // Side-effects that drive aggregate state and the failed-hints list.
+        // These can't live in `format_cell` (which is called per-column on
+        // the rendering thread); they need the full result and the target's
+        // metadata (`display`, `t.kind`, etc.).
+        if r.ping_ok { any_reachable = true; }
+        if r.chat_ok { any_chat_ok = true; }
 
         if !r.ping_ok {
-            eprintln!("{:<w$} {}", "\u{2014}".dimmed(), "\u{2014}".dimmed(), w = W_API);
             // If Ping(DIRECT) passed while Ping(PROXY) failed, the proxy
             // itself (not the network) is the problem — actionable hint.
             let hint = if r.ping_direct_ok {
@@ -750,34 +1129,10 @@ pub fn run_connectivity_suite(
                 format!("{}: both paths failed — check network / VPN / firewall", display)
             };
             failed_hints.push(hint);
-            rows.push((t.clone(), r));
-            continue;
-        }
-        any_reachable = true;
-
-        // API column (short-circuited by test_provider_connectivity when !ping).
-        let api_raw = if r.api_ok {
-            let h = r.api_status.map(|s| api_status_hint(s)).unwrap_or_default();
-            format!("ok ({}ms, {})", r.api_ms, h)
-        } else {
-            format!("fail ({}ms)", r.api_ms)
-        };
-        let api_col = if r.api_ok { format!("{:<w$}", api_raw, w = W_API).green().to_string() }
-                      else { format!("{:<w$}", api_raw, w = W_API).red().to_string() };
-        eprint!("{} ", api_col);
-        let _ = io::stderr().flush();
-
-        // Chat column.
-        if !r.api_ok {
-            eprintln!("{}", "\u{2014}".dimmed());
-            failed_hints.push(format!("{}: API unreachable — check base URL or provider status", display));
-        } else if r.chat_ok {
-            any_chat_ok = true;
-            let h = r.chat_status.map(|s| chat_status_hint(s)).unwrap_or_default();
-            eprintln!("{}", format!("ok ({}ms, {})", r.chat_ms, h).green());
-        } else {
-            let hint = r.chat_status.map(|s| format!(", HTTP {}: {}", s, chat_status_hint(s))).unwrap_or_default();
-            eprintln!("{}", format!("fail ({}ms{})", r.chat_ms, hint).red());
+        } else if !r.api_ok {
+            failed_hints.push(format!(
+                "{}: API unreachable — check base URL or provider status", display));
+        } else if !r.chat_ok {
             // Actionable hint tailored to credential kind + status.
             let suggestion = match (r.chat_status, t.kind, t.provider_code.as_str()) {
                 (Some(404), CredentialKind::OAuth, "openai") =>
@@ -826,13 +1181,35 @@ pub fn run_connectivity_suite(
                 .map(|t| t.provider_code.as_str());
             if let Some(p) = prov {
                 eprint!("  {:<12} ", "proxy".bold());
-                let r = test_proxy_connectivity(&proxy_addr, p);
-                if r.ok {
-                    let h = r.status.map(|s| proxy_status_hint(s)).unwrap_or_default();
-                    eprintln!("{} ({} ms, {})", "ok".green(), r.ms, h);
-                } else {
-                    eprintln!("{} ({} ms)", "failed".red(), r.ms);
-                }
+                let _ = io::stderr().flush();
+                // Single-column animation reusing the same primitive. The
+                // proxy probe is one HTTP call (~200 ms) — wrapping it as a
+                // 1-phase event keeps every connectivity surface painted with
+                // the same blinking-eyes affordance instead of a frozen line.
+                // The cell formatter renders ok/fail with status hint inline,
+                // so the helper paints the result the moment the probe ends.
+                let proxy_addr_owned = proxy_addr.clone();
+                let prov_owned = p.to_string();
+                let format_proxy_cell = |_col: usize, r: &ProxyProbeResult| -> String {
+                    if r.ok {
+                        let h = r.status.map(|s| proxy_status_hint(s)).unwrap_or_default();
+                        format!("{} ({} ms, {})", "ok".green(), r.ms, h)
+                    } else {
+                        format!("{} ({} ms)", "failed".red(), r.ms)
+                    }
+                };
+                let r = animate_blinking_while(
+                    &[12],
+                    format_proxy_cell,
+                    move |tx| {
+                        let _ = tx.send((0, AnimEvent::Started));
+                        let r = test_proxy_connectivity(&proxy_addr_owned, &prov_owned);
+                        let _ = tx.send((0, AnimEvent::Finished(r.clone())));
+                        r
+                    },
+                );
+                // Helper has painted the cell. Just close the line.
+                eprintln!();
                 Some(r)
             } else {
                 eprintln!("  {:<12} {}", "proxy".bold(), "skipped — no testable provider".dimmed());

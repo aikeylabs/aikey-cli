@@ -1309,7 +1309,7 @@ Detailed Commands
   Notes:
     - Gateway section reuses `aikey proxy status` output.
     - Keys section shows personal count, team count (total/active), and active key.
-    - Providers section lists all providers discovered from personal and team keys.
+    - Protocols section lists all protocols discovered from personal and team keys.
     - Supports --json for structured output.
 
 [1mwhoami[0m

@@ -163,11 +163,69 @@ _aikey_preflight() {
     esac
 }
 
+# Clear-before-handoff for terminals with broken alt-screen (2026-04-27).
+#
+# Symptom: when preflight runs `aikey test`, several lines hit the main
+# screen. The wrapped command (claude / codex) then enters its own TUI
+# via `\x1b[?1049h`. On terminals that DON'T implement alt-screen as a
+# separate buffer (older macOS Terminal.app, some VTE forks) the
+# preflight output gets "snapshotted" into the alt-screen entry and
+# ghosts under the wrapped TUI's own rendering — users report seeing
+# multiple stacked window snapshots.
+#
+# Heuristic mirrors `terminal_supports_alt_screen` in
+# aikey-cli/src/commands_watch.rs. Modern emulators (iTerm.app,
+# WezTerm, Kitty, vscode, Hyper, GNOME Terminal, modern Terminal.app)
+# handle alt-screen properly → keep preflight output visible. Known-
+# broken terminals → clear before handoff so the wrapped TUI starts
+# on a blank canvas.
+#
+# Override knobs:
+#   AIKEY_PREFLIGHT_NO_CLEAR=1     → never clear
+#   AIKEY_PREFLIGHT_FORCE_CLEAR=1  → always clear (for false negatives)
+_aikey_clear_before_tui_handoff() {
+    [[ "$AIKEY_PREFLIGHT_NO_CLEAR" == "1" ]] && return 0
+    if [[ "$AIKEY_PREFLIGHT_FORCE_CLEAR" == "1" ]]; then
+        printf '\033[H\033[2J' >&2
+        return 0
+    fi
+    # Non-interactive (stderr not a TTY) — no human to confuse.
+    [[ ! -t 2 ]] && return 0
+    # Multiplexer pass-through: tmux / screen handle alt-screen safely.
+    [[ -n "$TMUX" ]] && return 0
+    [[ -n "$STY"  ]] && return 0
+    case "$TERM" in
+        screen*|tmux*) return 0 ;;
+        dumb|unknown|"") printf '\033[H\033[2J' >&2; return 0 ;;
+    esac
+    # Old macOS Terminal.app (build < 433) is the canonical broken case.
+    if [[ "$TERM_PROGRAM" == "Apple_Terminal" ]]; then
+        local build="${TERM_PROGRAM_VERSION:-0}"
+        # Strip any decoration (rare, but defensive: parse only digits).
+        build="${build//[^0-9]/}"
+        [[ -z "$build" ]] && build=0
+        if (( build < 433 )); then
+            printf '\033[H\033[2J' >&2
+        fi
+        return 0
+    fi
+    # Modern terminals: trust them, leave preflight output visible.
+    return 0
+}
+
 # Wrap claude + codex. Guarded so the user's own function/alias (if any)
 # wins — respects the same convention as the `ak` wrapper above.
 if ! (( ${+functions[claude]} )) && ! alias claude >/dev/null 2>&1; then
-    function claude { _aikey_preflight anthropic || return $?; command claude "$@"; }
+    function claude {
+        _aikey_preflight anthropic || return $?
+        _aikey_clear_before_tui_handoff
+        command claude "$@"
+    }
 fi
 if ! (( ${+functions[codex]} )) && ! alias codex >/dev/null 2>&1; then
-    function codex { _aikey_preflight openai || return $?; command codex "$@"; }
+    function codex {
+        _aikey_preflight openai || return $?
+        _aikey_clear_before_tui_handoff
+        command codex "$@"
+    }
 fi

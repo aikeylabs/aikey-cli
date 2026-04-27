@@ -38,9 +38,10 @@ const SESSION_GAP: Duration = Duration::from_secs(15 * 60);
 /// Entrypoint for `aikey watch`.
 ///
 /// Chooses between TUI and snapshot mode by looking at stdout's TTY state
-/// — piping the command or running it under `--json`-style automation
-/// falls back to a one-shot render.  Set `AIKEY_WATCH_NO_TUI=1` to force
-/// snapshot mode even in a real terminal (useful for debugging).
+/// AND the host terminal's alt-screen capability — see
+/// `terminal_supports_alt_screen` for the heuristic. Override knobs:
+///   * `AIKEY_WATCH_NO_TUI=1`     → force snapshot (debug / unattended runs)
+///   * `AIKEY_WATCH_FORCE_TUI=1`  → bypass the broken-terminal check
 pub fn run() -> io::Result<()> {
     let Some(wal_dir) = default_wal_dir() else {
         eprintln!("aikey watch: HOME unset, cannot resolve WAL directory");
@@ -53,8 +54,8 @@ pub fn run() -> io::Result<()> {
     }
 
     use std::io::IsTerminal;
-    let force_snapshot = std::env::var("AIKEY_WATCH_NO_TUI").ok().is_some()
-        || !std::io::stdout().is_terminal();
+    let force_snapshot = !std::io::stdout().is_terminal()
+        || !terminal_supports_alt_screen();
 
     if force_snapshot {
         let now = SystemTime::now();
@@ -64,6 +65,72 @@ pub fn run() -> io::Result<()> {
     }
 
     run_tui(&wal_dir)
+}
+
+/// Decide whether the host terminal can be trusted with crossterm's
+/// `EnterAlternateScreen` (i.e. the `\x1b[?1049h` sequence).
+///
+/// Why a heuristic rather than always-on:
+///   On terminals that don't actually implement a separate alt-screen
+///   buffer, `\x1b[?1049h` falls back to "scroll the main screen out of
+///   the viewport, render the TUI, then scroll back on exit". That works
+///   visually DURING the session but litters the user's scrollback with
+///   blank lines after exit (one full viewport-height per session). The
+///   user-visible bug surfaced 2026-04-27 on macOS Terminal.app — see the
+///   thread that originated this fix.
+///
+/// Detection layers (highest precedence first):
+///   1. Explicit env opt-out (`AIKEY_WATCH_NO_TUI=1`) — always wins.
+///   2. Explicit env opt-in (`AIKEY_WATCH_FORCE_TUI=1`) — bypasses (3-6).
+///   3. Hard-incapable: TERM is empty / dumb / unknown.
+///   4. Multiplexer present (`TMUX`, `STY`, TERM starts with "screen") —
+///      they implement alt-screen reliably regardless of the host terminal.
+///   5. Known-broken: macOS Terminal.app builds < 433 (the cutoff used
+///      by other TUIs that hit the same bug — 433 ships in macOS 12+).
+///   6. Default → trust the terminal. Modern iTerm.app, WezTerm, Kitty,
+///      vscode, Hyper, GNOME Terminal, Konsole all handle alt-screen
+///      properly. False negatives can opt back in via env (#2).
+fn terminal_supports_alt_screen() -> bool {
+    // 1. Hard opt-out.
+    if std::env::var("AIKEY_WATCH_NO_TUI").is_ok() {
+        return false;
+    }
+    // 2. Hard opt-in.
+    if std::env::var("AIKEY_WATCH_FORCE_TUI").is_ok() {
+        return true;
+    }
+
+    // 3. TERM-based incapacity check.
+    let term = std::env::var("TERM").unwrap_or_default();
+    if term.is_empty() || term == "dumb" || term == "unknown" {
+        return false;
+    }
+
+    // 4. Multiplexer pass-through. tmux / GNU screen wrap the host
+    //    terminal and reliably handle alt-screen on their own.
+    if std::env::var("TMUX").is_ok()
+        || std::env::var("STY").is_ok()
+        || term.starts_with("screen")
+        || term.starts_with("tmux")
+    {
+        return true;
+    }
+
+    // 5. Known-broken Apple Terminal.app builds.
+    //    TERM_PROGRAM_VERSION is a build number string like "433" / "447".
+    //    Build 433 corresponds to macOS Monterey (12.x); earlier builds
+    //    on Big Sur (11.x) and below have the alt-screen scrollback bug.
+    //    Best-effort: if version parse fails, treat as broken (safer).
+    if std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal") {
+        let build: u32 = std::env::var("TERM_PROGRAM_VERSION")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        return build >= 433;
+    }
+
+    // 6. Trust everything else.
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -538,7 +605,24 @@ fn render_snapshot(agg: &Aggregator, now: SystemTime) {
     }
 
     println!();
-    println!("  {}", "(snapshot mode — run in a terminal for interactive TUI)".dimmed());
+    // Two-tier hint: distinguish "auto-fallback because we detected a
+    // known-broken alt-screen terminal" from the older "you piped me /
+    // I'm not on a TTY" case. Lets users on a buggy emulator know an
+    // override exists, instead of accepting snapshot mode as the only
+    // option.
+    use std::io::IsTerminal;
+    let is_tty = std::io::stdout().is_terminal();
+    let hint = if !is_tty {
+        "(snapshot mode — run in a terminal for interactive TUI)".to_string()
+    } else if std::env::var("AIKEY_WATCH_NO_TUI").is_ok() {
+        "(snapshot mode — AIKEY_WATCH_NO_TUI=1 set; unset to enable TUI)".to_string()
+    } else {
+        // Reached only when terminal_supports_alt_screen() returned false
+        // for capability reasons (TERM=dumb / old Apple_Terminal / etc.).
+        "(snapshot mode — terminal doesn't support alt-screen reliably; \
+         set AIKEY_WATCH_FORCE_TUI=1 to override)".to_string()
+    };
+    println!("  {}", hint.dimmed());
 }
 
 /// Build one aligned row for the RECENT strip. Widths chosen to fit the
@@ -1177,7 +1261,7 @@ fn table_header_line(sort: SortKey) -> String {
 
     let key_h   = paint(format!("{:<w$}", "KEY",      w = COL_KEY),      false);
     let type_h  = paint(format!("{:<w$}", "TYPE",     w = COL_TYPE),     false);
-    let prov_h  = paint(format!("{:<w$}", "PROVIDER", w = COL_PROVIDER), false);
+    let prov_h  = paint(format!("{:<w$}", "PROTOCOL", w = COL_PROVIDER), false);
     let h1_h    = paint(format!("{:>w$}", h1_label,    w = COL_TOKENS),  h1_active);
     let today_h = paint(format!("{:>w$}", today_label, w = COL_TOKENS),  today_active);
     let sess_h  = paint(format!("{:<w$}", sess_label,  w = COL_SESSION), sess_active);

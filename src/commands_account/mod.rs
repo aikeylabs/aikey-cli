@@ -1189,10 +1189,10 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     }
     rows.push(String::new());
 
-    // ── Providers ───────────────────────────────────────────────────────────
-    rows.push(format!("\u{1F50C} {}", "Providers".bold()));
+    // ── Protocols ───────────────────────────────────────────────────────────
+    rows.push(format!("\u{1F50C} {}", "Protocols".bold()));
     if providers.is_empty() {
-        rows.push(format!("  {}", "no providers configured".dimmed()));
+        rows.push(format!("  {}", "no protocols configured".dimmed()));
         rows.push("  hint:    add a key with `aikey add <alias> --provider <code>`".to_string());
     } else {
         rows.push(format!("  {}",
@@ -2591,7 +2591,7 @@ pub fn handle_key_use(
             use colored::Colorize;
             println!("Key '{}' supports multiple providers:", display_name.bold());
             for (i, p) in providers.iter().enumerate() { println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p); }
-            print!("Select provider(s) to set as Primary (comma-separated): ");
+            print!("Select protocol(s) to set as Primary (comma-separated): ");
             io::stdout().flush()?;
             let mut input = String::new(); io::stdin().read_line(&mut input)?;
             let input = input.trim();
@@ -2613,10 +2613,10 @@ pub fn handle_key_use(
         use colored::Colorize;
         println!("Key '{}' supports multiple providers:", display_name.bold());
         for (i, p) in providers.iter().enumerate() { println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p); }
-        print!("Select provider(s) to set as Primary (comma-separated): ");
+        print!("Select protocol(s) to set as Primary (comma-separated): ");
         io::stdout().flush()?;
         let mut input = String::new(); io::stdin().read_line(&mut input)?;
-        if input.trim().is_empty() { return Err("No provider selected.".into()); }
+        if input.trim().is_empty() { return Err("No protocol selected.".into()); }
         let mut selected = Vec::new();
         for part in input.trim().split(',').map(|s| s.trim()) {
             if let Ok(n) = part.parse::<usize>() {

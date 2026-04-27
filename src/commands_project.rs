@@ -497,9 +497,9 @@ pub fn handle_provider_ls(json_mode: bool) -> Result<(), Box<dyn std::error::Err
         }).collect();
         json_output::print_json(serde_json::json!({ "ok": true, "providers": providers }));
     } else if config.providers.is_empty() {
-        println!("No providers configured.");
+        println!("No protocols configured.");
     } else {
-        println!("Providers:");
+        println!("Protocols:");
         let mut names: Vec<_> = config.providers.keys().collect();
         names.sort();
         for name in names {
@@ -744,8 +744,8 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         if bindings.is_empty() {
             if !json_mode {
                 println!("  {} {:<18} {}",
-                    "·".dimmed(), "providers",
-                    "no provider bindings — run 'aikey add' first".dimmed());
+                    "·".dimmed(), "protocols",
+                    "no protocol bindings — run 'aikey add' first".dimmed());
             }
         } else {
             // Plan D (2026-04-22): all probes (including personal) go via
@@ -759,8 +759,8 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             if targets.is_empty() && build_errors.is_empty() {
                 if !json_mode {
                     println!("  {} {:<18} {}",
-                        "\u{b7}".dimmed(), "providers",
-                        "no provider bindings configured".dimmed());
+                        "\u{b7}".dimmed(), "protocols",
+                        "no protocol bindings configured".dimmed());
                 }
             } else {
                 // Deferred: run after emit closure is dropped (borrow conflict).
@@ -1447,11 +1447,40 @@ fn render_ingest_health() {
         return;
     }
 
+    // Cross-check log signal against current DB schema to suppress historical
+    // false positives. Without this, every doctor run after the migration was
+    // applied still flashes "drift detected" red because the log file still
+    // contains pre-fix INSERT failures (log doesn't auto-rotate). The state
+    // question — "is this column actually missing right now?" — is what the
+    // operator cares about; the historical count is just supporting context.
+    let live_cols: std::collections::HashSet<String> = {
+        let trial_db = home.join(TRIAL_DB_PATH);
+        match rusqlite::Connection::open_with_flags(
+            &trial_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        ) {
+            Ok(conn) => conn
+                .prepare("SELECT name FROM pragma_table_info('usage_event_ods')")
+                .and_then(|mut s| {
+                    s.query_map([], |r| r.get::<_, String>(0))
+                        .and_then(|it| it.collect::<Result<std::collections::HashSet<_>, _>>())
+                })
+                .unwrap_or_default(),
+            // Open failed — fall back to "assume no columns known", treats
+            // every signal as live drift. Conservative, may over-warn but
+            // never silently misses a real problem.
+            Err(_) => std::collections::HashSet::new(),
+        }
+    };
+    let (missing_live, missing_historical): (Vec<_>, Vec<_>) = missing_cols
+        .iter()
+        .partition(|(col, _)| !live_cols.contains(*col));
+
     let mut printed_any = false;
-    if !missing_cols.is_empty() {
+    if !missing_live.is_empty() {
         printed_any = true;
         println!("{} Schema drift detected:", "✗".red());
-        let mut entries: Vec<_> = missing_cols.iter().collect();
+        let mut entries = missing_live.clone();
         entries.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
         for (col, n) in entries {
             println!("   collector tried to write column {} but DB doesn't have it", col.yellow());
@@ -1461,6 +1490,25 @@ fn render_ingest_health() {
         println!("   {} {}", "FIX:".bold(),
             format!("aikey-config-tool db upgrade --edition trial --db-path {}",
                 trial_db.display()).cyan());
+    }
+    // Historical-only drift: column absent in past log lines but present in
+    // current schema → migration already ran. Surface as info-level so the
+    // operator knows the tail still contains pre-fix noise, but doesn't
+    // mistake it for an active problem.
+    if !missing_historical.is_empty() {
+        printed_any = true;
+        let mut entries = missing_historical;
+        entries.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        let total: usize = entries.iter().map(|(_, n)| **n).sum();
+        let cols_str = entries.iter()
+            .map(|(c, n)| format!("{} ({}×)", c, n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{} {} historical insert failures (already fixed — column now present in DB):",
+            "ℹ".cyan(), total.to_string().dimmed());
+        println!("   {}", cols_str.dimmed());
+        println!("   {} log retains pre-fix entries; run a fresh canary or `aikey doctor --detail` later to confirm clean tail",
+            "↳".dimmed());
     }
     if !not_null_cols.is_empty() {
         printed_any = true;

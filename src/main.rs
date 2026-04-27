@@ -451,7 +451,7 @@ fn run_unified_list(
         }
 
         let all_data: Vec<&RowData> = personal_rows.iter().chain(team_rows.iter()).collect();
-        let headers = ["ALIAS", "PROVIDERS", "USING FOR", "STATUS", "CREATED"];
+        let headers = ["ALIAS", "PROTOCOLS", "USING FOR", "STATUS", "CREATED"];
         let pad = 2;
         let w_alias   = headers[0].len().max(all_data.iter().map(|r| r.alias.len()).max().unwrap_or(0)) + pad;
         let w_prov    = headers[1].len().max(all_data.iter().map(|r| r.providers.len()).max().unwrap_or(0)) + pad;
@@ -544,7 +544,7 @@ fn run_unified_list(
             // Dynamic column widths
             let pad = 2;
             let w_id   = "IDENTITY".len().max(oauth_rows.iter().map(|r| r.identity.len()).max().unwrap_or(0)) + pad;
-            let w_prov = "PROVIDER".len().max(oauth_rows.iter().map(|r| r.provider.len()).max().unwrap_or(0)) + pad;
+            let w_prov = "PROTOCOL".len().max(oauth_rows.iter().map(|r| r.provider.len()).max().unwrap_or(0)) + pad;
             let w_uf   = "USING FOR".len().max(oauth_rows.iter().map(|r| r.use_for.len()).max().unwrap_or(0)) + pad;
             let w_st   = "STATUS".len().max(oauth_rows.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
             let w_tier = "TIER".len().max(oauth_rows.iter().map(|r| r.tier.len()).max().unwrap_or(0)) + pad;
@@ -553,7 +553,7 @@ fn run_unified_list(
             rows.push(String::new());
             rows.push(format!("\u{1F517} OAuth Accounts \x1b[90m({})\x1b[0m", oauth_accounts.len()));
             rows.push(format!("\x1b[2m  {:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}\x1b[0m",
-                "IDENTITY", "PROVIDER", "USING FOR", "STATUS", "TIER", "EXPIRES",
+                "IDENTITY", "PROTOCOL", "USING FOR", "STATUS", "TIER", "EXPIRES",
                 wi = w_id, wp = w_prov, wu = w_uf, ws = w_st, wt = w_tier));
             rows.push("\u{2500}".repeat(sep_width));
             for r in &oauth_rows {
@@ -822,13 +822,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 } else if std::io::stdin().is_terminal() && !cli.json {
                     use colored::Colorize;
                     let mut items: Vec<String> = known_providers.iter().map(|(n, _)| n.to_string()).collect();
-                    items.push("Other provider types...".to_string());
+                    items.push("Other protocol types...".to_string());
                     let custom_idx = known_providers.len();
                     let mut selected: Vec<String>;
                     let mut checked_state: Vec<bool> = vec![false; items.len()];
 
                     loop {
-                        let selected_indices = match ui_select::box_multi_select("Select provider type(s)", &items, &checked_state)? {
+                        let selected_indices = match ui_select::box_multi_select("Select protocol type(s)", &items, &checked_state)? {
                             ui_select::MultiSelectResult::Confirmed(idx) => idx,
                             ui_select::MultiSelectResult::Cancelled => { eprintln!("  Cancelled."); return Ok(()); }
                         };
@@ -851,7 +851,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             } else if idx == custom_idx { wants_custom = true; }
                         }
                         if wants_custom {
-                            print!("  \u{25c6} Other provider type(s), comma-separated: ");
+                            print!("  \u{25c6} Other protocol type(s), comma-separated: ");
                             io::stdout().flush()?;
                             let mut custom = String::new();
                             io::stdin().read_line(&mut custom)?;
@@ -861,7 +861,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                         if !selected.is_empty() { break; }
                         use colored::Colorize;
-                        eprintln!("  {} At least one provider is required.\n", "\u{25c6}".yellow());
+                        eprintln!("  {} At least one protocol is required.\n", "\u{25c6}".yellow());
                     }
 
                     // Show default base URLs for selected providers so the user
@@ -881,7 +881,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let url_input = url_input.trim().to_string();
                     let base_url = if url_input.is_empty() { None } else { Some(url_input) };
 
-                    eprintln!("  \u{2502} Providers: {}", selected.join(", ").bold());
+                    eprintln!("  \u{2502} Protocols: {}", selected.join(", ").bold());
                     if let Some(ref u) = base_url { eprintln!("  \u{2502} Base URL:  {}", u.dimmed()); }
                     (selected, base_url)
                 } else {
@@ -2519,7 +2519,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("No events recorded yet.");
             } else {
                 println!("{:<6} {:<20} {:<10} {:<12} {:<5} {}",
-                    "ID", "TIMESTAMP", "TYPE", "PROVIDER", "EXIT", "COMMAND");
+                    "ID", "TIMESTAMP", "TYPE", "PROTOCOL", "EXIT", "COMMAND");
                 println!("{}", "-".repeat(72));
                 for e in &entries {
                     let ts = e.timestamp.to_string();
@@ -2889,7 +2889,7 @@ fn handle_route(
     eprintln!("    {:<2} {:>nw$} {:<pw$} {:<li$} {:<kw$} {}",
         "",
         "#".dimmed(),
-        "PROVIDER".dimmed(),
+        "PROTOCOL".dimmed(),
         "LABEL".dimmed(),
         "API_KEY".dimmed(),
         "BASE URL".dimmed(),

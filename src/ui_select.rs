@@ -343,7 +343,7 @@ pub fn box_multi_select(
 }
 
 fn fallback_multi_select(items: &[String]) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
-    eprintln!("Select provider types (comma-separated numbers):");
+    eprintln!("Select protocol types (comma-separated numbers):");
     for (i, item) in items.iter().enumerate() { eprintln!("  [{}] {}", i + 1, item); }
     eprint!("Choice: "); io::stderr().flush()?;
     let mut input = String::new(); io::stdin().read_line(&mut input)?;
@@ -524,7 +524,7 @@ fn fallback_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<ProviderTre
             eprintln!("    {} {} [{}]", if g.selected == Some(i) { "(*)" } else { "( )" }, c.label, c.source_type);
         }
     }
-    eprintln!("Enter 'provider=number' per line, blank to confirm, 'q' to cancel:");
+    eprintln!("Enter 'protocol=number' per line, blank to confirm, 'q' to cancel:");
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let line = line?; let line = line.trim();

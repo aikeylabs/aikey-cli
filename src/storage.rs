@@ -78,9 +78,15 @@ pub fn get_vault_path() -> Result<PathBuf, String> {
 
 /// Opens a connection to the vault database with security pragmas + idempotent migrations.
 /// Used by all write-path commands.
+///
+/// Routes through the unified migrations registry (D plan PR8): every
+/// open auto-applies baseline + every subsequent version. main.rs /
+/// executor.rs ALSO call upgrade_all() before dispatch — that's
+/// belt-and-braces; the second call is a complete no-op due to
+/// idempotency.
 pub(crate) fn open_connection() -> Result<Connection, String> {
     let conn = open_connection_raw()?;
-    apply_migrations(&conn)?;
+    crate::migrations::upgrade_all(&conn)?;
     Ok(conn)
 }
 
@@ -111,394 +117,29 @@ fn open_connection_raw() -> Result<Connection, String> {
     Ok(conn)
 }
 
-/// Returns true if the given column exists on the given table.
+// D plan PR8 cleanup: the previous apply_migrations / ensure_column /
+// migrate_active_key_config_to_default_profile / mark_migration helpers
+// were moved to migrations.rs::v1_0_1_baseline. open_connection() now
+// routes through migrations::upgrade_all so the registry is the single
+// source of truth for vault DDL.
+
+/// Returns true if the given column exists on the given table. Used by a
+/// few non-migration code paths below that need to gate behaviour on
+/// schema state (e.g. recording route_token assignments on vaults that
+/// may or may not have v1.0.4 columns yet during a transient pre-
+/// migration window). The migration paths use their own private
+/// has_column inside migrations.rs.
 fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
     conn.query_row(
-        &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name=?1", table),
-        [column], |row| row.get::<_, i64>(0),
-    ).map(|c| c > 0).unwrap_or(false)
-}
-
-/// Adds a column to a table if it does not already exist.
-fn ensure_column(conn: &Connection, table: &str, col: &str, ddl: &str) -> Result<(), String> {
-    if !has_column(conn, table, col) {
-        conn.execute(ddl, []).map_err(|e| format!("Failed to add {}.{}: {}", table, col, e))?;
-    }
-    Ok(())
-}
-
-fn apply_migrations(conn: &Connection) -> Result<(), String> {
-    // Core tables
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS config (
-            key TEXT PRIMARY KEY,
-            value BLOB NOT NULL
-        )",
-        [],
-    )
-    .map_err(|e| format!("Failed to ensure config table: {}", e))?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            alias TEXT NOT NULL UNIQUE,
-            nonce BLOB NOT NULL,
-            ciphertext BLOB NOT NULL,
-            version_tag INTEGER NOT NULL DEFAULT 1,
-            metadata TEXT,
-            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-        )",
-        [],
-    )
-    .map_err(|e| format!("Failed to ensure entries table: {}", e))?;
-
-    // Profiles and bindings
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            is_active INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL
-        )",
-        [],
-    )
-    .map_err(|e| format!("Failed to ensure profiles table: {}", e))?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS bindings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            profile_name TEXT NOT NULL,
-            domain TEXT NOT NULL DEFAULT 'default',
-            alias TEXT NOT NULL,
-            FOREIGN KEY (profile_name) REFERENCES profiles(name),
-            UNIQUE(profile_name, domain)
-        )",
-        [],
-    )
-    .map_err(|e| format!("Failed to ensure bindings table: {}", e))?;
-
-    // Ensure domain column exists for older databases BEFORE creating index
-    let has_domain: bool = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('bindings') WHERE name='domain'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|count| count > 0)
-        .unwrap_or(false);
-
-    if !has_domain {
-        conn.execute(
-            "ALTER TABLE bindings ADD COLUMN domain TEXT NOT NULL DEFAULT 'default'",
-            [],
-        )
-        .map_err(|e| format!("Failed to add domain column to bindings: {}", e))?;
-    }
-
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_bindings_profile_domain ON bindings(profile_name, domain)",
-        [],
-    )
-    .map_err(|e| format!("Failed to ensure bindings index: {}", e))?;
-
-    // Events table for usage tracking
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp INTEGER NOT NULL,
-            event_type TEXT NOT NULL,
-            provider TEXT,
-            alias TEXT,
-            command TEXT,
-            exit_code INTEGER,
-            duration_ms INTEGER,
-            secrets_count INTEGER,
-            error TEXT,
-            project TEXT,
-            env TEXT,
-            profile TEXT,
-            ok INTEGER NOT NULL DEFAULT 0,
-            error_type TEXT
-        )",
-        [],
-    )
-    .map_err(|e| format!("Failed to ensure events table: {}", e))?;
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)",
-        [],
-    )
-    .map_err(|e| format!("Failed to ensure events index: {}", e))?;
-
-    // ---- Platform account (global identity) ----
-    // Stores the JWT and account metadata from aikey-control-service login.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS platform_account (
-            id              INTEGER PRIMARY KEY CHECK (id = 1), -- singleton row
-            account_id      TEXT NOT NULL,
-            email           TEXT NOT NULL,
-            jwt_token       TEXT NOT NULL,   -- Bearer token; refresh by re-login
-            control_url     TEXT NOT NULL,   -- e.g. https://control.aikey.io
-            logged_in_at    INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-        )",
-        [],
-    )
-    .map_err(|e| format!("Failed to ensure platform_account table: {}", e))?;
-
-    // ---- Team-managed virtual key cache ----
-    // Local mirror of managed_virtual_keys from the control service.
-    // provider_key_nonce + provider_key_ciphertext hold the real provider key
-    // re-encrypted with the local vault AES key (same scheme as entries table).
-    //
-    // local_state drives CLI/proxy behaviour; server share_status is authoritative
-    // but may be slightly stale between syncs.
-    //
-    // cache_schema_version allows the proxy to reject incompatible cache rows
-    // and prompt the user to re-sync.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS managed_virtual_keys_cache (
-            virtual_key_id       TEXT PRIMARY KEY,
-            org_id               TEXT NOT NULL,
-            seat_id              TEXT NOT NULL,
-            alias                TEXT NOT NULL,
-            provider_code        TEXT NOT NULL,
-            protocol_type        TEXT NOT NULL DEFAULT 'openai_compatible',
-            base_url             TEXT NOT NULL,
-            credential_id        TEXT NOT NULL,
-            credential_revision  TEXT NOT NULL,
-            virtual_key_revision TEXT NOT NULL,
-            key_status           TEXT NOT NULL DEFAULT 'active',
-            share_status         TEXT NOT NULL DEFAULT 'pending_claim',
-            local_state          TEXT NOT NULL DEFAULT 'synced_inactive',
-            expires_at           INTEGER,
-            provider_key_nonce      BLOB,        -- NULL until delivered
-            provider_key_ciphertext BLOB,        -- NULL until delivered
-            cache_schema_version INTEGER NOT NULL DEFAULT 1,
-            synced_at            INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-        )",
-        [],
-    )
-    .map_err(|e| format!("Failed to ensure managed_virtual_keys_cache table: {}", e))?;
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_mvkc_local_state ON managed_virtual_keys_cache(local_state)",
-        [],
-    )
-    .map_err(|e| format!("Failed to ensure managed_virtual_keys_cache index: {}", e))?;
-
-    // Migration guards for managed_virtual_keys_cache new columns.
-    for (col, ddl) in &[
-        (
-            "local_alias",
-            // v0.6: user-set local display name; does not affect server alias
-            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN local_alias TEXT",
+        &format!(
+            "SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name=?1",
+            table
         ),
-        (
-            "supported_providers",
-            // v0.7: JSON array of provider codes this key supports (e.g. '["anthropic"]')
-            // Populated from delivery payload slots at accept/sync time; used by `aikey use`
-            // to know which env vars to write into ~/.aikey/active.env.
-            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN supported_providers TEXT",
-        ),
-        (
-            "provider_base_urls",
-            // v0.7: JSON object mapping provider_code → upstream base_url for each provider
-            // slot (e.g. {"anthropic":"https://api.anthropic.com"}). Allows path-prefix proxy
-            // routing to use the correct per-provider admin-configured upstream URL.
-            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN provider_base_urls TEXT",
-        ),
-        (
-            "owner_account_id",
-            // v0.8: account scope for multi-account support; NULL = pre-v0.8 row (treated as current account).
-            // Set to the logged-in account_id at key accept / sync time.
-            // Used to scope-disable keys from previous accounts on account switch.
-            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN owner_account_id TEXT",
-        ),
-    ] {
-        let has_col: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('managed_virtual_keys_cache') WHERE name=?1",
-                [col],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|c| c > 0)
-            .unwrap_or(false);
-        if !has_col {
-            conn.execute(ddl, [])
-                .map_err(|e| format!("Failed to add managed_virtual_keys_cache.{} column: {}", col, e))?;
-        }
-    }
-
-    // Migration guards for entries routing columns (v0.7+).
-    for (col, ddl, desc) in &[
-        (
-            "provider_code",
-            "ALTER TABLE entries ADD COLUMN provider_code TEXT",
-            // NULL = ordinary secret, not involved in provider routing.
-            // Set via --provider flag or interactive prompt on `aikey add`.
-            "entries.provider_code",
-        ),
-        (
-            "base_url",
-            "ALTER TABLE entries ADD COLUMN base_url TEXT",
-            // User-supplied upstream base URL (e.g. a third-party proxy).
-            // Overrides the provider's default when set.
-            "entries.base_url",
-        ),
-    ] {
-        let has_col: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name=?1",
-                [col],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|c| c > 0)
-            .unwrap_or(false);
-        if !has_col {
-            conn.execute(ddl, [])
-                .map_err(|e| format!("Failed to add {} column: {}", desc, e))?;
-        }
-    }
-
-    // v1.0.2: supported_providers JSON array column on entries.
-    ensure_column(conn, "entries", "supported_providers",
-        "ALTER TABLE entries ADD COLUMN supported_providers TEXT")?;
-
-    // v1.0.4: route_token for per-request API gateway routing.
-    // Each personal key gets a random aikey_vk_ token that third-party clients
-    // (Cursor, OpenCode, etc.) use as their API_KEY via the local proxy.
-    ensure_column(conn, "entries", "route_token",
-        "ALTER TABLE entries ADD COLUMN route_token TEXT")?;
-    // Unique index: route_token must be globally unique across all entries.
-    conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_route_token \
-         ON entries(route_token) WHERE route_token IS NOT NULL",
-        [],
-    ).map_err(|e| format!("Failed to create idx_entries_route_token: {}", e))?;
-
-    // v1.0.4: route_token for provider_accounts (OAuth accounts).
-    if has_column(conn, "provider_accounts", "provider_account_id") {
-        // Table exists (created by v1.0.3 migration) — add route_token column.
-        ensure_column(conn, "provider_accounts", "route_token",
-            "ALTER TABLE provider_accounts ADD COLUMN route_token TEXT")?;
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_accounts_route_token \
-             ON provider_accounts(route_token) WHERE route_token IS NOT NULL",
-            [],
-        ).map_err(|e| format!("Failed to create idx_provider_accounts_route_token: {}", e))?;
-    }
-
-    // v1.0.2: user_profiles + user_profile_provider_bindings.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS user_profiles (
-            id TEXT PRIMARY KEY, is_active INTEGER NOT NULL DEFAULT 1,
-            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-        )", [],
-    ).map_err(|e| format!("Failed to ensure user_profiles: {}", e))?;
-    conn.execute("INSERT OR IGNORE INTO user_profiles (id, is_active) VALUES ('default', 1)", [])
-        .map_err(|e| format!("Failed to seed default profile: {}", e))?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS user_profile_provider_bindings (
-            profile_id TEXT NOT NULL, provider_code TEXT NOT NULL,
-            key_source_type TEXT NOT NULL, key_source_ref TEXT NOT NULL,
-            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            PRIMARY KEY (profile_id, provider_code),
-            FOREIGN KEY (profile_id) REFERENCES user_profiles(id)
-        )", [],
-    ).map_err(|e| format!("Failed to ensure user_profile_provider_bindings: {}", e))?;
-
-    migrate_active_key_config_to_default_profile(conn)?;
-
-    // Migration guards for platform_account OAuth columns (v0.5+).
-    // jwt_token is repurposed as the OAuth access_token; refresh_token and
-    // token_expires_at are new columns that allow silent token renewal.
-    for (col, ddl) in &[
-        ("refresh_token",    "ALTER TABLE platform_account ADD COLUMN refresh_token TEXT"),
-        ("token_expires_at", "ALTER TABLE platform_account ADD COLUMN token_expires_at INTEGER"),
-    ] {
-        let has_col: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('platform_account') WHERE name=?1",
-                [col],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|c| c > 0)
-            .unwrap_or(false);
-        if !has_col {
-            conn.execute(ddl, [])
-                .map_err(|e| format!("Failed to add platform_account.{} column: {}", col, e))?;
-        }
-    }
-
-    // ---- User profile provider bindings (v1.0.2+) ----
-    // Per-provider key source assignments for a user profile.
-    // Replaces the old single-key active_key_config model.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS user_profile_provider_bindings (
-            profile_id      TEXT    NOT NULL,
-            provider_code   TEXT    NOT NULL,
-            key_source_type TEXT    NOT NULL,
-            key_source_ref  TEXT    NOT NULL,
-            updated_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
-            PRIMARY KEY (profile_id, provider_code)
-        )",
-        [],
+        [column],
+        |row| row.get::<_, i64>(0),
     )
-    .map_err(|e| format!("Failed to ensure user_profile_provider_bindings table: {}", e))?;
-
-    // Migration guards for new event columns on existing databases
-    for (col, ddl) in &[
-        ("project",    "ALTER TABLE events ADD COLUMN project TEXT"),
-        ("env",        "ALTER TABLE events ADD COLUMN env TEXT"),
-        ("profile",    "ALTER TABLE events ADD COLUMN profile TEXT"),
-        ("ok",         "ALTER TABLE events ADD COLUMN ok INTEGER NOT NULL DEFAULT 0"),
-        ("error_type", "ALTER TABLE events ADD COLUMN error_type TEXT"),
-    ] {
-        let has_col: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('events') WHERE name=?1",
-                [col],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|c| c > 0)
-            .unwrap_or(false);
-        if !has_col {
-            conn.execute(ddl, [])
-                .map_err(|e| format!("Failed to add events.{} column: {}", col, e))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// One-time migration: carry legacy active_key_config into provider bindings.
-fn migrate_active_key_config_to_default_profile(conn: &Connection) -> Result<(), String> {
-    const SENTINEL: &str = "v1_profile_migration_done";
-    let done: bool = conn.query_row("SELECT COUNT(*) FROM config WHERE key = ?1", params![SENTINEL], |r| r.get::<_, i64>(0)).map(|c| c > 0).unwrap_or(false);
-    if done { return Ok(()); }
-
-    let key_type: Option<String> = conn.query_row("SELECT CAST(value AS TEXT) FROM config WHERE key = 'active_key_type'", [], |r| r.get(0)).ok();
-    let key_type = match key_type.as_deref() {
-        None | Some("") => { mark_migration(conn, SENTINEL)?; return Ok(()); }
-        Some(t) => t.to_string(),
-    };
-    let key_ref: String = conn.query_row("SELECT CAST(value AS TEXT) FROM config WHERE key = 'active_key_ref'", [], |r| r.get(0)).unwrap_or_default();
-    let pjson: String = conn.query_row("SELECT CAST(value AS TEXT) FROM config WHERE key = 'active_key_providers'", [], |r| r.get(0)).unwrap_or_else(|_| "[]".into());
-    let providers: Vec<String> = serde_json::from_str(&pjson).unwrap_or_default();
-    if key_ref.is_empty() || providers.is_empty() { mark_migration(conn, SENTINEL)?; return Ok(()); }
-    for p in &providers {
-        conn.execute("INSERT OR IGNORE INTO user_profile_provider_bindings (profile_id, provider_code, key_source_type, key_source_ref) VALUES ('default', ?1, ?2, ?3)", params![p, key_type, key_ref])
-            .map_err(|e| format!("migrate binding {}: {}", p, e))?;
-    }
-    mark_migration(conn, SENTINEL)
-}
-
-fn mark_migration(conn: &Connection, sentinel: &str) -> Result<(), String> {
-    conn.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)", params![sentinel, b"1".to_vec()])
-        .map_err(|e| format!("write sentinel '{}': {}", sentinel, e))?;
-    Ok(())
+    .map(|c| c > 0)
+    .unwrap_or(false)
 }
 
 /// Resolves effective supported providers for a personal key.
