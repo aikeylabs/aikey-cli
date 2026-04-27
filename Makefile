@@ -13,10 +13,20 @@ BUILD_ID     ?= $(shell head -c 2 /dev/urandom 2>/dev/null | xxd -p 2>/dev/null 
 BUILD_TIME    = $(shell date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
                   || powershell -NoProfile -C "(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')" 2>/dev/null \
                   || echo "unknown")
+# AIKEY_BUILD_VERSION default = Cargo.toml's `version` (already parsed into
+# $(VERSION) at line 2). build.rs uses this env to override CARGO_PKG_VERSION
+# at compile time. Without this default, dev builds (make restart-trial1,
+# build-dev-tarballs.sh, plain `make install`) fall through to whatever's in
+# Cargo.toml — usually correct after this commit, but easy to drift again.
+# Wiring AIKEY_BUILD_VERSION through BUILD_ENV makes Cargo.toml the canonical
+# dev-time source; release.sh still wins by exporting AIKEY_BUILD_VERSION in
+# its own env before calling cargo, since `?=` defers to existing env value.
+# Bugfix record: workflow/CI/bugfix/2026-04-27-aikey-cli-version-banner-stale.md
+AIKEY_BUILD_VERSION ?= $(VERSION)
 # Why `=` (deferred) not `:=` (immediate): BUILD_ID uses ?= so it can be
 # overridden by the parent CI Makefile via env var. With :=, $(BUILD_ID) would
 # be evaluated at parse time before the env override takes effect.
-BUILD_ENV   = AIKEY_BUILD_REVISION=$(GIT_REVISION)$(GIT_DIRTY) AIKEY_BUILD_ID=$(BUILD_ID) AIKEY_BUILD_TIME=$(BUILD_TIME)
+BUILD_ENV   = AIKEY_BUILD_VERSION=$(AIKEY_BUILD_VERSION) AIKEY_BUILD_REVISION=$(GIT_REVISION)$(GIT_DIRTY) AIKEY_BUILD_ID=$(BUILD_ID) AIKEY_BUILD_TIME=$(BUILD_TIME)
 
 .PHONY: all release dev rebuild run test test-integration test-unit test-verbose \
         test-import-recall \
