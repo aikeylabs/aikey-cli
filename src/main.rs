@@ -741,6 +741,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
             println!("{}", commands_account::hook_template_hash(kind));
         }
+        Commands::Hook { action } => {
+            handle_hook_command(action)?;
+        }
         Commands::Add { alias, provider, providers } => {
             // Reject empty / whitespace-only alias before any interactive prompt.
             // Why: an empty alias writes a ghost entry that is hard to target with
@@ -3971,14 +3974,49 @@ fn handle_activate(
         Some(s) => s,
         None => {
             detected = detect_shell().ok_or_else(shell_detection_error)?;
-            // When user calls binary directly (no wrapper), remind them to eval.
-            // All hints go to stderr — stdout stays pure shell code so the output
-            // is eval-safe even for direct invocations (H1 fix).
-            eprintln!("\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m", detected);
-            eprintln!("\x1b[90m  eval $(aikey activate {} --shell {})\x1b[0m", alias, detected);
             detected
         }
     };
+
+    // Direct-invocation guard (2026-04-27): refuse to dump shell code +
+    // "Activated" message when stdout is a TTY (i.e., the user typed
+    // `aikey activate <alias>` instead of `eval $(aikey activate ...)`).
+    //
+    // Why this matters: previously the binary printed the eval-able
+    // shell snippet on stdout AND a dim-grey "Activated" line on stderr,
+    // even when nothing was consuming stdout. Users saw "Activated" and
+    // assumed env vars were set in their shell — but they weren't. The
+    // very next `claude` / `codex` then failed with "Not logged in" /
+    // "Missing OPENAI_API_KEY" with no obvious explanation. Real session
+    // captured 2026-04-25 showed the user re-running `aikey activate`
+    // twice in disbelief before giving up.
+    //
+    // New behavior on direct invocation:
+    //   - Show a prominent yellow warning + the exact eval command.
+    //   - Skip the shell-code dump (would never reach a wrapper anyway).
+    //   - Skip the "Activated" message (since nothing was activated).
+    //   - Return Ok(()) — exit non-zero would feel punitive; the user's
+    //     intent was clear and we've explained what to do.
+    //
+    // Pipe / eval / redirect path (stdout NOT a TTY) keeps the original
+    // behavior verbatim — shell code on stdout, hint + "Activated" on
+    // stderr. That's the supported invocation pattern.
+    if io::stdout().is_terminal() {
+        eprintln!();
+        eprintln!("\x1b[1;33m  \u{26a0} Activation needs `eval` to apply env vars to your current shell.\x1b[0m");
+        eprintln!();
+        eprintln!("  Run:");
+        eprintln!("    \x1b[1;36meval $(aikey activate {} --shell {})\x1b[0m", alias, shell);
+        eprintln!();
+        eprintln!("\x1b[90m  (A direct call only prints the eval-able shell snippet — it does NOT activate.)\x1b[0m");
+        return Ok(());
+    }
+
+    // From here on we know stdout is being captured (eval / pipe / redirect),
+    // so the original hint pattern is safe — stderr stays visible to the user
+    // while stdout contains only the eval target.
+    eprintln!("\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m", shell);
+    eprintln!("\x1b[90m  eval $(aikey activate {} --shell {})\x1b[0m", alias, shell);
 
     // M2: warn if alias collides across sources. Priority (team > OAuth > personal)
     // is preserved by resolve_activate_key, but silent selection can confuse users.
@@ -4021,6 +4059,13 @@ fn handle_activate(
             }
 
             println!("unset {}", provider_vars.join(" "));
+            // Stage 4 (active-state cross-shell sync): _AIKEY_EXPLICIT_ALIAS
+            // is the canonical "this shell is pinned by an explicit
+            // `aikey activate`" marker — precmd uses it to skip auto-sync
+            // from active.env. AIKEY_ACTIVE_LABEL is kept during a 1-2
+            // version grace window so older hooks (which still gate on
+            // LABEL) keep working unchanged. After grace, drop the LABEL.
+            println!("export _AIKEY_EXPLICIT_ALIAS={}", shell_escape(&label));
             println!("export AIKEY_ACTIVE_LABEL={}", shell_escape(&label));
             println!("export _AIKEY_PROMPT_LABEL={}", shell_escape(&prompt_label));
             // Why: preexec hook (preexec.zsh/preexec.bash) reads AIKEY_ACTIVE_KEYS
@@ -4090,6 +4135,8 @@ fn handle_activate(
             for var in &provider_vars {
                 println!("Remove-Item Env:\\{} -ErrorAction SilentlyContinue", var);
             }
+            // Stage 4: see zsh/bash branch comment.
+            println!("$env:_AIKEY_EXPLICIT_ALIAS = {}", powershell_escape(&label));
             println!("$env:AIKEY_ACTIVE_LABEL = {}", powershell_escape(&label));
             println!("$env:_AIKEY_PROMPT_LABEL = {}", powershell_escape(&label));
             println!(
@@ -4122,6 +4169,8 @@ fn handle_activate(
             for var in &provider_vars {
                 println!("set {}=", var);
             }
+            // Stage 4: see zsh/bash branch comment.
+            println!("set _AIKEY_EXPLICIT_ALIAS={}", safe_label);
             println!("set AIKEY_ACTIVE_LABEL={}", safe_label);
             println!("set _AIKEY_PROMPT_LABEL={}", safe_label);
             // provider is a lowercase ASCII identifier; safe_label is cmd-escaped.
@@ -4187,7 +4236,8 @@ fn handle_deactivate(
             } else {
                 ("PS1", "_AIKEY_ORIG_PS1")
             };
-            println!("unset AIKEY_ACTIVE_LABEL _AIKEY_PROMPT_LABEL");
+            // Stage 4: clear both new and grace-period legacy pin vars.
+            println!("unset _AIKEY_EXPLICIT_ALIAS AIKEY_ACTIVE_LABEL _AIKEY_PROMPT_LABEL");
             println!("unset {}", provider_vars.join(" "));
             println!(
                 "if [ -n \"${op}\" ]; then {pv}=\"${op}\"; unset {op}; fi",
@@ -4205,8 +4255,9 @@ fn handle_deactivate(
             }
         }
         "powershell" => {
+            // Stage 4: include _AIKEY_EXPLICIT_ALIAS alongside the legacy LABEL.
             let all_vars: Vec<&str> = provider_vars.iter().copied()
-                .chain(["AIKEY_ACTIVE_LABEL", "_AIKEY_PROMPT_LABEL"].iter().copied())
+                .chain(["_AIKEY_EXPLICIT_ALIAS", "AIKEY_ACTIVE_LABEL", "_AIKEY_PROMPT_LABEL"].iter().copied())
                 .collect();
             for var in &all_vars {
                 println!("Remove-Item Env:\\{} -ErrorAction SilentlyContinue", var);
@@ -4228,8 +4279,9 @@ fn handle_deactivate(
             }
         }
         "cmd" => {
+            // Stage 4: include _AIKEY_EXPLICIT_ALIAS alongside the legacy LABEL.
             let all_vars: Vec<&str> = provider_vars.iter().copied()
-                .chain(["AIKEY_ACTIVE_LABEL", "_AIKEY_PROMPT_LABEL"].iter().copied())
+                .chain(["_AIKEY_EXPLICIT_ALIAS", "AIKEY_ACTIVE_LABEL", "_AIKEY_PROMPT_LABEL"].iter().copied())
                 .collect();
             for var in &all_vars {
                 println!("set {}=", var);
@@ -4264,6 +4316,282 @@ fn handle_deactivate(
 
     eprintln!("\x1b[90m  Deactivated: restored global settings ({})\x1b[0m", shell);
     Ok(())
+}
+
+/// Stage 8 (active-state cross-shell sync, 2026-04-27): `aikey hook update`
+/// and `aikey hook status` — explicit user entry points to the hash-based
+/// drift detector that already lives in the precmd hook.
+///
+/// Update is a thin wrapper around `ensure_shell_hook(false)`: that function
+/// already (a) writes the hook file unconditionally and (b) injects the
+/// rc-file `source` line if it's not present. Adding a `force` parameter
+/// would be misleading — the existing code path is already what users want.
+///
+/// Status reads the three hashes (file / binary / loaded) and reports drift
+/// in human-readable form. Output goes to stdout (machine-greppable lines)
+/// so `aikey hook status | grep state:` works.
+fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        HookAction::Update => {
+            // Honor the standard skip env var so CI / installer scripts can
+            // disable hook writes globally without a per-command flag.
+            if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
+                eprintln!("\x1b[90m  Skipped: AIKEY_NO_HOOK=1 set in environment.\x1b[0m");
+                return Ok(());
+            }
+            // Stage 8 / reviewer round-3 fix: use the *pure* refresh path that
+            // only rewrites ~/.aikey/hook.{zsh,bash}. The earlier draft called
+            // `ensure_shell_hook(false)` which, on first install, prompts the
+            // user AND appends a `source` line to their rc — surprising for a
+            // low-risk recovery command. `refresh_hook_file_only` writes the
+            // hook file and returns; rc-file install is `aikey use`'s job.
+            match commands_account::refresh_hook_file_only(None) {
+                Ok(path) => {
+                    eprintln!("\x1b[90m  ✓ Regenerated {} from current binary.\x1b[0m", path.display());
+                    let basename = path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("hook.zsh");
+                    eprintln!("\x1b[90m    Open shells will pick it up via the drift detector on next prompt,\x1b[0m");
+                    eprintln!("\x1b[90m    or run: source ~/.aikey/{}\x1b[0m", basename);
+                    // Helpful follow-up: if rc isn't yet wired (typical of
+                    // recovery scenarios where the user blew away their
+                    // dotfiles), tell them how to install it without us
+                    // silently mutating files behind their back.
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let rc_has_source = ["/.zshrc", "/.bashrc", "/.bash_profile"].iter().any(|rc| {
+                        let rc_path = format!("{}{}", home, rc);
+                        std::fs::read_to_string(&rc_path)
+                            .map(|c| c.contains("# BEGIN aikey") || c.contains(&format!("source ~/.aikey/{}", basename)))
+                            .unwrap_or(false)
+                    });
+                    if !rc_has_source {
+                        eprintln!("\x1b[90m    Note: no rc-file `source` line detected. To install it,\x1b[0m");
+                        eprintln!("\x1b[90m    run \x1b[36m`aikey use <alias>`\x1b[0m\x1b[90m once — that handles rc setup with confirmation.\x1b[0m");
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+        HookAction::Status { shell } => {
+            let detected;
+            let shell_str: &str = match shell.as_deref() {
+                Some(s) => s,
+                None => {
+                    detected = detect_shell().ok_or_else(shell_detection_error)?;
+                    detected
+                }
+            };
+            let kind = match shell_str {
+                "zsh" => commands_account::HookKind::Zsh,
+                "bash" => commands_account::HookKind::Bash,
+                other => return Err(format!(
+                    "unsupported shell '{}' for hook status — expected zsh or bash", other
+                ).into()),
+            };
+            let hook_filename = if matches!(kind, commands_account::HookKind::Zsh) {
+                "hook.zsh"
+            } else {
+                "hook.bash"
+            };
+
+            let aikey_dir = commands_account::resolve_aikey_dir();
+            let hook_path = aikey_dir.join(hook_filename);
+
+            let file_hash = std::fs::read_to_string(&hook_path)
+                .ok()
+                .and_then(|c| {
+                    c.lines()
+                        .take(8)
+                        .find_map(|line| {
+                            line.strip_prefix("# Hook-Template-Hash: ")
+                                .map(|s| s.trim().to_string())
+                        })
+                });
+            let binary_hash = commands_account::hook_template_hash(kind);
+            let loaded_hash = std::env::var("_AIKEY_HOOK_LOADED_HASH").ok();
+
+            let state = compute_hook_status_state(
+                hook_path.exists(),
+                file_hash.as_deref(),
+                &binary_hash,
+                loaded_hash.as_deref(),
+            );
+
+            println!("hook file:   {}", hook_path.display());
+            println!("file hash:   {}", file_hash.as_deref().unwrap_or("<missing or unparseable>"));
+            println!("binary hash: {}", binary_hash);
+            println!("loaded hash: {}", loaded_hash.as_deref().unwrap_or("<not set in this process env>"));
+            println!("state:       {}", state);
+            Ok(())
+        }
+    }
+}
+
+/// Pure state-machine for `aikey hook status`. Extracted from
+/// `handle_hook_command` so it can be unit-tested without touching the
+/// filesystem or shell env.
+///
+/// Decision tree:
+///   - file missing                     → not installed
+///   - file_hash != binary_hash         → file outdated (user upgraded
+///                                        binary without re-running
+///                                        `aikey use` / `aikey hook update`)
+///   - file matches binary AND loaded   → shell stale (this shell sourced
+///     present AND loaded != binary       the old version before user
+///                                        regenerated; fix: re-source)
+///   - file matches binary AND no       → in-sync (loaded hash unknown —
+///     loaded hash visible                the hook was never sourced in
+///                                        this shell, or it's an old hook
+///                                        that didn't record the hash)
+///   - file matches binary AND loaded   → in-sync (canonical good state)
+///     == binary
+///
+/// Why loaded_hash is checked last: even if binary == file, a long-running
+/// shell from before a regenerate may still hold the old wrappers in memory.
+fn compute_hook_status_state(
+    file_exists: bool,
+    file_hash: Option<&str>,
+    binary_hash: &str,
+    loaded_hash: Option<&str>,
+) -> &'static str {
+    if !file_exists {
+        return "not installed (run: aikey hook update)";
+    }
+    if file_hash != Some(binary_hash) {
+        return "file outdated (run: aikey hook update)";
+    }
+    match loaded_hash {
+        Some(loaded) if loaded != binary_hash => {
+            "shell stale (run: source ~/.aikey/hook.<zsh|bash>)"
+        }
+        Some(_) => "in-sync",
+        None => "in-sync (loaded hash unknown — old hook or unsourced shell)",
+    }
+}
+
+#[cfg(test)]
+mod hook_command_tests {
+    use super::compute_hook_status_state;
+
+    // Reviewer round-3 fix: the earlier draft only had substring tests on
+    // the hook templates. The actual state machine for `aikey hook status`
+    // had no test coverage. These cases pin every branch of the decision
+    // tree so a refactor that breaks one (e.g. swapping the precedence of
+    // file-vs-binary check and loaded-vs-binary check) gets caught.
+
+    #[test]
+    fn state_not_installed_when_file_missing() {
+        let state = compute_hook_status_state(false, None, "abc", None);
+        assert!(state.starts_with("not installed"), "got: {}", state);
+    }
+
+    #[test]
+    fn state_not_installed_when_file_missing_even_if_loaded_present() {
+        // A shell with a sourced hook but the file later deleted should
+        // still report 'not installed' — the file's the source of truth.
+        let state = compute_hook_status_state(false, None, "abc", Some("abc"));
+        assert!(state.starts_with("not installed"), "got: {}", state);
+    }
+
+    #[test]
+    fn state_file_outdated_when_hash_mismatch() {
+        let state = compute_hook_status_state(true, Some("old"), "new", None);
+        assert!(state.starts_with("file outdated"), "got: {}", state);
+    }
+
+    #[test]
+    fn state_file_outdated_takes_precedence_over_shell_stale() {
+        // file=old binary=new loaded=old: file outdated wins (fix the
+        // file first, then the shell will reload).
+        let state = compute_hook_status_state(true, Some("old"), "new", Some("old"));
+        assert_eq!(state, "file outdated (run: aikey hook update)");
+    }
+
+    #[test]
+    fn state_file_outdated_when_header_missing_but_file_exists() {
+        // File exists but Hook-Template-Hash header was scrubbed → grep
+        // returns None → file_hash is None → mismatch with non-empty
+        // binary hash → file outdated.
+        let state = compute_hook_status_state(true, None, "abc", None);
+        assert!(state.starts_with("file outdated"), "got: {}", state);
+    }
+
+    #[test]
+    fn state_shell_stale_when_loaded_differs_from_binary() {
+        let state = compute_hook_status_state(true, Some("abc"), "abc", Some("old"));
+        assert!(state.starts_with("shell stale"), "got: {}", state);
+    }
+
+    #[test]
+    fn state_in_sync_when_all_three_match() {
+        let state = compute_hook_status_state(true, Some("abc"), "abc", Some("abc"));
+        assert_eq!(state, "in-sync");
+    }
+
+    #[test]
+    fn state_in_sync_loaded_unknown_when_no_env_var() {
+        // No _AIKEY_HOOK_LOADED_HASH in env: hook either was never
+        // sourced in this shell, or it's a pre-Stage-1 hook that didn't
+        // record the hash. We report soft state, not an error.
+        let state = compute_hook_status_state(true, Some("abc"), "abc", None);
+        assert!(
+            state.starts_with("in-sync") && state.contains("loaded hash unknown"),
+            "got: {}", state
+        );
+    }
+}
+
+#[cfg(test)]
+mod refresh_hook_file_only_tests {
+    use super::commands_account::refresh_hook_file_only;
+
+    // Reviewer round-3 fix: cover the new pure-refresh helper (Stage 8).
+    // Cases that don't need filesystem mocks:
+    //   - AIKEY_NO_HOOK=1 short-circuits with Err (no write)
+    //   - explicit shell parameter respected
+    //   - unknown shell parameter rejected
+    //
+    // We don't cover happy-path filesystem writes here because that's
+    // already covered by shell_integration::hook_tests::write_hook_file_*
+    // which writes to a tmp HOME and reads back the rendered content.
+
+    #[test]
+    fn refresh_short_circuits_when_aikey_no_hook_set() {
+        // Save+restore around the env var manipulation so we don't leak
+        // state into other tests in the same process.
+        let prev = std::env::var("AIKEY_NO_HOOK").ok();
+        // Safety: tests in this module run sequentially under cargo's
+        // default thread scheduling for tests touching process env. The
+        // explicit save/restore keeps it well-behaved if a future
+        // -j>1 reorganisation lands.
+        unsafe { std::env::set_var("AIKEY_NO_HOOK", "1"); }
+        let res = refresh_hook_file_only(Some("zsh"));
+        match prev {
+            Some(v) => unsafe { std::env::set_var("AIKEY_NO_HOOK", v) },
+            None => unsafe { std::env::remove_var("AIKEY_NO_HOOK") },
+        }
+        match res {
+            Err(msg) => assert!(msg.contains("AIKEY_NO_HOOK"), "got: {}", msg),
+            Ok(p) => panic!("expected Err when AIKEY_NO_HOOK=1, got Ok({})", p.display()),
+        }
+    }
+
+    #[test]
+    fn refresh_rejects_unknown_shell() {
+        // Don't want to depend on $SHELL or AIKEY_NO_HOOK state, so pass
+        // explicit shell. If AIKEY_NO_HOOK happens to be set in the test
+        // environment, that takes precedence and the test below would
+        // get "AIKEY_NO_HOOK" error — handle both for robustness.
+        let res = refresh_hook_file_only(Some("fish"));
+        match res {
+            Err(msg) => assert!(
+                msg.contains("unsupported shell") || msg.contains("AIKEY_NO_HOOK"),
+                "got: {}", msg
+            ),
+            Ok(p) => panic!("expected Err for shell=fish, got Ok({})", p.display()),
+        }
+    }
 }
 
 #[cfg(test)]

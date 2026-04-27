@@ -599,14 +599,30 @@ where
             (s >= 200 && s < 300, Some(s))
         }
         Err(ureq::Error::Status(code, _)) => {
-            // 429 = auth passed but rate limited → treat as connectivity OK.
-            // Why: Claude OAuth returns 429 as business rejection when persona
-            // headers are incomplete, but also for genuine rate limits. Either way,
-            // the key is valid and the provider is reachable.
+            // 429 = auth passed but rate limited → connectivity OK.
+            //   Claude OAuth returns 429 as business rejection when persona
+            //   headers are incomplete, but also for genuine rate limits.
+            //   Either way, the key is valid and the provider is reachable.
             //
-            // 404 for openai via proxy = Codex uses Responses API, not Chat Completions.
-            // The probe endpoint doesn't exist, but the provider is reachable (API probe passed).
-            let ok = code == 429;
+            // 404 = endpoint reachable, content-level rejection → also OK.
+            //   Reported in the wild 2026-04-25:
+            //     - Anthropic personal: probe model `claude-haiku-4-5-20251001`
+            //       isn't available on every account tier → 404 "Model not
+            //       found", but auth itself succeeded (otherwise we'd see 401).
+            //     - Kimi Coding API at `/coding/v1/chat/completions`: probe
+            //       model `moonshot-v1-8k` isn't a coding-tier model → 404,
+            //       same shape.
+            //     - OpenAI OAuth via Codex proxy: `/v1/chat/completions`
+            //       doesn't exist there (Codex uses Responses API) → 404,
+            //       same shape — actual usage works regardless.
+            //   In all three the request reached the upstream and the upstream
+            //   answered authoritatively; flagging this as red "fail" with
+            //   `chat HTTP 404 — unexpected` (the previous behavior) misled
+            //   users into thinking their key was broken when it wasn't.
+            //   Treating 404 as OK with a "reachable, model unavailable" hint
+            //   keeps the column green and points at the real fix (use a
+            //   different model name) without falsely signalling auth failure.
+            let ok = code == 429 || code == 404;
             (ok, Some(code))
         }
         Err(_) => (false, None),
@@ -861,7 +877,12 @@ pub fn chat_status_hint(status: u16) -> String {
         400 => "bad request".to_string(),
         401 => "invalid key".to_string(),
         403 => "forbidden".to_string(),
-        404 => "not found".to_string(),
+        // 404 paired with `chat_ok = true` per the match arm in
+        // `test_provider_connectivity_with_progress`: route + auth worked,
+        // upstream rejected the specific (model, endpoint) combination.
+        // Most often a probe-time model-name mismatch — the user's key is
+        // fine, real usage with their own model name will succeed.
+        404 => "reachable, model unavailable".to_string(),
         422 => "invalid request".to_string(),
         429 => "rate limited, key valid".to_string(),
         _ if status >= 500 => format!("server error ({})", status),

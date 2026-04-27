@@ -25,8 +25,34 @@ if ! (( ${+functions[ak]} )) && ! alias ak >/dev/null 2>&1; then
 fi
 
 _aikey_precmd() {
-    [ -n "$AIKEY_ACTIVE_LABEL" ] && return
-    [[ -f ~/.aikey/active.env ]] && source ~/.aikey/active.env
+    # Stage 4 cross-shell sync (2026-04-27):
+    #   - `_AIKEY_EXPLICIT_ALIAS` is set by `aikey activate <alias>` and
+    #     means "this shell is pinned, do NOT auto-sync from active.env".
+    #     `AIKEY_ACTIVE_LABEL` is the legacy name kept during a 1-2 version
+    #     grace window for older `aikey activate` outputs still in flight.
+    #   - `AIKEY_AUTO_REFRESH=off` is the user kill-switch.
+    #   - When neither pin nor kill-switch is set, do a cheap seq diff.
+    #     active.env now embeds `export AIKEY_ACTIVE_SEQ="N"` near the top;
+    #     if it matches the in-shell value, skip the source — that is the
+    #     hot path on every prompt and must stay <1ms.
+    #   - When the file is missing the SEQ line (older CLI wrote it) we
+    #     fall back to unconditional source for correctness.
+    [[ "$AIKEY_AUTO_REFRESH" == "off" ]] && { _aikey_hook_check_once; return; }
+    [[ -n "$_AIKEY_EXPLICIT_ALIAS" || -n "$AIKEY_ACTIVE_LABEL" ]] && { _aikey_hook_check_once; return; }
+    [[ -f ~/.aikey/active.env ]] || { _aikey_hook_check_once; return; }
+    local on_disk_seq
+    on_disk_seq=$(grep -m1 -oE 'AIKEY_ACTIVE_SEQ="[0-9]+"' ~/.aikey/active.env 2>/dev/null \
+                  | grep -oE '[0-9]+')
+    if [[ -n "$on_disk_seq" ]]; then
+        if [[ "$on_disk_seq" != "${AIKEY_ACTIVE_SEQ:-0}" ]]; then
+            source ~/.aikey/active.env
+            [[ -n "$AIKEY_REFRESH_NOTIFY" ]] && \
+                printf '\033[90m[aikey] active key refreshed (seq=%s)\033[0m\n' "$AIKEY_ACTIVE_SEQ" >&2
+        fi
+    else
+        # Fallback for active.env produced by pre-Stage-1 CLI (no SEQ line).
+        source ~/.aikey/active.env
+    fi
     _aikey_hook_check_once
 }
 

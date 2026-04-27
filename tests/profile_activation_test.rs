@@ -348,3 +348,158 @@ fn refresh_writes_empty_env_when_no_bindings() {
     assert!(contents.contains("auto-generated"));
     assert!(!contents.contains("API_KEY"));
 }
+
+// ============================================================================
+// Stage 1+2 contract: AIKEY_ACTIVE_SEQ + active.env.flat (reviewer round-7)
+// ============================================================================
+//
+// Cross-shell sync depends on three contracts. The original "writes
+// API_KEY / BASE_URL" tests above don't pin them, so a future refactor
+// could quietly drop:
+//   1. AIKEY_ACTIVE_SEQ near the top of active.env (precmd's grep target)
+//   2. seq monotonically advancing across refresh calls (atomic write
+//      guarantee from the design doc's "seq 契约")
+//   3. active.env.flat sibling file with PowerShell/cmd-friendly KEY=VALUE
+//      (Windows deactivate path)
+// These three tests pin each one.
+
+#[test]
+fn refresh_writes_aikey_active_seq_near_top() {
+    let _dir = setup();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "my-claude")
+        .unwrap();
+    profile_activation::refresh_implicit_profile_activation().unwrap();
+
+    let home = std::env::var("HOME").unwrap();
+    let env_path = std::path::PathBuf::from(&home).join(".aikey/active.env");
+    let contents = std::fs::read_to_string(&env_path).expect("active.env should exist");
+
+    // Format: `export AIKEY_ACTIVE_SEQ="<digits>"`. The hook precmd does
+    // `grep -m1 -oE 'AIKEY_ACTIVE_SEQ="[0-9]+"' ... | grep -oE '[0-9]+'`,
+    // so this exact shape matters — pin both the export prefix and the
+    // quoted-digits payload.
+    let line = contents.lines()
+        .find(|l| l.starts_with("export AIKEY_ACTIVE_SEQ="))
+        .expect("active.env must contain export AIKEY_ACTIVE_SEQ= line");
+    assert!(
+        line.contains("AIKEY_ACTIVE_SEQ=\""),
+        "seq value must be double-quoted (precmd grep depends on this), got: {}",
+        line
+    );
+    let value = line
+        .trim_start_matches("export AIKEY_ACTIVE_SEQ=\"")
+        .trim_end_matches('"');
+    assert!(
+        !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()),
+        "AIKEY_ACTIVE_SEQ value must be a non-empty digit run, got: {:?}",
+        value
+    );
+
+    // Position: precmd uses `grep -m1` so the seq line must appear early.
+    // We're stricter than the smoke (top 5 lines) — pin to top 3.
+    let head: Vec<&str> = contents.lines().take(3).collect();
+    assert!(
+        head.iter().any(|l| l.starts_with("export AIKEY_ACTIVE_SEQ=")),
+        "AIKEY_ACTIVE_SEQ must appear in the first 3 lines, got:\n{}",
+        head.join("\n")
+    );
+}
+
+#[test]
+fn refresh_seq_advances_monotonically() {
+    let _dir = setup();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "k1")
+        .unwrap();
+
+    let read_seq = || -> u64 {
+        let home = std::env::var("HOME").unwrap();
+        let env_path = std::path::PathBuf::from(&home).join(".aikey/active.env");
+        let contents = std::fs::read_to_string(&env_path).unwrap();
+        let line = contents.lines()
+            .find(|l| l.starts_with("export AIKEY_ACTIVE_SEQ="))
+            .expect("seq line must exist");
+        let v = line.trim_start_matches("export AIKEY_ACTIVE_SEQ=\"").trim_end_matches('"');
+        v.parse().expect("seq must parse as u64")
+    };
+
+    profile_activation::refresh_implicit_profile_activation().unwrap();
+    let s1 = read_seq();
+    profile_activation::refresh_implicit_profile_activation().unwrap();
+    let s2 = read_seq();
+    profile_activation::refresh_implicit_profile_activation().unwrap();
+    let s3 = read_seq();
+
+    // Strictly monotonic across consecutive refreshes — the precmd uses
+    // this to detect "binding changed since I last sourced". Equality
+    // would let a refresh go undetected and break cross-shell sync.
+    assert!(s2 > s1, "seq must advance: s1={} s2={}", s1, s2);
+    assert!(s3 > s2, "seq must advance: s2={} s3={}", s2, s3);
+}
+
+#[test]
+fn refresh_writes_active_env_flat_for_windows() {
+    let _dir = setup();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "my-claude")
+        .unwrap();
+    profile_activation::refresh_implicit_profile_activation().unwrap();
+
+    let home = std::env::var("HOME").unwrap();
+    let flat_path = std::path::PathBuf::from(&home).join(".aikey/active.env.flat");
+    let flat = std::fs::read_to_string(&flat_path)
+        .expect("active.env.flat should exist when there are bindings");
+
+    // Plain KEY=VALUE — no shell `export`, no shell expansion. PowerShell
+    // / cmd parse it as `[Environment]::SetEnvironmentVariable($1, $2)`,
+    // so any `${...}` literal would land as broken text in user env.
+    for line in flat.lines() {
+        if line.is_empty() { continue; }
+        assert!(!line.starts_with("export "),
+            "flat must not contain shell `export` prefix, got: {}", line);
+        assert!(!line.contains("${"),
+            "flat must not contain shell expansion ${{...}}, got: {}", line);
+        // Each non-empty line is KEY=VALUE; nothing else.
+        assert!(line.contains('='),
+            "flat line must be KEY=VALUE, got: {}", line);
+    }
+
+    // Same payload as active.env but in flat form — the seq must be there
+    // too so a Windows precmd-equivalent (when added) can use it.
+    assert!(flat.contains("AIKEY_ACTIVE_SEQ="),
+        "flat must carry AIKEY_ACTIVE_SEQ for Windows precmd parity, got:\n{}",
+        flat);
+    assert!(flat.contains("ANTHROPIC_API_KEY=aikey_personal_my-claude"),
+        "flat must carry the same env vars as active.env (no quoting), got:\n{}",
+        flat);
+}
+
+#[test]
+fn refresh_no_bindings_writes_flat_with_only_seq() {
+    // Stage 1 contract: AIKEY_ACTIVE_SEQ is unconditionally written to
+    // env_lines, which means .flat is always non-empty even when no
+    // bindings exist (it carries just the seq). This is a behaviour
+    // change from pre-Stage-1, where empty env_lines meant no .flat.
+    //
+    // Pin the new behaviour:
+    //   - .flat exists
+    //   - it has AIKEY_ACTIVE_SEQ=...
+    //   - it does NOT have any *_API_KEY (no provider envs to clear)
+    //
+    // Why we keep .flat in the no-bindings case: a future Windows
+    // precmd-equivalent will also want to detect "binary upgraded but
+    // no key configured" via the seq line. Dropping .flat here would
+    // make that scenario invisible to Windows shells.
+    let _dir = setup();
+
+    profile_activation::refresh_implicit_profile_activation().unwrap();
+
+    let home = std::env::var("HOME").unwrap();
+    let flat_path = std::path::PathBuf::from(&home).join(".aikey/active.env.flat");
+    assert!(flat_path.exists(),
+        "no bindings should still write .flat (carrying AIKEY_ACTIVE_SEQ)");
+
+    let flat = std::fs::read_to_string(&flat_path).unwrap();
+    assert!(flat.contains("AIKEY_ACTIVE_SEQ="),
+        ".flat with no bindings should still carry the seq, got:\n{}", flat);
+    assert!(!flat.contains("API_KEY"),
+        ".flat with no bindings must not contain provider env, got:\n{}", flat);
+}

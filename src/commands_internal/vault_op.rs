@@ -941,15 +941,111 @@ fn handle_use(env: StdinEnvelope) {
             (CredentialType::PersonalOAuthAccount, vec![acct.provider])
         }
         "team" => {
-            emit_error(req_id, "I_UNKNOWN_TARGET",
-                "target 'team' is reserved for future use and not implemented in v1.0");
-            return;
+            // Stage 7-1 (active-state cross-shell sync, 2026-04-27):
+            // team-target binding switch via the unified protocol. Looks up
+            // the vk by id, allowing virtual_key_id, local_alias, or server
+            // alias as input — same resolution order the CLI's interactive
+            // picker uses, so Web and CLI accept the same identifiers.
+            //
+            // Validation gate: only `local_state in (active, synced_inactive)`
+            // and `key_status == active` count as "usable". Anything else
+            // (revoked, scope-disabled, stale snapshot) is rejected with an
+            // explicit code so the Web UI can surface the right message.
+            let entries = match storage::list_virtual_key_cache() {
+                Ok(v) => v,
+                Err(e) => {
+                    emit_error(req_id, "I_INTERNAL",
+                        format!("list_virtual_key_cache: {}", e));
+                    return;
+                }
+            };
+            // Resolution order: exact virtual_key_id → local_alias → server alias.
+            // Exact id wins so a user who typed the canonical vk_xxx form is
+            // never ambiguous with a local nickname.
+            let entry = entries.iter().find(|e| e.virtual_key_id == payload.id)
+                .or_else(|| entries.iter().find(|e|
+                    e.local_alias.as_deref() == Some(payload.id.as_str())))
+                .or_else(|| entries.iter().find(|e| e.alias == payload.id))
+                .cloned();
+            let entry = match entry {
+                Some(e) => e,
+                None => {
+                    emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
+                        format!("team key '{}' not found in local cache (run `aikey key sync`)", payload.id));
+                    return;
+                }
+            };
+            // Reject keys that the user shouldn't / can't activate. Each
+            // local_state has a distinct error code so the Web UI can
+            // tailor the surface message; the proxy will not route through
+            // any of these regardless.
+            match entry.local_state.as_str() {
+                "active" | "synced_inactive" => {}
+                "disabled_by_account_scope"
+                | "disabled_by_account_status"
+                | "disabled_by_seat_status"
+                | "disabled_by_key_status" => {
+                    emit_error(req_id, "I_KEY_DISABLED",
+                        format!("team key '{}' is disabled (state={})", payload.id, entry.local_state));
+                    return;
+                }
+                "stale" => {
+                    emit_error(req_id, "I_KEY_STALE",
+                        format!("team key '{}' is stale (run `aikey key sync` to refresh)", payload.id));
+                    return;
+                }
+                other => {
+                    emit_error(req_id, "I_KEY_DISABLED",
+                        format!("team key '{}' is not usable (state={})", payload.id, other));
+                    return;
+                }
+            }
+            if entry.key_status != "active" {
+                emit_error(req_id, "I_KEY_DISABLED",
+                    format!("team key '{}' has server status '{}'", payload.id, entry.key_status));
+                return;
+            }
+            // Provider list: prefer multi-protocol `supported_providers`,
+            // fall back to single `provider_code`. Identical priority to
+            // the personal target branch above (single source of truth).
+            let providers: Vec<String> = if !entry.supported_providers.is_empty() {
+                entry.supported_providers.clone()
+            } else if !entry.provider_code.is_empty() {
+                vec![entry.provider_code.clone()]
+            } else {
+                emit_error(req_id, "I_KEY_NO_PROVIDER",
+                    format!("team key '{}' has no provider assignment", payload.id));
+                return;
+            };
+            // Use the canonical vk_id as the binding's key_source_ref —
+            // not the user-supplied identifier, which could have been a
+            // local_alias / server alias. This keeps `provider_bindings.
+            // key_source_ref` aligned with virtual_key_cache.virtual_key_id
+            // for joinable lookups.
+            (CredentialType::ManagedVirtualKey, providers)
         }
         other => {
             emit_error(req_id, "I_UNKNOWN_TARGET",
-                format!("unknown target '{}' (expected personal|oauth)", other));
+                format!("unknown target '{}' (expected personal|oauth|team)", other));
             return;
         }
+    };
+
+    // Re-resolve the canonical key_ref for team targets so write_bindings_canonical
+    // gets the vk_id even when payload.id was a local_alias / server alias.
+    // For personal/oauth, payload.id IS already canonical (alias / account_id).
+    let canonical_key_ref: String = match payload.target.as_str() {
+        "team" => {
+            // Safe to expect: we already validated entry exists above.
+            storage::list_virtual_key_cache().ok().and_then(|v| {
+                v.into_iter().find(|e|
+                    e.virtual_key_id == payload.id
+                    || e.local_alias.as_deref() == Some(payload.id.as_str())
+                    || e.alias == payload.id
+                ).map(|e| e.virtual_key_id)
+            }).unwrap_or_else(|| payload.id.clone())
+        }
+        _ => payload.id.clone(),
     };
 
     // Write bindings via the shared helper in commands_account — keeps the
@@ -958,7 +1054,7 @@ fn handle_use(env: StdinEnvelope) {
     if let Err(e) = crate::commands_account::write_bindings_canonical(
         &providers,
         source_type.as_str(),
-        &payload.id,
+        &canonical_key_ref,
     ) {
         emit_error(req_id, "I_INTERNAL", e);
         return;
@@ -968,13 +1064,14 @@ fn handle_use(env: StdinEnvelope) {
     // write already landed) — surface as warning, not hard error.
     let refresh_ok = profile_activation::refresh_implicit_profile_activation().is_ok();
 
-    let audit_logged = try_log_audit(&key, AuditOperation::Exec, Some(&payload.id), true);
+    let audit_logged = try_log_audit(&key, AuditOperation::Exec, Some(&canonical_key_ref), true);
 
     emit(&ResultEnvelope::ok(
         req_id,
         json!({
             "target": payload.target,
-            "id": payload.id,
+            "id": canonical_key_ref,
+            "input_id": payload.id,
             "activated_providers": providers,
             "active_env_refreshed": refresh_ok,
             "audit_logged": audit_logged,

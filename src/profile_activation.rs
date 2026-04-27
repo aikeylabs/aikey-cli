@@ -33,9 +33,20 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
     let bindings = storage::list_provider_bindings(DEFAULT_PROFILE)?;
     let proxy_port = commands_proxy::proxy_port();
 
-    // Build env lines.
+    // Bump change-seq up front so the value embedded in active.env is the
+    // value the proxy will see for this state. Why bump-before-write: a
+    // crashed process between write and bump would leave active.env with a
+    // seq newer than the on-disk counter, breaking precmd's diff for any
+    // shell that already saw that seq. Bump-first means a crash leaves the
+    // counter ahead of the file at worst — shells re-source on next prompt.
+    let _ = storage::bump_vault_change_seq();
+    let active_seq = storage::get_vault_change_seq().unwrap_or(0);
+
+    // Build env lines. AIKEY_ACTIVE_SEQ goes near the top so the precmd
+    // hook's `grep -m1` can short-circuit cheaply.
     let mut env_lines: Vec<String> = vec![
         "# aikey active key — auto-generated, do not edit manually".to_string(),
+        format!("export AIKEY_ACTIVE_SEQ=\"{}\"", active_seq),
     ];
     let mut activated_providers: Vec<String> = Vec::new();
 
@@ -129,8 +140,8 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
     // TODO: remove once all consumers are migrated to provider bindings.
     sync_active_key_config_from_bindings(&bindings)?;
 
-    // Bump change-seq so the proxy knows the vault state changed.
-    let _ = storage::bump_vault_change_seq();
+    // change_seq already bumped at the top of this function so the value
+    // is reflected in active.env. Just nudge the proxy now.
     commands_proxy::try_reload_proxy();
 
     Ok(RefreshResult {
@@ -331,7 +342,15 @@ fn sentinel_token(key_source_type: &str, key_source_ref: &str) -> String {
     }
 }
 
-/// Writes the env lines to `~/.aikey/active.env`.
+/// Writes the env lines to `~/.aikey/active.env` atomically.
+///
+/// Why atomic: a shell hook may be `source`-ing this file at the moment we
+/// rewrite it. Plain `std::fs::write` truncates first, opening a window
+/// where the shell reads a partial file → "command not found" / parse
+/// errors. Same for `active.env.flat` (Windows). We write to a temp file in
+/// the same directory then `rename`, which POSIX guarantees atomic on the
+/// same filesystem (and Win32 ReplaceFile semantics on Windows for stable
+/// readers — best-effort there).
 fn write_active_env_file(lines: &[String]) -> Result<(), String> {
     // Use resolve_aikey_dir for consistent HOME → USERPROFILE → "." fallback.
     let aikey_dir = crate::commands_account::resolve_aikey_dir();
@@ -344,7 +363,7 @@ fn write_active_env_file(lines: &[String]) -> Result<(), String> {
     // v3 architecture: active.env contains only env vars (no source statements).
     // Wrapper functions live in ~/.aikey/hook.{zsh,bash}, loaded once from shell rc.
 
-    std::fs::write(&env_path, content)
+    atomic_write(&env_path, content.as_bytes())
         .map_err(|e| format!("Failed to write active.env: {}", e))?;
 
     // Also write active.env.flat (plain KEY=VALUE, no shell syntax) for Windows.
@@ -368,10 +387,51 @@ fn write_active_env_file(lines: &[String]) -> Result<(), String> {
         })
         .collect();
     if !flat_lines.is_empty() {
-        let _ = std::fs::write(&flat_path, flat_lines.join("\n") + "\n");
+        // Reviewer round-3 fix: don't swallow .flat write errors. A failed
+        // .flat write means PowerShell / cmd `aikey deactivate` will read
+        // stale globals — the operation looks successful from the POSIX
+        // shell's POV but Windows users see ghost env. Surfacing as a
+        // warning (not a hard error) preserves the existing contract that
+        // `refresh_implicit_profile_activation` succeeds when the primary
+        // active.env write succeeds, while still giving operators a signal
+        // to chase the underlying disk / perms issue.
+        if let Err(e) = atomic_write(&flat_path, (flat_lines.join("\n") + "\n").as_bytes()) {
+            eprintln!(
+                "\x1b[33m[aikey] warn: failed to update {}: {} \
+                 (Windows deactivate may restore stale env)\x1b[0m",
+                flat_path.display(),
+                e,
+            );
+        }
     }
 
     Ok(())
+}
+
+/// Atomic file replace via temp+rename. Caller-provided directory must exist.
+/// On error the temp file is best-effort cleaned up.
+fn atomic_write(target: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent dir")
+    })?;
+    let file_name = target.file_name().and_then(|s| s.to_str()).unwrap_or("active");
+    // Per-pid suffix avoids collisions if two `aikey` processes refresh
+    // concurrently. Last writer wins on rename — that's the seq's job to
+    // record the order, the file content is a snapshot either way.
+    let temp_path = parent.join(format!("{}.tmp.{}", file_name, std::process::id()));
+    match std::fs::write(&temp_path, content) {
+        Ok(()) => match std::fs::rename(&temp_path, target) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                Err(e)
+            }
+        },
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            Err(e)
+        }
+    }
 }
 
 /// Searches for a replacement key that supports the given provider.
@@ -460,4 +520,61 @@ fn resolve_providers_for_entry(entry: &storage::SecretMetadata) -> Vec<String> {
         }
     }
     vec![]
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::atomic_write;
+
+    // Stage 4 (active-state cross-shell sync, 2026-04-27):
+    // active.env is now written via temp+rename so a shell that's mid-source
+    // never reads a partially-written file. These tests pin the contract.
+
+    #[test]
+    fn atomic_write_creates_target_with_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "aikey-atomic-test-create-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("active.env");
+        atomic_write(&target, b"hello\n").expect("write");
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "aikey-atomic-test-replace-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("active.env");
+        std::fs::write(&target, b"old content\n").unwrap();
+        atomic_write(&target, b"new content\n").expect("replace");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new content\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_does_not_leave_temp_file_on_success() {
+        // The whole point of temp+rename: post-rename, the .tmp.<pid> file
+        // must not exist. Otherwise drift detection / cleanup logic that
+        // greps the directory could trip over stale temps.
+        let dir = std::env::temp_dir().join(format!(
+            "aikey-atomic-test-cleanup-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("active.env");
+        atomic_write(&target, b"x\n").expect("write");
+        let entries: Vec<String> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !entries.iter().any(|n| n.contains(".tmp.")),
+            "temp file was not cleaned up after rename, dir contents: {:?}",
+            entries,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

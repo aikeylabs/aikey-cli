@@ -18,8 +18,27 @@ if ! type ak >/dev/null 2>&1; then
 fi
 
 _aikey_precmd_bash() {
-    [ -n "$AIKEY_ACTIVE_LABEL" ] && return
-    [ -f ~/.aikey/active.env ] && source ~/.aikey/active.env
+    # Stage 4 cross-shell sync (2026-04-27) — see hook.zsh _aikey_precmd
+    # for the full rationale. Same gating logic, POSIX-portable shell.
+    [ "$AIKEY_AUTO_REFRESH" = "off" ] && { _aikey_hook_check_once; return; }
+    if [ -n "$_AIKEY_EXPLICIT_ALIAS" ] || [ -n "$AIKEY_ACTIVE_LABEL" ]; then
+        _aikey_hook_check_once
+        return
+    fi
+    [ -f ~/.aikey/active.env ] || { _aikey_hook_check_once; return; }
+    local on_disk_seq
+    on_disk_seq=$(grep -m1 -oE 'AIKEY_ACTIVE_SEQ="[0-9]+"' ~/.aikey/active.env 2>/dev/null \
+                  | grep -oE '[0-9]+')
+    if [ -n "$on_disk_seq" ]; then
+        if [ "$on_disk_seq" != "${AIKEY_ACTIVE_SEQ:-0}" ]; then
+            source ~/.aikey/active.env
+            [ -n "$AIKEY_REFRESH_NOTIFY" ] && \
+                printf '\033[90m[aikey] active key refreshed (seq=%s)\033[0m\n' "$AIKEY_ACTIVE_SEQ" >&2
+        fi
+    else
+        # Fallback for active.env produced by pre-Stage-1 CLI (no SEQ line).
+        source ~/.aikey/active.env
+    fi
     _aikey_hook_check_once
 }
 

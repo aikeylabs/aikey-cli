@@ -946,6 +946,13 @@ fn v3_rc_block(hook_filename: &str) -> String {
 }
 
 /// Atomically write `~/.aikey/hook.{zsh,bash}` (write to tmp + rename).
+///
+/// Per-pid suffix on the temp name (matches the convention in
+/// `profile_activation::atomic_write`): a fixed `.aikey.tmp` would let two
+/// concurrent `aikey use` / `aikey hook update` invocations clobber each
+/// other's temp file mid-write. With the pid suffix, last writer wins on
+/// rename, which matches the `change_seq` ordering — the worse of the two
+/// races still produces a valid hook file, never a torn one.
 fn write_hook_file(home: &str, is_zsh: bool) -> io::Result<std::path::PathBuf> {
     let filename = if is_zsh { "hook.zsh" } else { "hook.bash" };
     let kind = if is_zsh { HookKind::Zsh } else { HookKind::Bash };
@@ -953,9 +960,13 @@ fn write_hook_file(home: &str, is_zsh: bool) -> io::Result<std::path::PathBuf> {
     let aikey_dir = std::path::PathBuf::from(home).join(".aikey");
     std::fs::create_dir_all(&aikey_dir)?;
     let target = aikey_dir.join(filename);
-    let tmp = aikey_dir.join(format!("{}.aikey.tmp", filename));
-    std::fs::write(&tmp, &content)?;
-    std::fs::rename(&tmp, &target)?;
+    let tmp = aikey_dir.join(format!("{}.aikey.tmp.{}", filename, std::process::id()));
+    let write_result = std::fs::write(&tmp, &content)
+        .and_then(|_| std::fs::rename(&tmp, &target));
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    write_result?;
     Ok(target)
 }
 
@@ -1023,6 +1034,11 @@ fn replace_between_markers(contents: &str, begin: &str, end: &str, replacement: 
 /// install/upgrade was silent and idempotent.
 ///
 /// Skipped with `--no-hook` flag or when `AIKEY_NO_HOOK=1` is set.
+///
+/// Side effects on first install: prompts the user and appends a `source`
+/// line to their shell rc. **For pure hook-file refresh without rc-file
+/// mutation**, use [`refresh_hook_file_only`] instead — that's the
+/// non-interactive entry point used by `aikey hook update`.
 pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
     if no_hook || std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
         return None;
@@ -1146,6 +1162,57 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
             rc_file, hook_filename
         )),
     }
+}
+
+/// Pure hook-file refresh path used by `aikey hook update` (Stage 8-1).
+///
+/// Why this is separate from [`ensure_shell_hook`]:
+/// - `ensure_shell_hook(false)` will, on first install with no rc marker,
+///   *prompt the user* and append a `source ~/.aikey/hook.{zsh,bash}` line
+///   to their rc (.zshrc / .bashrc / .bash_profile). That's the right
+///   behavior for `aikey use` (the user is opting into hook integration
+///   for the first time), but it's a surprise when the user runs
+///   `aikey hook update` as a low-risk recovery action — they expect a
+///   hook-file regenerate, not rc mutation.
+/// - This function only writes `~/.aikey/hook.{zsh,bash}` and returns. It
+///   does NOT touch the user's rc, never prompts, and (intentionally) is
+///   safe to call non-interactively from CI / scripts.
+///
+/// Returns the path written on success, or an error string for display.
+/// Honors `AIKEY_NO_HOOK=1` (skip both refresh and rc mutation).
+///
+/// `shell` selects the dialect explicitly (zsh / bash). When `None`, uses
+/// `$SHELL`; if neither matches, returns an error message rather than
+/// silently writing both files.
+pub fn refresh_hook_file_only(shell: Option<&str>) -> Result<std::path::PathBuf, String> {
+    if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
+        return Err("AIKEY_NO_HOOK=1 set in environment; refresh skipped".to_string());
+    }
+    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+
+    let is_zsh = match shell {
+        Some("zsh") => true,
+        Some("bash") => false,
+        Some(other) => return Err(format!(
+            "unsupported shell '{}' (need zsh or bash)", other
+        )),
+        None => {
+            let s = std::env::var("SHELL").unwrap_or_default();
+            if s.contains("zsh") {
+                true
+            } else if s.contains("bash") {
+                false
+            } else {
+                return Err(format!(
+                    "could not auto-detect shell from $SHELL='{}'; pass --shell zsh or --shell bash",
+                    s
+                ));
+            }
+        }
+    };
+
+    write_hook_file(&home, is_zsh)
+        .map_err(|e| format!("failed to write hook file: {}", e))
 }
 
 /// Strip a v1 block from rc contents and splice in the v3 block at the same spot.
@@ -1770,5 +1837,160 @@ mod hook_tests {
         assert!(!out.contains("api_key = \"old\""));
         assert!(out.contains("env_key = \"OPENAI_API_KEY\""));
         assert!(out.contains("model = \"gpt-5\""));
+    }
+
+    // ── Stage 4 (active-state cross-shell sync, 2026-04-27) regression ──────
+    //
+    // Drift detector lives in hook.zsh / hook.bash and depends on two
+    // injected lines near the top of the on-disk hook file:
+    //   `# Hook-Template-Hash: <hex>`         (greppable header)
+    //   `_AIKEY_HOOK_LOADED_HASH="<hex>"`     (set on source so the in-shell
+    //                                          wrapper hash is recorded)
+    //
+    // v1 of the implementation plan mistakenly thought these lines were
+    // missing (because the raw template source files don't have them) and
+    // proposed re-adding them. The lines are in fact added by
+    // `hook_content_with_hash_header` at render time. These tests pin the
+    // contract so the next refactor doesn't silently drop them and break
+    // the auto-reload path in hook.{zsh,bash}.
+    //
+    // See aikeylabs/roadmap20260320/技术实现/开源版本方案/20260427-active-state-implementation-plan.md §M3.
+
+    #[test]
+    fn rendered_hook_contains_hash_header_and_assignment_zsh() {
+        let rendered = hook_content_with_hash_header(HookKind::Zsh);
+        let hash = hook_template_hash(HookKind::Zsh);
+        assert!(
+            rendered.contains(&format!("# Hook-Template-Hash: {}", hash)),
+            "rendered zsh hook must contain greppable hash header"
+        );
+        assert!(
+            rendered.contains(&format!("_AIKEY_HOOK_LOADED_HASH=\"{}\"", hash)),
+            "rendered zsh hook must assign _AIKEY_HOOK_LOADED_HASH at source time"
+        );
+    }
+
+    #[test]
+    fn rendered_hook_contains_hash_header_and_assignment_bash() {
+        let rendered = hook_content_with_hash_header(HookKind::Bash);
+        let hash = hook_template_hash(HookKind::Bash);
+        assert!(
+            rendered.contains(&format!("# Hook-Template-Hash: {}", hash)),
+            "rendered bash hook must contain greppable hash header"
+        );
+        assert!(
+            rendered.contains(&format!("_AIKEY_HOOK_LOADED_HASH=\"{}\"", hash)),
+            "rendered bash hook must assign _AIKEY_HOOK_LOADED_HASH at source time"
+        );
+    }
+
+    #[test]
+    fn rendered_hook_header_lines_appear_near_top() {
+        // The drift detector greps the on-disk file; if the header sinks too
+        // deep, `grep -m1` still works but readers expecting "second line"
+        // (per the comment block in hook_content_with_hash_header) get
+        // confused. Pin the position to the first 5 lines.
+        let rendered = hook_content_with_hash_header(HookKind::Zsh);
+        let head: Vec<&str> = rendered.lines().take(5).collect();
+        assert!(
+            head.iter().any(|l| l.starts_with("# Hook-Template-Hash:")),
+            "hash header should appear in the first 5 lines, got:\n{}",
+            head.join("\n"),
+        );
+        assert!(
+            head.iter().any(|l| l.starts_with("_AIKEY_HOOK_LOADED_HASH=")),
+            "_AIKEY_HOOK_LOADED_HASH should appear in the first 5 lines, got:\n{}",
+            head.join("\n"),
+        );
+    }
+
+    #[test]
+    fn rendered_hook_hash_distinct_per_dialect() {
+        // Sanity: zsh and bash hooks have different content → different
+        // hashes → drift detector won't false-positive across dialects.
+        assert_ne!(
+            hook_template_hash(HookKind::Zsh),
+            hook_template_hash(HookKind::Bash),
+            "zsh and bash hooks must hash differently"
+        );
+    }
+
+    #[test]
+    fn rendered_hook_preserves_first_line_banner() {
+        // `_aikey_hook_check_once` greps starting at the top; the original
+        // "do not hand-edit" banner must remain on line 1 so users editing
+        // the file see it before any code.
+        let rendered = hook_content_with_hash_header(HookKind::Zsh);
+        let first_line = rendered.lines().next().unwrap_or("");
+        assert!(
+            first_line.contains("do not hand-edit") || first_line.contains("auto-generated"),
+            "first line should preserve the banner, got: {}",
+            first_line
+        );
+    }
+
+    #[test]
+    fn write_hook_file_includes_hash_lines_on_disk() {
+        // End-to-end: the file actually written under ~/.aikey/ must carry
+        // both injected lines. Catches a regression where someone bypasses
+        // hook_content_with_hash_header in the write path.
+        use std::io::Read;
+        let tmp = std::env::temp_dir().join(format!(
+            "aikey-test-write-hook-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = write_hook_file(tmp.to_str().unwrap(), true).expect("write zsh hook");
+        let mut f = std::fs::File::open(&path).expect("open written hook");
+        let mut s = String::new();
+        f.read_to_string(&mut s).expect("read written hook");
+        let hash = hook_template_hash(HookKind::Zsh);
+        assert!(s.contains(&format!("# Hook-Template-Hash: {}", hash)));
+        assert!(s.contains(&format!("_AIKEY_HOOK_LOADED_HASH=\"{}\"", hash)));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── precmd seq-diff contract (Stage 3 / M5) ─────────────────────────────
+    //
+    // The hook templates in src/templates/{hook.zsh,hook.bash} were updated
+    // to (a) honor `_AIKEY_EXPLICIT_ALIAS` as the explicit-pin flag and
+    // (b) compare `AIKEY_ACTIVE_SEQ` against the value embedded in
+    // ~/.aikey/active.env before re-sourcing. These tests pin the strings
+    // we depend on so they don't get refactored out of existence.
+
+    #[test]
+    fn hook_zsh_precmd_uses_explicit_alias_and_seq_diff() {
+        let c = hook_zsh_content();
+        assert!(
+            c.contains("_AIKEY_EXPLICIT_ALIAS"),
+            "zsh precmd must check _AIKEY_EXPLICIT_ALIAS for explicit pin"
+        );
+        assert!(
+            c.contains("AIKEY_ACTIVE_SEQ"),
+            "zsh precmd must reference AIKEY_ACTIVE_SEQ for cheap diff"
+        );
+        assert!(
+            c.contains("AIKEY_AUTO_REFRESH"),
+            "zsh precmd must honor AIKEY_AUTO_REFRESH=off kill-switch"
+        );
+    }
+
+    #[test]
+    fn hook_bash_precmd_uses_explicit_alias_and_seq_diff() {
+        let c = hook_bash_content();
+        assert!(c.contains("_AIKEY_EXPLICIT_ALIAS"));
+        assert!(c.contains("AIKEY_ACTIVE_SEQ"));
+        assert!(c.contains("AIKEY_AUTO_REFRESH"));
+    }
+
+    #[test]
+    fn hook_zsh_precmd_keeps_legacy_label_grace() {
+        // grace period: AIKEY_ACTIVE_LABEL still triggers the early return
+        // so users with the old `aikey activate` output sitting in their
+        // shell don't see auto-sync regress on them.
+        let c = hook_zsh_content();
+        assert!(
+            c.contains("AIKEY_ACTIVE_LABEL"),
+            "legacy grace var must still be checked alongside _AIKEY_EXPLICIT_ALIAS"
+        );
     }
 }

@@ -108,6 +108,22 @@ pub(crate) enum Commands {
         /// Which shell template to hash: zsh | bash
         shell: String,
     },
+    /// Manage the shell precmd hook installed under ~/.aikey/hook.{zsh,bash}
+    ///
+    /// `aikey hook update` regenerates the hook file from the binary's
+    /// embedded template and ensures the rc-file `source` line is present.
+    /// `aikey hook status` reports the file / binary / loaded hashes and
+    /// flags any drift.
+    ///
+    /// Both subcommands are idempotent. Update is the manual escape hatch
+    /// for users who want to refresh the hook without running `aikey use`;
+    /// status is for diagnostics when the precmd auto-reload prints a
+    /// drift warning and the user wants to confirm what's misaligned.
+    #[command(display_order = 10)]
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
     /// Save a new secret to the vault
     #[command(display_order = 1)]
     Add {
@@ -559,6 +575,25 @@ pub(crate) enum ProxyAction {
     Verify,
 }
 
+/// Subcommand verbs for `aikey hook`. Stage 8 (Stage 8-1 / 8-2 in the
+/// active-state cross-shell sync plan, 2026-04-27): exposes the hash-based
+/// drift detector that lives in hook.{zsh,bash} as an explicit user entry
+/// point so a user who only wants to refresh the hook (without changing any
+/// vault binding) doesn't have to run `aikey use` and worry about side
+/// effects on third-party CLI configs.
+#[derive(Subcommand)]
+pub(crate) enum HookAction {
+    /// Regenerate ~/.aikey/hook.{zsh,bash} from the binary's embedded
+    /// template and re-ensure the rc-file `source` line. Idempotent.
+    Update,
+    /// Report file / binary / loaded hashes and flag drift.
+    Status {
+        /// Override shell detection (zsh | bash). Default: detect from $SHELL.
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum KeyAction {
     /// Rotate a local secret to a new value
@@ -790,6 +825,10 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             },
             Commands::Watch => "watch".to_string(),
             Commands::HookHash { .. } => "_hook-hash".to_string(),
+            Commands::Hook { action } => match action {
+                HookAction::Update => "hook.update".to_string(),
+                HookAction::Status { .. } => "hook.status".to_string(),
+            },
         },
     }
 }

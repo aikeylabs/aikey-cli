@@ -2678,10 +2678,16 @@ pub fn handle_key_use(
             "active_env_written": true,
         }));
     } else {
+        // Stage 4 (active-state cross-shell sync, 2026-04-27): the previous
+        // "Env vars applied" message was a half-truth. `aikey` is a child
+        // process — it cannot mutate the parent shell's env directly. The
+        // precmd hook picks up the new active.env on the user's next prompt
+        // (free, unconditional), but if they want to use the new key in
+        // *this* prompt they can `source` the file. State that plainly.
         let status = if hook_msg.is_some() {
             "\u{2192} Shell hook just installed. Open a new terminal or: source ~/.aikey/active.env"
         } else {
-            "\u{2713} Env vars applied (shell hook active)"
+            "\u{2713} Active key updated. Next prompt picks it up automatically.\n     To apply right now: source ~/.aikey/active.env"
         };
 
         let mut rows: Vec<String> = Vec::new();
