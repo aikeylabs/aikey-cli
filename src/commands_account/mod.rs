@@ -857,45 +857,90 @@ pub fn handle_master_browse(page: Option<&str>, url_override: Option<&str>, port
     Ok(())
 }
 
-/// Returns the `control_panel_url` from install-state.json if available.
+/// Resolve the local-machine control-panel base URL from install-state.json.
+///
+/// **Why this is profile-driven instead of reading `control_panel_url` directly**
+/// (regression record: 2026-04-27 — server-then-trial install sequence left
+/// `control_panel_url` pointing at the production sandbox port 39000 even
+/// though the active service was the trial server on 8090; `make
+/// restart-trial1` doesn't rerun trial-install.sh and therefore can't
+/// overwrite the stale field). The fix decouples the URL from the
+/// `control_panel_url` field for local/trial profiles by deriving the
+/// console port from `ports.trial`, which both profiles already populate
+/// canonically:
+///
+///   * trial-install.sh writes  `ports.trial = trial_server_port`  (default 8090)
+///   * local-install.sh --with-console writes  `ports.trial = console_port`
+///     (also 8090 by default — same field, same meaning under both profiles)
+///   * server-install.sh writes a different port set (`ports.web` etc.) and
+///     `install_profile = "server"`; for that case we keep `control_panel_url`
+///     as the source of truth because it is genuinely externally configured
+///     (BIND_IP + manifest-resolved web port).
+///
+/// Returns `None` when no resolvable URL exists for the current profile —
+/// callers fall back to JWT / interactive resolution.
 fn try_local_control_url() -> Option<String> {
-    let home = dirs::home_dir()?;
-    let state_path = home.join(".aikey").join("install-state.json");
-    let content = std::fs::read_to_string(&state_path).ok()?;
-    let state: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let url = state.get("control_panel_url")?.as_str()?;
-    if url.is_empty() { None } else { Some(url.to_string()) }
+    let state = read_install_state()?;
+    derive_local_control_url(&state)
 }
 
-/// Try to resolve a local-user browse URL from install-state.json.
-///
-/// Returns `Some(full_url)` if `control_plane_mode == "local"` and
-/// `control_panel_url` is set; `None` otherwise (falls through to JWT flow).
-/// Build a local-mode browse URL, taking a pre-validated alias
-/// (produced by `web_page_alias`). Returning `None` means "not in
-/// local/trial mode — caller should fall back to the JWT path".
-fn try_local_browse_url(alias: &str) -> Option<String> {
-    let home = dirs::home_dir()?;
-    let state_path = home.join(".aikey").join("install-state.json");
-    let content = std::fs::read_to_string(&state_path).ok()?;
-    let state: serde_json::Value = serde_json::from_str(&content).ok()?;
+/// Pure helper for `try_local_control_url` so the resolution logic can be
+/// unit-tested without touching the filesystem. Profile-driven: see the
+/// caller's comment for the regression history.
+fn derive_local_control_url(state: &serde_json::Value) -> Option<String> {
+    let profile = state.get("install_profile").and_then(|v| v.as_str()).unwrap_or("");
+    match profile {
+        // trial / local-with-console: ports.trial is canonical (both profiles
+        // populate it; they only differ in `install_profile` value).
+        "trial" | "local" => {
+            let port = state.get("ports")?.get("trial")?.as_u64()?;
+            Some(format!("http://127.0.0.1:{}", port))
+        }
+        // server / production: control_panel_url is externally configured
+        // (BIND_IP + manifest web port), use as the source of truth.
+        "server" | "production" => {
+            let url = state.get("control_panel_url")?.as_str()?;
+            if url.is_empty() { None } else { Some(url.to_string()) }
+        }
+        // Unknown / blank profile — back-compat fallback to control_panel_url
+        // (older install-state.json versions may not carry an install_profile).
+        _ => {
+            let url = state.get("control_panel_url")?.as_str()?;
+            if url.is_empty() { None } else { Some(url.to_string()) }
+        }
+    }
+}
 
+/// Build a local-mode browse URL for `aikey browse <page>`.
+///
+/// Returning `None` means "not in local/trial mode — caller should fall back
+/// to the JWT path". Uses the same profile-driven base-URL resolution as
+/// `try_local_control_url` (see that fn's `Why` block). The alias is already
+/// validated by the caller.
+fn try_local_browse_url(alias: &str) -> Option<String> {
+    let state = read_install_state()?;
+
+    // "local" and "trial" both run the control panel on the same machine.
+    // Open the browser directly and let the web frontend handle auth — the
+    // CLI should not gatekeep when the server is local.
     let mode = state.get("control_plane_mode")?.as_str()?;
-    // Why: "local" and "trial" both run the control panel on the same machine.
-    // Open the browser directly and let the web frontend handle auth — the CLI
-    // should not gatekeep when the server is local.
     if mode != "local" && mode != "trial" {
         return None;
     }
 
-    let base_url = state.get("control_panel_url")?.as_str()?;
-    if base_url.is_empty() {
-        return None;
-    }
+    let base_url = derive_local_control_url(&state)?;
 
     // Both branches go through `/go/<alias>` so the web router owns
-    // every real route. The alias is already validated by the caller.
+    // every real route.
     Some(format!("{}/go/{}", base_url.trim_end_matches('/'), alias))
+}
+
+/// Read install-state.json once, returning the parsed value.
+fn read_install_state() -> Option<serde_json::Value> {
+    let home = dirs::home_dir()?;
+    let state_path = home.join(".aikey").join("install-state.json");
+    let content = std::fs::read_to_string(&state_path).ok()?;
+    serde_json::from_str(&content).ok()
 }
 
 /// Determine the base URL for `aikey web`.
@@ -3464,5 +3509,148 @@ mod core_tests {
         let anthropic_rows: Vec<_> = bindings.iter().filter(|b| b.provider_code == "anthropic").collect();
         assert_eq!(anthropic_rows.len(), 1, "UPSERT should leave exactly one row per canonical");
         assert_eq!(anthropic_rows[0].key_source_ref, "second");
+    }
+}
+
+// ============================================================================
+// derive_local_control_url tests
+//
+// Pin the regression caught on 2026-04-27: server-then-trial install left
+// `control_panel_url` pointing at the production sandbox port (39000) while
+// `install_profile == "trial"` and `ports.trial == 8090` were correct.
+// `aikey web` opened the wrong port. Fix is profile-driven URL derivation;
+// these tests pin every branch.
+// ============================================================================
+#[cfg(test)]
+mod control_url_resolution_tests {
+    use super::derive_local_control_url;
+
+    fn state(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).expect("test fixture must be valid JSON")
+    }
+
+    #[test]
+    fn trial_profile_uses_ports_trial_not_control_panel_url() {
+        // The exact mid-state we observed on 2026-04-27: install_profile=trial
+        // + ports.trial=8090 is correct, but control_panel_url=39000 is stale
+        // from a prior server install. Profile-driven derivation must IGNORE
+        // the stale URL and use ports.trial.
+        let s = state(r#"{
+            "install_profile": "trial",
+            "control_plane_mode": "trial",
+            "control_panel_url": "http://127.0.0.1:39000",
+            "ports": {"proxy": 27200, "trial": 8090}
+        }"#);
+        assert_eq!(
+            derive_local_control_url(&s),
+            Some("http://127.0.0.1:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn local_with_console_profile_uses_ports_trial() {
+        // local-install.sh --with-console writes ports.trial = console_port
+        // (same field name, same loopback semantics as trial). The current
+        // local installer also writes a matching control_panel_url, but if
+        // a stale value is present from a prior server install we still
+        // want ports.trial to win.
+        let s = state(r#"{
+            "install_profile": "local",
+            "control_plane_mode": "local",
+            "control_panel_url": "http://stale:39000",
+            "ports": {"proxy": 27200, "trial": 8090}
+        }"#);
+        assert_eq!(
+            derive_local_control_url(&s),
+            Some("http://127.0.0.1:8090".to_string())
+        );
+    }
+
+    #[test]
+    fn local_without_console_returns_none() {
+        // Personal-only install: no console, no ports.trial. derive returns
+        // None and the caller falls through to other resolution paths
+        // (interactive prompt, AIKEY_WEB_URL, etc).
+        let s = state(r#"{
+            "install_profile": "local",
+            "control_plane_mode": "none",
+            "control_panel_url": "",
+            "ports": {"proxy": 27200}
+        }"#);
+        assert_eq!(derive_local_control_url(&s), None);
+    }
+
+    #[test]
+    fn server_profile_uses_control_panel_url() {
+        // Production: control_panel_url IS the source of truth (externally
+        // configured BIND_IP + manifest web port). Don't try to derive from
+        // ports — server uses different port keys (web, control, ...).
+        let s = state(r#"{
+            "install_profile": "server",
+            "control_plane_mode": "remote",
+            "control_panel_url": "http://10.0.0.5:39000",
+            "ports": {"web": 39000, "control": 39080}
+        }"#);
+        assert_eq!(
+            derive_local_control_url(&s),
+            Some("http://10.0.0.5:39000".to_string())
+        );
+    }
+
+    #[test]
+    fn server_profile_with_empty_url_returns_none() {
+        let s = state(r#"{
+            "install_profile": "server",
+            "control_panel_url": ""
+        }"#);
+        assert_eq!(derive_local_control_url(&s), None);
+    }
+
+    #[test]
+    fn unknown_profile_falls_back_to_control_panel_url() {
+        // Older install-state.json versions or hand-edited files may have
+        // unknown / missing install_profile. Back-compat: still honor
+        // control_panel_url if non-empty.
+        let s = state(r#"{
+            "install_profile": "ancient-unknown",
+            "control_panel_url": "http://legacy:7777"
+        }"#);
+        assert_eq!(
+            derive_local_control_url(&s),
+            Some("http://legacy:7777".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_install_profile_falls_back_to_control_panel_url() {
+        let s = state(r#"{
+            "control_panel_url": "http://legacy:7777"
+        }"#);
+        assert_eq!(
+            derive_local_control_url(&s),
+            Some("http://legacy:7777".to_string())
+        );
+    }
+
+    #[test]
+    fn trial_with_no_ports_field_returns_none() {
+        // If install-state somehow lacks `ports` entirely (corrupt state),
+        // we don't fall back to the stale control_panel_url for trial —
+        // returning None forces the caller into safer interactive prompts.
+        let s = state(r#"{
+            "install_profile": "trial",
+            "control_panel_url": "http://stale:39000"
+        }"#);
+        assert_eq!(derive_local_control_url(&s), None);
+    }
+
+    #[test]
+    fn trial_with_ports_but_missing_trial_key_returns_none() {
+        let s = state(r#"{
+            "install_profile": "trial",
+            "ports": {"proxy": 27200},
+            "control_panel_url": "http://stale:39000"
+        }"#);
+        assert_eq!(derive_local_control_url(&s), None);
     }
 }
