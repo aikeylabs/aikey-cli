@@ -239,7 +239,11 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
         .map(|v| v.into_iter().filter(|a| a.status == "active").count())
         .unwrap_or(0);
     let logged_in = storage::get_platform_account().ok().flatten().is_some();
-    let proxy_running = crate::commands_proxy::is_proxy_running();
+    // Round 9 fix #1: migrated from is_proxy_running (PID-only, unsafe per
+    // Round 5) to proxy_is_running_managed (Layer 1 identity + ownership +
+    // /health). Project status now agrees with `aikey proxy status` in
+    // OrphanedPort / Unresponsive / PID-recycle scenarios.
+    let proxy_running = crate::commands_proxy::proxy_is_running_managed();
 
     // User-facing categorization:
     //   key       = personal + team (raw API keys stored in the vault)
@@ -694,38 +698,90 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     // ── 4. Proxy process + reachability ──────────────────────
+    //
+    // **Round 10 review fix (MEDIUM, Finding 1)**: previously this
+    // path consumed `doctor_proxy_status()`'s `(bool, Option<u32>)`
+    // 2-tuple, which collapsed `Crashed` / `Unresponsive` /
+    // `OrphanedPort` into one "proxy_up == false → attempt restart"
+    // branch. For OrphanedPort that is the wrong action policy:
+    // Layer 2 will reject the foreign owner anyway (correctly), but
+    // an interactive doctor session would have prompted for the vault
+    // password first — wasting user input on something we can't fix.
+    //
+    // Now consume the full `ProxyState` directly so each variant maps
+    // to its correct policy:
+    //   Running       → green, with /health latency
+    //   Stopped       → "not running" + auto-restart attempt
+    //   Crashed       → "stale pidfile" + auto-restart (start_proxy
+    //                   cleans up)
+    //   Unresponsive  → diagnostic only ("try restart manually" —
+    //                   auto-restart would just spawn over a sick
+    //                   sibling without killing it; user should run
+    //                   `aikey proxy restart` which goes through
+    //                   Layer 2's full SIGTERM→SIGKILL escalation)
+    //   OrphanedPort  → diagnostic only, NO restart attempt, NO
+    //                   password prompt — we provably can't manage
+    //                   the foreign owner
+    use crate::proxy_state::{proxy_state, ProxyState};
+
     let proxy_addr = crate::commands_proxy::doctor_proxy_addr();
-    let (mut proxy_up, proxy_pid) = crate::commands_proxy::doctor_proxy_status();
+    let initial_state = proxy_state(&proxy_addr);
+    let mut proxy_up = matches!(initial_state, ProxyState::Running { .. });
     {
-        let detail = match (proxy_up, proxy_pid) {
-            (true, Some(pid)) => {
+        match &initial_state {
+            ProxyState::Running { pid, .. } => {
                 // Measure latency against /health.
                 let start = Instant::now();
                 let url = format!("http://{}/health", proxy_addr);
                 let ok = ureq::get(&url).call().is_ok();
                 let ms = start.elapsed().as_millis();
-                if ok { format!("running  (pid {}, {} ms)", pid, ms) }
-                else   { format!("pid {} alive but /health unreachable", pid) }
-            }
-            (false, Some(pid)) => format!("pid {} alive but port not open", pid),
-            _ => "not running".to_string(),
-        };
-
-        if proxy_up {
-            emit("proxy", true, &detail, None);
-        } else {
-            emit("proxy", false, &detail, Some("attempting restart..."));
-            // Auto-restart: try env var first, then prompt for password.
-            if !json_mode {
-                crate::commands_proxy::ensure_proxy_for_use(false);
-                // Re-check after restart attempt.
-                let (up, _) = crate::commands_proxy::doctor_proxy_status();
-                if up {
-                    proxy_up = true;
-                    emit("proxy restart", true, "proxy restarted successfully", None);
+                let detail = if ok {
+                    format!("running  (pid {}, {} ms)", pid, ms)
                 } else {
-                    emit("proxy restart", false, "restart failed",
-                        Some("run 'aikey proxy start' manually to debug"));
+                    format!("pid {} alive but /health unreachable", pid)
+                };
+                emit("proxy", true, &detail, None);
+            }
+            ProxyState::Unresponsive { pid, port } => {
+                // Diagnostic-only: don't restart automatically. The
+                // sibling process is bound but unhealthy; only an
+                // explicit Layer 2 stop+start (with proper SIGTERM
+                // escalation) is safe here.
+                emit(
+                    "proxy",
+                    false,
+                    &format!("unresponsive (pid {pid}, port {port}, /health failing)"),
+                    Some("run 'aikey proxy restart' to recover"),
+                );
+            }
+            ProxyState::OrphanedPort { port, owner_pid, reason } => {
+                // Diagnostic-only: no auto-restart, no password prompt.
+                // Doing either would be wasted user input — Layer 2
+                // can't manage the foreign owner.
+                emit(
+                    "proxy",
+                    false,
+                    &format!("orphaned (port {port} owned by something we cannot manage)"),
+                    Some(&reason.hint(*port, *owner_pid)),
+                );
+            }
+            ProxyState::Crashed { .. } | ProxyState::Stopped => {
+                let detail = match &initial_state {
+                    ProxyState::Crashed { stale_pid } => format!("stale pidfile (was: {stale_pid})"),
+                    _ => "not running".to_string(),
+                };
+                emit("proxy", false, &detail, Some("attempting restart..."));
+                if !json_mode {
+                    crate::commands_proxy::ensure_proxy_for_use(false);
+                    // Re-check via Layer 1 — same single source of truth.
+                    let (up, _) = crate::commands_proxy::doctor_proxy_status();
+                    if up {
+                        proxy_up = true;
+                        emit("proxy restart", true, "proxy restarted successfully", None);
+                    } else {
+                        emit("proxy restart", false, "restart failed",
+                            Some("run 'aikey proxy start' manually to debug"));
+                    }
                 }
             }
         }

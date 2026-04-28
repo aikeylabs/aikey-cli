@@ -377,3 +377,99 @@ fn proxy_kill9_warns_on_next_cli_command() {
         "warning should include the `aikey proxy start` hint so users know \
          how to recover.\ncombined output:\n{}", combined);
 }
+
+/// Round-10 review fix #1 (Finding 1) regression test:
+/// `aikey doctor` MUST NOT attempt restart when the proxy port is held by
+/// something we cannot manage (OrphanedPort). The pre-fix code path
+/// collapsed `Crashed` / `Unresponsive` / `OrphanedPort` into one
+/// "proxy_up=false → ensure_proxy_for_use" branch, which on interactive
+/// sessions could prompt for the vault password before Layer 2 finally
+/// rejected the foreign owner — wasted user input on an unrecoverable
+/// state.
+///
+/// ## Construction
+///
+/// External `TcpListener` binds the proxy's configured port. No pidfile,
+/// no sidecar — Layer 1 sees `OrphanedPort { reason: PortHeldByExternal }`.
+/// `aikey doctor` is then expected to render the orphaned diagnostic and
+/// stop, without entering the restart path.
+#[test]
+fn doctor_under_orphaned_port_does_not_attempt_restart() {
+    let env = match Env::try_new("doctor-orphaned") {
+        Some(e) => e,
+        None => return skip_because_no_proxy_bin(),
+    };
+
+    // External holder on the proxy's port — Layer 1 will classify as
+    // OrphanedPort with reason PortHeldByExternal.
+    let listener = std::net::TcpListener::bind(format!("127.0.0.1:{}", env.port))
+        .expect("bind external holder");
+
+    let out = env.cmd().arg("doctor").output().expect("spawn doctor");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    drop(listener); // release external holder
+
+    let lower = combined.to_lowercase();
+    assert!(lower.contains("orphan"),
+        "doctor MUST report 'orphaned' when external port holder is detected \
+         (regression: Round-10 Finding 1).\ncombined output:\n{}", combined);
+    assert!(!combined.contains("attempting restart"),
+        "doctor MUST NOT enter the restart path when the port is held by a \
+         foreign process — Layer 2 cannot manage it, and a vault password \
+         prompt would be wasted user input. (regression: Round-10 Finding 1).\n\
+         combined output:\n{}", combined);
+}
+
+/// Round-10 review fix #2 (Finding 2) regression test:
+/// `warn_if_proxy_down` (called at the end of `aikey list`, `use`, `run`,
+/// `exec`) MUST detect `OrphanedPort` — not just "port unreachable". The
+/// pre-fix code used `port_reachable()` only; an external listener on the
+/// port made the helper silent because the TCP connect succeeded, even
+/// though the running process was not our proxy.
+///
+/// ## Construction
+///
+/// External `TcpListener` binds the proxy's configured port. `aikey list`
+/// renders the unified list (vault read is unaffected) and then calls
+/// `warn_if_proxy_down`. The combined output must contain the new
+/// OrphanedPort warning text.
+#[test]
+fn warn_if_proxy_down_under_foreign_owner_emits_warning() {
+    let env = match Env::try_new("warn-foreign") {
+        Some(e) => e,
+        None => return skip_because_no_proxy_bin(),
+    };
+
+    let listener = std::net::TcpListener::bind(format!("127.0.0.1:{}", env.port))
+        .expect("bind external holder");
+
+    // `aikey list` is one of the commands that calls `warn_if_proxy_down`
+    // at the end (main.rs line ~610). The vault read inside list is
+    // unaffected by the proxy state, so we exercise the post-op warn
+    // path cleanly.
+    let out = env.cmd().arg("list").output().expect("spawn list");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    drop(listener);
+
+    // The new warn_if_proxy_down emits "Port {port} is held by something
+    // we cannot manage" for OrphanedPort. We assert on the stable
+    // substring "cannot manage" (the orphan diagnostic vocabulary —
+    // also used by handle_status / status_rows / handle_verify, so this
+    // matches the unified diagnostic surface).
+    let lower = combined.to_lowercase();
+    assert!(lower.contains("cannot manage") || lower.contains("orphan"),
+        "warn_if_proxy_down MUST emit the OrphanedPort warning when the \
+         port is held by an external process — pre-fix relied on \
+         port_reachable() and was silent in this case. (regression: \
+         Round-10 Finding 2).\ncombined output:\n{}", combined);
+}

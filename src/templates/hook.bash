@@ -71,7 +71,7 @@ _aikey_hook_check_once() {
     bin_hash=$(command aikey _hook-hash bash 2>/dev/null)
     [ -z "$file_hash" ] || [ -z "$bin_hash" ] && return
     if [ "$file_hash" != "$bin_hash" ]; then
-        printf '\033[33m[aikey] hook.bash is outdated (file=%s, binary=%s).\n    run: aikey use   # regenerates ~/.aikey/hook.bash, then re-source\n\033[0m' "$file_hash" "$bin_hash" >&2
+        printf '\033[33m[aikey] hook.bash is outdated (file=%s, binary=%s).\n    run: aikey hook update   # regenerates ~/.aikey/hook.bash, then re-source\n\033[0m' "$file_hash" "$bin_hash" >&2
     fi
 }
 

@@ -136,7 +136,8 @@ fn configure_proxy_collector(control_url: &str, json_mode: bool) {
         eprintln!("    Usage reporting → {}", collector_url);
         // Proxy reads YAML at startup only; reload won't pick up config changes.
         // Auto-restart proxy so the new collector_url takes effect immediately.
-        if crate::commands_proxy::is_proxy_running() {
+        // Round 9 fix #1: was is_proxy_running (PID-only); now Layer 1.
+        if crate::commands_proxy::proxy_is_running_managed() {
             let pw = if let Some(cached) = crate::session::try_get() {
                 cached
             } else {
@@ -1146,9 +1147,11 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
             "key_ref":  cfg.key_ref,
             "providers": cfg.providers,
         }));
+        // Round 9 fix #1: was is_proxy_running (PID-only); now Layer 1.
+        let proxy_running = crate::commands_proxy::proxy_is_running_managed();
         crate::json_output::print_json(serde_json::json!({
             "gateway": {
-                "running": crate::commands_proxy::is_proxy_running(),
+                "running": proxy_running,
             },
             "login": {
                 "logged_in": account.is_some(),

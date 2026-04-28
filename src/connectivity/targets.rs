@@ -5,6 +5,15 @@
 //! module, which keeps the `TestTarget.provider_code` canonicalization
 //! invariant honest in one place.
 
+// **Round 9 review fix (MEDIUM, Finding 1)**: migrated all
+// `is_proxy_running()` calls to `proxy_is_running_managed()`, which
+// wraps Layer 1's `compute_proxy_state` for identity + ownership +
+// /health verification. Previously preflight here would treat any
+// PID-alive process as "ours" — including PID-recycled foreign
+// processes — and let target construction proceed against a proxy
+// we don't manage. The probe time cost of `compute_proxy_state` (~10ms
+// from /health) is acceptable for the safety upgrade.
+
 use crate::storage;
 
 use super::{
@@ -41,7 +50,7 @@ pub fn target_from_binding(
         // Post-2026-04-22 (plan D) this path matches team/OAuth: CLI never
         // touches the plaintext. Proxy decrypts on its side.
         CredentialType::PersonalApiKey => {
-            if !crate::commands_proxy::is_proxy_running() {
+            if !crate::commands_proxy::proxy_is_running_managed() {
                 return Err(BuildTargetError::ProxyNotRunning { label: row_label });
             }
             Ok(personal_target(
@@ -53,7 +62,7 @@ pub fn target_from_binding(
 
         // ── Team virtual key: route through the local proxy. ───────────────
         CredentialType::ManagedVirtualKey => {
-            if !crate::commands_proxy::is_proxy_running() {
+            if !crate::commands_proxy::proxy_is_running_managed() {
                 return Err(BuildTargetError::ProxyNotRunning { label: row_label });
             }
             // Sanity: team VK needs its ciphertext delivered for the proxy to
@@ -76,7 +85,7 @@ pub fn target_from_binding(
 
         // ── OAuth account: route through the local proxy. ──────────────────
         CredentialType::PersonalOAuthAccount => {
-            if !crate::commands_proxy::is_proxy_running() {
+            if !crate::commands_proxy::proxy_is_running_managed() {
                 return Err(BuildTargetError::ProxyNotRunning { label: row_label });
             }
             // Surface OAuth accounts in reauth/subscription_required early.
@@ -151,7 +160,7 @@ pub fn targets_from_alias(
         // Plan D (2026-04-22): no decryption here — proxy does it server-
         // side via the aikey_personal_alias_ sentinel. We just need the
         // provider list (metadata, unencrypted) and the proxy running.
-        if !crate::commands_proxy::is_proxy_running() {
+        if !crate::commands_proxy::proxy_is_running_managed() {
             return Vec::new();
         }
 
@@ -190,7 +199,7 @@ pub fn targets_from_alias(
     let team_entry = storage::get_virtual_key_cache(alias).ok().flatten()
         .or_else(|| storage::get_virtual_key_cache_by_alias(alias).ok().flatten());
     if let Some(vk) = team_entry {
-        if !crate::commands_proxy::is_proxy_running() {
+        if !crate::commands_proxy::proxy_is_running_managed() {
             return Vec::new();
         }
         if vk.provider_key_ciphertext.is_none() {
@@ -216,7 +225,7 @@ pub fn targets_from_alias(
             // CredentialType::PersonalOAuthAccount is the only kind we
             // route through here; other types would be data corruption.
             debug_assert_eq!(acct.credential_type, CredentialType::PersonalOAuthAccount);
-            if !crate::commands_proxy::is_proxy_running() {
+            if !crate::commands_proxy::proxy_is_running_managed() {
                 return Vec::new();
             }
             if !matches!(acct.status.as_str(), "active" | "idle") {

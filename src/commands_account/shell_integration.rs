@@ -1106,9 +1106,32 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         }
 
         // v2 or v1 present — migrate with rc backup.
+        //
+        // Hook coverage v1 review round 2 (2026-04-27): the H1.5 non-TTY
+        // refusal at the bottom of this function only guarded the *fresh
+        // install* branch. A pipe / CI / unattended invocation that
+        // landed on a system with leftover v1/v2 markers would still
+        // silently rewrite rc here. That's the same class of consent
+        // surprise H1.5 was meant to prevent — the rc edit's surface
+        // (file content rewrite + backup creation) is at least as
+        // significant as the fresh-install append.
+        //
+        // Decision: also gate v1/v2 migration on TTY. If unattended,
+        // keep rc as-is and tell the user to run `aikey hook install`
+        // interactively to confirm the migration.
         let has_v2 = contents.contains(V2_BEGIN);
         let has_v1 = contents.contains(V1_MARKER);
         if has_v2 || has_v1 {
+            use std::io::IsTerminal;
+            if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
+                return Some(format!(
+                    "  Detected legacy aikey hook (v1/v2) in {}.\n  \
+                     Migration to v3 needs interactive confirmation.\n  \
+                     Run interactively: \x1b[36maikey hook install\x1b[0m\n  \
+                     Or silence: \x1b[36mexport AIKEY_NO_HOOK=1\x1b[0m",
+                    rc,
+                ));
+            }
             let backup = match backup_rc_file(rc_path) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1134,46 +1157,125 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         }
     }
 
-    // 4. No marker found — fresh install. Prompt before touching rc.
-    let rc_file = rc_candidates
-        .iter()
-        .find(|rc| std::path::Path::new(rc).exists())
-        .or_else(|| rc_candidates.first())
-        .cloned()?;
-
+    // 4. No marker found — fresh install. We're about to mutate the user's
+    // dotfile (~/.zshrc / ~/.bashrc / ~/.bash_profile). Before doing that,
+    // refuse non-interactive invocation entirely:
+    //
+    // Reviewer round (2026-04-27, hook coverage v1 §H1.5): the prior
+    // implementation only TTY-gated the prompt; the append itself was
+    // unconditional. So a piped / scripted call (`printf KEY | aikey add`,
+    // CI invocations, etc.) would silently rewrite rc with default-Y
+    // semantics. That's a contract surprise — rc edits need explicit
+    // consent, and stdin/stderr being redirected is a strong signal that
+    // there is no human to grant it.
+    //
+    // After this gate: non-interactive callers get a clear hint to either
+    // run `aikey hook install` from a terminal, or set AIKEY_NO_HOOK=1
+    // (or pass `--no-hook`) to silence the suggestion entirely.
     use std::io::{IsTerminal, Write};
-    if io::stderr().is_terminal() {
-        let shell_name = if is_zsh { "zsh" } else { "bash" };
-        let rows = vec![
-            format!("Shell:  {}", shell_name),
-            format!("File:   {}", rc_file),
-            format!("Add:    source ~/.aikey/{}  (v3)", hook_filename),
-        ];
-        crate::ui_frame::eprint_box("\u{2753}", "Install Shell Hook", &rows);
-        eprint!("  Proceed? [Y/n] (default Y): ");
-        io::stderr().flush().ok();
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_ok()
-            && matches!(input.trim().to_lowercase().as_str(), "n" | "no")
-        {
-            return Some(format!(
-                "  Skipped. To apply once: source ~/.aikey/{}",
-                hook_filename
-            ));
-        }
+    if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
+        return Some(format!(
+            "  Shell hook file rendered, but ~/.{} (rc-file) wiring needs interactive confirmation.\n  \
+             Run interactively: \x1b[36maikey hook install\x1b[0m\n  \
+             Or silence this hint: \x1b[36mexport AIKEY_NO_HOOK=1\x1b[0m\n  \
+             To apply right now without rc wiring: \x1b[36msource ~/.aikey/{}\x1b[0m",
+            if is_zsh { "zshrc" } else { "bashrc" },
+            hook_filename,
+        ));
     }
 
-    match std::fs::OpenOptions::new().append(true).open(&rc_file) {
-        Ok(mut f) => {
-            let block = format!("\n{}", v3_block);
-            let _ = f.write_all(block.as_bytes());
-            Some(format!("  Shell hook installed in {}", rc_file))
-        }
-        Err(_) => Some(format!(
+    // macOS shell hook installation rules (hook coverage v1 §3rd-party
+    // review, 2026-04-27):
+    //
+    //   zsh : write hook block to ~/.zshrc (single canonical file)
+    //   bash: write hook block to ~/.bashrc (canonical Rule 3 location)
+    //         AND if ~/.bash_profile exists but doesn't already source
+    //         ~/.bashrc, append a source-bashrc shim there. macOS
+    //         Terminal.app launches bash as a login shell which reads
+    //         ~/.bash_profile first; without the shim, ~/.bashrc never
+    //         gets sourced and the hook never loads.
+    //
+    // Why the bash double-write is two distinct artifacts (NOT the same
+    // hook copied twice): hook BODY lives in one place (~/.bashrc); the
+    // shim in ~/.bash_profile is a one-line conditional source — there's
+    // no "duplication" between the two even though we touch both files.
+    let rc_file: String = if is_zsh {
+        format!("{}/.zshrc", home)
+    } else {
+        format!("{}/.bashrc", home)
+    };
+
+    let shell_name = if is_zsh { "zsh" } else { "bash" };
+    let rows = vec![
+        format!("Shell:  {}", shell_name),
+        format!("File:   {}", rc_file),
+        format!("Add:    source ~/.aikey/{}  (v3)", hook_filename),
+    ];
+    crate::ui_frame::eprint_box("\u{2753}", "Install Shell Hook", &rows);
+    eprint!("  Proceed? [Y/n] (default Y): ");
+    io::stderr().flush().ok();
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_ok()
+        && matches!(input.trim().to_lowercase().as_str(), "n" | "no")
+    {
+        return Some(format!(
+            "  Skipped. To apply once: source ~/.aikey/{}",
+            hook_filename
+        ));
+    }
+
+    // Write the canonical hook block. Use OpenOptions::create so the
+    // file lands even if the user has no existing rc (fresh macOS).
+    // Don't worry about losing user content — this is `append`, and
+    // `create` only kicks in when the file is missing.
+    let block = format!("\n{}", v3_block);
+    let write_result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&rc_file)
+        .and_then(|mut f| f.write_all(block.as_bytes()));
+    if write_result.is_err() {
+        return Some(format!(
             "  Could not write to {}. Source ~/.aikey/{} manually.",
             rc_file, hook_filename
-        )),
+        ));
     }
+
+    // For bash on macOS: also ensure ~/.bash_profile sources ~/.bashrc.
+    // Skip the shim if .bash_profile doesn't exist (don't create new
+    // dotfiles the user didn't have) or if it already sources .bashrc.
+    let mut extra_msg = String::new();
+    if !is_zsh {
+        let bash_profile = format!("{}/.bash_profile", home);
+        if std::path::Path::new(&bash_profile).exists() {
+            let bp_contents = std::fs::read_to_string(&bash_profile).unwrap_or_default();
+            // Detect any common form of "source .bashrc" already there:
+            // `source ~/.bashrc`, `. ~/.bashrc`, `. "$HOME/.bashrc"`, etc.
+            let already_sources_bashrc = bp_contents.lines().any(|l| {
+                let t = l.trim();
+                if t.starts_with('#') { return false; }
+                (t.contains("source") || t.starts_with(". ") || t == ".")
+                    && t.contains(".bashrc")
+            });
+            if !already_sources_bashrc {
+                let shim = "\n# >>> aikey: source bashrc for login shells (macOS Terminal) >>>\n\
+                            if [ -f \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n\
+                            # <<< aikey: source bashrc for login shells <<<\n";
+                let shim_result = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&bash_profile)
+                    .and_then(|mut f| f.write_all(shim.as_bytes()));
+                if shim_result.is_ok() {
+                    extra_msg = format!("\n  Also wired ~/.bash_profile → source ~/.bashrc (macOS login shells).");
+                }
+            }
+        }
+    }
+
+    Some(format!(
+        "  Shell hook installed in {}{}",
+        rc_file, extra_msg
+    ))
 }
 
 /// Pure hook-file refresh path used by `aikey hook update` (Stage 8-1).
@@ -1225,6 +1327,114 @@ pub fn refresh_hook_file_only(shell: Option<&str>) -> Result<std::path::PathBuf,
 
     write_hook_file(&home, is_zsh)
         .map_err(|e| format!("failed to write hook file: {}", e))
+}
+
+/// Reason code for `refresh_hook_file_only` failures, for Web envelope
+/// reporting (hook coverage v1 §2.3). The CLI / TTY paths typically only
+/// see the human-readable message; Web bridges need a machine-readable
+/// classifier so the SPA can pick the right banner copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookFailureReason {
+    /// `AIKEY_NO_HOOK=1` set — explicit user / CI opt-out.
+    AikeyNoHook,
+    /// `$HOME` not set in the process env. Container edge case.
+    HomeUnset,
+    /// `$SHELL` is not zsh or bash and no explicit dialect was passed.
+    /// Common in service environments (systemd often sets SHELL=/bin/sh).
+    ShellUndetectable,
+    /// File system error during temp+rename. Real failure.
+    IoError,
+}
+
+impl HookFailureReason {
+    /// Stable string token for the Web envelope.
+    pub fn as_envelope_str(&self) -> &'static str {
+        match self {
+            Self::AikeyNoHook       => "aikey_no_hook",
+            Self::HomeUnset         => "home_unset",
+            Self::ShellUndetectable => "shell_undetectable",
+            Self::IoError           => "io_error",
+        }
+    }
+}
+
+/// Web-bridge entry point — Stage 2 / H2.
+///
+/// Renders ~/.aikey/hook.{zsh,bash} (Layer 1 only — never touches rc).
+/// Returns `(installed, failure_reason)` so the Web envelope can report
+/// to the front-end with enough granularity to drive the §2.4 banner
+/// state machine.
+///
+/// Wraps `refresh_hook_file_only(None)` and classifies its String error
+/// into the typed `HookFailureReason`.
+pub fn web_install_hook_file_layer1() -> (bool, Option<HookFailureReason>) {
+    if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
+        return (false, Some(HookFailureReason::AikeyNoHook));
+    }
+    if std::env::var("HOME").is_err() {
+        return (false, Some(HookFailureReason::HomeUnset));
+    }
+    match refresh_hook_file_only(None) {
+        Ok(_) => (true, None),
+        Err(msg) => {
+            // Classify by message content. refresh_hook_file_only's
+            // error strings are stable (we own them); pattern-matching
+            // on the prefix lets us promote to typed reasons without
+            // changing that function's public signature.
+            let reason = if msg.contains("could not auto-detect shell") {
+                HookFailureReason::ShellUndetectable
+            } else if msg.starts_with("HOME not set") {
+                HookFailureReason::HomeUnset
+            } else if msg.starts_with("AIKEY_NO_HOOK") {
+                HookFailureReason::AikeyNoHook
+            } else {
+                HookFailureReason::IoError
+            };
+            (false, Some(reason))
+        }
+    }
+}
+
+/// Whether the user's shell rc file (for their current `$SHELL`) contains
+/// a v3 aikey marker block. Stage 2 / H2: Web envelope `hook_rc_wired`
+/// field.
+///
+/// Shell-aware (hook coverage v1 review, 2026-04-27): only checks the rc
+/// file(s) that the active `$SHELL` actually reads — checking all four
+/// dotfiles would surface a stale `.bashrc` block as `wired=true` for a
+/// zsh user whose live shell never sources it.
+///
+/// Read targets, mirroring [`ensure_shell_hook`]'s write-side rules:
+///   zsh   → ~/.zshrc only
+///   bash  → ~/.bashrc OR ~/.bash_profile (legacy install in either is
+///           still considered wired; the bash login chain reads at least
+///           one of them)
+///   other → false (no auto-wiring possible; banner shows the
+///           `shell_undetectable` state)
+///
+/// Missing $HOME → false (treat as unwired; prompts `aikey hook install`).
+pub fn shell_rc_has_aikey_block() -> bool {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let candidates: &[&str] = if shell.contains("zsh") {
+        &[".zshrc"]
+    } else if shell.contains("bash") {
+        &[".bashrc", ".bash_profile"]
+    } else {
+        return false;
+    };
+    for rc in candidates {
+        let path = std::path::PathBuf::from(&home).join(rc);
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if contents.contains(V3_BEGIN) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Strip a v1 block from rc contents and splice in the v3 block at the same spot.
@@ -2027,6 +2237,195 @@ mod hook_tests {
         assert!(
             c.contains("AIKEY_ACTIVE_LABEL"),
             "legacy grace var must still be checked alongside _AIKEY_EXPLICIT_ALIAS"
+        );
+    }
+
+    // ── H1.5 (hook coverage v1, 2026-04-27) regression ─────────────────────
+    //
+    // ensure_shell_hook used to TTY-gate only the prompt, not the rc append
+    // itself. Pipe-mode invocations (printf KEY | aikey add ..., CI runs)
+    // would silently mutate ~/.zshrc with default-Y semantics. The hardening
+    // refuses non-interactive append entirely.
+    //
+    // cargo test runs without a controlling TTY (stdin/stderr both
+    // redirected), so these tests exercise exactly the non-TTY branch.
+    // For TTY-mode coverage we'd need a pty; that's left to manual smoke
+    // and the sandbox harness (Stage 5).
+    //
+    // Both ensure_shell_hook_* tests mutate process-wide HOME / SHELL env
+    // vars. cargo's default test runner is multi-threaded, so they would
+    // race if run concurrently with each other (or with other env-mutating
+    // tests in this crate, e.g. session.rs). Serialize them on a shared
+    // mutex; any future test that mutates HOME/SHELL in this module must
+    // also lock this mutex. Poison is fine — we only need ordering.
+    static ENV_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn ensure_shell_hook_refuses_rc_append_in_non_tty() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Set up an isolated HOME with a fresh ~/.zshrc containing user
+        // content but no aikey marker. After ensure_shell_hook, the hook
+        // file should land but ~/.zshrc must be byte-identical to before.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_str().expect("home utf-8");
+        let zshrc_path = tmp.path().join(".zshrc");
+        let initial_rc = "# user content\nalias ll='ls -la'\n";
+        std::fs::write(&zshrc_path, initial_rc).expect("write initial rc");
+
+        // Override HOME + SHELL for this call so internal lookups land in
+        // the sandbox. Save+restore around the env mutation; cargo's
+        // default test threading makes this safe-enough — we don't run
+        // with -j>1 across env-mutating tests.
+        let prev_home = std::env::var("HOME").ok();
+        let prev_shell = std::env::var("SHELL").ok();
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("SHELL", "/bin/zsh");
+        }
+
+        let msg = ensure_shell_hook(false);
+
+        // Restore env first so a panic in assertions doesn't leak state.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_shell {
+                Some(v) => std::env::set_var("SHELL", v),
+                None => std::env::remove_var("SHELL"),
+            }
+        }
+
+        // Hook file should still land — that's Layer 1 and doesn't need
+        // confirmation.
+        let hook_path = tmp.path().join(".aikey/hook.zsh");
+        assert!(
+            hook_path.exists(),
+            "Layer 1 (hook file) should land in non-TTY mode"
+        );
+
+        // ~/.zshrc must be byte-identical: no marker block was appended.
+        let after_rc = std::fs::read_to_string(&zshrc_path).expect("read rc");
+        assert_eq!(
+            initial_rc, after_rc,
+            "non-TTY ensure_shell_hook MUST NOT mutate user's rc; before:\n{:?}\nafter:\n{:?}",
+            initial_rc, after_rc,
+        );
+
+        // Returned hint should mention `aikey hook install` so the user
+        // has a clear recovery path.
+        let msg = msg.expect("ensure_shell_hook should return a hint, got None");
+        assert!(
+            msg.contains("aikey hook install"),
+            "non-TTY hint should point at `aikey hook install`, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn ensure_shell_hook_no_hook_flag_short_circuits_before_tty_check() {
+        // --no-hook is the explicit "I know what I'm doing, skip" flag.
+        // It must work regardless of TTY state and skip both Layer 1
+        // (hook file render) and Layer 2 (rc wire). Pin the contract so
+        // a future refactor of the TTY check can't accidentally change
+        // the no_hook short-circuit behavior.
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", tmp.path().to_str().unwrap()); }
+
+        let msg = ensure_shell_hook(true);
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert!(
+            msg.is_none(),
+            "--no-hook should return None (silent skip), got: {:?}", msg
+        );
+        assert!(
+            !tmp.path().join(".aikey/hook.zsh").exists(),
+            "--no-hook should NOT write hook file"
+        );
+        assert!(
+            !tmp.path().join(".aikey/hook.bash").exists(),
+            "--no-hook should NOT write hook file"
+        );
+    }
+
+    // Round-3 review follow-up (2026-04-28): the v1/v2 → v3 migration branch
+    // inside ensure_shell_hook also TTY-gates (rewriting an rc that already
+    // has legacy markers is the same consent surface as a fresh append, just
+    // with a backup). Pin a regression test so a future refactor can't
+    // silently move that gate out from under us.
+    #[test]
+    fn ensure_shell_hook_refuses_v2_migration_in_non_tty() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_str().expect("home utf-8");
+        let zshrc_path = tmp.path().join(".zshrc");
+        // .zshrc with a v2 block sandwiched between user lines — the exact
+        // shape ensure_shell_hook used to silently rewrite under non-TTY
+        // before the gate was extended to migration paths.
+        let initial_rc = format!(
+            "export FOO=bar\n{}\naikey() {{ echo old; }}\nprecmd_functions+=(_aikey_precmd)\n{}\n# user code\n",
+            V2_BEGIN, V2_END
+        );
+        std::fs::write(&zshrc_path, &initial_rc).expect("write initial rc");
+
+        let prev_home = std::env::var("HOME").ok();
+        let prev_shell = std::env::var("SHELL").ok();
+        unsafe {
+            std::env::set_var("HOME", home);
+            std::env::set_var("SHELL", "/bin/zsh");
+        }
+
+        let msg = ensure_shell_hook(false);
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_shell {
+                Some(v) => std::env::set_var("SHELL", v),
+                None => std::env::remove_var("SHELL"),
+            }
+        }
+
+        // rc must be byte-identical: migration was refused, no backup
+        // created, no v3 block written.
+        let after_rc = std::fs::read_to_string(&zshrc_path).expect("read rc");
+        assert_eq!(
+            initial_rc, after_rc,
+            "non-TTY ensure_shell_hook MUST NOT rewrite a v2-marked rc; before:\n{:?}\nafter:\n{:?}",
+            initial_rc, after_rc,
+        );
+
+        // Backup file must NOT exist — backup_rc_file is only called inside
+        // the TTY branch.
+        let backup_glob = std::fs::read_dir(tmp.path())
+            .expect("readdir tmp")
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().starts_with(".zshrc.bak"));
+        assert!(!backup_glob, "non-TTY migration must not create rc backup");
+
+        // Hint must point the user at the interactive recovery path.
+        let msg = msg.expect("ensure_shell_hook should return a hint on legacy v2 in non-TTY");
+        assert!(
+            msg.contains("aikey hook install"),
+            "non-TTY v2 migration hint should point at `aikey hook install`, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("legacy aikey hook") || msg.contains("v1/v2"),
+            "non-TTY v2 migration hint should name the legacy marker, got: {}",
+            msg
         );
     }
 }

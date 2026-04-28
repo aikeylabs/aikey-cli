@@ -7,6 +7,14 @@
 //! A lightweight `proxy_guard` is exported for use by other commands (e.g. `run`)
 //! so the proxy is automatically started in the background when needed.
 
+// TRANSITIONAL (Stages 1-2, remove in Stage 3 cut-over):
+// `is_proxy_running` and `is_proxy_listening` are deprecated this file
+// — their replacement (`proxy_state::proxy_state()`) lives alongside
+// during Stages 1-2. The internal call sites here will be deleted /
+// rewritten in Stage 3. Suppressing file-level so the build output
+// during Stage 2 development isn't drowned in deprecation noise.
+#![allow(deprecated)]
+
 use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 use std::io;
@@ -20,6 +28,66 @@ use std::time::Duration;
 const PROXY_HEALTH_ADDR_DEFAULT: &str = "127.0.0.1:27200";
 const PID_FILENAME: &str = "proxy.pid";
 const DEFAULT_CONFIG_NAME: &str = "aikey-proxy.yaml";
+
+// ---------------------------------------------------------------------------
+// Layer 2 bridge — Stage 3 migration helpers
+// ---------------------------------------------------------------------------
+
+/// Canonical path for the proxy startup log. stderr from the spawned
+/// proxy gets appended here so silent-failure modes (vault decrypt,
+/// bind error, panicking goroutine) leave a forensic trail.
+///
+/// Bugfix record: 2026-04-28 — proxy auto-start silently failed when
+/// user typed wrong vault password; vault decrypt error was lost
+/// because stderr went to /dev/null.
+fn startup_log_path() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".aikey").join("logs").join("aikey-proxy-startup.log"))
+        .unwrap_or_else(|| PathBuf::from("/tmp/aikey-proxy-startup.log"))
+}
+
+/// Build a `StartOptions` struct from the existing CLI config-loading
+/// flow. Bridges legacy `Option<&str>` config arg + proxy.env discovery
+/// + binary lookup to the new Layer 2 surface.
+///
+/// Returns the loaded options + the proxy.env entries so the caller
+/// can print the "proxy.env: N entries [...]" diagnostic before
+/// invoking `start_proxy_*`.
+fn build_start_options(
+    config: Option<&str>,
+    stderr_target: crate::proxy_lifecycle::StderrTarget,
+) -> Result<(crate::proxy_lifecycle::StartOptions, Vec<String>), Box<dyn std::error::Error>> {
+    let binary_path = find_proxy_binary()?;
+    let config_path = resolve_config(config)?;
+    let listen_addr = proxy_listen_addr(Some(&config_path));
+
+    let (extra_env, env_keys) = match crate::proxy_env::read_proxy_env() {
+        Ok(env_map) => {
+            let keys: Vec<String> = env_map.keys().cloned().collect();
+            let pairs: Vec<(String, String)> =
+                env_map.into_iter().collect();
+            (pairs, keys)
+        }
+        Err(e) => {
+            return Err(format!(
+                "Failed to parse ~/.aikey/proxy.env: {}\n\
+                 Fix the file or remove it, then retry.",
+                e
+            )
+            .into());
+        }
+    };
+
+    let opts = crate::proxy_lifecycle::StartOptions {
+        config_path,
+        binary_path,
+        listen_addr,
+        healthy_deadline: crate::proxy_lifecycle::DEFAULT_HEALTHY_DEADLINE,
+        stderr_target,
+        extra_env,
+    };
+    Ok((opts, env_keys))
+}
 
 // ---------------------------------------------------------------------------
 // Vault change-sequence state helpers
@@ -62,7 +130,26 @@ pub fn proxy_vault_state() -> ProxyVaultState {
 /// `is_proxy_listening()` instead — it adds a port probe to catch the
 /// "PID alive but socket not bound" failure mode (e.g. proxy hung at
 /// startup before bind, or PID recycle pointing to an unrelated process).
-pub fn is_proxy_running() -> bool {
+///
+/// **Deprecated as of Round 5 (2026-04-28)**: this function returns
+/// PID-only existence which is **not safe** to use as a kill gate —
+/// PID recycling can make this return true for unrelated or
+/// other-instance aikey-proxy processes. Use
+/// [`crate::proxy_state::proxy_state`] instead, which combines
+/// identity + ownership verification.
+/// **Round 9 fix #1**: downgraded from `pub` to `pub(crate)` after all
+/// external callers migrated to `proxy_is_running_managed` (Layer 1).
+/// The remaining in-crate use (line 172, the deprecated `is_proxy_listening`
+/// internal call) is itself slated for removal once `is_proxy_listening`
+/// is dropped. Keeping the symbol behind the deprecation gate so any
+/// future re-introduction is loud at compile time.
+#[deprecated(
+    since = "1.0.6",
+    note = "Use proxy_state::proxy_state() — this PID-only check is unsafe \
+            for kill decisions due to PID recycle (Round 5). \
+            For boolean preflight, use commands_proxy::proxy_is_running_managed()."
+)]
+pub(crate) fn is_proxy_running() -> bool {
     read_pid().map_or(false, |pid| process_alive(pid))
 }
 
@@ -76,12 +163,47 @@ pub fn is_proxy_running() -> bool {
 /// pidfile (process died after `write_pid` but before `bind`) or PID
 /// recycle (kernel reassigned the PID to an unrelated process) both
 /// produce false positives. Adding a quick port probe closes both holes.
-pub fn is_proxy_listening() -> bool {
+///
+/// **Deprecated as of Round 5 (2026-04-28)**: PID + port-reachable is
+/// still insufficient — port can be held by a *different* aikey-proxy
+/// instance (PID recycle to another instance), in which case both
+/// signals are true but the process is not ours. Use
+/// [`crate::proxy_state::proxy_state`] which adds identity + ownership
+/// (birth_token) verification.
+/// **Round 9 fix #1**: downgraded from `pub` to `pub(crate)` after all
+/// external callers migrated to `proxy_is_running_managed`.
+#[deprecated(
+    since = "1.0.6",
+    note = "Use proxy_state::proxy_state() — PID + port still insufficient \
+            for ownership; need identity + birth_token (Round 5). \
+            For boolean preflight, use commands_proxy::proxy_is_running_managed()."
+)]
+#[allow(dead_code)]
+pub(crate) fn is_proxy_listening() -> bool {
+    #[allow(deprecated)]
     if !is_proxy_running() {
         return false;
     }
     let addr = proxy_listen_addr(None);
     port_reachable(&addr, Duration::from_millis(300))
+}
+
+/// Returns `true` iff the proxy is in `ProxyState::Running` —
+/// identity + ownership + `/health` all verified. Other states
+/// (Stopped, Crashed, Unresponsive, OrphanedPort) all return `false`.
+///
+/// **Round 9 review fix (MEDIUM, Finding 1)**: introduced as the
+/// canonical `bool` wrapper around `proxy_state::proxy_state()` for
+/// preflight callers (connectivity targets, `aikey run` dispatch,
+/// command-entry guards). Use this in place of the deprecated
+/// `is_proxy_running` / `is_proxy_listening` everywhere a simple
+/// "can I route through proxy right now?" check is needed. PID recycle
+/// to another aikey-proxy instance and OrphanedPort scenarios both
+/// correctly return `false` via this helper, where the legacy probes
+/// would have returned `true`.
+pub fn proxy_is_running_managed() -> bool {
+    use crate::proxy_state::{proxy_state, ProxyState};
+    matches!(proxy_state(&proxy_listen_addr(None)), ProxyState::Running { .. })
 }
 
 /// Sends `POST /admin/reload` to the proxy if it is currently running.
@@ -90,7 +212,10 @@ pub fn is_proxy_listening() -> bool {
 /// picks up the new route without a full restart.  Errors are suppressed —
 /// the proxy remains reachable even if the reload HTTP call fails.
 pub fn try_reload_proxy() {
-    if is_proxy_running() {
+    // Round 9 fix #1: was is_proxy_running (PID-only); now Layer 1 so we
+    // skip the reload POST when the proxy is OrphanedPort / Unresponsive
+    // (the POST would fail anyway, but the diagnostic noise is cleaner now).
+    if proxy_is_running_managed() {
         if let Err(e) = post_admin_reload() {
             let msg = e.to_string();
             // Why: after `aikey change-password`, the proxy process still has
@@ -109,108 +234,12 @@ pub fn try_reload_proxy() {
     }
 }
 
-/// Silently start the proxy in the background using the given password.
-///
-/// Unlike `proxy_guard`, this function produces no output on the happy path —
-/// it is intended for fully transparent auto-start triggered by other commands.
-/// Returns `true` if the proxy is up after the call, `false` otherwise.
-fn silently_start_proxy(password: &SecretString) -> bool {
-    // Already running — nothing to do.
-    if is_proxy_running() {
-        return true;
-    }
-
-    let proxy_bin = match find_proxy_binary() {
-        Ok(b) => b,
-        Err(_) => return false, // binary not installed — skip silently
-    };
-    let config_path = match resolve_config(None) {
-        Ok(p) => p,
-        Err(_) => return false, // no config — skip silently
-    };
-
-    let mut cmd = std::process::Command::new(&proxy_bin);
-    cmd.arg("--config").arg(&config_path);
-    // Load proxy.env entries — warn on parse failure but don't block auto-start.
-    match crate::proxy_env::read_proxy_env() {
-        Ok(env_map) => {
-            for (k, v) in &env_map {
-                cmd.env(k, v);
-            }
-        }
-        Err(e) => {
-            eprintln!("[aikey] warning: failed to parse ~/.aikey/proxy.env: {}", e);
-            eprintln!("[aikey] proxy will start without proxy.env settings");
-        }
-    }
-    cmd.env("AIKEY_MASTER_PASSWORD", password.expose_secret());
-    // Why log instead of /dev/null: silent start failures (vault decrypt,
-    // bind error, panicking goroutine) used to be invisible — caller saw
-    // only "proxy failed to start" with no actionable hint. Diverting
-    // stderr to a known location lets users `tail` it after a failure
-    // (and the ensure_proxy_for_use error path now points there).
-    // Best-effort: if we can't open the file we fall back to /dev/null
-    // (better than failing the whole start because logging broke).
-    // Bugfix record: 2026-04-28 — proxy auto-start silently failed when
-    // user typed wrong vault password; vault decrypt error was lost.
-    let startup_log = dirs::home_dir()
-        .map(|h| h.join(".aikey").join("logs").join("aikey-proxy-startup.log"));
-    if let Some(ref path) = startup_log {
-        let _ = std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new("/")));
-    }
-    let stderr_target = startup_log
-        .as_ref()
-        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
-        .map(std::process::Stdio::from)
-        .unwrap_or_else(std::process::Stdio::null);
-    cmd.stdout(std::process::Stdio::null())
-       .stderr(stderr_target);
-
-    match cmd.spawn() {
-        Ok(child) => {
-            let pid = child.id();
-            let _ = write_pid(pid);
-            if let Ok(seq) = crate::storage::get_vault_change_seq() {
-                let _ = crate::storage::set_proxy_loaded_seq(seq);
-            }
-            // Poll up to 4 s for proxy to become reachable. Why we also
-            // check process_alive(pid) per tick: if the child crashed
-            // immediately (vault decrypt failure, address-in-use, panic at
-            // startup) we don't want to wait the full 4 s before giving up.
-            //
-            // Why we clean up the pidfile on every failure exit: previously
-            // we wrote the pidfile right after spawn but left it untouched
-            // when start failed — the next `is_proxy_running()` call would
-            // see this dead PID, and during the OS PID-recycle race window
-            // process_alive could even return true for an unrelated process,
-            // making `aikey proxy ensure-running` falsely report success
-            // (observed 2026-04-28 — bugfix record forthcoming).
-            let health_addr = proxy_listen_addr(None);
-            let deadline = std::time::Instant::now() + Duration::from_secs(4);
-            loop {
-                if port_reachable(&health_addr, Duration::from_millis(300)) {
-                    return true;
-                }
-                if !process_alive(pid) {
-                    // Child died before binding — clean up pidfile so the
-                    // next caller doesn't see this dead entry.
-                    let _ = pid_path().map(std::fs::remove_file);
-                    return false;
-                }
-                if std::time::Instant::now() >= deadline {
-                    // Child still alive but never came up healthy — kill
-                    // it (otherwise it lingers as a hung process) AND clean
-                    // up the pidfile.
-                    let _ = terminate_process(pid);
-                    let _ = pid_path().map(std::fs::remove_file);
-                    return false;
-                }
-                std::thread::sleep(Duration::from_millis(300));
-            }
-        }
-        Err(_) => false,
-    }
-}
+// `silently_start_proxy` was deleted in Stage 3 cut-over (2026-04-28).
+// All call sites migrated to `crate::proxy_lifecycle::start_proxy`,
+// which provides a single canonical spawn path with RAII cleanup,
+// identity + ownership verification, and the lifecycle file lock.
+// See lifecycle 方案 § Layer 2 — anything that needs to spawn proxy
+// must go through Layer 2 now (no direct `Command::spawn` allowed).
 
 /// Try to auto-start the proxy silently using `AIKEY_MASTER_PASSWORD` or
 /// `AK_TEST_PASSWORD` environment variables.
@@ -218,70 +247,79 @@ fn silently_start_proxy(password: &SecretString) -> bool {
 /// Called at the top of every command dispatch so that the proxy is running
 /// whenever a master password is pre-injected (e.g. CI / scripted sessions).
 /// No-ops completely when neither env var is set — no prompt, no output.
+///
+/// Stage 3 migration: delegates to Layer 2 [`crate::proxy_lifecycle::start_proxy`]
+/// for atomic spawn + identity / ownership tracking. Errors are silently
+/// swallowed (function returns `()` not `Result`) — by design, this is a
+/// best-effort hook called automatically; failure should never block
+/// the actual command the user invoked.
 pub fn try_auto_start_from_env() {
-    if is_proxy_running() {
-        return;
-    }
+    use crate::proxy_lifecycle::StderrTarget;
+
     let pw = std::env::var("AIKEY_MASTER_PASSWORD")
         .or_else(|_| std::env::var("AK_TEST_PASSWORD"));
-    if let Ok(pw_val) = pw {
-        let _ = silently_start_proxy(&SecretString::new(pw_val));
-    }
+    let Ok(pw_val) = pw else { return };
+
+    let stderr_target = StderrTarget::Log(startup_log_path());
+    let Ok((opts, _)) = build_start_options(None, stderr_target) else { return };
+
+    let _ = crate::proxy_lifecycle::start_proxy(&SecretString::new(pw_val), opts);
 }
 
 /// Ensure the proxy is running, prompting for the master password when needed.
 ///
-/// Called by `aikey use` / `aikey key use` so that the proxy is always started
-/// after activating a key.  Priority:
-///   1. Already running → no-op
+/// Called by `aikey use` / `aikey key use` / wrapper hooks so that the
+/// proxy is always started after activating a key. Priority chain:
+///   1. Layer 1 says proxy is `Running` → no-op (idempotent fast-path)
 ///   2. `AIKEY_MASTER_PASSWORD` / `AK_TEST_PASSWORD` env var → silent start
-///   3. Interactive TTY → prompt once for master password, then start
-///   4. Non-TTY without env var → print a hint but don't block
+///   3. Session-cache hit → silent start (verified via `list_secrets` first)
+///   4. Interactive TTY → prompt + verify + start
+///   5. Non-TTY without env var → print a hint but don't block
+///
+/// Stage 3 migration: delegates to Layer 2 [`crate::proxy_lifecycle::start_proxy`]
+/// for the actual spawn. This shell handles the password resolution chain
+/// + verifying password against the vault before spawning (avoids the
+/// silent-vault-decrypt-failure pitfall — see commit history /
+/// `bugfix/2026-04-28-*`).
 pub fn ensure_proxy_for_use(password_stdin: bool) {
-    if is_proxy_running() {
+    use crate::proxy_lifecycle::{start_proxy, StartError, StderrTarget};
+
+    // 0. Fast-path: ask Layer 1 if proxy is already running. This is
+    // the safer-than-`is_proxy_running` check — Layer 1 verifies
+    // identity + ownership, so a `Running` here is provably ours.
+    let probe_listen = proxy_listen_addr(None);
+    if matches!(
+        crate::proxy_state::proxy_state(&probe_listen),
+        crate::proxy_state::ProxyState::Running { .. }
+    ) {
         return;
     }
 
-    // 1. Try env var (fully silent).
-    {
-        let pw = std::env::var("AIKEY_MASTER_PASSWORD")
-            .or_else(|_| std::env::var("AK_TEST_PASSWORD"));
-        if let Ok(pw_val) = pw {
-            let started = silently_start_proxy(&SecretString::new(pw_val));
-            if started {
-                eprintln!("[aikey] proxy started in background");
-            }
+    // 1. Resolve a candidate password.
+    let stderr_target = StderrTarget::Log(startup_log_path());
+    let env_pw = std::env::var("AIKEY_MASTER_PASSWORD")
+        .or_else(|_| std::env::var("AK_TEST_PASSWORD"))
+        .ok();
+
+    let (pw, from_cache, prompted, env_path) = if let Some(env_val) = env_pw {
+        // Env-var path: caller already injected the password; trust it.
+        // No vault verification — env var has the same security model as
+        // a flag, and the caller is responsible for getting it right.
+        (SecretString::new(env_val), false, false, true)
+    } else {
+        // Interactive / cache path. Need to actually have a TTY (or
+        // password-stdin mode) to ask for a fresh password.
+        use std::io::IsTerminal;
+        if !(io::stderr().is_terminal() || password_stdin) {
+            eprintln!("[aikey] proxy not running — run `aikey proxy start` to enable routing");
             return;
         }
-    }
-
-    // 2. Interactive: try the session cache first, prompt only on cache miss,
-    //    then VERIFY the password against the vault before spawning the proxy.
-    //
-    // Why cache-first: `aikey proxy start` and other write-paths use
-    // `prompt_vault_password` which already populates `session::store`. If the
-    // user typed their password recently, we silently reuse it — saves the
-    // "type password every claude/codex/use call" friction (observed
-    // 2026-04-28: users hit a fresh prompt despite having just unlocked the
-    // vault seconds earlier in another command).
-    //
-    // Why verify-before-spawn: `silently_start_proxy` redirects stderr so a
-    // wrong password manifests as "proxy failed to start" with no actionable
-    // hint — the proxy actually died on `vault decrypt`. Calling
-    // `executor::list_secrets` first turns wrong-password into an immediate
-    // CLI-level error (no spawn, no 4-second port poll, no cryptic message).
-    use std::io::IsTerminal;
-    if io::stderr().is_terminal() || password_stdin {
         eprintln!();
-        // Why no leading indent: 🔒 is a wide emoji (2 visual cols), so a
-        // matching "  " indent on the prompt line would push the prompt text
-        // out of alignment with the message above. Drop the indent on both
-        // lines to match the dominant `🔒 Enter Master Password:` style used
-        // in main.rs / commands_env.rs / commands_project.rs.
         eprintln!("Proxy not running — starting it now.");
 
-        // Cache hit path: silent, no prompt.
+        // Cache hit: silent.
         let mut from_cache = false;
+        let mut prompted = false;
         let pw: SecretString = if let Some(cached) = (!password_stdin)
             .then(|| crate::session::try_get())
             .flatten()
@@ -295,8 +333,10 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
             let mut line = String::new();
             let _ = io::stdin().read_line(&mut line);
             eprintln!("***");
+            prompted = true;
             SecretString::new(line.trim().to_string())
         } else {
+            prompted = true;
             match crate::prompt_hidden("\u{1F512} Enter Master Password: ") {
                 Ok(p) => SecretString::new(p),
                 Err(_) => {
@@ -306,15 +346,10 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
             }
         };
 
-        // Verify password against the vault before spawning the proxy.
-        // If list_secrets fails, the password is wrong (or the vault is
-        // corrupt) — either way, spawning the proxy with this password
-        // would just produce a silent vault-decrypt failure inside the
-        // child. Surface the real cause here.
+        // Verify password against the vault BEFORE spawning. Catches
+        // wrong-password early instead of letting it manifest as a
+        // silent vault-decrypt failure inside the child.
         if let Err(e) = crate::executor::list_secrets(&pw) {
-            // If the cached password failed, drop it from the cache so the
-            // next command prompts for a fresh one (covers the
-            // "user changed master password elsewhere" case).
             if from_cache {
                 crate::session::invalidate();
             }
@@ -322,34 +357,47 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
             eprintln!("  [aikey] retry with: aikey proxy start");
             return;
         }
-
-        // Password verified — store it in the session cache so subsequent
-        // commands in this terminal don't re-prompt. (Cache hits already
-        // refreshed above; this also covers the cache-miss prompt path.)
-        if !from_cache {
+        if prompted {
             crate::session::store(&pw);
         }
+        (pw, from_cache, prompted, false)
+    };
+    let _ = (from_cache, prompted, env_path); // suppress unused warnings on cfg paths
 
-        let started = silently_start_proxy(&pw);
-        if started {
+    // 2. Build StartOptions + delegate to Layer 2.
+    let (opts, _env_keys) = match build_start_options(None, stderr_target) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("  [aikey] {}", e);
+            return;
+        }
+    };
+
+    match start_proxy(&pw, opts) {
+        Ok(_) => {
             eprintln!("  [aikey] proxy started in background");
-        } else {
-            // Why: show actionable reason instead of a generic "failed" message.
-            // Note: vault-password failure is now caught above, so this branch
-            // is reached only for binary/config/port issues.
-            let bin_ok = find_proxy_binary().is_ok();
-            let cfg_ok = resolve_config(None).is_ok();
-            if !bin_ok {
-                eprintln!("  [aikey] proxy binary not found — reinstall with: aikey proxy install");
-            } else if !cfg_ok {
-                eprintln!("  [aikey] proxy config not found — run: aikey proxy start");
-            } else {
-                eprintln!("  [aikey] proxy failed to start — check ~/.aikey/logs/aikey-proxy-startup.log or run: aikey proxy start --foreground");
+            if let Ok(seq) = crate::storage::get_vault_change_seq() {
+                let _ = crate::storage::set_proxy_loaded_seq(seq);
             }
         }
-    } else {
-        // Non-interactive, no env var — print a one-line hint.
-        eprintln!("[aikey] proxy not running — run `aikey proxy start` to enable routing");
+        Err(StartError::OrphanedPort { port, owner_pid: _, reason: _ }) => {
+            eprintln!(
+                "  [aikey] port {port} is in use by another process — \
+                 run `aikey proxy status` for details"
+            );
+        }
+        Err(StartError::BinaryMissing(_)) => {
+            eprintln!("  [aikey] proxy binary not found — reinstall with: aikey proxy install");
+        }
+        Err(StartError::ConfigMissing(_)) => {
+            eprintln!("  [aikey] proxy config not found — run: aikey proxy start");
+        }
+        Err(e) => {
+            eprintln!(
+                "  [aikey] proxy failed to start: {e} — check ~/.aikey/logs/aikey-proxy-startup.log \
+                 or run: aikey proxy start --foreground"
+            );
+        }
     }
 }
 
@@ -358,7 +406,9 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
 /// vault open with the master password to decrypt entries.
 /// Call this after any vault-write operation (add, delete, update, etc.).
 pub fn maybe_warn_stale() {
-    if is_proxy_running() && proxy_vault_state() == ProxyVaultState::Stale {
+    // Round 9 fix #1: was is_proxy_running (PID-only); now Layer 1.
+    // Stale-vault check only meaningful when the proxy is genuinely ours.
+    if proxy_is_running_managed() && proxy_vault_state() == ProxyVaultState::Stale {
         if let Some(pw) = crate::session::try_get() {
             match handle_restart(None, &pw) {
                 Ok(_) => eprintln!("  Proxy restarted with new keys."),
@@ -457,51 +507,182 @@ fn proxy_listen_addr(config_path: Option<&std::path::Path>) -> String {
 // ---------------------------------------------------------------------------
 
 pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Check if already running.
-    if let Some(pid) = read_pid() {
-        if process_alive(pid) {
-            eprintln!("proxy already running (pid: {})", pid);
-            eprintln!("listen: http://{}", proxy_listen_addr(config.map(std::path::Path::new)));
+    if detach {
+        handle_start_background(config, password)
+    } else {
+        handle_start_foreground(config, password)
+    }
+}
+
+/// Background start path — delegates to Layer 2 [`crate::proxy_lifecycle::start_proxy`]
+/// which handles all the lifecycle invariants (lock, identity / ownership
+/// verification, atomic sidecar+pidfile write, RAII cleanup, healthy-poll).
+///
+/// This shell is responsible for:
+/// - building the [`StartOptions`] from the existing config-loading flow
+/// - printing the user-facing diagnostics ("Starting...", "config:",
+///   "binary:", "proxy.env: N entries")
+/// - converting [`StartError`] variants to the legacy CLI error strings
+///   so existing tests (`e2e_proxy_lifecycle.rs`) continue to pass
+fn handle_start_background(
+    config: Option<&str>,
+    password: &SecretString,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stderr_target = crate::proxy_lifecycle::StderrTarget::Log(startup_log_path());
+    let (opts, env_keys) = build_start_options(config, stderr_target)?;
+
+    eprintln!("Starting aikey-proxy...");
+    eprintln!("  config: {}", opts.config_path.display());
+    eprintln!("  binary: {}", opts.binary_path.display());
+    if !env_keys.is_empty() {
+        eprintln!("  proxy.env: {} entries [{}]", env_keys.len(), env_keys.join(", "));
+    }
+
+    let listen_addr_for_msg = opts.listen_addr.clone();
+    match crate::proxy_lifecycle::start_proxy(password, opts) {
+        Ok(state) => {
+            eprintln!(
+                "\x1b[32m✓\x1b[0m aikey-proxy running (pid: {}, http://{})",
+                state.pid, state.listen_addr
+            );
+            // Quick connectivity check for overseas providers after proxy starts.
+            // Only warn when a provider is unreachable — no noise when all is fine.
+            std::thread::spawn(|| {
+                check_overseas_connectivity();
+            });
+            // Record vault snapshot seq so reload-vs-restart logic can detect
+            // staleness later. (Sole writer per CLAUDE.md.)
+            if let Ok(seq) = crate::storage::get_vault_change_seq() {
+                let _ = crate::storage::set_proxy_loaded_seq(seq);
+            }
+            Ok(())
+        }
+        Err(crate::proxy_lifecycle::StartError::OrphanedPort { port, owner_pid: _, reason: _ }) => {
+            // Preserve legacy error string so e2e tests match.
+            Err(format!(
+                "address {} is already in use by another process.\n  \
+                 Stop the other listener or change listen.port in {}.\n  \
+                 Check: lsof -nP -iTCP:{} -sTCP:LISTEN",
+                listen_addr_for_msg,
+                resolve_config(config)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "<config>".into()),
+                port
+            )
+            .into())
+        }
+        Err(crate::proxy_lifecycle::StartError::ChildDiedAtStartup { stderr_log }) => {
+            let port = listen_addr_for_msg.rsplit(':').next().unwrap_or("27200");
+            Err(format!(
+                "aikey-proxy exited shortly after starting.\n  \
+                 Likely cause: address {} is already in use by another process, or the config is invalid.\n  \
+                 Check:  lsof -nP -iTCP:{} -sTCP:LISTEN\n  \
+                 Logs:   {}",
+                listen_addr_for_msg,
+                port,
+                stderr_log.display()
+            )
+            .into())
+        }
+        Err(e) => Err(format!("{e}").into()),
+    }
+}
+
+/// Foreground start path. Behaves like `aikey proxy start` but inherits
+/// stdout/stderr and blocks until the proxy exits.
+///
+/// **Round 7 review fix (HIGH, Finding 2)**: previously this path
+/// wrote only the pidfile, so Layer 1 classified the running proxy as
+/// `OrphanedPort + LegacyPidfileNoSidecar` and other shells could not
+/// `aikey proxy stop / restart` it. Now it shares
+/// `persist_ownership_files` with the detached path, so foreground
+/// instances are first-class members of the lifecycle state machine.
+///
+/// **Round 9 review fix (MEDIUM, Finding 3)**: previously the foreground
+/// path explicitly skipped Layer 2's lifecycle lock — meaning a
+/// concurrent `aikey proxy stop / restart / start` from another shell
+/// could race with foreground startup (e.g., another shell stop+start
+/// could end up signalling our just-spawned PID before our
+/// `persist_ownership_files` returns). The lock is now held across the
+/// entire critical section: Layer-1 state check → spawn → persist
+/// ownership files. After persist completes the lock is released and
+/// the foreground proxy lives independently for its full session,
+/// matching the detached-mode lock semantics (the lock serializes
+/// lifecycle *transitions*, not the running-proxy lifetime).
+///
+/// Cleanup on exit removes BOTH pidfile and sidecar in reverse order.
+/// Cleanup on Ctrl-C / panic is best-effort: we don't install a Drop
+/// guard around `child.wait()` because the foreground proxy is
+/// expected to outlive the CLI process for its full session — the
+/// next `aikey proxy *` invocation will see `Crashed` if the user
+/// SIGINTs the CLI but the proxy keeps running, or `Stopped` if
+/// they're both gone.
+fn handle_start_foreground(
+    config: Option<&str>,
+    password: &SecretString,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::proxy_lifecycle::{
+        acquire_lifecycle_lock, best_effort_remove, meta_path as lifecycle_meta_path,
+        persist_ownership_files, pid_path as lifecycle_pid_path,
+    };
+    use crate::proxy_state::{proxy_state, ProxyState};
+
+    let config_path = resolve_config(config)?;
+    let listen_addr = proxy_listen_addr(Some(&config_path));
+
+    // **Round 9 fix #3**: acquire lifecycle lock for the spawn +
+    // persist critical section. Released right after persist returns;
+    // the foreground proxy then lives independently of the lock.
+    let _lock = acquire_lifecycle_lock().map_err(|_| {
+        "another aikey proxy command is in flight; retry shortly".to_string()
+    })?;
+
+    // Layer 1 is the source of truth for "is something already there?"
+    // — it covers PID-recycle / OrphanedPort cases that the old
+    // `read_pid + process_alive` could not.
+    match proxy_state(&listen_addr) {
+        ProxyState::Running { pid, listen_addr: addr, .. } => {
+            eprintln!("proxy already running (pid: {pid})");
+            eprintln!("listen: http://{addr}");
             return Ok(());
         }
-        // Stale PID file — remove it.
-        let _ = fs::remove_file(pid_path()?);
+        ProxyState::Unresponsive { pid, port } => {
+            return Err(format!(
+                "previous aikey-proxy (pid: {pid}) is unresponsive on port {port}.\n  \
+                 Run `aikey proxy stop` (or restart) before starting a new instance.",
+            )
+            .into());
+        }
+        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+            return Err(format!(
+                "cannot start in foreground: port {port} is owned by something \
+                 we cannot manage ({})",
+                reason.hint(port, owner_pid)
+            )
+            .into());
+        }
+        ProxyState::Crashed { stale_pid: _ } => {
+            // Crashed cleanup happens here while we hold the lock so
+            // no other CLI can race in between cleanup and spawn.
+            if let Ok(p) = lifecycle_pid_path() {
+                best_effort_remove(&p);
+            }
+            if let Ok(p) = lifecycle_meta_path() {
+                best_effort_remove(&p);
+            }
+        }
+        ProxyState::Stopped => {}
     }
 
-    // 2. Locate proxy binary.
     let proxy_bin = find_proxy_binary()?;
-
-    // 3. Resolve config: cwd → ~/.aikey/
-    let config_path = resolve_config(config)?;
-
-    // 4. Pre-check: is the configured listen port already in use by someone else?
-    // Why: a post-spawn port_reachable() check cannot distinguish "our proxy bound
-    // successfully" from "someone else was already listening". In the collision
-    // case, our child dies on bind but port_reachable still returns true —
-    // producing a false "running" report. We have already cleared any stale pid
-    // file from a previous aikey proxy, so any live listener at this point is
-    // unrelated to us.
-    let listen_addr = proxy_listen_addr(Some(&config_path));
-    if port_reachable(&listen_addr, std::time::Duration::from_millis(250)) {
-        let port = listen_addr.rsplit(':').next().unwrap_or("?");
-        return Err(format!(
-            "address {} is already in use by another process.\n  \
-             Stop the other listener or change listen.port in {}.\n  \
-             Check: lsof -nP -iTCP:{} -sTCP:LISTEN",
-            listen_addr, config_path.display(), port
-        ).into());
-    }
 
     eprintln!("Starting aikey-proxy...");
     eprintln!("  config: {}", config_path.display());
     eprintln!("  binary: {}", proxy_bin.display());
 
-    // 4. Build the child command, injecting proxy.env + password via env.
     let mut cmd = Command::new(&proxy_bin);
     cmd.arg("--config").arg(&config_path);
 
-    // Load proxy.env entries into child process environment.
-    // Order: parent env (inherited) → proxy.env → CLI internal vars.
     match crate::proxy_env::read_proxy_env() {
         Ok(env_map) if !env_map.is_empty() => {
             let keys: Vec<&str> = env_map.keys().map(|k| k.as_str()).collect();
@@ -510,7 +691,7 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
                 cmd.env(k, v);
             }
         }
-        Ok(_) => {} // empty or no file — fine
+        Ok(_) => {}
         Err(e) => {
             return Err(format!(
                 "Failed to parse ~/.aikey/proxy.env: {}\n\
@@ -520,112 +701,101 @@ pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString)
         }
     }
 
-    // AIKEY_MASTER_PASSWORD always set last (cannot be overridden by proxy.env).
     cmd.env("AIKEY_MASTER_PASSWORD", password.expose_secret());
 
-    if detach {
-        // Background: stdout/stderr go to log file; terminal is not blocked.
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        let child = cmd.spawn()
-            .map_err(|e| format!("failed to spawn aikey-proxy: {}", e))?;
-        let pid = child.id();
-        write_pid(pid)?;
+    cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("failed to spawn aikey-proxy: {}", e))?;
+    let pid = child.id();
 
-        // Wait for proxy to become healthy before returning (max 3s).
-        // Check BOTH conditions per tick:
-        //   (a) our spawned child is still alive (process_alive)
-        //   (b) the listen address is reachable (port_reachable)
-        // Why both: port_reachable alone is insufficient. If the port is
-        // already held by *another* process (e.g. a stale proxy from a
-        // previous session or an unrelated service), our child crashes on
-        // bind but port_reachable still returns true — producing a false
-        // "running" report. Requiring process_alive closes that hole.
-        let addr = proxy_listen_addr(config.map(std::path::Path::new));
-        let mut healthy = false;
-        let mut spawn_died = false;
-        for _ in 0..6 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            if !process_alive(pid) {
-                spawn_died = true;
-                break;
-            }
-            if port_reachable(&addr, std::time::Duration::from_millis(300)) {
-                healthy = true;
-                break;
-            }
-        }
-        if healthy {
-            eprintln!("\x1b[32m✓\x1b[0m aikey-proxy running (pid: {}, http://{})", pid, addr);
-        } else if spawn_died {
-            // Clean up the pid file now so the next `aikey proxy start` does
-            // not go through the "stale pid" path with a confusing message.
-            let _ = fs::remove_file(pid_path()?);
-            let port = addr.rsplit(':').next().unwrap_or("27200");
-            return Err(format!(
-                "aikey-proxy (pid: {}) exited shortly after starting.\n  \
-                 Likely cause: address {} is already in use by another process, or the config is invalid.\n  \
-                 Check:  lsof -nP -iTCP:{} -sTCP:LISTEN\n  \
-                 Logs:   ~/.aikey/logs/",
-                pid, addr, port
-            ).into());
-        } else {
-            eprintln!("aikey-proxy spawned (pid: {}) but not yet reachable at http://{}", pid, addr);
-            eprintln!("  check logs: ~/.aikey/logs/");
-        }
-
-        // Quick connectivity check for overseas providers after proxy starts.
-        // Only warn when a provider is unreachable — no noise when all is fine.
-        std::thread::spawn(|| {
-            check_overseas_connectivity();
-        });
-
-        // Record the vault snapshot that this proxy generation was started with.
-        if let Ok(seq) = crate::storage::get_vault_change_seq() {
-            let _ = crate::storage::set_proxy_loaded_seq(seq);
-        }
-    } else {
-        // Foreground: inherit stdio so logs are visible; write PID before waiting.
-        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-        let mut child = cmd.spawn()
-            .map_err(|e| format!("failed to spawn aikey-proxy: {}", e))?;
-        let pid = child.id();
-        write_pid(pid)?;
-
-        // Record vault snapshot seq for the foreground process too.
-        if let Ok(seq) = crate::storage::get_vault_change_seq() {
-            let _ = crate::storage::set_proxy_loaded_seq(seq);
-        }
-
-        let status = child.wait()?;
-        let _ = fs::remove_file(pid_path()?);
-        if !status.success() {
-            return Err(format!("aikey-proxy exited with status: {}", status).into());
-        }
+    // Persist BOTH ownership anchor files so the proxy is recognized
+    // by Layer 1 as `Running` (not `LegacyPidfileNoSidecar`).
+    if let Err(e) = persist_ownership_files(pid, &proxy_bin, &config_path, &listen_addr) {
+        // Spawn succeeded but we can't anchor ownership — the proxy
+        // would otherwise be unmanageable from other shells. Kill the
+        // child to avoid leaving an unowned instance.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("failed to persist ownership files: {e}").into());
     }
 
+    if let Ok(seq) = crate::storage::get_vault_change_seq() {
+        let _ = crate::storage::set_proxy_loaded_seq(seq);
+    }
+
+    // Release the lifecycle lock now that ownership files are written.
+    // The foreground proxy continues running independently; other
+    // shells' `aikey proxy stop / restart / status` see it as a
+    // first-class managed instance via the sidecar meta.
+    drop(_lock);
+
+    let status = child.wait()?;
+
+    // Reverse order of write: pidfile first, sidecar second
+    // (mirrors StartCleanupGuard's invariant — the read path's worst
+    // intermediate state is "sidecar but no pidfile" = Stopped, which
+    // is harmless. The opposite ("pidfile but no sidecar"
+    // = LegacyPidfileNoSidecar) blocks subsequent management.)
+    if let Ok(p) = lifecycle_pid_path() {
+        best_effort_remove(&p);
+    }
+    if let Ok(p) = lifecycle_meta_path() {
+        best_effort_remove(&p);
+    }
+    if !status.success() {
+        return Err(format!("aikey-proxy exited with status: {}", status).into());
+    }
     Ok(())
 }
 
+/// Stop the proxy synchronously, honoring the 30s graceful drain
+/// contract aligned with `srv.Shutdown(30 * time.Second)` in the proxy
+/// binary. Delegates to Layer 2 [`crate::proxy_lifecycle::stop_proxy`]
+/// which handles the lifecycle lock, identity/ownership verification,
+/// SIGTERM-then-SIGKILL escalation, and pidfile + sidecar cleanup.
 pub fn handle_stop() -> Result<(), Box<dyn std::error::Error>> {
-    let pid = match read_pid() {
-        Some(p) => p,
-        None => {
-            eprintln!("proxy not running");
-            return Ok(());
+    use crate::proxy_lifecycle::{stop_proxy, StopError, DEFAULT_STOP_TIMEOUT};
+
+    // Capture pre-stop state so we can still print "proxy not running"
+    // for the no-pidfile case. (stop_proxy returns Ok silently for
+    // already-stopped — we want a user-visible line.)
+    let was_running_pid = read_pid().filter(|&pid| process_alive(pid));
+
+    // Round-6 review fix #3: pass the configured listen_addr explicitly
+    // so the stop loop probes the correct port even when the user has
+    // customised it in `aikey-proxy.yaml`.
+    let listen_addr = proxy_listen_addr(None);
+
+    match stop_proxy(&listen_addr, DEFAULT_STOP_TIMEOUT, |s| eprintln!("{s}")) {
+        Ok(()) => {
+            match was_running_pid {
+                Some(pid) => eprintln!("proxy stopped (pid: {})", pid),
+                None => eprintln!("proxy not running"),
+            }
+            Ok(())
         }
-    };
-
-    if !process_alive(pid) {
-        eprintln!("proxy not running (stale pid file cleaned up)");
-        let _ = fs::remove_file(pid_path()?);
-        return Ok(());
+        Err(StopError::NotOurs { port, owner_pid, reason }) => {
+            // **Round 7 review fix (MEDIUM)**: previously this branch
+            // returned Ok(()) so scripts that piped `stop && start`
+            // wouldn't break — but that hid a critical truth from
+            // automation: "stop succeeded" must mean "the proxy that
+            // was there is gone". Returning Ok(()) when we provably
+            // did NOT stop anything is dishonest and violates the
+            // synchronous-stop contract introduced in Round 2.
+            //
+            // Now we return Err so the exit code is non-zero. Scripts
+            // that want the old "noop = ok" behaviour can wrap with
+            // `|| true` or check the specific error message. The error
+            // is still actionable: it tells the user which PID owns
+            // the port and why we wouldn't touch it.
+            Err(format!(
+                "{}",
+                StopError::NotOurs { port, owner_pid, reason }
+            )
+            .into())
+        }
+        Err(e) => Err(format!("{e}").into()),
     }
-
-    // Send SIGTERM on Unix, TerminateProcess on Windows.
-    terminate_process(pid)?;
-    let _ = fs::remove_file(pid_path()?);
-    eprintln!("proxy stopped (pid: {})", pid);
-    Ok(())
 }
 
 pub fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
@@ -637,50 +807,109 @@ pub fn handle_status() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Returns the Gateway status as a list of display rows (no box frame).
 /// Used by both `aikey proxy status` (plain) and `aikey status` (boxed overview).
+///
+/// **Round 7 review fix (MEDIUM, Findings 3 + 4)**: rewritten to use
+/// Layer 1's `compute_proxy_state` as the single source of truth.
+/// Previously this function:
+/// 1. Used PID-only `process_alive` which could not distinguish a real
+///    aikey-proxy from a PID-recycled unrelated process (Round 4 / 5
+///    safety gap).
+/// 2. Mutated disk in a read path (`fs::remove_file(pid_path)`) and
+///    only cleaned the pidfile — leaving an orphan sidecar behind.
+///    File cleanup is a Layer 2 responsibility; reads must be pure.
+///
+/// The new flow renders each `ProxyState` variant directly. Crashed
+/// state's eventual cleanup happens on the next `start_proxy`, not in
+/// `status` — keeping read and write paths cleanly separated.
 pub fn status_rows() -> Vec<String> {
+    use crate::proxy_state::{proxy_state, ProxyState};
+
     let mut rows: Vec<String> = Vec::new();
-    match read_pid() {
-        None => {
+    let addr = proxy_listen_addr(None);
+    match proxy_state(&addr) {
+        ProxyState::Stopped => {
             rows.push("status:  stopped".to_string());
             rows.push("hint:    run `aikey proxy start` to start".to_string());
         }
-        Some(pid) => {
-            if !process_alive(pid) {
-                rows.push("status:  stopped (stale pid file)".to_string());
-                rows.push("hint:    run `aikey proxy start` to start".to_string());
-                if let Ok(p) = pid_path() { let _ = fs::remove_file(p); }
-            } else {
-                // Resolve the listen address from aikey-proxy.yaml (falls back to
-                // 127.0.0.1:27200 if the config cannot be parsed). Reading from
-                // config — rather than a hardcoded constant — keeps the displayed
-                // `listen:` line truthful when the user has customised the port.
-                let addr = proxy_listen_addr(None);
-                let healthy = port_reachable(&addr, Duration::from_millis(500));
-                let health_str = if healthy { "healthy" } else { "unreachable" };
-                rows.push(format!("status:  running ({})", health_str));
-                rows.push(format!("pid:     {}", pid));
-                rows.push(format!("listen:  http://{}", addr));
-                match proxy_vault_state() {
-                    ProxyVaultState::Current => rows.push("vault sync: current".to_string()),
-                    ProxyVaultState::Stale => {
-                        rows.push("vault sync: stale".to_string());
-                        rows.push("hint:    restart proxy to apply new keys: aikey proxy restart".to_string());
-                    }
-                    ProxyVaultState::Unknown => {}
+        ProxyState::Crashed { stale_pid } => {
+            rows.push(format!("status:  stopped (stale pid file, was: {stale_pid})"));
+            rows.push("hint:    run `aikey proxy start` to clean up and restart".to_string());
+        }
+        ProxyState::Running { pid, listen_addr, .. } => {
+            rows.push("status:  running (healthy)".to_string());
+            rows.push(format!("pid:     {pid}"));
+            rows.push(format!("listen:  http://{listen_addr}"));
+            match proxy_vault_state() {
+                ProxyVaultState::Current => rows.push("vault sync: current".to_string()),
+                ProxyVaultState::Stale => {
+                    rows.push("vault sync: stale".to_string());
+                    rows.push("hint:    restart proxy to apply new keys: aikey proxy restart".to_string());
                 }
+                ProxyVaultState::Unknown => {}
             }
+        }
+        ProxyState::Unresponsive { pid, port } => {
+            rows.push("status:  unresponsive (port bound, /health not responding)".to_string());
+            rows.push(format!("pid:     {pid}"));
+            rows.push(format!("listen:  http://127.0.0.1:{port}"));
+            rows.push("hint:    could be initializing or hung — wait or `aikey proxy restart`".to_string());
+        }
+        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+            rows.push("status:  orphaned (port held by something we cannot manage)".to_string());
+            if let Some(owner) = owner_pid {
+                rows.push(format!("owner:   pid {owner}"));
+            }
+            rows.push(format!("hint:    {}", reason.hint(port, owner_pid)));
         }
     }
     rows
 }
 
+/// Restart the proxy as a single atomic operation under one lifecycle
+/// lock acquisition. Why hard restart instead of graceful reload:
+/// restart must reload proxy.env (process environment variables),
+/// which can only take effect via a new process. Graceful reload only
+/// re-reads vault/YAML config within the existing process.
+///
+/// Delegates to Layer 2 [`crate::proxy_lifecycle::restart_proxy`] for
+/// the actual stop+start under shared lock; this shell builds the
+/// StartOptions and translates errors to legacy strings.
 pub fn handle_restart(config: Option<&str>, password: &SecretString) -> Result<(), Box<dyn std::error::Error>> {
-    // Why hard restart instead of graceful reload: restart must reload proxy.env
-    // (process environment variables), which can only take effect via a new process.
-    // Graceful reload only re-reads vault/YAML config within the existing process.
-    handle_stop()?;
-    std::thread::sleep(Duration::from_millis(300));
-    handle_start(config, true, password)
+    use crate::proxy_lifecycle::{restart_proxy, RestartError, StartError, StopError, StderrTarget, DEFAULT_STOP_TIMEOUT};
+
+    let stderr_target = StderrTarget::Log(startup_log_path());
+    let (opts, env_keys) = build_start_options(config, stderr_target)?;
+
+    eprintln!("Restarting aikey-proxy...");
+    eprintln!("  config: {}", opts.config_path.display());
+    eprintln!("  binary: {}", opts.binary_path.display());
+    if !env_keys.is_empty() {
+        eprintln!("  proxy.env: {} entries [{}]", env_keys.len(), env_keys.join(", "));
+    }
+
+    match restart_proxy(password, opts, DEFAULT_STOP_TIMEOUT, |s| eprintln!("{s}")) {
+        Ok(state) => {
+            eprintln!(
+                "\x1b[32m✓\x1b[0m aikey-proxy running (pid: {}, http://{})",
+                state.pid, state.listen_addr
+            );
+            if let Ok(seq) = crate::storage::get_vault_change_seq() {
+                let _ = crate::storage::set_proxy_loaded_seq(seq);
+            }
+            Ok(())
+        }
+        Err(RestartError::LockBusy) => Err("another aikey proxy command is in flight; retry shortly".into()),
+        Err(RestartError::Stop(StopError::NotOurs { .. })) => {
+            Err("cannot restart: existing port owner is not our managed proxy (see `aikey proxy status`)".into())
+        }
+        Err(RestartError::Stop(e)) => Err(format!("stop phase: {e}").into()),
+        Err(RestartError::Start(StartError::OrphanedPort { port, .. })) => Err(format!(
+            "address 127.0.0.1:{port} is in use by another process. \
+             Stop the other listener or change listen.port; check with: lsof -nP -iTCP:{port} -sTCP:LISTEN"
+        )
+        .into()),
+        Err(RestartError::Start(e)) => Err(format!("start phase: {e}").into()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -699,14 +928,11 @@ fn read_pid() -> Option<u32> {
     content.trim().parse().ok()
 }
 
-fn write_pid(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let path = pid_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&path, pid.to_string())?;
-    Ok(())
-}
+// `write_pid` removed in Round 7 review fix #2 — all writes now go
+// through `proxy_lifecycle::persist_ownership_files`, which atomically
+// writes BOTH pidfile and sidecar meta in the correct order. Direct
+// pidfile writes from outside Layer 2 are a layering violation that
+// produces `LegacyPidfileNoSidecar` orphans.
 
 /// Check whether a process with the given PID is alive.
 fn process_alive(pid: u32) -> bool {
@@ -735,6 +961,14 @@ fn process_alive(pid: u32) -> bool {
 }
 
 /// Send SIGTERM / TerminateProcess to the given PID.
+///
+/// `#[allow(dead_code)]`: TRANSITIONAL Stage 3 — `handle_stop` migrated
+/// to Layer 2 [`crate::proxy_lifecycle::stop_proxy`] which has its own
+/// `kill_pid_signal` helper. This local fn remains as a transitional
+/// utility and will be removed during the Stage 5 cleanup pass when
+/// the deprecated `is_proxy_running` / `is_proxy_listening` are also
+/// retired.
+#[allow(dead_code)]
 fn terminate_process(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
@@ -864,8 +1098,22 @@ fn find_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
 /// 5. Provider resolution from config
 /// 6. Proxy health (auto-starts in background if not running)
 pub fn handle_verify(password: &SecretString) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::proxy_state::{proxy_state, ProxyState};
+
+    // **Round 9 review fix (MEDIUM, Finding 2)**: was `is_proxy_running()`
+    // (PID-only) + hardcoded PROXY_HEALTH_ADDR_DEFAULT port probe — which
+    // diverged from the user's configured listen address AND could not
+    // distinguish OrphanedPort / Unresponsive from "ours, healthy".
+    // Migrated to Layer 1 `proxy_state(&listen_addr)` so verify shares
+    // the same single-source-of-truth as `aikey proxy status`.
+    let listen_addr = proxy_listen_addr(None);
+    let initial_state = proxy_state(&listen_addr);
+
     // Step 1: bail early if the proxy is running on a stale vault snapshot.
-    if is_proxy_running() && proxy_vault_state() == ProxyVaultState::Stale {
+    // (Stale check only meaningful when the proxy is actually ours.)
+    if matches!(initial_state, ProxyState::Running { .. })
+        && proxy_vault_state() == ProxyVaultState::Stale
+    {
         eprintln!("proxy is using an outdated vault snapshot.");
         eprintln!("restart proxy to apply new keys: aikey proxy restart");
         eprintln!("Then re-run: aikey proxy verify");
@@ -914,34 +1162,45 @@ pub fn handle_verify(password: &SecretString) -> Result<(), Box<dyn std::error::
     }
 
     // Step 5: proxy health — auto-start if needed.
-    let proxy_up = match read_pid() {
-        Some(pid) if process_alive(pid) => {
-            port_reachable(PROXY_HEALTH_ADDR_DEFAULT, Duration::from_millis(500))
+    // Use the SAME initial_state from Step 1 to avoid TOCTOU.
+    match initial_state {
+        ProxyState::Running { .. } => {
+            println!("proxy:    running (healthy)");
         }
-        _ => false,
-    };
-
-    if !proxy_up {
-        eprintln!("proxy not running — attempting to start...");
-        match handle_start(None, true, password) {
-            Ok(_) => {
-                std::thread::sleep(Duration::from_millis(800));
-                if port_reachable(PROXY_HEALTH_ADDR_DEFAULT, Duration::from_millis(1000)) {
-                    println!("proxy:    running (healthy)");
-                } else {
-                    println!("proxy:    unreachable after start attempt");
-                    println!("hint:     run `aikey proxy status` to debug");
+        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+            // Don't auto-start — we'd OrphanedPort-error. Surface the
+            // diagnostic so the user can resolve manually.
+            println!("proxy:    orphaned (port {port} held by something we cannot manage)");
+            println!("hint:     {}", reason.hint(port, owner_pid));
+            failed = true;
+        }
+        ProxyState::Unresponsive { pid, port } => {
+            println!("proxy:    unresponsive (pid {pid}, port {port})");
+            println!("hint:     run `aikey proxy restart` to recover");
+            failed = true;
+        }
+        ProxyState::Crashed { .. } | ProxyState::Stopped => {
+            // Crashed cleans its stale files inside start_proxy_locked.
+            eprintln!("proxy not running — attempting to start...");
+            match handle_start(None, true, password) {
+                Ok(_) => {
+                    // Re-check via Layer 1 (avoid hardcoded probe).
+                    std::thread::sleep(Duration::from_millis(300));
+                    if matches!(proxy_state(&listen_addr), ProxyState::Running { .. }) {
+                        println!("proxy:    running (healthy)");
+                    } else {
+                        println!("proxy:    unreachable after start attempt");
+                        println!("hint:     run `aikey proxy status` to debug");
+                        failed = true;
+                    }
+                }
+                Err(e) => {
+                    println!("proxy:    failed to start ({})", e);
+                    println!("hint:     run `aikey proxy start` to troubleshoot");
                     failed = true;
                 }
             }
-            Err(e) => {
-                println!("proxy:    failed to start ({})", e);
-                println!("hint:     run `aikey proxy start` to troubleshoot");
-                failed = true;
-            }
         }
-    } else {
-        println!("proxy:    running (healthy)");
     }
 
     println!();
@@ -961,12 +1220,23 @@ pub fn handle_verify(password: &SecretString) -> Result<(), Box<dyn std::error::
 /// if the proxy is (or becomes) reachable, `false` if startup failed.
 ///
 /// Designed to be transparent to end users: no output on the happy path.
+///
+/// **Round 7 review fix (MEDIUM, Finding 3)**: was previously a
+/// PID-only `process_alive + port_reachable` check that could not
+/// distinguish a real aikey-proxy from a PID-recycled unrelated
+/// process or a different aikey-proxy instance. Migrated to
+/// `compute_proxy_state` so the guard's "is it ours?" decision uses
+/// the same identity + ownership rules as `start_proxy` /
+/// `stop_proxy`. OrphanedPort / Unresponsive states correctly route
+/// to "do not auto-start; surface diagnostic" rather than silently
+/// trying to re-spawn over a foreign owner.
 pub fn proxy_guard(password: &SecretString) -> bool {
+    use crate::proxy_state::{proxy_state, ProxyState};
+
     let health_addr = proxy_listen_addr(None);
 
-    // Fast path: already running and healthy.
-    if let Some(pid) = read_pid() {
-        if process_alive(pid) && port_reachable(&health_addr, Duration::from_millis(300)) {
+    match proxy_state(&health_addr) {
+        ProxyState::Running { .. } => {
             // Warn once if the proxy is serving from a stale vault snapshot.
             if proxy_vault_state() == ProxyVaultState::Stale {
                 eprintln!("[aikey] proxy is using an outdated vault snapshot.");
@@ -974,9 +1244,29 @@ pub fn proxy_guard(password: &SecretString) -> bool {
             }
             return true;
         }
+        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+            // Layer 1 says the port is held by something we cannot
+            // manage — auto-starting would either OrphanedPort-error
+            // out or, worse, race with whoever owns it. Bail with a
+            // clear diagnostic so the user can resolve manually.
+            eprintln!("[aikey] cannot auto-start proxy: port {port} is owned by something \
+                       we cannot manage ({})", reason.hint(port, owner_pid));
+            eprintln!("[aikey] hint: run `aikey proxy status` for details");
+            return false;
+        }
+        ProxyState::Unresponsive { pid, port } => {
+            eprintln!("[aikey] previous aikey-proxy (pid: {pid}) is unresponsive on port {port}");
+            eprintln!("[aikey] attempting restart (Layer 2 will SIGTERM/SIGKILL it first)...");
+            // Fall through to the "start" path below, which will
+            // route through start_proxy_locked → terminate_unresponsive
+            // (Round 7 fix #1).
+        }
+        ProxyState::Crashed { .. } | ProxyState::Stopped => {
+            // Need a (re)start.
+        }
     }
 
-    // Proxy not running — start silently in background.
+    // Proxy not running (or stale state we should reset) — start silently in background.
     eprintln!("[aikey] proxy not running, starting in background...");
     match handle_start(None, true, password) {
         Ok(_) => {
@@ -1069,27 +1359,70 @@ pub fn proxy_port() -> u16 {
 }
 
 /// Lightweight post-operation check: prints a warning if the proxy is not
-/// reachable.  Does NOT attempt to auto-start — just informs the user.
+/// in `Running` state. Does NOT attempt to auto-start — just informs the user.
 ///
 /// Intended to be called at the end of commands that depend on the proxy
 /// (`list`, `use`, `run`, `exec`) so the user knows why requests may fail
 /// after an unexpected proxy termination (e.g. `kill -9`).
+///
+/// **Round 10 review fix (MEDIUM, Finding 2)**: was `port_reachable()`
+/// (port-open == healthy), which:
+///   - missed `Unresponsive` (port bound but `/health` 503 — most often
+///     when the proxy is mid-init or vault-decrypt has hung); and
+///   - missed `OrphanedPort` (port held by an external program OR a
+///     different aikey-proxy instance — `port_reachable` returns true
+///     for both).
+/// Now uses `proxy_state` directly so each non-Running variant gets a
+/// distinct, actionable warning, matching the diagnostic vocabulary
+/// `aikey proxy status` already uses.
 pub fn warn_if_proxy_down() {
+    use crate::proxy_state::{proxy_state, ProxyState};
+
     let addr = proxy_listen_addr(None);
-    if !port_reachable(&addr, Duration::from_millis(400)) {
-        eprintln!();
-        eprintln!("  \x1b[33m\u{26A0}\x1b[0m  Proxy is not running. Start it with: aikey proxy start");
+    match proxy_state(&addr) {
+        ProxyState::Running { .. } => {} // happy path: no warning
+        ProxyState::Stopped | ProxyState::Crashed { .. } => {
+            eprintln!();
+            eprintln!("  \x1b[33m\u{26A0}\x1b[0m  Proxy is not running. Start it with: aikey proxy start");
+        }
+        ProxyState::Unresponsive { pid, port } => {
+            eprintln!();
+            eprintln!("  \x1b[33m\u{26A0}\x1b[0m  Proxy (pid {pid}) is unresponsive on port {port} \
+                       (port bound, /health failing). Try: aikey proxy restart");
+        }
+        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+            eprintln!();
+            eprintln!("  \x1b[33m\u{26A0}\x1b[0m  Port {port} is held by something we cannot manage \
+                       — {}", reason.hint(port, owner_pid));
+            eprintln!("       Run `aikey proxy status` for details.");
+        }
     }
 }
 
-/// Returns `(is_running, pid)` — checks PID file + process alive + port reachable.
+/// Returns `(is_running, pid)` — Layer 1 wrapper for doctor / dashboard
+/// callers that need a 2-tuple summary.
+///
+/// **Round 9 review fix (MEDIUM, Finding 2)**: was `read_pid +
+/// process_alive + port_reachable`, which gave doctor a third
+/// independent definition of "running" — diverging from `status_rows`
+/// (already on `proxy_state`) and from Layer 2's `start_proxy` /
+/// `stop_proxy` decisions. Migrated so doctor sees the same
+/// identity + ownership-verified `Running` state as everyone else.
+///
+/// Mapping:
+/// - `Running { pid, .. }` → `(true, Some(pid))` (the only "ours, healthy" case)
+/// - `Unresponsive { pid, .. }` → `(false, Some(pid))` (port bound but /health bad)
+/// - `Crashed { stale_pid }` → `(false, Some(stale_pid))` (pidfile points at dead pid)
+/// - `OrphanedPort { owner_pid, .. }` → `(false, owner_pid)` (port held by foreign owner)
+/// - `Stopped` → `(false, None)`
 pub fn doctor_proxy_status() -> (bool, Option<u32>) {
+    use crate::proxy_state::{proxy_state, ProxyState};
     let addr = proxy_listen_addr(None);
-    match read_pid() {
-        Some(pid) if process_alive(pid) && port_reachable(&addr, Duration::from_millis(500)) => {
-            (true, Some(pid))
-        }
-        Some(pid) if process_alive(pid) => (false, Some(pid)), // alive but port not open yet
-        _ => (false, None),
+    match proxy_state(&addr) {
+        ProxyState::Running { pid, .. } => (true, Some(pid)),
+        ProxyState::Unresponsive { pid, .. } => (false, Some(pid)),
+        ProxyState::Crashed { stale_pid } => (false, Some(stale_pid)),
+        ProxyState::OrphanedPort { owner_pid, .. } => (false, owner_pid),
+        ProxyState::Stopped => (false, None),
     }
 }

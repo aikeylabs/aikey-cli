@@ -148,6 +148,12 @@ pub(crate) enum Commands {
         /// has no provider binding (legacy behavior).
         #[arg(long, value_name = "PROVIDERS", value_delimiter = ',', num_args = 1..)]
         providers: Vec<String>,
+        /// Skip installing the shell precmd hook into ~/.zshrc / ~/.bashrc.
+        /// Hook coverage v1: `aikey add` now installs the hook on first use
+        /// (parity with `aikey use`); pass this to opt out, or set
+        /// `AIKEY_NO_HOOK=1` in the environment.
+        #[arg(long)]
+        no_hook: bool,
     },
     /// Show all personal, team, and OAuth keys (alias for `aikey key list`)
     #[command(alias = "ls", display_order = 2)]
@@ -591,13 +597,29 @@ pub(crate) enum ProxyAction {
 #[derive(Subcommand)]
 pub(crate) enum HookAction {
     /// Regenerate ~/.aikey/hook.{zsh,bash} from the binary's embedded
-    /// template and re-ensure the rc-file `source` line. Idempotent.
+    /// template (Layer 1 only — does NOT touch your shell rc). Idempotent.
     Update,
     /// Report file / binary / loaded hashes and flag drift.
     Status {
         /// Override shell detection (zsh | bash). Default: detect from $SHELL.
         #[arg(long, value_name = "SHELL")]
         shell: Option<String>,
+    },
+    /// First-time install: render hook file AND wire ~/.zshrc / ~/.bashrc
+    /// (Layer 1 + Layer 2). Will prompt before modifying rc.
+    ///
+    /// Hook coverage v1: this is the explicit entry point for users who
+    /// went through Web-only onboarding (e.g. clicked 「Set as active key」
+    /// in the Web UI without ever running CLI commands). Web operations
+    /// only render the hook file; rc wiring still requires a CLI prompt.
+    Install {
+        /// Override shell detection (zsh | bash). Default: detect from $SHELL.
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
+        /// Skip Layer 2 (rc wiring). Equivalent to `aikey hook update`.
+        /// Useful in CI / sandbox tests that want Layer 1 only.
+        #[arg(long)]
+        no_hook: bool,
     },
 }
 
@@ -836,6 +858,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Hook { action } => match action {
                 HookAction::Update => "hook.update".to_string(),
                 HookAction::Status { .. } => "hook.status".to_string(),
+                HookAction::Install { .. } => "hook.install".to_string(),
             },
         },
     }

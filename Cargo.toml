@@ -60,12 +60,19 @@ notify = { version = "6", default-features = false, features = ["macos_fsevent"]
                     # Filesystem watcher for watch's live WAL tailing.  Only the
                     # FSEvents backend is compiled in; on Linux we fall back to
                     # the built-in poll watcher which is activated automatically.
+fs2 = "0.4"         # Cross-platform advisory file locking (proxy_lifecycle.rs:
+                    # ~/.aikey/run/proxy.lock to serialize start/stop/restart;
+                    # process exit auto-releases via OS, even on SIGKILL).
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"        # System calls for mlock (memory pinning)
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = ["Win32_System_Memory", "Win32_Foundation"] }
+windows-sys = { version = "0.52", features = [
+    "Win32_System_Memory",     # mlock-equivalent memory pinning
+    "Win32_Foundation",        # HANDLE / CloseHandle / FILETIME
+    "Win32_System_Threading",  # OpenProcess / QueryFullProcessImageNameW / GetProcessTimes (proxy_proc.rs)
+] }
 
 [dev-dependencies]
 assert_cmd = "2.0"      # Test CLI applications

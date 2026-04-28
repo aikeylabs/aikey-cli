@@ -36,6 +36,43 @@ fn try_log_audit(key: &[u8; 32], op: AuditOperation, alias: Option<&str>, succes
     }
 }
 
+/// Hook coverage v1 §H2 / §2.3: render hook file (Layer 1 only) + report
+/// rc-wire status to the Web envelope. Used by all mutating handlers
+/// (use / add / batch_import / delete_target) so the front-end can drive
+/// the §2.4 banner state machine consistently across operations.
+///
+/// Returns the three envelope fields as a JSON object that callers merge
+/// into their `ResultEnvelope::ok` payload. Layer 1 failure does NOT
+/// fail the vault op — the binding write already succeeded; the hook
+/// file is a side-channel best-effort.
+fn hook_status_for_envelope() -> serde_json::Value {
+    let (file_installed, failure_reason) =
+        crate::commands_account::web_install_hook_file_layer1();
+    let rc_wired = crate::commands_account::shell_rc_has_aikey_block();
+    json!({
+        "hook_file_installed": file_installed,
+        "hook_rc_wired": rc_wired,
+        "hook_failure_reason": failure_reason.map(|r| r.as_envelope_str()),
+    })
+}
+
+/// Merge the hook-status fields into an existing `serde_json::Value`
+/// object. Avoids each handler having to spell out the three fields.
+/// Idempotent: a future caller adding more fields elsewhere won't
+/// collide because we only write the three known keys.
+fn merge_hook_status(base: serde_json::Value) -> serde_json::Value {
+    let mut obj = base;
+    if let serde_json::Value::Object(ref mut map) = obj {
+        let hook = hook_status_for_envelope();
+        if let serde_json::Value::Object(hook_map) = hook {
+            for (k, v) in hook_map {
+                map.insert(k, v);
+            }
+        }
+    }
+    obj
+}
+
 // ========== action-specific payload types ==========
 
 #[derive(Debug, Deserialize)]
@@ -391,13 +428,13 @@ fn handle_add(env: StdinEnvelope) {
 
     emit(&ResultEnvelope::ok(
         req_id,
-        json!({
+        merge_hook_status(json!({
             "alias": outcome.alias,
             "action_taken": outcome.action.as_str(),
             "provider": outcome.primary_provider,
             "providers": outcome.providers,
             "audit_logged": audit_logged,
-        }),
+        })),
     ));
 }
 
@@ -543,7 +580,7 @@ fn handle_batch_import(env: StdinEnvelope) {
 
     emit(&ResultEnvelope::ok(
         req_id,
-        json!({
+        merge_hook_status(json!({
             "total": payload.items.len(),
             "inserted": inserted,
             "replaced": replaced,
@@ -551,7 +588,7 @@ fn handle_batch_import(env: StdinEnvelope) {
             "items": item_reports,
             "audit_logged": audit_failures == 0,
             "audit_failures": audit_failures,
-        }),
+        })),
     ));
 }
 
@@ -707,12 +744,12 @@ fn handle_delete_target(env: StdinEnvelope) {
             let audit_logged = try_log_audit(&key, AuditOperation::Delete, Some(&payload.id), true);
             emit(&ResultEnvelope::ok(
                 req_id,
-                json!({
+                merge_hook_status(json!({
                     "target": "personal",
                     "id": payload.id,
                     "action_taken": "deleted",
                     "audit_logged": audit_logged,
-                }),
+                })),
             ));
         }
         "oauth" => {
@@ -734,12 +771,12 @@ fn handle_delete_target(env: StdinEnvelope) {
             let audit_logged = try_log_audit(&key, AuditOperation::Delete, Some(&payload.id), true);
             emit(&ResultEnvelope::ok(
                 req_id,
-                json!({
+                merge_hook_status(json!({
                     "target": "oauth",
                     "id": payload.id,
                     "action_taken": "deleted",
                     "audit_logged": audit_logged,
-                }),
+                })),
             ));
         }
         "team" => {
@@ -1068,13 +1105,13 @@ fn handle_use(env: StdinEnvelope) {
 
     emit(&ResultEnvelope::ok(
         req_id,
-        json!({
+        merge_hook_status(json!({
             "target": payload.target,
             "id": canonical_key_ref,
             "input_id": payload.id,
             "activated_providers": providers,
             "active_env_refreshed": refresh_ok,
             "audit_logged": audit_logged,
-        }),
+        })),
     ));
 }

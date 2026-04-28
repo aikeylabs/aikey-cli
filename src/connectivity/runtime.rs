@@ -987,8 +987,12 @@ pub fn run_connectivity_suite(
             rows.push((t.clone(), r));
         }
 
+        // Round 9 fix #1: was is_proxy_running (PID-only); now uses
+        // proxy_is_running_managed (Layer 1 identity + ownership +
+        // /health) so the proxy row only appears when we actually own
+        // the running instance.
         let proxy_result = if opts.show_proxy_row && any_reachable
-            && crate::commands_proxy::is_proxy_running()
+            && crate::commands_proxy::proxy_is_running_managed()
         {
             let proxy_addr = crate::commands_proxy::doctor_proxy_addr();
             let prov = targets.iter()
@@ -1218,7 +1222,8 @@ pub fn run_connectivity_suite(
         if !any_reachable {
             eprintln!("  {:<12} {}", "proxy".bold(), "skipped (all providers unreachable)".dimmed());
             None
-        } else if crate::commands_proxy::is_proxy_running() {
+        } else if crate::commands_proxy::proxy_is_running_managed() {
+            // Round 9 fix #1: was is_proxy_running (PID-only); see top of fn.
             let proxy_addr = crate::commands_proxy::doctor_proxy_addr();
             let prov = targets.iter()
                 .find(|t| t.provider_code != "custom")

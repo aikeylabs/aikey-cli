@@ -108,7 +108,7 @@ _aikey_hook_check_once() {
     # stay silent — the drift detector is strictly best-effort.
     [[ -z "$file_hash" || -z "$bin_hash" ]] && return
     if [[ "$file_hash" != "$bin_hash" ]]; then
-        printf '\033[33m[aikey] hook.zsh is outdated (file=%s, binary=%s).\n    run: aikey use   # regenerates ~/.aikey/hook.zsh, then re-source\n\033[0m' "$file_hash" "$bin_hash" >&2
+        printf '\033[33m[aikey] hook.zsh is outdated (file=%s, binary=%s).\n    run: aikey hook update   # regenerates ~/.aikey/hook.zsh, then re-source\n\033[0m' "$file_hash" "$bin_hash" >&2
     fi
 }
 

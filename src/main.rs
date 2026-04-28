@@ -16,6 +16,13 @@ mod config;
 #[allow(dead_code)] mod connectivity;
 // mod commands_env; // removed: env commands dropped
 mod commands_proxy;
+// Layer 1 (state-machine read path) + Layer 2 (write path). Stage 1-2
+// of proxy lifecycle state machine refactor; commands_proxy.rs is in
+// the process of being migrated to thin shells over these.
+mod proxy_state;
+mod proxy_proc;
+mod proxy_lifecycle;
+mod proxy_events;
 #[allow(dead_code)] mod commands_account;
 // migrations module is in lib.rs (used by both main.rs and executor.rs)
 use aikeylabs_aikey_cli::migrations;
@@ -744,7 +751,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Hook { action } => {
             handle_hook_command(action)?;
         }
-        Commands::Add { alias, provider, providers } => {
+        Commands::Add { alias, provider, providers, no_hook } => {
             // Reject empty / whitespace-only alias before any interactive prompt.
             // Why: an empty alias writes a ghost entry that is hard to target with
             // later commands (`get ""`, `delete ""`) and pollutes `list --json`.
@@ -1017,6 +1024,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = profile_activation::refresh_implicit_profile_activation();
             }
 
+            // Hook coverage v1 §H1: install shell hook on `aikey add` too,
+            // not just on `aikey use`. First-key add is a typical onboarding
+            // path — without the hook, the user would see active.env get
+            // refreshed but their next prompt wouldn't auto-source it.
+            // ensure_shell_hook honors --no-hook + AIKEY_NO_HOOK=1 + non-TTY
+            // (H1.5 hardening), so this is safe in pipe/CI contexts too.
+            let hook_msg = if !cli.json {
+                commands_account::ensure_shell_hook(*no_hook)
+            } else {
+                None
+            };
+
             // Auto-configure third-party CLI tools when relevant providers are added.
             if !cli.json {
                 let proxy_port = commands_proxy::proxy_port();
@@ -1054,11 +1073,21 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("  \u{2502} {} Primary for: {}", "\u{2B50}".yellow(), newly_primary.join(", ").bold());
                 }
                 eprintln!("  \u{2502} Added key and refreshed current default activation.");
+                if let Some(ref msg) = hook_msg {
+                    eprintln!("  \u{2502}");
+                    for line in msg.lines() {
+                        eprintln!("  \u{2502} {}", line.trim_start());
+                    }
+                }
 
                 // Auto-start proxy after adding a key so the user can immediately
                 // use AI CLIs. Without this, `claude` / `cursor` would fail because
                 // the proxy isn't running to route requests.
-                if !commands_proxy::is_proxy_running() {
+                // Round 9 fix #1: was is_proxy_running (PID-only); now uses
+                // proxy_is_running_managed (Layer 1 identity + ownership +
+                // /health) so PID-recycle / OrphanedPort scenarios trigger the
+                // ensure_proxy_for_use path correctly.
+                if !commands_proxy::proxy_is_running_managed() {
                     eprintln!();
                     commands_proxy::ensure_proxy_for_use(cli.password_stdin);
                 }
@@ -1321,7 +1350,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Wrapper hooks (claude/codex/kimi) are expected to bring the
             // proxy up via `aikey proxy ensure-running` before calling us;
             // see hook.zsh `_aikey_preflight` for the orchestration.
-            if !commands_proxy::is_proxy_running() {
+            // Round 9 fix #1: was is_proxy_running (PID-only); now uses
+            // proxy_is_running_managed (Layer 1) so OrphanedPort / Unresponsive
+            // bail out with the "proxy not running" exit instead of
+            // proceeding with broken probe targets.
+            if !commands_proxy::proxy_is_running_managed() {
                 let msg = "aikey-proxy is not running. Run `aikey proxy start` and retry.";
                 if cli.json { json_output::error(msg, EXIT_PROXY_NOT_RUNNING); }
                 else { eprintln!("{}", msg); std::process::exit(EXIT_PROXY_NOT_RUNNING); }
@@ -2405,7 +2438,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     // Auto-restart proxy if running so new env takes effect immediately.
-                    if commands_proxy::is_proxy_running() {
+                    // Round 9 fix #1: was is_proxy_running (PID-only); now uses
+                    // proxy_is_running_managed so we don't try to restart an
+                    // OrphanedPort / Unresponsive instance that isn't ours.
+                    if commands_proxy::proxy_is_running_managed() {
                         eprintln!();
                         eprintln!("  Restarting proxy to apply changes...");
                         let pw = session::try_get()
@@ -2525,16 +2561,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     // so wrapper hooks can fall back to their existing "Continue
                     // anyway?" path on rc=5 from the subsequent `aikey test`.
                     //
-                    // Why is_proxy_listening (PID + port) instead of just is_proxy_running:
-                    // a stale pidfile pointing at a dead-or-recycled PID makes the
-                    // PID-only check report success even when the port is unbound
-                    // (observed 2026-04-28 — silently_start_proxy used to leave the
-                    // pidfile around when the child crashed, since fixed at the
-                    // source; the double-check here is defense-in-depth so a future
-                    // regression in start cleanup can't silently re-introduce the
-                    // false-positive).
+                    // Round 9 fix #1: was is_proxy_listening (PID + port);
+                    // now uses proxy_is_running_managed (Layer 1 identity +
+                    // ownership + /health). The original "PID + port" was
+                    // already insufficient — port can be held by a different
+                    // aikey-proxy instance. Layer 1 is the canonical
+                    // "is it ours and healthy" answer for the wrapper exit-code
+                    // contract (rc=5 means "not our proxy, fall back to user
+                    // prompt"). Defense-in-depth note: the false-positive
+                    // window from stale pidfile is now closed at the source
+                    // (StartCleanupGuard, Round 6 fix #1) AND here.
                     commands_proxy::ensure_proxy_for_use(cli.password_stdin);
-                    if !commands_proxy::is_proxy_listening() {
+                    if !commands_proxy::proxy_is_running_managed() {
                         std::process::exit(5);
                     }
                 }
@@ -3002,7 +3040,10 @@ fn handle_route(
             "\u{26a0}".red(), db_error_count);
     }
 
-    if !commands_proxy::is_proxy_running() {
+    // Round 9 fix #1: was is_proxy_running (PID-only); now uses
+    // proxy_is_running_managed so the warning fires correctly for
+    // OrphanedPort / Unresponsive scenarios where the proxy is not ours.
+    if !commands_proxy::proxy_is_running_managed() {
         eprintln!();
         eprintln!("  {} Proxy is not running. Start with: aikey proxy start", "\u{26a0}".yellow());
     }
@@ -4346,18 +4387,27 @@ fn handle_deactivate(
     Ok(())
 }
 
-/// Stage 8 (active-state cross-shell sync, 2026-04-27): `aikey hook update`
-/// and `aikey hook status` — explicit user entry points to the hash-based
-/// drift detector that already lives in the precmd hook.
+/// `aikey hook` subcommand family — explicit user entry points to the
+/// hash-based drift detector and rc-wiring lifecycle.
 ///
-/// Update is a thin wrapper around `ensure_shell_hook(false)`: that function
-/// already (a) writes the hook file unconditionally and (b) injects the
-/// rc-file `source` line if it's not present. Adding a `force` parameter
-/// would be misleading — the existing code path is already what users want.
+/// Three operations, deliberately distinct (Stage 8 + hook coverage v1):
 ///
-/// Status reads the three hashes (file / binary / loaded) and reports drift
-/// in human-readable form. Output goes to stdout (machine-greppable lines)
-/// so `aikey hook status | grep state:` works.
+///   `update`  — Layer 1 only: regenerate ~/.aikey/hook.{zsh,bash} from
+///               the binary's embedded template. Routes through
+///               `refresh_hook_file_only`. Never touches rc.
+///   `status`  — Read-only: reports three hashes (file / binary /
+///               loaded) and a derived state string. Output is stdout
+///               and grep-friendly so `aikey hook status | grep state:`
+///               works as a CI signal.
+///   `install` — Layer 1 + Layer 2: render hook file AND wire rc.
+///               Routes through `ensure_shell_hook(false)` which prompts
+///               before mutating ~/.zshrc / ~/.bashrc. Refuses non-TTY
+///               (H1.5 + v1/v2 migration guard).
+///
+/// Why `update` is NOT a wrapper around `ensure_shell_hook`: that helper
+/// also wires rc, which is precisely the side effect users running
+/// `update` are trying to avoid. The split was made deliberately during
+/// the Stage 8 reviewer round 3 — see plan §3.2.
 fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         HookAction::Update => {
@@ -4372,7 +4422,9 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             // `ensure_shell_hook(false)` which, on first install, prompts the
             // user AND appends a `source` line to their rc — surprising for a
             // low-risk recovery command. `refresh_hook_file_only` writes the
-            // hook file and returns; rc-file install is `aikey use`'s job.
+            // hook file and returns; rc wiring is the job of `aikey hook
+            // install` (Layer 2 only, no binding change) or `aikey use
+            // <alias>` (when the user is also picking a key).
             match commands_account::refresh_hook_file_only(None) {
                 Ok(path) => {
                     eprintln!("\x1b[90m  ✓ Regenerated {} from current binary.\x1b[0m", path.display());
@@ -4393,8 +4445,10 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                             .unwrap_or(false)
                     });
                     if !rc_has_source {
-                        eprintln!("\x1b[90m    Note: no rc-file `source` line detected. To install it,\x1b[0m");
-                        eprintln!("\x1b[90m    run \x1b[36m`aikey use <alias>`\x1b[0m\x1b[90m once — that handles rc setup with confirmation.\x1b[0m");
+                        eprintln!("\x1b[90m    Note: no rc-file `source` line detected. To install it, run\x1b[0m");
+                        eprintln!("\x1b[90m      \x1b[36maikey hook install\x1b[0m\x1b[90m            (rc only, no binding change), or\x1b[0m");
+                        eprintln!("\x1b[90m      \x1b[36maikey use <alias>\x1b[0m\x1b[90m             (also activates that key).\x1b[0m");
+                        eprintln!("\x1b[90m    Both prompt for confirmation before touching your rc file.\x1b[0m");
                     }
                     Ok(())
                 }
@@ -4452,6 +4506,59 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             println!("loaded hash: {}", loaded_hash.as_deref().unwrap_or("<not set in this process env>"));
             println!("state:       {}", state);
             Ok(())
+        }
+        HookAction::Install { shell, no_hook } => {
+            // Hook coverage v1 §H3: explicit Layer 1 + Layer 2 onboarding
+            // for users who set up everything via Web and never touched
+            // CLI — running this once wires their rc and unlocks the
+            // active-state cross-shell sync.
+            //
+            // Two paths by `--no-hook`:
+            //   --no-hook → Layer 1 only, equivalent to `aikey hook update`
+            //               (matches the docstring contract on the Install
+            //                variant). Routes through refresh_hook_file_only
+            //                so non-TTY / sandbox / CI invocations succeed.
+            //   default   → Layer 1 + Layer 2, prompts for rc consent.
+            //               Routes through ensure_shell_hook which honors
+            //                the H1.5 non-TTY refusal.
+            //
+            // Implementation note: shell auto-detection happens inside the
+            // helpers (uses $SHELL). The --shell flag is forwarded only on
+            // the Layer-1-only path (refresh_hook_file_only takes it); for
+            // the full install path, ensure_shell_hook is currently hard-
+            // wired to $SHELL — decoupling rc selection from $SHELL is out
+            // of scope for v1.
+            if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
+                eprintln!("\x1b[90m  Skipped: AIKEY_NO_HOOK=1 set in environment.\x1b[0m");
+                return Ok(());
+            }
+
+            if *no_hook {
+                match commands_account::refresh_hook_file_only(shell.as_deref()) {
+                    Ok(path) => {
+                        eprintln!(
+                            "\x1b[90m  ✓ Hook file rendered at {} (Layer 1 only; rc untouched).\x1b[0m",
+                            path.display(),
+                        );
+                        eprintln!(
+                            "\x1b[90m    To wire rc later: \x1b[36maikey hook install\x1b[0m",
+                        );
+                        Ok(())
+                    }
+                    Err(e) => Err(e.into()),
+                }
+            } else {
+                match commands_account::ensure_shell_hook(false) {
+                    Some(msg) => {
+                        println!("{}", msg);
+                    }
+                    None => {
+                        eprintln!("\x1b[90m  ✓ Shell hook installed and rc wired.\x1b[0m");
+                        eprintln!("\x1b[90m    Open a new terminal or `source` your rc file to activate.\x1b[0m");
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
