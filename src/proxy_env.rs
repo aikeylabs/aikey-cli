@@ -8,17 +8,18 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Returns the canonical path to `~/.aikey/proxy.env`.
+///
+/// Routes through `commands_account::resolve_aikey_dir()` — the single home-
+/// dir source of truth defined in windows-compatibility.md §B1. HOME-priority
+/// preserved for sandbox tests; USERPROFILE fallback unblocks native Windows
+/// where HOME is unset (was the failure mode of `aikey proxy start`).
 pub fn proxy_env_path() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME")
-        .map_err(|_| "Could not determine HOME directory".to_string())?;
-    Ok(PathBuf::from(home).join(".aikey").join("proxy.env"))
+    Ok(crate::commands_account::resolve_aikey_dir().join("proxy.env"))
 }
 
 /// Returns the canonical path to `~/.aikey/active.env`.
 pub fn active_env_path() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME")
-        .map_err(|_| "Could not determine HOME directory".to_string())?;
-    Ok(PathBuf::from(home).join(".aikey").join("active.env"))
+    Ok(crate::commands_account::resolve_aikey_dir().join("active.env"))
 }
 
 /// A parsed env entry (key=value).

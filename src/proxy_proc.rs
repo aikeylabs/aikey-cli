@@ -175,10 +175,47 @@ pub fn is_aikey_proxy(pid: u32) -> bool {
     let Some(stem) = path.file_name().and_then(|s| s.to_str()) else {
         return false;
     };
-    // Accept both Unix ("aikey-proxy") and Windows ("aikey-proxy.exe")
-    // basenames without dragging in cfg gating — matching strings is
-    // cheaper than splitting build paths.
-    stem == "aikey-proxy" || stem == "aikey-proxy.exe"
+    matches_aikey_proxy_basename(stem)
+}
+
+/// Returns true when `basename` is one of the file names a running
+/// `aikey-proxy` instance can legitimately have on disk:
+///
+/// - `"aikey-proxy"` — Unix canonical install
+/// - `"aikey-proxy.exe"` — Windows canonical install
+/// - `"aikey-proxy.old.<digits>"` — Unix rename produced by `aikey proxy
+///   start` upgrade-in-place when the new binary is dropped at the
+///   canonical name (rare, kept for symmetry).
+/// - `"aikey-proxy.exe.old.<digits>"` — Windows rename produced by
+///   installer / `aikey proxy start` upgrade-in-place. **This is not
+///   optional**: Windows refuses to overwrite a running `.exe`, so the
+///   installer is forced to rename the live file out of the way (suffix
+///   ".old.<pid>") before dropping the new binary at the canonical
+///   name. The OS-reported `QueryFullProcessImageNameW` for the live
+///   PID then reflects the renamed path. Without this match the live
+///   proxy fails identity check and Layer 1 demotes its state to
+///   OrphanedPort/PidRecycledToNonProxy — the user-visible symptom that
+///   `aikey proxy stop` refused to act on a clearly-our process across
+///   restart-in-place flows on Windows. (Bugfix 2026-04-28.)
+///
+/// Concrete examples that match: `aikey-proxy`, `aikey-proxy.exe`,
+/// `aikey-proxy.old.1234`, `aikey-proxy.exe.old.42`.
+///
+/// Concrete examples that do NOT match (and should not):
+/// `aikey-proxy.bak`, `aikey-proxy.exe.bak`, `aikey-proxy-backup`,
+/// `aikey-proxy-foo`, `not-aikey-proxy`, `aikey-proxy.old` (no digits),
+/// `aikey-proxy.old.abc` (non-digits).
+fn matches_aikey_proxy_basename(basename: &str) -> bool {
+    if basename == "aikey-proxy" || basename == "aikey-proxy.exe" {
+        return true;
+    }
+    let stem = basename
+        .strip_prefix("aikey-proxy.exe.old.")
+        .or_else(|| basename.strip_prefix("aikey-proxy.old."));
+    match stem {
+        Some(rest) if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) => true,
+        _ => false,
+    }
 }
 
 /// Read an *opaque* platform-specific string that uniquely identifies a
@@ -393,6 +430,44 @@ pub fn port_owner_pid(tcp_port: u16) -> Result<Option<u32>, PortOwnerError> {
         Err(PortOwnerError::Spawn(
             "port_owner_pid unsupported on this platform".into(),
         ))
+    }
+}
+
+/// Platform-appropriate one-liner the user can copy-paste to inspect
+/// who is listening on a given TCP port, used in error-message hints.
+///
+/// - Unix (Linux / macOS): `lsof -nP -iTCP:<port> -sTCP:LISTEN`
+/// - Windows: `Get-NetTCPConnection -LocalPort <port> -State Listen`
+///   (PowerShell — present by default on Windows 10 1809+ / Windows
+///   Server 2019+, the supported baseline per windows-compatibility.md;
+///   `lsof` is not shipped with stock Windows so the previous suggestion
+///   was unactionable for the user).
+///
+/// Lives next to [`port_owner_pid`] because both helpers describe the
+/// same "who owns this port" question — programmatic vs human-facing.
+/// Centralised so error messages, hints, and the actual probe stay
+/// consistent if we ever swap the underlying tool.
+pub fn port_inspect_command(tcp_port: u16) -> String {
+    if cfg!(windows) {
+        format!("Get-NetTCPConnection -LocalPort {tcp_port} -State Listen")
+    } else {
+        format!("lsof -nP -iTCP:{tcp_port} -sTCP:LISTEN")
+    }
+}
+
+/// Platform-appropriate one-liner the user can copy-paste to forcibly
+/// kill a process by PID, used in error-message hints next to
+/// [`port_inspect_command`].
+///
+/// - Unix: `kill -9 <pid>` (POSIX SIGKILL by signal number; works on
+///   macOS / Linux without depending on `kill` recognising signal names).
+/// - Windows: `taskkill /F /PID <pid>` (built-in to every supported
+///   Windows baseline; `kill` is not a native command).
+pub fn kill_command_hint(pid: u32) -> String {
+    if cfg!(windows) {
+        format!("taskkill /F /PID {pid}")
+    } else {
+        format!("kill -9 {pid}")
     }
 }
 
@@ -701,5 +776,99 @@ mod tests {
             elapsed < std::time::Duration::from_secs(1),
             "probe should respect timeout, took {elapsed:?}"
         );
+    }
+
+    // ── matches_aikey_proxy_basename ──────────────────────────────────
+    //
+    // Pins the post-2026-04-28 contract: the live binary's basename can
+    // legitimately be the canonical `aikey-proxy[.exe]` OR the
+    // installer-rename-on-upgrade form `aikey-proxy[.exe].old.<digits>`.
+    // Without the latter, a Windows in-place upgrade leaves the running
+    // proxy classified as `OrphanedPort/PidRecycledToNonProxy` so
+    // `aikey proxy stop` refuses to act on it.
+
+    #[test]
+    fn matches_basename_canonical_unix() {
+        assert!(matches_aikey_proxy_basename("aikey-proxy"));
+    }
+
+    #[test]
+    fn matches_basename_canonical_windows() {
+        assert!(matches_aikey_proxy_basename("aikey-proxy.exe"));
+    }
+
+    #[test]
+    fn matches_basename_renamed_unix_upgrade() {
+        // Unix-style rename produced by `mv aikey-proxy aikey-proxy.old.<pid>`.
+        assert!(matches_aikey_proxy_basename("aikey-proxy.old.42"));
+        assert!(matches_aikey_proxy_basename("aikey-proxy.old.999999"));
+    }
+
+    #[test]
+    fn matches_basename_renamed_windows_upgrade() {
+        // The exact form QueryFullProcessImageNameW reported on the
+        // Windows host where this bug was first observed: `.exe.old.1634`.
+        assert!(matches_aikey_proxy_basename("aikey-proxy.exe.old.1634"));
+        assert!(matches_aikey_proxy_basename("aikey-proxy.exe.old.0"));
+    }
+
+    #[test]
+    fn matches_basename_rejects_close_lookalikes() {
+        // Must NOT match — these are not produced by the installer's
+        // rename-on-upgrade pattern, so accepting them would weaken
+        // identity verification.
+        assert!(!matches_aikey_proxy_basename(""));
+        assert!(!matches_aikey_proxy_basename("aikey-proxy.bak"));
+        assert!(!matches_aikey_proxy_basename("aikey-proxy.exe.bak"));
+        assert!(!matches_aikey_proxy_basename("aikey-proxy-backup"));
+        assert!(!matches_aikey_proxy_basename("aikey-proxy-foo"));
+        assert!(!matches_aikey_proxy_basename("not-aikey-proxy"));
+        // Trailing `.old` with no digits is not the rename pattern; could
+        // be a user-renamed backup file. Refuse.
+        assert!(!matches_aikey_proxy_basename("aikey-proxy.old"));
+        assert!(!matches_aikey_proxy_basename("aikey-proxy.exe.old"));
+        assert!(!matches_aikey_proxy_basename("aikey-proxy.old."));
+        assert!(!matches_aikey_proxy_basename("aikey-proxy.exe.old."));
+        // Non-digit suffix — not a PID, not from the installer.
+        assert!(!matches_aikey_proxy_basename("aikey-proxy.old.abc"));
+        assert!(!matches_aikey_proxy_basename("aikey-proxy.exe.old.foo"));
+        // Mixed digit/non-digit also rejected — strict integer check.
+        assert!(!matches_aikey_proxy_basename("aikey-proxy.exe.old.12a"));
+    }
+
+    // ── port_inspect_command + kill_command_hint ──────────────────────
+    //
+    // Every Windows error-message path now uses these helpers; pinning
+    // their format so a future refactor can't silently put `lsof` /
+    // `kill` back into a Windows hint.
+
+    #[test]
+    fn port_inspect_command_format_matches_platform() {
+        let s = port_inspect_command(27200);
+        if cfg!(windows) {
+            assert_eq!(
+                s, "Get-NetTCPConnection -LocalPort 27200 -State Listen",
+                "Windows hint must use PowerShell Get-NetTCPConnection — \
+                 lsof is not shipped with stock Windows"
+            );
+        } else {
+            assert_eq!(
+                s, "lsof -nP -iTCP:27200 -sTCP:LISTEN",
+                "Unix hint must remain the long-form lsof command"
+            );
+        }
+    }
+
+    #[test]
+    fn kill_command_hint_format_matches_platform() {
+        let s = kill_command_hint(38520);
+        if cfg!(windows) {
+            assert_eq!(
+                s, "taskkill /F /PID 38520",
+                "Windows hint must use taskkill — `kill` is not native"
+            );
+        } else {
+            assert_eq!(s, "kill -9 38520");
+        }
     }
 }

@@ -47,8 +47,12 @@ pub struct SecretMetadata {
     pub use_count: Option<i64>,
 }
 
-/// Default vault data directory path (~/.aikey/data/)
-const VAULT_DIR: &str = ".aikey/data";
+/// Subdirectory under `~/.aikey/` that holds the vault data file.
+/// Why split from the `.aikey` literal: the home + `.aikey` portion now
+/// resolves through `commands_account::resolve_aikey_dir()` (windows-
+/// compatibility.md §B1 single source of truth) so we only join the
+/// trailing component here.
+const VAULT_DATA_SUBDIR: &str = "data";
 
 /// Database filename
 const DB_NAME: &str = "vault.db";
@@ -69,10 +73,13 @@ pub fn get_vault_path() -> Result<PathBuf, String> {
         }
     }
 
-    let home = std::env::var("HOME")
-        .map_err(|_| "Could not determine home directory".to_string())?;
-
-    let vault_dir = PathBuf::from(home).join(VAULT_DIR);
+    // Route through the single home-dir source of truth (windows-
+    // compatibility.md §B1). HOME-priority preserved so sandbox tests that
+    // override `HOME=<tmpdir>` keep working; USERPROFILE fallback covers
+    // native Windows where HOME is unset (the breakage that motivated this
+    // fix — `aikey proxy start` was failing with "Could not determine home
+    // directory" on Windows).
+    let vault_dir = crate::commands_account::resolve_aikey_dir().join(VAULT_DATA_SUBDIR);
     Ok(vault_dir.join(DB_NAME))
 }
 
@@ -190,9 +197,8 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
             (path.clone(), path.join(DB_NAME))
         }
     } else {
-        let home = std::env::var("HOME")
-            .map_err(|_| "Could not determine home directory".to_string())?;
-        let vault_dir = PathBuf::from(home).join(VAULT_DIR);
+        // See get_vault_path() — same single-source home resolution.
+        let vault_dir = crate::commands_account::resolve_aikey_dir().join(VAULT_DATA_SUBDIR);
         let db_path = vault_dir.join(DB_NAME);
         (vault_dir, db_path)
     };

@@ -734,16 +734,47 @@ pub fn unconfigure_codex_cli() {
 // active.env writer
 // ---------------------------------------------------------------------------
 
+/// Resolve the user's home directory consistently across platforms.
+///
+/// Priority: HOME → USERPROFILE → dirs::home_dir() → "." (last resort).
+///
+/// Why HOME is checked first: sandbox tests override `HOME=<tmpdir>` to
+/// redirect file paths, and tooling docs (windows-compatibility.md §B1)
+/// designate this fn as the single source of truth — sandbox semantics
+/// must survive intact.
+///
+/// Why USERPROFILE comes next: on native Windows shells (PowerShell / cmd)
+/// HOME is typically not set; USERPROFILE is the canonical Windows home.
+/// Without this branch `aikey proxy start` (and any vault op) crashed with
+/// "Could not determine home directory" — see bugfix
+/// 2026-04-28-vault-list-503-on-windows-cli-resolution.md sibling fix.
+///
+/// Why dirs::home_dir() last: passwd-database fallback on Unix when HOME
+/// is unset (rare; daemons / cron); on Windows dirs reads USERPROFILE so
+/// this branch is rarely hit on Windows but harmless.
+///
+/// Why ".": absolute last-resort so callers get a deterministic non-empty
+/// path rather than an Err — matches the prior `resolve_aikey_dir()`
+/// contract and avoids breaking shell-hook flows that swallow errors.
+pub fn resolve_user_home() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home);
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        return std::path::PathBuf::from(profile);
+    }
+    if let Some(dir) = dirs::home_dir() {
+        return dir;
+    }
+    std::path::PathBuf::from(".")
+}
+
 /// Resolve the ~/.aikey directory path consistently across platforms.
-/// Priority: HOME → USERPROFILE → "." (last resort).
-/// Why not just HOME: on Windows, HOME is often unset; USERPROFILE is the standard.
-/// Why not ".": the old fallback wrote to cwd, which makes the file unfindable by
-/// deactivate and other tools that look in the home directory.
+/// Thin wrapper over `resolve_user_home()` — kept as a named helper so
+/// callsites read intent-fully and so this stays the only place the
+/// `.aikey` literal appears in the home-resolution path.
 pub fn resolve_aikey_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home).join(".aikey")
+    resolve_user_home().join(".aikey")
 }
 
 pub(super) fn write_active_env(
