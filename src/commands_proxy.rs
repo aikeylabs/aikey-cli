@@ -729,6 +729,35 @@ fn handle_start_foreground(
     // first-class managed instance via the sidecar meta.
     drop(_lock);
 
+    // **Round-15 install-script fix #1**: forward SIGTERM / SIGINT
+    // from this CLI to the spawned proxy child. Critical for
+    // service-managed deployments (systemd Type=simple, launchd):
+    // the service manager signals US (the parent CLI), expecting
+    // the whole service tree to shut down. Without forwarding, the
+    // CLI would die from default SIGTERM handling and the proxy
+    // would be orphaned (PPID=1) — service manager would then
+    // restart, the new instance would see OrphanedPort, and the
+    // service would fail to recover.
+    //
+    // ctrlc 3.x supports installing a single global handler. We
+    // capture child PID into a local closure context. Any
+    // subsequent installation (also rare in CLI-shell contexts)
+    // overwrites the previous handler, which is acceptable here:
+    // the foreground proxy mode is the ONE long-running CLI command
+    // that needs signal forwarding, so first-installation-wins is
+    // fine for our model.
+    let child_pid_for_signal = pid;
+    let _ = ctrlc::set_handler(move || {
+        // Forward SIGTERM to the child. Best-effort: if the child is
+        // already gone, libc::kill returns ESRCH which we silently
+        // ignore. We do NOT exit the parent ourselves — child.wait()
+        // will return naturally once the proxy completes shutdown,
+        // and the cleanup path below runs as designed.
+        unsafe {
+            libc::kill(child_pid_for_signal as libc::pid_t, libc::SIGTERM);
+        }
+    });
+
     let status = child.wait()?;
 
     // Reverse order of write: pidfile first, sidecar second

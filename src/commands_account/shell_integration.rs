@@ -2428,4 +2428,114 @@ mod hook_tests {
             msg
         );
     }
+
+    // ── HC-21 (E2E plan v1, 验收报告 §0.3) ─────────────────────────────────
+    //
+    // Plan §HC-21 contract: `hook_rc_wired` must be shell-aware. A zsh user
+    // with stale `~/.bashrc` v3 markers (e.g. left over from when they
+    // briefly used bash) must NOT have envelope `hook_rc_wired=true`. The
+    // implementation lives in `shell_rc_has_aikey_block` — branching on
+    // SHELL and only scanning the rc files that shell would actually load.
+    //
+    // The 6-combination matrix below pins:
+    //   - zsh path scans only ~/.zshrc (negative case is the load-bearing one)
+    //   - bash path scans both ~/.bashrc and ~/.bash_profile
+    //   - other shells fail-closed (no false positive on any rc state)
+    //
+    // Without this matrix the only existing coverage was the *positive*
+    // path through trial-as09{,b} envelope assertions. The negative path
+    // (zsh user, .zshrc clean, .bashrc has marker) had no automated guard.
+    fn write_marker_rc(home: &std::path::Path, name: &str) {
+        let block = format!(
+            "{}\n[ -f ~/.aikey/hook.zsh ] && source ~/.aikey/hook.zsh\n{}\n",
+            V3_BEGIN, V3_END
+        );
+        std::fs::write(home.join(name), block).expect("write marker rc");
+    }
+
+    fn run_shell_rc_check(home: &std::path::Path, shell: &str) -> bool {
+        let prev_home = std::env::var("HOME").ok();
+        let prev_shell = std::env::var("SHELL").ok();
+        unsafe {
+            std::env::set_var("HOME", home.to_str().unwrap());
+            std::env::set_var("SHELL", shell);
+        }
+        let result = shell_rc_has_aikey_block();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_shell {
+                Some(v) => std::env::set_var("SHELL", v),
+                None => std::env::remove_var("SHELL"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn shell_rc_has_aikey_block_zsh_with_zshrc_marker() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_marker_rc(tmp.path(), ".zshrc");
+        assert!(run_shell_rc_check(tmp.path(), "/bin/zsh"));
+    }
+
+    #[test]
+    fn shell_rc_has_aikey_block_zsh_only_bashrc_has_marker_must_not_false_positive() {
+        // HC-21 critical negative path: zsh user, .zshrc clean, .bashrc has
+        // residual marker (e.g. from a previous bash session). The envelope
+        // must report rc_wired=false because zsh never loads .bashrc.
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(".zshrc"), "# clean user file\n")
+            .expect("write clean zshrc");
+        write_marker_rc(tmp.path(), ".bashrc");
+        assert!(
+            !run_shell_rc_check(tmp.path(), "/bin/zsh"),
+            "zsh path must not scan .bashrc — stale marker would false-positive"
+        );
+    }
+
+    #[test]
+    fn shell_rc_has_aikey_block_zsh_no_marker_anywhere() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(".zshrc"), "# clean\n").expect("write zshrc");
+        assert!(!run_shell_rc_check(tmp.path(), "/bin/zsh"));
+    }
+
+    #[test]
+    fn shell_rc_has_aikey_block_bash_with_bashrc_marker() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_marker_rc(tmp.path(), ".bashrc");
+        assert!(run_shell_rc_check(tmp.path(), "/bin/bash"));
+    }
+
+    #[test]
+    fn shell_rc_has_aikey_block_bash_with_bash_profile_marker_only() {
+        // bash with only .bash_profile having the marker (no .bashrc).
+        // The implementation scans both, so this should also report wired.
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_marker_rc(tmp.path(), ".bash_profile");
+        assert!(run_shell_rc_check(tmp.path(), "/bin/bash"));
+    }
+
+    #[test]
+    fn shell_rc_has_aikey_block_other_shell_always_false() {
+        // fish / sh / unknown: even with markers in every rc, the envelope
+        // must report rc_wired=false — we don't render hooks for these
+        // shells, so a marker presence would be unrelated user state.
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_marker_rc(tmp.path(), ".zshrc");
+        write_marker_rc(tmp.path(), ".bashrc");
+        write_marker_rc(tmp.path(), ".bash_profile");
+        assert!(!run_shell_rc_check(tmp.path(), "/usr/local/bin/fish"));
+        assert!(!run_shell_rc_check(tmp.path(), "/bin/sh"));
+        assert!(!run_shell_rc_check(tmp.path(), ""));
+    }
 }

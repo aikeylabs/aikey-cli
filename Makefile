@@ -29,7 +29,7 @@ AIKEY_BUILD_VERSION ?= $(VERSION)
 BUILD_ENV   = AIKEY_BUILD_VERSION=$(AIKEY_BUILD_VERSION) AIKEY_BUILD_REVISION=$(GIT_REVISION)$(GIT_DIRTY) AIKEY_BUILD_ID=$(BUILD_ID) AIKEY_BUILD_TIME=$(BUILD_TIME)
 
 .PHONY: all release dev rebuild run test test-integration test-unit test-verbose \
-        test-import-recall \
+        test-import-recall test-proxy-lifecycle-e2e build-mock-proxy \
         e2e-import-personal e2e-import-trial e2e-import-production \
         security-check-batch-import \
         lint fmt fmt-check install uninstall cross-compile clean help
@@ -144,6 +144,38 @@ security-check-batch-import:
 ##   Prints per-test [rule-v2] / [crf] / [fingerprint] summary lines.
 test-import-recall:
 	@$(BUILD_ENV) $(CARGO) test --release --test import_recall -- --nocapture --test-threads=1
+
+## Build the controlled-behavior mock_proxy Go binary used by lifecycle E2E
+## tests for scenarios the real proxy cannot easily emulate (BIND_FAIL,
+## HANG_INIT, DRAIN_DELAY, IGNORE_SIGTERM). Cached at target/test-bin/mock_proxy.
+##
+## Per E2E plan v6 §3.4 fallback strategy: if Go toolchain is missing,
+## the lifecycle E2E tests degrade to the "real-proxy-only" subset and
+## skip mock-dependent cases.
+build-mock-proxy:
+	@mkdir -p target/test-bin
+	@if command -v go >/dev/null 2>&1; then \
+	  echo "[build-mock-proxy] using $$(go version)"; \
+	  cd tests/lifecycle_fixtures/mock_proxy && \
+	    GOWORK=off go build -o ../../../target/test-bin/mock_proxy . && \
+	    echo "[build-mock-proxy] built target/test-bin/mock_proxy"; \
+	else \
+	  echo "[build-mock-proxy] Go toolchain missing — mock-dependent E2E tests will skip (per v6 §3.4)"; \
+	fi
+
+## Run the proxy lifecycle E2E acceptance suite (v6 plan §4 + Round-10 baseline).
+## Uses real aikey-proxy from $$HOME/.aikey/bin/aikey-proxy + mock_proxy from
+## target/test-bin/. Tests are Unix-only by design (v6 §5 platform matrix);
+## Windows runners run the regression baseline subset only.
+##
+## Serial execution (--test-threads=1) is mandatory: lifecycle tests share
+## ~/.aikey/run/proxy.{pid,lock,meta.json} files in their per-test HOME, but
+## port allocation via pick_free_port() needs serialization to avoid TOCTOU.
+test-proxy-lifecycle-e2e: build-mock-proxy
+	@AIKEY_PROXY_BIN="$${AIKEY_PROXY_BIN:-$$HOME/.aikey/bin/aikey-proxy}" \
+	  $(CARGO) test --test e2e_proxy_lifecycle -- --test-threads=1 && \
+	 AIKEY_PROXY_BIN="$${AIKEY_PROXY_BIN:-$$HOME/.aikey/bin/aikey-proxy}" \
+	  $(CARGO) test --test e2e_proxy_lifecycle_v6 -- --test-threads=1
 
 # ---------------------------------------------------------------------------
 # Code quality

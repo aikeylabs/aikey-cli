@@ -50,7 +50,7 @@ base64 = "0.21"     # Base64 encoding for JSON export
 shell-words = "1.1" # Shell command parsing for run command
 colored = "2.1"     # ANSI terminal colors; auto-disabled on non-TTY / NO_COLOR
 ureq = { version = "2.10", features = ["tls", "json"] } # Blocking HTTP client for control-service API calls
-ctrlc = "3.4"       # Signal handling for graceful shutdown
+ctrlc = { version = "3.4", features = ["termination"] }       # Signal handling for graceful shutdown — `termination` feature also catches SIGTERM (needed by `aikey proxy start --foreground` to forward systemd/launchd stop signals to the proxy child, Round-15 install-script fix #1a)
 rayon = "1.8"       # Parallel iteration for performance
 dirs = "5.0"        # Home directory detection for config files
 keyring = "2"       # OS keychain access for session password cache (macOS/Windows/Linux)
