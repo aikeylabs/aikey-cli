@@ -1316,7 +1316,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Pre-flight: the probe pipeline now ALWAYS goes through the
             // local proxy for API/Chat/ping-proxy. If the proxy is down we
             // can't even start — fail fast with a dedicated exit code so
-            // wrappers don't misinterpret it as "key invalid".
+            // wrappers don't misinterpret it as "key invalid". `aikey test`
+            // stays a pure diagnostic: it does NOT auto-start the proxy.
+            // Wrapper hooks (claude/codex/kimi) are expected to bring the
+            // proxy up via `aikey proxy ensure-running` before calling us;
+            // see hook.zsh `_aikey_preflight` for the orchestration.
             if !commands_proxy::is_proxy_running() {
                 let msg = "aikey-proxy is not running. Run `aikey proxy start` and retry.";
                 if cli.json { json_output::error(msg, EXIT_PROXY_NOT_RUNNING); }
@@ -2509,6 +2513,30 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     executor::list_secrets(&password)
                         .map_err(|e| format!("vault authentication failed: {}", e))?;
                     commands_proxy::handle_verify(&password)?;
+                }
+                ProxyAction::EnsureRunning => {
+                    // Wrapper-internal entry point (claude/codex/kimi shell hooks).
+                    // Reuses the same `ensure_proxy_for_use` chain `aikey use` invokes:
+                    //   already running → no-op silently
+                    //   AIKEY_MASTER_PASSWORD set → silent start
+                    //   interactive TTY → password prompt + start
+                    //   non-TTY no env var → print one-line hint, do not block
+                    // Exit non-zero only if the proxy is still down after the attempt,
+                    // so wrapper hooks can fall back to their existing "Continue
+                    // anyway?" path on rc=5 from the subsequent `aikey test`.
+                    //
+                    // Why is_proxy_listening (PID + port) instead of just is_proxy_running:
+                    // a stale pidfile pointing at a dead-or-recycled PID makes the
+                    // PID-only check report success even when the port is unbound
+                    // (observed 2026-04-28 — silently_start_proxy used to leave the
+                    // pidfile around when the child crashed, since fixed at the
+                    // source; the double-check here is defense-in-depth so a future
+                    // regression in start cleanup can't silently re-introduce the
+                    // false-positive).
+                    commands_proxy::ensure_proxy_for_use(cli.password_stdin);
+                    if !commands_proxy::is_proxy_listening() {
+                        std::process::exit(5);
+                    }
                 }
             }
         }

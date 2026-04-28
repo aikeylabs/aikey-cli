@@ -25,6 +25,23 @@ fn main() {
         println!("cargo:rerun-if-changed=.git/index");
     }
 
+    // 3. Shell hook templates: belt-and-suspenders rerun trigger.
+    //    `include_str!()` already makes rustc track these as deps so the
+    //    enclosing module recompiles when they change. In practice with
+    //    RUSTC_WRAPPER=sccache (or other layered caches) that signal can
+    //    get lost — observed 2026-04-28: editing src/templates/hook.zsh
+    //    didn't propagate to the installed binary's embedded template
+    //    until a `cargo clean`. Adding explicit rerun-if-changed + a
+    //    fingerprint env var guarantees a recompile when templates change.
+    println!("cargo:rerun-if-changed=src/templates/hook.zsh");
+    println!("cargo:rerun-if-changed=src/templates/hook.bash");
+    let hook_zsh   = std::fs::read("src/templates/hook.zsh").unwrap_or_default();
+    let hook_bash  = std::fs::read("src/templates/hook.bash").unwrap_or_default();
+    let hook_fp    = fnv1a_64(&hook_zsh).wrapping_mul(0x100000001b3) ^ fnv1a_64(&hook_bash);
+    // shell_integration.rs references this via `env!()` so changing it
+    // forces that module to recompile.
+    println!("cargo:rustc-env=AIKEY_HOOK_TEMPLATES_FINGERPRINT={:016x}", hook_fp);
+
     // === Revision ===
     let revision = std::env::var("AIKEY_BUILD_REVISION").unwrap_or_else(|_| {
         let sha = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
@@ -92,4 +109,16 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
+}
+
+/// FNV-1a-64. Stable across rustc versions (unlike std's DefaultHasher) so
+/// the AIKEY_HOOK_TEMPLATES_FINGERPRINT env var stays comparable across
+/// machines / build hosts during diagnostics.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }

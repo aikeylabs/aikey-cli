@@ -250,7 +250,15 @@ fn is_sensitive_key(key: &str) -> bool {
     SENSITIVE_FRAGMENTS.iter().any(|f| lower.contains(f))
 }
 
-/// Mask a value for display. Sensitive values show first 12 chars + "...".
+/// Mask a value for display: keep the first 15 + last 6 chars and replace
+/// the middle with `...`. The longer prefix preserves enough of the key for
+/// the user to recognise which provider/binding it belongs to (`sk-proj-…` /
+/// `aikey_vk_…` / `xai-…`); the suffix lets them disambiguate similar keys
+/// at a glance (industry convention — AWS console, 1Password, GitLab masked
+/// vars all show a tail).
+/// Values too short for the 15+6 frame to leave anything hidden are returned
+/// as-is — masking would expose more than it hides. The threshold therefore
+/// floats with `prefix + suffix` rather than being a separate constant.
 pub fn mask_value(key: &str, value: &str) -> String {
     let lower = key.to_lowercase();
     let is_known_safe = NON_SENSITIVE_KEYS.iter().any(|k| lower == *k);
@@ -258,17 +266,30 @@ pub fn mask_value(key: &str, value: &str) -> String {
         // Known non-sensitive: always show full value.
         value.to_string()
     } else if is_sensitive_key(key) {
-        if value.len() <= 12 {
-            value.to_string()
-        } else {
-            format!("{}...", &value[..12])
-        }
+        // The helper handles "too short to mask" (returns original) — no
+        // separate length gate needed here.
+        mask_prefix_suffix(value, 15, 6)
     } else if value.len() > 40 {
-        // Long values may contain tokens even if key name is innocent.
-        format!("{}...", &value[..20])
+        // Long values may carry tokens even if the key name is innocent.
+        // Same prefix/suffix shape as the sensitive branch for consistency.
+        mask_prefix_suffix(value, 15, 6)
     } else {
         value.to_string()
     }
+}
+
+/// `first N chars + "..." + last M chars`. Char-aware (won't panic on
+/// non-ASCII byte boundaries, unlike `&s[..N]`). Falls back to the original
+/// value if `N + M >= value.chars().count()` — i.e. masking would expose
+/// more than is hidden, so just show the original.
+fn mask_prefix_suffix(value: &str, prefix: usize, suffix: usize) -> String {
+    let total = value.chars().count();
+    if prefix + suffix >= total {
+        return value.to_string();
+    }
+    let head: String = value.chars().take(prefix).collect();
+    let tail: String = value.chars().skip(total - suffix).collect();
+    format!("{}...{}", head, tail)
 }
 
 // ── Config hash ──────────────────────────────────────────────────────────────
@@ -336,13 +357,39 @@ mod tests {
 
     #[test]
     fn mask_sensitive() {
-        // Short values (<= 12 chars): shown as-is (too short to partially mask)
+        // Short values (≤21 chars): show as-is — 15+6 frame would expose more
+        // than it hides, so the helper's safety guard returns the original.
         assert_eq!(mask_value("OPENAI_API_KEY", "sk-xxx"), "sk-xxx");
         assert_eq!(mask_value("MY_TOKEN", "abc"), "abc");
         assert_eq!(mask_value("MY_SECRET", "abc"), "abc");
         assert_eq!(mask_value("DB_PASSWORD", "abc"), "abc");
-        // Long values (> 12 chars): first 12 chars + "..."
-        assert_eq!(mask_value("OPENAI_API_KEY", "sk-1234567890abcdef"), "sk-123456789...");
+        // 19 chars — still ≤21, shown as-is under 15+6 (was masked under 6+4).
+        assert_eq!(mask_value("OPENAI_API_KEY", "sk-1234567890abcdef"), "sk-1234567890abcdef");
+        // 33 chars: first 15 = "sk-proj-abcdefg", last 6 = "90wxyz".
+        assert_eq!(
+            mask_value("OPENAI_API_KEY", "sk-proj-abcdefghijk1234567890wxyz"),
+            "sk-proj-abcdefg...90wxyz",
+        );
+        // Boundary: 22 chars (one past the 15+6 threshold) — middle elided.
+        // first 15 = "sk-1234567890abc", wait that's 16. Let me recount:
+        // "sk-12345678901234567890" = "sk-" + 20 digits = 23 chars.
+        assert_eq!(
+            mask_value("OPENAI_API_KEY", "sk-12345678901234567890"),
+            "sk-123456789012...567890",
+        );
+        // Non-ASCII: char-aware (no panic on multi-byte boundary).
+        // "sk-αβγδεζηθικλμνξοπρσ" = "sk-" + α..σ (18 Greek letters) = 21 chars
+        // → at threshold, returned as-is.
+        assert_eq!(
+            mask_value("OPENAI_API_KEY", "sk-αβγδεζηθικλμνξοπρσ"),
+            "sk-αβγδεζηθικλμνξοπρσ",
+        );
+        // 22-char non-ASCII triggers mask: first 15 = "sk-αβγδεζηθικλμ",
+        // last 6 = "ξοπρστ" (positions 17-22 of "sk-α..τ").
+        assert_eq!(
+            mask_value("OPENAI_API_KEY", "sk-αβγδεζηθικλμνξοπρστ"),
+            "sk-αβγδεζηθικλμ...ξοπρστ",
+        );
     }
 
     #[test]

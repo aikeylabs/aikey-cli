@@ -450,9 +450,9 @@ where
         // With a network proxy, TCP won't work — use HTTP HEAD through the
         // same proxy the CLI uses for real requests. Any response (incl.
         // 4xx/5xx) proves reachability.
-        probe_http_head_direct(&ping_target_url, Duration::from_secs(5))
+        probe_http_head_direct(&ping_target_url, Duration::from_secs(3))
     } else {
-        tcp_ping(&upstream_host, upstream_port, 5)
+        tcp_ping(&upstream_host, upstream_port, 3)
     };
     result.ping_direct_ok = ping_direct_ok;
     result.ping_direct_ms = ping_direct_ms;
@@ -666,15 +666,29 @@ fn parse_host_port(url_or_authority: &str) -> (String, u16) {
 /// Ping(DIRECT) when a network proxy is configured: HTTP HEAD to the
 /// upstream URL via the same proxy-aware agent used for everything else.
 /// Any response (including 4xx/5xx) proves reachability.
+///
+/// Why the thread + mpsc::recv_timeout dance: ureq 2.x's `AgentBuilder::timeout`
+/// does not reliably cap DNS resolution, TCP connect, or TLS handshake on the
+/// outbound proxy hop. Field reports show 60+ second hangs with a 5s setting
+/// when HTTPS_PROXY points at an unreachable upstream. Running the call in a
+/// detached thread with `recv_timeout` enforces a hard wall-clock cap; the
+/// orphaned thread eventually unwinds via the agent's own (looser) timeout.
 fn probe_http_head_direct(target_url: &str, timeout: std::time::Duration) -> (bool, u128) {
+    use std::sync::mpsc;
     use std::time::Instant;
-    let agent = build_proxy_aware_agent(timeout);
     let start = Instant::now();
-    let ok = match agent.head(target_url).call() {
-        Ok(_) => true,
-        Err(ureq::Error::Status(_, _)) => true, // HEAD may 405; still reached upstream
-        Err(_) => false,
-    };
+    let url = target_url.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let agent = build_proxy_aware_agent(timeout);
+        let ok = match agent.head(&url).call() {
+            Ok(_) => true,
+            Err(ureq::Error::Status(_, _)) => true, // HEAD may 405; still reached upstream
+            Err(_) => false,
+        };
+        let _ = tx.send(ok);
+    });
+    let ok = rx.recv_timeout(timeout).unwrap_or(false);
     (ok, start.elapsed().as_millis())
 }
 

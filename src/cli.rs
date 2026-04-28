@@ -573,6 +573,13 @@ pub(crate) enum ProxyAction {
     },
     /// Verify current project/env/provider connectivity through the proxy
     Verify,
+    /// (internal) Ensure aikey-proxy is running. No-op if already up; auto-
+    /// starts via the same env-var/cache/TTY-prompt chain `aikey use` uses.
+    /// Hidden from `--help` because it's a wrapper-internal entry point used
+    /// by the claude/codex/kimi shell hooks — end-users should reach for
+    /// `aikey proxy start` instead.
+    #[command(hide = true, name = "ensure-running")]
+    EnsureRunning,
 }
 
 /// Subcommand verbs for `aikey hook`. Stage 8 (Stage 8-1 / 8-2 in the
@@ -789,6 +796,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 ProxyAction::Status => "status",
                 ProxyAction::Restart { .. } => "restart",
                 ProxyAction::Verify => "verify",
+                ProxyAction::EnsureRunning => "ensure-running",
             }),
             Commands::Auth { action } => format!("auth.{}", match action {
                 AuthAction::Login { .. } => "login",

@@ -57,8 +57,31 @@ pub fn proxy_vault_state() -> ProxyVaultState {
 }
 
 /// Returns true if the proxy process is running.
+///
+/// Note: PID-only check (fast). For "actually serving requests" use
+/// `is_proxy_listening()` instead — it adds a port probe to catch the
+/// "PID alive but socket not bound" failure mode (e.g. proxy hung at
+/// startup before bind, or PID recycle pointing to an unrelated process).
 pub fn is_proxy_running() -> bool {
     read_pid().map_or(false, |pid| process_alive(pid))
+}
+
+/// Returns true if the proxy is BOTH (a) running per pidfile and
+/// (b) actually listening on its configured port. Use this when the
+/// answer needs to mean "the proxy can serve requests right now" — for
+/// success reporting in `aikey proxy ensure-running`, for diagnostic
+/// gates that need a hard truthful signal, etc.
+///
+/// `is_proxy_running()` alone is insufficient for those callers: a stale
+/// pidfile (process died after `write_pid` but before `bind`) or PID
+/// recycle (kernel reassigned the PID to an unrelated process) both
+/// produce false positives. Adding a quick port probe closes both holes.
+pub fn is_proxy_listening() -> bool {
+    if !is_proxy_running() {
+        return false;
+    }
+    let addr = proxy_listen_addr(None);
+    port_reachable(&addr, Duration::from_millis(300))
 }
 
 /// Sends `POST /admin/reload` to the proxy if it is currently running.
@@ -121,8 +144,27 @@ fn silently_start_proxy(password: &SecretString) -> bool {
         }
     }
     cmd.env("AIKEY_MASTER_PASSWORD", password.expose_secret());
+    // Why log instead of /dev/null: silent start failures (vault decrypt,
+    // bind error, panicking goroutine) used to be invisible — caller saw
+    // only "proxy failed to start" with no actionable hint. Diverting
+    // stderr to a known location lets users `tail` it after a failure
+    // (and the ensure_proxy_for_use error path now points there).
+    // Best-effort: if we can't open the file we fall back to /dev/null
+    // (better than failing the whole start because logging broke).
+    // Bugfix record: 2026-04-28 — proxy auto-start silently failed when
+    // user typed wrong vault password; vault decrypt error was lost.
+    let startup_log = dirs::home_dir()
+        .map(|h| h.join(".aikey").join("logs").join("aikey-proxy-startup.log"));
+    if let Some(ref path) = startup_log {
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new("/")));
+    }
+    let stderr_target = startup_log
+        .as_ref()
+        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(std::process::Stdio::null);
     cmd.stdout(std::process::Stdio::null())
-       .stderr(std::process::Stdio::null());
+       .stderr(stderr_target);
 
     match cmd.spawn() {
         Ok(child) => {
@@ -131,14 +173,36 @@ fn silently_start_proxy(password: &SecretString) -> bool {
             if let Ok(seq) = crate::storage::get_vault_change_seq() {
                 let _ = crate::storage::set_proxy_loaded_seq(seq);
             }
-            // Poll up to 4 s for proxy to become reachable.
+            // Poll up to 4 s for proxy to become reachable. Why we also
+            // check process_alive(pid) per tick: if the child crashed
+            // immediately (vault decrypt failure, address-in-use, panic at
+            // startup) we don't want to wait the full 4 s before giving up.
+            //
+            // Why we clean up the pidfile on every failure exit: previously
+            // we wrote the pidfile right after spawn but left it untouched
+            // when start failed — the next `is_proxy_running()` call would
+            // see this dead PID, and during the OS PID-recycle race window
+            // process_alive could even return true for an unrelated process,
+            // making `aikey proxy ensure-running` falsely report success
+            // (observed 2026-04-28 — bugfix record forthcoming).
             let health_addr = proxy_listen_addr(None);
             let deadline = std::time::Instant::now() + Duration::from_secs(4);
             loop {
                 if port_reachable(&health_addr, Duration::from_millis(300)) {
                     return true;
                 }
+                if !process_alive(pid) {
+                    // Child died before binding — clean up pidfile so the
+                    // next caller doesn't see this dead entry.
+                    let _ = pid_path().map(std::fs::remove_file);
+                    return false;
+                }
                 if std::time::Instant::now() >= deadline {
+                    // Child still alive but never came up healthy — kill
+                    // it (otherwise it lingers as a hung process) AND clean
+                    // up the pidfile.
+                    let _ = terminate_process(pid);
+                    let _ = pid_path().map(std::fs::remove_file);
                     return false;
                 }
                 std::thread::sleep(Duration::from_millis(300));
@@ -191,20 +255,49 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
         }
     }
 
-    // 2. Interactive: prompt once.
+    // 2. Interactive: try the session cache first, prompt only on cache miss,
+    //    then VERIFY the password against the vault before spawning the proxy.
+    //
+    // Why cache-first: `aikey proxy start` and other write-paths use
+    // `prompt_vault_password` which already populates `session::store`. If the
+    // user typed their password recently, we silently reuse it — saves the
+    // "type password every claude/codex/use call" friction (observed
+    // 2026-04-28: users hit a fresh prompt despite having just unlocked the
+    // vault seconds earlier in another command).
+    //
+    // Why verify-before-spawn: `silently_start_proxy` redirects stderr so a
+    // wrong password manifests as "proxy failed to start" with no actionable
+    // hint — the proxy actually died on `vault decrypt`. Calling
+    // `executor::list_secrets` first turns wrong-password into an immediate
+    // CLI-level error (no spawn, no 4-second port poll, no cryptic message).
     use std::io::IsTerminal;
     if io::stderr().is_terminal() || password_stdin {
         eprintln!();
-        eprintln!("  Proxy not running — starting it now.");
-        let pw = if password_stdin {
-            eprint!("  \u{1F512} Enter Master Password: ");
+        // Why no leading indent: 🔒 is a wide emoji (2 visual cols), so a
+        // matching "  " indent on the prompt line would push the prompt text
+        // out of alignment with the message above. Drop the indent on both
+        // lines to match the dominant `🔒 Enter Master Password:` style used
+        // in main.rs / commands_env.rs / commands_project.rs.
+        eprintln!("Proxy not running — starting it now.");
+
+        // Cache hit path: silent, no prompt.
+        let mut from_cache = false;
+        let pw: SecretString = if let Some(cached) = (!password_stdin)
+            .then(|| crate::session::try_get())
+            .flatten()
+        {
+            crate::session::refresh();
+            from_cache = true;
+            cached
+        } else if password_stdin {
+            eprint!("\u{1F512} Enter Master Password: ");
             let _ = io::stderr().flush();
             let mut line = String::new();
             let _ = io::stdin().read_line(&mut line);
             eprintln!("***");
             SecretString::new(line.trim().to_string())
         } else {
-            match crate::prompt_hidden("  \u{1F512} Enter Master Password: ") {
+            match crate::prompt_hidden("\u{1F512} Enter Master Password: ") {
                 Ok(p) => SecretString::new(p),
                 Err(_) => {
                     eprintln!("  [aikey] Could not read password — run `aikey proxy start` manually.");
@@ -212,11 +305,38 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
                 }
             }
         };
+
+        // Verify password against the vault before spawning the proxy.
+        // If list_secrets fails, the password is wrong (or the vault is
+        // corrupt) — either way, spawning the proxy with this password
+        // would just produce a silent vault-decrypt failure inside the
+        // child. Surface the real cause here.
+        if let Err(e) = crate::executor::list_secrets(&pw) {
+            // If the cached password failed, drop it from the cache so the
+            // next command prompts for a fresh one (covers the
+            // "user changed master password elsewhere" case).
+            if from_cache {
+                crate::session::invalidate();
+            }
+            eprintln!("  [aikey] vault password rejected: {}", e);
+            eprintln!("  [aikey] retry with: aikey proxy start");
+            return;
+        }
+
+        // Password verified — store it in the session cache so subsequent
+        // commands in this terminal don't re-prompt. (Cache hits already
+        // refreshed above; this also covers the cache-miss prompt path.)
+        if !from_cache {
+            crate::session::store(&pw);
+        }
+
         let started = silently_start_proxy(&pw);
         if started {
             eprintln!("  [aikey] proxy started in background");
         } else {
             // Why: show actionable reason instead of a generic "failed" message.
+            // Note: vault-password failure is now caught above, so this branch
+            // is reached only for binary/config/port issues.
             let bin_ok = find_proxy_binary().is_ok();
             let cfg_ok = resolve_config(None).is_ok();
             if !bin_ok {
@@ -224,7 +344,7 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
             } else if !cfg_ok {
                 eprintln!("  [aikey] proxy config not found — run: aikey proxy start");
             } else {
-                eprintln!("  [aikey] proxy failed to start — check port conflict or run: aikey proxy start --foreground");
+                eprintln!("  [aikey] proxy failed to start — check ~/.aikey/logs/aikey-proxy-startup.log or run: aikey proxy start --foreground");
             }
         }
     } else {

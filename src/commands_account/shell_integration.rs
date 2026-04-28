@@ -863,6 +863,18 @@ fn hook_bash_content() -> &'static str {
     include_str!("../templates/hook.bash")
 }
 
+/// Belt-and-suspenders rebuild trigger for the hook templates. The
+/// `include_str!()` macros above already make rustc record the templates
+/// as compile-time deps, but with `RUSTC_WRAPPER=sccache` (or other
+/// caching layers) that signal can get lost — observed 2026-04-28: the
+/// installed binary kept the old template content even after editing it
+/// + rebuilding. `build.rs` hashes both templates into
+/// `AIKEY_HOOK_TEMPLATES_FINGERPRINT`; referencing it via `env!()` here
+/// guarantees this module recompiles whenever either template changes
+/// (the fingerprint env var differs → rustc sees a new const → recompile).
+#[allow(dead_code)]
+const _HOOK_TEMPLATES_FINGERPRINT: &str = env!("AIKEY_HOOK_TEMPLATES_FINGERPRINT");
+
 /// Stable 16-hex-digit FNV-1a-64 hash of the raw template content.
 ///
 /// Why this exists: the hook file on disk is a *snapshot* of the template
@@ -1463,18 +1475,42 @@ mod hook_tests {
 
     #[test]
     fn hook_preflight_does_not_shadow_kimi() {
-        // The 2026-04-22 requirement names claude and codex only. Kimi is
-        // deliberately NOT wrapped — it has its own per-binding health
-        // semantics (subscription status checks that differ from the
-        // anthropic/openai probe paths), and the preflight's blanket
-        // approach could false-positive on a valid kimi setup. If this
-        // ever changes, update the requirement first, then this test.
+        // The 2026-04-22 carve-out: kimi is NOT in `_aikey_preflight` because
+        // `aikey test`'s chat probe historically false-positived on kimi's
+        // coding-API (subscription / coding-tier model 404). The diagnostic
+        // preflight stays scoped to claude + codex.
+        //
+        // 2026-04-28 update: kimi DOES get a wrapper now, but only to call
+        // `aikey proxy ensure-running` (auto-start proxy) — the diagnostic
+        // probe stays excluded. See companion test
+        // `hook_kimi_wrapper_uses_ensure_running_only` for the new positive
+        // contract. If `_aikey_preflight kimi` ever needs to come back,
+        // update the requirement + the bugfix record + remove this guard
+        // first.
         for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
-            // There should be no `function kimi { _aikey_preflight ... }`
-            // or `kimi() { _aikey_preflight ... }` in the template.
             assert!(!c.contains("_aikey_preflight kimi"),
                 "{}: kimi is intentionally out of scope for the 2026-04-22 \
-                 preflight requirement — see the bugfix record before adding", label);
+                 diagnostic preflight — see the bugfix record before adding", label);
+        }
+    }
+
+    #[test]
+    fn hook_kimi_wrapper_uses_ensure_running_only() {
+        // 2026-04-28 contract (paired with `hook_preflight_does_not_shadow_kimi`):
+        // kimi gets a wrapper that auto-starts the proxy via the dedicated
+        // `aikey proxy ensure-running` command, which reuses the same
+        // env-var/cache/TTY-prompt chain `aikey use` runs. No diagnostic
+        // preflight for kimi (carve-out preserved). If the carve-out is
+        // ever lifted (e.g. kimi's chat probe stops false-positiving),
+        // collapse this test into the claude/codex preflight test.
+        for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
+            assert!(c.contains("aikey proxy ensure-running"),
+                "{}: kimi wrapper must call `aikey proxy ensure-running` so \
+                 the user's first kimi invocation starts the proxy if it's down", label);
+            // Also assert there IS some kimi function definition. Lightweight
+            // check — exact function-form differs by shell (function kimi vs kimi()).
+            assert!(c.contains("kimi"),
+                "{}: hook must reference kimi at all (wrapper + preexec label)", label);
         }
     }
 
