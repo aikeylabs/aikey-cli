@@ -562,24 +562,28 @@ fn handle_start_background(
             Err(format!(
                 "address {} is already in use by another process.\n  \
                  Stop the other listener or change listen.port in {}.\n  \
-                 Check: lsof -nP -iTCP:{} -sTCP:LISTEN",
+                 Check: {}",
                 listen_addr_for_msg,
                 resolve_config(config)
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| "<config>".into()),
-                port
+                crate::proxy_proc::port_inspect_command(port),
             )
             .into())
         }
         Err(crate::proxy_lifecycle::StartError::ChildDiedAtStartup { stderr_log }) => {
-            let port = listen_addr_for_msg.rsplit(':').next().unwrap_or("27200");
+            let port: u16 = listen_addr_for_msg
+                .rsplit(':')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(27200);
             Err(format!(
                 "aikey-proxy exited shortly after starting.\n  \
                  Likely cause: address {} is already in use by another process, or the config is invalid.\n  \
-                 Check:  lsof -nP -iTCP:{} -sTCP:LISTEN\n  \
+                 Check:  {}\n  \
                  Logs:   {}",
                 listen_addr_for_msg,
-                port,
+                crate::proxy_proc::port_inspect_command(port),
                 stderr_log.display()
             )
             .into())
@@ -905,7 +909,8 @@ pub fn handle_restart(config: Option<&str>, password: &SecretString) -> Result<(
         Err(RestartError::Stop(e)) => Err(format!("stop phase: {e}").into()),
         Err(RestartError::Start(StartError::OrphanedPort { port, .. })) => Err(format!(
             "address 127.0.0.1:{port} is in use by another process. \
-             Stop the other listener or change listen.port; check with: lsof -nP -iTCP:{port} -sTCP:LISTEN"
+             Stop the other listener or change listen.port; check with: {}",
+            crate::proxy_proc::port_inspect_command(port),
         )
         .into()),
         Err(RestartError::Start(e)) => Err(format!("start phase: {e}").into()),

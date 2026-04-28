@@ -162,12 +162,21 @@ impl OrphanReason {
         match self {
             OrphanReason::PidRecycledToNonProxy => format!(
                 "pidfile points at PID that has been reused for an unrelated process; \
-                 run `lsof -nP -iTCP:{port} -sTCP:LISTEN` to inspect"
+                 run `{}` to inspect",
+                crate::proxy_proc::port_inspect_command(port),
             ),
             OrphanReason::LegacyPidfileNoSidecar => format!(
                 "an existing aikey-proxy ({owner}) was started by an older CLI (no sidecar meta). \
-                 Stop it manually and re-start with the current CLI: `kill {owner_disp}` then `aikey proxy start`",
-                owner_disp = owner_pid.map(|p| p.to_string()).unwrap_or_else(|| "<pid>".into()),
+                 Stop it manually and re-start with the current CLI: `{kill_cmd}` then `aikey proxy start`",
+                kill_cmd = owner_pid
+                    .map(crate::proxy_proc::kill_command_hint)
+                    .unwrap_or_else(|| {
+                        if cfg!(windows) {
+                            "taskkill /F /PID <pid>".into()
+                        } else {
+                            "kill <pid>".into()
+                        }
+                    }),
             ),
             OrphanReason::PidRecycledToDifferentInstance => format!(
                 "the pidfile's PID is now a *different* aikey-proxy instance ({owner}) — \

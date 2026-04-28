@@ -203,8 +203,9 @@ impl std::fmt::Display for StartError {
                 f,
                 "previous aikey-proxy (pid: {pid}) is unresponsive and did not exit \
                  after SIGTERM/SIGKILL; refusing to start a replacement (would risk \
-                 double instances). Investigate with: \
-                 lsof -nP -iTCP:{port} -sTCP:LISTEN; kill -9 {pid} (manual)"
+                 double instances). Investigate with: {}; {} (manual)",
+                crate::proxy_proc::port_inspect_command(*port),
+                crate::proxy_proc::kill_command_hint(*pid),
             ),
         }
     }
@@ -252,7 +253,8 @@ impl std::fmt::Display for StopError {
             }
             StopError::StuckAfterKill { pid, port } => write!(
                 f,
-                "PID {pid} or port {port} still active after SIGKILL — investigate with `lsof -nP -iTCP:{port} -sTCP:LISTEN`"
+                "PID {pid} or port {port} still active after SIGKILL — investigate with `{}`",
+                crate::proxy_proc::port_inspect_command(*port),
             ),
             StopError::KillFailed(s) => write!(f, "kill failed: {s}"),
         }
