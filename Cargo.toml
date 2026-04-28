@@ -72,6 +72,7 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Memory",     # mlock-equivalent memory pinning
     "Win32_Foundation",        # HANDLE / CloseHandle / FILETIME
     "Win32_System_Threading",  # OpenProcess / QueryFullProcessImageNameW / GetProcessTimes (proxy_proc.rs)
+    "Win32_System_Time",       # FileTimeToSystemTime / SystemTimeToTzSpecificLocalTime (commands_statusline.rs event_time_hm Windows variant)
 ] }
 
 [dev-dependencies]

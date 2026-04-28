@@ -709,6 +709,7 @@ fn render_line(ev: &UsageEvent) -> String {
 ///
 /// The offset probe runs once per call and is cheap (syscall-free on
 /// macOS/Linux after the initial tzset).
+#[cfg(unix)]
 fn event_time_hm(event_time_ms: i64) -> String {
     if event_time_ms <= 0 {
         return String::new();
@@ -725,6 +726,61 @@ fn event_time_hm(event_time_ms: i64) -> String {
     }
     // tm_hour / tm_min already in local time.
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
+/// Windows variant of `event_time_hm` — same contract (UTC millis →
+/// local "HH:MM" string) but built on Win32 time APIs because `libc`
+/// is not available on `cfg(windows)` (`Cargo.toml` declares libc only
+/// under `[target.'cfg(unix)'.dependencies]`).
+///
+/// Path: UTC millis → FILETIME → UTC SYSTEMTIME → local SYSTEMTIME via
+/// `SystemTimeToTzSpecificLocalTime` with NULL TZ pointer (uses the
+/// machine's currently-active time zone, DST-aware — semantically the
+/// same as `localtime_r` on Unix).  No extra crate deps: `windows-sys`
+/// is already declared on cfg(windows) for mlock.
+#[cfg(windows)]
+fn event_time_hm(event_time_ms: i64) -> String {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+
+    if event_time_ms <= 0 {
+        return String::new();
+    }
+    // Windows FILETIME is 100-nanosecond intervals since 1601-01-01 UTC.
+    // Unix epoch (1970-01-01 UTC) sits at 116_444_736_000_000_000 in that scale.
+    let ft100ns = match event_time_ms
+        .checked_mul(10_000)
+        .and_then(|v| v.checked_add(116_444_736_000_000_000_i64))
+    {
+        Some(v) if v >= 0 => v as u64,
+        _ => return String::new(),
+    };
+    let utc_ft = FILETIME {
+        dwLowDateTime: (ft100ns & 0xFFFF_FFFF) as u32,
+        dwHighDateTime: (ft100ns >> 32) as u32,
+    };
+    let mut utc_st = SYSTEMTIME {
+        wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0,
+        wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0,
+    };
+    // SAFETY: utc_ft is a valid FILETIME, utc_st is a writable SYSTEMTIME.
+    if unsafe { FileTimeToSystemTime(&utc_ft, &mut utc_st) } == 0 {
+        return String::new();
+    }
+    let mut local_st = SYSTEMTIME {
+        wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0,
+        wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0,
+    };
+    // Passing NULL for the TZ info uses the system's current time zone
+    // (DST-aware), which matches the wall clock on the user's machine —
+    // same semantics as `localtime_r` on Unix.
+    // SAFETY: utc_st is a valid SYSTEMTIME, local_st is writable.
+    if unsafe {
+        SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc_st, &mut local_st)
+    } == 0 {
+        return String::new();
+    }
+    format!("{:02}:{:02}", local_st.wHour, local_st.wMinute)
 }
 
 /// Abbreviate model IDs so they fit comfortably in the receipt.
