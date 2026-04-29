@@ -757,9 +757,23 @@ fn handle_start_foreground(
         // ignore. We do NOT exit the parent ourselves — child.wait()
         // will return naturally once the proxy completes shutdown,
         // and the cleanup path below runs as designed.
+        //
+        // Windows-compat (Stage 2.5): libc::kill / libc::pid_t are
+        // Unix-only symbols (libc 0.2 gates them behind cfg(unix)).
+        // Windows service shutdown uses a different model — Service
+        // Control Manager dispatches SERVICE_CONTROL_STOP directly to
+        // the registered handler in each process, so no PID-based
+        // signal forwarding from a parent CLI is needed. The handler
+        // body is therefore a no-op on Windows; ctrlc::set_handler()
+        // itself remains installed so interactive Ctrl+C in PowerShell
+        // /cmd is still observed (the wait below will see the child
+        // exit naturally if the user Ctrl+C's the console group).
+        #[cfg(unix)]
         unsafe {
             libc::kill(child_pid_for_signal as libc::pid_t, libc::SIGTERM);
         }
+        #[cfg(windows)]
+        let _ = child_pid_for_signal;
     });
 
     let status = child.wait()?;
