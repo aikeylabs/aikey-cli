@@ -46,9 +46,16 @@ static VERSIONS: &[VersionMigration] = &[
         upgrade: v1_0_4_alpha::upgrade,
         rollback: v1_0_4_alpha::rollback,
     },
-    // v1.0.5-alpha and v1.0.6-alpha were collapsed into v1.0.4-alpha before
-    // either migration shipped — see module comment on `v1_0_4_alpha`. No
-    // registry entries for these versions. (2026-04-23)
+    // v1.0.5-alpha (original) and v1.0.6-alpha were collapsed into v1.0.4-alpha
+    // before either shipped — see module comment on `v1_0_4_alpha`. The
+    // v1.0.5-alpha slot is reused below for the token-prefix rename refactor
+    // (2026-04-29) — naming reuse is safe because the previous v1.0.5 plans
+    // never reached a public registry.
+    VersionMigration {
+        version: "1.0.5-alpha",
+        upgrade: v1_0_5_alpha::upgrade,
+        rollback: v1_0_5_alpha::rollback,
+    },
 ];
 
 /// Run all upgrades up to the current binary version.
@@ -728,8 +735,10 @@ pub mod v1_0_4_alpha {
     ///
     /// 1. **route_token** columns (`entries.route_token` +
     ///    `provider_accounts.route_token`) + unique partial indexes. Random
-    ///    aikey_vk_ tokens used by third-party clients (Cursor, OpenCode,
-    ///    etc.) as their API_KEY when routing through the local proxy.
+    ///    bearer tokens used by third-party clients (Cursor, OpenCode, etc.)
+    ///    as their API_KEY when routing through the local proxy. Originally
+    ///    `aikey_vk_<64-hex>`; renamed to `aikey_personal_<64-hex>` by the
+    ///    v1.0.5-alpha migration (2026-04-29 prefix-rename refactor).
     ///
     /// 2. **Usage telemetry** columns (`entries.last_used_at`,
     ///    `entries.use_count`, `provider_accounts.use_count`). Populated by
@@ -835,8 +844,371 @@ pub mod v1_0_4_alpha {
     }
 }
 
-// v1.0.5-alpha (batch-import audit tables) and v1.0.6-alpha (per-key usage
-// telemetry) were collapsed into v1.0.4-alpha on 2026-04-23 before either
+// ---------------------------------------------------------------------------
+// v1.0.5-alpha — Token prefix rename (2026-04-29)
+//
+// Refactor renames token prefixes by role rather than credential type:
+//   - aikey_vk_<64-hex>  (legacy random bearer for personal/OAuth)
+//     → aikey_personal_<64-hex>
+//   - aikey_vk_<vk_id>    (legacy team identifier; stored in
+//     managed_virtual_keys_cache.virtual_key_id, NOT in route_token columns)
+//     → handled at runtime by team_token_normalize::team_token_from_vk_id;
+//     no SQL migration needed because the column already stores bare vk_id
+//     (the prefix is added at output time, not stored).
+//
+// This migration only touches `entries.route_token` and
+// `provider_accounts.route_token` — the only columns that store the actual
+// prefixed bearer token. UPDATE uses `'aikey_personal_' || lower(substr(...))`
+// rather than REPLACE() to force-lowercase the hex suffix (isTier1Personal
+// in the proxy only accepts [0-9a-f], so any uppercase would 401 post-migration).
+//
+// Two precheck queries gate the UPDATE: prefix-precheck (filters dirty old-prefix
+// rows that don't match the bearer form) and completeness-precheck (catches
+// NULL / empty token rows). Both must return 0 before UPDATE runs.
+//
+// Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md
+// ---------------------------------------------------------------------------
+
+pub mod v1_0_5_alpha {
+    use rusqlite::Connection;
+
+    fn has_table(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false)
+    }
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name=?1", table),
+            [column],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false)
+    }
+
+    /// Count rows where route_token starts with 'aikey_vk_' but doesn't match
+    /// the canonical bearer form (length 73, suffix is 64 lowercase-or-uppercase
+    /// hex). Returning > 0 means dirty data — refuse to migrate.
+    fn prefix_precheck(conn: &Connection, table: &str) -> Result<i64, String> {
+        // Why lower(): tolerate historical mixed-case hex; UPDATE will normalize
+        // to lowercase regardless. NOT GLOB '*[^0-9a-f]*' is the correct
+        // "all hex chars" check (negate "contains any non-hex"); GLOB '[0-9a-f]*'
+        // alone only checks the first character.
+        let sql = format!(
+            "SELECT COUNT(*) FROM {table} \
+             WHERE substr(route_token, 1, 9) = 'aikey_vk_' \
+               AND NOT ( \
+                 length(route_token) = 73 \
+                 AND length(substr(route_token, 10)) = 64 \
+                 AND lower(substr(route_token, 10)) NOT GLOB '*[^0-9a-f]*' \
+               )",
+            table = table
+        );
+        conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+            .map_err(|e| format!("{} prefix-precheck: {}", table, e))
+    }
+
+    /// Count rows where route_token is NULL or empty (excluded from prefix-precheck
+    /// because the WHERE clause requires `aikey_vk_` prefix). NULL/empty is acceptable
+    /// pre-migration if the row was added but never had a token generated; refuse
+    /// to migrate while these exist so the operator knows to resolve them first.
+    ///
+    /// Note: this precheck is informational on the upgrade path because empty
+    /// route_token simply skips the UPDATE filter (no harm done). Kept available
+    /// as a public function for E2E migration tests to assert on dirty fixtures.
+    #[allow(dead_code)]
+    pub fn completeness_precheck(conn: &Connection, table: &str) -> Result<i64, String> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE route_token IS NULL OR route_token = ''",
+            table
+        );
+        conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
+            .map_err(|e| format!("{} completeness-precheck: {}", table, e))
+    }
+
+    /// Forward migration: rename `aikey_vk_<64-hex>` → `aikey_personal_<64-hex>`
+    /// in entries.route_token and provider_accounts.route_token, force-lowercasing
+    /// the hex suffix.
+    pub fn upgrade(conn: &Connection) -> Result<(), String> {
+        // Tables to migrate. provider_accounts may not exist on very old
+        // vaults; skip gracefully (has_table guard).
+        let targets: &[&str] = &["entries", "provider_accounts"];
+
+        for table in targets {
+            if !has_table(conn, table) {
+                continue;
+            }
+            if !has_column(conn, table, "route_token") {
+                continue;
+            }
+
+            // Prefix-precheck: refuse to migrate if dirty old-prefix rows exist.
+            // The migration UPDATE strictly filters on the canonical form, so
+            // dirty rows would be silently left behind otherwise — defense in
+            // depth says fail fast and surface the issue.
+            let dirty = prefix_precheck(conn, table)?;
+            if dirty > 0 {
+                return Err(format!(
+                    "v1.0.5-alpha migration refused: {} has {} aikey_vk_* row(s) \
+                     that don't match the canonical aikey_vk_<64-hex> form. \
+                     Inspect dirty rows with: \
+                     SELECT alias, length(route_token), route_token FROM {} \
+                     WHERE substr(route_token, 1, 9) = 'aikey_vk_' \
+                       AND NOT (length(route_token) = 73 AND length(substr(route_token, 10)) = 64 \
+                                AND lower(substr(route_token, 10)) NOT GLOB '*[^0-9a-f]*');",
+                    table, dirty, table
+                ));
+            }
+
+            // UPDATE: prefix rename + force lowercase suffix. WHERE clause
+            // mirrors the precheck's "canonical form" rule so we only touch
+            // rows we just verified are safe.
+            let sql = format!(
+                "UPDATE {} \
+                 SET route_token = 'aikey_personal_' || lower(substr(route_token, 10)) \
+                 WHERE substr(route_token, 1, 9) = 'aikey_vk_' \
+                   AND length(route_token) = 73 \
+                   AND length(substr(route_token, 10)) = 64 \
+                   AND lower(substr(route_token, 10)) NOT GLOB '*[^0-9a-f]*'",
+                table
+            );
+            conn.execute(&sql, [])
+                .map_err(|e| format!("{} prefix rename UPDATE: {}", table, e))?;
+        }
+
+        Ok(())
+    }
+
+    /// Reverse migration: rename `aikey_personal_<64-hex>` → `aikey_vk_<64-hex>`.
+    ///
+    /// Same idempotency rules as upgrade: filters strictly on the canonical
+    /// post-migration form (length 79, new prefix, suffix 64 hex).
+    /// Tokens written by ANY other source (e.g. mid-rollback partial state)
+    /// are left untouched.
+    pub fn rollback(conn: &Connection) -> Result<(), String> {
+        let targets: &[&str] = &["entries", "provider_accounts"];
+
+        for table in targets {
+            if !has_table(conn, table) {
+                continue;
+            }
+            if !has_column(conn, table, "route_token") {
+                continue;
+            }
+
+            let sql = format!(
+                "UPDATE {} \
+                 SET route_token = 'aikey_vk_' || substr(route_token, 16) \
+                 WHERE substr(route_token, 1, 15) = 'aikey_personal_' \
+                   AND length(route_token) = 79 \
+                   AND length(substr(route_token, 16)) = 64 \
+                   AND lower(substr(route_token, 16)) NOT GLOB '*[^0-9a-f]*'",
+                table
+            );
+            match conn.execute(&sql, []) {
+                Ok(n) => eprintln!("[db rollback] {}: reverted {} row(s) aikey_personal_ → aikey_vk_", table, n),
+                Err(e) => eprintln!("[db rollback] {} WARN: {} — {}", table, sql, e),
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use rusqlite::Connection;
+
+        /// Set up an in-memory vault DB with the minimal schema for this
+        /// migration (entries + provider_accounts with route_token columns).
+        /// Mimics the tail of v1.0.4-alpha.upgrade()'s relevant DDL.
+        fn setup_db() -> Connection {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE entries (alias TEXT PRIMARY KEY, route_token TEXT);
+                 CREATE TABLE provider_accounts (
+                   provider_account_id TEXT PRIMARY KEY,
+                   route_token TEXT
+                 );",
+            )
+            .unwrap();
+            conn
+        }
+
+        const HEX_LOWER: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const HEX_UPPER: &str = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+
+        #[test]
+        fn upgrade_renames_lowercase_hex_token() {
+            let conn = setup_db();
+            let token = format!("aikey_vk_{}", HEX_LOWER);
+            conn.execute(
+                "INSERT INTO entries(alias, route_token) VALUES ('a', ?1)",
+                [&token],
+            )
+            .unwrap();
+
+            upgrade(&conn).unwrap();
+
+            let after: String = conn
+                .query_row("SELECT route_token FROM entries WHERE alias='a'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(after, format!("aikey_personal_{}", HEX_LOWER));
+            assert_eq!(after.len(), 79);
+        }
+
+        #[test]
+        fn upgrade_force_lowercases_uppercase_hex() {
+            let conn = setup_db();
+            let token = format!("aikey_vk_{}", HEX_UPPER);
+            conn.execute(
+                "INSERT INTO entries(alias, route_token) VALUES ('a', ?1)",
+                [&token],
+            )
+            .unwrap();
+
+            upgrade(&conn).unwrap();
+
+            let after: String = conn
+                .query_row("SELECT route_token FROM entries WHERE alias='a'", [], |r| r.get(0))
+                .unwrap();
+            // Force-lowercased — proxy's isTier1Personal only accepts [0-9a-f].
+            assert_eq!(after, format!("aikey_personal_{}", HEX_LOWER));
+        }
+
+        #[test]
+        fn upgrade_refuses_short_dirty_token() {
+            let conn = setup_db();
+            // 'aikey_vk_short' — not 73 chars; prefix precheck must catch it.
+            conn.execute(
+                "INSERT INTO entries(alias, route_token) VALUES ('a', 'aikey_vk_short')",
+                [],
+            )
+            .unwrap();
+
+            let res = upgrade(&conn);
+            assert!(res.is_err(), "expected refusal, got {:?}", res);
+            let err = res.unwrap_err();
+            assert!(err.contains("v1.0.5-alpha migration refused"), "msg: {}", err);
+        }
+
+        #[test]
+        fn upgrade_refuses_non_hex_token() {
+            let conn = setup_db();
+            // length 73 but suffix contains 'g' (non-hex)
+            let token = format!("aikey_vk_{}", "g".repeat(64));
+            conn.execute(
+                "INSERT INTO entries(alias, route_token) VALUES ('a', ?1)",
+                [&token],
+            )
+            .unwrap();
+
+            let res = upgrade(&conn);
+            assert!(res.is_err(), "expected refusal, got {:?}", res);
+        }
+
+        #[test]
+        fn upgrade_idempotent_on_already_migrated() {
+            let conn = setup_db();
+            let token = format!("aikey_vk_{}", HEX_LOWER);
+            conn.execute(
+                "INSERT INTO entries(alias, route_token) VALUES ('a', ?1)",
+                [&token],
+            )
+            .unwrap();
+
+            upgrade(&conn).unwrap();
+            upgrade(&conn).unwrap();  // Second run = no-op
+
+            let after: String = conn
+                .query_row("SELECT route_token FROM entries WHERE alias='a'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(after, format!("aikey_personal_{}", HEX_LOWER));
+        }
+
+        #[test]
+        fn upgrade_skips_null_and_empty() {
+            let conn = setup_db();
+            conn.execute("INSERT INTO entries(alias, route_token) VALUES ('null', NULL)", []).unwrap();
+            conn.execute("INSERT INTO entries(alias, route_token) VALUES ('empty', '')", []).unwrap();
+
+            // Should NOT error — NULL/empty don't match prefix filter.
+            upgrade(&conn).unwrap();
+
+            // Completeness precheck reports them but doesn't block upgrade.
+            let count = completeness_precheck(&conn, "entries").unwrap();
+            assert_eq!(count, 2);
+        }
+
+        #[test]
+        fn upgrade_covers_provider_accounts() {
+            let conn = setup_db();
+            let token = format!("aikey_vk_{}", HEX_LOWER);
+            conn.execute(
+                "INSERT INTO provider_accounts(provider_account_id, route_token) VALUES ('acct1', ?1)",
+                [&token],
+            )
+            .unwrap();
+
+            upgrade(&conn).unwrap();
+
+            let after: String = conn
+                .query_row(
+                    "SELECT route_token FROM provider_accounts WHERE provider_account_id='acct1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(after, format!("aikey_personal_{}", HEX_LOWER));
+        }
+
+        #[test]
+        fn rollback_reverts_personal_to_vk() {
+            let conn = setup_db();
+            let new_token = format!("aikey_personal_{}", HEX_LOWER);
+            conn.execute(
+                "INSERT INTO entries(alias, route_token) VALUES ('a', ?1)",
+                [&new_token],
+            )
+            .unwrap();
+
+            rollback(&conn).unwrap();
+
+            let after: String = conn
+                .query_row("SELECT route_token FROM entries WHERE alias='a'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(after, format!("aikey_vk_{}", HEX_LOWER));
+        }
+
+        #[test]
+        fn upgrade_then_rollback_round_trip() {
+            let conn = setup_db();
+            let original = format!("aikey_vk_{}", HEX_LOWER);
+            conn.execute(
+                "INSERT INTO entries(alias, route_token) VALUES ('a', ?1)",
+                [&original],
+            )
+            .unwrap();
+
+            upgrade(&conn).unwrap();
+            rollback(&conn).unwrap();
+
+            let after: String = conn
+                .query_row("SELECT route_token FROM entries WHERE alias='a'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(after, original, "round-trip must restore original token");
+        }
+    }
+}
+
+// v1.0.5-alpha (original — batch-import audit tables) and v1.0.6-alpha (per-key
+// usage telemetry) were collapsed into v1.0.4-alpha on 2026-04-23 before either
 // shipped — see the module comment at the top of `v1_0_4_alpha`. Intentionally
 // left blank so the file tree matches the VERSIONS registry.
 

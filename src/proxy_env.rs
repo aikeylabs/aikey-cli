@@ -254,13 +254,34 @@ fn is_sensitive_key(key: &str) -> bool {
 /// Mask a value for display: keep the first 15 + last 6 chars and replace
 /// the middle with `...`. The longer prefix preserves enough of the key for
 /// the user to recognise which provider/binding it belongs to (`sk-proj-…` /
-/// `aikey_vk_…` / `xai-…`); the suffix lets them disambiguate similar keys
+/// `aikey_personal_…` / `xai-…`); the suffix lets them disambiguate similar keys
 /// at a glance (industry convention — AWS console, 1Password, GitLab masked
 /// vars all show a tail).
 /// Values too short for the 15+6 frame to leave anything hidden are returned
 /// as-is — masking would expose more than it hides. The threshold therefore
 /// floats with `prefix + suffix` rather than being a separate constant.
 pub fn mask_value(key: &str, value: &str) -> String {
+    // AiKey routing namespace tokens. Show non-bearer ones in full so
+    // `aikey env` reveals which key/binding is currently active for each
+    // provider — that's the whole point of the command.
+    //
+    // Carved out (full display):
+    //   - aikey_active_<provider>     — `aikey use` sentinel (tier 3, dynamic) per-provider fixed string
+    //   - aikey_team_<vk_id>          — team static bearer; vk_id is server-issued identifier, not a secret
+    //   - aikey_probe_<alias>         — `aikey test` probe sentinel (tier 2); alias is user-known
+    //
+    // Still masked:
+    //   - aikey_personal_<64-hex>     — locally-generated random route token (real local-proxy bearer credential)
+    //   - aikey_route_*               — reserved namespace; if it ever appears, default-mask as a precaution
+    //
+    // Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md
+    if value.starts_with("aikey_active_")
+        || value.starts_with("aikey_team_")
+        || value.starts_with("aikey_probe_")
+    {
+        return value.to_string();
+    }
+
     let lower = key.to_lowercase();
     let is_known_safe = NON_SENSITIVE_KEYS.iter().any(|k| lower == *k);
     if is_known_safe {
@@ -278,6 +299,13 @@ pub fn mask_value(key: &str, value: &str) -> String {
         value.to_string()
     }
 }
+
+// Note: prior version had a helper to distinguish the legacy server-issued
+// vk_id form from the locally-generated random hex bearer (both shared the
+// same prefix). Removed in the 2026-04-29 prefix rename — new scheme uses
+// `aikey_team_*` (always identifier, never secret) and `aikey_personal_<64-hex>`
+// (always bearer, always secret). Direct prefix check in mask_value above
+// is enough.
 
 /// `first N chars + "..." + last M chars`. Char-aware (won't panic on
 /// non-ASCII byte boundaries, unlike `&s[..N]`). Falls back to the original
@@ -402,6 +430,56 @@ mod tests {
         assert_eq!(mask_value("http_proxy", "http://1.2.3.4"), "http://1.2.3.4");
         assert_eq!(mask_value("https_proxy", "http://1.2.3.4"), "http://1.2.3.4");
         assert_eq!(mask_value("all_proxy", "socks5://1.2.3.4"), "socks5://1.2.3.4");
+    }
+
+    #[test]
+    fn aikey_active_sentinels_shown_in_full() {
+        // `aikey use` writes per-provider sentinels to ~/.aikey/active.env.
+        // The proxy's tier-3 fallthrough resolves them via the URL path's
+        // canonical provider, not via the suffix — so they're not bearers,
+        // never secret, and `aikey env` reveals them in full.
+        assert_eq!(
+            mask_value("ANTHROPIC_AUTH_TOKEN", "aikey_active_anthropic"),
+            "aikey_active_anthropic",
+        );
+        assert_eq!(
+            mask_value("OPENAI_API_KEY", "aikey_active_openai"),
+            "aikey_active_openai",
+        );
+    }
+
+    #[test]
+    fn aikey_team_tokens_shown_in_full() {
+        // Team key static bearer = `aikey_team_<vk_id>`. The vk_id is
+        // server-issued and not a secret on its own (server has its own
+        // auth/scope rules); showing in full lets users see which team key
+        // is bound.
+        assert_eq!(
+            mask_value("ANTHROPIC_AUTH_TOKEN", "aikey_team_acc-1234abc"),
+            "aikey_team_acc-1234abc",
+        );
+    }
+
+    #[test]
+    fn aikey_probe_sentinels_shown_in_full() {
+        // `aikey test` preflight bearer; alias is user-known.
+        assert_eq!(
+            mask_value("X_API_KEY", "aikey_probe_my-key"),
+            "aikey_probe_my-key",
+        );
+    }
+
+    #[test]
+    fn aikey_personal_bearer_still_masked() {
+        // `aikey route` output = aikey_personal_<64-hex> — real local-proxy
+        // bearer credential. Mask it so an over-the-shoulder glance at
+        // `aikey env` doesn't leak a third-party-client token.
+        let bearer = "aikey_personal_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(bearer.len(), 79);
+        let masked = mask_value("ANTHROPIC_AUTH_TOKEN", bearer);
+        assert_ne!(masked, bearer);
+        assert!(masked.contains("..."));
+        assert!(masked.starts_with("aikey_personal_"));
     }
 
     #[test]

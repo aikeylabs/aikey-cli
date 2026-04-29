@@ -95,7 +95,9 @@ fn activate_eval_injects_provider_env_vars() {
         "#,
     );
     assert_eq!(code, 0, "bash script failed: {}", _stderr);
-    assert!(stdout.contains("API_KEY=aikey_vk_"),
+    // 2026-04-29 prefix rename: personal route_token form is now a 79-char
+    // string (15-char prefix + 64 lowercase hex).
+    assert!(stdout.contains("API_KEY=aikey_personal_"),
         "ANTHROPIC_API_KEY not injected or wrong prefix:\n{}", stdout);
     assert!(stdout.contains("BASE_URL=http://127.0.0.1:"),
         "ANTHROPIC_BASE_URL not injected:\n{}", stdout);
@@ -125,7 +127,7 @@ fn deactivate_restores_user_preexisting_env_var() {
     );
     assert_eq!(code, 0, "bash failed: {}", _stderr);
     // Activate should have REPLACED the user's value with the vault token.
-    assert!(stdout.contains("AFTER_ACTIVATE=aikey_vk_"),
+    assert!(stdout.contains("AFTER_ACTIVATE=aikey_personal_"),
         "activate should replace with vault token, got:\n{}", stdout);
     // Deactivate should have RESTORED the user's original value.
     assert!(stdout.contains("AFTER_DEACTIVATE=sk-user-owned-value"),

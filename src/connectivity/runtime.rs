@@ -755,16 +755,19 @@ pub fn test_proxy_connectivity(proxy_addr: &str, provider_code: &str) -> ProxyPr
     // The proxy's upstream base_url never ends with /v1, so use full /v1/... paths.
     let proxy_base = format!("http://{}/{}", proxy_addr, provider_code);
     let proxy_url = format!("{}{}", proxy_base, probe_suffix(provider_code, &proxy_base));
-    let active_cfg = crate::storage::get_active_key_config().ok().flatten();
-    let bearer = active_cfg.as_ref()
-        .map(|cfg| {
-            if cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey {
-                format!("aikey_vk_{}", cfg.key_ref)
-            } else {
-                format!("aikey_personal_{}", cfg.key_ref)
-            }
-        })
-        .unwrap_or_else(|| "aikey_test_probe".to_string());
+    // 2026-04-29 prefix rename + 评审 #3 (Low) 收紧:
+    // Probe ALL credential types via the active sentinel (tier 3 fallthrough),
+    // including team. This matches the `aikey use` runtime-switching model —
+    // probe should test "what `aikey use` would actually route to right now",
+    // NOT "this specific team key works in isolation". Earlier asymmetry
+    // (team via static bearer, personal/OAuth via active sentinel) was a
+    // legacy of the pre-rename "team is locked" model and no longer applies.
+    //
+    // The proxy resolves the active binding via path's canonical provider,
+    // independent of credential type — so this probe exercises exactly the
+    // path real claude/codex/kimi requests take.
+    let _active_cfg = crate::storage::get_active_key_config().ok().flatten();
+    let bearer = format!("aikey_active_{}", provider_code);
 
     let (auth_key, auth_val) = probe_auth(provider_code, &bearer);
     // Explicit no-proxy agent. Must NOT use `ureq::get()` shortcut — it

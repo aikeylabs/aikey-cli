@@ -72,15 +72,16 @@ pub use runtime::{
 /// destination, and display suffix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CredentialKind {
-    /// Personal API key stored in the vault. Tested by decrypting the key
-    /// locally and hitting the real provider directly.
+    /// Personal API key stored in the vault. Tested via the local proxy with
+    /// a probe sentinel (`aikey_probe_<alias>`); the proxy decrypts on demand
+    /// using its own startup-time vault key.
     PersonalApi,
-    /// Team-managed virtual key. Tested via the local proxy with a sentinel
-    /// bearer (`aikey_vk_<virtual_key_id>`); the proxy injects the real
+    /// Team-managed virtual key. Tested via the local proxy with a static
+    /// team bearer (`aikey_team_<vk_id>`); the proxy injects the real
     /// provider credential on forward.
     ManagedTeam,
-    /// Personal OAuth account. Tested via the local proxy with a sentinel
-    /// bearer (`aikey_personal_<account_id>`); the proxy refreshes tokens and
+    /// Personal OAuth account. Tested via the local proxy with a probe
+    /// sentinel (`aikey_probe_<account_id>`); the proxy refreshes tokens and
     /// attaches provider-specific persona headers on forward.
     OAuth,
 }
@@ -97,8 +98,8 @@ impl CredentialKind {
     }
 
     /// Post-plan-D (2026-04-22) all three credential kinds route through
-    /// the local proxy — personal via alias sentinel, team via vk sentinel,
-    /// OAuth via account sentinel. Kept as a function in case a future
+    /// the local proxy — personal via probe sentinel, team via static team
+    /// bearer, OAuth via probe sentinel. Kept as a function in case a future
     /// kind reintroduces a direct path.
     pub fn via_proxy(self) -> bool { true }
 }
@@ -148,12 +149,14 @@ impl TestTarget {
 // ---------------------------------------------------------------------------
 
 /// Build a PersonalApi target routed through the local proxy using the
-/// `aikey_personal_alias_<alias>` sentinel bearer.
+/// `aikey_probe_<alias>` sentinel bearer (proxy tier 2).
 ///
 /// Plan D (2026-04-22): CLI never touches plaintext. Proxy already holds
 /// the vault derived key from its own startup and decrypts on demand when
-/// it sees the sentinel bearer. Per-entry custom base URLs are respected
+/// it sees the probe sentinel. Per-entry custom base URLs are respected
 /// server-side via `GetPersonalKeyByAlias`.
+///
+/// 2026-04-29 prefix rename: legacy probe sentinel form replaced by `aikey_probe_*`.
 pub fn personal_target(
     source_ref: &str,
     provider_code: &str,
@@ -163,7 +166,7 @@ pub fn personal_target(
     TestTarget {
         provider_code: provider_code.to_string(),
         base_url:      format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
-        bearer:        format!("aikey_personal_alias_{}", source_ref),
+        bearer:        format!("aikey_probe_{}", source_ref),
         kind:          CredentialKind::PersonalApi,
         source_ref:    source_ref.to_string(),
     }
@@ -192,28 +195,40 @@ pub fn personal_target_direct(
     }
 }
 
-/// Build a ManagedTeam target: `aikey_vk_<id>` sentinel bearer, local-proxy URL.
+/// Build a ManagedTeam target: `aikey_team_<vk_id>` static bearer (tier 1),
+/// local-proxy URL. Goes through the shared `team_token_from_vk_id` helper
+/// so any historical-prefix residue in the cached vk_id is normalized away;
+/// matches the form `handle_route` and `resolve_activate_key` emit.
 pub fn team_target(
     virtual_key_id: &str,
     provider_code: &str,
     proxy_port: u16,
 ) -> TestTarget {
     let prefix = crate::commands_account::provider_proxy_prefix_pub(provider_code);
+    // Empty vk_id is upstream bug; helper returns Err. Fall back to a clearly
+    // invalid bearer so the test row surfaces the issue rather than silently
+    // probing a degenerate token.
+    let bearer = crate::team_token_normalize::team_token_from_vk_id(virtual_key_id)
+        .unwrap_or_else(|_| "aikey_team_<empty-vk_id>".to_string());
     TestTarget {
         provider_code: provider_code.to_string(),
         base_url:      format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
-        bearer:        format!("aikey_vk_{}", virtual_key_id),
+        bearer,
         kind:          CredentialKind::ManagedTeam,
         source_ref:    virtual_key_id.to_string(),
     }
 }
 
-/// Build an OAuth target: `aikey_personal_<id>` sentinel bearer, local-proxy URL.
+/// Build an OAuth target: `aikey_probe_<account_id>` sentinel bearer (tier 2),
+/// local-proxy URL. The probe path lets the proxy decrypt the OAuth credential
+/// + refresh tokens server-side — same path as a real `aikey test <oauth>`.
 ///
 /// `raw_provider` may be the broker vocabulary (`"claude"` / `"codex"`); this
 /// factory canonicalizes internally so the resulting `provider_code` field
 /// is always `"anthropic"` / `"openai"` / `"kimi"` / etc. Single chokepoint
 /// that keeps the `TestTarget.provider_code` canonical invariant honest.
+///
+/// 2026-04-29 prefix rename: legacy OAuth sentinel form replaced by `aikey_probe_<account_id>`.
 pub fn oauth_target(
     account_id: &str,
     raw_provider: &str,
@@ -225,7 +240,7 @@ pub fn oauth_target(
     TestTarget {
         provider_code: provider,
         base_url:      format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
-        bearer:        format!("aikey_personal_{}", account_id),
+        bearer:        format!("aikey_probe_{}", account_id),
         kind:          CredentialKind::OAuth,
         source_ref:    account_id.to_string(),
     }
@@ -332,14 +347,14 @@ mod connectivity_suite_tests {
     #[test]
     fn credential_kind_via_proxy_all_true_after_plan_d() {
         // Plan D (2026-04-22): personal keys now route through the local
-        // proxy using the aikey_personal_alias_<alias> sentinel, matching
-        // how team and OAuth already worked. `via_proxy()` is `true` for
-        // every variant — pinned so a future refactor can't silently
-        // reintroduce a direct-upstream path for any kind.
+        // proxy using a probe sentinel (aikey_probe_<alias> after the
+        // 2026-04-29 prefix rename), matching how team and OAuth already
+        // worked. `via_proxy()` is `true` for every variant — pinned so a
+        // future refactor can't silently reintroduce a direct-upstream path.
         assert!(CredentialKind::PersonalApi.via_proxy(),
-            "personal keys now route via proxy (aikey_personal_alias_ sentinel)");
+            "personal keys route via proxy probe sentinel");
         assert!(CredentialKind::ManagedTeam.via_proxy(),
-            "team keys route via proxy so the sentinel gets swapped for real credential");
+            "team keys route via proxy with static team bearer");
         assert!(CredentialKind::OAuth.via_proxy(),
             "OAuth routes via proxy so token refresh + persona headers apply");
     }
@@ -565,7 +580,7 @@ mod connectivity_suite_tests {
             "oauth_target MUST normalize broker vocab so downstream persona \
              tweaks key on the canonical code");
         assert_eq!(t.kind, CredentialKind::OAuth);
-        assert_eq!(t.bearer, "aikey_personal_acc_123");
+        assert_eq!(t.bearer, "aikey_probe_acc_123");
         assert!(t.base_url.starts_with("http://127.0.0.1:27200/"),
             "OAuth targets always route via local proxy, got: {}", t.base_url);
         assert_eq!(t.display_label(), "anthropic (oauth)",
@@ -590,22 +605,25 @@ mod connectivity_suite_tests {
     }
 
     #[test]
-    fn team_target_uses_vk_sentinel_and_proxy_url() {
+    fn team_target_uses_team_bearer_and_proxy_url() {
         let t = team_target("vk_abc", "anthropic", 27200);
         assert_eq!(t.kind, CredentialKind::ManagedTeam);
-        assert_eq!(t.bearer, "aikey_vk_vk_abc");
+        // 2026-04-29 prefix rename: legacy team prefix → `aikey_team_<vk_id>`
+        // (via team_token_from_vk_id helper for normalization).
+        assert_eq!(t.bearer, "aikey_team_vk_abc");
         assert!(t.base_url.starts_with("http://127.0.0.1:27200/anthropic"));
         assert_eq!(t.display_label(), "anthropic (team)");
         assert_eq!(t.source_ref, "vk_abc");
     }
 
     #[test]
-    fn personal_target_routes_via_proxy_with_sentinel() {
+    fn personal_target_routes_via_proxy_with_probe_sentinel() {
         // Plan D (2026-04-22): bearer is the sentinel, URL is local proxy.
+        // 2026-04-29 prefix rename: legacy probe sentinel → aikey_probe_<alias>
         let t = personal_target("my-key", "kimi", 27200);
         assert_eq!(t.kind, CredentialKind::PersonalApi);
-        assert_eq!(t.bearer, "aikey_personal_alias_my-key",
-            "bearer must be the sentinel, not plaintext — CLI never decrypts");
+        assert_eq!(t.bearer, "aikey_probe_my-key",
+            "bearer must be the probe sentinel, not plaintext — CLI never decrypts");
         assert!(t.base_url.starts_with("http://127.0.0.1:27200/"),
             "personal keys route through local proxy, got: {}", t.base_url);
         assert_eq!(t.display_label(), "kimi");

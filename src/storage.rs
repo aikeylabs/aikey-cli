@@ -28,7 +28,7 @@ pub struct SecretMetadata {
     /// Provider codes this key supports (v1.0.2+).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supported_providers: Option<Vec<String>>,
-    /// Route token (`aikey_vk_...`) — stable public id for this entry.
+    /// Route token (`aikey_personal_<64-hex>`) — stable public id for this entry.
     /// Added 2026-04-23 so the User Vault Web page can render a
     /// secondary id line under each alias without needing a second
     /// per-row query. Old callers ignore the new field via
@@ -1177,13 +1177,19 @@ pub fn set_proxy_loaded_seq(seq: u64) -> Result<(), String> {
 // Route token generation and backfill
 // ---------------------------------------------------------------------------
 
-/// Generates a random route token: "aikey_vk_" + 64 hex chars (256 bits).
-/// Used as the API_KEY identifier for per-request proxy routing.
+/// Generates a random route token: "aikey_personal_" + 64 lowercase hex chars
+/// (256 bits). Used as the API_KEY identifier for static per-key proxy routing
+/// (third-party clients via `aikey route`, current shell pin via `aikey activate`).
+///
+/// The output is always lowercase hex (Rust `hex::encode` default) — the proxy's
+/// `isTier1Personal` form check rejects uppercase, so this is a hard contract.
+///
+/// Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md §4
 pub fn generate_route_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
-    format!("aikey_vk_{}", hex::encode(bytes))
+    format!("aikey_personal_{}", hex::encode(bytes))
 }
 
 /// Sets the route_token for a personal key entry.

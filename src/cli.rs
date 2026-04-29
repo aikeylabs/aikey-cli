@@ -108,6 +108,25 @@ pub(crate) enum Commands {
         /// Which shell template to hash: zsh | bash
         shell: String,
     },
+    /// Hidden: regenerate `~/.aikey/active.env` after the 2026-04-29
+    /// token-prefix rename. Called by installer scripts at upgrade time, and
+    /// by the CLI main dispatch as a safety net when the on-disk file
+    /// contains legacy-form tokens.
+    ///
+    /// Does NOT require the vault password — `user_profile_provider_bindings`
+    /// is not encrypted, so we can re-read the bindings + write the new
+    /// per-provider sentinels (`aikey_active_<provider>`) without prompting.
+    ///
+    /// The `--if-legacy` flag (the canonical installer-callable form) makes
+    /// this a no-op when no legacy form is detected — safe to call on every
+    /// upgrade regardless of whether the user already migrated.
+    #[command(hide = true, name = "_refresh-active-env")]
+    RefreshActiveEnv {
+        /// Only refresh if the on-disk file contains a legacy-form token.
+        /// Idempotent: safe to call on every install/upgrade.
+        #[arg(long)]
+        if_legacy: bool,
+    },
     /// Manage the shell precmd hook installed under ~/.aikey/hook.{zsh,bash}
     ///
     /// `aikey hook update` regenerates the hook file from the binary's
@@ -763,6 +782,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 crate::commands_internal::InternalAction::Query(_) => "query",
                 crate::commands_internal::InternalAction::UpdateAlias(_) => "update-alias",
                 crate::commands_internal::InternalAction::Parse(_) => "parse",
+                crate::commands_internal::InternalAction::Rules(_) => "rules",
             }),
             Commands::Add { .. } => "add".to_string(),
             Commands::Get { .. } => "get".to_string(),
@@ -855,6 +875,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             },
             Commands::Watch => "watch".to_string(),
             Commands::HookHash { .. } => "_hook-hash".to_string(),
+            Commands::RefreshActiveEnv { .. } => "_refresh-active-env".to_string(),
             Commands::Hook { action } => match action {
                 HookAction::Update => "hook.update".to_string(),
                 HookAction::Status { .. } => "hook.status".to_string(),
@@ -917,7 +938,18 @@ Notes:
     - AiKey ensures the local proxy is running before activation.
     - --provider <PROVIDER> narrows a personal key to a specific provider.
     - --provider with no value opens an interactive provider selector.
-    - --no-hook skips shell hook installation."),
+    - --no-hook skips shell hook installation.
+
+Runtime switching of a running CLI (e.g. an open `claude` chat):
+    - For ANY credential type (personal API key, OAuth, team), a later
+      `aikey use` takes effect immediately in already-running CLI sessions
+      launched via plain `claude` / `codex` / `kimi` — no restart needed
+      (e.g. swap to a fresh OAuth account when one runs out of quota).
+    - The 2026-04-29 token-prefix rename refactor unified all credential
+      types under one namespace-authority dispatch model — the previous
+      'team is locked' asymmetry has been removed.
+    - Sessions launched via `aikey activate` are pinned and DO NOT follow.
+    - See: workflow/Docs/Production/aikey-use-runtime-switching.md"),
 
         "activate" => Some("\
 Notes:
@@ -926,7 +958,15 @@ Notes:
     - Closing the terminal automatically reverts to global settings.
     - --provider is required when the key supports multiple providers.
     - --shell is passed automatically by the aikey() shell wrapper.
-    - Use `aikey deactivate` to restore global settings in the same terminal."),
+    - Use `aikey deactivate` to restore global settings in the same terminal.
+
+Pinning semantics (vs. `aikey use`):
+    - `aikey activate` PINS the launched CLI to the named key for any
+      credential type (personal / OAuth / team). A later `aikey use` from
+      another shell does NOT switch the pinned CLI — restart it to change.
+    - Use `aikey use` (not `activate`) if you want runtime switching of a
+      running CLI session for personal / OAuth keys.
+    - See: workflow/Docs/Production/aikey-use-runtime-switching.md"),
 
         "deactivate" => Some("\
 Notes:
@@ -937,7 +977,7 @@ Notes:
         "route" => Some("\
 Notes:
     - Shows route tokens for configuring third-party AI clients (Cursor, OpenCode, etc.).
-    - Each key/account gets a random aikey_vk_ token used as the API_KEY in client config.
+    - Each key/account gets a random aikey_personal_<64-hex> token used as the API_KEY in client config.
     - `aikey route` lists all available routes (tokens truncated by default).
     - `aikey route <label>` shows full token + base_url for copy-paste configuration.
     - `aikey route --json` outputs all routes as JSON with full tokens (for scripts).
@@ -1201,6 +1241,15 @@ Detailed Commands
     - --provider with no value opens an interactive provider selector.
     - --no-hook skips shell hook installation.
 
+  Runtime switching of a running CLI (e.g. an open `claude` chat):
+    - For ANY credential type (personal API key, OAuth, team), a later
+      `aikey use` takes effect immediately in already-running CLI sessions
+      launched via plain `claude` / `codex` / `kimi` — no restart needed.
+    - The 2026-04-29 token-prefix rename refactor unified all credential
+      types; the previous 'team is locked' asymmetry has been removed.
+    - Sessions launched via `aikey activate` are pinned and DO NOT follow.
+    - See: workflow/Docs/Production/aikey-use-runtime-switching.md
+
 [1mactivate[0m
   Temporarily activate a key in the current terminal.
 
@@ -1213,6 +1262,14 @@ Detailed Commands
     - --provider is required when the key supports multiple providers.
     - --shell is passed automatically by the shell wrapper function.
     - Use `aikey deactivate` to restore global settings without closing the terminal.
+
+  Pinning semantics (vs. `aikey use`):
+    - `aikey activate` PINS the launched CLI to the named key for any
+      credential type (personal / OAuth / team). A later `aikey use` from
+      another shell does NOT switch the pinned CLI — restart it to change.
+    - Use `aikey use` (not `activate`) if you want runtime switching of a
+      running CLI session for personal / OAuth keys.
+    - See: workflow/Docs/Production/aikey-use-runtime-switching.md
 
 [1mdeactivate[0m
   Restore global active.env settings in the current terminal.
@@ -1231,7 +1288,7 @@ Detailed Commands
     aikey route [--full] [--json] [LABEL]
 
   Notes:
-    - Each key/account gets a random aikey_vk_ token used as API_KEY in client config.
+    - Each key/account gets a random aikey_personal_<64-hex> token used as API_KEY in client config.
     - Without LABEL: lists all routes (tokens truncated; use --full for complete tokens).
     - With LABEL: shows full base_url + api_key ready to copy-paste.
     - --json outputs all routes as JSON with full tokens (for scripts).
@@ -1241,7 +1298,7 @@ Detailed Commands
     $ aikey route my-key
     # Configuration for: my-key (personal, anthropic)
     base_url:  http://127.0.0.1:27200/anthropic
-    api_key:   aikey_vk_b82ef1d49c3a7e08...
+    api_key:   aikey_personal_b82ef1d49c3a7e08...
 
 [1mlogin[0m
   Log in to the control service.

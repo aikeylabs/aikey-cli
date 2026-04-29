@@ -5,13 +5,14 @@
 //! - 所有子命令都通过 `--stdin-json` 读统一 JSON 信封（见 `protocol.rs`）
 //! - 所有子命令都输出统一 JSON 信封到 stdout（成功/失败同一格式）
 //!
-//! # 子命令清单（v1.0 目标 4 个）
+//! # 子命令清单（v1.0 目标 4 个 + 一个静态数据出口）
 //! | 子命令 | Phase | 作用 |
 //! |---|---|---|
 //! | `vault-op` | A/B | vault 读写加密操作（verify/add/batch_import/update_secret/delete）|
 //! | `query` | C | vault 读（带解密）|
 //! | `update-alias` | D | 编辑非敏感元数据 |
 //! | `parse` | E (Stage 3) | 文本解析三层流水（规则+CRF+Fingerprint）|
+//! | `rules` | — | 把 provider_fingerprint.yaml 静态映射透传给 Web UI（无 vault 访问）|
 //!
 //! # 错误码约定
 //! 所有错误码用 `I_` 前缀（Internal），详见 `error_codes::ErrorCode` 的 I_* 变体。
@@ -24,6 +25,7 @@ pub mod vault_op;
 pub mod query;
 pub mod update_alias;
 pub mod parse;
+pub mod rules;
 pub mod internal_log;
 
 #[cfg(test)]
@@ -43,6 +45,9 @@ pub enum InternalAction {
 
     /// 文本解析三层流水（Stage 3 实施）
     Parse(StdinOnlyArgs),
+
+    /// provider_fingerprint.yaml 静态映射透传（layer 版本 / family_*_urls / sample_providers）
+    Rules(StdinOnlyArgs),
 }
 
 /// 所有 `_internal` 子命令都只接受 `--stdin-json`，JSON 从 stdin 读
@@ -71,6 +76,7 @@ pub fn dispatch(action: &InternalAction) {
         InternalAction::Query(_)       => "query",
         InternalAction::UpdateAlias(_) => "update-alias",
         InternalAction::Parse(_)       => "parse",
+        InternalAction::Rules(_)       => "rules",
     };
     let env = match stdin_json::read_envelope() {
         Ok(e) => e,
@@ -94,5 +100,6 @@ pub fn dispatch(action: &InternalAction) {
         InternalAction::Query(_) => query::handle(env),
         InternalAction::UpdateAlias(_) => update_alias::handle(env),
         InternalAction::Parse(_) => parse::handle(env),
+        InternalAction::Rules(_) => rules::handle(env),
     }
 }

@@ -12,7 +12,8 @@
 //!   (there's no `aikey-proxy.yaml` in the tmp HOME). That's fine: the child
 //!   process still gets the env vars, we just don't exercise the HTTP path.
 //! - `aikey run` without `--direct` injects SENTINEL tokens (e.g.
-//!   `aikey_personal_<alias>`) that the proxy resolves to real keys.
+//!   `aikey_active_<provider>` post-2026-04-29 prefix rename) that the
+//!   proxy resolves to real keys via tier-3 fallthrough.
 //!   `--direct` bypasses the proxy and injects the real decrypted key.
 //! - `--provider <code>` requires a project-level `aikey.config.json` with
 //!   `providers.<code>.keyAlias` — that path has its own project-config
@@ -102,9 +103,11 @@ fn run_injects_provider_env_vars_from_binding() {
     let base_url = env_value(&stdout, "ANTHROPIC_BASE_URL")
         .expect("ANTHROPIC_BASE_URL must be injected (non-openai providers keep their base URL)");
 
-    // Sentinel token, NOT the real secret — the proxy resolves this.
-    assert_eq!(api_key, "aikey_personal_my-anthropic",
-        "expected personal sentinel token, got {}", api_key);
+    // 2026-04-29 prefix rename: per-provider active sentinel (was
+    // `aikey_personal_<alias>`, now `aikey_active_<provider>` — alias-
+    // independent). Proxy's tier-3 fallthrough resolves via URL path.
+    assert_eq!(api_key, "aikey_active_anthropic",
+        "expected per-provider active sentinel token, got {}", api_key);
     assert_ne!(api_key, "sk-ant-real-value",
         "real secret must NOT leak into child process without --direct");
 
@@ -261,8 +264,9 @@ fn run_direct_injects_real_decrypted_secret() {
     assert_eq!(api_key, "sk-ant-real-value",
         "--direct must inject the REAL decrypted secret, not a sentinel; got {}",
         api_key);
-    // The sentinel prefix MUST NOT appear.
-    assert!(!api_key.starts_with("aikey_personal_"),
+    // The sentinel prefix MUST NOT appear under --direct.
+    // Post-2026-04-29 prefix rename: sentinel is `aikey_active_<provider>`.
+    assert!(!api_key.starts_with("aikey_active_"),
         "--direct must not leave a proxy sentinel in env: {}", api_key);
 }
 

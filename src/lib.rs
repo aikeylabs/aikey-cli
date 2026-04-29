@@ -2,8 +2,10 @@
 //!
 //! This library provides the core functionality for the AK CLI tool.
 
+pub mod active_env_migration;
 pub mod credential_type;
 pub mod crypto;
+pub mod team_token_normalize;
 pub mod provider_registry;
 pub mod storage;
 pub mod synapse;

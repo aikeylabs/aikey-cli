@@ -778,8 +778,8 @@ pub fn resolve_aikey_dir() -> std::path::PathBuf {
 }
 
 pub(super) fn write_active_env(
-    key_type: &str,
-    key_ref: &str,    // virtual_key_id (team) or alias (personal)
+    _key_type: &str,  // legacy parameter — token is now per-provider sentinel (see body)
+    _key_ref: &str,   // legacy parameter — see _key_type
     display_name: &str,
     providers: &[String],
     proxy_port: u16,
@@ -795,11 +795,13 @@ pub(super) fn write_active_env(
 
     for provider in providers {
         if let Some((api_key_var, base_url_var)) = super::provider_env_vars(provider) {
-            let token_value = if key_type == "team" {
-                format!("aikey_vk_{}", key_ref)
-            } else {
-                format!("aikey_personal_{}", key_ref)
-            };
+            // Per-provider active sentinel (post-2026-04-29 prefix rename).
+            // Was: per-credential-type sentinel (vk_id for team, alias/account for others).
+            // Now: aikey_active_<provider> for ALL credential types — proxy's
+            // tier-3 fallthrough resolves the active binding via URL path.
+            // key_type / key_ref unused here but kept in signature for caller
+            // ergonomics. Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md
+            let token_value = format!("aikey_active_{}", provider);
             let base_url = format!("http://127.0.0.1:{}/{}", proxy_port, super::provider_proxy_prefix(provider));
             kv_pairs.push((api_key_var.to_string(), token_value));
             kv_pairs.push((base_url_var.to_string(), base_url));

@@ -321,8 +321,14 @@ fn refresh_writes_active_env_for_all_bindings() {
     let env_path = std::path::PathBuf::from(&home).join(".aikey/active.env");
     let contents = std::fs::read_to_string(&env_path).expect("active.env should exist");
 
-    assert!(contents.contains("ANTHROPIC_API_KEY=\"aikey_personal_my-claude\""));
-    assert!(contents.contains("OPENAI_API_KEY=\"aikey_vk_vk_openai\""));
+    // 2026-04-29 prefix rename: sentinel is per-provider, alias-independent.
+    // Old: per-credential-type sentinel embedded the alias / vk_id.
+    // New: ANTHROPIC_API_KEY=aikey_active_anthropic (same string regardless of bound alias).
+    // Alias info still surfaces via the separate AIKEY_ACTIVE_KEYS=anthropic=my-claude,...
+    assert!(contents.contains("ANTHROPIC_API_KEY=\"aikey_active_anthropic\""));
+    assert!(contents.contains("OPENAI_API_KEY=\"aikey_active_openai\""));
+    assert!(contents.contains("anthropic=my-claude"),
+        "AIKEY_ACTIVE_KEYS must surface the bound personal alias for anthropic");
     assert!(contents.contains("ANTHROPIC_BASE_URL="));
     // OPENAI_BASE_URL is deliberately NOT written: Codex v0.118+ warns when it's
     // set, because Codex now reads `openai_base_url` from ~/.codex/config.toml
@@ -467,7 +473,7 @@ fn refresh_writes_active_env_flat_for_windows() {
     assert!(flat.contains("AIKEY_ACTIVE_SEQ="),
         "flat must carry AIKEY_ACTIVE_SEQ for Windows precmd parity, got:\n{}",
         flat);
-    assert!(flat.contains("ANTHROPIC_API_KEY=aikey_personal_my-claude"),
+    assert!(flat.contains("ANTHROPIC_API_KEY=aikey_active_anthropic"),
         "flat must carry the same env vars as active.env (no quoting), got:\n{}",
         flat);
 }

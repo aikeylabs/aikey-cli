@@ -27,8 +27,9 @@ use super::{
 /// `_password_unused` is kept in the signature as `Option<&SecretString>` so
 /// external callers still pass through their existing handle but it is
 /// **no longer read**. Plan D (2026-04-22) moved personal-key decryption
-/// to the proxy side via the aikey_personal_alias_ sentinel, so CLI-side
-/// password access is no longer required for any probe path. Removing
+/// to the proxy side via the probe sentinel (post-2026-04-29 prefix rename:
+/// `aikey_probe_*`), so CLI-side password access is no longer required for
+/// any probe path. Removing
 /// the parameter entirely would be a breaking API change for no gain —
 /// callers are free to stop passing a password whenever convenient.
 pub fn target_from_binding(
@@ -158,8 +159,9 @@ pub fn targets_from_alias(
     // ── 1. Personal vault entry (highest priority). ──────────────────────
     if storage::entry_exists(alias).unwrap_or(false) {
         // Plan D (2026-04-22): no decryption here — proxy does it server-
-        // side via the aikey_personal_alias_ sentinel. We just need the
-        // provider list (metadata, unencrypted) and the proxy running.
+        // side via the probe sentinel (post-2026-04-29 prefix rename:
+        // `aikey_probe_<alias>`). We just need the provider list (metadata,
+        // unencrypted) and the proxy running.
         if !crate::commands_proxy::proxy_is_running_managed() {
             return Vec::new();
         }

@@ -94,7 +94,8 @@ fn route_table_has_expected_columns() {
     // A row should contain the alias + a truncated token + the base_url.
     assert!(stderr.contains("my-openai"),
         "route row missing alias:\n{}", stderr);
-    assert!(stderr.contains("aikey_vk_"),
+    // 2026-04-29 prefix rename: route_token form is now aikey_personal_<64-hex>.
+    assert!(stderr.contains("aikey_personal_"),
         "route row missing token prefix:\n{}", stderr);
     assert!(stderr.contains("http://127.0.0.1:") && stderr.contains("/openai"),
         "route row missing proxy base URL:\n{}", stderr);
@@ -115,7 +116,7 @@ fn route_default_truncates_token_but_full_flag_shows_it_all() {
     let full_err = strip_ansi(&String::from_utf8_lossy(&full_out.stderr));
     // --full must emit at least one 64-hex char token in full (no ellipsis in the token).
     let full_token_present = full_err.split_whitespace().any(|w| {
-        w.strip_prefix("aikey_vk_")
+        w.strip_prefix("aikey_personal_")
             .map(|tail| tail.len() >= 64 && tail.chars().all(|c| c.is_ascii_hexdigit()))
             .unwrap_or(false)
     });
@@ -186,8 +187,8 @@ fn route_json_mode_emits_parseable_json_with_schema() {
     }
     assert_eq!(r["label"], "json-key");
     assert_eq!(r["provider"], "anthropic");
-    assert!(r["api_key"].as_str().unwrap().starts_with("aikey_vk_"),
-        "api_key should use aikey_vk_ prefix: {}", r["api_key"]);
+    assert!(r["api_key"].as_str().unwrap().starts_with("aikey_personal_"),
+        "api_key should use aikey_personal_ prefix: {}", r["api_key"]);
 }
 
 // ── single-label copy-paste view ────────────────────────────────────────
@@ -206,7 +207,7 @@ fn route_single_label_emits_copy_paste_block_on_stdout() {
         "single-label route should print 'base_url' on stdout:\n{}", stdout);
     assert!(stdout.contains("api_key"),
         "single-label route should print 'api_key' on stdout:\n{}", stdout);
-    assert!(stdout.contains("aikey_vk_"),
+    assert!(stdout.contains("aikey_personal_"),
         "single-label route should print the token on stdout:\n{}", stdout);
     assert!(stdout.contains("http://127.0.0.1:"),
         "single-label route should print the base URL on stdout:\n{}", stdout);
@@ -265,7 +266,7 @@ fn route_shows_synced_inactive_team_keys() {
     env.add_key("bootstrap-personal", "openai");
     let vault = env.tmp.join(".aikey/data/vault.db");
 
-    insert_team_key(&vault, "aikey_vk_synced_inactive_xyz", "team-not-yet-delivered",
+    insert_team_key(&vault, "synced_inactive_xyz", "team-not-yet-delivered",
                     "synced_inactive");
 
     let out = env.cmd().arg("route").output().expect("spawn route");
@@ -290,7 +291,7 @@ fn activate_rejects_synced_inactive_team_key() {
     env.add_key("bootstrap-personal", "openai");
     let vault = env.tmp.join(".aikey/data/vault.db");
 
-    insert_team_key(&vault, "aikey_vk_synced_inactive_reject_abc",
+    insert_team_key(&vault, "synced_inactive_reject_abc",
                     "stale-team-key", "synced_inactive");
 
     let out = env.cmd()
@@ -321,7 +322,7 @@ fn route_shows_team_keys_with_active_state() {
     env.add_key("bootstrap-personal", "openai");
     let vault = env.tmp.join(".aikey/data/vault.db");
 
-    insert_team_key(&vault, "aikey_vk_active_abc", "team-delivered", "active");
+    insert_team_key(&vault, "active_abc", "team-delivered", "active");
 
     let out = env.cmd().arg("route").output().expect("spawn route");
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));

@@ -52,7 +52,7 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
 
     for b in &bindings {
         if let Some((api_key_var, base_url_var)) = provider_env_vars_pub(&b.provider_code) {
-            let token = sentinel_token(b.key_source_type.as_str(), &b.key_source_ref);
+            let token = sentinel_token(&b.provider_code);
             let base_url = format!(
                 "http://127.0.0.1:{}/{}",
                 proxy_port,
@@ -333,13 +333,22 @@ fn sync_active_key_config_from_bindings(bindings: &[ProviderBinding]) -> Result<
     Ok(())
 }
 
-/// Builds the sentinel token that the proxy expects in env vars.
-fn sentinel_token(key_source_type: &str, key_source_ref: &str) -> String {
-    if key_source_type == "team" {
-        format!("aikey_vk_{}", key_source_ref)
-    } else {
-        format!("aikey_personal_{}", key_source_ref)
-    }
+/// Builds the sentinel token that the proxy expects in env vars for the
+/// "follow active binding" routing semantic.
+///
+/// The token is per-provider (e.g. `aikey_active_anthropic`) — independent of
+/// which credential is currently bound. The proxy's tier-3 fallthrough uses
+/// the URL path's canonical provider code to look up the active binding from
+/// the vault DB on every request, so the suffix here is purely informational
+/// and never read by the proxy. This means `aikey use` switching credentials
+/// (personal / OAuth / team) for the same provider does NOT need to rewrite
+/// active.env — the sentinel string stays the same; only the binding table
+/// changes. Eliminates a class of "shell didn't re-source after `aikey use`"
+/// bugs.
+///
+/// Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md
+fn sentinel_token(canonical_provider: &str) -> String {
+    format!("aikey_active_{}", canonical_provider)
 }
 
 /// Writes the env lines to `~/.aikey/active.env` atomically.

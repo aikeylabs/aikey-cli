@@ -1,4 +1,6 @@
+#[allow(dead_code)] mod active_env_migration;
 #[allow(dead_code)] mod credential_type;
+#[allow(dead_code)] mod team_token_normalize;
 #[allow(dead_code)] mod storage;
 #[allow(dead_code)] mod provider_registry;
 mod crypto;
@@ -614,6 +616,42 @@ fn run_unified_list(
 fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let command = cli.command.as_ref().unwrap();
 
+    // 2026-04-29 prefix rename safety net (合约 B): auto-rewrite legacy
+    // active.env on first invocation post-upgrade. Covers the case where
+    // the installer hook didn't run (manual binary swap, machine-to-machine
+    // copy of ~/.aikey/, hot-reload during dev).
+    //
+    // Failure here is non-fatal — print a warn line to stderr and continue
+    // the user's actual command. The next invocation will retry. Skipped
+    // for the explicit RefreshActiveEnv command (avoid recursion) and for
+    // commands that predate active.env (Init / Version).
+    match command {
+        Commands::RefreshActiveEnv { .. } | Commands::Init | Commands::Version => {}
+        _ => {
+            if active_env_migration::active_env_has_legacy_form() {
+                match active_env_migration::refresh_active_env(true) {
+                    Ok(active_env_migration::RefreshOutcome::Refreshed { .. }) => {
+                        eprintln!("[aikey] auto-rewrote ~/.aikey/active.env to new sentinel form (post-upgrade)");
+                    }
+                    Ok(active_env_migration::RefreshOutcome::NoLegacyDetected) => {}
+                    Ok(active_env_migration::RefreshOutcome::NoBindingsToFollow) => {
+                        // Legacy form present but no vault yet — likely a stale
+                        // active.env from a prior install whose vault was wiped.
+                        // Don't loop-warn on every command; the user's next
+                        // `aikey add` / `aikey use` will overwrite it cleanly.
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[aikey] WARN: active.env auto-migration failed: {}; \
+                             run `aikey use <key>` to manually trigger or `aikey _refresh-active-env --if-legacy`",
+                            e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Quarantine a corrupt vault file before anything else reads from it.
     // Why up here: `run_unified_list`, `whoami`, `status`, etc. all call
     // `storage::list_entries_with_metadata().unwrap_or_default()` which would
@@ -747,6 +785,38 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 ).into()),
             };
             println!("{}", commands_account::hook_template_hash(kind));
+        }
+        Commands::RefreshActiveEnv { if_legacy } => {
+            // 2026-04-29 prefix rename auto-migration entry. Called by
+            // installer scripts at end of install/upgrade. Also called by
+            // CLI main entry safety net (commands_proxy::ensure_active_env_migrated)
+            // — but that path bypasses dispatch and goes straight to the
+            // helper, so this branch is for the explicit installer call.
+            //
+            // Output is short status line on stderr + exit code: 0 on
+            // success or no-op, 1 on backup/refresh failure. Installer
+            // scripts log stderr but don't block on failure (the safety
+            // net runs at next CLI invocation).
+            match active_env_migration::refresh_active_env(*if_legacy) {
+                Ok(active_env_migration::RefreshOutcome::NoLegacyDetected) => {
+                    eprintln!("[aikey] active.env: no legacy form detected, no migration needed");
+                }
+                Ok(active_env_migration::RefreshOutcome::NoBindingsToFollow) => {
+                    eprintln!("[aikey] active.env: no vault / no bindings yet, nothing to migrate. \
+                               Run `aikey add <provider>:<alias>` then `aikey use <alias>` to set up.");
+                }
+                Ok(active_env_migration::RefreshOutcome::Refreshed { backup }) => {
+                    if let Some(p) = backup {
+                        eprintln!("[aikey] active.env: refreshed (backup: {})", p.display());
+                    } else {
+                        eprintln!("[aikey] active.env: refreshed (no prior file to backup)");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[aikey] active.env auto-migration failed: {}", e);
+                    return Err(e.into());
+                }
+            }
         }
         Commands::Hook { action } => {
             handle_hook_command(action)?;
@@ -1360,9 +1430,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 else { eprintln!("{}", msg); std::process::exit(EXIT_PROXY_NOT_RUNNING); }
             }
 
-            // Plan D (2026-04-22): personal keys probe via proxy using the
-            // aikey_personal_alias_ sentinel; proxy does decryption server-
-            // side. CLI no longer prompts for vault password, which is the
+            // Plan D (2026-04-22): personal keys probe via proxy using a
+            // probe sentinel (post-2026-04-29 prefix rename: `aikey_probe_*`);
+            // proxy does decryption server-side. CLI no longer prompts for
+            // vault password, which is the
             // precondition for the `claude()` / `codex()` wrapper preflight
             // to run silently before every invocation.
             let proxy_port = commands_proxy::proxy_port();
@@ -2683,7 +2754,7 @@ fn provider_proxy_path(code: &str) -> String {
 /// is truncated as "first 15 chars + ... + last 4 chars". Keep in sync with the
 /// truncation formula so padding math stays consistent.
 const TOKEN_TRUNCATE_THRESHOLD: usize = 24;
-// Token column width. A truncated `aikey_vk_xxxxxx...yyyy` is 22 chars; +1 pad
+// Token column width. A truncated personal-bearer display is 22 chars; +1 pad
 // is enough to keep base_url from touching the token. Previously 38, which left
 // a big visual gap — user reported the API_KEY/BASE URL pairing felt far apart.
 const TOKEN_DISPLAY_WIDTH: usize = 23;
@@ -2811,11 +2882,20 @@ fn handle_route(
             continue;
         }
         let display_alias = vk.local_alias.as_deref().unwrap_or(&vk.alias);
-        // Team keys use virtual_key_id directly (already has aikey_vk_ prefix from server).
-        let token = if vk.virtual_key_id.starts_with("aikey_vk_") {
-            vk.virtual_key_id.clone()
-        } else {
-            format!("aikey_vk_{}", vk.virtual_key_id)
+        // Team key static bearer — shared helper guarantees identical output
+        // with `resolve_activate_key`'s team branch (no drift between
+        // `aikey route` and `aikey activate` for the same team key).
+        // Empty vk_id is an upstream bug; warn + skip the row rather than
+        // emit a degenerate `aikey_team_` token.
+        let token = match team_token_normalize::team_token_from_vk_id(&vk.virtual_key_id) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "[aikey route] WARN: skip team key '{}' — {} (raw vk_id={:?})",
+                    vk.alias, e, vk.virtual_key_id
+                );
+                continue;
+            }
         };
         let providers = if vk.supported_providers.is_empty() {
             vec![vk.provider_code.clone()]
@@ -3882,11 +3962,14 @@ fn resolve_activate_key(
             ).into());
         }
         let display = vk.local_alias.as_deref().unwrap_or(&vk.alias).to_string();
-        let token = if vk.virtual_key_id.starts_with("aikey_vk_") {
-            vk.virtual_key_id.clone()
-        } else {
-            format!("aikey_vk_{}", vk.virtual_key_id)
-        };
+        // Team key static bearer — shared helper (same as handle_route's
+        // team branch). Empty vk_id is upstream bug; surface it as a user-
+        // visible error so they can run `aikey key sync` to refresh.
+        let token = team_token_normalize::team_token_from_vk_id(&vk.virtual_key_id)
+            .map_err(|e| format!(
+                "Team key '{}' has empty vk_id ({}). Run: aikey key sync",
+                vk.alias, e
+            ))?;
         let providers = if !vk.supported_providers.is_empty() {
             vk.supported_providers.clone()
         } else if !vk.provider_code.is_empty() {

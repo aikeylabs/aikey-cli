@@ -42,7 +42,7 @@ use super::candidate::{Candidate, Kind};
 use super::line_class::{line_class, LineFlags, LineKind};
 use super::provider_fingerprint;
 use block::split_into_blocks;
-use types::{Block, DraftFields, DraftRecord, DraftType, EndpointGroup, GroupReason};
+use types::{Block, ClusterReason, DraftFields, DraftRecord, DraftType, EndpointGroup, GroupReason};
 
 /// 完整 L2+L3 入口:candidates → drafts + groups + orphans
 ///
@@ -52,10 +52,56 @@ pub fn group_and_cluster(
     text: &str,
     candidates: &[Candidate],
 ) -> (Vec<DraftRecord>, Vec<EndpointGroup>, Vec<Candidate>) {
-    let (drafts, orphans) = group_candidates(text, candidates);
+    let (mut drafts, orphans) = group_candidates(text, candidates);
     let blocks = split_into_blocks(text);
     let groups = cluster::cluster_endpoints(text, &drafts, &blocks);
+
+    // L3 → L2 base_url backfill (bugfix 2026-04-28-import-l3-group-baseurl-not-backfilled).
+    //
+    // Bug shape: when two adjacent blocks contain the SAME URL string
+    // (e.g. user pastes Kimi11 + URL + key, then Kimitest8 + URL + key with
+    // identical URL line), the L2 candidate dedup attributes the URL to the
+    // first matching block only. The second draft's `fields.base_url` is
+    // None even though L3 cluster_endpoints correctly groups both drafts
+    // under the same Explicit group with that URL.
+    //
+    // Frontend Web Import "Use-Official Rule 2" reads `fields.base_url` per
+    // draft — so the second draft can't trigger the official-host swap and
+    // can't show a `revert` button to the original pasted URL.
+    //
+    // Fix: after L3 settles, walk every Explicit-reason group and copy its
+    // `base_url` into any member draft whose `fields.base_url` is empty.
+    // Materializes what L3 already concluded at the per-draft layer.
+    //
+    // Spike validation (workflow/CI/research/2026-04-28-l3-group-baseurl-backfill-spike.md):
+    //   - holdout/OOD/adversarial 5 suites × 76 samples: byte-identical metrics
+    //   - 6 real-user paste samples × 133 drafts: attribution rate 92.3% → 100%,
+    //     5 drafts moved from None → inherited URL (URL列表式 / 桃子 / 社群乱序)
+    //   - draft / group / orphan counts unchanged everywhere
+    //
+    // Gated to ClusterReason::Explicit only — InheritedSticky / Default
+    // would widen the FP surface (sticky inheritance is already
+    // confidence-scored at L3, but writing back to the per-draft field
+    // promotes a soft signal to a hard one).
+    apply_group_base_url_backfill(&mut drafts, &groups);
+
     (drafts, groups, orphans)
+}
+
+/// Copy each Explicit-reason group's `base_url` into member drafts whose
+/// `fields.base_url` is None. See `group_and_cluster` doc for context.
+fn apply_group_base_url_backfill(drafts: &mut [DraftRecord], groups: &[EndpointGroup]) {
+    for g in groups {
+        if g.reason != ClusterReason::Explicit { continue; }
+        let Some(group_url) = g.base_url.as_deref() else { continue };
+        for member_id in &g.member_draft_ids {
+            if let Some(draft) = drafts.iter_mut().find(|d| &d.id == member_id) {
+                if draft.fields.base_url.is_none() {
+                    draft.fields.base_url = Some(group_url.to_string());
+                }
+            }
+        }
+    }
 }
 
 /// 主入口:扁平 candidates → 分组成 drafts + orphans
@@ -727,5 +773,111 @@ mod tests {
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].fields.base_url.as_deref(), Some("https://api.anthropic.com/v1"));
         assert_eq!(drafts[0].fields.api_key.as_deref(), Some("sk-ant-api03-AAA_BBB_CCC_ddd_eee"));
+    }
+
+    // ── L3 → L2 base_url backfill (bugfix 2026-04-28) ─────────────────────
+    //
+    // Bug: when two adjacent blocks share an IDENTICAL URL string, L2
+    // candidate dedup attributes the URL only to the first matching block.
+    // L3 cluster_endpoints correctly groups both drafts under the same
+    // Explicit-reason group with that URL — but `fields.base_url` on the
+    // second draft stays None, so frontend Use-Official Rule 2 misses it.
+    //
+    // Spike validation: workflow/CI/research/2026-04-28-l3-group-baseurl-backfill-spike.md
+    // (5 drafts of lift on 6 real-user paste samples; holdout / OOD /
+    // adversarial metrics byte-identical).
+
+    #[test]
+    fn backfill_two_blocks_same_url_via_group_and_cluster() {
+        // Exactly the user-reported `kimi11 / kimitest8` shape: two
+        // adjacent blocks with identical platform.moonshot.cn URL.
+        // Pre-fix the second draft had base_url=None; post-fix both
+        // have it filled from the L3 group.
+        let text = concat!(
+            "Kimi11\n",
+            "https://platform.moonshot.cn/console/api-keys\n",
+            "sk-RzORWDtmGsXbqcVhPZCg0WYPqujfSpjAaHQYLJP2TRUaPo3i\n",
+            "\n",
+            "Kimitest8\n",
+            "https://platform.moonshot.cn/console/api-keys\n",
+            "sk-Kh8bEwSPBFvLa26Bv2IIavhtEpofhe1JMCnBUb1r2cBm2Urs",
+        );
+        let cands = vec![
+            cand(Kind::Url, "https://platform.moonshot.cn/console/api-keys"),
+            cand(Kind::Url, "https://platform.moonshot.cn/console/api-keys"),
+            cand(Kind::SecretLike, "sk-RzORWDtmGsXbqcVhPZCg0WYPqujfSpjAaHQYLJP2TRUaPo3i"),
+            cand(Kind::SecretLike, "sk-Kh8bEwSPBFvLa26Bv2IIavhtEpofhe1JMCnBUb1r2cBm2Urs"),
+        ];
+        let (drafts, groups, _orphans) = group_and_cluster(text, &cands);
+
+        assert_eq!(drafts.len(), 2, "should produce one draft per block");
+        // Both drafts must carry the URL after backfill.
+        for d in &drafts {
+            assert_eq!(
+                d.fields.base_url.as_deref(),
+                Some("https://platform.moonshot.cn/console/api-keys"),
+                "draft {} missing base_url after backfill", d.id,
+            );
+        }
+        // L3 still puts both into the same Explicit group.
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].reason, ClusterReason::Explicit);
+        assert_eq!(groups[0].member_draft_ids.len(), 2);
+    }
+
+    #[test]
+    fn backfill_three_blocks_same_url_via_group_and_cluster() {
+        // 3-block variant — all members of the same Explicit group must
+        // get base_url backfilled.
+        let text = concat!(
+            "k1\nhttps://platform.moonshot.cn/console/api-keys\n",
+            "sk-z1AbcDef0123456789AbcDef0123456789AbcDef01\n\n",
+            "k2\nhttps://platform.moonshot.cn/console/api-keys\n",
+            "sk-z2GhiJkl0123456789AbcDef0123456789AbcDef02\n\n",
+            "k3\nhttps://platform.moonshot.cn/console/api-keys\n",
+            "sk-z3MnoPqr0123456789AbcDef0123456789AbcDef03",
+        );
+        let cands = vec![
+            cand(Kind::Url, "https://platform.moonshot.cn/console/api-keys"),
+            cand(Kind::Url, "https://platform.moonshot.cn/console/api-keys"),
+            cand(Kind::Url, "https://platform.moonshot.cn/console/api-keys"),
+            cand(Kind::SecretLike, "sk-z1AbcDef0123456789AbcDef0123456789AbcDef01"),
+            cand(Kind::SecretLike, "sk-z2GhiJkl0123456789AbcDef0123456789AbcDef02"),
+            cand(Kind::SecretLike, "sk-z3MnoPqr0123456789AbcDef0123456789AbcDef03"),
+        ];
+        let (drafts, groups, _orphans) = group_and_cluster(text, &cands);
+        assert_eq!(drafts.len(), 3);
+        for d in &drafts {
+            assert_eq!(
+                d.fields.base_url.as_deref(),
+                Some("https://platform.moonshot.cn/console/api-keys"),
+                "draft {} missing base_url after backfill", d.id,
+            );
+        }
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].member_draft_ids.len(), 3);
+    }
+
+    #[test]
+    fn backfill_does_not_overwrite_existing_baseurl() {
+        // If a draft already has its own base_url (different from the
+        // group), backfill must NOT clobber it. This guards against the
+        // (currently impossible but cheap to assert) scenario where L3
+        // groups two drafts with mismatched URLs into one bucket.
+        let text = concat!(
+            "Block1\nhttps://api.anthropic.com\n",
+            "sk-ant-api03-block1example1234567890abcdefghij\n",
+        );
+        let cands = vec![
+            cand(Kind::Url, "https://api.anthropic.com"),
+            cand(Kind::SecretLike, "sk-ant-api03-block1example1234567890abcdefghij"),
+        ];
+        let (drafts, _groups, _orphans) = group_and_cluster(text, &cands);
+        assert_eq!(drafts.len(), 1);
+        // The draft already had base_url from L2; backfill is a no-op.
+        assert_eq!(
+            drafts[0].fields.base_url.as_deref(),
+            Some("https://api.anthropic.com"),
+        );
     }
 }

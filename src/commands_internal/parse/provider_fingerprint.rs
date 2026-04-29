@@ -134,6 +134,16 @@ impl FingerprintClassifier {
         self.family_base_urls.get(family).cloned()
     }
 
+    /// 全量 family → 登录页 URL 映射 (用于 `_internal rules` 把整张表透出给 Web UI)
+    pub fn family_login_urls_map(&self) -> &std::collections::HashMap<String, String> {
+        &self.family_login_urls
+    }
+
+    /// 全量 family → 官方 API base_url 映射 (同上,用于 _internal rules)
+    pub fn family_base_urls_map(&self) -> &std::collections::HashMap<String, String> {
+        &self.family_base_urls
+    }
+
     /// 直接分类（不用上下文）
     pub fn classify(&self, token: &str) -> Option<&ProviderEntry> {
         // 按 YAML 中顺序匹配：YAML 里更具体的 pattern 放前面，第一个 match 赢

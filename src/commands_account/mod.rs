@@ -2362,9 +2362,12 @@ pub(crate) fn provider_proxy_prefix(provider_code: &str) -> &'static str {
 
 /// Writes `~/.aikey/active.env` with provider env vars for the active key.
 ///
-/// For team keys the API key value is the virtual key ID (`aikey_vk_xxx`) — proxy
-/// reads the active config and injects the real key.  For personal keys the value
-/// is a sentinel `aikey_personal_<alias>` that the proxy resolves via `GetSecret`.
+/// For all credential types (team / personal API key / OAuth) the API key
+/// value is the active sentinel `aikey_active_<provider>` — proxy's tier-3
+/// fallthrough reads the active binding via the URL path's canonical provider
+/// and injects the real key. The sentinel suffix is informational (post-
+/// 2026-04-29 prefix rename — was previously per-credential-type sentinels).
+///
 /// `aikey run --direct -- <cmd>`
 ///
 /// Decrypts the real key for the currently active **personal** key and injects it directly

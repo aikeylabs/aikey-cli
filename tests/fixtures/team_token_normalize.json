@@ -1,0 +1,71 @@
+{
+  "_comment": "Golden cases for team_token_from_vk_id (Rust) / NormalizeTeamToken (Go). Both implementations must produce identical results across this fixture. See: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md §4 helper段.",
+  "cases": [
+    {
+      "name": "bare_vk_id_happy",
+      "input": "acc-1234",
+      "expected_ok": "aikey_team_acc-1234",
+      "expected_err": null
+    },
+    {
+      "name": "old_vk_prefix_single_layer",
+      "input": "aikey_vk_acc-1234",
+      "expected_ok": "aikey_team_acc-1234",
+      "expected_err": null
+    },
+    {
+      "name": "new_team_prefix_idempotent",
+      "input": "aikey_team_acc-1234",
+      "expected_ok": "aikey_team_acc-1234",
+      "expected_err": null
+    },
+    {
+      "name": "double_prefix_vk_outer_team_inner",
+      "input": "aikey_vk_aikey_team_acc-1234",
+      "expected_ok": "aikey_team_acc-1234",
+      "expected_err": null
+    },
+    {
+      "name": "double_prefix_team_outer_vk_inner",
+      "input": "aikey_team_aikey_vk_acc-1234",
+      "expected_ok": "aikey_team_acc-1234",
+      "expected_err": null
+    },
+    {
+      "name": "leading_trailing_whitespace_trimmed",
+      "input": "  acc-1234  ",
+      "expected_ok": "aikey_team_acc-1234",
+      "expected_err": null
+    },
+    {
+      "name": "whitespace_after_old_prefix_trimmed",
+      "input": "aikey_vk_ acc-1234",
+      "expected_ok": "aikey_team_acc-1234",
+      "expected_err": null
+    },
+    {
+      "name": "empty_string_rejected",
+      "input": "",
+      "expected_ok": null,
+      "expected_err": "empty vk_id"
+    },
+    {
+      "name": "whitespace_only_rejected",
+      "input": "   ",
+      "expected_ok": null,
+      "expected_err": "empty vk_id"
+    },
+    {
+      "name": "old_prefix_only_no_suffix_rejected",
+      "input": "aikey_vk_",
+      "expected_ok": null,
+      "expected_err": "empty vk_id"
+    },
+    {
+      "name": "new_prefix_only_no_suffix_rejected",
+      "input": "aikey_team_",
+      "expected_ok": null,
+      "expected_err": "empty vk_id"
+    }
+  ]
+}

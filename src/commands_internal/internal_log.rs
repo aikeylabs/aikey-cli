@@ -281,7 +281,7 @@ mod tests {
         let v = json!({
             "alias": "my-kimi",
             "secret_plaintext": "sk-REAL",
-            "bearer": "aikey_vk_xxx",
+            "bearer": "<test-bearer-placeholder>",
             "nested": {
                 "password": "hunter2",
                 "safe": "keep-me",

@@ -1211,14 +1211,15 @@ pub fn build_run_env(
 
     if !bindings.is_empty() {
         // ---- New model: per-provider bindings ----
+        // Inject the per-provider active sentinel (`aikey_active_<provider>`).
+        // The proxy's tier-3 fallthrough reads URL path's canonical provider
+        // — the suffix is informational. This means switching credentials
+        // (personal/OAuth/team) for the same provider works without rewriting
+        // env, and `aikey run` follows whatever `aikey use` set most recently.
+        // Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md
         for binding in bindings {
-            let token = match &binding.key_source_type {
-                crate::credential_type::CredentialType::ManagedVirtualKey => format!("aikey_vk_{}", binding.key_source_ref),
-                crate::credential_type::CredentialType::PersonalApiKey => format!("aikey_personal_{}", binding.key_source_ref),
-                crate::credential_type::CredentialType::PersonalOAuthAccount => format!("aikey_oauth_{}", binding.key_source_ref),
-            };
-
             if let Some((api_var, base_var)) = provider_env_vars_pub(&binding.provider_code) {
+                let token = format!("aikey_active_{}", binding.provider_code);
                 env_map.insert(api_var.to_string(), token);
                 let base_url = format!(
                     "http://127.0.0.1:{}/{}",
@@ -1239,15 +1240,13 @@ pub fn build_run_env(
             active_cfg.providers.clone()
         };
 
-        let token_value = if active_cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey {
-            format!("aikey_vk_{}", active_cfg.key_ref)
-        } else {
-            format!("aikey_personal_{}", active_cfg.key_ref)
-        };
-
+        // Same per-provider sentinel as the new path. Legacy fallback no
+        // longer differentiates credential type at the token level — the
+        // proxy's tier-3 fallthrough handles it.
         for provider in &providers {
             if let Some((api_var, base_var)) = provider_env_vars_pub(provider) {
-                env_map.insert(api_var.to_string(), token_value.clone());
+                let token = format!("aikey_active_{}", provider);
+                env_map.insert(api_var.to_string(), token);
                 let base_url = format!(
                     "http://127.0.0.1:{}/{}",
                     proxy_port,
@@ -1257,6 +1256,10 @@ pub fn build_run_env(
                 injected_providers.push(provider.clone());
             }
         }
+        // active_cfg's key_type / key_ref intentionally unused — we used to
+        // pass them through the token, but the new tier-3 sentinel design
+        // doesn't need per-key info on the CLI side. Suppress unused warning.
+        let _ = active_cfg;
     }
 
     Ok((env_map, injected_providers, used_legacy))
@@ -1266,8 +1269,10 @@ pub fn build_run_env(
 ///
 /// Reads `user_profile_provider_bindings` (profile = "default") to determine
 /// per-provider key sources, then injects proxy-routed env vars (e.g.
-/// `ANTHROPIC_API_KEY=aikey_vk_xxx`, `OPENAI_API_KEY=aikey_personal_yyy`,
+/// `ANTHROPIC_API_KEY=aikey_active_anthropic`, `OPENAI_API_KEY=aikey_active_openai`,
 /// `*_BASE_URL=http://127.0.0.1:27200/{provider}`) into the child process.
+/// Proxy's tier-3 fallthrough resolves the per-provider active binding from
+/// the vault DB on every request — the sentinel suffix is informational only.
 ///
 /// Fallback: if no provider bindings exist (pre-migration vault), falls back
 /// to the legacy `active_key_config` single-key model for backward compat.

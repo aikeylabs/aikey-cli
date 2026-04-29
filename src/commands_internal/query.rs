@@ -619,7 +619,7 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                 let official_base_url =
                     m.provider_code.as_deref().and_then(default_base_url);
                 // route_token is blanked in the locked-state response. It is
-                // an `aikey_vk_...` bearer accepted directly by aikey-proxy;
+                // a personal-bearer token accepted directly by aikey-proxy;
                 // exposing the real value to anonymous local_bypass callers
                 // (personal/trial editions) would let a malicious page issue
                 // authenticated proxy calls without ever unlocking the vault.

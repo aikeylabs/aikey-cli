@@ -102,13 +102,13 @@ fn e2e_add_same_provider_does_not_overwrite_primary() {
     // First key becomes Primary for anthropic.
     env.add_key("claude-main", "anthropic").success();
     let content1 = env.active_env_content();
-    assert!(content1.contains("aikey_personal_claude-main"), "first key should be primary");
+    assert!(content1.contains("anthropic=claude-main"), "first key should be primary");
 
     // Second key for same provider should NOT replace.
     env.add_key("claude-backup", "anthropic").success();
     let content2 = env.active_env_content();
-    assert!(content2.contains("aikey_personal_claude-main"), "first key should still be primary");
-    assert!(!content2.contains("aikey_personal_claude-backup"), "backup should not be in active.env");
+    assert!(content2.contains("anthropic=claude-main"), "first key should still be primary");
+    assert!(!content2.contains("anthropic=claude-backup"), "backup should not be in active.env");
 }
 
 // ============================================================================
@@ -124,7 +124,7 @@ fn e2e_use_alias_switches_primary() {
 
     // Verify initial state: claude-main is Primary.
     let content1 = env.active_env_content();
-    assert!(content1.contains("aikey_personal_claude-main"));
+    assert!(content1.contains("anthropic=claude-main"));
 
     // Switch to backup.
     env.cmd()
@@ -136,9 +136,9 @@ fn e2e_use_alias_switches_primary() {
 
     // Verify: backup is now Primary.
     let content2 = env.active_env_content();
-    assert!(content2.contains("aikey_personal_claude-backup"),
+    assert!(content2.contains("anthropic=claude-backup"),
         "backup should now be primary. Content:\n{}", content2);
-    assert!(!content2.contains("aikey_personal_claude-main"),
+    assert!(!content2.contains("anthropic=claude-main"),
         "main should no longer be in active.env for anthropic");
 }
 
@@ -155,7 +155,7 @@ fn e2e_delete_primary_auto_backfills() {
 
     // Verify initial Primary.
     let content1 = env.active_env_content();
-    assert!(content1.contains("aikey_personal_claude-main"));
+    assert!(content1.contains("anthropic=claude-main"));
 
     // Delete the Primary key.
     env.cmd()
@@ -167,7 +167,7 @@ fn e2e_delete_primary_auto_backfills() {
 
     // Verify: backup should be auto-promoted.
     let content2 = env.active_env_content();
-    assert!(content2.contains("aikey_personal_claude-backup"),
+    assert!(content2.contains("anthropic=claude-backup"),
         "backup should be auto-promoted after primary deletion. Content:\n{}", content2);
 }
 
@@ -255,13 +255,13 @@ fn e2e_mixed_providers_coexist() {
 
     // Verify: anthropic = claude-main, openai = gpt-backup, google = gemini-main
     let content = env.active_env_content();
-    assert!(content.contains("aikey_personal_claude-main"),
+    assert!(content.contains("anthropic=claude-main"),
         "anthropic should still be claude-main");
-    assert!(content.contains("aikey_personal_gpt-backup"),
+    assert!(content.contains("openai=gpt-backup"),
         "openai should be switched to gpt-backup");
-    assert!(content.contains("aikey_personal_gemini-main"),
+    assert!(content.contains("google=gemini-main"),
         "google should still be gemini-main");
     // gpt-main should NOT appear.
-    assert!(!content.contains("aikey_personal_gpt-main"),
+    assert!(!content.contains("openai=gpt-main"),
         "gpt-main should no longer be primary");
 }
