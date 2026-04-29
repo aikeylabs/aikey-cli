@@ -523,8 +523,13 @@ fn local_date_string(ts: SystemTime) -> String {
 }
 
 fn current_tz_offset_secs() -> i64 {
-    // Rust std doesn't expose local timezone offset portably.  Shell out
-    // to libc's localtime_r to read the seconds east of UTC for "now".
+    // Rust std doesn't expose local timezone offset portably. Shell out
+    // to the platform API to read the seconds east of UTC for "now".
+    //
+    // Stage 1.5 windows-compat: previous Windows fallback returned 0
+    // (UTC) which made `aikey watch` show wrong-day boundaries for users
+    // east/west of UTC. Now we use `GetTimeZoneInformation` so the watch
+    // TUI shows local-day rollovers correctly on Windows too.
     #[cfg(unix)]
     unsafe {
         let t: libc::time_t = libc::time(std::ptr::null_mut());
@@ -534,7 +539,37 @@ fn current_tz_offset_secs() -> i64 {
         }
         tm.tm_gmtoff as i64
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::mem::MaybeUninit;
+        use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
+        // Win32 stable values; not re-exported by windows-sys 0.52 at the
+        // Time module path so we inline them here. See Microsoft docs:
+        // https://learn.microsoft.com/windows/win32/api/timezoneapi/nf-timezoneapi-gettimezoneinformation
+        const TIME_ZONE_ID_STANDARD: u32 = 1;
+        const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+
+        let mut tz = MaybeUninit::<TIME_ZONE_INFORMATION>::zeroed();
+        // Why we negate-and-multiply-by-60: Windows reports `Bias` as
+        // minutes such that `UTC = local + bias` — so seconds east of UTC
+        // = `-bias_minutes * 60`. DaylightBias is added on top when DST
+        // is active. StandardBias mirrors the GMT side and is typically 0
+        // for most zones; we still sum both so non-zero entries (rare,
+        // e.g. some Australian zones) are honoured.
+        let id = unsafe { GetTimeZoneInformation(tz.as_mut_ptr()) };
+        let tz = unsafe { tz.assume_init() };
+        let extra = match id {
+            TIME_ZONE_ID_DAYLIGHT => tz.DaylightBias as i64,
+            TIME_ZONE_ID_STANDARD => tz.StandardBias as i64,
+            // TIME_ZONE_ID_UNKNOWN (0) or TIME_ZONE_ID_INVALID (u32::MAX)
+            // → fall back to bias only; better than 0 if the host has any
+            // tz config at all.
+            _ => 0,
+        };
+        let offset_minutes = -(tz.Bias as i64 + extra);
+        offset_minutes * 60
+    }
+    #[cfg(not(any(unix, windows)))]
     { 0 }
 }
 
@@ -1070,10 +1105,12 @@ fn probe_proxy() -> (Option<u32>, bool) {
         Err(_) => return (None, false),
     };
 
-    #[cfg(unix)]
-    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
-    #[cfg(not(unix))]
-    let alive = false;  // best-effort; Windows probe is deferred
+    // Stage 1.5 windows-compat: route through the cross-platform
+    // `proxy_proc::process_alive` (Unix `kill(pid, 0)` + Windows
+    // `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`) instead of a local
+    // libc::kill call. Single source of truth for "is this PID still ours";
+    // Windows probe is no longer deferred.
+    let alive = crate::proxy_proc::process_alive(pid);
 
     (Some(pid), alive)
 }
@@ -1409,6 +1446,40 @@ fn humanize_duration_short(d: Duration) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Stage 1.5 windows-compat regression guard: tz offset must be a
+    /// real value within the +/- 14h band (tightest possible bounds —
+    /// LINT (Kiribati) is +14:00, Baker Island would be -12:00 if
+    /// inhabited; +14h covers the worst real-world case). An out-of-
+    /// band value indicates the GetTimeZoneInformation parse went
+    /// wrong (e.g. summing Bias as u32 wrap rather than i32 negation).
+    #[test]
+    fn current_tz_offset_secs_is_in_realistic_band() {
+        let offset = current_tz_offset_secs();
+        let max = 14 * 3600;
+        let min = -12 * 3600;
+        assert!(
+            (min..=max).contains(&offset),
+            "tz offset {offset}s outside realistic band [{min}, {max}]; \
+             likely a Bias-sign / DST-arm bug",
+        );
+    }
+
+    /// Stage 1.5 windows-compat: seconds must align on minute
+    /// boundaries — every IANA / Windows tz definition uses
+    /// minute-precision Bias values. A non-zero value mod 60 means
+    /// either we're truncating wrong (GetTimeZoneInformation gave us
+    /// minutes which we forgot to multiply) or we picked up garbage
+    /// stack memory.
+    #[test]
+    fn current_tz_offset_secs_is_minute_aligned() {
+        let offset = current_tz_offset_secs();
+        assert_eq!(
+            offset % 60,
+            0,
+            "tz offset {offset}s is not a multiple of 60 — Bias parse is suspect",
+        );
+    }
 
     /// `ts` is an RFC3339 string for test readability; we parse it into
     /// int64 millis (the post-v1.0.3-alpha storage format) so the test

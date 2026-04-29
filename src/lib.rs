@@ -6,6 +6,7 @@ pub mod credential_type;
 pub mod crypto;
 pub mod provider_registry;
 pub mod storage;
+pub mod storage_acl;
 pub mod synapse;
 pub mod executor;
 pub mod migrations;
@@ -34,6 +35,12 @@ pub mod commands_internal;
 pub mod commands_import;
 pub mod session;
 pub mod ui_frame;
+// Windows-only siblings — never compile on macOS / Linux. Each module
+// is `#[cfg(windows)]`-internal so the declaration here is a no-op on
+// Unix (cargo skips the file lookup entirely). Strategy A pure — see
+// each module's docstring.
+#[cfg(windows)] pub mod prompt_hidden_windows;
+#[cfg(windows)] pub mod ui_frame_windows;
 pub mod proxy_env;
 pub mod profile_activation;
 pub mod usage_wal;
@@ -43,13 +50,15 @@ pub mod commands_watch;
 /// Prompts for a hidden input (password / API key), showing a `*` for each
 /// keystroke in real time. Supports backspace and handles paste gracefully.
 ///
-/// Falls back to `rpassword::read_password()` on non-Unix or if termios fails.
+/// Falls back to `rpassword::read_password()` (silent, no stars) if the
+/// platform-specific star-feedback path can't acquire the controlling
+/// terminal — e.g. stdin redirected, no console attached.
 pub fn prompt_hidden(prompt: &str) -> std::io::Result<String> {
     use std::io::Write;
     eprint!("{}", prompt);
     let _ = std::io::stderr().flush();
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         if let Ok(value) = read_password_with_stars() {
             eprintln!(); // newline after the stars
@@ -174,4 +183,13 @@ fn read_password_with_stars() -> std::io::Result<String> {
     unsafe { libc::tcsetattr(tty_fd, libc::TCSANOW, &orig); }
 
     Ok(password)
+}
+
+// Windows: read_password_with_stars Windows variant lives in the sibling
+// `prompt_hidden_windows` module (Strategy A pure — keeps lib.rs Unix
+// macOS-byte-clean; the module is `#[cfg(windows)]`-only). Stage 1.1
+// extracted 2026-04-29.
+#[cfg(windows)]
+fn read_password_with_stars() -> std::io::Result<String> {
+    crate::prompt_hidden_windows::read_password_with_stars_windows()
 }

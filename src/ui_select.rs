@@ -2,8 +2,25 @@
 //!
 //! Renders a bordered list of items with arrow-key navigation.
 //! Non-selectable rows (separators, disabled keys) are skipped automatically.
+//!
+//! # Windows status (Stage 1 windows-compat)
+//!
+//! The interactive path (`interactive_select` / `interactive_multi_select`
+//! / `interactive_provider_tree`) is `#[cfg(unix)]` because it relies on
+//! `/dev/tty` + termios for raw input. On Windows the public dispatchers
+//! transparently fall through to the `fallback_*` numbered-list path,
+//! which works on cmd / PowerShell / Windows Terminal but lacks arrow-key
+//! navigation.
+//!
+//! The full Windows console-mode impl (ReadConsoleInputW + KEY_EVENT
+//! parsing, mirroring the Unix raw-key path) is tracked separately in
+//! windows-compatibility.md §1.2 and will land in a focused PR with the
+//! §7.3 byte-level macOS comparison required for high-risk files. We keep
+//! the Stage-1 PR scope small to minimise Unix-side regression risk.
 
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{self, Write};
 use crate::ui_frame::{visible_len, pad_visible};
 
 /// Result of `box_select`: chosen index or cancelled.
@@ -15,6 +32,9 @@ pub enum SelectResult {
 }
 
 /// Renders an interactive box-framed selector and returns the chosen index.
+///
+/// Windows: see module-level note — interactive path is Unix-only for now;
+/// non-Unix targets fall through to the numbered-list `fallback_select`.
 pub fn box_select(
     title: &str,
     header: &str,
@@ -37,8 +57,23 @@ pub fn box_select(
     #[cfg(unix)]
     return interactive_select(title, header, items, selectable, initial);
 
-    #[cfg(not(unix))]
-    fallback_select(items, selectable)
+    // Stage 1.2 (2026-04-29) windows-compat: native Windows console picker
+    // (ReadConsoleInputW + VT output). Falls through to fallback_select if
+    // RawConsole::open() fails (stdin / stderr redirected → no real console
+    // attached, e.g. CI without TTY).
+    #[cfg(windows)]
+    {
+        match crate::ui_select_windows::interactive_select_windows(title, header, items, selectable, initial) {
+            Ok(r) => return Ok(r),
+            Err(_) => return fallback_select(items, selectable),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (title, header, initial); // suppress unused-variable warnings on the fallback path
+        fallback_select(items, selectable)
+    }
 }
 
 /// Simple numbered-list fallback for non-TTY environments.
@@ -67,7 +102,7 @@ fn fallback_select(
 }
 
 /// Compute the inner width for the box based on content.
-fn compute_inner_w(title: &str, header: &str, items: &[String]) -> usize {
+pub(crate) fn compute_inner_w(title: &str, header: &str, items: &[String]) -> usize {
     let icon_title = format!("\u{1F50D} {}", title);
     let title_vis = visible_len(&icon_title);
     let header_vis = visible_len(header);
@@ -88,7 +123,7 @@ fn compute_inner_w(title: &str, header: &str, items: &[String]) -> usize {
 /// walls; narrow layout: drop the walls so content can spread across the
 /// reclaimed ~6 columns. Cursor marker + padding stay the same so the
 /// interactive redraw math is identical in both modes.
-fn format_row(item: &str, is_cursor: bool, inner_w: usize) -> String {
+pub(crate) fn format_row(item: &str, is_cursor: bool, inner_w: usize) -> String {
     let marker = if is_cursor { "\x1b[36;1m> \x1b[0m" } else { "  " }; // cyan bold ">"
     let content = format!("{}{}", marker, item);
     let pad_target = inner_w.saturating_sub(4);
@@ -244,7 +279,12 @@ fn interactive_select(
     Ok(result)
 }
 
-enum Key { Up, Down, Enter, Space, Escape, CtrlC, Char(char), Other }
+// Stage 1.2 (2026-04-29) windows-compat: pub(crate) so the sibling
+// ui_select_windows module can map ReadConsoleInputW KEY_EVENT records to
+// the same enum the Unix render loop already uses. Visibility bump is a
+// no-op for macOS / Linux machine code (no public-API surface change;
+// the enum stays inside the crate).
+pub(crate) enum Key { Up, Down, Enter, Space, Escape, CtrlC, Char(char), Other }
 
 #[cfg(unix)]
 fn read_key(tty: &std::fs::File) -> io::Result<Key> {
@@ -281,7 +321,7 @@ fn read_key(tty: &std::fs::File) -> io::Result<Key> {
     }
 }
 
-fn next_selectable(current: usize, selectable: &[bool], forward: bool) -> Option<usize> {
+pub(crate) fn next_selectable(current: usize, selectable: &[bool], forward: bool) -> Option<usize> {
     let len = selectable.len();
     let mut i = current;
     loop {
@@ -298,8 +338,14 @@ fn next_selectable(current: usize, selectable: &[bool], forward: bool) -> Option
 
 /// Redraw old row (remove >) and new row (add >).
 /// item[i] is (total - i) + 1 lines above the hint line.
-#[cfg(unix)]
-fn redraw_two(
+///
+/// Stage 1.2 (2026-04-29): de-cfg'd. The function body is purely ANSI
+/// escape sequences via `Write` — works on both Unix and Windows once
+/// the latter has `ENABLE_VIRTUAL_TERMINAL_PROCESSING` set on the
+/// output handle (handled by `ui_select_windows::RawConsole`). The
+/// previous `#[cfg(unix)]` attribute was a no-op for macOS / Linux
+/// machine code, so removing it is byte-identical there.
+pub(crate) fn redraw_two(
     out: &mut impl Write,
     old: usize,
     new: usize,
@@ -339,6 +385,20 @@ pub fn box_multi_select(
             return interactive_multi_select(title, items, initially_checked);
         }
     }
+    // Stage 1.2 (2026-04-29) windows-compat: native picker when stderr is a
+    // real console; otherwise fallback_multi_select (numbered list).
+    #[cfg(windows)]
+    {
+        use std::io::IsTerminal;
+        if io::stderr().is_terminal() {
+            match crate::ui_select_windows::interactive_multi_select_windows(title, items, initially_checked) {
+                Ok(r) => return Ok(r),
+                Err(_) => return fallback_multi_select(items),
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (title, initially_checked); // unused on the fallback path (see module note)
     fallback_multi_select(items)
 }
 
@@ -352,7 +412,7 @@ fn fallback_multi_select(items: &[String]) -> Result<MultiSelectResult, Box<dyn 
     if indices.is_empty() { Ok(MultiSelectResult::Cancelled) } else { Ok(MultiSelectResult::Confirmed(indices)) }
 }
 
-fn format_multi_row(item: &str, index: usize, is_cursor: bool, is_checked: bool, inner_w: usize) -> String {
+pub(crate) fn format_multi_row(item: &str, index: usize, is_cursor: bool, is_checked: bool, inner_w: usize) -> String {
     let cursor_mark = if is_cursor { "\x1b[36;1m> \x1b[0m" } else { "  " };
     let check_mark = if is_checked { "\x1b[32m[\x1b[1m*\x1b[0m\x1b[32m]\x1b[0m" } else { "[ ]" };
     let num = format!("\x1b[90m{}\x1b[0m", index + 1); // dim number
@@ -478,16 +538,16 @@ fn interactive_multi_select(title: &str, items: &[String], initially_checked: &[
     Ok(result)
 }
 
-#[cfg(unix)]
-fn redraw_multi_two(out: &mut impl Write, old: usize, new: usize, items: &[String], checked: &[bool], inner_w: usize, total: usize) -> io::Result<()> {
+// Stage 1.2 (2026-04-29): de-cfg'd. Same rationale as `redraw_two` —
+// pure ANSI via `Write`, no Unix syscall. Byte-identical on macOS / Linux.
+pub(crate) fn redraw_multi_two(out: &mut impl Write, old: usize, new: usize, items: &[String], checked: &[bool], inner_w: usize, total: usize) -> io::Result<()> {
     let up = |i: usize| -> usize { (total - i) + 1 };
     let n = up(old); write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[old], old, false, checked[old], inner_w), n)?;
     let n = up(new); write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[new], new, true, checked[new], inner_w), n)?;
     out.flush()
 }
 
-#[cfg(unix)]
-fn redraw_multi_one(out: &mut impl Write, idx: usize, items: &[String], checked: &[bool], inner_w: usize, total: usize) -> io::Result<()> {
+pub(crate) fn redraw_multi_one(out: &mut impl Write, idx: usize, items: &[String], checked: &[bool], inner_w: usize, total: usize) -> io::Result<()> {
     let n = (total - idx) + 1;
     write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[idx], idx, true, checked[idx], inner_w), n)?;
     out.flush()
@@ -512,6 +572,17 @@ pub enum ProviderTreeResult { Confirmed(Vec<ProviderGroup>), Cancelled }
 pub fn provider_tree_select(groups: &mut Vec<ProviderGroup>) -> Result<ProviderTreeResult, Box<dyn std::error::Error>> {
     #[cfg(unix)]
     { use std::io::IsTerminal; if io::stderr().is_terminal() { return interactive_provider_tree(groups); } }
+    // Stage 1.2 (2026-04-29) windows-compat: native tree picker.
+    #[cfg(windows)]
+    {
+        use std::io::IsTerminal;
+        if io::stderr().is_terminal() {
+            match crate::ui_select_windows::interactive_provider_tree_windows(groups) {
+                Ok(r) => return Ok(r),
+                Err(_) => return fallback_provider_tree(groups),
+            }
+        }
+    }
     fallback_provider_tree(groups)
 }
 
@@ -541,9 +612,9 @@ fn fallback_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<ProviderTre
 }
 
 #[derive(Clone)]
-enum TreeRow { Provider(usize), Candidate(usize, usize), Blank, Separator, Confirm, Cancel }
+pub(crate) enum TreeRow { Provider(usize), Candidate(usize, usize), Blank, Separator, Confirm, Cancel }
 
-fn build_tree_rows(groups: &[ProviderGroup]) -> Vec<TreeRow> {
+pub(crate) fn build_tree_rows(groups: &[ProviderGroup]) -> Vec<TreeRow> {
     let mut rows = Vec::new();
     for (gi, g) in groups.iter().enumerate() {
         if gi > 0 { rows.push(TreeRow::Blank); } // visual spacing between groups
@@ -553,10 +624,10 @@ fn build_tree_rows(groups: &[ProviderGroup]) -> Vec<TreeRow> {
     rows
 }
 
-fn is_focusable(row: &TreeRow) -> bool { !matches!(row, TreeRow::Separator | TreeRow::Blank) }
+pub(crate) fn is_focusable(row: &TreeRow) -> bool { !matches!(row, TreeRow::Separator | TreeRow::Blank) }
 
 /// Compute the maximum visible label width across all candidates in all groups.
-fn max_candidate_label_width(groups: &[ProviderGroup]) -> usize {
+pub(crate) fn max_candidate_label_width(groups: &[ProviderGroup]) -> usize {
     groups.iter()
         .flat_map(|g| g.candidates.iter())
         .map(|c| visible_len(&c.label))
@@ -565,7 +636,7 @@ fn max_candidate_label_width(groups: &[ProviderGroup]) -> usize {
         .max(20) // minimum 20
 }
 
-fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inner_w: usize, label_col_w: usize, type_col_w: usize) -> String {
+pub(crate) fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor: bool, inner_w: usize, label_col_w: usize, type_col_w: usize) -> String {
     let cursor_mark = if is_cursor { "\x1b[36;1m> \x1b[0m" } else { "  " };
     let pad_target = inner_w.saturating_sub(4);
     let content = match row {

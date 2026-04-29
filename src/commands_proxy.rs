@@ -978,7 +978,6 @@ fn process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use std::ptr;
         use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -1350,9 +1349,13 @@ fn resolve_config(explicit: Option<&str>) -> Result<PathBuf, Box<dyn std::error:
             return Ok(path);
         }
         // Warn and fall back instead of failing hard, so the proxy can still start.
-        let default_path = dirs::home_dir()
-            .map(|h| h.join(".aikey").join("config").join(DEFAULT_CONFIG_NAME).display().to_string())
-            .unwrap_or_else(|| format!("~/.aikey/config/{}", DEFAULT_CONFIG_NAME));
+        // Stage 2.2 windows-compat: show the actual resolved path; if the home
+        // resolver degrades, fall back to a Windows-friendly display string.
+        let default_path = crate::commands_account::resolve_aikey_dir()
+            .join("config")
+            .join(DEFAULT_CONFIG_NAME)
+            .display()
+            .to_string();
         eprintln!("Warning: AIKEY_PROXY_CONFIG not found: {}", path.display());
         eprintln!("         Falling back to default: {}", default_path);
     }

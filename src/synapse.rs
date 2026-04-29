@@ -269,15 +269,8 @@ pub fn export_vault(
     fs::write(output_path, file_data)
         .map_err(|e| format!("Failed to write file: {}", e))?;
 
-    // Set restrictive permissions (0600 on Unix)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::metadata(output_path)?;
-        let mut perms = metadata.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(output_path, perms)?;
-    }
+    // Stage 2.4 windows-compat: cross-platform owner-only ACL.
+    let _ = crate::storage_acl::enforce_owner_only_file(output_path);
 
     Ok(count)
 }

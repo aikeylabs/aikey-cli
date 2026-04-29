@@ -128,16 +128,13 @@ fn remove_meta() {
 // File permissions helper
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
+/// Tighten file permissions so only the owner can read/write.
+/// Stage 2.4 windows-compat: previous Windows branch was a no-op based on
+/// the false assumption that NTFS defaults to owner-only — it doesn't,
+/// inherited DACLs typically include Authenticated Users. The cross-platform
+/// helper now uses icacls on Windows to remove that grant.
 fn set_file_permissions_600(path: &PathBuf) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn set_file_permissions_600(_path: &PathBuf) {
-    // On Windows the file is written to the user's home directory;
-    // no explicit chmod is needed as ACLs default to owner-only.
+    let _ = crate::storage_acl::enforce_owner_only_file(path.as_path());
 }
 
 // ---------------------------------------------------------------------------

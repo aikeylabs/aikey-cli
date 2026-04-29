@@ -60,8 +60,13 @@ struct Writer {
 
 impl Writer {
     fn new() -> Option<Self> {
-        let home = std::env::var("HOME").ok()?;
-        let dir = PathBuf::from(home).join(".aikey/logs/aikey-cli");
+        // Stage 2.1 windows-compat: route through `resolve_aikey_dir()` so
+        // internal-log writes follow the same HOME / USERPROFILE chain as
+        // vault paths. `Some(...)` unconditionally now — the `"."` fallback
+        // in `resolve_user_home` keeps degraded environments writing to
+        // cwd rather than silently dropping logs.
+        let dir = crate::commands_account::resolve_aikey_dir()
+            .join("logs").join("aikey-cli");
         // create_dir_all is idempotent and safe across concurrent processes.
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("internal.jsonl");

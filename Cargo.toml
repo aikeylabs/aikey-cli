@@ -63,16 +63,26 @@ notify = { version = "6", default-features = false, features = ["macos_fsevent"]
 fs2 = "0.4"         # Cross-platform advisory file locking (proxy_lifecycle.rs:
                     # ~/.aikey/run/proxy.lock to serialize start/stop/restart;
                     # process exit auto-releases via OS, even on SIGKILL).
+filetime = "0.2"    # Cross-platform set_file_times (Stage 1.5 windows-compat:
+                    # replaces libc::utimensat in commands_statusline.rs so the
+                    # Windows target compiles. Behaviour matches utimensat for
+                    # regular files; symlink follow-mode differs but our
+                    # call-sites only touch regular files.
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"        # System calls for mlock (memory pinning)
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
-    "Win32_System_Memory",     # mlock-equivalent memory pinning
+    "Win32_System_Memory",     # mlock-equivalent memory pinning (crypto.rs lock_memory)
     "Win32_Foundation",        # HANDLE / CloseHandle / FILETIME
-    "Win32_System_Threading",  # OpenProcess / QueryFullProcessImageNameW / GetProcessTimes (proxy_proc.rs)
-    "Win32_System_Time",       # FileTimeToSystemTime / SystemTimeToTzSpecificLocalTime (commands_statusline.rs event_time_hm Windows variant)
+    "Win32_System_Threading",  # OpenProcess / QueryFullProcessImageNameW / GetProcessTimes (proxy_proc.rs);
+                               # also OpenProcessToken (profile_activation.rs is_running_elevated — bugfix
+                               # 2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure)
+    "Win32_Security",          # GetTokenInformation / TOKEN_ELEVATION (profile_activation.rs is_running_elevated)
+    "Win32_System_Time",       # FileTimeToSystemTime / SystemTimeToTzSpecificLocalTime (commands_statusline.rs event_time_hm)
+    "Win32_System_Console",    # GetStdHandle / ReadConsoleW / GetConsoleMode / SetConsoleMode / GetConsoleScreenBufferInfo
+                               # (lib.rs prompt_hidden / ui_select.rs raw input / ui_frame.rs term_width — Stage 1 windows-compat)
 ] }
 
 [dev-dependencies]
@@ -80,3 +90,13 @@ assert_cmd = "2.0"      # Test CLI applications
 predicates = "3.0"      # Assertions for command output
 tempfile = "3.8"        # Temporary directories for isolated tests
 serde_json = "1.0"      # JSON parsing for metadata tests
+
+# Dev profile tuned for fast incremental rebuilds.
+# Why: line-table debuginfo is enough for backtraces but cuts link size
+# dramatically; deps at opt-level=1 cost more on the first cold build but
+# user-code edits afterwards link in a fraction of the time.
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 1

@@ -127,8 +127,12 @@ pub fn local_server_status_line() -> String {
 //        remote Control Panel at <url>" for Production).
 
 fn read_local_server_port() -> Result<u16, String> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| "HOME directory not found".to_string())?;
+    // Stage 2.1 windows-compat: route through the single home-resolver so
+    // sandbox tests (HOME-override) and Windows (USERPROFILE-only) take
+    // the same code path the rest of the CLI uses. The previous direct
+    // `dirs::home_dir()` skipped HOME entirely on Linux/macOS and skipped
+    // USERPROFILE on Windows when the user had explicitly redirected.
+    let home = crate::commands_account::resolve_user_home();
 
     // 1. Authoritative: yaml's listen line.
     if let Some(port) = read_yaml_listen_port(&home.join(YAML_CONFIG_REL))? {
@@ -372,7 +376,29 @@ fn try_open_browser(url: &str) -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        // Stage 3.5 windows-compat: shell out to `rundll32 url.dll,FileProtocolHandler <url>`
+        // rather than `Start-Process` or `cmd /c start`.
+        //
+        // Why rundll32 url.dll:
+        //   - It's a pure Win32 entry point — does not depend on any
+        //     shell wrapper that might disable URL launches under
+        //     ExecutionPolicy / Group Policy lockdown.
+        //   - Honors the user's default-browser registry binding
+        //     (HKEY_CURRENT_USER\Software\Microsoft\Windows\Shell\Associations\...)
+        //     same as a click-from-Explorer would.
+        //   - Available on every Windows since the Win9x era; no PATH
+        //     surprises (it lives in System32, which is always on PATH).
+        //   - cmd `start` would briefly flash a console window; rundll32
+        //     does not.
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let _ = url;
         false
