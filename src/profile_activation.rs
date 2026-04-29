@@ -133,6 +133,27 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
     // Write active.env
     write_active_env_file(&env_lines)?;
 
+    // Sync the anthropic sentinel token's last-20 chars into ~/.claude.json's
+    // `customApiKeyResponses.approved` array. Without this, claude code v2.1.x
+    // interactive mode rejects the env-injected ANTHROPIC_API_KEY and falls
+    // through to the OAuth login URL even though the key is valid (see
+    // bugfix doc 2026-04-29-claude-interactive-ignores-anthropic-api-key.md
+    // and design doc 20260429-claude-customApiKeyResponses-approval-pre-write.md).
+    //
+    // Soft-fail: ~/.claude.json is a tertiary writeback (active.env is the
+    // primary contract; .claude.json is a workaround for an upstream bug
+    // Anthropic marked closed-not-planned). A failure here just degrades to
+    // the original symptom — equivalent to current state — so we warn and
+    // continue rather than aborting the whole activation.
+    if let Err(e) = write_claude_json_approvals(&bindings) {
+        eprintln!(
+            "\x1b[33m[aikey] warn: could not pre-approve ANTHROPIC_API_KEY in \
+             ~/.claude.json: {} \
+             (claude may still ask to /login on first run)\x1b[0m",
+            e,
+        );
+    }
+
     // Backward compat: also write active_key_config for any remaining consumers
     // of the legacy single-key model. executor::run_with_active_key() now reads
     // provider bindings directly, but this shim is kept for pre-migration vault
@@ -417,9 +438,174 @@ fn write_active_env_file(lines: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Sync `~/.claude.json`'s `customApiKeyResponses.approved` array with the
+/// last-20 chars of every aikey-managed Anthropic sentinel token currently
+/// in `active.env`.
+///
+/// Why this exists: claude code v2.1.x interactive mode requires the
+/// ANTHROPIC_API_KEY in env to be pre-approved (entry in this array)
+/// before it will use it; otherwise it falls through to a fresh OAuth
+/// login flow even though the key is valid. Anthropic closed the
+/// upstream issues (#27900 / #9699 / #25069) as "not planned", so we
+/// pre-approve at activation time. Mac users historically don't see the
+/// bug only because they completed an interactive approval at some point;
+/// this writeback makes the experience uniform across Mac / Windows /
+/// Linux without depending on user history.
+///
+/// Why merge-safe (read-modify-write, never overwrite): `~/.claude.json`
+/// is also written by claude code itself (themes, recent sessions, MCP
+/// servers, etc). A naive overwrite would destroy unrelated user state.
+///
+/// Why goes through `atomic_write` (5×retry budget): on Windows, claude
+/// code may have an open handle on `~/.claude.json` while we try to
+/// rewrite — same sharing-violation class as the
+/// 2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure bug.
+fn write_claude_json_approvals(bindings: &[ProviderBinding]) -> Result<(), String> {
+    // Collect last-20-char tails of every anthropic-bound sentinel token.
+    // Dedupe inside this batch (one provider may appear once; defensive).
+    let mut tails: Vec<String> = Vec::new();
+    for b in bindings {
+        let canonical = crate::commands_account::oauth_provider_to_canonical(
+            &b.provider_code.to_lowercase(),
+        );
+        if canonical != "anthropic" {
+            continue;
+        }
+        let tok = sentinel_token(b.key_source_type.as_str(), &b.key_source_ref);
+        let tail = last_n_chars(&tok, 20);
+        if !tails.contains(&tail) {
+            tails.push(tail);
+        }
+    }
+    if tails.is_empty() {
+        // No anthropic binding → nothing to approve. Don't read or write
+        // ~/.claude.json — preserves mtime, avoids touching unrelated state.
+        return Ok(());
+    }
+
+    let claude_json_path =
+        crate::commands_account::resolve_user_home().join(".claude.json");
+    apply_claude_json_approvals_at(&claude_json_path, &tails)
+}
+
+/// Take the last `n` characters of a UTF-8 string. Char-aware (not byte-aware)
+/// to match how claude code's JS implementation slices `string.slice(-20)`.
+/// For ASCII-only sentinel tokens (current schema), char count == byte count,
+/// but kept char-aware in case future provider sentinels grow non-ASCII.
+fn last_n_chars(s: &str, n: usize) -> String {
+    let total = s.chars().count();
+    let skip = total.saturating_sub(n);
+    s.chars().skip(skip).collect()
+}
+
+/// Testable core: take an explicit path so tests don't need to override HOME
+/// (which would race with parallel cargo test threads).
+fn apply_claude_json_approvals_at(
+    claude_json_path: &std::path::Path,
+    tails: &[String],
+) -> Result<(), String> {
+    use serde_json::Value;
+
+    if tails.is_empty() {
+        return Ok(());
+    }
+
+    // Read existing config; treat missing as empty object. Treat malformed
+    // JSON as a soft skip — overwriting could destroy user state in a way
+    // we cannot recover; degrading to "this approval did not stick" is
+    // strictly better than that.
+    let mut config: Value = match std::fs::read_to_string(claude_json_path) {
+        Ok(s) if !s.trim().is_empty() => match serde_json::from_str::<Value>(&s) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!(
+                    "\x1b[33m[aikey] warn: {} is not valid JSON; skipping \
+                     customApiKeyResponses update (will retry on next aikey use)\x1b[0m",
+                    claude_json_path.display(),
+                );
+                return Ok(());
+            }
+        },
+        _ => Value::Object(serde_json::Map::new()),
+    };
+    if !config.is_object() {
+        // Top-level is something other than an object (array, string, ...).
+        // Same conservative posture as malformed JSON: don't clobber.
+        eprintln!(
+            "\x1b[33m[aikey] warn: {} top-level is not a JSON object; \
+             skipping customApiKeyResponses update\x1b[0m",
+            claude_json_path.display(),
+        );
+        return Ok(());
+    }
+
+    // Ensure customApiKeyResponses sub-object exists with an "approved" array
+    // and a "rejected" array. Use entry().or_insert_with() so existing
+    // user/claude-code state under either field is preserved.
+    let cfg_obj = config.as_object_mut().expect("checked is_object above");
+    let cak = cfg_obj
+        .entry("customApiKeyResponses".to_string())
+        .or_insert_with(|| {
+            serde_json::json!({
+                "approved": [],
+                "rejected": [],
+            })
+        });
+    if !cak.is_object() {
+        // Existing field is the wrong shape — replace with a fresh object.
+        // This is the one place we overwrite, justified because the field
+        // we own is unusable in its current form.
+        *cak = serde_json::json!({"approved": [], "rejected": []});
+    }
+    let cak_obj = cak.as_object_mut().expect("just-ensured object");
+
+    let approved = cak_obj
+        .entry("approved".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !approved.is_array() {
+        *approved = Value::Array(Vec::new());
+    }
+    let approved_arr = approved.as_array_mut().expect("just-ensured array");
+
+    // Idempotent append. If every tail is already present, do not write
+    // (preserves mtime, avoids invalidating any reader's cache).
+    let mut changed = false;
+    for tail in tails {
+        let v = Value::String(tail.clone());
+        if !approved_arr.iter().any(|existing| existing == &v) {
+            approved_arr.push(v);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+
+    let serialized = serde_json::to_vec_pretty(&config)
+        .map_err(|e| format!("serialize ~/.claude.json: {}", e))?;
+
+    // Ensure parent dir exists (~/.claude/ is created by `claude` itself,
+    // but if the user has not run claude at all yet it may be absent).
+    if let Some(parent) = claude_json_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create_dir_all {}: {}", parent.display(), e))?;
+    }
+
+    atomic_write(claude_json_path, &serialized)
+        .map_err(|e| format!("atomic_write ~/.claude.json: {}", e))?;
+    Ok(())
+}
+
 /// Atomic file replace via temp+rename. Caller-provided directory must exist.
 /// On error the temp file is best-effort cleaned up.
-fn atomic_write(target: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+///
+/// `pub(crate)` so other modules that write into `~/.aikey/` (notably
+/// `commands_account::shell_integration::write_hook_file`) can share the
+/// Windows transient-rename retry budget — without it, EACCES from a
+/// concurrent file-open in another shell would surface as an unrecoverable
+/// hard error on the very first attempt. See bugfix doc
+/// `2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure.md`.
+pub(crate) fn atomic_write(target: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     let parent = target.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent dir")
     })?;
@@ -428,19 +614,130 @@ fn atomic_write(target: &std::path::Path, content: &[u8]) -> std::io::Result<()>
     // concurrently. Last writer wins on rename — that's the seq's job to
     // record the order, the file content is a snapshot either way.
     let temp_path = parent.join(format!("{}.tmp.{}", file_name, std::process::id()));
-    match std::fs::write(&temp_path, content) {
-        Ok(()) => match std::fs::rename(&temp_path, target) {
-            Ok(()) => Ok(()),
+    if let Err(e) = std::fs::write(&temp_path, content) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
+
+    // On Windows, MoveFileEx (which std::fs::rename compiles to) can fail
+    // with ERROR_ACCESS_DENIED (5) or ERROR_SHARING_VIOLATION (32) when
+    // another process holds the target open without FILE_SHARE_DELETE.
+    // Known transient holders we cannot eliminate from the writer side:
+    //   1. Antivirus / Windows Defender on-access scan after temp write.
+    //   2. Windows Search indexer briefly opening the file.
+    //   3. Other shells whose hooks were authored before the 2026-04-29
+    //      hook.ps1 ReadAllLines fix and still leak StreamReader handles.
+    //
+    // Retry budget: 5 attempts over ~310ms total. Bounded so a genuinely
+    // persistent failure (revoked ACL, disk full mid-rename) returns
+    // promptly. Non-transient errors fail-fast on the first attempt.
+    // POSIX rename(2) is atomic and never returns EACCES for "another
+    // process has it open" — `is_transient_rename_error` returns false
+    // off-Windows, collapsing this to a single attempt.
+    let backoffs_ms = [0u64, 10, 30, 70, 150];
+    let mut last_err: std::io::Error =
+        std::io::Error::new(std::io::ErrorKind::Other, "rename retry budget exhausted");
+    for &delay_ms in &backoffs_ms {
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        match std::fs::rename(&temp_path, target) {
+            Ok(()) => return Ok(()),
             Err(e) => {
-                let _ = std::fs::remove_file(&temp_path);
-                Err(e)
+                if !is_transient_rename_error(&e) {
+                    let _ = std::fs::remove_file(&temp_path);
+                    return Err(e);
+                }
+                last_err = e;
             }
-        },
-        Err(e) => {
-            let _ = std::fs::remove_file(&temp_path);
-            Err(e)
         }
     }
+    let _ = std::fs::remove_file(&temp_path);
+    Err(last_err)
+}
+
+/// Returns true when the rename error is the kind that's typically
+/// transient on Windows — another process has the target open briefly
+/// without FILE_SHARE_DELETE — and a backoff retry is worth the wait.
+///
+/// On POSIX this always returns false: rename(2) is atomic and the
+/// "target held open" condition does not surface as EACCES, so
+/// `atomic_write` collapses to a single attempt off-Windows.
+/// Public to crate so call sites that re-do their own retry loop (or
+/// classify the error in user-facing text) can reuse the canonical list
+/// of "OS errors that mean another process briefly held the target".
+#[cfg(windows)]
+pub(crate) fn is_transient_rename_error(e: &std::io::Error) -> bool {
+    // ERROR_ACCESS_DENIED       = 5
+    // ERROR_SHARING_VIOLATION   = 32
+    matches!(e.raw_os_error(), Some(5) | Some(32))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_transient_rename_error(_: &std::io::Error) -> bool {
+    false
+}
+
+/// True iff the current process is running with Administrator-elevated
+/// token on Windows. False everywhere else.
+///
+/// Why we care: on Windows, the native `sudo` shim defaults to
+/// `forceNewWindow` mode which spawns the elevated process in a separate
+/// console that closes immediately on exit — so any error our binary
+/// prints is invisible to the caller. If the user runs `sudo aikey hook
+/// update` and it fails (e.g., because another non-elevated PowerShell
+/// session is holding hook.ps1 open), the error window flashes and the
+/// user sees nothing. We use this helper at command entry to print an
+/// upfront warning explaining that elevation cannot fix the actual
+/// failure mode (sharing-violation by an unrelated user-mode process is
+/// orthogonal to elevation), redirecting them to the right action:
+/// close the other shells, then re-run unelevated.
+///
+/// Implementation: opens the current process token with TOKEN_QUERY,
+/// queries TokenElevation. Returns false on any error path so the
+/// non-elevated default never blocks legitimate use. Closes the handle
+/// on every exit.
+///
+/// Cost: one syscall pair per call. We call this once per `aikey hook
+/// update` invocation.
+#[cfg(windows)]
+pub(crate) fn is_running_elevated() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    // SAFETY:
+    //   - GetCurrentProcess returns a pseudo-handle that does not need closing.
+    //   - We zero TOKEN_ELEVATION before passing a pointer to it.
+    //   - On non-zero return from OpenProcessToken we always CloseHandle.
+    //   - On any failure path (Open*, GetTokenInformation) we return false.
+    // windows-sys 0.52: HANDLE is `isize` (a numeric handle), not `*mut c_void`.
+    // The "null" sentinel for a not-yet-acquired handle is therefore 0_isize,
+    // not std::ptr::null_mut().
+    unsafe {
+        let mut token_handle: HANDLE = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token_handle) == 0 {
+            return false;
+        }
+        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut return_length: u32 = 0;
+        let ok = GetTokenInformation(
+            token_handle,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut return_length,
+        );
+        CloseHandle(token_handle);
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_running_elevated() -> bool {
+    false
 }
 
 /// Searches for a replacement key that supports the given provider.
@@ -533,7 +830,7 @@ fn resolve_providers_for_entry(entry: &storage::SecretMetadata) -> Vec<String> {
 
 #[cfg(test)]
 mod atomic_write_tests {
-    use super::atomic_write;
+    use super::{atomic_write, is_transient_rename_error};
 
     // Stage 4 (active-state cross-shell sync, 2026-04-27):
     // active.env is now written via temp+rename so a shell that's mid-source
@@ -564,6 +861,115 @@ mod atomic_write_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── 2026-04-29 active.env.flat rename access-denied on Windows ──────────
+
+    /// Pin the predicate that decides which rename errors trigger retry.
+    /// On Windows, ERROR_ACCESS_DENIED (5) and ERROR_SHARING_VIOLATION (32)
+    /// surface when another process holds the target file open without
+    /// FILE_SHARE_DELETE — typical of antivirus / Search indexer / a leaked
+    /// PowerShell StreamReader handle. Other errors must fail-fast (we don't
+    /// want to wait 310ms for a permission-denied that won't ever clear).
+    #[cfg(windows)]
+    #[test]
+    fn is_transient_rename_error_classifies_windows_sharing_codes() {
+        let access_denied = std::io::Error::from_raw_os_error(5);
+        let sharing_violation = std::io::Error::from_raw_os_error(32);
+        let path_not_found = std::io::Error::from_raw_os_error(3);
+        let disk_full = std::io::Error::from_raw_os_error(112);
+        assert!(is_transient_rename_error(&access_denied));
+        assert!(is_transient_rename_error(&sharing_violation));
+        assert!(!is_transient_rename_error(&path_not_found));
+        assert!(!is_transient_rename_error(&disk_full));
+    }
+
+    /// The full-stack regression: simulate the 2026-04-29 cascade where the
+    /// PowerShell hook leaked a StreamReader handle on `active.env.flat`,
+    /// then the next `aikey use` failed to atomic-rename over it. The hook
+    /// is fixed in templates/hook.ps1 (ReadAllLines), but defense-in-depth
+    /// retry in atomic_write must still let the writer succeed when an
+    /// uncontrolled holder (antivirus, Search indexer) briefly grabs the
+    /// file.
+    ///
+    /// Test setup: open the target with FILE_SHARE_READ | FILE_SHARE_WRITE
+    /// (no FILE_SHARE_DELETE) — the same restrictive sharing PowerShell's
+    /// StreamReader uses — then drop the handle after 50ms. atomic_write
+    /// has a 310ms retry budget, so it must recover.
+    #[cfg(windows)]
+    #[test]
+    fn atomic_write_retries_through_transient_sharing_violation() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aikey-atomic-test-retry-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("active.env.flat");
+        std::fs::write(&target, b"AIKEY_ACTIVE_SEQ=1\nold=value\n").unwrap();
+
+        // FILE_SHARE_READ (1) | FILE_SHARE_WRITE (2) — NO FILE_SHARE_DELETE (4).
+        // Mirrors the share mode PowerShell's [System.IO.File]::ReadLines
+        // uses, which is the real-world holder we saw in the field.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .open(&target)
+            .expect("open holder");
+
+        let release_after = std::time::Duration::from_millis(50);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(release_after);
+            drop(holder);
+        });
+
+        let result = atomic_write(&target, b"AIKEY_ACTIVE_SEQ=2\nnew=value\n");
+        releaser.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "atomic_write must succeed after the transient holder releases; got {:?}",
+            result,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "AIKEY_ACTIVE_SEQ=2\nnew=value\n",
+            "post-retry content must reflect the new write",
+        );
+
+        // Cleanup must still run — assert no stale .tmp.<pid> debris from
+        // the failed attempts before the holder released.
+        let stale_tmps: Vec<_> = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            stale_tmps.is_empty(),
+            "stale temp file left after successful retry: {:?}",
+            stale_tmps.iter().map(|e| e.file_name()).collect::<Vec<_>>(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bugfix 2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure:
+    /// `is_running_elevated` must NOT panic in the test process and must
+    /// return a boolean. We don't assert the value because cargo test can
+    /// run from elevated or unelevated parents; the contract is "doesn't
+    /// crash, returns a stable bool".
+    #[test]
+    fn is_running_elevated_is_callable_from_tests() {
+        let _ = super::is_running_elevated();
+    }
+
+    /// Off-Windows the helper must always return false — no syscall path
+    /// to take, and callers rely on this to short-circuit Windows-only
+    /// warnings (the elevated-warning at the top of `aikey hook update`).
+    #[cfg(not(windows))]
+    #[test]
+    fn is_running_elevated_is_false_off_windows() {
+        assert!(!super::is_running_elevated(),
+            "non-Windows builds must always report false");
+    }
+
     #[test]
     fn atomic_write_does_not_leave_temp_file_on_success() {
         // The whole point of temp+rename: post-rename, the .tmp.<pid> file
@@ -584,6 +990,286 @@ mod atomic_write_tests {
             "temp file was not cleaned up after rename, dir contents: {:?}",
             entries,
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod claude_json_tests {
+    //! Bugfix 2026-04-29-claude-interactive-ignores-anthropic-api-key:
+    //! claude code v2.1.x interactive mode rejects ANTHROPIC_API_KEY env
+    //! unless `~/.claude.json`'s `customApiKeyResponses.approved` array
+    //! already contains the key's last 20 chars. We pre-approve at every
+    //! `aikey use` to make the experience uniform across platforms.
+    //!
+    //! These tests pin the contract on the testable core
+    //! `apply_claude_json_approvals_at(&path, &tails)` which takes an
+    //! explicit path so we don't override $HOME (which would race with
+    //! parallel cargo test threads).
+    use super::{apply_claude_json_approvals_at, last_n_chars};
+    use serde_json::Value;
+
+    fn fresh_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aikey-claude-json-{}-{}-{}",
+            label,
+            std::process::id(),
+            rand::random::<u64>(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read_json(path: &std::path::Path) -> Value {
+        let s = std::fs::read_to_string(path).expect("read claude.json");
+        serde_json::from_str(&s).expect("parse claude.json")
+    }
+
+    fn approved_array(v: &Value) -> Vec<String> {
+        v.pointer("/customApiKeyResponses/approved")
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter().filter_map(|e| e.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn last_n_chars_handles_short_strings() {
+        // String shorter than n → return whole string (saturating_sub avoids
+        // panic on underflow). Important: claude code's slice(-20) on a
+        // 5-char string returns the whole 5-char string, not "" or panic.
+        assert_eq!(last_n_chars("abc", 20), "abc");
+        assert_eq!(last_n_chars("", 20), "");
+        // Exactly n chars → whole string.
+        assert_eq!(last_n_chars("aikey_personal_xxxxx", 20), "aikey_personal_xxxxx");
+        // Longer than n → last n.
+        let s = "aikey_personal_my-anthropic-alias-1234567890";
+        assert_eq!(last_n_chars(s, 20).chars().count(), 20);
+        assert!(s.ends_with(&last_n_chars(s, 20)));
+    }
+
+    #[test]
+    fn creates_when_missing() {
+        let dir = fresh_dir("create");
+        let path = dir.join(".claude.json");
+        assert!(!path.exists(), "precondition: file does not exist");
+
+        apply_claude_json_approvals_at(&path, &["tail-twenty-chars-aaa".to_string()])
+            .expect("write");
+
+        let v = read_json(&path);
+        assert_eq!(approved_array(&v), vec!["tail-twenty-chars-aaa".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preserves_unrelated_fields() {
+        // Critical: ~/.claude.json is also written by claude code itself.
+        // Naive overwrite would destroy themePreference / recentChats / etc.
+        let dir = fresh_dir("preserve");
+        let path = dir.join(".claude.json");
+        let existing = serde_json::json!({
+            "themePreference": "dark",
+            "userInfo": { "uuid": "abc-123" },
+            "mcpServers": { "github": {"command": "gh-mcp"} },
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&existing).unwrap()).unwrap();
+
+        apply_claude_json_approvals_at(&path, &["xxxxxxxxxxxxxxxxxxx1".to_string()])
+            .expect("write");
+
+        let v = read_json(&path);
+        assert_eq!(v["themePreference"], "dark");
+        assert_eq!(v["userInfo"]["uuid"], "abc-123");
+        assert_eq!(v["mcpServers"]["github"]["command"], "gh-mcp");
+        assert_eq!(approved_array(&v), vec!["xxxxxxxxxxxxxxxxxxx1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idempotent_no_write_when_already_approved() {
+        // When every tail is already in the array, we must NOT write —
+        // preserving the file's mtime is important because claude code
+        // itself watches this file for self-changes.
+        let dir = fresh_dir("idempotent");
+        let path = dir.join(".claude.json");
+        let initial = serde_json::json!({
+            "customApiKeyResponses": {
+                "approved": ["xxxxxxxxxxxxxxxxxxx1"],
+                "rejected": [],
+            },
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Sleep just enough that any rewrite would be observable.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        apply_claude_json_approvals_at(&path, &["xxxxxxxxxxxxxxxxxxx1".to_string()])
+            .expect("noop write");
+
+        let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "idempotent path must not touch the file (rewrite invalidates claude code's cache)",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appends_without_replacing_other_tails() {
+        // User's ~/.claude.json may already have approvals for non-aikey
+        // keys (e.g. user manually approved an Anthropic console key once).
+        // Those entries must survive.
+        let dir = fresh_dir("append");
+        let path = dir.join(".claude.json");
+        let initial = serde_json::json!({
+            "customApiKeyResponses": {
+                "approved": ["existing-tail-1234567"],
+                "rejected": [],
+            },
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+
+        apply_claude_json_approvals_at(&path, &["new-tail-aaaaaaaaaaa".to_string()])
+            .expect("append write");
+
+        let v = read_json(&path);
+        let approved = approved_array(&v);
+        assert!(approved.contains(&"existing-tail-1234567".to_string()),
+            "existing tail must be preserved, got {:?}", approved);
+        assert!(approved.contains(&"new-tail-aaaaaaaaaaa".to_string()),
+            "new tail must be appended, got {:?}", approved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skips_malformed_silently() {
+        // Invalid JSON → don't crash, don't overwrite (overwriting could
+        // destroy unrelated user state if we misclassified valid JSON as
+        // invalid for any reason — much safer to skip).
+        let dir = fresh_dir("malformed");
+        let path = dir.join(".claude.json");
+        std::fs::write(&path, b"{not valid json at all").unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        apply_claude_json_approvals_at(&path, &["xxxxxxxxxxxxxxxxxxx1".to_string()])
+            .expect("must not propagate parse error");
+
+        // File content must be byte-identical.
+        assert_eq!(std::fs::read(&path).unwrap(), original,
+            "malformed file must not be overwritten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn skips_when_top_level_not_object() {
+        // Defensive: handle the (extremely unlikely) case that ~/.claude.json
+        // has been replaced with an array or scalar by some other tool.
+        // Don't overwrite — same rationale as malformed.
+        let dir = fresh_dir("toplevel-array");
+        let path = dir.join(".claude.json");
+        std::fs::write(&path, b"[]").unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        apply_claude_json_approvals_at(&path, &["xxxxxxxxxxxxxxxxxxx1".to_string()])
+            .expect("must not propagate");
+
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_tails_is_noop() {
+        // No anthropic binding in the activation set → no write at all.
+        // This is the kimi-only / openai-only path: we must not even read
+        // ~/.claude.json (let alone write to it) when there's nothing for
+        // claude code to approve.
+        let dir = fresh_dir("empty-tails");
+        let path = dir.join(".claude.json");
+        // Path explicitly does NOT exist. If function reads/writes anyway
+        // the assertion below would fail.
+
+        apply_claude_json_approvals_at(&path, &[]).expect("noop");
+
+        assert!(!path.exists(), "empty-tails must not create the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replaces_wrong_shape_custom_api_key_responses() {
+        // If `customApiKeyResponses` exists but is the wrong type (string,
+        // array, ...), we replace it with a fresh object. Only acceptable
+        // overwrite path because the existing field is unusable. Note: we
+        // are NOT touching other top-level fields, just this one field.
+        let dir = fresh_dir("wrong-shape");
+        let path = dir.join(".claude.json");
+        let initial = serde_json::json!({
+            "themePreference": "dark",
+            "customApiKeyResponses": "this is the wrong type",
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+
+        apply_claude_json_approvals_at(&path, &["xxxxxxxxxxxxxxxxxxx1".to_string()])
+            .expect("write");
+
+        let v = read_json(&path);
+        assert_eq!(v["themePreference"], "dark", "unrelated field preserved");
+        assert_eq!(approved_array(&v), vec!["xxxxxxxxxxxxxxxxxxx1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn creates_parent_dir_if_missing() {
+        // ~/.claude.json's parent (the user's home dir) always exists, but
+        // make sure we don't crash if the parent is missing — this also
+        // catches the case where a sandboxed test passes a deeper path.
+        let dir = fresh_dir("nested-parent");
+        let nested = dir.join("nonexistent-subdir");
+        let path = nested.join(".claude.json");
+        assert!(!nested.exists());
+
+        apply_claude_json_approvals_at(&path, &["xxxxxxxxxxxxxxxxxxx1".to_string()])
+            .expect("must create parent dir");
+
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bugfix 2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure
+    /// applies here too: claude code may have ~/.claude.json open without
+    /// FILE_SHARE_DELETE while we try to atomic-rename. atomic_write's
+    /// 5×retry budget must let us ride past that. Mirrors the existing
+    /// `atomic_write_retries_through_transient_sharing_violation` test
+    /// but exercised through the claude.json writer to prevent a future
+    /// regression that bypasses atomic_write here.
+    #[cfg(windows)]
+    #[test]
+    fn recovers_from_transient_sharing_violation() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = fresh_dir("sharing-violation");
+        let path = dir.join(".claude.json");
+        std::fs::write(&path, b"{}").unwrap();
+
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001 | 0x0000_0002) // SHARE_READ | SHARE_WRITE
+            .open(&path)
+            .expect("open holder");
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(holder);
+        });
+
+        let result = apply_claude_json_approvals_at(
+            &path,
+            &["xxxxxxxxxxxxxxxxxxx1".to_string()],
+        );
+        releaser.join().unwrap();
+
+        result.expect("write_claude_json_approvals must ride past transient hold");
+        let v = read_json(&path);
+        assert_eq!(approved_array(&v), vec!["xxxxxxxxxxxxxxxxxxx1".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

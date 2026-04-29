@@ -104,6 +104,15 @@ pub fn term_width() -> usize {
             }
         }
     }
+    // Windows: GetConsoleScreenBufferInfo probe lives in the sibling
+    // `ui_frame_windows` module (Strategy A pure — keeps ui_frame.rs
+    // Unix macOS-byte-clean). Stage 1.3 extracted 2026-04-29.
+    #[cfg(windows)]
+    {
+        if let Some(cols) = crate::ui_frame_windows::term_width_windows() {
+            return cols;
+        }
+    }
     80
 }
 
@@ -210,4 +219,61 @@ pub fn eprint_box(icon: &str, title: &str, rows: &[String]) {
 /// Print a box frame to stdout (used by list/info displays).
 pub fn print_box(icon: &str, title: &str, rows: &[String]) {
     println!("{}", render_box(icon, title, rows));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// term_width must always return a positive value, even when stdin /
+    /// stdout / stderr are all redirected (no console attached). Stage
+    /// 1.3 windows-compat regression guard: an earlier draft returned 0
+    /// when GetConsoleScreenBufferInfo failed on a piped handle, which
+    /// caused divide-by-zero in box renderer width math.
+    #[test]
+    fn term_width_is_always_positive() {
+        let w = term_width();
+        assert!(w > 0, "term_width returned 0; box renderer would divide by zero");
+    }
+
+    /// Bounded sanity: term_width should never exceed some absurd value.
+    /// 4096 cols is wider than any practical terminal; if we see more,
+    /// we're returning a garbage value (e.g. negative converted to usize).
+    #[test]
+    fn term_width_is_bounded() {
+        let w = term_width();
+        assert!(w <= 4096, "term_width returned absurd value: {w}");
+    }
+
+    /// COLUMNS env var must take priority over the OS-specific probe so
+    /// CI runners can pin a width for snapshot-style tests. Both Unix
+    /// and Windows code paths honour this.
+    #[test]
+    fn term_width_respects_columns_env() {
+        let prev = std::env::var_os("COLUMNS");
+        std::env::set_var("COLUMNS", "120");
+        let w = term_width();
+        // Restore before asserting in case the assertion panics.
+        match prev {
+            Some(v) => std::env::set_var("COLUMNS", v),
+            None => std::env::remove_var("COLUMNS"),
+        }
+        assert_eq!(w, 120);
+    }
+
+    /// is_narrow defaults to true on terminals < 90 cols.
+    /// Narrow box layout is the path Windows users hit most often
+    /// because the default cmd.exe window is 80 cols.
+    #[test]
+    fn is_narrow_at_80_cols() {
+        let prev = std::env::var_os("COLUMNS");
+        std::env::set_var("COLUMNS", "80");
+        std::env::remove_var("AIKEY_COMPACT");
+        let result = is_narrow();
+        match prev {
+            Some(v) => std::env::set_var("COLUMNS", v),
+            None => std::env::remove_var("COLUMNS"),
+        }
+        assert!(result, "80-col terminal must select narrow layout");
+    }
 }

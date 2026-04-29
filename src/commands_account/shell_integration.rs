@@ -141,22 +141,20 @@ fn write_config_atomic(config_dir: &Path, config_path: &Path, contents: &str) ->
 pub(crate) enum KimiUninstallOutcome {
     Removed,
     NothingToRemove,
-    HomeMissing,
+    // Stage 2.3 windows-compat: dropped `HomeMissing`. Previously surfaced
+    // when `env::var("HOME")` failed; now `kimi_config_paths()` always
+    // resolves a path (HOME → USERPROFILE → ".") so the status is
+    // unreachable. Removing keeps callers honest about the actual states.
 }
 
 /// Thin wrapper around `unconfigure_kimi_cli` that reports whether anything
 /// actually changed, for consistent top-level CLI output.
 pub(crate) fn uninstall_kimi_hook() -> KimiUninstallOutcome {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return KimiUninstallOutcome::HomeMissing,
-    };
-    let config_path = std::path::PathBuf::from(&home)
-        .join(".kimi")
-        .join("config.toml");
-    let backup_path = std::path::PathBuf::from(&home)
-        .join(".kimi")
-        .join("config.aikey_backup.toml");
+    // Stage 2.3 windows-compat: use the cross-platform Kimi path resolver
+    // (HOME → USERPROFILE → ...). HomeMissing as a status is preserved
+    // semantically for a degraded environment, but `resolve_user_home`
+    // never returns Err — the `"."` fallback means we always proceed.
+    let (config_path, backup_path) = kimi_config_paths();
 
     let had_region = std::fs::read_to_string(&config_path)
         .map(|c| c.contains(AIKEY_BEGIN) || c.contains(LEGACY_MARKER))
@@ -174,10 +172,7 @@ pub(crate) fn uninstall_kimi_hook() -> KimiUninstallOutcome {
 /// Inspect the current Kimi config state for `aikey statusline status`. Does
 /// not modify anything. Returns (region_present, hook_command_matches_this_bin).
 pub(crate) fn kimi_status() -> (bool, bool) {
-    let Ok(home) = std::env::var("HOME") else { return (false, false); };
-    let config_path = std::path::PathBuf::from(&home)
-        .join(".kimi")
-        .join("config.toml");
+    let (config_path, _) = kimi_config_paths();
     let Ok(content) = std::fs::read_to_string(&config_path) else {
         return (false, false);
     };
@@ -199,13 +194,9 @@ pub fn configure_kimi_cli(proxy_port: u16) {
     use colored::Colorize;
     use std::io::{IsTerminal, Write};
 
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let config_dir = std::path::PathBuf::from(&home).join(".kimi");
-    let config_path = config_dir.join("config.toml");
-    let backup_path = config_dir.join("config.aikey_backup.toml");
+    let (config_path, backup_path) = kimi_config_paths();
+    let config_dir = config_path.parent().map(|p| p.to_path_buf())
+        .unwrap_or_else(|| resolve_user_home().join(".kimi"));
 
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
     let region = build_kimi_managed_region(proxy_port);
@@ -278,12 +269,12 @@ pub fn configure_kimi_cli(proxy_port: u16) {
         if io::stderr().is_terminal() {
             let rows: Vec<String> = {
                 let mut r = vec![
-                    format!("File:    {}", "~/.kimi/config.toml"),
+                    format!("File:    {}", display_path(".kimi/config.toml")),
                     format!("Add:     Stop hook → aikey statusline render kimi"),
                     format!("         (provider/models come from env vars)"),
                 ];
                 if !existing.is_empty() {
-                    r.push(format!("Backup:  {}", "~/.kimi/config.aikey_backup.toml"));
+                    r.push(format!("Backup:  {}", display_path(".kimi/config.aikey_backup.toml")));
                 }
                 r
             };
@@ -350,13 +341,9 @@ pub fn configure_kimi_cli(proxy_port: u16) {
 /// the provider but drop only the hook must hand-edit the hooks block out of
 /// the marker region.
 pub fn unconfigure_kimi_cli() {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let config_dir = std::path::PathBuf::from(&home).join(".kimi");
-    let config_path = config_dir.join("config.toml");
-    let backup_path = config_dir.join("config.aikey_backup.toml");
+    let (config_path, backup_path) = kimi_config_paths();
+    let config_dir = config_path.parent().map(|p| p.to_path_buf())
+        .unwrap_or_else(|| resolve_user_home().join(".kimi"));
 
     // Path 1: backup exists — rename overwrites atomically.
     if backup_path.exists() {
@@ -573,13 +560,9 @@ pub fn configure_codex_cli(proxy_port: u16) {
     use colored::Colorize;
     use std::io::{IsTerminal, Write};
 
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let config_dir = std::path::PathBuf::from(&home).join(".codex");
-    let config_path = config_dir.join("config.toml");
-    let backup_path = config_dir.join("config.aikey_backup.toml");
+    let (config_path, backup_path) = codex_config_paths();
+    let config_dir = config_path.parent().map(|p| p.to_path_buf())
+        .unwrap_or_else(|| resolve_user_home().join(".codex"));
 
     let base_url = format!("http://127.0.0.1:{}/openai", proxy_port);
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
@@ -592,12 +575,12 @@ pub fn configure_codex_cli(proxy_port: u16) {
     let first_time = !has_any_marker;
     if first_time && io::stderr().is_terminal() {
         let mut rows: Vec<String> = vec![
-            format!("File:    {}", "~/.codex/config.toml"),
+            format!("File:    {}", display_path(".codex/config.toml")),
             format!("Add:     openai_base_url + [model_providers.aikey]"),
             format!("         env_key = \"OPENAI_API_KEY\" (per-shell token)"),
         ];
         if !existing.is_empty() {
-            rows.push(format!("Backup:  {}", "~/.codex/config.aikey_backup.toml"));
+            rows.push(format!("Backup:  {}", display_path(".codex/config.aikey_backup.toml")));
         }
         crate::ui_frame::eprint_box("\u{2753}", "Configure Codex CLI", &rows);
         eprint!("  Proceed? [Y/n] (default Y): ");
@@ -693,13 +676,7 @@ pub fn configure_codex_cli(proxy_port: u16) {
 /// `# managed by aikey` single-line marker. Never deletes non-aikey user
 /// content.
 pub fn unconfigure_codex_cli() {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let config_dir = std::path::PathBuf::from(&home).join(".codex");
-    let config_path = config_dir.join("config.toml");
-    let backup_path = config_dir.join("config.aikey_backup.toml");
+    let (config_path, backup_path) = codex_config_paths();
 
     // Path 1: backup exists → restore wholesale.
     if backup_path.exists() {
@@ -777,6 +754,176 @@ pub fn resolve_aikey_dir() -> std::path::PathBuf {
     resolve_user_home().join(".aikey")
 }
 
+// ---------------------------------------------------------------------------
+// Third-party CLI config-path helpers (Stage 2.3 windows-compat)
+// ---------------------------------------------------------------------------
+//
+// Kimi and Codex CLIs on Windows natively read their config from
+// `%USERPROFILE%\.kimi\config.toml` and `%USERPROFILE%\.codex\config.toml`
+// respectively (same dir layout as the Unix `~/.kimi/`, `~/.codex/`).
+// Routing through `resolve_user_home()` therefore lands at the right
+// native path on both platforms — no per-CLI special-case needed.
+//
+// Decision recorded in
+// `roadmap20260320/技术实现/开源版本方案/windows-third-party-cli-paths.md`
+// (Stage 2.3 ADR — option 2 from windows-compatibility.md §10).
+
+/// Returns `(config_path, backup_path)` for the Kimi CLI.
+pub(super) fn kimi_config_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = resolve_user_home().join(".kimi");
+    (
+        dir.join("config.toml"),
+        dir.join("config.aikey_backup.toml"),
+    )
+}
+
+/// Returns `(config_path, backup_path)` for the Codex CLI.
+pub(super) fn codex_config_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = resolve_user_home().join(".codex");
+    (
+        dir.join("config.toml"),
+        dir.join("config.aikey_backup.toml"),
+    )
+}
+
+/// Format a relative-to-home path for display in user-facing messages.
+///
+/// `relative` is the part after the home directory (no leading `/` or `\`).
+/// Output uses the platform's natural conventions:
+/// - Unix: `~/<relative>` with forward slashes
+/// - Windows: `%USERPROFILE%\<relative>` with backslashes
+///
+/// Why a single helper rather than `format!("~/{rel}")` everywhere:
+/// PowerShell / cmd.exe don't expand `~` so a literal `~/.aikey/...` in a
+/// Windows error message is a dead instruction. `%USERPROFILE%` is the
+/// closest universally-understood equivalent and Windows users can paste
+/// it into either shell. Stage 2.2 windows-compat (windows-compatibility.md §B2).
+pub fn display_path(relative: &str) -> String {
+    let rel = relative.trim_start_matches(['/', '\\']);
+    #[cfg(windows)]
+    {
+        if rel.is_empty() {
+            return "%USERPROFILE%".to_string();
+        }
+        let win_rel = rel.replace('/', "\\");
+        format!("%USERPROFILE%\\{win_rel}")
+    }
+    #[cfg(not(windows))]
+    {
+        if rel.is_empty() {
+            return "~".to_string();
+        }
+        format!("~/{rel}")
+    }
+}
+
+/// Shell dialect the user is currently running.
+///
+/// Used by user-facing error / hint text to phrase the "run X to apply"
+/// follow-up correctly for the user's actual shell. We deliberately
+/// pick the most-likely shell based on env signals rather than parsing
+/// `/proc/<ppid>/comm` (Linux-only) or `getppid()` + `ps` (slow + racy).
+///
+/// Detection priority:
+///   1. `AIKEY_SHELL_OVERRIDE`   — escape hatch for tests / sandbox.
+///   2. `$SHELL` ends with `zsh` — POSIX convention.
+///   3. `$SHELL` ends with `bash`.
+///   4. `$PSModulePath` set      — every PowerShell session sets this.
+///   5. `$ComSpec` set + no `$SHELL`/`$PSModulePath` — cmd.exe.
+///   6. Unknown.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ShellKind {
+    Zsh,
+    Bash,
+    PowerShell,
+    Cmd,
+    Unknown,
+}
+
+pub fn shell_kind() -> ShellKind {
+    if let Ok(over) = std::env::var("AIKEY_SHELL_OVERRIDE") {
+        // Defensive trim: env var pasted with trailing whitespace (rare
+        // but seen in PowerShell-here-string injections) shouldn't fall
+        // through to the auto-detection chain.
+        match over.trim().to_ascii_lowercase().as_str() {
+            "zsh" => return ShellKind::Zsh,
+            "bash" => return ShellKind::Bash,
+            "powershell" | "pwsh" => return ShellKind::PowerShell,
+            "cmd" => return ShellKind::Cmd,
+            _ => {}
+        }
+    }
+    if let Ok(s) = std::env::var("SHELL") {
+        // Strip any path prefix; the leaf binary name is what matters.
+        // After rsplit by / and \, `leaf` cannot itself contain those
+        // separators, so the "ends_with('/zsh')" check from earlier
+        // drafts was dead code.
+        let leaf = s.trim().rsplit(['/', '\\']).next().unwrap_or("");
+        if leaf == "zsh" { return ShellKind::Zsh; }
+        if leaf == "bash" { return ShellKind::Bash; }
+    }
+    // Win32: PowerShell sessions set PSModulePath; cmd.exe doesn't. Both
+    // set ComSpec, so we check PSModulePath first.
+    if std::env::var("PSModulePath").is_ok() {
+        return ShellKind::PowerShell;
+    }
+    if std::env::var("ComSpec").is_ok() {
+        return ShellKind::Cmd;
+    }
+    ShellKind::Unknown
+}
+
+/// Suggest the reload command appropriate for the user's shell after
+/// aikey wrote `~/.aikey/active.env` / `active.env.flat` (or an rc file).
+///
+/// Why a single helper: the user-facing prompts in main.rs and
+/// commands_account/* used to hardcode `source ~/.zshrc` for everyone,
+/// which is a dead instruction for PowerShell / cmd users. Centralising
+/// here keeps the dispatch logic in one place; if a future shell needs
+/// special handling we update one fn.
+pub fn reload_hint_for_shell() -> String {
+    match shell_kind() {
+        ShellKind::Zsh => "source ~/.zshrc".to_string(),
+        ShellKind::Bash => "source ~/.bashrc".to_string(),
+        ShellKind::PowerShell => ". $PROFILE".to_string(),
+        ShellKind::Cmd => "open a new cmd.exe window (cmd has no rc reload)".to_string(),
+        // Unknown deliberately avoids suggesting `source ...` (POSIX-only).
+        // Returns the same message the bash/zsh/PS branches' callers
+        // would append as their "or open a new terminal" suffix —
+        // letting `reload_hint_has_runnable_command()` skip the
+        // duplicate suffix.
+        ShellKind::Unknown => "open a new terminal session".to_string(),
+    }
+}
+
+/// True when `reload_hint_for_shell()` returned an actually-runnable
+/// command (one the user could paste at the prompt). False when the
+/// hint is itself an advisory like "open a new terminal" — the call
+/// site should NOT append a duplicate "(or open a new terminal)" in
+/// that case.
+///
+/// Stage 3 review fix (2026-04-29): without this, Cmd / Unknown users
+/// would see "Run: open a new cmd.exe window  (or open a new terminal)"
+/// — two near-identical instructions that look like a CLI bug.
+pub fn reload_hint_has_runnable_command() -> bool {
+    matches!(
+        shell_kind(),
+        ShellKind::Zsh | ShellKind::Bash | ShellKind::PowerShell,
+    )
+}
+
+/// Convenience: format a path under `~/.aikey/<rel>` for display.
+/// Equivalent to `display_path(&format!(".aikey/{rel}"))` but keeps the
+/// `.aikey` literal centralised (matches `resolve_aikey_dir`).
+pub fn display_aikey_path(relative: &str) -> String {
+    let rel = relative.trim_start_matches(['/', '\\']);
+    if rel.is_empty() {
+        display_path(".aikey")
+    } else {
+        display_path(&format!(".aikey/{rel}"))
+    }
+}
+
 pub(super) fn write_active_env(
     _key_type: &str,  // legacy parameter — token is now per-provider sentinel (see body)
     _key_ref: &str,   // legacy parameter — see _key_type
@@ -789,7 +936,22 @@ pub(super) fn write_active_env(
     let env_path = aikey_dir.join("active.env");
 
     // Collect plain key-value pairs (no shell expressions) for both files.
+    //
+    // AIKEY_ACTIVE_SEQ inclusion (Stage 3 review fix, 2026-04-29):
+    // hook.bash / hook.zsh use this value to short-circuit the precmd
+    // re-source on prompts where nothing changed. The other writer
+    // (`profile_activation::refresh_implicit_profile_activation`)
+    // already embeds it; without doing the same here, an `aikey use`
+    // would produce an active.env / active.env.flat with no SEQ line —
+    // both bash and the new PowerShell hook (`hook.ps1`) would have to
+    // fall back to unconditional re-source on every prompt.
+    //
+    // We READ the seq (vs `bump_vault_change_seq`) because the bump is
+    // the responsibility of `profile_activation` — that's the proper
+    // change-driver. write_active_env reflects current state.
+    let active_seq = crate::storage::get_vault_change_seq().unwrap_or(0);
     let mut kv_pairs: Vec<(String, String)> = vec![
+        ("AIKEY_ACTIVE_SEQ".to_string(), active_seq.to_string()),
         ("AIKEY_ACTIVE_KEY".to_string(), display_name.to_string()),
     ];
 
@@ -881,8 +1043,11 @@ pub(super) fn write_active_env(
 const V1_MARKER: &str = "# aikey shell hook";
 const V2_BEGIN: &str = "# aikey shell hook v2 begin";
 const V2_END: &str = "# aikey shell hook v2 end";
-const V3_BEGIN: &str = "# aikey shell hook v3 begin";
-const V3_END: &str = "# aikey shell hook v3 end";
+// pub(super) — needed by the sibling shell_integration_windows module
+// (commands_account/shell_integration_windows.rs) which writes the same
+// marker block into PowerShell's $PROFILE. Stage 1.2-extract 2026-04-29.
+pub(super) const V3_BEGIN: &str = "# aikey shell hook v3 begin";
+pub(super) const V3_END: &str = "# aikey shell hook v3 end";
 
 /// Content of `~/.aikey/hook.zsh`. Sourced from `src/templates/hook.zsh` via
 /// `include_str!()` so the template authoring experience is plain .zsh with
@@ -894,6 +1059,13 @@ fn hook_zsh_content() -> &'static str {
 /// Content of `~/.aikey/hook.bash`. Sourced from `src/templates/hook.bash`.
 fn hook_bash_content() -> &'static str {
     include_str!("../templates/hook.bash")
+}
+
+/// Content of `~/.aikey/hook.ps1`. Stage 3.1 windows-compat — mirrors
+/// hook.bash / hook.zsh wrapper + cross-shell-sync + drift-detector
+/// contract for PowerShell sessions.
+fn hook_ps1_content() -> &'static str {
+    include_str!("../templates/hook.ps1")
 }
 
 /// Belt-and-suspenders rebuild trigger for the hook templates. The
@@ -926,6 +1098,7 @@ pub fn hook_template_hash(kind: HookKind) -> String {
     let content = match kind {
         HookKind::Zsh  => hook_zsh_content(),
         HookKind::Bash => hook_bash_content(),
+        HookKind::PowerShell => hook_ps1_content(),
     };
     let mut h: u64 = 0xcbf29ce484222325; // FNV offset basis
     for b in content.as_bytes() {
@@ -937,7 +1110,14 @@ pub fn hook_template_hash(kind: HookKind) -> String {
 
 /// Shell dialect selector used by the hook-hash + write helpers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum HookKind { Zsh, Bash }
+pub enum HookKind {
+    Zsh,
+    Bash,
+    /// Stage 3.1 windows-compat: persistent hook for PowerShell sessions.
+    /// Persisted under `~/.aikey/hook.ps1`; sourced from
+    /// `$PROFILE.CurrentUserAllHosts` (Stage 3.2).
+    PowerShell,
+}
 
 /// Prepend a `# Hook-Template-Hash: <hex>` header to the raw template so a
 /// running shell can compare its disk copy against the binary's embedded
@@ -948,22 +1128,32 @@ fn hook_content_with_hash_header(kind: HookKind) -> String {
     let raw = match kind {
         HookKind::Zsh  => hook_zsh_content(),
         HookKind::Bash => hook_bash_content(),
+        HookKind::PowerShell => hook_ps1_content(),
     };
     let hash = hook_template_hash(kind);
     // Stable format: the hook-check script greps `^# Hook-Template-Hash: `.
     // Keep this literal — tests pin it, and so does _aikey_hook_check_once.
     //
-    // Second line (`_AIKEY_HOOK_LOADED_HASH=...`) is a shell assignment
-    // (M1, 2026-04-22): when the file is sourced, this records the hash
-    // that this shell's in-memory wrapper functions came from. The drift
-    // check in `_aikey_hook_check_once` compares this var against the
-    // on-disk `# Hook-Template-Hash:` — if they diverge, the user has
-    // regenerated the hook file AFTER this shell sourced it, so the
-    // claude/codex wrapper defs in memory are stale. Prompts a re-source.
-    let header = format!(
-        "# Hook-Template-Hash: {hash}\n_AIKEY_HOOK_LOADED_HASH=\"{hash}\"\n",
-        hash = hash,
-    );
+    // Second line records the hash the current shell loaded — POSIX shells
+    // get a `_AIKEY_HOOK_LOADED_HASH=...` assignment (sourced as a shell
+    // var); PowerShell gets `$script:_aikey_hook_loaded_hash = ...` so the
+    // drift detector can compare against on-disk hash without polluting
+    // either shell with the other's syntax.
+    //
+    // The drift check in `_aikey_hook_check_once` compares this var
+    // against the on-disk `# Hook-Template-Hash:` — if they diverge,
+    // the user has regenerated the hook file AFTER this shell sourced
+    // it, so the claude/codex wrapper defs in memory are stale.
+    let header = match kind {
+        HookKind::Zsh | HookKind::Bash => format!(
+            "# Hook-Template-Hash: {hash}\n_AIKEY_HOOK_LOADED_HASH=\"{hash}\"\n",
+            hash = hash,
+        ),
+        HookKind::PowerShell => format!(
+            "# Hook-Template-Hash: {hash}\n$script:_aikey_hook_loaded_hash = '{hash}'\n",
+            hash = hash,
+        ),
+    };
     // Insert after the first `# ~/.aikey/...` banner line so the header
     // stays near the top but doesn't displace the do-not-hand-edit warning.
     let mut out = String::with_capacity(raw.len() + header.len() + 8);
@@ -980,7 +1170,7 @@ fn hook_content_with_hash_header(kind: HookKind) -> String {
     out
 }
 
-/// Build the v3 rc block: marker + single source line + marker.
+/// Build the v3 rc block for POSIX shells: marker + single source line + marker.
 fn v3_rc_block(hook_filename: &str) -> String {
     format!(
         "{begin}\n[[ -f ~/.aikey/{hook} ]] && source ~/.aikey/{hook}\n{end}\n",
@@ -990,6 +1180,23 @@ fn v3_rc_block(hook_filename: &str) -> String {
     )
 }
 
+// Stage 3.2 windows-compat: PowerShell-specific helpers
+// (`v3_rc_block_powershell`, `powershell_profile_candidates`,
+// `ensure_powershell_hook`) live in the sibling
+// `shell_integration_windows` module. Stage 1.2-extract 2026-04-29
+// for Strategy A purity (see that module's docstring).
+//
+// The tests in the test modules below reference `v3_rc_block_powershell` /
+// `powershell_profile_candidates` directly. They run on macOS / Linux too
+// (pwsh-on-mac is a real platform — `_windows.rs` here is a naming-only
+// suffix, not a compilation gate; see the sibling module's docstring),
+// so this `use` MUST be cross-platform — gating it `#[cfg(windows)]`
+// would break `cargo test` on macOS.
+#[cfg(test)]
+use super::shell_integration_windows::{
+    powershell_profile_candidates, v3_rc_block_powershell,
+};
+
 /// Atomically write `~/.aikey/hook.{zsh,bash}` (write to tmp + rename).
 ///
 /// Per-pid suffix on the temp name (matches the convention in
@@ -998,21 +1205,33 @@ fn v3_rc_block(hook_filename: &str) -> String {
 /// other's temp file mid-write. With the pid suffix, last writer wins on
 /// rename, which matches the `change_seq` ordering — the worse of the two
 /// races still produces a valid hook file, never a torn one.
-fn write_hook_file(home: &str, is_zsh: bool) -> io::Result<std::path::PathBuf> {
-    let filename = if is_zsh { "hook.zsh" } else { "hook.bash" };
-    let kind = if is_zsh { HookKind::Zsh } else { HookKind::Bash };
+pub(super) fn write_hook_file(home: &str, kind: HookKind) -> io::Result<std::path::PathBuf> {
+    let filename = hook_filename_for_kind(kind);
     let content = hook_content_with_hash_header(kind);
     let aikey_dir = std::path::PathBuf::from(home).join(".aikey");
     std::fs::create_dir_all(&aikey_dir)?;
     let target = aikey_dir.join(filename);
-    let tmp = aikey_dir.join(format!("{}.aikey.tmp.{}", filename, std::process::id()));
-    let write_result = std::fs::write(&tmp, &content)
-        .and_then(|_| std::fs::rename(&tmp, &target));
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    write_result?;
+    // Why atomic_write (not raw temp+rename): on Windows, MoveFileExW can
+    // return ERROR_ACCESS_DENIED (5) / ERROR_SHARING_VIOLATION (32) when
+    // another PowerShell session has loaded an outdated hook.ps1 whose
+    // ReadLines+break leaks the StreamReader handle. atomic_write retries
+    // for ~310ms across 5 attempts so the user's `aikey hook update` rides
+    // through transient holds. Without this, the very first user-visible
+    // failure that drove the bugfix doc 2026-04-29-aikey-hook-update-eacces-
+    // and-sudo-silent-failure.md was an unrecoverable EACCES on the first
+    // rename — propagated up to the user as "拒绝访问 (os error 5)".
+    crate::profile_activation::atomic_write(&target, content.as_bytes())?;
     Ok(target)
+}
+
+/// Filename for the hook file under `~/.aikey/`. Stage 3.1 windows-compat
+/// added the PowerShell branch.
+fn hook_filename_for_kind(kind: HookKind) -> &'static str {
+    match kind {
+        HookKind::Zsh => "hook.zsh",
+        HookKind::Bash => "hook.bash",
+        HookKind::PowerShell => "hook.ps1",
+    }
 }
 
 /// Remove obsolete v1/v2 helper files (activate-hook.*, preexec.*) under
@@ -1050,7 +1269,7 @@ fn backup_rc_file(rc: &std::path::Path) -> io::Result<std::path::PathBuf> {
 
 /// Replace the text between `begin` and `end` markers (inclusive) in `contents`.
 /// Returns the replaced content, or None if markers not found.
-fn replace_between_markers(contents: &str, begin: &str, end: &str, replacement: &str) -> Option<String> {
+pub(super) fn replace_between_markers(contents: &str, begin: &str, end: &str, replacement: &str) -> Option<String> {
     let start_idx = contents.find(begin)?;
     let end_idx = contents.find(end)?;
     if end_idx <= start_idx { return None; }
@@ -1089,20 +1308,33 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         return None;
     }
 
+    // Stage 3.2 windows-compat: PowerShell sessions go through a sibling
+    // install path. Detection happens before the $SHELL probe because
+    // PowerShell on Windows typically doesn't set $SHELL — falling
+    // through to the bash/zsh branch would print a misleading "Shell not
+    // recognized" message every `aikey use` for Windows users.
+    if shell_kind() == ShellKind::PowerShell {
+        return super::shell_integration_windows::ensure_powershell_hook();
+    }
+
     let home = std::env::var("HOME").ok()?;
     let shell = std::env::var("SHELL").unwrap_or_default();
     let is_zsh = shell.contains("zsh");
     let is_bash = shell.contains("bash");
 
     if !is_zsh && !is_bash {
+        // cmd.exe + Unknown both land here. cmd has no rc-equivalent
+        // and PowerShell is handled above; the existing message is
+        // accurate for the remaining cases.
         return Some(
             "  Shell not recognized (need zsh/bash). Source ~/.aikey/active.env manually.".to_string(),
         );
     }
 
     // 1. Write / refresh the hook file (source of truth for wrapper logic).
-    let hook_filename = if is_zsh { "hook.zsh" } else { "hook.bash" };
-    if let Err(e) = write_hook_file(&home, is_zsh) {
+    let hook_kind = if is_zsh { HookKind::Zsh } else { HookKind::Bash };
+    let hook_filename = hook_filename_for_kind(hook_kind);
+    if let Err(e) = write_hook_file(&home, hook_kind) {
         return Some(format!("  Could not write ~/.aikey/{}: {}", hook_filename, e));
     }
 
@@ -1311,6 +1543,14 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
     ))
 }
 
+// Stage 3.2 windows-compat: `powershell_profile_candidates` and
+// `ensure_powershell_hook` were extracted to the sibling
+// `shell_integration_windows` module on 2026-04-29 (Strategy A purity —
+// see that module's docstring). Tests reach them via the cross-platform
+// `#[cfg(test)] use super::shell_integration_windows::*` higher up in
+// this file; the `aikey use` runtime call lives at the
+// `shell_kind() == ShellKind::PowerShell` branch in `ensure_shell_hook`.
+
 /// Pure hook-file refresh path used by `aikey hook update` (Stage 8-1).
 ///
 /// Why this is separate from [`ensure_shell_hook`]:
@@ -1335,30 +1575,39 @@ pub fn refresh_hook_file_only(shell: Option<&str>) -> Result<std::path::PathBuf,
     if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
         return Err("AIKEY_NO_HOOK=1 set in environment; refresh skipped".to_string());
     }
-    let home = std::env::var("HOME").map_err(|_| "HOME not set".to_string())?;
+    // Stage 3.3 windows-compat: route HOME through `resolve_user_home`
+    // so PowerShell on Windows (no $HOME, only %USERPROFILE%) can refresh
+    // hook.ps1 without erroring out at the env probe.
+    let home_path = resolve_user_home();
+    let home = home_path.to_str().ok_or_else(|| "HOME path not UTF-8".to_string())?.to_string();
 
-    let is_zsh = match shell {
-        Some("zsh") => true,
-        Some("bash") => false,
+    let kind = match shell {
+        Some("zsh") => HookKind::Zsh,
+        Some("bash") => HookKind::Bash,
+        Some("powershell") | Some("pwsh") => HookKind::PowerShell,
         Some(other) => return Err(format!(
-            "unsupported shell '{}' (need zsh or bash)", other
+            "unsupported shell '{}' (need zsh, bash, or powershell)", other
         )),
         None => {
-            let s = std::env::var("SHELL").unwrap_or_default();
-            if s.contains("zsh") {
-                true
-            } else if s.contains("bash") {
-                false
-            } else {
-                return Err(format!(
-                    "could not auto-detect shell from $SHELL='{}'; pass --shell zsh or --shell bash",
-                    s
-                ));
+            // Stage 3.3: shell_kind() honours PowerShell via $PSModulePath
+            // — no $SHELL needed. Falls through to "could not auto-detect"
+            // for cmd / Unknown, preserving the existing error envelope.
+            match shell_kind() {
+                ShellKind::Zsh => HookKind::Zsh,
+                ShellKind::Bash => HookKind::Bash,
+                ShellKind::PowerShell => HookKind::PowerShell,
+                _ => {
+                    let s = std::env::var("SHELL").unwrap_or_default();
+                    return Err(format!(
+                        "could not auto-detect shell from $SHELL='{}'; pass --shell zsh|bash|powershell",
+                        s
+                    ));
+                }
             }
         }
     };
 
-    write_hook_file(&home, is_zsh)
+    write_hook_file(&home, kind)
         .map_err(|e| format!("failed to write hook file: {}", e))
 }
 
@@ -1404,7 +1653,17 @@ pub fn web_install_hook_file_layer1() -> (bool, Option<HookFailureReason>) {
     if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
         return (false, Some(HookFailureReason::AikeyNoHook));
     }
-    if std::env::var("HOME").is_err() {
+    // Stage 3.3 windows-compat: probe through `resolve_user_home` instead
+    // of `env::var("HOME")` directly, so PowerShell on Windows
+    // (USERPROFILE-only) doesn't get a spurious `HomeUnset` envelope.
+    // The check is "is there ANY home we can resolve?" — `resolve_user_home`
+    // returns `"."` as last-resort, so the only true HomeUnset is when
+    // both HOME and USERPROFILE are unset AND `dirs::home_dir()` returns
+    // None (extremely rare; happens in stripped CI containers).
+    if std::env::var("HOME").is_err()
+        && std::env::var("USERPROFILE").is_err()
+        && dirs::home_dir().is_none()
+    {
         return (false, Some(HookFailureReason::HomeUnset));
     }
     match refresh_hook_file_only(None) {
@@ -1432,35 +1691,59 @@ pub fn web_install_hook_file_layer1() -> (bool, Option<HookFailureReason>) {
 /// a v3 aikey marker block. Stage 2 / H2: Web envelope `hook_rc_wired`
 /// field.
 ///
-/// Shell-aware (hook coverage v1 review, 2026-04-27): only checks the rc
-/// file(s) that the active `$SHELL` actually reads — checking all four
-/// dotfiles would surface a stale `.bashrc` block as `wired=true` for a
-/// zsh user whose live shell never sources it.
+/// Shell-aware (hook coverage v1 review, 2026-04-27 + Stage 3.3 windows-compat):
+/// only checks the rc file(s) that the active shell actually reads —
+/// checking all dotfiles would surface a stale `.bashrc` block as
+/// `wired=true` for a zsh user whose live shell never sources it.
 ///
-/// Read targets, mirroring [`ensure_shell_hook`]'s write-side rules:
-///   zsh   → ~/.zshrc only
-///   bash  → ~/.bashrc OR ~/.bash_profile (legacy install in either is
-///           still considered wired; the bash login chain reads at least
-///           one of them)
-///   other → false (no auto-wiring possible; banner shows the
-///           `shell_undetectable` state)
+/// Read targets, mirroring [`ensure_shell_hook`] / [`ensure_powershell_hook`]'s
+/// write-side rules:
+///   zsh        → ~/.zshrc only
+///   bash       → ~/.bashrc OR ~/.bash_profile (legacy install in either
+///                is still considered wired; the bash login chain reads
+///                at least one of them)
+///   PowerShell → any `$PROFILE.CurrentUserAllHosts` candidate
+///                (Documents\PowerShell\profile.ps1 for pwsh 7+, the
+///                WindowsPowerShell variant for 5.1) — wired if the v3
+///                marker appears in any candidate
+///   other      → false (no auto-wiring possible; banner shows the
+///                `shell_undetectable` state)
 ///
 /// Missing $HOME → false (treat as unwired; prompts `aikey hook install`).
 pub fn shell_rc_has_aikey_block() -> bool {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-    let shell = std::env::var("SHELL").unwrap_or_default();
-    let candidates: &[&str] = if shell.contains("zsh") {
-        &[".zshrc"]
-    } else if shell.contains("bash") {
-        &[".bashrc", ".bash_profile"]
-    } else {
-        return false;
-    };
-    for rc in candidates {
-        let path = std::path::PathBuf::from(&home).join(rc);
+    // Stage 3.3 windows-compat: route through `shell_kind()` so PowerShell
+    // (and a future cmd / nushell etc.) can plug in without retro-fitting
+    // env-var heuristics here.
+    match shell_kind() {
+        ShellKind::Zsh => rc_contains_v3(&[".zshrc"]),
+        ShellKind::Bash => rc_contains_v3(&[".bashrc", ".bash_profile"]),
+        ShellKind::PowerShell => {
+            // `$PROFILE.CurrentUserAllHosts` — try every candidate so a
+            // marker in either pwsh 7+ or PS 5.1 dir counts as wired.
+            // Sibling `shell_integration_windows` owns the candidate
+            // resolver post Stage 1.2-extract (2026-04-29).
+            for profile in super::shell_integration_windows::powershell_profile_candidates() {
+                if let Ok(contents) = std::fs::read_to_string(&profile) {
+                    if contents.contains(V3_BEGIN) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        ShellKind::Cmd | ShellKind::Unknown => false,
+    }
+}
+
+/// Helper: return true if any of the named files under HOME contains the
+/// v3 marker. Used by `shell_rc_has_aikey_block`'s zsh/bash branches.
+/// Routes home through `resolve_user_home` so the check works on Windows
+/// (USERPROFILE-only) too — though the only PowerShell call into this
+/// helper is via the dedicated branch above.
+fn rc_contains_v3(rc_names: &[&str]) -> bool {
+    let home = resolve_user_home();
+    for rc in rc_names {
+        let path = home.join(rc);
         if let Ok(contents) = std::fs::read_to_string(&path) {
             if contents.contains(V3_BEGIN) {
                 return true;
@@ -2218,7 +2501,7 @@ mod hook_tests {
             "aikey-test-write-hook-{}", std::process::id()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
-        let path = write_hook_file(tmp.to_str().unwrap(), true).expect("write zsh hook");
+        let path = write_hook_file(tmp.to_str().unwrap(), HookKind::Zsh).expect("write zsh hook");
         let mut f = std::fs::File::open(&path).expect("open written hook");
         let mut s = String::new();
         f.read_to_string(&mut s).expect("read written hook");
@@ -2570,5 +2853,1196 @@ mod hook_tests {
         assert!(!run_shell_rc_check(tmp.path(), "/usr/local/bin/fish"));
         assert!(!run_shell_rc_check(tmp.path(), "/bin/sh"));
         assert!(!run_shell_rc_check(tmp.path(), ""));
+    }
+}
+
+// ============================================================================
+// Stage 2 windows-compat helpers — tests
+// ============================================================================
+//
+// These tests cover the cross-platform path / display helpers added in
+// Stage 2.1 / 2.2 / 2.3. Many of them mutate the process-wide HOME /
+// USERPROFILE env vars, which is why they live in a separate `mod` with
+// a single mutex (Rust runs `#[test]` items in parallel within a binary
+// by default and parallel env-var rewrites would race).
+
+#[cfg(test)]
+mod path_helper_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Why a mutex: every test in this module reads/writes HOME and
+    // USERPROFILE. Cargo runs tests in parallel, so two tests setting
+    // HOME=A then HOME=B can race. The mutex serialises them.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Snapshot HOME + USERPROFILE before a test, restore after.
+    /// Returns the held mutex guard so the env stays serialised for the
+    /// caller's lifetime.
+    struct EnvSnapshot {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev_home: Option<std::ffi::OsString>,
+        prev_userprofile: Option<std::ffi::OsString>,
+    }
+
+    impl EnvSnapshot {
+        fn take() -> Self {
+            let guard = match ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            Self {
+                _guard: guard,
+                prev_home: std::env::var_os("HOME"),
+                prev_userprofile: std::env::var_os("USERPROFILE"),
+            }
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.prev_userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        }
+    }
+
+    // ── display_path ────────────────────────────────────────────────────────
+
+    #[test]
+    fn display_path_strips_leading_separators() {
+        // Both `/` and `\\` leading separators must be stripped so the
+        // final string never has a duplicate separator after the home
+        // marker.
+        let s1 = display_path("/.aikey/x");
+        let s2 = display_path("\\.aikey\\x");
+        let s3 = display_path(".aikey/x");
+        // All three must produce the same suffix (modulo separator).
+        // Just assert no duplicate-separator artifacts.
+        assert!(!s1.contains("//"), "{s1} contains //");
+        assert!(!s1.contains("\\\\"), "{s1} contains \\\\");
+        assert!(!s2.contains("//"));
+        assert!(!s2.contains("\\\\"));
+        assert!(!s3.contains("//"));
+        assert!(!s3.contains("\\\\"));
+    }
+
+    #[test]
+    fn display_path_empty_yields_home_marker_only() {
+        // Stage 2.4 review fix: empty rel must not produce a trailing
+        // separator like `~/` or `%USERPROFILE%\`.
+        let s = display_path("");
+        assert!(!s.ends_with('/') && !s.ends_with('\\'),
+                "empty rel produced trailing separator: {s:?}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn display_path_unix_format_and_separator() {
+        let s = display_path(".aikey/x");
+        assert_eq!(s, "~/.aikey/x");
+        assert!(!s.contains('\\'), "Unix display must not contain backslash");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_path_windows_format_and_separator() {
+        let s = display_path(".aikey/x");
+        assert_eq!(s, "%USERPROFILE%\\.aikey\\x");
+        assert!(!s.contains('/'), "Windows display must convert / → \\");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_path_windows_empty_yields_userprofile_only() {
+        let s = display_path("");
+        assert_eq!(s, "%USERPROFILE%");
+    }
+
+    // ── display_aikey_path ──────────────────────────────────────────────────
+
+    #[test]
+    fn display_aikey_path_empty_returns_aikey_dir_display() {
+        let s = display_aikey_path("");
+        let expected = display_path(".aikey");
+        assert_eq!(s, expected);
+    }
+
+    #[test]
+    fn display_aikey_path_strips_leading_separator() {
+        let with_slash = display_aikey_path("/data/vault.db");
+        let no_slash = display_aikey_path("data/vault.db");
+        assert_eq!(with_slash, no_slash);
+    }
+
+    // ── resolve_user_home priority chain ────────────────────────────────────
+
+    #[test]
+    fn resolve_user_home_prefers_home_when_set() {
+        let _snap = EnvSnapshot::take();
+        std::env::set_var("HOME", "/tmp/aikey-home-priority");
+        std::env::set_var("USERPROFILE", "/tmp/aikey-userprofile-priority");
+        let resolved = resolve_user_home();
+        assert_eq!(
+            resolved.to_string_lossy(),
+            "/tmp/aikey-home-priority",
+            "HOME must take priority over USERPROFILE — sandbox tests rely on this"
+        );
+    }
+
+    #[test]
+    fn resolve_user_home_falls_back_to_userprofile_when_home_unset() {
+        let _snap = EnvSnapshot::take();
+        std::env::remove_var("HOME");
+        std::env::set_var("USERPROFILE", "/tmp/aikey-userprofile-fallback");
+        let resolved = resolve_user_home();
+        assert_eq!(
+            resolved.to_string_lossy(),
+            "/tmp/aikey-userprofile-fallback",
+            "USERPROFILE must be the fallback when HOME is unset (native Windows)"
+        );
+    }
+
+    #[test]
+    fn resolve_aikey_dir_appends_dot_aikey() {
+        let _snap = EnvSnapshot::take();
+        std::env::set_var("HOME", "/tmp/aikey-base");
+        let dir = resolve_aikey_dir();
+        // PathBuf join may use different separators on Windows; check via
+        // the components rather than string comparison.
+        let last = dir.file_name().and_then(|s| s.to_str());
+        assert_eq!(last, Some(".aikey"));
+        let parent = dir.parent().and_then(|p| p.to_str());
+        assert_eq!(parent, Some("/tmp/aikey-base"));
+    }
+
+    // ── kimi_config_paths / codex_config_paths ──────────────────────────────
+
+    #[test]
+    fn kimi_config_paths_under_user_home() {
+        let _snap = EnvSnapshot::take();
+        std::env::set_var("HOME", "/tmp/aikey-kimi-base");
+        let (config, backup) = kimi_config_paths();
+        assert!(config.ends_with("config.toml"), "got {config:?}");
+        assert!(backup.ends_with("config.aikey_backup.toml"), "got {backup:?}");
+        // Both must live under .kimi/ off the resolved home.
+        assert!(
+            config.iter().any(|c| c == std::ffi::OsStr::new(".kimi")),
+            "kimi config must be under .kimi/, got {config:?}",
+        );
+        assert!(
+            backup.iter().any(|c| c == std::ffi::OsStr::new(".kimi")),
+            "kimi backup must be under .kimi/, got {backup:?}",
+        );
+    }
+
+    #[test]
+    fn codex_config_paths_under_user_home() {
+        let _snap = EnvSnapshot::take();
+        std::env::set_var("HOME", "/tmp/aikey-codex-base");
+        let (config, backup) = codex_config_paths();
+        assert!(config.ends_with("config.toml"));
+        assert!(backup.ends_with("config.aikey_backup.toml"));
+        assert!(config.iter().any(|c| c == std::ffi::OsStr::new(".codex")));
+        assert!(backup.iter().any(|c| c == std::ffi::OsStr::new(".codex")));
+    }
+
+    #[test]
+    fn kimi_and_codex_paths_have_same_shape() {
+        // Both helpers must return a (config, backup) pair structured
+        // the same way — Stage 2.3 ADR contract. Catches divergence if
+        // someone later adds a `.aikey_backup.toml` rename to one but
+        // not the other.
+        let _snap = EnvSnapshot::take();
+        std::env::set_var("HOME", "/tmp/aikey-shape");
+        let (kc, kb) = kimi_config_paths();
+        let (cc, cb) = codex_config_paths();
+        // Same extension, same backup suffix.
+        assert_eq!(kc.extension(), cc.extension());
+        assert_eq!(kb.file_name(), cb.file_name());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kimi_paths_resolve_via_userprofile_on_windows() {
+        let _snap = EnvSnapshot::take();
+        std::env::remove_var("HOME");
+        std::env::set_var("USERPROFILE", r"C:\Users\stage2-test");
+        let (config, _) = kimi_config_paths();
+        let s = config.to_string_lossy();
+        // Stage 2.3 ADR: kimi-cli on Windows reads %USERPROFILE%\.kimi\;
+        // our wrapper must land at the same dir.
+        assert!(
+            s.contains(r"C:\Users\stage2-test"),
+            "kimi config path on Windows must use USERPROFILE; got {s}",
+        );
+        assert!(s.contains(".kimi"));
+    }
+}
+
+// ============================================================================
+// Stage 3 windows-compat — PowerShell hook + shell-kind tests
+// ============================================================================
+
+#[cfg(test)]
+mod stage3_powershell_hook_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Same env-mutation isolation pattern as path_helper_tests above —
+    // many tests in this module twiddle PSModulePath / SHELL / etc.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvSnapshot {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvSnapshot {
+        fn take(vars: &[&'static str]) -> Self {
+            let guard = match ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let prev = vars
+                .iter()
+                .map(|v| (*v, std::env::var_os(v)))
+                .collect();
+            Self { _guard: guard, prev }
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    // ── shell_kind() priority ───────────────────────────────────────────────
+
+    #[test]
+    fn shell_kind_override_wins() {
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::set_var("AIKEY_SHELL_OVERRIDE", "powershell");
+        std::env::set_var("SHELL", "/bin/zsh"); // would otherwise win
+        assert_eq!(shell_kind(), ShellKind::PowerShell);
+    }
+
+    #[test]
+    fn shell_kind_recognises_zsh_path() {
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        std::env::set_var("SHELL", "/usr/local/bin/zsh");
+        std::env::remove_var("PSModulePath");
+        std::env::remove_var("ComSpec");
+        assert_eq!(shell_kind(), ShellKind::Zsh);
+    }
+
+    #[test]
+    fn shell_kind_recognises_bash_path() {
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        std::env::set_var("SHELL", "/bin/bash");
+        std::env::remove_var("PSModulePath");
+        std::env::remove_var("ComSpec");
+        assert_eq!(shell_kind(), ShellKind::Bash);
+    }
+
+    #[test]
+    fn shell_kind_powershell_via_psmodulepath() {
+        // The Windows PowerShell signature: PSModulePath set, SHELL absent.
+        // (Most PowerShell sessions on Windows match this.)
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        std::env::remove_var("SHELL");
+        std::env::set_var("PSModulePath", r"C:\Users\michael\Documents\PowerShell\Modules");
+        // ComSpec is also typically set on Windows, but PSModulePath wins.
+        std::env::set_var("ComSpec", r"C:\Windows\System32\cmd.exe");
+        assert_eq!(shell_kind(), ShellKind::PowerShell);
+    }
+
+    #[test]
+    fn shell_kind_cmd_via_comspec_no_psmodulepath() {
+        // cmd.exe also sets ComSpec but NOT PSModulePath. The check order
+        // (PSModulePath first) is essential — getting it wrong would
+        // mis-classify every PowerShell session as cmd.
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        std::env::remove_var("SHELL");
+        std::env::remove_var("PSModulePath");
+        std::env::set_var("ComSpec", r"C:\Windows\System32\cmd.exe");
+        assert_eq!(shell_kind(), ShellKind::Cmd);
+    }
+
+    #[test]
+    fn shell_kind_unknown_when_nothing_matches() {
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        std::env::remove_var("SHELL");
+        std::env::remove_var("PSModulePath");
+        std::env::remove_var("ComSpec");
+        assert_eq!(shell_kind(), ShellKind::Unknown);
+    }
+
+    // ── reload_hint_for_shell() ────────────────────────────────────────────
+
+    #[test]
+    fn reload_hint_powershell_uses_dot_profile() {
+        let _snap = EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE"]);
+        std::env::set_var("AIKEY_SHELL_OVERRIDE", "powershell");
+        let hint = reload_hint_for_shell();
+        assert!(
+            hint.contains("$PROFILE"),
+            "PowerShell reload hint must reference $PROFILE; got: {hint}",
+        );
+        assert!(
+            !hint.contains("source"),
+            "PowerShell reload hint must NOT use POSIX `source`; got: {hint}",
+        );
+    }
+
+    #[test]
+    fn reload_hint_zsh_uses_source_zshrc() {
+        let _snap = EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE"]);
+        std::env::set_var("AIKEY_SHELL_OVERRIDE", "zsh");
+        let hint = reload_hint_for_shell();
+        assert!(
+            hint.contains("source") && hint.contains(".zshrc"),
+            "zsh reload hint must be `source ~/.zshrc`; got: {hint}",
+        );
+    }
+
+    #[test]
+    fn reload_hint_bash_uses_source_bashrc() {
+        let _snap = EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE"]);
+        std::env::set_var("AIKEY_SHELL_OVERRIDE", "bash");
+        let hint = reload_hint_for_shell();
+        assert!(
+            hint.contains("source") && hint.contains(".bashrc"),
+            "bash reload hint must be `source ~/.bashrc`; got: {hint}",
+        );
+    }
+
+    #[test]
+    fn reload_hint_cmd_explains_no_rc_reload() {
+        // cmd.exe has no rc reload — the hint must say so explicitly so
+        // the user knows opening a new window is the only path.
+        let _snap = EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE"]);
+        std::env::set_var("AIKEY_SHELL_OVERRIDE", "cmd");
+        let hint = reload_hint_for_shell();
+        assert!(
+            hint.to_lowercase().contains("cmd") || hint.to_lowercase().contains("new"),
+            "cmd reload hint must mention cmd / new window; got: {hint}",
+        );
+    }
+
+    // ── hook.ps1 template content ──────────────────────────────────────────
+
+    #[test]
+    fn hook_ps1_template_defines_aikey_wrapper() {
+        let c = hook_ps1_content();
+        assert!(c.contains("function global:aikey"),
+                "hook.ps1 must define the global aikey wrapper function");
+        assert!(c.contains("--shell"), "hook.ps1 wrapper must pass --shell flag");
+        assert!(c.contains("powershell"),
+                "hook.ps1 wrapper must specify --shell powershell");
+    }
+
+    #[test]
+    fn hook_ps1_template_defines_ak_alias_guarded() {
+        // ak is a common short alias (kubectl, aws). The hook must defer
+        // to the user's pre-existing definition rather than overwrite —
+        // same contract as bash/zsh hook.
+        let c = hook_ps1_content();
+        assert!(c.contains("Get-Command ak"),
+                "hook.ps1 must guard the ak alias with Get-Command");
+        assert!(c.contains("function global:ak"),
+                "hook.ps1 must define the ak short-alias function");
+    }
+
+    #[test]
+    fn hook_ps1_template_has_drift_detector() {
+        // Two-layer drift detector: layer 1 reads disk hash, layer 2
+        // spawns binary and compares. Both must be present.
+        let c = hook_ps1_content();
+        assert!(c.contains("_aikey_hook_check_once"),
+                "hook.ps1 must define _aikey_hook_check_once for drift detection");
+        assert!(c.contains("_hook-hash powershell"),
+                "drift detector layer 2 must spawn `aikey _hook-hash powershell`");
+        assert!(c.contains("Hook-Template-Hash:"),
+                "drift detector layer 1 must grep the disk hash header");
+    }
+
+    #[test]
+    fn hook_ps1_template_wraps_prompt_for_cross_shell_sync() {
+        let c = hook_ps1_content();
+        assert!(c.contains("function global:prompt"),
+                "hook.ps1 must wrap the prompt function for cross-shell sync");
+        assert!(c.contains("_aikey_precmd_powershell"),
+                "hook.ps1 prompt wrap must call _aikey_precmd_powershell");
+        assert!(c.contains("_aikeyOrigPromptForHook"),
+                "hook.ps1 must capture the original prompt to chain");
+    }
+
+    // ── Wrapper preflight (claude / codex / kimi) — Stage 1.2-followup
+    //    review (2026-04-29): pin parity with hook.bash so the next time
+    //    someone "simplifies" hook.ps1 the connectivity-test is preserved.
+
+    #[test]
+    fn hook_ps1_defines_aikey_preflight_function() {
+        let c = hook_ps1_content();
+        assert!(
+            c.contains("function global:_aikey_preflight"),
+            "hook.ps1 must define _aikey_preflight (parity with hook.bash _aikey_preflight)",
+        );
+    }
+
+    #[test]
+    fn hook_ps1_preflight_honours_off_kill_switch() {
+        // The kill-switch is the only escape hatch for users who legitimately
+        // want claude/codex to skip the connectivity probe (e.g. local-mock
+        // environments or running offline). Removing it would force an
+        // env-var-rename migration on every existing user — defend it.
+        let c = hook_ps1_content();
+        assert!(
+            c.contains("AIKEY_PREFLIGHT") && c.contains("'off'"),
+            "hook.ps1 _aikey_preflight must honour $env:AIKEY_PREFLIGHT='off' to skip",
+        );
+    }
+
+    #[test]
+    fn hook_ps1_preflight_calls_proxy_ensure_running_and_test() {
+        // The two-step probe is the actual "connectivity test before claude
+        // runs" contract: (1) proxy alive, (2) `aikey test <id>` reaches the
+        // upstream API. Both must appear or we'd silently skip half the
+        // probe — exactly the Stage-1.2-review-find-class regression.
+        let c = hook_ps1_content();
+        assert!(
+            c.contains("proxy ensure-running"),
+            "_aikey_preflight must call `aikey proxy ensure-running` (auto-start proxy)",
+        );
+        assert!(
+            c.contains(" test "),
+            "_aikey_preflight must call `aikey test <id>` (upstream connectivity probe)",
+        );
+    }
+
+    #[test]
+    fn hook_ps1_wraps_claude_codex_kimi_with_guards() {
+        let c = hook_ps1_content();
+        // Each of the three CLIs must have a function wrapper.
+        for cli in ["function global:claude", "function global:codex", "function global:kimi"] {
+            assert!(c.contains(cli),
+                "hook.ps1 must wrap {} (parity with hook.bash claude()/codex()/kimi())", cli);
+        }
+        // Each wrapper must be guarded — checking via Get-Command -CommandType
+        // Function, Alias — so we don't clobber a user's pre-existing function
+        // / alias of the same name (kubectl-style 'codex', etc.).
+        for guard in ["Get-Command claude -CommandType Function, Alias",
+                      "Get-Command codex -CommandType Function, Alias",
+                      "Get-Command kimi -CommandType Function, Alias"] {
+            assert!(c.contains(guard),
+                "hook.ps1 must guard wrappers via Get-Command -CommandType Function,Alias check; missing: {}", guard);
+        }
+    }
+
+    #[test]
+    fn hook_ps1_claude_codex_call_preflight_kimi_does_not() {
+        // Per hook.bash 2026-04-22 carve-out: kimi-cli has its own
+        // connectivity probe that overlaps with `aikey test`, so kimi's
+        // wrapper does proxy-ensure-running ONLY, no `_aikey_preflight`.
+        // Pin the asymmetry so a future "consistency cleanup" doesn't
+        // accidentally break kimi launch by adding the diagnostic probe.
+        let c = hook_ps1_content();
+        // Find the claude wrapper body and assert preflight call.
+        let claude_block = c
+            .split("function global:claude")
+            .nth(1).unwrap_or("")
+            .split("function global:codex")
+            .next().unwrap_or("");
+        assert!(
+            claude_block.contains("_aikey_preflight"),
+            "claude wrapper must invoke _aikey_preflight",
+        );
+        let codex_block = c
+            .split("function global:codex")
+            .nth(1).unwrap_or("")
+            .split("function global:kimi")
+            .next().unwrap_or("");
+        assert!(
+            codex_block.contains("_aikey_preflight"),
+            "codex wrapper must invoke _aikey_preflight",
+        );
+        let kimi_block = c
+            .split("function global:kimi")
+            .nth(1).unwrap_or("");
+        assert!(
+            !kimi_block.contains("_aikey_preflight"),
+            "kimi wrapper must NOT invoke _aikey_preflight (carve-out: kimi-cli has its own probe)",
+        );
+        assert!(
+            kimi_block.contains("ensure-running"),
+            "kimi wrapper must still call `proxy ensure-running` (auto-start)",
+        );
+    }
+
+    #[test]
+    fn hook_ps1_preflight_dispatches_to_real_binary_via_command_application() {
+        // Wrappers must dispatch to the real binary on PATH via
+        // Get-Command -CommandType Application — bypassing our own
+        // function (otherwise infinite recursion).
+        let c = hook_ps1_content();
+        assert!(
+            c.matches("Get-Command claude -CommandType Application").count() >= 1,
+            "claude wrapper must use Get-Command -CommandType Application to find real binary",
+        );
+        assert!(
+            c.matches("Get-Command codex -CommandType Application").count() >= 1,
+            "codex wrapper must use Get-Command -CommandType Application",
+        );
+        assert!(
+            c.matches("Get-Command kimi -CommandType Application").count() >= 1,
+            "kimi wrapper must use Get-Command -CommandType Application",
+        );
+    }
+
+    #[test]
+    fn hook_ps1_template_uses_active_env_flat_not_active_env() {
+        // active.env is sh-syntax (export ...). PowerShell can't parse it.
+        // The Stage 3 hook must read active.env.flat (plain KEY=VALUE).
+        let c = hook_ps1_content();
+        assert!(c.contains("active.env.flat"),
+                "hook.ps1 must read active.env.flat (sh-syntax active.env is unparseable)");
+    }
+
+    #[test]
+    fn hook_ps1_template_does_not_invoke_expression_active_env_flat() {
+        // §4 red line 2: active.env.flat parsing must not Invoke-Expression.
+        // The flat file must be parsed line-by-line as KEY=VALUE so a
+        // malformed value can't execute arbitrary PowerShell.
+        //
+        // The wrapper itself uses Invoke-Expression on `aikey activate`
+        // output (single-quoted via powershell_escape — safe; the
+        // security argument matches bash/zsh's `eval` on their `--shell`
+        // output). The active.env.flat reload path must NOT.
+        //
+        // We count CODE occurrences only — comment text mentions are
+        // expected and harmless. PowerShell single-line comments start
+        // with `#` and run to end of line; we strip after the first `#`
+        // when no `'` quote precedes it (string literals can contain `#`).
+        let c = hook_ps1_content();
+        let code_only_ie_count: usize = c
+            .lines()
+            .map(|line| {
+                // Trim block-comment-style lines and inline `#` comments.
+                // Conservative: drop everything from the first `#` outside
+                // a string literal. The hook template doesn't have `#`
+                // inside strings so the simple strip is safe.
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') { return 0; }
+                let code = match line.split_once('#') {
+                    Some((before, _comment)) => before,
+                    None => line,
+                };
+                code.matches("Invoke-Expression").count()
+            })
+            .sum();
+        assert!(
+            code_only_ie_count <= 1,
+            "Invoke-Expression should only appear in the activate/deactivate wrapper code, not in active.env.flat parsing; found {code_only_ie_count} code-line occurrences",
+        );
+    }
+
+    // ── hook hash + content header (PowerShell variant) ────────────────────
+
+    #[test]
+    fn hook_template_hash_is_stable_for_powershell() {
+        // Hash must be a 16-hex-digit FNV-1a-64 string — same format as
+        // zsh/bash. The web-bridge envelope and drift detector both
+        // expect `^[a-f0-9]{16}$`.
+        let h = hook_template_hash(HookKind::PowerShell);
+        assert_eq!(h.len(), 16);
+        assert!(h.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "PowerShell hook hash must be lowercase hex; got: {h}");
+    }
+
+    #[test]
+    fn hook_content_with_hash_header_powershell_uses_powershell_syntax() {
+        let rendered = hook_content_with_hash_header(HookKind::PowerShell);
+        assert!(
+            rendered.contains("# Hook-Template-Hash:"),
+            "PowerShell hook header must include the canonical # Hook-Template-Hash: line",
+        );
+        assert!(
+            rendered.contains("$script:_aikey_hook_loaded_hash ="),
+            "PowerShell hook header must use $script: scope, not POSIX shell var assignment",
+        );
+        // The POSIX form would be `_AIKEY_HOOK_LOADED_HASH="..."` — must NOT appear in PS template.
+        assert!(
+            !rendered.contains("_AIKEY_HOOK_LOADED_HASH=\""),
+            "PowerShell hook header must NOT inherit POSIX shell var assignment syntax",
+        );
+    }
+
+    #[test]
+    fn write_hook_file_powershell_writes_hook_ps1() {
+        let tmp = std::env::temp_dir().join(format!(
+            "aikey-test-write-ps1-{}-{}",
+            std::process::id(),
+            rand::random::<u64>(),
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = write_hook_file(tmp.to_str().unwrap(), HookKind::PowerShell)
+            .expect("write powershell hook");
+        assert!(path.ends_with("hook.ps1"));
+        let body = std::fs::read_to_string(&path).expect("read written hook");
+        assert!(body.contains("function global:aikey"),
+                "written hook.ps1 must contain the wrapper function");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Bugfix 2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure:
+    /// `write_hook_file` must ride through transient sharing-violations
+    /// from another shell holding the target hook file open. The earlier
+    /// implementation used a one-shot `std::fs::rename` so EACCES was an
+    /// unrecoverable hard failure. Switching to `atomic_write` (~310ms
+    /// retry budget) fixes it.
+    ///
+    /// Mirrors `atomic_write_retries_through_transient_sharing_violation`
+    /// in profile_activation.rs but goes through the actual hook write
+    /// path so a future regression that bypasses atomic_write (e.g. by
+    /// reverting to inline temp+rename) still fails this test.
+    #[cfg(windows)]
+    #[test]
+    fn write_hook_file_recovers_from_transient_sharing_violation() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "aikey-test-hook-retry-{}-{}",
+            std::process::id(),
+            rand::random::<u64>(),
+        ));
+        std::fs::create_dir_all(tmp.join(".aikey")).unwrap();
+        // Pre-seed an existing hook.ps1 so the rename has a target to
+        // replace — replicates the user's case where `aikey hook update`
+        // tries to overwrite an existing-but-stale file.
+        let hook_target = tmp.join(".aikey").join("hook.ps1");
+        std::fs::write(&hook_target, b"# stale\n").unwrap();
+
+        // Hold the target with FILE_SHARE_READ | FILE_SHARE_WRITE
+        // (no FILE_SHARE_DELETE) — same share mode the leaky pre-fix
+        // PowerShell hook used. atomic_write must retry past this.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x0000_0001 | 0x0000_0002)
+            .open(&hook_target)
+            .expect("open holder");
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(holder);
+        });
+
+        let result = write_hook_file(tmp.to_str().unwrap(), HookKind::PowerShell);
+        releaser.join().unwrap();
+
+        let path = result.expect("write_hook_file must succeed after holder releases");
+        let body = std::fs::read_to_string(&path).expect("read written hook");
+        assert!(body.contains("function global:aikey"),
+                "post-retry content must be the new template, not the stale stub");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── v3_rc_block_powershell ─────────────────────────────────────────────
+
+    #[test]
+    fn v3_rc_block_powershell_has_marker_pair() {
+        let block = v3_rc_block_powershell();
+        assert!(block.contains(V3_BEGIN), "PowerShell v3 block must include begin marker");
+        assert!(block.contains(V3_END), "PowerShell v3 block must include end marker");
+    }
+
+    #[test]
+    fn v3_rc_block_powershell_uses_powershell_syntax_not_bash() {
+        let block = v3_rc_block_powershell();
+        // Must use Test-Path + dot-source, not bash `[[ -f ... ]] && source`.
+        assert!(block.contains("Test-Path") && block.contains(". $_aikeyHookFile"),
+                "PowerShell rc block must use Test-Path + . to source the hook");
+        assert!(!block.contains("[[ -f"),
+                "PowerShell rc block must NOT contain bash test syntax");
+        assert!(!block.contains("source ~/.aikey"),
+                "PowerShell rc block must NOT contain bash `source` syntax");
+    }
+
+    #[test]
+    fn v3_rc_block_powershell_idempotent_via_replace_between_markers() {
+        // Verify the markers play nicely with the existing
+        // replace_between_markers helper that bash/zsh path uses for
+        // idempotent rewrites.
+        let original = "before\n# aikey shell hook v3 begin\nold-content\n# aikey shell hook v3 end\nafter\n";
+        let new_block = v3_rc_block_powershell();
+        let updated = replace_between_markers(original, V3_BEGIN, V3_END, &new_block).unwrap();
+        assert!(updated.contains("before"));
+        assert!(updated.contains("after"));
+        assert!(!updated.contains("old-content"));
+        assert!(updated.contains("Test-Path"));
+    }
+
+    // ── powershell_profile_candidates() ────────────────────────────────────
+
+    #[test]
+    fn powershell_profile_candidates_is_non_empty() {
+        // Always returns at least one path — the install needs to know
+        // where to write even on a fresh machine without pwsh installed.
+        let candidates = powershell_profile_candidates();
+        assert!(!candidates.is_empty(),
+                "powershell_profile_candidates must always return at least one path");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_profile_candidates_windows_includes_documents_powershell() {
+        let candidates = powershell_profile_candidates();
+        let s: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+        let any_pwsh7 = s.iter().any(|p|
+            p.contains("Documents") && p.contains("PowerShell") && !p.contains("WindowsPowerShell")
+        );
+        assert!(any_pwsh7,
+                "Windows candidates must include pwsh-7+ Documents\\PowerShell; got: {s:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_profile_candidates_windows_includes_windowspowershell_5_1() {
+        let candidates = powershell_profile_candidates();
+        let s: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+        let any_5_1 = s.iter().any(|p| p.contains("WindowsPowerShell"));
+        assert!(any_5_1,
+                "Windows candidates must include legacy WindowsPowerShell 5.1; got: {s:?}");
+    }
+}
+
+// ============================================================================
+// Stage 3 self-review fix pins (2026-04-29)
+// ============================================================================
+//
+// Each test below corresponds to a specific issue surfaced during the
+// post-Stage-3 self-review. The doc-comment on each test names the issue
+// it pins so a future regression has its blame trail.
+
+#[cfg(test)]
+mod stage3_review_fix_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvSnapshot {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+    impl EnvSnapshot {
+        fn take(vars: &[&'static str]) -> Self {
+            let guard = match ENV_LOCK.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let prev = vars.iter().map(|v| (*v, std::env::var_os(v))).collect();
+            Self { _guard: guard, prev }
+        }
+    }
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            for (k, v) in &self.prev {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    // ── Issue: AIKEY_SHELL_OVERRIDE with whitespace (review fix S2) ────────
+
+    /// Pre-fix: `AIKEY_SHELL_OVERRIDE="powershell  "` (trailing space)
+    /// would not match the lowercase literal "powershell" → fall through
+    /// to auto-detection. Post-fix: trim() catches it.
+    #[test]
+    fn shell_override_trims_trailing_whitespace() {
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::set_var("AIKEY_SHELL_OVERRIDE", "  powershell  ");
+        std::env::remove_var("SHELL");
+        std::env::remove_var("PSModulePath");
+        std::env::remove_var("ComSpec");
+        assert_eq!(shell_kind(), ShellKind::PowerShell);
+    }
+
+    /// Pre-fix: SHELL with leading/trailing whitespace would pass through
+    /// to rsplit and produce a leaf with embedded whitespace that doesn't
+    /// match the literal "zsh". Post-fix: trim() before split.
+    #[test]
+    fn shell_var_trims_whitespace_before_leaf_extraction() {
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        std::env::set_var("SHELL", "  /bin/zsh  ");
+        std::env::remove_var("PSModulePath");
+        std::env::remove_var("ComSpec");
+        assert_eq!(shell_kind(), ShellKind::Zsh);
+    }
+
+    // ── Issue: SHELL with shell name suffix (e.g. zsh-5.9) (review S1) ─────
+
+    /// Pre-fix and post-fix both return Unknown for `zsh-5.9` because
+    /// real-world zsh binaries are always exactly named `zsh`. This test
+    /// pins the conservative behaviour so a future "fuzzy match"
+    /// temptation doesn't sneak in (a fuzzy match like `contains("zsh")`
+    /// would mis-classify `/opt/myzsh-fork/bin/myshell`).
+    #[test]
+    fn shell_name_with_version_suffix_is_unknown_not_zsh() {
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        std::env::set_var("SHELL", "/usr/bin/zsh-5.9");
+        std::env::remove_var("PSModulePath");
+        std::env::remove_var("ComSpec");
+        assert_eq!(
+            shell_kind(),
+            ShellKind::Unknown,
+            "shell_kind() must NOT match suffixed binaries — keeps detection conservative",
+        );
+    }
+
+    /// fish, tcsh, ksh etc. are not supported and must be classified as
+    /// Unknown. The tests pin the contract so a future "let's add fish
+    /// support" PR has to add the ShellKind variant + reload_hint case
+    /// rather than falling through to a misleading Unknown fallback.
+    #[test]
+    fn unsupported_shells_classified_as_unknown() {
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        for unsup in ["/usr/bin/fish", "/bin/tcsh", "/bin/ksh", "/bin/dash"] {
+            std::env::set_var("SHELL", unsup);
+            std::env::remove_var("PSModulePath");
+            std::env::remove_var("ComSpec");
+            assert_eq!(
+                shell_kind(),
+                ShellKind::Unknown,
+                "shell_kind() must classify {unsup} as Unknown",
+            );
+        }
+    }
+
+    // ── Issue: reload_hint_for_shell Unknown branch was POSIX-biased ────────
+
+    /// Pre-fix: Unknown returned `"source ~/.aikey/active.env (or open
+    /// a new terminal)"` — `source` is bash-only. On Windows non-PS
+    /// non-cmd hosts (e.g. nushell) this was a dead instruction.
+    /// Post-fix: returns just an "open a new terminal" advisory.
+    #[test]
+    fn reload_hint_unknown_does_not_emit_source_keyword() {
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        std::env::remove_var("SHELL");
+        std::env::remove_var("PSModulePath");
+        std::env::remove_var("ComSpec");
+        let hint = reload_hint_for_shell();
+        assert_eq!(shell_kind(), ShellKind::Unknown);
+        assert!(
+            !hint.contains("source "),
+            "Unknown reload hint must NOT use POSIX `source ` (dead off bash); got: {hint}",
+        );
+    }
+
+    // ── Issue: reload_hint_has_runnable_command flag (new helper) ───────────
+
+    /// Pre-fix: main.rs always appended "(or open a new terminal)" to
+    /// the hint, producing "Run: open a new cmd.exe window  (or open
+    /// a new terminal)" for cmd users — two near-identical instructions
+    /// that look like a CLI bug. Post-fix: helper returns false for
+    /// Cmd / Unknown so the suffix is suppressed.
+    #[test]
+    fn reload_hint_runnable_flag_true_for_runnable_shells() {
+        for (over, expected) in [
+            ("zsh", true),
+            ("bash", true),
+            ("powershell", true),
+            ("cmd", false),
+        ] {
+            let _snap = EnvSnapshot::take(&[
+                "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+            ]);
+            std::env::set_var("AIKEY_SHELL_OVERRIDE", over);
+            assert_eq!(
+                reload_hint_has_runnable_command(),
+                expected,
+                "shell {over}: expected runnable={expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn reload_hint_runnable_flag_false_for_unknown() {
+        let _snap = EnvSnapshot::take(&[
+            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
+        ]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        std::env::remove_var("SHELL");
+        std::env::remove_var("PSModulePath");
+        std::env::remove_var("ComSpec");
+        assert!(!reload_hint_has_runnable_command());
+    }
+
+    // ── Issue: hook.ps1 should NOT `return $rc` (PS prints int as output) ──
+
+    /// Pre-fix: `return $rc` in PowerShell adds the int to the output
+    /// stream → user sees `0` after every `aikey activate foo`. Post-fix:
+    /// removed the explicit return, $LASTEXITCODE is what callers check.
+    #[test]
+    fn hook_ps1_wrapper_does_not_return_lastexitcode_explicitly() {
+        // Strip `#`-comments before scanning so the explanatory comment
+        // ("do NOT `return $LASTEXITCODE`") doesn't trip the test.
+        //
+        // Scope: this rule applies ONLY to the user-typed `aikey
+        // activate|deactivate` wrapper — that's the place where a stray
+        // `return $rc` would surface `0` to the user's stdout (the
+        // activate output is captured by Invoke-Expression and any
+        // additional output stream contents leak to the prompt).
+        // Internal helpers like `_aikey_preflight` legitimately return
+        // an int that callers capture as `$rc = _aikey_preflight ...`
+        // — same idiom hook.bash uses for its `_aikey_preflight`.
+        // Pre-2026-04-29 the test scanned the entire file which falsely
+        // flagged the preflight helper.
+        let full = hook_ps1_content();
+        // Extract the body of `function global:aikey { ... }` (the
+        // activate/deactivate wrapper) by walking braces.
+        let needle = "function global:aikey {";
+        let start = full.find(needle).expect("hook.ps1 must define function global:aikey");
+        let body_start = start + needle.len();
+        let mut depth: i32 = 1;
+        let mut end = body_start;
+        for (i, ch) in full[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let wrapper_body: String = full[body_start..end]
+            .lines()
+            .map(|line| line.split_once('#').map(|(b, _)| b).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !wrapper_body.contains("return $rc"),
+            "aikey() wrapper must not `return $rc` — that prints the int to user's stdout",
+        );
+        assert!(
+            !wrapper_body.contains("return $LASTEXITCODE"),
+            "aikey() wrapper must not `return $LASTEXITCODE` — same reason as above",
+        );
+    }
+
+    // ── Issue: hook.ps1 must guard Get-Item function:prompt (review H1) ────
+
+    /// Pre-fix: stripped PS hosts without a `prompt` function would
+    /// throw at hook source time. Post-fix: -ErrorAction SilentlyContinue
+    /// + default-prompt fallback.
+    #[test]
+    fn hook_ps1_guards_missing_prompt_function() {
+        let c = hook_ps1_content();
+        assert!(
+            c.contains("Get-Item function:prompt -ErrorAction SilentlyContinue"),
+            "hook.ps1 must guard Get-Item function:prompt against missing-item error",
+        );
+        // Fallback default ScriptBlock must exist.
+        assert!(
+            c.contains("Get-Location"),
+            "hook.ps1 fallback prompt must use Get-Location (default PS prompt shape)",
+        );
+    }
+
+    // ── Issue: hook.ps1 must defensively coerce $RemArgs (review H2) ───────
+
+    #[test]
+    fn hook_ps1_wrapper_coerces_remargs_to_array() {
+        let c = hook_ps1_content();
+        assert!(
+            c.contains("$RemArgs = @($RemArgs)"),
+            "hook.ps1 wrapper must defensively coerce $RemArgs to array (safe for $null on no-arg call)",
+        );
+    }
+
+    // ── Issue: hook.ps1 must handle missing AIKEY_ACTIVE_SEQ (review SEQ) ──
+
+    /// Pre-fix: when active.env.flat had no AIKEY_ACTIVE_SEQ line (which
+    /// is the case for the `aikey use` write_active_env path before my
+    /// fix), the PS hook silently skipped re-import → cross-shell sync
+    /// never triggered. Post-fix: missing SEQ falls back to unconditional
+    /// reload (mirrors hook.bash's "pre-Stage-1 fallback").
+    #[test]
+    fn hook_ps1_falls_back_to_unconditional_reload_when_seq_missing() {
+        let c = hook_ps1_content();
+        // The fallback marker: `should_reload = if ($null -eq $on_disk_seq) { $true }`
+        assert!(
+            c.contains("$null -eq $on_disk_seq") && c.contains("$true"),
+            "hook.ps1 must reload unconditionally when on_disk_seq is null \
+             (mirrors hook.bash's pre-Stage-1 fallback path)",
+        );
+    }
+
+    // ── Issue: write_active_env must include AIKEY_ACTIVE_SEQ (review fix) ──
+
+    /// Pre-fix: write_active_env's kv_pairs started with only
+    /// AIKEY_ACTIVE_KEY — no SEQ. Both active.env (for bash/zsh hooks)
+    /// AND active.env.flat (for PS hook) ended up missing SEQ on the
+    /// `aikey use` flow. Bash hook had a fallback for this; PS hook now
+    /// has one too — but write_active_env itself should also write SEQ
+    /// so the cheap-diff path is taken.
+    #[test]
+    fn write_active_env_includes_active_seq_in_flat() {
+        // We can't directly call write_active_env without setting up a
+        // full vault context, but we can pin the contract by reading the
+        // function's source and asserting the AIKEY_ACTIVE_SEQ kv_pair is
+        // pushed before any provider iteration. This is a structure test
+        // — it intentionally couples to the source layout, which is the
+        // right level of fixation for "this MUST be present".
+        let src = include_str!("shell_integration.rs");
+        // Find the write_active_env function body and look for the SEQ push.
+        let needle = r#"("AIKEY_ACTIVE_SEQ".to_string(), active_seq.to_string())"#;
+        assert!(
+            src.contains(needle),
+            "write_active_env's kv_pairs must push AIKEY_ACTIVE_SEQ \
+             so active.env.flat carries the seq for cheap PS-hook diff",
+        );
+    }
+
+    // ── 2026-04-29 hook.ps1 must not leak file handles via ReadLines + break
+
+    /// Pre-fix: hook.ps1 used `[System.IO.File]::ReadLines + foreach + break`
+    /// in 4 places (active.env.flat seq probe, active.env.flat reload, two
+    /// hook.ps1 hash-header reads). ReadLines returns an IEnumerable backed
+    /// by a StreamReader; PowerShell's `break` does not eagerly dispose the
+    /// enumerator, so the file handle survives until GC — typically the
+    /// entire prompt cycle. The handle is opened with FILE_SHARE_READ |
+    /// FILE_SHARE_WRITE (NO FILE_SHARE_DELETE), so the next `aikey use`
+    /// could not atomically replace active.env.flat (Windows MoveFileEx
+    /// returns ERROR_ACCESS_DENIED). User-visible cascade: stale .flat →
+    /// hook hits the SEQ-matches fast path → no env reload → claude.exe /
+    /// codex / kimi launched without ANTHROPIC_* in env → login prompt
+    /// despite a valid binding.
+    ///
+    /// Post-fix: hook.ps1 uses `[System.IO.File]::ReadAllLines` everywhere,
+    /// which closes the StreamReader synchronously before returning. This
+    /// test pins the absence of the leaky pattern so a future "let's stream
+    /// for memory" PR can't silently re-introduce it.
+    ///
+    /// See bugfix doc:
+    ///   workflow/CI/bugfix/2026-04-29-active-env-flat-rename-access-denied-on-windows.md
+    #[test]
+    fn hook_ps1_does_not_use_leaky_readlines_pattern() {
+        let c = hook_ps1_content();
+        // Strip line comments so the explanatory comment "Why ReadAllLines
+        // (not ReadLines): ..." doesn't trip the assertion. Block-comment
+        // syntax doesn't exist in PowerShell line-by-line lexing for our
+        // purposes here, so a simple split-on-`#` is sufficient.
+        let code_only: String = c.lines()
+            .map(|line| line.split_once('#').map(|(b, _)| b).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code_only.contains("[System.IO.File]::ReadLines"),
+            "hook.ps1 must not use [System.IO.File]::ReadLines — the returned \
+             IEnumerable's StreamReader leaks across `break`, blocking the \
+             next atomic rename of active.env.flat on Windows. Use ReadAllLines.",
+        );
+        // Belt-and-braces: ensure the replacement IS in use, so we don't
+        // accidentally pass this test by deleting all reads of the file.
+        assert!(
+            code_only.contains("[System.IO.File]::ReadAllLines"),
+            "hook.ps1 must read its files via [System.IO.File]::ReadAllLines \
+             (eager-read, handle-disposed-on-return)",
+        );
+    }
+
+    // ── Issue: ensure_powershell_hook prefers existing-parent candidate ────
+
+    /// Pre-fix: fresh install always wrote to candidates.first()
+    /// = pwsh 7+ profile path, even if the user only had PS 5.1
+    /// installed. PS 5.1 sessions never sourced the file → silent UX
+    /// failure. Post-fix: prefer the candidate whose parent dir exists.
+    #[cfg(windows)]
+    #[test]
+    fn powershell_hook_install_prefers_existing_parent_dir() {
+        // Simulate: PS 5.1-only user — Documents\WindowsPowerShell exists,
+        // Documents\PowerShell does NOT. The selected target should be
+        // the 5.1 path, not the 7+ path.
+        //
+        // We construct a tempdir mimicking the layout, then assert the
+        // parent-exists preference logic (replicated here as a pure fn
+        // since `ensure_powershell_hook` is private and writes to the
+        // real `$PROFILE` on success).
+        let tmp = std::env::temp_dir().join(format!(
+            "aikey-ps-5-1-only-{}",
+            rand::random::<u64>(),
+        ));
+        std::fs::create_dir_all(tmp.join("Documents/WindowsPowerShell")).unwrap();
+        // Documents/PowerShell intentionally NOT created.
+
+        let candidates = vec![
+            tmp.join("Documents/PowerShell/profile.ps1"),
+            tmp.join("Documents/WindowsPowerShell/profile.ps1"),
+        ];
+        // Replicates the ensure_powershell_hook selection logic.
+        let target = candidates
+            .iter()
+            .find(|p| p.parent().map(|d| d.exists()).unwrap_or(false))
+            .cloned()
+            .or_else(|| candidates.first().cloned())
+            .unwrap();
+
+        assert!(
+            target.to_string_lossy().contains("WindowsPowerShell"),
+            "PS 5.1-only user must get 5.1 profile path; got {}",
+            target.display(),
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

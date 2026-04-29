@@ -2,6 +2,7 @@
 #[allow(dead_code)] mod credential_type;
 #[allow(dead_code)] mod team_token_normalize;
 #[allow(dead_code)] mod storage;
+#[allow(dead_code)] mod storage_acl;
 #[allow(dead_code)] mod provider_registry;
 mod crypto;
 mod session;
@@ -38,6 +39,9 @@ mod resolver;
 #[allow(dead_code)] mod observability;
 mod ui_frame;
 #[allow(dead_code)] mod ui_select;
+#[cfg(windows)] #[allow(dead_code)] mod ui_select_windows;
+#[cfg(windows)] #[allow(dead_code)] mod prompt_hidden_windows;
+#[cfg(windows)] #[allow(dead_code)] mod ui_frame_windows;
 mod proxy_env;
 #[allow(dead_code)] mod profile_activation;
 mod commands_auth;
@@ -780,8 +784,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let kind = match shell.as_str() {
                 "zsh"  => commands_account::HookKind::Zsh,
                 "bash" => commands_account::HookKind::Bash,
+                "powershell" | "pwsh" => commands_account::HookKind::PowerShell,
                 other  => return Err(format!(
-                    "unknown shell '{}' — expected 'zsh' or 'bash'", other
+                    "unknown shell '{}' — expected 'zsh', 'bash', or 'powershell'", other
                 ).into()),
             };
             println!("{}", commands_account::hook_template_hash(kind));
@@ -2361,8 +2366,20 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         // Check if the shell hook is active: if AIKEY_ACTIVE_KEYS is set
                         // in the parent shell, precmd is working and will auto-refresh.
                         // If not, the user needs to source manually (first time or new terminal).
+                        //
+                        // Stage 3.6 windows-compat: route the hint through `reload_hint_for_shell`
+                        // so PowerShell / cmd users see something runnable in their shell
+                        // instead of `source ~/.zshrc` (which is a dead string off Unix).
+                        // Stage 3 review fix: only append "(or open a new terminal)" when
+                        // the hint is actually a runnable command — Cmd / Unknown already
+                        // says "open a new terminal", appending it twice looks broken.
                         if std::env::var("AIKEY_ACTIVE_KEYS").is_err() {
-                            eprintln!("  \x1b[33m!\x1b[0m Run: \x1b[1msource ~/.zshrc\x1b[0m  (or open a new terminal)");
+                            let hint = commands_account::reload_hint_for_shell();
+                            if commands_account::reload_hint_has_runnable_command() {
+                                eprintln!("  \x1b[33m!\x1b[0m Run: \x1b[1m{hint}\x1b[0m  (or open a new terminal)");
+                            } else {
+                                eprintln!("  \x1b[33m!\x1b[0m {hint}");
+                            }
                         }
                         println!();
                     }
@@ -4470,6 +4487,45 @@ fn handle_deactivate(
     Ok(())
 }
 
+/// Convert a `refresh_hook_file_only` error into a user-actionable
+/// message. The original messages from the lower layer can be opaque
+/// OS errors ("拒绝访问。 (os error 5)") that don't tell the user what
+/// to do next. This wrapper detects the common Windows-specific
+/// failure modes — sharing-violation from another shell holding the
+/// hook file open — and appends a remediation step.
+///
+/// Why this lives in main.rs rather than `refresh_hook_file_only`:
+/// the lower layer returns a `String` error so the Web envelope path
+/// (`web_install_hook_file_layer1`) can classify it via prefix match.
+/// Mutating that prefix would force every classifier to be updated in
+/// lockstep. Instead we keep the raw error stable and rewrite it for
+/// human consumption only at the CLI boundary.
+fn augment_hook_update_error(raw: &str) -> String {
+    // The string format we produce upstream is:
+    //   "failed to write hook file: <io::Error::Display>"
+    // On Windows EACCES this expands to either:
+    //   "... 拒绝访问。 (os error 5)"   (Chinese-locale Windows)
+    //   "... Access is denied. (os error 5)"
+    //   "... (os error 32)"             (sharing violation)
+    let is_eacces = raw.contains("os error 5") || raw.contains("os error 32");
+    if !is_eacces {
+        return raw.to_string();
+    }
+    let mut out = String::new();
+    out.push_str(raw);
+    out.push_str("\n\nThis usually means another PowerShell window has loaded an outdated\n");
+    out.push_str("hook.ps1 that holds the file open via a leaked file handle (pre-2026-04-29\n");
+    out.push_str("hooks used a streaming reader whose handle survived `break`).\n\n");
+    out.push_str("To fix:\n");
+    out.push_str("  1. Close ALL other PowerShell / pwsh windows that have aikey loaded.\n");
+    out.push_str("  2. Open a fresh PowerShell.\n");
+    out.push_str("  3. Run: aikey hook update      (without sudo — elevation does not help)\n\n");
+    out.push_str("Why elevation does NOT help: the failure is a sharing-violation between\n");
+    out.push_str("two user-mode processes; both are owned by you and both have full ACL.\n");
+    out.push_str("Closing the holding shell releases the handle; running elevated does not.");
+    out
+}
+
 /// `aikey hook` subcommand family — explicit user entry points to the
 /// hash-based drift detector and rc-wiring lifecycle.
 ///
@@ -4499,6 +4555,25 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
                 eprintln!("\x1b[90m  Skipped: AIKEY_NO_HOOK=1 set in environment.\x1b[0m");
                 return Ok(());
+            }
+            // Pre-flight: warn if running elevated on Windows. The native
+            // `sudo` shim defaults to forceNewWindow mode which spawns the
+            // elevated process in a separate console that closes on exit —
+            // any error we print is invisible. Worse: elevation does NOT
+            // help here. The canonical failure mode of `aikey hook update`
+            // is another non-elevated PowerShell session holding hook.ps1
+            // open via a leaked StreamReader handle (pre-2026-04-29 hooks);
+            // sharing-violation is orthogonal to elevation, so the elevated
+            // process hits the same EACCES. The right fix is to close the
+            // other shells, not to elevate.
+            // See bugfix 2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure.md.
+            if profile_activation::is_running_elevated() {
+                eprintln!("\x1b[33m  ⚠ Running elevated on Windows.\x1b[0m");
+                eprintln!("\x1b[90m    Elevation does not help `aikey hook update` succeed —\x1b[0m");
+                eprintln!("\x1b[90m    EACCES on hook.ps1 is typically caused by another\x1b[0m");
+                eprintln!("\x1b[90m    PowerShell session holding the file open, not by ACL.\x1b[0m");
+                eprintln!("\x1b[90m    If this command fails: close other PS shells, then run\x1b[0m");
+                eprintln!("\x1b[90m    `aikey hook update` again WITHOUT sudo.\x1b[0m");
             }
             // Stage 8 / reviewer round-3 fix: use the *pure* refresh path that
             // only rewrites ~/.aikey/hook.{zsh,bash}. The earlier draft called
@@ -4535,7 +4610,7 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                     }
                     Ok(())
                 }
-                Err(e) => Err(e.into()),
+                Err(e) => Err(augment_hook_update_error(&e).into()),
             }
         }
         HookAction::Status { shell } => {
@@ -4550,14 +4625,15 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             let kind = match shell_str {
                 "zsh" => commands_account::HookKind::Zsh,
                 "bash" => commands_account::HookKind::Bash,
+                "powershell" | "pwsh" => commands_account::HookKind::PowerShell,
                 other => return Err(format!(
-                    "unsupported shell '{}' for hook status — expected zsh or bash", other
+                    "unsupported shell '{}' for hook status — expected zsh, bash, or powershell", other
                 ).into()),
             };
-            let hook_filename = if matches!(kind, commands_account::HookKind::Zsh) {
-                "hook.zsh"
-            } else {
-                "hook.bash"
+            let hook_filename = match kind {
+                commands_account::HookKind::Zsh => "hook.zsh",
+                commands_account::HookKind::Bash => "hook.bash",
+                commands_account::HookKind::PowerShell => "hook.ps1",
             };
 
             let aikey_dir = commands_account::resolve_aikey_dir();
@@ -4809,6 +4885,55 @@ mod refresh_hook_file_only_tests {
             ),
             Ok(p) => panic!("expected Err for shell=fish, got Ok({})", p.display()),
         }
+    }
+}
+
+#[cfg(test)]
+mod hook_update_error_hint_tests {
+    use super::augment_hook_update_error;
+
+    // Bugfix 2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure.md:
+    // when `aikey hook update` fails with a Windows sharing-violation
+    // (os error 5 / 32) the user must see actionable next steps, not
+    // just the opaque OS message.
+
+    #[test]
+    fn eacces_message_gets_remediation_hint() {
+        let raw = "failed to write hook file: 拒绝访问。 (os error 5)";
+        let aug = augment_hook_update_error(raw);
+        assert!(aug.starts_with(raw), "original message must be preserved verbatim");
+        assert!(aug.contains("Close ALL other PowerShell"), "missing close-shells step: {}", aug);
+        assert!(aug.contains("without sudo"), "missing no-sudo guidance: {}", aug);
+        assert!(aug.contains("elevation does not help") || aug.contains("elevation does NOT help"),
+            "missing elevation explanation: {}", aug);
+    }
+
+    #[test]
+    fn sharing_violation_also_gets_hint() {
+        // ERROR_SHARING_VIOLATION (32) is the other common transient
+        // hold mode (e.g. Windows Search indexer), not just EACCES.
+        let raw = "failed to write hook file: The process cannot access the file (os error 32)";
+        let aug = augment_hook_update_error(raw);
+        assert!(aug.contains("Close ALL other PowerShell"), "got: {}", aug);
+    }
+
+    #[test]
+    fn unrelated_error_passes_through_unchanged() {
+        // Non-EACCES errors (e.g. ENOENT, EROFS) should not get the
+        // close-shells hint — that would mislead the user. Only the
+        // sharing-violation family gets the augmentation.
+        let raw = "failed to write hook file: No such file or directory (os error 2)";
+        let aug = augment_hook_update_error(raw);
+        assert_eq!(aug, raw, "non-EACCES error should pass through");
+    }
+
+    #[test]
+    fn english_locale_eacces_also_gets_hint() {
+        // Don't lock in the Chinese-locale "拒绝访问" prefix — match
+        // on the OS error code, not the localised string.
+        let raw = "failed to write hook file: Access is denied. (os error 5)";
+        let aug = augment_hook_update_error(raw);
+        assert!(aug.contains("Close ALL other PowerShell"), "got: {}", aug);
     }
 }
 

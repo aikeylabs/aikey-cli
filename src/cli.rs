@@ -1842,8 +1842,12 @@ fn banner_gold(s: &str) -> colored::ColoredString {
 pub(crate) fn print_banner() {
     use colored::Colorize;
     let version = BUILD_VERSION;
-    let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-    let aikey_home = format!("{}/.aikey", home);
+    // Stage 2.6 windows-compat: `format!("{}/...", home)` produced
+    // mixed separators on Windows (`C:\Users\michael/.aikey`). Route
+    // through the canonical resolver so the banner shows native paths.
+    let aikey_home = crate::commands_account::resolve_aikey_dir()
+        .display()
+        .to_string();
 
     // Lines 2–5 of the icon carry side labels (title/divider/tagline/home).
     // Lines 1 and 6 are purely decorative. Initial eyes render OPEN —

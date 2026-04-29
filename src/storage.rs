@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use crate::storage_acl;
 
 /// Metadata for a secret entry (used for JSON output)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,15 +206,12 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         fs::create_dir_all(&vault_dir)
             .map_err(|e| format!("Failed to create vault directory: {}", e))?;
 
-        #[cfg(unix)]
-        {
-            let metadata = fs::metadata(&vault_dir)
-                .map_err(|e| format!("Failed to read directory metadata: {}", e))?;
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o700);
-            fs::set_permissions(&vault_dir, perms)
-                .map_err(|e| format!("Failed to set directory permissions: {}", e))?;
-        }
+        // Stage 2.4 windows-compat: cross-platform owner-only ACL.
+        // Unix → chmod 0o700 (unchanged); Windows → icacls strips the
+        // inherited Authenticated Users grant so files created inside
+        // (vault.db below) inherit owner-only.
+        storage_acl::enforce_owner_only_dir(&vault_dir)
+            .map_err(|e| format!("Failed to set directory permissions: {}", e))?;
     }
 
     // If the DB file exists, check whether it was fully initialized (has master_salt).
@@ -239,15 +235,12 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
     let conn = Connection::open(&db_path)
         .map_err(|e| format!("Failed to create database: {}", e))?;
 
-    #[cfg(unix)]
-    {
-        let metadata = fs::metadata(&db_path)
-            .map_err(|e| format!("Failed to read database metadata: {}", e))?;
-        let mut perms = metadata.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(&db_path, perms)
-            .map_err(|e| format!("Failed to set database permissions: {}", e))?;
-    }
+    // Stage 2.4 windows-compat: belt-and-suspenders — vault_dir's ACL
+    // already inherits owner-only to vault.db on Windows, but we set it
+    // explicitly here so even a vault.db that pre-existed (e.g. user
+    // manually copied an old vault file in) gets re-hardened.
+    storage_acl::enforce_owner_only_file(&db_path)
+        .map_err(|e| format!("Failed to set database permissions: {}", e))?;
 
     // SECURITY: Enable secure delete to overwrite deleted data with zeros
     conn.pragma_update(None, "secure_delete", "ON")

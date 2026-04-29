@@ -18,6 +18,13 @@ use crate::crypto;
 use crate::platform_client::{PlatformClient, PollResponse};
 use crate::storage::{self, VirtualKeyCacheEntry};
 
+// Stage 2.1 windows-compat: in-module callsites use
+// `shell_integration::shell_integration::resolve_aikey_dir()` directly. Importing it via
+// `use` collides with the `pub use shell_integration::*;` re-export at
+// the bottom of this module (E0603 privacy conflict), and a local
+// alias would shadow that re-export — so we just spell the path out
+// at the few callsites in this file.
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -32,9 +39,15 @@ use crate::storage::{self, VirtualKeyCacheEntry};
 const LOGIN_THROTTLE_SECS: u64 = 60;
 
 /// Path to the throttle marker file. Absent file ⇒ no prior attempt.
+///
+/// Stage 2.1 windows-compat: route through `shell_integration::resolve_aikey_dir()` so the
+/// throttle file lands in the same `~/.aikey` (or `%USERPROFILE%\.aikey`)
+/// the rest of the CLI uses. Always returns `Some(...)` now —
+/// `resolve_user_home` has a `"."` last-resort that keeps the contract
+/// "absent file ⇒ no prior attempt" intact (the file simply won't exist
+/// in degraded environments).
 fn login_throttle_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(std::path::PathBuf::from(home).join(".aikey").join(".login_throttle.json"))
+    Some(shell_integration::resolve_aikey_dir().join(".login_throttle.json"))
 }
 
 /// Returns the unix-seconds timestamp of the last recorded login attempt,
@@ -67,9 +80,10 @@ fn write_login_throttle() -> std::io::Result<()> {
 }
 
 /// Read `controlPanelUrl` from `~/.aikey/config/config.json` (if present).
+///
+/// Stage 2.1 windows-compat: routed through `shell_integration::resolve_aikey_dir()`.
 fn read_control_url_from_config() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
-    let path = std::path::PathBuf::from(home).join(".aikey/config/config.json");
+    let path = shell_integration::resolve_aikey_dir().join("config").join("config.json");
     let data = std::fs::read_to_string(path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
     parsed["controlPanelUrl"].as_str()
@@ -79,12 +93,10 @@ fn read_control_url_from_config() -> Option<String> {
 
 /// Auto-configure proxy `collector_url` in `~/.aikey/config/aikey-proxy.yaml`.
 /// Uses the same control_url (nginx proxies collector API on the same port).
+///
+/// Stage 2.1 windows-compat: routed through `shell_integration::resolve_aikey_dir()`.
 fn configure_proxy_collector(control_url: &str, json_mode: bool) {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let proxy_config = std::path::PathBuf::from(&home).join(".aikey/config/aikey-proxy.yaml");
+    let proxy_config = shell_integration::resolve_aikey_dir().join("config").join("aikey-proxy.yaml");
     if !proxy_config.exists() {
         return; // No proxy config yet — skip silently.
     }
@@ -157,12 +169,10 @@ fn configure_proxy_collector(control_url: &str, json_mode: bool) {
 }
 
 /// Persist `controlPanelUrl` in `~/.aikey/config/config.json`.
+///
+/// Stage 2.1 windows-compat: routed through `shell_integration::resolve_aikey_dir()`.
 fn save_control_url_to_config(url: &str) {
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let dir = std::path::PathBuf::from(&home).join(".aikey/config");
+    let dir = shell_integration::resolve_aikey_dir().join("config");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("config.json");
 
@@ -2461,6 +2471,15 @@ pub fn handle_run_direct(
 
 mod shell_integration;
 pub use shell_integration::*;
+
+// PowerShell hook install logic, extracted 2026-04-29 from
+// shell_integration.rs (Strategy A purity). Compiled on all platforms —
+// pwsh 7+ runs on macOS / Linux too, and cross-platform tests in
+// stage3_powershell_hook_tests reference its functions on macOS.
+// `_windows.rs` is a naming convention here (this is the PowerShell
+// sibling, mainly relevant to Windows users), not a compilation gate.
+// See shell_integration_windows.rs module docstring.
+mod shell_integration_windows;
 
 /// Resolve an OAuth account by `provider_account_id` OR `display_identity`
 /// (email). Returns `None` when no match — caller treats that as "not

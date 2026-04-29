@@ -247,9 +247,14 @@ fn compute_cutoff(max_age: Option<Duration>) -> i64 {
 
 /// Default WAL directory (`~/.aikey/data/usage-wal`). Kept here so CLI
 /// commands don't each reinvent the path.
+///
+/// Stage 2.1 windows-compat: route through `resolve_aikey_dir()` so the
+/// WAL path resolves on native Windows shells (HOME unset / USERPROFILE
+/// only). Returning `Some(...)` unconditionally is intentional —
+/// `resolve_user_home` has a `"."` last-resort fallback so the caller
+/// never gets `None` from a missing HOME.
 pub fn default_wal_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".aikey").join("data").join("usage-wal"))
+    Some(crate::commands_account::resolve_aikey_dir().join("data").join("usage-wal"))
 }
 
 /// Scan WAL files newest-first, invoking `match_fn` on each entry.  Returns

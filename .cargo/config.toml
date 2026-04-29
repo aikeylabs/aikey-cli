@@ -1,0 +1,6 @@
+# Build acceleration on Windows (MSVC).
+# Why: link time dominates rebuilds on Windows; rust-lld (bundled with rustup)
+# is several times faster than link.exe and produces equivalent binaries.
+# Unix targets keep their default linker — change scoped to MSVC only.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

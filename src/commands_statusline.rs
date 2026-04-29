@@ -351,20 +351,23 @@ fn tuple_gt(file_a: &str, seq_a: u64, file_b: &str, seq_b: u64) -> bool {
 
 /// Kimi session dir following kimi-cli's `WorkDirMeta.sessions_dir` formula:
 /// `~/.kimi/sessions/<md5(cwd)>/<session_id>/`
+///
+/// Stage 2.3 windows-compat: route through `resolve_user_home()` so the
+/// path lands at `%USERPROFILE%\.kimi\sessions\...` on Windows, matching
+/// what kimi-cli itself reads on Windows.
 fn kimi_session_dir(cwd: &str, session_id: &str) -> PathBuf {
     use md5::{Md5, Digest};
     let digest = Md5::digest(cwd.as_bytes());
     let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    home.join(".kimi").join("sessions").join(hex).join(session_id)
+    crate::commands_account::resolve_user_home()
+        .join(".kimi").join("sessions").join(hex).join(session_id)
 }
 
 /// Directory for per-session turn watermarks: `~/.aikey/run/kimi-turns/`.
 /// The `_in` variant takes an explicit base dir so tests can substitute a
 /// tempdir (setting `$HOME` process-wide would collide with parallel tests).
 fn kimi_turns_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    home.join(".aikey").join("run").join("kimi-turns")
+    crate::commands_account::resolve_aikey_dir().join("run").join("kimi-turns")
 }
 
 /// Read the watermark file. **Fail-closed** in every error / corruption
@@ -1075,9 +1078,6 @@ pub fn uninstall_kimi() -> io::Result<()> {
                 "No aikey-managed Kimi config found — nothing to remove.".dimmed()
             );
         }
-        KimiUninstallOutcome::HomeMissing => {
-            eprintln!("  {} $HOME not set — cannot locate Kimi config.", "!".yellow());
-        }
     }
     Ok(())
 }
@@ -1199,14 +1199,11 @@ fn print_status_claude() -> io::Result<()> {
 
 fn print_status_kimi() {
     use colored::Colorize;
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => {
-            println!("  {}", "HOME not set — cannot locate Kimi config.".yellow());
-            return;
-        }
-    };
-    let config_path = PathBuf::from(&home).join(".kimi").join("config.toml");
+    // Stage 2.3 windows-compat: status display always works now —
+    // resolve_user_home falls back through HOME → USERPROFILE → "." so
+    // we never hit the bare "HOME not set" path on Windows.
+    let config_path = crate::commands_account::resolve_user_home()
+        .join(".kimi").join("config.toml");
     println!("  {}: {}", "file".dimmed(), config_path.display());
     println!(
         "  {}: {}",
@@ -1234,7 +1231,7 @@ fn print_status_kimi() {
                 .yellow()
         ),
     }
-    let backup = PathBuf::from(&home)
+    let backup = crate::commands_account::resolve_user_home()
         .join(".kimi")
         .join("config.aikey_backup.toml");
     if backup.exists() {
@@ -1247,12 +1244,12 @@ fn print_status_kimi() {
 // ---------------------------------------------------------------------------
 
 fn claude_settings_path() -> Option<PathBuf> {
-    // Prefer HOME because `dirs::home_dir()` would add a heavy dependency just
-    // for this lookup.  Falls back to USERPROFILE for Windows parity with the
-    // rest of the CLI (matches `resolve_aikey_dir()`).
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(".claude").join("settings.json"))
+    // Stage 2.3 windows-compat: route through `resolve_user_home()`. The
+    // claude-code CLI on Windows reads `%USERPROFILE%\.claude\settings.json`
+    // natively, so the same dir layout works on both platforms — only the
+    // home-resolution chain changes.
+    Some(crate::commands_account::resolve_user_home()
+        .join(".claude").join("settings.json"))
 }
 
 /// Backup path: `<dir>/settings.aikey_backup.json`.  The backup is always a
@@ -1781,33 +1778,19 @@ mod tests {
         // Fresh file — must survive.
         write_watermark_in(&dir, "fresh", "wal.jsonl", 1).unwrap();
 
-        // Stale file — age mtime to 10 days ago via utimensat (libc).
+        // Stale file — age mtime to 10 days ago. Stage 1.5 windows-compat:
+        // use the cross-platform `filetime` crate (Unix utimensat / Windows
+        // SetFileTime) so this assertion runs on Windows too.
         let stale = dir.join("stale.watermark");
         std::fs::write(&stale, "old\t1").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            let c_path = std::ffi::CString::new(stale.as_os_str().as_bytes()).unwrap();
-            let ten_days_ago = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                - 10 * 24 * 3600;
-            let ts = libc::timespec {
-                tv_sec: ten_days_ago as libc::time_t,
-                tv_nsec: 0,
-            };
-            let times = [ts, ts];
-            // SAFETY: C FFI, path and times are valid for the call duration.
-            unsafe {
-                libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0);
-            }
-        }
+        let ten_days_ago = std::time::SystemTime::now()
+            - std::time::Duration::from_secs(10 * 24 * 3600);
+        let ft = filetime::FileTime::from_system_time(ten_days_ago);
+        filetime::set_file_times(&stale, ft, ft).unwrap();
 
         gc_stale_watermarks_in(&dir).unwrap();
 
         assert!(dir.join("fresh.watermark").exists(), "fresh file should survive GC");
-        #[cfg(unix)]
         assert!(!stale.exists(), "stale file should be purged by GC");
 
         std::fs::remove_dir_all(&dir).ok();
