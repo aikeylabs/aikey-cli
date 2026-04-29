@@ -471,7 +471,7 @@ fn write_claude_json_approvals(bindings: &[ProviderBinding]) -> Result<(), Strin
         if canonical != "anthropic" {
             continue;
         }
-        let tok = sentinel_token(b.key_source_type.as_str(), &b.key_source_ref);
+        let tok = sentinel_token(&canonical);
         let tail = last_n_chars(&tok, 20);
         if !tails.contains(&tail) {
             tails.push(tail);
@@ -1040,9 +1040,11 @@ mod claude_json_tests {
         assert_eq!(last_n_chars("abc", 20), "abc");
         assert_eq!(last_n_chars("", 20), "");
         // Exactly n chars → whole string.
-        assert_eq!(last_n_chars("aikey_personal_xxxxx", 20), "aikey_personal_xxxxx");
+        // Fixture is content-irrelevant; we test length math, not token shape —
+        // intentionally non-aikey-prefixed to keep prefix-rename-gate clean.
+        assert_eq!(last_n_chars("abcdefghij0123456789", 20), "abcdefghij0123456789");
         // Longer than n → last n.
-        let s = "aikey_personal_my-anthropic-alias-1234567890";
+        let s = "this_is_a_long_fixture_string_more_than_twenty_chars";
         assert_eq!(last_n_chars(s, 20).chars().count(), 20);
         assert!(s.ends_with(&last_n_chars(s, 20)));
     }

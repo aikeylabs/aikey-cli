@@ -484,6 +484,13 @@ where
         return result;
     }
 
+    // Note (2026-04-29): Earlier draft of fix C added an OAuth probe
+    // short-circuit here. After fix A (proxy.go Tier2Probe OAuth branch)
+    // landed and was verified working, C became redundant and was actively
+    // hiding A's success — cells went empty in the panel because the
+    // short-circuit returned api_status=999 before the real probe ran.
+    // Removed in same PR. See bugfix/2026-04-29-oauth-probe-tier2-503.md.
+
     let agent = build_proxy_aware_agent(Duration::from_secs(10));
 
     // Is this probe flowing through our own local aikey-proxy? If so the
