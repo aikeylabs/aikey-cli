@@ -471,7 +471,15 @@ fn write_claude_json_approvals(bindings: &[ProviderBinding]) -> Result<(), Strin
         if canonical != "anthropic" {
             continue;
         }
-        let tok = sentinel_token(b.key_source_type.as_str(), &b.key_source_ref);
+        // Pass the canonical provider — the upstream MAC refactor
+        // (20260429-token前缀按角色重命名) collapsed sentinel_token to a
+        // single canonical_provider arg, but missed propagating the
+        // signature change here. Using `&canonical` produces
+        // `aikey_active_anthropic`, matching the cross-role invariant
+        // documented in sentinel_token's doc-comment ("sentinel stays
+        // the same; only the binding table changes" across role
+        // switches).
+        let tok = sentinel_token(&canonical);
         let tail = last_n_chars(&tok, 20);
         if !tails.contains(&tail) {
             tails.push(tail);
