@@ -52,7 +52,18 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
 
     for b in &bindings {
         if let Some((api_key_var, base_url_var)) = provider_env_vars_pub(&b.provider_code) {
-            let token = sentinel_token(&b.provider_code);
+            // Canonicalize before deriving the sentinel. See
+            // sentinel_token's doc-comment + spec §6.1 in
+            // 20260429-token前缀按角色重命名.md: `<provider>` MUST be a
+            // canonical code (lowercase ASCII, no underscore/dot
+            // suffix). Without canonicalization, OAuth-derived bindings
+            // whose provider_code is e.g. "claude.ai" would produce
+            // `aikey_active_claude.ai`, breaking the namespace-isolation
+            // invariant in §3 and the proxy `aikey_*` tier switch.
+            let canonical_provider = crate::commands_account::oauth_provider_to_canonical(
+                &b.provider_code.to_lowercase(),
+            );
+            let token = sentinel_token(canonical_provider);
             let base_url = format!(
                 "http://127.0.0.1:{}/{}",
                 proxy_port,
@@ -471,6 +482,14 @@ fn write_claude_json_approvals(bindings: &[ProviderBinding]) -> Result<(), Strin
         if canonical != "anthropic" {
             continue;
         }
+        // Pass the canonical provider — the upstream MAC refactor
+        // (20260429-token前缀按角色重命名) collapsed sentinel_token to a
+        // single canonical_provider arg, but missed propagating the
+        // signature change here. Using `&canonical` produces
+        // `aikey_active_anthropic`, matching the cross-role invariant
+        // documented in sentinel_token's doc-comment ("sentinel stays
+        // the same; only the binding table changes" across role
+        // switches).
         let tok = sentinel_token(&canonical);
         let tail = last_n_chars(&tok, 20);
         if !tails.contains(&tail) {
