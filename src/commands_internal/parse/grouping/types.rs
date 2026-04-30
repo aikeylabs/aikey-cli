@@ -199,12 +199,12 @@ pub struct DraftRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub login_url: Option<String>,
-    /// v4.2: 推断出的 provider 对应的官方 API base_url。
+    /// v4.3 (2026-05-01): 推断出的 provider 对应的官方 API base_url。
     ///
-    /// 由 parse handler 从 `FingerprintClassifier::base_url_for_family` 填充;
-    /// 未推断 / yaml 未配时为 None。UI "use official" 按钮消费此字段填入
-    /// `fields.base_url`。之前硬编码在前端 PROVIDER_DEFAULT_BASE_URL Record,
-    /// 现挪 YAML —— ControlPanel 可热更新,新聚合网关出现无需前端发版。
+    /// 由 parse handler 从 `FingerprintClassifier::route_for_host` (优先) 或
+    /// `route_for_provider` (fallback) 查 yaml provider_routes 表得到,
+    /// 值 = base_url + version。未推断 / yaml 未配时为 None。UI "use official"
+    /// 按钮消费此字段填入 `fields.base_url`。
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub official_base_url: Option<String>,

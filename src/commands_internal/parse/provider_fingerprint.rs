@@ -61,6 +61,19 @@ pub struct Disambiguator {
     pub suggest: String,
 }
 
+/// v4.3 (2026-05-01): per-host upstream routing entry. See yaml `provider_routes`
+/// section for full schema. Replaces former family_base_urls + host_to_base_url
+/// + proxy applyBaseURL tail-overlap dedup with a single declarative table.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct ProviderRoute {
+    pub host: String,
+    pub protocol: String,
+    pub provider: String,
+    pub base_url: String,
+    #[serde(default)]
+    pub version: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct Registry {
     #[allow(dead_code)]
@@ -74,15 +87,12 @@ struct Registry {
     /// UI "Open login page" 按钮消费此字段(window.open)
     #[serde(default)]
     family_login_urls: std::collections::HashMap<String, String>,
-    /// v4.2: family → 官方 API endpoint base_url
-    /// UI "use official" 按钮点击填入 draft.fields.base_url 消费此表
+    /// v4.3 (2026-05-01): per-host upstream routing table. 替代 v4.2 的
+    /// family_base_urls + v4.2.1 的 host_to_base_url + proxy applyBaseURL
+    /// 的 dedup 算法。每行声明 host → (protocol, provider, base_url, version),
+    /// proxy/CLI/UI 共用单一查表。
     #[serde(default)]
-    family_base_urls: std::collections::HashMap<String, String>,
-    /// v4.2.1 (2026-05-01): host → base_url 精分流 override.
-    /// 解析到具体 URL host 时优先查这张表;查不到再回落到 family_base_urls。
-    /// 让同 family 下多 host 各自路由不同 endpoint (kimi.com vs moonshot.cn)。
-    #[serde(default)]
-    host_to_base_url: std::collections::HashMap<String, String>,
+    provider_routes: Vec<ProviderRoute>,
 }
 
 // ========== Classifier ==========
@@ -93,10 +103,11 @@ pub struct FingerprintClassifier {
     aggregator_families: std::collections::HashSet<String>,
     /// v4.1 Stage 10+: family → 登录页 URL 映射(从 yaml 加载)
     family_login_urls: std::collections::HashMap<String, String>,
-    /// v4.2: family → 官方 API base_url 映射(从 yaml 加载)
-    family_base_urls: std::collections::HashMap<String, String>,
-    /// v4.2.1: host → base_url 精分流 override 表(从 yaml 加载)
-    host_to_base_url: std::collections::HashMap<String, String>,
+    /// v4.3 (2026-05-01): per-host upstream routing table. Lookup by host
+    /// returns the full route declaration (protocol, provider, base_url,
+    /// version). 同一 provider 可有多 host 行 (e.g. kimi 下 api.kimi.com 与
+    /// api.moonshot.cn 是两行,都 provider=kimi 但 base_url 不同)。
+    provider_routes: Vec<ProviderRoute>,
 }
 
 impl FingerprintClassifier {
@@ -115,9 +126,8 @@ impl FingerprintClassifier {
         let aggregator_families: std::collections::HashSet<String> =
             reg.aggregator_families.into_iter().collect();
         let family_login_urls = reg.family_login_urls;
-        let family_base_urls = reg.family_base_urls;
-        let host_to_base_url = reg.host_to_base_url;
-        Self { entries, aggregator_families, family_login_urls, family_base_urls, host_to_base_url }
+        let provider_routes = reg.provider_routes;
+        Self { entries, aggregator_families, family_login_urls, provider_routes }
     }
 
     /// v4.1 Stage 5+: 从 inferred provider family 派生 protocol_types 列表。
@@ -137,30 +147,39 @@ impl FingerprintClassifier {
         self.family_login_urls.get(family).cloned()
     }
 
-    /// v4.2: 查 family 的官方 API base_url (UI "use official" 按钮填入)
-    pub fn base_url_for_family(&self, family: &str) -> Option<String> {
-        self.family_base_urls.get(family).cloned()
+    /// v4.3: lookup provider_route by host (exact match, lowercase host expected).
+    /// Returns None if host not in table (UI/proxy treats as "third-party gateway,
+    /// no auto routing"; user must declare it via a new yaml row).
+    pub fn route_for_host(&self, host: &str) -> Option<&ProviderRoute> {
+        self.provider_routes.iter().find(|r| r.host.eq_ignore_ascii_case(host))
+    }
+
+    /// v4.3: lookup the FIRST route matching a provider_code. Used as a family-
+    /// level fallback when no host info is available (e.g. user picks a
+    /// provider chip without pasting a URL). Multi-host providers (kimi)
+    /// return their first row's route — caller knows this is heuristic.
+    pub fn route_for_provider(&self, provider: &str) -> Option<&ProviderRoute> {
+        self.provider_routes.iter().find(|r| r.provider.eq_ignore_ascii_case(provider))
+    }
+
+    /// v4.3: full official URL = base_url + version (with empty-version edge case).
+    /// 这是用户在 UI 上看到 / 期望粘贴的 endpoint URL。
+    pub fn official_url_for_route(route: &ProviderRoute) -> String {
+        if route.version.is_empty() {
+            route.base_url.clone()
+        } else {
+            format!("{}{}", route.base_url, route.version)
+        }
+    }
+
+    /// 整张 provider_routes 列表 (供 `_internal rules` 透传给 Web UI / proxy 编译期 embed)
+    pub fn provider_routes(&self) -> &[ProviderRoute] {
+        &self.provider_routes
     }
 
     /// 全量 family → 登录页 URL 映射 (用于 `_internal rules` 把整张表透出给 Web UI)
     pub fn family_login_urls_map(&self) -> &std::collections::HashMap<String, String> {
         &self.family_login_urls
-    }
-
-    /// 全量 family → 官方 API base_url 映射 (同上,用于 _internal rules)
-    pub fn family_base_urls_map(&self) -> &std::collections::HashMap<String, String> {
-        &self.family_base_urls
-    }
-
-    /// v4.2.1: 按 host 精分流查 base_url。host 应预先归一(小写、去 port、去
-    /// path),典型来自 `extract_host(parsed_url)`。
-    pub fn base_url_for_host(&self, host: &str) -> Option<String> {
-        self.host_to_base_url.get(host).cloned()
-    }
-
-    /// 全量 host → base_url 映射 (用于 _internal rules 透传给前端)
-    pub fn host_to_base_url_map(&self) -> &std::collections::HashMap<String, String> {
-        &self.host_to_base_url
     }
 
     /// 直接分类（不用上下文）

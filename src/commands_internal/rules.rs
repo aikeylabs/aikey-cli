@@ -72,20 +72,25 @@ fn build_rules_payload() -> Value {
         Value::Object(out)
     };
 
+    // v4.3 (2026-05-01): 把 provider_routes 整张表透传给 Web UI / proxy。
+    // 顺序保留 yaml 声明序 (host 不去重排,因为多 host 行的相对顺序在 yaml
+    // 里是设计意图,前端按 host map 查表与顺序无关;但稳定输出对调试更友好)。
+    let routes_json = serde_json::to_value(fp.provider_routes())
+        .expect("provider_routes serialise");
+
     json!({
         "layer_versions": {
             "rules":       LAYER_VERSION_RULES,
             "crf":         LAYER_VERSION_CRF,
             "fingerprint": LAYER_VERSION_FINGERPRINT,
         },
-        "sample_providers": SAMPLE_PROVIDERS,
-        "family_base_urls":  to_sorted_obj(fp.family_base_urls_map()),
+        "sample_providers":  SAMPLE_PROVIDERS,
         "family_login_urls": to_sorted_obj(fp.family_login_urls_map()),
-        // v4.2.1 (2026-05-01): per-host base_url 精分流表。前端
-        // applyOfficialDefaults Rule 2 在查 family_base_urls 之前先查它。
-        // 解决同 family 多 host 各走不同 endpoint 的场景 (kimi.com 编程
-        // 模型 vs moonshot.cn 平台)。Go 端 rulesFallback 也得同步加。
-        "host_to_base_url":  to_sorted_obj(fp.host_to_base_url_map()),
+        // v4.3: per-host upstream routing table. Each entry:
+        //   { host, protocol, provider, base_url, version }
+        // 替代旧 family_base_urls + host_to_base_url 两层 + proxy applyBaseURL
+        // 的 dedup 算法。前端 / Go fallback / proxy 全部从这一张表取数。
+        "provider_routes":   routes_json,
     })
 }
 
@@ -94,40 +99,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rules_payload_carries_both_maps() {
+    fn rules_payload_exposes_provider_routes() {
         let v = build_rules_payload();
-        // shape sanity
         assert!(v["layer_versions"]["rules"].is_string());
         assert!(v["sample_providers"].is_array());
 
-        // both YAML maps reach the wire
-        let base = &v["family_base_urls"];
-        assert_eq!(base["anthropic"], "https://api.anthropic.com");
-        assert_eq!(base["openai"], "https://api.openai.com/v1");
-
         let login = &v["family_login_urls"];
-        // Critical: this is the gap that motivated the whole refactor —
-        // user pastes aistudio.google.com / dashscope.console.aliyun.com,
-        // Web UI's host-match Rule 2 only fires if these hosts are in the
-        // login_urls payload.
         assert_eq!(login["google_gemini"], "https://aistudio.google.com/app/apikey");
         assert_eq!(login["qwen"], "https://dashscope.console.aliyun.com/apiKey");
 
-        // v4.2.1: kimi family 下两个不同 endpoint 都被 host_to_base_url 精分
-        // 流到正确 URL。这是修 "web import 把 sk-kimi-* 错误路由到 moonshot
-        // 端点" 的根因(2026-05-01 bugfix)。
-        let h2b = &v["host_to_base_url"];
-        assert_eq!(h2b["api.kimi.com"], "https://api.kimi.com/coding/v1");
-        assert_eq!(h2b["api.moonshot.cn"], "https://api.moonshot.cn/v1");
-    }
+        // v4.3: provider_routes 表是单一权威源。前端 + proxy 都从这取。
+        let routes = v["provider_routes"].as_array().expect("provider_routes array");
+        assert!(!routes.is_empty(), "provider_routes must have entries");
 
-    #[test]
-    fn family_base_urls_keys_are_sorted() {
-        let v = build_rules_payload();
-        let obj = v["family_base_urls"].as_object().expect("object");
-        let keys: Vec<&String> = obj.keys().collect();
-        let mut sorted = keys.clone();
-        sorted.sort();
-        assert_eq!(keys, sorted, "family_base_urls keys must be sorted for stable wire output");
+        // pin: kimi family 下 api.kimi.com 与 api.moonshot.cn 是两条独立
+        // 路由(同 provider=kimi,但 base_url 不同),修 2026-05-01 bug 的关键。
+        let kimi_coding = routes.iter()
+            .find(|r| r["host"] == "api.kimi.com")
+            .expect("api.kimi.com route present");
+        assert_eq!(kimi_coding["provider"], "kimi");
+        assert_eq!(kimi_coding["base_url"], "https://api.kimi.com/coding");
+        assert_eq!(kimi_coding["version"], "/v1");
+
+        let moonshot = routes.iter()
+            .find(|r| r["host"] == "api.moonshot.cn")
+            .expect("api.moonshot.cn route present");
+        assert_eq!(moonshot["provider"], "kimi");      // same family
+        assert_eq!(moonshot["base_url"], "https://api.moonshot.cn");  // but different upstream
+        assert_eq!(moonshot["version"], "/v1");
+
+        // perplexity: empty version (no /v1 path segment in upstream)
+        let perplexity = routes.iter()
+            .find(|r| r["host"] == "api.perplexity.ai")
+            .expect("api.perplexity.ai route present");
+        assert_eq!(perplexity["version"], "");
     }
 }

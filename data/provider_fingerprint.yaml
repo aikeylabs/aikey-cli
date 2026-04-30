@@ -60,83 +60,61 @@ family_login_urls:
   yunwu:         "https://yunwu.ai"
   zeroeleven:    "https://0011.ai"
 
-# v4.2: family → 官方 base_url (API endpoint)
+# v4.3 (2026-05-01) · provider_routes: per-host upstream routing table.
 #
-# UI "use official" 按钮点击后,把对应 family 的 base_url 填入 draft.fields.base_url。
-# parse handler 为每个 draft 的 inferred_provider 查此表,写入 DraftRecord.official_base_url。
+# 用途: 用一张声明式表代替原 family_base_urls + host_to_base_url 两层映射 +
+# proxy applyBaseURL 的 tail-overlap dedup 算法。每行 = 一个 host 的完整路由
+# 声明; 新加 gateway 加一行,不动代码。
 #
-# 与 family_login_urls 的区别:
-#   family_login_urls    → 浏览器打开的登录 / API key 管理页面 (https://..../login)
-#   family_base_urls     → API 请求发往的 endpoint (https://api..../v1)
+# 字段语义:
+#   host       URL host portion (用户粘贴 / vault 存储 base_url 抽出的 host)
+#   protocol   匹配 aikey-proxy provider registry 的 protocol 名 (anthropic /
+#              openai_compatible / gemini),决定 RewriteRequest 实现
+#   provider   canonical provider_code (写入 vault.entries.provider_code,
+#              CLI / UI / DB 一致使用; 同 provider 可有多 host 行,如 kimi
+#              下 api.kimi.com 与 api.moonshot.cn 都是 provider=kimi)
+#   base_url   上游 root URL (host + 任何 path prefix BEFORE version,不含 version)
+#   version    API version path 段,proxy 会显式 append; 部分 provider 无 version
+#              (perplexity 直接 /chat/completions),写空字符串
 #
-# 挪进 YAML 的 Why: ControlPanel 可热更新,新聚合网关出现不用前端发版;
-# 原本这张表硬编码在 aikey-control/web PROVIDER_DEFAULT_BASE_URL Record 里。
+# proxy 拼接规则 (一条数学规则):
+#   final_url = base_url + version + (request_path 剥掉 leading version 后的部分)
+# 客户端可能带 /v1 (kimi-cli / anthropic SDK), 也可能不带 (OpenAI SDK 把 /v1
+# 当作 base_url 的一部分自己 append) —— 都被 strip 一次后由 proxy 显式补回,
+# 拼出去重唯一的 upstream URL。无 if/else 特例。
 #
-# 数据来源 (2026-04 校对):
-#   - Anthropic:    官方 https://api.anthropic.com
-#   - OpenAI:       官方 v1
-#   - Kimi:         Kimi Coding v1 (api.kimi.com/coding/v1) — 项目 sandbox.env
-#                   认定的"kimi family"指 Kimi 编程模型产品线;Moonshot 平台
-#                   (api.moonshot.cn/v1) 是同公司另一条产品线但 KEY 形态不同
-#                   (sk-Kh* vs sk-kimi-*),不在本 default 含义内。2026-05-01
-#                   修正:之前默认值 api.moonshot.cn/v1 与 CLI connectivity
-#                   probe (硬编码 api.kimi.com/coding/v1) 自相矛盾,导致 web
-#                   import 自动填充把 sk-kimi-* KEY 路由到错误端点,鉴权失败。
-#   - DeepSeek:     官方 v1
-#   - Gemini:       Google generativelanguage
-#   - Groq:         OpenAI-兼容 v1
-#   - XAI Grok:     官方 v1
-#   - Zhipu GLM:    bigmodel.cn (智谱 PAAS)
-#   - Doubao:       Volcengine Ark v3
-#   - Qwen:         DashScope OpenAI-compat v1 (阿里通义千问)
-#   - SiliconFlow:  siliconflow.cn v1
-#   - HuggingFace:  inference v1
-#   - Perplexity:   perplexity.ai v1
-#   - OpenRouter:   聚合 v1
-#   - Yunwu:        云雾 聚合 v1
-#   - Zeroeleven:   0011 聚合 (2026-04 迁至 aicoding.2233.ai)
-family_base_urls:
-  anthropic:     "https://api.anthropic.com"
-  openai:        "https://api.openai.com/v1"
-  kimi:          "https://api.kimi.com/coding/v1"  # 兜底:无 URL 解析到时使用
-  deepseek:      "https://api.deepseek.com/v1"
-  google_gemini: "https://generativelanguage.googleapis.com"
-  groq:          "https://api.groq.com/openai/v1"
-  xai_grok:      "https://api.x.ai/v1"
-  zhipu:         "https://open.bigmodel.cn/api/paas"
-  doubao:        "https://ark.cn-beijing.volces.com/api/v3"
-  qwen:          "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  siliconflow:   "https://api.siliconflow.cn/v1"
-  huggingface:   "https://api-inference.huggingface.co/v1"
-  perplexity:    "https://api.perplexity.ai/v1"
-  openrouter:    "https://openrouter.ai/api/v1"
-  yunwu:         "https://yunwu.ai/v1"
-  zeroeleven:    "https://aicoding.2233.ai"
-
-# v4.2.1 (2026-05-01): per-host base_url override.
+# Web import "use official" 按钮:
+#   user 粘贴 URL → 抽 host → lookup → official URL = base_url + version
 #
-# 用途: import 解析到具体 URL host 时优先查这张表,获得"哪个 host 用哪个
-# endpoint" 的精确映射;查不到再回落到 family_base_urls。这一层补全了同一
-# protocol family 下多个 host 各自路由不同 endpoint 的能力。
-#
-# 典型场景: kimi family 同时覆盖 Kimi Coding (api.kimi.com/coding/v1) 和
-# Moonshot 平台 (api.moonshot.cn/v1)——两条产品线协议族相同 (OpenAI-compat),
-# 但 endpoint 不同; 用 family_base_urls 这一层无法区分。
-#
-# 解析顺序 (consume 端: applyOfficialDefaults / classifier.base_url_for_host):
-#   1. host 命中 host_to_base_url     → 用该 URL
-#   2. 否则查 inferred_provider 对应的 family_base_urls → 用 family 兜底 URL
-#   3. 都查不到 → 留空,UI 上提示用户手填
-#
-# 关键: 不需要拆 provider_code (kimi 仍是单一 family,protocol_types=[kimi]),
-# 只是 base_url 这一字段按 host 精分流。Why: v4.1 时项目主动从 'moonshot_kimi'
-# rename 为 'kimi' 以避免名词分裂; 这次的 fix 不反转那一决策,只在 base_url
-# 维度补一张更精的 host map。
-host_to_base_url:
-  "api.kimi.com":          "https://api.kimi.com/coding/v1"
-  "www.kimi.com":          "https://api.kimi.com/coding/v1"
-  "api.moonshot.cn":       "https://api.moonshot.cn/v1"
-  "platform.moonshot.cn":  "https://api.moonshot.cn/v1"
+# 数据来源 (2026-05-01 校对):
+#   - Anthropic:   官方 https://api.anthropic.com/v1
+#   - OpenAI:      官方 https://api.openai.com/v1
+#   - Kimi Coding: https://api.kimi.com/coding/v1 (sk-kimi-* KEY 形态)
+#   - Moonshot:    https://api.moonshot.cn/v1 (sk-Kh* KEY 形态; 同 provider=kimi
+#                  family,但产品线 / endpoint 不同)
+#   - DeepSeek / Groq / xAI / OpenRouter / Perplexity / Gemini / Zhipu /
+#     Doubao / Qwen / SiliconFlow / HuggingFace / Yunwu / Zeroeleven 同上游
+#     官方文档,详见各 provider 主页。
+provider_routes:
+  - { host: "api.anthropic.com",                  protocol: anthropic,         provider: anthropic,     base_url: "https://api.anthropic.com",                  version: "/v1"     }
+  - { host: "api.openai.com",                     protocol: openai_compatible, provider: openai,        base_url: "https://api.openai.com",                     version: "/v1"     }
+  - { host: "api.kimi.com",                       protocol: openai_compatible, provider: kimi,          base_url: "https://api.kimi.com/coding",                version: "/v1"     }
+  - { host: "www.kimi.com",                       protocol: openai_compatible, provider: kimi,          base_url: "https://api.kimi.com/coding",                version: "/v1"     }
+  - { host: "api.moonshot.cn",                    protocol: openai_compatible, provider: kimi,          base_url: "https://api.moonshot.cn",                    version: "/v1"     }
+  - { host: "platform.moonshot.cn",               protocol: openai_compatible, provider: kimi,          base_url: "https://api.moonshot.cn",                    version: "/v1"     }
+  - { host: "api.deepseek.com",                   protocol: openai_compatible, provider: deepseek,      base_url: "https://api.deepseek.com",                   version: "/v1"     }
+  - { host: "api.groq.com",                       protocol: openai_compatible, provider: groq,          base_url: "https://api.groq.com/openai",                version: "/v1"     }
+  - { host: "api.x.ai",                           protocol: openai_compatible, provider: xai_grok,      base_url: "https://api.x.ai",                           version: "/v1"     }
+  - { host: "openrouter.ai",                      protocol: openai_compatible, provider: openrouter,    base_url: "https://openrouter.ai/api",                  version: "/v1"     }
+  - { host: "api.perplexity.ai",                  protocol: openai_compatible, provider: perplexity,    base_url: "https://api.perplexity.ai",                  version: ""        }
+  - { host: "generativelanguage.googleapis.com",  protocol: gemini,            provider: google_gemini, base_url: "https://generativelanguage.googleapis.com",  version: "/v1beta" }
+  - { host: "open.bigmodel.cn",                   protocol: openai_compatible, provider: zhipu,         base_url: "https://open.bigmodel.cn/api/paas",          version: ""        }
+  - { host: "ark.cn-beijing.volces.com",          protocol: openai_compatible, provider: doubao,        base_url: "https://ark.cn-beijing.volces.com/api",      version: "/v3"     }
+  - { host: "dashscope.aliyuncs.com",             protocol: openai_compatible, provider: qwen,          base_url: "https://dashscope.aliyuncs.com/compatible-mode", version: "/v1" }
+  - { host: "api.siliconflow.cn",                 protocol: openai_compatible, provider: siliconflow,   base_url: "https://api.siliconflow.cn",                 version: "/v1"     }
+  - { host: "api-inference.huggingface.co",       protocol: openai_compatible, provider: huggingface,   base_url: "https://api-inference.huggingface.co",       version: "/v1"     }
+  - { host: "yunwu.ai",                           protocol: openai_compatible, provider: yunwu,         base_url: "https://yunwu.ai",                           version: "/v1"     }
+  - { host: "aicoding.2233.ai",                   protocol: openai_compatible, provider: zeroeleven,    base_url: "https://aicoding.2233.ai",                   version: "/v1"     }
 
 # v4.1 Stage 5+: 聚合网关 family 清单 (UI Provider 字段 multi-select 设计驱动)
 #
