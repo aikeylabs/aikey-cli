@@ -4,3 +4,14 @@
 # Unix targets keep their default linker — change scoped to MSVC only.
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld.exe"
+
+# Cross-compile from macOS to Linux musl (statically linked, portable).
+# Linkers come from `brew install messense/macos-cross-toolchains/{x86_64,aarch64}-unknown-linux-musl`.
+# Why musl over glibc: static linking → no glibc-version compat issues across
+# Linux distros, single binary works everywhere from minimal containers to
+# desktop. Trade-off: slightly larger binary, no dlopen.
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-unknown-linux-musl-gcc"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-unknown-linux-musl-gcc"

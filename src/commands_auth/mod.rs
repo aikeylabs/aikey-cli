@@ -254,6 +254,26 @@ fn submit_code_and_finish(
         let _ = crate::storage::ensure_provider_account_route_token(account_id);
     }
 
+    // Auto-bind as Primary for the freshly-logged-in provider, then
+    // refresh active.env. Without this, `aikey auth login <provider>`
+    // saves the OAuth account but leaves shell + proxy still pointed at
+    // whichever credential was Primary before — UX divergence from the
+    // personal-key path, which auto-binds in `Commands::Add`
+    // (main.rs:1093-1099). `auto_assign_primaries_for_key` is
+    // conservative: only fills providers that currently have no Primary,
+    // so re-logging into a provider where another credential is already
+    // Primary won't silently steal the binding (use `aikey use <display>`
+    // for the explicit switch). `provider` here is the broker code
+    // (claude/codex/kimi); the helper canonicalizes internally.
+    if !account_id.is_empty() {
+        let _ = crate::profile_activation::auto_assign_primaries_for_key(
+            "personal_oauth_account",
+            account_id,
+            &[provider.to_string()],
+        );
+        let _ = crate::profile_activation::refresh_implicit_profile_activation();
+    }
+
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
@@ -302,6 +322,20 @@ fn poll_login_status(
                 // Generate route token for per-request proxy routing (API gateway).
                 if !account_id.is_empty() {
                     let _ = crate::storage::ensure_provider_account_route_token(account_id);
+                }
+
+                // Auto-bind as Primary + refresh active.env. See identical
+                // block in `login_setup_token` for rationale (mirrors
+                // `Commands::Add`'s post-write step so OAuth login produces
+                // the same "ready to use" state). Conservative: only assigns
+                // if no Primary exists for this provider yet.
+                if !account_id.is_empty() {
+                    let _ = crate::profile_activation::auto_assign_primaries_for_key(
+                        "personal_oauth_account",
+                        account_id,
+                        &[provider.to_string()],
+                    );
+                    let _ = crate::profile_activation::refresh_implicit_profile_activation();
                 }
 
                 if json_mode {

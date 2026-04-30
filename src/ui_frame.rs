@@ -97,7 +97,10 @@ pub fn term_width() -> usize {
         for fd in [libc::STDERR_FILENO, libc::STDOUT_FILENO, libc::STDIN_FILENO] {
             unsafe {
                 let mut ws = MaybeUninit::<Winsize>::zeroed();
-                if libc::ioctl(fd, TIOCGWINSZ, ws.as_mut_ptr()) == 0 {
+                // `as _`: ioctl's `request` parameter type is platform-dependent
+                // (c_ulong on darwin / linux-gnu, c_int on linux-musl). Let the
+                // compiler infer per target instead of forcing one type.
+                if libc::ioctl(fd, TIOCGWINSZ as _, ws.as_mut_ptr()) == 0 {
                     let ws = ws.assume_init();
                     if ws.ws_col > 0 { return ws.ws_col as usize; }
                 }

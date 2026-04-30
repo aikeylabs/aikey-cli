@@ -777,6 +777,27 @@ pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> 
         }
     }
 
+    // Personal-no-console mode (control_plane_mode = "none"): user installed
+    // CLI + Proxy only, no local web console. Falling through to the JWT
+    // branch below would tell them to "Run 'aikey login' first" — confusing
+    // because login is for team/trial OAuth, not Personal. Give the right
+    // hint instead: reinstall with --with-console to enable a local console.
+    if port.is_none() {
+        if let Some(state) = read_install_state() {
+            let mode = state.get("control_plane_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if mode == "none" {
+                return Err(
+                    "No web console on this Personal install (CLI + Proxy only).\n  \
+                     To enable a local console, reinstall with --with-console:\n  \
+                     curl -fsSL https://github.com/aikeylabs/launch/releases/latest/download/latest-install.sh \\\n    \
+                       | sh -s -- --yes --with-console".into()
+                );
+            }
+        }
+    }
+
     // JWT-based browse (team/trial mode).
     let acc = storage::get_platform_account()?
         .ok_or("Not logged in. Run 'aikey login' first.")?;

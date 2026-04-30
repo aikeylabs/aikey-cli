@@ -424,6 +424,27 @@ fn handle_add(env: StdinEnvelope) {
     // entry is still usable until a later `ensure_entry_route_token` fills it.
     let _ = storage::ensure_entry_route_token(&outcome.alias);
 
+    // Auto-assign as Primary + refresh active.env. Mirrors the CLI's
+    // `Commands::Add` post-write block in main.rs:1093-1099 — without
+    // these two calls, a key added via the web UI silently lacks a
+    // provider binding and the proxy/shell never picks it up. (Per
+    // CLAUDE.md `_internal must reuse public command core` — both
+    // entry points should produce identical state.) Best-effort:
+    // failures here don't roll back the entry write that already
+    // succeeded; the metadata can be reconciled later by `aikey use
+    // <alias>`.
+    let newly_primary = profile_activation::auto_assign_primaries_for_key(
+        "personal",
+        &outcome.alias,
+        &outcome.providers,
+    ).unwrap_or_default();
+    let active_env_refreshed = if !newly_primary.is_empty() || !outcome.providers.is_empty() {
+        profile_activation::refresh_implicit_profile_activation().is_ok()
+    } else {
+        // No bindings touched (no providers given) — leave active.env alone.
+        false
+    };
+
     let audit_logged = try_log_audit(&key, AuditOperation::Add, Some(&outcome.alias), true);
 
     emit(&ResultEnvelope::ok(
@@ -433,6 +454,8 @@ fn handle_add(env: StdinEnvelope) {
             "action_taken": outcome.action.as_str(),
             "provider": outcome.primary_provider,
             "providers": outcome.providers,
+            "newly_primary_providers": newly_primary,
+            "active_env_refreshed": active_env_refreshed,
             "audit_logged": audit_logged,
         })),
     ));
