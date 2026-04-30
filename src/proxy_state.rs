@@ -702,7 +702,10 @@ mod tests {
             hint.contains("older CLI") || hint.contains("legacy") || hint.contains("sidecar"),
             "hint must signal this is an upgrade-friction situation, not an external conflict"
         );
-        assert!(hint.contains("kill 54321"), "hint must give a concrete shell command");
+        assert!(
+            hint.contains("kill") && hint.contains("54321"),
+            "hint must give a concrete shell command (kill / kill -9 / taskkill) referencing the PID; got: {hint}"
+        );
     }
 
     #[test]

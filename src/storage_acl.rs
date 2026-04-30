@@ -54,6 +54,16 @@ pub fn enforce_owner_only_dir(path: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn enforce_owner_only(path: &Path, is_dir: bool) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+
+    // Match the cross-platform aikeycompat contract: nonexistent path is a
+    // no-op. The Windows branch already early-returns; without this, the
+    // unix branch would error on ENOENT, forcing every caller into a
+    // "stat first, then enforce" pattern. The eventual MkdirAll/WriteFile
+    // is the source of truth for "does this path exist".
+    if !path.exists() {
+        return Ok(());
+    }
+
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_mode(if is_dir { 0o700 } else { 0o600 });
     std::fs::set_permissions(path, perms)
