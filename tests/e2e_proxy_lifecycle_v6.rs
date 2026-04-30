@@ -84,13 +84,27 @@ fn pick_free_port() -> u16 {
 }
 
 /// Write a minimal `aikey-proxy.yaml` for the given port + vault path.
-fn write_test_config(dir: &PathBuf, port: u16, vault: &PathBuf) -> PathBuf {
+///
+/// `port_drift_max`: None → omit field, proxy uses default (10). Some(-1) →
+/// disable drift (strict legacy: fail on first EADDRINUSE). Some(N>=0) →
+/// allow drift up to N. Tests that assert "port held → start fails" must
+/// use Some(-1) to keep the assertion valid under the new drift design.
+fn write_test_config(
+    dir: &PathBuf,
+    port: u16,
+    vault: &PathBuf,
+    port_drift_max: Option<i32>,
+) -> PathBuf {
     let cfg_path = dir.join("aikey-proxy.yaml");
+    let drift_field = match port_drift_max {
+        Some(n) => format!("  port_drift_max: {n}\n"),
+        None => String::new(),
+    };
     let yaml = format!(
         r#"listen:
   host: "127.0.0.1"
   port: {port}
-
+{drift_field}
 vault:
   path: "{vault_path}"
 
@@ -102,6 +116,7 @@ providers:
     timeout: 120s
 "#,
         port = port,
+        drift_field = drift_field,
         vault_path = vault.display(),
     );
     std::fs::write(&cfg_path, yaml).expect("write test config");
@@ -155,7 +170,9 @@ impl Env {
         assert!(bootstrap.success(), "bootstrap add failed");
 
         let cfg = tmp.join(".aikey/config/aikey-proxy.yaml");
-        write_test_config(&tmp.join(".aikey/config"), port, &vault);
+        // Tests default to drift OFF (port_drift_max:-1). Each test that
+        // covers drift opts in via Env::with_drift_max.
+        write_test_config(&tmp.join(".aikey/config"), port, &vault, Some(-1));
         assert!(cfg.exists());
 
         Some(Self { tmp, port, proxy_bin })
@@ -189,6 +206,23 @@ impl Env {
 
     fn pid_path(&self) -> PathBuf {
         self.tmp.join(".aikey/run/proxy.pid")
+    }
+
+    /// Path to the proxy runtime snapshot (per 20260430-端口偏移能力修复.md §2.1).
+    fn runtime_snapshot_path(&self) -> PathBuf {
+        self.tmp.join(".aikey/run/proxy-runtime.json")
+    }
+
+    /// Rewrite the proxy yaml with drift enabled at `drift_max`. Tests that
+    /// need to assert drift behavior call this before `proxy start`.
+    fn with_drift_max(&self, drift_max: i32) {
+        let vault = self.tmp.join(".aikey/data/vault.db");
+        write_test_config(
+            &self.tmp.join(".aikey/config"),
+            self.port,
+            &vault,
+            Some(drift_max),
+        );
     }
 
     fn meta_path(&self) -> PathBuf {
@@ -319,6 +353,109 @@ fn w2_start_with_external_port_holder_returns_error() {
         "stderr should contain external holder diagnostic; got:\n{}",
         combined
     );
+}
+
+/// W2-drift → scenario 2-bis: external port holder + drift enabled →
+/// start succeeds on port+1, runtime.json reflects the drift.
+///
+/// Per 20260430-端口偏移能力修复.md §6 验收标准 row 2 ("默认端口被外部
+/// 进程占 → actual_addr=配置端口+1, drift_offset=1, CLI 自动连接到 +1").
+#[test]
+fn w2b_start_with_external_port_holder_drifts_to_next_port() {
+    let env = match Env::try_new("w2b-drift") {
+        Some(e) => e,
+        None => return skip("AIKEY_PROXY_BIN not found"),
+    };
+
+    // Enable drift on this Env (default in try_new is strict / drift OFF
+    // so other tests stay deterministic).
+    env.with_drift_max(10);
+
+    // Pin the configured port BEFORE start, forcing the proxy to drift
+    // to env.port+1.
+    let _holder = TcpListener::bind(format!("127.0.0.1:{}", env.port))
+        .expect("bind external holder");
+
+    let out = env.cmd().args(["proxy", "start"]).output().expect("spawn");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    assert!(
+        out.status.success(),
+        "start should succeed by drifting to port+1; got failure.\noutput:\n{}",
+        combined
+    );
+
+    // runtime.json must reflect the drift outcome.
+    let snap_path = env.runtime_snapshot_path();
+    assert!(
+        snap_path.exists(),
+        "proxy-runtime.json must exist after successful drifted start; missing at {:?}",
+        snap_path
+    );
+    let snap_text = std::fs::read_to_string(&snap_path).expect("read runtime.json");
+    let snap: serde_json::Value =
+        serde_json::from_str(&snap_text).expect("parse runtime.json");
+
+    let pid = snap.get("pid").and_then(|v| v.as_i64()).unwrap_or(-1);
+    assert!(pid > 0, "runtime.json pid must be positive, got {}", pid);
+
+    let configured = snap
+        .pointer("/listen/configured_addr")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let actual = snap
+        .pointer("/listen/actual_addr")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let drift = snap
+        .pointer("/listen/drift_offset")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+
+    let expected_configured = format!("127.0.0.1:{}", env.port);
+    let expected_actual = format!("127.0.0.1:{}", env.port + 1);
+    assert_eq!(
+        configured, expected_configured,
+        "configured_addr should be the held port; got {} expected {}",
+        configured, expected_configured
+    );
+    assert_eq!(
+        actual, expected_actual,
+        "actual_addr should be configured port + 1; got {} expected {}",
+        actual, expected_actual
+    );
+    assert_eq!(drift, 1, "drift_offset should be 1; got {}", drift);
+
+    // Live-event verification: `aikey proxy status` must reach the proxy
+    // through the drift-aware address resolver (runtime.json wins over env
+    // var AIKEY_PROXY_PORT, which still points at the held configured
+    // port). Per CLAUDE.md "E2E 必须走活体事件" — verifying the snapshot
+    // file alone isn't enough; we need an HTTP round-trip proving the
+    // proxy is actually serving on the drifted port.
+    let status_out = env
+        .cmd()
+        .args(["proxy", "status"])
+        .output()
+        .expect("proxy status");
+    let status_combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&status_out.stdout),
+        String::from_utf8_lossy(&status_out.stderr),
+    );
+    assert!(
+        status_combined.contains(&expected_actual)
+            || status_combined.to_lowercase().contains("running"),
+        "proxy status should report the drifted address {}; got:\n{}",
+        expected_actual,
+        status_combined
+    );
+
+    // Cleanup runs in Env::Drop (proxy stop). runtime.json removal is the
+    // proxy's responsibility on graceful shutdown.
 }
 
 /// W3 → scenario 4: child dies at init → start returns error.

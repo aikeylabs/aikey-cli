@@ -467,20 +467,53 @@ pub fn post_admin_reload() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Read the `listen.host:port` from the yaml config (best-effort, falls back to default).
+/// Read the proxy's listen address with priority:
+///
+/// 1. **`~/.aikey/run/proxy-runtime.json` `listen.actual_addr` (live pid)**
+///    — the ground truth for an actively running proxy. Wins over
+///    intent-level sources because the proxy may have drifted to N+k due
+///    to runtime port-conflict handling (see 20260430-端口偏移能力修复.md).
+///    "Live pid" means the recorded pid passes a process-alive check;
+///    stale residue from a crashed prior incarnation is ignored.
+/// 2. AIKEY_PROXY_PORT env var (host fixed to 127.0.0.1) — operator
+///    intent override; used when no live proxy is running.
+/// 3. yaml config `listen.host:port` — configured intent.
+/// 4. PROXY_HEALTH_ADDR_DEFAULT (127.0.0.1:27200) — last-resort fallback.
+///
+/// Why runtime.json sits at the top: priority is "where can I actually
+/// reach the proxy?". Intent-level sources tell you *where it should be*;
+/// runtime.json tells you *where it is*. When a live proxy has drifted,
+/// preferring intent over runtime would make `aikey proxy status` /
+/// auto-restart logic talk to the wrong port.
 fn proxy_listen_addr(config_path: Option<&std::path::Path>) -> String {
+    // Priority 1: live runtime.json — actual bound port of the running proxy.
+    if let Some(actual) = read_runtime_actual_addr() {
+        return actual;
+    }
+
+    // Priority 2: env var (intent override; takes effect only when there
+    // is no live proxy to talk to).
+    if let Ok(port_str) = std::env::var("AIKEY_PROXY_PORT") {
+        if let Ok(p) = port_str.trim().parse::<u16>() {
+            return format!("127.0.0.1:{}", p);
+        }
+    }
+
+    // Priority 3: yaml config (configured intent).
+    if let Some(addr) = read_yaml_listen_addr(config_path) {
+        return addr;
+    }
+
+    PROXY_HEALTH_ADDR_DEFAULT.to_string()
+}
+
+/// Minimal yaml parse for `listen.host` / `listen.port`.
+fn read_yaml_listen_addr(config_path: Option<&std::path::Path>) -> Option<String> {
     let path = match config_path {
         Some(p) => p.to_path_buf(),
-        None => match resolve_config(None) {
-            Ok(p) => p,
-            Err(_) => return PROXY_HEALTH_ADDR_DEFAULT.to_string(),
-        },
+        None => resolve_config(None).ok()?,
     };
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(_) => return PROXY_HEALTH_ADDR_DEFAULT.to_string(),
-    };
-    // Minimal parse: look for `host:` and `port:` lines under `listen:`.
+    let text = fs::read_to_string(&path).ok()?;
     let mut host = "127.0.0.1".to_string();
     let mut port = 27200u16;
     let mut in_listen = false;
@@ -495,11 +528,46 @@ fn proxy_listen_addr(config_path: Option<&std::path::Path>) -> String {
                     port = p;
                 }
             } else if !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with(' ') {
-                in_listen = false; // left the listen block
+                in_listen = false;
             }
         }
     }
-    format!("{}:{}", host, port)
+    Some(format!("{}:{}", host, port))
+}
+
+/// Read `listen.actual_addr` from `~/.aikey/run/proxy-runtime.json` IFF
+/// the recorded pid is alive. Returns None when the file is absent,
+/// malformed, or its pid is dead (stale residue from a crashed prior
+/// incarnation).
+fn read_runtime_actual_addr() -> Option<String> {
+    let path = runtime_snapshot_path()?;
+    let text = fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let pid_i64 = v.get("pid")?.as_i64()?;
+    if pid_i64 <= 0 || pid_i64 > u32::MAX as i64 {
+        return None;
+    }
+    let pid = pid_i64 as u32;
+    let actual = v
+        .get("listen")
+        .and_then(|l| l.get("actual_addr"))
+        .and_then(|a| a.as_str())?
+        .to_string();
+    if !process_alive(pid) {
+        return None;
+    }
+    Some(actual)
+}
+
+fn runtime_snapshot_path() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("AIKEY_RUN_DIR") {
+        return Some(std::path::PathBuf::from(dir).join("proxy-runtime.json"));
+    }
+    Some(
+        crate::commands_account::resolve_aikey_dir()
+            .join("run")
+            .join("proxy-runtime.json"),
+    )
 }
 
 // ---------------------------------------------------------------------------

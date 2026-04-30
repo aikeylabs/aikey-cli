@@ -50,10 +50,15 @@ fn pick_free_port() -> u16 {
 /// correctness here, only that start/stop/status work.
 fn write_test_config(dir: &PathBuf, port: u16, vault: &PathBuf) -> PathBuf {
     let cfg_path = dir.join("aikey-proxy.yaml");
+    // port_drift_max: -1 disables drift to preserve "port held → start
+    // fails" assertions in this legacy E2E suite. Drift behavior has
+    // dedicated coverage in e2e_proxy_lifecycle_v6.rs::w2b_*. See
+    // 20260430-端口偏移能力修复.md.
     let yaml = format!(
         r#"listen:
   host: "127.0.0.1"
   port: {port}
+  port_drift_max: -1
 
 vault:
   path: "{vault_path}"

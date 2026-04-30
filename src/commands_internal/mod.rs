@@ -26,6 +26,7 @@ pub mod query;
 pub mod update_alias;
 pub mod parse;
 pub mod rules;
+pub mod init;
 pub mod internal_log;
 
 #[cfg(test)]
@@ -48,6 +49,13 @@ pub enum InternalAction {
 
     /// provider_fingerprint.yaml 静态映射透传（layer 版本 / family_*_urls / sample_providers）
     Rules(StdinOnlyArgs),
+
+    /// Vault first-time initialization (web-driven first-run flow).
+    /// Per 20260430-个人vault-Web首次设置-方案A.md: aikey-local-server
+    /// invokes `aikey _internal init --stdin-json` with `{password}`.
+    /// Distinct from vault-op because vault doesn't exist yet (no
+    /// vault_key to derive); uses its own envelope shape in init.rs.
+    Init(StdinOnlyArgs),
 }
 
 /// 所有 `_internal` 子命令都只接受 `--stdin-json`，JSON 从 stdin 读
@@ -71,12 +79,21 @@ pub fn dispatch(action: &InternalAction) {
     // 注意：所有 action 接收同一 envelope；action 名称通过 envelope.action 字段传
     // —— 这与子命令名（vault-op/query/...）**不冲突**：subcommand 选择模块，envelope.action 选择 action
     // （例如 `_internal vault-op --stdin-json` 下 envelope.action 可以是 "verify"/"add"/...）
+    // Init has its own envelope shape (no vault_key_hex — vault doesn't
+    // exist yet) and reads stdin internally. Dispatch to it before the
+    // shared envelope reader rejects the missing field.
+    if let InternalAction::Init(_) = action {
+        init::handle();
+        return;
+    }
+
     let action_name = match action {
         InternalAction::VaultOp(_)     => "vault-op",
         InternalAction::Query(_)       => "query",
         InternalAction::UpdateAlias(_) => "update-alias",
         InternalAction::Parse(_)       => "parse",
         InternalAction::Rules(_)       => "rules",
+        InternalAction::Init(_)        => unreachable!("handled above"),
     };
     let env = match stdin_json::read_envelope() {
         Ok(e) => e,
@@ -101,5 +118,6 @@ pub fn dispatch(action: &InternalAction) {
         InternalAction::UpdateAlias(_) => update_alias::handle(env),
         InternalAction::Parse(_) => parse::handle(env),
         InternalAction::Rules(_) => rules::handle(env),
+        InternalAction::Init(_) => unreachable!("handled above"),
     }
 }

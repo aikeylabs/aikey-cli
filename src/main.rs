@@ -49,6 +49,7 @@ mod commands_statusline;
 mod commands_watch;
 mod commands_internal;
 mod commands_import;
+mod commands_init;
 #[allow(dead_code)] mod usage_wal;
 mod cli;
 
@@ -711,25 +712,23 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Commands::Init => {
+            // CLI shell: prompt + delegate to the shared init core. The
+            // same core is reused by `_internal vault-op init` for the
+            // web-driven first-run flow (per
+            // 20260430-个人vault-Web首次设置-方案A.md).
             let password = prompt_password_secure("\u{1F512} Set Master Password: ", cli.password_stdin, cli.json)?;
-            let mut salt = [0u8; 16];
-            crypto::generate_salt(&mut salt)?;
 
             if !cli.json {
                 println!("Initializing vault...");
             }
 
-            let result = storage::initialize_vault(&salt, &password);
-            if let Err(e) = result {
+            if let Err(e) = commands_init::core::initialize(&password) {
                 if cli.json {
                     json_output::error(&e, 1);
                 } else {
                     return Err(e.into());
                 }
             }
-
-            audit::initialize_audit_log()?;
-            let _ = audit::log_audit_event(&password, audit::AuditOperation::Init, None, true);
 
             if cli.json {
                 json_output::success(serde_json::json!({

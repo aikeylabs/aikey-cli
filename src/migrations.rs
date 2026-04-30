@@ -56,6 +56,15 @@ static VERSIONS: &[VersionMigration] = &[
         upgrade: v1_0_5_alpha::upgrade,
         rollback: v1_0_5_alpha::rollback,
     },
+    // v1.0.0 = first public GA tag. v1.0.3-alpha → v1.0.5-alpha were
+    // internal milestones (never published), kept in the chain so alpha
+    // users (≤ v1.0.2-alpha) upgrade to GA via the same path. v1.0.0
+    // itself is a no-op marker — see the `v1_0_0` module below for why.
+    VersionMigration {
+        version: "1.0.0",
+        upgrade: v1_0_0::upgrade,
+        rollback: v1_0_0::rollback,
+    },
 ];
 
 /// Run all upgrades up to the current binary version.
@@ -1211,6 +1220,44 @@ pub mod v1_0_5_alpha {
 // usage telemetry) were collapsed into v1.0.4-alpha on 2026-04-23 before either
 // shipped — see the module comment at the top of `v1_0_4_alpha`. Intentionally
 // left blank so the file tree matches the VERSIONS registry.
+
+// ---------------------------------------------------------------------------
+// v1.0.0 — first public GA release
+// ---------------------------------------------------------------------------
+//
+// v1.0.3-alpha through v1.0.5-alpha were authored as internal milestones
+// but never published externally. Their migrations stay in the registry so
+// internal alpha users (≤ v1.0.2-alpha based on workflow/versions/catalog/
+// releases.yaml) upgrade to GA via the same chain — no one-shot bridge.
+//
+// v1.0.0 itself is a marker (no-op upgrade / no-op rollback). Reasons:
+//   - The schema produced by running the registry up through
+//     v1.0.5-alpha is the GA schema; nothing more to do at GA time.
+//   - Keeping v1.0.0 in the registry makes `aikey db rollback --to
+//     v1.0.5-alpha` a meaningful target (rolls back nothing) rather
+//     than a "target not in registry" rejection.
+//   - When real GA-only vault changes are needed in the future, add
+//     them as additional `pub fn upgrade(...)` lines in this module.
+//
+// Why a no-op is safe to call on every CLI command: `upgrade_all`
+// invokes each version's upgrade() unconditionally. Idempotency is
+// the contract; eprintln'ing once per invocation is too noisy, so we
+// stay silent.
+pub mod v1_0_0 {
+    use rusqlite::Connection;
+
+    /// Marker upgrade — no schema changes. Stays as a registered no-op
+    /// so the registry chain has a v1.0.0 anchor for rollback targeting
+    /// and future GA-only DDL.
+    pub fn upgrade(_: &Connection) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Marker rollback — no schema to revert. Symmetry with upgrade().
+    pub fn rollback(_: &Connection) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
