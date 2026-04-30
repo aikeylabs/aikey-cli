@@ -184,6 +184,63 @@ pub(crate) fn kimi_status() -> (bool, bool) {
     (true, hook_present)
 }
 
+/// Apply / revert third-party CLI auto-configuration based on the currently
+/// active provider list.
+///
+/// Why this is a shared helper (regression record 2026-04-30):
+///   The same kimi/codex provider-match-then-write block was inlined in
+///   three places — `aikey use` (interactive), `aikey activate` (refresh
+///   path in main.rs), and the public `handle_key_use` in this module.
+///   The web-side `_internal vault_op handle_use` (which the Vault page's
+///   Use button hits via `vaultApi.use`) was NOT one of them. Result: the
+///   user clicked "Use kimi" in Web, the binding flipped server-side, the
+///   active.env updated — but `~/.kimi/config.toml` never got the
+///   aikey-managed `[[hooks]]` Stop region, so launching `kimi` showed
+///   "Model: not set, send /login to login". User had to drop to a
+///   terminal and re-run `aikey use` to trigger the inline block before
+///   kimi worked. Lifting the logic to a single function fixes the gap
+///   structurally and obeys CLAUDE.md "_internal command reuses public
+///   command core".
+///
+/// Inputs:
+///   `providers` — the canonical provider_code list currently bound (the
+///   helper looks for kimi / moonshot to drive Kimi CLI scaffolding, and
+///   openai / gpt / chatgpt to drive Codex CLI scaffolding).
+///   `proxy_port` — the local proxy port, embedded into the kimi/codex
+///   config.toml so they route requests through aikey-proxy.
+///
+/// Behaviour: idempotent. configure_*_cli is a no-op if the managed region
+/// is already present and matches; unconfigure_*_cli is a no-op if the
+/// region was never written. Non-TTY callers (the Web path) do NOT trigger
+/// the first-install "Proceed? [Y/n]" prompt — configure_*_cli falls
+/// through to the silent write when stderr isn't a terminal.
+pub fn apply_third_party_cli_configs(providers: &[String], proxy_port: u16) {
+    let has_kimi = providers.iter().any(|p| {
+        let c = p.to_lowercase();
+        c == "kimi" || c == "moonshot"
+    });
+    if has_kimi {
+        // Token-agnostic: writes scaffold once; token comes from KIMI_API_KEY env var.
+        configure_kimi_cli(proxy_port);
+    } else {
+        // Switching away from kimi — restore Kimi CLI to standalone mode.
+        unconfigure_kimi_cli();
+    }
+
+    // Codex CLI: inject openai_base_url when openai provider is active.
+    // Why: Codex v0.118+ deprecated OPENAI_BASE_URL env var and reads
+    // openai_base_url from ~/.codex/config.toml instead.
+    let has_openai = providers.iter().any(|p| {
+        let c = p.to_lowercase();
+        c == "openai" || c == "gpt" || c == "chatgpt"
+    });
+    if has_openai {
+        configure_codex_cli(proxy_port);
+    } else {
+        unconfigure_codex_cli();
+    }
+}
+
 /// Ensure the aikey-managed scaffold exists in `~/.kimi/config.toml`.
 ///
 /// Writes the region only if absent or content-drifted — subsequent `aikey use`
@@ -1537,9 +1594,18 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         }
     }
 
+    // Why we tell the user to source rc: writing to ~/.zshrc / ~/.bashrc
+    // does NOT affect the running shell process. Without this hint the user
+    // runs `claude`/`codex` immediately after `aikey auth login` and the
+    // wrapper function is undefined → bare binary runs with no preflight,
+    // no proxy injection. Symptom matches user report 2026-04-30:
+    // "为什么运行 claude 没有触发连通性测试呢？". Show the source command
+    // so they can either run it now, open a new shell tab, or accept that
+    // the next session will be fine.
     Some(format!(
-        "  Shell hook installed in {}{}",
-        rc_file, extra_msg
+        "  Shell hook installed in {}{}\n  \
+         \x1b[33m▲ Run \x1b[36msource {}\x1b[33m (or open a new shell tab) so `claude`/`codex`/`kimi` use the proxy.\x1b[0m",
+        rc_file, extra_msg, rc_file
     ))
 }
 

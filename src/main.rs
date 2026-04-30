@@ -2291,6 +2291,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let changes = pick_providers_interactively()?;
                     if changes.is_empty() {
                         eprintln!("  No changes.");
+                        // Even when bindings didn't change, install the shell
+                        // hook idempotently. Reason: post-`aikey auth login`
+                        // the user's bindings are already correct (auto-bind
+                        // wrote them) → `aikey use` returns "No changes." →
+                        // without this call the .zshrc never gets the hook
+                        // block → `claude` runs the bare binary with no
+                        // preflight + no proxy injection. Calling
+                        // ensure_shell_hook here is idempotent (it rewrites
+                        // the v3 block in-place when already present).
+                        if !*no_hook {
+                            commands_account::ensure_shell_hook(false);
+                        }
                     } else {
                         // Canonical-write (2026-04-24 rule) — interactive
                         // `aikey use` picker's selected bindings go through
@@ -2309,30 +2321,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         // Auto-configure / unconfigure third-party CLI tools.
+                        // Shared helper so this `aikey use` (interactive picker)
+                        // path, `handle_key_use` (programmatic), and the Web-side
+                        // `_internal vault_op handle_use` all stay in lockstep.
+                        // See `apply_third_party_cli_configs` doc-comment for
+                        // the regression history (2026-04-30).
                         let proxy_port = commands_proxy::proxy_port();
                         let all_providers: Vec<String> = refresh.bindings.iter()
                             .map(|b| b.provider_code.clone())
                             .collect();
-
-                        let has_kimi = all_providers.iter().any(|p| {
-                            let c = p.to_lowercase();
-                            c == "kimi" || c == "moonshot"
-                        });
-                        if has_kimi {
-                            commands_account::configure_kimi_cli(proxy_port);
-                        } else {
-                            commands_account::unconfigure_kimi_cli();
-                        }
-
-                        let has_openai = all_providers.iter().any(|p| {
-                            let c = p.to_lowercase();
-                            c == "openai" || c == "gpt" || c == "chatgpt"
-                        });
-                        if has_openai {
-                            commands_account::configure_codex_cli(proxy_port);
-                        } else {
-                            commands_account::unconfigure_codex_cli();
-                        }
+                        commands_account::apply_third_party_cli_configs(&all_providers, proxy_port);
 
                         // Print a summary box showing the final state.
                         use colored::Colorize;

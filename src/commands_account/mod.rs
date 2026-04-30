@@ -2730,31 +2730,21 @@ pub fn handle_key_use(
     let hook_msg = if !json_mode { ensure_shell_hook(no_hook) } else { None };
 
     // ── 6b. Auto-configure / unconfigure third-party CLI tools ─────────────
+    // Skipped in JSON mode (caller handles it explicitly via the structured
+    // response); shared helper used so `aikey use`, `aikey activate`, and
+    // the web-side `_internal vault_op handle_use` all stay in lockstep
+    // (regression record 2026-04-30: web path skipped this entirely → user
+    // had to re-run `aikey use` from CLI just to make the kimi config.toml
+    // pick up the new active key).
+    //
+    // Drive off the refreshed binding set, not just the providers we set
+    // here — switching one provider away from kimi must unconfigure
+    // ~/.kimi/config.toml when no other binding still routes through kimi.
     if !json_mode {
-        let has_kimi = providers.iter().any(|p| {
-            let c = p.to_lowercase();
-            c == "kimi" || c == "moonshot"
-        });
-        if has_kimi {
-            // Token-agnostic: writes scaffold once; token comes from KIMI_API_KEY env var.
-            configure_kimi_cli(proxy_port);
-        } else {
-            // Switching away from kimi — restore Kimi CLI to standalone mode.
-            unconfigure_kimi_cli();
-        }
-
-        // Codex CLI: inject openai_base_url when openai provider is active.
-        // Why: Codex v0.118+ deprecated OPENAI_BASE_URL env var and reads
-        // openai_base_url from ~/.codex/config.toml instead.
-        let has_openai = providers.iter().any(|p| {
-            let c = p.to_lowercase();
-            c == "openai" || c == "gpt" || c == "chatgpt"
-        });
-        if has_openai {
-            configure_codex_cli(proxy_port);
-        } else {
-            unconfigure_codex_cli();
-        }
+        let active_providers: Vec<String> = refresh.bindings.iter()
+            .map(|b| b.provider_code.clone())
+            .collect();
+        apply_third_party_cli_configs(&active_providers, proxy_port);
     }
 
     // ── 5. Output ─────────────────────────────────────────────────────────────

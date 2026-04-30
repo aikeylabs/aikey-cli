@@ -1122,7 +1122,23 @@ fn handle_use(env: StdinEnvelope) {
 
     // Refresh active.env + nudge proxy. Failure here is recoverable (the DB
     // write already landed) — surface as warning, not hard error.
-    let refresh_ok = profile_activation::refresh_implicit_profile_activation().is_ok();
+    let refresh = profile_activation::refresh_implicit_profile_activation();
+    let refresh_ok = refresh.is_ok();
+
+    // Auto-configure / unconfigure third-party CLI scaffolds (kimi config.toml,
+    // codex config.toml). Without this, clicking "Use kimi" / "Use codex" in
+    // Web flips the binding + active.env but leaves `~/.kimi/config.toml` /
+    // `~/.codex/config.toml` stale, forcing the user to re-run `aikey use`
+    // from a terminal just to make the third-party CLI work. Shared helper
+    // keeps this in lockstep with the interactive `aikey use` and
+    // `handle_key_use` paths. Bugfix: 2026-04-30-web-use-skips-third-party-cli-config.
+    if let Ok(ref r) = refresh {
+        let proxy_port = crate::commands_proxy::proxy_port();
+        let active_providers: Vec<String> = r.bindings.iter()
+            .map(|b| b.provider_code.clone())
+            .collect();
+        crate::commands_account::apply_third_party_cli_configs(&active_providers, proxy_port);
+    }
 
     let audit_logged = try_log_audit(&key, AuditOperation::Exec, Some(&canonical_key_ref), true);
 
