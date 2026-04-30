@@ -269,9 +269,19 @@ fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'st
 
         // v4.1 Stage 10+: 填 login_url (UI "Open login page" 按钮用)
         // v4.2: 同时填 official_base_url (UI "use official" 按钮用)
+        // v4.2.1 (2026-05-01): host 优先查 host_to_base_url,精分流到具体 endpoint
+        // (如 kimi family 下 api.kimi.com vs api.moonshot.cn);查不到回落到 family
+        // 兜底。Why: 同 protocol family 下不同 host 实际走不同 endpoint,family 维度
+        // 一个 URL 兜底无法区分,会把 sk-kimi-* KEY 错误路由到 moonshot 端点。
         if let Some(family) = &d.inferred_provider {
             d.login_url = classifier.login_url_for_family(family);
-            d.official_base_url = classifier.base_url_for_family(family);
+
+            let host_specific = d.fields.base_url.as_deref()
+                .and_then(extract_url_domain)
+                .map(|h| h.to_lowercase())
+                .and_then(|h| classifier.base_url_for_host(&h));
+            d.official_base_url = host_specific
+                .or_else(|| classifier.base_url_for_family(family));
         }
     }
 

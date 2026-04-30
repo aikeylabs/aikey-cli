@@ -75,7 +75,13 @@ family_login_urls:
 # 数据来源 (2026-04 校对):
 #   - Anthropic:    官方 https://api.anthropic.com
 #   - OpenAI:       官方 v1
-#   - Kimi:         Moonshot v1
+#   - Kimi:         Kimi Coding v1 (api.kimi.com/coding/v1) — 项目 sandbox.env
+#                   认定的"kimi family"指 Kimi 编程模型产品线;Moonshot 平台
+#                   (api.moonshot.cn/v1) 是同公司另一条产品线但 KEY 形态不同
+#                   (sk-Kh* vs sk-kimi-*),不在本 default 含义内。2026-05-01
+#                   修正:之前默认值 api.moonshot.cn/v1 与 CLI connectivity
+#                   probe (硬编码 api.kimi.com/coding/v1) 自相矛盾,导致 web
+#                   import 自动填充把 sk-kimi-* KEY 路由到错误端点,鉴权失败。
 #   - DeepSeek:     官方 v1
 #   - Gemini:       Google generativelanguage
 #   - Groq:         OpenAI-兼容 v1
@@ -92,7 +98,7 @@ family_login_urls:
 family_base_urls:
   anthropic:     "https://api.anthropic.com"
   openai:        "https://api.openai.com/v1"
-  kimi:          "https://api.moonshot.cn/v1"
+  kimi:          "https://api.kimi.com/coding/v1"  # 兜底:无 URL 解析到时使用
   deepseek:      "https://api.deepseek.com/v1"
   google_gemini: "https://generativelanguage.googleapis.com"
   groq:          "https://api.groq.com/openai/v1"
@@ -106,6 +112,31 @@ family_base_urls:
   openrouter:    "https://openrouter.ai/api/v1"
   yunwu:         "https://yunwu.ai/v1"
   zeroeleven:    "https://aicoding.2233.ai"
+
+# v4.2.1 (2026-05-01): per-host base_url override.
+#
+# 用途: import 解析到具体 URL host 时优先查这张表,获得"哪个 host 用哪个
+# endpoint" 的精确映射;查不到再回落到 family_base_urls。这一层补全了同一
+# protocol family 下多个 host 各自路由不同 endpoint 的能力。
+#
+# 典型场景: kimi family 同时覆盖 Kimi Coding (api.kimi.com/coding/v1) 和
+# Moonshot 平台 (api.moonshot.cn/v1)——两条产品线协议族相同 (OpenAI-compat),
+# 但 endpoint 不同; 用 family_base_urls 这一层无法区分。
+#
+# 解析顺序 (consume 端: applyOfficialDefaults / classifier.base_url_for_host):
+#   1. host 命中 host_to_base_url     → 用该 URL
+#   2. 否则查 inferred_provider 对应的 family_base_urls → 用 family 兜底 URL
+#   3. 都查不到 → 留空,UI 上提示用户手填
+#
+# 关键: 不需要拆 provider_code (kimi 仍是单一 family,protocol_types=[kimi]),
+# 只是 base_url 这一字段按 host 精分流。Why: v4.1 时项目主动从 'moonshot_kimi'
+# rename 为 'kimi' 以避免名词分裂; 这次的 fix 不反转那一决策,只在 base_url
+# 维度补一张更精的 host map。
+host_to_base_url:
+  "api.kimi.com":          "https://api.kimi.com/coding/v1"
+  "www.kimi.com":          "https://api.kimi.com/coding/v1"
+  "api.moonshot.cn":       "https://api.moonshot.cn/v1"
+  "platform.moonshot.cn":  "https://api.moonshot.cn/v1"
 
 # v4.1 Stage 5+: 聚合网关 family 清单 (UI Provider 字段 multi-select 设计驱动)
 #

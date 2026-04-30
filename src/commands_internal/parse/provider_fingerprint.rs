@@ -78,6 +78,11 @@ struct Registry {
     /// UI "use official" 按钮点击填入 draft.fields.base_url 消费此表
     #[serde(default)]
     family_base_urls: std::collections::HashMap<String, String>,
+    /// v4.2.1 (2026-05-01): host → base_url 精分流 override.
+    /// 解析到具体 URL host 时优先查这张表;查不到再回落到 family_base_urls。
+    /// 让同 family 下多 host 各自路由不同 endpoint (kimi.com vs moonshot.cn)。
+    #[serde(default)]
+    host_to_base_url: std::collections::HashMap<String, String>,
 }
 
 // ========== Classifier ==========
@@ -90,6 +95,8 @@ pub struct FingerprintClassifier {
     family_login_urls: std::collections::HashMap<String, String>,
     /// v4.2: family → 官方 API base_url 映射(从 yaml 加载)
     family_base_urls: std::collections::HashMap<String, String>,
+    /// v4.2.1: host → base_url 精分流 override 表(从 yaml 加载)
+    host_to_base_url: std::collections::HashMap<String, String>,
 }
 
 impl FingerprintClassifier {
@@ -109,7 +116,8 @@ impl FingerprintClassifier {
             reg.aggregator_families.into_iter().collect();
         let family_login_urls = reg.family_login_urls;
         let family_base_urls = reg.family_base_urls;
-        Self { entries, aggregator_families, family_login_urls, family_base_urls }
+        let host_to_base_url = reg.host_to_base_url;
+        Self { entries, aggregator_families, family_login_urls, family_base_urls, host_to_base_url }
     }
 
     /// v4.1 Stage 5+: 从 inferred provider family 派生 protocol_types 列表。
@@ -142,6 +150,17 @@ impl FingerprintClassifier {
     /// 全量 family → 官方 API base_url 映射 (同上,用于 _internal rules)
     pub fn family_base_urls_map(&self) -> &std::collections::HashMap<String, String> {
         &self.family_base_urls
+    }
+
+    /// v4.2.1: 按 host 精分流查 base_url。host 应预先归一(小写、去 port、去
+    /// path),典型来自 `extract_host(parsed_url)`。
+    pub fn base_url_for_host(&self, host: &str) -> Option<String> {
+        self.host_to_base_url.get(host).cloned()
+    }
+
+    /// 全量 host → base_url 映射 (用于 _internal rules 透传给前端)
+    pub fn host_to_base_url_map(&self) -> &std::collections::HashMap<String, String> {
+        &self.host_to_base_url
     }
 
     /// 直接分类（不用上下文）

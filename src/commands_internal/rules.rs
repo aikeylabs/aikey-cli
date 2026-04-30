@@ -81,6 +81,11 @@ fn build_rules_payload() -> Value {
         "sample_providers": SAMPLE_PROVIDERS,
         "family_base_urls":  to_sorted_obj(fp.family_base_urls_map()),
         "family_login_urls": to_sorted_obj(fp.family_login_urls_map()),
+        // v4.2.1 (2026-05-01): per-host base_url 精分流表。前端
+        // applyOfficialDefaults Rule 2 在查 family_base_urls 之前先查它。
+        // 解决同 family 多 host 各走不同 endpoint 的场景 (kimi.com 编程
+        // 模型 vs moonshot.cn 平台)。Go 端 rulesFallback 也得同步加。
+        "host_to_base_url":  to_sorted_obj(fp.host_to_base_url_map()),
     })
 }
 
@@ -107,6 +112,13 @@ mod tests {
         // login_urls payload.
         assert_eq!(login["google_gemini"], "https://aistudio.google.com/app/apikey");
         assert_eq!(login["qwen"], "https://dashscope.console.aliyun.com/apiKey");
+
+        // v4.2.1: kimi family 下两个不同 endpoint 都被 host_to_base_url 精分
+        // 流到正确 URL。这是修 "web import 把 sk-kimi-* 错误路由到 moonshot
+        // 端点" 的根因(2026-05-01 bugfix)。
+        let h2b = &v["host_to_base_url"];
+        assert_eq!(h2b["api.kimi.com"], "https://api.kimi.com/coding/v1");
+        assert_eq!(h2b["api.moonshot.cn"], "https://api.moonshot.cn/v1");
     }
 
     #[test]
