@@ -18,7 +18,7 @@
 //!   代价是能访问 local-server 端口的进程不需主密码就能枚举 alias。实际风险边界几乎不变 ——
 //!   同机攻击者本就可直读 vault.db 明文列。生产版 Web 本身不挂 /user/vault，不影响。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -77,14 +77,41 @@ fn protocol_family_of(raw: Option<&str>) -> String {
     }
 }
 
-fn load_active_binding_refs() -> (HashSet<String>, HashSet<String>) {
-    let mut personal: HashSet<String> = HashSet::new();
-    let mut oauth: HashSet<String> = HashSet::new();
+/// Per-key-source map of providers that source is the active binding for.
+///
+/// Why a map (not a flat set; regression record 2026-04-30):
+///   The previous flat `HashSet<key_ref>` returned by this function lost the
+///   `provider_code` dimension of each binding row. Then `in_use: refs.
+///   contains(&record.id)` evaluated `true` for ANY provider where the
+///   record was active — but the Web UI groups records by their supported
+///   providers, so a key bound only to `openai` (e.g. `zeroeleven_key_1`)
+///   showed `in_use=true` under the `anthropic` group purely because its
+///   alias appeared in the flat set. CLI's interactive picker didn't trip
+///   this because it reads bindings per-provider directly. Web ended up
+///   showing TWO active marks under `anthropic` (the OAuth account that's
+///   actually anthropic-active + the openai-personal-key spuriously
+///   marked in_use) — the user's "two inuse" report.
+///
+///   The fix is structural: keep the (key_ref → providers) mapping all the
+///   way through to the JSON envelope. Emitters produce `in_use_for:
+///   Vec<provider>` per record, and `in_use: bool` becomes derivative
+///   (`!in_use_for.is_empty()`) for back-compat with older Web bundles.
+///   New Web bundles render the badge ONLY when the current group's
+///   provider is in `in_use_for`.
+type ActiveBindingMap = HashMap<String, Vec<String>>;
+
+fn load_active_binding_refs() -> (ActiveBindingMap, ActiveBindingMap) {
+    let mut personal: ActiveBindingMap = HashMap::new();
+    let mut oauth: ActiveBindingMap = HashMap::new();
     if let Ok(bindings) = storage::list_provider_bindings_readonly("default") {
         for b in bindings {
             match b.key_source_type {
-                CredentialType::PersonalApiKey => { personal.insert(b.key_source_ref); }
-                CredentialType::PersonalOAuthAccount => { oauth.insert(b.key_source_ref); }
+                CredentialType::PersonalApiKey => {
+                    personal.entry(b.key_source_ref).or_default().push(b.provider_code);
+                }
+                CredentialType::PersonalOAuthAccount => {
+                    oauth.entry(b.key_source_ref).or_default().push(b.provider_code);
+                }
                 // Team (ManagedVirtualKey) bindings reference virtual_key_id, not
                 // anything we render in the Vault Web list today — skip.
                 _ => {}
@@ -432,7 +459,14 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
             "route_token": m.route_token,
             "last_used_at": m.last_used_at,
             "use_count": m.use_count.unwrap_or(0),
-            "in_use": active_personal.contains(&m.alias),
+            // in_use_for: per-(record, provider) — empty list means not bound
+            // anywhere; non-empty list = active for those specific providers.
+            // in_use: bool kept for back-compat with older Web bundles, derived
+            // as `!in_use_for.is_empty()`. New Web checks group.provider ∈
+            // in_use_for. See load_active_binding_refs doc for the regression
+            // record.
+            "in_use_for": active_personal.get(&m.alias).cloned().unwrap_or_default(),
+            "in_use": active_personal.contains_key(&m.alias),
             "secret_prefix": prefix,
             "secret_suffix": suffix,
             "secret_len": len,
@@ -532,7 +566,9 @@ fn handle_list_oauth(env: StdinEnvelope) {
         "created_at": a.created_at,
         "last_used_at": a.last_used_at,
         "use_count": a.use_count.unwrap_or(0),
-        "in_use": active_oauth.contains(&a.provider_account_id),
+        // See list_personal handler for the in_use_for / in_use rationale.
+        "in_use_for": active_oauth.get(&a.provider_account_id).cloned().unwrap_or_default(),
+        "in_use": active_oauth.contains_key(&a.provider_account_id),
         "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
     })).collect();
 
@@ -644,7 +680,10 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "route_token": serde_json::Value::Null,
                     "last_used_at": m.last_used_at,
                     "use_count": m.use_count.unwrap_or(0),
-                    "in_use": active_personal.contains(&m.alias),
+                    // See handle_list_personal_with_masked for the in_use_for
+                    // / in_use rationale.
+                    "in_use_for": active_personal.get(&m.alias).cloned().unwrap_or_default(),
+                    "in_use": active_personal.contains_key(&m.alias),
                     // Null sentinel — front end uses this to render a
                     // fully-masked (no prefix, no suffix) secret pill.
                     "secret_prefix": serde_json::Value::Null,
@@ -687,7 +726,10 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "created_at": a.created_at,
                     "last_used_at": a.last_used_at,
                     "use_count": a.use_count.unwrap_or(0),
-                    "in_use": active_oauth.contains(&a.provider_account_id),
+                    // See handle_list_personal_with_masked for the in_use_for
+                    // / in_use rationale.
+                    "in_use_for": active_oauth.get(&a.provider_account_id).cloned().unwrap_or_default(),
+                    "in_use": active_oauth.contains_key(&a.provider_account_id),
                     "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
                 }));
             }
@@ -716,6 +758,94 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
             "locked": true,
         }),
     ));
+}
+
+#[cfg(test)]
+mod active_binding_refs_tests {
+    use super::*;
+    use crate::storage;
+
+    /// Regression pin (2026-04-30): user reported "two inuse under anthropic"
+    /// after `aikey auth login claude` (writes anthropic-OAuth binding) +
+    /// adding a personal key bound to openai (writes openai-personal binding).
+    /// The bug was `load_active_binding_refs` returning a provider-agnostic
+    /// `HashSet<key_ref>`, so when Web grouped records by provider and asked
+    /// "is this record in_use", any record whose alias appeared in the
+    /// global active set returned true — including the openai-personal key
+    /// rendered under the anthropic group. Correct semantics: per-key-ref
+    /// MAP of providers, so `in_use_for: ["openai"]` and the Web filters
+    /// by group.provider before showing the badge.
+    #[test]
+    fn binding_refs_carry_per_provider_info_for_oauth_and_personal() {
+        let guard = storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).expect("salt");
+        let pw = secrecy::SecretString::new("test_password".to_string());
+        storage::initialize_vault(&salt, &pw).expect("init vault");
+
+        // Reproduce user's flow:
+        //   1. `aikey auth login claude` → binding(anthropic, oauth, acct-OAUTH)
+        //   2. (key added via web) → no binding yet
+        //   3. click `use` on openai-only personal key → binding(openai, personal, zeroeleven_key_1)
+        storage::set_provider_binding("default", "anthropic", "personal_oauth_account", "acct-OAUTH").unwrap();
+        storage::set_provider_binding("default", "openai", "personal", "zeroeleven_key_1").unwrap();
+
+        let (personal, oauth) = load_active_binding_refs();
+
+        // OAuth account is bound for ANTHROPIC only — must not appear active
+        // for any other provider.
+        let anthropic_oauth_providers = oauth.get("acct-OAUTH").expect("OAuth ref present");
+        assert_eq!(anthropic_oauth_providers, &vec!["anthropic".to_string()]);
+
+        // Personal alias is bound for OPENAI only — must NOT show up in any
+        // anthropic-grouped Web row's in_use computation. This is the
+        // assertion that would have caught the user's bug.
+        let openai_personal_providers = personal.get("zeroeleven_key_1").expect("personal ref present");
+        assert_eq!(openai_personal_providers, &vec!["openai".to_string()]);
+
+        // Cross-check: alias does NOT appear in oauth map (different
+        // key_source_type partition) and account_id does not appear in
+        // personal map. The flat `HashSet`-era code would have collapsed
+        // both partitions so this check verifies the type discrimination.
+        assert!(!oauth.contains_key("zeroeleven_key_1"));
+        assert!(!personal.contains_key("acct-OAUTH"));
+
+        drop(guard);
+    }
+
+    /// Multi-provider key (e.g. aggregator gateway): one alias bound for
+    /// BOTH anthropic + openai. The map MUST list both providers under the
+    /// same alias so the Web shows in_use under both groups (and ONLY
+    /// those two — not under random unrelated groups like `kimi`).
+    #[test]
+    fn binding_refs_handle_multi_provider_alias() {
+        let guard = storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).expect("salt");
+        let pw = secrecy::SecretString::new("test_password".to_string());
+        storage::initialize_vault(&salt, &pw).expect("init vault");
+
+        storage::set_provider_binding("default", "anthropic", "personal", "openrouter_key").unwrap();
+        storage::set_provider_binding("default", "openai", "personal", "openrouter_key").unwrap();
+
+        let (personal, _oauth) = load_active_binding_refs();
+        let providers = personal.get("openrouter_key").expect("alias present");
+        let mut sorted = providers.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["anthropic".to_string(), "openai".to_string()]);
+
+        drop(guard);
+    }
 }
 
 #[cfg(test)]
