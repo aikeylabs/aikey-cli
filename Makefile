@@ -121,11 +121,11 @@ e2e-import-production: release
 security-check-batch-import:
 	@echo "→ importpkg must not import crypto/aes or crypto/cipher"
 	@! grep -rE '"crypto/aes"|"crypto/cipher"' \
-	    ../aikey-control/service/internal/api/user/importpkg/ 2>/dev/null \
+	    ../aikey-control/service/pkg/userapi/importpkg/ 2>/dev/null \
 	    || { echo "FAIL: AES import found in importpkg"; exit 1; }
 	@echo "→ importpkg must not import aikey-proxy vault package"
 	@! grep -r 'aikey-proxy/internal/vault' \
-	    ../aikey-control/service/internal/api/user/importpkg/ 2>/dev/null \
+	    ../aikey-control/service/pkg/userapi/importpkg/ 2>/dev/null \
 	    || { echo "FAIL: importpkg leaks proxy vault coupling"; exit 1; }
 	@echo "→ cli must not log vault_key_hex / password plaintext"
 	@! grep -rnE 'eprintln!.*vault_key|println!.*vault_key|eprintln!.*password|println!.*password' \
