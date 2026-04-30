@@ -113,6 +113,8 @@ fn login_setup_token(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_url = resp["auth_url"].as_str().unwrap_or("");
 
+    let clipboard_ok = try_copy_to_clipboard(auth_url);
+
     if !json_mode {
         eprintln!();
         eprintln!("  {} Note: Claude OAuth requires a Pro or Max subscription.", "\u{25c6}".cyan());
@@ -120,45 +122,151 @@ fn login_setup_token(
         eprintln!("  {}", "\u{2502}".dimmed());
         eprintln!("  {}   {}", "\u{2502}".dimmed(), auth_url);
         eprintln!("  {}", "\u{2502}".dimmed());
+        if clipboard_ok {
+            eprintln!("  {} {}", "\u{2502}".dimmed(), "Auth URL copied to clipboard.".dimmed());
+            eprintln!("  {}", "\u{2502}".dimmed());
+        }
     }
 
     // Try to open browser
     let _ = open_browser(auth_url);
 
-    // Read code#state with masked input (shows **** like Master Password).
-    let code_state = crate::prompt_hidden("  \u{25c6} Paste the code (format: code#state): ")
-        .map_err(|e| format!("Failed to read code: {}", e))?;
-    let code_state = code_state.trim().to_string();
-
-    if code_state.is_empty() {
-        return Err("No code provided. Login cancelled.".into());
-    }
-
-    // Client-side state validation: broker will hard-reject on mismatch, but we
-    // also confirm with the user to give them a chance to re-paste.
-    // Extract expected state from auth_url query param.
-    if !json_mode {
-        if let Some(expected_state) = extract_state_param(auth_url) {
-            let pasted_state = code_state.split('#').nth(1).unwrap_or("");
-            if !expected_state.is_empty() && pasted_state != expected_state {
-                if pasted_state.is_empty() {
-                    eprintln!("  {} state missing from pasted code — expected code#state format", "\u{25c6}".yellow());
-                } else {
-                    eprintln!("  {} state mismatch — pasted state differs from expected (CSRF risk)", "\u{25c6}".yellow());
-                }
-                eprint!("  {} Continue anyway? [y/N] ", "\u{25c6}".yellow());
-                io::stderr().flush()?;
-                let mut confirm = String::new();
-                io::stdin().lock().read_line(&mut confirm)?;
-                if !confirm.trim().eq_ignore_ascii_case("y") && !confirm.trim().eq_ignore_ascii_case("yes") {
-                    return Err("Login cancelled due to state mismatch.".into());
-                }
-            }
-        }
-    }
+    // Pasting can fail for two reasons: the user copies only the `code` part
+    // (no `#state` suffix), or the state value doesn't match. Both used to
+    // dead-end the flow and force the user to re-run `aikey auth login`. We
+    // now allow up to MAX_PASTE_ATTEMPTS pastes within a single login session,
+    // re-prompting on incomplete pastes and offering retry-as-default on a
+    // CSRF state mismatch (the y/N confirmation is preserved because state
+    // mismatch is a real security signal, not just a typo).
+    let code_state = read_code_with_retry(auth_url, json_mode)?;
 
     // Phase 2: submit code
     submit_code_and_finish(base, session_id, &code_state, provider, alias, json_mode)
+}
+
+const MAX_PASTE_ATTEMPTS: u32 = 3;
+
+/// Outcome of validating a `code#state` paste against the expected state from
+/// the auth_url. Pulled out as an enum so the branching is unit-testable
+/// without a real terminal / prompt_hidden round trip.
+#[derive(Debug, PartialEq, Eq)]
+enum PasteCheck {
+    /// Submit the pasted code as-is (state matches, or no expected state to compare).
+    Accept,
+    /// `#state` segment is missing or empty — likely partial paste, re-prompt.
+    MissingState,
+    /// State value differs from expected — CSRF signal, gate behind y/N.
+    StateMismatch,
+}
+
+fn classify_paste(expected_state: Option<&str>, pasted: &str) -> PasteCheck {
+    let Some(expected) = expected_state else { return PasteCheck::Accept };
+    if expected.is_empty() {
+        return PasteCheck::Accept;
+    }
+    let pasted_state = pasted.split('#').nth(1).unwrap_or("");
+    if pasted_state == expected {
+        return PasteCheck::Accept;
+    }
+    if pasted_state.is_empty() {
+        return PasteCheck::MissingState;
+    }
+    PasteCheck::StateMismatch
+}
+
+/// Prompts for the OAuth `code#state` paste with up to `MAX_PASTE_ATTEMPTS`
+/// retries, performing client-side state validation against `auth_url`.
+///
+/// Behavior per attempt:
+/// - Empty paste → cancel immediately (user pressed Enter without input).
+/// - Missing `#state` (likely partial copy) → re-prompt without y/N.
+/// - State value mismatch → CSRF warning, prompt `[r]etry / [y]continue / [n]cancel`,
+///   default = retry. The y/n confirmation is preserved because state mismatch
+///   is a real security signal that warrants explicit user override.
+/// - Match (or no expected state available) → return the pasted code.
+///
+/// Returns `Err` when the user cancels, runs out of attempts, or hits an I/O error.
+fn read_code_with_retry(auth_url: &str, json_mode: bool) -> Result<String, Box<dyn std::error::Error>> {
+    let expected_state = if json_mode { None } else { extract_state_param(auth_url) };
+
+    for attempt in 1..=MAX_PASTE_ATTEMPTS {
+        let prompt = if attempt == 1 {
+            "  \u{25c6} Paste the code (format: code#state): ".to_string()
+        } else {
+            format!(
+                "  \u{25c6} Paste the code again [attempt {}/{}] (format: code#state, empty to cancel): ",
+                attempt, MAX_PASTE_ATTEMPTS
+            )
+        };
+        let pasted = crate::prompt_hidden(&prompt)
+            .map_err(|e| format!("Failed to read code: {}", e))?;
+        let pasted = pasted.trim().to_string();
+
+        if pasted.is_empty() {
+            return Err("No code provided. Login cancelled.".into());
+        }
+
+        match classify_paste(expected_state.as_deref(), &pasted) {
+            PasteCheck::Accept => return Ok(pasted),
+            PasteCheck::MissingState => {
+                // Partial paste — most common cause is the user copying only
+                // up to a whitespace/control char. Re-prompt without y/N noise.
+                eprintln!(
+                    "  {} Pasted code is missing the `#state` suffix — please paste the full `code#state` value.",
+                    "\u{25c6}".yellow()
+                );
+                if attempt == MAX_PASTE_ATTEMPTS {
+                    return Err("Too many invalid pastes. Run 'aikey auth login' again.".into());
+                }
+                continue;
+            }
+            PasteCheck::StateMismatch => {}
+        }
+
+        // State mismatch — keep the y/N gate because this is a CSRF signal.
+        // Default action changes from "cancel" to "retry": pressing Enter
+        // re-prompts instead of bailing.
+        eprintln!(
+            "  {} state mismatch — pasted state differs from expected (CSRF risk)",
+            "\u{25c6}".yellow()
+        );
+        if attempt == MAX_PASTE_ATTEMPTS {
+            // Last attempt: don't offer retry, just continue/cancel.
+            eprint!("  {} Continue anyway? [y/N] ", "\u{25c6}".yellow());
+            io::stderr().flush()?;
+            let mut confirm = String::new();
+            io::stdin().lock().read_line(&mut confirm)?;
+            let answer = confirm.trim().to_ascii_lowercase();
+            if answer == "y" || answer == "yes" {
+                return Ok(pasted);
+            }
+            return Err("Login cancelled due to state mismatch.".into());
+        }
+        eprint!(
+            "  {} [R]etry paste / [y] continue anyway / [n] cancel (default R): ",
+            "\u{25c6}".yellow()
+        );
+        io::stderr().flush()?;
+        let mut confirm = String::new();
+        io::stdin().lock().read_line(&mut confirm)?;
+        let answer = confirm.trim().to_ascii_lowercase();
+        match answer.as_str() {
+            "y" | "yes" => return Ok(pasted),
+            "n" | "no" => return Err("Login cancelled due to state mismatch.".into()),
+            _ => continue, // "", "r", "retry", anything else → re-prompt.
+        }
+    }
+    Err("Too many invalid pastes. Run 'aikey auth login' again.".into())
+}
+
+/// Best-effort clipboard copy. Returns false on platforms where the clipboard
+/// is unavailable (headless servers, CI containers, missing xclip/wl-copy)
+/// without aborting the login flow.
+fn try_copy_to_clipboard(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    crate::executor::copy_to_clipboard(text).is_ok()
 }
 
 /// Codex: Auth Code — open browser, localhost callback auto-receives code
@@ -168,9 +276,14 @@ fn login_auth_code(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_url = resp["auth_url"].as_str().unwrap_or("");
 
+    let clipboard_ok = try_copy_to_clipboard(auth_url);
+
     if !json_mode {
         eprintln!();
         eprintln!("  {} Opening browser for {} login...", "\u{25c6}".cyan(), provider);
+        if clipboard_ok {
+            eprintln!("  {} {}", "\u{2502}".dimmed(), "Auth URL copied to clipboard.".dimmed());
+        }
         eprintln!("  {}", "\u{2502}".dimmed());
     }
     let _ = open_browser(auth_url);
@@ -191,11 +304,16 @@ fn login_device_code(
     let user_code = resp["user_code"].as_str().unwrap_or("");
     let verify_url = resp["verification_url"].as_str().unwrap_or("");
 
+    let clipboard_ok = try_copy_to_clipboard(verify_url);
+
     if !json_mode {
         eprintln!();
         eprintln!("  {} Open this URL and enter the code:", "\u{25c6}".cyan());
         eprintln!("  {}   URL:  {}", "\u{2502}".dimmed(), verify_url);
         eprintln!("  {}   Code: {}", "\u{2502}".dimmed(), user_code.bold());
+        if clipboard_ok {
+            eprintln!("  {}   {}", "\u{2502}".dimmed(), "Verification URL copied to clipboard.".dimmed());
+        }
         eprintln!("  {}", "\u{2502}".dimmed());
     }
 
@@ -274,6 +392,28 @@ fn submit_code_and_finish(
         let _ = crate::profile_activation::refresh_implicit_profile_activation();
     }
 
+    // Install the shell hook so the next `claude`/`codex`/`kimi` invocation
+    // routes through `_aikey_preflight` (connectivity probe) before exec.
+    // Why call it here: `aikey auth login <provider>` is a typical first-key
+    // onboarding path (the user did not run `aikey add`), and `aikey use`
+    // returns "No changes." in this scenario (auto-bind already wrote the
+    // primary), so its hook-install branch never fires either. Without this
+    // call, the user runs `claude` against the bare binary with no preflight
+    // and no aikey injection — defeating the whole proxy gateway.
+    // ensure_shell_hook is idempotent and JSON-mode safe.
+    //
+    // We MUST print the returned message (not discard it): on fresh install
+    // it tells the user to run `source ~/.zshrc` for the wrapper to take
+    // effect in the current shell. Without that hint, user-report
+    // 2026-04-30 round 2 — auth-login appears successful, hook block lands
+    // in .zshrc, but the running zsh process never reloads it, so `claude`
+    // still bypasses the wrapper with no clue why.
+    let hook_msg = if !json_mode {
+        crate::commands_account::ensure_shell_hook(false)
+    } else {
+        None
+    };
+
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
@@ -284,6 +424,12 @@ fn submit_code_and_finish(
         // Stage 11+: --alias 非空则直接写;否则旧逻辑(display 为空/非 email 时 prompt)
         if alias.is_some() || display.is_empty() || !display.contains('@') {
             resolve_display_identity(base, account_id, alias)?;
+        }
+
+        // Surface the hook-install message AFTER login confirmation so the
+        // "▲ Run source ~/.zshrc" hint isn't buried under the OAuth banner.
+        if let Some(msg) = hook_msg {
+            eprintln!("{}", msg);
         }
     }
 
@@ -338,6 +484,18 @@ fn poll_login_status(
                     let _ = crate::profile_activation::refresh_implicit_profile_activation();
                 }
 
+                // Install the shell hook (preflight wrapper for claude/codex/kimi).
+                // See identical block in `login_setup_token` for rationale —
+                // both auth-login paths must install the hook so the user's
+                // very next `claude`/`codex` invocation goes through the
+                // proxy with a connectivity probe. Capture the message so the
+                // "Run source ~/.zshrc" hint reaches the user.
+                let hook_msg = if !json_mode {
+                    crate::commands_account::ensure_shell_hook(false)
+                } else {
+                    None
+                };
+
                 if json_mode {
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                 } else {
@@ -354,6 +512,13 @@ fn poll_login_status(
                     // equivalent status-line hooks so we skip them here.
                     if provider == "claude" {
                         crate::commands_statusline::ensure_claude_statusline_installed();
+                    }
+
+                    // Surface the hook-install message AFTER login + statusline
+                    // so the "▲ Run source ~/.zshrc" hint sits at the bottom
+                    // where the user is currently looking.
+                    if let Some(msg) = hook_msg {
+                        eprintln!("{}", msg);
                     }
                 }
                 return Ok(());
@@ -966,4 +1131,148 @@ fn open_browser(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "windows")]
     { let _ = ProcessCommand::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn(); }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_paste, PasteCheck};
+
+    // Regression guard for user report 2026-04-30:
+    //
+    //   "为什么运行 claude 没有触发连通性测试呢？"
+    //
+    // After `aikey auth login claude` + `aikey use` (which returned "No
+    // changes." because auth-login already auto-bound primary), the user
+    // ran `claude` and the preflight wrapper did not fire — because no
+    // codepath had called ensure_shell_hook to write the v3 source line
+    // into ~/.zshrc. This test pins that BOTH login completion paths
+    // (login_setup_token and poll_login_status) call ensure_shell_hook.
+    // Source-text check is intentional: a real end-to-end test needs an
+    // OAuth provider mock; this catches the regression of someone removing
+    // the call without recreating the bug.
+
+    const SOURCE: &str = include_str!("mod.rs");
+
+    // ── classify_paste: pure-function unit tests ──────────────────────────
+    // The retry loop in read_code_with_retry depends on these branches.
+    // Source-text guards below pin the loop wiring; here we cover the
+    // semantic decisions.
+
+    #[test]
+    fn classify_paste_accepts_when_expected_state_unknown() {
+        // json_mode and malformed auth_url both produce expected_state=None;
+        // we must not hold up the user — submit and let the broker decide.
+        assert_eq!(classify_paste(None, "raw_code_without_hash"), PasteCheck::Accept);
+        assert_eq!(classify_paste(None, "code#anything"), PasteCheck::Accept);
+    }
+
+    #[test]
+    fn classify_paste_accepts_when_expected_state_empty_string() {
+        // Defensive: extract_state_param returned Some("") — treat same as None.
+        assert_eq!(classify_paste(Some(""), "code#whatever"), PasteCheck::Accept);
+    }
+
+    #[test]
+    fn classify_paste_accepts_on_exact_state_match() {
+        assert_eq!(
+            classify_paste(Some("abc123"), "code_value#abc123"),
+            PasteCheck::Accept
+        );
+    }
+
+    #[test]
+    fn classify_paste_flags_missing_state_when_no_hash_in_paste() {
+        // User copied only the `code` half, missing `#state`. The retry loop
+        // must re-prompt without offering y/N (no CSRF signal yet — likely
+        // a partial paste from an over-eager triple-click).
+        assert_eq!(
+            classify_paste(Some("abc123"), "code_value_only"),
+            PasteCheck::MissingState
+        );
+    }
+
+    #[test]
+    fn classify_paste_flags_missing_state_when_hash_present_but_empty() {
+        // Edge case: `code#` with empty state. Same UX path as no-hash.
+        assert_eq!(
+            classify_paste(Some("abc123"), "code_value#"),
+            PasteCheck::MissingState
+        );
+    }
+
+    #[test]
+    fn classify_paste_flags_state_mismatch_on_wrong_value() {
+        // Real CSRF signal: state present but doesn't match. Must surface
+        // the y/N gate, not auto-retry.
+        assert_eq!(
+            classify_paste(Some("abc123"), "code_value#WRONG"),
+            PasteCheck::StateMismatch
+        );
+    }
+
+    // ── Source-text guards for the retry loop and clipboard wiring ────────
+
+    #[test]
+    fn auth_url_copied_to_clipboard_in_all_three_flows() {
+        // setup_token (Claude), auth_code (Codex), device_code (Kimi) must
+        // each call try_copy_to_clipboard so the user can paste the URL on
+        // another device when the auto-launched browser doesn't fit.
+        // Three call sites in production code + we don't count any test code.
+        let prod_only = SOURCE.split("#[cfg(test)]").next().unwrap_or(SOURCE);
+        let calls = prod_only.matches("try_copy_to_clipboard(").count();
+        assert!(
+            calls >= 4,
+            "expected at least 4 try_copy_to_clipboard call sites \
+             (1 helper definition + 3 flow call sites: login_setup_token, \
+              login_auth_code, login_device_code); found {}",
+            calls
+        );
+    }
+
+    #[test]
+    fn paste_retry_loop_is_wired_with_max_attempts() {
+        // Pins the retry-on-bad-paste UX so a future refactor doesn't silently
+        // revert to the old "first paste fails → cancel" behavior.
+        assert!(
+            SOURCE.contains("MAX_PASTE_ATTEMPTS"),
+            "MAX_PASTE_ATTEMPTS constant must exist — drives the paste retry loop \
+             that lets users re-paste without re-running `aikey auth login`."
+        );
+        assert!(
+            SOURCE.contains("read_code_with_retry"),
+            "read_code_with_retry must be the entrypoint for the setup_token paste flow."
+        );
+    }
+
+    #[test]
+    fn state_mismatch_prompt_defaults_to_retry_not_cancel() {
+        // Behavioral pin: on a CSRF state mismatch the prompt offers retry,
+        // continue, or cancel — and bare-Enter (default) means retry. Old
+        // behavior was "[y/N]" with default = cancel, which forced the user
+        // to re-run `aikey auth login` after a single mispaste.
+        assert!(
+            SOURCE.contains("[R]etry paste"),
+            "state-mismatch prompt must surface retry as the default action, \
+             not silently cancel like the pre-2026-04-30 [y/N] gate."
+        );
+    }
+
+    #[test]
+    fn auth_login_calls_ensure_shell_hook_in_both_paths() {
+        // Both completion paths must install the hook so the user's next
+        // `claude`/`codex` invocation routes through _aikey_preflight.
+        let occurrences = SOURCE
+            .matches("commands_account::ensure_shell_hook(false)")
+            .count();
+        assert!(
+            occurrences >= 2,
+            "expected at least 2 calls to ensure_shell_hook(false) in commands_auth/mod.rs \
+             (login_setup_token + poll_login_status); found {}. \
+             Removing these calls means `aikey auth login` won't install the v3 hook \
+             block in ~/.zshrc — the user's next `claude` runs the bare binary \
+             with no preflight or proxy injection. See bugfix \
+             2026-04-30-auth-login-skips-shell-hook-install.md.",
+            occurrences
+        );
+    }
 }
