@@ -50,6 +50,9 @@ pub mod usage_wal;
 pub mod commands_statusline;
 pub mod commands_watch;
 
+#[cfg(test)]
+pub(crate) mod test_env_lock;
+
 /// Prompts for a hidden input (password / API key), showing a `*` for each
 /// keystroke in real time. Supports backspace and handles paste gracefully.
 ///

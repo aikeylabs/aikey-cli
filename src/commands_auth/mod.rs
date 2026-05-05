@@ -393,7 +393,7 @@ fn submit_code_and_finish(
     }
 
     // Install the shell hook so the next `claude`/`codex`/`kimi` invocation
-    // routes through `_aikey_preflight` (connectivity probe) before exec.
+    // routes through `aikey_preflight` (connectivity probe) before exec.
     // Why call it here: `aikey auth login <provider>` is a typical first-key
     // onboarding path (the user did not run `aikey add`), and `aikey use`
     // returns "No changes." in this scenario (auto-bind already wrote the
@@ -1260,7 +1260,7 @@ mod tests {
     #[test]
     fn auth_login_calls_ensure_shell_hook_in_both_paths() {
         // Both completion paths must install the hook so the user's next
-        // `claude`/`codex` invocation routes through _aikey_preflight.
+        // `claude`/`codex` invocation routes through aikey_preflight.
         let occurrences = SOURCE
             .matches("commands_account::ensure_shell_hook(false)")
             .count();

@@ -19,7 +19,7 @@
 # Resolve the real aikey.exe binary, bypassing this very wrapper function.
 # Why Get-Command + Application: avoids infinite recursion when a user types
 # `aikey ...` (which would call our function again instead of the binary).
-function global:_aikey_resolve_bin {
+function global:aikey_resolve_bin {
     $cmd = Get-Command aikey -CommandType Application -ErrorAction SilentlyContinue |
            Select-Object -First 1
     if ($null -eq $cmd) { return $null }
@@ -35,7 +35,7 @@ function global:aikey {
     # / [0] indexing don't trip on PowerShell 5.1 strict-mode-ish hosts.
     $RemArgs = @($RemArgs)
 
-    $bin = _aikey_resolve_bin
+    $bin = aikey_resolve_bin
     if ($null -eq $bin) {
         Write-Error "aikey binary not found on PATH"
         return
@@ -73,7 +73,7 @@ if (-not (Get-Command ak -ErrorAction SilentlyContinue)) {
     }
 }
 
-# Cross-shell sync (mirrors hook.bash _aikey_precmd_bash):
+# Cross-shell sync (mirrors hook.bash aikey_precmd_bash):
 #   - Skip if AIKEY_AUTO_REFRESH=off (kill switch).
 #   - Skip if this shell is pinned (_AIKEY_EXPLICIT_ALIAS / AIKEY_ACTIVE_LABEL set
 #     by a previous `aikey activate <alias>` in this very session).
@@ -84,17 +84,17 @@ if (-not (Get-Command ak -ErrorAction SilentlyContinue)) {
 # because PowerShell can't parse `${NO_PROXY:-}` / `export ...`. The .flat
 # variant is written by the same code path as active.env (see
 # `write_active_env` in src/commands_account/shell_integration.rs).
-function global:_aikey_precmd_powershell {
-    if ($env:AIKEY_AUTO_REFRESH -eq 'off') { _aikey_hook_check_once; return }
+function global:aikey_precmd_powershell {
+    if ($env:AIKEY_AUTO_REFRESH -eq 'off') { aikey_hook_check_once; return }
     if ($env:_AIKEY_EXPLICIT_ALIAS -or $env:AIKEY_ACTIVE_LABEL) {
-        _aikey_hook_check_once
+        aikey_hook_check_once
         return
     }
 
     $home_dir = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
-    if (-not $home_dir) { _aikey_hook_check_once; return }
+    if (-not $home_dir) { aikey_hook_check_once; return }
     $flat = Join-Path (Join-Path $home_dir '.aikey') 'active.env.flat'
-    if (-not (Test-Path -LiteralPath $flat)) { _aikey_hook_check_once; return }
+    if (-not (Test-Path -LiteralPath $flat)) { aikey_hook_check_once; return }
 
     # Cheap seq probe: read the whole file (small — ~10 KEY=VALUE pairs).
     #
@@ -123,7 +123,7 @@ function global:_aikey_precmd_powershell {
                 break
             }
         }
-    } catch { _aikey_hook_check_once; return }
+    } catch { aikey_hook_check_once; return }
 
     # Decide whether to re-import:
     #   - on_disk_seq present + differs from in-shell → reload (cheap path)
@@ -157,13 +157,13 @@ function global:_aikey_precmd_powershell {
         }
     }
 
-    _aikey_hook_check_once
+    aikey_hook_check_once
 }
 
-# Two-layer drift detector — mirrors _aikey_hook_check_once in hook.bash.
+# Two-layer drift detector — mirrors aikey_hook_check_once in hook.bash.
 # Layer 1: cheap (every prompt) — disk hook header hash vs in-memory hash.
 # Layer 2: spawn `aikey _hook-hash powershell` once per session, compare to disk.
-function global:_aikey_hook_check_once {
+function global:aikey_hook_check_once {
     $home_dir = if ($env:HOME) { $env:HOME } else { $env:USERPROFILE }
     if (-not $home_dir) { return }
     $hook_path = Join-Path (Join-Path $home_dir '.aikey') 'hook.ps1'
@@ -199,7 +199,7 @@ function global:_aikey_hook_check_once {
     # ── Layer 2 ───────────────────────────────────────────────────────────
     if ($script:_aikey_hook_layer2_checked) { return }
     $script:_aikey_hook_layer2_checked = $true
-    $bin = _aikey_resolve_bin
+    $bin = aikey_resolve_bin
     if ($null -eq $bin) { return }
 
     $file_hash = $null
@@ -221,7 +221,7 @@ function global:_aikey_hook_check_once {
     }
 }
 
-# Wrap the prompt function so _aikey_precmd_powershell runs before each new
+# Wrap the prompt function so aikey_precmd_powershell runs before each new
 # prompt. Capture the user's existing prompt as a ScriptBlock once (don't
 # recapture on subsequent sources — that would nest our own wrapper).
 #
@@ -242,7 +242,7 @@ if (-not (Get-Variable -Scope Global -Name _aikeyOrigPromptForHook -ErrorAction 
     Remove-Variable -Name _aikey_existing_prompt, _aikey_orig -ErrorAction SilentlyContinue
 }
 function global:prompt {
-    _aikey_precmd_powershell
+    aikey_precmd_powershell
     if ($env:_AIKEY_PROMPT_LABEL) {
         "($env:_AIKEY_PROMPT_LABEL) " + (& $global:_aikeyOrigPromptForHook)
     } else {
@@ -252,7 +252,7 @@ function global:prompt {
 
 # ── Wrapper preflight (claude / codex) ────────────────────────────────────
 #
-# Mirror of hook.bash's `_aikey_preflight` + `_aikey_clear_before_tui_handoff`
+# Mirror of hook.bash's `aikey_preflight` + `aikey_clear_before_tui_handoff`
 # + claude/codex/kimi function wrappers. Same contract:
 #
 #   - $env:AIKEY_PREFLIGHT = 'off' disables the connectivity probe entirely.
@@ -269,7 +269,7 @@ function global:prompt {
 # surfaces "API rejected the key" / "proxy can't reach upstream" with a
 # concrete next step BEFORE the user's prompt reaches the wrapped CLI.
 
-function global:_aikey_preflight {
+function global:aikey_preflight {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string]$Provider)
 
@@ -290,7 +290,7 @@ function global:_aikey_preflight {
     $id = ($entry -split '=', 2)[1]
     if (-not $id) { return 0 }
 
-    $bin = _aikey_resolve_bin
+    $bin = aikey_resolve_bin
     if ($null -eq $bin) {
         Write-Host "[aikey] preflight skipped — aikey.exe not on PATH" -ForegroundColor Yellow
         return 0
@@ -330,7 +330,7 @@ function global:_aikey_preflight {
 # issue doesn't reproduce — keep the function as a no-op for now so
 # the wrapper signature stays parallel to bash, but skip the actual
 # clear unless explicitly asked via $env:AIKEY_PREFLIGHT_FORCE_CLEAR='1'.
-function global:_aikey_clear_before_tui_handoff {
+function global:aikey_clear_before_tui_handoff {
     if ($env:AIKEY_PREFLIGHT_NO_CLEAR -eq '1') { return }
     if ($env:AIKEY_PREFLIGHT_FORCE_CLEAR -eq '1') {
         # ESC[H ESC[2J — same VT escape the bash hook uses.
@@ -353,9 +353,9 @@ if (-not (Get-Command claude -CommandType Function, Alias -ErrorAction SilentlyC
         [CmdletBinding()]
         param([Parameter(ValueFromRemainingArguments = $true)] $RemArgs)
         $RemArgs = @($RemArgs)
-        $rc = _aikey_preflight -Provider 'anthropic'
+        $rc = aikey_preflight -Provider 'anthropic'
         if ($rc -ne 0) { return }
-        _aikey_clear_before_tui_handoff
+        aikey_clear_before_tui_handoff
         $real = (Get-Command claude -CommandType Application -ErrorAction SilentlyContinue |
                  Select-Object -First 1).Source
         if ($null -eq $real) {
@@ -371,16 +371,18 @@ if (-not (Get-Command codex -CommandType Function, Alias -ErrorAction SilentlyCo
         [CmdletBinding()]
         param([Parameter(ValueFromRemainingArguments = $true)] $RemArgs)
         $RemArgs = @($RemArgs)
-        $rc = _aikey_preflight -Provider 'openai'
+        $rc = aikey_preflight -Provider 'openai'
         if ($rc -ne 0) { return }
-        _aikey_clear_before_tui_handoff
+        aikey_clear_before_tui_handoff
         $real = (Get-Command codex -CommandType Application -ErrorAction SilentlyContinue |
                  Select-Object -First 1).Source
         if ($null -eq $real) {
             Write-Error "codex binary not found on PATH"
             return
         }
-        & $real @RemArgs
+        # `-c model_provider=aikey` overrides the toml top-level model_provider
+        # at runtime — see bugfix 2026-05-05 and matching block in hook.zsh.
+        & $real -c model_provider=aikey @RemArgs
     }
 }
 
@@ -392,11 +394,11 @@ if (-not (Get-Command kimi -CommandType Function, Alias -ErrorAction SilentlyCon
         [CmdletBinding()]
         param([Parameter(ValueFromRemainingArguments = $true)] $RemArgs)
         $RemArgs = @($RemArgs)
-        $bin = _aikey_resolve_bin
+        $bin = aikey_resolve_bin
         if ($null -ne $bin) {
             & cmd.exe /c "`"$bin`" proxy ensure-running < NUL > NUL 2>&1"
         }
-        _aikey_clear_before_tui_handoff
+        aikey_clear_before_tui_handoff
         $real = (Get-Command kimi -CommandType Application -ErrorAction SilentlyContinue |
                  Select-Object -First 1).Source
         if ($null -eq $real) {

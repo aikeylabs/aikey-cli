@@ -227,9 +227,16 @@ pub fn apply_third_party_cli_configs(providers: &[String], proxy_port: u16) {
         unconfigure_kimi_cli();
     }
 
-    // Codex CLI: inject openai_base_url when openai provider is active.
-    // Why: Codex v0.118+ deprecated OPENAI_BASE_URL env var and reads
-    // openai_base_url from ~/.codex/config.toml instead.
+    // Codex CLI: install full aikey scaffold when openai provider is active.
+    // Writes (1) `[model_providers.aikey]` block (custom provider with
+    // env_key=OPENAI_API_KEY + base_url=proxy + requires_openai_auth=false),
+    // (2) legacy `openai_base_url = ...` line for back-compat, (3) conditional
+    // top-level `model_provider = "aikey"` (only if no conflicting user setting).
+    // The shell wrapper around `codex` injects `-c model_provider=aikey` at
+    // launch time so routing also works when (3) was skipped due to conflict.
+    // See bugfix 2026-04-20-codex-integration-env-var-routing.md (initial
+    // design) and bugfix 2026-05-05-codex-wrapper-injects-model-provider-arg.md
+    // (wrapper arg fallback).
     let has_openai = providers.iter().any(|p| {
         let c = p.to_lowercase();
         c == "openai" || c == "gpt" || c == "chatgpt"
@@ -681,7 +688,15 @@ pub fn configure_codex_cli(proxy_port: u16) {
         );
         eprintln!(
             "    {}",
-            "  • Invoke as: codex --local-provider aikey".dimmed()
+            "  • Invoke as: codex -c model_provider=aikey".dimmed()
+        );
+        eprintln!(
+            "    {}",
+            "Note: the aikey-managed `codex` shell wrapper already injects \
+             `-c model_provider=aikey` automatically; this hint is for when \
+             you call the codex binary directly via `command codex` or a \
+             non-shell launcher."
+                .dimmed()
         );
         false
     } else {
@@ -1189,7 +1204,7 @@ fn hook_content_with_hash_header(kind: HookKind) -> String {
     };
     let hash = hook_template_hash(kind);
     // Stable format: the hook-check script greps `^# Hook-Template-Hash: `.
-    // Keep this literal — tests pin it, and so does _aikey_hook_check_once.
+    // Keep this literal — tests pin it, and so does aikey_hook_check_once.
     //
     // Second line records the hash the current shell loaded — POSIX shells
     // get a `_AIKEY_HOOK_LOADED_HASH=...` assignment (sourced as a shell
@@ -1197,7 +1212,7 @@ fn hook_content_with_hash_header(kind: HookKind) -> String {
     // drift detector can compare against on-disk hash without polluting
     // either shell with the other's syntax.
     //
-    // The drift check in `_aikey_hook_check_once` compares this var
+    // The drift check in `aikey_hook_check_once` compares this var
     // against the on-disk `# Hook-Template-Hash:` — if they diverge,
     // the user has regenerated the hook file AFTER this shell sourced
     // it, so the claude/codex wrapper defs in memory are stale.
@@ -1823,7 +1838,11 @@ fn rc_contains_v3(rc_names: &[&str]) -> bool {
 ///
 /// v1 has no end marker — the block is the `# aikey shell hook` header line
 /// plus the function definition that follows until the `precmd_functions+=` line
-/// (zsh) or `PROMPT_COMMAND='_aikey_precmd_bash'` line (bash). Returns the
+/// (zsh) or `PROMPT_COMMAND='_aikey_precmd_bash'` line (bash). The literal
+/// `_aikey_*` names below are historical (v1 used the underscore prefix); they
+/// stay as terminator fixtures so we can still strip legacy v1 blocks from
+/// users upgrading from old aikey versions, even though current hooks use
+/// the underscore-free `aikey_*` names. Returns the
 /// original contents unchanged if no terminator is found within a bounded
 /// window — conservative on purpose, we never want to splice past legitimate
 /// user code following a partially-edited v1 block.
@@ -1889,8 +1908,10 @@ mod hook_tests {
         assert!(c.contains("activate|deactivate"));
         assert!(c.contains("--shell zsh"));
         assert!(c.contains("AIKEY_ACTIVE_LABEL"));
-        assert!(c.contains("_aikey_precmd"));
-        assert!(c.contains("_aikey_preexec"));
+        // No leading underscore — see bugfix 2026-05-05 (snapshot tools filter
+        // `_*` private-function names, breaking wrappers in subprocesses).
+        assert!(c.contains("aikey_precmd") && !c.contains("_aikey_precmd"));
+        assert!(c.contains("aikey_preexec") && !c.contains("_aikey_preexec"));
         assert!(c.contains("precmd_functions"));
         assert!(c.contains("preexec_functions"));
     }
@@ -1902,10 +1923,11 @@ mod hook_tests {
         assert!(c.contains("ak()"), "bash hook must define ak() short-alias wrapper");
         assert!(c.contains("--shell bash"));
         assert!(c.contains("AIKEY_ACTIVE_LABEL"));
-        assert!(c.contains("_aikey_precmd_bash"));
-        assert!(c.contains("_aikey_preexec_bash"));
+        // No leading underscore — see bugfix 2026-05-05.
+        assert!(c.contains("aikey_precmd_bash") && !c.contains("_aikey_precmd_bash"));
+        assert!(c.contains("aikey_preexec_bash") && !c.contains("_aikey_preexec_bash"));
         assert!(c.contains("PROMPT_COMMAND"));
-        assert!(c.contains("trap '_aikey_preexec_bash' DEBUG"));
+        assert!(c.contains("trap 'aikey_preexec_bash' DEBUG"));
     }
 
     #[test]
@@ -1959,8 +1981,14 @@ mod hook_tests {
     #[test]
     fn hook_zsh_defines_claude_and_codex_preflight_wrappers() {
         let c = hook_zsh_content();
-        assert!(c.contains("_aikey_preflight"),
-            "zsh hook must define _aikey_preflight helper function");
+        // Why no leading underscore on the helper name: Claude Code and other
+        // shell-snapshot-based tools filter out functions whose names start
+        // with `_` when rebuilding shells in subprocesses, breaking the
+        // `function codex` wrapper (it would call a missing helper). See
+        // bugfix 2026-05-05-codex-wrapper-injects-model-provider-arg.md.
+        assert!(c.contains("aikey_preflight") && !c.contains("_aikey_preflight"),
+            "zsh hook must define aikey_preflight helper (no underscore prefix — \
+             snapshot tools filter `_*` private-function names)");
         // stdin redirect /dev/null is still required — it's a safety belt
         // against any regression that would reintroduce a password prompt
         // under the wrapper (plan D eliminated the normal path; this
@@ -1989,15 +2017,21 @@ mod hook_tests {
         // Must delegate to the real binary via `command` to avoid recursion.
         assert!(c.contains("command claude \"$@\""),
             "claude wrapper must call `command claude \"$@\"` to reach the real binary");
-        assert!(c.contains("command codex \"$@\""),
-            "codex wrapper must call `command codex \"$@\"` to reach the real binary");
+        // Codex wrapper must inject `-c model_provider=aikey` so codex routes
+        // through the aikey provider block at runtime regardless of any
+        // pre-existing `model_provider = "ollama"` etc. in ~/.codex/config.toml.
+        // See bugfix 2026-05-05-codex-wrapper-injects-model-provider-arg.md.
+        assert!(c.contains("command codex -c model_provider=aikey \"$@\""),
+            "codex wrapper must inject `-c model_provider=aikey` so codex \
+             always uses the aikey provider block, regardless of toml top-level state");
     }
 
     #[test]
     fn hook_bash_defines_claude_and_codex_preflight_wrappers() {
         let c = hook_bash_content();
-        assert!(c.contains("_aikey_preflight"),
-            "bash hook must define _aikey_preflight helper function");
+        assert!(c.contains("aikey_preflight") && !c.contains("_aikey_preflight"),
+            "bash hook must define aikey_preflight helper (no underscore prefix — \
+             snapshot tools filter `_*` names; see bugfix 2026-05-05)");
         assert!(c.contains("command aikey test") && c.contains("</dev/null"),
             "bash preflight must invoke `command aikey test ... </dev/null`");
         // Stderr must not be redirected — table output is the user-visible
@@ -2011,8 +2045,8 @@ mod hook_tests {
             "bash hook must guard codex() behind declare -F + alias check");
         assert!(c.contains("command claude \"$@\""),
             "claude wrapper must delegate to real binary via `command`");
-        assert!(c.contains("command codex \"$@\""),
-            "codex wrapper must delegate to real binary via `command`");
+        assert!(c.contains("command codex -c model_provider=aikey \"$@\""),
+            "codex wrapper must inject `-c model_provider=aikey` (see bugfix 2026-05-05)");
     }
 
     #[test]
@@ -2067,7 +2101,7 @@ mod hook_tests {
 
     #[test]
     fn hook_preflight_does_not_shadow_kimi() {
-        // The 2026-04-22 carve-out: kimi is NOT in `_aikey_preflight` because
+        // The 2026-04-22 carve-out: kimi is NOT in `aikey_preflight` because
         // `aikey test`'s chat probe historically false-positived on kimi's
         // coding-API (subscription / coding-tier model 404). The diagnostic
         // preflight stays scoped to claude + codex.
@@ -2076,11 +2110,11 @@ mod hook_tests {
         // `aikey proxy ensure-running` (auto-start proxy) — the diagnostic
         // probe stays excluded. See companion test
         // `hook_kimi_wrapper_uses_ensure_running_only` for the new positive
-        // contract. If `_aikey_preflight kimi` ever needs to come back,
+        // contract. If `aikey_preflight kimi` ever needs to come back,
         // update the requirement + the bugfix record + remove this guard
         // first.
         for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
-            assert!(!c.contains("_aikey_preflight kimi"),
+            assert!(!c.contains("aikey_preflight kimi"),
                 "{}: kimi is intentionally out of scope for the 2026-04-22 \
                  diagnostic preflight — see the bugfix record before adding", label);
         }
@@ -2545,7 +2579,7 @@ mod hook_tests {
 
     #[test]
     fn rendered_hook_preserves_first_line_banner() {
-        // `_aikey_hook_check_once` greps starting at the top; the original
+        // `aikey_hook_check_once` greps starting at the top; the original
         // "do not hand-edit" banner must remain on line 1 so users editing
         // the file see it before any code.
         let rendered = hook_content_with_hash_header(HookKind::Zsh);
@@ -2638,9 +2672,10 @@ mod hook_tests {
     // vars. cargo's default test runner is multi-threaded, so they would
     // race if run concurrently with each other (or with other env-mutating
     // tests in this crate, e.g. session.rs). Serialize them on a shared
-    // mutex; any future test that mutates HOME/SHELL in this module must
-    // also lock this mutex. Poison is fine — we only need ordering.
-    static ENV_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // crate-wide mutex (see src/test_env_lock.rs); the previous per-module
+    // static raced against session::tests and the three other test modules
+    // below — fix recorded in workflow/CI/bugfix.
+    use crate::test_env_lock::ENV_MUTATION_LOCK;
 
     #[test]
     fn ensure_shell_hook_refuses_rc_append_in_non_tty() {
@@ -2935,12 +2970,12 @@ mod hook_tests {
 #[cfg(test)]
 mod path_helper_tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // Why a mutex: every test in this module reads/writes HOME and
-    // USERPROFILE. Cargo runs tests in parallel, so two tests setting
-    // HOME=A then HOME=B can race. The mutex serialises them.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Why a crate-wide mutex (see src/test_env_lock.rs): every test in
+    // this module reads/writes HOME and USERPROFILE. Cargo runs tests in
+    // parallel across modules, so a private mutex would still race with
+    // hook_tests / session::tests on the same process-global vars.
+    use crate::test_env_lock::ENV_MUTATION_LOCK as ENV_LOCK;
 
     /// Snapshot HOME + USERPROFILE before a test, restore after.
     /// Returns the held mutex guard so the env stays serialised for the
@@ -3158,11 +3193,12 @@ mod path_helper_tests {
 #[cfg(test)]
 mod stage3_powershell_hook_tests {
     use super::*;
-    use std::sync::Mutex;
 
     // Same env-mutation isolation pattern as path_helper_tests above —
     // many tests in this module twiddle PSModulePath / SHELL / etc.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Routed through the crate-wide mutex (src/test_env_lock.rs) so
+    // mutations stay serialised across all unit tests in the crate.
+    use crate::test_env_lock::ENV_MUTATION_LOCK as ENV_LOCK;
 
     struct EnvSnapshot {
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -3353,8 +3389,10 @@ mod stage3_powershell_hook_tests {
         // Two-layer drift detector: layer 1 reads disk hash, layer 2
         // spawns binary and compares. Both must be present.
         let c = hook_ps1_content();
-        assert!(c.contains("_aikey_hook_check_once"),
-                "hook.ps1 must define _aikey_hook_check_once for drift detection");
+        // No leading underscore — see bugfix 2026-05-05.
+        assert!(c.contains("aikey_hook_check_once") && !c.contains("_aikey_hook_check_once"),
+                "hook.ps1 must define aikey_hook_check_once for drift detection \
+                 (no underscore prefix — snapshot tools filter `_*` names)");
         assert!(c.contains("_hook-hash powershell"),
                 "drift detector layer 2 must spawn `aikey _hook-hash powershell`");
         assert!(c.contains("Hook-Template-Hash:"),
@@ -3366,8 +3404,8 @@ mod stage3_powershell_hook_tests {
         let c = hook_ps1_content();
         assert!(c.contains("function global:prompt"),
                 "hook.ps1 must wrap the prompt function for cross-shell sync");
-        assert!(c.contains("_aikey_precmd_powershell"),
-                "hook.ps1 prompt wrap must call _aikey_precmd_powershell");
+        assert!(c.contains("aikey_precmd_powershell") && !c.contains("_aikey_precmd_powershell"),
+                "hook.ps1 prompt wrap must call aikey_precmd_powershell (no underscore prefix)");
         assert!(c.contains("_aikeyOrigPromptForHook"),
                 "hook.ps1 must capture the original prompt to chain");
     }
@@ -3380,8 +3418,9 @@ mod stage3_powershell_hook_tests {
     fn hook_ps1_defines_aikey_preflight_function() {
         let c = hook_ps1_content();
         assert!(
-            c.contains("function global:_aikey_preflight"),
-            "hook.ps1 must define _aikey_preflight (parity with hook.bash _aikey_preflight)",
+            c.contains("function global:aikey_preflight") && !c.contains("function global:_aikey_preflight"),
+            "hook.ps1 must define aikey_preflight (parity with hook.bash aikey_preflight, \
+             no underscore prefix — see bugfix 2026-05-05)",
         );
     }
 
@@ -3394,7 +3433,7 @@ mod stage3_powershell_hook_tests {
         let c = hook_ps1_content();
         assert!(
             c.contains("AIKEY_PREFLIGHT") && c.contains("'off'"),
-            "hook.ps1 _aikey_preflight must honour $env:AIKEY_PREFLIGHT='off' to skip",
+            "hook.ps1 aikey_preflight must honour $env:AIKEY_PREFLIGHT='off' to skip",
         );
     }
 
@@ -3407,11 +3446,11 @@ mod stage3_powershell_hook_tests {
         let c = hook_ps1_content();
         assert!(
             c.contains("proxy ensure-running"),
-            "_aikey_preflight must call `aikey proxy ensure-running` (auto-start proxy)",
+            "aikey_preflight must call `aikey proxy ensure-running` (auto-start proxy)",
         );
         assert!(
             c.contains(" test "),
-            "_aikey_preflight must call `aikey test <id>` (upstream connectivity probe)",
+            "aikey_preflight must call `aikey test <id>` (upstream connectivity probe)",
         );
     }
 
@@ -3438,7 +3477,7 @@ mod stage3_powershell_hook_tests {
     fn hook_ps1_claude_codex_call_preflight_kimi_does_not() {
         // Per hook.bash 2026-04-22 carve-out: kimi-cli has its own
         // connectivity probe that overlaps with `aikey test`, so kimi's
-        // wrapper does proxy-ensure-running ONLY, no `_aikey_preflight`.
+        // wrapper does proxy-ensure-running ONLY, no `aikey_preflight`.
         // Pin the asymmetry so a future "consistency cleanup" doesn't
         // accidentally break kimi launch by adding the diagnostic probe.
         let c = hook_ps1_content();
@@ -3449,8 +3488,8 @@ mod stage3_powershell_hook_tests {
             .split("function global:codex")
             .next().unwrap_or("");
         assert!(
-            claude_block.contains("_aikey_preflight"),
-            "claude wrapper must invoke _aikey_preflight",
+            claude_block.contains("aikey_preflight"),
+            "claude wrapper must invoke aikey_preflight",
         );
         let codex_block = c
             .split("function global:codex")
@@ -3458,15 +3497,15 @@ mod stage3_powershell_hook_tests {
             .split("function global:kimi")
             .next().unwrap_or("");
         assert!(
-            codex_block.contains("_aikey_preflight"),
-            "codex wrapper must invoke _aikey_preflight",
+            codex_block.contains("aikey_preflight"),
+            "codex wrapper must invoke aikey_preflight",
         );
         let kimi_block = c
             .split("function global:kimi")
             .nth(1).unwrap_or("");
         assert!(
-            !kimi_block.contains("_aikey_preflight"),
-            "kimi wrapper must NOT invoke _aikey_preflight (carve-out: kimi-cli has its own probe)",
+            !kimi_block.contains("aikey_preflight"),
+            "kimi wrapper must NOT invoke aikey_preflight (carve-out: kimi-cli has its own probe)",
         );
         assert!(
             kimi_block.contains("ensure-running"),
@@ -3721,9 +3760,9 @@ mod stage3_powershell_hook_tests {
 #[cfg(test)]
 mod stage3_review_fix_tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Crate-wide mutex (src/test_env_lock.rs) — see path_helper_tests above.
+    use crate::test_env_lock::ENV_MUTATION_LOCK as ENV_LOCK;
 
     struct EnvSnapshot {
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -3904,9 +3943,9 @@ mod stage3_review_fix_tests {
         // `return $rc` would surface `0` to the user's stdout (the
         // activate output is captured by Invoke-Expression and any
         // additional output stream contents leak to the prompt).
-        // Internal helpers like `_aikey_preflight` legitimately return
-        // an int that callers capture as `$rc = _aikey_preflight ...`
-        // — same idiom hook.bash uses for its `_aikey_preflight`.
+        // Internal helpers like `aikey_preflight` legitimately return
+        // an int that callers capture as `$rc = aikey_preflight ...`
+        // — same idiom hook.bash uses for its `aikey_preflight`.
         // Pre-2026-04-29 the test scanned the entire file which falsely
         // flagged the preflight helper.
         let full = hook_ps1_content();

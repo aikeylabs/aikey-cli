@@ -24,7 +24,7 @@ if ! (( ${+functions[ak]} )) && ! alias ak >/dev/null 2>&1; then
     function ak { aikey "$@"; }
 fi
 
-_aikey_precmd() {
+aikey_precmd() {
     # Stage 4 cross-shell sync (2026-04-27):
     #   - `_AIKEY_EXPLICIT_ALIAS` is set by `aikey activate <alias>` and
     #     means "this shell is pinned, do NOT auto-sync from active.env".
@@ -37,9 +37,9 @@ _aikey_precmd() {
     #     hot path on every prompt and must stay <1ms.
     #   - When the file is missing the SEQ line (older CLI wrote it) we
     #     fall back to unconditional source for correctness.
-    [[ "$AIKEY_AUTO_REFRESH" == "off" ]] && { _aikey_hook_check_once; return; }
-    [[ -n "$_AIKEY_EXPLICIT_ALIAS" || -n "$AIKEY_ACTIVE_LABEL" ]] && { _aikey_hook_check_once; return; }
-    [[ -f ~/.aikey/active.env ]] || { _aikey_hook_check_once; return; }
+    [[ "$AIKEY_AUTO_REFRESH" == "off" ]] && { aikey_hook_check_once; return; }
+    [[ -n "$_AIKEY_EXPLICIT_ALIAS" || -n "$AIKEY_ACTIVE_LABEL" ]] && { aikey_hook_check_once; return; }
+    [[ -f ~/.aikey/active.env ]] || { aikey_hook_check_once; return; }
     local on_disk_seq
     on_disk_seq=$(grep -m1 -oE 'AIKEY_ACTIVE_SEQ="[0-9]+"' ~/.aikey/active.env 2>/dev/null \
                   | grep -oE '[0-9]+')
@@ -53,7 +53,7 @@ _aikey_precmd() {
         # Fallback for active.env produced by pre-Stage-1 CLI (no SEQ line).
         source ~/.aikey/active.env
     fi
-    _aikey_hook_check_once
+    aikey_hook_check_once
 }
 
 # Two-layer drift detector. Why split: the previous one-shot design ran
@@ -74,7 +74,7 @@ _aikey_precmd() {
 # hash vs binary's embedded hash. Catches the rarer case (binary upgraded
 # but hook file not regenerated). One-shot guard via `_AIKEY_HOOK_CHECKED`
 # kept here because binary spawns aren't free (~20ms).
-_aikey_hook_check_once() {
+aikey_hook_check_once() {
     # ── Layer 1 (every prompt) ──────────────────────────────────────────
     # Auto-reload when the disk file has changed since this shell sourced it.
     if [ -n "$_AIKEY_HOOK_LOADED_HASH" ]; then
@@ -112,7 +112,7 @@ _aikey_hook_check_once() {
     fi
 }
 
-_aikey_preexec() {
+aikey_preexec() {
     [[ -z "$AIKEY_ACTIVE_KEYS" ]] && return
     local cmd="${1%% *}" prov
     case "$cmd" in
@@ -126,8 +126,8 @@ _aikey_preexec() {
 }
 
 # Dedupe-safe registration — re-sourcing this file is harmless.
-(( ${precmd_functions[(I)_aikey_precmd]} )) || precmd_functions+=(_aikey_precmd)
-(( ${preexec_functions[(I)_aikey_preexec]} )) || preexec_functions+=(_aikey_preexec)
+(( ${precmd_functions[(I)aikey_precmd]} )) || precmd_functions+=(aikey_precmd)
+(( ${preexec_functions[(I)aikey_preexec]} )) || preexec_functions+=(aikey_preexec)
 
 # ── Wrapper preflight (claude / codex) ────────────────────────────────────
 #
@@ -145,7 +145,7 @@ _aikey_preexec() {
 # prompt appears. We redirect stdin from /dev/null so a cache-miss turns
 # into a graceful non-zero exit rather than a blocking password prompt —
 # wrapper then treats that like any other preflight failure (warn + ask).
-_aikey_preflight() {
+aikey_preflight() {
     [[ "$AIKEY_PREFLIGHT" == "off" ]] && return 0
     # No active binding in this shell — can't tell what to probe. Emit one
     # advisory line so first-time users see the missing step instead of a
@@ -222,7 +222,7 @@ _aikey_preflight() {
 # Override knobs:
 #   AIKEY_PREFLIGHT_NO_CLEAR=1     → never clear
 #   AIKEY_PREFLIGHT_FORCE_CLEAR=1  → always clear (for false negatives)
-_aikey_clear_before_tui_handoff() {
+aikey_clear_before_tui_handoff() {
     [[ "$AIKEY_PREFLIGHT_NO_CLEAR" == "1" ]] && return 0
     if [[ "$AIKEY_PREFLIGHT_FORCE_CLEAR" == "1" ]]; then
         printf '\033[H\033[2J' >&2
@@ -254,28 +254,37 @@ _aikey_clear_before_tui_handoff() {
 
 # Wrap claude + codex. Guarded so the user's own function/alias (if any)
 # wins — respects the same convention as the `ak` wrapper above.
-# claude / codex: `_aikey_preflight` runs `aikey test`, which now itself
+# claude / codex: `aikey_preflight` runs `aikey test`, which now itself
 # auto-starts aikey-proxy if it's down (via the same env-var/cache/TTY-prompt
 # chain `aikey use` uses). So the wrapper has nothing extra to do — the
 # cold-start sequence (password prompt → "proxy started" → connectivity
 # table) all happens inside one `aikey test` call.
 if ! (( ${+functions[claude]} )) && ! alias claude >/dev/null 2>&1; then
     function claude {
-        _aikey_preflight anthropic || return $?
-        _aikey_clear_before_tui_handoff
+        aikey_preflight anthropic || return $?
+        aikey_clear_before_tui_handoff
         command claude "$@"
     }
 fi
 if ! (( ${+functions[codex]} )) && ! alias codex >/dev/null 2>&1; then
     function codex {
-        _aikey_preflight openai || return $?
-        _aikey_clear_before_tui_handoff
-        command codex "$@"
+        aikey_preflight openai || return $?
+        aikey_clear_before_tui_handoff
+        # `-c model_provider=aikey` overrides the toml top-level model_provider
+        # at runtime so codex routes through aikey-proxy regardless of any
+        # pre-existing `model_provider = "ollama"` etc. in ~/.codex/config.toml.
+        # Why a wrapper arg (vs. rewriting the toml top-level field): keeps
+        # the user's free choice intact when they invoke `command codex`
+        # directly, and avoids the conflict-detect "warn-but-don't-overwrite"
+        # half-state that left codex routing to localhost:11434 (ollama).
+        # Per-invocation override beats global toml edit. See bugfix
+        # 2026-05-05-codex-wrapper-injects-model-provider-arg.md.
+        command codex -c model_provider=aikey "$@"
     }
 fi
 # kimi: auto-start proxy ONLY — NO diagnostic preflight.
 # Why scoped this narrowly: the 2026-04-22 carve-out kept kimi out of
-# `_aikey_preflight` because `aikey test` historically false-positived on
+# `aikey_preflight` because `aikey test` historically false-positived on
 # kimi's coding-API (subscription / coding-tier model 404). The carve-out
 # is pinned by `hook_preflight_does_not_shadow_kimi`. We still want kimi
 # users' first invocation to bring the proxy up (parallel to claude/codex)
@@ -286,7 +295,7 @@ fi
 if ! (( ${+functions[kimi]} )) && ! alias kimi >/dev/null 2>&1; then
     function kimi {
         command aikey proxy ensure-running </dev/null
-        _aikey_clear_before_tui_handoff
+        aikey_clear_before_tui_handoff
         command kimi "$@"
     }
 fi

@@ -17,15 +17,15 @@ if ! type ak >/dev/null 2>&1; then
     ak() { aikey "$@"; }
 fi
 
-_aikey_precmd_bash() {
-    # Stage 4 cross-shell sync (2026-04-27) — see hook.zsh _aikey_precmd
+aikey_precmd_bash() {
+    # Stage 4 cross-shell sync (2026-04-27) — see hook.zsh aikey_precmd
     # for the full rationale. Same gating logic, POSIX-portable shell.
-    [ "$AIKEY_AUTO_REFRESH" = "off" ] && { _aikey_hook_check_once; return; }
+    [ "$AIKEY_AUTO_REFRESH" = "off" ] && { aikey_hook_check_once; return; }
     if [ -n "$_AIKEY_EXPLICIT_ALIAS" ] || [ -n "$AIKEY_ACTIVE_LABEL" ]; then
-        _aikey_hook_check_once
+        aikey_hook_check_once
         return
     fi
-    [ -f ~/.aikey/active.env ] || { _aikey_hook_check_once; return; }
+    [ -f ~/.aikey/active.env ] || { aikey_hook_check_once; return; }
     local on_disk_seq
     on_disk_seq=$(grep -m1 -oE 'AIKEY_ACTIVE_SEQ="[0-9]+"' ~/.aikey/active.env 2>/dev/null \
                   | grep -oE '[0-9]+')
@@ -39,13 +39,13 @@ _aikey_precmd_bash() {
         # Fallback for active.env produced by pre-Stage-1 CLI (no SEQ line).
         source ~/.aikey/active.env
     fi
-    _aikey_hook_check_once
+    aikey_hook_check_once
 }
 
 # Two-layer drift detector — see hook.zsh for the full rationale.
 # Layer 1 (every prompt): cheap disk-hash vs in-memory hash check.
 # Layer 2 (once per shell): expensive binary-vs-disk hash check.
-_aikey_hook_check_once() {
+aikey_hook_check_once() {
     # ── Layer 1 (every prompt) ──
     if [ -n "$_AIKEY_HOOK_LOADED_HASH" ]; then
         local _disk_hash
@@ -75,7 +75,7 @@ _aikey_hook_check_once() {
     fi
 }
 
-_aikey_preexec_bash() {
+aikey_preexec_bash() {
     [ -z "$AIKEY_ACTIVE_KEYS" ] && return
     local cmd="${BASH_COMMAND%% *}" prov
     case "$cmd" in
@@ -92,8 +92,8 @@ _aikey_preexec_bash() {
 # Dedupe-safe PROMPT_COMMAND registration. Append-with-check preserves hooks
 # from direnv / pyenv / atuin that may have registered first.
 case ";$PROMPT_COMMAND;" in
-    *\;_aikey_precmd_bash\;*) ;;
-    *) PROMPT_COMMAND="_aikey_precmd_bash${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+    *\;aikey_precmd_bash\;*) ;;
+    *) PROMPT_COMMAND="aikey_precmd_bash${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
 esac
 # bash has no native preexec — fall back to the DEBUG trap. But DEBUG can hold
 # only one handler at a time, so unconditionally setting it would clobber any
@@ -101,7 +101,7 @@ esac
 # exists; we lose the per-command label echo but preserve user plumbing. Users
 # who want the label can integrate via `bash-preexec.sh`'s `preexec_functions`.
 if [ -z "$(trap -p DEBUG 2>/dev/null)" ]; then
-    trap '_aikey_preexec_bash' DEBUG
+    trap 'aikey_preexec_bash' DEBUG
 fi
 
 # ── Wrapper preflight (claude / codex) ────────────────────────────────────
@@ -112,7 +112,7 @@ fi
 #     (session-cache hits stay silent, cache misses become a preflight fail
 #     rather than a hanging prompt).
 #   - On non-zero exit, warn + prompt, default "no".
-_aikey_preflight() {
+aikey_preflight() {
     [ "$AIKEY_PREFLIGHT" = "off" ] && return 0
     # No active binding in this shell — emit an advisory line instead of
     # silently passing through. See hook.zsh for the full rationale.
@@ -158,7 +158,7 @@ _aikey_preflight() {
 # Clear-before-handoff for terminals with broken alt-screen (2026-04-27).
 # See hook.zsh's matching helper for the full rationale and override
 # env vars (AIKEY_PREFLIGHT_NO_CLEAR / AIKEY_PREFLIGHT_FORCE_CLEAR).
-_aikey_clear_before_tui_handoff() {
+aikey_clear_before_tui_handoff() {
     [ "$AIKEY_PREFLIGHT_NO_CLEAR" = "1" ] && return 0
     if [ "$AIKEY_PREFLIGHT_FORCE_CLEAR" = "1" ]; then
         printf '\033[H\033[2J' >&2
@@ -188,20 +188,22 @@ _aikey_clear_before_tui_handoff() {
 # builtins, and PATH — we only want to skip when the first three match (PATH
 # is the real binary we'll call via `command`). Shell grammar limitation:
 # there's no clean one-liner to split that, so use `declare -F` + alias.
-# claude / codex: `aikey test` (called inside _aikey_preflight) self-starts
+# claude / codex: `aikey test` (called inside aikey_preflight) self-starts
 # aikey-proxy if it's down. See hook.zsh for the full rationale.
 if ! declare -F claude >/dev/null 2>&1 && ! alias claude >/dev/null 2>&1; then
     claude() {
-        _aikey_preflight anthropic || return $?
-        _aikey_clear_before_tui_handoff
+        aikey_preflight anthropic || return $?
+        aikey_clear_before_tui_handoff
         command claude "$@"
     }
 fi
 if ! declare -F codex >/dev/null 2>&1 && ! alias codex >/dev/null 2>&1; then
     codex() {
-        _aikey_preflight openai || return $?
-        _aikey_clear_before_tui_handoff
-        command codex "$@"
+        aikey_preflight openai || return $?
+        aikey_clear_before_tui_handoff
+        # `-c model_provider=aikey` overrides toml top-level at runtime — see
+        # bugfix 2026-05-05 and matching block in hook.zsh.
+        command codex -c model_provider=aikey "$@"
     }
 fi
 # kimi: auto-start proxy ONLY — NO diagnostic preflight. See hook.zsh for
@@ -209,7 +211,7 @@ fi
 if ! declare -F kimi >/dev/null 2>&1 && ! alias kimi >/dev/null 2>&1; then
     kimi() {
         command aikey proxy ensure-running </dev/null
-        _aikey_clear_before_tui_handoff
+        aikey_clear_before_tui_handoff
         command kimi "$@"
     }
 fi

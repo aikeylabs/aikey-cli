@@ -430,11 +430,13 @@ pub fn invalidate() {
 mod tests {
     use super::*;
     use std::env;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    // Global mutex: tests that override HOME must run sequentially.
-    static HOME_MUTEX: Mutex<()> = Mutex::new(());
+    // Crate-wide mutex (see src/test_env_lock.rs): serialises env mutations
+    // across all test modules in this crate, not just session.rs's own tests.
+    // A per-module mutex was insufficient — shell_integration's hook_tests
+    // also mutate HOME and would race with session::tests otherwise.
+    use crate::test_env_lock::ENV_MUTATION_LOCK as HOME_MUTEX;
 
     /// Redirect all session file paths to a temp directory by overriding HOME.
     fn with_temp_home(f: impl FnOnce()) {

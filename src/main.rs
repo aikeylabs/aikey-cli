@@ -53,6 +53,13 @@ mod commands_init;
 #[allow(dead_code)] mod usage_wal;
 mod cli;
 
+// Crate-wide test-env mutex (see src/test_env_lock.rs). Declared in both
+// main.rs and lib.rs because session / commands_account are pulled into
+// each compilation unit's module tree separately, and `crate::test_env_lock`
+// must resolve in both.
+#[cfg(test)]
+mod test_env_lock;
+
 use cli::*;
 use clap::Parser;
 use secrecy::{ExposeSecret, SecretString};
@@ -1423,7 +1430,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // stays a pure diagnostic: it does NOT auto-start the proxy.
             // Wrapper hooks (claude/codex/kimi) are expected to bring the
             // proxy up via `aikey proxy ensure-running` before calling us;
-            // see hook.zsh `_aikey_preflight` for the orchestration.
+            // see hook.zsh `aikey_preflight` for the orchestration.
             // Round 9 fix #1: was is_proxy_running (PID-only); now uses
             // proxy_is_running_managed (Layer 1) so OrphanedPort / Unresponsive
             // bail out with the "proxy not running" exit instead of

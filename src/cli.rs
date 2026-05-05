@@ -97,7 +97,7 @@ pub(crate) enum Commands {
     },
     /// Internal: print the FNV-1a-64 hash of the embedded hook template.
     ///
-    /// Consumed by `_aikey_hook_check_once` in hook.zsh / hook.bash to detect
+    /// Consumed by `aikey_hook_check_once` in hook.zsh / hook.bash to detect
     /// an outdated `~/.aikey/hook.{zsh,bash}` (user upgraded the `aikey`
     /// binary without re-running `aikey use`, so the on-disk hook lags
     /// behind the binary's embedded template). Output format is a bare
