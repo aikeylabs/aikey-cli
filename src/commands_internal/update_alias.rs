@@ -239,15 +239,13 @@ fn handle_rename_target(env: StdinEnvelope) {
                 "action_taken": "renamed",
                 "audit_logged": audit_logged,
             });
-            // Emit target-specific display field for backward-compat with
-            // existing Go/TS response shape expectations.
+            // Emit target-specific display field. OAuth rename writes
+            // local_alias (post v1.0.1-alpha.1) and leaves display_identity
+            // immutable, so the response field that carries the new label
+            // is `local_alias` for both oauth and team — matches the
+            // underlying column they actually wrote.
             match outcome.target {
-                "oauth" => {
-                    if let Some(o) = body.as_object_mut() {
-                        o.insert("display_identity".into(), json!(outcome.new_value));
-                    }
-                }
-                "team" => {
+                "oauth" | "team" => {
                     if let Some(o) = body.as_object_mut() {
                         o.insert("local_alias".into(), json!(outcome.new_value));
                     }

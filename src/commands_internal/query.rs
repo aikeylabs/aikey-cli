@@ -549,28 +549,53 @@ fn handle_list_oauth(env: StdinEnvelope) {
     let expires_map = load_oauth_expires_map().unwrap_or_default();
     let (_active_personal, active_oauth) = load_active_binding_refs();
 
-    let arr: Vec<_> = accounts.iter().map(|a| json!({
-        "target": "oauth",
-        "id": a.provider_account_id,
-        "provider_account_id": a.provider_account_id,
-        "provider": a.provider,
-        "protocol_family": protocol_family_of(Some(&a.provider)),
-        "auth_type": a.auth_type,
-        "credential_type": a.credential_type.as_str(),
-        "display_identity": a.display_identity,
-        "alias": a.display_identity,
-        "external_id": a.external_id,
-        "org_uuid": a.org_uuid,
-        "account_tier": a.account_tier,
-        "status": a.status,
-        "created_at": a.created_at,
-        "last_used_at": a.last_used_at,
-        "use_count": a.use_count.unwrap_or(0),
-        // See list_personal handler for the in_use_for / in_use rationale.
-        "in_use_for": active_oauth.get(&a.provider_account_id).cloned().unwrap_or_default(),
-        "in_use": active_oauth.contains_key(&a.provider_account_id),
-        "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
-    })).collect();
+    let arr: Vec<_> = accounts.iter().map(|a| {
+        // route_url + route_token mirror the personal-key payload (2026-05-06).
+        // Why: the user/vault drawer needs the same SDK-base-url + opaque token
+        // pair for OAuth accounts that it already shows for personal keys, so
+        // the values match `aikey route` exactly. Generation logic is identical
+        // — `route_url_for` + `provider_proxy_path` already canonicalize aliases
+        // (claude → anthropic, moonshot → moonshot/v1) the same way `aikey route`
+        // does in handle_route. route_token is the server-issued opaque
+        // identifier stored on the account; absent only on pre-route-token
+        // vaults (returns null in that case, drawer hides the row).
+        let route_token = storage::get_provider_account_route_token_readonly(&a.provider_account_id)
+            .ok()
+            .flatten();
+        // Effective alias = local_alias if user has renamed, else
+        // display_identity. v1.0.1-alpha.1 split the two so the
+        // "alias differs from identity ⇒ render Identity row separately"
+        // UI rule has a real signal — pre-split they were always equal.
+        let effective_alias = a
+            .local_alias
+            .clone()
+            .or_else(|| a.display_identity.clone());
+        json!({
+            "target": "oauth",
+            "id": a.provider_account_id,
+            "provider_account_id": a.provider_account_id,
+            "provider": a.provider,
+            "protocol_family": protocol_family_of(Some(&a.provider)),
+            "auth_type": a.auth_type,
+            "credential_type": a.credential_type.as_str(),
+            "display_identity": a.display_identity,
+            "alias": effective_alias,
+            "local_alias": a.local_alias,
+            "external_id": a.external_id,
+            "org_uuid": a.org_uuid,
+            "account_tier": a.account_tier,
+            "status": a.status,
+            "created_at": a.created_at,
+            "last_used_at": a.last_used_at,
+            "use_count": a.use_count.unwrap_or(0),
+            // See list_personal handler for the in_use_for / in_use rationale.
+            "in_use_for": active_oauth.get(&a.provider_account_id).cloned().unwrap_or_default(),
+            "in_use": active_oauth.contains_key(&a.provider_account_id),
+            "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
+            "route_url": route_url_for(&a.provider),
+            "route_token": route_token,
+        })
+    }).collect();
 
     emit(&ResultEnvelope::ok(
         req_id,
@@ -704,11 +729,23 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
 
     let personal_count = out.len();
 
-    // OAuth accounts: identical shape to `handle_list_oauth`; no tokens.
+    // OAuth accounts: same shape as `handle_list_oauth` plus the same
+    // route_url-public + route_token-null security stance applied to personal
+    // keys above (2026-04-24 security review). The drawer's
+    // `{oauth.route_token && ...}` guard hides the row when null, so the
+    // user sees the route URL but cannot copy a usable bearer until they
+    // unlock the vault.
     let expires_map = load_oauth_expires_map().unwrap_or_default();
     let oauth_count = match storage::list_provider_accounts() {
         Ok(accounts) => {
             for a in &accounts {
+                // Effective alias = local_alias if user has renamed, else
+                // display_identity. Same rule as the unlocked-mode handler;
+                // see comment in handle_list_oauth.
+                let effective_alias = a
+                    .local_alias
+                    .clone()
+                    .or_else(|| a.display_identity.clone());
                 out.push(json!({
                     "target": "oauth",
                     "id": a.provider_account_id,
@@ -718,7 +755,8 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "auth_type": a.auth_type,
                     "credential_type": a.credential_type.as_str(),
                     "display_identity": a.display_identity,
-                    "alias": a.display_identity,
+                    "alias": effective_alias,
+                    "local_alias": a.local_alias,
                     "external_id": a.external_id,
                     "org_uuid": a.org_uuid,
                     "account_tier": a.account_tier,
@@ -731,6 +769,13 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "in_use_for": active_oauth.get(&a.provider_account_id).cloned().unwrap_or_default(),
                     "in_use": active_oauth.contains_key(&a.provider_account_id),
                     "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
+                    // Public — same SDK base URL the proxy serves; safe to expose
+                    // in locked mode so users see the routing target before unlocking.
+                    "route_url": route_url_for(&a.provider),
+                    // Blanked in locked mode (same policy as personal route_token):
+                    // an opaque bearer the proxy accepts; emitting null preserves
+                    // the TS shape contract `route_token: string | null`.
+                    "route_token": serde_json::Value::Null,
                 }));
             }
             accounts.len()

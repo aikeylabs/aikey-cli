@@ -1028,7 +1028,15 @@ fn handle_doctor(provider: Option<&str>, proxy_port: u16) -> Result<(), Box<dyn 
     } else {
         eprintln!("  {} {} OAuth account(s) found", "\u{2713}".green(), accounts.len());
         for a in &accounts {
-            let display = a.display_identity.as_deref().unwrap_or("-");
+            // Show the user-facing label (local_alias if renamed, else
+            // upstream email) instead of just display_identity, so the
+            // user sees the same name they'd type into `aikey activate`.
+            let display = a.effective_label();
+            let display = if display.is_empty() || display == a.provider_account_id {
+                "-"
+            } else {
+                display
+            };
             eprintln!("    {}/{} — {}", a.provider, display, a.status);
         }
     }
@@ -1066,10 +1074,13 @@ fn find_account(id_or_display: &str) -> Result<storage::ProviderAccountInfo, Box
     // which can silently target the wrong account on logout/use.
     let all = storage::list_provider_accounts()?;
 
-    // Tier 1: exact match on display_identity or provider_account_id.
+    // Tier 1: exact match on local_alias, display_identity, or provider_account_id.
+    // v1.0.1-alpha.1 added local_alias so a renamed account is reachable
+    // by its new label (e.g. `aikey auth logout my-renamed-claude`).
     let exact: Vec<_> = all.iter()
         .filter(|a|
-            a.display_identity.as_deref() == Some(id_or_display)
+            a.local_alias.as_deref() == Some(id_or_display)
+            || a.display_identity.as_deref() == Some(id_or_display)
             || a.provider_account_id == id_or_display
         )
         .cloned()
@@ -1093,11 +1104,12 @@ fn find_account(id_or_display: &str) -> Result<storage::ProviderAccountInfo, Box
         return Err(ambiguous_match_err(id_or_display, &by_provider));
     }
 
-    // Tier 3: prefix match on display_identity or provider_account_id.
+    // Tier 3: prefix match on local_alias, display_identity, or provider_account_id.
     // Safer than contains — `alice` matches `alice@x.com` but NOT `malice@x.com`.
     let prefix: Vec<_> = all.into_iter()
         .filter(|a|
-            a.display_identity.as_deref().map_or(false, |d| d.starts_with(id_or_display))
+            a.local_alias.as_deref().map_or(false, |d| d.starts_with(id_or_display))
+            || a.display_identity.as_deref().map_or(false, |d| d.starts_with(id_or_display))
             || a.provider_account_id.starts_with(id_or_display)
         )
         .collect();

@@ -522,8 +522,15 @@ fn run_unified_list(
             // Build row data for dynamic width calculation
             struct OAuthRow { identity: String, provider: String, use_for: String, has_use: bool, status: String, tier: String, expires: String }
             let oauth_rows: Vec<OAuthRow> = oauth_accounts.iter().map(|acct| {
-                let identity = acct.display_identity.as_deref()
+                // Precedence: local_alias (rename) → display_identity →
+                // truncated external_id → "-". v1.0.1-alpha.1 added
+                // local_alias on top so a renamed account shows the new
+                // label, while still falling back to the upstream
+                // email/UUID when neither alias nor display_identity is
+                // populated.
+                let identity = acct.local_alias.as_deref()
                     .filter(|s| !s.is_empty())
+                    .or_else(|| acct.display_identity.as_deref().filter(|s| !s.is_empty()))
                     .or_else(|| acct.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
                     .unwrap_or("-").to_string();
                 let uf: Vec<&str> = bindings.iter()
@@ -2938,8 +2945,7 @@ fn handle_route(
     // 2. OAuth accounts
     for acct in storage::list_provider_accounts_readonly().unwrap_or_default() {
         if acct.status != "active" { continue; }
-        let label_str = acct.display_identity.as_deref()
-            .unwrap_or(&acct.provider_account_id);
+        let label_str = acct.effective_label();
         match storage::get_provider_account_route_token_readonly(&acct.provider_account_id) {
             Ok(Some(token)) => {
                 entries.push(RouteEntry {
@@ -3308,11 +3314,13 @@ fn resolve_binding_display_name(source_type: &str, source_ref: &str) -> String {
             return entry.local_alias.unwrap_or(entry.alias);
         }
     }
-    // OAuth accounts: show email identity instead of opaque provider_account_id
+    // OAuth accounts: show the user-facing label (local_alias if renamed,
+    // else email identity) instead of opaque provider_account_id.
     if source_type == "personal_oauth_account" {
         if let Ok(Some(acct)) = storage::get_provider_account(source_ref) {
-            if let Some(id) = acct.display_identity.as_deref().filter(|s: &&str| !s.is_empty()) {
-                return id.to_string();
+            let label = acct.effective_label();
+            if !label.is_empty() && label != acct.provider_account_id {
+                return label.to_string();
             }
             if let Some(id) = acct.external_id.as_deref().filter(|s: &&str| !s.is_empty()) {
                 return id.to_string();
@@ -3564,8 +3572,9 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
         }
     }
 
-    // OAuth group — `resolve_activate_key` accepts display_identity or
-    // provider_account_id, so feed back whichever is more human-readable.
+    // OAuth group — `resolve_activate_key` accepts local_alias /
+    // display_identity / provider_account_id, so feed back the
+    // user-facing label (local_alias if renamed, else email).
     if !oauth_usable.is_empty() {
         items.push(format!("{}", "oauth".bold().cyan()));
         aliases.push(String::new());
@@ -3574,9 +3583,7 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
         let n = oauth_usable.len();
         for (i, acct) in oauth_usable.iter().enumerate() {
             let connector = if i + 1 == n { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
-            let identity = acct.display_identity.as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(&acct.provider_account_id);
+            let identity = acct.effective_label();
             let in_use = bindings.iter().any(|b|
                 b.key_source_type == credential_type::CredentialType::PersonalOAuthAccount
                 && b.key_source_ref == acct.provider_account_id);
@@ -3638,7 +3645,8 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
                 || (cfg.key_type == credential_type::CredentialType::PersonalOAuthAccount
                     && oauth_usable.iter().any(|o|
                         o.provider_account_id == cfg.key_ref
-                        && (o.display_identity.as_deref() == Some(a.as_str())
+                        && (o.local_alias.as_deref() == Some(a.as_str())
+                            || o.display_identity.as_deref() == Some(a.as_str())
                             || o.provider_account_id == *a)))
         })
     }).and_then(|i| if selectable[i] { Some(i) } else { None });
@@ -3767,8 +3775,11 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
         // instead of duplicating the alias map inline.
         for acct in &oauth_accounts {
             if provider_canonical(&acct.provider) == *prov {
-                let identity = acct.display_identity.as_deref()
+                // Precedence: local_alias → display_identity → trunc(external_id)
+                // → provider_account_id. v1.0.1-alpha.1 added local_alias on top.
+                let identity = acct.local_alias.as_deref()
                     .filter(|s| !s.is_empty())
+                    .or_else(|| acct.display_identity.as_deref().filter(|s| !s.is_empty()))
                     .or_else(|| acct.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
                     .unwrap_or(&acct.provider_account_id);
                 // Truncate long email username for picker display
@@ -3937,12 +3948,22 @@ fn probe_alias_sources(alias: &str) -> Vec<&'static str> {
         sources.push("team");
     }
 
+    // Match against local_alias (rename), display_identity (email), and
+    // provider_account_id. Adding local_alias here (v1.0.1-alpha.1) lets
+    // `aikey activate <new-alias>` correctly mark the OAuth source as a
+    // candidate for the ambiguity warning even when the alias has been
+    // renamed away from the upstream email.
     let oauth_exists = storage::list_provider_accounts_readonly()
         .unwrap_or_default()
         .iter()
         .any(|a| {
-            let id = a.display_identity.as_deref().unwrap_or(&a.provider_account_id);
-            id.eq_ignore_ascii_case(alias) || a.provider_account_id.eq_ignore_ascii_case(alias)
+            a.provider_account_id.eq_ignore_ascii_case(alias)
+                || a.local_alias.as_deref()
+                    .map(|d| d.eq_ignore_ascii_case(alias))
+                    .unwrap_or(false)
+                || a.display_identity.as_deref()
+                    .map(|d| d.eq_ignore_ascii_case(alias))
+                    .unwrap_or(false)
         });
     if oauth_exists {
         sources.push("OAuth");
@@ -4003,14 +4024,20 @@ fn resolve_activate_key(
     }
 
     // ── 2. Try OAuth accounts ───────────────────────────────────────────────
+    // v1.0.1-alpha.1: match by local_alias (rename) → display_identity →
+    // provider_account_id, mirroring resolve_oauth_account so
+    // `aikey activate <new-alias>` works after a rename.
     for acct in storage::list_provider_accounts_readonly().unwrap_or_default() {
         if acct.status != "active" { continue; }
-        let identity = acct.display_identity.as_deref()
-            .unwrap_or(&acct.provider_account_id);
-        if !identity.eq_ignore_ascii_case(alias)
-            && !acct.provider_account_id.eq_ignore_ascii_case(alias) {
-            continue;
-        }
+        let matches = acct.provider_account_id.eq_ignore_ascii_case(alias)
+            || acct.local_alias.as_deref()
+                .map(|d| d.eq_ignore_ascii_case(alias))
+                .unwrap_or(false)
+            || acct.display_identity.as_deref()
+                .map(|d| d.eq_ignore_ascii_case(alias))
+                .unwrap_or(false);
+        if !matches { continue; }
+        let identity = acct.effective_label();
         let token = storage::get_provider_account_route_token_readonly(&acct.provider_account_id)?
             .ok_or_else(|| format!("No route token for '{}'. Run `aikey use` first to generate tokens.", identity))?;
         let providers = vec![acct.provider.clone()];

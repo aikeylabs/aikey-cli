@@ -1006,15 +1006,45 @@ pub struct ProviderAccountInfo {
     pub credential_type: CredentialType,
     pub status: String,
     pub external_id: Option<String>,
+    /// Original/immutable account identity from the OAuth provider (typically
+    /// email, falls back to user_id / external_id when the upstream login
+    /// flow doesn't return an email). Renames must NOT touch this field — see
+    /// `local_alias`.
     pub display_identity: Option<String>,
     pub org_uuid: Option<String>,
     pub account_tier: Option<String>,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     /// Monotonic counter of recorded usages, bumped by
-    /// `_internal vault-op record_usage`. Added v1.0.6-alpha; old vaults
-    /// default to 0 (NOT NULL DEFAULT 0 on the column).
+    /// `_internal vault-op record_usage`. Added with the route_token /
+    /// telemetry batch (current registry: v1.0.4-alpha); old vaults default
+    /// to 0 (NOT NULL DEFAULT 0 on the column).
     pub use_count: Option<i64>,
+    /// User-set local label written by the OAuth rename path. NULL means
+    /// "never renamed"; callers should fall back to `display_identity` for
+    /// a stable label. Added v1.0.1-alpha.1 (post-GA); pre-migration vaults
+    /// project NULL via the column-list fallback below. The split
+    /// (display_identity vs local_alias) lets the UI detect "this account
+    /// has been renamed" by `local_alias.is_some()` and render the original
+    /// identity as a separate row instead of overwriting it.
+    pub local_alias: Option<String>,
+}
+
+impl ProviderAccountInfo {
+    /// User-facing label following the v1.0.1-alpha.1 precedence:
+    ///   local_alias (if user has renamed) → display_identity → account_id.
+    /// Use this anywhere the CLI prints "this account" / "this key" to the
+    /// user, so renamed accounts show the new alias instead of the
+    /// original email. For sites that *specifically* want the immutable
+    /// upstream identity (audit logs, dedup keys, OAuth-provider lookups)
+    /// keep reading `display_identity` directly.
+    pub fn effective_label(&self) -> &str {
+        self.local_alias
+            .as_deref()
+            .or(self.display_identity.as_deref())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.provider_account_id)
+    }
 }
 
 fn row_to_provider_account(row: &rusqlite::Row) -> rusqlite::Result<ProviderAccountInfo> {
@@ -1032,21 +1062,31 @@ fn row_to_provider_account(row: &rusqlite::Row) -> rusqlite::Result<ProviderAcco
         created_at:          row.get(9)?,
         last_used_at:        row.get(10)?,
         use_count:           row.get(11).ok(),
+        local_alias:         row.get(12).ok().flatten(),
     })
 }
 
-// Two column lists to tolerate vaults that predate v1.0.6-alpha (where
-// `use_count` doesn't exist). Every query tries FULL first and falls back
-// to LEGACY on prepare failure. The fallback projects a literal 0 so
-// row_to_provider_account's row.get(11) always has a sensible value.
+// Three-tier column list cascade — each tier corresponds to a vault that
+// stopped at a particular schema generation:
+//   FULL              — post v1.0.1-alpha.1 (has use_count AND local_alias)
+//   NO_LOCAL_ALIAS    — has use_count but predates v1.0.1-alpha.1
+//                       (literal NULL projected for local_alias)
+//   LEGACY            — predates use_count too (literal 0 + NULL)
+// Callers prepare(FULL) → fallback prepare(NO_LOCAL_ALIAS) → fallback
+// prepare(LEGACY). Read-only paths that open a vault without running
+// migrations rely on this cascade; write paths see FULL after upgrade_all.
 const PROVIDER_ACCOUNT_COLUMNS_FULL: &str =
     "provider_account_id, provider, auth_type, credential_type, status, \
      external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
-     use_count";
+     use_count, local_alias";
+const PROVIDER_ACCOUNT_COLUMNS_NO_LOCAL_ALIAS: &str =
+    "provider_account_id, provider, auth_type, credential_type, status, \
+     external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
+     use_count, NULL";
 const PROVIDER_ACCOUNT_COLUMNS_LEGACY: &str =
     "provider_account_id, provider, auth_type, credential_type, status, \
      external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
-     0";
+     0, NULL";
 
 /// List all provider OAuth accounts (write connection with migrations).
 pub fn list_provider_accounts() -> Result<Vec<ProviderAccountInfo>, String> {
@@ -1062,14 +1102,21 @@ pub fn list_provider_accounts_readonly() -> Result<Vec<ProviderAccountInfo>, Str
 }
 
 fn query_provider_accounts(conn: &Connection) -> Result<Vec<ProviderAccountInfo>, String> {
-    // Try v1.0.6+ columns first; fall back to legacy (literal 0 for
-    // use_count) on prepare failure. If BOTH fail, the table itself
-    // doesn't exist yet (old vault) — return empty, same as before.
+    // Three-tier prepare cascade: FULL (post v1.0.1-alpha.1) → NO_LOCAL_ALIAS
+    // (use_count present, local_alias missing) → LEGACY (both missing). If
+    // ALL fail, the table itself doesn't exist yet (very old vault) —
+    // return empty, same as before.
     let mut stmt = match conn
         .prepare(&format!(
             "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
             PROVIDER_ACCOUNT_COLUMNS_FULL
         ))
+        .or_else(|_| {
+            conn.prepare(&format!(
+                "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
+                PROVIDER_ACCOUNT_COLUMNS_NO_LOCAL_ALIAS
+            ))
+        })
         .or_else(|_| {
             conn.prepare(&format!(
                 "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
@@ -1106,6 +1153,17 @@ pub fn get_provider_account(id: &str) -> Result<Option<ProviderAccountInfo>, Str
             _ => conn.query_row(
                 &format!(
                     "SELECT {} FROM provider_accounts WHERE provider_account_id = ?1",
+                    PROVIDER_ACCOUNT_COLUMNS_NO_LOCAL_ALIAS
+                ),
+                params![id],
+                |row| row_to_provider_account(row),
+            ),
+        })
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &format!(
+                    "SELECT {} FROM provider_accounts WHERE provider_account_id = ?1",
                     PROVIDER_ACCOUNT_COLUMNS_LEGACY
                 ),
                 params![id],
@@ -1127,6 +1185,12 @@ pub fn get_provider_accounts_by_provider(provider: &str) -> Result<Vec<ProviderA
             "SELECT {} FROM provider_accounts WHERE provider = ?1 ORDER BY created_at",
             PROVIDER_ACCOUNT_COLUMNS_FULL
         ))
+        .or_else(|_| {
+            conn.prepare(&format!(
+                "SELECT {} FROM provider_accounts WHERE provider = ?1 ORDER BY created_at",
+                PROVIDER_ACCOUNT_COLUMNS_NO_LOCAL_ALIAS
+            ))
+        })
         .or_else(|_| {
             conn.prepare(&format!(
                 "SELECT {} FROM provider_accounts WHERE provider = ?1 ORDER BY created_at",
@@ -1159,6 +1223,17 @@ pub fn get_provider_account_by_external_id(
             params![provider, external_id],
             |row| row_to_provider_account(row),
         )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &format!(
+                    "SELECT {} FROM provider_accounts WHERE provider = ?1 AND external_id = ?2",
+                    PROVIDER_ACCOUNT_COLUMNS_NO_LOCAL_ALIAS
+                ),
+                params![provider, external_id],
+                |row| row_to_provider_account(row),
+            ),
+        })
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Err(e),
             _ => conn.query_row(

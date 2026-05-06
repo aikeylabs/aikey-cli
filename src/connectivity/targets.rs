@@ -96,9 +96,12 @@ pub fn target_from_binding(
                     .find(|a| a.provider_account_id == binding.key_source_ref)
                 {
                     if !matches!(acct.status.as_str(), "active" | "idle") {
+                        // Surface the user-facing label (local_alias if
+                        // renamed, else email) — `effective_label` falls
+                        // through to provider_account_id only when both are
+                        // empty, matching the pre-v1.0.1-alpha.1 fallback.
                         return Err(BuildTargetError::OAuthUnhealthy {
-                            account: acct.display_identity.clone()
-                                .unwrap_or_else(|| binding.key_source_ref.clone()),
+                            account: acct.effective_label().to_string(),
                             status: acct.status.clone(),
                         });
                     }
@@ -215,10 +218,15 @@ pub fn targets_from_alias(
         return vec![team_target(&vk.virtual_key_id, &provider, proxy_port)];
     }
 
-    // ── 3. OAuth account (by ID or display_identity / email). ────────────
+    // ── 3. OAuth account (by ID, local_alias, or display_identity / email). ────
+    // v1.0.1-alpha.1: also match local_alias so a renamed OAuth account
+    // resolves correctly here. Mirror with `commands_account::resolve_oauth_account`.
     if let Ok(accounts) = storage::list_provider_accounts_readonly() {
         let hit = accounts.iter().find(|a| {
             a.provider_account_id.eq_ignore_ascii_case(alias)
+                || a.local_alias.as_deref()
+                    .map(|d| d.eq_ignore_ascii_case(alias))
+                    .unwrap_or(false)
                 || a.display_identity.as_deref()
                     .map(|d| d.eq_ignore_ascii_case(alias))
                     .unwrap_or(false)

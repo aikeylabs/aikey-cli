@@ -65,6 +65,20 @@ static VERSIONS: &[VersionMigration] = &[
         upgrade: v1_0_0::upgrade,
         rollback: v1_0_0::rollback,
     },
+    // v1.0.1-alpha.1 = first post-GA informal increment under the
+    // v1.0.1-alpha development cycle. Adds provider_accounts.local_alias
+    // so OAuth rename can preserve the original email. See the
+    // `v1_0_1_alpha_1` module below for the full rationale.
+    //
+    // Naming note: post-GA cycle is `v1.0.1-alpha`, `v1.0.1-alpha.1`,
+    // `v1.0.1-alpha.2`, ... The earlier `v1.0.2-alpha` slot in this
+    // registry is the historical pre-GA milestone (kept for upgrade-from-
+    // alpha-users) and is unrelated to the post-GA naming scheme.
+    VersionMigration {
+        version: "1.0.1-alpha.1",
+        upgrade: v1_0_1_alpha_1::upgrade,
+        rollback: v1_0_1_alpha_1::rollback,
+    },
 ];
 
 /// Run all upgrades up to the current binary version.
@@ -664,7 +678,20 @@ pub mod v1_0_3_alpha {
                 credential_type      TEXT NOT NULL DEFAULT 'personal_oauth_account',
                 status               TEXT NOT NULL DEFAULT 'active',
                 external_id          TEXT,
+                -- display_identity: original/immutable account identity from the
+                -- OAuth provider (typically email, falls back to external_id /
+                -- alias when the upstream login flow doesn't return an email).
+                -- Renames must NOT touch this column — see local_alias.
                 display_identity     TEXT,
+                -- local_alias: user-set local label, written by `aikey rename`
+                -- and the web Vault rename action. NULL means \"never renamed\";
+                -- callers fall back to display_identity. Added v1.0.1-alpha.1
+                -- (post-GA); baseline ships it natively for fresh installs so
+                -- the upgrade path and the fresh path produce identical
+                -- schemas. UI uses local_alias.is_some() as the signal that
+                -- the alias should be rendered separately from the underlying
+                -- identity.
+                local_alias          TEXT,
                 org_uuid             TEXT,
                 account_tier         TEXT,
                 created_at           INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
@@ -1260,6 +1287,91 @@ pub mod v1_0_0 {
 }
 
 // ---------------------------------------------------------------------------
+// v1.0.1-alpha.1 — provider_accounts.local_alias (post-GA, 2026-05-06)
+//
+// Naming: this is the first post-GA informal increment in the v1.0.1-alpha
+// dev cycle. The historical pre-GA `v1.0.2-alpha` slot earlier in this
+// registry is from the pre-GA milestone numbering and is unrelated to
+// the post-GA `v1.0.1-alpha` cycle — see the registry comment.
+//
+// Why this migration exists:
+//   Before this version, OAuth account "rename" overwrote
+//   provider_accounts.display_identity directly — destroying the original
+//   email/identity returned by the upstream OAuth provider. After rename
+//   there was no way to recover the underlying email; the identity column
+//   became indistinguishable from a user-chosen label.
+//
+//   v1.0.1-alpha.1 splits the two concepts:
+//     - display_identity → immutable origin (set once at OAuth login,
+//                          never touched by rename).
+//     - local_alias      → user-set label (written by `aikey rename`
+//                          and the web Vault rename action). NULL means
+//                          "never renamed"; callers fall back to
+//                          display_identity for a stable label.
+//
+//   Effective alias for the UI / CLI display becomes
+//   `local_alias.unwrap_or(display_identity)`. The rule "alias differs
+//   from identity ⇒ render Identity row separately with the email icon"
+//   only fires when local_alias.is_some(), so renamed accounts now keep
+//   their email visible.
+//
+// Idempotency: ALTER TABLE … ADD COLUMN guarded by has_column() so the
+// migration is safe to re-run on already-upgraded vaults. Fresh installs
+// get the column from the v1.0.3-alpha baseline (which was updated to
+// include local_alias natively) — running this migration on a fresh vault
+// is a no-op.
+// ---------------------------------------------------------------------------
+
+pub mod v1_0_1_alpha_1 {
+    use rusqlite::Connection;
+
+    fn has_table(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false)
+    }
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name=?1", table),
+            [column],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false)
+    }
+
+    pub fn upgrade(conn: &Connection) -> Result<(), String> {
+        if !has_table(conn, "provider_accounts") {
+            // Vault predates v1.0.3-alpha and never registered baseline OAuth
+            // tables; skip silently — baseline upgrade earlier in the chain
+            // would have created the table with local_alias already in place.
+            return Ok(());
+        }
+        if !has_column(conn, "provider_accounts", "local_alias") {
+            conn.execute(
+                "ALTER TABLE provider_accounts ADD COLUMN local_alias TEXT",
+                [],
+            )
+            .map_err(|e| format!("provider_accounts.local_alias: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// Reverse migration. SQLite (pre-3.35) cannot DROP COLUMN cleanly, so
+    /// the column stays after rollback — older binaries simply ignore the
+    /// extra column. Symmetric with v1.0.4-alpha rollback policy.
+    pub fn rollback(_: &Connection) -> Result<(), String> {
+        eprintln!("[db rollback] SKIP: provider_accounts.local_alias (SQLite no DROP COLUMN)");
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1479,5 +1591,104 @@ mod tests {
         }
         assert!(table_exists(&conn, "user_profiles"));
         assert!(table_exists(&conn, "provider_accounts"));
+    }
+
+    // ── v1.0.1-alpha.1: provider_accounts.local_alias ──────────────────
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name=?1", table),
+            [column],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    }
+
+    /// Fresh install (baseline + every registered migration) ships
+    /// provider_accounts.local_alias from the start — the baseline CREATE
+    /// TABLE includes the column. Confirms the upgrade-vs-fresh paths
+    /// produce the same shape.
+    #[test]
+    fn v1_0_1_alpha_1_fresh_install_has_local_alias_column() {
+        let conn = fresh_vault();
+        assert!(
+            column_exists(&conn, "provider_accounts", "local_alias"),
+            "fresh-install vault is missing provider_accounts.local_alias \
+             — baseline CREATE TABLE must include it"
+        );
+    }
+
+    /// Simulate an alpha-user vault that stopped at v1.0.5-alpha (i.e.
+    /// before the post-GA local_alias addition). Apply the v1.0.1-alpha.1
+    /// upgrade and assert the column appears with the right type.
+    #[test]
+    fn v1_0_1_alpha_1_adds_local_alias_to_legacy_vault() {
+        let conn = Connection::open_in_memory().expect("open");
+
+        // Manually run upgrades up through v1.0.0 (the GA marker, last
+        // pre-v1.0.1-alpha.1 entry in the registry). We can't just call
+        // upgrade_all() because that would also apply v1.0.1-alpha.1 and
+        // there'd be no "before" state to test against. Instead replicate
+        // the chain by running each registered upgrade up to (but not
+        // including) v1.0.1-alpha.1.
+        for v in VERSIONS {
+            if v.version == "1.0.1-alpha.1" {
+                break;
+            }
+            (v.upgrade)(&conn).expect("pre-v1.0.1-alpha.1 upgrade");
+        }
+        // Drop the column to simulate a vault whose baseline predated the
+        // post-GA addition (since our updated baseline already creates it,
+        // the only realistic "missing column" case is an old fixture from
+        // a time when baseline did not include local_alias).
+        conn.execute("ALTER TABLE provider_accounts DROP COLUMN local_alias", [])
+            .or_else(|_| {
+                // SQLite < 3.35 cannot DROP COLUMN; skip the simulation —
+                // the migration is still safe (it would no-op).
+                Ok::<usize, rusqlite::Error>(0)
+            })
+            .ok();
+
+        // If the column was dropped above, the migration must add it back.
+        // If the SQLite build didn't support DROP COLUMN, the migration
+        // must still succeed as a no-op (idempotent).
+        v1_0_1_alpha_1::upgrade(&conn).expect("v1.0.1-alpha.1 upgrade");
+        assert!(
+            column_exists(&conn, "provider_accounts", "local_alias"),
+            "v1.0.1-alpha.1 upgrade did not produce local_alias column"
+        );
+    }
+
+    /// Idempotency: running v1.0.1-alpha.1::upgrade on a vault that already
+    /// has local_alias must succeed without error.
+    #[test]
+    fn v1_0_1_alpha_1_is_idempotent() {
+        let conn = fresh_vault();
+        // First run is a no-op (column already in baseline) — must succeed.
+        v1_0_1_alpha_1::upgrade(&conn).expect("first re-run");
+        v1_0_1_alpha_1::upgrade(&conn).expect("second re-run");
+        assert!(column_exists(&conn, "provider_accounts", "local_alias"));
+    }
+
+    /// Vault that predates v1.0.3-alpha (no provider_accounts table at all)
+    /// must skip the migration silently — has_table guard.
+    #[test]
+    fn v1_0_1_alpha_1_skips_when_provider_accounts_missing() {
+        let conn = Connection::open_in_memory().expect("open");
+        // Bare baseline-1.0.1 only (no provider_accounts table).
+        v1_0_1_baseline::upgrade(&conn).expect("baseline upgrade");
+        // We assume baseline doesn't create provider_accounts on its own —
+        // it's introduced by v1.0.3-alpha. Drop it if baseline did create
+        // it (defensive).
+        let _ = conn.execute("DROP TABLE IF EXISTS provider_accounts", []);
+        assert!(!table_exists(&conn, "provider_accounts"));
+
+        // Migration must succeed without creating the table or panicking.
+        v1_0_1_alpha_1::upgrade(&conn).expect("migration on bare vault");
+        assert!(
+            !table_exists(&conn, "provider_accounts"),
+            "v1.0.1-alpha.1 must not create provider_accounts; v1.0.3-alpha is the table owner"
+        );
     }
 }

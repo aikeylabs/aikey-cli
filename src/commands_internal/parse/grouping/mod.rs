@@ -73,7 +73,7 @@ pub fn group_and_cluster(
     // `base_url` into any member draft whose `fields.base_url` is empty.
     // Materializes what L3 already concluded at the per-draft layer.
     //
-    // Spike validation (workflow/CI/research/2026-04-28-l3-group-baseurl-backfill-spike.md):
+    // Spike validation (workflow/CI/research/ablation/2026-04-28-l3-group-baseurl-backfill-spike.md):
     //   - holdout/OOD/adversarial 5 suites × 76 samples: byte-identical metrics
     //   - 6 real-user paste samples × 133 drafts: attribution rate 92.3% → 100%,
     //     5 drafts moved from None → inherited URL (URL列表式 / 桃子 / 社群乱序)
@@ -783,7 +783,7 @@ mod tests {
     // Explicit-reason group with that URL — but `fields.base_url` on the
     // second draft stays None, so frontend Use-Official Rule 2 misses it.
     //
-    // Spike validation: workflow/CI/research/2026-04-28-l3-group-baseurl-backfill-spike.md
+    // Spike validation: workflow/CI/research/ablation/2026-04-28-l3-group-baseurl-backfill-spike.md
     // (5 drafts of lift on 6 real-user paste samples; holdout / OOD /
     // adversarial metrics byte-identical).
 

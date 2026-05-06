@@ -2170,8 +2170,12 @@ pub enum RenameTarget {
     /// Team (virtual) key — renames `managed_virtual_keys_cache.local_alias`
     /// (server alias stays untouched).
     Team,
-    /// OAuth account — renames `provider_accounts.display_identity` (no
-    /// UNIQUE; two accounts may legitimately share a label).
+    /// OAuth account — writes `provider_accounts.local_alias`, leaving
+    /// `display_identity` (the immutable upstream identity) untouched. No
+    /// UNIQUE constraint on either column; two accounts may legitimately
+    /// share a label. Pre-v1.0.1-alpha.1 overwrote `display_identity`
+    /// instead — that path destroyed the original email returned by the
+    /// OAuth provider, which the new column split fixes.
     Oauth,
 }
 
@@ -2199,7 +2203,7 @@ pub struct RenameOutcome {
     /// The human-facing new label actually applied:
     ///   - personal → new alias (same as `id`)
     ///   - team → new local_alias
-    ///   - oauth → new display_identity
+    ///   - oauth → new local_alias (display_identity stays immutable)
     pub new_value: String,
 }
 
@@ -2306,16 +2310,37 @@ pub fn apply_rename_core(
         RenameTarget::Oauth => {
             let new_trimmed = new_value.trim().to_string();
             // Existence check for precise 404
-            match storage::get_provider_account(id)
+            let acct = match storage::get_provider_account(id)
                 .map_err(|e| format!("get_provider_account '{}': {}", id, e))?
             {
-                Some(_) => {}
+                Some(a) => a,
                 None => return Err(format!("provider_account_id '{}' not found", id)),
+            };
+            // v1.0.1-alpha.1: rename writes provider_accounts.local_alias
+            // and leaves display_identity (the immutable upstream identity)
+            // untouched. Why: the previous behavior overwrote
+            // display_identity, destroying the original email returned by
+            // the OAuth provider and making the "alias differs from
+            // identity" UI rule unreachable. local_alias = NULL ↔ "never
+            // renamed"; resolvers fall back to display_identity for a
+            // stable label.
+            //
+            // No-op short-circuit: if the new value equals the effective
+            // current label (local_alias if set, else display_identity)
+            // there's nothing to do — match the personal-rename "identical"
+            // error so callers get a consistent signal.
+            let current_effective = acct
+                .local_alias
+                .as_deref()
+                .or(acct.display_identity.as_deref())
+                .unwrap_or("");
+            if current_effective == new_trimmed {
+                return Err("old and new alias are identical".to_string());
             }
             let conn = storage::open_connection()
                 .map_err(|e| format!("open vault: {}", e))?;
             let n = conn.execute(
-                "UPDATE provider_accounts SET display_identity = ?1 WHERE provider_account_id = ?2",
+                "UPDATE provider_accounts SET local_alias = ?1 WHERE provider_account_id = ?2",
                 rusqlite::params![&new_trimmed, id],
             )
             .map_err(|e| format!("UPDATE provider_accounts: {}", e))?;
@@ -2502,19 +2527,25 @@ pub use shell_integration::*;
 // See shell_integration_windows.rs module docstring.
 mod shell_integration_windows;
 
-/// Resolve an OAuth account by `provider_account_id` OR `display_identity`
-/// (email). Returns `None` when no match — caller treats that as "not
-/// OAuth, try next lookup kind".
+/// Resolve an OAuth account by `provider_account_id`, `local_alias`, OR
+/// `display_identity` (email). Returns `None` when no match — caller treats
+/// that as "not OAuth, try next lookup kind".
 ///
-/// Case-insensitive on both keys: account_id is a UUID-ish random string
-/// so case doesn't practically matter, but emails are routinely typed
-/// with varying case. Mirrors the lookup in
-/// `connectivity::targets::targets_from_alias` so behaviour stays
-/// symmetric between `aikey test` and `aikey use`.
+/// Case-insensitive on all keys: account_id is a UUID-ish random string so
+/// case doesn't practically matter, but emails / aliases are routinely
+/// typed with varying case. Mirrors the lookup in
+/// `connectivity::targets::targets_from_alias` so behaviour stays symmetric
+/// between `aikey test` and `aikey use`.
+///
+/// v1.0.1-alpha.1: matches `local_alias` first so a renamed account is
+/// findable by its new label without losing the email-based fallback.
 fn resolve_oauth_account(alias_or_id: &str) -> Option<storage::ProviderAccountInfo> {
     let accounts = storage::list_provider_accounts_readonly().ok()?;
     accounts.into_iter().find(|a| {
         a.provider_account_id.eq_ignore_ascii_case(alias_or_id)
+            || a.local_alias.as_deref()
+                .map(|d| d.eq_ignore_ascii_case(alias_or_id))
+                .unwrap_or(false)
             || a.display_identity.as_deref()
                 .map(|d| d.eq_ignore_ascii_case(alias_or_id))
                 .unwrap_or(false)
