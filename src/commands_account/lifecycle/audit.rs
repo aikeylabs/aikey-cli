@@ -22,6 +22,19 @@ use crate::commands_account::shell_integration;
 use crate::proxy_env;
 use crate::storage;
 
+/// Wraps a command-name string in cyan-bold + restores surrounding dim
+/// when rendered inside `aikey doctor`'s emit() closure (which wraps the
+/// whole hint with `.dimmed()`). Without the trailing `\x1b[0m\x1b[2m`,
+/// text after the cyan portion would lose its dim formatting because
+/// `\x1b[0m` resets ALL attributes.
+///
+/// Use this for actionable commands inside hint strings so they pop out
+/// of the surrounding dim text and match the cyan convention used by
+/// installer / status output elsewhere.
+fn cmd(s: &str) -> String {
+    format!("\x1b[1;36m{}\x1b[0m\x1b[2m", s)
+}
+
 /// Which two source-of-truths a `DiffEntry` is comparing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffSource {
@@ -236,7 +249,7 @@ fn diff_db_vs_active_env(
                 a_says: format!("DB has binding(s) for {}", missing.join(",")),
                 b_says: "active.env AIKEY_ACTIVE_KEYS missing entry".into(),
                 severity: DiffSeverity::Critical,
-                hint: Some("run `aikey use <alias>` or restart proxy to refresh active.env".into()),
+                hint: Some(format!("run {} or restart proxy to refresh active.env", cmd("aikey use <alias>"))),
             });
         }
         if !extra.is_empty() {
@@ -246,7 +259,7 @@ fn diff_db_vs_active_env(
                 a_says: "no DB binding".into(),
                 b_says: format!("active.env still has {}", extra.join(",")),
                 severity: DiffSeverity::Critical,
-                hint: Some("phantom env entry — run `aikey use <alias>` to force a refresh".into()),
+                hint: Some(format!("phantom env entry — run {} to force a refresh", cmd("aikey use <alias>"))),
             });
         }
         if missing.is_empty() && extra.is_empty() {
@@ -333,8 +346,8 @@ fn diff_active_env_vs_provider_toml(
                 b_says: format!("{} aikey region absent", toml_path_label),
                 severity: DiffSeverity::Critical,
                 hint: Some(format!(
-                    "{} won't route through aikey-proxy — run `aikey use <alias>` to re-inject region",
-                    provider_label
+                    "{} won't route through aikey-proxy — run {} to re-inject region",
+                    provider_label, cmd("aikey use <alias>"),
                 )),
             });
         }
@@ -346,7 +359,8 @@ fn diff_active_env_vs_provider_toml(
                 b_says: format!("{} aikey region still present", toml_path_label),
                 severity: DiffSeverity::Critical,
                 hint: Some(format!(
-                    "stale aikey region — run `aikey hook update` or re-run `aikey use` to reconcile"
+                    "stale aikey region — run {} or re-run {} to reconcile",
+                    cmd("aikey hook update"), cmd("aikey use"),
                 )),
             });
         }
@@ -368,7 +382,8 @@ fn diff_active_env_vs_provider_toml(
                 b_says: format!("active.env + {} both unconfigured", toml_path_label),
                 severity: DiffSeverity::Warning,
                 hint: Some(format!(
-                    "refresh hasn't propagated — `aikey use <alias>` to force"
+                    "refresh hasn't propagated — run {} to force",
+                    cmd("aikey use <alias>"),
                 )),
             });
         }

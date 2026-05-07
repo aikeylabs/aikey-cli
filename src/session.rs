@@ -336,17 +336,32 @@ pub fn maybe_configure_backend() {
         eprint!("  Choice [F/n] (default F): ");
     }
 
-    let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() {
-        crate::storage::set_session_backend_pref(if is_macos { "keychain" } else { "file" });
-        return;
-    }
-
-    let pref = match line.trim().to_lowercase().as_str() {
-        "k" | "keychain" if is_macos => "keychain",
-        "f" | "file" => "file",
-        "n" | "no" | "disabled" => "disabled",
-        _ => if is_macos { "keychain" } else { "file" }, // default (Enter)
+    // Re-prompt on invalid input so a typo (e.g. 'h') is not silently accepted
+    // as the default. Empty input (Enter) and EOF/IO error use the default.
+    let pref = loop {
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Err(_) | Ok(0) => break if is_macos { "keychain" } else { "file" },
+            Ok(_) => {}
+        }
+        match line.trim().to_lowercase().as_str() {
+            "" => break if is_macos { "keychain" } else { "file" },
+            "k" | "keychain" if is_macos => break "keychain",
+            "f" | "file" => break "file",
+            "n" | "no" | "disabled" => break "disabled",
+            other => {
+                eprintln!(
+                    "  Invalid choice '{}'. Please enter {} or press Enter for default.",
+                    other,
+                    if is_macos { "k, f, or n" } else { "f or n" }
+                );
+                if is_macos {
+                    eprint!("  Choice [K/f/n] (default K): ");
+                } else {
+                    eprint!("  Choice [F/n] (default F): ");
+                }
+            }
+        }
     };
     crate::storage::set_session_backend_pref(pref);
     eprintln!("  Session backend set to '{}'. You can change this with: aikey config session-backend", pref);

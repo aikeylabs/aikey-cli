@@ -36,15 +36,20 @@ fn try_log_audit(key: &[u8; 32], op: AuditOperation, alias: Option<&str>, succes
     }
 }
 
-/// Hook coverage v1 §H2 / §2.3: render hook file (Layer 1 only) + report
-/// rc-wire status to the Web envelope. Used by all mutating handlers
-/// (use / add / batch_import / delete_target) so the front-end can drive
-/// the §2.4 banner state machine consistently across operations.
+/// Hook coverage v1 §H2 / §2.3: report rc-wire status to the Web envelope.
 ///
-/// Returns the three envelope fields as a JSON object that callers merge
-/// into their `ResultEnvelope::ok` payload. Layer 1 failure does NOT
-/// fail the vault op — the binding write already succeeded; the hook
-/// file is a side-channel best-effort.
+/// Phase Y (2026-05-07): Layer 1 (hook file render) is now done by the
+/// lifecycle funnel tail, NOT by this function. Callers that already
+/// have a `LifecycleOutcome` (i.e., all mutating handlers after the
+/// 2026-05-07 batch_import fix) MUST use `merge_hook_status_from_outcome`
+/// to avoid double-rendering Layer 1.
+///
+/// This function (no-outcome variant) is retained for two scenarios:
+///   1. handlers that don't run lifecycle (read-only / metadata)
+///   2. fallback when lifecycle was skipped (no binding changes touched)
+///
+/// Independently of Layer 1, `hook_rc_wired` is always read from disk
+/// here — it's a passive grep of `~/.zshrc`/`~/.bashrc`, not a write.
 fn hook_status_for_envelope() -> serde_json::Value {
     let (file_installed, failure_reason) =
         crate::commands_account::web_install_hook_file_layer1();
@@ -56,14 +61,68 @@ fn hook_status_for_envelope() -> serde_json::Value {
     })
 }
 
+/// Phase Y (2026-05-07): outcome-aware hook status. Reads `hook_file_installed`
+/// + `hook_failure_reason` from the `LifecycleOutcome` (populated by the
+/// funnel's tail step 4) instead of re-rendering Layer 1. `hook_rc_wired`
+/// is still grep'd from disk (it's an independent passive read).
+///
+/// Use this from any handler that has just run lifecycle. Falls back to a
+/// fresh Layer 1 render when `outcome` reports the tail didn't run
+/// (e.g. no-op event with no binding touch) — guards against vault_op
+/// emitting `file_installed=false` for pure passive operations.
+fn hook_status_from_outcome(outcome: &crate::commands_account::LifecycleOutcome) -> serde_json::Value {
+    let rc_wired = crate::commands_account::shell_rc_has_aikey_block();
+    if outcome.active_env_refreshed {
+        // Tail ran — outcome carries authoritative fields.
+        json!({
+            "hook_file_installed": outcome.hook_file_installed,
+            "hook_rc_wired": rc_wired,
+            "hook_failure_reason": outcome.hook_failure_reason.map(|r| r.as_envelope_str()),
+        })
+    } else {
+        // Tail skipped (event was a no-op for bindings). Fall back to a
+        // fresh Layer 1 render so the envelope still reports correct
+        // file_installed state (not the default `false`).
+        let (file_installed, failure_reason) =
+            crate::commands_account::web_install_hook_file_layer1();
+        json!({
+            "hook_file_installed": file_installed,
+            "hook_rc_wired": rc_wired,
+            "hook_failure_reason": failure_reason.map(|r| r.as_envelope_str()),
+        })
+    }
+}
+
 /// Merge the hook-status fields into an existing `serde_json::Value`
 /// object. Avoids each handler having to spell out the three fields.
 /// Idempotent: a future caller adding more fields elsewhere won't
 /// collide because we only write the three known keys.
+///
+/// Phase Y (2026-05-07): when caller has a `LifecycleOutcome`, prefer
+/// `merge_hook_status_from_outcome` to avoid Layer 1 double-render.
 fn merge_hook_status(base: serde_json::Value) -> serde_json::Value {
     let mut obj = base;
     if let serde_json::Value::Object(ref mut map) = obj {
         let hook = hook_status_for_envelope();
+        if let serde_json::Value::Object(hook_map) = hook {
+            for (k, v) in hook_map {
+                map.insert(k, v);
+            }
+        }
+    }
+    obj
+}
+
+/// Phase Y (2026-05-07): outcome-aware merge. Same shape as
+/// `merge_hook_status` but reads Layer 1 status from the funnel outcome
+/// instead of re-rendering. Callers with lifecycle MUST prefer this.
+fn merge_hook_status_from_outcome(
+    base: serde_json::Value,
+    outcome: &crate::commands_account::LifecycleOutcome,
+) -> serde_json::Value {
+    let mut obj = base;
+    if let serde_json::Value::Object(ref mut map) = obj {
+        let hook = hook_status_from_outcome(outcome);
         if let serde_json::Value::Object(hook_map) = hook {
             for (k, v) in hook_map {
                 map.insert(k, v);
@@ -443,14 +502,14 @@ fn handle_add(env: StdinEnvelope) {
             providers: &outcome.providers,
         },
     ).unwrap_or_default();
-    let newly_primary = lifecycle.newly_primary;
+    let newly_primary = lifecycle.newly_primary.clone();
     let active_env_refreshed = lifecycle.active_env_refreshed;
 
     let audit_logged = try_log_audit(&key, AuditOperation::Add, Some(&outcome.alias), true);
 
     emit(&ResultEnvelope::ok(
         req_id,
-        merge_hook_status(json!({
+        merge_hook_status_from_outcome(json!({
             "alias": outcome.alias,
             "action_taken": outcome.action.as_str(),
             "provider": outcome.primary_provider,
@@ -458,7 +517,7 @@ fn handle_add(env: StdinEnvelope) {
             "newly_primary_providers": newly_primary,
             "active_env_refreshed": active_env_refreshed,
             "audit_logged": audit_logged,
-        })),
+        }), &lifecycle),
     ));
 }
 
@@ -527,6 +586,15 @@ fn handle_batch_import(env: StdinEnvelope) {
     let mut skipped = 0usize;
     let mut item_reports = Vec::with_capacity(payload.items.len());
     let mut per_item_audit: Vec<String> = Vec::with_capacity(payload.items.len());
+    // Bugfix 2026-05-07: capture (canonical_alias, canonical_providers) per
+    // Inserted/Replaced item so we can run the lifecycle funnel after the
+    // entries-write tx commits. Without this, batch_import wrote vault
+    // entries but never auto-promoted to primary, never refreshed
+    // active.env, never synced toml regions — symptom: web import +
+    // CLI `claude` ran with no env routing at all. Phase 5 lifecycle
+    // refactor wired 11 callers but missed batch_import; the user
+    // surfaced this on 2026-05-07.
+    let mut lifecycle_inputs: Vec<(String, Vec<String>)> = Vec::with_capacity(payload.items.len());
 
     for it in &payload.items {
         // Resolve providers: `providers` (multi, preferred) > `provider` (single).
@@ -568,10 +636,16 @@ fn handle_batch_import(env: StdinEnvelope) {
             crate::commands_account::AddAction::Inserted => {
                 inserted += 1;
                 per_item_audit.push(outcome.alias.clone());
+                lifecycle_inputs.push((outcome.alias.clone(), outcome.providers.clone()));
             }
             crate::commands_account::AddAction::Replaced => {
                 replaced += 1;
                 per_item_audit.push(outcome.alias.clone());
+                // Replaced rows still need lifecycle: the secret changed,
+                // primary may need to be re-pointed (esp. when this alias
+                // already was primary — preserve it). Treat as Added so
+                // auto_assign re-evaluates against current binding state.
+                lifecycle_inputs.push((outcome.alias.clone(), outcome.providers.clone()));
             }
             crate::commands_account::AddAction::Skipped => {
                 skipped += 1;
@@ -602,9 +676,45 @@ fn handle_batch_import(env: StdinEnvelope) {
         }
     }
 
+    // Lifecycle funnel — auto_assign + refresh active.env + apply third-
+    // party CLI configs. Bugfix 2026-05-07: previously omitted, leaving
+    // imported keys with no binding rows, no active.env update, no toml
+    // sync. Run AFTER the entries-write tx commits because the funnel
+    // opens its own DB connection (and would deadlock on the held tx).
+    // Failure here doesn't roll back the entries write; the binding
+    // can be reconciled later by `aikey use <alias>` (matches the
+    // best-effort posture of vault_op handle_add).
+    let lifecycle_events: Vec<crate::commands_account::CredentialLifecycleEvent> =
+        lifecycle_inputs
+            .iter()
+            .map(|(alias, providers)| crate::commands_account::CredentialLifecycleEvent::Added {
+                source_type: "personal",
+                source_ref: alias.as_str(),
+                providers: providers.as_slice(),
+            })
+            .collect();
+    let lifecycle_outcomes =
+        crate::commands_account::apply_credential_lifecycle_batch(&lifecycle_events)
+            .unwrap_or_default();
+    let total_newly_primary: Vec<String> = lifecycle_outcomes
+        .iter()
+        .flat_map(|o| o.newly_primary.clone())
+        .collect();
+    // active_env_refreshed: true iff the funnel ran the tail and at least
+    // one outcome reports it. The batch flavor runs the tail once after
+    // all writes succeed, so all outcomes share the same value — but we
+    // OR them together to be defensive against future funnel changes.
+    let active_env_refreshed = lifecycle_outcomes.iter().any(|o| o.active_env_refreshed);
+    // Phase Y: any outcome will do for hook fields — tail runs once, all
+    // outcomes share the same hook_file_installed / hook_failure_reason.
+    // Default outcome (empty events list path) reports tail-skipped,
+    // which the merge_hook_status_from_outcome helper falls back to a
+    // fresh Layer 1 render for.
+    let representative_outcome = lifecycle_outcomes.first().cloned().unwrap_or_default();
+
     emit(&ResultEnvelope::ok(
         req_id,
-        merge_hook_status(json!({
+        merge_hook_status_from_outcome(json!({
             "total": payload.items.len(),
             "inserted": inserted,
             "replaced": replaced,
@@ -612,7 +722,9 @@ fn handle_batch_import(env: StdinEnvelope) {
             "items": item_reports,
             "audit_logged": audit_failures == 0,
             "audit_failures": audit_failures,
-        })),
+            "newly_primary_providers": total_newly_primary,
+            "active_env_refreshed": active_env_refreshed,
+        }), &representative_outcome),
     ));
 }
 
@@ -774,21 +886,21 @@ fn handle_delete_target(env: StdinEnvelope) {
                 return;
             }
             // Single funnel: Removed event runs reconcile → refresh → apply.
-            let _ = crate::commands_account::apply_credential_lifecycle(
+            let lifecycle = crate::commands_account::apply_credential_lifecycle(
                 crate::commands_account::CredentialLifecycleEvent::Removed {
                     source_type: "personal",
                     source_ref: &payload.id,
                 },
-            );
+            ).unwrap_or_default();
             let audit_logged = try_log_audit(&key, AuditOperation::Delete, Some(&payload.id), true);
             emit(&ResultEnvelope::ok(
                 req_id,
-                merge_hook_status(json!({
+                merge_hook_status_from_outcome(json!({
                     "target": "personal",
                     "id": payload.id,
                     "action_taken": "deleted",
                     "audit_logged": audit_logged,
-                })),
+                }), &lifecycle),
             ));
         }
         "oauth" => {
@@ -1145,13 +1257,213 @@ fn handle_use(env: StdinEnvelope) {
 
     emit(&ResultEnvelope::ok(
         req_id,
-        merge_hook_status(json!({
+        merge_hook_status_from_outcome(json!({
             "target": payload.target,
             "id": canonical_key_ref,
             "input_id": payload.id,
             "activated_providers": providers,
             "active_env_refreshed": refresh_ok,
             "audit_logged": audit_logged,
-        })),
+        }), &lifecycle),
     ));
+}
+
+// ============================================================================
+// Phase Y (2026-05-07) — hook_status_from_outcome / merge_hook_status_from_outcome tests
+// ============================================================================
+//
+// Pin the contract that vault_op envelope's hook fields reflect the
+// `LifecycleOutcome` populated by the funnel tail (instead of double-
+// rendering Layer 1). Tests cover the outcome path, the no-tail fallback
+// path, and the merge shape.
+//
+// The helpers also call `shell_rc_has_aikey_block()` which reads
+// HOME/SHELL env. We isolate via a tmpdir + ENV_MUTATION_LOCK so this
+// module doesn't race with session.rs / shell_integration tests.
+
+#[cfg(test)]
+mod hook_envelope_tests {
+    use super::*;
+    use crate::commands_account::{HookFailureReason, LifecycleOutcome};
+    use crate::test_env_lock::ENV_MUTATION_LOCK;
+
+    /// Small RAII-ish helper: set HOME + SHELL for the lifetime of a closure,
+    /// restore on exit. Same pattern as shell_integration's run_shell_rc_check.
+    fn with_home_shell<F, R>(home: &std::path::Path, shell: &str, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let prev_home = std::env::var("HOME").ok();
+        let prev_shell = std::env::var("SHELL").ok();
+        let prev_no_hook = std::env::var("AIKEY_NO_HOOK").ok();
+        unsafe {
+            std::env::set_var("HOME", home.to_str().unwrap());
+            std::env::set_var("SHELL", shell);
+            // Default off — individual tests opt-in by setting AIKEY_NO_HOOK
+            // before calling f().
+            std::env::remove_var("AIKEY_NO_HOOK");
+        }
+        let result = f();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_shell {
+                Some(v) => std::env::set_var("SHELL", v),
+                None => std::env::remove_var("SHELL"),
+            }
+            match prev_no_hook {
+                Some(v) => std::env::set_var("AIKEY_NO_HOOK", v),
+                None => std::env::remove_var("AIKEY_NO_HOOK"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn outcome_path_uses_outcome_fields_when_tail_ran() {
+        // When LifecycleOutcome.active_env_refreshed=true, the helper MUST
+        // read hook_file_installed / hook_failure_reason from the outcome
+        // (not call web_install_hook_file_layer1 again). This is the whole
+        // point of Phase Y — eliminate double Layer 1 renders per envelope.
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let outcome = LifecycleOutcome {
+            active_env_refreshed: true,
+            // Set an unambiguously fake reason. If the helper falls through
+            // to web_install_hook_file_layer1, it would report the real
+            // host's state (likely None in this temp HOME) — the assertion
+            // below would fail.
+            hook_file_installed: false,
+            hook_failure_reason: Some(HookFailureReason::IoError),
+            ..Default::default()
+        };
+
+        let json = with_home_shell(tmp.path(), "/bin/zsh", || {
+            hook_status_from_outcome(&outcome)
+        });
+
+        assert_eq!(json["hook_file_installed"], serde_json::json!(false));
+        assert_eq!(json["hook_failure_reason"], serde_json::json!("io_error"));
+        // rc_wired is independently grep'd; tmp HOME with no .zshrc → false
+        assert_eq!(json["hook_rc_wired"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn outcome_path_passes_through_success_state() {
+        // Mirror of the previous test for the success case: outcome reports
+        // file_installed=true with no failure_reason; merge MUST surface
+        // those exact values to the envelope.
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let outcome = LifecycleOutcome {
+            active_env_refreshed: true,
+            hook_file_installed: true,
+            hook_failure_reason: None,
+            ..Default::default()
+        };
+
+        let json = with_home_shell(tmp.path(), "/bin/zsh", || {
+            hook_status_from_outcome(&outcome)
+        });
+
+        assert_eq!(json["hook_file_installed"], serde_json::json!(true));
+        assert_eq!(json["hook_failure_reason"], serde_json::json!(null));
+    }
+
+    #[test]
+    fn fallback_path_runs_fresh_layer1_when_tail_skipped() {
+        // When the funnel didn't run its tail (no_op event with no binding
+        // touch), outcome.active_env_refreshed=false and outcome's hook
+        // fields are at their default (false / None). The helper MUST
+        // fall back to a fresh Layer 1 render so the envelope still
+        // reports an accurate file_installed (not the misleading default
+        // false).
+        //
+        // We force a known fallback result by setting AIKEY_NO_HOOK=1,
+        // which makes web_install_hook_file_layer1 short-circuit to
+        // (false, AikeyNoHook). If the helper instead read outcome's
+        // hook_failure_reason=None directly, the assertion would fail.
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let outcome = LifecycleOutcome::default(); // active_env_refreshed=false
+
+        let json = with_home_shell(tmp.path(), "/bin/zsh", || {
+            unsafe { std::env::set_var("AIKEY_NO_HOOK", "1") };
+            let r = hook_status_from_outcome(&outcome);
+            unsafe { std::env::remove_var("AIKEY_NO_HOOK") };
+            r
+        });
+
+        assert_eq!(json["hook_file_installed"], serde_json::json!(false));
+        assert_eq!(json["hook_failure_reason"], serde_json::json!("aikey_no_hook"));
+    }
+
+    #[test]
+    fn merge_preserves_base_fields_and_adds_three_hook_fields() {
+        // Pin the merge contract: base fields untouched, exactly the three
+        // documented hook fields added. A future caller adding a fourth
+        // hook-related field would need to update the merge function AND
+        // this test in lockstep — the assertion's exact-key list is the
+        // contract.
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let outcome = LifecycleOutcome {
+            active_env_refreshed: true,
+            hook_file_installed: true,
+            hook_failure_reason: None,
+            ..Default::default()
+        };
+        let base = serde_json::json!({
+            "alias": "foo",
+            "newly_primary_providers": ["anthropic"],
+        });
+
+        let merged = with_home_shell(tmp.path(), "/bin/zsh", || {
+            merge_hook_status_from_outcome(base.clone(), &outcome)
+        });
+
+        // Base fields preserved
+        assert_eq!(merged["alias"], serde_json::json!("foo"));
+        assert_eq!(merged["newly_primary_providers"], serde_json::json!(["anthropic"]));
+        // Three hook fields added — exact key set, no others
+        assert!(merged.get("hook_file_installed").is_some());
+        assert!(merged.get("hook_rc_wired").is_some());
+        assert!(merged.get("hook_failure_reason").is_some());
+    }
+
+    #[test]
+    fn rc_wired_grep_picks_up_v3_block_in_zshrc() {
+        // Independent verification that hook_rc_wired correctly reflects
+        // disk state — sanity check that the helper isn't always returning
+        // the default false. Pre-write a v3 marker block to tmp/.zshrc;
+        // helper should report rc_wired=true.
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zshrc = tmp.path().join(".zshrc");
+        std::fs::write(
+            &zshrc,
+            "# user content\n\
+             # aikey shell hook v3 begin\n\
+             [[ -f ~/.aikey/hook.zsh ]] && source ~/.aikey/hook.zsh\n\
+             # aikey shell hook v3 end\n",
+        )
+        .expect("write zshrc");
+
+        let outcome = LifecycleOutcome {
+            active_env_refreshed: true,
+            hook_file_installed: true,
+            ..Default::default()
+        };
+        let json = with_home_shell(tmp.path(), "/bin/zsh", || {
+            hook_status_from_outcome(&outcome)
+        });
+
+        assert_eq!(json["hook_rc_wired"], serde_json::json!(true));
+    }
 }

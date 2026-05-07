@@ -11,6 +11,8 @@
 //! `commands_account.rs`.  Functions here return results; callers decide
 //! how to present them.
 
+use std::collections::HashSet;
+
 use crate::commands_account::{provider_env_vars_pub, provider_extra_env_vars_pub, provider_proxy_prefix_pub};
 use crate::commands_proxy;
 use crate::credential_type;
@@ -18,6 +20,50 @@ use crate::storage::{self, ProviderBinding};
 
 /// Default profile id used throughout v1.0.2 (implicit unique profile).
 pub const DEFAULT_PROFILE: &str = "default";
+
+/// For every env var registered in `provider_registry::entries()` that was
+/// NOT in `emitted_export_vars`, append an `unset VAR 2>/dev/null` line to
+/// `env_lines`.
+///
+/// Why: `source FILE.env` only runs the file's `export` statements; it does
+/// NOT auto-unset vars that the file no longer mentions. So a shell that
+/// already sourced an older active.env (with KIMI_API_KEY=...) and then
+/// re-sources a newer one (no KIMI_*) keeps the stale `KIMI_API_KEY` until
+/// the user opens a new terminal. This helper makes the active.env file
+/// itself emit explicit `unset` for everything inactive, so re-sourcing is
+/// idempotent — every shell ends up with exactly the active set, no more.
+///
+/// Why registry-driven (not a hardcoded provider list): single source of
+/// truth. Adding a provider to `data/provider_registry.yaml` automatically
+/// extends the unset coverage. kimi vs moonshot are intentionally distinct
+/// entries with distinct env vars (KIMI_* vs MOONSHOT_*); both get covered
+/// without dedup logic.
+fn append_unset_lines_for_inactive_providers(
+    env_lines: &mut Vec<String>,
+    emitted_export_vars: &HashSet<String>,
+) {
+    // Track vars already given an `unset` line so we don't duplicate when
+    // multiple registry entries reference the same env var (e.g. kimi +
+    // moonshot share KIMI_MODEL_NAME via extras when they map the same
+    // protocol family). HashSet::insert returns true the first time only,
+    // doubling as the "should we emit?" gate.
+    let mut already_unset: HashSet<&'static str> = HashSet::new();
+    let mut emit = |env_lines: &mut Vec<String>,
+                    var: &'static str,
+                    already: &mut HashSet<&'static str>| {
+        if !emitted_export_vars.contains(var) && already.insert(var) {
+            env_lines.push(format!("unset {} 2>/dev/null", var));
+        }
+    };
+    for entry in crate::provider_registry::entries() {
+        let (api_key_var, base_url_var) = entry.env_vars;
+        emit(env_lines, api_key_var, &mut already_unset);
+        emit(env_lines, base_url_var, &mut already_unset);
+        for (extra_var, _) in entry.extra_env_vars {
+            emit(env_lines, extra_var, &mut already_unset);
+        }
+    }
+}
 
 // ============================================================================
 // refresh_implicit_profile_activation
@@ -49,6 +95,10 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
         format!("export AIKEY_ACTIVE_SEQ=\"{}\"", active_seq),
     ];
     let mut activated_providers: Vec<String> = Vec::new();
+    // Track every env var name we `export` below so we can decide which
+    // registry-known vars need an `unset` line at the end (see comment
+    // before the unset loop for rationale).
+    let mut emitted_export_vars: HashSet<String> = HashSet::new();
 
     for b in &bindings {
         if let Some((api_key_var, base_url_var)) = provider_env_vars_pub(&b.provider_code) {
@@ -70,6 +120,7 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
                 provider_proxy_prefix_pub(&b.provider_code)
             );
             env_lines.push(format!("export {}=\"{}\"", api_key_var, token));
+            emitted_export_vars.insert(api_key_var.to_string());
             // Why: Codex v0.118+ warns when OPENAI_BASE_URL env var is set,
             // because it now reads openai_base_url from ~/.codex/config.toml.
             // We inject that config via configure_codex_cli(), so skip the
@@ -80,15 +131,21 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             );
             if !skip_base_url {
                 env_lines.push(format!("export {}=\"{}\"", base_url_var, base_url));
+                emitted_export_vars.insert(base_url_var.to_string());
             }
             // Provider-specific extras (e.g. KIMI_MODEL_NAME for the
             // minimal-scaffold Kimi config — see commands_account docstring).
             for (extra_var, extra_val) in provider_extra_env_vars_pub(&b.provider_code) {
                 env_lines.push(format!("export {}=\"{}\"", extra_var, extra_val));
+                emitted_export_vars.insert(extra_var.to_string());
             }
             activated_providers.push(b.provider_code.clone());
         }
     }
+
+    // Emit `unset` lines for every registry-known env var that we did NOT
+    // export this round. See helper docstring for rationale.
+    append_unset_lines_for_inactive_providers(&mut env_lines, &emitted_export_vars);
 
     // Ensure localhost traffic to the local proxy is never hijacked by the
     // user's HTTP proxy (http_proxy / all_proxy).  We append 127.0.0.1 and
@@ -845,6 +902,113 @@ fn resolve_providers_for_entry(entry: &storage::SecretMetadata) -> Vec<String> {
         }
     }
     vec![]
+}
+
+#[cfg(test)]
+mod unset_inactive_tests {
+    //! Regression coverage for the source-only-export gap (2026-05-07):
+    //! before this fix, deleting a provider from active bindings left the
+    //! shell with stale per-provider env vars (KIMI_API_KEY etc.) until a
+    //! new terminal was opened. The unset-line emitter makes active.env
+    //! self-cleaning under `source`.
+    //!
+    //! Tests target the pure helper `append_unset_lines_for_inactive_providers`
+    //! so they run without a real vault DB.
+    use super::*;
+
+    #[test]
+    fn unset_emitted_for_kimi_when_only_anthropic_active() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut exported = HashSet::new();
+        // Simulate "anthropic active": only ANTHROPIC_* exported.
+        exported.insert("ANTHROPIC_API_KEY".to_string());
+        exported.insert("ANTHROPIC_BASE_URL".to_string());
+
+        append_unset_lines_for_inactive_providers(&mut lines, &exported);
+        let blob = lines.join("\n");
+
+        // Each registry-known non-anthropic api_key var must have an unset line.
+        for var in [
+            "KIMI_API_KEY", "KIMI_BASE_URL",
+            "MOONSHOT_API_KEY", "MOONSHOT_BASE_URL",
+            "OPENAI_API_KEY",
+        ] {
+            assert!(
+                blob.contains(&format!("unset {} 2>/dev/null", var)),
+                "expected `unset {}` line, got:\n{}", var, blob,
+            );
+        }
+
+        // Active ones must NOT be unset.
+        assert!(!blob.contains("unset ANTHROPIC_API_KEY"),
+            "ANTHROPIC_API_KEY was exported, should not be unset");
+        assert!(!blob.contains("unset ANTHROPIC_BASE_URL"),
+            "ANTHROPIC_BASE_URL was exported, should not be unset");
+    }
+
+    #[test]
+    fn unset_emitted_for_anthropic_when_only_kimi_active() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut exported = HashSet::new();
+        exported.insert("KIMI_API_KEY".to_string());
+        exported.insert("KIMI_BASE_URL".to_string());
+        exported.insert("KIMI_MODEL_NAME".to_string());
+
+        append_unset_lines_for_inactive_providers(&mut lines, &exported);
+        let blob = lines.join("\n");
+
+        for var in [
+            "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+            "OPENAI_API_KEY",
+        ] {
+            assert!(
+                blob.contains(&format!("unset {} 2>/dev/null", var)),
+                "expected `unset {}`, got:\n{}", var, blob,
+            );
+        }
+
+        // Kimi extras that we exported should NOT be unset.
+        assert!(!blob.contains("unset KIMI_API_KEY"));
+        assert!(!blob.contains("unset KIMI_MODEL_NAME"));
+    }
+
+    #[test]
+    fn unset_emitted_for_all_when_no_provider_active() {
+        let mut lines: Vec<String> = Vec::new();
+        let exported = HashSet::new(); // nothing exported
+
+        append_unset_lines_for_inactive_providers(&mut lines, &exported);
+        let blob = lines.join("\n");
+
+        // Sanity: every registry entry's api_key_var must show up.
+        for entry in crate::provider_registry::entries() {
+            let (api_key_var, _) = entry.env_vars;
+            assert!(
+                blob.contains(&format!("unset {} 2>/dev/null", api_key_var)),
+                "missing `unset {}` for empty-active state, got:\n{}",
+                api_key_var, blob,
+            );
+        }
+    }
+
+    #[test]
+    fn no_unset_when_all_active() {
+        // Synthetic: every registry api_key + base_url is in the exported set.
+        let mut lines: Vec<String> = Vec::new();
+        let mut exported = HashSet::new();
+        for entry in crate::provider_registry::entries() {
+            let (api, base) = entry.env_vars;
+            exported.insert(api.to_string());
+            exported.insert(base.to_string());
+            for (extra_var, _) in entry.extra_env_vars {
+                exported.insert(extra_var.to_string());
+            }
+        }
+        append_unset_lines_for_inactive_providers(&mut lines, &exported);
+        assert!(lines.is_empty(),
+            "no unsets expected when everything is active, got:\n{}",
+            lines.join("\n"));
+    }
 }
 
 #[cfg(test)]

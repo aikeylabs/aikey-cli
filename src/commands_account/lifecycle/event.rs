@@ -64,7 +64,7 @@ pub enum CredentialLifecycleEvent<'a> {
 /// `newly_primary`, or surfacing reconcile actions in the per-alias delete
 /// summary).
 #[must_use = "lifecycle outcome carries diagnostic info that should be surfaced"]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct LifecycleOutcome {
     /// Providers where this event resulted in a NEW primary binding.
     /// Populated only for `Added` (auto_assign) and `Switched` (always
@@ -80,6 +80,16 @@ pub struct LifecycleOutcome {
     /// Active providers as seen by `refresh_implicit_profile_activation`
     /// after this event. Empty when `active_env_refreshed = false`.
     pub active_providers: Vec<String>,
+    /// Phase Y (2026-05-07) — Layer 1 hook file (`~/.aikey/hook.{zsh,bash}`)
+    /// state after this event's tail. Populated by the funnel's tail step
+    /// 4 (`web_install_hook_file_layer1`). Web envelope's `hook_file_installed`
+    /// field reads from here so vault_op handlers don't double-render.
+    /// Always shared across all outcomes in a batch (tail runs once).
+    pub hook_file_installed: bool,
+    /// Phase Y (2026-05-07) — typed reason when `hook_file_installed=false`.
+    /// `None` on success or when no event in the batch touched bindings
+    /// (tail skipped).
+    pub hook_failure_reason: Option<crate::commands_account::HookFailureReason>,
 }
 
 /// Single-event entry: equivalent to `apply_credential_lifecycle_batch(&[event])`
@@ -165,6 +175,16 @@ pub fn apply_credential_lifecycle_batch(
 
     // Side-effect tail — runs once per batch, even when individual events
     // were no-ops, so toml regions stay in sync after a refresh-only call.
+    //
+    // Phase Y (2026-05-07): tail extended from 2 steps (refresh + apply
+    // third-party tomls) to 3 (+ render Layer 1 hook file). Layer 1 is
+    // a state sync — same shape as active.env / toml — and used to be
+    // duplicated by every vault_op handler calling
+    // `web_install_hook_file_layer1`. Centralizing here means:
+    //   - Every binding-changing path renders L1 (no missed callers)
+    //   - vault_op handlers just read outcome.hook_file_installed
+    //   - Layer 2 (rc marker) stays out: it's an install event with
+    //     consent, not a binding-driven state sync
     if any_binding_touched {
         if let Ok(refresh) = refresh_implicit_profile_activation() {
             let proxy_port = crate::commands_proxy::proxy_port();
@@ -177,11 +197,19 @@ pub fn apply_credential_lifecycle_batch(
                 &active_providers,
                 proxy_port,
             );
+            // Layer 1 hook file — write once, share result across batch
+            // outcomes. Best-effort: failure here surfaces via
+            // `hook_failure_reason` for the Web envelope but doesn't
+            // propagate as Err (binding writes already landed).
+            let (hook_file_installed, hook_failure_reason) =
+                crate::commands_account::web_install_hook_file_layer1();
             // Backfill on every outcome so callers can read post-refresh
             // active set without holding the RefreshResult separately.
             for outcome in &mut outcomes {
                 outcome.active_env_refreshed = true;
                 outcome.active_providers = active_providers.clone();
+                outcome.hook_file_installed = hook_file_installed;
+                outcome.hook_failure_reason = hook_failure_reason;
             }
         }
     }

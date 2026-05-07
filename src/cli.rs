@@ -784,6 +784,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 crate::commands_internal::InternalAction::Parse(_) => "parse",
                 crate::commands_internal::InternalAction::Rules(_) => "rules",
                 crate::commands_internal::InternalAction::Init(_) => "init",
+                crate::commands_internal::InternalAction::HookOp(_) => "hook-op",
             }),
             Commands::Add { .. } => "add".to_string(),
             Commands::Get { .. } => "get".to_string(),

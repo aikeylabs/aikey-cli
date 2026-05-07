@@ -27,6 +27,7 @@ pub mod update_alias;
 pub mod parse;
 pub mod rules;
 pub mod init;
+pub mod hook_op;
 pub mod internal_log;
 
 #[cfg(test)]
@@ -56,6 +57,14 @@ pub enum InternalAction {
     /// Distinct from vault-op because vault doesn't exist yet (no
     /// vault_key to derive); uses its own envelope shape in init.rs.
     Init(StdinOnlyArgs),
+
+    /// Web-modal "Allow" path for shell-hook rc wiring.
+    /// Per 20260507-web-hook-rc-modal-自动注入.md: aikey-local-server
+    /// (or trial-server in trial-full mode) invokes
+    /// `aikey _internal hook-op --stdin-json` with `{action: "wire-rc"}`.
+    /// Distinct from vault-op because no vault_key needed (only touches
+    /// ~/.aikey/hook.* and ~/.zshrc); uses its own envelope shape in hook_op.rs.
+    HookOp(StdinOnlyArgs),
 }
 
 /// 所有 `_internal` 子命令都只接受 `--stdin-json`，JSON 从 stdin 读
@@ -86,6 +95,13 @@ pub fn dispatch(action: &InternalAction) {
         init::handle();
         return;
     }
+    // hook-op shares init's pattern: own envelope (no vault_key_hex),
+    // own stdin reader inside the handler. Bypass the shared envelope
+    // reader so the missing vault_key_hex doesn't trigger an error.
+    if let InternalAction::HookOp(_) = action {
+        hook_op::handle();
+        return;
+    }
 
     let action_name = match action {
         InternalAction::VaultOp(_)     => "vault-op",
@@ -94,6 +110,7 @@ pub fn dispatch(action: &InternalAction) {
         InternalAction::Parse(_)       => "parse",
         InternalAction::Rules(_)       => "rules",
         InternalAction::Init(_)        => unreachable!("handled above"),
+        InternalAction::HookOp(_)      => unreachable!("handled above"),
     };
     let env = match stdin_json::read_envelope() {
         Ok(e) => e,
@@ -119,5 +136,6 @@ pub fn dispatch(action: &InternalAction) {
         InternalAction::Parse(_) => parse::handle(env),
         InternalAction::Rules(_) => rules::handle(env),
         InternalAction::Init(_) => unreachable!("handled above"),
+        InternalAction::HookOp(_) => unreachable!("handled above"),
     }
 }

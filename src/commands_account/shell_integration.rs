@@ -1432,225 +1432,173 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         );
     }
 
-    // 1. Write / refresh the hook file (source of truth for wrapper logic).
     let hook_kind = if is_zsh { HookKind::Zsh } else { HookKind::Bash };
     let hook_filename = hook_filename_for_kind(hook_kind);
+
+    // Layer 1 (~/.aikey/hook.{zsh,bash}) lives in our own directory and
+    // needs no user consent. Render it eagerly so non-TTY callers that
+    // bail out below (LegacyMarker / NoMarker → return hint) still leave
+    // a working hook file the user can `source` once. Tests pin this:
+    // `ensure_shell_hook_refuses_rc_append_in_non_tty` asserts L1 lands
+    // even when L2 is refused.
     if let Err(e) = write_hook_file(&home, hook_kind) {
         return Some(format!("  Could not write ~/.aikey/{}: {}", hook_filename, e));
     }
-
-    // 2. Remove obsolete v2 helper files — hook.* is the single source of truth now.
     cleanup_legacy_hook_files(&home);
 
-    let rc_candidates: Vec<String> = if is_zsh {
-        vec![format!("{}/.zshrc", home)]
-    } else {
-        vec![
-            format!("{}/.bashrc", home),
-            format!("{}/.bash_profile", home),
-        ]
-    };
+    // Phase Z (2026-05-07) — TTY/consent gating split from file-IO.
+    //
+    // Read-only classify first → decide whether consent is needed → only
+    // call the shared `write_v3_layers_with_consent` helper after the
+    // appropriate gate passes. The helper is the same one Web modal's
+    // `wire_rc_with_consent` calls; the only difference between these
+    // two entry points is the consent source (TTY prompt vs modal click).
+    // Helper re-writes L1 idempotently; cheap and keeps consent semantics
+    // local to this function.
+    use std::io::{IsTerminal, Write};
+    let state = classify_rc_state_for_kind(&home, hook_kind);
 
-    let v3_block = v3_rc_block(hook_filename);
-
-    // 3. Scan rc candidates for existing markers (v1/v2/v3).
-    for rc in &rc_candidates {
-        let rc_path = std::path::Path::new(rc);
-        let contents = match std::fs::read_to_string(rc) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        // v3 already installed — idempotent, rewrite block in case marker line drifted.
-        if contents.contains(V3_BEGIN) {
-            if let Some(updated) = replace_between_markers(&contents, V3_BEGIN, V3_END, &v3_block) {
-                if updated != contents {
-                    let _ = std::fs::write(rc_path, updated);
-                }
-            }
+    match &state {
+        // v3 already there — no consent needed (idempotent rewrite).
+        // The helper still does L1 (write_hook_file) which picks up
+        // any binary template drift. No user-visible message.
+        RcStateForKind::AlreadyV3 { .. } => {
+            // Best-effort — failure here just means the next invocation
+            // will retry. Don't drown the user in a message about a
+            // no-op idempotent operation.
+            let _ = write_v3_layers_with_consent(&home, hook_kind);
             return None;
         }
-
-        // v2 or v1 present — migrate with rc backup.
-        //
-        // Hook coverage v1 review round 2 (2026-04-27): the H1.5 non-TTY
-        // refusal at the bottom of this function only guarded the *fresh
-        // install* branch. A pipe / CI / unattended invocation that
-        // landed on a system with leftover v1/v2 markers would still
-        // silently rewrite rc here. That's the same class of consent
-        // surprise H1.5 was meant to prevent — the rc edit's surface
-        // (file content rewrite + backup creation) is at least as
-        // significant as the fresh-install append.
-        //
-        // Decision: also gate v1/v2 migration on TTY. If unattended,
-        // keep rc as-is and tell the user to run `aikey hook install`
-        // interactively to confirm the migration.
-        let has_v2 = contents.contains(V2_BEGIN);
-        let has_v1 = contents.contains(V1_MARKER);
-        if has_v2 || has_v1 {
-            use std::io::IsTerminal;
+        // v1/v2 marker present — needs explicit consent before backup+rewrite.
+        // Hook coverage v1 review round 2 (2026-04-27): same TTY-gating
+        // discipline as the fresh-install branch — non-TTY callers
+        // (CI, pipes) get a hint instead of a silent rewrite.
+        RcStateForKind::LegacyMarker { rc_file, .. } => {
             if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
                 return Some(format!(
                     "  Detected legacy aikey hook (v1/v2) in {}.\n  \
                      Migration to v3 needs interactive confirmation.\n  \
                      Run interactively: \x1b[36maikey hook install\x1b[0m\n  \
                      Or silence: \x1b[36mexport AIKEY_NO_HOOK=1\x1b[0m",
-                    rc,
+                    rc_file.display(),
                 ));
             }
-            let backup = match backup_rc_file(rc_path) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Some(format!("  Could not back up {}: {}", rc, e));
+            // TTY present → consent granted. Write through the helper.
+            match write_v3_layers_with_consent(&home, hook_kind) {
+                Ok(HookInstallSummary::MigratedV2 { backup, .. })
+                | Ok(HookInstallSummary::MigratedV1 { backup, .. }) => {
+                    return Some(format!(
+                        "  Shell hook migrated to v3. Backup: {}",
+                        backup.display()
+                    ));
+                }
+                Ok(_) => {
+                    // The classifier said Legacy but the helper found
+                    // something else (race? rc edited between calls).
+                    // Defensible silent success — the rc is in a valid
+                    // v3 state regardless.
+                    return None;
+                }
+                Err(_) => {
+                    return Some(format!(
+                        "  Could not migrate {}. Backup may not exist; inspect manually.",
+                        rc_file.display(),
+                    ));
+                }
+            }
+        }
+        // Fresh install — same TTY gate, plus interactive Y/n prompt.
+        // Reviewer round (2026-04-27, §H1.5): the rc append needs explicit
+        // consent because stdin/stderr being redirected is a strong signal
+        // there is no human to grant it.
+        RcStateForKind::NoMarker { canonical_rc_file } => {
+            if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
+                return Some(format!(
+                    "  Shell hook file rendered, but ~/.{} (rc-file) wiring needs interactive confirmation.\n  \
+                     Run interactively: \x1b[36maikey hook install\x1b[0m\n  \
+                     Or silence this hint: \x1b[36mexport AIKEY_NO_HOOK=1\x1b[0m\n  \
+                     To apply right now without rc wiring: \x1b[36msource ~/.aikey/{}\x1b[0m",
+                    if is_zsh { "zshrc" } else { "bashrc" },
+                    hook_filename,
+                ));
+            }
+
+            // macOS shell hook installation rules: zsh writes ~/.zshrc;
+            // bash writes ~/.bashrc + a one-line .bash_profile shim if
+            // .bash_profile exists. Both branches handled by the helper
+            // (the .bash_profile shim is part of FreshAppend).
+            let shell_name = if is_zsh { "zsh" } else { "bash" };
+            let rows = vec![
+                format!("Shell:  {}", shell_name),
+                format!("File:   {}", canonical_rc_file.display()),
+                format!("Add:    source ~/.aikey/{}  (v3)", hook_filename),
+            ];
+            crate::ui_frame::eprint_box("\u{2753}", "Install Shell Hook", &rows);
+            eprint!("  Proceed? [Y/n] (default Y): ");
+            io::stderr().flush().ok();
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_ok()
+                && matches!(input.trim().to_lowercase().as_str(), "n" | "no")
+            {
+                // We declined to write rc, but we DID render the hook
+                // file (Layer 1) at the top of this function. Let the
+                // user know they can source it once for the current
+                // shell as a workaround.
+                return Some(format!(
+                    "  Skipped. To apply once: source ~/.aikey/{}",
+                    hook_filename
+                ));
+            }
+
+            // Consent obtained → write through the helper.
+            let summary = match write_v3_layers_with_consent(&home, hook_kind) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Some(format!(
+                        "  Could not write to {}. Source ~/.aikey/{} manually.",
+                        canonical_rc_file.display(),
+                        hook_filename,
+                    ));
                 }
             };
-
-            let migrated = if has_v2 {
-                replace_between_markers(&contents, V2_BEGIN, V2_END, &v3_block)
-                    .unwrap_or_else(|| contents.clone())
-            } else {
-                // v1 has no end marker — strip line-by-line by scanning for the header.
-                strip_v1_block(&contents, &v3_block)
+            let (rc_file_disp, extra_msg) = match summary {
+                HookInstallSummary::FreshAppend {
+                    rc_file,
+                    bash_profile_shim_added,
+                } => {
+                    let extra = if bash_profile_shim_added {
+                        "\n  Also wired ~/.bash_profile → source ~/.bashrc (macOS login shells).".to_string()
+                    } else {
+                        String::new()
+                    };
+                    (rc_file, extra)
+                }
+                // Other variants shouldn't happen on the NoMarker branch
+                // (helper would have classified differently), but build
+                // defensible messages anyway.
+                HookInstallSummary::RewrittenV3 { rc_file }
+                | HookInstallSummary::MigratedV2 { rc_file, .. }
+                | HookInstallSummary::MigratedV1 { rc_file, .. } => (rc_file, String::new()),
             };
 
-            if let Err(e) = std::fs::write(rc_path, migrated) {
-                return Some(format!("  Could not write {}: {}", rc, e));
-            }
+            // Why we tell the user to source rc: writing to ~/.zshrc /
+            // ~/.bashrc does NOT affect the running shell process.
+            // Without this hint the user runs `claude`/`codex`
+            // immediately after `aikey auth login` and the wrapper
+            // function is undefined → bare binary runs with no
+            // preflight, no proxy injection. Symptom matches user
+            // report 2026-04-30: "为什么运行 claude 没有触发连通性测试呢？".
+            // Show the source command so they can either run it now,
+            // open a new shell tab, or accept that the next session
+            // will be fine.
+            let rc_file_str = rc_file_disp.display().to_string();
             return Some(format!(
-                "  Shell hook migrated to v3. Backup: {}",
-                backup.display()
+                "  Shell hook installed in {}{}\n  \
+                 \x1b[33m▲ Run \x1b[36msource {}\x1b[33m (or open a new shell tab) so `claude`/`codex`/`kimi` use the proxy.\x1b[0m",
+                rc_file_str, extra_msg, rc_file_str
             ));
         }
     }
-
-    // 4. No marker found — fresh install. We're about to mutate the user's
-    // dotfile (~/.zshrc / ~/.bashrc / ~/.bash_profile). Before doing that,
-    // refuse non-interactive invocation entirely:
-    //
-    // Reviewer round (2026-04-27, hook coverage v1 §H1.5): the prior
-    // implementation only TTY-gated the prompt; the append itself was
-    // unconditional. So a piped / scripted call (`printf KEY | aikey add`,
-    // CI invocations, etc.) would silently rewrite rc with default-Y
-    // semantics. That's a contract surprise — rc edits need explicit
-    // consent, and stdin/stderr being redirected is a strong signal that
-    // there is no human to grant it.
-    //
-    // After this gate: non-interactive callers get a clear hint to either
-    // run `aikey hook install` from a terminal, or set AIKEY_NO_HOOK=1
-    // (or pass `--no-hook`) to silence the suggestion entirely.
-    use std::io::{IsTerminal, Write};
-    if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
-        return Some(format!(
-            "  Shell hook file rendered, but ~/.{} (rc-file) wiring needs interactive confirmation.\n  \
-             Run interactively: \x1b[36maikey hook install\x1b[0m\n  \
-             Or silence this hint: \x1b[36mexport AIKEY_NO_HOOK=1\x1b[0m\n  \
-             To apply right now without rc wiring: \x1b[36msource ~/.aikey/{}\x1b[0m",
-            if is_zsh { "zshrc" } else { "bashrc" },
-            hook_filename,
-        ));
-    }
-
-    // macOS shell hook installation rules (hook coverage v1 §3rd-party
-    // review, 2026-04-27):
-    //
-    //   zsh : write hook block to ~/.zshrc (single canonical file)
-    //   bash: write hook block to ~/.bashrc (canonical Rule 3 location)
-    //         AND if ~/.bash_profile exists but doesn't already source
-    //         ~/.bashrc, append a source-bashrc shim there. macOS
-    //         Terminal.app launches bash as a login shell which reads
-    //         ~/.bash_profile first; without the shim, ~/.bashrc never
-    //         gets sourced and the hook never loads.
-    //
-    // Why the bash double-write is two distinct artifacts (NOT the same
-    // hook copied twice): hook BODY lives in one place (~/.bashrc); the
-    // shim in ~/.bash_profile is a one-line conditional source — there's
-    // no "duplication" between the two even though we touch both files.
-    let rc_file: String = if is_zsh {
-        format!("{}/.zshrc", home)
-    } else {
-        format!("{}/.bashrc", home)
-    };
-
-    let shell_name = if is_zsh { "zsh" } else { "bash" };
-    let rows = vec![
-        format!("Shell:  {}", shell_name),
-        format!("File:   {}", rc_file),
-        format!("Add:    source ~/.aikey/{}  (v3)", hook_filename),
-    ];
-    crate::ui_frame::eprint_box("\u{2753}", "Install Shell Hook", &rows);
-    eprint!("  Proceed? [Y/n] (default Y): ");
-    io::stderr().flush().ok();
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_ok()
-        && matches!(input.trim().to_lowercase().as_str(), "n" | "no")
-    {
-        return Some(format!(
-            "  Skipped. To apply once: source ~/.aikey/{}",
-            hook_filename
-        ));
-    }
-
-    // Write the canonical hook block. Use OpenOptions::create so the
-    // file lands even if the user has no existing rc (fresh macOS).
-    // Don't worry about losing user content — this is `append`, and
-    // `create` only kicks in when the file is missing.
-    let block = format!("\n{}", v3_block);
-    let write_result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&rc_file)
-        .and_then(|mut f| f.write_all(block.as_bytes()));
-    if write_result.is_err() {
-        return Some(format!(
-            "  Could not write to {}. Source ~/.aikey/{} manually.",
-            rc_file, hook_filename
-        ));
-    }
-
-    // For bash on macOS: also ensure ~/.bash_profile sources ~/.bashrc.
-    // Skip the shim if .bash_profile doesn't exist (don't create new
-    // dotfiles the user didn't have) or if it already sources .bashrc.
-    let mut extra_msg = String::new();
-    if !is_zsh {
-        let bash_profile = format!("{}/.bash_profile", home);
-        if std::path::Path::new(&bash_profile).exists() {
-            let bp_contents = std::fs::read_to_string(&bash_profile).unwrap_or_default();
-            // Detect any common form of "source .bashrc" already there:
-            // `source ~/.bashrc`, `. ~/.bashrc`, `. "$HOME/.bashrc"`, etc.
-            let already_sources_bashrc = bp_contents.lines().any(|l| {
-                let t = l.trim();
-                if t.starts_with('#') { return false; }
-                (t.contains("source") || t.starts_with(". ") || t == ".")
-                    && t.contains(".bashrc")
-            });
-            if !already_sources_bashrc {
-                let shim = "\n# >>> aikey: source bashrc for login shells (macOS Terminal) >>>\n\
-                            if [ -f \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n\
-                            # <<< aikey: source bashrc for login shells <<<\n";
-                let shim_result = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&bash_profile)
-                    .and_then(|mut f| f.write_all(shim.as_bytes()));
-                if shim_result.is_ok() {
-                    extra_msg = format!("\n  Also wired ~/.bash_profile → source ~/.bashrc (macOS login shells).");
-                }
-            }
-        }
-    }
-
-    // Why we tell the user to source rc: writing to ~/.zshrc / ~/.bashrc
-    // does NOT affect the running shell process. Without this hint the user
-    // runs `claude`/`codex` immediately after `aikey auth login` and the
-    // wrapper function is undefined → bare binary runs with no preflight,
-    // no proxy injection. Symptom matches user report 2026-04-30:
-    // "为什么运行 claude 没有触发连通性测试呢？". Show the source command
-    // so they can either run it now, open a new shell tab, or accept that
-    // the next session will be fine.
-    Some(format!(
-        "  Shell hook installed in {}{}\n  \
-         \x1b[33m▲ Run \x1b[36msource {}\x1b[33m (or open a new shell tab) so `claude`/`codex`/`kimi` use the proxy.\x1b[0m",
-        rc_file, extra_msg, rc_file
-    ))
 }
 
 // Stage 3.2 windows-compat: `powershell_profile_candidates` and
@@ -1795,6 +1743,296 @@ pub fn web_install_hook_file_layer1() -> (bool, Option<HookFailureReason>) {
             (false, Some(reason))
         }
     }
+}
+
+/// Result of a successful `write_v3_layers_with_consent` call.
+///
+/// Carries enough info for callers to construct user-facing messages
+/// (e.g. ensure_shell_hook's "Migrated. Backup at X" success line)
+/// without needing to re-stat anything. Phase Z (2026-05-07) extracted
+/// this from inline state in two duplicated code paths.
+#[derive(Debug)]
+pub(super) enum HookInstallSummary {
+    /// rc already had a v3 marker. We re-wrote it (idempotent — picks up
+    /// any template drift) but otherwise no user-visible change.
+    RewrittenV3 { rc_file: std::path::PathBuf },
+    /// rc had a v2 marker; we backed it up and migrated to v3.
+    MigratedV2 {
+        rc_file: std::path::PathBuf,
+        backup: std::path::PathBuf,
+    },
+    /// rc had a v1 marker (pre-end-marker era); we backed up and migrated.
+    MigratedV1 {
+        rc_file: std::path::PathBuf,
+        backup: std::path::PathBuf,
+    },
+    /// No marker found in any candidate; we appended fresh to the canonical rc.
+    /// `bash_profile_shim_added` true iff we also wrote the .bash_profile shim.
+    FreshAppend {
+        rc_file: std::path::PathBuf,
+        bash_profile_shim_added: bool,
+    },
+}
+
+/// State of the rc files BEFORE we'd write — used by callers that need to
+/// gate writes behind consent (e.g., ensure_shell_hook's TTY guard for
+/// fresh installs and v1/v2 migrations). Read-only; doesn't write anything.
+#[derive(Debug)]
+pub(super) enum RcStateForKind {
+    /// At least one rc candidate already has a v3 marker. Idempotent
+    /// rewrite is safe to do unconditionally (no consent needed).
+    AlreadyV3 { rc_file: std::path::PathBuf },
+    /// At least one rc candidate has a legacy v1/v2 marker. Migration
+    /// needs explicit consent — backups will be created.
+    LegacyMarker {
+        rc_file: std::path::PathBuf,
+        has_v2: bool,
+    },
+    /// No marker found in any candidate. Fresh install needs explicit
+    /// consent — will append to canonical rc.
+    NoMarker {
+        canonical_rc_file: std::path::PathBuf,
+    },
+}
+
+/// Cheap read-only classification of rc state. Decides what action a
+/// subsequent `write_v3_layers_with_consent` call would take. Used by
+/// ensure_shell_hook to decide whether to TTY-gate / prompt before writing.
+pub(super) fn classify_rc_state_for_kind(home: &str, kind: HookKind) -> RcStateForKind {
+    let rc_candidates: Vec<String> = match kind {
+        HookKind::Zsh => vec![format!("{}/.zshrc", home)],
+        HookKind::Bash => vec![
+            format!("{}/.bashrc", home),
+            format!("{}/.bash_profile", home),
+        ],
+        HookKind::PowerShell => unreachable!("classify_rc_state_for_kind on PowerShell"),
+    };
+    for rc in &rc_candidates {
+        let rc_path = std::path::Path::new(rc);
+        let contents = match std::fs::read_to_string(rc_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if contents.contains(V3_BEGIN) {
+            return RcStateForKind::AlreadyV3 {
+                rc_file: rc_path.to_path_buf(),
+            };
+        }
+        if contents.contains(V2_BEGIN) {
+            return RcStateForKind::LegacyMarker {
+                rc_file: rc_path.to_path_buf(),
+                has_v2: true,
+            };
+        }
+        if contents.contains(V1_MARKER) {
+            return RcStateForKind::LegacyMarker {
+                rc_file: rc_path.to_path_buf(),
+                has_v2: false,
+            };
+        }
+    }
+    let canonical = match kind {
+        HookKind::Zsh => format!("{}/.zshrc", home),
+        HookKind::Bash => format!("{}/.bashrc", home),
+        HookKind::PowerShell => unreachable!(),
+    };
+    RcStateForKind::NoMarker {
+        canonical_rc_file: std::path::PathBuf::from(canonical),
+    }
+}
+
+/// Layer 1 + Layer 2 writer. Caller has already obtained any necessary
+/// consent (TTY prompt, modal Allow click, AIKEY_NO_HOOK opt-in/out, etc.).
+///
+/// Action selection (mirrors `classify_rc_state_for_kind`):
+///   - existing v3 marker → idempotent rewrite (pick up template drift)
+///   - existing v1/v2 marker → migrate with backup
+///   - no marker found in ANY rc candidate → fresh append to canonical rc
+///
+/// Bash also gets `~/.bash_profile` shim (`if [ -f ~/.bashrc ]; then . ~/.bashrc; fi`)
+/// if the file exists and doesn't already source bashrc — only on the
+/// FreshAppend branch (not on rewrite/migrate, where the existing block
+/// is already wired and the shim either already exists or the user
+/// declined it before).
+///
+/// Returns `HookInstallSummary` describing what happened so callers can
+/// build human-readable status messages.
+///
+/// Caller responsibilities (NOT done here):
+///   - AIKEY_NO_HOOK env-var check
+///   - HOME/USERPROFILE check
+///   - $SHELL detection (kind must already be Zsh or Bash)
+///   - TTY guard / interactive prompt (where applicable)
+///   - PowerShell handling (separate function in shell_integration_windows)
+pub(super) fn write_v3_layers_with_consent(
+    home: &str,
+    kind: HookKind,
+) -> Result<HookInstallSummary, HookFailureReason> {
+    write_hook_file(home, kind).map_err(|_| HookFailureReason::IoError)?;
+    cleanup_legacy_hook_files(home);
+    let hook_filename = hook_filename_for_kind(kind);
+    let v3_block = v3_rc_block(hook_filename);
+
+    let rc_candidates: Vec<String> = match kind {
+        HookKind::Zsh => vec![format!("{}/.zshrc", home)],
+        HookKind::Bash => vec![
+            format!("{}/.bashrc", home),
+            format!("{}/.bash_profile", home),
+        ],
+        HookKind::PowerShell => return Err(HookFailureReason::ShellUndetectable),
+    };
+
+    for rc in &rc_candidates {
+        let rc_path = std::path::Path::new(rc);
+        let contents = match std::fs::read_to_string(rc_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if contents.contains(V3_BEGIN) {
+            if let Some(updated) = replace_between_markers(&contents, V3_BEGIN, V3_END, &v3_block) {
+                if updated != contents {
+                    std::fs::write(rc_path, updated).map_err(|_| HookFailureReason::IoError)?;
+                }
+            }
+            return Ok(HookInstallSummary::RewrittenV3 {
+                rc_file: rc_path.to_path_buf(),
+            });
+        }
+        if contents.contains(V2_BEGIN) {
+            let backup = backup_rc_file(rc_path).map_err(|_| HookFailureReason::IoError)?;
+            let migrated = replace_between_markers(&contents, V2_BEGIN, V2_END, &v3_block)
+                .unwrap_or_else(|| contents.clone());
+            std::fs::write(rc_path, migrated).map_err(|_| HookFailureReason::IoError)?;
+            return Ok(HookInstallSummary::MigratedV2 {
+                rc_file: rc_path.to_path_buf(),
+                backup,
+            });
+        }
+        if contents.contains(V1_MARKER) {
+            let backup = backup_rc_file(rc_path).map_err(|_| HookFailureReason::IoError)?;
+            let migrated = strip_v1_block(&contents, &v3_block);
+            std::fs::write(rc_path, migrated).map_err(|_| HookFailureReason::IoError)?;
+            return Ok(HookInstallSummary::MigratedV1 {
+                rc_file: rc_path.to_path_buf(),
+                backup,
+            });
+        }
+    }
+
+    // No marker found anywhere; fresh append to canonical rc.
+    let canonical_rc = match kind {
+        HookKind::Zsh => format!("{}/.zshrc", home),
+        HookKind::Bash => format!("{}/.bashrc", home),
+        HookKind::PowerShell => unreachable!(),
+    };
+    let canonical_path = std::path::PathBuf::from(&canonical_rc);
+    {
+        use std::io::Write;
+        let block = format!("\n{}", v3_block);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&canonical_path)
+            .and_then(|mut f| f.write_all(block.as_bytes()))
+            .map_err(|_| HookFailureReason::IoError)?;
+    }
+    let bash_profile_shim_added = apply_bash_profile_shim_if_needed(home, kind);
+    Ok(HookInstallSummary::FreshAppend {
+        rc_file: canonical_path,
+        bash_profile_shim_added,
+    })
+}
+
+/// Bash-on-macOS supplement: ensure ~/.bash_profile sources ~/.bashrc so
+/// login shells (Terminal.app's default) actually load the hook.
+///
+/// Best-effort: failure here doesn't propagate because the primary write
+/// already succeeded. No-op for non-Bash kinds, missing .bash_profile,
+/// or .bash_profile that already sources .bashrc. Returns whether the
+/// shim was actually added (for the FreshAppend summary).
+pub(super) fn apply_bash_profile_shim_if_needed(home: &str, kind: HookKind) -> bool {
+    if !matches!(kind, HookKind::Bash) {
+        return false;
+    }
+    let bash_profile = format!("{}/.bash_profile", home);
+    if !std::path::Path::new(&bash_profile).exists() {
+        return false;
+    }
+    let bp = std::fs::read_to_string(&bash_profile).unwrap_or_default();
+    let already = bp.lines().any(|l| {
+        let t = l.trim();
+        if t.starts_with('#') {
+            return false;
+        }
+        (t.contains("source") || t.starts_with(". ") || t == ".") && t.contains(".bashrc")
+    });
+    if already {
+        return false;
+    }
+    use std::io::Write;
+    let shim = "\n# >>> aikey: source bashrc for login shells (macOS Terminal) >>>\n\
+                if [ -f \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n\
+                # <<< aikey: source bashrc for login shells <<<\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&bash_profile)
+        .and_then(|mut f| f.write_all(shim.as_bytes()))
+        .is_ok()
+}
+
+/// Web-modal entry point — Hook coverage v1 update 2026-05-07
+/// (`20260507-web-hook-rc-modal-自动注入.md`).
+///
+/// Writes BOTH Layer 1 (`~/.aikey/hook.{zsh,bash}`) AND Layer 2 (rc marker
+/// block in `~/.zshrc` / `~/.bashrc`) on behalf of the user. Used only by
+/// the Web bridge handler `_internal hook-op wire-rc`, which is itself
+/// only reachable via `POST /api/user/hook/install` on Personal/Trial
+/// editions.
+///
+/// **Why this is separate from [`ensure_shell_hook`]**:
+/// - `ensure_shell_hook(false)` enforces an H1.5 TTY guard — non-TTY
+///   callers cannot mutate the rc file because there is no human to grant
+///   consent. The CLI path (interactive `aikey use` / `aikey hook install`)
+///   relies on this.
+/// - Web modal "Allow" IS explicit consent, but the bridge invocation is
+///   not a TTY. Loosening `ensure_shell_hook` to accept an alternate
+///   consent source would risk silently dropping the TTY guard for other
+///   non-TTY callers (CI / piped invocations). Separate function keeps
+///   the contract local: this path is only used after a Web modal click.
+///
+/// **AIKEY_NO_HOOK still honored**: even with explicit Web consent, an
+/// environment-level opt-out wins. Returns `AikeyNoHook` so the front-end
+/// can surface "you opted out — unset AIKEY_NO_HOOK to enable" copy.
+///
+/// **Shell discipline**: only zsh / bash. PowerShell users go through
+/// [`super::shell_integration_windows::ensure_powershell_hook`]; from
+/// Web that path is currently surfaced as `ShellUndetectable` since it
+/// needs $PROFILE handling that doesn't fit this POSIX-rc shape.
+pub fn wire_rc_with_consent() -> Result<(), HookFailureReason> {
+    if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
+        return Err(HookFailureReason::AikeyNoHook);
+    }
+    let home = std::env::var("HOME").map_err(|_| HookFailureReason::HomeUnset)?;
+    if home.is_empty() {
+        return Err(HookFailureReason::HomeUnset);
+    }
+
+    // Detect shell. PowerShell / fish / sh / unknown → ShellUndetectable.
+    // The front-end shows a `shell_undetectable` banner pointing at
+    // `aikey hook install --shell zsh` so the user can pick explicitly.
+    let kind = match shell_kind() {
+        ShellKind::Zsh => HookKind::Zsh,
+        ShellKind::Bash => HookKind::Bash,
+        _ => return Err(HookFailureReason::ShellUndetectable),
+    };
+
+    // Phase Z (2026-05-07): delegate the actual L1+L2 file IO to the
+    // shared `write_v3_layers_with_consent` helper — same logic
+    // `ensure_shell_hook` runs after its TTY/prompt consent gates pass.
+    // Web modal "Allow" is the consent here; we drop the install summary
+    // because the JSON envelope's fields (file_installed / rc_wired /
+    // failure_reason) are recomputed by callers from FS state.
+    write_v3_layers_with_consent(&home, kind).map(|_| ())
 }
 
 /// Whether the user's shell rc file (for their current `$SHELL`) contains
@@ -3006,6 +3244,171 @@ mod hook_tests {
         assert!(!run_shell_rc_check(tmp.path(), "/usr/local/bin/fish"));
         assert!(!run_shell_rc_check(tmp.path(), "/bin/sh"));
         assert!(!run_shell_rc_check(tmp.path(), ""));
+    }
+}
+
+// ============================================================================
+// `wire_rc_with_consent` — tests (Hook coverage v1 update 2026-05-07)
+// ============================================================================
+//
+// Web-modal "Allow" path. Unlike `ensure_shell_hook`, no TTY guard — the
+// modal click IS the consent. Tests cover the four observable outcomes:
+//   - Ok: zsh fresh append, bash append, idempotent v3 rewrite, v2 migration
+//   - Err(ShellUndetectable): $SHELL unrecognized
+//   - Err(HomeUnset): no $HOME
+//   - Err(AikeyNoHook): AIKEY_NO_HOOK=1 (env opt-out wins over Web consent)
+//   - Err(IoError): rc file unwritable
+
+#[cfg(test)]
+mod wire_rc_with_consent_tests {
+    use super::*;
+    use crate::test_env_lock::ENV_MUTATION_LOCK;
+
+    /// Run `wire_rc_with_consent` with a hermetic HOME + SHELL, restoring
+    /// env on exit. Mirrors `run_shell_rc_check`'s harness.
+    fn run_wire_rc(
+        home: &std::path::Path,
+        shell: &str,
+        no_hook: bool,
+    ) -> Result<(), HookFailureReason> {
+        let prev_home = std::env::var("HOME").ok();
+        let prev_shell = std::env::var("SHELL").ok();
+        let prev_no_hook = std::env::var("AIKEY_NO_HOOK").ok();
+        unsafe {
+            std::env::set_var("HOME", home.to_str().unwrap());
+            std::env::set_var("SHELL", shell);
+            if no_hook {
+                std::env::set_var("AIKEY_NO_HOOK", "1");
+            } else {
+                std::env::remove_var("AIKEY_NO_HOOK");
+            }
+        }
+        let result = wire_rc_with_consent();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_shell {
+                Some(v) => std::env::set_var("SHELL", v),
+                None => std::env::remove_var("SHELL"),
+            }
+            match prev_no_hook {
+                Some(v) => std::env::set_var("AIKEY_NO_HOOK", v),
+                None => std::env::remove_var("AIKEY_NO_HOOK"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn wire_rc_zsh_fresh_install_appends_v3_block() {
+        // Pre: ~/.zshrc has user content but no aikey marker.
+        // Expect: Ok(()), .zshrc gains v3 block at end, ~/.aikey/hook.zsh
+        // exists, no TTY prompt asked (this whole path skips the H1.5 gate).
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(".zshrc"), "# user content\nexport FOO=bar\n")
+            .expect("seed zshrc");
+        let result = run_wire_rc(tmp.path(), "/bin/zsh", false);
+        assert_eq!(result, Ok(()));
+        let zshrc = std::fs::read_to_string(tmp.path().join(".zshrc")).expect("read zshrc");
+        assert!(zshrc.contains("# user content"), "user content preserved");
+        assert!(zshrc.contains(V3_BEGIN), "v3 begin marker present");
+        assert!(zshrc.contains(V3_END), "v3 end marker present");
+        assert!(
+            zshrc.contains("source ~/.aikey/hook.zsh"),
+            "source line wired"
+        );
+        assert!(
+            tmp.path().join(".aikey/hook.zsh").exists(),
+            "hook.zsh rendered as side-effect of Layer 1"
+        );
+    }
+
+    #[test]
+    fn wire_rc_zsh_idempotent_when_v3_already_present() {
+        // Pre: ~/.zshrc already has a v3 block.
+        // Expect: Ok(()), no duplicate block, marker rewritten in place.
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pre = format!(
+            "# user content\n{}\n[ -f ~/.aikey/hook.zsh ] && source ~/.aikey/hook.zsh\n{}\n",
+            V3_BEGIN, V3_END
+        );
+        std::fs::write(tmp.path().join(".zshrc"), &pre).expect("seed zshrc");
+        let result = run_wire_rc(tmp.path(), "/bin/zsh", false);
+        assert_eq!(result, Ok(()));
+        let zshrc = std::fs::read_to_string(tmp.path().join(".zshrc")).expect("read zshrc");
+        // Exactly one v3 begin marker — no duplicate append.
+        assert_eq!(zshrc.matches(V3_BEGIN).count(), 1);
+        assert_eq!(zshrc.matches(V3_END).count(), 1);
+    }
+
+    #[test]
+    fn wire_rc_bash_fresh_install_appends_v3_block_to_bashrc() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(".bashrc"), "# bash user content\n").expect("seed bashrc");
+        let result = run_wire_rc(tmp.path(), "/bin/bash", false);
+        assert_eq!(result, Ok(()));
+        let bashrc = std::fs::read_to_string(tmp.path().join(".bashrc")).expect("read bashrc");
+        assert!(bashrc.contains(V3_BEGIN));
+        assert!(bashrc.contains("source ~/.aikey/hook.bash"));
+        assert!(tmp.path().join(".aikey/hook.bash").exists());
+    }
+
+    #[test]
+    fn wire_rc_returns_shell_undetectable_for_fish() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let result = run_wire_rc(tmp.path(), "/usr/local/bin/fish", false);
+        assert_eq!(result, Err(HookFailureReason::ShellUndetectable));
+        // Crucially, no rc file written even though we had a tmp HOME.
+        assert!(!tmp.path().join(".zshrc").exists());
+        assert!(!tmp.path().join(".bashrc").exists());
+    }
+
+    #[test]
+    fn wire_rc_returns_aikey_no_hook_when_env_opted_out() {
+        // AIKEY_NO_HOOK=1 wins over Web consent. The user / CI explicitly
+        // opted out at env level — Web modal click cannot override.
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(".zshrc"), "# user\n").expect("seed zshrc");
+        let result = run_wire_rc(tmp.path(), "/bin/zsh", true /* AIKEY_NO_HOOK */);
+        assert_eq!(result, Err(HookFailureReason::AikeyNoHook));
+        let zshrc = std::fs::read_to_string(tmp.path().join(".zshrc")).expect("read zshrc");
+        assert!(!zshrc.contains(V3_BEGIN), "rc must not be touched when opted out");
+    }
+
+    #[test]
+    fn wire_rc_returns_home_unset_when_home_missing() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var("HOME").ok();
+        let prev_shell = std::env::var("SHELL").ok();
+        let prev_no_hook = std::env::var("AIKEY_NO_HOOK").ok();
+        unsafe {
+            std::env::remove_var("HOME");
+            std::env::set_var("SHELL", "/bin/zsh");
+            std::env::remove_var("AIKEY_NO_HOOK");
+        }
+        let result = wire_rc_with_consent();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_shell {
+                Some(v) => std::env::set_var("SHELL", v),
+                None => std::env::remove_var("SHELL"),
+            }
+            match prev_no_hook {
+                Some(v) => std::env::set_var("AIKEY_NO_HOOK", v),
+                None => std::env::remove_var("AIKEY_NO_HOOK"),
+            }
+        }
+        assert_eq!(result, Err(HookFailureReason::HomeUnset));
     }
 }
 

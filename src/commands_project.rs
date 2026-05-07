@@ -713,10 +713,15 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // JSON consumers can filter sub-rows by check name prefix.
     {
         let report = crate::commands_account::audit_credential_lifecycle(false);
+        // Drift hint: highlight the two actionable commands in cyan-bold
+        // inside the surrounding dim emit-wrap. `\x1b[0m\x1b[2m` after each
+        // cyan close reapplies dim so text after the cyan portion stays dim
+        // (else `\x1b[0m` would reset all attributes including dim).
+        let drift_hint = format!(
+            "run \x1b[1;36maikey use <alias>\x1b[0m\x1b[2m to force a reconcile, or \x1b[1;36maikey doctor --detail\x1b[0m\x1b[2m for per-source diff",
+        );
         emit("active state sync", report.is_consistent, &report.summary,
-            if report.is_consistent { None } else {
-                Some("run 'aikey use <alias>' to force a reconcile, or 'aikey doctor --detail' for per-source diff")
-            });
+            if report.is_consistent { None } else { Some(&drift_hint) });
         if !report.is_consistent {
             for d in &report.diffs {
                 let label = format!("  {}", d.source.label());
