@@ -1104,13 +1104,20 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // own connection — safe to run post-write on the same DB.
             let _ = storage::ensure_entry_route_token(&outcome.alias);
 
-            // Auto-assign as Primary + refresh active.env.
-            let newly_primary = profile_activation::auto_assign_primaries_for_key(
-                "personal", alias, &resolved_providers,
+            // Single funnel: Added event runs auto_assign_primaries → refresh
+            // → apply_third_party_cli_configs. Replaces the legacy
+            // "configure_kimi_cli + configure_codex_cli only" pattern that
+            // could only inject regions, never strip them — the unified
+            // helper handles both directions, keeping CLI add in lockstep
+            // with Web add (vault_op handle_add).
+            let lifecycle = commands_account::apply_credential_lifecycle(
+                commands_account::CredentialLifecycleEvent::Added {
+                    source_type: "personal",
+                    source_ref: alias,
+                    providers: &resolved_providers,
+                },
             ).unwrap_or_default();
-            if !newly_primary.is_empty() || !resolved_providers.is_empty() {
-                let _ = profile_activation::refresh_implicit_profile_activation();
-            }
+            let newly_primary = lifecycle.newly_primary;
 
             // Hook coverage v1 §H1: install shell hook on `aikey add` too,
             // not just on `aikey use`. First-key add is a typical onboarding
@@ -1123,26 +1130,6 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
-
-            // Auto-configure third-party CLI tools when relevant providers are added.
-            if !cli.json {
-                let proxy_port = commands_proxy::proxy_port();
-                let has_openai = resolved_providers.iter().any(|p| {
-                    let c = p.to_lowercase();
-                    c == "openai" || c == "gpt" || c == "chatgpt"
-                });
-                if has_openai {
-                    commands_account::configure_codex_cli(proxy_port);
-                }
-
-                let has_kimi = resolved_providers.iter().any(|p| {
-                    let c = p.to_lowercase();
-                    c == "kimi" || c == "moonshot"
-                });
-                if has_kimi {
-                    commands_account::configure_kimi_cli(proxy_port);
-                }
-            }
 
             if cli.json {
                 json_output::success(serde_json::json!({
@@ -1267,25 +1254,45 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Run per-alias deletes + collect outcomes. Don't short-circuit
             // on error — user wants to know which one failed and still have
             // the others removed.
+            //
+            // Reconcile + refresh + apply runs ONCE at the end via
+            // apply_credential_lifecycle_batch (Removed event per successful
+            // delete). reconcile_actions come back per-event so we can render
+            // the "⭐ promoted X" / "⚠ no replacement" lines per alias.
             let mut per_alias: Vec<(String, Result<(), String>, Vec<profile_activation::ReconcileAction>)>
                 = Vec::with_capacity(batch);
+            let mut events: Vec<commands_account::CredentialLifecycleEvent> = Vec::new();
+            // Two passes: first do the entry-level deletes, then funnel
+            // successful ones through apply_credential_lifecycle_batch.
+            // Failed deletes don't produce events (entry never went away).
             for alias in &ordered {
                 let result = executor::delete_secret(alias, &password);
                 let _ = audit::log_audit_event(
                     &password, audit::AuditOperation::Delete, Some(alias), result.is_ok(),
                 );
-                let actions: Vec<profile_activation::ReconcileAction> = if result.is_ok() {
-                    profile_activation::reconcile_provider_primary_after_key_removal(
-                        "personal", alias,
-                    ).unwrap_or_default()
-                } else { Vec::new() };
-                per_alias.push((alias.clone(), result, actions));
+                if result.is_ok() {
+                    events.push(commands_account::CredentialLifecycleEvent::Removed {
+                        source_type: "personal",
+                        source_ref: alias,
+                    });
+                }
+                per_alias.push((alias.clone(), result, Vec::new()));
             }
-
-            // One activation refresh at the end if ANY delete produced reconcile actions.
-            let any_reconciled = per_alias.iter().any(|(_, _, a)| !a.is_empty());
-            if any_reconciled {
-                let _ = profile_activation::refresh_implicit_profile_activation();
+            // Single funnel — runs reconcile per event, refresh + apply once.
+            if !events.is_empty() {
+                let outcomes = commands_account::apply_credential_lifecycle_batch(&events)
+                    .unwrap_or_default();
+                // Walk outcomes in lockstep with successful per_alias rows
+                // and copy reconcile_actions back so the UX renderer below
+                // can show them per-alias.
+                let mut outcome_iter = outcomes.into_iter();
+                for (_, result, actions_slot) in per_alias.iter_mut() {
+                    if result.is_ok() {
+                        if let Some(o) = outcome_iter.next() {
+                            *actions_slot = o.reconcile_actions;
+                        }
+                    }
+                }
             }
 
             let ok_count = per_alias.iter().filter(|(_, r, _)| r.is_ok()).count();
@@ -2073,13 +2080,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     match result {
                         Ok(_) => {
-                            // Reconcile provider bindings after removal.
-                            let actions = profile_activation::reconcile_provider_primary_after_key_removal(
-                                "personal", name,
+                            // Single funnel: Removed event runs reconcile →
+                            // refresh → apply. Same chain as Commands::Delete.
+                            let outcome = commands_account::apply_credential_lifecycle(
+                                commands_account::CredentialLifecycleEvent::Removed {
+                                    source_type: "personal",
+                                    source_ref: name,
+                                },
                             ).unwrap_or_default();
-                            if !actions.is_empty() {
-                                let _ = profile_activation::refresh_implicit_profile_activation();
-                            }
+                            let actions = outcome.reconcile_actions;
 
                             if cli.json {
                                 json_output::print_json(serde_json::json!({
@@ -2318,33 +2327,30 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             commands_account::ensure_shell_hook(false);
                         }
                     } else {
-                        // Canonical-write (2026-04-24 rule) — interactive
-                        // `aikey use` picker's selected bindings go through
-                        // the same helper as every other write path.
-                        for (prov, src_type, src_ref) in &changes {
-                            commands_account::write_bindings_canonical(
-                                &[prov.clone()],
-                                src_type,
-                                src_ref,
-                            ).map_err(|e| format!("Failed to set binding: {}", e))?;
-                        }
-                        let refresh = profile_activation::refresh_implicit_profile_activation()
-                            .map_err(|e| format!("Failed to refresh activation: {}", e))?;
+                        // Single funnel: each (provider, source_type, source_ref)
+                        // tuple becomes a Switched event. Batch flavor runs
+                        // write_bindings_canonical N times then refresh + apply ONCE.
+                        let events: Vec<commands_account::CredentialLifecycleEvent> = changes
+                            .iter()
+                            .map(|(prov, src_type, src_ref)| {
+                                commands_account::CredentialLifecycleEvent::Switched {
+                                    source_type: src_type.as_str(),
+                                    source_ref: src_ref.as_str(),
+                                    providers: std::slice::from_ref(prov),
+                                }
+                            })
+                            .collect();
+                        commands_account::apply_credential_lifecycle_batch(&events)
+                            .map_err(|e| format!("Failed to apply use: {}", e))?;
                         if !*no_hook {
                             commands_account::ensure_shell_hook(false);
                         }
 
-                        // Auto-configure / unconfigure third-party CLI tools.
-                        // Shared helper so this `aikey use` (interactive picker)
-                        // path, `handle_key_use` (programmatic), and the Web-side
-                        // `_internal vault_op handle_use` all stay in lockstep.
-                        // See `apply_third_party_cli_configs` doc-comment for
-                        // the regression history (2026-04-30).
-                        let proxy_port = commands_proxy::proxy_port();
-                        let all_providers: Vec<String> = refresh.bindings.iter()
-                            .map(|b| b.provider_code.clone())
-                            .collect();
-                        commands_account::apply_third_party_cli_configs(&all_providers, proxy_port);
+                        // Re-read bindings for the summary box (display only —
+                        // the apply chain already wrote everything). Cheap;
+                        // single DB read.
+                        let bindings = storage::list_provider_bindings_readonly("default")
+                            .unwrap_or_default();
 
                         // Print a summary box showing the final state.
                         use colored::Colorize;
@@ -2352,7 +2358,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             .map(|(p, _, _)| p.as_str())
                             .collect();
                         let mut box_rows: Vec<String> = Vec::new();
-                        for b in &refresh.bindings {
+                        for b in &bindings {
                             let display_name = resolve_binding_display_name(b.key_source_type.as_str(), &b.key_source_ref);
                             let is_changed = changed_providers.contains(&b.provider_code.as_str());
                             let value_raw = format!("\u{2192} {}", display_name);

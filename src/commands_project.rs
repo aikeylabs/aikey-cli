@@ -697,6 +697,34 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             None);
     }
 
+    // ── 3.5. Lifecycle state consistency ─────────────────────
+    //
+    // Audit DB ↔ active.env ↔ kimi.toml ↔ codex.toml. Drift here is
+    // a frequent root cause of "I added a key but my CLI still hits
+    // the old one" complaints. Reporting it BEFORE provider
+    // connectivity means the user sees the right hint instead of
+    // re-trying connectivity probes that were never going to work.
+    //
+    // Pure read-only; no master password, no network. Proxy cache
+    // comparison is gated on `--detail` (HTTP call, slower).
+    //
+    // Each drift becomes a sub-row (label starts with whitespace), so
+    // emit renders them as dim tree branches under the parent check.
+    // JSON consumers can filter sub-rows by check name prefix.
+    {
+        let report = crate::commands_account::audit_credential_lifecycle(false);
+        emit("active state sync", report.is_consistent, &report.summary,
+            if report.is_consistent { None } else {
+                Some("run 'aikey use <alias>' to force a reconcile, or 'aikey doctor --detail' for per-source diff")
+            });
+        if !report.is_consistent {
+            for d in &report.diffs {
+                let label = format!("  {}", d.source.label());
+                emit(&label, false, &d.describe(), d.hint.as_deref());
+            }
+        }
+    }
+
     // ── 4. Proxy process + reachability ──────────────────────
     //
     // **Round 10 review fix (MEDIUM, Finding 1)**: previously this

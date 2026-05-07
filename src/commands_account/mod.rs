@@ -2518,6 +2518,12 @@ pub fn handle_run_direct(
 mod shell_integration;
 pub use shell_integration::*;
 
+// Credential lifecycle: single funnel for all binding writes + read-only
+// state audit. See `lifecycle/mod.rs` for the design rationale (Phase 5
+// of bugfix 2026-05-07-handle-add-skips-third-party-cli-config).
+mod lifecycle;
+pub use lifecycle::*;
+
 // PowerShell hook install logic, extracted 2026-04-29 from
 // shell_integration.rs (Strategy A purity). Compiled on all platforms —
 // pwsh 7+ runs on macOS / Linux too, and cross-platform tests in
@@ -2749,34 +2755,28 @@ pub fn handle_key_use(
         selected
     };
 
-    // Write provider bindings via the shared core helper (normalizes
-    // provider_code to canonical form + cleans any stale alias rows).
-    write_bindings_canonical(&target_providers, key_type.as_str(), &key_ref)?;
-
-    // ── 3. Refresh active.env from ALL provider bindings ─────────────────────
-    let refresh = crate::profile_activation::refresh_implicit_profile_activation()
-        .map_err(|e| format!("Failed to refresh activation: {}", e))?;
+    // Single funnel: Switched event runs write_bindings_canonical →
+    // refresh → apply_third_party_cli_configs. Drive off the refreshed
+    // binding set so switching one provider away from kimi/codex correctly
+    // unconfigures the corresponding toml region.
+    let _lifecycle = apply_credential_lifecycle(
+        CredentialLifecycleEvent::Switched {
+            source_type: key_type.as_str(),
+            source_ref: &key_ref,
+            providers: &target_providers,
+        },
+    )
+    .map_err(|e| format!("Failed to apply use: {}", e))?;
 
     // ── 6. Shell hook (one-time, first use) ───────────────────────────────────
     let hook_msg = if !json_mode { ensure_shell_hook(no_hook) } else { None };
 
-    // ── 6b. Auto-configure / unconfigure third-party CLI tools ─────────────
-    // Skipped in JSON mode (caller handles it explicitly via the structured
-    // response); shared helper used so `aikey use`, `aikey activate`, and
-    // the web-side `_internal vault_op handle_use` all stay in lockstep
-    // (regression record 2026-04-30: web path skipped this entirely → user
-    // had to re-run `aikey use` from CLI just to make the kimi config.toml
-    // pick up the new active key).
-    //
-    // Drive off the refreshed binding set, not just the providers we set
-    // here — switching one provider away from kimi must unconfigure
-    // ~/.kimi/config.toml when no other binding still routes through kimi.
-    if !json_mode {
-        let active_providers: Vec<String> = refresh.bindings.iter()
-            .map(|b| b.provider_code.clone())
-            .collect();
-        apply_third_party_cli_configs(&active_providers, proxy_port);
-    }
+    // Bindings reread for the JSON envelope below (apply already wrote
+    // active.env). Cheap; single DB read.
+    let bindings = crate::storage::list_provider_bindings_readonly("default")
+        .unwrap_or_default();
+    // Suppress unused-warning when json_mode skips the helper apply.
+    let _ = proxy_port;
 
     // ── 5. Output ─────────────────────────────────────────────────────────────
     if json_mode {
@@ -2786,7 +2786,7 @@ pub fn handle_key_use(
             "key_ref": key_ref,
             "display_name": display_name,
             "promoted_providers": target_providers,
-            "all_active_providers": refresh.activated_providers,
+            "all_active_providers": bindings.iter().map(|b| &b.provider_code).collect::<Vec<_>>(),
             "active_env_written": true,
         }));
     } else {
@@ -2803,7 +2803,7 @@ pub fn handle_key_use(
         };
 
         let mut rows: Vec<String> = Vec::new();
-        for b in &refresh.bindings {
+        for b in &bindings {
             if let Some((api_key_var, _)) = provider_env_vars(&b.provider_code) {
                 let display_ref = resolve_binding_display_name(b.key_source_type.as_str(), &b.key_source_ref);
                 let is_changed = target_providers.contains(&b.provider_code);

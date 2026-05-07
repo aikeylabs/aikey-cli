@@ -384,12 +384,15 @@ fn submit_code_and_finish(
     // for the explicit switch). `provider` here is the broker code
     // (claude/codex/kimi); the helper canonicalizes internally.
     if !account_id.is_empty() {
-        let _ = crate::profile_activation::auto_assign_primaries_for_key(
-            "personal_oauth_account",
-            account_id,
-            &[provider.to_string()],
+        // Single funnel: Added event runs auto_assign_primaries → refresh
+        // → apply_third_party_cli_configs.
+        let _ = crate::commands_account::apply_credential_lifecycle(
+            crate::commands_account::CredentialLifecycleEvent::Added {
+                source_type: "personal_oauth_account",
+                source_ref: account_id,
+                providers: &[provider.to_string()],
+            },
         );
-        let _ = crate::profile_activation::refresh_implicit_profile_activation();
     }
 
     // Install the shell hook so the next `claude`/`codex`/`kimi` invocation
@@ -871,24 +874,24 @@ fn handle_use(account: &str, _proxy_port: u16, json_mode: bool) -> Result<(), Bo
     // Get old binding for the provider (for replacement notice)
     let old_binding = storage::get_provider_binding("default", canonical).ok().flatten();
 
-    // Update per-provider binding via the shared canonical-write helper
-    // (2026-04-24 rule — single source of truth for `user_profile_provider_
-    // bindings` writes, handles stale alias cleanup as a side effect).
-    crate::commands_account::write_bindings_canonical(
-        &[target.provider.clone()], // raw — helper normalizes internally
-        CredentialType::PersonalOAuthAccount.as_str(),
-        &target.provider_account_id,
+    // Single funnel: Switched event runs write_bindings_canonical →
+    // refresh → apply_third_party_cli_configs.
+    crate::commands_account::apply_credential_lifecycle(
+        crate::commands_account::CredentialLifecycleEvent::Switched {
+            source_type: CredentialType::PersonalOAuthAccount.as_str(),
+            source_ref: &target.provider_account_id,
+            providers: &[target.provider.clone()],
+        },
     )?;
 
-    // Update global active_key_config
+    // Update global active_key_config (legacy single-active concept,
+    // separate from per-provider bindings managed above).
     storage::set_active_key_config(&storage::ActiveKeyConfig {
         key_type: CredentialType::PersonalOAuthAccount,
         key_ref: target.provider_account_id.clone(),
         providers: vec![canonical.to_string()],
     })?;
 
-    // Refresh active.env from all provider bindings + reload proxy
-    let _ = crate::profile_activation::refresh_implicit_profile_activation();
     // Trigger proxy reload
     let _ = crate::commands_proxy::post_admin_reload();
 
@@ -944,7 +947,19 @@ fn handle_logout(target: &str, proxy_port: u16, json_mode: bool) -> Result<(), B
     // Also clean up local bindings
     let _ = storage::delete_provider_account(&acct.provider_account_id);
 
-    // If this was the active credential, clear it
+    // Single funnel: Removed event runs reconcile (clears phantom bindings)
+    // → refresh → apply_third_party_cli_configs (strips kimi/codex toml
+    // regions when this OAuth was the only credential keeping that
+    // provider active).
+    let _ = crate::commands_account::apply_credential_lifecycle(
+        crate::commands_account::CredentialLifecycleEvent::Removed {
+            source_type: "personal_oauth_account",
+            source_ref: &acct.provider_account_id,
+        },
+    );
+
+    // If this was the *global* active credential (legacy single-active concept,
+    // separate from per-provider bindings above), clear it too and reload proxy.
     if let Ok(Some(cfg)) = storage::get_active_key_config() {
         if cfg.key_type == CredentialType::PersonalOAuthAccount && cfg.key_ref == acct.provider_account_id {
             let _ = storage::set_active_key_config(&storage::ActiveKeyConfig {
@@ -952,7 +967,6 @@ fn handle_logout(target: &str, proxy_port: u16, json_mode: bool) -> Result<(), B
                 key_ref: String::new(),
                 providers: vec![],
             });
-            let _ = crate::profile_activation::refresh_implicit_profile_activation();
             let _ = crate::commands_proxy::post_admin_reload();
         }
     }

@@ -433,17 +433,18 @@ fn handle_add(env: StdinEnvelope) {
     // failures here don't roll back the entry write that already
     // succeeded; the metadata can be reconciled later by `aikey use
     // <alias>`.
-    let newly_primary = profile_activation::auto_assign_primaries_for_key(
-        "personal",
-        &outcome.alias,
-        &outcome.providers,
+    // Single funnel: Added event runs auto_assign_primaries → refresh →
+    // apply_third_party_cli_configs. Bugfix history pinned by the
+    // CredentialLifecycleEvent variant docs.
+    let lifecycle = crate::commands_account::apply_credential_lifecycle(
+        crate::commands_account::CredentialLifecycleEvent::Added {
+            source_type: "personal",
+            source_ref: &outcome.alias,
+            providers: &outcome.providers,
+        },
     ).unwrap_or_default();
-    let active_env_refreshed = if !newly_primary.is_empty() || !outcome.providers.is_empty() {
-        profile_activation::refresh_implicit_profile_activation().is_ok()
-    } else {
-        // No bindings touched (no providers given) — leave active.env alone.
-        false
-    };
+    let newly_primary = lifecycle.newly_primary;
+    let active_env_refreshed = lifecycle.active_env_refreshed;
 
     let audit_logged = try_log_audit(&key, AuditOperation::Add, Some(&outcome.alias), true);
 
@@ -702,6 +703,14 @@ fn handle_delete(env: StdinEnvelope) {
         return;
     }
 
+    // Single funnel: Removed event runs reconcile → refresh → apply.
+    let _ = crate::commands_account::apply_credential_lifecycle(
+        crate::commands_account::CredentialLifecycleEvent::Removed {
+            source_type: "personal",
+            source_ref: &payload.alias,
+        },
+    );
+
     let audit_logged = try_log_audit(&key, AuditOperation::Delete, Some(&payload.alias), true);
 
     emit(&ResultEnvelope::ok(
@@ -764,6 +773,13 @@ fn handle_delete_target(env: StdinEnvelope) {
                 emit_error(req_id, "I_INTERNAL", format!("delete_entry failed: {}", e));
                 return;
             }
+            // Single funnel: Removed event runs reconcile → refresh → apply.
+            let _ = crate::commands_account::apply_credential_lifecycle(
+                crate::commands_account::CredentialLifecycleEvent::Removed {
+                    source_type: "personal",
+                    source_ref: &payload.id,
+                },
+            );
             let audit_logged = try_log_audit(&key, AuditOperation::Delete, Some(&payload.id), true);
             emit(&ResultEnvelope::ok(
                 req_id,
@@ -1108,37 +1124,22 @@ fn handle_use(env: StdinEnvelope) {
         _ => payload.id.clone(),
     };
 
-    // Write bindings via the shared helper in commands_account — keeps the
-    // canonical-code normalization + stale-alias cleanup in lockstep with
-    // `aikey use` (single source of truth for provider_code writes).
-    if let Err(e) = crate::commands_account::write_bindings_canonical(
-        &providers,
-        source_type.as_str(),
-        &canonical_key_ref,
+    // Single funnel: Switched event runs write_bindings_canonical → refresh
+    // → apply_third_party_cli_configs.
+    let lifecycle = match crate::commands_account::apply_credential_lifecycle(
+        crate::commands_account::CredentialLifecycleEvent::Switched {
+            source_type: source_type.as_str(),
+            source_ref: &canonical_key_ref,
+            providers: &providers,
+        },
     ) {
-        emit_error(req_id, "I_INTERNAL", e);
-        return;
-    }
-
-    // Refresh active.env + nudge proxy. Failure here is recoverable (the DB
-    // write already landed) — surface as warning, not hard error.
-    let refresh = profile_activation::refresh_implicit_profile_activation();
-    let refresh_ok = refresh.is_ok();
-
-    // Auto-configure / unconfigure third-party CLI scaffolds (kimi config.toml,
-    // codex config.toml). Without this, clicking "Use kimi" / "Use codex" in
-    // Web flips the binding + active.env but leaves `~/.kimi/config.toml` /
-    // `~/.codex/config.toml` stale, forcing the user to re-run `aikey use`
-    // from a terminal just to make the third-party CLI work. Shared helper
-    // keeps this in lockstep with the interactive `aikey use` and
-    // `handle_key_use` paths. Bugfix: 2026-04-30-web-use-skips-third-party-cli-config.
-    if let Ok(ref r) = refresh {
-        let proxy_port = crate::commands_proxy::proxy_port();
-        let active_providers: Vec<String> = r.bindings.iter()
-            .map(|b| b.provider_code.clone())
-            .collect();
-        crate::commands_account::apply_third_party_cli_configs(&active_providers, proxy_port);
-    }
+        Ok(o) => o,
+        Err(e) => {
+            emit_error(req_id, "I_INTERNAL", e);
+            return;
+        }
+    };
+    let refresh_ok = lifecycle.active_env_refreshed;
 
     let audit_logged = try_log_audit(&key, AuditOperation::Exec, Some(&canonical_key_ref), true);
 
