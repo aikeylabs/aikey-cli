@@ -169,6 +169,35 @@ pub(crate) fn uninstall_kimi_hook() -> KimiUninstallOutcome {
     KimiUninstallOutcome::Removed
 }
 
+/// Returns the third-party CLI config files into which aikey has injected
+/// its managed region. Used by `aikey env` so users can see at a glance
+/// which provider CLIs are wired up.
+///
+/// Detection is by AIKEY_BEGIN marker presence — the same source of truth
+/// used by `*_status()` and `unconfigure_*` so display can never disagree
+/// with the actual injection state.
+///
+/// Files that don't exist or don't contain the marker are omitted; the
+/// caller can render "(none)" when the result is empty.
+pub fn injected_provider_toml_paths() -> Vec<(&'static str, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    let (kimi, _) = kimi_config_paths();
+    if file_has_aikey_marker(&kimi) {
+        out.push(("kimi", kimi));
+    }
+    let (codex, _) = codex_config_paths();
+    if file_has_aikey_marker(&codex) {
+        out.push(("codex", codex));
+    }
+    out
+}
+
+fn file_has_aikey_marker(p: &std::path::Path) -> bool {
+    std::fs::read_to_string(p)
+        .map(|s| s.contains(AIKEY_BEGIN))
+        .unwrap_or(false)
+}
+
 /// Inspect the current Kimi config state for `aikey statusline status`. Does
 /// not modify anything. Returns (region_present, hook_command_matches_this_bin).
 pub(crate) fn kimi_status() -> (bool, bool) {
@@ -2118,6 +2147,29 @@ mod hook_tests {
                 "{}: kimi is intentionally out of scope for the 2026-04-22 \
                  diagnostic preflight — see the bugfix record before adding", label);
         }
+    }
+
+    #[test]
+    fn hook_preflight_passes_provider_to_aikey_test() {
+        // 2026-05-07 contract: `aikey_preflight` must invoke `aikey test`
+        // with `--provider <prov>` so a multi-protocol alias (e.g.
+        // claude-0011 bound to both anthropic and openai) only probes the
+        // protocol the wrapper is actually launching.
+        //
+        // Why pinned: without this, codex (which only ever uses openai)
+        // wastes a second roundtrip probing anthropic on every launch and
+        // a transient anthropic-side failure produces a misleading
+        // preflight error. See `aikey test --provider` (cli.rs::Test) for
+        // the filter that honours this arg server-side.
+        for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
+            assert!(c.contains(r#"--provider "$prov""#),
+                "{}: aikey_preflight must pass --provider \"$prov\" so a \
+                 multi-protocol alias only probes the active wrapper's lane", label);
+        }
+        // PowerShell uses the parameter name $Provider (capital P, no $prov shadow var).
+        let ps1 = hook_ps1_content();
+        assert!(ps1.contains("--provider $Provider"),
+            "hook.ps1: aikey_preflight must pass --provider $Provider to narrow probe");
     }
 
     #[test]

@@ -134,7 +134,9 @@ aikey_preflight() {
     command aikey proxy ensure-running </dev/null
     local rc=$?
     if [ $rc -eq 0 ]; then
-        command aikey test "$id" </dev/null
+        # Why --provider $prov: see hook.zsh — alias may bind to multiple
+        # protocols, only probe the one the wrapper is launching.
+        command aikey test "$id" --provider "$prov" </dev/null
         rc=$?
     fi
     [ $rc -eq 0 ] && return 0

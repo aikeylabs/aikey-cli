@@ -305,7 +305,11 @@ function global:aikey_preflight {
     if ($rc -eq 0) {
         # Connectivity probe — full Ping/API/Chat table goes to stderr
         # (visible to user) so a slow probe doesn't look like a hang.
-        & $bin test $id
+        # --provider $Provider: alias may bind to multiple protocols
+        # (e.g. claude-0011 supports anthropic + openai). The wrapper
+        # only launches one protocol's binary, so probing others is
+        # wasted latency. Filter to the active wrapper's lane.
+        & $bin test $id --provider $Provider
         $rc = $LASTEXITCODE
     }
     if ($rc -eq 0) { return 0 }

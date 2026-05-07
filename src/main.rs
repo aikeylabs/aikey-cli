@@ -2482,6 +2482,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if !found_any {
                         eprintln!("  {}", "(no proxy env vars detected)".dimmed());
                     }
+
+                    // Injected provider configs: third-party CLI toml files
+                    // (kimi, codex) where aikey has written its managed
+                    // region. Hidden when no injection has happened so the
+                    // section doesn't add noise on fresh installs.
+                    let injected = commands_account::injected_provider_toml_paths();
+                    if !injected.is_empty() {
+                        eprintln!();
+                        eprintln!("{}", "Injected provider configs:".bold());
+                        for (name, path) in &injected {
+                            eprintln!("  {} {}", name, path.display().to_string().dimmed());
+                        }
+                    }
                 }
                 Some(EnvAction::Set { args }) => {
                     // `aikey env set -- KEY=VALUE ...`

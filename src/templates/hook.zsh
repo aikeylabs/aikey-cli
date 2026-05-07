@@ -199,7 +199,13 @@ aikey_preflight() {
     command aikey proxy ensure-running </dev/null
     local rc=$?
     if [[ $rc -eq 0 ]]; then
-        command aikey test "$id" </dev/null
+        # Why --provider $prov: the alias may be bound to multiple protocols
+        # (e.g. claude-0011 supports both anthropic and openai). The wrapper
+        # only invokes the binary for ONE protocol, so probing the others is
+        # wasted latency and possibly noisy false positives. Pass the
+        # protocol the wrapper is launching for so test only probes that
+        # lane. See `aikey test --provider` (cli.rs::Test) for the filter.
+        command aikey test "$id" --provider "$prov" </dev/null
         rc=$?
     fi
     [[ $rc -eq 0 ]] && return 0
