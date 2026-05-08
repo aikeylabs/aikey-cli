@@ -461,6 +461,30 @@ pub mod v1_0_0_baseline {
                 [],
             )
             .map_err(|e| format!("Failed to create idx_provider_accounts_route_token: {}", e))?;
+
+            // local_alias on provider_accounts — retrofit for rc.1 vaults.
+            //
+            // 2026-05-08 baseline-fold-bugfix: when v_1_0_1_alpha_1.go was
+            // folded back into baseline (per §3 pre-GA pending file rule),
+            // its `ALTER TABLE provider_accounts ADD COLUMN local_alias`
+            // step was lost — fresh installs got the column via the
+            // updated CREATE TABLE on line ~315, but EXISTING rc.1 vaults
+            // (where the table was created without the column) would not
+            // get it back via CREATE TABLE IF NOT EXISTS (no-op).
+            //
+            // main.rs reads `acct.local_alias` in 14+ sites (`aikey list`,
+            // `aikey use`, `aikey rename`, web Vault page, etc.). Without
+            // this retrofit, rc.1 → rc.2 upgrade breaks "no such column"
+            // on first read.
+            //
+            // Same pattern as route_token above: idempotent has_column
+            // probe + ALTER. Belt-and-braces for upgrade safety.
+            ensure_column(
+                conn,
+                "provider_accounts",
+                "local_alias",
+                "ALTER TABLE provider_accounts ADD COLUMN local_alias TEXT",
+            )?;
         }
 
         // user_profiles + user_profile_provider_bindings (predates D
@@ -727,6 +751,116 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open");
         upgrade_all(&conn).expect("first upgrade_all");
         upgrade_all(&conn).expect("second upgrade_all (must be idempotent)");
+    }
+
+    /// 2026-05-08 fold-bugfix regression test:
+    ///
+    /// Simulates an rc.1 vault state (provider_accounts table created
+    /// WITHOUT local_alias column — that's the shape rc.1's baseline
+    /// produced before the 2026-05-08 mid-cycle fold absorbed the
+    /// v_1_0_1_alpha_1 column add into baseline.go's CREATE TABLE).
+    ///
+    /// Then runs upgrade_all() (rc.2 binary's path) and asserts:
+    ///   1. provider_accounts.local_alias column is NOW present
+    ///   2. existing row's data is preserved
+    ///   3. column accepts NULL (the historical default for rc.1 rows)
+    ///
+    /// Without the ensure_column ALTER retrofit at line ~470, this
+    /// test would fail — `CREATE TABLE IF NOT EXISTS` is a no-op when
+    /// the table exists, so the new column from baseline's CREATE
+    /// TABLE statement never lands on rc.1 vaults.
+    ///
+    /// This is the regression guard for the rc.1 → rc.2 in-place
+    /// upgrade path (covered live by the personal upgrade simulation
+    /// at workflow/versions/upgrade-simulations/.../personal/).
+    #[test]
+    fn rc1_to_rc2_provider_accounts_local_alias_retrofit() {
+        let conn = Connection::open_in_memory().expect("open");
+
+        // Simulate rc.1's provider_accounts shape: 14 columns INCLUDING
+        // route_token (added by the legacy v_1_0_4_alpha module that
+        // shipped with rc.1's registry) but NOT local_alias (which was
+        // added later by v_1_0_1_alpha_1 between rc.1 and rc.2 — the
+        // file folded back into baseline by 2026-05-08 fold).
+        //
+        // Verified against the 2026-05-06 personal upgrade-simulation's
+        // pre-migration.json which captured rc.1's actual vault and
+        // recorded `provider_accounts: 14 columns, has_local_alias: 0`.
+        conn.execute_batch(
+            "CREATE TABLE provider_accounts (
+                provider_account_id  TEXT PRIMARY KEY,
+                provider             TEXT NOT NULL,
+                auth_type            TEXT NOT NULL,
+                credential_type      TEXT NOT NULL DEFAULT 'personal_oauth_account',
+                status               TEXT NOT NULL DEFAULT 'active',
+                external_id          TEXT,
+                display_identity     TEXT,
+                org_uuid             TEXT,
+                account_tier         TEXT,
+                created_at           INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                last_used_at         INTEGER,
+                owner_type           TEXT NOT NULL DEFAULT 'local_user',
+                route_token          TEXT,
+                use_count            INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(provider, external_id)
+            );
+            INSERT INTO provider_accounts (provider_account_id, provider, auth_type, display_identity)
+            VALUES ('test-acct-rc1', 'anthropic', 'oauth', 'test@rc1.example.com');",
+        )
+        .expect("seed rc.1-shape provider_accounts");
+
+        // Sanity: pre-upgrade column count is 14 (rc.1 baseline shape).
+        let pre_cols = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('provider_accounts')",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(pre_cols, 14, "rc.1-shape table should have 14 columns");
+
+        // Run upgrade_all (rc.2's path).
+        upgrade_all(&conn).expect("upgrade_all on rc.1-shape vault");
+
+        // Assert local_alias is now present.
+        let has_local_alias: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('provider_accounts') WHERE name='local_alias'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_local_alias, 1,
+            "local_alias retrofit failed — rc.1 → rc.2 upgrade would break"
+        );
+
+        // Assert pre-existing row preserved.
+        let display: String = conn
+            .query_row(
+                "SELECT display_identity FROM provider_accounts WHERE provider_account_id='test-acct-rc1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(display, "test@rc1.example.com");
+
+        // Assert local_alias is NULL for the pre-existing row (ALTER ADD COLUMN
+        // doesn't backfill — this is the documented rc.1 → rc.2 behavior).
+        let local_alias: Option<String> = conn
+            .query_row(
+                "SELECT local_alias FROM provider_accounts WHERE provider_account_id='test-acct-rc1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            local_alias.is_none(),
+            "pre-existing rc.1 row's local_alias should be NULL after retrofit"
+        );
+
+        // Idempotent: re-running must succeed.
+        upgrade_all(&conn).expect("second upgrade_all must be idempotent");
     }
 
     // T26 + cycle test were both deleted 2026-05-06: they exercised the

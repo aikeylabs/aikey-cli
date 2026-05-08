@@ -550,6 +550,37 @@ mod tests {
         assert_eq!(fam, "moonshot");
     }
 
+    /// 2026-05-08 第三方评审第七轮反馈 [中]#3:补 api.moonshot.cn 直接断言。
+    /// 之前测了 platform.moonshot.cn,但 api.moonshot.cn 是上游官方推荐 host
+    /// (provider_routes 里也是这条),helper 层显式锁定。
+    #[test]
+    fn url_host_api_moonshot_cn_routes_to_moonshot() {
+        let (fam, _) = url_host_family_and_pattern("https://api.moonshot.cn/v1")
+            .expect("api.moonshot.cn host should match");
+        assert_eq!(fam, "moonshot",
+            "api.moonshot.cn 必须 family-resolve 到 moonshot,不能误归 kimi_code");
+        // .ai 别名一并锁定
+        let (fam, _) = url_host_family_and_pattern("https://api.moonshot.ai")
+            .expect("moonshot.ai host should match");
+        assert_eq!(fam, "moonshot");
+    }
+
+    /// 2026-05-08 第三方评审第七轮反馈 [中]#3:补 rk-kimi-* 对抗样本反向断言。
+    /// fingerprint helper 层确认 rk- 前缀**不命中** sk-kimi-* confirmed 规则,
+    /// 防止未来 regex 改动让对抗样本误归 kimi_code。
+    /// 与 [enrich.rs::w6_rk_kimi_adversarial_url_host_wins_over_keyword_stack]
+    /// 形成两层防护(integration + helper unit)。
+    #[test]
+    fn classify_rk_kimi_prefix_does_not_match_kimi_code_confirmed() {
+        let registry = FingerprintClassifier::new_embedded();
+        let id = registry
+            .classify("rk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLL")
+            .map(|e| e.id.as_str())
+            .unwrap_or("<none>");
+        assert_ne!(id, "kimi_code",
+            "rk- 前缀必须不触发 sk-kimi-* confirmed 规则 (对抗样本 regression guard)");
+    }
+
     /// shell var KIMI_*/MOONSHOT_* 都默认归 'moonshot' —— 论证见
     /// shell_var_family_and_pattern 注释 (env var 推断这一层不可能遇到
     /// kimi_code 的 key,因为 sk-kimi-* 已被 confirmed regex 捕获)。
