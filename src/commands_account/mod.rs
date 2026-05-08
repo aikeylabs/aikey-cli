@@ -2577,74 +2577,7 @@ fn resolve_oauth_account(alias_or_id: &str) -> Option<storage::ProviderAccountIn
 /// `aikey key use <alias-or-id>` / `aikey use <alias-or-id>`
 ///
 /// Global mutex: deactivates ALL keys (personal + team), then activates the target.
-/// 2026-05-08 Kimi family multi-provider 显式选 helper(详见 update/20260508-Kimi-family
-/// 互斥-active-env统一KIMI写入.md 决策 #3 + 第三方评审第七轮反馈 [高]#2):
 ///
-/// 当一把 key 同时支持 ≥2 个 Kimi family provider (典型: gateway key supports
-/// kimi_code + moonshot)时,**严禁 comma 多选** —— `KIMI_BASE_URL` 只能指一个上游,
-/// 两条 Kimi binding 写入会被 family-mutex transaction 互相覆盖,实际生效不可预期。
-///
-/// 行为:
-///   - 非交互 / json_mode: Kimi-specific 错误 + 两条示例命令(决策 #3 ③)
-///   - 交互: 单选 picker(决策 #3 ②),仅展示 Kimi family 选项,直接拒绝 comma 多选
-///
-/// 与之前的"通用 multi-provider comma 多选 + lifecycle Switched arm 兜底拒"对比,
-/// 本方案在 UI 层就阻止用户输入坏数据,无需依赖兜底。
-///
-/// 2026-05-08 评审第七轮 [高]#3 后:此函数同时被 main.rs picker confirm path 调用
-/// (用于同 family 多协议 entry dedup 后的 platform 选择),所以提升到 pub(crate)。
-pub(crate) fn resolve_multi_kimi_pick(
-    display_name: &str,
-    kimi_in_providers: &[String],
-    json_mode: bool,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    use colored::Colorize;
-    let kimi_list = kimi_in_providers.join(", ");
-
-    if !std::io::stdin().is_terminal() || json_mode {
-        return Err(format!(
-            "Key '{}' supports both kimi_code and moonshot ({}). KIMI_BASE_URL can only point to one upstream — please specify:\n\
-             \n  aikey use {} --provider kimi_code\n  \
-             aikey use {} --provider moonshot\n",
-            display_name, kimi_list, display_name, display_name
-        ).into());
-    }
-
-    println!("Key '{}' supports multiple Kimi-family providers:", display_name.bold());
-    println!("  Note: KIMI_BASE_URL routes to {} one upstream — pick the platform you want active.", "exactly".bold());
-    for (i, p) in kimi_in_providers.iter().enumerate() {
-        let label = match p.to_lowercase().as_str() {
-            "kimi_code" => "kimi(kimi-code)  → api.kimi.com/coding",
-            "moonshot"  => "kimi(moonshot)   → api.moonshot.cn",
-            "kimi"      => "kimi (deprecated alias) → resolves to kimi_code",
-            _ => p.as_str(),
-        };
-        println!("  {}  {}", format!("[{}]", i + 1).dimmed(), label);
-    }
-    print!("Select platform [1-{}] (single choice, no comma): ", kimi_in_providers.len());
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let input = input.trim();
-    if input.is_empty() {
-        return Err("No platform selected. Use --provider kimi_code or --provider moonshot.".into());
-    }
-    if input.contains(',') {
-        return Err(format!(
-            "Multi-select not allowed for Kimi family (KIMI_BASE_URL routes to one upstream). \
-             Use --provider kimi_code OR --provider moonshot."
-        ).into());
-    }
-    let n: usize = input.parse().map_err(|_| {
-        format!("Invalid selection '{}'. Enter 1-{}.", input, kimi_in_providers.len())
-    })?;
-    if n < 1 || n > kimi_in_providers.len() {
-        return Err(format!("Selection {} out of range [1-{}]", n, kimi_in_providers.len()).into());
-    }
-    Ok(vec![kimi_in_providers[n - 1].clone()])
-}
-
 /// Writes `~/.aikey/active.env` with provider env vars; installs shell hook on first use.
 /// Accepts virtual_key_id, alias (local_alias preferred, then server alias),
 /// or OAuth account (by provider_account_id or display_identity / email).
@@ -2789,18 +2722,9 @@ pub fn handle_key_use(
 
     // ── 2. Provider-level primary promotion (v1.0.2) ─────────────────────────
     //
-    // 2026-05-08 Kimi family multi-provider 显式选(详见 update/20260508-Kimi-family
-    // 互斥-active-env统一KIMI写入.md 决策 #3):providers 含 ≥2 Kimi family 成员时,
-    // 不能让用户 comma 多选 (KIMI_BASE_URL 只能指一个上游;两条 binding 写入会被
-    // family-mutex transaction 互相覆盖,实际生效不可预期)。
-    //   - 非交互 / json: Kimi-specific 错误 + 两条示例命令
-    //   - 交互: 单选 Kimi platform (替代原 comma 多选 + lifecycle 兜底拒)
-    let kimi_in_providers: Vec<String> = providers.iter()
-        .filter(|p| crate::storage::KIMI_FAMILY_CODES.contains(&p.to_lowercase().as_str()))
-        .cloned()
-        .collect();
-    let multi_kimi = kimi_in_providers.len() > 1;
-
+    // Kimi family multi-provider 在添加 / import 阶段已经被 input-layer mutex 阻止
+    // (Web ProviderMultiSelect / Import / CLI add 都强制 family 内单选),所以这里
+    // 不会再遇到 supports kimi_code+moonshot 的同 key entry。
     let target_providers: Vec<String> = if let Some(ov) = provider_override {
         if !ov.is_empty() {
             let code = ov.to_lowercase();
@@ -2809,9 +2733,6 @@ pub fn handle_key_use(
             }
             vec![code]
         } else if providers.len() == 1 { providers.clone() }
-        else if multi_kimi {
-            resolve_multi_kimi_pick(&display_name, &kimi_in_providers, json_mode)?
-        }
         else {
             if !std::io::stdin().is_terminal() || json_mode {
                 return Err(format!("This key supports multiple providers: {}. Please specify --provider or choose interactively.", providers.join(", ")).into());
@@ -2834,9 +2755,6 @@ pub fn handle_key_use(
             selected
         }
     } else if providers.len() == 1 { providers.clone() }
-    else if multi_kimi {
-        resolve_multi_kimi_pick(&display_name, &kimi_in_providers, json_mode)?
-    }
     else {
         if !std::io::stdin().is_terminal() || json_mode {
             return Err(format!("This key supports multiple providers: {}. Please specify --provider.", providers.join(", ")).into());
@@ -3898,71 +3816,3 @@ mod control_url_resolution_tests {
     }
 }
 
-#[cfg(test)]
-mod multi_kimi_pick_tests {
-    //! 2026-05-08 第三方评审第七轮反馈 [高]#2:验证 resolve_multi_kimi_pick 在
-    //! 非交互 / json_mode 路径返回 Kimi-specific 错误 + 两条示例命令。
-    //! 交互路径(单选 picker)依赖 stdin,本测试仅覆盖 json_mode + non-tty 分支。
-    use super::resolve_multi_kimi_pick;
-
-    fn ps(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn json_mode_returns_kimi_specific_error() {
-        let result = resolve_multi_kimi_pick(
-            "e2e-gw",
-            &ps(&["kimi_code", "moonshot"]),
-            true, // json_mode
-        );
-        let err = result.unwrap_err().to_string();
-        // Kimi-specific 错误文案 (不是通用 "supports multiple providers")
-        assert!(err.contains("kimi_code") && err.contains("moonshot"),
-            "error must mention both Kimi platforms: {}", err);
-        assert!(err.contains("KIMI_BASE_URL"),
-            "error must explain KIMI_BASE_URL constraint: {}", err);
-    }
-
-    #[test]
-    fn json_mode_error_includes_both_example_commands() {
-        let result = resolve_multi_kimi_pick(
-            "e2e-gw",
-            &ps(&["kimi_code", "moonshot"]),
-            true,
-        );
-        let err = result.unwrap_err().to_string();
-        // 两条示例命令(便于用户复制粘贴)
-        assert!(err.contains("aikey use e2e-gw --provider kimi_code"),
-            "error must include kimi_code example: {}", err);
-        assert!(err.contains("aikey use e2e-gw --provider moonshot"),
-            "error must include moonshot example: {}", err);
-    }
-
-    #[test]
-    fn json_mode_error_uses_actual_alias() {
-        // 不能硬编码 alias,要从入参取
-        let result = resolve_multi_kimi_pick(
-            "my-custom-alias",
-            &ps(&["kimi_code", "moonshot"]),
-            true,
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("my-custom-alias"),
-            "error must reference actual alias 'my-custom-alias': {}", err);
-    }
-
-    #[test]
-    fn json_mode_handles_three_kimi_family_codes() {
-        // 包括 deprecated kimi alias 在内的极端 case
-        let result = resolve_multi_kimi_pick(
-            "legacy-gw",
-            &ps(&["kimi", "kimi_code", "moonshot"]),
-            true,
-        );
-        let err = result.unwrap_err().to_string();
-        // 列表里所有 family 成员都应出现
-        assert!(err.contains("kimi_code"));
-        assert!(err.contains("moonshot"));
-    }
-}

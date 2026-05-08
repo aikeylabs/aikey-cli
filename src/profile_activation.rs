@@ -314,28 +314,6 @@ pub struct RefreshResult {
 /// would correctly show as "two in_use in one family". Callers can pass
 /// raw OAuth-vocabulary provider codes ("claude" / "codex") here; the
 /// helper normalizes + cleans stale alias rows on write.
-/// 2026-05-08 multi-Kimi 显式选择规则(详见 update/20260508-Kimi-family互斥-active-env
-/// 统一KIMI写入.md 决策 #3):同一 key 的 providers 数组同时含 ≥2 个 Kimi family
-/// 成员 (典型: gateway key supports `kimi_code` + `moonshot`) 时,**禁止 auto-primary
-/// 任何 Kimi family 成员**,即使 family 当前空 —— 否则会出现"按数组顺序最后一个
-/// silently wins"的歧义(family-mutex 在 set_provider_binding 内每次都覆盖前一条,
-/// 实际生效不可预期)。用户必须后续显式 `aikey use <key> --provider <kimi_code|moonshot>`。
-///
-/// **下沉位置**:本规则之前只在 commands_account/lifecycle/event.rs::Added arm 实现,
-/// 但 reconcile_provider_primaries_after_team_key_sync / 其它非-Added 调用路径直接进
-/// auto_assign_primaries_for_key 会绕过。下沉到 auto_assign 后:Added / team sync /
-/// import batch 共享同一 family 互斥规则。
-pub(crate) fn providers_contain_multiple_kimi_family(providers: &[String]) -> bool {
-    providers.iter()
-        .filter(|p| {
-            let canonical = crate::commands_account::oauth_provider_to_canonical(
-                &p.to_lowercase()
-            );
-            storage::KIMI_FAMILY_CODES.contains(&canonical)
-        })
-        .count() > 1
-}
-
 pub fn auto_assign_primaries_for_key(
     key_source_type: &str,
     key_source_ref: &str,
@@ -354,10 +332,6 @@ pub fn auto_assign_primaries_for_key(
             .unwrap_or(false)
     });
 
-    // 2026-05-08 multi-Kimi 显式选择规则下沉(评审第三方反馈):见
-    // providers_contain_multiple_kimi_family 文档。
-    let multi_kimi_in_providers = providers_contain_multiple_kimi_family(providers);
-
     let mut newly_assigned: Vec<String> = Vec::new();
 
     for raw in providers {
@@ -365,12 +339,8 @@ pub fn auto_assign_primaries_for_key(
             &raw.to_lowercase()
         ).to_string();
 
-        // Kimi family auto-assign 规则(任一命中即跳过):
-        //   ① fill-empty-only: family 已有 primary
-        //   ② multi-Kimi 显式选: 此 key 的 providers 含 ≥2 个 Kimi family
-        if storage::KIMI_FAMILY_CODES.contains(&canonical.as_str())
-            && (kimi_family_has_primary || multi_kimi_in_providers)
-        {
+        // Kimi family fill-empty-only: family 已有 primary 就跳过。
+        if storage::KIMI_FAMILY_CODES.contains(&canonical.as_str()) && kimi_family_has_primary {
             continue;
         }
 
@@ -1556,80 +1526,3 @@ mod claude_json_tests {
     }
 }
 
-#[cfg(test)]
-mod multi_kimi_filter_tests {
-    //! 2026-05-08 multi-Kimi 显式选择规则下沉测试 (评审第三方反馈)。
-    //! 验证 providers_contain_multiple_kimi_family 在 Added / team sync / import batch
-    //! 共享路径都生效 —— 之前规则只在 Added arm 实现,team sync 直接进
-    //! auto_assign_primaries_for_key 会绕过。
-    use super::providers_contain_multiple_kimi_family;
-
-    fn ps(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn single_kimi_code_only_not_multi() {
-        // Single Kimi family member → 允许 auto-primary
-        assert!(!providers_contain_multiple_kimi_family(&ps(&["kimi_code"])));
-    }
-
-    #[test]
-    fn single_moonshot_only_not_multi() {
-        assert!(!providers_contain_multiple_kimi_family(&ps(&["moonshot"])));
-    }
-
-    #[test]
-    fn deprecated_kimi_alias_only_not_multi() {
-        // 'kimi' 是 deprecated alias,canonical 化到 kimi_code,算 1 个 family 成员
-        assert!(!providers_contain_multiple_kimi_family(&ps(&["kimi"])));
-    }
-
-    #[test]
-    fn kimi_code_plus_moonshot_is_multi() {
-        // 经典 multi-Kimi gateway 场景
-        assert!(providers_contain_multiple_kimi_family(&ps(&["kimi_code", "moonshot"])));
-    }
-
-    #[test]
-    fn moonshot_plus_kimi_code_is_multi() {
-        // 顺序无关
-        assert!(providers_contain_multiple_kimi_family(&ps(&["moonshot", "kimi_code"])));
-    }
-
-    #[test]
-    fn deprecated_kimi_plus_moonshot_is_multi() {
-        // 老数据 'kimi' + moonshot 也算 multi (canonical 后是 kimi_code+moonshot)
-        assert!(providers_contain_multiple_kimi_family(&ps(&["kimi", "moonshot"])));
-    }
-
-    #[test]
-    fn anthropic_plus_openai_not_multi_kimi() {
-        // 跨 family 不算 (本规则只针对 Kimi family 内部歧义)
-        assert!(!providers_contain_multiple_kimi_family(&ps(&["anthropic", "openai"])));
-    }
-
-    #[test]
-    fn anthropic_plus_kimi_code_not_multi_kimi() {
-        // 跨 family 含 1 个 Kimi family 成员 → 不算 multi
-        // (anthropic 走 normal auto-primary,kimi_code 走单 family 成员逻辑)
-        assert!(!providers_contain_multiple_kimi_family(&ps(&["anthropic", "kimi_code"])));
-    }
-
-    #[test]
-    fn three_kimi_family_members_is_multi() {
-        // gateway 同时支持三个 Kimi family code (理论极端 case)
-        assert!(providers_contain_multiple_kimi_family(&ps(&["kimi", "kimi_code", "moonshot"])));
-    }
-
-    #[test]
-    fn case_insensitive_input() {
-        // 输入大小写无关
-        assert!(providers_contain_multiple_kimi_family(&ps(&["KIMI_CODE", "Moonshot"])));
-    }
-
-    #[test]
-    fn empty_providers_not_multi() {
-        assert!(!providers_contain_multiple_kimi_family(&ps(&[])));
-    }
-}

@@ -914,6 +914,25 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if cleaned.is_empty() {
                         return Err("--providers given but all entries were empty after trim.".into());
                     }
+
+                    // 2026-05-08 Kimi family select 互斥(非交互路径):
+                    // --providers kimi_code,moonshot 这种命令行直接传两个 Kimi family
+                    // 成员被 input 层拒绝(同 Web ProviderMultiSelect / CLI 交互 picker 互斥
+                    // 决策)。详见 update/20260508-Kimi-family互斥-active-env统一KIMI写入.md 决策 #3。
+                    let kimi_in_cleaned: Vec<String> = cleaned.iter()
+                        .filter(|c| ["kimi_code", "moonshot", "kimi"].contains(&c.as_str()))
+                        .cloned()
+                        .collect();
+                    if kimi_in_cleaned.len() > 1 {
+                        return Err(format!(
+                            "--providers cannot include multiple Kimi family members ({}). \
+                             KIMI_BASE_URL routes to exactly one upstream — pick one:\n  \
+                             aikey add <alias> --provider kimi_code\n  \
+                             aikey add <alias> --provider moonshot",
+                            kimi_in_cleaned.join(", ")
+                        ).into());
+                    }
+
                     (cleaned, None)
                 } else if let Some(code) = provider {
                     (vec![code.to_lowercase()], None)
@@ -937,8 +956,24 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    // Kimi family one-upstream mutex: kimi_code / moonshot / kimi
+                    // (deprecated alias) share `KIMI_BASE_URL`, so the picker enforces
+                    // at-most-one at toggle time (mirrors Web ProviderMultiSelect).
+                    // Indices are computed off picker_entries since item order = entry
+                    // declaration order in provider_registry.yaml.
+                    let kimi_mutex_group: Vec<usize> = picker_entries.iter()
+                        .enumerate()
+                        .filter(|(_, e)| matches!(e.code, "kimi_code" | "moonshot" | "kimi"))
+                        .map(|(i, _)| i)
+                        .collect();
+                    let mutex_groups: Vec<Vec<usize>> = if kimi_mutex_group.len() > 1 {
+                        vec![kimi_mutex_group]
+                    } else {
+                        Vec::new()
+                    };
+
                     loop {
-                        let selected_indices = match ui_select::box_multi_select("Select protocol type(s)", &items, &checked_state)? {
+                        let selected_indices = match ui_select::box_multi_select("Select protocol type(s)", &items, &checked_state, &mutex_groups)? {
                             ui_select::MultiSelectResult::Confirmed(idx) => idx,
                             ui_select::MultiSelectResult::Cancelled => { eprintln!("  Cancelled."); return Ok(()); }
                         };
@@ -969,6 +1004,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 if !code.is_empty() && !selected.contains(&code) { selected.push(code); }
                             }
                         }
+
+                        // Kimi family mutex is enforced inside box_multi_select via
+                        // mutex_groups (toggle-time), so multi-Kimi selection cannot
+                        // arrive here. The custom-protocol "Other..." path could still
+                        // pull in conflicting codes; that's a niche escape hatch we
+                        // accept for now (the Custom prompt is power-user territory).
                         if !selected.is_empty() { break; }
                         use colored::Colorize;
                         eprintln!("  {} At least one protocol is required.\n", "\u{25c6}".yellow());
@@ -3797,7 +3838,6 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
                     source_type: "personal".to_string(),
                     source_ref: e.alias.clone(),
                     display_type: None,
-                    multi_protocol_in_family: None, // 后续 dedup pass 填充
                 });
             }
         }
@@ -3815,7 +3855,6 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
                     source_type: "team".to_string(),
                     source_ref: e.virtual_key_id.clone(),
                     display_type: None,
-                    multi_protocol_in_family: None,
                 });
             }
         }
@@ -3855,7 +3894,6 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
                     source_type: "personal_oauth_account".to_string(), // DB value
                     source_ref: acct.provider_account_id.clone(),
                     display_type: Some(source_display), // UI: "oauth" or "oauth(f)"
-                    multi_protocol_in_family: None, // OAuth 单 provider,跨 family 无 dedup
                 });
             }
         }
@@ -3893,68 +3931,6 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
         });
     }
 
-    // 2026-05-08 V-layer 同 family 多协议 entry dedup(详见 update/20260508-display-
-    // family-grouping.md 评审第七轮 [高]#3):一把 KEY 同时 supports kimi_code+moonshot
-    // 时,naive 构建会让该 entry 在 groups[kimi_code] 和 groups[moonshot] 各 push 一条 →
-    // family-merge 渲染后用户看到两行 + 双 (*)(current_binding family fallback 让两个
-    // group 都 selected)。
-    //
-    // 修复:扫描 same-family group 序列,若某个 (source_type, source_ref) 出现在多个
-    // 同 family group → 保留 first-encountered (registry 顺序: kimi_code first),后续
-    // 同 family group 删除该 candidate;first 的 candidate.multi_protocol_in_family 写入
-    // 全部命中的 provider_codes 列表,confirm 时由 caller 调 resolve_multi_kimi_pick
-    // 弹 platform 单选(与 handle_key_use multi-Kimi 路径同款规则)。
-    //
-    // 跨 family 的 multi-protocol entry (e.g. claude-0011 anthropic+openai) 不受影响,
-    // 各 family group 独立显示一行(行为与改前一致)。
-    {
-        use std::collections::HashMap;
-        // (family, source_type, source_ref) → (first_group_index, [matched provider_codes])
-        let mut seen: HashMap<(String, String, String), (usize, Vec<String>)> = HashMap::new();
-        let mut to_remove: Vec<(usize, usize)> = Vec::new(); // (group_idx, candidate_idx) to delete
-
-        for (gi, g) in groups.iter().enumerate() {
-            let family = provider_registry::family_of(&g.provider_code).to_string();
-            for (ci, c) in g.candidates.iter().enumerate() {
-                let key = (family.clone(), c.source_type.clone(), c.source_ref.clone());
-                match seen.get_mut(&key) {
-                    None => {
-                        seen.insert(key, (gi, vec![g.provider_code.clone()]));
-                    }
-                    Some((_first_gi, codes)) => {
-                        codes.push(g.provider_code.clone());
-                        to_remove.push((gi, ci));
-                    }
-                }
-            }
-        }
-
-        // Apply: for each first-encountered candidate, set multi_protocol_in_family if codes.len()>1
-        for ((_family, src_type, src_ref), (first_gi, codes)) in &seen {
-            if codes.len() > 1 {
-                if let Some(c) = groups[*first_gi].candidates.iter_mut()
-                    .find(|c| &c.source_type == src_type && &c.source_ref == src_ref)
-                {
-                    c.multi_protocol_in_family = Some(codes.clone());
-                }
-            }
-        }
-
-        // Remove duplicates from later same-family groups (descending order to keep indices stable).
-        to_remove.sort_by(|a, b| b.cmp(a));
-        for (gi, ci) in to_remove {
-            // Adjust selected index if pointing past the removed candidate
-            if let Some(sel) = groups[gi].selected {
-                if sel == ci {
-                    groups[gi].selected = None; // selection on removed candidate dropped
-                } else if sel > ci {
-                    groups[gi].selected = Some(sel - 1);
-                }
-            }
-            groups[gi].candidates.remove(ci);
-        }
-    }
-
     // Snapshot original selections for diffing.
     let original_selections: Vec<Option<usize>> = groups.iter()
         .map(|g| g.selected)
@@ -3962,42 +3938,32 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
 
     match ui_select::provider_tree_select(&mut groups)? {
         ui_select::ProviderTreeResult::Confirmed(updated_groups) => {
-            let mut changes: Vec<(String, String, String)> = Vec::new();
-            for (i, g) in updated_groups.iter().enumerate() {
-                if g.selected != original_selections[i] {
-                    if let Some(sel) = g.selected {
-                        let c = &g.candidates[sel];
-                        // 2026-05-08 V-layer 同 family 多协议 dedup confirm 处理:
-                        // 若 candidate 是 multi-protocol same-family entry,弹 platform
-                        // 单选 picker 让用户决定 binding 到哪个 provider_code
-                        // (与 handle_key_use 路径同款 resolve_multi_kimi_pick)。
-                        let provider_code = if let Some(multi) = &c.multi_protocol_in_family {
-                            // resolve_multi_kimi_pick: 交互弹单选 / 非交互报错 + 示例命令
-                            // 返回 Vec<String> 长度 1 (只允许单选 platform)
-                            let picked = commands_account::resolve_multi_kimi_pick(
-                                &c.label, multi, false,
-                            )
-                            .map_err(|e| format!("multi-Kimi platform resolution: {}", e))?;
-                            picked.into_iter().next()
-                                .ok_or("resolve_multi_kimi_pick returned empty")?
-                        } else {
-                            g.provider_code.clone()
-                        };
-                        changes.push((
-                            provider_code,
-                            c.source_type.clone(),
-                            c.source_ref.clone(),
-                        ));
-                    }
-                }
-            }
-            Ok(changes)
+            collect_picker_changes(&updated_groups, &original_selections)
         }
         ui_select::ProviderTreeResult::Cancelled => {
             eprintln!("  Selection cancelled.");
             Ok(vec![])
         }
     }
+}
+
+/// Confirm handler for `pick_providers_interactively`. For each group whose
+/// `selected` differs from the snapshot, emit one (provider_code, source_type,
+/// source_ref) change.
+fn collect_picker_changes(
+    updated_groups: &[ui_select::ProviderGroup],
+    original_selections: &[Option<usize>],
+) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
+    let mut changes: Vec<(String, String, String)> = Vec::new();
+    for (i, g) in updated_groups.iter().enumerate() {
+        if g.selected == original_selections[i] {
+            continue;
+        }
+        let Some(sel) = g.selected else { continue };
+        let c = &g.candidates[sel];
+        changes.push((g.provider_code.clone(), c.source_type.clone(), c.source_ref.clone()));
+    }
+    Ok(changes)
 }
 
 // ============================================================================
@@ -5116,4 +5082,5 @@ mod hook_update_error_hint_tests {
 #[cfg(test)]
 #[path = "activate_tests.rs"]
 mod activate_tests;
+
 

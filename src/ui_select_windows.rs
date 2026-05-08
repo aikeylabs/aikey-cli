@@ -442,6 +442,7 @@ pub(crate) fn interactive_multi_select_windows(
     title: &str,
     items: &[String],
     initially_checked: &[bool],
+    mutex_groups: &[Vec<usize>],
 ) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
     let rc = RawConsole::open()?;
 
@@ -502,8 +503,16 @@ pub(crate) fn interactive_multi_select_windows(
                 }
             }
             Key::Space => {
+                let prev = checked.clone();
                 checked[cursor] = !checked[cursor];
+                crate::ui_select::apply_mutex_on_toggle(&mut checked, cursor, mutex_groups);
                 redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?;
+                for i in 0..total {
+                    if i != cursor && checked[i] != prev[i] {
+                        let n = (total - i) + 1;
+                        write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[i], i, false, checked[i], inner_w), n)?;
+                    }
+                }
                 write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?;
                 out.flush()?;
             }
@@ -514,6 +523,7 @@ pub(crate) fn interactive_multi_select_windows(
                     );
                 } else {
                     checked[cursor] = true;
+                    crate::ui_select::apply_mutex_on_toggle(&mut checked, cursor, mutex_groups);
                     redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?;
                     write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?;
                     out.flush()?;
@@ -523,12 +533,20 @@ pub(crate) fn interactive_multi_select_windows(
                 let idx = (c as usize) - ('1' as usize);
                 if idx < total {
                     has_moved = true;
+                    let prev = checked.clone();
                     checked[idx] = !checked[idx];
+                    crate::ui_select::apply_mutex_on_toggle(&mut checked, idx, mutex_groups);
                     if cursor != idx {
                         let old = cursor; cursor = idx;
                         redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?;
                     } else {
                         redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?;
+                    }
+                    for i in 0..total {
+                        if i != cursor && i != idx && checked[i] != prev[i] {
+                            let n = (total - i) + 1;
+                            write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[i], i, false, checked[i], inner_w), n)?;
+                        }
                     }
                     write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?;
                     out.flush()?;

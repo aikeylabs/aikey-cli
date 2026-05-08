@@ -375,14 +375,21 @@ pub enum MultiSelectResult {
     Cancelled,
 }
 
+/// `mutex_groups` declares index sets that must hold AT MOST ONE checked item
+/// at a time. Toggling an item ON inside a mutex group automatically clears
+/// the other members of that same group. Used by `aikey add` to enforce the
+/// kimi-family one-upstream constraint at toggle time (matches Web
+/// ProviderMultiSelect's add-time mutex).
+///
+/// Pass `&[]` to opt out — preserves the original generic multi-select.
 pub fn box_multi_select(
-    title: &str, items: &[String], initially_checked: &[bool],
+    title: &str, items: &[String], initially_checked: &[bool], mutex_groups: &[Vec<usize>],
 ) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
         use std::io::IsTerminal;
         if io::stderr().is_terminal() {
-            return interactive_multi_select(title, items, initially_checked);
+            return interactive_multi_select(title, items, initially_checked, mutex_groups);
         }
     }
     // Stage 1.2 (2026-04-29) windows-compat: native picker when stderr is a
@@ -391,15 +398,31 @@ pub fn box_multi_select(
     {
         use std::io::IsTerminal;
         if io::stderr().is_terminal() {
-            match crate::ui_select_windows::interactive_multi_select_windows(title, items, initially_checked) {
+            match crate::ui_select_windows::interactive_multi_select_windows(title, items, initially_checked, mutex_groups) {
                 Ok(r) => return Ok(r),
                 Err(_) => return fallback_multi_select(items),
             }
         }
     }
     #[cfg(not(any(unix, windows)))]
-    let _ = (title, initially_checked); // unused on the fallback path (see module note)
+    let _ = (title, initially_checked, mutex_groups); // unused on the fallback path (see module note)
     fallback_multi_select(items)
+}
+
+/// Apply mutex constraints after toggling `idx` ON: for any group that
+/// contains `idx`, clear all other members. No-op when `idx` was just toggled
+/// OFF or when no mutex group contains it.
+pub(crate) fn apply_mutex_on_toggle(checked: &mut [bool], idx: usize, mutex_groups: &[Vec<usize>]) {
+    if !checked[idx] { return; } // toggled OFF — nothing to enforce
+    for group in mutex_groups {
+        if group.contains(&idx) {
+            for &other in group {
+                if other != idx && other < checked.len() {
+                    checked[other] = false;
+                }
+            }
+        }
+    }
 }
 
 fn fallback_multi_select(items: &[String]) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
@@ -423,7 +446,7 @@ pub(crate) fn format_multi_row(item: &str, index: usize, is_cursor: bool, is_che
 }
 
 #[cfg(unix)]
-fn interactive_multi_select(title: &str, items: &[String], initially_checked: &[bool]) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
+fn interactive_multi_select(title: &str, items: &[String], initially_checked: &[bool], mutex_groups: &[Vec<usize>]) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
     use std::os::unix::io::AsRawFd;
     let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty")?;
     let tty_fd = tty.as_raw_fd();
@@ -499,8 +522,17 @@ fn interactive_multi_select(title: &str, items: &[String], initially_checked: &[
                 }
             }
             Key::Space => {
+                let prev = checked.clone();
                 checked[cursor] = !checked[cursor];
+                apply_mutex_on_toggle(&mut checked, cursor, mutex_groups);
                 redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?;
+                // Redraw any sibling rows the mutex auto-cleared (non-cursor).
+                for i in 0..total {
+                    if i != cursor && checked[i] != prev[i] {
+                        let n = (total - i) + 1;
+                        write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[i], i, false, checked[i], inner_w), n)?;
+                    }
+                }
                 write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?; out.flush()?;
             }
             Key::Enter => {
@@ -511,6 +543,8 @@ fn interactive_multi_select(title: &str, items: &[String], initially_checked: &[
                 } else {
                     // Nothing selected → select current item first.
                     checked[cursor] = true;
+                    // Empty -> 1 item, no mutex sibling can have been ON, but call for symmetry.
+                    apply_mutex_on_toggle(&mut checked, cursor, mutex_groups);
                     redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?;
                     write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?; out.flush()?;
                 }
@@ -520,12 +554,21 @@ fn interactive_multi_select(title: &str, items: &[String], initially_checked: &[
                 let idx = (c as usize) - ('1' as usize);
                 if idx < total {
                     has_moved = true; // number jump counts as move
+                    let prev = checked.clone();
                     checked[idx] = !checked[idx];
+                    apply_mutex_on_toggle(&mut checked, idx, mutex_groups);
                     if cursor != idx {
                         let old = cursor; cursor = idx;
                         redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?;
                     } else {
                         redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?;
+                    }
+                    // Redraw mutex-cleared siblings (other than cursor & prior cursor).
+                    for i in 0..total {
+                        if i != cursor && i != idx && checked[i] != prev[i] {
+                            let n = (total - i) + 1;
+                            write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[i], i, false, checked[i], inner_w), n)?;
+                        }
                     }
                     write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?; out.flush()?;
                 }
@@ -563,18 +606,6 @@ pub struct KeyCandidate {
     pub source_type: String,       // DB value: "personal", "team", "personal_oauth_account"
     pub source_ref: String,
     pub display_type: Option<String>, // UI display override (e.g., "oauth(f)"). None → auto from source_type.
-    /// 2026-05-08 V-layer dedup 协同信息(详见 update/20260508-display-family-grouping.md
-    /// 评审第七轮 [高]#3 修复):同 family 多协议 entry 合并为单条 row 时,此字段列出
-    /// entry 的全部 same-family provider_codes,confirm 时由 caller 调
-    /// resolve_multi_kimi_pick 弹 platform 单选(与 `aikey use --provider X` 路径一致)。
-    ///
-    /// **None** = 单协议 entry / 跨 family 多协议 entry(后者按现有 per-group 渲染)
-    /// **Some(vec)** = 同 family 多协议 entry,vec 元素就是该 entry 的 supported_providers
-    ///                 中属于本 family 的全部 provider_code
-    ///
-    /// **此字段是纯 V 层派生数据**,从 entry.supported_providers (M) 在 picker 装配时
-    /// 计算而来,不写回任何 DB / API / IPC,picker drop 后即消失。
-    pub multi_protocol_in_family: Option<Vec<String>>,
 }
 #[derive(Clone)]
 pub struct ProviderGroup { pub provider_code: String, pub candidates: Vec<KeyCandidate>, pub selected: Option<usize>, pub expanded: bool }
@@ -847,7 +878,6 @@ mod family_grouping_tests {
                 source_type: "personal".to_string(),
                 source_ref: format!("k{}", i),
                 display_type: None,
-                multi_protocol_in_family: None,
             }).collect(),
             selected: None,
             expanded,
