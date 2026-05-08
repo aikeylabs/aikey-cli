@@ -235,15 +235,23 @@ fn provider_canonical_gemini_to_google() {
 }
 
 #[test]
-fn provider_canonical_moonshot_to_kimi() {
-    // moonshot is a brand of kimi at the vault/routing layer.
-    // DO NOT break this without updating proxy/internal/proxy/middleware.go.
-    assert_eq!(provider_canonical("moonshot"), "kimi");
+fn provider_canonical_moonshot_stays_moonshot() {
+    // 2026-05-08 Kimi 双平台拆分 review feedback [高] #1: moonshot 必须保持
+    // moonshot,不能被折叠回 kimi —— 否则 aikey activate moonshot 会用错的
+    // env vars / base_url / binding (走 Kimi Code 路径)。family ("kimi") 通过
+    // provider_info(...).family 获取,与 canonical_code 严格分开。
+    assert_eq!(provider_canonical("moonshot"), "moonshot");
+    // 'kimi' 是 deprecated alias,canonical 是 "kimi_code"
+    assert_eq!(provider_canonical("kimi"), "kimi_code");
+    assert_eq!(provider_canonical("kimi_code"), "kimi_code");
 }
 
 #[test]
 fn provider_canonical_codes_unchanged() {
-    for code in ["anthropic", "openai", "google", "kimi", "deepseek"] {
+    // 2026-05-08 Kimi 双平台拆分: "kimi" 已变成 deprecated alias of "kimi_code"
+    // (per registry oauth_aliases),不再 pass-through 不变;改用 "kimi_code"
+    // 作为 canonical 测试目标。其他 canonical codes 仍 pass-through。
+    for code in ["anthropic", "openai", "google", "kimi_code", "moonshot", "deepseek"] {
         assert_eq!(provider_canonical(code), code,
             "canonical code {} should pass through unchanged", code);
     }
@@ -253,7 +261,9 @@ fn provider_canonical_codes_unchanged() {
 fn provider_canonical_case_insensitive() {
     assert_eq!(provider_canonical("Claude"), "anthropic");
     assert_eq!(provider_canonical("CHATGPT"), "openai");
-    assert_eq!(provider_canonical("MOONSHOT"), "kimi");
+    // 2026-05-08 Kimi 双平台拆分: MOONSHOT 不再折叠到 kimi family,保持 moonshot
+    assert_eq!(provider_canonical("MOONSHOT"), "moonshot");
+    assert_eq!(provider_canonical("Kimi"), "kimi_code"); // deprecated alias → canonical
 }
 
 #[test]
@@ -374,15 +384,35 @@ fn provider_info_aliases_share_canonical_code() {
 }
 
 #[test]
-fn provider_info_moonshot_canonical_is_kimi_but_env_vars_distinct() {
-    // L5 preserves the asymmetry: moonshot canonical-maps to "kimi" (same vault
-    // account / binding lookup key) but keeps its own env vars so users can
-    // optionally configure MOONSHOT_API_KEY separately if desired.
-    let kimi     = commands_account::provider_info("kimi").unwrap();
-    let moonshot = commands_account::provider_info("moonshot").unwrap();
-    assert_eq!(kimi.canonical_code, moonshot.canonical_code); // both "kimi"
-    assert_ne!(kimi.env_vars, moonshot.env_vars);             // distinct env vars
-    assert_ne!(kimi.proxy_path, moonshot.proxy_path);         // distinct URL paths
+fn provider_info_kimi_and_moonshot_distinct_codes_share_family() {
+    // 2026-05-08 Kimi 双平台拆分 review feedback [高] #1: kimi_code 与
+    // moonshot 是两个独立 canonical_code (各自独立 env vars / proxy paths /
+    // base_urls),只共享 'kimi' family (UI 分组用)。'kimi' 字面值是 deprecated
+    // alias,经 registry alias 解析到 kimi_code。
+    let kimi_alias = commands_account::provider_info("kimi").unwrap();
+    let kimi_code  = commands_account::provider_info("kimi_code").unwrap();
+    let moonshot   = commands_account::provider_info("moonshot").unwrap();
+
+    // canonical_code: 各自独立,不互相折叠
+    assert_eq!(kimi_alias.canonical_code, "kimi_code"); // alias → canonical
+    assert_eq!(kimi_code.canonical_code, "kimi_code");
+    assert_eq!(moonshot.canonical_code, "moonshot");
+    assert_ne!(kimi_code.canonical_code, moonshot.canonical_code,
+        "kimi_code 与 moonshot 不能折叠成同一 canonical_code (review fix [高] #1)");
+
+    // family: 三者共享 'kimi' (UI 分组)
+    assert_eq!(kimi_code.family, "kimi");
+    assert_eq!(moonshot.family, "kimi");
+    assert_eq!(kimi_alias.family, "kimi");
+
+    // 2026-05-08 Kimi family 互斥后(详见 update/20260508-Kimi-family互斥-active-env
+    // 统一KIMI写入.md 决策 #8): kimi_code 与 moonshot 共享同一 env vars (KIMI_*),
+    // 区分上游路由由 proxy_path 决定。**不再**断言 env_vars 各自独立。
+    assert_eq!(kimi_code.env_vars, moonshot.env_vars,
+        "Kimi family unified to KIMI_API_KEY/KIMI_BASE_URL post family-mutex");
+    // proxy_path 仍然各自独立 (kimi/v1 vs moonshot/v1)
+    assert_ne!(kimi_code.proxy_path, moonshot.proxy_path,
+        "proxy_path differentiates upstream (kimi.com/coding vs moonshot.cn)");
 }
 
 #[test]

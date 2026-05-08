@@ -243,11 +243,26 @@ pub(crate) fn kimi_status() -> (bool, bool) {
 /// region was never written. Non-TTY callers (the Web path) do NOT trigger
 /// the first-install "Proceed? [Y/n]" prompt — configure_*_cli falls
 /// through to the silent write when stderr isn't a terminal.
-pub fn apply_third_party_cli_configs(providers: &[String], proxy_port: u16) {
-    let has_kimi = providers.iter().any(|p| {
+/// Whether the given providers list includes any Kimi family code that
+/// needs the Kimi CLI scaffold.
+///
+/// 2026-05-08 Kimi 双平台拆分: 'kimi' 拆为 'kimi_code' + 'moonshot'。三个 code
+/// 都属 Kimi family,共用 kimi-cli upstream (读 KIMI_API_KEY env var,不区分平台),
+/// 所以三者任一存在都需要保留 Kimi CLI scaffold。pre-fix 漏掉 'kimi_code' →
+/// 用户切到 kimi(kimi-code) 时反而触发 unconfigure_kimi_cli() 卸载 scaffold,
+/// kimi cli 不能用。
+///
+/// 抽出为 pub(super) helper 让测试可以直接断言此预测函数,
+/// 不必触发 ~/.kimi/config.toml 写盘 side effect。
+pub(super) fn providers_need_kimi_scaffold(providers: &[String]) -> bool {
+    providers.iter().any(|p| {
         let c = p.to_lowercase();
-        c == "kimi" || c == "moonshot"
-    });
+        c == "kimi_code" || c == "moonshot" || c == "kimi"
+    })
+}
+
+pub fn apply_third_party_cli_configs(providers: &[String], proxy_port: u16) {
+    let has_kimi = providers_need_kimi_scaffold(providers);
     if has_kimi {
         // Token-agnostic: writes scaffold once; token comes from KIMI_API_KEY env var.
         configure_kimi_cli(proxy_port);
@@ -3244,6 +3259,54 @@ mod hook_tests {
         assert!(!run_shell_rc_check(tmp.path(), "/usr/local/bin/fish"));
         assert!(!run_shell_rc_check(tmp.path(), "/bin/sh"));
         assert!(!run_shell_rc_check(tmp.path(), ""));
+    }
+
+    // ── 2026-05-08 Kimi 双平台拆分回归断言 ────────────────────────────────────
+    //
+    // Why these tests exist: 评审反馈 [高] #3 发现 apply_third_party_cli_configs
+    // 的 has_kimi 判断 pre-fix 只检查 ["kimi", "moonshot"],漏掉新 canonical
+    // 'kimi_code'。用户切到 kimi(kimi-code) 时反而触发 unconfigure_kimi_cli()
+    // 卸载 scaffold,kimi cli 不能用。下面的断言锁定 helper 必须包含三个码,
+    // 防退化。
+
+    #[test]
+    fn kimi_scaffold_kept_for_kimi_code() {
+        assert!(providers_need_kimi_scaffold(&["kimi_code".to_string()]));
+    }
+
+    #[test]
+    fn kimi_scaffold_kept_for_moonshot() {
+        assert!(providers_need_kimi_scaffold(&["moonshot".to_string()]));
+    }
+
+    #[test]
+    fn kimi_scaffold_kept_for_deprecated_kimi_alias() {
+        // Defense:老 vault 残留或手工构造的 'kimi' 字面值仍能保留 scaffold。
+        assert!(providers_need_kimi_scaffold(&["kimi".to_string()]));
+    }
+
+    #[test]
+    fn kimi_scaffold_kept_when_mixed_with_others() {
+        assert!(providers_need_kimi_scaffold(&[
+            "anthropic".to_string(),
+            "kimi_code".to_string(),
+            "openai".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn kimi_scaffold_unconfigured_for_no_kimi_family() {
+        assert!(!providers_need_kimi_scaffold(&[
+            "anthropic".to_string(),
+            "openai".to_string(),
+        ]));
+        assert!(!providers_need_kimi_scaffold(&[]));
+    }
+
+    #[test]
+    fn kimi_scaffold_case_insensitive() {
+        assert!(providers_need_kimi_scaffold(&["KIMI_CODE".to_string()]));
+        assert!(providers_need_kimi_scaffold(&["Moonshot".to_string()]));
     }
 }
 

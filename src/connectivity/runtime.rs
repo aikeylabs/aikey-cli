@@ -602,7 +602,12 @@ where
     // Without it, KIMI returns access_terminated_error (HTTP 403).
     // We use "claude-code/1.0 (aikey)" to satisfy the whitelist while
     // identifying ourselves. This only affects the connectivity probe.
-    if provider_code == "kimi" {
+    //
+    // 2026-05-08 Kimi 双平台拆分: 'kimi_code' 是新 canonical code (api.kimi.com
+    // 上游),沿用同样的 coding-agent whitelist 要求;'kimi' 是 deprecated alias
+    // 仍兼容老 vault 数据 / 任何残留的 'kimi' 字面值。Moonshot (api.moonshot.cn)
+    // 不在 whitelist 范围内,**不**注入此 header,避免污染请求形态。
+    if provider_code == "kimi_code" || provider_code == "kimi" {
         req = req.set("User-Agent", "claude-code/1.0");
     }
     on_phase(ProbePhase::Chat, ProbeStage::Started);
@@ -861,7 +866,15 @@ fn probe_model(provider_code: &str) -> &'static str {
         "anthropic" => "claude-haiku-4-5-20251001",
         "openai"    => "gpt-4o-mini",
         "deepseek"  => "deepseek-chat",
-        "kimi"      => "moonshot-v1-8k",
+        // 2026-05-08 Kimi 双平台拆分: 三个 code 都属 Kimi family,但默认探针 model
+        // 各自独立 (kimi-cli upstream 不同模型集):
+        //   - kimi_code (api.kimi.com/coding) → kimi-k2.5 (Kimi Coding 默认)
+        //   - moonshot (api.moonshot.cn) → moonshot-v1-8k (Moonshot 平台)
+        //   - kimi (deprecated alias) → 与 kimi_code 一致
+        // pre-fix 只有 "kimi" case,kimi_code/moonshot 跑到 fallback gpt-4o-mini,
+        // api.kimi.com 探针被 reject (model not found),结果 doctor 报错误诊断。
+        "kimi_code" | "kimi" => "kimi-k2.5",
+        "moonshot"  => "moonshot-v1-8k",
         "google"    => "gemini-2.0-flash",
         "glm" | "zhipu" => "glm-4-flash",
         "yi"        => "yi-lightning",
@@ -1415,5 +1428,37 @@ mod proxy_probe_regression_tests {
             "probe agent must NOT inherit HTTPS_PROXY env var — the runtime \
              proxy is on 127.0.0.1 and routing that through Clash/corporate \
              proxies produces bogus 'failed (10 ms)' bottom row");
+    }
+}
+
+#[cfg(test)]
+mod probe_model_kimi_split_tests {
+    //! 2026-05-08 Kimi 双平台拆分 review feedback (medium): probe_model 此前
+    //! 只有 "kimi" case (返回 moonshot-v1-8k),拆分后 kimi_code/moonshot 都
+    //! fallback 到 gpt-4o-mini → api.kimi.com 探针被 reject (model not found),
+    //! aikey doctor 报错误诊断。下面锁定每条 family 内 provider_code 的 model:
+
+    use super::probe_model;
+
+    #[test]
+    fn probe_model_kimi_code_uses_kimi_k2_5() {
+        assert_eq!(probe_model("kimi_code"), "kimi-k2.5");
+    }
+
+    #[test]
+    fn probe_model_moonshot_uses_moonshot_v1_8k() {
+        assert_eq!(probe_model("moonshot"), "moonshot-v1-8k");
+    }
+
+    #[test]
+    fn probe_model_kimi_deprecated_alias_matches_kimi_code() {
+        // Defense:老 vault 数据 / 手工构造的 'kimi' 字面值仍能跑探针。
+        assert_eq!(probe_model("kimi"), "kimi-k2.5");
+    }
+
+    #[test]
+    fn probe_model_unknown_falls_back_to_gpt_4o_mini() {
+        // 未知 provider 走 fallback,大多数 OpenAI-compat gateway 都接受 gpt-4o-mini。
+        assert_eq!(probe_model("some-new-aggregator"), "gpt-4o-mini");
     }
 }

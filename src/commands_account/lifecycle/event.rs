@@ -127,13 +127,45 @@ pub fn apply_credential_lifecycle_batch(
                 providers,
             } => {
                 if !providers.is_empty() {
-                    let primaries = auto_assign_primaries_for_key(
-                        source_type,
-                        source_ref,
-                        providers,
-                    )
-                    .unwrap_or_default();
-                    outcome.newly_primary = primaries;
+                    // 2026-05-08 multi-Kimi family key 在 add 时不 auto-primary
+                    // 任何 Kimi family 成员(详见 update/20260508-Kimi-family互斥-
+                    // active-env统一KIMI写入.md 决策 #3 + #2.1):
+                    // ① 多个 Kimi family member 在同一 key 下 → 用户必须显式
+                    //   `aikey use --provider <choice>` 才能激活,否则 auto_assign
+                    //   按 providers 顺序默认选第一个/最后一个,silently surprise
+                    // ② 跳过 auto_assign 不影响非 Kimi family 的 providers
+                    //   (例如 aggregator key 同时支持 kimi_code+moonshot+anthropic
+                    //   时,anthropic 仍走正常 fill-empty-only auto-primary)
+                    let kimi_family_in_providers: Vec<&str> = providers.iter()
+                        .filter(|p| crate::storage::KIMI_FAMILY_CODES.contains(&p.as_str()))
+                        .map(|p| p.as_str())
+                        .collect();
+                    let providers_for_auto: Vec<String> = if kimi_family_in_providers.len() > 1 {
+                        // multi-Kimi key: 过滤掉所有 Kimi family,只 auto-primary 其它 providers
+                        // hint 给用户:激活路径
+                        eprintln!(
+                            "  Note: key supports multiple Kimi-family providers ({}). \
+                             Run `aikey use <key> --provider kimi_code` or \
+                             `aikey use <key> --provider moonshot` to activate one.",
+                            kimi_family_in_providers.join(", ")
+                        );
+                        providers.iter()
+                            .filter(|p| !crate::storage::KIMI_FAMILY_CODES.contains(&p.as_str()))
+                            .cloned()
+                            .collect()
+                    } else {
+                        providers.to_vec()
+                    };
+
+                    if !providers_for_auto.is_empty() {
+                        let primaries = auto_assign_primaries_for_key(
+                            source_type,
+                            source_ref,
+                            &providers_for_auto,
+                        )
+                        .unwrap_or_default();
+                        outcome.newly_primary = primaries;
+                    }
                     // Treat presence of providers as a binding touch so
                     // downstream toml apply re-runs even when no auto-promote
                     // happened (idempotent no-op when state already matches).
@@ -146,6 +178,31 @@ pub fn apply_credential_lifecycle_batch(
                 providers,
             } => {
                 if !providers.is_empty() {
+                    // 2026-05-08 multi-Kimi family key 强制显式选(详见 update/
+                    // 20260508-Kimi-family互斥-active-env统一KIMI写入.md 决策 #3):
+                    // 一个 key 同时支持 kimi_code + moonshot(典型: 0011/yunwu gateway)
+                    // 时,Switched 必须只接收单一 Kimi family member,否则 family
+                    // 互斥(Phase B 下沉到 set_provider_binding)会让最后写入的悄悄
+                    // 抢占 KIMI_BASE_URL,产生 silent surprise。
+                    // 这里在 lifecycle 入口拦住,要求 caller 先做 --provider 解析或
+                    // 交互 picker(主流程已经按 provider-by-provider 拆 Switched event,
+                    // 此校验是兜底防御)。
+                    let kimi_family_in_event: Vec<&str> = providers.iter()
+                        .filter(|p| crate::storage::KIMI_FAMILY_CODES.contains(&p.as_str()))
+                        .map(|p| p.as_str())
+                        .collect();
+                    if kimi_family_in_event.len() > 1 {
+                        return Err(format!(
+                            "Switched event contains {} Kimi family providers ({:?}); \
+                             KIMI_BASE_URL can only point to one upstream. \
+                             Caller must split into separate Switched events or \
+                             pre-filter via --provider <kimi_code|moonshot>. \
+                             Aborting to avoid silent overwrite.",
+                            kimi_family_in_event.len(),
+                            kimi_family_in_event
+                        ));
+                    }
+
                     crate::commands_account::write_bindings_canonical(
                         providers,
                         source_type,

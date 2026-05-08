@@ -269,7 +269,11 @@ pub fn render_kimi() -> io::Result<()> {
         ScanOptions::default()
     };
     let hits = collect_wal_backward(&wal_dir, move |hit| {
-        hit.event.provider_code == "kimi"
+        // 2026-05-08 Kimi 双平台拆分: kimi family 的三个 provider_code 都会被
+        // Kimi CLI Stop hook 触发 statusline 渲染。pre-fix 只过滤 "kimi",
+        // 拆分后 kimi_code/moonshot 事件不被统计 → statusline 空白。
+        let pc = hit.event.provider_code.as_str();
+        (pc == "kimi_code" || pc == "moonshot" || pc == "kimi")
             && hit.event.session_id.as_deref() == Some(sid.as_str())
             && tuple_gt(&hit.wal_file_name, hit.wal_seq, &pf, prev_seq)
     }, opts)?;

@@ -29,21 +29,21 @@ static VERSIONS: &[VersionMigration] = &[
         upgrade: v1_0_0_baseline::upgrade,
         rollback: v1_0_0_baseline::rollback,
     },
-    // v1.0.1-alpha.1 = first post-baseline-fold increment under the
-    // v1.0.1-alpha dev cycle. Adds provider_accounts.local_alias so OAuth
-    // rename can preserve the original email. See the `v1_0_1_alpha_1`
-    // module below for the full rationale.
+    // 2026-05-08 baseline-fold history (pre-GA changes folded into v1.0.0):
+    //   - provider_accounts.local_alias 列 (原 v1.0.1-alpha.1,误命名;baseline
+    //     CREATE TABLE 已含此列,alpha.1 module 删除,无 vault 受影响);
+    //   - Kimi 双平台拆分: provider_code 'kimi' → 'kimi_code' / 'moonshot'。
+    //     **不做数据迁移**:旧 rc.1 testers 走 `uninstall.sh + reinstall` 路径
+    //     (与 2026-05-01 把 v1.0.{2..5}-alpha 折回 baseline 时同样的 "no
+    //     upgrade path" 处理); CLI provider_registry.yaml 仍把 'kimi' 留作
+    //     deprecated alias,防御性兜底。
     //
-    // Naming note: per workflow/CD/version-naming.md (2026-05-01 fold),
-    // the post-baseline cycle is `v1.0.1-alpha`, `v1.0.1-alpha.1`,
-    // `v1.0.1-alpha.2`, ... The pre-baseline `v1.0.{2,3,4,5}-alpha` slots
-    // were DELETED on 2026-05-06 (no internal testers remained on those
-    // schema_migrations rows; only v1.0.0-rc.1 testers exist).
-    VersionMigration {
-        version: "1.0.1-alpha.1",
-        upgrade: v1_0_1_alpha_1::upgrade,
-        rollback: v1_0_1_alpha_1::rollback,
-    },
+    // Why fold pattern: 当前 released = v1.0.0-rc.1; next pending = v1.0.0-rc.2;
+    // pre-GA 改动直接进 baseline 是项目惯例 (workflow/CD/version-naming.md §3),
+    // CLI vault 无 schema_migrations 跟踪表(纯 idempotency 模型),fold 零孤儿风险。
+    //
+    // 详见 roadmap20260320/技术实现/update/20260508-Kimi双平台拆分-moonshot与kimi-code.md
+    // §"版本周期决策" 节。
 ];
 
 /// Run all upgrades up to the current binary version.
@@ -527,6 +527,16 @@ pub mod v1_0_0_baseline {
             ensure_column(conn, "events", col, ddl)?;
         }
 
+        // 2026-05-08 Kimi 双平台拆分 — **不做数据迁移**。
+        // Why: 当前 released = v1.0.0-rc.1 (pre-GA),next = v1.0.0-rc.2;按项目
+        // pre-GA "no upgrade path" 惯例 (类比 2026-05-01 把 v1.0.{2..5}-alpha
+        // 折回 baseline 时让 internal testers `uninstall.sh + reinstall`),旧
+        // provider_code='kimi' 的 vault 数据通过 reinstall 重建,而非在线迁移。
+        // CLI binary 的 provider_registry.yaml 仍把 'kimi' 留作 deprecated alias,
+        // 防御性地保护任何手工构造或迁移残留的旧数据。
+        //
+        // 详见 roadmap20260320/技术实现/update/20260508-Kimi双平台拆分-moonshot与kimi-code.md
+        // §"版本周期决策" 节。
         Ok(())
     }
 
@@ -613,87 +623,6 @@ pub mod v1_0_0_baseline {
     /// sufficient to protect user data.
     pub fn rollback(_: &Connection) -> Result<(), String> {
         eprintln!("[db rollback] v1.0.0 baseline is irreversible — vault tables retained");
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// v1.0.1-alpha.1 — provider_accounts.local_alias (post-baseline, 2026-05-06)
-//
-// First post-baseline-fold informal increment under the v1.0.1-alpha
-// dev cycle. Per workflow/CD/version-naming.md (2026-05-01 fold), the
-// post-baseline cycle is `v1.0.1-alpha`, `v1.0.1-alpha.1`,
-// `v1.0.1-alpha.2`, ... — `.N` strict-increment per release publish.
-//
-// Why this migration exists:
-//   Before this version, OAuth account "rename" overwrote
-//   provider_accounts.display_identity directly — destroying the original
-//   email/identity returned by the upstream OAuth provider. After rename
-//   there was no way to recover the underlying email; the identity column
-//   became indistinguishable from a user-chosen label.
-//
-//   v1.0.1-alpha.1 splits the two concepts:
-//     - display_identity → immutable origin (set once at OAuth login,
-//                          never touched by rename).
-//     - local_alias      → user-set label (written by `aikey rename`
-//                          and the web Vault rename action). NULL means
-//                          "never renamed"; callers fall back to
-//                          display_identity for a stable label.
-//
-//   Effective alias for the UI / CLI display becomes
-//   `local_alias.unwrap_or(display_identity)`.
-//
-// Idempotency: ALTER TABLE … ADD COLUMN guarded by has_column() so the
-// migration is safe to re-run on already-upgraded vaults. Fresh installs
-// get the column from the v1.0.0 baseline (which absorbed it during the
-// 2026-05-01 fold) — running this migration on a fresh vault is a no-op.
-// ---------------------------------------------------------------------------
-
-pub mod v1_0_1_alpha_1 {
-    use rusqlite::Connection;
-
-    fn has_table(conn: &Connection, table: &str) -> bool {
-        conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-            [table],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|c| c > 0)
-        .unwrap_or(false)
-    }
-
-    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name=?1", table),
-            [column],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|c| c > 0)
-        .unwrap_or(false)
-    }
-
-    pub fn upgrade(conn: &Connection) -> Result<(), String> {
-        if !has_table(conn, "provider_accounts") {
-            // Vault predates v1.0.3-alpha and never registered baseline OAuth
-            // tables; skip silently — baseline upgrade earlier in the chain
-            // would have created the table with local_alias already in place.
-            return Ok(());
-        }
-        if !has_column(conn, "provider_accounts", "local_alias") {
-            conn.execute(
-                "ALTER TABLE provider_accounts ADD COLUMN local_alias TEXT",
-                [],
-            )
-            .map_err(|e| format!("provider_accounts.local_alias: {}", e))?;
-        }
-        Ok(())
-    }
-
-    /// Reverse migration. SQLite (pre-3.35) cannot DROP COLUMN cleanly, so
-    /// the column stays after rollback — older binaries simply ignore the
-    /// extra column. Symmetric with v1.0.4-alpha rollback policy.
-    pub fn rollback(_: &Connection) -> Result<(), String> {
-        eprintln!("[db rollback] SKIP: provider_accounts.local_alias (SQLite no DROP COLUMN)");
         Ok(())
     }
 }
@@ -802,107 +731,9 @@ mod tests {
 
     // T26 + cycle test were both deleted 2026-05-06: they exercised the
     // multi-version chain (rollback to v1.0.2-alpha then re-upgrade
-    // through v1.0.3, v1.0.4) which no longer exists post-fold. With
-    // single-version registry (v1.0.0 + v1.0.1-alpha.1), there's no
-    // chain to test partial-state recovery against. Re-add tests when
-    // the next post-baseline alpha lands and produces a real chain.
-
-    // ── v1.0.1-alpha.1: provider_accounts.local_alias ──────────────────
-
-    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM pragma_table_info('{}') WHERE name=?1", table),
-            [column],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|n| n > 0)
-        .unwrap_or(false)
-    }
-
-    /// Fresh install (baseline + every registered migration) ships
-    /// provider_accounts.local_alias from the start — the baseline CREATE
-    /// TABLE includes the column. Confirms the upgrade-vs-fresh paths
-    /// produce the same shape.
-    #[test]
-    fn v1_0_1_alpha_1_fresh_install_has_local_alias_column() {
-        let conn = fresh_vault();
-        assert!(
-            column_exists(&conn, "provider_accounts", "local_alias"),
-            "fresh-install vault is missing provider_accounts.local_alias \
-             — baseline CREATE TABLE must include it"
-        );
-    }
-
-    /// Simulate an alpha-user vault that stopped at v1.0.5-alpha (i.e.
-    /// before the post-GA local_alias addition). Apply the v1.0.1-alpha.1
-    /// upgrade and assert the column appears with the right type.
-    #[test]
-    fn v1_0_1_alpha_1_adds_local_alias_to_legacy_vault() {
-        let conn = Connection::open_in_memory().expect("open");
-
-        // Manually run upgrades up through v1.0.0 (the GA marker, last
-        // pre-v1.0.1-alpha.1 entry in the registry). We can't just call
-        // upgrade_all() because that would also apply v1.0.1-alpha.1 and
-        // there'd be no "before" state to test against. Instead replicate
-        // the chain by running each registered upgrade up to (but not
-        // including) v1.0.1-alpha.1.
-        for v in VERSIONS {
-            if v.version == "1.0.1-alpha.1" {
-                break;
-            }
-            (v.upgrade)(&conn).expect("pre-v1.0.1-alpha.1 upgrade");
-        }
-        // Drop the column to simulate a vault whose baseline predated the
-        // post-GA addition (since our updated baseline already creates it,
-        // the only realistic "missing column" case is an old fixture from
-        // a time when baseline did not include local_alias).
-        conn.execute("ALTER TABLE provider_accounts DROP COLUMN local_alias", [])
-            .or_else(|_| {
-                // SQLite < 3.35 cannot DROP COLUMN; skip the simulation —
-                // the migration is still safe (it would no-op).
-                Ok::<usize, rusqlite::Error>(0)
-            })
-            .ok();
-
-        // If the column was dropped above, the migration must add it back.
-        // If the SQLite build didn't support DROP COLUMN, the migration
-        // must still succeed as a no-op (idempotent).
-        v1_0_1_alpha_1::upgrade(&conn).expect("v1.0.1-alpha.1 upgrade");
-        assert!(
-            column_exists(&conn, "provider_accounts", "local_alias"),
-            "v1.0.1-alpha.1 upgrade did not produce local_alias column"
-        );
-    }
-
-    /// Idempotency: running v1.0.1-alpha.1::upgrade on a vault that already
-    /// has local_alias must succeed without error.
-    #[test]
-    fn v1_0_1_alpha_1_is_idempotent() {
-        let conn = fresh_vault();
-        // First run is a no-op (column already in baseline) — must succeed.
-        v1_0_1_alpha_1::upgrade(&conn).expect("first re-run");
-        v1_0_1_alpha_1::upgrade(&conn).expect("second re-run");
-        assert!(column_exists(&conn, "provider_accounts", "local_alias"));
-    }
-
-    /// Vault that predates v1.0.3-alpha (no provider_accounts table at all)
-    /// must skip the migration silently — has_table guard.
-    #[test]
-    fn v1_0_1_alpha_1_skips_when_provider_accounts_missing() {
-        let conn = Connection::open_in_memory().expect("open");
-        // Bare baseline-1.0.1 only (no provider_accounts table).
-        v1_0_0_baseline::upgrade(&conn).expect("baseline upgrade");
-        // We assume baseline doesn't create provider_accounts on its own —
-        // it's introduced by v1.0.3-alpha. Drop it if baseline did create
-        // it (defensive).
-        let _ = conn.execute("DROP TABLE IF EXISTS provider_accounts", []);
-        assert!(!table_exists(&conn, "provider_accounts"));
-
-        // Migration must succeed without creating the table or panicking.
-        v1_0_1_alpha_1::upgrade(&conn).expect("migration on bare vault");
-        assert!(
-            !table_exists(&conn, "provider_accounts"),
-            "v1.0.1-alpha.1 must not create provider_accounts; v1.0.3-alpha is the table owner"
-        );
-    }
+    // through v1.0.3, v1.0.4) which no longer exists post-fold. After
+    // the 2026-05-08 second fold (v1.0.1-alpha.1 + Kimi split also
+    // absorbed into v1.0.0 baseline), the registry is again single-version
+    // — no chain to test partial-state recovery against. Re-add tests when
+    // the next post-GA cycle lands and produces a real chain.
 }

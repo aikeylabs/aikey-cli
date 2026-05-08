@@ -86,22 +86,22 @@ family_login_urls:
 # Web import "use official" 按钮:
 #   user 粘贴 URL → 抽 host → lookup → official URL = base_url + version
 #
-# 数据来源 (2026-05-01 校对):
+# 数据来源 (2026-05-01 校对; 2026-05-08 Kimi 双平台拆分修订):
 #   - Anthropic:   官方 https://api.anthropic.com/v1
 #   - OpenAI:      官方 https://api.openai.com/v1
-#   - Kimi Coding: https://api.kimi.com/coding/v1 (sk-kimi-* KEY 形态)
-#   - Moonshot:    https://api.moonshot.cn/v1 (sk-Kh* KEY 形态; 同 provider=kimi
-#                  family,但产品线 / endpoint 不同)
+#   - Kimi Code:   https://api.kimi.com/coding/v1 (sk-kimi-* KEY 形态稳定 → confirmed regex)
+#   - Moonshot:    https://api.moonshot.cn/v1 (无稳定前缀,只能靠 URL/keyword 兜底;
+#                  与 Kimi Code 同 family=kimi 但 provider_code 已拆为独立的 moonshot)
 #   - DeepSeek / Groq / xAI / OpenRouter / Perplexity / Gemini / Zhipu /
 #     Doubao / Qwen / SiliconFlow / HuggingFace / Yunwu / Zeroeleven 同上游
 #     官方文档,详见各 provider 主页。
 provider_routes:
   - { host: "api.anthropic.com",                  protocol: anthropic,         provider: anthropic,     base_url: "https://api.anthropic.com",                  version: "/v1"     }
   - { host: "api.openai.com",                     protocol: openai_compatible, provider: openai,        base_url: "https://api.openai.com",                     version: "/v1"     }
-  - { host: "api.kimi.com",                       protocol: openai_compatible, provider: kimi,          base_url: "https://api.kimi.com/coding",                version: "/v1"     }
-  - { host: "www.kimi.com",                       protocol: openai_compatible, provider: kimi,          base_url: "https://api.kimi.com/coding",                version: "/v1"     }
-  - { host: "api.moonshot.cn",                    protocol: openai_compatible, provider: kimi,          base_url: "https://api.moonshot.cn",                    version: "/v1"     }
-  - { host: "platform.moonshot.cn",               protocol: openai_compatible, provider: kimi,          base_url: "https://api.moonshot.cn",                    version: "/v1"     }
+  - { host: "api.kimi.com",                       protocol: openai_compatible, provider: kimi_code,     base_url: "https://api.kimi.com/coding",                version: "/v1"     }
+  - { host: "www.kimi.com",                       protocol: openai_compatible, provider: kimi_code,     base_url: "https://api.kimi.com/coding",                version: "/v1"     }
+  - { host: "api.moonshot.cn",                    protocol: openai_compatible, provider: moonshot,      base_url: "https://api.moonshot.cn",                    version: "/v1"     }
+  - { host: "platform.moonshot.cn",               protocol: openai_compatible, provider: moonshot,      base_url: "https://api.moonshot.cn",                    version: "/v1"     }
   - { host: "api.deepseek.com",                   protocol: openai_compatible, provider: deepseek,      base_url: "https://api.deepseek.com",                   version: "/v1"     }
   - { host: "api.groq.com",                       protocol: openai_compatible, provider: groq,          base_url: "https://api.groq.com/openai",                version: "/v1"     }
   - { host: "api.x.ai",                           protocol: openai_compatible, provider: xai_grok,      base_url: "https://api.x.ai",                           version: "/v1"     }
@@ -254,6 +254,15 @@ providers:
     regex: '^-----BEGIN [A-Z ]+-----[\s\S]+-----END [A-Z ]+-----$'
     tier: confirmed
 
+  # 2026-05-08 Kimi 双平台拆分：sk-kimi-* 前缀稳定且独占 → confirmed tier。
+  # Why 必须在 generic_sk 之前：Rust regex crate 不支持 lookahead，无法在 generic_sk
+  # 写 `^sk-(?!kimi-)...`；first-match-wins YAML 顺序保证 sk-kimi-* key 走精确分支，
+  # 其余 sk-* key 落到 generic_sk ambiguous bucket（Moonshot / DeepSeek / yunwu 等）。
+  - id: kimi_code
+    display: "Kimi Code (api.kimi.com)"
+    regex: '^sk-kimi-[A-Za-z0-9_\-]{20,}$'
+    tier: confirmed
+
   # ============ Tier: ambiguous（sk- 通用前缀，需上下文补强） ============
 
   - id: zhipu_glm
@@ -276,11 +285,21 @@ providers:
     hint: "通用 sk- 前缀，需结合同文档 URL/title 判定具体 provider"
     # v4.1 family rename: 'moonshot_kimi' → 'kimi' 与 connectivity/runtime PROVIDER_DEFAULTS 字典对齐
     # (CLI 其他地方一律叫 'kimi';UI Provider 字段直接消费此值,避免名词分裂)
+    # 2026-05-08 Kimi 双平台拆分: provider_code 'kimi' 拆为 'moonshot' + 'kimi_code'
+    #   - sk-kimi-* 前缀已被前置 confirmed 规则吃掉(id=kimi_code),不会到这里。
+    #   - 落到 generic_sk 的 sk-* key 默认归 'moonshot'(用户决策 #4);URL host 强证据
+    #     可下钻到 kimi_code(api.kimi.com / www.kimi.com)。
     disambiguators:
       - url_domain: "platform.moonshot.cn"
-        suggest: "kimi"
+        suggest: "moonshot"
+      - url_domain: "api.moonshot.cn"
+        suggest: "moonshot"
       - url_domain: "platform.moonshot.ai"
-        suggest: "kimi"
+        suggest: "moonshot"
+      - url_domain: "api.kimi.com"
+        suggest: "kimi_code"
+      - url_domain: "www.kimi.com"
+        suggest: "kimi_code"
       - url_domain: "platform.deepseek.com"
         suggest: "deepseek"
       - url_domain: "yunwu.ai"
@@ -289,7 +308,8 @@ providers:
         suggest: "zeroeleven"
     # M3 新增：URL 消歧失败时，UI 手选下拉优先展示的候选 provider id
     siblings:
-      - kimi
+      - moonshot
+      - kimi_code
       - deepseek
       - yunwu
       - zeroeleven

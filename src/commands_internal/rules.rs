@@ -112,20 +112,22 @@ mod tests {
         let routes = v["provider_routes"].as_array().expect("provider_routes array");
         assert!(!routes.is_empty(), "provider_routes must have entries");
 
-        // pin: kimi family 下 api.kimi.com 与 api.moonshot.cn 是两条独立
-        // 路由(同 provider=kimi,但 base_url 不同),修 2026-05-01 bug 的关键。
+        // pin: 2026-05-08 Kimi 双平台拆分,api.kimi.com 与 api.moonshot.cn 现在是
+        // 两个独立的 provider_code (kimi_code / moonshot),不再是同一 provider 下
+        // 两个 host。family 仍归一到 'kimi' (UI 分组),但 provider_code 拆分修掉了
+        // first-match-wins 默认偏 Kimi Code 的隐性 bug。
         let kimi_coding = routes.iter()
             .find(|r| r["host"] == "api.kimi.com")
             .expect("api.kimi.com route present");
-        assert_eq!(kimi_coding["provider"], "kimi");
+        assert_eq!(kimi_coding["provider"], "kimi_code");
         assert_eq!(kimi_coding["base_url"], "https://api.kimi.com/coding");
         assert_eq!(kimi_coding["version"], "/v1");
 
         let moonshot = routes.iter()
             .find(|r| r["host"] == "api.moonshot.cn")
             .expect("api.moonshot.cn route present");
-        assert_eq!(moonshot["provider"], "kimi");      // same family
-        assert_eq!(moonshot["base_url"], "https://api.moonshot.cn");  // but different upstream
+        assert_eq!(moonshot["provider"], "moonshot");
+        assert_eq!(moonshot["base_url"], "https://api.moonshot.cn");
         assert_eq!(moonshot["version"], "/v1");
 
         // perplexity: empty version (no /v1 path segment in upstream)

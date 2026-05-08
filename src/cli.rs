@@ -456,15 +456,20 @@ pub(crate) enum Commands {
 #[derive(Subcommand)]
 pub(crate) enum AuthAction {
     /// Login to a provider OAuth account
+    // 2026-05-08 Kimi 双平台拆分 review feedback [中]: 标签 "Kimi (Moonshot AI)"
+    // 误导用户(实际是 Kimi Code OAuth);改为明确 "Kimi Code (kimi_code)" 并提示
+    // Moonshot 走 API key 路径。'kimi' 仍作为 deprecated alias 接受。
     #[command(after_help = "\x1b[1mSupported providers:\x1b[0m
-  claude    Claude (Anthropic) — requires Pro or Max subscription
-  codex     Codex / ChatGPT (OpenAI) — requires ChatGPT Pro/Plus
-  kimi      Kimi (Moonshot AI)
+  claude              Claude (Anthropic) — requires Pro or Max subscription
+  codex               Codex / ChatGPT (OpenAI) — requires ChatGPT Pro/Plus
+  kimi_code (or kimi) Kimi Code (api.kimi.com) — Kimi Coding Plan
+                      Note: Moonshot (api.moonshot.cn) does NOT support OAuth.
+                            Use `aikey add <alias> --provider moonshot` instead.
 
 \x1b[1mExamples:\x1b[0m
   aikey auth login claude
   aikey auth login codex --alias dev@acme.io
-  aikey auth login kimi --alias my-kimi")]
+  aikey auth login kimi_code --alias my-kimi")]
     Login {
         /// Provider name: claude, codex, kimi (omit for interactive picker)
         provider: Option<String>,

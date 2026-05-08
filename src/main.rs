@@ -925,6 +925,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let mut selected: Vec<String>;
                     let mut checked_state: Vec<bool> = vec![false; items.len()];
 
+                    // 2026-05-08 Kimi 双平台拆分:用户已粘的 secret 含 'sk-kimi-' 前缀时,
+                    // 预选 'kimi(kimi-code)' picker 项以减少手动操作。
+                    // Why 仅这一条预选: 'sk-kimi-' 是稳定独占前缀(confirmed-tier);其他
+                    // sk-* 形态因 Moonshot 没有稳定前缀,无法可靠预选,留给用户手选。
+                    if secret.trim().starts_with("sk-kimi-") {
+                        if let Some(idx) = picker_entries.iter().position(|e| e.code == "kimi_code") {
+                            if idx < checked_state.len() {
+                                checked_state[idx] = true;
+                            }
+                        }
+                    }
+
                     loop {
                         let selected_indices = match ui_select::box_multi_select("Select protocol type(s)", &items, &checked_state)? {
                             ui_select::MultiSelectResult::Confirmed(idx) => idx,
@@ -2780,6 +2792,9 @@ struct RouteEntry {
 }
 
 /// Provider code (or brand alias) → canonical data-model code for display.
+/// Real canonical provider code (e.g. "claude" → "anthropic", "moonshot" stays
+/// "moonshot"). For activation / binding / proxy routing — must NOT collapse
+/// distinct provider_codes within the same family.
 /// Unknown codes fall back to the lowercased input. Delegates to the unified
 /// `commands_account::provider_info` table (L5 2026-04-17).
 fn provider_canonical(code: &str) -> String {
@@ -2787,6 +2802,12 @@ fn provider_canonical(code: &str) -> String {
         .map(|i| i.canonical_code.to_string())
         .unwrap_or_else(|| code.to_lowercase())
 }
+
+// 2026-05-08 Kimi 双平台拆分 review feedback: ProviderInfo 已暴露 `family`
+// 字段供想做 family-level 分组的 caller 直接用 (`provider_info(code).family`)。
+// 此处之前曾加过 `fn provider_family(code) -> String` helper, self-review 时
+// 发现没有 caller —— 删除不预先抽象 (CLAUDE.md "Don't design for hypothetical
+// future requirements"),避免 dead code。如未来 UI 需要再加回。
 
 /// Provider code → proxy URL path segment used when building `base_url` for
 /// third-party clients. Unknown codes fall back to the lowercased input so new
@@ -3742,7 +3763,15 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
     for acct in &oauth_accounts {
         add_prov(&provider_canonical(&acct.provider));
     }
-    all_providers.sort();
+    // 2026-05-08 V-layer family-grouping (详见 update/20260508-display-family-grouping.md):
+    // 按 (family, code) 排序,让同 family 的 provider_code 在 picker 里相邻;ui_select.rs
+    // build_tree_rows 依赖此顺序做"同 family 共享 header"的 render-merge。
+    // M 层零改动 — groups 仍 1 group/provider_code,只是顺序变了。
+    all_providers.sort_by(|a, b| {
+        let fa = provider_registry::family_of(a);
+        let fb = provider_registry::family_of(b);
+        (fa, a.as_str()).cmp(&(fb, b.as_str()))
+    });
 
     if all_providers.is_empty() {
         return Err("No keys or accounts found.".into());
@@ -3833,9 +3862,20 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
         // for any future bindings row that's already canonical: provider_canonical
         // is idempotent, so the OR is belt-and-suspenders against an in-flight
         // migration where canonicalization status varies row-to-row.
-        let current_binding = bindings.iter().find(|b|
-            provider_canonical(&b.provider_code) == *prov || b.provider_code == *prov
-        );
+        //
+        // 2026-05-08 V-layer family-grouping (update/20260508-display-family-grouping.md):
+        // 兼容老数据 — 老 entry kimi-official 的 supported_providers=["kimi"] 落在
+        // groups[kimi].candidates,但 `aikey use` 后 binding 被 canonical 化为
+        // 'kimi_code'。此时 groups[kimi] 自身的 b.provider_code/canonical 比对都不命中,
+        // 但视觉上应该显示 (*) 在 kimi-official 行。fallback 到 family 级匹配:同 family
+        // 的 binding 也算"该 group 当前 active",候选位置由 candidates 自身命中决定。
+        let current_binding = bindings.iter().find(|b| {
+            let canon = provider_canonical(&b.provider_code);
+            if canon == *prov || b.provider_code == *prov { return true; }
+            provider_registry::family_of(&canon) == provider_registry::family_of(prov)
+        });
+        // Selection 仍按候选 source_type/source_ref 匹配,确保 binding 指向的 entry
+        // 必须真的在本 group 的 candidates 列表中才会显示 (*) — 防止跨 group 误标。
         let selected = current_binding.and_then(|b| {
             candidates.iter().position(|c|
                 c.source_type == b.key_source_type.as_str() && c.source_ref == b.key_source_ref
@@ -3940,6 +3980,12 @@ fn bash_prompt_escape(s: &str) -> String {
 }
 
 /// All known provider env var pairs — used by deactivate to unset everything.
+///
+/// 2026-05-08 Kimi family 互斥落地后 moonshot binding 也写入 KIMI_*(详见
+/// roadmap20260320/技术实现/update/20260508-Kimi-family互斥-active-env统一KIMI写入.md
+/// 决策 #8),aikey 不再写 MOONSHOT_*,故从 deactivate unset 清单移除 ——
+/// 列表仅枚举 aikey 当前主动写入的 env var,不替用户清理"既不是 aikey 写的也无消费方"
+/// 的 stale shell vars(实证三层证据:kimi-cli runtime / Moonshot 官方文档 / 项目 grep)。
 const ALL_PROVIDER_ENV_PAIRS: &[(&str, &str)] = &[
     ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
     ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
@@ -3947,7 +3993,6 @@ const ALL_PROVIDER_ENV_PAIRS: &[(&str, &str)] = &[
     ("GEMINI_API_KEY", "GEMINI_BASE_URL"),
     ("KIMI_API_KEY", "KIMI_BASE_URL"),
     ("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"),
-    ("MOONSHOT_API_KEY", "MOONSHOT_BASE_URL"),
 ];
 
 /// All known provider env var names (flattened from ALL_PROVIDER_ENV_PAIRS).

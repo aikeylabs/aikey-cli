@@ -15,7 +15,9 @@
 //! 对每个 Draft:
 //! 1. `collect_evidence` 收全部证据 → Vec<(family, InferenceSource)>
 //! 2. 按 family 累加权重 (FingerprintConfirmed=1.0, InlineTitle=0.9, ShellVar=0.85,
-//!    SectionHeading=0.8, FingerprintLikely=0.7, UrlHost=0.6)
+//!    SectionHeading=0.8, FingerprintLikely=0.7, UrlHost=0.6) —— 仅 Tier 2 段使用,
+//!    Tier 1 strong evidence 走硬规则(详见本文件 enrich_drafts 实现 + update/
+//!    20260508-inference-weights-decision-3-realign.md)
 //! 3. 最高分 family,若 score ≥ 0.5 THRESHOLD → 填 inferred_provider + confidence + evidence
 //!
 //! # Phase 3 scope
@@ -71,6 +73,25 @@ fn line_label_zone(line: &str) -> &str {
 }
 
 /// 主入口:对 drafts 做就地 enrich (填 inferred_provider / confidence / evidence)
+///
+/// **2026-05-08 架构调整 (Path B,详见 update/20260508-inference-weights-decision-3-realign.md)**:
+/// 决策 #3 优先级 `URL host > key prefix > keyword > family default` 改为**显式分层**而非
+/// 加权投票模拟。
+///
+/// **Tier 1 — strong evidence 硬规则短路**:
+///   - E5 UrlHostPattern 触发 → 锁定该 family (URL host = 用户主动写的强意图证据)
+///   - E1 FingerprintConfirmed 触发 (URL 不在场时) → 锁定该 family (regex 直命中)
+///   - 跨 family 冲突时 URL host 优先 (决策 #3)
+///   - 同 family 多 strong evidence 触发 → 全部列入 inference_evidence (UI transparency)
+///   - inference_confidence = 1.0
+///   - **不与 Tier 2 弱证据混合投票**:Why 旧设计的"加权累加"会让两条 keyword (E2+E3=1.7)
+///     翻盘 confirmed prefix + URL host (E1+E5=1.6),与决策 #3 priority list 矛盾
+///
+/// **Tier 2 — 无 strong evidence 时回退到加权投票**:
+///   - 适用 evidence: E1 FingerprintLikely / E2 InlineTitleKeyword / E3 SectionHeadingKeyword
+///     / E4 ShellVarPattern / E6 InlineLabelKeyword
+///   - 按 family 累加权重,最高分 family 若 ≥ THRESHOLD 写入
+///   - Why 仍累加:多个弱证据共识能突破阈值(heading + inline label 双证 = 0.8+0.75=1.55)
 pub fn enrich_drafts(
     drafts: &mut [DraftRecord],
     text: &str,
@@ -80,14 +101,53 @@ pub fn enrich_drafts(
     let lines: Vec<&str> = text.lines().collect();
     for d in drafts.iter_mut() {
         let evidence = collect_evidence(d, &lines, blocks, registry);
+
+        // ── Tier 1: strong evidence 硬规则短路 ──
+        let url_evidence: Vec<&(String, InferenceSource)> = evidence.iter()
+            .filter(|(_, s)| matches!(s, InferenceSource::UrlHostPattern{..}))
+            .collect();
+        let confirmed_evidence: Vec<&(String, InferenceSource)> = evidence.iter()
+            .filter(|(_, s)| matches!(s, InferenceSource::FingerprintConfirmed{..}))
+            .collect();
+
+        // URL host 优先级 > prefix (决策 #3 priority list);任一边触发即锁定
+        let chosen_family: Option<String> = if let Some((fam, _)) = url_evidence.first() {
+            Some(fam.clone())
+        } else if let Some((fam, _)) = confirmed_evidence.first() {
+            Some(fam.clone())
+        } else {
+            None
+        };
+
+        if let Some(family) = chosen_family {
+            // 同 family 多 strong evidence 全部列入(UI transparency,Q2 决策)
+            let supporting: Vec<InferenceSource> = url_evidence.iter()
+                .chain(confirmed_evidence.iter())
+                .filter(|(f, _)| f == &family)
+                .map(|(_, s)| s.clone())
+                .collect();
+            d.inferred_provider = Some(family.clone());
+            d.inference_evidence = supporting;
+            d.inference_confidence = 1.0;
+            d.protocol_types = registry.protocol_types_for_family(&family);
+            continue;
+        }
+
+        // ── Tier 2: 无 strong evidence → 弱证据加权投票 ──
         let mut family_scores: HashMap<String, f32> = HashMap::new();
         let mut family_evidence: HashMap<String, Vec<InferenceSource>> = HashMap::new();
         for (family, src) in evidence {
+            // 防御性: Tier 1 已处理 strong evidence,这里跳过(理论上 Tier 1 已 continue)
+            if matches!(
+                src,
+                InferenceSource::UrlHostPattern{..} | InferenceSource::FingerprintConfirmed{..}
+            ) {
+                continue;
+            }
             let w = src.weight();
             *family_scores.entry(family.clone()).or_insert(0.0) += w;
             family_evidence.entry(family).or_default().push(src);
         }
-        // 最高分 family
         let best = family_scores
             .iter()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -97,7 +157,6 @@ pub fn enrich_drafts(
                 d.inferred_provider = Some(family.clone());
                 d.inference_confidence = score;
                 d.inference_evidence = family_evidence.remove(&family).unwrap_or_default();
-                // v4.1 Stage 5+: 派生 protocol_types(聚合网关 → []，官方厂商 → [family])
                 d.protocol_types = registry.protocol_types_for_family(&family);
             }
         }
@@ -309,7 +368,9 @@ mod tests {
 
     #[test]
     fn e3_section_heading_moonshot() {
-        // Title "Kimi11" → SectionHeading keyword kimi → kimi (v4.1 family rename)
+        // Title "Kimi11" → SectionHeading keyword kimi → moonshot
+        // (2026-05-08 Kimi 双平台拆分后,decision #4: keyword "kimi" 单字默认 → moonshot;
+        // URL platform.moonshot.cn → moonshot; 两证据一致,inferred_provider=moonshot)
         let text = "Kimi11\nhttps://platform.moonshot.cn/console/api-keys\nsk-RzORWDtmGsXbqcVhPZCg0WYPqujfSpjAaHQYLJP2TRUaPo3i";
         let cands = vec![
             cand(Kind::Url, "https://platform.moonshot.cn/console/api-keys"),
@@ -319,7 +380,7 @@ mod tests {
         let blocks = split_into_blocks(text);
         enrich_drafts(&mut drafts, text, &blocks, provider_fingerprint::instance());
         assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("kimi"));
+        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("moonshot"));
         // Section heading + URL host 两个证据加权应 ≥ 0.8 + 0.6 = 1.4
         assert!(drafts[0].inference_confidence >= 0.6);
     }
@@ -346,7 +407,8 @@ mod tests {
     fn e6_inline_label_keyword_emoji_prefix_kimi() {
         // BUG-04 regression guard: 单行 Complex `🔑 kimi: sk-moonshot_...` —
         // block.provider_hint 取首 token "🔑"(丢 keyword),E3 scan block 内遇 Credential 即 break。
-        // 无 E6 的话 inferred_provider = None(spike 验证过)。E6 InlineLabelKeyword 兜底 → kimi。
+        // 无 E6 的话 inferred_provider = None(spike 验证过)。E6 InlineLabelKeyword 兜底 → moonshot
+        // (2026-05-08 Kimi 双平台拆分后,decision #4: keyword "kimi" 单字默认 moonshot)。
         let text = "\u{1F511} kimi: sk-moonshot_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO";
         let cands = vec![
             cand(Kind::SecretLike, "sk-moonshot_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO"),
@@ -355,7 +417,7 @@ mod tests {
         let blocks = split_into_blocks(text);
         enrich_drafts(&mut drafts, text, &blocks, provider_fingerprint::instance());
         assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("kimi"));
+        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("moonshot"));
         // 0.75 (E6) alone ≥ THRESHOLD 0.5
         assert!(drafts[0].inference_confidence >= 0.75);
     }
@@ -413,5 +475,124 @@ mod tests {
         // sk-ant-api03 会被 fingerprint 命中 → anthropic (不是 below threshold 示例)
         // 此 test 只验证 enrich 不 panic
         assert_eq!(drafts.len(), 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Path B (2026-05-08) matrix: 决策 #3 优先级 `URL host > key prefix
+    // > keyword > family default` 显式分层验证。
+    // 镜像 spike `path_b_matrix_tests`,详见 update/20260508-inference-
+    // weights-decision-3-realign.md。
+    // ─────────────────────────────────────────────────────────────────
+
+    fn run_enrich(text: &str, cands: Vec<Candidate>) -> Vec<super::super::DraftRecord> {
+        let (mut drafts, _) = group_candidates(text, &cands);
+        let blocks = split_into_blocks(text);
+        enrich_drafts(&mut drafts, text, &blocks, provider_fingerprint::instance());
+        drafts
+    }
+
+    #[test]
+    fn w1_strong_url_plus_strong_prefix_same_family_kimi_code() {
+        // user 真实 case: sk-kimi-* + api.kimi.com/coding/v1 → 必须 kimi_code
+        let text = "Kimi-official:\nbase_url: https://api.kimi.com/coding/v1\napi_key: sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM";
+        let cands = vec![
+            cand(Kind::Url, "https://api.kimi.com/coding/v1"),
+            cand(Kind::SecretLike, "sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM"),
+        ];
+        let drafts = run_enrich(text, cands);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("kimi_code"),
+            "W1: title 'Kimi-official' keyword 不能翻盘 confirmed prefix + URL host");
+        assert!((drafts[0].inference_confidence - 1.0).abs() < 0.001,
+            "Tier 1 confidence = 1.0");
+    }
+
+    #[test]
+    fn w2_strong_url_moonshot_overrides_strong_prefix_kimi_code() {
+        // 决策 #3: URL host > key prefix。sk-kimi 但 base_url=api.moonshot.cn 时,
+        // URL 表达用户意图 → 用 Moonshot 上游
+        let text = "Mixed:\nbase_url: https://api.moonshot.cn/v1\napi_key: sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM";
+        let cands = vec![
+            cand(Kind::Url, "https://api.moonshot.cn/v1"),
+            cand(Kind::SecretLike, "sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM"),
+        ];
+        let drafts = run_enrich(text, cands);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("moonshot"),
+            "W2: URL host 优先于 prefix (决策 #3 priority list)");
+    }
+
+    #[test]
+    fn w3_strong_url_alone_resolves_to_url_family() {
+        // 仅 URL 强证据 → moonshot
+        let text = "Moonshot key:\nbase_url: https://api.moonshot.cn/v1\napi_key: sk-XVmmhF9Yv4qf24bEHa6SrDMsAa94oeMdkKLd1gLuuTcQGqaq";
+        let cands = vec![
+            cand(Kind::Url, "https://api.moonshot.cn/v1"),
+            cand(Kind::SecretLike, "sk-XVmmhF9Yv4qf24bEHa6SrDMsAa94oeMdkKLd1gLuuTcQGqaq"),
+        ];
+        let drafts = run_enrich(text, cands);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("moonshot"));
+    }
+
+    #[test]
+    fn w4_weak_keyword_only_kimi_defaults_moonshot_per_decision_4() {
+        // Tier 2 加权回退 → keyword "kimi" → moonshot (决策 #4)
+        let text = "kimi: sk-XVmmhF9Yv4qf24bEHa6SrDMsAa94oeMdkKLd1gLuuTcQGqaq";
+        let cands = vec![
+            cand(Kind::SecretLike, "sk-XVmmhF9Yv4qf24bEHa6SrDMsAa94oeMdkKLd1gLuuTcQGqaq"),
+        ];
+        let drafts = run_enrich(text, cands);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("moonshot"));
+    }
+
+    #[test]
+    fn w5_strong_prefix_alone_kimi_code_wins_keyword() {
+        // sk-kimi-* (E1 confirmed) + 关键词 "kimi" → Tier 1 锁定 kimi_code
+        let text = "Some kimi note\nsk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM";
+        let cands = vec![
+            cand(Kind::SecretLike, "sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM"),
+        ];
+        let drafts = run_enrich(text, cands);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("kimi_code"),
+            "W5: confirmed prefix 锁定 kimi_code,即使 title 含 'kimi' keyword(→moonshot)");
+        assert!((drafts[0].inference_confidence - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn w6_rk_kimi_adversarial_url_host_wins_over_keyword_stack() {
+        // rk-kimi-* (对抗,E1 不命中) + api.kimi.com (E5 强) + title keyword(E2/E3)
+        // 旧 weighted: keyword stack(1.7) 翻盘 URL(0.6) → moonshot ❌
+        // Path B: Tier 1 URL 锁定 kimi_code,keyword 不参与 ✓
+        let text = "rk-kimi adversarial:\nbase_url: https://api.kimi.com/coding/v1\napi_key: rk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM";
+        let cands = vec![
+            cand(Kind::Url, "https://api.kimi.com/coding/v1"),
+            cand(Kind::SecretLike, "rk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM"),
+        ];
+        let drafts = run_enrich(text, cands);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("kimi_code"),
+            "W6: URL host strong evidence 锁定 kimi_code,keyword 不参与");
+    }
+
+    #[test]
+    fn w7_anthropic_consistent_url_plus_prefix_records_both_evidences() {
+        // Q2 决策: 同 family 多 strong evidence 触发时,inference_evidence 列出全部
+        let text = "Claude:\nhttps://api.anthropic.com\nsk-ant-api03-Fake_AAA_BBB_CCC_DDD_EEE_FFF_GGG_HHH_III_JJJ_KKK_LLL_valid";
+        let cands = vec![
+            cand(Kind::Url, "https://api.anthropic.com"),
+            cand(Kind::SecretLike, "sk-ant-api03-Fake_AAA_BBB_CCC_DDD_EEE_FFF_GGG_HHH_III_JJJ_KKK_LLL_valid"),
+        ];
+        let drafts = run_enrich(text, cands);
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("anthropic"));
+        let has_url = drafts[0].inference_evidence.iter()
+            .any(|e| matches!(e, InferenceSource::UrlHostPattern{..}));
+        let has_prefix = drafts[0].inference_evidence.iter()
+            .any(|e| matches!(e, InferenceSource::FingerprintConfirmed{..}));
+        assert!(has_url, "W7: must include UrlHostPattern evidence");
+        assert!(has_prefix, "W7: must include FingerprintConfirmed evidence");
     }
 }

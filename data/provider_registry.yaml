@@ -76,7 +76,27 @@ providers:
     picker: true
     display: deepseek
 
-  - code: kimi
+  # 2026-05-08 Kimi 双平台拆分：原单一 'kimi' 条目拆为 'kimi_code' + 'moonshot' 两条。
+  #   - 旧 'kimi' 字符串作为 oauth_aliases 挂在 kimi_code 上,registry.lookup("kimi")
+  #     → kimi_code entry; oauth_provider_to_canonical("kimi") → "kimi_code"。
+  #     CLI auth login kimi / 老脚本 / 老 vault 残留 / broker 字面值 "kimi" 都会被
+  #     归一化到 'kimi_code'。Why alias 而非独立 entry:独立 entry 让 canonical()
+  #     返回 "kimi" 自身,binding 写到 vault 时仍是 deprecated 形态,绕过拆分。
+  #   - 'moonshot' 从 picker: false 升为 picker: true,UI 标签 'kimi(moonshot)';
+  #     表示 platform.moonshot.cn 的 OpenAI 兼容产品线 (no OAuth,只 API key)。
+  #   - 'kimi_code' 是新增的精确码,UI 标签 'kimi(kimi-code)';sk-kimi-* 前缀稳定独占;
+  #     family Kimi 内**唯一支持 OAuth** 的产品 (kimi-cli device-code flow)。
+  #   - 三者 family=kimi (UI 分组归一);env_api_key/extra_env_vars 在 kimi_code 沿用
+  #     KIMI_* 命名(与现存 shell hook / Kimi CLI 兼容,不强制用户重设 env)。
+  - code: kimi_code
+    family: kimi
+    # 'kimi' 是 deprecated 别名:CLI auth login kimi / 老 vault 残留 provider_code
+    # 都通过 alias 解析到 kimi_code 这个 canonical entry,oauth_provider_to_canonical
+    # 自动归一化无需 provider_canonical_code 上单独处理。
+    oauth_aliases: [kimi]
+    # Why proxy_path 仍是 'kimi/v1' (而非 'kimi_code/v1'): 旧版本 shell hook 已经把
+    # KIMI_BASE_URL 设为 http://127.0.0.1:27200/kimi/v1; 改 path 会让用户已经打开的
+    # 终端断流。新 path 唯一收益是命名更精确,代价是用户体验损失,不值。
     # Why /v1: Kimi OpenAI-compatible SDK appends /chat/completions relative
     # to base_url. Kimi's upstream base is /coding (no /v1), so the proxy-
     # side path MUST carry /v1 for the final URL to hit /coding/v1/...
@@ -85,24 +105,41 @@ providers:
     env_base_url: KIMI_BASE_URL
     default_base_url: https://api.kimi.com/coding/v1
     picker: true
-    display: kimi
+    display: kimi(kimi-code)
     extra_env_vars:
       - {var: KIMI_MODEL_NAME, value: "kimi-k2.5"}
       - {var: KIMI_MODEL_MAX_CONTEXT_SIZE, value: "131072"}
 
   - code: moonshot
-    # Same protocol family as kimi but kept distinct at env-var level so
-    # tools can wire to different brands independently.
+    # 'kimi(moonshot)' picker — Moonshot platform (api.moonshot.cn).
+    # Why picker: true: 双平台拆分后 UI 必须给用户两个明确选项,不能再隐藏。
+    #
+    # 2026-05-08 Kimi family 互斥 + active.env 统一 KIMI_* 写入(详见
+    # roadmap20260320/技术实现/update/20260508-Kimi-family互斥-active-env统一KIMI写入.md):
+    # ① env_api_key / env_base_url 从 MOONSHOT_* 改回 KIMI_*,与 kimi_code 一致 ——
+    #    Kimi family 内 active binding 互斥(同时只 1 个),激活哪条都走 KIMI_API_KEY
+    #    / KIMI_BASE_URL,kimi CLI 上游只读这一组。区分 platform 由 proxy_path 决定:
+    #    moonshot 走 /moonshot/v1 → 上游 api.moonshot.cn;kimi_code 走 /kimi/v1 →
+    #    上游 api.kimi.com/coding。
+    # ② extra_env_vars KIMI_MODEL_NAME 从 kimi-k2.5 改为 moonshot-v1-8k,
+    #    Moonshot 上游不支持 kimi-k2.5(原值是从 kimi_code 复制的 bug)。
+    # ③ MOONSHOT_API_KEY / MOONSHOT_BASE_URL 三层证据(kimi-cli runtime grep /
+    #    Moonshot 官方 env-vars 文档 / 项目内 grep)实证无消费方,直接停写。
+    # ④ KIMI_MODEL_MAX_CONTEXT_SIZE = 8192(不是 131072): Moonshot 模型族名字直接
+    #    编码 context 上限(moonshot-v1-8k=8192 / -32k=32768 / -128k=131072),
+    #    默认配最便宜的 8k 模型 + 匹配的 8192 context,首单成本最低,长文用户
+    #    自行升 -32k/-128k。原 131072 与 8k 模型互相矛盾,会让 kimi-cli 端做错
+    #    截断预估。
     family: kimi
     proxy_path: moonshot/v1
-    env_api_key: MOONSHOT_API_KEY
-    env_base_url: MOONSHOT_BASE_URL
+    env_api_key: KIMI_API_KEY
+    env_base_url: KIMI_BASE_URL
     default_base_url: https://api.moonshot.cn/v1
-    picker: false   # users prefer the "kimi" label; moonshot kept for compat
-    display: moonshot
+    picker: true
+    display: kimi(moonshot)
     extra_env_vars:
-      - {var: KIMI_MODEL_NAME, value: "kimi-k2.5"}
-      - {var: KIMI_MODEL_MAX_CONTEXT_SIZE, value: "131072"}
+      - {var: KIMI_MODEL_NAME, value: "moonshot-v1-8k"}
+      - {var: KIMI_MODEL_MAX_CONTEXT_SIZE, value: "8192"}
 
   # ──────────────────────────────────────────────────────────────────
   # P0 additions (2026-04-24) — widely-adopted OpenAI-compatible Western

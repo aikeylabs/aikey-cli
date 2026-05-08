@@ -57,7 +57,8 @@ use windows_sys::Win32::System::Console::{
 // + KEY_EVENT_RECORD parsing, which doesn't need VT input mode.
 
 use crate::ui_select::{
-    build_tree_rows, compute_inner_w, format_multi_row, format_row, format_tree_row,
+    build_tree_rows, compute_inner_w, family_aware_select, family_aware_toggle_expanded,
+    format_multi_row, format_row, format_tree_row,
     is_focusable, max_candidate_label_width, next_selectable, redraw_multi_one,
     redraw_multi_two, redraw_two,
     Key, MultiSelectResult, ProviderGroup, ProviderTreeResult, SelectResult, TreeRow,
@@ -612,9 +613,11 @@ pub(crate) fn interactive_provider_tree_windows(
                     if is_focusable(&rows[n]) { cursor = n; break; }
                 }
             }
+            // 2026-05-08 V-layer family-grouping: Space 键 family-aware (与 ui_select.rs Unix
+            // 路径同款),详见 update/20260508-display-family-grouping.md。
             Key::Space => match &rows[cursor] {
-                TreeRow::Provider(gi) => { groups[*gi].expanded = !groups[*gi].expanded; }
-                TreeRow::Candidate(gi, ci) => { groups[*gi].selected = Some(*ci); }
+                TreeRow::Provider(gi) => family_aware_toggle_expanded(groups, *gi),
+                TreeRow::Candidate(gi, ci) => family_aware_select(groups, *gi, *ci),
                 _ => {}
             },
             Key::Enter => {

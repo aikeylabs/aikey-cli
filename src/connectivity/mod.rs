@@ -554,12 +554,15 @@ mod connectivity_suite_tests {
     }
 
     #[test]
-    fn oauth_canonicalization_passes_unknown_through() {
-        // Third-party OAuth providers (kimi today; others in the future) use
-        // the same code in both slots, so no mapping needed.
+    fn oauth_canonicalization_kimi_resolves_to_kimi_code() {
+        // 2026-05-08 Kimi 双平台拆分: registry 把 'kimi' 挂在 kimi_code 的
+        // oauth_aliases 里 → canonical("kimi") = "kimi_code"。这是修评审反馈
+        // [中] 项的关键:让 OAuth binding write 与 proxy URL 路径 canonicalize
+        // 一致到同一字符串,GetProviderBinding 不再 miss。
         assert_eq!(
             crate::commands_account::oauth_provider_to_canonical("kimi"),
-            "kimi");
+            "kimi_code");
+        // Unknown providers still pass through unchanged (custom user codes).
         assert_eq!(
             crate::commands_account::oauth_provider_to_canonical("something-new"),
             "something-new");

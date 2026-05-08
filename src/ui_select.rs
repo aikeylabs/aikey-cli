@@ -614,12 +614,56 @@ fn fallback_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<ProviderTre
 #[derive(Clone)]
 pub(crate) enum TreeRow { Provider(usize), Candidate(usize, usize), Blank, Separator, Confirm, Cancel }
 
+/// V-layer family-aware: toggle 同 family 全部 group 的 expanded 一起翻转,
+/// 确保 picker 视觉合并时折叠/展开状态一致。Caller 是 Space 键 on Provider header。
+pub(crate) fn family_aware_toggle_expanded(groups: &mut Vec<ProviderGroup>, gi: usize) {
+    let target_fam = crate::provider_registry::family_of(&groups[gi].provider_code);
+    let new_state = !groups[gi].expanded;
+    for og in groups.iter_mut() {
+        if crate::provider_registry::family_of(&og.provider_code) == target_fam {
+            og.expanded = new_state;
+        }
+    }
+}
+
+/// V-layer family-aware: 选中 candidate 时清空同 family 其它 group 的 selection,
+/// picker 层 family-mutex 视觉一致 (DB 层互斥仍由 set_provider_binding transaction 兜底)。
+/// Caller 是 Space 键 on Candidate row。
+pub(crate) fn family_aware_select(groups: &mut Vec<ProviderGroup>, gi: usize, ci: usize) {
+    let target_fam = crate::provider_registry::family_of(&groups[gi].provider_code);
+    for (other_gi, og) in groups.iter_mut().enumerate() {
+        if other_gi != gi
+            && crate::provider_registry::family_of(&og.provider_code) == target_fam
+        {
+            og.selected = None;
+        }
+    }
+    groups[gi].selected = Some(ci);
+}
+
 pub(crate) fn build_tree_rows(groups: &[ProviderGroup]) -> Vec<TreeRow> {
+    // 2026-05-08 显示层 family-grouping (V-layer render-merge,详见 update/
+    // 20260508-display-family-grouping.md):同 family 的连续 group 共享一个 header,
+    // candidates 按 group 顺序展开在同一 header 下。
+    //
+    // 前提:caller 已按 family-then-code 排好序 (main.rs run_use_picker 里 sort
+    // by (family_of, code)),所以 family 边界与 group 顺序一致。
+    //
+    // M 层零改动:groups 仍是 N 个 ProviderGroup (每 provider_code 一个),candidates
+    // 也保留所属 group 索引;选中绑定时仍读 g.provider_code 写真值 (不是 family)。
     let mut rows = Vec::new();
+    let mut prev_family: Option<&'static str> = None;
     for (gi, g) in groups.iter().enumerate() {
-        if gi > 0 { rows.push(TreeRow::Blank); } // visual spacing between groups
-        rows.push(TreeRow::Provider(gi));
-        if g.expanded { for ci in 0..g.candidates.len() { rows.push(TreeRow::Candidate(gi, ci)); } }
+        let cur_family = crate::provider_registry::family_of(&g.provider_code);
+        let new_family = prev_family != Some(cur_family);
+        if new_family {
+            if !rows.is_empty() { rows.push(TreeRow::Blank); }
+            rows.push(TreeRow::Provider(gi));
+        }
+        if g.expanded {
+            for ci in 0..g.candidates.len() { rows.push(TreeRow::Candidate(gi, ci)); }
+        }
+        prev_family = Some(cur_family);
     }
     rows
 }
@@ -643,7 +687,11 @@ pub(crate) fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor
         TreeRow::Provider(gi) => {
             let g = &groups[*gi];
             let arrow = if g.expanded { "\u{25BC}" } else { "\u{25B6}" };
-            format!("{}{} \x1b[1m{}\x1b[0m", cursor_mark, arrow, g.provider_code)
+            // 2026-05-08 V-layer family-grouping: header 文字用 family 而不是 provider_code。
+            // 单 platform family family_of(code)==code, 行为不变 (e.g. anthropic / openai)。
+            // 多 platform family (kimi: kimi/kimi_code/moonshot 共享) 显示 "kimi"。
+            let display_name = crate::provider_registry::family_of(&g.provider_code);
+            format!("{}{} \x1b[1m{}\x1b[0m", cursor_mark, arrow, display_name)
         }
         TreeRow::Candidate(gi, ci) => {
             let g = &groups[*gi]; let c = &g.candidates[*ci];
@@ -750,9 +798,11 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
             Key::Up => { let mut n = cursor; loop { if n == 0 { break; } n -= 1; if is_focusable(&rows[n]) { cursor = n; break; } } }
             Key::Down => { let mut n = cursor; loop { if n + 1 >= total { break; } n += 1; if is_focusable(&rows[n]) { cursor = n; break; } } }
             Key::Space => {
+                // 2026-05-08 V-layer family-grouping: Space 键 family-aware,详见
+                // family_aware_toggle_expanded / family_aware_select 单测。
                 match &rows[cursor] {
-                    TreeRow::Provider(gi) => { groups[*gi].expanded = !groups[*gi].expanded; }
-                    TreeRow::Candidate(gi, ci) => { groups[*gi].selected = Some(*ci); }
+                    TreeRow::Provider(gi) => family_aware_toggle_expanded(groups, *gi),
+                    TreeRow::Candidate(gi, ci) => family_aware_select(groups, *gi, *ci),
                     _ => {}
                 }
             }
@@ -764,5 +814,162 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
             Key::Escape | Key::CtrlC => { write!(out, "\x1b[?25h")?; out.flush()?; return Ok(ProviderTreeResult::Cancelled); }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod family_grouping_tests {
+    use super::*;
+
+    // 2026-05-08 显示层 family-grouping (详见 update/20260508-display-family-grouping.md)
+    // 验证 V-layer render-merge 行为:
+    //   - 同 family 连续 group 共享 header
+    //   - 不同 family 独立 header
+    //   - Space 键 family-aware (同步展开 / 同步互斥选中)
+
+    fn group(provider_code: &str, candidate_count: usize, expanded: bool) -> ProviderGroup {
+        ProviderGroup {
+            provider_code: provider_code.to_string(),
+            candidates: (0..candidate_count).map(|i| KeyCandidate {
+                label: format!("k{}", i),
+                source_type: "personal".to_string(),
+                source_ref: format!("k{}", i),
+                display_type: None,
+            }).collect(),
+            selected: None,
+            expanded,
+        }
+    }
+
+    fn count_provider_headers(rows: &[TreeRow]) -> usize {
+        rows.iter().filter(|r| matches!(r, TreeRow::Provider(_))).count()
+    }
+
+    #[test]
+    fn build_tree_rows_single_platform_families_one_header_each() {
+        // anthropic / openai 各自单 platform → 各 1 header (与改前行为一致)
+        let groups = vec![
+            group("anthropic", 2, true),
+            group("openai", 1, true),
+        ];
+        let rows = build_tree_rows(&groups);
+        assert_eq!(count_provider_headers(&rows), 2);
+    }
+
+    #[test]
+    fn build_tree_rows_kimi_family_three_codes_emit_one_combined_header() {
+        // kimi family 三个 provider_code 必须共享 1 个 header
+        // (caller 已按 family-then-code 排序,所以同 family 相邻)
+        let groups = vec![
+            group("kimi", 1, true),       // family=kimi
+            group("kimi_code", 1, true),  // family=kimi
+            group("moonshot", 1, true),   // family=kimi
+        ];
+        let rows = build_tree_rows(&groups);
+        assert_eq!(count_provider_headers(&rows), 1,
+            "Kimi family 3 个 code 必须只 emit 1 个 header");
+    }
+
+    #[test]
+    fn build_tree_rows_kimi_family_candidates_all_under_one_header() {
+        // 三个 group 共 6 个 candidate 都应展开在同一 header 下
+        let groups = vec![
+            group("kimi", 2, true),       // 2 candidates
+            group("kimi_code", 1, true),  // 1 candidate
+            group("moonshot", 3, true),   // 3 candidates
+        ];
+        let rows = build_tree_rows(&groups);
+        let candidate_count = rows.iter().filter(|r| matches!(r, TreeRow::Candidate(_, _))).count();
+        assert_eq!(candidate_count, 6);
+    }
+
+    #[test]
+    fn build_tree_rows_mixed_families_each_family_has_own_header() {
+        // anthropic + kimi family + openai → 3 个 header
+        let groups = vec![
+            group("anthropic", 1, true),
+            group("kimi", 1, true),
+            group("kimi_code", 1, true),
+            group("moonshot", 1, true),
+            group("openai", 1, true),
+        ];
+        let rows = build_tree_rows(&groups);
+        assert_eq!(count_provider_headers(&rows), 3,
+            "anthropic / kimi family / openai → 各 1 header");
+    }
+
+    #[test]
+    fn build_tree_rows_collapsed_group_no_candidates_emitted() {
+        // collapsed group 不展开 candidates,但 header 仍显示
+        let groups = vec![
+            group("anthropic", 3, false),
+        ];
+        let rows = build_tree_rows(&groups);
+        assert_eq!(count_provider_headers(&rows), 1);
+        assert_eq!(rows.iter().filter(|r| matches!(r, TreeRow::Candidate(_, _))).count(), 0);
+    }
+
+    #[test]
+    fn family_aware_toggle_synchronizes_kimi_family_expansion() {
+        // toggle 任一 group 必须同步同 family 全部 group
+        let mut groups = vec![
+            group("anthropic", 1, true),  // 控制组,不应被影响
+            group("kimi", 1, true),
+            group("kimi_code", 1, true),
+            group("moonshot", 1, true),
+        ];
+        // 折叠 kimi family (toggle index 1 即 kimi group)
+        family_aware_toggle_expanded(&mut groups, 1);
+        assert_eq!(groups[0].expanded, true,  "anthropic 不受影响");
+        assert_eq!(groups[1].expanded, false, "kimi → collapsed");
+        assert_eq!(groups[2].expanded, false, "kimi_code → 同 family 跟随");
+        assert_eq!(groups[3].expanded, false, "moonshot → 同 family 跟随");
+        // 展开回去 (toggle index 2 即 kimi_code group, 应同样同步)
+        family_aware_toggle_expanded(&mut groups, 2);
+        assert_eq!(groups[1].expanded, true);
+        assert_eq!(groups[2].expanded, true);
+        assert_eq!(groups[3].expanded, true);
+    }
+
+    #[test]
+    fn family_aware_select_kimi_family_mutex_clears_other_selections() {
+        // 选中 kimi family 内一个 candidate 时,同 family 其它 group 的 selection 清空
+        let mut groups = vec![
+            group("anthropic", 1, true),
+            group("kimi_code", 1, true),
+            group("moonshot", 1, true),
+        ];
+        // 先选中 anthropic 和 moonshot
+        groups[0].selected = Some(0);
+        groups[2].selected = Some(0);
+        // 现在选中 kimi_code candidate
+        family_aware_select(&mut groups, 1, 0);
+        assert_eq!(groups[0].selected, Some(0), "anthropic 不受影响 (跨 family)");
+        assert_eq!(groups[1].selected, Some(0), "kimi_code 选中");
+        assert_eq!(groups[2].selected, None,    "moonshot 同 family 互斥被清");
+    }
+
+    #[test]
+    fn family_aware_select_does_not_clear_self_selection() {
+        // 选中本组的 candidate (不清空自己)
+        let mut groups = vec![
+            group("kimi_code", 2, true),
+        ];
+        family_aware_select(&mut groups, 0, 1);
+        assert_eq!(groups[0].selected, Some(1));
+    }
+
+    #[test]
+    fn family_aware_toggle_independent_families_unaffected() {
+        // 切 anthropic 不影响 kimi family
+        let mut groups = vec![
+            group("anthropic", 1, true),
+            group("kimi", 1, true),
+            group("moonshot", 1, true),
+        ];
+        family_aware_toggle_expanded(&mut groups, 0);
+        assert_eq!(groups[0].expanded, false, "anthropic 折叠");
+        assert_eq!(groups[1].expanded, true,  "kimi 不受影响");
+        assert_eq!(groups[2].expanded, true,  "moonshot 不受影响");
     }
 }

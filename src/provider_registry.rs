@@ -213,6 +213,28 @@ pub fn canonical(code: &str) -> &'static str {
     }
 }
 
+/// V-layer helper: provider_code → display family name.
+///
+/// Used by:
+///   - CLI `aikey use` picker rendering (group entries by family)
+///   - Backend `commands_internal::query::protocol_family_of` (vault list response)
+///
+/// Why a dedicated helper (vs. callers reading `lookup(code).map(|e| e.family)`):
+/// (1) callsites stay short and self-documenting; (2) unknown-code fallback path
+/// (custom user-entered providers not in registry) is centralized — falls back to
+/// `canonical(code)` so the unknown code displays as its own self-named family
+/// group, matching the pre-family-grouping behavior for unknowns.
+///
+/// Family is purely a V-layer concern (display label) — no struct stores it as a
+/// field; callers compute it on demand. The registry's `RegistryEntry.family` is
+/// the single source of truth.
+pub fn family_of(code: &str) -> &'static str {
+    match lookup(code) {
+        Some(e) => e.family,
+        None => canonical(code),
+    }
+}
+
 /// Leak-once cache for unknown-code passthrough in `canonical()`. Bounded
 /// by the distinct set of unknown codes the CLI ever sees in its lifetime
 /// (in practice: a handful of user-typed custom provider names).
@@ -354,5 +376,42 @@ mod tests {
         // anthropic should be first (YAML declaration order) — if someone
         // reorders the YAML, this pins the expectation.
         assert_eq!(list[0].code, "anthropic");
+    }
+
+    // ── family_of helper (V-layer) ───────────────────────────────────
+    // 2026-05-08 显示层 family-grouping (详见 update/20260508-display-family-grouping.md)
+    // 验证 V-layer 从 provider_code → display family 的映射,picker / vault list 渲染
+    // 时分组显示所依赖的核心。
+
+    #[test]
+    fn family_of_kimi_code_resolves_to_kimi_family() {
+        assert_eq!(family_of("kimi_code"), "kimi");
+    }
+
+    #[test]
+    fn family_of_moonshot_resolves_to_kimi_family() {
+        assert_eq!(family_of("moonshot"), "kimi");
+    }
+
+    #[test]
+    fn family_of_kimi_alias_resolves_to_kimi_family() {
+        // deprecated 'kimi' OAuth alias → kimi_code entry,family=kimi
+        assert_eq!(family_of("kimi"), "kimi");
+    }
+
+    #[test]
+    fn family_of_anthropic_resolves_to_self_when_no_explicit_family() {
+        // 单 platform family 默认 family == code
+        assert_eq!(family_of("anthropic"), "anthropic");
+        // 'claude' 是 anthropic 的 OAuth alias,family 同
+        assert_eq!(family_of("claude"), "anthropic");
+    }
+
+    #[test]
+    fn family_of_unknown_code_falls_back_to_canonical() {
+        // 用户自定义 provider_code 不在 registry → 回落到 canonical (= 输入小写),
+        // 表现为独立 family group(picker / vault list 显示与改前一致)。
+        let unknown = family_of("custom-vendor-xyz");
+        assert_eq!(unknown, "custom-vendor-xyz");
     }
 }

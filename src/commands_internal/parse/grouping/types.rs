@@ -134,13 +134,19 @@ pub enum InferenceSource {
 impl InferenceSource {
     #[allow(dead_code)] // Stage 4 才用
     pub fn weight(&self) -> f32 {
+        // 仅在 Tier 2 弱证据加权投票里使用(`enrich.rs::enrich_drafts` Tier 2 段)。
+        // Tier 1 strong evidence (E5 UrlHostPattern + E1 FingerprintConfirmed) 走硬规则
+        // 短路,不读这里的 weight。Why 这么分:决策 #3 priority `URL host > key prefix
+        // > keyword > family default` 是 declarative 优先级,不是连续光谱;weighted
+        // vote 在 Tier 1 层语义上不正确(强证据被弱关键词数学翻盘是设计错误,详见
+        // update/20260508-inference-weights-decision-3-realign.md)。
         match self {
-            InferenceSource::FingerprintConfirmed{..} => 1.0,
+            InferenceSource::FingerprintConfirmed{..} => 1.0,  // dead code 路径,Tier 1 直接接管
             InferenceSource::FingerprintLikely{..}    => 0.7,
             InferenceSource::InlineTitleKeyword{..}   => 0.9,
             InferenceSource::SectionHeadingKeyword{..} => 0.8,
             InferenceSource::ShellVarPattern{..}      => 0.85,
-            InferenceSource::UrlHostPattern{..}       => 0.6,
+            InferenceSource::UrlHostPattern{..}       => 0.6,  // dead code 路径,Tier 1 直接接管
             InferenceSource::InlineLabelKeyword{..}   => 0.75,
         }
     }

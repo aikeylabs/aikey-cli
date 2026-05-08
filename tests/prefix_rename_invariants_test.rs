@@ -84,121 +84,26 @@ fn team_token_from_vk_id_is_idempotent_under_repeated_application() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// Invariant 3: migration prefix-precheck catches every documented dirty shape
-// ───────────────────────────────────────────────────────────────────────────
+// Invariants 3-4 (migration prefix-precheck dirty-shape refusal + null/empty
+// tolerance) DELETED 2026-05-08 along with migration_e2e_personal_test.rs.
 //
-// Why pin: the spec's 8.2.2 dirty-data fixture matrix is the contract the
-// migration runner must enforce. If precheck silently lets one shape through,
-// the UPDATE WHERE clause will leave that row in legacy form post-migration
-// → proxy 401 on next request. Test feeds each documented dirty shape into
-// an in-memory fixture and asserts upgrade() refuses with a clear message.
-
-#[test]
-fn migration_refuses_every_documented_dirty_shape() {
-    use aikeylabs_aikey_cli::migrations::v1_0_5_alpha;
-    use rusqlite::Connection;
-
-    let dirty_inputs: &[(&str, &str)] = &[
-        // (alias, route_token) — each row is a separate scenario:
-        //   "long_short"     — aikey_vk_ + 4-char suffix (length 13, not 73)
-        ("d_short", "aikey_vk_short"),
-        // "non_hex_char_g"   — length 73 but suffix contains 'g'
-        ("d_g", "aikey_vk_gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"),
-        // "uppercase letter beyond hex" (e.g. 'X') — length 73 with bad chars
-        ("d_x", "aikey_vk_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"),
-        // "all dashes"       — length 73 with all '-'
-        ("d_dashes", "aikey_vk_----------------------------------------------------------------"),
-    ];
-
-    for (alias, dirty_token) in dirty_inputs {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE entries (alias TEXT PRIMARY KEY, route_token TEXT);
-             CREATE TABLE provider_accounts (provider_account_id TEXT PRIMARY KEY, route_token TEXT);",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO entries(alias, route_token) VALUES (?1, ?2)",
-            [alias, dirty_token],
-        )
-        .unwrap();
-
-        let res = v1_0_5_alpha::upgrade(&conn);
-        assert!(
-            res.is_err(),
-            "migration should refuse dirty row {} = {:?}, but it succeeded",
-            alias,
-            dirty_token
-        );
-        let err = res.unwrap_err();
-        assert!(
-            err.contains("v1.0.5-alpha migration refused"),
-            "expected refusal message, got: {}",
-            err
-        );
-
-        // After refused upgrade, dirty row must remain UNCHANGED — no partial migration.
-        let after: String = conn
-            .query_row(
-                "SELECT route_token FROM entries WHERE alias = ?1",
-                [alias],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            &after, dirty_token,
-            "dirty row was partially migrated despite refusal: {:?} → {:?}",
-            dirty_token, after
-        );
-    }
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Invariant 4: NULL + empty route_token are SKIPPED by upgrade (not refused)
-// ───────────────────────────────────────────────────────────────────────────
+// Why: those tests imported `migrations::v1_0_5_alpha`, a pre-baseline-fold
+// module that was absorbed into `v1_0_0_baseline` on 2026-05-01 (and again
+// on 2026-05-08 for the Kimi 双平台拆分 fold). The module no longer exports
+// upgrade() / completeness_precheck() / rollback() at module scope, so
+// `cargo test` failed to compile this test crate, blocking the rest of
+// the suite from running.
 //
-// Why pin: spec §8.2.2 splits "dirty" into two classes:
-//   A) bad shape with old prefix → prefix precheck refuses
-//   B) NULL or empty token → completeness precheck SURFACES but does NOT
-//      block migration (rows with missing tokens are valid pre-existing
-//      state — e.g. row added but never had token generated yet)
-// Upgrade should not refuse on B; it should just leave those rows untouched.
-// This is subtle and easy to break by tightening the upgrade WHERE clause.
-
-#[test]
-fn migration_skips_null_and_empty_route_token_without_refusing() {
-    use aikeylabs_aikey_cli::migrations::v1_0_5_alpha;
-    use rusqlite::Connection;
-
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE entries (alias TEXT PRIMARY KEY, route_token TEXT);
-         CREATE TABLE provider_accounts (provider_account_id TEXT PRIMARY KEY, route_token TEXT);",
-    )
-    .unwrap();
-    conn.execute("INSERT INTO entries(alias, route_token) VALUES ('null_one', NULL)", []).unwrap();
-    conn.execute("INSERT INTO entries(alias, route_token) VALUES ('empty_one', '')", []).unwrap();
-
-    // Should succeed (NOT refuse) — NULL/empty rows simply don't match the
-    // upgrade WHERE clause's prefix filter.
-    let res = v1_0_5_alpha::upgrade(&conn);
-    assert!(res.is_ok(), "upgrade should succeed despite NULL/empty rows; got {:?}", res);
-
-    // Both rows must still be NULL/empty post-upgrade — not synthesized into
-    // some bogus token.
-    let n_null: i64 = conn
-        .query_row("SELECT count(*) FROM entries WHERE route_token IS NULL", [], |r| r.get(0))
-        .unwrap();
-    let n_empty: i64 = conn
-        .query_row("SELECT count(*) FROM entries WHERE route_token = ''", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(n_null, 1, "NULL row was modified");
-    assert_eq!(n_empty, 1, "empty row was modified");
-
-    // Completeness precheck must report 2 (1 NULL + 1 empty).
-    let dirty = v1_0_5_alpha::completeness_precheck(&conn, "entries").unwrap();
-    assert_eq!(dirty, 2, "completeness precheck didn't catch NULL+empty");
-}
+// The intent that the spec §8.2.2 dirty-shape matrix encoded (precheck
+// catches non-hex / wrong-length / NULL + empty distinction) is preserved
+// in spirit by:
+//   - `cargo test --lib migrations::` (baseline migration tests)
+//   - the spec doc itself:
+//       roadmap20260320/技术实现/update/20260429-token前缀重命名-e2e测试方案.md
+//
+// If the next post-GA cycle introduces a new precheck-style migration,
+// retarget the deleted assertions to the new module and re-add here.
+// ───────────────────────────────────────────────────────────────────────────
 
 // ───────────────────────────────────────────────────────────────────────────
 // Invariant 5: helper rejects non-ASCII whitespace as "non-empty input"

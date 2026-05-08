@@ -1842,17 +1842,31 @@ pub fn handle_key_sync(
 /// was emitting `/kimi/v1` (working). The single match table prevents future drift.
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderInfo {
-    /// Data-model canonical code for vault queries and provider bindings.
-    /// Aliases like "claude" normalize to "anthropic"; "moonshot" shares "kimi".
+    /// Real canonical provider code for vault queries / activation / binding /
+    /// proxy routing. Aliases like "claude" → "anthropic"; "moonshot" stays
+    /// "moonshot" (NOT folded to family "kimi").
+    ///
+    /// 2026-05-08 Kimi 双平台拆分 evaluation feedback: 历史上此字段曾返回
+    /// `entry.family`,导致 moonshot/kimi_code 在 resolve_single_provider 被
+    /// 折叠回 "kimi",环境变量 / base_url / binding 都走错路径。修后回归
+    /// "真正的 provider_code" 语义,UI 分组通过新 `family` 字段处理。
     pub canonical_code: &'static str,
+    /// Protocol family for UI grouping / vault-query "show all of one brand"
+    /// scenarios. kimi_code 和 moonshot 的 family 都是 "kimi",上层 UI 想
+    /// 把它们分到同一卡片下时按 family 聚合;具体路由仍然按 canonical_code。
+    pub family: &'static str,
     /// URL path segment registered in the proxy. Must include `/v1` suffix
     /// for providers whose upstream has no `/v1` prefix AND whose SDK doesn't
     /// auto-prepend /v1 (kimi/moonshot use OpenAI-compatible SDKs that treat
     /// base_url as "already has /v1").
     pub proxy_path: &'static str,
     /// Provider-specific env var names written by `aikey use`/`aikey activate`.
-    /// Kept distinct per brand even when canonical_code collides (e.g. moonshot
-    /// has MOONSHOT_API_KEY independent from kimi's KIMI_API_KEY).
+    ///
+    /// 2026-05-08 Kimi family 互斥后(详见 update/20260508-Kimi-family互斥-active-env
+    /// 统一KIMI写入.md 决策 #8): kimi_code / moonshot / kimi(deprecated) 三个 family
+    /// 内 provider_code 都共用 KIMI_API_KEY / KIMI_BASE_URL,family 互斥保证同时只
+    /// 1 个 active binding,激活哪个由 proxy_path 决定上游路由。其它 family 仍
+    /// 各自一对 env var(ANTHROPIC_*, OPENAI_* 等),互不干扰。
     pub env_vars: (&'static str, &'static str),
 }
 
@@ -1865,11 +1879,11 @@ pub struct ProviderInfo {
 pub fn provider_info(code: &str) -> Option<ProviderInfo> {
     let entry = crate::provider_registry::lookup(code)?;
     Some(ProviderInfo {
-        // `canonical_code` historically meant "protocol family" — the code
-        // that multiple brand-distinct entries (kimi + moonshot) share at
-        // the vault-query grouping level. The registry's `family` field
-        // captures exactly this; default-to-self for entries without one.
-        canonical_code: entry.family,
+        // 2026-05-08 review feedback: 必须是 entry.code (真正 canonical code),
+        // 不是 entry.family —— 否则 moonshot 激活时会被折叠回 kimi,后续
+        // env / base_url / binding 全走错路径。Family 通过新 `family` 字段提供。
+        canonical_code: entry.code,
+        family: entry.family,
         proxy_path: entry.proxy_path,
         env_vars: entry.env_vars,
     })
@@ -2378,10 +2392,12 @@ pub fn apply_rename_core(
 /// enforced structurally via the PRIMARY KEY constraint (UPSERT replaces
 /// the prior in-family active automatically).
 ///
-/// Moonshot/Kimi are intentionally left distinct here — they have
-/// different env var tuples (MOONSHOT_API_KEY vs KIMI_API_KEY) and
-/// different proxy paths, so their routes don't collide and
-/// `oauth_provider_to_canonical` correctly passes both through unchanged.
+/// 2026-05-08 Kimi family 互斥(详见 update/20260508-Kimi-family互斥-active-env
+/// 统一KIMI写入.md 决策 #2):family 内 kimi_code / moonshot / kimi(deprecated)
+/// 三者 binding 互斥(同时只 1 个 active);env var 全部统一 KIMI_*,proxy_path
+/// 区分上游路由(kimi_code 与 deprecated kimi 走 /kimi/v1,moonshot 走 /moonshot/v1)。
+/// 互斥逻辑下沉到 set_provider_binding 内事务包裹,所有 lifecycle event(Switched/
+/// Added/team-sync/reconcile)统一遵守。
 pub(crate) fn write_bindings_canonical(
     providers: &[String],
     key_type_str: &str,
@@ -2964,14 +2980,19 @@ mod provider_mapping_tests {
     }
 
     #[test]
-    fn env_vars_kimi_and_moonshot_are_distinct() {
-        // IMPORTANT: kimi and moonshot have SEPARATE env var pairs here, even though
-        // main.rs::canonical_provider remaps moonshot→kimi for URL routing.
-        // A future dedup must preserve this asymmetry or explicitly change the contract.
+    fn env_vars_kimi_family_unified_to_kimi_envs() {
+        // 2026-05-08 Kimi family 互斥落地: kimi_code / moonshot / kimi(deprecated)
+        // 三个 provider_code 都共用 KIMI_API_KEY / KIMI_BASE_URL env var (因 Kimi
+        // CLI 上游只读 KIMI_*,实证三层证据见 update/20260508-Kimi-family互斥-active-env
+        // 统一KIMI写入.md)。区分 platform 由 proxy_path 决定 (moonshot 走 /moonshot/v1,
+        // 其它走 /kimi/v1),不再由 env var 名区分。
+        // pre-fix 时 moonshot 写 MOONSHOT_API_KEY,但实证无消费方,直接停写。
         assert_eq!(provider_env_vars("kimi"),
             Some(("KIMI_API_KEY", "KIMI_BASE_URL")));
+        assert_eq!(provider_env_vars("kimi_code"),
+            Some(("KIMI_API_KEY", "KIMI_BASE_URL")));
         assert_eq!(provider_env_vars("moonshot"),
-            Some(("MOONSHOT_API_KEY", "MOONSHOT_BASE_URL")));
+            Some(("KIMI_API_KEY", "KIMI_BASE_URL")));
     }
 
     #[test]
@@ -3094,21 +3115,64 @@ mod provider_mapping_tests {
         // google/gemini
         assert_eq!(provider_info("google").unwrap().canonical_code,
                    provider_info("gemini").unwrap().canonical_code);
-        // kimi/moonshot (moonshot canonicalizes to kimi)
-        assert_eq!(provider_info("kimi").unwrap().canonical_code,
-                   provider_info("moonshot").unwrap().canonical_code);
+        // 2026-05-08 Kimi 双平台拆分 review feedback:
+        //   - kimi (deprecated alias) canonicalizes → kimi_code (registry alias)
+        //   - moonshot is its own canonical (NOT folded to kimi anymore)
+        // 共享的是 family ("kimi"),不是 canonical_code。
+        assert_eq!(provider_info("kimi").unwrap().canonical_code, "kimi_code");
+        assert_eq!(provider_info("moonshot").unwrap().canonical_code, "moonshot");
+        assert_ne!(provider_info("kimi").unwrap().canonical_code,
+                   provider_info("moonshot").unwrap().canonical_code,
+                   "kimi_code 与 moonshot 是两个独立 provider_code,不能折叠");
+        // family-level: 两者都属 'kimi' family
+        assert_eq!(provider_info("kimi").unwrap().family,
+                   provider_info("moonshot").unwrap().family);
+        assert_eq!(provider_info("kimi_code").unwrap().family, "kimi");
+    }
+
+    /// 2026-05-08 review feedback [高] #1 防退化:resolve_single_provider 必须
+    /// 返回真正 provider_code (kimi_code / moonshot),不能折叠回 family ("kimi")。
+    /// 否则 aikey activate moonshot 会用错 env vars / base_url / binding。
+    #[test]
+    fn provider_info_canonical_code_is_real_code_not_family() {
+        use super::provider_info;
+        // moonshot 必须保持 moonshot,不被折叠
+        assert_eq!(provider_info("moonshot").unwrap().canonical_code, "moonshot");
+        // kimi_code 自身就是 canonical
+        assert_eq!(provider_info("kimi_code").unwrap().canonical_code, "kimi_code");
+        // 'kimi' 字面值 (deprecated alias) → 经 registry alias 解析 → kimi_code
+        assert_eq!(provider_info("kimi").unwrap().canonical_code, "kimi_code");
     }
 
     #[test]
-    fn provider_extra_env_vars_kimi_has_model_name_and_context_size() {
+    fn provider_extra_env_vars_kimi_family_per_platform_model() {
         // Minimal-scaffold Kimi requires KIMI_MODEL_NAME so Kimi's empty-model
-        // fallback can populate the model. Max context size is a convenience
-        // default matching kimi-k2.5 / moonshot-v1-128k (both 131072).
-        let kimi = provider_extra_env_vars("kimi");
-        assert!(kimi.iter().any(|(k, _)| *k == "KIMI_MODEL_NAME"));
-        assert!(kimi.iter().any(|(k, _)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE"));
-        // Alias moonshot must return same extras.
-        assert_eq!(kimi, provider_extra_env_vars("moonshot"));
+        // fallback can populate the model.
+        //
+        // 2026-05-08 Kimi family 互斥 + per-platform model(详见 update/20260508-
+        // Kimi-family互斥-active-env统一KIMI写入.md 决策 #9):
+        // 三个 family 内 provider_code 各自的 KIMI_MODEL_NAME / MAX_CONTEXT_SIZE 不同
+        // (避免上游 reject + 客户端预估错):
+        //   kimi_code → kimi-k2.5 / 131072(api.kimi.com 自家 model,128K context)
+        //   moonshot  → moonshot-v1-8k / 8192(模型名编码 context 上限,默认配最便宜)
+        //   kimi(deprecated)→ 与 kimi_code 一致(经 oauth_alias 解析)
+        let kimi_code = provider_extra_env_vars("kimi_code");
+        assert!(kimi_code.iter().any(|(k, v)| *k == "KIMI_MODEL_NAME" && *v == "kimi-k2.5"));
+        assert!(kimi_code.iter().any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "131072"));
+
+        let moonshot = provider_extra_env_vars("moonshot");
+        assert!(moonshot.iter().any(|(k, v)| *k == "KIMI_MODEL_NAME" && *v == "moonshot-v1-8k"));
+        // Moonshot 模型族名字直接编码 context 上限: moonshot-v1-8k=8192, -32k=32768,
+        // -128k=131072。default 配 8k 模型必须配 8192 context, 否则 kimi-cli 端会做错截断预估。
+        assert!(moonshot.iter().any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "8192"));
+
+        // deprecated 'kimi' alias 解析到 kimi_code,继承 kimi-k2.5 / 131072
+        let kimi_alias = provider_extra_env_vars("kimi");
+        assert_eq!(kimi_alias, kimi_code);
+
+        // 关键不变量:moonshot 的 model 不应该是 kimi-k2.5(pre-fix bug)
+        assert_ne!(moonshot, kimi_code,
+            "moonshot extras must use moonshot-v1-8k, not kimi-k2.5 (would be rejected by api.moonshot.cn)");
     }
 
     #[test]
@@ -3348,13 +3412,14 @@ mod core_tests {
     }
 
     #[test]
-    fn normalize_providers_leaves_moonshot_distinct_from_kimi() {
-        // oauth_provider_to_canonical deliberately does NOT map moonshot → kimi
-        // (their env vars and proxy paths differ even though canonical_code
-        // in provider_info says they're the same family).
+    fn normalize_providers_leaves_moonshot_distinct_from_kimi_code() {
+        // 2026-05-08 Kimi 双平台拆分: 'kimi' 字符串被作为 oauth_aliases 挂在
+        // kimi_code 上,canonical("kimi") = "kimi_code"。Moonshot 与 kimi_code
+        // 仍是两个独立 provider_code,各自 env vars / proxy paths 不同。
+        // pre-split 测试期望 ["moonshot", "kimi"]; 后:["moonshot", "kimi_code"]。
         assert_eq!(
             normalize_providers(&["moonshot".to_string(), "kimi".to_string()]),
-            vec!["moonshot".to_string(), "kimi".to_string()],
+            vec!["moonshot".to_string(), "kimi_code".to_string()],
         );
     }
 
@@ -3558,13 +3623,37 @@ mod core_tests {
     }
 
     #[test]
-    fn write_bindings_canonical_leaves_moonshot_kimi_distinct() {
+    fn write_bindings_canonical_kimi_family_mutex_last_write_wins() {
+        // 2026-05-08 Kimi family 互斥(详见 update/20260508-Kimi-family互斥-active-env
+        // 统一KIMI写入.md 决策 #2):同 profile 内 kimi_code / moonshot / kimi(legacy)
+        // 互斥,同时只 1 个 active binding。set_provider_binding 在事务内做 mutex,
+        // 写新 family 成员之前 DELETE 其它 family 成员。
+        //
+        // pre-mutex 测试期望两个 binding 共存 → 实际不再可能。改测试为断言:
+        //   ① mutex 生效:最后写入的 family 成员独占
+        //   ② 输入 "kimi" 经 oauth_alias 解析到 canonical "kimi_code"
+        //   ③ deprecated 'kimi' 字面值不落库
+        //   ④ 跨 family 不受影响(anthropic 不被 mutex 触动)
         let (_dir, _lock) = setup_vault();
+        // 先写 anthropic 作为 cross-family 不受影响的对照
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "k-claude").unwrap();
+        // 然后顺序写入 kimi family 两个成员
         write_bindings_canonical(&["moonshot".to_string()], "personal", "k-moonshot").unwrap();
         write_bindings_canonical(&["kimi".to_string()], "personal", "k-kimi").unwrap();
+
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
-        assert!(bindings.iter().any(|b| b.provider_code == "moonshot"));
-        assert!(bindings.iter().any(|b| b.provider_code == "kimi"));
+        // ① + ② 最后写入的 'kimi' 经 alias → kimi_code,独占 family
+        assert!(bindings.iter().any(|b| b.provider_code == "kimi_code"),
+            "expected kimi_code (canonical of 'kimi' alias) as final family active");
+        // mutex 应该已经删除 moonshot binding
+        assert!(!bindings.iter().any(|b| b.provider_code == "moonshot"),
+            "moonshot should be deactivated by family mutex when 'kimi' (→ kimi_code) was written after");
+        // ③ deprecated 'kimi' 字面值不落库
+        assert!(!bindings.iter().any(|b| b.provider_code == "kimi"),
+            "post-split 'kimi' should be canonicalized to 'kimi_code' on write");
+        // ④ cross-family 不受 mutex 影响
+        assert!(bindings.iter().any(|b| b.provider_code == "anthropic"),
+            "anthropic binding must survive Kimi family mutex");
     }
 
     #[test]

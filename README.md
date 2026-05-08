@@ -134,9 +134,10 @@ OAuth tokens are managed by [aikey-auth-broker](../aikey-auth-broker/README.md) 
 
 ```bash
 # Login to a provider (opens browser for OAuth authorization)
-aikey auth login claude    # Claude Pro/Max — paste code from callback page
-aikey auth login codex     # ChatGPT Plus/Pro — auto callback
-aikey auth login kimi      # Kimi Code — enter device code in browser
+aikey auth login claude        # Claude Pro/Max — paste code from callback page
+aikey auth login codex         # ChatGPT Plus/Pro — auto callback
+aikey auth login kimi_code     # Kimi Code (api.kimi.com) — device code in browser
+                               # ('kimi' still works as a deprecated alias)
 
 # List OAuth accounts
 aikey auth list
@@ -157,7 +158,11 @@ Supported providers:
 |----------|------|---------------|-------------|
 | Claude (Anthropic) | Setup Token (manual paste) | 1 year | Pro/Max required |
 | Codex (ChatGPT) | Auth Code (auto callback) | 10 days | Plus/Pro (free works too) |
-| Kimi (Moonshot) | Device Code (polling) | 15 minutes | Coding Plan |
+| Kimi Code (`kimi_code`) | Device Code (polling) | 15 minutes | Kimi Coding Plan |
+
+> **Note**: Moonshot AI (`moonshot` provider, api.moonshot.cn) does not support OAuth — use `aikey add` with an API key.
+> The two Kimi-family platforms are split as of v1.0.0-rc.2: `kimi(kimi-code)` for [api.kimi.com](https://api.kimi.com)
+> (subscription / OAuth) and `kimi(moonshot)` for [api.moonshot.cn](https://api.moonshot.cn) (API key only).
 
 OAuth and API Key are mutually exclusive per provider — `aikey auth use` replaces `aikey use` for the same provider, and vice versa.
 

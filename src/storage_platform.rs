@@ -917,15 +917,58 @@ pub fn get_provider_binding(
     }
 }
 
+/// Kimi family provider_code 集合 — 互斥单元。
+///
+/// 2026-05-08 Kimi family 互斥落地(详见 roadmap20260320/技术实现/update/
+/// 20260508-Kimi-family互斥-active-env统一KIMI写入.md 决策 #1 + #2):
+/// 同 profile 内最多 1 个 active primary binding,任一激活会 deactivate 其它两个。
+///
+/// **包含 deprecated 'kimi'**: rc.1 时期写入的 binding row 仍可能 provider_code='kimi'
+/// (no migration),互斥识别必须包含此字面量;否则老 binding 与新 kimi_code/moonshot
+/// 同时活时,active.env 的 KIMI_* 写入会出现覆盖竞态。
+///
+/// **不用 registry-driven**: deprecated 'kimi' 已不在 provider_registry.yaml 顶级
+/// entries(仅作 oauth_alias on kimi_code),按 family 读 registry 会漏。硬编码三元素
+/// 数组虽然散弹,但稳定可读,family 成员变动需要显式审视(不会无意中漂移)。
+///
+/// `pub(crate)` 暴露给同 crate 内 profile_activation::auto_assign_primaries_for_key
+/// (fill-empty-only 检查)和 profile_activation::regenerate_active_env(corrupt state
+/// pre-scan)使用,避免散弹复制粘贴。
+pub(crate) const KIMI_FAMILY_CODES: &[&str] = &["kimi_code", "moonshot", "kimi"];
+
 /// Sets (upserts) a provider binding in a profile.
+///
+/// 2026-05-08 Kimi family 互斥强制点(详见上面 KIMI_FAMILY_CODES doc):
+/// 写入 Kimi family 任一 provider_code 之前,先在同事务里 DELETE 同 family 其它
+/// 成员的 binding。这样所有 lifecycle event(Switched/Added/team-sync/reconcile)
+/// 自动遵守"同 profile 内 Kimi family 最多 1 个 primary"的数据库不变量,**不需
+/// 要在每个调用方分别加互斥检查**。
+///
+/// 注意:此函数仅保证"如果写,则同 family 仅一个"。**caller 是否应该写**(例如
+/// Added 路径的 fill-empty-only 语义)由调用方判断;此函数不做 fill-empty 决策。
 pub fn set_provider_binding(
     profile_id: &str,
     provider_code: &str,
     key_source_type: &str,
     key_source_ref: &str,
 ) -> Result<(), String> {
-    let conn = open_connection()?;
-    conn.execute(
+    let mut conn = open_connection()?;
+    let tx = conn.transaction().map_err(|e| format!("begin tx: {}", e))?;
+
+    // family 互斥: 写入 Kimi family code 时,先 deactivate 同 family 其它成员
+    if KIMI_FAMILY_CODES.contains(&provider_code) {
+        for other in KIMI_FAMILY_CODES.iter().filter(|c| **c != provider_code) {
+            tx.execute(
+                "DELETE FROM user_profile_provider_bindings
+                  WHERE profile_id = ?1 AND provider_code = ?2",
+                params![profile_id, other],
+            )
+            .map_err(|e| format!("family mutex deactivate {}: {}", other, e))?;
+        }
+    }
+
+    // UPSERT 主体写入
+    tx.execute(
         "INSERT INTO user_profile_provider_bindings
             (profile_id, provider_code, key_source_type, key_source_ref, updated_at)
          VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))
@@ -936,6 +979,8 @@ pub fn set_provider_binding(
         params![profile_id, provider_code, key_source_type, key_source_ref],
     )
     .map_err(|e| format!("Failed to set provider binding: {}", e))?;
+
+    tx.commit().map_err(|e| format!("commit binding tx: {}", e))?;
     Ok(())
 }
 

@@ -253,6 +253,12 @@ pub fn provider_family_of(id: &str) -> Option<&'static str> {
         "generic_jwt" => Some("generic_jwt"),
         "pem_block" => Some("pem_block"),
         "zhipu_glm" => Some("zhipu"),
+        // 2026-05-08 Kimi 双平台拆分: kimi_code 是 confirmed-tier id,family 也叫
+        // 'kimi_code' (而非笼统的 'kimi') —— enrich 阶段把 sk-kimi-* 的 E1
+        // fingerprint 证据按 'kimi_code' 评分;若改为 'kimi' family 会与
+        // generic_sk URL host 推断 ('moonshot') 在同一个 family bucket 里互相
+        // 冲销得分。
+        "kimi_code" => Some("kimi_code"),
         // ambiguous / warn 档不参与 family 归属 (evidence 不采纳)
         _ => None,
     }
@@ -281,8 +287,12 @@ pub fn text_keyword_family_and_keyword(text: &str) -> Option<(String, String)> {
         ("google ai",     "google_gemini"),
         // v4.1 family rename: kimi/moonshot → "kimi" (与 connectivity/runtime PROVIDER_DEFAULTS 字典对齐;
         // 旧 family 名 "moonshot_kimi" 与 CLI 其他地方一律叫 "kimi" 不一致,UI Provider 字段直接消费此值)
-        ("moonshot",      "kimi"),
-        ("kimi",          "kimi"),
+        // 2026-05-08 Kimi 双平台拆分: provider_code 'kimi' 拆为 'moonshot' + 'kimi_code'。
+        //   - keyword "moonshot" → moonshot (精确品牌)
+        //   - keyword "kimi" 单字 → moonshot (用户决策 #4: 两个平台都叫 Kimi,默认归 moonshot;
+        //     URL 强证据 api.kimi.com / www.kimi.com 走 url_host_family_and_pattern 下钻 kimi_code)
+        ("moonshot",      "moonshot"),
+        ("kimi",          "moonshot"),
         ("groq",          "groq"),
         ("deepseek",      "deepseek"),
         ("mistral",       "mistral"),
@@ -326,8 +336,22 @@ pub fn shell_var_family_and_pattern(var_name: &str) -> Option<(String, String)> 
         ("OPENROUTER", "openrouter",    "OPENROUTER_*"),
         ("GEMINI",     "google_gemini", "GEMINI_*"),
         ("GOOGLE_AI",  "google_gemini", "GOOGLE_AI_*"),
-        ("MOONSHOT",   "kimi",          "MOONSHOT_*"),
-        ("KIMI",       "kimi",          "KIMI_*"),
+        // 2026-05-08 Kimi 双平台拆分: MOONSHOT_* / KIMI_* 都映射到 moonshot。
+        //
+        // 这不只是"按 #4 默认"——而是当前调用链路里**唯一逻辑自洽**的答案。论证:
+        //   1. 决策 #3 已确认所有 Kimi Code 的 KEY 都以稳定的 'sk-kimi-' 前缀开头。
+        //   2. providers 列表里 'kimi_code' (confirmed tier) 排在 'generic_sk' (ambiguous)
+        //      之前,first-match-wins 保证 sk-kimi-* 的 key 在 regex 直接命中阶段就拿到
+        //      id=kimi_code,**不会走到 env var 推断 (E4 ShellVarPattern) 这一层**。
+        //   3. 反推:本函数被调用时,key 一定不是 sk-kimi-* 形态,即一定不是 Kimi Code。
+        //   4. KIMI_*/MOONSHOT_* env var 又把 key 锁定在 Kimi family 内 → 唯一可能是 Moonshot。
+        //
+        // 维护警告:future 若想把 'KIMI' 改回归 'kimi'(family) 或 'kimi_code',必须先验
+        // 证 #1-#2 前提是否仍成立(Kimi Code 是否还坚持稳定前缀 / kimi_code 规则是否
+        // 还在 generic_sk 之前)。否则会引入"KIMI_API_KEY=非kimi-code形态 → 误判 kimi_code"
+        // 的回归 bug。decision #4 的命名歧义解释见 text_keyword_family_and_keyword。
+        ("MOONSHOT",   "moonshot",      "MOONSHOT_*"),
+        ("KIMI",       "moonshot",      "KIMI_*"),
         ("GROQ",       "groq",          "GROQ_*"),
         ("DEEPSEEK",   "deepseek",      "DEEPSEEK_*"),
         ("MISTRAL",    "mistral",       "MISTRAL_*"),
@@ -367,8 +391,12 @@ pub fn url_host_family_and_pattern(url: &str) -> Option<(String, String)> {
         ("openrouter.ai",        "openrouter"),
         ("generativelanguage.googleapis.com", "google_gemini"),
         ("aistudio.google.com",  "google_gemini"),
-        ("moonshot.cn",          "kimi"),
-        ("moonshot.ai",          "kimi"),
+        // 2026-05-08 Kimi 双平台拆分: URL host 强证据下钻到具体 provider_code
+        //   - moonshot.cn / moonshot.ai → moonshot
+        //   - kimi.com (api.kimi.com / www.kimi.com) → kimi_code (Kimi Code 平台)
+        ("moonshot.cn",          "moonshot"),
+        ("moonshot.ai",          "moonshot"),
+        ("kimi.com",             "kimi_code"),
         ("groq.com",             "groq"),
         ("deepseek.com",         "deepseek"),
         ("mistral.ai",           "mistral"),
@@ -473,5 +501,63 @@ mod tests {
         let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC\n-----END OPENSSH PRIVATE KEY-----";
         let e = c.classify(pem).expect("pem");
         assert_eq!(e.id, "pem_block");
+    }
+
+    // ── 2026-05-08 Kimi 双平台拆分回归断言 ────────────────────────────────────
+
+    /// sk-kimi-* 前缀必须命中 confirmed-tier `kimi_code` (排在 `generic_sk` 之前)。
+    /// 防退化:若 YAML 顺序被改回 generic_sk 在前,sk-kimi-* 会落 ambiguous,
+    /// E2E case 1 + import flow 受影响。
+    #[test]
+    fn classify_sk_kimi_prefix_to_kimi_code_confirmed() {
+        let c = instance();
+        let tok = "sk-kimi-FakeKey_abcdefg1234567890sampleTokenZZZZZZZZ";
+        let e = c.classify(tok).expect("sk-kimi-*");
+        assert_eq!(e.id, "kimi_code");
+        assert_eq!(e.tier, Tier::Confirmed);
+    }
+
+    /// `provider_family_of("kimi_code")` 必须返回 `Some("kimi_code")`,否则
+    /// E1 fingerprint 证据(评审反馈 [高] #2)在 enrich 时会被丢弃,
+    /// 用户粘 sk-kimi-* 不带 URL 时无法推断 kimi_code。
+    #[test]
+    fn provider_family_of_kimi_code_resolves() {
+        assert_eq!(provider_family_of("kimi_code"), Some("kimi_code"));
+        // 防退化:不能改回笼统的 'kimi' family,会与 generic_sk URL host
+        // 推断 ('moonshot') 在同一 family bucket 内互相冲销
+        assert_ne!(provider_family_of("kimi_code"), Some("kimi"));
+    }
+
+    /// keyword "kimi" 单字 (无 URL / 无前缀) 默认归 'moonshot' (决策 #4)。
+    /// keyword "moonshot" 显式归 'moonshot'。
+    #[test]
+    fn keyword_to_family_kimi_defaults_moonshot_per_decision_4() {
+        let (fam, _) = text_keyword_family_and_keyword("kimi 备份号").expect("kimi keyword");
+        assert_eq!(fam, "moonshot");
+        let (fam, _) = text_keyword_family_and_keyword("moonshot dev").expect("moonshot keyword");
+        assert_eq!(fam, "moonshot");
+    }
+
+    /// URL host `api.kimi.com` / `www.kimi.com` 强证据下钻到 `kimi_code`,
+    /// `moonshot.cn` / `moonshot.ai` 下钻到 `moonshot`。
+    #[test]
+    fn url_host_kimi_com_routes_to_kimi_code() {
+        let (fam, _) = url_host_family_and_pattern("https://api.kimi.com/coding/v1").expect("kimi url");
+        assert_eq!(fam, "kimi_code");
+        let (fam, _) = url_host_family_and_pattern("https://www.kimi.com/code/console").expect("kimi.com url");
+        assert_eq!(fam, "kimi_code");
+        let (fam, _) = url_host_family_and_pattern("https://platform.moonshot.cn/console").expect("moonshot url");
+        assert_eq!(fam, "moonshot");
+    }
+
+    /// shell var KIMI_*/MOONSHOT_* 都默认归 'moonshot' —— 论证见
+    /// shell_var_family_and_pattern 注释 (env var 推断这一层不可能遇到
+    /// kimi_code 的 key,因为 sk-kimi-* 已被 confirmed regex 捕获)。
+    #[test]
+    fn shell_var_kimi_and_moonshot_default_to_moonshot() {
+        let (fam, _) = shell_var_family_and_pattern("KIMI_API_KEY").expect("KIMI shell var");
+        assert_eq!(fam, "moonshot");
+        let (fam, _) = shell_var_family_and_pattern("MOONSHOT_BASE_URL").expect("MOONSHOT shell var");
+        assert_eq!(fam, "moonshot");
     }
 }

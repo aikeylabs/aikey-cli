@@ -17,11 +17,17 @@ use std::process::Command as ProcessCommand;
 fn pick_oauth_provider() -> Result<String, Box<dyn std::error::Error>> {
     use crate::ui_select::{box_select, SelectResult};
 
-    // Display name → broker provider code
+    // Display name → broker provider code.
+    //
+    // 2026-05-08 Kimi 双平台拆分 review feedback [中]: 之前 picker 标签写
+    // "Kimi (Moonshot AI)",但 broker "kimi" 实际指 Kimi Code (api.kimi.com,
+    // kimi-cli device-code OAuth);Moonshot (api.moonshot.cn) 不支持 OAuth。
+    // 旧标签会让用户误以为选的是 Moonshot,实际登录的是 Kimi Code。改为
+    // 明确写 "Kimi Code (kimi_code)" 并加 hint 说 Moonshot 不支持 OAuth。
     let choices = [
         ("Claude    (Anthropic) — requires Pro or Max subscription", "claude"),
         ("Codex     (OpenAI)    — requires ChatGPT Pro/Plus", "codex"),
-        ("Kimi      (Moonshot AI)", "kimi"),
+        ("Kimi Code (kimi_code) — Moonshot uses API key only (aikey add)", "kimi"),
     ];
 
     let items: Vec<String> = choices.iter().map(|(label, _)| label.to_string()).collect();
@@ -65,10 +71,25 @@ fn handle_login(provider: &str, alias: Option<&str>, proxy_port: u16, json_mode:
 
     // Normalize provider alias → broker provider code.
     // Why: broker uses "claude"/"codex"/"kimi", users may type canonical names.
-    let provider = match provider.to_lowercase().as_str() {
+    // 2026-05-08 Kimi 双平台拆分 (review feedback [中]): Moonshot 不支持 OAuth
+    // (只能 aikey add API key),不能让 `aikey auth login moonshot` 默默回退到
+    // Kimi Code OAuth —— 用户会以为登录的是 Moonshot,实际拿到 kimi_code。
+    // 'kimi' 和 'kimi_code' 都映射到 broker "kimi" (Kimi Code 的 device-code
+    // OAuth flow);'moonshot' 显式报错并指引用户用 aikey add API key 路径。
+    let lower = provider.to_lowercase();
+    if lower == "moonshot" {
+        return Err(format!(
+            "Moonshot ({}provider=moonshot) does not support OAuth. \
+             To add a Moonshot API key:\n  \
+             aikey add <alias> --provider moonshot\n\
+             (For Kimi Code OAuth, run: aikey auth login kimi_code)",
+            "--"
+        ).into());
+    }
+    let provider = match lower.as_str() {
         "anthropic" | "claude" => "claude",
         "openai" | "codex" | "chatgpt" => "codex",
-        "kimi" | "moonshot" => "kimi",
+        "kimi" | "kimi_code" => "kimi",
         _ => provider,
     };
 

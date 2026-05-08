@@ -100,7 +100,40 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
     // before the unset loop for rationale).
     let mut emitted_export_vars: HashSet<String> = HashSet::new();
 
+    // 2026-05-08 Kimi family corrupt-state pre-scan(详见 update/20260508-Kimi-family
+    // 互斥-active-env统一KIMI写入.md 决策 #4):
+    // family 互斥(set_provider_binding)在写入层保证最多 1 个 active binding,
+    // 但运行时仍可能因 (a) 手工改 vault (b) migration race (c) future bug 出现
+    // 同 family 多 active binding 的 corrupt state。此时**绝不 silently 选第一个写**
+    // (该选 binding 顺序 ORDER BY provider_code 不稳定,且 binding 顺序的语义不
+    // 等价于"用户最近选的"),改为:
+    //   ① 输出 WARN 到 stderr + telemetry
+    //   ② 跳过所有 Kimi family 的 KIMI_* / MODEL_* exports
+    //   ③ 仍正常写非 Kimi family 的其它 provider exports(让用户能继续用 Claude/OpenAI)
+    //   ④ 不整体 panic / abort active.env(不阻断其它 family 的 prompt activation)
+    let kimi_family_active: Vec<&str> = bindings.iter()
+        .filter(|b| storage::KIMI_FAMILY_CODES.contains(&b.provider_code.as_str()))
+        .map(|b| b.provider_code.as_str())
+        .collect();
+    let kimi_family_corrupt = kimi_family_active.len() > 1;
+    if kimi_family_corrupt {
+        eprintln!(
+            "  [aikey] WARN: corrupt state detected — {} active Kimi family bindings ({:?}). \
+             Skipping KIMI_* exports until repaired. Run `aikey use <key> --provider <kimi_code|moonshot>` \
+             to fix. Other providers (Claude / OpenAI / etc.) unaffected.",
+            kimi_family_active.len(),
+            kimi_family_active
+        );
+    }
+
     for b in &bindings {
+        // family corrupt state 跳过整个 Kimi family
+        if kimi_family_corrupt
+            && storage::KIMI_FAMILY_CODES.contains(&b.provider_code.as_str())
+        {
+            continue;
+        }
+
         if let Some((api_key_var, base_url_var)) = provider_env_vars_pub(&b.provider_code) {
             // Canonicalize before deriving the sentinel. See
             // sentinel_token's doc-comment + spec §6.1 in
@@ -119,8 +152,17 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
                 proxy_port,
                 provider_proxy_prefix_pub(&b.provider_code)
             );
-            env_lines.push(format!("export {}=\"{}\"", api_key_var, token));
-            emitted_export_vars.insert(api_key_var.to_string());
+            // 2026-05-08 Kimi 双平台拆分 review self-review fix: 如果同一个 env
+            // var 名已经被前一个 binding 写过 (典型场景:vault 同时有 'kimi'
+            // (deprecated alias) + 'kimi_code',两者 env_vars 都是 KIMI_API_KEY
+            // / KIMI_BASE_URL),不要重复 push,否则 active.env 里同一变量出现
+            // 2-3 次 (shell 中后写覆盖前写,值正确但噪声很大,影响 prompt 速度
+            // + bug-trace 噪声)。emitted_export_vars HashSet 已经在跟踪此信息,
+            // 这里复用它做幂等门控。
+            if !emitted_export_vars.contains(api_key_var) {
+                env_lines.push(format!("export {}=\"{}\"", api_key_var, token));
+                emitted_export_vars.insert(api_key_var.to_string());
+            }
             // Why: Codex v0.118+ warns when OPENAI_BASE_URL env var is set,
             // because it now reads openai_base_url from ~/.codex/config.toml.
             // We inject that config via configure_codex_cli(), so skip the
@@ -129,15 +171,19 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
                 b.provider_code.to_lowercase().as_str(),
                 "openai" | "gpt" | "chatgpt"
             );
-            if !skip_base_url {
+            if !skip_base_url && !emitted_export_vars.contains(base_url_var) {
                 env_lines.push(format!("export {}=\"{}\"", base_url_var, base_url));
                 emitted_export_vars.insert(base_url_var.to_string());
             }
             // Provider-specific extras (e.g. KIMI_MODEL_NAME for the
             // minimal-scaffold Kimi config — see commands_account docstring).
+            // 同样对 extras 做幂等去重 (kimi_code / moonshot 都把 KIMI_MODEL_NAME
+            // 作为 extra,不去重则重复出现)。
             for (extra_var, extra_val) in provider_extra_env_vars_pub(&b.provider_code) {
-                env_lines.push(format!("export {}=\"{}\"", extra_var, extra_val));
-                emitted_export_vars.insert(extra_var.to_string());
+                if !emitted_export_vars.contains(extra_var) {
+                    env_lines.push(format!("export {}=\"{}\"", extra_var, extra_val));
+                    emitted_export_vars.insert(extra_var.to_string());
+                }
             }
             activated_providers.push(b.provider_code.clone());
         }
@@ -268,17 +314,66 @@ pub struct RefreshResult {
 /// would correctly show as "two in_use in one family". Callers can pass
 /// raw OAuth-vocabulary provider codes ("claude" / "codex") here; the
 /// helper normalizes + cleans stale alias rows on write.
+/// 2026-05-08 multi-Kimi 显式选择规则(详见 update/20260508-Kimi-family互斥-active-env
+/// 统一KIMI写入.md 决策 #3):同一 key 的 providers 数组同时含 ≥2 个 Kimi family
+/// 成员 (典型: gateway key supports `kimi_code` + `moonshot`) 时,**禁止 auto-primary
+/// 任何 Kimi family 成员**,即使 family 当前空 —— 否则会出现"按数组顺序最后一个
+/// silently wins"的歧义(family-mutex 在 set_provider_binding 内每次都覆盖前一条,
+/// 实际生效不可预期)。用户必须后续显式 `aikey use <key> --provider <kimi_code|moonshot>`。
+///
+/// **下沉位置**:本规则之前只在 commands_account/lifecycle/event.rs::Added arm 实现,
+/// 但 reconcile_provider_primaries_after_team_key_sync / 其它非-Added 调用路径直接进
+/// auto_assign_primaries_for_key 会绕过。下沉到 auto_assign 后:Added / team sync /
+/// import batch 共享同一 family 互斥规则。
+pub(crate) fn providers_contain_multiple_kimi_family(providers: &[String]) -> bool {
+    providers.iter()
+        .filter(|p| {
+            let canonical = crate::commands_account::oauth_provider_to_canonical(
+                &p.to_lowercase()
+            );
+            storage::KIMI_FAMILY_CODES.contains(&canonical)
+        })
+        .count() > 1
+}
+
 pub fn auto_assign_primaries_for_key(
     key_source_type: &str,
     key_source_ref: &str,
     providers: &[String],
 ) -> Result<Vec<String>, String> {
+    // 2026-05-08 Kimi family fill-empty-only(详见 update/20260508-Kimi-family
+    // 互斥-active-env统一KIMI写入.md 决策 #2.1):family 内已有任何 primary
+    // (kimi_code / moonshot / legacy kimi)→ 新 key 不抢占任何 family 成员,
+    // 只入 vault.entries 备用;family 完全空才允许 auto-primary。
+    // 真正的 active 切换只发生在 `aikey use`(Switched lifecycle event)。
+    // Why: `aikey add` / team sync / reconcile 都是"保存 / 同步",不应该悄悄
+    // 切换用户当前正在使用的上游。
+    let kimi_family_has_primary = storage::KIMI_FAMILY_CODES.iter().any(|c| {
+        storage::get_provider_binding(DEFAULT_PROFILE, c)
+            .map(|o| o.is_some())
+            .unwrap_or(false)
+    });
+
+    // 2026-05-08 multi-Kimi 显式选择规则下沉(评审第三方反馈):见
+    // providers_contain_multiple_kimi_family 文档。
+    let multi_kimi_in_providers = providers_contain_multiple_kimi_family(providers);
+
     let mut newly_assigned: Vec<String> = Vec::new();
 
     for raw in providers {
         let canonical = crate::commands_account::oauth_provider_to_canonical(
             &raw.to_lowercase()
         ).to_string();
+
+        // Kimi family auto-assign 规则(任一命中即跳过):
+        //   ① fill-empty-only: family 已有 primary
+        //   ② multi-Kimi 显式选: 此 key 的 providers 含 ≥2 个 Kimi family
+        if storage::KIMI_FAMILY_CODES.contains(&canonical.as_str())
+            && (kimi_family_has_primary || multi_kimi_in_providers)
+        {
+            continue;
+        }
+
         let existing = storage::get_provider_binding(DEFAULT_PROFILE, &canonical)?;
         if existing.is_none() {
             // Funnels through the shared canonical-write helper so any
@@ -928,9 +1023,11 @@ mod unset_inactive_tests {
         let blob = lines.join("\n");
 
         // Each registry-known non-anthropic api_key var must have an unset line.
+        // 2026-05-08 Kimi family 互斥落地: moonshot 改写 KIMI_* (与 kimi_code 一致),
+        // MOONSHOT_API_KEY/MOONSHOT_BASE_URL 不再出现在 registry env_api_key/env_base_url
+        // 字段里,故从此处 assertion 移除 — registry-driven unset 自然不会包含它们。
         for var in [
             "KIMI_API_KEY", "KIMI_BASE_URL",
-            "MOONSHOT_API_KEY", "MOONSHOT_BASE_URL",
             "OPENAI_API_KEY",
         ] {
             assert!(
@@ -1456,5 +1553,83 @@ mod claude_json_tests {
         let v = read_json(&path);
         assert_eq!(approved_array(&v), vec!["xxxxxxxxxxxxxxxxxxx1".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod multi_kimi_filter_tests {
+    //! 2026-05-08 multi-Kimi 显式选择规则下沉测试 (评审第三方反馈)。
+    //! 验证 providers_contain_multiple_kimi_family 在 Added / team sync / import batch
+    //! 共享路径都生效 —— 之前规则只在 Added arm 实现,team sync 直接进
+    //! auto_assign_primaries_for_key 会绕过。
+    use super::providers_contain_multiple_kimi_family;
+
+    fn ps(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn single_kimi_code_only_not_multi() {
+        // Single Kimi family member → 允许 auto-primary
+        assert!(!providers_contain_multiple_kimi_family(&ps(&["kimi_code"])));
+    }
+
+    #[test]
+    fn single_moonshot_only_not_multi() {
+        assert!(!providers_contain_multiple_kimi_family(&ps(&["moonshot"])));
+    }
+
+    #[test]
+    fn deprecated_kimi_alias_only_not_multi() {
+        // 'kimi' 是 deprecated alias,canonical 化到 kimi_code,算 1 个 family 成员
+        assert!(!providers_contain_multiple_kimi_family(&ps(&["kimi"])));
+    }
+
+    #[test]
+    fn kimi_code_plus_moonshot_is_multi() {
+        // 经典 multi-Kimi gateway 场景
+        assert!(providers_contain_multiple_kimi_family(&ps(&["kimi_code", "moonshot"])));
+    }
+
+    #[test]
+    fn moonshot_plus_kimi_code_is_multi() {
+        // 顺序无关
+        assert!(providers_contain_multiple_kimi_family(&ps(&["moonshot", "kimi_code"])));
+    }
+
+    #[test]
+    fn deprecated_kimi_plus_moonshot_is_multi() {
+        // 老数据 'kimi' + moonshot 也算 multi (canonical 后是 kimi_code+moonshot)
+        assert!(providers_contain_multiple_kimi_family(&ps(&["kimi", "moonshot"])));
+    }
+
+    #[test]
+    fn anthropic_plus_openai_not_multi_kimi() {
+        // 跨 family 不算 (本规则只针对 Kimi family 内部歧义)
+        assert!(!providers_contain_multiple_kimi_family(&ps(&["anthropic", "openai"])));
+    }
+
+    #[test]
+    fn anthropic_plus_kimi_code_not_multi_kimi() {
+        // 跨 family 含 1 个 Kimi family 成员 → 不算 multi
+        // (anthropic 走 normal auto-primary,kimi_code 走单 family 成员逻辑)
+        assert!(!providers_contain_multiple_kimi_family(&ps(&["anthropic", "kimi_code"])));
+    }
+
+    #[test]
+    fn three_kimi_family_members_is_multi() {
+        // gateway 同时支持三个 Kimi family code (理论极端 case)
+        assert!(providers_contain_multiple_kimi_family(&ps(&["kimi", "kimi_code", "moonshot"])));
+    }
+
+    #[test]
+    fn case_insensitive_input() {
+        // 输入大小写无关
+        assert!(providers_contain_multiple_kimi_family(&ps(&["KIMI_CODE", "Moonshot"])));
+    }
+
+    #[test]
+    fn empty_providers_not_multi() {
+        assert!(!providers_contain_multiple_kimi_family(&ps(&[])));
     }
 }

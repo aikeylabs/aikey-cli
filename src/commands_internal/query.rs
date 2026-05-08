@@ -62,17 +62,31 @@ fn route_url_for(provider_code: &str) -> Option<String> {
 // second migration-bearing open would be redundant. If the readonly open
 // or query fails (e.g. old vault without `user_profile_provider_bindings`),
 // we degrade to empty sets — in_use comes back false everywhere, no error.
-// Protocol-family classifier for UI grouping. Credentials that speak the
-// same upstream API are placed in one group regardless of which client
-// (claude.ai / chatgpt.com / anthropic API key) issued them. See
-// `oauth_provider_to_canonical` for the authoritative mapping (claude →
-// anthropic, codex → openai). Personal keys' provider_code is already
-// canonical at write-time, so we just pass it through the same normalizer
-// to survive any pre-normalization drift and to keep the single source
-// of truth in one place.
+// Protocol-family classifier for UI grouping (V-layer transformer).
+//
+// Maps a record's M-layer provider_code (e.g. "kimi_code", "moonshot",
+// "anthropic", or OAuth alias "claude") to its V-layer display family
+// (e.g. "kimi", "anthropic"). Credentials that speak the same upstream API
+// **and belong to the same family group in the UI** are placed together.
+//
+// 2026-05-08 显示层 family-grouping (详见 update/20260508-display-family-grouping.md):
+// 之前实现误返回 canonical provider_code (e.g. "kimi_code" 自身),让 Web vault
+// 列表把 Kimi family 三个 provider_code(kimi / kimi_code / moonshot)显示成
+// 三个独立 group,违反"统一名词字典"原则。本函数是 V-layer transformer
+// (DB query → HTTP response 中间),修正为真正返回 family。
+//
+// Pipeline:
+//   ① OAuth alias canonicalization: "claude" → "anthropic"; "kimi" → "kimi_code"
+//      (provider_registry.canonical 处理)
+//   ② Family lookup: provider_registry.family_of("kimi_code") → "kimi"
+//   ③ Unknown provider (custom user-entered, not in registry) → falls back to
+//      its canonical code (= input lowercased),表现为独立 family group。
 fn protocol_family_of(raw: Option<&str>) -> String {
     match raw {
-        Some(s) if !s.is_empty() => oauth_provider_to_canonical(&s.to_lowercase()).to_string(),
+        Some(s) if !s.is_empty() => {
+            let canonical = oauth_provider_to_canonical(&s.to_lowercase());
+            crate::provider_registry::family_of(canonical).to_string()
+        }
         _ => "unknown".to_string(),
     }
 }
@@ -966,5 +980,61 @@ mod prefix_suffix_tests {
     fn github_pat_prefix_recognized() {
         let (p, _, _) = extract_prefix_suffix("github_pat_AAAAAAAAAAAAAAAA_BBBBBBBBBBBBBBBBBBBB");
         assert_eq!(p, "github_pat_");
+    }
+}
+
+#[cfg(test)]
+mod protocol_family_of_tests {
+    use super::protocol_family_of;
+
+    // 2026-05-08 显示层 family-grouping (详见 update/20260508-display-family-grouping.md):
+    // V-layer transformer 必须返回 display family,不是 canonical provider_code。
+    // Web vault 列表用此字段做分组渲染,语义错误会导致 family 内多 provider_code 显示成多个独立 group。
+
+    #[test]
+    fn kimi_code_returns_kimi_family() {
+        assert_eq!(protocol_family_of(Some("kimi_code")), "kimi");
+    }
+
+    #[test]
+    fn moonshot_returns_kimi_family() {
+        // 拆分前 'moonshot' 与 'kimi_code' 在不同 group,改后合并到 kimi family
+        assert_eq!(protocol_family_of(Some("moonshot")), "kimi");
+    }
+
+    #[test]
+    fn kimi_oauth_alias_returns_kimi_family() {
+        // 'kimi' 是 kimi_code 的 OAuth alias → canonical "kimi_code" → family "kimi"
+        assert_eq!(protocol_family_of(Some("kimi")), "kimi");
+    }
+
+    #[test]
+    fn anthropic_returns_anthropic_family_unchanged() {
+        // 单 platform family,family == code,与改前行为完全一致
+        assert_eq!(protocol_family_of(Some("anthropic")), "anthropic");
+    }
+
+    #[test]
+    fn claude_oauth_alias_returns_anthropic_family() {
+        assert_eq!(protocol_family_of(Some("claude")), "anthropic");
+    }
+
+    #[test]
+    fn unknown_custom_provider_falls_back_to_canonical() {
+        // 用户自定义不在 registry 的 provider → 独立 family group (与改前一致)
+        assert_eq!(protocol_family_of(Some("custom-vendor")), "custom-vendor");
+    }
+
+    #[test]
+    fn empty_or_none_returns_unknown() {
+        assert_eq!(protocol_family_of(None), "unknown");
+        assert_eq!(protocol_family_of(Some("")), "unknown");
+    }
+
+    #[test]
+    fn case_insensitive_input() {
+        // 输入大小写无关
+        assert_eq!(protocol_family_of(Some("KIMI_CODE")), "kimi");
+        assert_eq!(protocol_family_of(Some("Moonshot")), "kimi");
     }
 }
