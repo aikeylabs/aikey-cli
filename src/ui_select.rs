@@ -563,6 +563,18 @@ pub struct KeyCandidate {
     pub source_type: String,       // DB value: "personal", "team", "personal_oauth_account"
     pub source_ref: String,
     pub display_type: Option<String>, // UI display override (e.g., "oauth(f)"). None → auto from source_type.
+    /// 2026-05-08 V-layer dedup 协同信息(详见 update/20260508-display-family-grouping.md
+    /// 评审第七轮 [高]#3 修复):同 family 多协议 entry 合并为单条 row 时,此字段列出
+    /// entry 的全部 same-family provider_codes,confirm 时由 caller 调
+    /// resolve_multi_kimi_pick 弹 platform 单选(与 `aikey use --provider X` 路径一致)。
+    ///
+    /// **None** = 单协议 entry / 跨 family 多协议 entry(后者按现有 per-group 渲染)
+    /// **Some(vec)** = 同 family 多协议 entry,vec 元素就是该 entry 的 supported_providers
+    ///                 中属于本 family 的全部 provider_code
+    ///
+    /// **此字段是纯 V 层派生数据**,从 entry.supported_providers (M) 在 picker 装配时
+    /// 计算而来,不写回任何 DB / API / IPC,picker drop 后即消失。
+    pub multi_protocol_in_family: Option<Vec<String>>,
 }
 #[derive(Clone)]
 pub struct ProviderGroup { pub provider_code: String, pub candidates: Vec<KeyCandidate>, pub selected: Option<usize>, pub expanded: bool }
@@ -835,6 +847,7 @@ mod family_grouping_tests {
                 source_type: "personal".to_string(),
                 source_ref: format!("k{}", i),
                 display_type: None,
+                multi_protocol_in_family: None,
             }).collect(),
             selected: None,
             expanded,

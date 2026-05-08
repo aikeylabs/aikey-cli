@@ -2590,7 +2590,10 @@ fn resolve_oauth_account(alias_or_id: &str) -> Option<storage::ProviderAccountIn
 ///
 /// 与之前的"通用 multi-provider comma 多选 + lifecycle Switched arm 兜底拒"对比,
 /// 本方案在 UI 层就阻止用户输入坏数据,无需依赖兜底。
-fn resolve_multi_kimi_pick(
+///
+/// 2026-05-08 评审第七轮 [高]#3 后:此函数同时被 main.rs picker confirm path 调用
+/// (用于同 family 多协议 entry dedup 后的 platform 选择),所以提升到 pub(crate)。
+pub(crate) fn resolve_multi_kimi_pick(
     display_name: &str,
     kimi_in_providers: &[String],
     json_mode: bool,
