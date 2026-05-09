@@ -1012,6 +1012,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 header_label: Some("Connectivity Test"),
                 password: None,   // PersonalApi plaintext is already baked into each target
                 proxy_port: crate::commands_proxy::proxy_port(),
+                show_key_column: false,
             },
             json_mode,
         );
