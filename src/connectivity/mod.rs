@@ -29,6 +29,7 @@ pub use targets::{
     target_from_binding,
     targets_from_active_bindings,
     targets_from_alias,
+    targets_from_all_keys,
     targets_from_new_personal_key,
 };
 #[allow(unused_imports)]
@@ -664,8 +665,8 @@ mod connectivity_suite_tests {
         let r = ConnectivityResult {
             ping_direct_ok: false, ping_direct_ms: 0,
             ping_ok: false, ping_ms: 0,
-            api_ok: false, api_ms: 0, api_status: None,
-            chat_ok: false, chat_ms: 0, chat_status: None,
+            api_ok: false, api_ms: 0, api_status: None, api_body_snippet: None,
+            chat_ok: false, chat_ms: 0, chat_status: None, chat_body_snippet: None,
         };
         // Ping(DIRECT) must not participate in success bookkeeping —
         // it's informational only. Main overall-success logic keys on API.
@@ -681,8 +682,8 @@ mod connectivity_suite_tests {
         let r = ConnectivityResult {
             ping_direct_ok: true, ping_direct_ms: 10,
             ping_ok: false, ping_ms: 3000,
-            api_ok: false, api_ms: 0, api_status: None,
-            chat_ok: false, chat_ms: 0, chat_status: None,
+            api_ok: false, api_ms: 0, api_status: None, api_body_snippet: None,
+            chat_ok: false, chat_ms: 0, chat_status: None, chat_body_snippet: None,
         };
         assert!(r.ping_direct_ok && !r.ping_ok,
             "struct must represent 'laptop ok, proxy broken' as a valid state");
