@@ -3815,6 +3815,30 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
     });
 
     if all_providers.is_empty() {
+        // Differentiate "truly empty" from "team has entries but none usable yet".
+        // Why: bg snapshot sync (try_background_snapshot_sync) updates metadata
+        // silently on every command, but cannot download provider-key ciphertext
+        // because that requires the master password. So a freshly-issued team key
+        // shows up in `aikey ls` (cache has metadata) yet `aikey use` filters it
+        // out (ciphertext absent). The generic "No keys or accounts found"
+        // contradicts what the user just saw in `ls` and gives no path forward.
+        // Probing the unfiltered `team` slice here lets us point at `aikey key
+        // sync` — which IS the action that will claim + download ciphertext.
+        let pending_download: Vec<&str> = team.iter()
+            .filter(|e| e.key_status == "active"
+                && !e.local_state.starts_with("disabled_by_")
+                && e.local_state != "stale"
+                && (e.provider_key_ciphertext.is_none()
+                    || e.share_status == "pending_claim"))
+            .map(|e| e.local_alias.as_deref().unwrap_or(e.alias.as_str()))
+            .collect();
+        if !pending_download.is_empty() {
+            return Err(format!(
+                "Found {} team key(s) pending download: {}. Run `aikey key sync` to claim and download.",
+                pending_download.len(),
+                pending_download.join(", ")
+            ).into());
+        }
         return Err("No keys or accounts found.".into());
     }
 

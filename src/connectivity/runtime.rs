@@ -74,6 +74,16 @@ pub struct ConnectivityResult {
     pub chat_ok: bool,
     pub chat_ms: u128,
     pub chat_status: Option<u16>,
+    /// First ~512 chars of the API response body when the probe got an HTTP
+    /// status (success or error). Used by api_status_hint to disambiguate
+    /// "upstream rejected the key" from "local proxy didn't recognize the
+    /// bearer" — both are 401, but the operator action differs (reissue key
+    /// vs. restart proxy / sync). None when the probe never reached HTTP
+    /// (TCP fail, agent error, etc.).
+    pub api_body_snippet: Option<String>,
+    /// First ~512 chars of the Chat response body when the probe got an HTTP
+    /// status. Same role as `api_body_snippet`, fed into chat_status_hint.
+    pub chat_body_snippet: Option<String>,
 }
 
 /// Default base URLs for known providers — always use the official recommended URL.
@@ -522,14 +532,34 @@ where
     let api_result = api_req.call();
     let api_ms = api_start.elapsed().as_millis();
 
-    let (api_ok, api_status) = match api_result {
-        Ok(r) => (true, Some(r.status())),
-        Err(ureq::Error::Status(code, _)) => (true, Some(code)),
-        Err(_) => (false, None),
+    // Capture body snippet so api_status_hint can distinguish proxy-side
+    // registry miss ("Route token not found in registry") from upstream-side
+    // key rejection. Both surface as 401 but mean different things and
+    // require different operator actions. Cap at ~512 chars to keep the
+    // ConnectivityResult cheap to clone / serialize.
+    let (api_ok, api_status, api_body_snippet) = match api_result {
+        Ok(r) => {
+            let s = r.status();
+            let body = r.into_string().ok().map(truncate_body_snippet);
+            (true, Some(s), body)
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response.into_string().ok().map(truncate_body_snippet);
+            // Local proxy registry miss is reported via 401 + a specific
+            // body shape (proxy.go writeJSONError TOKEN_INVALID). It is NOT
+            // "reachable from upstream's perspective" — it never left the
+            // local proxy. Demote api_ok to false so the table cell renders
+            // red and points the operator at the actual fix.
+            let is_local_registry_miss = code == 401
+                && body.as_deref().map(body_indicates_registry_miss).unwrap_or(false);
+            (!is_local_registry_miss, Some(code), body)
+        }
+        Err(_) => (false, None, None),
     };
     result.api_ok = api_ok;
     result.api_ms = api_ms;
     result.api_status = api_status;
+    result.api_body_snippet = api_body_snippet;
     on_phase(ProbePhase::Api, ProbeStage::Finished(&result));
 
     if !api_ok {
@@ -614,12 +644,14 @@ where
     let chat_result = req.send_string(&body.to_string());
     let chat_ms = chat_start.elapsed().as_millis();
 
-    let (chat_ok, chat_status) = match chat_result {
+    let (chat_ok, chat_status, chat_body_snippet) = match chat_result {
         Ok(r) => {
             let s = r.status();
-            (s >= 200 && s < 300, Some(s))
+            let body = r.into_string().ok().map(truncate_body_snippet);
+            (s >= 200 && s < 300, Some(s), body)
         }
-        Err(ureq::Error::Status(code, _)) => {
+        Err(ureq::Error::Status(code, response)) => {
+            let body = response.into_string().ok().map(truncate_body_snippet);
             // 429 = auth passed but rate limited → connectivity OK.
             //   Claude OAuth returns 429 as business rejection when persona
             //   headers are incomplete, but also for genuine rate limits.
@@ -644,13 +676,14 @@ where
             //   keeps the column green and points at the real fix (use a
             //   different model name) without falsely signalling auth failure.
             let ok = code == 429 || code == 404;
-            (ok, Some(code))
+            (ok, Some(code), body)
         }
-        Err(_) => (false, None),
+        Err(_) => (false, None, None),
     };
     result.chat_ok = chat_ok;
     result.chat_ms = chat_ms;
     result.chat_status = chat_status;
+    result.chat_body_snippet = chat_body_snippet;
     on_phase(ProbePhase::Chat, ProbeStage::Finished(&result));
 
     result
@@ -917,7 +950,31 @@ fn probe_auth(provider_code: &str, api_key: &str) -> (&'static str, String) {
 }
 
 /// Format a chat probe status code into a human-readable hint.
-pub fn chat_status_hint(status: u16) -> String {
+/// Cap a response body to ~512 chars; safe to embed in display + JSON.
+/// Uses `chars().take` so multi-byte UTF-8 isn't sliced mid-codepoint.
+pub fn truncate_body_snippet(s: String) -> String {
+    if s.chars().count() <= 512 { s } else { s.chars().take(512).collect() }
+}
+
+/// Returns true when a proxy 401 body indicates the local Tier1 registry
+/// didn't recognize the bearer (post-2026-05-09 fix scope: stale
+/// vault/proxy state, not an actual upstream auth failure).
+///
+/// Substring matched against `proxy.go::writeJSONError` payload for the
+/// "Route token not found in registry" case. Stays as a substring check —
+/// don't JSON-parse here; the proxy's exact JSON shape evolves and we want
+/// the detector to survive shape changes as long as the message text holds.
+pub fn body_indicates_registry_miss(body: &str) -> bool {
+    body.contains("not found in registry") || body.contains("TOKEN_INVALID")
+}
+
+pub fn chat_status_hint(status: u16, body: Option<&str>) -> String {
+    // Disambiguate "local proxy didn't recognize the bearer" from "upstream
+    // says key is invalid" — both surface as 401 but the operator action is
+    // very different (sync/restart proxy vs. reissue/check upstream key).
+    if status == 401 && body.map(body_indicates_registry_miss).unwrap_or(false) {
+        return "key not registered in proxy (try `aikey proxy restart`)".to_string();
+    }
     match status {
         200 => "valid".to_string(),
         400 => "bad request".to_string(),
@@ -937,7 +994,14 @@ pub fn chat_status_hint(status: u16) -> String {
 }
 
 /// Format an API probe status code into a human-readable hint.
-pub fn api_status_hint(status: u16) -> String {
+pub fn api_status_hint(status: u16, body: Option<&str>) -> String {
+    // Same registry-miss disambiguation as chat_status_hint — without it,
+    // the API column rendered "ok (reachable, key rejected)" for a local
+    // proxy registry miss, which actively misleads the operator into
+    // checking their upstream key when the real fix is local.
+    if status == 401 && body.map(body_indicates_registry_miss).unwrap_or(false) {
+        return "key not registered in proxy (try `aikey proxy restart`)".to_string();
+    }
     match status {
         200 => "valid key".to_string(),
         401 | 403 => "reachable, key rejected".to_string(),
@@ -1116,10 +1180,19 @@ pub fn run_connectivity_suite(
                         format!("{:<w$}", "\u{2014}", w = W_API).dimmed().to_string()
                     } else {
                         let raw = if r.api_ok {
-                            let h = r.api_status.map(|s| api_status_hint(s)).unwrap_or_default();
+                            let h = r.api_status
+                                .map(|s| api_status_hint(s, r.api_body_snippet.as_deref()))
+                                .unwrap_or_default();
                             format!("ok ({}ms, {})", r.api_ms, h)
                         } else {
-                            format!("fail ({}ms)", r.api_ms)
+                            // Surface registry-miss reason in the fail cell too
+                            // — without it, the operator sees a bare "fail (1ms)"
+                            // and has no clue why. Same disambiguation as Chat
+                            // column below.
+                            let hint = r.api_status
+                                .map(|s| format!(", HTTP {}: {}", s, api_status_hint(s, r.api_body_snippet.as_deref())))
+                                .unwrap_or_default();
+                            format!("fail ({}ms{})", r.api_ms, hint)
                         };
                         if r.api_ok {
                             format!("{:<w$}", raw, w = W_API).green().to_string()
@@ -1134,11 +1207,13 @@ pub fn run_connectivity_suite(
                     if !r.ping_ok || !r.api_ok {
                         "\u{2014}".dimmed().to_string()
                     } else if r.chat_ok {
-                        let h = r.chat_status.map(|s| chat_status_hint(s)).unwrap_or_default();
+                        let h = r.chat_status
+                            .map(|s| chat_status_hint(s, r.chat_body_snippet.as_deref()))
+                            .unwrap_or_default();
                         format!("ok ({}ms, {})", r.chat_ms, h).green().to_string()
                     } else {
                         let hint = r.chat_status
-                            .map(|s| format!(", HTTP {}: {}", s, chat_status_hint(s)))
+                            .map(|s| format!(", HTTP {}: {}", s, chat_status_hint(s, r.chat_body_snippet.as_deref())))
                             .unwrap_or_default();
                         format!("fail ({}ms{})", r.chat_ms, hint).red().to_string()
                     }

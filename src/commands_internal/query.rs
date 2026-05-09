@@ -493,39 +493,37 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
     ));
 }
 
-/// Known secret prefixes used to produce human-recognizable mask chips.
-/// Order matters: longest-match-first (sk-ant-api03- must come before sk-ant-).
-const KNOWN_SECRET_PREFIXES: &[&str] = &[
-    "sk-ant-api03-", "sk-ant-sid01-", "sk-ant-oat01-", "sk-ant-",
-    "sk-proj-", "sk-svcacct-", "sk-admin-",
-    "AIzaSy", "AIza",
-    "gsk_", "xai-",
-    "github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
-    "sess_",
-    "AKIA", "ASIA",
-    "hf_", "glpat-", "ya29.",
-    "SG.", "sg.",
-    "sk-",
-];
-
 /// Extract a (prefix, suffix4, len) triple for masked UI display. Never
-/// returns the middle of the secret. Short secrets (<= 8 chars) return
-/// `"****"` for both prefix and suffix to avoid exposing >half the token.
+/// returns the middle of the secret.
+///
+/// 2026-05-09: prefix is always the first 12 chars. Previously we
+/// matched a `KNOWN_SECRET_PREFIXES` allowlist (variable-width brand
+/// markers like `sk-ant-api03-`) and fell back to first 4 chars
+/// otherwise, which produced inconsistent column widths and hid
+/// middle-of-prefix differentiators for unrecognized vendors. 12 chars
+/// is enough to read brand markers (sk-ant-api03 = 12, sk-proj- = 8,
+/// AIzaSy = 6, ya29. = 5, gsk_ = 4) AND give unrecognized providers
+/// a reasonable identification window — without crossing the
+/// "≥ half the secret" exposure line for any standard ≥ 32-char key.
+///
+/// Short-secret guard: secrets shorter than 24 chars return `"****"`
+/// for both prefix and suffix. Rationale: with prefix=12 + suffix=4
+/// we expose 16 chars; a mid-mask ≥ 8 chars means total ≥ 24.
+/// Anything shorter than 24 chars is masked entirely. This is stricter
+/// than the prior `len <= 8` guard but still covers the realistic
+/// space (no major LLM provider issues keys < 32 chars).
 fn extract_prefix_suffix(secret: &str) -> (String, String, usize) {
+    const PREFIX_CHARS: usize = 12;
+    const SUFFIX_CHARS: usize = 4;
+    const MIN_LEN_FOR_REVEAL: usize = PREFIX_CHARS + SUFFIX_CHARS + 8; // 24
+
     let len = secret.chars().count();
-    if len <= 8 {
+    if len < MIN_LEN_FOR_REVEAL {
         return ("****".to_string(), "****".to_string(), len);
     }
     let chars: Vec<char> = secret.chars().collect();
-    let suffix: String = chars[len - 4..].iter().collect();
-
-    for kp in KNOWN_SECRET_PREFIXES {
-        if secret.starts_with(kp) {
-            return ((*kp).to_string(), suffix, len);
-        }
-    }
-    // Unknown shape: fall back to first 4 chars (safe — 4/len < 50% for len > 8).
-    let prefix: String = chars[..4].iter().collect();
+    let prefix: String = chars[..PREFIX_CHARS].iter().collect();
+    let suffix: String = chars[len - SUFFIX_CHARS..].iter().collect();
     (prefix, suffix, len)
 }
 
@@ -911,75 +909,89 @@ mod active_binding_refs_tests {
 mod prefix_suffix_tests {
     use super::extract_prefix_suffix;
 
+    // 2026-05-09 contract: prefix is always the first 12 chars (no
+    // brand-allowlist matching anymore); suffix is always the last 4
+    // chars; secrets shorter than 24 chars return "****" / "****"
+    // (full mask). The tests below pin both reveal-mode shape and the
+    // short-secret guard.
+
     #[test]
-    fn anthropic_api_v3_prefix_recognized() {
+    fn anthropic_api_v3_prefix_is_first_12() {
+        // 30-char secret (≥ 24 → reveal). First 12 covers `sk-ant-api03`
+        // (12 chars; the trailing `-` is char 13 and gets masked) so the
+        // brand is still identifiable.
         let s = "sk-ant-api03-XXXXXXXXXXXXafef3";
         let (p, sfx, len) = extract_prefix_suffix(s);
-        assert_eq!(p, "sk-ant-api03-");
-        assert_eq!(sfx, "fef3"); // last 4 chars
+        assert_eq!(p, "sk-ant-api03");
+        assert_eq!(sfx, "fef3");
         assert_eq!(len, s.chars().count());
     }
 
     #[test]
-    fn openai_project_prefix_recognized() {
+    fn openai_project_prefix_is_first_12() {
+        // sk-proj- = 8 chars; 12-char window grabs into the random body,
+        // which is fine — the brand prefix is still visually present.
         let (p, sfx, _) = extract_prefix_suffix("sk-proj-AAAAAAAAAAAAAAAAAAAAAAGHIJ");
-        assert_eq!(p, "sk-proj-");
+        assert_eq!(p, "sk-proj-AAAA");
         assert_eq!(sfx, "GHIJ");
     }
 
     #[test]
-    fn groq_prefix_recognized() {
-        let (p, _, _) = extract_prefix_suffix("gsk_AAAAAAAAAAAAAAAAAAq2Nt");
-        assert_eq!(p, "gsk_");
-    }
-
-    #[test]
-    fn gemini_prefix_recognized() {
+    fn gemini_prefix_is_first_12() {
+        // AIzaSy = 6 chars; 12-char window includes 6 random chars after.
         let (p, _, _) = extract_prefix_suffix("AIzaSyAAAAAAAAAAAAAAAAAAAkzM1");
-        // AIzaSy is longer and more specific than AIza — longest-match wins.
-        assert_eq!(p, "AIzaSy");
+        assert_eq!(p, "AIzaSyAAAAAA");
     }
 
     #[test]
-    fn oauth_session_prefix_recognized() {
-        let (p, _, _) = extract_prefix_suffix("sess_AAAAAAAAAAAAAAAAAAAAAAb7f2");
-        assert_eq!(p, "sess_");
+    fn unknown_shape_first_12_chars() {
+        // Secret ≥ 24 chars, no recognized brand: still gets first 12.
+        // "zzzz1234567890abcdefghijklmn" — first 12 = "zzzz12345678",
+        // last 4 = "klmn".
+        let (p, sfx, len) = extract_prefix_suffix("zzzz1234567890abcdefghijklmn");
+        assert_eq!(p, "zzzz12345678");
+        assert_eq!(sfx, "klmn");
+        assert_eq!(len, 28);
     }
 
     #[test]
-    fn unknown_shape_falls_back_to_first_4() {
-        let (p, sfx, len) = extract_prefix_suffix("zzzz1234567890abcd");
-        assert_eq!(p, "zzzz");
-        assert_eq!(sfx, "abcd");
-        assert_eq!(len, 18);
+    fn boundary_24_chars_reveals() {
+        // Exactly 24 chars: prefix=12, suffix=4, mid=8 hidden — minimum
+        // length that still passes the short-secret guard.
+        let (p, sfx, len) = extract_prefix_suffix("123456789012XXXXXXXXLAST");
+        assert_eq!(p, "123456789012");
+        assert_eq!(sfx, "LAST");
+        assert_eq!(len, 24);
+    }
+
+    #[test]
+    fn boundary_23_chars_is_fully_masked() {
+        // One short of the 24-char threshold: full mask both ends.
+        let (p, sfx, len) = extract_prefix_suffix("12345678901234567890123");
+        assert_eq!(p, "****");
+        assert_eq!(sfx, "****");
+        assert_eq!(len, 23);
     }
 
     #[test]
     fn short_secret_is_fully_masked() {
-        // Secrets <= 8 chars must not expose half the token — return **** both ends.
-        let (p, sfx, len) = extract_prefix_suffix("short");
-        assert_eq!(p, "****");
-        assert_eq!(sfx, "****");
-        assert_eq!(len, 5);
-
-        let (p, sfx, len) = extract_prefix_suffix("12345678");
-        assert_eq!(p, "****");
-        assert_eq!(sfx, "****");
-        assert_eq!(len, 8);
+        // Various short lengths under the 24-char threshold.
+        for s in ["short", "12345678", "sk-ant-12345"] {
+            let (p, sfx, _) = extract_prefix_suffix(s);
+            assert_eq!(p, "****", "expected full mask for '{}'", s);
+            assert_eq!(sfx, "****", "expected full mask for '{}'", s);
+        }
     }
 
     #[test]
-    fn longest_match_wins_for_anthropic() {
-        // sk-ant-api03- is longer than sk-ant- is longer than sk- — must pick the longest.
-        let s = "sk-ant-api03-1234567890abcdef";
-        let (p, _, _) = extract_prefix_suffix(s);
-        assert_eq!(p, "sk-ant-api03-");
-    }
-
-    #[test]
-    fn github_pat_prefix_recognized() {
-        let (p, _, _) = extract_prefix_suffix("github_pat_AAAAAAAAAAAAAAAA_BBBBBBBBBBBBBBBBBBBB");
-        assert_eq!(p, "github_pat_");
+    fn long_real_world_anthropic_key() {
+        // Realistic 108-char Anthropic key. First 12 includes the brand,
+        // suffix shows last 4 — exactly the masking the Vault drawer expects.
+        let s = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1234";
+        let (p, sfx, len) = extract_prefix_suffix(s);
+        assert_eq!(p, "sk-ant-api03");
+        assert_eq!(sfx, "1234");
+        assert_eq!(len, s.chars().count());
     }
 }
 
