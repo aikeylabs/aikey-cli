@@ -790,22 +790,31 @@ fn event_time_hm(event_time_ms: i64) -> String {
     format!("{:02}:{:02}", local_st.wHour, local_st.wMinute)
 }
 
-/// Abbreviate model IDs so they fit comfortably in the receipt.
-/// e.g. `claude-sonnet-4-5-20250929` -> `sonnet-4-5`
-///      `claude-sonnet-4-6`          -> `sonnet-4-6`
+/// Abbreviate model IDs for the receipt, preserving the date pin.
+/// e.g. `claude-sonnet-4-5-20250929` -> `sonnet-4-5-20250929`
+///      `claude-opus-4-7-20251015`   -> `opus-4-7-20251015`
+///      `claude-opus-4-7`            -> `opus-4-7`        (no date: gateway echo signal)
 ///      `kimi-k2.5`                  -> `kimi-k2.5`
 ///      `moonshot-v1-128k`           -> `moonshot-v1-128k`
-/// The `claude-` prefix is always dropped since the ecosystem context makes
-/// it redundant; date suffixes are trimmed to preserve the version family.
+///
+/// 2026-05-09: stopped stripping the `-YYYYMMDD` date tail. Reason: the
+/// date suffix is a strong authenticity signal — real Anthropic ALWAYS
+/// pins to a dated alias, while aggregator gateways (0011 / openrouter
+/// / yunwu / zeroeleven) echo the client's request verbatim, which
+/// usually omits the date. Showing the suffix lets the user spot
+/// "claimed Opus, no date pin" downgrades at a glance, instead of the
+/// previous behavior that hid this signal in the name of compactness.
+///
+/// Receipt length impact: typical Anthropic id grows ~9 chars
+/// (`opus-4-7` → `opus-4-7-20251015`). Still well within terminal
+/// width budget; if it ever bites we'd want a "verbose mode" toggle
+/// rather than a silent strip.
+///
+/// The `claude-` prefix is still dropped (ecosystem context makes it
+/// redundant — every Anthropic id starts with it).
 fn shorten_model(model: &str) -> String {
     if model.is_empty() { return String::new(); }
     let without_prefix = model.strip_prefix("claude-").unwrap_or(model);
-    // Strip the YYYYMMDD date tail Anthropic appends to stable model IDs.
-    // Example: "sonnet-4-5-20250929" → "sonnet-4-5"
-    let parts: Vec<&str> = without_prefix.rsplitn(2, '-').collect();
-    if parts.len() == 2 && parts[0].len() == 8 && parts[0].chars().all(|c| c.is_ascii_digit()) {
-        return parts[1].to_string();
-    }
     without_prefix.to_string()
 }
 
@@ -1455,16 +1464,21 @@ mod tests {
     }
 
     #[test]
-    fn shorten_model_drops_claude_prefix_and_date() {
-        assert_eq!(shorten_model("claude-sonnet-4-5-20250929"), "sonnet-4-5");
-        assert_eq!(shorten_model("claude-sonnet-4-6"), "sonnet-4-6");
+    fn shorten_model_drops_claude_prefix_only_keeps_date_pin() {
+        // 2026-05-09 contract: keep the date suffix so the user can
+        // tell "real Anthropic (dated)" from "gateway echo (no date)"
+        // at a glance. Only strip the redundant `claude-` prefix.
+        assert_eq!(shorten_model("claude-sonnet-4-5-20250929"), "sonnet-4-5-20250929");
+        assert_eq!(shorten_model("claude-opus-4-7-20251015"), "opus-4-7-20251015");
+        // Aggregator-echoed (no date) — preserved verbatim so the
+        // missing suffix is itself a visible authenticity signal.
         assert_eq!(shorten_model("claude-opus-4-7"), "opus-4-7");
+        assert_eq!(shorten_model("claude-sonnet-4-6"), "sonnet-4-6");
+        // Non-Anthropic ids untouched.
         assert_eq!(shorten_model("kimi-k2.5"), "kimi-k2.5");
         assert_eq!(shorten_model("moonshot-v1-128k"), "moonshot-v1-128k");
+        assert_eq!(shorten_model("gpt-4o-2024-08-06"), "gpt-4o-2024-08-06");
         assert_eq!(shorten_model(""), "");
-        // 8-digit tail that isn't actually a date still gets trimmed — acceptable
-        // tradeoff since no real model ID uses 8 trailing digits for anything else.
-        assert_eq!(shorten_model("gpt-4-20241201"), "gpt-4");
     }
 
     #[test]
