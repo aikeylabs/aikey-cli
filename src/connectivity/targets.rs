@@ -256,6 +256,119 @@ pub fn targets_from_alias(
     Vec::new()
 }
 
+/// Enumerate every credential in the vault (personal entries + team keys +
+/// OAuth accounts) and build TestTargets for the connectivity suite.
+///
+/// 2026-05-09: backs `aikey test --all`. Different from
+/// `targets_from_active_bindings` (which only tests the **Primary** for each
+/// provider): this iterates every stored key regardless of activation state,
+/// so the user can audit dormant / multi-provider / aggregator keys without
+/// repeatedly running `aikey test <alias>` per row.
+///
+/// Each personal entry expands across its supported_providers list (so a
+/// multi-protocol aggregator key like 0011 produces one row per protocol).
+/// Team keys and OAuth accounts each produce exactly one row (their provider
+/// is inherent to the credential).
+///
+/// Returns the same (targets, build_errors) shape as
+/// `targets_from_active_bindings` so the suite runner doesn't care which
+/// builder produced its inputs.
+pub fn targets_from_all_keys(
+    proxy_port: u16,
+) -> (Vec<TestTarget>, Vec<BuildTargetError>) {
+    let mut targets = Vec::new();
+    let errors: Vec<BuildTargetError> = Vec::new();
+
+    // ── 1. Personal entries ──────────────────────────────────────────────
+    // Use _readonly variant: enumeration shouldn't bump vault_change_seq or
+    // contend with concurrent CLI writes. proxy_is_running gate matches
+    // the `targets_from_alias` precondition (probe path needs proxy up).
+    let proxy_up = crate::commands_proxy::proxy_is_running_managed();
+    if proxy_up {
+        if let Ok(metas) = storage::list_entries_with_metadata_readonly() {
+            for m in metas {
+                let providers: Vec<String> = if let Some(ref sp) = m.supported_providers {
+                    if !sp.is_empty() {
+                        sp.clone()
+                    } else if let Some(ref code) = m.provider_code {
+                        vec![code.clone()]
+                    } else {
+                        // No provider info — skip (vs. fan out across all
+                        // defaults like the alias-resolver does). For --all
+                        // we want signal not noise; an unbound key has
+                        // nothing to test against.
+                        continue;
+                    }
+                } else if let Some(ref code) = m.provider_code {
+                    vec![code.clone()]
+                } else {
+                    continue;
+                };
+                for code in providers {
+                    targets.push(personal_target(&m.alias, &code, proxy_port));
+                }
+            }
+        }
+    }
+
+    // ── 2. Team virtual keys ─────────────────────────────────────────────
+    if proxy_up {
+        if let Ok(team_entries) = storage::list_virtual_key_cache_readonly() {
+            for vk in team_entries {
+                // Skip keys without ciphertext (server hasn't delivered the
+                // real key yet) — probe path can't decrypt nothing.
+                if vk.provider_key_ciphertext.is_none() {
+                    continue;
+                }
+                // Skip stale / disabled rows (matches the runtime route
+                // gate in vault.GetActiveManagedKeys).
+                if vk.local_state == "stale" || vk.local_state.starts_with("disabled_by_") {
+                    continue;
+                }
+                if vk.key_status != "active" {
+                    continue;
+                }
+                // Friendly Key column: local_alias (renamed) → server alias
+                // (canonical, e.g. `key-335923591-0011-1`). vk_id tail is
+                // useless to humans — never surface it as the display label
+                // when a real alias is available.
+                let mut t = team_target(&vk.virtual_key_id, &vk.provider_code, proxy_port);
+                t.display_alias = vk.local_alias.clone().unwrap_or_else(|| vk.alias.clone());
+                targets.push(t);
+            }
+        }
+    }
+
+    // ── 3. OAuth accounts ────────────────────────────────────────────────
+    if proxy_up {
+        if let Ok(accounts) = storage::list_provider_accounts_readonly() {
+            for acct in accounts {
+                if !matches!(acct.status.as_str(), "active" | "idle") {
+                    continue;
+                }
+                if !matches!(
+                    acct.credential_type,
+                    crate::credential_type::CredentialType::PersonalOAuthAccount
+                ) {
+                    continue;
+                }
+                let mut t = oauth_target(
+                    &acct.provider_account_id,
+                    &acct.provider,
+                    proxy_port,
+                );
+                // Friendly Key column: effective_label = local_alias → display_identity
+                // → account_id. Falls back to source_ref via TestTarget::key_display
+                // when it's empty (rare; only if all three are missing).
+                t.display_alias = acct.effective_label().to_string();
+                targets.push(t);
+            }
+        }
+    }
+
+    (targets, errors)
+}
+
 /// Build targets for the `aikey add` post-entry probe: one plaintext key
 /// tested against each of the user-selected providers.
 ///

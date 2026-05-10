@@ -185,6 +185,13 @@ pub(crate) enum Commands {
         /// Provider code to test against (overrides stored provider)
         #[arg(long, value_name = "PROVIDER")]
         provider: Option<String>,
+        /// Test EVERY stored credential (personal + team + OAuth) regardless
+        /// of activation state. Without this flag, omitting `<alias>` only
+        /// tests the current Primary binding for each provider.
+        ///
+        /// Mutually exclusive with `<alias>`: pass one or the other.
+        #[arg(long, conflicts_with = "alias")]
+        all: bool,
     },
     /// Select the active key for routing (shortcut for `key use`)
     #[command(display_order = 4)]

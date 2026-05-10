@@ -125,15 +125,30 @@ pub struct TestTarget {
     pub bearer:        String,
     pub kind:          CredentialKind,
     /// Reference to the source row: vault alias, virtual_key_id, or
-    /// provider_account_id. Used for JSON payloads and error messages;
-    /// never printed as-is in the table (row shows provider + kind suffix).
+    /// provider_account_id. Used for JSON payloads, error messages, and the
+    /// proxy probe sentinel/bearer construction. **Never** mutated to a
+    /// friendlier label — that would break routing.
     pub source_ref:    String,
+    /// Human-readable label for the optional Key column in `aikey test --all`
+    /// — `key-335923591-0011-1` for team keys, `email@domain.com` (or
+    /// local_alias) for OAuth, vault alias for personal. Separate from
+    /// `source_ref` because team / OAuth probe paths need the bearer-form
+    /// id (vk_id / account_id), not the display name. Empty string falls
+    /// back to `source_ref` at render time.
+    pub display_alias: String,
 }
 
 impl TestTarget {
     /// "kimi" / "anthropic (oauth)" / "openai (team)" — the table label.
     pub fn display_label(&self) -> String {
         format!("{}{}", self.provider_code, self.kind.display_suffix())
+    }
+
+    /// Friendly identifier for the optional Key column. Falls back to
+    /// `source_ref` when no separate alias is recorded (e.g. personal
+    /// targets where alias == source_ref by definition).
+    pub fn key_display(&self) -> &str {
+        if self.display_alias.is_empty() { &self.source_ref } else { &self.display_alias }
     }
 }
 
@@ -170,6 +185,7 @@ pub fn personal_target(
         bearer:        format!("aikey_probe_{}", source_ref),
         kind:          CredentialKind::PersonalApi,
         source_ref:    source_ref.to_string(),
+        display_alias: String::new(), // personal: alias == source_ref, no separate label needed
     }
 }
 
@@ -193,6 +209,7 @@ pub fn personal_target_direct(
         bearer:        plaintext.trim().to_string(),
         kind:          CredentialKind::PersonalApi,
         source_ref:    source_ref.to_string(),
+        display_alias: String::new(), // personal: alias == source_ref, no separate label needed
     }
 }
 
@@ -217,6 +234,7 @@ pub fn team_target(
         bearer,
         kind:          CredentialKind::ManagedTeam,
         source_ref:    virtual_key_id.to_string(),
+        display_alias: String::new(), // populated by callers that have access to the alias row
     }
 }
 
@@ -244,6 +262,7 @@ pub fn oauth_target(
         bearer:        format!("aikey_probe_{}", account_id),
         kind:          CredentialKind::OAuth,
         source_ref:    account_id.to_string(),
+        display_alias: String::new(), // populated by callers (email / local_alias / display_identity)
     }
 }
 
@@ -317,6 +336,13 @@ pub struct SuiteOptions {
     /// in the "cannot test" section rather than being tested.
     pub password: Option<SecretString>,
     pub proxy_port: u16,
+    /// 2026-05-09: prepend a "Key" column to the table showing each row's
+    /// source alias / vk_id / OAuth identity. On for `aikey test --all`
+    /// (multiple credentials per provider — without this column the user
+    /// can't tell which row corresponds to which key). Off everywhere else
+    /// (single-key or Primary-binding modes have one row per provider, so
+    /// the protocol column already disambiguates).
+    pub show_key_column: bool,
 }
 
 /// Aggregate outcome of one suite run.
@@ -368,6 +394,7 @@ mod connectivity_suite_tests {
             bearer:        "sk-redacted".into(),
             kind:          CredentialKind::PersonalApi,
             source_ref:    "kimi-local".into(),
+            display_alias: String::new(),
         };
         assert_eq!(personal.display_label(), "kimi",
             "personal keys: just the provider code, no suffix");

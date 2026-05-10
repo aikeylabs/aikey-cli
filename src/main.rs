@@ -1094,6 +1094,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         header_label:   None,
                         password:       None,
                         proxy_port:     commands_proxy::proxy_port(),
+                        show_key_column: false,
                     };
                     let outcome = commands_project::run_connectivity_suite(targets, opts, false);
                     if !outcome.any_chat_ok {
@@ -1472,7 +1473,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 commands_proxy::maybe_warn_stale();
             }
         }
-        Commands::Test { alias, provider: test_provider } => {
+        Commands::Test { alias, provider: test_provider, all } => {
             // Structured exit codes so shell wrappers (claude/codex/kimi) can
             // branch without parsing output:
             //
@@ -1534,7 +1535,75 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // are accessible via their bindings at call time. (Kept local to
             // avoid leaking these into the module's public surface.)
 
-            if let Some(ref alias) = alias {
+            if *all {
+                // ── --all mode: test every stored credential ─────────────
+                // Hard-rejected `--all <alias>` at clap level (conflicts_with),
+                // so reaching this branch means alias is None. test_provider
+                // could be set; we honour it as a filter (only run targets
+                // whose provider matches), since the user might want
+                // "all keys but only their anthropic side" for a quick audit.
+                let (mut targets, _build_errors) =
+                    commands_project::targets_from_all_keys(proxy_port);
+
+                if let Some(ref filter_provider) = test_provider {
+                    let f = filter_provider.to_lowercase();
+                    targets.retain(|t| {
+                        // TestTarget exposes provider via display_label / a
+                        // typed accessor, but for the filter we compare the
+                        // canonical provider field directly. The credential
+                        // route_token's URL prefix carries the provider code
+                        // — match against the URL fragment so non-canonical
+                        // forms (e.g. `claude` vs `anthropic`) don't slip
+                        // through silently.
+                        t.base_url
+                            .to_lowercase()
+                            .contains(&format!("/{}/", f))
+                            || t.base_url.to_lowercase().contains(&format!("/{}", f))
+                    });
+                }
+
+                if targets.is_empty() {
+                    let msg = if test_provider.is_some() {
+                        format!(
+                            "No stored credentials match provider '{}'. \
+                             Run `aikey list` to see available aliases.",
+                            test_provider.as_deref().unwrap_or("")
+                        )
+                    } else {
+                        "No stored credentials. Add a key with `aikey add` first.".to_string()
+                    };
+                    if cli.json { json_output::error(&msg, EXIT_ALIAS_NOT_FOUND); }
+                    else { return Err(msg.into()); }
+                }
+
+                let opts = commands_project::SuiteOptions {
+                    show_proxy_row: true,
+                    header_label:   None,
+                    password:       None,
+                    proxy_port,
+                    // 2026-05-09: --all is the only place where multiple
+                    // credentials share a provider (e.g. team + oauth both
+                    // routing anthropic). Show the Key column so each row
+                    // is identifiable. Single-alias / Primary-binding modes
+                    // never see this case.
+                    show_key_column: true,
+                };
+                let outcome = if cli.json {
+                    commands_project::run_connectivity_suite(targets, opts, true)
+                } else {
+                    eprintln!("  Testing {} credential(s) (--all)...\n", targets.len());
+                    commands_project::run_connectivity_suite(targets, opts, false)
+                };
+                if cli.json {
+                    let payload = serde_json::json!({
+                        "status": if exit_code_from_outcome(&outcome) == EXIT_OK { "success" } else { "failed" },
+                        "scope":  "all",
+                        "credentials_tested": outcome.json_results,
+                    });
+                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                }
+                std::process::exit(exit_code_from_outcome(&outcome));
+            } else if let Some(ref alias) = alias {
                 // ── Single-alias mode: resolve across personal/team/OAuth ──
                 let targets = commands_project::targets_from_alias(
                     alias,
@@ -1559,6 +1628,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     header_label:   None,
                     password:       None,
                     proxy_port,
+                    show_key_column: false,
                 };
                 let outcome = if cli.json {
                     commands_project::run_connectivity_suite(targets, opts, true)
@@ -1602,6 +1672,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     header_label:   None,
                     password:       None,
                     proxy_port,
+                    show_key_column: false,
                 };
                 let outcome = if cli.json {
                     commands_project::run_connectivity_suite(targets, opts, true)

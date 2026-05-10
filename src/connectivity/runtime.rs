@@ -1117,7 +1117,40 @@ pub fn run_connectivity_suite(
         .max()
         .unwrap_or(12)
         .max("Protocol".len()) + 2;
-    // 5 columns: Protocol | Ping(D) | Ping | API | Chat
+    // 2026-05-09: optional Key column for `aikey test --all`. Uses
+    // `key_display()` rather than the raw `source_ref` so team rows surface
+    // their human alias (`key-335923591-0011-1`) and OAuth rows surface the
+    // email / local_alias instead of the bearer-form id (vk_id /
+    // provider_account_id). source_ref must stay routing-stable; the
+    // friendly label lives in the parallel `display_alias` field that
+    // `targets_from_all_keys` populates.
+    //
+    // Off by default — single-alias / Primary-binding modes have one row per
+    // provider so the protocol column already disambiguates. When --all
+    // surfaces multiple rows for the same provider (e.g. team + oauth both
+    // Anthropic), the Key column is the only way to tell which row goes
+    // with which credential.
+    // Hard cap Key column width: the row already carries ~92 chars of fixed
+    // columns (Protocol + Ping(D) + Ping + API + Chat + padding); adding an
+    // unbounded Key column makes the row wrap on standard 120-col terminals,
+    // which breaks `animate_blinking_while`'s `\x1b7`/`\x1b8` cursor restore
+    // (the wrap scrolls past the saved position, leaving a trail of blink
+    // frames instead of overwriting in place — visible on long OAuth emails).
+    // 22 covers `key-335923591-0011-1` (20 chars) intact and forces mid-
+    // ellipsis truncation on emails — runtime renderer already implements
+    // `head…tail` shortening below.
+    const KEY_W_CAP: usize = 22;
+    let key_w = if opts.show_key_column {
+        let raw = targets.iter()
+            .map(|t| t.key_display().chars().count())
+            .max()
+            .unwrap_or(8)
+            .max("Key".len()) + 2;
+        raw.min(KEY_W_CAP)
+    } else {
+        0
+    };
+    // 5/6 columns: [Key] | Protocol | Ping(D) | Ping | API | Chat
     //   Ping(D) = CLI → upstream (independent baseline).
     //   Ping    = CLI → aikey-proxy → upstream (gates API+Chat).
     const W_PD:   usize = 14;   // "Ping(D)" column, short latency (+" (Xms)")
@@ -1128,11 +1161,19 @@ pub fn run_connectivity_suite(
         eprintln!();
         eprintln!("  \u{1F50C} {}", header.bold());
     }
-    eprintln!("  {:<wp$} {:<wpd$} {:<wpi$} {:<wap$} {}",
-        "Protocol".dimmed(), "Ping(D)".dimmed(), "Ping".dimmed(),
-        "API".dimmed(), "Chat".dimmed(),
-        wp = label_w, wpd = W_PD, wpi = W_PING, wap = W_API);
-    eprintln!("  {}", "\u{2500}".repeat(label_w + W_PD + W_PING + W_API + 22).dimmed());
+    if opts.show_key_column {
+        eprintln!("  {:<wk$} {:<wp$} {:<wpd$} {:<wpi$} {:<wap$} {}",
+            "Key".dimmed(), "Protocol".dimmed(), "Ping(D)".dimmed(),
+            "Ping".dimmed(), "API".dimmed(), "Chat".dimmed(),
+            wk = key_w, wp = label_w, wpd = W_PD, wpi = W_PING, wap = W_API);
+        eprintln!("  {}", "\u{2500}".repeat(key_w + label_w + W_PD + W_PING + W_API + 22).dimmed());
+    } else {
+        eprintln!("  {:<wp$} {:<wpd$} {:<wpi$} {:<wap$} {}",
+            "Protocol".dimmed(), "Ping(D)".dimmed(), "Ping".dimmed(),
+            "API".dimmed(), "Chat".dimmed(),
+            wp = label_w, wpd = W_PD, wpi = W_PING, wap = W_API);
+        eprintln!("  {}", "\u{2500}".repeat(label_w + W_PD + W_PING + W_API + 22).dimmed());
+    }
 
     let mut failed_hints: Vec<String> = Vec::new();
     // Animation column widths must match the printed-result widths so each
@@ -1142,7 +1183,29 @@ pub fn run_connectivity_suite(
     const W_CHAT_ANIM: usize = 10;
     for t in &targets {
         let display = t.display_label();
-        eprint!("  {:<wp$} ", display.bold(), wp = label_w);
+        if opts.show_key_column {
+            // Truncate over-long key labels with a mid-ellipsis so the row
+            // doesn't blow out. `key_w` is sized to the longest key_display
+            // already, so this only kicks in if a credential's identifier
+            // exceeds the column budget after column-cap clamping (rare —
+            // mostly OAuth account_id or very long emails).
+            let key_src = t.key_display();
+            let key_disp = if key_src.chars().count() > key_w.saturating_sub(2) {
+                let take = key_w.saturating_sub(3);
+                let head: String = key_src.chars().take(take * 2 / 3).collect();
+                let tail: String = key_src
+                    .chars()
+                    .skip(key_src.chars().count() - (take - take * 2 / 3))
+                    .collect();
+                format!("{head}…{tail}")
+            } else {
+                key_src.to_string()
+            };
+            eprint!("  {:<wk$} {:<wp$} ", key_disp.dimmed(), display.bold(),
+                wk = key_w, wp = label_w);
+        } else {
+            eprint!("  {:<wp$} ", display.bold(), wp = label_w);
+        }
         let _ = io::stderr().flush();
 
         // Per-column formatter: invoked by `animate_blinking_while` the
