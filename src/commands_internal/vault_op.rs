@@ -263,45 +263,22 @@ fn prepare_vault(env: &StdinEnvelope) -> Option<([u8; 32], rusqlite::Connection)
     Some((key, conn))
 }
 
-/// 校验 vault_key 与 config.password_hash 一致（或兼容旧 vault 无 password_hash 情况）
+/// 校验 vault_key 与 config.password_hash 一致。
+///
+/// 2026-05-11 重构：从前这里有一份与 `executor::verify_password_internal`
+/// 平行的实现，并附带一条「无 password_hash + 空 vault 兜底 Ok(())」的
+/// 静默接受分支。该分支正是 2026-05-11 team-key 解密不一致事件的成因，
+/// 已在 `storage::verify_vault_key` 中收紧为严格匹配，此处委托过去以保持
+/// 单一真相源；返回值再包成本模块的 `I_VAULT_KEY_INVALID` 错误码。
+///
+/// `_conn` 参数保留供日后扩展，但目前 storage::verify_vault_key 内部自己
+/// 打开连接以保证它对 password_hash 的读取与最终写入路径同源（避免事务
+/// 视图差异）。
 fn verify_key_against_vault(
-    conn: &rusqlite::Connection,
+    _conn: &rusqlite::Connection,
     key: &[u8; 32],
 ) -> Result<(), (&'static str, String)> {
-    let stored_hash: Result<Vec<u8>, rusqlite::Error> = conn.query_row(
-        "SELECT value FROM config WHERE key = 'password_hash'",
-        [],
-        |r| r.get(0),
-    );
-    match stored_hash {
-        Ok(hash) => {
-            if hash.as_slice() == key.as_slice() {
-                Ok(())
-            } else {
-                Err((
-                    "I_VAULT_KEY_INVALID",
-                    "vault_key does not match stored password_hash".to_string(),
-                ))
-            }
-        }
-        Err(_) => {
-            // 无 password_hash：尝试解一条 entry 兜底
-            let entry: Result<(Vec<u8>, Vec<u8>), rusqlite::Error> = conn.query_row(
-                "SELECT nonce, ciphertext FROM entries LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            );
-            match entry {
-                Ok((nonce, ciphertext)) => crypto::decrypt(key, &nonce, &ciphertext)
-                    .map(|_| ())
-                    .map_err(|_| (
-                        "I_VAULT_KEY_INVALID",
-                        "vault_key failed to decrypt any entry".to_string(),
-                    )),
-                Err(_) => Ok(()), // 空 vault 兜底
-            }
-        }
-    }
+    storage::verify_vault_key(key).map_err(|msg| ("I_VAULT_KEY_INVALID", msg))
 }
 
 /// 把 plaintext 加密为 (nonce, ciphertext)
@@ -1192,6 +1169,44 @@ fn handle_use(env: StdinEnvelope) {
                 emit_error(req_id, "I_KEY_DISABLED",
                     format!("team key '{}' has server status '{}'", payload.id, entry.key_status));
                 return;
+            }
+            // Phase 3B (2026-05-11): if the local cache has metadata but
+            // ciphertext was never delivered, the binding would write but
+            // the proxy couldn't actually route. Auto-trigger a snapshot
+            // sync using the bridge's already-derived vault_key — the web
+            // session has the vault_key (from the unlock POST + cookie),
+            // not the password, so we can't take the CLI's session-based
+            // path. The new `*_with_vault_key` variant skips the Argon2id
+            // step. If sync still can't deliver ciphertext (network down,
+            // server lost the key blob, etc.), fail loudly with
+            // `I_KEY_NOT_DELIVERED` so the Web UI can prompt the user
+            // (e.g. "run `aikey key sync` from a terminal" — the CLI
+            // session might have additional sync paths).
+            let mut entry = entry;
+            if entry.provider_key_ciphertext.is_none() {
+                match crate::commands_account::run_full_snapshot_sync_with_vault_key(&key) {
+                    Ok(_) => {
+                        // Re-read the entry — the sync may have populated
+                        // ciphertext + flipped local_state.
+                        if let Ok(Some(refreshed)) = storage::get_virtual_key_cache(&entry.virtual_key_id) {
+                            entry = refreshed;
+                        }
+                    }
+                    Err(e) => {
+                        // Sync attempt itself failed (network / token expired).
+                        // Fall through to the ciphertext check below — we'll
+                        // emit a clearer error there if still missing.
+                        eprintln!("[vault_op handle_use WARN] auto-sync for team key '{}' failed: {}",
+                            entry.alias, e);
+                    }
+                }
+                if entry.provider_key_ciphertext.is_none() {
+                    emit_error(req_id, "I_KEY_NOT_DELIVERED",
+                        format!("Team key '{}' was not delivered (ciphertext missing). \
+                                Try running `aikey key sync` in a terminal, or contact \
+                                your team admin to re-issue the key.", entry.alias));
+                    return;
+                }
             }
             // Provider list: prefer multi-protocol `supported_providers`,
             // fall back to single `provider_code`. Identical priority to

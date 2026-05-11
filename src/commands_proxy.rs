@@ -467,6 +467,69 @@ pub fn post_admin_reload() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// POSTs to the proxy's `/admin/replay-dead-letter` endpoint and returns
+/// the parsed result body as a JSON string (left as String rather than
+/// a typed struct so this Rust side doesn't have to track the Go-side
+/// `ReplayDeadLetterResult` shape — the caller is just the CLI command
+/// that prints it).
+///
+/// Added 2026-05-11 for the B-phase dead-letter retry follow-up. Pairs
+/// with the `aikey proxy replay-dead-letter` subcommand.
+pub fn post_admin_replay_dead_letter() -> Result<String, Box<dyn std::error::Error>> {
+    let addr = proxy_listen_addr(None);
+    let stream = TcpStream::connect(&addr)
+        .map_err(|e| format!("cannot connect to proxy at {}: {}", addr, e))?;
+    // Replay can take up to 60 s on the proxy side; give ourselves a
+    // little more on the read side so we don't bail before it does.
+    stream.set_read_timeout(Some(Duration::from_secs(75)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    let traceparent_header = crate::observability::trace()
+        .map(|tc| format!("traceparent: {}\r\n", tc.traceparent))
+        .unwrap_or_default();
+    let request = format!(
+        "POST /admin/replay-dead-letter HTTP/1.0\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n{}\r\n",
+        addr, traceparent_header
+    );
+    {
+        let mut w = stream.try_clone()?;
+        w.write_all(request.as_bytes())?;
+    }
+
+    let reader = BufReader::new(stream);
+    let mut lines = reader.lines();
+
+    let status_line = lines
+        .next()
+        .ok_or("proxy closed connection without response")??;
+
+    // Read the rest of the headers + body. Body starts after the blank line.
+    let mut body = String::new();
+    let mut in_body = false;
+    for line in lines.flatten() {
+        if in_body {
+            body.push_str(&line);
+            body.push('\n');
+        } else if line.is_empty() {
+            in_body = true;
+        }
+    }
+    let body = body.trim().to_string();
+
+    // 503 (reporter not configured) is a real-but-expected operator state —
+    // surface it cleanly. Other non-2xx is a fault.
+    if status_line.contains("503") {
+        return Err(format!("replay unavailable: proxy reporter not configured. \
+                            Check ~/.aikey/config/aikey-proxy.yaml `events.collector_url` / \
+                            `events.collector_routes` is set.\n  {}", body).into());
+    }
+    if !status_line.contains("200") {
+        return Err(format!("replay failed: {} — {}", status_line.trim(), body).into());
+    }
+
+    Ok(body)
+}
+
 /// Read the proxy's listen address with priority:
 ///
 /// 1. **`~/.aikey/run/proxy-runtime.json` `listen.actual_addr` (live pid)**

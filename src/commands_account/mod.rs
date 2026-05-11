@@ -91,84 +91,344 @@ fn read_control_url_from_config() -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Auto-configure proxy `collector_url` in `~/.aikey/config/aikey-proxy.yaml`.
-/// Uses the same control_url (nginx proxies collector API on the same port).
+/// Auto-configure the proxy's TEAM upload destination after a successful
+/// `aikey login --control-url <REMOTE>`.
+///
+/// 2026-05-11 F1 fix — write to user-layer config, not system yaml.
+///
+/// Before this fix the function patched `~/.aikey/config/aikey-proxy.yaml`
+/// directly (system layer). That worked until the user ran any path that
+/// re-renders the system yaml from template — `make restart-personal`,
+/// `local-install.sh`, `aikey-config-tool render`, etc. — all of which
+/// `rm` and re-emit the yaml from `workflow/CD/templates/common/
+/// aikey-proxy.yaml.tmpl`, silently wiping the team route override. The
+/// observable failure was "team usage events lost to the local SQLite
+/// collector while the user is staring at the Postgres-backed master web
+/// dashboard" — see workflow/CI/bugfix/2026-05-11-team-key-decrypt-…md
+/// follow-up.
+///
+/// The fix moves the team-route override into `~/.aikey/config/
+/// aikey-user.yaml` under a new `proxy:` section. The user file is the
+/// system+user config-split scheme's user-owned layer (workflow/CLAUDE.md
+/// "Config Split (Stage A-D landed)") — installer / render commands
+/// never touch it. proxy's `config.Load` now calls
+/// `configmerge.LoadAndMerge(system, user, "proxy")` so user-layer
+/// values win deterministically on every restart.
+///
+/// `personal` and `oauth` route entries — and the legacy `collector_url` —
+/// are intentionally NOT written here. Their install-time values (local
+/// collector on Personal / Trial; production collector on Server) are
+/// the correct sticky defaults; nothing about a remote-team login should
+/// change where Personal-key usage events flow.
 ///
 /// Stage 2.1 windows-compat: routed through `shell_integration::resolve_aikey_dir()`.
+///
+/// 2026-05-11 B3-phase extension: in addition to the F1 team-URL write,
+/// also writes the current user JWT (access_token + expires_at) to
+/// `proxy.events.collector_credentials.team`. proxy's reporter consumes
+/// that to populate `RefreshableJWT.AccessToken` + `.ExpiresAt` on
+/// startup so team events upload with a user-scoped bearer instead of
+/// the legacy admin service_token. `refresh_token` is intentionally NOT
+/// written here — it stays encrypted in the vault's `platform_account`
+/// table, and B4's proxy reads it via the supervisor's already-derived
+/// master key (no plaintext refresh_token on disk).
 fn configure_proxy_collector(control_url: &str, json_mode: bool) {
-    let proxy_config = shell_integration::resolve_aikey_dir().join("config").join("aikey-proxy.yaml");
-    if !proxy_config.exists() {
-        return; // No proxy config yet — skip silently.
-    }
+    let user_config = shell_integration::resolve_aikey_dir().join("config").join("aikey-user.yaml");
 
     // Collector API is proxied through nginx on the same origin as the control panel.
     // Proxy uploads to {collector_url}/v1/usage-events:batch
     let collector_url = control_url.trim_end_matches('/').to_string();
+    let refresh_url = format!("{}/auth/refresh", collector_url);
 
-    let content = match std::fs::read_to_string(&proxy_config) {
-        Ok(c) => c,
-        Err(_) => return,
+    // Pull the user's current access_token + expires_at from vault. This is
+    // the same blob `aikey login` just wrote a few lines up; reading it
+    // back keeps a single source of truth (the vault row) rather than
+    // threading the token down via parameters from every login call site.
+    //
+    // Missing platform_account = "login wasn't completed" — bail quietly
+    // (file unchanged). Missing token_expires_at = "legacy CLI session
+    // upgraded mid-flight" — emit credential with expires_at=0 so the
+    // first Bearer() call triggers a refresh (it's within the 5min skew
+    // window by definition).
+    let cred_fields = match storage::get_platform_account() {
+        Ok(Some(acc)) if !acc.jwt_token.is_empty() => Some(CredentialFields {
+            access_token: acc.jwt_token,
+            expires_at: acc.token_expires_at.unwrap_or(0),
+            refresh_url: refresh_url.clone(),
+        }),
+        _ => None,
     };
 
-    // Check if collector_url is already set to the correct value.
-    if content.contains(&format!("collector_url: \"{}\"", collector_url)) {
-        return; // Already configured correctly.
+    // Already configured to the same value? Avoid a no-op write that would
+    // restart the proxy for nothing. Compare BOTH the URL and the credential
+    // bundle — a stale access_token in the file should trigger a rewrite
+    // even if the URL hasn't changed.
+    let current = read_user_yaml_team(&user_config);
+    let url_matches = current.as_ref().and_then(|s| s.url.as_deref()) == Some(collector_url.as_str());
+    let cred_matches = match (&cred_fields, current.as_ref().and_then(|s| s.cred.as_ref())) {
+        (Some(new), Some(cur)) => {
+            new.access_token == cur.access_token
+                && new.expires_at == cur.expires_at
+                && new.refresh_url == cur.refresh_url
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if url_matches && cred_matches {
+        return;
     }
 
-    // Update or insert collector_url.
-    let updated = if content.contains("collector_url:") {
-        // Replace existing line.
-        let mut result = String::new();
-        for line in content.lines() {
-            if line.trim_start().starts_with("collector_url:") {
-                let indent = &line[..line.len() - line.trim_start().len()];
-                result.push_str(&format!("{}collector_url: \"{}\"", indent, collector_url));
-            } else {
-                result.push_str(line);
-            }
-            result.push('\n');
+    if let Err(e) = write_user_yaml_team_section(&user_config, &collector_url, cred_fields.as_ref()) {
+        if !json_mode {
+            eprintln!("    {} couldn't update {}: {}",
+                "!".yellow(), user_config.display(), e);
+            eprintln!("      Run {} after editing manually.", "'aikey proxy restart'".bold());
         }
-        result
-    } else if content.contains("flush_interval:") {
-        // Append after flush_interval.
-        let mut result = String::new();
-        for line in content.lines() {
-            result.push_str(line);
-            result.push('\n');
-            if line.trim_start().starts_with("flush_interval:") {
-                result.push_str(&format!("  collector_url: \"{}\"\n", collector_url));
-            }
-        }
-        result
-    } else {
-        return; // Can't find a safe place to insert.
-    };
+        return;
+    }
 
-    if std::fs::write(&proxy_config, &updated).is_ok() && !json_mode {
-        eprintln!("    Usage reporting → {}", collector_url);
-        // Proxy reads YAML at startup only; reload won't pick up config changes.
-        // Auto-restart proxy so the new collector_url takes effect immediately.
-        // Round 9 fix #1: was is_proxy_running (PID-only); now Layer 1.
-        if crate::commands_proxy::proxy_is_running_managed() {
-            let pw = if let Some(cached) = crate::session::try_get() {
-                cached
-            } else {
-                // No cached password — prompt inline with star echo.
-                eprintln!("    Restart proxy to apply.");
-                match crate::prompt_hidden("    \u{1F512} Enter Master Password: ") {
-                    Ok(p) => SecretString::new(p),
-                    Err(_) => {
-                        eprintln!("\n    Run {} manually.", "'aikey proxy restart'".bold());
-                        return;
-                    }
-                }
-            };
-            let _ = crate::commands_proxy::handle_restart(None, &pw);
+    if !json_mode {
+        eprintln!("    Team usage reporting → {}", collector_url);
+        if cred_fields.is_some() {
+            eprintln!("    Team usage credentials → JWT ({})",
+                if cred_fields.as_ref().unwrap().expires_at > 0 {
+                    "auto-refresh enabled"
+                } else {
+                    "first-call refresh on startup"
+                });
         }
+    }
+
+    // Proxy reads its config at startup only; the new merge target won't
+    // take effect until a restart. Mirror the historic UX: auto-restart
+    // when we hold (or can obtain) the master password, otherwise hint.
+    if crate::commands_proxy::proxy_is_running_managed() {
+        let pw = if let Some(cached) = crate::session::try_get() {
+            cached
+        } else if !json_mode {
+            eprintln!("    Restart proxy to apply.");
+            match crate::prompt_hidden("    \u{1F512} Enter Master Password: ") {
+                Ok(p) => SecretString::new(p),
+                Err(_) => {
+                    eprintln!("\n    Run {} manually.", "'aikey proxy restart'".bold());
+                    return;
+                }
+            }
+        } else {
+            return; // json_mode + no cached pw: don't prompt; caller will surface.
+        };
+        let _ = crate::commands_proxy::handle_restart(None, &pw);
     }
 }
 
-/// Persist `controlPanelUrl` in `~/.aikey/config/config.json`.
+/// CredentialFields are the user-JWT bits proxy reporter needs to
+/// bootstrap its RefreshableJWT for the team route. `access_token` is
+/// the current short-lived JWT; `expires_at` is its unix expiry
+/// (0 = unknown, treat as "refresh on first use"); `refresh_url` is
+/// the absolute URL the proxy's auto-refresh loop POSTs to.
+///
+/// refresh_token is deliberately NOT here — it's a higher-sensitivity
+/// long-lived credential and stays encrypted in the vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CredentialFields {
+    access_token: String,
+    expires_at: i64,
+    refresh_url: String,
+}
+
+/// UserYAMLTeamSection is the parsed shape of what configure_proxy_collector
+/// cares about under `proxy.events`. Only used internally for the
+/// no-op-write short-circuit; not exported.
+#[derive(Debug, Default)]
+struct UserYAMLTeamSection {
+    url: Option<String>,
+    cred: Option<CredentialFields>,
+}
+
+/// Reads what configure_proxy_collector cares about under
+/// `proxy.events`: the team route URL and credential bundle (if any).
+/// Used to short-circuit no-op writes so re-running `aikey login`
+/// against the same control URL + still-fresh JWT doesn't trigger a
+/// needless proxy restart.
+///
+/// Missing file / malformed yaml / missing sub-paths all return a
+/// zero-value section — caller treats it the same as "nothing
+/// configured yet" and proceeds to write.
+fn read_user_yaml_team(user_config: &std::path::Path) -> Option<UserYAMLTeamSection> {
+    let data = std::fs::read_to_string(user_config).ok()?;
+    let v: serde_yaml::Value = serde_yaml::from_str(&data).ok()?;
+    let events = v.get("proxy")?.get("events")?;
+    let url = events
+        .get("collector_routes")
+        .and_then(|m| m.get("team"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
+    let cred = events
+        .get("collector_credentials")
+        .and_then(|m| m.get("team"))
+        .and_then(|t| {
+            let access_token = t.get("token")?.as_str()?.to_string();
+            let expires_at = t.get("expires_at")?.as_i64()?;
+            let refresh_url = t.get("refresh_url")?.as_str()?.to_string();
+            Some(CredentialFields { access_token, expires_at, refresh_url })
+        });
+    Some(UserYAMLTeamSection { url, cred })
+}
+
+/// Backwards-compat shim — older unit tests / callers may still ask
+/// for "just the team URL". Kept here to avoid churning every existing
+/// regression test added in F1.
+#[cfg(test)]
+fn read_user_yaml_team_route(user_config: &std::path::Path) -> Option<String> {
+    read_user_yaml_team(user_config).and_then(|s| s.url)
+}
+
+/// Writes `proxy.events.collector_routes.team` (URL) and optionally
+/// `proxy.events.collector_credentials.team` (JWT bundle) to
+/// `aikey-user.yaml`, creating the file if absent and preserving every
+/// other top-level section (e.g. existing `trial:` secrets).
+///
+/// Why parse-modify-serialize (vs string surgery): the user file is
+/// shared with the trial installer which writes
+/// `trial.{jwt_secret, master_key, service_token, admin_email}`.
+/// Hand-spliced edits risked corrupting that section's indentation; a
+/// structured rewrite via `serde_yaml::Value` is safe.
+///
+/// File mode is owner-only (0600) on Unix because adjacent fields in
+/// the same file are secrets (jwt_secret, master_key, access_token,
+/// refresh_token). Mirrors the trial installer's chmod. No-op on
+/// Windows where unix file modes don't apply.
+///
+/// cred == None means "remove the credential bundle if present" — used
+/// by `aikey account logout` to scrub the user JWT from disk while
+/// keeping the team URL (re-login may target the same backend).
+fn write_user_yaml_team_section(
+    user_config: &std::path::Path,
+    team_url: &str,
+    cred: Option<&CredentialFields>,
+) -> Result<(), String> {
+    let mut root: serde_yaml::Value = if user_config.exists() {
+        let data = std::fs::read_to_string(user_config)
+            .map_err(|e| format!("read {}: {}", user_config.display(), e))?;
+        if data.trim().is_empty() {
+            serde_yaml::Value::Mapping(Default::default())
+        } else {
+            serde_yaml::from_str(&data)
+                .map_err(|e| format!("parse {}: {}", user_config.display(), e))?
+        }
+    } else {
+        if let Some(parent) = user_config.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create dir {}: {}", parent.display(), e))?;
+        }
+        serde_yaml::Value::Mapping(Default::default())
+    };
+
+    // Ensure root is a mapping. If the file existed but had a scalar/sequence
+    // top-level, refuse to silently overwrite — that's a corruption signal
+    // worth surfacing.
+    let root_map = root.as_mapping_mut()
+        .ok_or_else(|| format!("{} top-level is not a mapping", user_config.display()))?;
+
+    // Walk / create the proxy.events.{collector_routes, collector_credentials} paths.
+    let proxy = root_map
+        .entry(serde_yaml::Value::String("proxy".into()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()))
+        .as_mapping_mut()
+        .ok_or_else(|| "proxy: section is not a mapping".to_string())?;
+    let events = proxy
+        .entry(serde_yaml::Value::String("events".into()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()))
+        .as_mapping_mut()
+        .ok_or_else(|| "proxy.events: is not a mapping".to_string())?;
+
+    // collector_routes.team — URL string.
+    {
+        let routes = events
+            .entry(serde_yaml::Value::String("collector_routes".into()))
+            .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()))
+            .as_mapping_mut()
+            .ok_or_else(|| "proxy.events.collector_routes: is not a mapping".to_string())?;
+        routes.insert(
+            serde_yaml::Value::String("team".into()),
+            serde_yaml::Value::String(team_url.to_string()),
+        );
+    }
+
+    // collector_credentials.team — JWT bundle (optional).
+    if let Some(cf) = cred {
+        let credentials = events
+            .entry(serde_yaml::Value::String("collector_credentials".into()))
+            .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()))
+            .as_mapping_mut()
+            .ok_or_else(|| "proxy.events.collector_credentials: is not a mapping".to_string())?;
+        let mut team_cred: serde_yaml::Mapping = Default::default();
+        team_cred.insert(
+            serde_yaml::Value::String("type".into()),
+            serde_yaml::Value::String("jwt".into()),
+        );
+        team_cred.insert(
+            serde_yaml::Value::String("token".into()),
+            serde_yaml::Value::String(cf.access_token.clone()),
+        );
+        team_cred.insert(
+            serde_yaml::Value::String("expires_at".into()),
+            serde_yaml::Value::Number(cf.expires_at.into()),
+        );
+        team_cred.insert(
+            serde_yaml::Value::String("refresh_url".into()),
+            serde_yaml::Value::String(cf.refresh_url.clone()),
+        );
+        credentials.insert(
+            serde_yaml::Value::String("team".into()),
+            serde_yaml::Value::Mapping(team_cred),
+        );
+    } else if let Some(credentials) = events
+        .get_mut(serde_yaml::Value::String("collector_credentials".into()))
+        .and_then(|v| v.as_mapping_mut())
+    {
+        // cred == None and credentials block already exists: scrub the
+        // team entry (logout path). Leave other route credentials
+        // untouched in case future B-phases add personal/oauth here.
+        credentials.remove(serde_yaml::Value::String("team".into()));
+    }
+
+    let serialized = serde_yaml::to_string(&root)
+        .map_err(|e| format!("serialize yaml: {}", e))?;
+    std::fs::write(user_config, &serialized)
+        .map_err(|e| format!("write {}: {}", user_config.display(), e))?;
+
+    // Cross-platform owner-only hardening (2026-05-11 fix): the previous
+    // `#[cfg(unix)]` chmod 0o600 left Windows files world-readable.
+    // user.yaml now carries `proxy.events.collector_credentials.team.token`
+    // (a user-scoped JWT) alongside the historical `trial.{jwt_secret,
+    // master_key}` — both deserve owner-only protection on every OS.
+    // storage_acl::enforce_owner_only_file abstracts the per-OS API
+    // (Unix chmod 0600 / Windows icacls strip-everyone-except-owner).
+    let _ = crate::storage_acl::enforce_owner_only_file(user_config);
+    Ok(())
+}
+
+/// Test/back-compat wrapper for the URL-only write path. Callers using
+/// the F1-era signature (URL only, no credential) still work unchanged
+/// — they just don't write a credential bundle.
+#[cfg(test)]
+fn write_user_yaml_team_route(
+    user_config: &std::path::Path,
+    team_url: &str,
+) -> Result<(), String> {
+    write_user_yaml_team_section(user_config, team_url, None)
+}
+
+/// (Removed 2026-05-11 F1 fix) — the system-yaml-patching `patch_team_route`
+/// / `local_collector_default` helpers and their unit tests lived here. They
+/// patched `aikey-proxy.yaml` directly, which got wiped by every
+/// `make restart-personal` (bootstrap-config rm + re-render). Replacement
+/// path: `configure_proxy_collector` now writes
+/// `proxy.events.collector_routes.team` to `aikey-user.yaml`, and the proxy
+/// loader (aikey-proxy/internal/config/config.go::Load) deep-merges it on
+/// top of the rendered system config at startup. Net effect: login-time
+/// overrides survive system-yaml re-renders.
 ///
 /// Stage 2.1 windows-compat: routed through `shell_integration::resolve_aikey_dir()`.
 fn save_control_url_to_config(url: &str) {
@@ -760,6 +1020,16 @@ pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> 
     // Local-user mode: open console directly without JWT.
     // Why: personal edition has no login flow — LocalIdentityMiddleware handles
     // auth server-side, and the SPA is served with authMode:"local_bypass".
+    //
+    // Phase 3B (2026-05-11) note: unlike `aikey master`, `aikey web` keeps
+    // the local-mode shortcut active even when the user is logged into a
+    // remote team. Reasoning: `web` opens the user's own dashboard / vault /
+    // overview, which are served by the LOCAL local-server — that's where
+    // the Phase 3A merged Personal + Team key display lives. The remote
+    // team server has its own separate user-facing pages, but they're a
+    // different context (master-managed view, no local Personal keys).
+    // `aikey master` is the command that should follow the login URL
+    // (team-admin console); `aikey web` stays local.
     if port.is_none() {
         if let Some(url) = try_local_browse_url(alias) {
             if json_mode {
@@ -850,15 +1120,25 @@ pub fn handle_master_browse(page: Option<&str>, url_override: Option<&str>, port
         }
     };
 
-    // Resolve base URL: --url > --port > install-state > stored account > interactive prompt.
+    // Resolve base URL: --url > --port > stored account > install-state > interactive prompt.
+    //
+    // Phase 3B (2026-05-11): platform_account (login URL) was promoted ABOVE
+    // try_local_control_url (install-state). Reasoning: if the user explicitly
+    // ran `aikey login --control-url X`, X is their active workspace; the
+    // local install-state URL is just the install profile's default. Previous
+    // order opened localhost even after login to a remote team server, which
+    // confused users running `aikey master` after `aikey login` to a team
+    // server URL — they expected the team console, got their local trial.
+    // Users who genuinely want the local console can still pass --url / --port
+    // explicitly, both of which still win over login.
     let base_url = if let Some(u) = url_override {
         u.to_string()
     } else if let Some(p) = port {
         format!("http://localhost:{}", p)
-    } else if let Some(url) = try_local_control_url() {
-        url
     } else if let Ok(Some(acc)) = storage::get_platform_account() {
         acc.control_url.clone()
+    } else if let Some(url) = try_local_control_url() {
+        url
     } else if !json_mode && std::io::stdin().is_terminal() {
         // Interactive prompt with a sensible default
         use std::io::Write;
@@ -945,22 +1225,64 @@ fn derive_local_control_url(state: &serde_json::Value) -> Option<String> {
 
 /// Build a local-mode browse URL for `aikey browse <page>`.
 ///
-/// Returning `None` means "not in local/trial mode — caller should fall back
-/// to the JWT path". Uses the same profile-driven base-URL resolution as
+/// Returning `None` means "no local server is installed — caller should fall
+/// back to the JWT path". Uses the same profile-driven base-URL resolution as
 /// `try_local_control_url` (see that fn's `Why` block). The alias is already
 /// validated by the caller.
+///
+/// Phase 3B (2026-05-11): the `control_plane_mode` gate was removed.
+/// Reasoning: `aikey web` is the user's own dashboard (Personal vault +
+/// Phase 3A merged Team-key view), which is served by the LOCAL local-server
+/// regardless of whether the user has logged into a remote team. Previously
+/// the gate over-restricted to mode=="local"|"trial"; an install whose
+/// install-state.json had a stale `control_plane_mode: "remote"` field
+/// (set by an old `aikey login --control-url` flow that wrote the field)
+/// would route `aikey web` through the remote JWT path, which fails with
+/// "Not logged in" before login and opens the remote server's user pages
+/// (a different context — no local Personal keys) after login.
+///
+/// `installed_components` is the canonical signal "local-server is on this
+/// machine"; we check that instead. derive_local_control_url's downstream
+/// requirement on `ports.trial` is the second guard for malformed states.
 fn try_local_browse_url(alias: &str) -> Option<String> {
     let state = read_install_state()?;
+    derive_local_browse_url(&state, alias)
+}
 
-    // "local" and "trial" both run the control panel on the same machine.
-    // Open the browser directly and let the web frontend handle auth — the
-    // CLI should not gatekeep when the server is local.
-    let mode = state.get("control_plane_mode")?.as_str()?;
-    if mode != "local" && mode != "trial" {
+/// Pure helper for `try_local_browse_url` so the resolution logic can be
+/// unit-tested without touching the filesystem. Mirrors the
+/// `derive_local_control_url` ↔ `try_local_control_url` pattern.
+///
+/// Edition signatures (workflow/CD/installer/*.sh write these strings):
+///   - Personal w/ console : installed_components includes "local-server"
+///   - Personal CLI-only   : neither — returns None (caller's mode=="none"
+///                           guard then shows "No web console" hint)
+///   - Trial               : installed_components includes "full-trial"
+///                           (aikey-full-trial bundles the same user-side
+///                           web at 127.0.0.1:8090, just packaged in a
+///                           single binary with master + collector + query)
+///
+/// Phase 3B (2026-05-11 regression fix): the literal "local-server" check
+/// was missing the Trial case, breaking `aikey web` on Trial installs
+/// (spec: requirements/2026-05-11-aikey-web-local-first-team-merge.md R5).
+/// The Trial composer's `/go/<alias>` routes are wire-identical to Personal
+/// — same web bundle, same handlers — so accepting either component name
+/// is the correct fix.
+fn derive_local_browse_url(state: &serde_json::Value, alias: &str) -> Option<String> {
+    let has_local_web = state
+        .get("installed_components")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().any(|c| {
+                matches!(c.as_str(), Some("local-server") | Some("full-trial"))
+            })
+        })
+        .unwrap_or(false);
+    if !has_local_web {
         return None;
     }
 
-    let base_url = derive_local_control_url(&state)?;
+    let base_url = derive_local_control_url(state)?;
 
     // Both branches go through `/go/<alias>` so the web router owns
     // every real route.
@@ -1297,16 +1619,48 @@ pub fn handle_logout(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
+    // Phase 3B R3/C (2026-05-11) — ghost-binding cleanup:
+    // Wipe all team-key rows from user_profile_provider_bindings. Without
+    // this, the bindings table keeps `key_source_type='managed_virtual_key'`
+    // rows pointing at vk_ids the user no longer owns; a subsequent
+    // `aikey login` (even to a different account) would re-activate stale
+    // bindings and proxy.list / vault-list would surface them as if the
+    // team key were still bound. Spec: requirements/2026-05-11-aikey-web-
+    // local-first-team-merge.md R3 (ghost binding paragraph).
+    //
+    // Returns the (provider_code, vk_id) tuples we cleared so we can refresh
+    // active.env afterwards — any team-bound provider needs its env vars
+    // re-derived since the binding is gone.
+    let cleared_team_bindings = storage::remove_bindings_by_key_source_type(
+        crate::profile_activation::DEFAULT_PROFILE,
+        crate::credential_type::CredentialType::ManagedVirtualKey.as_str(),
+    )
+    .unwrap_or_default();
+
     // Reset sync version so the next login always performs a full sync,
     // even if the new account happens to be different from the old one
     // (in which case finish_login won't detect an "account switch").
     storage::set_local_seen_sync_version(0);
 
     storage::clear_platform_account()?;
+
+    // Refresh active.env after binding wipe so the proxy / shells see the
+    // updated state. No-op when no team bindings existed (skip the syscall
+    // overhead in the common path).
+    if !cleared_team_bindings.is_empty() {
+        let _ = crate::profile_activation::refresh_implicit_profile_activation();
+    }
+
     if json_mode {
-        crate::json_output::print_json(serde_json::json!({ "ok": true }));
+        crate::json_output::print_json(serde_json::json!({
+            "ok": true,
+            "cleared_team_bindings": cleared_team_bindings.len(),
+        }));
     } else {
         println!("Logged out.");
+        if !cleared_team_bindings.is_empty() {
+            println!("  Cleared {} team-key binding(s).", cleared_team_bindings.len());
+        }
     }
     Ok(())
 }
@@ -1496,7 +1850,29 @@ pub fn run_snapshot_sync() -> Result<bool, String> {
 ///
 /// Returns the number of newly downloaded keys.
 pub fn run_full_snapshot_sync(password: &SecretString) -> Result<usize, String> {
+    let vault_key = derive_vault_key(password)?;
+    run_full_snapshot_sync_with_vault_key(&vault_key)
+}
+
+/// Phase 3B (2026-05-11): vault_key-only snapshot sync. Used by the web
+/// bridge path where the master password isn't available — only the
+/// already-derived 32-byte vault_key flows through the session cookie.
+///
+/// Identical behavior to `run_full_snapshot_sync` minus the password →
+/// vault_key Argon2id step. Caller must guarantee `vault_key` matches
+/// the vault's stored password_hash (the bridge's `prepare_vault`
+/// already enforces this before invoking us).
+pub fn run_full_snapshot_sync_with_vault_key(vault_key: &[u8; crypto::KEY_SIZE]) -> Result<usize, String> {
     use colored::Colorize;
+
+    // Strict-verify before any encrypt write: a vault_key that does not
+    // match the stored password_hash would silently encrypt managed-key
+    // ciphertext that nothing downstream can decrypt — root cause of the
+    // 2026-05-11 team-key registry-miss incident. Both call sites
+    // (CLI `aikey key sync` via derive + handle_use's bridge path) pass
+    // through here, so this is the single chokepoint.
+    crate::storage::verify_vault_key(vault_key)
+        .map_err(|e| format!("snapshot sync aborted: {}", e))?;
 
     let acc = match storage::get_platform_account().ok().flatten() {
         Some(a) => a,
@@ -1519,7 +1895,6 @@ pub fn run_full_snapshot_sync(password: &SecretString) -> Result<usize, String> 
     let _ = storage::bump_vault_change_seq();
 
     // Claim any unclaimed keys and download missing key material.
-    let vault_key = derive_vault_key(password)?;
     let account_id = Some(acc.account_id.clone());
 
     let cached = storage::list_virtual_key_cache().unwrap_or_default();
@@ -1558,7 +1933,7 @@ pub fn run_full_snapshot_sync(password: &SecretString) -> Result<usize, String> 
                     Some(binding) => {
                         let protocol_type = payload.primary_protocol_type().to_string();
                         let (nonce, ciphertext) =
-                            crypto::encrypt(&vault_key, binding.provider_key.as_bytes())
+                            crypto::encrypt(vault_key, binding.provider_key.as_bytes())
                                 .map_err(|e| format!("encrypt: {}", e))?;
 
                         let sync_supported_providers = if !payload.supported_providers.is_empty() {
@@ -1790,7 +2165,24 @@ pub fn sync_managed_key_metadata() -> bool {
 pub fn handle_key_sync(
     password: &SecretString,
     json_mode: bool,
+    force_reencrypt: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // --force-reencrypt: clear local ciphertext on active team keys so the
+    // sync loop below treats them as `needs_download` and pulls a fresh
+    // copy encrypted under the current vault_key. Recovery path for the
+    // 2026-05-11 decrypt-inconsistency incident — see
+    // workflow/CI/bugfix/2026-05-11-team-key-decrypt-inconsistent.md.
+    if force_reencrypt {
+        let cleared = storage::clear_managed_key_ciphertexts()
+            .map_err(|e| format!("clear team key ciphertext: {}", e))?;
+        if !json_mode {
+            use colored::Colorize;
+            eprintln!(
+                "  {} Cleared local ciphertext on {} active team key(s); re-downloading...",
+                "↻".cyan(), cleared
+            );
+        }
+    }
     // Force a full sync by resetting local_seen_sync_version to 0.
     storage::set_local_seen_sync_version(0);
     let downloaded = run_full_snapshot_sync(password)?;
@@ -3671,6 +4063,58 @@ mod core_tests {
         assert_eq!(anthropic_rows.len(), 1, "UPSERT should leave exactly one row per canonical");
         assert_eq!(anthropic_rows[0].key_source_ref, "second");
     }
+
+    // ── snapshot sync verify (2026-05-11 fix) ────────────────────────────────
+
+    /// Critical defense-in-depth: `run_full_snapshot_sync_with_vault_key`
+    /// MUST reject a vault_key that doesn't match the stored password_hash
+    /// BEFORE touching the network or writing ciphertext. The pre-fix
+    /// version silently encrypted team-key material with whatever key it
+    /// was given, persisted the result, and downstream proxy decrypts then
+    /// failed forever (the 2026-05-11 incident).
+    ///
+    /// We assert two properties:
+    ///   1. Err result containing "vault_key does not match" guidance.
+    ///   2. NO network call: the test runs with no platform account
+    ///      registered, so reaching the snapshot fetch would crash with
+    ///      a different error. A bare "snapshot sync aborted" return
+    ///      proves verify ran first and short-circuited.
+    #[test]
+    fn run_full_snapshot_sync_rejects_wrong_vault_key() {
+        let (_dir, _lock) = setup_vault();
+        // Wrong vault_key — all zeros never matches the derived hash.
+        let wrong_key = [0u8; 32];
+        let err = run_full_snapshot_sync_with_vault_key(&wrong_key)
+            .expect_err("must reject vault_key that doesn't match password_hash");
+        assert!(
+            err.contains("snapshot sync aborted") && err.contains("password_hash"),
+            "error must call out the verify failure (not a downstream network error), got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn run_full_snapshot_sync_accepts_correct_vault_key_in_offline_mode() {
+        // The matching test: a correctly-derived vault_key passes verify.
+        // Without a platform account the snapshot fetch returns Ok(0) — no
+        // network — so this exercises the verify path's happy case without
+        // standing up a control server.
+        let (_dir, _lock) = setup_vault();
+        let salt = storage::get_salt().expect("salt");
+        let (m, t, p) = storage::get_kdf_params().expect("kdf");
+        let key = crate::crypto::derive_key_with_params(
+            &SecretString::new("test_password".to_string()),
+            &salt, m, t, p,
+        ).expect("derive");
+        let mut vk = [0u8; 32];
+        vk.copy_from_slice(key.as_slice());
+
+        // get_platform_account returns None on a fresh vault → snapshot sync
+        // returns Ok(0). The verify gate must allow the call through.
+        let result = run_full_snapshot_sync_with_vault_key(&vk);
+        assert!(result.is_ok(), "correct vault_key must pass verify; got {:?}", result);
+        assert_eq!(result.unwrap(), 0, "no platform account → no downloads");
+    }
 }
 
 // ============================================================================
@@ -3813,6 +4257,361 @@ mod control_url_resolution_tests {
             "control_panel_url": "http://stale:39000"
         }"#);
         assert_eq!(derive_local_control_url(&s), None);
+    }
+}
+
+// ============================================================================
+// derive_local_browse_url tests — edition coverage for R5
+//
+// Pin the regression caught on 2026-05-11: `try_local_browse_url` originally
+// checked the literal string "local-server" in installed_components, missing
+// the Trial edition's "full-trial" component. Result: `aikey web` on Trial
+// installs fell through to the JWT path → "Not logged in" error or wrong
+// remote URL routing. Spec: requirements/2026-05-11-aikey-web-local-first-
+// team-merge.md R5.
+// ============================================================================
+#[cfg(test)]
+mod browse_url_resolution_tests {
+    use super::derive_local_browse_url;
+
+    fn state(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).expect("test fixture must be valid JSON")
+    }
+
+    #[test]
+    fn personal_with_console_returns_local_go_url() {
+        // local-install.sh --with-console writes "local-server" and ports.trial.
+        let s = state(r#"{
+            "install_profile": "local",
+            "control_plane_mode": "local",
+            "installed_components": ["cli", "proxy", "local-server"],
+            "ports": {"proxy": 27200, "trial": 8090}
+        }"#);
+        assert_eq!(
+            derive_local_browse_url(&s, "vault"),
+            Some("http://127.0.0.1:8090/go/vault".to_string())
+        );
+    }
+
+    #[test]
+    fn trial_returns_local_go_url() {
+        // trial-install.sh writes "full-trial" (not "local-server") +
+        // ports.trial. Before the 2026-05-11 fix this case returned None.
+        let s = state(r#"{
+            "install_profile": "trial",
+            "control_plane_mode": "trial",
+            "installed_components": ["cli", "proxy", "full-trial"],
+            "ports": {"proxy": 27200, "trial": 8090}
+        }"#);
+        assert_eq!(
+            derive_local_browse_url(&s, "vault"),
+            Some("http://127.0.0.1:8090/go/vault".to_string())
+        );
+    }
+
+    #[test]
+    fn personal_cli_only_returns_none() {
+        // No local web server installed → caller falls back to the
+        // mode=="none" guard which shows "No web console" hint.
+        let s = state(r#"{
+            "install_profile": "local",
+            "control_plane_mode": "none",
+            "installed_components": ["cli", "proxy"]
+        }"#);
+        assert_eq!(derive_local_browse_url(&s, "vault"), None);
+    }
+
+    #[test]
+    fn production_server_returns_none() {
+        // Server installs deploy services, not user-facing web — there's
+        // no /go/<alias> route on the server-side machine.
+        // (End-user CLI pointing at production has installed_components
+        // [cli, proxy] only, identical to personal_cli_only test above.)
+        let s = state(r#"{
+            "install_profile": "server",
+            "control_plane_mode": "remote",
+            "installed_components": ["control-service", "collector-service", "query-service"],
+            "control_panel_url": "http://10.0.0.5:39000"
+        }"#);
+        assert_eq!(derive_local_browse_url(&s, "vault"), None);
+    }
+
+    #[test]
+    fn alias_threads_through_to_path_suffix() {
+        // Sanity-check that the alias parameter becomes the path suffix.
+        let s = state(r#"{
+            "install_profile": "local",
+            "installed_components": ["cli", "proxy", "local-server"],
+            "ports": {"proxy": 27200, "trial": 8090}
+        }"#);
+        assert_eq!(
+            derive_local_browse_url(&s, "import"),
+            Some("http://127.0.0.1:8090/go/import".to_string())
+        );
+        assert_eq!(
+            derive_local_browse_url(&s, "overview"),
+            Some("http://127.0.0.1:8090/go/overview".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_installed_components_returns_none() {
+        // Defensive: older install-state.json formats may not have the
+        // field at all — treat as "no local web" rather than crashing.
+        let s = state(r#"{
+            "install_profile": "local",
+            "ports": {"trial": 8090}
+        }"#);
+        assert_eq!(derive_local_browse_url(&s, "vault"), None);
+    }
+}
+
+// ============================================================================
+// 2026-05-11 F1 fix tests — user-layer team-route writer/reader.
+//
+// configure_proxy_collector now writes proxy.events.collector_routes.team
+// to ~/.aikey/config/aikey-user.yaml so the value survives system-yaml
+// re-renders (the make restart-personal / aikey-config-tool render
+// pipeline rm + re-emits the system file every time). These tests pin
+// the surface a downstream refactor would have to preserve.
+// ============================================================================
+#[cfg(test)]
+mod user_yaml_team_route_tests {
+    use super::{read_user_yaml_team_route, write_user_yaml_team_route};
+    use tempfile::TempDir;
+
+    /// Fresh install: aikey-user.yaml doesn't exist yet. Writer must
+    /// create the parent dir + file + minimal mapping shape.
+    #[test]
+    fn writes_team_route_when_file_absent() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config").join("aikey-user.yaml");
+        write_user_yaml_team_route(&path, "http://192.168.0.113:3000").unwrap();
+        let got = read_user_yaml_team_route(&path);
+        assert_eq!(got.as_deref(), Some("http://192.168.0.113:3000"));
+    }
+
+    /// Trial installs already write `trial.{jwt_secret, master_key, ...}`
+    /// to the same file. The writer must NOT touch any other section —
+    /// corrupting that section would brick the trial server's auth.
+    #[test]
+    fn writes_team_route_preserving_other_sections() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aikey-user.yaml");
+        std::fs::write(
+            &path,
+            "trial:\n  jwt_secret: dont-touch-me\n  service_token: also-dont\n",
+        )
+        .unwrap();
+
+        write_user_yaml_team_route(&path, "http://192.168.0.113:3000").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
+        // trial: section intact
+        assert_eq!(
+            v.get("trial").and_then(|t| t.get("jwt_secret")).and_then(|s| s.as_str()),
+            Some("dont-touch-me"),
+            "trial.jwt_secret must survive the proxy-section write"
+        );
+        assert_eq!(
+            v.get("trial").and_then(|t| t.get("service_token")).and_then(|s| s.as_str()),
+            Some("also-dont"),
+        );
+        // proxy: section was added
+        assert_eq!(
+            read_user_yaml_team_route(&path).as_deref(),
+            Some("http://192.168.0.113:3000"),
+        );
+    }
+
+    /// Re-login against a different control URL overwrites the previous
+    /// team route in place — no orphaned old value left behind.
+    #[test]
+    fn rewrites_existing_team_route() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aikey-user.yaml");
+        write_user_yaml_team_route(&path, "http://old:3000").unwrap();
+        write_user_yaml_team_route(&path, "http://new:3000").unwrap();
+        assert_eq!(read_user_yaml_team_route(&path).as_deref(), Some("http://new:3000"));
+    }
+
+    /// Reader contract: missing file / missing path returns None rather
+    /// than erroring. configure_proxy_collector relies on this to
+    /// short-circuit no-op writes.
+    #[test]
+    fn reader_returns_none_for_missing_file_or_path() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nope.yaml");
+        assert_eq!(read_user_yaml_team_route(&path), None);
+
+        // File exists but no proxy section
+        let path = dir.path().join("aikey-user.yaml");
+        std::fs::write(&path, "trial:\n  jwt_secret: x\n").unwrap();
+        assert_eq!(read_user_yaml_team_route(&path), None);
+    }
+
+    /// Top-level scalar / sequence is corruption — writer refuses to
+    /// silently smash it. Returning Err here surfaces the issue (caller
+    /// prints a hint) instead of writing on top of bad state.
+    #[test]
+    fn writer_refuses_to_overwrite_corrupt_root() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aikey-user.yaml");
+        std::fs::write(&path, "- just\n- a\n- list\n").unwrap();
+        let err = write_user_yaml_team_route(&path, "http://x:3000")
+            .expect_err("non-mapping root must reject");
+        assert!(err.contains("top-level"), "error must name the shape issue: {}", err);
+    }
+
+    // ── 2026-05-11 B3: collector_credentials.team bundle ─────────────────
+    //
+    // configure_proxy_collector now ALSO writes a JWT bundle into
+    // proxy.events.collector_credentials.team — these tests pin that
+    // contract (proxy reporter's RefreshableJWT depends on the exact
+    // field names + nesting). Keeping the tests in the existing test
+    // mod since they share the same fixtures.
+
+    fn make_cred(token: &str, exp: i64, url: &str) -> super::CredentialFields {
+        super::CredentialFields {
+            access_token: token.into(),
+            expires_at: exp,
+            refresh_url: url.into(),
+        }
+    }
+
+    /// Happy path: writer emits the full bundle in the expected shape.
+    /// proxy reporter loads `token`/`expires_at`/`refresh_url` plus
+    /// `type` (selector for future non-JWT credentials, e.g. mTLS).
+    #[test]
+    fn writes_team_credential_bundle() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aikey-user.yaml");
+        let cred = make_cred(
+            "eyJ.fakejwt.xyz",
+            1_778_500_000,
+            "http://192.168.0.113:3000/auth/refresh",
+        );
+        super::write_user_yaml_team_section(&path, "http://192.168.0.113:3000", Some(&cred))
+            .expect("write");
+
+        let got = super::read_user_yaml_team(&path).expect("read");
+        assert_eq!(got.url.as_deref(), Some("http://192.168.0.113:3000"));
+        assert_eq!(
+            got.cred.as_ref().map(|c| c.access_token.as_str()),
+            Some("eyJ.fakejwt.xyz"),
+        );
+        assert_eq!(got.cred.as_ref().map(|c| c.expires_at), Some(1_778_500_000));
+        assert_eq!(
+            got.cred.as_ref().map(|c| c.refresh_url.as_str()),
+            Some("http://192.168.0.113:3000/auth/refresh"),
+        );
+
+        // The serialized form must include `type: jwt` so future
+        // selector logic (multi-credential type) keeps working.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("type: jwt"), "serialized yaml should declare type: jwt; got:\n{}", raw);
+    }
+
+    /// Re-login refreshes the bundle: new access_token + new expires_at
+    /// land in user.yaml, replacing the prior values in place.
+    #[test]
+    fn rewrites_team_credential_on_relogin() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aikey-user.yaml");
+
+        super::write_user_yaml_team_section(
+            &path,
+            "http://192.168.0.113:3000",
+            Some(&make_cred("old-jwt", 1_000_000, "http://192.168.0.113:3000/auth/refresh")),
+        ).unwrap();
+
+        super::write_user_yaml_team_section(
+            &path,
+            "http://192.168.0.113:3000",
+            Some(&make_cred("new-jwt", 9_999_999, "http://192.168.0.113:3000/auth/refresh")),
+        ).unwrap();
+
+        let got = super::read_user_yaml_team(&path).unwrap();
+        assert_eq!(got.cred.unwrap().access_token, "new-jwt");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("old-jwt"), "old credential must be fully replaced; got:\n{}", raw);
+    }
+
+    /// cred == None: the writer leaves the URL but scrubs any prior
+    /// credential. Models the `aikey account logout` path — user
+    /// shouldn't leave a usable JWT on disk after signing out.
+    #[test]
+    fn scrubs_team_credential_when_cred_is_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aikey-user.yaml");
+
+        // Seed with a credential bundle.
+        super::write_user_yaml_team_section(
+            &path,
+            "http://x:3000",
+            Some(&make_cred("secret-jwt", 100, "http://x:3000/auth/refresh")),
+        ).unwrap();
+
+        // Logout-like call: same URL, no credential.
+        super::write_user_yaml_team_section(&path, "http://x:3000", None).unwrap();
+
+        let got = super::read_user_yaml_team(&path).unwrap();
+        assert_eq!(got.url.as_deref(), Some("http://x:3000"), "URL must persist");
+        assert!(got.cred.is_none(), "credential bundle must be scrubbed");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("secret-jwt"), "scrubbed yaml must not contain old jwt; got:\n{}", raw);
+    }
+
+    /// Credential writes preserve sibling sections (`trial:` and the
+    /// other `proxy.events.collector_routes.*` entries). Trial-server
+    /// installer writes `trial.jwt_secret` etc.; corrupting that would
+    /// brick the trial server.
+    #[test]
+    fn credential_write_preserves_trial_section() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aikey-user.yaml");
+        std::fs::write(
+            &path,
+            "trial:\n  jwt_secret: dont-touch\n  master_key: keep-me\n",
+        ).unwrap();
+
+        super::write_user_yaml_team_section(
+            &path,
+            "http://x:3000",
+            Some(&make_cred("jwt-A", 7777, "http://x:3000/auth/refresh")),
+        ).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
+        assert_eq!(
+            v.get("trial").and_then(|t| t.get("jwt_secret")).and_then(|s| s.as_str()),
+            Some("dont-touch"),
+        );
+        assert_eq!(
+            v.get("trial").and_then(|t| t.get("master_key")).and_then(|s| s.as_str()),
+            Some("keep-me"),
+        );
+    }
+
+    /// Reader returns None on missing / malformed; configure_proxy_collector
+    /// relies on this short-circuit to decide write-vs-noop.
+    #[test]
+    fn read_returns_partial_when_only_url_set() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("aikey-user.yaml");
+        super::write_user_yaml_team_section(&path, "http://x:3000", None).unwrap();
+        let got = super::read_user_yaml_team(&path).unwrap();
+        assert_eq!(got.url.as_deref(), Some("http://x:3000"));
+        assert!(got.cred.is_none(), "credential should be absent");
+    }
+
+    #[test]
+    fn read_returns_none_on_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nope.yaml");
+        assert!(super::read_user_yaml_team(&path).is_none());
     }
 }
 

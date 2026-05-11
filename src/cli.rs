@@ -610,6 +610,18 @@ pub(crate) enum ProxyAction {
     },
     /// Verify current project/env/provider connectivity through the proxy
     Verify,
+    /// Re-deliver dead-lettered usage events to the collector. Triggers
+    /// the proxy's POST /admin/replay-dead-letter endpoint using the
+    /// reporter's CURRENT config (post-login JWT, current route URLs).
+    /// Idempotent: events that re-deliver are removed from
+    /// dead_letter.jsonl; events still failing stay for a future try.
+    ///
+    /// Use after fixing the upstream cause of a terminal failure (e.g.
+    /// re-logging in to refresh an expired JWT, restoring a collector
+    /// that was briefly down) to recover events that would otherwise
+    /// be permanently lost.
+    #[command(name = "replay-dead-letter")]
+    ReplayDeadLetter,
     /// (internal) Ensure aikey-proxy is running. No-op if already up; auto-
     /// starts via the same env-var/cache/TTY-prompt chain `aikey use` uses.
     /// Hidden from `--help` because it's a wrapper-internal entry point used
@@ -667,7 +679,14 @@ pub(crate) enum KeyAction {
     /// Show all personal, team, and OAuth keys (alias: `aikey list`)
     List,
     /// Sync all team key metadata from the control service
-    Sync,
+    Sync {
+        /// Clear local team key ciphertext before sync and re-download under
+        /// the current vault_key. Recovery path when proxy logs
+        /// "managed key: decryption failed, skipping" (e.g. after a vault
+        /// state where ciphertext was written with an inconsistent key).
+        #[arg(long = "force-reencrypt")]
+        force_reencrypt: bool,
+    },
     /// Activate a key for proxy routing and write ~/.aikey/active.env
     Use {
         /// Virtual key alias or ID to activate
@@ -823,7 +842,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Key { action } => format!("key.{}", match action {
                 KeyAction::Rotate { .. } => "rotate",
                 KeyAction::List => "list",
-                KeyAction::Sync => "sync",
+                KeyAction::Sync { .. } => "sync",
                 KeyAction::Use { .. } => "use",
                 KeyAction::Alias { .. } => "alias",
             }),
@@ -852,6 +871,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 ProxyAction::Status => "status",
                 ProxyAction::Restart { .. } => "restart",
                 ProxyAction::Verify => "verify",
+                ProxyAction::ReplayDeadLetter => "replay-dead-letter",
                 ProxyAction::EnsureRunning => "ensure-running",
             }),
             Commands::Auth { action } => format!("auth.{}", match action {
@@ -2130,7 +2150,7 @@ mod tests {
         let cmd = Commands::Account { action: AccountAction::Login { url: None, token: None, email: None, resend: false } };
         assert_eq!(command_name(Some(&cmd)), "account.login");
 
-        let cmd = Commands::Key { action: KeyAction::Sync };
+        let cmd = Commands::Key { action: KeyAction::Sync { force_reencrypt: false } };
         assert_eq!(command_name(Some(&cmd)), "key.sync");
     }
 

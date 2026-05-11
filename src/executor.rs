@@ -120,10 +120,36 @@ impl VaultContext {
                 Ok(())
             }
             Err(_) => {
-                // Password hash doesn't exist (old database or migration).
-                // Why not just accept: a wrong password would be stored as the real hash,
-                // locking the user out permanently. Instead, verify by trying to decrypt
-                // an existing entry. If no entries exist (empty vault), accept and store.
+                // Password hash row is missing. Historic fallback accepted any
+                // password when entries was also empty and silently wrote the
+                // supplied key as the new hash — root cause of the 2026-05-11
+                // team-key decrypt-inconsistency incident: a stale password
+                // got persisted, later writes used the verified-but-wrong
+                // hash, and the proxy could no longer decrypt ciphertexts
+                // written under a different derived key.
+                //
+                // New policy (strict): if `master_salt` is present we are in
+                // a normal post-init vault and a missing `password_hash` is
+                // an anomaly — refuse rather than auto-seed. Only when salt
+                // is ALSO absent (true pre-init / quarantined vault) do we
+                // fall through to the entry-decryption recovery path.
+                let salt_present: bool = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM config WHERE key IN ('master_salt','salt')",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map(|n| n > 0)
+                    .unwrap_or(false);
+                if salt_present {
+                    return Err(
+                        "vault state inconsistent: master_salt present but password_hash missing. \
+                         Refusing to silently accept the supplied password. \
+                         Run `aikey init` (or restore the vault) to reseat both fields."
+                            .to_string(),
+                    );
+                }
+
                 let has_entries: bool = conn
                     .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get::<_, i64>(0))
                     .map(|n| n > 0)
@@ -143,7 +169,8 @@ impl VaultContext {
                         .map_err(|_| msgs::INVALID_PASSWORD.to_string())?;
                 }
 
-                // Password verified (or empty vault) — store hash for future checks
+                // Password verified (or empty vault + no salt: pre-init) —
+                // store hash for future checks.
                 conn.execute(
                     "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
                     params!["password_hash", &**key],
@@ -1688,4 +1715,126 @@ pub fn dry_run_project_config(
     infos.sort_by(|a, b| a.env_var.cmp(&b.env_var));
 
     Ok(infos)
+}
+
+#[cfg(test)]
+mod verify_password_internal_tests {
+    use super::*;
+    use secrecy::SecretString;
+    use tempfile::TempDir;
+
+    fn setup_initialized_vault() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        let mut salt = [0u8; 16];
+        crypto::generate_salt(&mut salt).expect("salt");
+        let pw = SecretString::new("test_password".to_string());
+        storage::initialize_vault(&salt, &pw).expect("init vault");
+        (dir, guard)
+    }
+
+    fn derive_current(password: &str) -> [u8; 32] {
+        let salt = storage::get_salt().expect("salt");
+        let (m, t, p) = storage::get_kdf_params().expect("kdf");
+        let key = crypto::derive_key_with_params(
+            &SecretString::new(password.to_string()),
+            &salt, m, t, p,
+        ).expect("derive");
+        let mut out = [0u8; 32];
+        out.copy_from_slice(key.as_slice());
+        out
+    }
+
+    /// 2026-05-11 regression guard: prior to the fix,
+    /// `verify_password_internal` accepted ANY password as "valid" when
+    /// `password_hash` was missing and the entries table was empty, then
+    /// silently persisted the supplied key as the new hash. That window
+    /// is the suspected origin of team-key ciphertext encrypted under
+    /// a vault_key that didn't match later derivations.
+    ///
+    /// New policy: if `master_salt` is present (i.e. this is a real,
+    /// post-init vault), a missing `password_hash` must be reported as an
+    /// inconsistent state — NOT silently accepted.
+    #[test]
+    fn no_silent_accept_when_salt_present_but_hash_missing() {
+        let (_dir, _lock) = setup_initialized_vault();
+
+        // Snapshot the vault state mid-flight: keep salt, delete hash —
+        // exactly the dangerous window that prompted the fix.
+        let conn = storage::open_connection().expect("open");
+        conn.execute("DELETE FROM config WHERE key='password_hash'", [])
+            .expect("delete hash");
+
+        // The current (correct) password — which previously would still
+        // have been "accepted" because the historic fallback only checked
+        // entries-emptiness, not salt presence.
+        let correct = derive_current("test_password");
+        let err = verify_password(&correct)
+            .expect_err("policy now: missing hash + salt present → REJECT");
+        assert!(
+            err.to_lowercase().contains("vault state inconsistent")
+                || err.to_lowercase().contains("password_hash"),
+            "rejection must surface the state mismatch, got: {}", err
+        );
+
+        // password_hash MUST still be missing — verify must not auto-seed.
+        let conn = storage::open_connection().expect("reopen");
+        let row: Result<Vec<u8>, _> = conn.query_row(
+            "SELECT value FROM config WHERE key='password_hash'",
+            [], |r| r.get(0),
+        );
+        assert!(row.is_err(),
+            "rejected verify must NOT have re-seeded password_hash silently");
+    }
+
+    /// Empty vault (no salt, no entries) is the legitimate pre-init case;
+    /// the fallback there is still benign because there's literally
+    /// nothing to encrypt under a wrong key yet, and `initialize_vault`
+    /// will write authoritative salt + hash on the next call.
+    #[test]
+    fn pre_init_vault_with_no_salt_still_allowed_through_fallback() {
+        let guard = crate::storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+
+        // Hand-create an empty vault file with the schema but no salt/hash —
+        // mirrors the "session-backend created the file before vault init"
+        // window documented in initialize_vault.
+        let conn = rusqlite::Connection::open(&db_path).expect("open");
+        conn.execute(
+            "CREATE TABLE config (key TEXT PRIMARY KEY, value BLOB NOT NULL)",
+            [],
+        ).expect("create config");
+        conn.execute(
+            "CREATE TABLE entries (
+                id INTEGER PRIMARY KEY,
+                alias TEXT NOT NULL UNIQUE,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL
+            )",
+            [],
+        ).expect("create entries");
+        drop(conn);
+
+        let any_key = [0xAAu8; 32];
+        // Fallback writes the hash; subsequent same-key verifies must pass.
+        verify_password(&any_key).expect("pre-init fallback must accept");
+
+        let conn = rusqlite::Connection::open(&db_path).expect("reopen");
+        let stored: Vec<u8> = conn.query_row(
+            "SELECT value FROM config WHERE key='password_hash'",
+            [], |r| r.get(0),
+        ).expect("hash should be seeded by fallback");
+        assert_eq!(stored.as_slice(), &any_key[..],
+            "fallback persists the supplied key as the new hash");
+
+        drop(guard);
+    }
 }

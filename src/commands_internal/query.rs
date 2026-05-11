@@ -114,9 +114,162 @@ fn protocol_family_of(raw: Option<&str>) -> String {
 ///   provider is in `in_use_for`.
 type ActiveBindingMap = HashMap<String, Vec<String>>;
 
-fn load_active_binding_refs() -> (ActiveBindingMap, ActiveBindingMap) {
+/// Phase 3B revised (2026-05-11): emit team records inline with personal
+/// + oauth in vault.list responses. Replaces the prior architecture where
+/// team rows came from a separate cross-origin fetch to the team server
+/// (see useTeamVaultStore). Now the CLI's `managed_virtual_keys_cache`
+/// is the single source of truth for what team keys the user has
+/// claimed locally — alias (local_alias preferred), route_url,
+/// route_token, in_use_for state, and lifecycle metadata all flow
+/// through one channel.
+///
+/// route_token derivation: team keys don't store a token in the cache
+/// table — aikey-proxy expects `aikey_team_<virtual_key_id>` as the
+/// bearer (see aikey-proxy/internal/proxy/dispatch.go line 84
+/// "HasPrefix aikey_team_" path). We compute it here so the Web
+/// drawer's "Route token" row mirrors the personal-key pattern.
+///
+/// route_url derivation: same `route_url_for(provider_code)` helper
+/// personal/oauth use — the local aikey-proxy URL is per-provider, not
+/// per-key.
+///
+/// effective_status: see `team_effective_status` helper below for the
+/// full truth table. Short version: "usable right now" (decoupled from
+/// "currently routed"), so claimed-but-not-routed keys correctly read
+/// as active.
+
+/// Format a Unix epoch (seconds, possibly negative) as an RFC3339 UTC
+/// timestamp like "2027-05-10T08:34:20Z". Manual conversion to avoid
+/// pulling in chrono just for this one call site. Algorithm: Gregorian
+/// civil-from-days based on Howard Hinnant's date routines (public
+/// domain, widely used). Negative timestamps are clamped — team key
+/// expiry is always in the future on the wire, but defensive handling
+/// keeps tests deterministic.
+fn unix_to_rfc3339(secs: i64) -> String {
+    let secs = secs.max(0);
+    let days = secs / 86_400;
+    let time_of_day = secs % 86_400;
+    let hh = (time_of_day / 3600) as u32;
+    let mm = ((time_of_day / 60) % 60) as u32;
+    let ss = (time_of_day % 60) as u32;
+
+    // Civil-from-days: shift epoch to year -4800 so all dates fall in
+    // the positive 400-year cycle. See Hinnant's "civil_from_days" paper.
+    let z = days + 719_468; // days since 0000-03-01
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hh, mm, ss)
+}
+
+/// Pure helper: derive `effective_status` ("active" | "inactive") for a
+/// team key from the three CLI-local lifecycle fields.
+///
+/// "Usable" = the key can be selected via `aikey use` AND will route
+/// through the proxy. Decoupled from "currently routed" (the latter
+/// lives in `user_profile_provider_bindings` / `in_use_for`).
+///
+/// Truth table:
+/// | key_status | share_status  | local_state            | result   |
+/// |------------|---------------|------------------------|----------|
+/// | active     | claimed       | active                 | active   |
+/// | active     | claimed       | synced_inactive        | active   |
+/// | active     | claimed       | prompt_dismissed       | active   |
+/// | active     | claimed       | stale                  | inactive |
+/// | active     | claimed       | disabled_by_*          | inactive |
+/// | revoked    | *             | *                      | inactive |
+/// | *          | pending_claim | *                      | inactive |
+///
+/// Regression: see bugfix
+/// 20260511-team-vault-effective-status-mismaps-synced-inactive.md.
+/// The prior naive `local_state == "active"` check conflated "usable"
+/// with "currently routed", hiding the Use button on every
+/// valid-but-not-routed team key.
+pub(crate) fn team_effective_status(
+    key_status: &str,
+    share_status: &str,
+    local_state: &str,
+) -> &'static str {
+    let is_usable = key_status == "active"
+        && share_status == "claimed"
+        && !local_state.starts_with("disabled_")
+        && local_state != "stale";
+    if is_usable { "active" } else { "inactive" }
+}
+
+fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Value> {
+    let entries = match storage::list_virtual_key_cache_readonly() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    entries
+        .into_iter()
+        .map(|t| {
+            let effective_alias = t.local_alias.clone().unwrap_or_else(|| t.alias.clone());
+            let route_token = format!("aikey_team_{}", t.virtual_key_id);
+            let effective_status =
+                team_effective_status(&t.key_status, &t.share_status, &t.local_state);
+            // Wire-shape normalization for TeamVaultRecord:
+            //   - share_status "pending_claim" → "pending" (UI union is
+            //     'pending' | 'claimed' | 'revoked'). Pass through
+            //     unrecognized values so debug/legacy values still surface
+            //     in DOM rather than getting silently dropped.
+            //   - expires_at i64 Unix seconds → RFC3339 string (UI type
+            //     `expires_at?: string`). None → omit.
+            let share_status_wire = match t.share_status.as_str() {
+                "pending_claim" => "pending",
+                other => other,
+            };
+            // expires_at: format as RFC3339 UTC string to match the
+            // existing TeamVaultRecord.expires_at?: string contract that
+            // the old teamVaultStore path emitted (via JSON serialization
+            // of B's response). Manual conversion to avoid pulling chrono
+            // in for one format call.
+            let expires_at_iso = t.expires_at.map(unix_to_rfc3339);
+            json!({
+                "target": "team",
+                "id": t.virtual_key_id,
+                "virtual_key_id": t.virtual_key_id,
+                "alias": effective_alias,
+                "local_alias": t.local_alias,
+                "protocol_family": protocol_family_of(Some(&t.provider_code)),
+                "supported_providers": t.supported_providers,
+                "share_status": share_status_wire,
+                "effective_status": effective_status,
+                "expires_at": expires_at_iso,
+                "route_url": route_url_for(&t.provider_code),
+                "route_token": route_token,
+                // in_use_for: per-provider active binding membership. Same
+                // semantics as personal — empty vec means "not bound
+                // anywhere", non-empty means "active for those providers".
+                "in_use_for": active_team.get(&t.virtual_key_id).cloned().unwrap_or_default(),
+                "in_use": active_team.contains_key(&t.virtual_key_id),
+                // status mirror for the existing TeamRowRecord chip
+                // (UI reads either `effective_status` or `status` — both
+                // are kept in lockstep for backward-compat with consumers
+                // that branched before the field rename).
+                "status": effective_status,
+                // Shim fields: TeamRowRecord declares these as 0/null
+                // placeholders since the team-store DTO didn't carry
+                // them. Same defaults keep helpers/Row component happy.
+                "created_at": 0,
+                "last_used_at": serde_json::Value::Null,
+                "use_count": 0,
+            })
+        })
+        .collect()
+}
+
+fn load_active_binding_refs() -> (ActiveBindingMap, ActiveBindingMap, ActiveBindingMap) {
     let mut personal: ActiveBindingMap = HashMap::new();
     let mut oauth: ActiveBindingMap = HashMap::new();
+    let mut team: ActiveBindingMap = HashMap::new();
     if let Ok(bindings) = storage::list_provider_bindings_readonly("default") {
         for b in bindings {
             match b.key_source_type {
@@ -126,13 +279,21 @@ fn load_active_binding_refs() -> (ActiveBindingMap, ActiveBindingMap) {
                 CredentialType::PersonalOAuthAccount => {
                     oauth.entry(b.key_source_ref).or_default().push(b.provider_code);
                 }
-                // Team (ManagedVirtualKey) bindings reference virtual_key_id, not
-                // anything we render in the Vault Web list today — skip.
-                _ => {}
+                // Phase 3B (2026-05-11): team (ManagedVirtualKey) bindings
+                // also captured. Map keyed by virtual_key_id so the Web
+                // can populate per-team-row `in_use_for` after fetching the
+                // team key list cross-origin from B. Previously this branch
+                // was a no-op because team rows weren't rendered; clicking
+                // `aikey use` on a team key wrote the binding correctly but
+                // the Web showed no Active state, making it look like Use
+                // had no effect.
+                CredentialType::ManagedVirtualKey => {
+                    team.entry(b.key_source_ref).or_default().push(b.provider_code);
+                }
             }
         }
     }
-    (personal, oauth)
+    (personal, oauth, team)
 }
 
 // ========== payload types ==========
@@ -422,9 +583,13 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
         }
     };
 
-    let (active_personal, _active_oauth) = load_active_binding_refs();
+    let (active_personal, _active_oauth, active_team) = load_active_binding_refs();
+    // Phase 3B revised (2026-05-11): team records inline with personal.
+    // Web vault page now reads team rows from this list instead of
+    // cross-fetching the team server via useTeamVaultStore.
+    let team_records = team_records_for_emit(&active_team);
 
-    let mut out = Vec::with_capacity(metas.len());
+    let mut out = Vec::with_capacity(metas.len() + team_records.len());
     for m in metas {
         let (nonce, ciphertext) = match storage::get_entry(&m.alias) {
             Ok(t) => t,
@@ -487,9 +652,26 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
         }));
     }
 
+    // Phase 3B revised: append team records inline.
+    let personal_count = out.len();
+    out.extend(team_records.iter().cloned());
+
     emit(&ResultEnvelope::ok(
         req_id,
-        json!({"count": out.len(), "entries": out}),
+        json!({
+            "count": out.len(),
+            "personal_count": personal_count,
+            "team_count": team_records.len(),
+            "entries": out,
+            // Phase 3B (2026-05-11): team binding map keyed by virtual_key_id.
+            // The local vault list returns Personal entries here, but the Web
+            // also needs to know which team keys (fetched separately from B)
+            // are the active binding for each provider — that information
+            // lives in the same `user_profile_provider_bindings` table.
+            // Surfacing it on the existing list response is the path of least
+            // surprise (no new endpoint, no extra fetch hop).
+            "team_active_bindings": active_team,
+        }),
     ));
 }
 
@@ -559,7 +741,7 @@ fn handle_list_oauth(env: StdinEnvelope) {
     // blobs but we project only the expires_at timestamp, never the tokens
     // themselves (D3 rule: OAuth session tokens never leave cli → Go).
     let expires_map = load_oauth_expires_map().unwrap_or_default();
-    let (_active_personal, active_oauth) = load_active_binding_refs();
+    let (_active_personal, active_oauth, active_team) = load_active_binding_refs();
 
     let arr: Vec<_> = accounts.iter().map(|a| {
         // route_url + route_token mirror the personal-key payload (2026-05-06).
@@ -611,7 +793,16 @@ fn handle_list_oauth(env: StdinEnvelope) {
 
     emit(&ResultEnvelope::ok(
         req_id,
-        json!({"count": arr.len(), "accounts": arr}),
+        json!({
+            "count": arr.len(),
+            "accounts": arr,
+            // Phase 3B (2026-05-11): same payload contract as list_personal_with_masked.
+            // See that handler for the team-binding rationale.
+            // Phase 3B revised (2026-05-11): team records are emitted ONLY by
+            // list_personal_with_masked (the records merge in Go's
+            // collectRecords reads from there).
+            "team_active_bindings": active_team,
+        }),
     ));
 }
 
@@ -676,7 +867,7 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
     }
 
     let mut out: Vec<serde_json::Value> = Vec::new();
-    let (active_personal, active_oauth) = load_active_binding_refs();
+    let (active_personal, active_oauth, active_team) = load_active_binding_refs();
 
     // Personal entries: plaintext metadata only. We go through the same
     // `list_entries_with_metadata` helper that the unlocked path uses —
@@ -802,6 +993,27 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
         }
     };
 
+    // Phase 3B revised (2026-05-11): emit team records inline in the
+    // locked path too. local_alias, share_status, expires_at, alias,
+    // provider_code are all plaintext columns (not encrypted), so the
+    // locked safety contract isn't broken. route_token IS sensitive
+    // (a bearer the proxy accepts) — for team rows it's derived from
+    // virtual_key_id without secrets, but exposing it would give an
+    // unauthenticated reader a usable proxy bearer. Blank it to match
+    // the personal/oauth locked-path policy (`null` so the TS
+    // `{record.route_token && ...}` guards skip the row).
+    let team_records: Vec<serde_json::Value> = team_records_for_emit(&active_team)
+        .into_iter()
+        .map(|mut v| {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("route_token".to_string(), serde_json::Value::Null);
+            }
+            v
+        })
+        .collect();
+    let team_count = team_records.len();
+    out.extend(team_records);
+
     emit(&ResultEnvelope::ok(
         req_id,
         json!({
@@ -809,10 +1021,16 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
             "counts": {
                 "personal": personal_count,
                 "oauth":    oauth_count,
-                "team":     0,
-                "total":    personal_count + oauth_count,
+                "team":     team_count,
+                "total":    personal_count + oauth_count + team_count,
             },
             "locked": true,
+            // Phase 3B (2026-05-11): team binding map. Surfaced even in the
+            // locked list because the team-key list (B-side fetch) doesn't
+            // require an unlocked vault either — keeping the Active state
+            // consistent across lock/unlock prevents the team Active chip
+            // from disappearing when the vault re-locks.
+            "team_active_bindings": active_team,
         }),
     ));
 }
@@ -852,7 +1070,7 @@ mod active_binding_refs_tests {
         storage::set_provider_binding("default", "anthropic", "personal_oauth_account", "acct-OAUTH").unwrap();
         storage::set_provider_binding("default", "openai", "personal", "zeroeleven_key_1").unwrap();
 
-        let (personal, oauth) = load_active_binding_refs();
+        let (personal, oauth, _team) = load_active_binding_refs();
 
         // OAuth account is bound for ANTHROPIC only — must not appear active
         // for any other provider.
@@ -895,11 +1113,115 @@ mod active_binding_refs_tests {
         storage::set_provider_binding("default", "anthropic", "personal", "openrouter_key").unwrap();
         storage::set_provider_binding("default", "openai", "personal", "openrouter_key").unwrap();
 
-        let (personal, _oauth) = load_active_binding_refs();
+        let (personal, _oauth, _team) = load_active_binding_refs();
         let providers = personal.get("openrouter_key").expect("alias present");
         let mut sorted = providers.clone();
         sorted.sort();
         assert_eq!(sorted, vec!["anthropic".to_string(), "openai".to_string()]);
+
+        drop(guard);
+    }
+
+    /// Phase 3B C (2026-05-11) — ghost binding cleanup pin:
+    /// `aikey logout` must wipe all team-key rows from the bindings table,
+    /// otherwise a subsequent login (even to a different account) would
+    /// re-activate stale bindings pointing at vk_ids the new account
+    /// doesn't own. Asserts:
+    ///   - remove_bindings_by_key_source_type returns the affected rows
+    ///     (provider_code, vk_id) pairs
+    ///   - rows are actually deleted from the table
+    ///   - other binding types (personal / oauth) are NOT touched
+    #[test]
+    fn remove_bindings_by_key_source_type_wipes_team_only() {
+        let guard = storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).expect("salt");
+        let pw = secrecy::SecretString::new("test_password".to_string());
+        storage::initialize_vault(&salt, &pw).expect("init vault");
+
+        // Mix of three binding types, simulating a user who has personal +
+        // OAuth + team bindings active simultaneously.
+        storage::set_provider_binding("default", "anthropic", "managed_virtual_key", "vk_team_anthropic").unwrap();
+        storage::set_provider_binding("default", "google", "managed_virtual_key", "vk_team_gemini").unwrap();
+        storage::set_provider_binding("default", "openai", "personal", "personal_key").unwrap();
+        storage::set_provider_binding("default", "kimi_code", "personal_oauth_account", "oauth_acct_id").unwrap();
+
+        // Bulk-wipe team bindings.
+        let cleared = storage::remove_bindings_by_key_source_type(
+            "default",
+            "managed_virtual_key",
+        ).unwrap();
+
+        // Both team rows surfaced.
+        assert_eq!(cleared.len(), 2);
+        let cleared_set: std::collections::HashSet<(String, String)> =
+            cleared.into_iter().collect();
+        assert!(cleared_set.contains(&("anthropic".to_string(), "vk_team_anthropic".to_string())));
+        assert!(cleared_set.contains(&("google".to_string(), "vk_team_gemini".to_string())));
+
+        // Personal + OAuth bindings preserved.
+        let (personal, oauth, team) = load_active_binding_refs();
+        assert!(personal.contains_key("personal_key"), "personal binding wiped accidentally");
+        assert!(oauth.contains_key("oauth_acct_id"), "oauth binding wiped accidentally");
+        assert!(team.is_empty(), "team bindings should be empty after bulk wipe");
+
+        drop(guard);
+    }
+
+    /// Phase 3B regression pin (2026-05-11): user clicked Use on a team key
+    /// from the Web vault page; the binding row was written correctly
+    /// (`key_source_type='managed_virtual_key'`, `key_source_ref=<vk_id>`)
+    /// but no Web row showed an Active state because `load_active_binding_refs`
+    /// dropped the team branch on the floor (see git blame on the
+    /// `_ => {}` arm pre-fix). Web sees `team_active_bindings: {}` and the
+    /// in_use_for shim returns false → "Use button doesn't take effect"
+    /// from the user's perspective.
+    ///
+    /// Asserts:
+    ///   - team key bindings DO appear in the third map keyed by virtual_key_id
+    ///   - the (vk_id → providers) shape matches the Personal/OAuth maps
+    ///   - team and personal bindings under the same provider don't collide
+    ///     (different partition by `key_source_type`)
+    #[test]
+    fn binding_refs_now_carry_team_bindings() {
+        let guard = storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).expect("salt");
+        let pw = secrecy::SecretString::new("test_password".to_string());
+        storage::initialize_vault(&salt, &pw).expect("init vault");
+
+        // Mirror real-world flow: anthropic binding owned by a team VK,
+        // openai binding owned by a personal alias. Both rows live in the
+        // same `user_profile_provider_bindings` table — only key_source_type
+        // distinguishes them. This is exactly the shape our team-merge UX hit.
+        storage::set_provider_binding("default", "anthropic", "managed_virtual_key", "vk_team_anthropic_xxx").unwrap();
+        storage::set_provider_binding("default", "openai", "personal", "personal_openai_alias").unwrap();
+
+        let (personal, oauth, team) = load_active_binding_refs();
+
+        // Team binding extracted into the third map.
+        let team_providers = team.get("vk_team_anthropic_xxx").expect("team vk_id present");
+        assert_eq!(team_providers, &vec!["anthropic".to_string()]);
+
+        // Personal binding extracted into the personal map.
+        let personal_providers = personal.get("personal_openai_alias").expect("personal alias present");
+        assert_eq!(personal_providers, &vec!["openai".to_string()]);
+
+        // Cross-partition guard: team vk_id MUST NOT appear in the personal
+        // or oauth map (would re-trigger the original "two inuse" regression
+        // class for personal/oauth Web rows).
+        assert!(!personal.contains_key("vk_team_anthropic_xxx"));
+        assert!(!oauth.contains_key("vk_team_anthropic_xxx"));
 
         drop(guard);
     }

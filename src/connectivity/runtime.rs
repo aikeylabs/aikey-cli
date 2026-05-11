@@ -973,7 +973,14 @@ pub fn chat_status_hint(status: u16, body: Option<&str>) -> String {
     // says key is invalid" — both surface as 401 but the operator action is
     // very different (sync/restart proxy vs. reissue/check upstream key).
     if status == 401 && body.map(body_indicates_registry_miss).unwrap_or(false) {
-        return "key not registered in proxy (try `aikey proxy restart`)".to_string();
+        // 2026-05-11: two-cause guidance. Registry miss can mean (a) a
+        // recent `aikey use` whose seq the proxy's 5-second poller has not
+        // picked up yet, or (b) a vault_key inconsistency where managed
+        // key ciphertext was written under a different key than the proxy
+        // now derives — see workflow/CI/bugfix/2026-05-11-team-key-decrypt-inconsistent.md.
+        // The proxy doesn't surface the reason in the 401 body, so we
+        // print both recovery paths and let the user pick.
+        return "proxy has no route for this key. Causes: (a) just ran `aikey use`? proxy reloads within 5s — retry or `aikey proxy reload`; (b) vault decrypt mismatch — `aikey key sync --force-reencrypt`".to_string();
     }
     match status {
         200 => "valid".to_string(),
@@ -1000,7 +1007,14 @@ pub fn api_status_hint(status: u16, body: Option<&str>) -> String {
     // proxy registry miss, which actively misleads the operator into
     // checking their upstream key when the real fix is local.
     if status == 401 && body.map(body_indicates_registry_miss).unwrap_or(false) {
-        return "key not registered in proxy (try `aikey proxy restart`)".to_string();
+        // 2026-05-11: two-cause guidance. Registry miss can mean (a) a
+        // recent `aikey use` whose seq the proxy's 5-second poller has not
+        // picked up yet, or (b) a vault_key inconsistency where managed
+        // key ciphertext was written under a different key than the proxy
+        // now derives — see workflow/CI/bugfix/2026-05-11-team-key-decrypt-inconsistent.md.
+        // The proxy doesn't surface the reason in the 401 body, so we
+        // print both recovery paths and let the user pick.
+        return "proxy has no route for this key. Causes: (a) just ran `aikey use`? proxy reloads within 5s — retry or `aikey proxy reload`; (b) vault decrypt mismatch — `aikey key sync --force-reencrypt`".to_string();
     }
     match status {
         200 => "valid key".to_string(),

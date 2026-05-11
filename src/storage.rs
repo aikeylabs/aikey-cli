@@ -574,6 +574,57 @@ pub fn get_kdf_params() -> Result<(u32, u32, u32), String> {
     Ok((m_cost, t_cost, p_cost))
 }
 
+/// Verifies that a 32-byte derived `vault_key` matches the vault's stored
+/// `password_hash` config row. Returns `Ok(())` on match, `Err` on mismatch
+/// or on any vault state that cannot authoritatively confirm the key.
+///
+/// Why this exists: any code path that derives `vault_key` from a password
+/// (or accepts one over a bridge) and then proceeds to `crypto::encrypt`
+/// into a vault table MUST first call this. Without it, an unverified
+/// `vault_key` silently encrypts ciphertext that no later reader can ever
+/// decrypt — observed as the 2026-05-11 team-key registry-miss incident,
+/// where `managed_virtual_keys_cache.provider_key_ciphertext` was written
+/// with a key that did not match the current `password_hash`, and the
+/// downstream proxy responded 401 "Route token not found in registry".
+///
+/// Strict-match semantics (no silent-accept fallback): this function
+/// requires `password_hash` to exist and equal the supplied key. The
+/// matching legacy "no hash + decrypt-an-entry-to-recover" fallback used
+/// by `executor::verify_password_internal` is intentionally NOT replicated
+/// here — write-path callers must fail loud on uncertainty, never silently
+/// proceed to encrypt.
+pub fn verify_vault_key(vault_key: &[u8]) -> Result<(), String> {
+    if vault_key.len() != crate::crypto::KEY_SIZE {
+        return Err(format!(
+            "vault_key length mismatch (got {} bytes, expected {})",
+            vault_key.len(),
+            crate::crypto::KEY_SIZE
+        ));
+    }
+    let conn = open_connection()?;
+    let stored: Result<Vec<u8>, rusqlite::Error> = conn.query_row(
+        "SELECT value FROM config WHERE key = ?1",
+        params!["password_hash"],
+        |row| row.get(0),
+    );
+    match stored {
+        Ok(hash) => {
+            if hash.as_slice() == vault_key {
+                Ok(())
+            } else {
+                Err("vault_key does not match stored password_hash \
+                     (write-path verify; refusing to encrypt with an unverified key)"
+                    .to_string())
+            }
+        }
+        Err(_) => Err(
+            "vault password_hash missing — cannot verify write-path vault_key. \
+             Run `aikey init` or restore the vault before any encrypt operation."
+                .to_string(),
+        ),
+    }
+}
+
 /// Stores an encrypted entry in the vault
 pub fn store_entry(alias: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<(), String> {
     let db_path = get_vault_path()?;
@@ -867,6 +918,140 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
             params![new_nonce, new_ciphertext, id],
         )
         .map_err(|e| format!("Failed to update entry '{}': {}", alias, e))?;
+    }
+
+    // ── Re-encrypt managed_virtual_keys_cache.provider_key_{nonce,ciphertext} ──
+    //
+    // Why this loop was added (2026-05-11 bugfix): the previous implementation
+    // only re-encrypted the `entries` table. After change-password, team-key
+    // ciphertext kept its old-key encryption while the rest of the vault
+    // (salt, password_hash, entries) rotated — proxy then logged
+    // "decrypt: invalid key or corrupted data" for every team key and dropped
+    // it from the registry, surfacing as 401 "Route token not found in
+    // registry" on the very next claude / codex / kimi launch.
+    //
+    // Refusal policy on row-level decrypt failure: per CLAUDE.md "失败要显眼，
+    // 不要沉默" we abort the entire change-password (transaction rollback) and
+    // hand the user the precise recovery path. The alternative — skipping the
+    // bad row — would have us emit a new wrong-key ciphertext under the new
+    // master and permanently lock that vk_id out, exactly the silent failure
+    // we are trying to surface.
+    let mvk_rows: Vec<(String, Vec<u8>, Vec<u8>)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT virtual_key_id, provider_key_nonce, provider_key_ciphertext
+                 FROM managed_virtual_keys_cache
+                 WHERE provider_key_nonce IS NOT NULL
+                   AND provider_key_ciphertext IS NOT NULL",
+            )
+            .map_err(|e| format!("Failed to prepare managed_virtual_keys_cache select: {}", e))?;
+        let mapped = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?))
+            })
+            .map_err(|e| format!("Failed to query managed_virtual_keys_cache: {}", e))?;
+        let collected: Result<Vec<_>, _> = mapped.collect();
+        collected.map_err(|e| format!("Failed to collect managed_virtual_keys_cache rows: {}", e))?
+    };
+    for (vk_id, old_nonce, old_ciphertext) in mvk_rows {
+        let plaintext = crate::crypto::decrypt(&old_key, &old_nonce, &old_ciphertext)
+            .map_err(|e| format!(
+                "Failed to decrypt team key '{vk}' during password change: {err}. \
+                 This row's ciphertext was written with a different vault_key than \
+                 the current password_hash — change-password cannot rotate it. \
+                 Recover by running `aikey key sync --force-reencrypt` first \
+                 (clears stale ciphertext + re-downloads under the current key), \
+                 then retry `aikey change-password`.",
+                vk = vk_id, err = e))?;
+        let (new_nonce, new_ciphertext) = crate::crypto::encrypt(&new_key, &plaintext)
+            .map_err(|e| format!("Failed to re-encrypt team key '{}': {}", vk_id, e))?;
+        tx.execute(
+            "UPDATE managed_virtual_keys_cache
+                SET provider_key_nonce = ?, provider_key_ciphertext = ?
+              WHERE virtual_key_id = ?",
+            params![new_nonce, new_ciphertext, vk_id],
+        )
+        .map_err(|e| format!("Failed to update team key '{}': {}", vk_id, e))?;
+    }
+
+    // ── Re-encrypt provider_account_tokens (OAuth access + refresh tokens) ──
+    //
+    // Same rationale as managed_virtual_keys_cache: if change-password didn't
+    // rotate these, every OAuth account would silently lose access on the next
+    // refresh-cycle and force the user through `aikey auth login` again. The
+    // access_token/refresh_token pairs are independently nullable, so we
+    // re-encrypt each non-null pair in place.
+    let oauth_rows: Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT provider_account_id,
+                        access_token_nonce, access_token_ciphertext,
+                        refresh_token_nonce, refresh_token_ciphertext
+                 FROM provider_account_tokens",
+            )
+            .map_err(|e| format!("Failed to prepare provider_account_tokens select: {}", e))?;
+        let mapped = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            })
+            .map_err(|e| format!("Failed to query provider_account_tokens: {}", e))?;
+        let collected: Result<Vec<_>, _> = mapped.collect();
+        collected.map_err(|e| format!("Failed to collect provider_account_tokens rows: {}", e))?
+    };
+    for (account_id, at_nonce, at_ct, rt_nonce, rt_ct) in oauth_rows {
+        // Skip rows whose tokens are null on both sides — they hold metadata
+        // only, no ciphertext to rotate. Matches the legacy schema where a
+        // pending OAuth handshake row may exist before either token lands.
+        let has_access = at_nonce.is_some() && at_ct.is_some();
+        let has_refresh = rt_nonce.is_some() && rt_ct.is_some();
+        if !has_access && !has_refresh {
+            continue;
+        }
+
+        let (new_at_nonce, new_at_ct) = if has_access {
+            let pt = crate::crypto::decrypt(&old_key, &at_nonce.unwrap(), &at_ct.unwrap())
+                .map_err(|e| format!(
+                    "Failed to decrypt OAuth access_token for account '{acc}': {err}. \
+                     This token was encrypted with a vault_key that doesn't match \
+                     the current password_hash. Run `aikey auth login <provider>` to \
+                     re-issue, then retry change-password.",
+                    acc = account_id, err = e))?;
+            let (n, c) = crate::crypto::encrypt(&new_key, &pt)
+                .map_err(|e| format!("Failed to re-encrypt OAuth access_token for '{}': {}", account_id, e))?;
+            (Some(n), Some(c))
+        } else {
+            (None, None)
+        };
+
+        let (new_rt_nonce, new_rt_ct) = if has_refresh {
+            let pt = crate::crypto::decrypt(&old_key, &rt_nonce.unwrap(), &rt_ct.unwrap())
+                .map_err(|e| format!(
+                    "Failed to decrypt OAuth refresh_token for account '{acc}': {err}. \
+                     This token was encrypted with a vault_key that doesn't match \
+                     the current password_hash. Run `aikey auth login <provider>` to \
+                     re-issue, then retry change-password.",
+                    acc = account_id, err = e))?;
+            let (n, c) = crate::crypto::encrypt(&new_key, &pt)
+                .map_err(|e| format!("Failed to re-encrypt OAuth refresh_token for '{}': {}", account_id, e))?;
+            (Some(n), Some(c))
+        } else {
+            (None, None)
+        };
+
+        tx.execute(
+            "UPDATE provider_account_tokens
+                SET access_token_nonce = ?, access_token_ciphertext = ?,
+                    refresh_token_nonce = ?, refresh_token_ciphertext = ?
+              WHERE provider_account_id = ?",
+            params![new_at_nonce, new_at_ct, new_rt_nonce, new_rt_ct, account_id],
+        )
+        .map_err(|e| format!("Failed to update OAuth tokens for '{}': {}", account_id, e))?;
     }
 
     // Update salt in config
@@ -1675,6 +1860,258 @@ mod tests {
         ).expect("derive");
         assert_eq!(hash_after.as_slice(), expected.as_slice(),
             "failed change attempt must not mutate password_hash");
+    }
+
+    // ── change_password re-encrypts ALL ciphertext tables (2026-05-11 fix) ─
+
+    /// Derives the current vault_key for a given password (using the live
+    /// vault's salt + KDF params), used by the multi-table re-encrypt tests
+    /// to verify that ciphertext can in fact be decrypted under the new
+    /// password — the property that broke before the 2026-05-11 fix.
+    fn derive_current(password: &str) -> [u8; 32] {
+        let salt = get_salt().expect("salt");
+        let (m, t, p) = get_kdf_params().expect("kdf");
+        let key = crate::crypto::derive_key_with_params(
+            &SecretString::new(password.to_string()),
+            &salt,
+            m,
+            t,
+            p,
+        )
+        .expect("derive");
+        let mut out = [0u8; 32];
+        out.copy_from_slice(key.as_slice());
+        out
+    }
+
+    #[test]
+    fn change_password_reencrypts_managed_virtual_keys_cache() {
+        let (_dir, _db_path, _lock) = setup_vault();
+
+        // Seed a team key row with provider_key ciphertext encrypted under
+        // the *current* vault_key — the realistic state after `aikey key sync`.
+        let conn = open_connection().expect("open");
+        // managed_virtual_keys_cache schema is created by the platform
+        // migrations; force them to run via storage_platform's first read.
+        let _ = crate::storage::list_virtual_key_cache();
+
+        let old_key = derive_current("test_password");
+        let plaintext = b"sk-ant-fake-team-key-material";
+        let (nonce, ct) = crate::crypto::encrypt(&old_key, plaintext).expect("encrypt");
+
+        conn.execute(
+            "INSERT INTO managed_virtual_keys_cache
+                (virtual_key_id, org_id, seat_id, alias, provider_code, protocol_type,
+                 base_url, credential_id, credential_revision, virtual_key_revision,
+                 key_status, share_status, local_state,
+                 provider_key_nonce, provider_key_ciphertext, synced_at)
+             VALUES ('vk-test','org-1','seat-1','my-team-key','anthropic','anthropic',
+                     'https://api.anthropic.com','cred-1','rev-1','vrev-1',
+                     'active','claimed','synced_inactive', ?1, ?2, strftime('%s','now'))",
+            params![nonce, ct],
+        )
+        .expect("insert managed key row");
+
+        // Rotate the password — the new path must re-encrypt the team key row too.
+        let old = SecretString::new("test_password".to_string());
+        let new = SecretString::new("new_password_xyz".to_string());
+        change_password(&old, &new).expect("change_password ok");
+
+        // Read back: provider_key_ciphertext must decrypt under the NEW vault_key.
+        let conn = open_connection().expect("reopen");
+        let (new_nonce, new_ct): (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT provider_key_nonce, provider_key_ciphertext
+                 FROM managed_virtual_keys_cache WHERE virtual_key_id = ?1",
+                params!["vk-test"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read row");
+
+        let new_key = derive_current("new_password_xyz");
+        let recovered = crate::crypto::decrypt(&new_key, &new_nonce, &new_ct)
+            .expect("decrypt with new vault_key must succeed");
+        assert_eq!(recovered.as_slice(), plaintext,
+            "team key plaintext must round-trip across change_password");
+
+        // The old vault_key must NOT decrypt anymore — proves a real rotate.
+        assert!(
+            crate::crypto::decrypt(&old_key, &new_nonce, &new_ct).is_err(),
+            "old vault_key must no longer decrypt the rotated ciphertext"
+        );
+    }
+
+    #[test]
+    fn change_password_reencrypts_provider_account_tokens() {
+        let (_dir, _db_path, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache(); // run platform migrations
+
+        let old_key = derive_current("test_password");
+        let at_plain = b"oauth-access-token-xyz";
+        let rt_plain = b"oauth-refresh-token-abc";
+        let (at_n, at_c) = crate::crypto::encrypt(&old_key, at_plain).expect("encrypt access");
+        let (rt_n, rt_c) = crate::crypto::encrypt(&old_key, rt_plain).expect("encrypt refresh");
+
+        let conn = open_connection().expect("open");
+        // provider_account_tokens has FK → provider_accounts; seed parent first.
+        conn.execute(
+            "INSERT INTO provider_accounts
+                (provider_account_id, provider, auth_type, display_identity, created_at)
+             VALUES ('acct-1','claude','oauth','user@example.com', strftime('%s','now'))",
+            [],
+        ).expect("insert provider_account");
+        conn.execute(
+            "INSERT INTO provider_account_tokens
+                (provider_account_id,
+                 access_token_nonce, access_token_ciphertext,
+                 refresh_token_nonce, refresh_token_ciphertext,
+                 token_expires_at, updated_at)
+             VALUES ('acct-1', ?1, ?2, ?3, ?4, 9999999999, strftime('%s','now'))",
+            params![at_n, at_c, rt_n, rt_c],
+        ).expect("insert tokens");
+
+        let old = SecretString::new("test_password".to_string());
+        let new = SecretString::new("new_password_xyz".to_string());
+        change_password(&old, &new).expect("change_password ok");
+
+        let conn = open_connection().expect("reopen");
+        let (atn, atc, rtn, rtc): (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT access_token_nonce, access_token_ciphertext,
+                        refresh_token_nonce, refresh_token_ciphertext
+                 FROM provider_account_tokens WHERE provider_account_id = ?1",
+                params!["acct-1"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read tokens");
+
+        let new_key = derive_current("new_password_xyz");
+        let at_back = crate::crypto::decrypt(&new_key, &atn, &atc)
+            .expect("access decrypt with new vault_key");
+        let rt_back = crate::crypto::decrypt(&new_key, &rtn, &rtc)
+            .expect("refresh decrypt with new vault_key");
+        assert_eq!(at_back.as_slice(), at_plain);
+        assert_eq!(rt_back.as_slice(), rt_plain);
+    }
+
+    #[test]
+    fn change_password_aborts_when_team_key_ciphertext_was_written_under_wrong_key() {
+        let (_dir, _db_path, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache(); // run platform migrations
+
+        // Simulate the 2026-05-11 incident: insert team key ciphertext
+        // encrypted under a vault_key that does NOT match password_hash.
+        let bogus_key = [0u8; 32];
+        let (nonce, ct) = crate::crypto::encrypt(&bogus_key, b"unknown-plaintext").expect("encrypt");
+        let conn = open_connection().expect("open");
+        conn.execute(
+            "INSERT INTO managed_virtual_keys_cache
+                (virtual_key_id, org_id, seat_id, alias, provider_code, protocol_type,
+                 base_url, credential_id, credential_revision, virtual_key_revision,
+                 key_status, share_status, local_state,
+                 provider_key_nonce, provider_key_ciphertext, synced_at)
+             VALUES ('vk-stale','org','seat','stale','anthropic','anthropic',
+                     'https://api.anthropic.com','c','r','v',
+                     'active','claimed','synced_inactive', ?1, ?2, strftime('%s','now'))",
+            params![nonce, ct],
+        ).expect("seed bad row");
+
+        let old = SecretString::new("test_password".to_string());
+        let new = SecretString::new("new_password_xyz".to_string());
+        let err = change_password(&old, &new)
+            .expect_err("change_password must abort when a team-key row can't be re-encrypted");
+        assert!(
+            err.contains("vk-stale") && err.contains("--force-reencrypt"),
+            "error must name the affected vk_id and the recovery command, got: {}",
+            err
+        );
+
+        // The password rotation must NOT have landed (transaction rollback).
+        let conn = open_connection().expect("reopen");
+        let hash_after: Vec<u8> = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = 'password_hash'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("hash present");
+        let original = derive_current("test_password");
+        assert_eq!(hash_after, original,
+            "transaction must roll back: password_hash stays on the old key");
+    }
+
+    // ── force-reencrypt + verify_vault_key (2026-05-11 fix) ──
+
+    #[test]
+    fn clear_managed_key_ciphertexts_resets_only_active_rows() {
+        let (_dir, _db_path, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache();
+        let conn = open_connection().expect("open");
+        let key = derive_current("test_password");
+        let (n, c) = crate::crypto::encrypt(&key, b"x").expect("encrypt");
+
+        // Three rows: active+ct, disabled_by_account_scope+ct, active without ct.
+        conn.execute(
+            "INSERT INTO managed_virtual_keys_cache
+                (virtual_key_id, org_id, seat_id, alias, provider_code, protocol_type,
+                 base_url, credential_id, credential_revision, virtual_key_revision,
+                 key_status, share_status, local_state,
+                 provider_key_nonce, provider_key_ciphertext, synced_at)
+             VALUES ('vk-A','o','s','A','anthropic','anthropic','u','c','r','v',
+                     'active','claimed','synced_inactive', ?1, ?2, 0),
+                    ('vk-B','o','s','B','anthropic','anthropic','u','c','r','v',
+                     'active','claimed','disabled_by_account_scope', ?1, ?2, 0),
+                    ('vk-C','o','s','C','anthropic','anthropic','u','c','r','v',
+                     'active','pending_claim','synced_inactive', NULL, NULL, 0)",
+            params![n, c],
+        ).expect("seed");
+
+        let cleared = crate::storage::clear_managed_key_ciphertexts().expect("clear");
+        assert_eq!(cleared, 1, "only vk-A (active + non-disabled + has ct) is cleared");
+
+        // vk-A: cleared
+        let conn = open_connection().expect("reopen");
+        let a_ct: Option<Vec<u8>> = conn.query_row(
+            "SELECT provider_key_ciphertext FROM managed_virtual_keys_cache WHERE virtual_key_id='vk-A'",
+            [], |row| row.get(0)).expect("vk-A");
+        assert!(a_ct.is_none(), "vk-A ciphertext must be NULL after force-reencrypt");
+
+        // vk-B: still has ct (disabled rows untouched — server-owned lifecycle)
+        let b_ct: Option<Vec<u8>> = conn.query_row(
+            "SELECT provider_key_ciphertext FROM managed_virtual_keys_cache WHERE virtual_key_id='vk-B'",
+            [], |row| row.get(0)).expect("vk-B");
+        assert!(b_ct.is_some(), "disabled rows must NOT be cleared");
+    }
+
+    #[test]
+    fn verify_vault_key_strict_match_and_mismatch() {
+        let (_dir, _db_path, _lock) = setup_vault();
+        let good = derive_current("test_password");
+        assert!(verify_vault_key(&good).is_ok(), "current key must verify");
+
+        let wrong = [0u8; 32];
+        let err = verify_vault_key(&wrong).expect_err("wrong key must reject");
+        assert!(err.contains("password_hash"),
+            "rejection message must reference password_hash, got: {}", err);
+
+        // Length mismatch is a programmer error, not a credential error.
+        assert!(verify_vault_key(&[0u8; 31]).is_err());
+    }
+
+    #[test]
+    fn verify_vault_key_requires_password_hash_no_silent_accept() {
+        let (_dir, db_path, _lock) = setup_vault();
+        // Remove password_hash to simulate a broken vault state. With the old
+        // fallback this would silently accept any key on an empty-entries
+        // vault — the precise hole the 2026-05-11 fix closes.
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("DELETE FROM config WHERE key='password_hash'", []).unwrap();
+
+        let any_key = [0u8; 32];
+        let err = verify_vault_key(&any_key)
+            .expect_err("missing password_hash must REJECT (no silent accept)");
+        assert!(err.contains("password_hash") && err.contains("init"),
+            "rejection must explain missing hash + point at `aikey init`, got: {}", err);
     }
 }
 

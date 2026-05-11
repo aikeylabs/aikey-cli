@@ -93,3 +93,102 @@ fn result_envelope_error_serialization() {
     // 无 request_id 时应省略该字段
     assert!(!s.contains("request_id"));
 }
+
+// ─── team_effective_status (regression: 2026-05-11) ─────────────────────
+//
+// Bugfix: workflow/CI/bugfix/
+//   20260511-team-vault-effective-status-mismaps-synced-inactive.md
+//
+// The prior `local_state == "active"` check conflated "usable" with
+// "currently routed", which made every claimed-but-not-routed team key
+// (the common case after `aikey use` switches to a different key) render
+// as INACTIVE on the vault page and hid the Use button — i.e. you could
+// not re-select it because the UI lied about its state.
+//
+// These tests pin the truth table so the conflation cannot re-emerge.
+
+use super::query::team_effective_status;
+
+#[test]
+fn team_effective_status_active_when_active_claimed_active() {
+    assert_eq!(team_effective_status("active", "claimed", "active"), "active");
+}
+
+#[test]
+fn team_effective_status_active_when_claimed_synced_inactive() {
+    // The regression case: valid + claimed + not currently routed.
+    // Must read as ACTIVE so the Use button is offered.
+    assert_eq!(
+        team_effective_status("active", "claimed", "synced_inactive"),
+        "active",
+    );
+}
+
+#[test]
+fn team_effective_status_active_when_claimed_prompt_dismissed() {
+    // User dismissed the auto-claim prompt; key is still valid + selectable.
+    assert_eq!(
+        team_effective_status("active", "claimed", "prompt_dismissed"),
+        "active",
+    );
+}
+
+#[test]
+fn team_effective_status_inactive_when_local_state_stale() {
+    // Server snapshot no longer includes this key — we don't know if it's
+    // still valid, so don't offer it.
+    assert_eq!(
+        team_effective_status("active", "claimed", "stale"),
+        "inactive",
+    );
+}
+
+#[test]
+fn team_effective_status_inactive_when_disabled_by_anything() {
+    // Every `disabled_by_*` variant means the server told us this key is
+    // unusable for a reason we can't override locally.
+    for ls in [
+        "disabled_by_key_status",
+        "disabled_by_account_status",
+        "disabled_by_account_scope",
+        "disabled_by_seat_status",
+    ] {
+        assert_eq!(
+            team_effective_status("active", "claimed", ls),
+            "inactive",
+            "local_state={} should map to inactive",
+            ls,
+        );
+    }
+}
+
+#[test]
+fn team_effective_status_inactive_when_key_status_not_active() {
+    // Server-revoked / expired keys never usable regardless of local_state.
+    assert_eq!(
+        team_effective_status("revoked", "claimed", "active"),
+        "inactive",
+    );
+    assert_eq!(
+        team_effective_status("expired", "claimed", "active"),
+        "inactive",
+    );
+}
+
+#[test]
+fn team_effective_status_inactive_when_share_pending() {
+    // Not yet claimed → no `aikey_team_<vk_id>` binding the proxy will
+    // accept, so unusable even though key_status=active.
+    assert_eq!(
+        team_effective_status("active", "pending_claim", "active"),
+        "inactive",
+    );
+}
+
+#[test]
+fn team_effective_status_inactive_when_share_revoked() {
+    assert_eq!(
+        team_effective_status("active", "revoked", "active"),
+        "inactive",
+    );
+}

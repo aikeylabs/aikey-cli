@@ -253,6 +253,43 @@ pub fn clear_virtual_key_cache() -> Result<(), String> {
     Ok(())
 }
 
+/// Clears `provider_key_nonce` / `provider_key_ciphertext` on all active
+/// (non-disabled) managed virtual keys, so a subsequent
+/// `run_full_snapshot_sync` will treat them as `needs_download` and pull
+/// fresh ciphertext encrypted under the current `vault_key`.
+///
+/// Used exclusively by `aikey key sync --force-reencrypt` — the user-facing
+/// recovery path when a vault holds team-key ciphertext that the current
+/// `vault_key` cannot decrypt (e.g. proxy logs
+/// "managed key: decryption failed, skipping" followed by 401
+/// "Route token not found in registry" from the wrapper preflight). See
+/// `aikeylabs/workflow/CI/bugfix/2026-05-11-team-key-decrypt-inconsistent.md`.
+///
+/// Returns the number of rows that had ciphertext cleared. Rows already
+/// without ciphertext (pending_claim / not-yet-delivered) are not touched
+/// and not counted, so a `0` return reliably means "no active team key
+/// currently carries ciphertext locally — re-encrypt is a no-op".
+///
+/// Scoped to `key_status = 'active'` and excludes `local_state LIKE
+/// 'disabled_by_%'` to avoid waking up keys that the server has revoked
+/// or that the current account no longer owns; the regular snapshot sync
+/// owns the lifecycle of those flags.
+pub fn clear_managed_key_ciphertexts() -> Result<usize, String> {
+    let conn = open_connection()?;
+    let n = conn
+        .execute(
+            "UPDATE managed_virtual_keys_cache
+                SET provider_key_nonce      = NULL,
+                    provider_key_ciphertext = NULL
+              WHERE key_status = 'active'
+                AND COALESCE(local_state, '') NOT LIKE 'disabled_by_%'
+                AND provider_key_ciphertext IS NOT NULL",
+            [],
+        )
+        .map_err(|e| format!("Failed to clear managed key ciphertexts: {}", e))?;
+    Ok(n)
+}
+
 /// On account switch: marks all cached keys not owned by `new_account_id` as
 /// `disabled_by_account_scope`.
 ///
@@ -999,6 +1036,45 @@ pub fn remove_provider_binding(
         )
         .map_err(|e| format!("Failed to remove provider binding: {}", e))?;
     Ok(rows > 0)
+}
+
+/// Phase 3B C (2026-05-11): removes ALL bindings of a given `key_source_type`,
+/// regardless of `key_source_ref`. Used by `aikey logout` to wipe team-key
+/// bindings (`key_source_type='managed_virtual_key'`) so a subsequent login
+/// to a different account doesn't reactivate stale rows pointing at vk_ids
+/// the new account doesn't own — the "ghost binding" issue documented in
+/// requirements/2026-05-11-aikey-web-local-first-team-merge.md R3.
+///
+/// Returns the list of (provider_code, key_source_ref) tuples whose bindings
+/// were removed, so the caller can refresh active.env / proxy state for the
+/// affected providers.
+pub fn remove_bindings_by_key_source_type(
+    profile_id: &str,
+    key_source_type: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let conn = open_connection()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT provider_code, key_source_ref FROM user_profile_provider_bindings
+              WHERE profile_id = ?1 AND key_source_type = ?2",
+        )
+        .map_err(|e| format!("Failed to prepare bulk binding cleanup query: {}", e))?;
+    let affected: Vec<(String, String)> = stmt
+        .query_map(params![profile_id, key_source_type], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| format!("Failed to query affected bindings: {}", e))?
+        .collect::<SqlResult<Vec<(String, String)>>>()
+        .map_err(|e| format!("Failed to collect affected bindings: {}", e))?;
+    if !affected.is_empty() {
+        conn.execute(
+            "DELETE FROM user_profile_provider_bindings
+              WHERE profile_id = ?1 AND key_source_type = ?2",
+            params![profile_id, key_source_type],
+        )
+        .map_err(|e| format!("Failed to bulk-remove bindings by type: {}", e))?;
+    }
+    Ok(affected)
 }
 
 /// Removes all bindings that reference a specific key source.

@@ -2362,9 +2362,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 KeyAction::List => {
                     run_unified_list(cli.password_stdin, cli.json)?;
                 }
-                KeyAction::Sync => {
+                KeyAction::Sync { force_reencrypt } => {
                     let password = prompt_vault_password(cli.password_stdin, cli.json)?;
-                    commands_account::handle_key_sync(&password, cli.json)?;
+                    commands_account::handle_key_sync(&password, cli.json, *force_reencrypt)?;
                 }
                 KeyAction::Use { alias_or_id, no_hook } => {
                     commands_proxy::ensure_proxy_for_use(cli.password_stdin);
@@ -2791,6 +2791,40 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     executor::list_secrets(&password)
                         .map_err(|e| format!("vault authentication failed: {}", e))?;
                     commands_proxy::handle_verify(&password)?;
+                }
+                ProxyAction::ReplayDeadLetter => {
+                    // No vault password needed — we hit the proxy's admin
+                    // endpoint over loopback. Proxy itself already holds the
+                    // master key in-memory (it's the running process).
+                    let body = commands_proxy::post_admin_replay_dead_letter()
+                        .map_err(|e| format!("replay-dead-letter: {}", e))?;
+                    if cli.json {
+                        // Body is already JSON from the proxy; pass-through.
+                        println!("{}", body);
+                    } else {
+                        // Pretty-print the four key counters; the body is
+                        // small enough that even a casual grep is fine.
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                            let scan = v.get("entries_scanned").and_then(|x| x.as_i64()).unwrap_or(0);
+                            let ok = v.get("entries_replayed_ok").and_then(|x| x.as_i64()).unwrap_or(0);
+                            let fail = v.get("entries_still_failing").and_then(|x| x.as_i64()).unwrap_or(0);
+                            let ev_ok = v.get("events_replayed_ok").and_then(|x| x.as_i64()).unwrap_or(0);
+                            let ev_fail = v.get("events_still_failing").and_then(|x| x.as_i64()).unwrap_or(0);
+                            eprintln!("  Replay pass complete:");
+                            eprintln!("    entries scanned       : {}", scan);
+                            eprintln!("    entries re-delivered  : {}", ok);
+                            eprintln!("    entries still failing : {}", fail);
+                            eprintln!("    events re-delivered   : {}", ev_ok);
+                            eprintln!("    events still failing  : {}", ev_fail);
+                            if let Some(last) = v.get("last_error").and_then(|x| x.as_str()) {
+                                if !last.is_empty() {
+                                    eprintln!("    last error            : {}", last);
+                                }
+                            }
+                        } else {
+                            eprintln!("{}", body);
+                        }
+                    }
                 }
                 ProxyAction::EnsureRunning => {
                     // Wrapper-internal entry point (claude/codex/kimi shell hooks).
