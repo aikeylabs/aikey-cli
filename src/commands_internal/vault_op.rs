@@ -1144,8 +1144,18 @@ fn handle_use(env: StdinEnvelope) {
             // local_state has a distinct error code so the Web UI can
             // tailor the surface message; the proxy will not route through
             // any of these regardless.
+            //
+            // 2026-05-12 rc.3 fix: `prompt_dismissed` was missing from the
+            // ok arm — it fell into the `other` catch-all and emitted
+            // I_KEY_DISABLED, even though the key is valid (user just
+            // dismissed the auto-claim banner). The state is documented
+            // in storage_platform.rs as "user dismissed the accept banner;
+            // no longer prompted" — explicitly the same routability class
+            // as `synced_inactive`. The vault page's `team_effective_status`
+            // (commands_internal/query.rs) already maps it to "active",
+            // so the UI shows Use and the handler must accept it.
             match entry.local_state.as_str() {
-                "active" | "synced_inactive" => {}
+                "active" | "synced_inactive" | "prompt_dismissed" => {}
                 "disabled_by_account_scope"
                 | "disabled_by_account_status"
                 | "disabled_by_seat_status"
