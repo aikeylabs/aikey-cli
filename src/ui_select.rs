@@ -733,8 +733,21 @@ pub(crate) fn format_tree_row(row: &TreeRow, groups: &[ProviderGroup], is_cursor
             // 2026-05-08 V-layer family-grouping: header 文字用 family 而不是 provider_code。
             // 单 platform family family_of(code)==code, 行为不变 (e.g. anthropic / openai)。
             // 多 platform family (kimi: kimi/kimi_code/moonshot 共享) 显示 "kimi"。
-            let display_name = crate::provider_registry::family_of(&g.provider_code);
-            format!("{}{} \x1b[1m{}\x1b[0m", cursor_mark, arrow, display_name)
+            //
+            // 2026-05-12: render brand alias next to the family label in dim
+            // styling — e.g. `anthropic (claude)` — for single-platform
+            // families where the canonical code isn't the brand users
+            // recognize. Multi-platform families (kimi) get no alias at
+            // family level (see provider_registry::family_display).
+            let family = crate::provider_registry::family_of(&g.provider_code);
+            let (display_name, alias) = crate::provider_registry::family_display(family);
+            match alias {
+                Some(a) => format!(
+                    "{}{} \x1b[1m{}\x1b[0m \x1b[2m({})\x1b[0m",
+                    cursor_mark, arrow, display_name, a,
+                ),
+                None => format!("{}{} \x1b[1m{}\x1b[0m", cursor_mark, arrow, display_name),
+            }
         }
         TreeRow::Candidate(gi, ci) => {
             let g = &groups[*gi]; let c = &g.candidates[*ci];
@@ -796,6 +809,19 @@ fn interactive_provider_tree(groups: &mut Vec<ProviderGroup>) -> Result<Provider
     let icon_title = format!("\u{1F310} {}", title);
     let mut out = io::stderr();
     let mut cursor: usize = 0;
+
+    // 2026-05-12 guidance: tell the user up-front what Enter does and which
+    // tools the choice affects. Printed once outside the loop so it stays
+    // above the box and doesn't re-render with the tree. Style: subdued so
+    // the box itself remains the focal element.
+    write!(
+        out,
+        "\r\n  \x1b[2mPick the default key for each provider.\x1b[0m\r\n",
+    )?;
+    write!(
+        out,
+        "  \x1b[2mYour CLI tools (claude / codex / kimi …) will route through these keys until you switch again.\x1b[0m\r\n",
+    )?;
 
     loop {
         let rows = build_tree_rows(groups);

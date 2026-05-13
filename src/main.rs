@@ -686,7 +686,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // is available in the environment.  Skipped for proxy lifecycle commands which
     // manage the process themselves, and for version/init which predate the proxy.
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Watch => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Statusline { action: Some(cli::StatuslineAction::Ensure) } | Commands::Watch => {}
         _ => { commands_proxy::try_auto_start_from_env(); }
     }
 
@@ -695,7 +695,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // lifecycle and init commands which either predate the vault or manage the
     // process themselves.
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Watch => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Statusline { action: Some(cli::StatuslineAction::Ensure) } | Commands::Watch => {}
         _ => { commands_account::try_background_snapshot_sync(); }
     }
 
@@ -704,7 +704,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Skipped for init/proxy/db which manage their own lifecycle.
     // Only runs if vault.db exists (no-op on fresh install).
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Watch => {}
+        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Statusline { action: Some(cli::StatuslineAction::Ensure) } | Commands::Watch => {}
         _ => {
             if let Ok(vault_path) = storage::get_vault_path() {
                 if vault_path.exists() {
@@ -2909,6 +2909,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if target == "kimi" {
                     let _ = commands_statusline::render_kimi();
                 }
+            }
+            Some(cli::StatuslineAction::Ensure) => {
+                // Wrapper-invoked fire-and-forget. Always exit 0 so a write
+                // failure can't break `claude` startup — the wrapper script
+                // already pipes `|| true` defensively, but defense-in-depth.
+                let _ = commands_statusline::ensure();
             }
         },
         Commands::Watch => {

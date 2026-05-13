@@ -1046,6 +1046,102 @@ pub fn ensure_claude_statusline_installed() {
     let _ = install_inner(false, true);
 }
 
+/// If the active Claude config dir's `settings.json` contains an
+/// aikey-managed `statusLine` entry, return its full path. Returns `None`
+/// when the file doesn't exist, can't be parsed, has no statusLine, or
+/// the statusLine belongs to a third party (starship, ccusage, etc.).
+///
+/// Used by `aikey env` to show users which third-party CLI config files
+/// aikey has currently injected into. Honors `$CLAUDE_CONFIG_DIR` so the
+/// reported path matches whichever Claude persona the user's shell is
+/// currently pointing at.
+pub fn injected_claude_settings_path() -> Option<PathBuf> {
+    let settings = claude_settings_path()?;
+    let parsed = read_settings(&settings).ok()?;
+    let cmd = parsed
+        .get("statusLine")
+        .and_then(|sl| sl.get("command"))
+        .and_then(|c| c.as_str())?;
+    if cmd.contains("aikey statusline") {
+        Some(settings)
+    } else {
+        None
+    }
+}
+
+/// `aikey statusline ensure` — non-interactive auto-install invoked by the
+/// shell wrapper on each `claude` launch. Designed to be fire-and-forget:
+/// completely silent on every code path, never blocks claude startup.
+///
+/// Why this exists: `aikey statusline install` writes to whatever path
+/// `$CLAUDE_CONFIG_DIR/settings.json` resolves to right now. Users who
+/// switch personas via `CLAUDE_CONFIG_DIR=~/.claude-aikey claude` would
+/// otherwise have to remember to run install in each new config dir.
+/// `ensure` makes that automatic.
+///
+/// Conflict policy (解法 1 静默): if the target settings.json already has
+/// a non-aikey `statusLine` (starship, ccusage, etc.), skip silently. The
+/// `aikey statusline status` subcommand is the visibility channel for
+/// users who wonder why no receipt appeared — printing per-launch warnings
+/// would spam terminals dozens of times per day.
+///
+/// Opt-out: `AIKEY_DISABLE_STATUSLINE_ENSURE=1` short-circuits the whole
+/// function. This is the documented escape hatch for users who ran
+/// `aikey statusline uninstall` and want it to stay uninstalled — without
+/// this flag the next `claude` launch would re-install it (since empty
+/// statusLine is the "install" trigger).
+pub fn ensure() -> io::Result<()> {
+    if env_flag("AIKEY_DISABLE_STATUSLINE_ENSURE") {
+        return Ok(());
+    }
+    let Some(settings_path) = claude_settings_path() else {
+        return Ok(());
+    };
+    // Don't conjure config on a non-Claude-Code machine. If `$CLAUDE_CONFIG_DIR`
+    // is set but the directory doesn't exist, the user hasn't run claude
+    // there yet — let claude itself bootstrap it on first launch.
+    let claude_dir = settings_path.parent().expect("settings file has a parent");
+    if !claude_dir.exists() {
+        return Ok(());
+    }
+    let current = match read_settings(&settings_path) {
+        Ok(v) => v,
+        Err(ReadError::NotFound) => serde_json::json!({}),
+        // Malformed or IO error: bail silently. Wrapper context cannot
+        // surface a useful message — user discovers via `statusline status`.
+        Err(ReadError::Malformed(_)) | Err(ReadError::Io(_)) => return Ok(()),
+    };
+    let existing_cmd = current
+        .as_object()
+        .and_then(|o| o.get("statusLine"))
+        .and_then(|sl| sl.as_object())
+        .and_then(|sl| sl.get("command"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    if existing_cmd.contains("aikey statusline") {
+        return Ok(());
+    }
+    if !existing_cmd.is_empty() {
+        // Other-tool statusLine occupies the slot — silent skip.
+        return Ok(());
+    }
+    // Empty / missing: merge-write. Back up first so a future `uninstall`
+    // can restore the pre-aikey state (even if that state was "no file").
+    backup_settings(&settings_path)?;
+    let mut merged = match &current {
+        serde_json::Value::Object(_) => current.clone(),
+        _ => serde_json::json!({}),
+    };
+    if let Some(obj) = merged.as_object_mut() {
+        obj.insert("statusLine".into(), serde_json::json!({
+            "type": "command",
+            "command": aikey_statusline_command(),
+        }));
+    }
+    write_settings_atomic(&settings_path, &merged)?;
+    Ok(())
+}
+
 /// `aikey statusline uninstall [target] [--all]` — top-level dispatcher.
 pub fn uninstall(target: Option<&str>, all: bool) -> io::Result<()> {
     if all {
@@ -1170,10 +1266,8 @@ pub fn print_status() -> io::Result<()> {
 
 fn print_status_claude() -> io::Result<()> {
     use colored::Colorize;
-    let Some(settings_path) = claude_settings_path() else {
-        println!("  {}", "config dir not resolvable (HOME unset?)".yellow());
-        return Ok(());
-    };
+    let (config_dir, source) = claude_config_dir_with_source();
+    let settings_path = config_dir.join("settings.json");
 
     let exists = settings_path.exists();
     let parsed = match read_settings(&settings_path) {
@@ -1192,15 +1286,39 @@ fn print_status_claude() -> io::Result<()> {
         .and_then(|sl| sl.get("command"))
         .and_then(|c| c.as_str());
 
+    let source_tag = match source {
+        ConfigDirSource::EnvVar => "from CLAUDE_CONFIG_DIR".to_string(),
+        ConfigDirSource::Default => "default (~/.claude)".to_string(),
+    };
+    println!("  {}: {}", "config dir".dimmed(),
+        format!("{} ({})", config_dir.display(), source_tag));
     println!("  {}: {}", "file".dimmed(), settings_path.display());
     println!("  {}: {}", "exists".dimmed(), if exists { "yes" } else { "no" });
     match cmd {
-        None => println!("  {}: {}", "statusLine".dimmed(), "not configured".dimmed()),
+        None => {
+            println!("  {}: {}", "statusLine".dimmed(), "not configured".dimmed());
+            // Surface why no receipt appears. The shell wrapper's `ensure`
+            // installs on next `claude` launch unless opted out.
+            if env_flag("AIKEY_DISABLE_STATUSLINE_ENSURE") {
+                println!("  {} {}",
+                    "ⓘ".cyan(),
+                    "AIKEY_DISABLE_STATUSLINE_ENSURE=1 — wrapper auto-install is disabled.".dimmed());
+            }
+        }
         Some(c) if c.contains("aikey statusline") => {
             println!("  {}: {}", "statusLine".dimmed(), format!("aikey ({c})").green());
         }
         Some(c) => {
             println!("  {}: {}", "statusLine".dimmed(), format!("other ({c})").yellow());
+            // Solution 1 (silent on conflict) means the wrapper won't print
+            // anything when this slot is occupied — status is the visibility
+            // out. Tell the user why their receipt isn't showing.
+            println!("  {} {}",
+                "ⓘ".cyan(),
+                "Another tool owns the Claude statusLine — aikey receipt is suppressed.".dimmed());
+            println!("    {} {}",
+                "→".dimmed(),
+                "Run `aikey statusline install --force` to take over (existing value backed up).".dimmed());
         }
     }
     let backup = statusline_backup_path(&settings_path);
@@ -1257,12 +1375,39 @@ fn print_status_kimi() {
 // ---------------------------------------------------------------------------
 
 fn claude_settings_path() -> Option<PathBuf> {
-    // Stage 2.3 windows-compat: route through `resolve_user_home()`. The
-    // claude-code CLI on Windows reads `%USERPROFILE%\.claude\settings.json`
-    // natively, so the same dir layout works on both platforms — only the
-    // home-resolution chain changes.
-    Some(crate::commands_account::resolve_user_home()
-        .join(".claude").join("settings.json"))
+    Some(claude_config_dir_with_source().0.join("settings.json"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigDirSource {
+    /// `CLAUDE_CONFIG_DIR` env was set to a non-empty value.
+    EnvVar,
+    /// Fell back to `<home>/.claude`.
+    Default,
+}
+
+/// Resolve the Claude Code config directory. Honors `CLAUDE_CONFIG_DIR`
+/// when set to a non-empty value; otherwise falls back to `~/.claude/`.
+///
+/// Why: users with multiple Claude personas (OAuth + isolated API-key
+/// sandbox) set `CLAUDE_CONFIG_DIR=~/.claude-aikey claude` so the second
+/// persona has its own credentials, settings, and history. Before this
+/// honoring, `aikey statusline install` always wrote to `~/.claude/`, so
+/// the alternate persona's session never showed the receipt statusLine.
+///
+/// Stage 2.3 windows-compat: the home fallback routes through
+/// `resolve_user_home()`. The claude-code CLI on Windows reads
+/// `%USERPROFILE%\.claude\settings.json` natively, so the same layout
+/// works on both platforms.
+fn claude_config_dir_with_source() -> (PathBuf, ConfigDirSource) {
+    if let Some(v) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        let s = v.to_string_lossy().into_owned();
+        if !s.trim().is_empty() {
+            return (PathBuf::from(s), ConfigDirSource::EnvVar);
+        }
+    }
+    (crate::commands_account::resolve_user_home().join(".claude"),
+     ConfigDirSource::Default)
 }
 
 /// Backup path: `<dir>/settings.aikey_backup.json`.  The backup is always a
@@ -1922,5 +2067,268 @@ mod tests {
         assert!(!entry.path().join("delivery.json.tmp").exists());
 
         std::fs::remove_dir_all(&session_dir).ok();
+    }
+
+    // ----- CLAUDE_CONFIG_DIR resolution + ensure() -----------------------
+
+    /// Run `f` with `CLAUDE_CONFIG_DIR` overridden (or unset). Restores the
+    /// previous state after, so the harness mutation doesn't poison
+    /// parallel/subsequent tests. Holds the shared `ENV_MUTATION_LOCK`
+    /// because env mutation is process-global.
+    fn with_claude_config_dir<F: FnOnce()>(value: Option<&std::path::Path>, f: F) {
+        let _lock = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
+        match value {
+            Some(p) => std::env::set_var("CLAUDE_CONFIG_DIR", p),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        f();
+        match prev {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    fn claude_config_dir_honors_env_when_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        with_claude_config_dir(Some(tmp.path()), || {
+            let (dir, source) = claude_config_dir_with_source();
+            assert_eq!(dir, tmp.path());
+            assert_eq!(source, ConfigDirSource::EnvVar);
+            // settings_path joins settings.json under the env dir.
+            let sp = claude_settings_path().unwrap();
+            assert_eq!(sp, tmp.path().join("settings.json"));
+        });
+    }
+
+    #[test]
+    fn claude_config_dir_falls_back_to_home_when_env_unset() {
+        with_claude_config_dir(None, || {
+            let (dir, source) = claude_config_dir_with_source();
+            assert!(dir.ends_with(".claude"),
+                "fallback should be <home>/.claude: {}", dir.display());
+            assert_eq!(source, ConfigDirSource::Default);
+        });
+    }
+
+    #[test]
+    fn claude_config_dir_falls_back_when_env_empty_or_whitespace() {
+        // An accidentally-set-but-empty CLAUDE_CONFIG_DIR should not point
+        // settings into the user's CWD ("").
+        for empty in ["", "   ", "\t"] {
+            let _lock = crate::test_env_lock::ENV_MUTATION_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
+            std::env::set_var("CLAUDE_CONFIG_DIR", empty);
+            let (_dir, source) = claude_config_dir_with_source();
+            assert_eq!(source, ConfigDirSource::Default,
+                "empty env {:?} must fall back to default", empty);
+            match prev {
+                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+        }
+    }
+
+    // ----- ensure() conflict policy --------------------------------------
+
+    /// Build a settings.json with the given `statusLine.command` value.
+    /// Pass `None` to write `{}` (no statusLine key).
+    fn write_settings_with(path: &std::path::Path, status_cmd: Option<&str>) {
+        let value = match status_cmd {
+            Some(c) => serde_json::json!({
+                "statusLine": { "type": "command", "command": c }
+            }),
+            None => serde_json::json!({}),
+        };
+        std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn ensure_writes_statusline_when_slot_is_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let settings = tmp.path().join("settings.json");
+        write_settings_with(&settings, None);
+        let expected_cmd = aikey_statusline_command();
+        with_claude_config_dir(Some(tmp.path()), || {
+            ensure().expect("ensure must succeed on empty slot");
+            let v: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&settings).unwrap()
+            ).unwrap();
+            let cmd = v.get("statusLine")
+                .and_then(|sl| sl.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            // Compare against what aikey_statusline_command() would produce
+            // right now (binary path varies between prod/test). Substring
+            // check on "aikey statusline" is too literal — the test binary
+            // is `aikeylabs_aikey_cli-<hash>`, not `aikey`.
+            assert_eq!(cmd, expected_cmd,
+                "empty slot must be filled with current aikey statusline command");
+        });
+    }
+
+    #[test]
+    fn ensure_is_noop_when_aikey_already_owns_the_slot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let settings = tmp.path().join("settings.json");
+        write_settings_with(&settings, Some("/somewhere/aikey statusline"));
+        let pre = std::fs::read(&settings).unwrap();
+        with_claude_config_dir(Some(tmp.path()), || {
+            ensure().expect("ensure must succeed on aikey-owned slot");
+            let post = std::fs::read(&settings).unwrap();
+            assert_eq!(pre, post, "aikey-owned slot must not be rewritten");
+        });
+    }
+
+    #[test]
+    fn ensure_silently_skips_when_third_party_owns_the_slot() {
+        // 解法 1 静默 contract: don't touch / don't print when starship,
+        // ccusage, etc. occupy the statusLine. Visibility goes through
+        // `aikey statusline status`, not per-launch warnings.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let settings = tmp.path().join("settings.json");
+        write_settings_with(&settings, Some("/usr/local/bin/starship status"));
+        let pre = std::fs::read(&settings).unwrap();
+        with_claude_config_dir(Some(tmp.path()), || {
+            ensure().expect("ensure must not error on conflict");
+            let post = std::fs::read(&settings).unwrap();
+            assert_eq!(pre, post, "third-party slot must be preserved verbatim");
+        });
+    }
+
+    #[test]
+    fn ensure_creates_statusline_from_nothing_when_file_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No settings.json at all — ensure should still install (the dir
+        // exists, so we know Claude Code has been here).
+        let settings = tmp.path().join("settings.json");
+        assert!(!settings.exists());
+        let expected_cmd = aikey_statusline_command();
+        with_claude_config_dir(Some(tmp.path()), || {
+            ensure().expect("ensure must succeed when file missing");
+            assert!(settings.exists(),
+                "ensure should have created settings.json");
+            let v: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&settings).unwrap()
+            ).unwrap();
+            let cmd = v.get("statusLine")
+                .and_then(|sl| sl.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            assert_eq!(cmd, expected_cmd);
+        });
+    }
+
+    #[test]
+    fn ensure_skips_when_config_dir_missing() {
+        // Pointing CLAUDE_CONFIG_DIR at a non-existent dir simulates a
+        // freshly-set env var before the user has run claude there. We
+        // refuse to conjure config — claude will bootstrap the dir on its
+        // own first launch.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ghost = tmp.path().join("never-existed");
+        with_claude_config_dir(Some(&ghost), || {
+            ensure().expect("ensure must succeed (silent no-op)");
+            assert!(!ghost.exists(),
+                "ensure must not create the config dir");
+        });
+    }
+
+    #[test]
+    fn ensure_respects_opt_out_env_flag() {
+        // After `aikey statusline uninstall` the user may want it to stay
+        // uninstalled. AIKEY_DISABLE_STATUSLINE_ENSURE=1 is the documented
+        // opt-out.
+        let _lock = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let settings = tmp.path().join("settings.json");
+        write_settings_with(&settings, None);
+        let prev_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        let prev_flag = std::env::var_os("AIKEY_DISABLE_STATUSLINE_ENSURE");
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+        std::env::set_var("AIKEY_DISABLE_STATUSLINE_ENSURE", "1");
+
+        let pre = std::fs::read(&settings).unwrap();
+        ensure().expect("ensure must succeed when opted out");
+        let post = std::fs::read(&settings).unwrap();
+        assert_eq!(pre, post,
+            "opt-out flag must short-circuit the install");
+
+        match prev_dir {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        match prev_flag {
+            Some(v) => std::env::set_var("AIKEY_DISABLE_STATUSLINE_ENSURE", v),
+            None => std::env::remove_var("AIKEY_DISABLE_STATUSLINE_ENSURE"),
+        }
+    }
+
+    #[test]
+    fn injected_claude_settings_path_some_when_aikey_owns_statusline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let settings = tmp.path().join("settings.json");
+        write_settings_with(&settings, Some("/Users/jake/.aikey/bin/aikey statusline"));
+        with_claude_config_dir(Some(tmp.path()), || {
+            let got = injected_claude_settings_path();
+            assert_eq!(got, Some(settings.clone()),
+                "must report the active config dir's settings.json when aikey \
+                 owns the statusLine");
+        });
+    }
+
+    #[test]
+    fn injected_claude_settings_path_none_when_third_party_owns_slot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let settings = tmp.path().join("settings.json");
+        write_settings_with(&settings, Some("/usr/local/bin/starship status"));
+        with_claude_config_dir(Some(tmp.path()), || {
+            assert_eq!(injected_claude_settings_path(), None,
+                "third-party statusLine must not count as injected by aikey");
+        });
+    }
+
+    #[test]
+    fn injected_claude_settings_path_none_when_file_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // No settings.json written.
+        with_claude_config_dir(Some(tmp.path()), || {
+            assert_eq!(injected_claude_settings_path(), None);
+        });
+    }
+
+    #[test]
+    fn ensure_preserves_other_settings_keys_on_install() {
+        // If the user has other keys in settings.json (e.g. `theme`,
+        // `permissions`), ensure must merge — not overwrite.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let settings = tmp.path().join("settings.json");
+        std::fs::write(&settings, serde_json::to_vec_pretty(&serde_json::json!({
+            "theme": "dark",
+            "permissions": { "allow": ["Bash(ls)"] }
+        })).unwrap()).unwrap();
+        let expected_cmd = aikey_statusline_command();
+        with_claude_config_dir(Some(tmp.path()), || {
+            ensure().expect("ensure must succeed and merge");
+            let v: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&settings).unwrap()
+            ).unwrap();
+            assert_eq!(v.get("theme").and_then(|t| t.as_str()), Some("dark"),
+                "ensure must preserve user's theme");
+            assert!(v.get("permissions").is_some(),
+                "ensure must preserve user's permissions");
+            let cmd = v.get("statusLine")
+                .and_then(|sl| sl.get("command"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+            assert_eq!(cmd, expected_cmd);
+        });
     }
 }

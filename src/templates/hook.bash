@@ -195,6 +195,11 @@ aikey_clear_before_tui_handoff() {
 if ! declare -F claude >/dev/null 2>&1 && ! alias claude >/dev/null 2>&1; then
     claude() {
         aikey_preflight anthropic || return $?
+        # Auto-install the aikey statusLine into the active Claude config dir
+        # (`$CLAUDE_CONFIG_DIR` or `~/.claude`). Silent, idempotent, non-blocking.
+        # Set AIKEY_DISABLE_STATUSLINE_ENSURE=1 to opt out (e.g. after `aikey
+        # statusline uninstall` if you want it to stay uninstalled).
+        command aikey statusline ensure >/dev/null 2>&1 || true
         aikey_clear_before_tui_handoff
         command claude "$@"
     }

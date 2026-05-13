@@ -129,6 +129,8 @@ Full design: `roadmap20260320/技术实现/开源版本方案/config-split-syste
 
 ## Provider OAuth Accounts (`aikey auth`)
 
+> ⚠️ `aikey auth login <provider>` **adds a provider credential to the local vault**. It is NOT the same as the team edition's `aikey login` (alias of `aikey account login`, which connects the CLI to the AiKey control service). Don't confuse them.
+
 Use subscription plans (Claude Pro/Max, ChatGPT Plus, Kimi Code) instead of API Keys.
 OAuth tokens are managed by [aikey-auth-broker](../aikey-auth-broker/README.md) via the proxy.
 

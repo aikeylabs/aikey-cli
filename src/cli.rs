@@ -575,6 +575,13 @@ pub(crate) enum StatuslineAction {
         /// statusLine path (no subcommand).
         target: String,
     },
+    /// Fire-and-forget auto-install for the shell wrapper. Resolves the
+    /// active Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), then
+    /// installs the aikey statusLine if the slot is empty. Silent on every
+    /// path — never prints, never blocks `claude` startup. Set
+    /// `AIKEY_DISABLE_STATUSLINE_ENSURE=1` to short-circuit if you ran
+    /// `aikey statusline uninstall` and want it to stay uninstalled.
+    Ensure,
 }
 
 #[derive(Subcommand)]
@@ -906,6 +913,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 Some(StatuslineAction::Render { target }) => {
                     format!("statusline.render.{target}")
                 }
+                Some(StatuslineAction::Ensure) => "statusline.ensure".to_string(),
             },
             Commands::Watch => "watch".to_string(),
             Commands::HookHash { .. } => "_hook-hash".to_string(),

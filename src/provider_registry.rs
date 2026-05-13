@@ -61,6 +61,8 @@ struct RegistryEntryRaw {
     #[serde(default)]
     display: Option<String>,
     #[serde(default)]
+    display_alias: Option<String>,
+    #[serde(default)]
     extra_env_vars: Vec<ExtraEnvVarRaw>,
 }
 
@@ -91,6 +93,13 @@ pub struct RegistryEntry {
     pub picker: bool,
     /// Human-facing label for the picker. Defaults to `code`.
     pub display: &'static str,
+    /// Brand alias rendered dimmed in parentheses next to `display` (e.g.
+    /// `anthropic` `(claude)`). `None` for families whose `display` already
+    /// encodes a platform discriminator (e.g. Kimi `kimi(kimi-code)`) or
+    /// where the canonical code is itself the recognizable brand
+    /// (`deepseek`, `groq`). See requirements spec
+    /// `workflow/CI/requirements/2026-05-12-provider-display-label-spec.md`.
+    pub display_alias: Option<&'static str>,
     /// Extra env vars (e.g. `KIMI_MODEL_NAME`) written alongside api_key /
     /// base_url for SDKs that need additional context.
     pub extra_env_vars: &'static [(&'static str, &'static str)],
@@ -139,6 +148,7 @@ fn state() -> &'static RegistryState {
                 Some(d) => leak(d),
                 None => code,
             };
+            let display_alias: Option<&'static str> = r.display_alias.map(leak);
             entries.push(RegistryEntry {
                 code,
                 family,
@@ -148,6 +158,7 @@ fn state() -> &'static RegistryState {
                 default_base_url: leak(r.default_base_url),
                 picker: r.picker,
                 display,
+                display_alias,
                 extra_env_vars: leak_extras(r.extra_env_vars),
             });
         }
@@ -232,6 +243,44 @@ pub fn family_of(code: &str) -> &'static str {
     match lookup(code) {
         Some(e) => e.family,
         None => canonical(code),
+    }
+}
+
+/// Resolve display label + brand alias for the FAMILY-level header (e.g.
+/// the Provider row in `aikey use`'s tree picker, or the Vault page's
+/// group chip).
+///
+/// - Single-platform family (one entry): returns that entry's `display`
+///   + `display_alias`. Example: `family_display("anthropic")` →
+///   `("anthropic", Some("claude"))`.
+/// - Multi-platform family (Kimi, where `kimi_code` + `moonshot` share
+///   `family: kimi`): returns `(family, None)` — no alias at family level,
+///   because the per-row display strings (`kimi(kimi-code)` /
+///   `kimi(moonshot)`) already carry the platform discriminator.
+/// - Unknown family (user-typed custom provider): returns the input
+///   string with no alias.
+pub fn family_display(family: &str) -> (&'static str, Option<&'static str>) {
+    let s = state();
+    let mut sole: Option<&'static RegistryEntry> = None;
+    let mut count = 0usize;
+    for e in &s.entries {
+        if e.family == family {
+            count += 1;
+            if count == 1 { sole = Some(e); }
+            if count > 1 { break; }
+        }
+    }
+    match count {
+        1 => {
+            let e = sole.unwrap();
+            (e.display, e.display_alias)
+        }
+        n if n > 1 => {
+            // All entries with this family share the same `e.family`
+            // 'static slice, so we can borrow from any of them.
+            (sole.unwrap().family, None)
+        }
+        _ => (cached_leak(family), None),
     }
 }
 

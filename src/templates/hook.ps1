@@ -359,6 +359,10 @@ if (-not (Get-Command claude -CommandType Function, Alias -ErrorAction SilentlyC
         $RemArgs = @($RemArgs)
         $rc = aikey_preflight -Provider 'anthropic'
         if ($rc -ne 0) { return }
+        # Auto-install the aikey statusLine into the active Claude config dir
+        # (`$env:CLAUDE_CONFIG_DIR` or `~/.claude`). Silent, idempotent.
+        # Set $env:AIKEY_DISABLE_STATUSLINE_ENSURE=1 to opt out.
+        try { & aikey statusline ensure *> $null } catch {}
         aikey_clear_before_tui_handoff
         $real = (Get-Command claude -CommandType Application -ErrorAction SilentlyContinue |
                  Select-Object -First 1).Source

@@ -48,6 +48,12 @@ providers:
     default_base_url: https://api.anthropic.com
     picker: true
     display: anthropic
+    # Per 2026-05-12 display-label convention: single-platform families get
+    # a brand alias rendered in muted parenthetical so users see the CLI tool
+    # they recognize ("claude") next to the canonical provider code. The
+    # multi-platform Kimi family keeps its (platform-code) parenthetical in
+    # the display field itself instead — see kimi_code / moonshot below.
+    display_alias: claude
 
   - code: openai
     oauth_aliases: [gpt, chatgpt, codex]
@@ -57,6 +63,7 @@ providers:
     default_base_url: https://api.openai.com/v1
     picker: true
     display: openai
+    display_alias: codex
 
   - code: google
     oauth_aliases: [gemini]
@@ -66,6 +73,7 @@ providers:
     default_base_url: https://generativelanguage.googleapis.com
     picker: true
     display: google
+    display_alias: gemini
 
   - code: deepseek
     # DeepSeek upstream already contains /v1 → proxy path bare.
@@ -161,7 +169,10 @@ providers:
     env_base_url: XAI_BASE_URL
     default_base_url: https://api.x.ai/v1
     picker: true
-    display: xai (grok)
+    # Migrated 2026-05-12 from inline-paren `display: xai (grok)` to
+    # structured display_alias so renderers can dim the parenthetical.
+    display: xai
+    display_alias: grok
 
   - code: openrouter
     proxy_path: openrouter/api/v1
@@ -194,7 +205,8 @@ providers:
     env_base_url: ZHIPUAI_BASE_URL
     default_base_url: https://open.bigmodel.cn/api/paas/v4
     picker: true
-    display: zhipu (GLM)
+    display: zhipu
+    display_alias: GLM
 
   - code: qwen
     oauth_aliases: [dashscope, tongyi]
@@ -204,7 +216,8 @@ providers:
     env_base_url: DASHSCOPE_BASE_URL
     default_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     picker: true
-    display: qwen (DashScope)
+    display: qwen
+    display_alias: DashScope
 
   - code: doubao
     # User-decided 2026-04-24: canonical code = "doubao" (用户心智里是豆包),
@@ -215,7 +228,8 @@ providers:
     env_base_url: ARK_BASE_URL
     default_base_url: https://ark.cn-beijing.volces.com/api/v3
     picker: true
-    display: doubao (ARK)
+    display: doubao
+    display_alias: ARK
 
   - code: siliconflow
     proxy_path: siliconflow/v1

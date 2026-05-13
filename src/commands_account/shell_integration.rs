@@ -189,6 +189,16 @@ pub fn injected_provider_toml_paths() -> Vec<(&'static str, std::path::PathBuf)>
     if file_has_aikey_marker(&codex) {
         out.push(("codex", codex));
     }
+    // Claude lives in a JSON settings file, not a TOML — but it's still a
+    // third-party CLI config aikey has injected into, so it belongs in the
+    // same "Injected provider configs" listing for `aikey env`. The path
+    // honors `$CLAUDE_CONFIG_DIR` so users with multiple Claude personas
+    // see whichever one their current shell points at.
+    if let Some(claude_settings) =
+        crate::commands_statusline::injected_claude_settings_path()
+    {
+        out.push(("claude", claude_settings));
+    }
     out
 }
 
@@ -2329,6 +2339,43 @@ mod hook_tests {
             "claude wrapper must delegate to real binary via `command`");
         assert!(c.contains("command codex -c model_provider=aikey \"$@\""),
             "codex wrapper must inject `-c model_provider=aikey` (see bugfix 2026-05-05)");
+    }
+
+    #[test]
+    fn hook_claude_wrapper_calls_statusline_ensure() {
+        // Why this is pinned: the claude wrapper auto-installs the aikey
+        // statusLine into the active Claude config dir on each launch so
+        // `CLAUDE_CONFIG_DIR=~/.claude-aikey claude` doesn't lose the
+        // receipt display. If this call is silently removed in a future
+        // refactor, users with multiple Claude personas will see broken
+        // receipts and have no easy diagnostic path. The matching opt-out
+        // env var must be documented alongside the call so the wrapper
+        // is self-explanatory.
+        for (label, c) in [
+            ("hook.zsh", hook_zsh_content()),
+            ("hook.bash", hook_bash_content()),
+        ] {
+            assert!(c.contains("aikey statusline ensure"),
+                "{label}: claude wrapper must call `aikey statusline ensure` \
+                 so the receipt statusLine follows CLAUDE_CONFIG_DIR");
+            assert!(c.contains("AIKEY_DISABLE_STATUSLINE_ENSURE"),
+                "{label}: wrapper must document AIKEY_DISABLE_STATUSLINE_ENSURE \
+                 opt-out alongside the ensure call");
+            // Must not abort the wrapper if ensure fails (network-less
+            // CI, read-only FS, etc.). The `|| true` guard is load-bearing.
+            assert!(c.contains("aikey statusline ensure >/dev/null 2>&1 || true"),
+                "{label}: ensure must be fire-and-forget — failures must \
+                 not block `claude` startup");
+        }
+    }
+
+    #[test]
+    fn hook_ps1_claude_wrapper_calls_statusline_ensure() {
+        let c = hook_ps1_content();
+        assert!(c.contains("aikey statusline ensure"),
+            "hook.ps1: claude wrapper must call `aikey statusline ensure`");
+        assert!(c.contains("AIKEY_DISABLE_STATUSLINE_ENSURE"),
+            "hook.ps1: wrapper must document AIKEY_DISABLE_STATUSLINE_ENSURE opt-out");
     }
 
     #[test]
