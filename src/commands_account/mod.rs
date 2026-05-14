@@ -1102,7 +1102,11 @@ pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> 
 ///
 /// Resolves the control panel URL from install-state.json or the stored
 /// platform account, then opens `/master/<page>` in the browser.
-/// Master console always requires admin login (handled by the web frontend).
+///
+/// Precondition: without explicit `--url` / `--port`, refuse to open unless
+/// either (a) install_profile=="trial" or (b) the user has a stored
+/// platform_account (logged in). Spec: requirements/2026-05-11-aikey-web-
+/// local-first-team-merge.md §R4-pre.
 pub fn handle_master_browse(page: Option<&str>, url_override: Option<&str>, port: Option<u16>, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     let path = match page {
         Some("seats")                          => "/master/orgs/default/seats",
@@ -1119,6 +1123,17 @@ pub fn handle_master_browse(page: Option<&str>, url_override: Option<&str>, port
             ).into());
         }
     };
+
+    // Precondition gate (skipped when --url / --port explicitly given).
+    if url_override.is_none() && port.is_none() {
+        let install_state = read_install_state();
+        let logged_in = matches!(storage::get_platform_account(), Ok(Some(_)));
+        if !master_precondition_satisfied(install_state.as_ref(), logged_in) {
+            return Err(
+                "Enterprise edition not connected. Run `aikey login --control-url <your-team-url>` first.".into()
+            );
+        }
+    }
 
     // Resolve base URL: --url > --port > stored account > install-state > interactive prompt.
     //
@@ -1290,6 +1305,24 @@ fn derive_local_browse_url(state: &serde_json::Value, alias: &str) -> Option<Str
 }
 
 /// Read install-state.json once, returning the parsed value.
+/// Pure decision: is `aikey master` allowed to proceed without `--url` / `--port` override?
+///
+/// True when either:
+///   - install_profile == "trial"  (local aikey-full-trial bundles a master), or
+///   - the user has a stored platform_account (`aikey login` has been run).
+///
+/// All other states (e.g. Personal install with no team login) return false
+/// and the caller refuses with a brief "not connected" message.
+fn master_precondition_satisfied(
+    install_state: Option<&serde_json::Value>,
+    logged_in: bool,
+) -> bool {
+    let is_trial = install_state
+        .and_then(|s| s.get("install_profile").and_then(|v| v.as_str()))
+        == Some("trial");
+    is_trial || logged_in
+}
+
 fn read_install_state() -> Option<serde_json::Value> {
     let home = dirs::home_dir()?;
     let state_path = home.join(".aikey").join("install-state.json");
@@ -3025,28 +3058,64 @@ pub fn handle_key_use(
             // (share_status=pending_claim). Auto-trigger a full snapshot sync (which
             // includes key material download) instead of forcing a separate command.
             eprintln!("  Key '{}' not yet delivered — syncing...", entry.alias);
-            // Full sync needs the vault master password to decrypt/re-encrypt key material.
-            // Try session cache first, then env var (for automation/testing).
-            let pw = crate::session::try_get()
+
+            // Acquire the master password. Order:
+            //   1) Session cache (kept warm by recent vault ops),
+            //   2) Test env vars (automation),
+            //   3) Interactive TTY prompt (and persist to session for the rest of the run).
+            //
+            // Why no silent metadata-only fallback: after `aikey login` the
+            // session cache is invalidated by the snapshot apply (vault_seq
+            // bumps), so the previous "let _ = run_full_snapshot_sync(); else
+            // metadata_only" path would silently land here, write no
+            // ciphertext, and exit with a misleading "admin may need to
+            // re-issue" error. Fail-fast surfaces the real client-side
+            // password requirement.
+            let pw_cached = crate::session::try_get()
                 .or_else(|| std::env::var("AK_TEST_PASSWORD").ok().map(secrecy::SecretString::new))
                 .or_else(|| std::env::var("AIKEY_TEST_MASTER_PASSWORD").ok().map(secrecy::SecretString::new));
-            if let Some(ref password) = pw {
-                let _ = run_full_snapshot_sync(password);
-            } else {
-                // Cannot get password — fallback to metadata-only sync.
-                sync_managed_key_metadata();
+
+            let pw = match pw_cached {
+                Some(p) => p,
+                None => {
+                    let can_prompt = !json_mode && std::io::stdin().is_terminal();
+                    if !can_prompt {
+                        return Err(format!(
+                            "Key '{}' needs to be downloaded but no master password is available. \
+                             Set AK_TEST_PASSWORD or run from an interactive terminal.",
+                            entry.alias
+                        ).into());
+                    }
+                    let raw = crate::prompt_hidden("  \u{1F512} Enter Master Password: ")
+                        .map_err(|e| format!("prompt: {}", e))?;
+                    let pw_fresh = secrecy::SecretString::new(raw);
+                    // Persist to session cache so subsequent commands don't re-prompt.
+                    crate::session::maybe_configure_backend();
+                    crate::session::store(&pw_fresh);
+                    pw_fresh
+                }
+            };
+
+            if let Err(e) = run_full_snapshot_sync(&pw) {
+                return Err(format!("Sync failed for '{}': {}", entry.alias, e).into());
             }
-            // Re-read the entry after sync.
+
+            // Re-read after sync.
             let refreshed = storage::get_virtual_key_cache(&entry.virtual_key_id)?
                 .or_else(|| storage::get_virtual_key_cache_by_alias(alias_or_id).ok().flatten());
             if refreshed.as_ref().and_then(|e| e.provider_key_ciphertext.as_ref()).is_none() {
+                // Sync ran but didn't produce ciphertext — the most likely
+                // causes are server-side: no active binding for this VK, key
+                // revoked between snapshot and delivery, or admin hasn't
+                // attached a credential yet. Surface those instead of the
+                // old "admin may need to re-issue" blanket message.
                 return Err(format!(
-                    "Key '{}' could not be delivered. The admin may need to re-issue the key, \
-                     or try again with: aikey key sync",
+                    "Key '{}' downloaded no key material — the team admin may need to \
+                     attach a provider credential to it. Retry with `aikey key sync` after \
+                     the admin confirms the binding.",
                     entry.alias
                 ).into());
             }
-            // Re-call with the refreshed state.
             drop(refreshed);
             return handle_key_use(alias_or_id, no_hook, provider_override, json_mode);
         }
@@ -4270,6 +4339,45 @@ mod control_url_resolution_tests {
 // remote URL routing. Spec: requirements/2026-05-11-aikey-web-local-first-
 // team-merge.md R5.
 // ============================================================================
+#[cfg(test)]
+mod master_precondition_tests {
+    use super::master_precondition_satisfied;
+
+    fn state(profile: &str) -> serde_json::Value {
+        serde_json::json!({ "install_profile": profile })
+    }
+
+    #[test]
+    fn trial_allows_without_login() {
+        assert!(master_precondition_satisfied(Some(&state("trial")), false));
+    }
+
+    #[test]
+    fn local_with_login_allows() {
+        assert!(master_precondition_satisfied(Some(&state("local")), true));
+    }
+
+    #[test]
+    fn local_without_login_denies() {
+        assert!(!master_precondition_satisfied(Some(&state("local")), false));
+    }
+
+    #[test]
+    fn server_without_login_denies() {
+        assert!(!master_precondition_satisfied(Some(&state("server")), false));
+    }
+
+    #[test]
+    fn missing_state_without_login_denies() {
+        assert!(!master_precondition_satisfied(None, false));
+    }
+
+    #[test]
+    fn missing_state_with_login_allows() {
+        assert!(master_precondition_satisfied(None, true));
+    }
+}
+
 #[cfg(test)]
 mod browse_url_resolution_tests {
     use super::derive_local_browse_url;

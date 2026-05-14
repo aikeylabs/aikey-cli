@@ -3925,24 +3925,24 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
         (fa, a.as_str()).cmp(&(fb, b.as_str()))
     });
 
+    // Probe pending-but-not-downloaded team keys. Why we always probe (not
+    // only when all_providers.is_empty()): `aikey ls` shows pending team
+    // keys, but `aikey use`'s picker filters them out (no ciphertext = not
+    // usable). If the user has *other* usable providers, the picker silently
+    // hides the pending team key — user sees it in `ls`, can't find it in
+    // `use`, no hint where it went. Print a banner whenever any team key
+    // needs sync, regardless of whether other providers are populated.
+    // Stays Err only in the truly-empty case.
+    let pending_download: Vec<&str> = team.iter()
+        .filter(|e| e.key_status == "active"
+            && !e.local_state.starts_with("disabled_by_")
+            && e.local_state != "stale"
+            && (e.provider_key_ciphertext.is_none()
+                || e.share_status == "pending_claim"))
+        .map(|e| e.local_alias.as_deref().unwrap_or(e.alias.as_str()))
+        .collect();
+
     if all_providers.is_empty() {
-        // Differentiate "truly empty" from "team has entries but none usable yet".
-        // Why: bg snapshot sync (try_background_snapshot_sync) updates metadata
-        // silently on every command, but cannot download provider-key ciphertext
-        // because that requires the master password. So a freshly-issued team key
-        // shows up in `aikey ls` (cache has metadata) yet `aikey use` filters it
-        // out (ciphertext absent). The generic "No keys or accounts found"
-        // contradicts what the user just saw in `ls` and gives no path forward.
-        // Probing the unfiltered `team` slice here lets us point at `aikey key
-        // sync` — which IS the action that will claim + download ciphertext.
-        let pending_download: Vec<&str> = team.iter()
-            .filter(|e| e.key_status == "active"
-                && !e.local_state.starts_with("disabled_by_")
-                && e.local_state != "stale"
-                && (e.provider_key_ciphertext.is_none()
-                    || e.share_status == "pending_claim"))
-            .map(|e| e.local_alias.as_deref().unwrap_or(e.alias.as_str()))
-            .collect();
         if !pending_download.is_empty() {
             return Err(format!(
                 "Found {} team key(s) pending download: {}. Run `aikey key sync` to claim and download.",
@@ -3951,6 +3951,22 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
             ).into());
         }
         return Err("No keys or accounts found.".into());
+    }
+
+    if !pending_download.is_empty() {
+        use colored::Colorize;
+        eprintln!(
+            "  {} {} team key(s) pending download: {}",
+            "!".yellow(),
+            pending_download.len(),
+            pending_download.join(", ")
+        );
+        eprintln!(
+            "    Run `{}` to claim and download, or `{}` to activate and auto-sync.",
+            "aikey key sync".bold(),
+            format!("aikey use {}", pending_download[0]).bold()
+        );
+        eprintln!();
     }
 
     // Build ProviderGroup for each provider.
