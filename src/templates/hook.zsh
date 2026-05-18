@@ -287,6 +287,24 @@ aikey_clear_before_tui_handoff() {
 # chain `aikey use` uses). So the wrapper has nothing extra to do — the
 # cold-start sequence (password prompt → "proxy started" → connectivity
 # table) all happens inside one `aikey test` call.
+# Reload semantics — drop OUR own previous wrapper if it's currently in
+# memory, so `source ~/.zshrc` (or the precmd auto-reload at L80-99) can
+# install the new version. We identify our wrappers by checking the
+# function body for `aikey_clear_before_tui_handoff` (an aikey-internal
+# helper present in all 3 wrappers; a user-defined claude/codex/kimi
+# would not call it). Users' own custom wrappers stay protected because
+# the body grep doesn't match. Without this, the plain `${+functions[claude]}`
+# guard saw the in-memory function from a prior aikey version and skipped
+# redefinition — the 2026-05-18 codex sentinel-gate fix never reached
+# running shells via `source`. See bugfix
+# 2026-05-18-hook-wrappers-not-reloadable-via-source.md.
+for _aikey_wrap in claude codex kimi; do
+    if (( ${+functions[$_aikey_wrap]} )) \
+       && [[ "${functions[$_aikey_wrap]}" == *aikey_clear_before_tui_handoff* ]]; then
+        unfunction "$_aikey_wrap" 2>/dev/null
+    fi
+done
+unset _aikey_wrap
 if ! (( ${+functions[claude]} )) && ! alias claude >/dev/null 2>&1; then
     function claude {
         aikey_preflight anthropic || return $?
@@ -312,7 +330,18 @@ if ! (( ${+functions[codex]} )) && ! alias codex >/dev/null 2>&1; then
         # half-state that left codex routing to localhost:11434 (ollama).
         # Per-invocation override beats global toml edit. See bugfix
         # 2026-05-05-codex-wrapper-injects-model-provider-arg.md.
-        command codex -c model_provider=aikey "$@"
+        #
+        # Sentinel-gated injection: only force `model_provider=aikey` when
+        # active.env has actually bound openai (OPENAI_API_KEY=aikey_active_*).
+        # Otherwise `aikey unuse openai` strips the [model_providers.aikey]
+        # block from ~/.codex/config.toml and a hard-coded `-c` makes codex
+        # error with "Model provider `aikey` not found". See bugfix
+        # 2026-05-18-codex-wrapper-injects-unconditionally-after-unuse.md.
+        if [[ "$OPENAI_API_KEY" == aikey_active_* ]]; then
+            command codex -c model_provider=aikey "$@"
+        else
+            command codex "$@"
+        fi
     }
 fi
 # kimi: auto-start proxy ONLY — NO diagnostic preflight.

@@ -622,11 +622,13 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         }
 
         // Probe backend services (docker or native).
-        // control/collector/query = server-mode docker services.
-        // trial-server = local-server or full-trial on :8090.
+        // control/collector/query = server-mode docker services. Probed
+        // silently — failures here aren't actionable for Personal users.
+        // local-server is checked separately below (after drop(emit)) so
+        // its NOT-RUNNING case can render as a ⚠ warning with a start
+        // hint, rather than being silently skipped.
         for (name, port) in &[
             ("control", 8080u16), ("collector", 27300), ("query", 27310),
-            ("trial-server", 8090),
         ] {
             let url = format!("http://127.0.0.1:{}/version", port);
             match ureq::AgentBuilder::new()
@@ -1021,6 +1023,70 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         } else {
             render_cannot_test_block(&build_errors, json_mode);
         }
+    }
+
+    // ── local-server (Personal / Trial only) ──────────────────────────
+    //
+    // Why placed AFTER drop(emit): we need to write to `results` from a
+    // path that mimics emit's warn behavior — ⚠ icon, no `any_failed`
+    // bubble. Doing it through emit (which only knows ok/fail) would
+    // either trigger a false red ✗ + nonzero exit, or be misclassified
+    // as success. The closure's borrow on results would also prevent a
+    // sideband warn helper from coexisting. Placing this block after
+    // drop(emit) sidesteps both problems.
+    //
+    // Skip silently on editions without local-server (Personal CLI-only,
+    // Production) — there's nothing actionable to report.
+    if crate::local_server_probe::is_local_server_installed() {
+        let (label, ok_for_json, detail, hint) =
+            match crate::local_server_probe::read_local_server_port() {
+                Ok(port) => {
+                    let base = format!("http://127.0.0.1:{}", port);
+                    match crate::local_server_probe::probe_vault_status(&base) {
+                        Ok(unlocked) => (
+                            "local-server",
+                            true,
+                            format!("running on port {} (vault: {})",
+                                port,
+                                if unlocked { "unlocked" } else { "locked" }),
+                            None,
+                        ),
+                        Err(_) => (
+                            "local-server",
+                            false,
+                            format!("not running on port {}", port),
+                            Some(crate::local_server_probe::start_command_hint()),
+                        ),
+                    }
+                }
+                Err(e) => (
+                    "local-server",
+                    false,
+                    format!("configuration unreadable — {}", e),
+                    None,
+                ),
+            };
+
+        if !json_mode {
+            let icon = if ok_for_json { "✓".green() } else { "⚠".yellow() };
+            println!("{} {:<18} {}", icon, label, detail);
+            if let Some(ref h) = hint {
+                println!("  {}", format!("↳ Start: {}", h).dimmed());
+            }
+        }
+        results.push(serde_json::json!({
+            "check": label,
+            "ok": ok_for_json,
+            // `severity: "warn"` distinguishes "this is informational and
+            // doesn't fail the overall doctor check" from "this is broken".
+            // JSON consumers should treat warn === ok for pass/fail purposes
+            // but may still surface it as actionable.
+            "severity": if ok_for_json { "ok" } else { "warn" },
+            "detail": detail,
+            "hint": hint,
+        }));
+        // Deliberately do NOT touch `any_failed` — local-server being down
+        // is a Personal-edition convenience problem, not a doctor failure.
     }
 
     if !json_mode {

@@ -35,6 +35,7 @@ pub mod proxy_lifecycle;
 pub mod proxy_events;
 pub mod commands_internal;
 pub mod commands_import;
+pub mod local_server_probe;
 pub mod commands_init;
 pub mod session;
 pub mod ui_frame;

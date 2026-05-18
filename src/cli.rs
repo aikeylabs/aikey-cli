@@ -229,6 +229,13 @@ pub(crate) enum Commands {
         #[arg(long, value_name = "SHELL")]
         shell: Option<String>,
     },
+    /// Remove the active binding for one or more providers
+    #[command(display_order = 4)]
+    Unuse {
+        /// Provider codes to unbind (e.g. openai, anthropic, kimi)
+        #[arg(required = true, num_args = 1..)]
+        providers: Vec<String>,
+    },
     /// Show proxy route tokens for third-party AI clients (Cursor, OpenCode, etc.)
     #[command(display_order = 5)]
     Route {
@@ -671,6 +678,15 @@ pub(crate) enum HookAction {
         #[arg(long)]
         no_hook: bool,
     },
+    /// Force re-write both layers (hook file + rc block) and report which
+    /// file was touched. Use after a major hook template change (e.g. the
+    /// 2026-05-18 codex sentinel-gate) to make the propagation visible.
+    /// Idempotent; safe to run repeatedly.
+    Reinstall {
+        /// Override shell detection (zsh | bash). Default: detect from $SHELL.
+        #[arg(long, value_name = "SHELL")]
+        shell: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -854,6 +870,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 KeyAction::Alias { .. } => "alias",
             }),
             Commands::Use { .. } => "key.use".to_string(),
+            Commands::Unuse { .. } => "key.unuse".to_string(),
             Commands::Activate { .. } => "activate".to_string(),
             Commands::Deactivate { .. } => "deactivate".to_string(),
             Commands::Route { .. } => "route".to_string(),
@@ -922,6 +939,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 HookAction::Update => "hook.update".to_string(),
                 HookAction::Status { .. } => "hook.status".to_string(),
                 HookAction::Install { .. } => "hook.install".to_string(),
+                HookAction::Reinstall { .. } => "hook.reinstall".to_string(),
             },
         },
     }

@@ -183,8 +183,49 @@ aikey web --port 18090     # force a specific local port
 aikey web --json           # print the URL as JSON, don't launch the browser
 ```
 
-Prerequisites are the same as Bulk Import below (`aikey-local-server` must
-be running).
+**Auto-start**: if `aikey-local-server` isn't running, `aikey web` first
+probes the port and then prompts `Start local-server now? [Y/n]`. Pressing
+Enter or `y` runs `launchctl start` (macOS) / `systemctl --user start`
+(Linux), waits up to 5 seconds for readiness, then opens the browser.
+
+- Choose `n`: prints the manual start command and exits without opening
+  the browser.
+- `--json` mode: no interactive prompt — emits a structured error and a
+  stderr hint pointing at non-JSON mode if auto-start is desired.
+
+## System health (`aikey doctor`)
+
+Single-shot health check across CLI / Proxy / Vault / network /
+local-server. The local-server check reports a ⚠ warning (not a failure)
+when it's down — that keeps `aikey doctor`'s overall exit code stable for
+Personal users who occasionally stop the service — and prints a copy-
+pasteable platform command alongside.
+
+```bash
+aikey doctor               # full health check
+aikey doctor --detail      # adds recent failures + ingest health + 4xx body capture
+```
+
+## Unbind a provider (`aikey unuse`)
+
+Inverse of `aikey use`. Removes the active binding for one or more
+providers and reconciles all side effects in one shot:
+
+- Drops the binding row from the vault DB.
+- Refreshes `~/.aikey/active.env` so the provider's env vars (e.g.
+  `ANTHROPIC_API_KEY`) are no longer injected by the shell hook.
+- Cleans the corresponding scaffold from third-party CLI configs:
+  `~/.kimi/config.toml`, `~/.codex/config.toml`,
+  `~/.claude/settings.json` (statusLine).
+
+```bash
+aikey unuse anthropic                # unbind one provider
+aikey unuse anthropic openai kimi    # unbind multiple at once
+aikey unuse anthropic --json         # structured output for scripts
+```
+
+Idempotent: providers without an active binding are reported as
+"already unbound" and produce no error.
 
 ## Bulk Import
 

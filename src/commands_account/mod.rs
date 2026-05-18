@@ -1032,18 +1032,38 @@ pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> 
     // (team-admin console); `aikey web` stays local.
     if port.is_none() {
         if let Some(url) = try_local_browse_url(alias) {
-            if json_mode {
-                crate::json_output::print_json(serde_json::json!({
-                    "ok": true,
-                    "url": &url,
-                    "mode": "local",
-                }));
-            } else {
-                println!("Opening Local Console...");
-                println!("  {}", url);
+            // Pre-flight: probe local-server before opening the browser.
+            // Without this, an unstarted service produced ERR_CONNECTION_
+            // REFUSED in the browser with no useful actionable hint —
+            // user couldn't tell whether the install was broken or the
+            // service just needed starting. See decisions (1c, A-a, B-b,
+            // C-b) recorded in the 2026-05-18 session.
+            let preflight = local_server_preflight_for_browse(json_mode);
+            match preflight {
+                BrowseLocalPreflight::OpenNow => {
+                    if json_mode {
+                        crate::json_output::print_json(serde_json::json!({
+                            "ok": true,
+                            "url": &url,
+                            "mode": "local",
+                        }));
+                    } else {
+                        println!("Opening Local Console...");
+                        println!("  {}", url);
+                    }
+                    open_url_silently(&url);
+                    return Ok(());
+                }
+                BrowseLocalPreflight::DeclineNoOpen => {
+                    // User said "no, don't auto-start". Don't open a URL
+                    // that will refuse the connection; exit non-zero so
+                    // wrapper scripts can detect the abort.
+                    return Err("local-server is not running; declined to start".into());
+                }
+                BrowseLocalPreflight::JsonModeError(msg) => {
+                    return Err(msg.into());
+                }
             }
-            open_url_silently(&url);
-            return Ok(());
         }
     }
 
@@ -1262,6 +1282,138 @@ fn derive_local_control_url(state: &serde_json::Value) -> Option<String> {
 fn try_local_browse_url(alias: &str) -> Option<String> {
     let state = read_install_state()?;
     derive_local_browse_url(&state, alias)
+}
+
+/// Outcome of the local-server pre-flight that `aikey web` runs before
+/// opening the browser. Three terminal states; the caller branches on
+/// these instead of taking action mid-helper so the I/O surface stays
+/// localized.
+enum BrowseLocalPreflight {
+    /// Either the service is already up, or the user opted to auto-start
+    /// (regardless of whether the start actually succeeded — decision A
+    /// is "open the browser anyway and let the user see the real error").
+    OpenNow,
+    /// User answered "no" to the auto-start prompt. Don't open a URL
+    /// that's known to be unreachable.
+    DeclineNoOpen,
+    /// `--json` mode: pre-flight surfaces a structured error and exits;
+    /// auto-start prompts only make sense in tty mode.
+    JsonModeError(String),
+}
+
+/// Probe local-server, then either proceed, prompt for auto-start, or
+/// surface a JSON-mode error. Decisions encoded here:
+///   - Auto-start uses platform-native service manager (launchctl /
+///     systemd-user / direct spawn) — no master password required.
+///   - 5 s reachability deadline after start.
+///   - On start failure or timeout, still open the browser so the user
+///     sees ERR_CONNECTION_REFUSED with the real port (decision A-a).
+///   - JSON mode never prompts — auto-start needs a tty; we emit JSON
+///     error + a stderr hint pointing at non-JSON mode (decision C-b).
+fn local_server_preflight_for_browse(json_mode: bool) -> BrowseLocalPreflight {
+    // Resolve port once — both probe and prompt need it.
+    let port = match crate::local_server_probe::read_local_server_port() {
+        Ok(p) => p,
+        Err(e) => {
+            // Discovery failed (yaml missing, config.json bad). In this
+            // state try_local_browse_url shouldn't have returned Some,
+            // but if it did, surface the real reason instead of opening
+            // a half-baked URL.
+            let msg = format!("local-server configuration unreadable: {}", e);
+            if json_mode {
+                crate::json_output::print_json(serde_json::json!({
+                    "ok": false,
+                    "error": "local_server_unconfigured",
+                    "detail": &msg,
+                }));
+                return BrowseLocalPreflight::JsonModeError(msg);
+            }
+            eprintln!("{}", msg);
+            return BrowseLocalPreflight::DeclineNoOpen;
+        }
+    };
+
+    let base = format!("http://127.0.0.1:{}", port);
+
+    // Reachable? Open immediately, identical to pre-pre-flight behavior.
+    if crate::local_server_probe::probe_vault_status(&base).is_ok() {
+        return BrowseLocalPreflight::OpenNow;
+    }
+
+    // Unreachable. JSON mode surfaces a structured error and exits.
+    if json_mode {
+        let msg = format!(
+            "local-server is not running on port {}. Auto-start requires \
+             non-JSON (tty) mode.",
+            port
+        );
+        crate::json_output::print_json(serde_json::json!({
+            "ok": false,
+            "error": "local_server_not_running",
+            "port": port,
+            "detail": &msg,
+        }));
+        eprintln!("Re-run `aikey web` without --json to auto-start local-server, \
+                   or start it manually: {}",
+            crate::local_server_probe::start_command_hint());
+        return BrowseLocalPreflight::JsonModeError(msg);
+    }
+
+    // Tty path: prompt to auto-start.
+    println!("local-server is not running on port {}.", port);
+    if !prompt_yes_no_default_yes("Start local-server now? [Y/n] ") {
+        eprintln!("To start manually:\n    {}",
+            crate::local_server_probe::start_command_hint());
+        return BrowseLocalPreflight::DeclineNoOpen;
+    }
+
+    println!("Starting local-server…");
+    let start_result = crate::local_server_probe::spawn_start_command();
+    let wait = crate::local_server_probe::wait_for_reachable(
+        port, std::time::Duration::from_secs(5));
+
+    match (start_result, &wait) {
+        (Ok(()), Ok(())) => {
+            println!("local-server is up.");
+        }
+        (Err(e), _) => {
+            // The start command itself failed to invoke (e.g. launchctl
+            // not on PATH, plist missing). Tell the user what we tried,
+            // then continue to open-browser per decision A-a so they
+            // see the underlying connection error in context.
+            eprintln!("Auto-start failed: {}", e);
+            eprintln!("Continuing to open the browser anyway — it will \
+                       report the connection error directly.");
+        }
+        (Ok(()), Err(e)) => {
+            // Start command succeeded but service didn't come up within
+            // 5 s. Could be slow boot or a config error. Open browser
+            // per decision A-a.
+            eprintln!("{}. Continuing to open the browser anyway — it \
+                       will report what local-server actually returns.", e);
+        }
+    }
+
+    BrowseLocalPreflight::OpenNow
+}
+
+/// Simple yes/no prompt with Y as the default (empty input → true).
+/// Reads from stdin. Returns false for explicit "n" / "no" and on EOF
+/// (e.g. stdin closed) to fail safe — auto-start should require an
+/// affirmative human action.
+fn prompt_yes_no_default_yes(prompt: &str) -> bool {
+    use std::io::Write;
+    print!("{}", prompt);
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) => false, // EOF — treat as no (fail safe)
+        Ok(_) => {
+            let t = line.trim().to_lowercase();
+            t.is_empty() || t == "y" || t == "yes"
+        }
+        Err(_) => false,
+    }
 }
 
 /// Pure helper for `try_local_browse_url` so the resolution logic can be
@@ -3305,13 +3457,93 @@ pub fn handle_key_use(
         println!();
     }
 
-    // Auto-install the Claude Code status-line integration when the user
-    // promotes a key that covers the anthropic provider.  Idempotent —
-    // `ensure_claude_statusline_installed` is safe to call every time.
-    // See 费用小票-实施方案.md §5.6 for the trigger matrix.
-    if target_providers.iter().any(|p| p.eq_ignore_ascii_case("anthropic")) {
-        crate::commands_statusline::ensure_claude_statusline_installed();
+    // Claude Code status-line install/uninstall is now driven through the
+    // shared lifecycle tail (`apply_third_party_cli_configs`) — symmetric
+    // with kimi/codex. See bugfix 2026-05-18-claude-statusline-residue-on-
+    // unuse.md for why the previous one-sided install call was hiding a
+    // matching uninstall gap.
+    Ok(())
+}
+
+/// `aikey unuse <PROVIDERS...>` — remove the active binding for one or more
+/// providers, clearing the corresponding env vars from active.env and toml
+/// configs (kimi.toml, codex.toml, etc.).
+///
+/// Inverse of `aikey use`. After unbinding, the provider's env var will no
+/// longer be injected by the shell hook, and third-party CLI configs that
+/// reference the proxy endpoint for that provider will be cleared.
+///
+/// Idempotent: if a provider has no active binding, it's silently skipped
+/// (exit 0, no error).
+pub fn handle_key_unuse(
+    providers: &[String],
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let mut unbound: Vec<String> = Vec::new();
+    let mut already_unbound: Vec<String> = Vec::new();
+
+    for raw in providers {
+        let canonical = oauth_provider_to_canonical(&raw.to_lowercase());
+        let removed = storage::remove_provider_binding(
+            crate::profile_activation::DEFAULT_PROFILE,
+            canonical,
+        ).map_err(|e| format!("remove binding for {}: {}", canonical, e))?;
+
+        if removed {
+            unbound.push(canonical.to_string());
+        } else {
+            already_unbound.push(canonical.to_string());
+        }
     }
+
+    // Run the side-effect tail (same as lifecycle event batch tail):
+    // refresh active.env → apply third-party CLI configs → hook file.
+    // This ensures env vars and toml regions for unbound providers are
+    // removed immediately.
+    if !unbound.is_empty() {
+        if let Ok(refresh) = crate::profile_activation::refresh_implicit_profile_activation() {
+            let proxy_port = crate::commands_proxy::proxy_port();
+            let active_providers: Vec<String> = refresh
+                .bindings
+                .iter()
+                .map(|b| b.provider_code.clone())
+                .collect();
+            apply_third_party_cli_configs(&active_providers, proxy_port);
+            let _ = web_install_hook_file_layer1();
+        }
+    }
+
+    if json_mode {
+        crate::json_output::print_json(serde_json::json!({
+            "ok": true,
+            "unbound_providers": unbound,
+            "already_unbound": already_unbound,
+        }));
+    } else {
+        if unbound.is_empty() && !already_unbound.is_empty() {
+            println!("No active binding for {}. Nothing to do.",
+                already_unbound.join(", "));
+        } else if !unbound.is_empty() {
+            let rows: Vec<String> = unbound.iter()
+                .map(|p| format!("  {} {}", "\u{2717}".red(), p))
+                .collect();
+            crate::ui_frame::print_box(
+                "\u{1F7E1}",
+                &format!("Unbound: {}", unbound.join(", ")),
+                &rows,
+            );
+            println!();
+            println!("{}", "\u{2713} active.env and CLI configs updated. Next prompt picks it up automatically.".dimmed());
+            if !already_unbound.is_empty() {
+                println!("  {} already had no binding: {}",
+                    "\u{2139}\u{FE0F}".dimmed(),
+                    already_unbound.join(", "));
+            }
+        }
+    }
+
     Ok(())
 }
 

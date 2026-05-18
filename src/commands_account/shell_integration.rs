@@ -300,6 +300,29 @@ pub fn apply_third_party_cli_configs(providers: &[String], proxy_port: u16) {
     } else {
         unconfigure_codex_cli();
     }
+
+    // Claude Code statusLine: install when anthropic is active, uninstall
+    // when it's not. Symmetric handling — without this, switching away from
+    // anthropic (via `aikey use <non-anthropic>` or `aikey unuse anthropic`)
+    // would leave a stale `aikey statusline` entry in `~/.claude/settings.json`,
+    // visible to users as a residual injection in `aikey env`. Single funnel
+    // here means every binding-changing path reconciles claude's settings.json
+    // alongside the kimi/codex tomls.
+    //
+    // Both helpers are idempotent and conflict-aware: install skips silently
+    // if a third-party statusLine (starship, ccusage, etc.) already owns the
+    // slot; uninstall is gated on `points_to_us` so it only touches aikey-
+    // owned entries. quiet=true suppresses uninstall chatter so this lifecycle
+    // tail doesn't spam the terminal on every binding operation.
+    let has_anthropic = providers.iter().any(|p| {
+        let c = p.to_lowercase();
+        c == "anthropic" || c == "claude"
+    });
+    if has_anthropic {
+        crate::commands_statusline::ensure_claude_statusline_installed();
+    } else {
+        let _ = crate::commands_statusline::uninstall_claude(true);
+    }
 }
 
 /// Ensure the aikey-managed scaffold exists in `~/.kimi/config.toml`.
@@ -2339,6 +2362,104 @@ mod hook_tests {
             "claude wrapper must delegate to real binary via `command`");
         assert!(c.contains("command codex -c model_provider=aikey \"$@\""),
             "codex wrapper must inject `-c model_provider=aikey` (see bugfix 2026-05-05)");
+    }
+
+    // ── Sentinel-gated codex `-c` injection ─────────────────────────────
+    //
+    // Bugfix 2026-05-18: previously the codex wrapper injected `-c model_
+    // provider=aikey` UNCONDITIONALLY. After `aikey unuse openai` the
+    // [model_providers.aikey] block is stripped from ~/.codex/config.toml,
+    // and the unconditional `-c` then makes codex fail with "Model provider
+    // `aikey` not found". The wrapper now gates the injection on the
+    // active.env sentinel `OPENAI_API_KEY=aikey_active_*`, which is only
+    // present when openai is actually bound. These tests pin that condition.
+
+    #[test]
+    fn zsh_codex_wrapper_gates_inject_on_active_sentinel() {
+        let c = hook_zsh_content();
+        let codex_block = c.split("function codex").nth(1).unwrap_or("")
+            .split("\nfi\n").next().unwrap_or("");
+        assert!(codex_block.contains(r#"[[ "$OPENAI_API_KEY" == aikey_active_*"#),
+            "zsh codex wrapper must gate `-c model_provider=aikey` on the \
+             active.env sentinel; block was:\n{}", codex_block);
+        assert!(codex_block.contains("command codex \"$@\""),
+            "zsh codex wrapper must have an else-branch that calls codex \
+             without `-c`; block was:\n{}", codex_block);
+    }
+
+    #[test]
+    fn bash_codex_wrapper_gates_inject_on_active_sentinel() {
+        let c = hook_bash_content();
+        let codex_block = c.split("codex() {").nth(1).unwrap_or("")
+            .split("\nfi\n").next().unwrap_or("");
+        assert!(codex_block.contains(r#"[[ "$OPENAI_API_KEY" == aikey_active_*"#),
+            "bash codex wrapper must gate `-c model_provider=aikey` on the \
+             active.env sentinel; block was:\n{}", codex_block);
+        assert!(codex_block.contains("command codex \"$@\""),
+            "bash codex wrapper must have an else-branch that calls codex \
+             without `-c`; block was:\n{}", codex_block);
+    }
+
+    // ── Wrapper reload semantics ────────────────────────────────────────
+    //
+    // Bugfix 2026-05-18: the original `if ! (( ${+functions[claude]} ))`
+    // guards blocked redefinition on `source ~/.zshrc` — aikey's own
+    // previous wrapper, already in memory, made the guard fail. New
+    // templates prepend a cleanup loop that drops in-memory wrappers
+    // whose body contains the aikey-internal marker
+    // `aikey_clear_before_tui_handoff`. These tests pin that the cleanup
+    // loop is present in all 3 templates AND uses the correct marker.
+
+    #[test]
+    fn zsh_hook_has_reload_cleanup_loop() {
+        let c = hook_zsh_content();
+        assert!(c.contains("for _aikey_wrap in claude codex kimi"),
+            "hook.zsh must iterate the three known wrappers in the cleanup loop");
+        assert!(c.contains("aikey_clear_before_tui_handoff"),
+            "hook.zsh cleanup loop must identify aikey-owned wrappers via the \
+             `aikey_clear_before_tui_handoff` body marker");
+        assert!(c.contains("unfunction \"$_aikey_wrap\""),
+            "hook.zsh cleanup loop must drop the function with `unfunction`");
+    }
+
+    #[test]
+    fn bash_hook_has_reload_cleanup_loop() {
+        let c = hook_bash_content();
+        assert!(c.contains("for _aikey_wrap in claude codex kimi"),
+            "hook.bash must iterate the three known wrappers in the cleanup loop");
+        assert!(c.contains("aikey_clear_before_tui_handoff"),
+            "hook.bash cleanup loop must identify aikey-owned wrappers via the \
+             `aikey_clear_before_tui_handoff` body marker");
+        assert!(c.contains("unset -f \"$_aikey_wrap\""),
+            "hook.bash cleanup loop must drop the function with `unset -f`");
+    }
+
+    #[test]
+    fn ps1_hook_has_reload_cleanup_loop() {
+        let c = hook_ps1_content();
+        assert!(c.contains("foreach ($_aikey_wrap in @('claude','codex','kimi'))"),
+            "hook.ps1 must iterate the three known wrappers in the cleanup loop");
+        assert!(c.contains("aikey_clear_before_tui_handoff"),
+            "hook.ps1 cleanup loop must identify aikey-owned wrappers via the \
+             `aikey_clear_before_tui_handoff` Definition marker");
+        assert!(c.contains("Remove-Item (\"Function:\\\" + $_aikey_wrap)"),
+            "hook.ps1 cleanup loop must drop the function with `Remove-Item Function:...`");
+    }
+
+    #[test]
+    fn ps1_codex_wrapper_gates_inject_on_active_sentinel() {
+        let c = hook_ps1_content();
+        let codex_block = c.split("function global:codex").nth(1).unwrap_or("")
+            .split("\nfunction global:kimi").next().unwrap_or("");
+        assert!(codex_block.contains(r#"$env:OPENAI_API_KEY"#)
+             && codex_block.contains(r#"StartsWith("aikey_active_")"#),
+            "ps1 codex wrapper must gate `-c model_provider=aikey` on the \
+             active.env sentinel; block was:\n{}", codex_block);
+        // Else branch must invoke codex without the `-c` flag — split on
+        // newline+spaces and assert at least one `& $real @RemArgs` line.
+        assert!(codex_block.contains("& $real @RemArgs"),
+            "ps1 codex wrapper must have an else-branch that calls codex \
+             without `-c`; block was:\n{}", codex_block);
     }
 
     #[test]

@@ -1145,12 +1145,12 @@ pub fn ensure() -> io::Result<()> {
 /// `aikey statusline uninstall [target] [--all]` — top-level dispatcher.
 pub fn uninstall(target: Option<&str>, all: bool) -> io::Result<()> {
     if all {
-        uninstall_claude()?;
+        uninstall_claude(false)?;
         uninstall_kimi()?;
         return Ok(());
     }
     match target.unwrap_or("claude") {
-        "claude" => uninstall_claude()?,
+        "claude" => uninstall_claude(false)?,
         "kimi" => uninstall_kimi()?,
         other => {
             use colored::Colorize;
@@ -1192,22 +1192,30 @@ pub fn uninstall_kimi() -> io::Result<()> {
 }
 
 /// Claude-specific uninstall.
-pub fn uninstall_claude() -> io::Result<()> {
+///
+/// `quiet=true` suppresses all stderr chatter so this is callable from the
+/// lifecycle-event tail (`apply_third_party_cli_configs`) without spamming
+/// the terminal on every `aikey use` / `aikey unuse` that doesn't have
+/// anthropic in the active set. Top-level `aikey statusline uninstall`
+/// keeps `quiet=false` so user-initiated calls still print confirmations.
+pub fn uninstall_claude(quiet: bool) -> io::Result<()> {
     use colored::Colorize;
     let Some(settings_path) = claude_settings_path() else {
-        eprintln!("  {}", "No Claude Code config directory — nothing to uninstall.".dimmed());
+        if !quiet { eprintln!("  {}", "No Claude Code config directory — nothing to uninstall.".dimmed()); }
         return Ok(());
     };
 
     let current = match read_settings(&settings_path) {
         Ok(v) => v,
         Err(ReadError::NotFound) => {
-            eprintln!("  {}", "~/.claude/settings.json does not exist — nothing to uninstall.".dimmed());
+            if !quiet { eprintln!("  {}", "~/.claude/settings.json does not exist — nothing to uninstall.".dimmed()); }
             return Ok(());
         }
         Err(ReadError::Malformed(e)) => {
-            eprintln!("  {} {}", "✗".red(),
-                format!("Cannot parse settings.json: {}", e).red());
+            if !quiet {
+                eprintln!("  {} {}", "✗".red(),
+                    format!("Cannot parse settings.json: {}", e).red());
+            }
             return Ok(());
         }
         Err(ReadError::Io(e)) => return Err(e),
@@ -1221,7 +1229,7 @@ pub fn uninstall_claude() -> io::Result<()> {
         .unwrap_or(false);
 
     if !points_to_us {
-        eprintln!("  {}", "Claude Code status line is not configured for aikey — nothing to remove.".dimmed());
+        if !quiet { eprintln!("  {}", "Claude Code status line is not configured for aikey — nothing to remove.".dimmed()); }
         return Ok(());
     }
 
@@ -1230,7 +1238,7 @@ pub fn uninstall_claude() -> io::Result<()> {
     let backup_path = statusline_backup_path(&settings_path);
     if backup_path.exists() {
         std::fs::rename(&backup_path, &settings_path)?;
-        eprintln!("  {} Restored {} from backup.", "✓".green(), settings_path.display());
+        if !quiet { eprintln!("  {} Restored {} from backup.", "✓".green(), settings_path.display()); }
         return Ok(());
     }
 
@@ -1244,10 +1252,10 @@ pub fn uninstall_claude() -> io::Result<()> {
     // empty `{}` that looks like user-configured state.
     if next.as_object().map(|o| o.is_empty()).unwrap_or(false) {
         std::fs::remove_file(&settings_path)?;
-        eprintln!("  {} Removed {} (file was otherwise empty).", "✓".green(), settings_path.display());
+        if !quiet { eprintln!("  {} Removed {} (file was otherwise empty).", "✓".green(), settings_path.display()); }
     } else {
         write_settings_atomic(&settings_path, &next)?;
-        eprintln!("  {} Removed aikey statusLine from {}.", "✓".green(), settings_path.display());
+        if !quiet { eprintln!("  {} Removed aikey statusLine from {}.", "✓".green(), settings_path.display()); }
     }
     Ok(())
 }
@@ -2302,6 +2310,135 @@ mod tests {
         with_claude_config_dir(Some(tmp.path()), || {
             assert_eq!(injected_claude_settings_path(), None);
         });
+    }
+
+    // ── Regression: apply_third_party_cli_configs symmetric for claude ──
+    //
+    // Bug 2026-05-18: `aikey unuse anthropic` (and `aikey use <non-anthropic>`
+    // when previously claude was active) left a stale `aikey statusline`
+    // entry in `~/.claude/settings.json`. Root cause: the shared lifecycle
+    // tail (`apply_third_party_cli_configs`) handled kimi and codex
+    // configure/unconfigure symmetrically but only INSTALLED claude — never
+    // uninstalled. These tests lock the symmetric behavior in place.
+
+    /// Override HOME + CLAUDE_CONFIG_DIR for a closure. Both are needed
+    /// because the lifecycle tail also touches `~/.kimi/config.toml` and
+    /// `~/.codex/config.toml` via HOME; without overriding both, the test
+    /// would mutate the developer's real configs.
+    fn with_home_and_claude_dir<F: FnOnce()>(
+        home: &std::path::Path,
+        claude_dir: &std::path::Path,
+        f: F,
+    ) {
+        let _lock = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let prev_home = std::env::var_os("HOME");
+        let prev_ccd = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("HOME", home);
+        std::env::set_var("CLAUDE_CONFIG_DIR", claude_dir);
+        f();
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_ccd {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    fn apply_third_party_cli_configs_uninstalls_claude_when_anthropic_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings = claude_dir.join("settings.json");
+        // Pre-state: aikey owns the statusLine slot.
+        write_settings_with(&settings, Some("/Users/x/.aikey/bin/aikey statusline"));
+
+        with_home_and_claude_dir(tmp.path(), &claude_dir, || {
+            // Active set has kimi only — no anthropic. The shared chain
+            // must uninstall the aikey statusLine.
+            crate::commands_account::apply_third_party_cli_configs(
+                &["kimi".to_string()], 27200,
+            );
+        });
+
+        // Settings.json may have been removed entirely (if it was otherwise
+        // empty) or rewritten without a statusLine key. Either is a pass.
+        // We assert structurally rather than by substring because the test
+        // binary path doesn't contain literal "aikey statusline".
+        match std::fs::read_to_string(&settings) {
+            Err(_) => {} // file removed — clean exit
+            Ok(content) => {
+                let parsed: serde_json::Value = serde_json::from_str(&content)
+                    .expect("settings.json must be valid JSON");
+                assert!(parsed.get("statusLine").is_none(),
+                    "statusLine key must be removed: {}", content);
+            }
+        }
+    }
+
+    #[test]
+    fn apply_third_party_cli_configs_installs_claude_when_anthropic_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings = claude_dir.join("settings.json");
+        // Pre-state: empty settings.json (no statusLine).
+        write_settings_with(&settings, None);
+
+        with_home_and_claude_dir(tmp.path(), &claude_dir, || {
+            crate::commands_account::apply_third_party_cli_configs(
+                &["anthropic".to_string()], 27200,
+            );
+        });
+
+        // Test binary is `aikeylabs_aikey_cli-<hash>`, not `aikey`, so
+        // substring "aikey statusline" does NOT appear contiguously in test
+        // builds. Parse JSON and assert on the structural invariant: the
+        // statusLine.command was written and ends with the subcommand name.
+        let content = std::fs::read_to_string(&settings)
+            .expect("settings.json must exist after install");
+        let parsed: serde_json::Value = serde_json::from_str(&content)
+            .expect("settings.json must be valid JSON after install");
+        let cmd = parsed.get("statusLine")
+            .and_then(|sl| sl.get("command"))
+            .and_then(|c| c.as_str())
+            .expect("statusLine.command must exist after anthropic activation");
+        assert!(cmd.ends_with(" statusline"),
+            "statusLine.command must end with ' statusline' subcommand: {}", cmd);
+    }
+
+    #[test]
+    fn apply_third_party_cli_configs_leaves_third_party_statusline_alone() {
+        // When user has starship / ccusage / etc. in settings.json, the
+        // lifecycle tail must NOT clobber it — install path is conflict-
+        // aware. This guards against accidental over-reach during anthropic
+        // activation.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let settings = claude_dir.join("settings.json");
+        write_settings_with(&settings, Some("/usr/local/bin/starship status"));
+
+        with_home_and_claude_dir(tmp.path(), &claude_dir, || {
+            crate::commands_account::apply_third_party_cli_configs(
+                &["anthropic".to_string()], 27200,
+            );
+        });
+
+        let content = std::fs::read_to_string(&settings).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content)
+            .expect("settings.json must remain valid JSON");
+        let cmd = parsed.get("statusLine")
+            .and_then(|sl| sl.get("command"))
+            .and_then(|c| c.as_str())
+            .expect("starship statusLine must still be present");
+        assert!(cmd.contains("starship"),
+            "third-party statusLine must be preserved verbatim: {}", cmd);
+        assert!(!cmd.ends_with(" statusline"),
+            "must not overwrite third-party statusLine with aikey: {}", cmd);
     }
 
     #[test]

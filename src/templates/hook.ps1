@@ -352,6 +352,21 @@ function global:aikey_clear_before_tui_handoff {
 # / Alias separately from Application. We only skip when a non-binary
 # definition exists; the binary on PATH is what we're wrapping.
 
+# Reload semantics — drop OUR own previous wrapper if it's currently in
+# memory, so `. $PROFILE` (or precmd auto-reload) can install the new
+# version. We identify aikey-owned wrappers by inspecting the function's
+# Definition string for `aikey_clear_before_tui_handoff` (an aikey-
+# internal helper present in all 3 wrappers). Users' own functions are
+# protected because their Definition doesn't contain that marker. See
+# bugfix 2026-05-18-hook-wrappers-not-reloadable-via-source.md.
+foreach ($_aikey_wrap in @('claude','codex','kimi')) {
+    $_existing = Get-Command $_aikey_wrap -CommandType Function -ErrorAction SilentlyContinue
+    if ($null -ne $_existing -and $_existing.Definition -match 'aikey_clear_before_tui_handoff') {
+        Remove-Item ("Function:\" + $_aikey_wrap) -ErrorAction SilentlyContinue
+    }
+}
+Remove-Variable _existing, _aikey_wrap -ErrorAction SilentlyContinue
+
 if (-not (Get-Command claude -CommandType Function, Alias -ErrorAction SilentlyContinue)) {
     function global:claude {
         [CmdletBinding()]
@@ -390,7 +405,18 @@ if (-not (Get-Command codex -CommandType Function, Alias -ErrorAction SilentlyCo
         }
         # `-c model_provider=aikey` overrides the toml top-level model_provider
         # at runtime — see bugfix 2026-05-05 and matching block in hook.zsh.
-        & $real -c model_provider=aikey @RemArgs
+        #
+        # Sentinel-gated: only inject when active.env actually bound openai
+        # (OPENAI_API_KEY=aikey_active_*). After `aikey unuse openai` the
+        # [model_providers.aikey] block is stripped from ~/.codex/config.toml;
+        # an unconditional `-c` then makes codex error with "Model provider
+        # `aikey` not found". See bugfix
+        # 2026-05-18-codex-wrapper-injects-unconditionally-after-unuse.md.
+        if ($env:OPENAI_API_KEY -and $env:OPENAI_API_KEY.StartsWith("aikey_active_")) {
+            & $real -c model_provider=aikey @RemArgs
+        } else {
+            & $real @RemArgs
+        }
     }
 }
 

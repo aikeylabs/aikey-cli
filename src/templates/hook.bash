@@ -192,6 +192,20 @@ aikey_clear_before_tui_handoff() {
 # there's no clean one-liner to split that, so use `declare -F` + alias.
 # claude / codex: `aikey test` (called inside aikey_preflight) self-starts
 # aikey-proxy if it's down. See hook.zsh for the full rationale.
+# Reload semantics — drop OUR own previous wrapper if it's currently in
+# memory, so `source ~/.bashrc` (or the precmd auto-reload) can install
+# the new version. We identify our wrappers by checking the function body
+# for `aikey_clear_before_tui_handoff` (an aikey-internal helper present
+# in all 3 wrappers). Users' own custom wrappers stay protected because
+# the body grep doesn't match. See bugfix
+# 2026-05-18-hook-wrappers-not-reloadable-via-source.md.
+for _aikey_wrap in claude codex kimi; do
+    if declare -F "$_aikey_wrap" >/dev/null 2>&1 \
+       && declare -f "$_aikey_wrap" 2>/dev/null | grep -q aikey_clear_before_tui_handoff; then
+        unset -f "$_aikey_wrap"
+    fi
+done
+unset _aikey_wrap
 if ! declare -F claude >/dev/null 2>&1 && ! alias claude >/dev/null 2>&1; then
     claude() {
         aikey_preflight anthropic || return $?
@@ -210,7 +224,18 @@ if ! declare -F codex >/dev/null 2>&1 && ! alias codex >/dev/null 2>&1; then
         aikey_clear_before_tui_handoff
         # `-c model_provider=aikey` overrides toml top-level at runtime — see
         # bugfix 2026-05-05 and matching block in hook.zsh.
-        command codex -c model_provider=aikey "$@"
+        #
+        # Sentinel-gated: only inject when active.env actually bound openai
+        # (OPENAI_API_KEY=aikey_active_*). After `aikey unuse openai` the
+        # [model_providers.aikey] block in ~/.codex/config.toml is stripped;
+        # an unconditional `-c` then makes codex error with "Model provider
+        # `aikey` not found". See bugfix
+        # 2026-05-18-codex-wrapper-injects-unconditionally-after-unuse.md.
+        if [[ "$OPENAI_API_KEY" == aikey_active_* ]]; then
+            command codex -c model_provider=aikey "$@"
+        else
+            command codex "$@"
+        fi
     }
 fi
 # kimi: auto-start proxy ONLY — NO diagnostic preflight. See hook.zsh for

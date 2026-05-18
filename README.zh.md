@@ -17,6 +17,9 @@ aikey import ~/my-keys.txt           # 打开并预填文件路径
 # 选择当前使用的 Key
 aikey use my-claude
 
+# 取消某个 provider 的当前激活（清空对应 env 注入和第三方 CLI 配置）
+aikey unuse anthropic            # 同时支持多个：aikey unuse anthropic openai
+
 # 通过代理运行命令
 aikey run -- claude
 ```
@@ -35,7 +38,26 @@ aikey web --port 18090     # 强制指定本地端口
 aikey web --json           # 仅输出 URL JSON，不启动浏览器
 ```
 
-前置条件与下面的"批量导入"相同（`aikey-local-server` 需在运行）。
+**自动启动**：如果 `aikey-local-server` 没在跑，`aikey web` 会先探测端口，
+再提示 `Start local-server now? [Y/n]`。按 Enter 或 `y` 会自动调
+`launchctl start`（macOS）或 `systemctl --user start`（Linux）拉起服务，
+最多等待 5 秒，然后打开浏览器。
+
+- 选 `n`：打印手动启动命令并退出（不打开浏览器）。
+- `--json` 模式：不弹交互提示，直接输出结构化错误 + 在 stderr 提示
+  "如需自动启动请用非 JSON 模式"。
+
+## 系统体检（`aikey doctor`）
+
+一行命令体检 CLI / Proxy / Vault / 网络 / local-server 等所有关键组件。
+其中 local-server 用 ⚠ 警告级别上报"没在跑"的状态 —— 不会让 doctor
+整体 exit code 变红（personal 版偶尔停了 local-server 不算系统故障），
+但会在输出里直接给出 `Start: ...` 平台命令方便操作。
+
+```bash
+aikey doctor          # 整体体检
+aikey doctor --detail # 额外打印最近失败 + ingest 健康 + 4xx 抓包
+```
 
 ## 批量导入（`aikey import`）
 

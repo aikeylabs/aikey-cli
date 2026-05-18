@@ -50,6 +50,7 @@ mod commands_watch;
 mod commands_internal;
 mod commands_import;
 mod commands_init;
+mod local_server_probe;
 #[allow(dead_code)] mod usage_wal;
 mod cli;
 
@@ -2404,6 +2405,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Deactivate { shell } => {
             handle_deactivate(shell.as_deref())?;
         }
+        Commands::Unuse { providers } => {
+            commands_account::handle_key_unuse(providers, cli.json)?;
+        }
         Commands::Route { label, full } => {
             handle_route(label.as_deref(), *full, cli.json)?;
         }
@@ -2747,7 +2751,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // roadmap20260320/技术实现/update/20260422-批量导入-aikey-serve-命令移除.md
             if !cli.json {
                 println!();
-                println!("{}", commands_import::local_server_status_line());
+                println!("{}", local_server_probe::local_server_status_line());
             }
         }
         Commands::Whoami => {
@@ -5005,14 +5009,76 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                         println!("{}", msg);
                     }
                     None => {
+                        // Highlight the two actionable next steps in bold cyan
+                        // so users notice them in the dim-gray success block.
+                        // The reload command is shell-aware (zsh/bash/PowerShell/
+                        // cmd) via `reload_hint_for_shell` — never hard-code
+                        // `source ~/.zshrc` because that's a dead instruction
+                        // for non-POSIX shells.
+                        let reload = commands_account::reload_hint_for_shell();
                         eprintln!("\x1b[90m  ✓ Shell hook installed and rc wired.\x1b[0m");
-                        eprintln!("\x1b[90m    Open a new terminal or `source` your rc file to activate.\x1b[0m");
+                        eprintln!(
+                            "\x1b[90m    Activate now: \x1b[1;36m{}\x1b[0m\x1b[90m  or  \x1b[1;36mopen a new terminal\x1b[0m",
+                            reload,
+                        );
                     }
                 }
                 Ok(())
             }
         }
+        HookAction::Reinstall { shell } => {
+            handle_hook_reinstall(shell.as_deref())
+        }
     }
+}
+
+/// `aikey hook reinstall` — force-rewrite both layers regardless of state.
+///
+/// Difference vs `aikey hook install`:
+///   - `install` short-circuits silently on the AlreadyV3 path (returns
+///     None, no message) so repeated invocations don't spam the user.
+///   - `reinstall` ALWAYS prints a confirmation showing which rc file was
+///     rewritten + a highlighted reload hint. Useful after a major hook
+///     template change (e.g. the 2026-05-18 codex sentinel-gate) when the
+///     user wants visible feedback that the new template propagated.
+///
+/// Both layers are still rewritten idempotently — the difference is the
+/// reporting, not the underlying operation. No backup is created when v3
+/// marker already exists (the helper detects RewrittenV3 and skips backup).
+fn handle_hook_reinstall(shell: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    // Always refresh Layer 1 first — even if Layer 2 rewrite fails below,
+    // the user gets the new hook content in ~/.aikey/hook.* and can `source`
+    // it manually.
+    let hook_path = commands_account::refresh_hook_file_only(shell)
+        .map_err(|e| format!("refresh hook file: {}", e))?;
+
+    // Layer 2: drive through ensure_shell_hook so consent + legacy migration
+    // + non-tty fallback paths stay in one place. The AlreadyV3 branch
+    // returns None silently — reinstall converts that into an explicit
+    // "rewritten" confirmation.
+    let l2_msg = commands_account::ensure_shell_hook(false);
+    let reload = commands_account::reload_hint_for_shell();
+
+    eprintln!("\x1b[90m  ✓ Hook file regenerated at {}.\x1b[0m", hook_path.display());
+    match l2_msg {
+        Some(msg) => {
+            // Legacy migration / fresh-install / error path — surface the
+            // helper's message verbatim (it already encodes the right hint).
+            eprintln!("{}", msg);
+        }
+        None => {
+            // AlreadyV3 silent-rewrite path. Reinstall makes this visible.
+            eprintln!("\x1b[90m  ✓ Shell rc block rewritten in place.\x1b[0m");
+        }
+    }
+    // Highlight both actions with bold cyan via raw ANSI — `colored` strips
+    // styling under non-TTY pipes, but raw ANSI prints unconditionally and
+    // matches the surrounding gray frame.
+    eprintln!(
+        "\x1b[90m    Activate now: \x1b[1;36m{}\x1b[0m\x1b[90m  or  \x1b[1;36mopen a new terminal\x1b[0m",
+        reload,
+    );
+    Ok(())
 }
 
 /// Pure state-machine for `aikey hook status`. Extracted from
