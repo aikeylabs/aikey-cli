@@ -50,6 +50,7 @@ mod commands_watch;
 mod commands_internal;
 mod commands_import;
 mod commands_init;
+mod commands_trust;
 mod local_server_probe;
 #[allow(dead_code)] mod usage_wal;
 mod cli;
@@ -2924,6 +2925,20 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Watch => {
             commands_watch::run()?;
         }
+        Commands::Trust { action } => match action {
+            cli::TrustAction::Verify { alias, force, no_wait, wait: _ } => {
+                commands_trust::handle_verify(alias, *force, *no_wait, cli.json)?;
+            }
+            cli::TrustAction::Status { alias } => {
+                commands_trust::handle_status(alias.as_deref(), cli.json)?;
+            }
+            cli::TrustAction::History { alias } => {
+                commands_trust::handle_history(alias, cli.json)?;
+            }
+            cli::TrustAction::Sync { target } => {
+                commands_trust::handle_sync(target, cli.json)?;
+            }
+        },
     }
     Ok(())
 }

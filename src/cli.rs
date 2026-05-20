@@ -465,6 +465,57 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Detect LLM model substitution / degradation per KEY
+    /// (M4: passthrough to trust-local on :8801; requires degrade-detector installed)
+    #[command(display_order = 25)]
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
+}
+
+/// Subcommands for `aikey trust` (M4).
+#[derive(Subcommand)]
+pub(crate) enum TrustAction {
+    /// Run cascade L3 verification against a KEY (asks ~10 model-specific questions).
+    /// Real cost: ~$0.01-0.15 / run, ~30s. Mock mode (default in M3): <100ms, free.
+    Verify {
+        /// Vault alias name to verify (must exist in `aikey list`).
+        alias: String,
+        /// Skip the 24h × 1 rate-limit (audited). Default off.
+        #[arg(long)]
+        force: bool,
+        /// Don't wait for cascade completion; print verify_id and return immediately.
+        #[arg(long, conflicts_with = "wait")]
+        no_wait: bool,
+        /// Explicitly wait (default behavior; flag present for symmetry).
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Show current trust state for an alias (or list all aliases if omitted).
+    Status {
+        /// Alias to inspect. Omit to list all observed aliases.
+        alias: Option<String>,
+    },
+    /// Show recent verify runs for an alias.
+    History {
+        /// Vault alias name.
+        alias: String,
+    },
+    /// Trigger baseline / question-bank sync from trust-central.
+    Sync {
+        /// What to sync. Default: both.
+        #[arg(long, value_enum, default_value_t = SyncTarget::Both)]
+        target: SyncTarget,
+    },
+}
+
+/// Choices for `aikey trust sync --target`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub(crate) enum SyncTarget {
+    Baseline,
+    Questions,
+    Both,
 }
 
 #[derive(Subcommand)]
@@ -940,6 +991,12 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 HookAction::Status { .. } => "hook.status".to_string(),
                 HookAction::Install { .. } => "hook.install".to_string(),
                 HookAction::Reinstall { .. } => "hook.reinstall".to_string(),
+            },
+            Commands::Trust { action } => match action {
+                TrustAction::Verify { .. } => "trust.verify".to_string(),
+                TrustAction::Status { .. } => "trust.status".to_string(),
+                TrustAction::History { .. } => "trust.history".to_string(),
+                TrustAction::Sync { .. } => "trust.sync".to_string(),
             },
         },
     }
