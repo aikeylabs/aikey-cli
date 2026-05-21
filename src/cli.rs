@@ -472,6 +472,24 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: TrustAction,
     },
+    /// Manage third-party Agent integrations (Phase 4).
+    ///
+    /// An "app" is an external client (Claude Code / Codex / a custom Agent)
+    /// that talks to AiKey via a per-app bearer token + a per-app provider
+    /// binding. `aikey app register` declares it, `aikey app authorize`
+    /// issues the bearer + initial bindings, `aikey app route` (re)binds it
+    /// to an upstream credential, and `aikey app revoke / pause / resume /
+    /// rotate` manage the bearer's lifecycle. See `aikey app list` for the
+    /// current state.
+    ///
+    /// The bearer is sent at:
+    ///   http://127.0.0.1:<proxy-port>/apps/<slug>/<protocol>/v1/...
+    /// where <protocol> is one of the app's declared protocols (e.g. openai).
+    #[command(display_order = 26)]
+    App {
+        #[command(subcommand)]
+        action: AppAction,
+    },
 }
 
 /// Subcommands for `aikey trust` (M4).
@@ -516,6 +534,116 @@ pub(crate) enum SyncTarget {
     Baseline,
     Questions,
     Both,
+}
+
+/// Subcommands for `aikey app` (Phase 4 third-party Agent integration,
+/// Phase 2 Day 7 redesign).
+///
+/// Flow:
+///   `aikey app register --slug X --upstreams openai,anthropic`  (declare)
+///   `aikey app route X`                                          (interactive: pick keys + issue bearer)
+///   `aikey app list / revoke / pause / resume / rotate`          (manage)
+///
+/// `aikey app authorize` was removed in Phase 2 Day 7 — bearer issuance
+/// merges into the first full run of `aikey app route` (gated by an
+/// explicit "Issue bearer token?" consent prompt to preserve the
+/// security-event semantics).
+#[derive(Subcommand)]
+pub(crate) enum AppAction {
+    /// Declare a new third-party Agent integration.
+    ///
+    /// Writes `app_records` with the given metadata. Does NOT issue a
+    /// bearer or write bindings — run `aikey app route <slug>` next.
+    ///
+    /// `--upstreams` is the set of UPSTREAM PROVIDERS the Agent will use.
+    /// At request time, AiKey infers the upstream from body.model
+    /// (claude-* → anthropic, gpt-* → openai, ...) and looks up the
+    /// binding written for that upstream. Declare all upstreams the
+    /// Agent might call here so the route picker can show one row per
+    /// upstream.
+    Register {
+        #[arg(long)]
+        slug: String,
+        #[arg(long)]
+        name: String,
+        /// Free-text vendor/owner identifier. Optional but recommended
+        /// (shows up in `aikey app list` for audit).
+        #[arg(long, default_value = "")]
+        vendor: String,
+        /// Comma-separated upstream provider list (e.g. `openai` or
+        /// `openai,anthropic`). At least one required.
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        upstreams: Vec<String>,
+        /// Mark this app as first-party (AiKey-owned). Unlocks
+        /// `--follow-user-active` and other privileged modes. Default:
+        /// third-party (the safe default for unknown integrations).
+        #[arg(long)]
+        first_party: bool,
+        /// Use the user's current `aikey use` selection as the binding
+        /// instead of a frozen per-app binding. First-party only.
+        #[arg(long)]
+        follow_user_active: bool,
+        /// Reserved for forward compatibility — not yet enforced at
+        /// request time. Stored as a JSON array on the app_records row.
+        #[arg(long, value_delimiter = ',', num_args = 0..)]
+        requested_permissions: Vec<String>,
+        /// Force a new bearer to be issued even if the app already has
+        /// an active one. Default: reuse existing bearer on
+        /// re-register (vendor installer can re-run register safely).
+        #[arg(long)]
+        rotate_bearer: bool,
+    },
+    /// List all registered apps + their active key + last-used timestamp.
+    List,
+    /// Set or update a per-upstream binding for an app + issue the bearer
+    /// on first full run (with consent prompt).
+    ///
+    /// Default UX is INTERACTIVE: shows one table row per declared
+    /// upstream, lets you pick a key (personal alias / OAuth account /
+    /// team-managed key) for each. After bindings are written, asks for
+    /// explicit consent to issue the bearer token (first time only).
+    ///
+    /// CI / non-interactive mode: pass `--upstream X --key-type Y
+    /// --key-ref Z` to set one specific binding. Add `--yes` to also
+    /// auto-issue the bearer on first run (without consent prompt).
+    Route {
+        slug: String,
+        /// Non-interactive: which upstream provider to bind (must be one
+        /// of the values declared via `aikey app register --upstreams`).
+        #[arg(long)]
+        upstream: Option<String>,
+        /// Non-interactive: `personal` / `team` / `personal_oauth_account`.
+        #[arg(long, requires = "upstream", requires = "key_ref")]
+        key_type: Option<String>,
+        /// Non-interactive: vault alias / virtual_key_id / OAuth account_id
+        /// matching the chosen --key-type.
+        #[arg(long, requires = "upstream", requires = "key_type")]
+        key_ref: Option<String>,
+        /// Auto-accept the bearer-issuance consent prompt (CI-only).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Revoke ALL active bearer tokens for an app. History rows are
+    /// preserved for audit; the app stays registered. Re-issue by
+    /// running `aikey app route <slug>` again.
+    Revoke {
+        slug: String,
+    },
+    /// Mark all active keys for an app as paused (state column flipped
+    /// to 'paused'). Pause is reversible via `aikey app resume`.
+    Pause {
+        slug: String,
+    },
+    /// Re-activate all paused keys for an app (state 'paused' → 'active').
+    Resume {
+        slug: String,
+    },
+    /// Rotate the bearer: in one atomic transaction, revoke the current
+    /// active key and issue a new one with the same bindings. Used when
+    /// you suspect the bearer was leaked.
+    Rotate {
+        slug: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -997,6 +1125,15 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 TrustAction::Status { .. } => "trust.status".to_string(),
                 TrustAction::History { .. } => "trust.history".to_string(),
                 TrustAction::Sync { .. } => "trust.sync".to_string(),
+            },
+            Commands::App { action } => match action {
+                AppAction::Register { .. } => "app.register".to_string(),
+                AppAction::List => "app.list".to_string(),
+                AppAction::Route { .. } => "app.route".to_string(),
+                AppAction::Revoke { .. } => "app.revoke".to_string(),
+                AppAction::Pause { .. } => "app.pause".to_string(),
+                AppAction::Resume { .. } => "app.resume".to_string(),
+                AppAction::Rotate { .. } => "app.rotate".to_string(),
             },
         },
     }

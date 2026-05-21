@@ -28,6 +28,7 @@ pub mod events;
 pub mod observability;
 pub mod platform_client;
 pub mod commands_account;
+pub mod commands_app;
 pub mod commands_proxy;
 pub mod proxy_state;
 pub mod proxy_proc;

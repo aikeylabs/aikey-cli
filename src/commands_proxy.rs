@@ -1476,8 +1476,17 @@ pub fn proxy_guard(password: &SecretString) -> bool {
 /// Resolve the proxy config file path in priority order:
 /// 1. Explicit `--config` argument
 /// 2. `AIKEY_PROXY_CONFIG` environment variable
-/// 3. Current working directory (`aikey-proxy.yaml`)
-/// 4. `~/.aikey/config/aikey-proxy.yaml`
+/// 3. `~/.aikey/config/aikey-proxy.yaml`  (system layer, single source of truth)
+///
+/// cwd-first (`./aikey-proxy.yaml`) was REMOVED 2026-05-21 — see
+/// config-split-system-user.md v9 + bugfix 20260521-proxy-config-cwd-first-
+/// loads-stale-dev-fixture.md. The 2026-03-24 §43-45 design that allowed
+/// cwd-first fallback is officially deprecated.
+///
+/// Transition WARN: if a `./aikey-proxy.yaml` exists in cwd it is NO LONGER
+/// loaded automatically — we emit a stderr advisory so developers who relied
+/// on the old behavior notice the change instead of silently switching to a
+/// different config.
 fn resolve_config(explicit: Option<&str>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(p) = explicit {
         let path = PathBuf::from(p);
@@ -1505,13 +1514,23 @@ fn resolve_config(explicit: Option<&str>) -> Result<PathBuf, Box<dyn std::error:
         eprintln!("         Falling back to default: {}", default_path);
     }
 
-    // Current working directory.
+    // ── Transition WARN: cwd-first deprecation ────────────────────────────
+    // When a `./aikey-proxy.yaml` is present in the current directory we
+    // do NOT load it (would re-open the bugfix 20260521 hole), but we DO
+    // surface a one-line WARN so developers who used to rely on cwd-first
+    // discover that behavior moved. Detection is path-existence only —
+    // no file read — to keep this cheap on every invocation.
     let cwd_cfg = PathBuf::from(DEFAULT_CONFIG_NAME);
     if cwd_cfg.exists() {
-        return Ok(cwd_cfg);
+        eprintln!(
+            "\x1b[33m[aikey] WARN: local `./{}` detected but NOT loaded (cwd-first removed 2026-05-21).\n  \
+             To load it intentionally:  aikey proxy start --config ./{}\n  \
+             Otherwise default source:  ~/.aikey/config/{}\x1b[0m",
+            DEFAULT_CONFIG_NAME, DEFAULT_CONFIG_NAME, DEFAULT_CONFIG_NAME,
+        );
     }
 
-    // ~/.aikey/config/aikey-proxy.yaml
+    // ~/.aikey/config/aikey-proxy.yaml  (system layer — single source of truth)
     if let Some(home) = dirs::home_dir() {
         let home_cfg = home.join(".aikey").join("config").join(DEFAULT_CONFIG_NAME);
         if home_cfg.exists() {
@@ -1519,8 +1538,12 @@ fn resolve_config(explicit: Option<&str>) -> Result<PathBuf, Box<dyn std::error:
         }
     }
 
-    Err("aikey-proxy.yaml not found. Searched: current directory, ~/.aikey/config/. \
-         Use --config to specify explicitly.".into())
+    Err(format!(
+        "aikey-proxy.yaml not found at ~/.aikey/config/{}.\n  \
+         Run installer (local-install.sh) or `aikey-config-tool render --profile personal`\n  \
+         to generate it. Use `--config <path>` to specify an explicit alternative.",
+        DEFAULT_CONFIG_NAME,
+    ).into())
 }
 
 // ---------------------------------------------------------------------------
@@ -1606,5 +1629,120 @@ pub fn doctor_proxy_status() -> (bool, Option<u32>) {
         ProxyState::Crashed { stale_pid } => (false, Some(stale_pid)),
         ProxyState::OrphanedPort { owner_pid, .. } => (false, owner_pid),
         ProxyState::Stopped => (false, None),
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Tests — resolve_config (regression net for the 2026-05-21 cwd-first
+// deprecation: see config-split-system-user.md v9 + bugfix 20260521).
+// ───────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod resolve_config_tests {
+    use super::*;
+
+    /// Pin the bugfix: even when `./aikey-proxy.yaml` exists in cwd, we
+    /// MUST NOT pick it up. Otherwise the 2026-05-21 silent-loss recurs.
+    #[test]
+    fn does_not_pick_up_cwd_yaml_when_present() {
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let stale_yaml = tmp.path().join(DEFAULT_CONFIG_NAME);
+        std::fs::write(&stale_yaml, "listen:\n  port: 27200\n").unwrap();
+
+        // Push a fake HOME that has NO ~/.aikey/config/aikey-proxy.yaml,
+        // so resolve_config can't accidentally satisfy itself there.
+        let prev_home = std::env::var_os("HOME");
+        let prev_proxy_cfg = std::env::var_os("AIKEY_PROXY_CONFIG");
+        let prev_cwd = std::env::current_dir().ok();
+        std::env::set_var("HOME", tmp.path());          // home with no .aikey/config
+        std::env::remove_var("AIKEY_PROXY_CONFIG");
+        std::env::set_current_dir(tmp.path()).unwrap(); // cwd contains stale yaml
+
+        let resolved = resolve_config(None);
+
+        // Restore process state first so a panic in assertions below
+        // doesn't leak HOME / cwd across tests.
+        if let Some(d) = prev_cwd { let _ = std::env::set_current_dir(d); }
+        if let Some(h) = prev_home { std::env::set_var("HOME", h); }
+        else { std::env::remove_var("HOME"); }
+        if let Some(p) = prev_proxy_cfg { std::env::set_var("AIKEY_PROXY_CONFIG", p); }
+
+        match resolved {
+            Ok(p) => panic!(
+                "resolve_config MUST NOT pick up cwd-local yaml; got: {}",
+                p.display()
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("~/.aikey/config/") || msg.contains(".aikey"),
+                    "error must point user at canonical home location; got: {}", msg);
+            }
+        }
+    }
+
+    /// Explicit --config still wins (CI / Production systemd contract
+    /// unchanged).
+    #[test]
+    fn explicit_config_argument_still_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = tmp.path().join("custom.yaml");
+        std::fs::write(&yaml, "listen:\n  port: 27200\n").unwrap();
+        let resolved = resolve_config(Some(yaml.to_str().unwrap())).unwrap();
+        assert_eq!(resolved, yaml);
+    }
+
+    /// AIKEY_PROXY_CONFIG env still wins over the default (CI override
+    /// contract unchanged).
+    #[test]
+    fn env_override_still_works() {
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = tmp.path().join("env-pointed.yaml");
+        std::fs::write(&yaml, "listen:\n  port: 27200\n").unwrap();
+
+        let prev = std::env::var_os("AIKEY_PROXY_CONFIG");
+        std::env::set_var("AIKEY_PROXY_CONFIG", &yaml);
+
+        let resolved = resolve_config(None);
+
+        if let Some(p) = prev { std::env::set_var("AIKEY_PROXY_CONFIG", p); }
+        else { std::env::remove_var("AIKEY_PROXY_CONFIG"); }
+
+        assert_eq!(resolved.unwrap(), yaml);
+    }
+
+    /// The home-default path resolves to absolute `~/.aikey/config/...`.
+    #[test]
+    fn home_default_path_is_absolute_and_under_dot_aikey_config() {
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock().unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg_dir = tmp.path().join(".aikey").join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let yaml = cfg_dir.join(DEFAULT_CONFIG_NAME);
+        std::fs::write(&yaml, "listen:\n  port: 27200\n").unwrap();
+
+        let prev_home = std::env::var_os("HOME");
+        let prev_proxy_cfg = std::env::var_os("AIKEY_PROXY_CONFIG");
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("AIKEY_PROXY_CONFIG");
+
+        let resolved = resolve_config(None);
+
+        if let Some(h) = prev_home { std::env::set_var("HOME", h); }
+        else { std::env::remove_var("HOME"); }
+        if let Some(p) = prev_proxy_cfg { std::env::set_var("AIKEY_PROXY_CONFIG", p); }
+
+        let got = resolved.unwrap();
+        assert!(got.is_absolute(), "must return absolute path; got: {}", got.display());
+        assert!(got.to_string_lossy().contains(".aikey"),
+            "must be under .aikey/config; got: {}", got.display());
+        assert_eq!(got.file_name().and_then(|s| s.to_str()), Some(DEFAULT_CONFIG_NAME));
     }
 }

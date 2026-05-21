@@ -1,278 +1,261 @@
-# AiKey CLI (Stage 0)
+# AiKey CLI
 
-**AiKey** is a secure, local-first secret management CLI for developers. It provides runtime credential injection without storing secrets in project files.
+> 🌐 **English** | [中文](./README.zh.md)
 
-## Stage 0 Contract
+[![Crates.io](https://img.shields.io/crates/v/aikeylabs-aikey-cli.svg)](https://crates.io/crates/aikeylabs-aikey-cli)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Issues](https://img.shields.io/github/issues/aikeylabs/launch.svg)](https://github.com/aikeylabs/launch/issues)
 
-AiKey is a **runtime credential layer** ("management, not a password book"). Projects declare intent in `aikey.config.json` (no secrets). At runtime, credentials are resolved and injected via **one blessed path**: `aikey run -- <cmd>`.
+**Secure local-first credential vault + runtime routing for AI tools.** Manage API keys and provider OAuth accounts in an encrypted local vault, distribute revocable route tokens to daily tools (Claude / Codex / Kimi / etc.), and observe per-key usage — without ever pasting real credentials into project files or env vars.
 
-**What Stage 0 includes:**
-- Config-driven secret injection (`aikey.config.json`)
-- Runtime-only credential access (`aikey run -- <cmd>`)
-- Local encrypted vault (Argon2id + AES-256-GCM)
-- Non-sensitive context variables in `.env` files
+## 1. Responsibilities
 
-**What Stage 0 does NOT include:**
-- Plaintext secret export workflows
-- Eval-style shell injection
-- Writing secrets to files or environment variables outside child processes
+**Does**
 
-> **Important:** The Stage 0 contract does not include plaintext secret export or inject workflows. If the current binary still exposes legacy flags or subcommands, they are out of contract and will be removed in a future release. Integrations must not rely on them.
+- Store API keys + provider OAuth tokens in a local SQLite vault, encrypted with Argon2id + AES-256-GCM.
+- Issue revocable **virtual keys** (`aikey_vk_*`) that route through `aikey-proxy` to upstream providers.
+- Inject credentials at runtime via `aikey run -- <cmd>` or shell hook — no env var pollution outside the child process.
+- Track per-key / per-provider usage, surface cost receipts after each session.
+- Open the local Vault Web UI (`aikey web`) served by `aikey-local-server`.
 
-## Quick Start (5 minutes)
+**Does NOT**
 
-### 1. Initialize Vault (one-time per machine)
+- Export plaintext secrets to files, env vars, or stdout (no `aikey export`, no eval-style injection).
+- Sync vault to cloud by default. The vault is **device-local**; cross-device migration is explicitly out of scope until further notice.
+- Replace your provider account. AiKey is a **runtime credential layer** — keys still belong to your providers.
 
-The vault is created automatically when you run any `aikey` command for the first time (e.g. `aikey quickstart` or `aikey add`). You'll be prompted to set a master password.
+**Sibling components** (each has its own repo)
 
-### 2. Create Project Config (no secrets)
+- [`aikey-proxy`](https://github.com/aikeylabs/aikey-proxy) — Local HTTP/HTTPS proxy that resolves virtual keys → real provider keys and records usage.
+- [`aikey-local-server`](https://github.com/aikeylabs/aikey-local-server) — Local web server that serves the Vault UI to `aikey web`.
 
-```bash
-cd your-project
-aikey project init
+## 2. Architecture
+
+```mermaid
+flowchart LR
+  user(["You / CI"]) -->|"aikey run -- claude"| cli["aikey CLI"]
+  cli -->|"unlock + inject vk_*"| proxy["aikey-proxy<br/>(127.0.0.1:27200)"]
+  cli <-->|"read/write"| vault[("Vault<br/>~/.aikey/vault.db<br/>Argon2id + AES-256-GCM")]
+  cli -.opens browser.-> webui["aikey-local-server<br/>(Web Vault UI)"]
+  webui <-->|"shared SQLite"| vault
+  proxy -->|"X-API-Key: real_key"| provider["Provider<br/>(Anthropic / OpenAI / Kimi / …)"]
+  proxy -->|"usage event"| wal[("usage_wal.db")]
 ```
 
-This creates `aikey.config.json` - a committable declaration file that specifies which secrets your project needs, but contains no actual secret values.
+**Why this shape**: the CLI never sees the real provider key after vault unlock — `aikey-proxy` does the substitution at the TLS edge. Tools see only a stable virtual key (`aikey_vk_*`); rotating the real key behind it does not touch any tool config.
 
-> **Note:** Run `aikey --help` to see your build's available commands. The project config file is always `aikey.config.json`.
+## 3. Call Sequence — `aikey run -- claude`
 
-### 3. Add API Keys to Vault
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant CLI as aikey CLI
+  participant V as Vault (SQLite)
+  participant P as aikey-proxy
+  participant API as Provider API
 
-Two paths, pick whichever matches your situation:
-
-**Single key — CLI prompt:**
-```bash
-aikey add anthropic:default
+  U->>CLI: aikey run -- claude
+  CLI->>V: prompt master password (cached if session live)
+  V-->>CLI: KDF unlock → DEK
+  CLI->>P: ensure proxy running (autostart if not)
+  CLI->>CLI: build child env with vk_* + provider base URL
+  CLI->>U: spawn `claude` as child process
+  U->>P: claude → 127.0.0.1:27200 (X-API-Key: vk_…)
+  P->>V: resolve vk_ → real api_key (read-only)
+  P->>API: forward with real key
+  API-->>P: stream response
+  P-->>U: stream back to tool
+  P->>P: write usage_wal row (provider, tokens, cost)
 ```
 
-**Many keys from unstructured notes — Web UI:**
-```bash
-aikey import ~/my-keys.txt   # or just: aikey import
+The vault is only unlocked once per shell session by default — subsequent `aikey run` calls reuse the cached DEK until session timeout.
+
+## 4. Data Flow
+
+| Command | Reads | Writes | Downstream consumer |
+|---------|-------|--------|---------------------|
+| `aikey add <alias>` | vault.db (alias uniqueness) | vault.db (encrypted blob) | proxy on next request |
+| `aikey use <alias>` | vault.db | `active_env` config file | shell hook (env injection) |
+| `aikey run -- <cmd>` | vault.db | child process env only | child process |
+| `aikey import <file>` | input file | vault.db (bulk) | web UI for confirmation |
+| `aikey auth login <provider>` | OAuth callback | vault.db (token record) | proxy on next request |
+| `aikey web [page]` | none | none | spawns browser → aikey-local-server |
+| `aikey hook install` | shell rc (`.zshrc` / `.bashrc`) | shell rc + `~/.aikey/hook.sh` | every new terminal |
+| `aikey doctor` | proxy port, vault path, hooks | none (diagnose only) | stdout report |
+
+Real credentials never leave `vault.db` except as the substituted `X-API-Key` header inside the proxy → provider call.
+
+## 5. Tech Stack
+
+| Layer | Choice | Why |
+|-------|--------|-----|
+| Language | Rust 2021 | Single static binary, no runtime dep on host; type-safe key handling |
+| CLI parsing | `clap` v4 derive | Declarative; auto `--help`; subcommand aliases (`ls`, `browse`) |
+| Storage | SQLite via `rusqlite` (`bundled`) | Zero install footprint; no service required; portable file |
+| Password KDF | Argon2id (m=64 MiB, t=3, p=4) | OWASP-recommended; resists GPU attacks |
+| Symmetric crypto | AES-256-GCM (`aes-gcm`) | AEAD, authenticated; NIST-approved |
+| Memory hygiene | `secrecy` + `zeroize` | Sensitive bytes wiped on drop; never logged via `Debug` |
+| OAuth | provider-specific in `commands_auth/` | Native OAuth 2.0 + PKCE; no third-party broker |
+| Clipboard (Magic Add) | `arboard` | Cross-platform paste detection |
+| Password prompt | `rpassword` | TTY echo-off; works in restricted shells |
+
+**Pinned decision**: `rusqlite` with `bundled` means SQLite is statically linked. Trade-off is +1.5 MB binary size for zero host-SQLite version variance.
+
+## 6. Runtime Environment
+
+| Item | Requirement |
+|------|-------------|
+| OS | macOS 12+ / Linux (Ubuntu 20.04+, CentOS 8+, Alpine 3.16+) / Windows 10+ |
+| Architecture | x86_64 / arm64 |
+| Runtime deps | **None** (single static binary) |
+| Disk | ~30 MB binary + vault grows ~1 KB per key |
+| Network | Outbound to provider APIs only; proxy binds to `127.0.0.1:27200` (loopback) |
+
+**Filesystem layout** (`$AIKEY_HOME`, default `~/.aikey/`):
+
 ```
-This opens `http://127.0.0.1:<port>/user/import` in your browser. Paste any
-mixed-format text (credentials copied from 1Password, team onboarding emails,
-`.env` fragments, Keychain exports — anything); the parser extracts API keys,
-email/password pairs, and OAuth handoffs into a review list. You check which
-drafts to import and click **Import N records**. See the "Bulk Import" section
-below for details and the full supported provider list.
-
-Either way: API Keys are stored encrypted in your local vault, never in
-project files.
-
-### 4. Run Commands (the blessed path)
-
-```bash
-aikey run -- <your-command>
-```
-
-This is the **only blessed execution path**. Secrets are injected into the child process environment at runtime and exist only in that process's memory.
-
-**Examples:**
-```bash
-aikey run -- npm start
-aikey run -- python app.py
-aikey run -- ./my-script.sh
-```
-
-### What About .env Files?
-
-If your project generates a `.env` file, it contains **non-sensitive context only** (project name, environment name, etc.) plus placeholders. Actual secret values are never written to `.env` files.
-
-For workflows that need repeated commands, you can use `aikey shell` to set up non-sensitive context, but each command execution still goes through `aikey run`.
-
-## For Integrations and Automation
-
-If you're building integrations or automation, see `docs/cli-platform-contract.md` for the minimal external contract around:
-- `--json` mode behavior
-- stdout/stderr handling
-- Exit codes
-- Password input in automation
-
-**Key principle:** Integrations must use `aikey run -- <cmd>` for secret injection. The CLI does not provide plaintext secret export functionality.
-
-## Security Posture
-
-**Core principles:**
-1. **Secrets never in files** - No secrets in `aikey.config.json`, `.env`, or any project files
-2. **Runtime-only injection** - Secrets exist only in child process memory during execution
-3. **Local-first encryption** - All secrets encrypted with Argon2id + AES-256-GCM
-4. **No network transmission** - Secrets never leave your machine
-5. **Single blessed path** - Only `aikey run -- <cmd>` injects secrets
-
-**What this means:**
-- Your `aikey.config.json` is safe to commit (it declares intent, not values)
-- Generated `.env` files contain only non-sensitive context
-- Secrets are decrypted on-demand and injected directly into child process environment
-- No plaintext secret export or eval-style injection workflows
-
-For security vulnerability reporting, see `SECURITY.md`.
-
-## Per-user configuration
-
-Beyond the vault, aikey installs split runtime config into a system layer
-(rendered by the installer) and a user layer (`aikey-user.yaml`). The user
-file holds trial secrets + admin email and lives in:
-
-- Linux / macOS: `~/.aikey/config/aikey-user.yaml`
-- Windows: `%LOCALAPPDATA%\Aikey\config\aikey-user.yaml`
-
-It is created on first trial install (`trial-install.sh`) or when running
-`local-install.sh --with-console`. CLI-only / personal installs do not
-write a user file.
-
-To adjust log verbosity without editing yaml:
-
-- `AIKEY_LOG_LEVEL=debug` for the trial server
-- `AIKEY_PROXY_LOG_LEVEL=debug` for the proxy
-
-Full design: `roadmap20260320/技术实现/开源版本方案/config-split-system-user.md`.
-
-## Provider OAuth Accounts (`aikey auth`)
-
-> ⚠️ `aikey auth login <provider>` **adds a provider credential to the local vault**. It is NOT the same as the team edition's `aikey login` (alias of `aikey account login`, which connects the CLI to the AiKey control service). Don't confuse them.
-
-Use subscription plans (Claude Pro/Max, ChatGPT Plus, Kimi Code) instead of API Keys.
-OAuth tokens are managed by [aikey-auth-broker](../aikey-auth-broker/README.md) via the proxy.
-
-```bash
-# Login to a provider (opens browser for OAuth authorization)
-aikey auth login claude        # Claude Pro/Max — paste code from callback page
-aikey auth login codex         # ChatGPT Plus/Pro — auto callback
-aikey auth login kimi_code     # Kimi Code (api.kimi.com) — device code in browser
-                               # ('kimi' still works as a deprecated alias)
-
-# List OAuth accounts
-aikey auth list
-
-# Set an OAuth account as active (replaces API Key for that provider)
-aikey auth use <account_id>
-
-# Check account health
-aikey auth status <account_id>
-
-# Logout
-aikey auth logout <account_id>
+~/.aikey/
+├── vault.db          # encrypted SQLite (file mode 0600)
+├── identity          # local installer ID (uuid, anonymous)
+├── hook.sh           # sourced from your shell rc
+├── active_env        # current `aikey use` selections (per-provider)
+├── proxy/            # aikey-proxy state (PID file, logs)
+└── backups/          # automatic vault backups before destructive ops
 ```
 
-Supported providers:
+**Default proxy port**: `127.0.0.1:27200`. Override via `AIKEY_PROXY_PORT` env if 27200 is taken.
 
-| Provider | Flow | Token Lifetime | Subscription |
-|----------|------|---------------|-------------|
-| Claude (Anthropic) | Setup Token (manual paste) | 1 year | Pro/Max required |
-| Codex (ChatGPT) | Auth Code (auto callback) | 10 days | Plus/Pro (free works too) |
-| Kimi Code (`kimi_code`) | Device Code (polling) | 15 minutes | Kimi Coding Plan |
-
-> **Note**: Moonshot AI (`moonshot` provider, api.moonshot.cn) does not support OAuth — use `aikey add` with an API key.
-> The two Kimi-family platforms are split as of v1.0.0-rc.2: `kimi(kimi-code)` for [api.kimi.com](https://api.kimi.com)
-> (subscription / OAuth) and `kimi(moonshot)` for [api.moonshot.cn](https://api.moonshot.cn) (API key only).
-
-OAuth and API Key are mutually exclusive per provider — `aikey auth use` replaces `aikey use` for the same provider, and vice versa.
-
-## Web UI (`aikey web`)
-
-Opens the local-only User Console in your default browser. The console is
-served by `aikey-local-server` (started by the installer) and aggregates the
-vault, OAuth accounts, virtual keys, usage ledger, and bulk-import pages —
-all over `localhost`, no cloud calls.
+## 7. Quick Start
 
 ```bash
-aikey web                  # open the default landing page
-aikey web vault            # → Personal Vault page
-aikey web import           # → Bulk Import page
-aikey web --port 18090     # force a specific local port
-aikey web --json           # print the URL as JSON, don't launch the browser
+# 1. Install (auto-detects OS)
+curl -fsSL https://aikeylabs.com/i/of | sh
+
+# 2. Re-source your shell so PATH picks up the binary
+source ~/.zshrc                              # or ~/.bashrc
+
+# 3. Add your first key (vault auto-initializes — prompts for master password on first run)
+aikey add my-claude --provider anthropic
+
+# 4. Activate the key
+aikey use my-claude
+
+# 5. Run a tool through aikey (proxy autostarts if needed)
+aikey run -- claude
 ```
 
-**Auto-start**: if `aikey-local-server` isn't running, `aikey web` first
-probes the port and then prompts `Start local-server now? [Y/n]`. Pressing
-Enter or `y` runs `launchctl start` (macOS) / `systemctl --user start`
-(Linux), waits up to 5 seconds for readiness, then opens the browser.
+After step 5, the `claude` CLI talks to `127.0.0.1:27200`, which substitutes your virtual key for the real Anthropic key. A cost receipt prints on session exit.
 
-- Choose `n`: prints the manual start command and exits without opening
-  the browser.
-- `--json` mode: no interactive prompt — emits a structured error and a
-  stderr hint pointing at non-JSON mode if auto-start is desired.
+## 8. Startup Notes
 
-## System health (`aikey doctor`)
+What auto-fires on first launch (and why):
 
-Single-shot health check across CLI / Proxy / Vault / network /
-local-server. The local-server check reports a ⚠ warning (not a failure)
-when it's down — that keeps `aikey doctor`'s overall exit code stable for
-Personal users who occasionally stop the service — and prints a copy-
-pasteable platform command alongside.
+| Trigger | What happens | Why |
+|---------|--------------|-----|
+| First `aikey <any-command>` | Vault auto-init at `~/.aikey/vault.db`, prompts master password | Avoid a manual `aikey vault init` ceremony |
+| First `aikey run` per shell | `aikey-proxy` autostarts on `127.0.0.1:27200` if not running | Tool invocations don't fail with "proxy not up" |
+| First install | `~/.aikey/identity` generated (anonymous uuid) | Local stats + future invite features; not tied to email |
+| `aikey hook install` | Appends 1 line to `~/.zshrc` / `~/.bashrc` | Future terminals load `active_env` so `claude` "just works" without `aikey run` |
+| Vault unlock | DEK cached in memory for the shell session | Avoid re-prompting password for every command |
+
+> **Reset / forget**: delete `~/.aikey/identity` to regenerate the installer ID. Delete `~/.aikey/vault.db` to start over (irreversible — back it up first).
+
+## 9. Usage Examples
 
 ```bash
-aikey doctor               # full health check
-aikey doctor --detail      # adds recent failures + ingest health + 4xx body capture
+# Inventory
+aikey list                                  # or `aikey ls`
+aikey whoami                                # who am I + currently active key
+aikey route                                 # third-party client integration map
+
+# Add credentials
+aikey add my-claude --provider anthropic    # single key via prompt
+aikey import ~/keys.txt                     # bulk import via browser UI
+aikey auth login claude                     # OAuth Pro/Max account
+
+# Activation
+aikey use my-claude                         # global active (persisted to active_env)
+aikey activate my-claude                    # current shell only (temporary)
+aikey deactivate                            # restore previous global state
+aikey unuse anthropic                       # clear active for one provider (multi-arg OK)
+
+# Run tools
+aikey run -- claude                         # one-shot through proxy
+aikey run -- python eval.py                 # works with any tool that reads provider env
+
+# Web Vault UI
+aikey web                                   # opens local console (default page)
+aikey web usage                             # jumps straight to Usage page
+aikey web vault                             # jumps straight to Vault page
+
+# Maintenance
+aikey doctor                                # diagnose PATH / hook / proxy / vault
+aikey test --all                            # connectivity test all keys
+aikey env                                   # show injected env for current shell
+aikey proxy restart                         # restart the local proxy
 ```
 
-## Unbind a provider (`aikey unuse`)
+Run `aikey --help` for the full subcommand list (display order = frequency, frequent first).
 
-Inverse of `aikey use`. Removes the active binding for one or more
-providers and reconciles all side effects in one shot:
+## 10. Error Codes
 
-- Drops the binding row from the vault DB.
-- Refreshes `~/.aikey/active.env` so the provider's env vars (e.g.
-  `ANTHROPIC_API_KEY`) are no longer injected by the shell hook.
-- Cleans the corresponding scaffold from third-party CLI configs:
-  `~/.kimi/config.toml`, `~/.codex/config.toml`,
-  `~/.claude/settings.json` (statusLine).
+CLI errors return a structured `error_code` (mirrored in `_internal` IPC and `aikey-local-server` API responses). [`src/error_codes.rs`](src/error_codes.rs) is the source of truth; the table below is the **stable user-facing subset**.
 
-```bash
-aikey unuse anthropic                # unbind one provider
-aikey unuse anthropic openai kimi    # unbind multiple at once
-aikey unuse anthropic --json         # structured output for scripts
+| Code | When | Next step |
+|------|------|-----------|
+| `ALIAS_EXISTS` | `aikey add <alias>` collides with existing | Use a different alias or `aikey remove <alias>` first |
+| `ALIAS_NOT_FOUND` | `aikey use / activate / run` references unknown alias | `aikey list` to see what's available |
+| `VAULT_LOCKED` | Operation needs master password but session expired | Re-run command, enter master password when prompted |
+| `VAULT_NOT_INITIALIZED` | First-time vault file missing | Run any `aikey` command; auto-init will prompt |
+| `NO_ACTIVE_PROFILE` | `aikey run` invoked without `aikey use` first | `aikey use <alias>` to select a key |
+| `INVALID_INPUT` | Argument shape wrong (e.g. unknown provider name) | Check `aikey <subcmd> --help` |
+| `UNSUPPORTED_PROTOCOL` | OAuth / proxy version mismatch | Update CLI: `curl -fsSL https://aikeylabs.com/i/of \| sh` |
+| `TIMEOUT` | Proxy / provider didn't respond | `aikey doctor`; check outbound network |
+| `IO_ERROR` | Filesystem / network unexpected error | Check disk space, file perms (`~/.aikey` must be 0700) |
+
+`_internal` IPC codes (prefix `I_*`, used between CLI and `aikey-local-server`) — full table in [docs/VAULT_SPEC.md](docs/VAULT_SPEC.md); you only see these in `aikey-local-server` logs.
+
+## 11. Project Structure
+
+```
+aikey-cli/
+├── src/
+│   ├── main.rs                   # entry + global error handling
+│   ├── cli.rs                    # clap definitions (all subcommands)
+│   ├── lib.rs                    # public API for aikey-sdk / aikey-local-server
+│   ├── storage.rs                # vault SQLite open/migrate/query
+│   ├── storage_platform.rs       # platform account + virtual key cache
+│   ├── error_codes.rs            # central error enum (source of truth)
+│   ├── observability.rs          # event names + structured logging
+│   ├── audit.rs                  # audit log writer
+│   ├── executor.rs               # `aikey run` child-process spawning
+│   ├── commands_account/         # account / OAuth / `use` / `browse` / `status`
+│   ├── commands_auth/            # OAuth flows (per provider)
+│   ├── commands_app/             # third-party app integration helpers
+│   ├── commands_env.rs           # `aikey env` / `aikey env set`
+│   ├── commands_import.rs        # bulk import via web UI
+│   ├── commands_init.rs          # vault init
+│   ├── commands_project.rs       # `aikey project init`
+│   ├── commands_proxy.rs         # proxy lifecycle (start/stop/restart)
+│   ├── commands_statusline.rs    # shell statusline integration
+│   └── commands_watch.rs         # watch mode for usage events
+├── aikey-sdk/                    # reusable lib crate (used by other Rust callers)
+├── docs/                         # VAULT_SPEC.md + cli-platform-contract.md
+├── scripts/                      # one-off probes (kimi / statusline / e2e dashboards)
+├── tests/                        # integration tests
+└── Cargo.toml                    # workspace root
 ```
 
-Idempotent: providers without an active binding are reported as
-"already unbound" and produce no error.
+## 12. Links
 
-## Bulk Import
+- 🐛 **Issues / feature requests**: https://github.com/aikeylabs/launch/issues
+- 📖 **Vault spec (deep dive)**: [docs/VAULT_SPEC.md](docs/VAULT_SPEC.md)
+- 🔌 **CLI platform contract**: [docs/cli-platform-contract.md](docs/cli-platform-contract.md)
+- 🤝 **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
+- 🔒 **Security policy**: [SECURITY.md](SECURITY.md)
+- 🌐 **Main site**: https://aikeylabs.com — install command + docs + enterprise
+- 📦 **Sibling repos**: [aikey-proxy](https://github.com/aikeylabs/aikey-proxy) · [aikey-local-server](https://github.com/aikeylabs/aikey-local-server)
 
-Opens a local-only Web UI (`/user/import`) for bringing credentials in from
-unstructured text. The parser is three layers (rule v2 → CRF + shape filter →
-Provider Fingerprint) and runs **entirely offline** — no telemetry, no
-network calls for parsing.
+---
 
-### Prerequisites
-- `local-install.sh` (or `trial-install.sh`) has run. The installer writes the
-  console port to `~/.aikey/config/local-server.port` and starts the server.
-- `aikey status` shows a `local-server: running on port <p>` line.
-
-If the server is not running:
-- **macOS:** `launchctl start com.aikey.local-server`
-- **Linux:** `systemctl --user start aikey-local-server`
-- **Anywhere:** `~/.aikey/bin/aikey-local-server --config ~/.aikey/config/control-trial.yaml &`
-
-### Usage
-```bash
-aikey import                         # open empty paste page
-aikey import ~/notes.txt             # open page primed to re-parse that file
-aikey import --json                  # print the URL as JSON, no browser
-```
-
-### Recognized formats
-- API keys with known prefixes: `sk-ant-api03-`, `sk-proj-`, `AIza`, `gsk_`,
-  `ghp_`, `AKIA`, `SG.`, `eyJ…`, plus 15 more providers (openrouter, stripe,
-  slack, huggingface, perplexity, xai, …)
-- Email + password pairs (English or Chinese field labels: `email:` `邮箱:`
-  `password:` `密码:`)
-- OAuth handoff rows (Claude / Codex / Kimi) — the UI emits the exact
-  `aikey auth login <provider>` command for you to copy-paste to a terminal
-- Third-party gateway `base_url` (e.g. OpenAI-compatible endpoints)
-
-### Privacy
-The page runs `OFFLINE · NOTHING LEAVES` across the top strip. The textarea
-content stays in the browser and in the local server process; it is never
-sent to any cloud. The vault stays locked until you explicitly unlock via the
-inline banner.
-
-## Additional Notes
-
-- Historical daemon/prototype subsystems have been removed; Stage 0 focuses on the single blessed path (`aikey run -- <cmd>`)
-- For the complete list of available commands in your build, run `aikey --help`
-- This is an open-source project under Apache-2.0 license - contributions welcome! See `CONTRIBUTING.md`
-
-## License
-
-Apache-2.0 - See `LICENSE` file for details.
+**License**: Apache-2.0 © AiKey Labs. See [LICENSE](LICENSE).

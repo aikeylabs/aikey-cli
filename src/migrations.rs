@@ -561,6 +561,96 @@ pub mod v1_0_0_baseline {
         //
         // 详见 roadmap20260320/技术实现/update/20260508-Kimi双平台拆分-moonshot与kimi-code.md
         // §"版本周期决策" 节。
+
+        // 2026-05-20 第三方 Agent 接入 (App pipeline) — 两张新表 fold 进 baseline。
+        // Why fold (而非新版本 module): 当前 released = v1.0.0 RC 系列 (pre-GA),
+        // 项目惯例 (workflow/CD/version-naming.md §3 + 上文 fold pattern) 是
+        // pre-GA 改动直接进 baseline,internal testers 走 `uninstall.sh + reinstall`,
+        // 无 in-place 升级路径需求。
+        //
+        // Schema 设计 spec:
+        //   - 主方案 §11.C "App Key 撤销传播" 与 §11 schema 示例
+        //   - 实施路线图 §3.2.1.B
+        //   - ER 图 §1.2 / §1.3 / §2.2
+        //
+        // 关键决策点 (route_token 字段):
+        //   - app_keys.route_token = **明文** aikey_app_<64hex> (不是 hash)。
+        //     Why: aikey-proxy 的 vkeys.Registry byToken map 用明文 token 做 key
+        //     (跟 entries.route_token / provider_accounts.route_token 同模式),
+        //     Authorization header 来的就是明文,hash 后无法匹配。
+        //     vault 文件已经 Argon2id + AES-256-GCM 加密保护,route_token 作为
+        //     vault 内字段已经受保护,不需要在 vault 之上再 hash。
+        //   - app_keys.token_hash = 可选 sha256(route_token),仅用于审计场景
+        //     (e.g., 日志只想 log hash 不想 log 明文 token),写或不写 proxy 行为不变。
+        //
+        // Phase 0 spike 验证 (Day 2 报告):
+        //   roadmap20260320/技术实现/阶段4-增值版/2026-05-20-Phase0-spike-day2.md §3
+        // 2026-05-21 Phase 2 阶段 0: column renamed `protocols` → `upstreams`.
+        // Why: `protocols` was ambiguous (was it inbound URL wire-format or
+        // upstream provider?). Phase 2's protocol-translator splits the two
+        // — inbound is always OpenAI shape; the field declares which UPSTREAM
+        // PROVIDERS the Agent will route to via body.model. See LangChain
+        // wire-protocol research at roadmap20260320/技术实现/protocol-translator/langchain-wire-protocol-research.md
+        // for the alignment rationale. Pre-GA fold (no in-place upgrade);
+        // existing dev vaults need `uninstall.sh + reinstall`.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS app_records (
+                slug TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                vendor TEXT,
+                upstreams TEXT NOT NULL,
+                app_kind TEXT NOT NULL DEFAULT 'third-party',
+                follow_user_active INTEGER NOT NULL DEFAULT 0,
+                requested_permissions TEXT,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                CHECK (app_kind IN ('third-party', 'first-party')),
+                CHECK (follow_user_active IN (0, 1))
+            )",
+            [],
+        )
+        .map_err(|e| format!("Failed to ensure app_records: {}", e))?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS app_keys (
+                key_id TEXT PRIMARY KEY,
+                app_slug TEXT NOT NULL REFERENCES app_records(slug) ON DELETE CASCADE,
+                route_token TEXT NOT NULL UNIQUE,
+                token_hash TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                expires_at INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                last_used_at INTEGER,
+                CHECK (status IN ('active', 'paused', 'revoked'))
+            )",
+            [],
+        )
+        .map_err(|e| format!("Failed to ensure app_keys: {}", e))?;
+
+        // Indexes — 跟主方案 §11.C / 路线图 §3.2.1.B 一致。
+        //   - idx_app_keys_route_token: UNIQUE 已经隐式建索引, 显式声明仅为可读
+        //     (Registry 命中走 in-memory map, 不真打 DB)。
+        //   - idx_app_keys_token_hash: PARTIAL index 只对非 NULL 行建, 减少体积
+        //     (MVP 多数 token_hash=NULL)。
+        //   - idx_app_keys_slug_status: 让 "按 slug 找 active" 走 index scan
+        //     (Registry 启动加载 + revoke/rotate 批量更新都用这个 prefix)。
+        for (name, ddl) in &[
+            (
+                "idx_app_keys_route_token",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_app_keys_route_token ON app_keys(route_token)",
+            ),
+            (
+                "idx_app_keys_token_hash",
+                "CREATE INDEX IF NOT EXISTS idx_app_keys_token_hash ON app_keys(token_hash) WHERE token_hash IS NOT NULL",
+            ),
+            (
+                "idx_app_keys_slug_status",
+                "CREATE INDEX IF NOT EXISTS idx_app_keys_slug_status ON app_keys(app_slug, status)",
+            ),
+        ] {
+            conn.execute(ddl, [])
+                .map_err(|e| format!("Failed to ensure index {}: {}", name, e))?;
+        }
         Ok(())
     }
 
@@ -658,7 +748,7 @@ pub mod v1_0_0_baseline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+    use rusqlite::{params, Connection};
 
     /// Builds a fresh in-memory vault with the baseline + every version
     /// migration applied. Used as the starting state for rollback tests.
@@ -870,4 +960,181 @@ mod tests {
     // absorbed into v1.0.0 baseline), the registry is again single-version
     // — no chain to test partial-state recovery against. Re-add tests when
     // the next post-GA cycle lands and produces a real chain.
+
+    // ---------------------------------------------------------------------
+    // 2026-05-20 App pipeline tables (third-party Agent 接入) regression tests.
+    // ---------------------------------------------------------------------
+
+    /// app_records + app_keys tables are created by baseline.upgrade() with
+    /// the documented schema shape (columns + indexes). This pins the
+    /// schema-Code coherence invariant (CLAUDE.md "Schema-Code 一致性") —
+    /// if anyone alters the CREATE TABLE statements without updating Reader
+    /// code on the Go side, this test catches the column-name drift.
+    #[test]
+    fn app_pipeline_tables_created_by_baseline() {
+        let conn = fresh_vault();
+
+        assert!(
+            table_exists(&conn, "app_records"),
+            "app_records table must be created by baseline.upgrade()"
+        );
+        assert!(
+            table_exists(&conn, "app_keys"),
+            "app_keys table must be created by baseline.upgrade()"
+        );
+
+        // Pin exact column set so any future schema drift is caught here
+        // (rather than at runtime when proxy/CLI SELECTs explode).
+        let app_records_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('app_records') ORDER BY cid")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            app_records_cols,
+            vec![
+                "slug",
+                "name",
+                "vendor",
+                "upstreams",
+                "app_kind",
+                "follow_user_active",
+                "requested_permissions",
+                "created_at",
+                "updated_at",
+            ],
+            "app_records columns drifted — 2026-05-21 Phase 2 schema (protocols → upstreams) 不再一致"
+        );
+
+        let app_keys_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('app_keys') ORDER BY cid")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            app_keys_cols,
+            vec![
+                "key_id",
+                "app_slug",
+                "route_token",
+                "token_hash",
+                "status",
+                "expires_at",
+                "created_at",
+                "last_used_at",
+            ],
+            "app_keys columns drifted — Day 2 spike route_token decision broken"
+        );
+
+        // Indexes pin: route_token UNIQUE + token_hash PARTIAL + slug_status composite.
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='app_keys' AND name LIKE 'idx_app_keys_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 3, "app_keys must have 3 named indexes");
+    }
+
+    /// ON DELETE CASCADE: deleting an app_records row must cascade-delete
+    /// all its app_keys rows. Critical invariant — without this, uninstall
+    /// leaves orphan keys that proxy might still load into Registry,
+    /// producing ghost tokens that can still authenticate.
+    ///
+    /// Why this test exists: SQLite CASCADE requires `PRAGMA foreign_keys = ON`
+    /// at the connection level, not at the schema level. fresh_vault() uses
+    /// `Connection::open_in_memory()` directly (NOT through storage::open_connection),
+    /// so we must enable the pragma here. The pragma is set by
+    /// storage.rs::open_connection in real runtime — that pragma assertion is
+    /// indirectly verified by the broader storage_test suite.
+    #[test]
+    fn app_keys_cascade_delete_on_app_records_drop() {
+        let conn = fresh_vault();
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .expect("enable foreign_keys pragma");
+
+        conn.execute(
+            "INSERT INTO app_records (slug, name, upstreams) VALUES (?1, ?2, ?3)",
+            params!["test-agent", "Test Agent", "[\"openai\"]"],
+        )
+        .expect("insert app_records");
+
+        conn.execute(
+            "INSERT INTO app_keys (key_id, app_slug, route_token) VALUES (?1, ?2, ?3)",
+            params!["key-uuid-1", "test-agent", "aikey_app_aaaa0000111122223333444455556666777788889999aaaabbbbccccddddeeee"],
+        )
+        .expect("insert app_keys");
+
+        let pre: i64 = conn
+            .query_row("SELECT COUNT(*) FROM app_keys WHERE app_slug='test-agent'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pre, 1, "precondition: 1 app_key row inserted");
+
+        // CASCADE-trigger: delete the parent app_records row.
+        // SECURITY NOTE: This requires PRAGMA foreign_keys = ON at the
+        // connection level (set by storage::open_connection). If that
+        // pragma is ever dropped, this test fails loud.
+        conn.execute("DELETE FROM app_records WHERE slug='test-agent'", [])
+            .expect("delete app_records");
+
+        let post: i64 = conn
+            .query_row("SELECT COUNT(*) FROM app_keys WHERE app_slug='test-agent'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            post, 0,
+            "CASCADE failed — orphan app_keys row survived parent delete (foreign_keys pragma broken?)"
+        );
+    }
+
+    /// CHECK constraints on app_records.app_kind + follow_user_active and
+    /// app_keys.status pin the value-set invariants from 主方案 §11.1.
+    /// Without these, a buggy writer could insert app_kind='admin' or
+    /// status='deleted' and Reader code would silently route on it.
+    #[test]
+    fn app_pipeline_check_constraints() {
+        let conn = fresh_vault();
+
+        // app_kind must be in {'third-party', 'first-party'}.
+        let bad_kind = conn.execute(
+            "INSERT INTO app_records (slug, name, upstreams, app_kind) VALUES ('x', 'X', '[]', 'admin')",
+            [],
+        );
+        assert!(bad_kind.is_err(), "app_kind='admin' must be rejected by CHECK");
+
+        // follow_user_active must be 0 or 1.
+        let bad_follow = conn.execute(
+            "INSERT INTO app_records (slug, name, upstreams, follow_user_active) VALUES ('y', 'Y', '[]', 2)",
+            [],
+        );
+        assert!(bad_follow.is_err(), "follow_user_active=2 must be rejected by CHECK");
+
+        // status must be in {'active', 'paused', 'revoked'}.
+        conn.execute(
+            "INSERT INTO app_records (slug, name, upstreams) VALUES ('z', 'Z', '[\"openai\"]')",
+            [],
+        )
+        .unwrap();
+        let bad_status = conn.execute(
+            "INSERT INTO app_keys (key_id, app_slug, route_token, status) VALUES ('k1', 'z', 'aikey_app_xx', 'deleted')",
+            [],
+        );
+        assert!(bad_status.is_err(), "status='deleted' must be rejected by CHECK");
+
+        // route_token UNIQUE: two app_keys cannot share the same route_token.
+        conn.execute(
+            "INSERT INTO app_keys (key_id, app_slug, route_token) VALUES ('k1', 'z', 'aikey_app_unique')",
+            [],
+        )
+        .unwrap();
+        let dup_token = conn.execute(
+            "INSERT INTO app_keys (key_id, app_slug, route_token) VALUES ('k2', 'z', 'aikey_app_unique')",
+            [],
+        );
+        assert!(dup_token.is_err(), "duplicate route_token must be rejected by UNIQUE constraint");
+    }
 }

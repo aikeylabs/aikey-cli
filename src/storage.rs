@@ -1370,6 +1370,24 @@ pub fn generate_route_token() -> String {
     format!("aikey_personal_{}", hex::encode(bytes))
 }
 
+/// Generates a random app route token: "aikey_app_" + 64 lowercase hex chars
+/// (256 bits). Used by the App pipeline (Phase 4) as the Bearer the
+/// third-party Agent presents in Authorization headers.
+///
+/// Symmetric to `generate_route_token` but with the `aikey_app_` namespace
+/// — the proxy's `isTier1App` form check + ClassifyToken's `aikey_app_*`
+/// arm rely on this exact prefix + 64-hex shape (AKL-104, dispatch.go).
+///
+/// Why not parameterize `generate_route_token(prefix)`: only 2 instances
+/// today (personal, app), and parameterizing would force all current
+/// callers to switch signature — no DRY win against a 5-line helper.
+pub fn generate_app_route_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!("aikey_app_{}", hex::encode(bytes))
+}
+
 /// Sets the route_token for a personal key entry.
 pub fn set_entry_route_token(alias: &str, token: &str) -> Result<(), String> {
     let conn = open_connection()?;

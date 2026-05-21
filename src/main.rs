@@ -28,6 +28,7 @@ mod proxy_lifecycle;
 mod proxy_events;
 #[allow(dead_code)] mod commands_account;
 // migrations module is in lib.rs (used by both main.rs and executor.rs)
+use aikeylabs_aikey_cli::commands_app;
 use aikeylabs_aikey_cli::migrations;
 #[allow(dead_code)] mod platform_client;
 // mod profiles; // removed: profile commands dropped
@@ -2937,6 +2938,60 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             cli::TrustAction::Sync { target } => {
                 commands_trust::handle_sync(target, cli.json)?;
+            }
+        },
+        // Phase 4 third-party Agent integration. Each branch dispatches
+        // 1:1 to a `commands_app::handle_*` function that was
+        // landed earlier; this is the missing CLI surface that lets users
+        // (and E2E drivers) invoke them. See cli.rs `AppAction` docs for
+        // per-subcommand semantics.
+        Commands::App { action } => match action {
+            cli::AppAction::Register {
+                slug,
+                name,
+                vendor,
+                upstreams,
+                first_party,
+                follow_user_active,
+                requested_permissions,
+                rotate_bearer,
+            } => {
+                commands_app::handle_register(
+                    slug,
+                    name,
+                    vendor,
+                    upstreams,
+                    *first_party,
+                    *follow_user_active,
+                    requested_permissions,
+                    *rotate_bearer,
+                    cli.json,
+                )?;
+            }
+            cli::AppAction::List => {
+                commands_app::handle_list(cli.json)?;
+            }
+            cli::AppAction::Route { slug, upstream, key_type, key_ref, yes } => {
+                commands_app::handle_route(
+                    slug,
+                    upstream.as_deref(),
+                    key_type.as_deref(),
+                    key_ref.as_deref(),
+                    *yes,
+                    cli.json,
+                )?;
+            }
+            cli::AppAction::Revoke { slug } => {
+                commands_app::handle_revoke(slug, cli.json)?;
+            }
+            cli::AppAction::Pause { slug } => {
+                commands_app::handle_pause(slug, cli.json)?;
+            }
+            cli::AppAction::Resume { slug } => {
+                commands_app::handle_resume(slug, cli.json)?;
+            }
+            cli::AppAction::Rotate { slug } => {
+                commands_app::handle_rotate(slug, cli.json)?;
             }
         },
     }
