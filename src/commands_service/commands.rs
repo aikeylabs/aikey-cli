@@ -150,10 +150,19 @@ mod trust_local {
         final_state.map_err(|e| e.into())
     }
 
+    #[cfg(unix)]
     fn current_uid() -> u32 {
         // SAFETY: getuid() is a documented thread-safe syscall.
         unsafe { libc::getuid() }
     }
+
+    // Windows path is unreachable — `dispatch` returns "platform '{}' not
+    // supported" before this is called on anything other than macos/linux.
+    // The stub exists only so the windows-amd64 cross-compile target type-
+    // checks. BR-rc.5-50 — `libc::getuid` is Unix-only and broke Windows
+    // build under the rc.5 hotfix re-release.
+    #[cfg(not(unix))]
+    fn current_uid() -> u32 { 0 }
 
     fn launchctl_kickstart(uid: u32) -> Result<(), String> {
         // -k flag = kill running and start again; idempotent for
