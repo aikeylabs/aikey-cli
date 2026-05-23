@@ -52,6 +52,7 @@ mod commands_internal;
 mod commands_import;
 mod commands_init;
 mod commands_trust;
+mod commands_service;
 mod local_server_probe;
 #[allow(dead_code)] mod usage_wal;
 mod cli;
@@ -1597,11 +1598,23 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("  Testing {} credential(s) (--all)...\n", targets.len());
                     commands_project::run_connectivity_suite(targets, opts, false)
                 };
+                // Persist per-credential Last test snapshots to vault so
+                // the Web Vault page's "Last test" column reflects this
+                // run. Shared helper with `_internal vault-op test`
+                // (internal-command-reuses-public-core principle).
+                let persisted = commands_project::persist_test_outcome(&outcome);
+                if !cli.json {
+                    let ok_count = persisted.iter().filter(|p| p.persisted).count();
+                    if ok_count > 0 {
+                        eprintln!("\n  \u{2192} Recorded Last test for {} credential(s).", ok_count);
+                    }
+                }
                 if cli.json {
                     let payload = serde_json::json!({
                         "status": if exit_code_from_outcome(&outcome) == EXIT_OK { "success" } else { "failed" },
                         "scope":  "all",
                         "credentials_tested": outcome.json_results,
+                        "last_test_persisted": persisted.iter().filter(|p| p.persisted).count(),
                     });
                     eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
@@ -1648,6 +1661,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!();
                     commands_project::run_connectivity_suite(targets, opts, false)
                 };
+                // Persist Last test snapshot to vault (shared with
+                // `_internal vault-op test` so terminal and Web stay
+                // in lockstep).
+                let persisted = commands_project::persist_test_outcome(&outcome);
+                if !cli.json && persisted.iter().any(|p| p.persisted) {
+                    eprintln!("\n  \u{2192} Recorded Last test for '{}'.", alias);
+                }
                 // Emit JSON BEFORE the exit; json_output::success exits with
                 // code 0, which would clobber our structured exit code —
                 // print raw JSON then exit with the right code instead.
@@ -1656,6 +1676,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "status":  if exit_code_from_outcome(&outcome) == EXIT_OK { "success" } else { "failed" },
                         "alias":   alias,
                         "results": outcome.json_results,
+                        "last_test_persisted": persisted.iter().filter(|p| p.persisted).count(),
                     });
                     eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
@@ -1686,6 +1707,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     commands_project::render_cannot_test_block(&build_errors, false);
                     outcome
                 };
+                // Persist Last test snapshots — same shared helper as
+                // the other two branches above. Active-bindings mode
+                // typically touches multiple credentials (one per
+                // active provider), so each gets its own snapshot.
+                let persisted = commands_project::persist_test_outcome(&outcome);
+                if !cli.json {
+                    let ok_count = persisted.iter().filter(|p| p.persisted).count();
+                    if ok_count > 0 {
+                        eprintln!("\n  \u{2192} Recorded Last test for {} credential(s).", ok_count);
+                    }
+                }
                 if cli.json {
                     let payload = serde_json::json!({
                         "status": if exit_code_from_outcome(&outcome) == EXIT_OK { "success" } else { "failed" },
@@ -1694,6 +1726,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             "label":  e.label(),
                             "reason": e.reason(),
                         })).collect::<Vec<_>>(),
+                        "last_test_persisted": persisted.iter().filter(|p| p.persisted).count(),
                     });
                     eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
@@ -2721,6 +2754,20 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Web { page, import, vault, port } => {
+            // Intercept service-control verbs first. `start` / `stop` /
+            // `restart` as the positional argument route to service
+            // management instead of opening a browser page. This keeps
+            // the public surface to one command (`aikey web`) — bare
+            // form opens the console, action form controls the backend.
+            // Shortcut flags (--vault / --import) are page-only and
+            // not meaningful for service actions, so we ignore them on
+            // that branch.
+            if let Some(action) = page.as_deref() {
+                if matches!(action, "start" | "stop" | "restart") {
+                    commands_account::handle_web_service(action, cli.json)?;
+                    return Ok(());
+                }
+            }
             // Shortcut flags override the positional page. `--vault` and
             // `--import` are mutually informative — `--vault` wins when
             // both are passed (alphabetical fallback, intentional choice;
@@ -2939,6 +2986,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             cli::TrustAction::Sync { target } => {
                 commands_trust::handle_sync(target, cli.json)?;
             }
+            cli::TrustAction::Refresh { alias } => {
+                commands_trust::handle_refresh(alias.as_deref(), cli.json)?;
+            }
         },
         // Phase 4 third-party Agent integration. Each branch dispatches
         // 1:1 to a `commands_app::handle_*` function that was
@@ -2993,7 +3043,20 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             cli::AppAction::Rotate { slug } => {
                 commands_app::handle_rotate(slug, cli.json)?;
             }
+            cli::AppAction::Install { slug } => {
+                commands_app::handle_install(slug, cli.json)?;
+            }
         },
+        Commands::Service { action } => {
+            // `aikey service` is the unified service-control namespace.
+            // Whitelist (`trust-local` / `web` / `proxy`) + dispatch
+            // lives in commands_service. `aikey web start` and
+            // `aikey proxy start` are intentionally preserved as
+            // backward-compatible aliases — both ultimately call into
+            // the same handle_web_service / commands_proxy::handle_*
+            // functions.
+            commands_service::handle_service(action, cli.json, cli.password_stdin)?;
+        }
     }
     Ok(())
 }
@@ -3617,7 +3680,7 @@ fn truncate_email(email: &str, max_user_len: usize) -> String {
 /// Returns the master password, using the 30-minute session cache when available.
 /// Use for LOW-sensitivity commands (list, get, run, key sync, proxy start, ...).
 /// After a successful vault operation the caller should call `session::refresh()`.
-fn prompt_vault_password(password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
+pub(crate) fn prompt_vault_password(password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
     // Skip cache when reading from stdin or in automated test mode.
     if !password_stdin && std::env::var("AK_TEST_PASSWORD").is_err() {
         if let Some(cached) = session::try_get() {

@@ -261,12 +261,19 @@ pub(crate) enum Commands {
         #[arg(long)]
         resend: bool,
     },
-    /// Open the User Console in your default browser
+    /// Open the User Console in your default browser, or control the local
+    /// web service with `start` / `stop` / `restart`.
     #[command(alias = "browse", display_order = 6)]
     Web {
         /// Page to open: overview (default), keys, vault, account, usage, import.
         /// Also accepts aliases (virtual-keys, team-keys, secrets, profile,
         /// usage-ledger, bulk-import, quick-import) — resolved by the web UI.
+        ///
+        /// Service control: pass `start`, `stop`, or `restart` instead of a
+        /// page name to start / stop / restart the local web service
+        /// (aikey-local-server on Personal, aikey-trial-server on Trial).
+        /// Production servers are not managed here — use the server-install
+        /// runbook on the server host instead.
         page: Option<String>,
         /// Shortcut for `aikey web import` — opens the Import page directly.
         #[arg(long)]
@@ -476,19 +483,64 @@ pub(crate) enum Commands {
     ///
     /// An "app" is an external client (Claude Code / Codex / a custom Agent)
     /// that talks to AiKey via a per-app bearer token + a per-app provider
-    /// binding. `aikey app register` declares it, `aikey app authorize`
-    /// issues the bearer + initial bindings, `aikey app route` (re)binds it
-    /// to an upstream credential, and `aikey app revoke / pause / resume /
-    /// rotate` manage the bearer's lifecycle. See `aikey app list` for the
-    /// current state.
+    /// binding. `aikey app register` declares the app AND issues the bearer
+    /// in one step — output includes the env lines (OPENAI_API_KEY +
+    /// OPENAI_BASE_URL) for the Agent to use, plus a binding summary
+    /// snapshotted from your `aikey use` selection. `aikey app route` is
+    /// **optional**, only needed when you want to override per-app
+    /// bindings (e.g., lock this app to a specific team key). `aikey app
+    /// revoke / pause / resume / rotate` manage the bearer's lifecycle.
+    /// See `aikey app list` for current state.
     ///
     /// The bearer is sent at:
-    ///   http://127.0.0.1:<proxy-port>/apps/<slug>/<protocol>/v1/...
-    /// where <protocol> is one of the app's declared protocols (e.g. openai).
+    ///   http://127.0.0.1:<proxy-port>/apps/<slug>/v1/...
+    /// Upstream provider is inferred from body.model at request time
+    /// (claude-* → anthropic, gpt-* → openai, ...). No `<protocol>` URL
+    /// segment since Phase 2 Day 7.
     #[command(display_order = 26)]
     App {
         #[command(subcommand)]
         action: AppAction,
+    },
+    /// Manage AiKey background services (`start` / `stop` / `restart`).
+    ///
+    /// Generic service-control namespace for any AiKey-owned daemon
+    /// that runs as a user-scope launchd / systemd unit. Today the
+    /// only registered service is `trust-local` (degrade-detector).
+    /// Refuses to operate on names not in the whitelist — this is NOT
+    /// a generic launchd/systemd wrapper.
+    ///
+    /// Examples:
+    ///   aikey service start trust-local
+    ///   aikey service restart trust-local
+    ///   aikey service stop trust-local
+    #[command(display_order = 27)]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+/// Subcommands for `aikey service`.
+///
+/// `name` is a short identifier (e.g. `trust-local`), not a launchd
+/// label. We map short name → label internally so the user doesn't
+/// have to memorize `aikey.trust-local`.
+#[derive(Subcommand)]
+pub(crate) enum ServiceAction {
+    /// Start a registered AiKey service.
+    Start {
+        /// Service short name (e.g. `trust-local`). Run without a
+        /// name to see the list of supported services.
+        name: Option<String>,
+    },
+    /// Stop a registered AiKey service.
+    Stop {
+        name: Option<String>,
+    },
+    /// Restart a registered AiKey service.
+    Restart {
+        name: Option<String>,
     },
 }
 
@@ -526,6 +578,20 @@ pub(crate) enum TrustAction {
         #[arg(long, value_enum, default_value_t = SyncTarget::Both)]
         target: SyncTarget,
     },
+    /// Recompute L1 from observed proxy traffic (no cascade verify run).
+    ///
+    /// L1 is rolled up from `local_observations` (D-rule hits the
+    /// proxy plugin recorded). It's normally refreshed as a side
+    /// effect of `aikey trust verify`, `aikey trust sync`, and
+    /// trust-local boot — this command is the explicit-only path.
+    ///
+    /// With no alias argument, sweeps every (alias, provider, model)
+    /// trust-local knows about. With an alias, recomputes just that one.
+    /// No upstream traffic, no token cost.
+    Refresh {
+        /// Alias to recompute. Omit to sweep all aliases.
+        alias: Option<String>,
+    },
 }
 
 /// Choices for `aikey trust sync --target`.
@@ -537,30 +603,50 @@ pub(crate) enum SyncTarget {
 }
 
 /// Subcommands for `aikey app` (Phase 4 third-party Agent integration,
-/// Phase 2 Day 7 redesign).
+/// Phase 2 Day 7 + 2026-05-21 register-one-step redesign).
 ///
-/// Flow:
-///   `aikey app register --slug X --upstreams openai,anthropic`  (declare)
-///   `aikey app route X`                                          (interactive: pick keys + issue bearer)
+/// Typical flow:
+///   `aikey app register --slug X --upstreams openai,anthropic`  (one step:
+///                              writes metadata + issues bearer + snapshots
+///                              bindings from `aikey use` + prints env lines)
 ///   `aikey app list / revoke / pause / resume / rotate`          (manage)
 ///
+/// Optional override:
+///   `aikey app route X --upstream U --key-type T --key-ref R`    (lock the
+///                              app to a specific key for upstream U; bearer
+///                              is NOT re-issued)
+///
 /// `aikey app authorize` was removed in Phase 2 Day 7 — bearer issuance
-/// merges into the first full run of `aikey app route` (gated by an
-/// explicit "Issue bearer token?" consent prompt to preserve the
-/// security-event semantics).
+/// moved into `aikey app register` itself (see 2026-05-21 design note
+/// `20260521-app-register-issues-bearer-and-default-from-aikey-use.md`).
 #[derive(Subcommand)]
 pub(crate) enum AppAction {
-    /// Declare a new third-party Agent integration.
+    /// Declare a new third-party Agent integration AND issue its bearer
+    /// in one step (2026-05-21 redesign).
     ///
-    /// Writes `app_records` with the given metadata. Does NOT issue a
-    /// bearer or write bindings — run `aikey app route <slug>` next.
+    /// What this command does (atomic):
+    ///   1. UPSERT `app_records` with metadata + upstreams
+    ///   2. For each upstream, snapshot the user's current `aikey use`
+    ///      selection into a per-app binding (profile `app:<slug>`)
+    ///      — unless `--follow-user-active` is set (then resolver
+    ///      dynamically falls back to the default profile)
+    ///   3. Issue a bearer token (reuses existing if any; pass
+    ///      `--rotate-bearer` to force a new one)
+    ///   4. Print the env lines the Agent needs:
+    ///        OPENAI_API_KEY=aikey_app_xxx
+    ///        OPENAI_BASE_URL=http://127.0.0.1:<port>/apps/<slug>/v1
+    ///      plus a "snapshotted from your aikey use" binding summary,
+    ///      and warnings for any upstream where `aikey use` had no
+    ///      selection.
     ///
     /// `--upstreams` is the set of UPSTREAM PROVIDERS the Agent will use.
     /// At request time, AiKey infers the upstream from body.model
     /// (claude-* → anthropic, gpt-* → openai, ...) and looks up the
-    /// binding written for that upstream. Declare all upstreams the
-    /// Agent might call here so the route picker can show one row per
-    /// upstream.
+    /// binding written for that upstream.
+    ///
+    /// Re-running this command is safe (idempotent): app_records UPSERT,
+    /// bearer reused, and user overrides set via `aikey app route` are
+    /// preserved (not overwritten by the snapshot).
     Register {
         #[arg(long)]
         slug: String,
@@ -595,17 +681,22 @@ pub(crate) enum AppAction {
     },
     /// List all registered apps + their active key + last-used timestamp.
     List,
-    /// Set or update a per-upstream binding for an app + issue the bearer
-    /// on first full run (with consent prompt).
+    /// Override the per-upstream binding for an already-registered app
+    /// (optional; default binding is the snapshot taken at `aikey app
+    /// register` time, inherited from `aikey use`).
+    ///
+    /// Bearer issuance has moved into `aikey app register` (2026-05-21
+    /// redesign); this command only writes the binding row and DOES NOT
+    /// issue or rotate a bearer. The `--yes` flag is preserved for
+    /// backward compatibility but is a no-op (you'll get a deprecation
+    /// warning).
     ///
     /// Default UX is INTERACTIVE: shows one table row per declared
     /// upstream, lets you pick a key (personal alias / OAuth account /
-    /// team-managed key) for each. After bindings are written, asks for
-    /// explicit consent to issue the bearer token (first time only).
+    /// team-managed key) for each.
     ///
     /// CI / non-interactive mode: pass `--upstream X --key-type Y
-    /// --key-ref Z` to set one specific binding. Add `--yes` to also
-    /// auto-issue the bearer on first run (without consent prompt).
+    /// --key-ref Z` to set one specific binding.
     Route {
         slug: String,
         /// Non-interactive: which upstream provider to bind (must be one
@@ -642,6 +733,38 @@ pub(crate) enum AppAction {
     /// active key and issue a new one with the same bindings. Used when
     /// you suspect the bearer was leaked.
     Rotate {
+        slug: String,
+    },
+    /// Install a first-party / deep-partner app from the aikeylabs/launch
+    /// manifest registry.
+    ///
+    /// Plugin-autonomy model (2026-05-22):
+    ///   1. CLI validates `<slug>` against a built-in TRUSTED_APPS allow-list
+    ///      (slug + manifest URL + SHA-256 are all pinned at compile time).
+    ///   2. Downloads the manifest, verifies SHA-256 against the built-in
+    ///      hash (zero phishing window — the binary is the trust anchor),
+    ///      caches at `~/.aikey/apps-cache/<slug>/manifest.json`.
+    ///   3. Curl-pipes the manifest's `service_installer.url` to the user's
+    ///      shell. The installer script is owned by the plugin and is
+    ///      responsible for ALL plugin-specific setup:
+    ///        - downloading the plugin's binary
+    ///        - registering launchd / systemd services
+    ///        - writing any required env / token files
+    ///        - and (idempotently) calling `aikey app register` to surface
+    ///          the app in the vault — see the install_service.sh fallback
+    ///          for the canonical pattern
+    ///
+    /// CLI is intentionally NOT in charge of register / authorize for these
+    /// installs — that's the plugin's domain (it knows its own manifest
+    /// fields). CLI is a launcher, not an orchestrator of plugin state.
+    ///
+    /// Third-party Agents do NOT use this command — they ship their own
+    /// installer and call `aikey app register` directly. See
+    /// `roadmap20260320/技术实现/阶段4-增值版/第三方Agent自助接入与应用级Key方案.md`
+    /// §2.6 + §11.B for the design rationale.
+    Install {
+        /// Trusted app slug. Must match an entry in CLI's built-in
+        /// allow-list (currently: degrade-detector).
         slug: String,
     },
 }
@@ -1016,6 +1139,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 crate::commands_internal::InternalAction::UpdateAlias(_) => "update-alias",
                 crate::commands_internal::InternalAction::Parse(_) => "parse",
                 crate::commands_internal::InternalAction::Rules(_) => "rules",
+                crate::commands_internal::InternalAction::App(_) => "app",
                 crate::commands_internal::InternalAction::Init(_) => "init",
                 crate::commands_internal::InternalAction::HookOp(_) => "hook-op",
             }),
@@ -1125,6 +1249,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 TrustAction::Status { .. } => "trust.status".to_string(),
                 TrustAction::History { .. } => "trust.history".to_string(),
                 TrustAction::Sync { .. } => "trust.sync".to_string(),
+                TrustAction::Refresh { .. } => "trust.refresh".to_string(),
             },
             Commands::App { action } => match action {
                 AppAction::Register { .. } => "app.register".to_string(),
@@ -1134,6 +1259,12 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 AppAction::Pause { .. } => "app.pause".to_string(),
                 AppAction::Resume { .. } => "app.resume".to_string(),
                 AppAction::Rotate { .. } => "app.rotate".to_string(),
+                AppAction::Install { .. } => "app.install".to_string(),
+            },
+            Commands::Service { action } => match action {
+                ServiceAction::Start { .. } => "service.start".to_string(),
+                ServiceAction::Stop { .. } => "service.stop".to_string(),
+                ServiceAction::Restart { .. } => "service.restart".to_string(),
             },
         },
     }
@@ -1254,6 +1385,9 @@ Notes:
         "web" | "browse" => Some("\
 Notes:
     - PAGE: overview | keys | vault | account | usage | import | referrals
+    - Service control: PAGE = start | stop | restart  →  controls the local
+      web service (aikey-local-server on Personal, aikey-trial-server on Trial).
+      Bare `aikey web` opens the browser; `aikey web restart` reboots the backend.
     - --vault and --import are shortcut flags for opening those pages directly.
     - In local/trial mode, opens the local console directly.
     - In team mode, requires a valid account session.
@@ -2386,5 +2520,138 @@ mod tests {
     #[test]
     fn test_command_detail_notes_unknown() {
         assert!(command_detail_notes("nonexistent").is_none());
+    }
+
+    // ── service-control fence tests ──────────────────────────────────────
+    //
+    // These tests are the "重构前后行为一致" safety net for the
+    // `aikey service` introduction (M5 Day 5 follow-up Z series). They
+    // pin:
+    //   (1) the existing `aikey web start` / `aikey proxy start` /
+    //       `aikey trust verify` parsings are NOT broken by the new
+    //       Service / ServiceAction additions
+    //   (2) `aikey service start <name>` parses as expected, with
+    //       missing-name and unknown-name handled at dispatch (not at
+    //       parse — clap accepts arbitrary strings)
+    //
+    // What these DON'T cover: actual launchctl / systemctl dispatch
+    // (would require shelling out under test, fragile). The dispatch
+    // is mostly passthrough so the parse-level pin is the load-bearing
+    // half of the contract.
+
+    use clap::Parser;
+
+    /// `aikey web start` MUST keep parsing exactly as before — the
+    /// service-control intercept lives in main.rs and depends on the
+    /// page-positional Some("start"). If clap derive ever changes
+    /// this we want to know.
+    #[test]
+    fn fence_aikey_web_start_parses_unchanged() {
+        let cli = Cli::try_parse_from(["aikey", "web", "start"]).expect("parse");
+        match cli.command {
+            Some(Commands::Web { page, .. }) => {
+                assert_eq!(page.as_deref(), Some("start"));
+            }
+            other => panic!("expected Web {{ page: Some(\"start\") }}, got {:?}", command_name(other.as_ref())),
+        }
+    }
+
+    /// Same fence for `aikey proxy start`.
+    #[test]
+    fn fence_aikey_proxy_start_parses_unchanged() {
+        let cli = Cli::try_parse_from(["aikey", "proxy", "start"]).expect("parse");
+        match cli.command {
+            Some(Commands::Proxy { action }) => {
+                assert!(matches!(action, ProxyAction::Start { .. }));
+            }
+            other => panic!("expected Proxy Start, got {:?}", command_name(other.as_ref())),
+        }
+    }
+
+    /// `aikey trust verify <alias>` — the cli.rs add of ServiceAction
+    /// shouldn't change TrustAction ordering / parsing.
+    #[test]
+    fn fence_aikey_trust_verify_parses_unchanged() {
+        let cli = Cli::try_parse_from(["aikey", "trust", "verify", "my-alias"]).expect("parse");
+        match cli.command {
+            Some(Commands::Trust { action }) => match action {
+                TrustAction::Verify { alias, .. } => assert_eq!(alias, "my-alias"),
+                _ => panic!("expected TrustAction::Verify"),
+            },
+            _ => panic!("expected Commands::Trust"),
+        }
+    }
+
+    /// `aikey service start trust-local` — new command path.
+    #[test]
+    fn aikey_service_start_named() {
+        let cli = Cli::try_parse_from(["aikey", "service", "start", "trust-local"]).expect("parse");
+        match cli.command {
+            Some(Commands::Service { action }) => match action {
+                ServiceAction::Start { name } => assert_eq!(name.as_deref(), Some("trust-local")),
+                _ => panic!("expected ServiceAction::Start"),
+            },
+            _ => panic!("expected Commands::Service"),
+        }
+    }
+
+    /// `aikey service start` (no name) — should parse with name=None
+    /// so the dispatcher can print the supported list. Clap doesn't
+    /// require the optional positional.
+    #[test]
+    fn aikey_service_start_no_name() {
+        let cli = Cli::try_parse_from(["aikey", "service", "start"]).expect("parse");
+        match cli.command {
+            Some(Commands::Service { action: ServiceAction::Start { name } }) => {
+                assert!(name.is_none());
+            }
+            _ => panic!("expected ServiceAction::Start with name=None"),
+        }
+    }
+
+    /// Stop / restart parse the same way as start.
+    #[test]
+    fn aikey_service_stop_restart_named() {
+        let stop = Cli::try_parse_from(["aikey", "service", "stop", "web"]).expect("parse");
+        assert!(matches!(
+            stop.command,
+            Some(Commands::Service { action: ServiceAction::Stop { ref name } })
+                if name.as_deref() == Some("web")
+        ));
+        let restart = Cli::try_parse_from(["aikey", "service", "restart", "proxy"]).expect("parse");
+        assert!(matches!(
+            restart.command,
+            Some(Commands::Service { action: ServiceAction::Restart { ref name } })
+                if name.as_deref() == Some("proxy")
+        ));
+    }
+
+    /// Unknown service NAMES (e.g. "foo") DO parse — the whitelist
+    /// rejection happens at dispatch in commands_service. This test
+    /// pins that distinction so a future "reject at parse" tightening
+    /// is an intentional decision, not a silent regression.
+    #[test]
+    fn aikey_service_unknown_name_parses_then_rejected_at_dispatch() {
+        let cli = Cli::try_parse_from(["aikey", "service", "start", "some-rogue-name"]);
+        assert!(cli.is_ok(), "clap accepts arbitrary name string");
+    }
+
+    /// command_name reports `service.*` for telemetry. Pin the format.
+    #[test]
+    fn fence_command_name_for_service() {
+        let cmd = Commands::Service {
+            action: ServiceAction::Start { name: Some("trust-local".to_string()) },
+        };
+        assert_eq!(command_name(Some(&cmd)), "service.start");
+
+        let cmd = Commands::Service {
+            action: ServiceAction::Stop { name: None },
+        };
+        assert_eq!(command_name(Some(&cmd)), "service.stop");
+
+        let cmd = Commands::Service {
+            action: ServiceAction::Restart { name: Some("proxy".to_string()) },
+        };
+        assert_eq!(command_name(Some(&cmd)), "service.restart");
     }
 }

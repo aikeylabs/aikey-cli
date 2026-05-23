@@ -408,15 +408,21 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
 pub fn maybe_warn_stale() {
     // Round 9 fix #1: was is_proxy_running (PID-only); now Layer 1.
     // Stale-vault check only meaningful when the proxy is genuinely ours.
+    //
+    // 2026-05-22: rewrote to inform-not-restart. Every vault-write CLI op
+    // bumps change_seq; aikey-proxy's syncManagedKeys loop (5s tick) picks
+    // up the new state and atomically swaps the registry — no restart
+    // needed. Earlier behavior auto-restarted aggressively (when a cached
+    // password was available) which interrupted in-flight sessions for
+    // changes the sync loop handles transparently. See
+    // memory: no-proxy-restart-for-vault-mutations.
+    //
+    // The Stale signal is still informative for the operator (esp. in
+    // scripts), but should NOT prompt restart. The legitimate restart
+    // cases (master-password change, HTTPS_PROXY env change) have their
+    // own dedicated prompts — they don't flow through this helper.
     if proxy_is_running_managed() && proxy_vault_state() == ProxyVaultState::Stale {
-        if let Some(pw) = crate::session::try_get() {
-            match handle_restart(None, &pw) {
-                Ok(_) => eprintln!("  Proxy restarted with new keys."),
-                Err(_) => eprintln!("  Run 'aikey proxy restart' to apply new keys."),
-            }
-        } else {
-            eprintln!("  Run 'aikey proxy restart' to apply new keys.");
-        }
+        eprintln!("  Proxy will pick up new state within 5s (auto-sync).");
     }
 }
 
@@ -1020,8 +1026,7 @@ pub fn status_rows() -> Vec<String> {
             match proxy_vault_state() {
                 ProxyVaultState::Current => rows.push("vault sync: current".to_string()),
                 ProxyVaultState::Stale => {
-                    rows.push("vault sync: stale".to_string());
-                    rows.push("hint:    restart proxy to apply new keys: aikey proxy restart".to_string());
+                    rows.push("vault sync: syncing (auto-pickup within 5s)".to_string());
                 }
                 ProxyVaultState::Unknown => {}
             }
@@ -1287,15 +1292,28 @@ pub fn handle_verify(password: &SecretString) -> Result<(), Box<dyn std::error::
     let listen_addr = proxy_listen_addr(None);
     let initial_state = proxy_state(&listen_addr);
 
-    // Step 1: bail early if the proxy is running on a stale vault snapshot.
-    // (Stale check only meaningful when the proxy is actually ours.)
+    // Step 1: if the proxy's vault snapshot lags, give the 5s sync loop
+    // one chance to catch up before bailing. Pre-2026-05-22 this was a
+    // hard bail asking the user to `aikey proxy restart`; with app/oauth/
+    // personal/team routes all now auto-syncing within 5s, the right
+    // behaviour is to wait briefly. See memory: no-proxy-restart-for-vault-mutations.
     if matches!(initial_state, ProxyState::Running { .. })
         && proxy_vault_state() == ProxyVaultState::Stale
     {
-        eprintln!("proxy is using an outdated vault snapshot.");
-        eprintln!("restart proxy to apply new keys: aikey proxy restart");
-        eprintln!("Then re-run: aikey proxy verify");
-        return Err("verify aborted: proxy vault snapshot is stale".into());
+        // Sync loop ticks every 5s; wait up to 6s (one full tick + slack)
+        // before declaring failure.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if proxy_vault_state() != ProxyVaultState::Stale {
+                break;
+            }
+        }
+        if proxy_vault_state() == ProxyVaultState::Stale {
+            eprintln!("proxy vault snapshot did not sync within 6s.");
+            eprintln!("This is unusual — check proxy logs for sync errors.");
+            return Err("verify aborted: proxy vault snapshot is stale".into());
+        }
     }
 
     let mut failed = false;
@@ -1415,11 +1433,12 @@ pub fn proxy_guard(password: &SecretString) -> bool {
 
     match proxy_state(&health_addr) {
         ProxyState::Running { .. } => {
-            // Warn once if the proxy is serving from a stale vault snapshot.
-            if proxy_vault_state() == ProxyVaultState::Stale {
-                eprintln!("[aikey] proxy is using an outdated vault snapshot.");
-                eprintln!("[aikey] restart proxy to apply new keys: aikey proxy restart");
-            }
+            // 2026-05-22: pre-fix this warned + told the user to restart.
+            // Now the 5s syncManagedKeys loop auto-picks up vault changes,
+            // so Stale is transient by design — staying silent here keeps
+            // the auto-start UX clean. If the staleness lingers past one
+            // sync tick, downstream callers (e.g. proxy verify) handle it
+            // with their own bounded wait.
             return true;
         }
         ProxyState::OrphanedPort { port, owner_pid, reason } => {

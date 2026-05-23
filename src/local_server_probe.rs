@@ -32,6 +32,58 @@ pub const ERR_I_CLI_NOT_AVAILABLE: &str = "I_CLI_NOT_AVAILABLE";
 const YAML_CONFIG_REL: &str = ".aikey/config/control-trial.yaml";
 const JSON_CONFIG_REL: &str = ".aikey/config/config.json";
 
+/// Which local web service is installed on this host.
+///
+/// Personal = `aikey-local-server` (per-user, no privilege).
+/// Trial    = `aikey-full-trial` (system-wide on Linux, user-scope on macOS).
+///
+/// Why an enum vs free strings: every service-control call site needs
+/// to dispatch on edition (different launchctl labels, different
+/// systemctl scopes, different binaries). Centralising the choice in
+/// one detector keeps the three-platform × two-edition matrix tractable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edition {
+    Personal,
+    Trial,
+}
+
+impl Edition {
+    /// Human label used in CLI messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Edition::Personal => "aikey-local-server",
+            Edition::Trial => "aikey-trial-server",
+        }
+    }
+}
+
+/// Inspect `~/.aikey/install-state.json` and return the edition.
+/// `None` means neither local-server nor full-trial is installed
+/// (CLI-only Personal, Production, or no install state at all).
+pub fn detect_edition() -> Option<Edition> {
+    let home = crate::commands_account::resolve_user_home();
+    let path = home.join(".aikey/install-state.json");
+    let raw = fs::read_to_string(&path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let components = parsed.get("installed_components")?.as_array()?;
+    // Why Trial wins over local-server when both appear: trial-server
+    // is a superset bundle that includes local-server's user-side
+    // routes; on a trial host the running listener is full-trial, so
+    // service-control commands must target that label, not the
+    // never-started local-server one.
+    let has_trial = components.iter()
+        .any(|c| c.as_str() == Some("full-trial"));
+    if has_trial {
+        return Some(Edition::Trial);
+    }
+    let has_local = components.iter()
+        .any(|c| c.as_str() == Some("local-server"));
+    if has_local {
+        return Some(Edition::Personal);
+    }
+    None
+}
+
 // ── Public API ──────────────────────────────────────────────────────────
 
 /// Resolve local-server's listen port from the canonical config file,
@@ -78,23 +130,30 @@ pub fn probe_vault_status(base: &str) -> Result<bool, String> {
     Ok(body.contains(r#""unlocked":true"#))
 }
 
-/// Platform-specific command users can copy-paste to start local-server.
-/// Wired to launchd / systemd where available; otherwise a direct
-/// background invocation. Never returns an empty string — callers depend
-/// on this being non-empty for the NOT-RUNNING hint to be useful.
+/// Single canonical user-facing command to start/stop/restart the
+/// local web service. Now that `aikey web {start|stop|restart}` is
+/// the supported entry point, every hint points at it — there's no
+/// need to leak the underlying launchctl / nohup details. Reason:
+/// local-install.sh and trial-install.sh both spawn the service
+/// directly with `nohup` (only `aikey-proxy` is registered with
+/// launchd/systemd), so a launchctl hint would not even work.
 pub fn start_command_hint() -> String {
-    #[cfg(target_os = "macos")]
-    {
-        "launchctl start com.aikey.local-server".to_string()
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "systemctl --user start aikey-local-server".to_string()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        "~/.aikey/bin/aikey-local-server --config ~/.aikey/config/control-trial.yaml &"
-            .to_string()
+    "aikey web start".to_string()
+}
+
+/// User-facing hint for a specific service action. Always routes
+/// through `aikey web <action>` for the same reason as
+/// `start_command_hint`. Edition is accepted so the caller can
+/// surface "which service" in surrounding text, but the command
+/// itself is edition-agnostic — the CLI auto-detects.
+pub fn service_command_hint(_edition: Edition, action: &str) -> String {
+    format!("aikey web {}", action)
+}
+
+fn web_service_binary(edition: Edition) -> &'static str {
+    match edition {
+        Edition::Personal => "aikey-local-server",
+        Edition::Trial => "aikey-full-trial",
     }
 }
 
@@ -141,50 +200,272 @@ pub fn wait_for_reachable(port: u16, wait_for: std::time::Duration) -> Result<()
     ))
 }
 
-/// Fire the platform-native start command for local-server (launchd /
-/// systemd-user / direct spawn). Returns Ok if the command exited 0,
-/// Err with diagnostic otherwise. Does NOT wait for the service to come
-/// up — callers should follow with `wait_for_reachable`.
+/// Fire the platform-native start command for the local web service
+/// (launchd / systemd / direct spawn). Edition-aware — Personal targets
+/// `aikey-local-server`, Trial targets `aikey-full-trial`. Returns Ok
+/// if the command exited 0, Err with diagnostic otherwise. Does NOT
+/// wait for the service to come up — callers should follow with
+/// `wait_for_reachable`.
 pub fn spawn_start_command() -> Result<(), String> {
-    use std::process::Command;
+    let edition = detect_edition().unwrap_or(Edition::Personal);
+    run_service_action(edition, ServiceAction::Start)
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("launchctl")
-            .args(["start", "com.aikey.local-server"])
-            .status()
-            .map_err(|e| format!("invoke launchctl: {}", e))
-            .and_then(|s| if s.success() { Ok(()) } else {
-                Err(format!("launchctl start exit {}", s.code().unwrap_or(-1)))
-            })
+/// Stop the local web service. Edition-aware. See `spawn_start_command`.
+pub fn spawn_stop_command() -> Result<(), String> {
+    let edition = detect_edition().ok_or_else(||
+        "neither aikey-local-server nor aikey-trial-server is installed".to_string())?;
+    run_service_action(edition, ServiceAction::Stop)
+}
+
+/// Restart the local web service. Edition-aware. See `spawn_start_command`.
+pub fn spawn_restart_command() -> Result<(), String> {
+    let edition = detect_edition().ok_or_else(||
+        "neither aikey-local-server nor aikey-trial-server is installed".to_string())?;
+    run_service_action(edition, ServiceAction::Restart)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ServiceAction {
+    fn verb(self) -> &'static str {
+        match self {
+            ServiceAction::Start => "start",
+            ServiceAction::Stop => "stop",
+            ServiceAction::Restart => "restart",
+        }
     }
-    #[cfg(target_os = "linux")]
-    {
-        Command::new("systemctl")
-            .args(["--user", "start", "aikey-local-server"])
-            .status()
-            .map_err(|e| format!("invoke systemctl: {}", e))
-            .and_then(|s| if s.success() { Ok(()) } else {
-                Err(format!("systemctl start exit {}", s.code().unwrap_or(-1)))
-            })
+}
+
+// Why direct process management instead of launchctl / systemctl:
+//   local-install.sh and trial-install.sh both start the web service
+//   via plain `nohup ${BIN}/aikey-{local-server,full-trial} --config
+//   ${CONFIG}/control-trial.yaml`. Neither installer registers a
+//   launchd plist or systemd unit for the web service itself (only
+//   `aikey-proxy` is registered). So any launchctl/systemctl-based
+//   restart command would target a label that doesn't exist on the
+//   user's host. The original `spawn_start_command` had this bug
+//   silently — the auto-start prompt in `aikey web` was a no-op for
+//   every Personal install. Fixing it here also fixes that.
+
+fn run_service_action(edition: Edition, action: ServiceAction) -> Result<(), String> {
+    match action {
+        ServiceAction::Start => start_service(edition),
+        ServiceAction::Stop => stop_service(),
+        ServiceAction::Restart => {
+            // Best-effort stop — don't fail restart if the service
+            // wasn't running (a common state right after install).
+            let _ = stop_service();
+            // Brief gap so the listener actually releases the port
+            // before we try to bind on it again.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            start_service(edition)
+        }
     }
+}
+
+fn start_service(edition: Edition) -> Result<(), String> {
+    // Idempotent: if the service is already healthy on its configured
+    // port, skip the spawn — re-spawning would race the existing
+    // process for the port and leave one of them broken.
+    if let Ok(port) = read_local_server_port() {
+        let base = format!("http://127.0.0.1:{}", port);
+        if probe_health(&base).is_ok() {
+            return Ok(());
+        }
+    }
+
+    let home = crate::commands_account::resolve_user_home();
+    let bin_name = web_service_binary(edition);
     #[cfg(target_os = "windows")]
-    {
-        // No native service manager wired up for Personal Windows installs
-        // yet — spawn the binary directly in the background. Matches the
-        // hint from `start_command_hint()` for this platform.
-        let home = crate::commands_account::resolve_user_home();
-        let bin = home.join(".aikey").join("bin").join("aikey-local-server.exe");
-        let cfg = home.join(".aikey").join("config").join("control-trial.yaml");
-        Command::new(&bin)
-            .arg("--config").arg(&cfg)
-            .spawn()
-            .map_err(|e| format!("spawn aikey-local-server: {}", e))
-            .map(|_| ())
+    let bin_file = format!("{}.exe", bin_name);
+    #[cfg(not(target_os = "windows"))]
+    let bin_file = bin_name.to_string();
+
+    let bin = home.join(".aikey").join("bin").join(&bin_file);
+    let cfg = home.join(".aikey").join("config").join("control-trial.yaml");
+
+    if !bin.exists() {
+        return Err(format!(
+            "binary not found: {} (run the {} installer to (re)install)",
+            bin.display(),
+            edition.label()
+        ));
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+
+    spawn_detached(&bin, &cfg)
+}
+
+fn stop_service() -> Result<(), String> {
+    let port = read_local_server_port()
+        .map_err(|e| format!("cannot resolve service port: {}", e))?;
+    let pid = match find_listening_pid(port) {
+        Some(p) => p,
+        None => return Ok(()), // already stopped
+    };
+    signal_terminate(pid)?;
+    // Wait up to 5s for graceful exit; SIGKILL if still alive.
+    for _ in 0..50 {
+        if !pid_alive(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    signal_kill(pid)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_detached(bin: &Path, cfg: &Path) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new(bin);
+    cmd.arg("--config").arg(cfg);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // setsid detaches the child from this process's session — without
+    // it the spawned web service would die when the shell that ran
+    // `aikey web start` exits. This matches what `nohup` gives us in
+    // the installer's invocation.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()
+        .map_err(|e| format!("spawn {}: {}", bin.display(), e))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_detached(bin: &Path, cfg: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    // CREATE_NO_WINDOW (0x08000000) | DETACHED_PROCESS (0x00000008) —
+    // child survives parent exit and has no console window.
+    const DETACHED_NO_WINDOW: u32 = 0x0800_0008;
+    Command::new(bin)
+        .arg("--config").arg(cfg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("spawn {}: {}", bin.display(), e))?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn spawn_detached(_bin: &Path, _cfg: &Path) -> Result<(), String> {
+    Err("service start not supported on this platform".to_string())
+}
+
+#[cfg(unix)]
+fn signal_terminate(pid: u32) -> Result<(), String> {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if rc != 0 {
+        return Err(format!("kill(SIGTERM) for pid {} failed", pid));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn signal_kill(pid: u32) -> Result<(), String> {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    if rc != 0 {
+        return Err(format!("kill(SIGKILL) for pid {} failed", pid));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // signal 0 = existence check, doesn't actually deliver a signal.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn signal_terminate(pid: u32) -> Result<(), String> {
+    use std::process::Command;
+    // Windows has no graceful-shutdown signal for arbitrary
+    // processes; taskkill without /F sends WM_CLOSE which is the
+    // closest equivalent. /F is reserved for the kill fallback.
+    Command::new("taskkill")
+        .args(["/PID", &pid.to_string()])
+        .status()
+        .map_err(|e| format!("invoke taskkill: {}", e))
+        .and_then(|s| if s.success() { Ok(()) } else {
+            Err(format!("taskkill exit {}", s.code().unwrap_or(-1)))
+        })
+}
+
+#[cfg(windows)]
+fn signal_kill(pid: u32) -> Result<(), String> {
+    use std::process::Command;
+    Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status()
+        .map_err(|e| format!("invoke taskkill: {}", e))
+        .and_then(|s| if s.success() { Ok(()) } else {
+            Err(format!("taskkill /F exit {}", s.code().unwrap_or(-1)))
+        })
+}
+
+#[cfg(windows)]
+fn pid_alive(pid: u32) -> bool {
+    use std::process::Command;
+    // tasklist filtering is the simplest existence check without
+    // pulling in winapi crates.
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+        .unwrap_or(false)
+}
+
+fn find_listening_pid(port: u16) -> Option<u32> {
+    #[cfg(unix)]
     {
-        Err("auto-start not supported on this platform".to_string())
+        use std::process::Command;
+        // `lsof -ti :<port> -sTCP:LISTEN` returns just the PIDs of
+        // listening sockets — same idiom the installer uses to find
+        // the previous instance. We pick the first one because
+        // there's at most one listener on a given port at a time.
+        let out = Command::new("lsof")
+            .args(["-ti", &format!(":{}", port), "-sTCP:LISTEN"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout);
+        s.lines().next()?.trim().parse::<u32>().ok()
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        // `netstat -ano` lines look like:
+        //   "  TCP    127.0.0.1:8090   0.0.0.0:0    LISTENING    1234"
+        let out = Command::new("netstat").args(["-ano", "-p", "TCP"]).output().ok()?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        for line in s.lines() {
+            if !line.contains("LISTENING") { continue; }
+            let needle = format!(":{} ", port);
+            if !line.contains(&needle) { continue; }
+            if let Some(pid_str) = line.split_whitespace().last() {
+                if let Ok(pid) = pid_str.parse::<u32>() { return Some(pid); }
+            }
+        }
+        None
     }
 }
 
@@ -698,6 +979,92 @@ mod tests {
         with_home(tmp.path(), || {
             assert!(!is_local_server_installed());
         });
+    }
+
+    // ── detect_edition ───────────────────────────────────────────────
+
+    #[test]
+    fn detect_edition_returns_personal_for_local_server_only() {
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_install_state(tmp.path(),
+            r#"{"installed_components":["aikey-cli","local-server"]}"#);
+        with_home(tmp.path(), || {
+            assert_eq!(detect_edition(), Some(Edition::Personal));
+        });
+    }
+
+    #[test]
+    fn detect_edition_returns_trial_for_full_trial() {
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_install_state(tmp.path(),
+            r#"{"installed_components":["full-trial"]}"#);
+        with_home(tmp.path(), || {
+            assert_eq!(detect_edition(), Some(Edition::Trial));
+        });
+    }
+
+    #[test]
+    fn detect_edition_prefers_trial_when_both_listed() {
+        // If a host's install-state.json mentions both (unusual but
+        // possible on a machine that ran both installers), the running
+        // listener is full-trial, so service control must target Trial.
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_install_state(tmp.path(),
+            r#"{"installed_components":["local-server","full-trial"]}"#);
+        with_home(tmp.path(), || {
+            assert_eq!(detect_edition(), Some(Edition::Trial));
+        });
+    }
+
+    #[test]
+    fn detect_edition_none_for_cli_only() {
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_install_state(tmp.path(),
+            r#"{"installed_components":["aikey-cli"]}"#);
+        with_home(tmp.path(), || {
+            assert_eq!(detect_edition(), None);
+        });
+    }
+
+    #[test]
+    fn detect_edition_none_when_state_missing() {
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        with_home(tmp.path(), || {
+            assert_eq!(detect_edition(), None);
+        });
+    }
+
+    // ── service_command_hint ─────────────────────────────────────────
+
+    #[test]
+    fn service_command_hint_points_at_aikey_web() {
+        // Hints are intentionally edition-agnostic now — the CLI
+        // auto-detects which edition is installed, so the user-facing
+        // command is the same regardless. Surrounding text in error
+        // messages still references the edition by name.
+        for action in ["start", "stop", "restart"] {
+            for ed in [Edition::Personal, Edition::Trial] {
+                let h = service_command_hint(ed, action);
+                assert_eq!(h, format!("aikey web {}", action),
+                    "hint should be `aikey web {}`, got: {}", action, h);
+            }
+        }
+    }
+
+    #[test]
+    fn start_command_hint_points_at_aikey_web_start() {
+        assert_eq!(start_command_hint(), "aikey web start");
+    }
+
+    #[test]
+    fn edition_label_is_user_facing() {
+        assert_eq!(Edition::Personal.label(), "aikey-local-server");
+        assert_eq!(Edition::Trial.label(), "aikey-trial-server");
     }
 
     #[test]

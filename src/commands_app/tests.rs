@@ -490,11 +490,18 @@ fn list_apps_returns_records_with_active_key_join() {
     // list_apps uses the public function which calls open_connection —
     // we can't reuse our in-memory conn here. Instead drive the JOIN via
     // raw SQL on the in-memory conn to verify the same shape.
+    //
+    // WHERE r.app_kind = 'third-party' filters out the baseline-seeded
+    // first-party `degrade-detector` row so this test stays focused on the
+    // third-party agents inserted above. The seed is added by
+    // ensure_first_party_app_keys in migrations.rs; without the filter the
+    // expected row count would shift whenever first-party seeds are added.
     let mut stmt = conn
         .prepare(
             "SELECT r.slug, k.key_id
                FROM app_records r
           LEFT JOIN app_keys k ON k.app_slug = r.slug AND k.status = 'active'
+              WHERE r.app_kind = 'third-party'
            ORDER BY r.slug",
         )
         .unwrap();

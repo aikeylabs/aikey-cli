@@ -216,6 +216,9 @@ pub fn handle(env: StdinEnvelope) {
         "delete" => handle_delete(env),
         "delete_target" => handle_delete_target(env),
         "record_usage" => handle_record_usage(env),
+        "record_test_result" => handle_record_test_result(env),
+        "test" => handle_test(env),
+        "test_raw" => handle_test_raw(env),
         "use" => handle_use(env),
         other => {
             emit_error(
@@ -1002,6 +1005,401 @@ fn handle_record_usage(env: StdinEnvelope) {
         )),
         Err(e) => emit_error(req_id, "I_INTERNAL", format!("record_usage: {}", e)),
     }
+}
+
+// ========== record_test_result ==========
+//
+// Persists the most-recent connectivity-test outcome for a key into the
+// `extra` JSON column at `$.last_test`. Called by `_internal test` after
+// the run_connectivity_suite finishes, and by `aikey test` for parity so
+// the CLI and Web Test Connection button feed the same "Last test" column
+// on the Vault page.
+//
+// Payload:
+//   { "target": "personal"|"oauth"|"team",
+//     "id": "...",
+//     "result": { at: i64, status: "pass"|"fail",
+//                 latency_ms?: i64, error_code?: String,
+//                 error_message?: String, suggestion?: String,
+//                 suite_results?: [...] } }
+//
+// `result` is opaque to this handler — we serialise it back to JSON and
+// json_set it under `$.last_test`. The shape contract lives at the writer
+// (run_connectivity_suite → JSON envelope) so adding a new field there
+// doesn't need a change here.
+//
+// Security stance mirrors record_usage: no vault_key verification (the
+// stored value contains only status + latency + error code, no secret
+// material; the Go layer's service-token / JWT auth still gates the call).
+//
+// Team scope: schema column exists on managed_virtual_keys_cache but is
+// not yet wired through the storage layer (see VirtualKeyCacheEntry doc
+// — INSERT OR REPLACE in upsert_virtual_key_cache would wipe extra on
+// every `aikey key sync`; needs an ON CONFLICT DO UPDATE refactor first).
+// Until then this action returns I_NOT_IMPLEMENTED for target=team rather
+// than silently dropping the result — the Web should surface that as a
+// "Test ran but result not persisted for team keys yet" hint.
+fn handle_record_test_result(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        target: String,
+        id: String,
+        result: serde_json::Value,
+    }
+    let payload: Payload = match serde_json::from_value(env.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_error(req_id, "I_STDIN_INVALID_JSON",
+                format!("record_test_result payload: {}", e));
+            return;
+        }
+    };
+    if payload.id.trim().is_empty() {
+        emit_error(req_id, "I_STDIN_INVALID_JSON", "id must be non-empty");
+        return;
+    }
+    if !payload.result.is_object() {
+        emit_error(req_id, "I_STDIN_INVALID_JSON",
+            "result must be a JSON object");
+        return;
+    }
+
+    if let Err(e) = storage::ensure_vault_exists() {
+        emit_error(req_id, "I_VAULT_NOT_INITIALIZED", format!("{}", e));
+        return;
+    }
+
+    let result_json = match serde_json::to_string(&payload.result) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_error(req_id, "I_INTERNAL",
+                format!("serialise result: {}", e));
+            return;
+        }
+    };
+
+    let affected = match payload.target.as_str() {
+        "personal" => storage::merge_entry_extra(&payload.id, "$.last_test", &result_json),
+        "oauth"    => storage::merge_oauth_extra(&payload.id, "$.last_test", &result_json),
+        "team"     => storage::merge_team_extra(&payload.id, "$.last_test", &result_json),
+        other      => {
+            emit_error(req_id, "I_UNKNOWN_TARGET",
+                format!("unknown target '{}' (expected personal|oauth|team)", other));
+            return;
+        }
+    };
+
+    match affected {
+        Ok(0) => emit_error(
+            req_id,
+            "I_CREDENTIAL_NOT_FOUND",
+            format!("{} '{}' not found", payload.target, payload.id),
+        ),
+        Ok(n) => emit(&ResultEnvelope::ok(
+            req_id,
+            json!({
+                "target": payload.target,
+                "id": payload.id,
+                "rows_affected": n,
+            }),
+        )),
+        Err(e) => emit_error(req_id, "I_INTERNAL", format!("record_test_result: {}", e)),
+    }
+}
+
+// ========== test (connectivity probe + persist) ==========
+//
+// Runs the same connectivity suite that `aikey test <alias> --json` runs
+// from the terminal, aggregates one "Last test" snapshot, persists it to
+// the vault at `extra.$.last_test`, and emits the full result envelope
+// back to the caller. Used by the Web "Test Connection" button — keeps
+// CLI and Web parity by sharing `run_connectivity_suite` as the single
+// core (internal-command-reuses-public-core principle).
+//
+// Payload:
+//   { "target": "personal"|"oauth"|"team",
+//     "id": "<alias|provider_account_id|virtual_key_id>" }
+//
+// Why `target` is taken explicitly (rather than resolving from id alone):
+// `targets_from_alias` already disambiguates by trying personal → team →
+// oauth in order, but the persist sink differs by kind (merge_entry_extra
+// vs. merge_oauth_extra) and we need to pick the right one BEFORE we
+// know which probe succeeded. Caller (Go layer) knows the kind from the
+// vault list response, so it tells us.
+//
+// Aggregation rule for `last_test.status`:
+//   - pass: any probe row has api_ok = true
+//   - fail: otherwise
+//   - latency_ms: min api_ms across passing rows (when status = pass),
+//     else max ping_ms across rows (so the user sees the slowest hop).
+//   - error_code / error_message: from the first failing row when fail,
+//     omitted when pass.
+//   - suite_results: raw per-row JSON from outcome.json_results, so the
+//     popup can show per-provider breakdown without a follow-up call.
+//
+// Security: no vault_key verification (same stance as record_test_result
+// — written value contains no secret material).
+fn handle_test(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        target: String,
+        id: String,
+    }
+    let payload: Payload = match serde_json::from_value(env.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_error(req_id, "I_STDIN_INVALID_JSON",
+                format!("test payload: {}", e));
+            return;
+        }
+    };
+    if payload.id.trim().is_empty() {
+        emit_error(req_id, "I_STDIN_INVALID_JSON", "id must be non-empty");
+        return;
+    }
+    if !matches!(payload.target.as_str(), "personal" | "oauth" | "team") {
+        emit_error(req_id, "I_UNKNOWN_TARGET",
+            format!("unknown target '{}' (expected personal|oauth|team)", payload.target));
+        return;
+    }
+
+    if let Err(e) = storage::ensure_vault_exists() {
+        emit_error(req_id, "I_VAULT_NOT_INITIALIZED", format!("{}", e));
+        return;
+    }
+
+    // Proxy must be up — the suite probes via proxy for every credential
+    // kind. Same exit-condition as `aikey test`'s pre-flight.
+    if !crate::commands_proxy::proxy_is_running_managed() {
+        emit_error(req_id, "I_PROXY_NOT_RUNNING",
+            "aikey-proxy is not running. Run `aikey proxy start` and retry.");
+        return;
+    }
+    let proxy_port = crate::commands_proxy::proxy_port();
+
+    // Resolve targets via the shared helper. `targets_from_alias` tries
+    // personal → team → oauth; we filter to the caller's declared target
+    // kind so a Web-side "test this OAuth key" doesn't accidentally hit a
+    // personal alias that happens to share the same name.
+    let mut targets = crate::commands_project::targets_from_alias(
+        &payload.id, None, None, proxy_port,
+    );
+    use crate::commands_project::CredentialKind;
+    let expected_kind = match payload.target.as_str() {
+        "personal" => Some(CredentialKind::PersonalApi),
+        "oauth"    => Some(CredentialKind::OAuth),
+        "team"     => Some(CredentialKind::ManagedTeam),
+        _          => None,
+    };
+    if let Some(want) = expected_kind {
+        targets.retain(|t| t.kind == want);
+    }
+    if targets.is_empty() {
+        emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
+            format!("no {} credential matches id '{}'", payload.target, payload.id));
+        return;
+    }
+
+    // Run the suite in JSON mode so json_results is populated for the
+    // popup's per-provider breakdown. No interactive output — the second
+    // arg to run_connectivity_suite controls that.
+    let opts = crate::commands_project::SuiteOptions {
+        show_proxy_row:  false,
+        header_label:    None,
+        password:        None,
+        proxy_port,
+        show_key_column: false,
+    };
+    let outcome = crate::commands_project::run_connectivity_suite(targets, opts, /*json_mode*/ true);
+
+    // Aggregate + persist via the shared helper. Same code path the
+    // public `aikey test` CLI uses, so the row a Web user sees after
+    // clicking Test connection is byte-identical to what a terminal
+    // user sees after running `aikey test`. Internal-command-reuses-
+    // public-core principle.
+    let persisted_results = crate::commands_project::persist_test_outcome(&outcome);
+
+    // Find the entry that matches the caller's (target, id). With a
+    // single-credential probe targets are filtered to one CredentialKind,
+    // so there's at-most-one matching result; we still pick by source_ref
+    // == id to stay correct if `targets_from_alias` ever resolves to
+    // multiple credentials of the same kind.
+    let expected_kind_filter = expected_kind;
+    let matched = persisted_results.into_iter().find(|p| {
+        Some(p.target_kind) == expected_kind_filter && p.source_ref == payload.id
+    });
+    let (persisted, last_test) = match matched {
+        Some(p) => (p.persisted, p.last_test),
+        None => {
+            // Shouldn't happen — we already returned early if targets
+            // was empty — but if persist_test_outcome somehow drops the
+            // group (e.g. all rows had a different source_ref than the
+            // payload's id, which can occur if targets_from_alias did
+            // alias→canonical translation), fall back to a synthesized
+            // record so the caller still sees a structured failure.
+            eprintln!("[_internal test WARN] no persisted result matched (target={}, id={})",
+                payload.target, payload.id);
+            (false, json!({
+                "at": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                "status": "fail",
+                "error_code": "I_INTERNAL_NO_MATCH",
+                "error_message": "probe completed but result aggregation didn't match the requested target",
+            }))
+        }
+    };
+
+    emit(&ResultEnvelope::ok(
+        req_id,
+        json!({
+            "target": payload.target,
+            "id": payload.id,
+            "persisted": persisted,
+            "last_test": last_test,
+        }),
+    ));
+}
+
+// ========== test_raw (pre-save connectivity probe) ==========
+//
+// Runs the same connectivity suite that `aikey add` runs after a user
+// fills in the new-key form — but without ever touching the vault. The
+// Web Add-Key Guided flow (spec §3.1 / §5.1) calls this action from
+// page 2's Run-test button so the user can see Ping(D) / API / Chat
+// outcomes BEFORE deciding whether to Save / Save-anyway / Cancel.
+//
+// Reuses three pieces of `aikey add` 's existing pre-save plumbing
+// (internal-command-reuses-public-core principle):
+//   1. `targets_from_new_personal_key`: builds one ad-hoc TestTarget per
+//      selected provider, plaintext bearer, no vault row needed.
+//   2. `run_connectivity_suite`: the same probe runner the CLI invokes.
+//   3. `aggregate_test_outcome`: the same record-build aggregator
+//      `aikey test` writes to `extra.$.last_test` — minus the vault
+//      write (there's no row to write to yet).
+//
+// Payload:
+//   { "providers": ["openai","anthropic", ...],  // ≥ 1 required
+//     "secret":    "<plaintext>",
+//     "alias_hint": "<source_ref label, only used in JSON output>",
+//     "base_url":  "<optional override>" }
+//
+// Returns: `{ providers, last_test }` — `last_test` matches the
+// VaultLastTest shape so the Web popup can render it identically to
+// the post-save row.
+//
+// Security:
+//   - The plaintext secret never lands on disk. It flows through stdin
+//     into the probe agent which makes a direct upstream HTTP call and
+//     drops the bearer when the response is read.
+//   - This action does NOT require vault_key_hex (no vault touch).
+//   - No persistence — caller is expected to follow up with
+//     `vault-op add` if the user chooses Save / Save-anyway.
+fn handle_test_raw(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        providers: Vec<String>,
+        secret: String,
+        #[serde(default)]
+        alias_hint: String,
+        #[serde(default)]
+        base_url: String,
+    }
+    let payload: Payload = match serde_json::from_value(env.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_error(req_id, "I_STDIN_INVALID_JSON",
+                format!("test_raw payload: {}", e));
+            return;
+        }
+    };
+
+    if payload.providers.is_empty() {
+        emit_error(req_id, "I_STDIN_INVALID_JSON",
+            "test_raw requires at least one provider");
+        return;
+    }
+    if payload.secret.trim().is_empty() {
+        emit_error(req_id, "I_STDIN_INVALID_JSON",
+            "test_raw requires a non-empty secret");
+        return;
+    }
+
+    // alias_hint only appears in json_results / suite_results.source_ref;
+    // it never lands in any vault row. Default to a stable sentinel so
+    // multiple pre-save probes from the same session aren't lumped into
+    // one group when the caller forgets to supply one.
+    let alias_hint = if payload.alias_hint.trim().is_empty() {
+        "_pre_save_probe".to_string()
+    } else {
+        payload.alias_hint.clone()
+    };
+    let base_url_override = if payload.base_url.trim().is_empty() {
+        None
+    } else {
+        Some(payload.base_url.as_str())
+    };
+
+    let targets = crate::commands_project::targets_from_new_personal_key(
+        &alias_hint,
+        payload.secret.trim(),
+        &payload.providers,
+        base_url_override,
+    );
+    if targets.is_empty() {
+        emit_error(req_id, "I_INTERNAL",
+            "test_raw: target construction yielded zero targets");
+        return;
+    }
+
+    // show_proxy_row=false: pre-save probe never has a valid proxy
+    // sentinel route (the key isn't in vault yet), so the Proxy row
+    // would always show "skipped" — better to omit than to mislead.
+    // The Web spec's 4-phase table renders Proxy as "skipped" client-
+    // side when last_test carries no Proxy row.
+    let opts = crate::commands_project::SuiteOptions {
+        show_proxy_row: false,
+        header_label:   None,
+        password:       None,
+        proxy_port:     crate::commands_proxy::proxy_port(),
+        show_key_column: false,
+    };
+    let outcome = crate::commands_project::run_connectivity_suite(
+        targets, opts, /*json_mode*/ true,
+    );
+
+    // Aggregate WITHOUT persisting. With targets_from_new_personal_key
+    // producing one PersonalApi TestTarget per provider — all sharing
+    // the same source_ref=alias_hint — aggregate collapses them into
+    // exactly one record per spec §10.5 any-ok semantics.
+    let records = crate::commands_project::aggregate_test_outcome(&outcome);
+    let last_test = records.into_iter().next()
+        .map(|r| r.last_test)
+        .unwrap_or_else(|| json!({
+            "at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            "status": "fail",
+            "error_code": "I_INTERNAL_NO_AGGREGATE",
+            "error_message": "probe completed but aggregation produced no record",
+        }));
+
+    emit(&ResultEnvelope::ok(
+        req_id,
+        json!({
+            "providers": payload.providers,
+            "alias_hint": alias_hint,
+            "last_test": last_test,
+        }),
+    ));
 }
 
 // ========== use (provider-binding switch) ==========

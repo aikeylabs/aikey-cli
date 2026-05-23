@@ -195,4 +195,49 @@ impl TrustClient {
             .send_json(serde_json::json!({}))?;
         Ok(resp.into_json()?)
     }
+
+    /// POST /v1/aggregate — recompute L1 from observations.
+    ///
+    /// When all three of `alias_name` / `provider_id` / `model` are
+    /// supplied, recomputes only that triple. When `alias_name` is
+    /// `None`, body is `{}` and trust-local sweeps every triple.
+    pub fn post_aggregate(
+        &self,
+        target: Option<(&str, &str, &str)>,
+    ) -> Result<AggregateResponse, ureq::Error> {
+        let url = format!("{}/v1/aggregate", self.base_url);
+        let body = match target {
+            Some((alias, provider, model)) => serde_json::json!({
+                "alias_name":  alias,
+                "provider_id": provider,
+                "model":       model,
+            }),
+            None => serde_json::json!({}),
+        };
+        let resp = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .post(&url)
+            .send_json(body)?;
+        Ok(resp.into_json()?)
+    }
+}
+
+/// Wire response shape from POST /v1/aggregate. Kept narrow — the
+/// per-row debug fields land in `signals_summary`, the CLI surfaces
+/// `s_l1` + `anomaly_suggested` + a `hits` summary line.
+#[derive(serde::Deserialize, Debug)]
+pub struct AggregateResponse {
+    pub written: usize,
+    pub items: Vec<AggregateRow>,
+}
+
+#[derive(serde::Deserialize, Debug)]
+pub struct AggregateRow {
+    pub alias_name: String,
+    pub provider_id: String,
+    pub model: String,
+    pub s_l1: Option<i64>,
+    pub anomaly_suggested: bool,
+    pub signals_summary: serde_json::Value,
 }

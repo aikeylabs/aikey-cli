@@ -465,10 +465,42 @@ pub struct VirtualKeyCacheEntry {
     /// The `account_id` that last synced/accepted this key. `None` for pre-v0.8 rows.
     /// Used to scope-disable keys when the user switches to a different account.
     pub owner_account_id: Option<String>,
+    /// Generic per-key extension JSON blob — same shape contract as
+    /// `storage::SecretMetadata::extra`. Stores connectivity-test results
+    /// at `$.last_test` (written by `_internal vault-op record_test_result`
+    /// / `test` with target=team) and any future per-key facts users add.
+    ///
+    /// CRITICAL invariant: `upsert_virtual_key_cache` MUST NOT include
+    /// `extra` in its UPDATE SET — every `aikey key sync` calls upsert,
+    /// and if sync ever overwrites this column the user's recorded
+    /// test results disappear silently. The 2026-05-22 refactor switched
+    /// upsert from `INSERT OR REPLACE` (which wipes unlisted columns) to
+    /// `INSERT ... ON CONFLICT(virtual_key_id) DO UPDATE SET <only
+    /// sync-authoritative fields>` exactly to enforce this.
+    pub extra: Option<serde_json::Value>,
 }
 
-/// Inserts or replaces a cache entry.
-/// `provider_key_nonce` / `provider_key_ciphertext` may be `None` until the key is accepted.
+/// Inserts a new row or updates the sync-authoritative fields of an
+/// existing row, keyed by `virtual_key_id`.
+///
+/// 2026-05-22 — switched from `INSERT OR REPLACE` to
+/// `INSERT ... ON CONFLICT DO UPDATE`. The previous form deletes the
+/// old row and re-inserts, which silently wipes any column the writer
+/// doesn't include in its INSERT list. That destroyed user-owned
+/// per-key state every `aikey key sync` — notably the new
+/// `extra` JSON blob that holds connectivity-test results
+/// (`extra.$.last_test`), favourites, tags, and other future per-key
+/// facts.
+///
+/// The new form lists every field this writer owns (the columns the
+/// server is authoritative over) in the DO UPDATE SET clause. Any
+/// column not in that list — currently `extra`, and `cache_schema_version`
+/// which is constant — survives the upsert intact. Adding a future
+/// "user-owned" column for team rows is now safe: leave it out of
+/// SET and sync won't touch it.
+///
+/// `provider_key_nonce` / `provider_key_ciphertext` may be `None` until
+/// the key is accepted.
 pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), String> {
     let conn = open_connection()?;
     let supported_providers_json = serde_json::to_string(&entry.supported_providers)
@@ -476,7 +508,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
     let provider_base_urls_json = serde_json::to_string(&entry.provider_base_urls)
         .unwrap_or_else(|_| "{}".to_string());
     conn.execute(
-        "INSERT OR REPLACE INTO managed_virtual_keys_cache (
+        "INSERT INTO managed_virtual_keys_cache (
              virtual_key_id, org_id, seat_id, alias,
              provider_code, protocol_type, base_url,
              credential_id, credential_revision, virtual_key_revision,
@@ -496,7 +528,31 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              1,   strftime('%s', 'now'),
              ?17, ?18,
              ?19, ?20
-         )",
+         )
+         ON CONFLICT(virtual_key_id) DO UPDATE SET
+             org_id                  = excluded.org_id,
+             seat_id                 = excluded.seat_id,
+             alias                   = excluded.alias,
+             provider_code           = excluded.provider_code,
+             protocol_type           = excluded.protocol_type,
+             base_url                = excluded.base_url,
+             credential_id           = excluded.credential_id,
+             credential_revision     = excluded.credential_revision,
+             virtual_key_revision    = excluded.virtual_key_revision,
+             key_status              = excluded.key_status,
+             share_status            = excluded.share_status,
+             local_state             = excluded.local_state,
+             expires_at              = excluded.expires_at,
+             provider_key_nonce      = excluded.provider_key_nonce,
+             provider_key_ciphertext = excluded.provider_key_ciphertext,
+             synced_at               = strftime('%s', 'now'),
+             local_alias             = excluded.local_alias,
+             supported_providers     = excluded.supported_providers,
+             provider_base_urls      = excluded.provider_base_urls,
+             owner_account_id        = excluded.owner_account_id
+             /* extra: DELIBERATELY OMITTED — user-owned column. See doc
+                comment above and on VirtualKeyCacheEntry::extra. */
+             /* cache_schema_version: omitted because it's a constant. */",
         params![
             entry.virtual_key_id,
             entry.org_id,
@@ -548,48 +604,89 @@ pub fn list_virtual_key_cache_readonly() -> Result<Vec<VirtualKeyCacheEntry>, St
     query_virtual_key_cache(&open_connection_readonly()?)
 }
 
+// ── managed_virtual_keys_cache column cascade ──────────────────────────
+//
+// FULL  — post 2026-05-22 vaults (has `extra` column)
+// LEGACY — pre-2026-05-22 (no extra column; project literal NULL)
+//
+// Why a cascade rather than relying purely on ensure_column to backfill:
+// `list_virtual_key_cache_readonly` opens the DB read-only (no migrations
+// applied), and there is no out-of-process write path that materialises
+// the column for read-only callers. The fallback prepare lets the
+// read-only client serve old vaults uniformly while the next write opens
+// a write conn and triggers ensure_column.
+const VK_CACHE_COLUMNS_FULL: &str =
+    "virtual_key_id, org_id, seat_id, alias, \
+     provider_code, protocol_type, base_url, \
+     credential_id, credential_revision, virtual_key_revision, \
+     key_status, share_status, local_state, \
+     expires_at, \
+     provider_key_nonce, provider_key_ciphertext, \
+     synced_at, local_alias, supported_providers, \
+     provider_base_urls, owner_account_id, extra";
+const VK_CACHE_COLUMNS_LEGACY: &str =
+    "virtual_key_id, org_id, seat_id, alias, \
+     provider_code, protocol_type, base_url, \
+     credential_id, credential_revision, virtual_key_revision, \
+     key_status, share_status, local_state, \
+     expires_at, \
+     provider_key_nonce, provider_key_ciphertext, \
+     synced_at, local_alias, supported_providers, \
+     provider_base_urls, owner_account_id, NULL";
+
+/// Single mapping from a SELECT row (in the column order declared by
+/// `VK_CACHE_COLUMNS_*` above) to a struct. Centralised here so adding
+/// future columns is a one-place edit; previously this mapping was
+/// copy-pasted in three call sites and drifted easily.
+fn row_to_virtual_key_cache(row: &rusqlite::Row) -> rusqlite::Result<VirtualKeyCacheEntry> {
+    // Parse `extra` opportunistically — corrupt blob (shouldn't happen,
+    // writers always go through json_set) is treated as None so a bad
+    // row doesn't break the whole list query.
+    let extra = row
+        .get::<_, Option<String>>(21)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    Ok(VirtualKeyCacheEntry {
+        virtual_key_id: row.get(0)?,
+        org_id: row.get(1)?,
+        seat_id: row.get(2)?,
+        alias: row.get(3)?,
+        provider_code: row.get(4)?,
+        protocol_type: row.get(5)?,
+        base_url: row.get(6)?,
+        credential_id: row.get(7)?,
+        credential_revision: row.get(8)?,
+        virtual_key_revision: row.get(9)?,
+        key_status: row.get(10)?,
+        share_status: row.get(11)?,
+        local_state: row.get(12)?,
+        expires_at: row.get(13)?,
+        provider_key_nonce: row.get(14)?,
+        provider_key_ciphertext: row.get(15)?,
+        synced_at: row.get(16)?,
+        local_alias: row.get(17)?,
+        supported_providers: parse_providers_json(row.get(18)?),
+        provider_base_urls: parse_base_urls_json(row.get(19)?),
+        owner_account_id: row.get(20)?,
+        extra,
+    })
+}
+
 fn query_virtual_key_cache(conn: &Connection) -> Result<Vec<VirtualKeyCacheEntry>, String> {
     let mut stmt = conn
-        .prepare(
-            "SELECT virtual_key_id, org_id, seat_id, alias,
-                    provider_code, protocol_type, base_url,
-                    credential_id, credential_revision, virtual_key_revision,
-                    key_status, share_status, local_state,
-                    expires_at,
-                    provider_key_nonce, provider_key_ciphertext,
-                    synced_at, local_alias, supported_providers,
-                    provider_base_urls, owner_account_id
-               FROM managed_virtual_keys_cache
-              ORDER BY COALESCE(local_alias, alias)",
-        )
+        .prepare(&format!(
+            "SELECT {} FROM managed_virtual_keys_cache ORDER BY COALESCE(local_alias, alias)",
+            VK_CACHE_COLUMNS_FULL
+        ))
+        .or_else(|_| conn.prepare(&format!(
+            "SELECT {} FROM managed_virtual_keys_cache ORDER BY COALESCE(local_alias, alias)",
+            VK_CACHE_COLUMNS_LEGACY
+        )))
         .map_err(|e| format!("Failed to prepare list query: {}", e))?;
 
     let rows = stmt
-        .query_map([], |row| {
-            Ok(VirtualKeyCacheEntry {
-                virtual_key_id: row.get(0)?,
-                org_id: row.get(1)?,
-                seat_id: row.get(2)?,
-                alias: row.get(3)?,
-                provider_code: row.get(4)?,
-                protocol_type: row.get(5)?,
-                base_url: row.get(6)?,
-                credential_id: row.get(7)?,
-                credential_revision: row.get(8)?,
-                virtual_key_revision: row.get(9)?,
-                key_status: row.get(10)?,
-                share_status: row.get(11)?,
-                local_state: row.get(12)?,
-                expires_at: row.get(13)?,
-                provider_key_nonce: row.get(14)?,
-                provider_key_ciphertext: row.get(15)?,
-                synced_at: row.get(16)?,
-                local_alias: row.get(17)?,
-                supported_providers: parse_providers_json(row.get(18)?),
-                provider_base_urls: parse_base_urls_json(row.get(19)?),
-                owner_account_id: row.get(20)?,
-            })
-        })
+        .query_map([], row_to_virtual_key_cache)
         .map_err(|e| format!("Failed to query virtual key cache: {}", e))?;
 
     rows.collect::<Result<Vec<_>, _>>()
@@ -603,44 +700,26 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
         return Ok(None);
     }
     let conn = open_connection()?;
-    let result = conn.query_row(
-        "SELECT virtual_key_id, org_id, seat_id, alias,
-                provider_code, protocol_type, base_url,
-                credential_id, credential_revision, virtual_key_revision,
-                key_status, share_status, local_state,
-                expires_at,
-                provider_key_nonce, provider_key_ciphertext,
-                synced_at, local_alias, supported_providers,
-                provider_base_urls, owner_account_id
-           FROM managed_virtual_keys_cache
-          WHERE virtual_key_id = ?1",
-        params![virtual_key_id],
-        |row| {
-            Ok(VirtualKeyCacheEntry {
-                virtual_key_id: row.get(0)?,
-                org_id: row.get(1)?,
-                seat_id: row.get(2)?,
-                alias: row.get(3)?,
-                provider_code: row.get(4)?,
-                protocol_type: row.get(5)?,
-                base_url: row.get(6)?,
-                credential_id: row.get(7)?,
-                credential_revision: row.get(8)?,
-                virtual_key_revision: row.get(9)?,
-                key_status: row.get(10)?,
-                share_status: row.get(11)?,
-                local_state: row.get(12)?,
-                expires_at: row.get(13)?,
-                provider_key_nonce: row.get(14)?,
-                provider_key_ciphertext: row.get(15)?,
-                synced_at: row.get(16)?,
-                local_alias: row.get(17)?,
-                supported_providers: parse_providers_json(row.get(18)?),
-                provider_base_urls: parse_base_urls_json(row.get(19)?),
-                owner_account_id: row.get(20)?,
-            })
-        },
-    );
+    let result = conn
+        .query_row(
+            &format!(
+                "SELECT {} FROM managed_virtual_keys_cache WHERE virtual_key_id = ?1",
+                VK_CACHE_COLUMNS_FULL
+            ),
+            params![virtual_key_id],
+            row_to_virtual_key_cache,
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &format!(
+                    "SELECT {} FROM managed_virtual_keys_cache WHERE virtual_key_id = ?1",
+                    VK_CACHE_COLUMNS_LEGACY
+                ),
+                params![virtual_key_id],
+                row_to_virtual_key_cache,
+            ),
+        });
     match result {
         Ok(entry) => Ok(Some(entry)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -656,46 +735,28 @@ pub fn get_virtual_key_cache_by_alias(alias: &str) -> Result<Option<VirtualKeyCa
         return Ok(None);
     }
     let conn = open_connection()?;
-    let result = conn.query_row(
-        "SELECT virtual_key_id, org_id, seat_id, alias,
-                provider_code, protocol_type, base_url,
-                credential_id, credential_revision, virtual_key_revision,
-                key_status, share_status, local_state,
-                expires_at,
-                provider_key_nonce, provider_key_ciphertext,
-                synced_at, local_alias, supported_providers,
-                provider_base_urls, owner_account_id
-           FROM managed_virtual_keys_cache
-          WHERE local_alias = ?1 OR alias = ?1
-          ORDER BY CASE WHEN local_alias = ?1 THEN 0 ELSE 1 END
-          LIMIT 1",
-        params![alias],
-        |row| {
-            Ok(VirtualKeyCacheEntry {
-                virtual_key_id: row.get(0)?,
-                org_id: row.get(1)?,
-                seat_id: row.get(2)?,
-                alias: row.get(3)?,
-                provider_code: row.get(4)?,
-                protocol_type: row.get(5)?,
-                base_url: row.get(6)?,
-                credential_id: row.get(7)?,
-                credential_revision: row.get(8)?,
-                virtual_key_revision: row.get(9)?,
-                key_status: row.get(10)?,
-                share_status: row.get(11)?,
-                local_state: row.get(12)?,
-                expires_at: row.get(13)?,
-                provider_key_nonce: row.get(14)?,
-                provider_key_ciphertext: row.get(15)?,
-                synced_at: row.get(16)?,
-                local_alias: row.get(17)?,
-                supported_providers: parse_providers_json(row.get(18)?),
-                provider_base_urls: parse_base_urls_json(row.get(19)?),
-                owner_account_id: row.get(20)?,
-            })
-        },
-    );
+    let where_clause = "WHERE local_alias = ?1 OR alias = ?1 \
+         ORDER BY CASE WHEN local_alias = ?1 THEN 0 ELSE 1 END LIMIT 1";
+    let result = conn
+        .query_row(
+            &format!(
+                "SELECT {} FROM managed_virtual_keys_cache {}",
+                VK_CACHE_COLUMNS_FULL, where_clause
+            ),
+            params![alias],
+            row_to_virtual_key_cache,
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &format!(
+                    "SELECT {} FROM managed_virtual_keys_cache {}",
+                    VK_CACHE_COLUMNS_LEGACY, where_clause
+                ),
+                params![alias],
+                row_to_virtual_key_cache,
+            ),
+        });
     match result {
         Ok(entry) => Ok(Some(entry)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1149,6 +1210,12 @@ pub struct ProviderAccountInfo {
     /// has been renamed" by `local_alias.is_some()` and render the original
     /// identity as a separate row instead of overwriting it.
     pub local_alias: Option<String>,
+    /// Generic per-account extension JSON blob — see
+    /// `storage::SecretMetadata::extra` for the contract. First consumer
+    /// is `$.last_test` (connectivity-test result), written by
+    /// `_internal vault-op record_test_result`. Any future per-account
+    /// fact nests as a sibling subkey via the same json_set() write path.
+    pub extra: Option<serde_json::Value>,
 }
 
 impl ProviderAccountInfo {
@@ -1170,6 +1237,14 @@ impl ProviderAccountInfo {
 
 fn row_to_provider_account(row: &rusqlite::Row) -> rusqlite::Result<ProviderAccountInfo> {
     let raw_ctype: String = row.get(3)?;
+    // `extra` stored as TEXT (JSON object); parse opportunistically — a
+    // corrupt blob (writers always go through json_set) is treated the
+    // same as None so it can't break the list query.
+    let extra = row
+        .get::<_, Option<String>>(13)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
     Ok(ProviderAccountInfo {
         provider_account_id: row.get(0)?,
         provider:            row.get(1)?,
@@ -1184,30 +1259,36 @@ fn row_to_provider_account(row: &rusqlite::Row) -> rusqlite::Result<ProviderAcco
         last_used_at:        row.get(10)?,
         use_count:           row.get(11).ok(),
         local_alias:         row.get(12).ok().flatten(),
+        extra,
     })
 }
 
-// Three-tier column list cascade — each tier corresponds to a vault that
+// Four-tier column list cascade — each tier corresponds to a vault that
 // stopped at a particular schema generation:
-//   FULL              — post v1.0.1-alpha.1 (has use_count AND local_alias)
+//   FULL              — post 2026-05-22 (has use_count AND local_alias AND extra)
+//   NO_EXTRA          — post v1.0.1-alpha.1 but pre extra (literal NULL)
 //   NO_LOCAL_ALIAS    — has use_count but predates v1.0.1-alpha.1
-//                       (literal NULL projected for local_alias)
-//   LEGACY            — predates use_count too (literal 0 + NULL)
-// Callers prepare(FULL) → fallback prepare(NO_LOCAL_ALIAS) → fallback
-// prepare(LEGACY). Read-only paths that open a vault without running
+//                       (literal NULL for local_alias + extra)
+//   LEGACY            — predates use_count too (literal 0 + NULL + NULL)
+// Callers prepare(FULL) → fallback NO_EXTRA → fallback NO_LOCAL_ALIAS →
+// fallback LEGACY. Read-only paths that open a vault without running
 // migrations rely on this cascade; write paths see FULL after upgrade_all.
 const PROVIDER_ACCOUNT_COLUMNS_FULL: &str =
     "provider_account_id, provider, auth_type, credential_type, status, \
      external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
-     use_count, local_alias";
+     use_count, local_alias, extra";
+const PROVIDER_ACCOUNT_COLUMNS_NO_EXTRA: &str =
+    "provider_account_id, provider, auth_type, credential_type, status, \
+     external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
+     use_count, local_alias, NULL";
 const PROVIDER_ACCOUNT_COLUMNS_NO_LOCAL_ALIAS: &str =
     "provider_account_id, provider, auth_type, credential_type, status, \
      external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
-     use_count, NULL";
+     use_count, NULL, NULL";
 const PROVIDER_ACCOUNT_COLUMNS_LEGACY: &str =
     "provider_account_id, provider, auth_type, credential_type, status, \
      external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
-     0, NULL";
+     0, NULL, NULL";
 
 /// List all provider OAuth accounts (write connection with migrations).
 pub fn list_provider_accounts() -> Result<Vec<ProviderAccountInfo>, String> {
@@ -1223,15 +1304,21 @@ pub fn list_provider_accounts_readonly() -> Result<Vec<ProviderAccountInfo>, Str
 }
 
 fn query_provider_accounts(conn: &Connection) -> Result<Vec<ProviderAccountInfo>, String> {
-    // Three-tier prepare cascade: FULL (post v1.0.1-alpha.1) → NO_LOCAL_ALIAS
-    // (use_count present, local_alias missing) → LEGACY (both missing). If
-    // ALL fail, the table itself doesn't exist yet (very old vault) —
-    // return empty, same as before.
+    // Four-tier prepare cascade — see PROVIDER_ACCOUNT_COLUMNS_* constants
+    // for the schema generations each tier corresponds to. If all fail,
+    // the table itself doesn't exist yet (very old vault) — return empty,
+    // same as before.
     let mut stmt = match conn
         .prepare(&format!(
             "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
             PROVIDER_ACCOUNT_COLUMNS_FULL
         ))
+        .or_else(|_| {
+            conn.prepare(&format!(
+                "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
+                PROVIDER_ACCOUNT_COLUMNS_NO_EXTRA
+            ))
+        })
         .or_else(|_| {
             conn.prepare(&format!(
                 "SELECT {} FROM provider_accounts ORDER BY provider, created_at",
@@ -1274,6 +1361,17 @@ pub fn get_provider_account(id: &str) -> Result<Option<ProviderAccountInfo>, Str
             _ => conn.query_row(
                 &format!(
                     "SELECT {} FROM provider_accounts WHERE provider_account_id = ?1",
+                    PROVIDER_ACCOUNT_COLUMNS_NO_EXTRA
+                ),
+                params![id],
+                |row| row_to_provider_account(row),
+            ),
+        })
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &format!(
+                    "SELECT {} FROM provider_accounts WHERE provider_account_id = ?1",
                     PROVIDER_ACCOUNT_COLUMNS_NO_LOCAL_ALIAS
                 ),
                 params![id],
@@ -1306,6 +1404,12 @@ pub fn get_provider_accounts_by_provider(provider: &str) -> Result<Vec<ProviderA
             "SELECT {} FROM provider_accounts WHERE provider = ?1 ORDER BY created_at",
             PROVIDER_ACCOUNT_COLUMNS_FULL
         ))
+        .or_else(|_| {
+            conn.prepare(&format!(
+                "SELECT {} FROM provider_accounts WHERE provider = ?1 ORDER BY created_at",
+                PROVIDER_ACCOUNT_COLUMNS_NO_EXTRA
+            ))
+        })
         .or_else(|_| {
             conn.prepare(&format!(
                 "SELECT {} FROM provider_accounts WHERE provider = ?1 ORDER BY created_at",
@@ -1349,6 +1453,17 @@ pub fn get_provider_account_by_external_id(
             _ => conn.query_row(
                 &format!(
                     "SELECT {} FROM provider_accounts WHERE provider = ?1 AND external_id = ?2",
+                    PROVIDER_ACCOUNT_COLUMNS_NO_EXTRA
+                ),
+                params![provider, external_id],
+                |row| row_to_provider_account(row),
+            ),
+        })
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &format!(
+                    "SELECT {} FROM provider_accounts WHERE provider = ?1 AND external_id = ?2",
                     PROVIDER_ACCOUNT_COLUMNS_NO_LOCAL_ALIAS
                 ),
                 params![provider, external_id],
@@ -1385,6 +1500,39 @@ pub fn bump_oauth_usage(id: &str, ts: i64) -> Result<usize, String> {
         params![ts, id],
     )
     .map_err(|e| format!("bump_oauth_usage UPDATE: {}", e))
+}
+
+/// Atomically merge a value into the `extra` JSON column at the given JSON
+/// path (e.g. `$.last_test`). See `storage::merge_entry_extra` for the
+/// concurrent-safety rationale. `value_json` must be valid JSON.
+/// Returns rows affected; 0 means the id is unknown.
+pub fn merge_oauth_extra(id: &str, json_path: &str, value_json: &str) -> Result<usize, String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE provider_accounts SET extra = json_set(COALESCE(extra, '{}'), ?1, json(?2)) WHERE provider_account_id = ?3",
+        params![json_path, value_json, id],
+    )
+    .map_err(|e| format!("merge_oauth_extra UPDATE: {}", e))
+}
+
+/// Atomically merge a value into the `extra` JSON column on
+/// `managed_virtual_keys_cache` at the given JSON path. Same
+/// concurrent-safety + payload-shape contract as `merge_entry_extra` /
+/// `merge_oauth_extra`. Lookup is by `virtual_key_id` (the team row's
+/// stable identifier — `local_alias` and the server alias may both
+/// change). Returns rows affected; 0 means the id is unknown.
+///
+/// This is the team-row companion to merge_entry_extra / merge_oauth_extra
+/// and only became safe to surface after the 2026-05-22 upsert refactor
+/// (see `upsert_virtual_key_cache` doc): under the old INSERT OR REPLACE
+/// every `aikey key sync` would wipe whatever this writer just wrote.
+pub fn merge_team_extra(virtual_key_id: &str, json_path: &str, value_json: &str) -> Result<usize, String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE managed_virtual_keys_cache SET extra = json_set(COALESCE(extra, '{}'), ?1, json(?2)) WHERE virtual_key_id = ?3",
+        params![json_path, value_json, virtual_key_id],
+    )
+    .map_err(|e| format!("merge_team_extra UPDATE: {}", e))
 }
 
 /// Delete a provider account and its tokens (cascade not enforced by SQLite,

@@ -390,14 +390,110 @@ pub(crate) fn handle_sync(target: &SyncTarget, json: bool) -> Result<(), String>
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// refresh
+// ───────────────────────────────────────────────────────────────────────────
+
+pub(crate) fn handle_refresh(alias: Option<&str>, json: bool) -> Result<(), String> {
+    let client = TrustClient::new();
+    // If an alias is provided we resolve its provider/model via the
+    // same vault-priority chain `aikey trust verify` uses. Omitted →
+    // server-side sweep.
+    let target = match alias {
+        Some(a) => {
+            let (provider, model) = resolve_provider_model(a)?;
+            Some((a.to_string(), provider, model))
+        }
+        None => None,
+    };
+    let body = target
+        .as_ref()
+        .map(|(a, p, m)| (a.as_str(), p.as_str(), m.as_str()));
+    let resp = client
+        .post_aggregate(body)
+        .map_err(|e| format_ureq_err(&client, e, "trust-local POST /v1/aggregate"))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "written": resp.written,
+                "items": resp.items.iter().map(|r| serde_json::json!({
+                    "alias_name": r.alias_name,
+                    "provider_id": r.provider_id,
+                    "model": r.model,
+                    "s_l1": r.s_l1,
+                    "anomaly_suggested": r.anomaly_suggested,
+                    "signals_summary": r.signals_summary,
+                })).collect::<Vec<_>>(),
+            }))
+            .map_err(|e| e.to_string())?
+        );
+    } else {
+        println!("refreshed {} alias(es) from local observations", resp.written);
+        for r in &resp.items {
+            // Compact one-line per row: alias  s_l1=N  [anomaly]  hits=...
+            let l1 = r
+                .s_l1
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "—".to_string());
+            // signals_summary may be an empty {} (no observations in
+            // window) — print "no observations in window" so the
+            // user knows the aggregator actually ran but found nothing.
+            let hits_blurb = r
+                .signals_summary
+                .get("hits")
+                .and_then(|h| h.as_object())
+                .map(|map| {
+                    if map.is_empty() {
+                        "no observations in window".to_string()
+                    } else {
+                        let mut parts: Vec<String> = map
+                            .iter()
+                            .map(|(k, v)| format!("{}={}", k, v))
+                            .collect();
+                        parts.sort();
+                        format!("hits={}", parts.join(","))
+                    }
+                })
+                .unwrap_or_else(|| "no observations in window".to_string());
+            let anomaly_tag = if r.anomaly_suggested { "  ⚠ANOMALY" } else { "" };
+            println!(
+                "  {} ({}/{}) s_l1={} {}{}",
+                r.alias_name, r.provider_id, r.model, l1, hits_blurb, anomaly_tag,
+            );
+        }
+    }
+    Ok(())
+}
+
+// Service start/stop/restart (`aikey.trust-local` launchd / systemd
+// label) lives in commands_service::trust_local, not here — the
+// trust namespace is API-talking (verify/status/history/sync/refresh)
+// while service control is OS-process management. They share no helpers.
+
+// ───────────────────────────────────────────────────────────────────────────
 // shared helpers
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Resolve `(provider, model)` from vault entries table for an alias.
+/// Resolve `(provider, model)` for an alias by scanning vault in priority
+/// order: personal API key (`entries`) first, then OAuth account
+/// (`provider_accounts`). OAuth aliases are looked up against both
+/// `local_alias` (user-renamed label) and `display_identity` (original
+/// email / external_id from the OAuth provider) so verifying a Pro/Max
+/// subscription account works whether the user typed the email or the
+/// renamed label.
+///
+/// The provider-code → canonical mapping covers OAuth provider codes
+/// (`claude` / `codex` / `kimi_code`) on top of the API-key codes
+/// (`anthropic` / `openai` / `kimi`). Both map to the same default model
+/// because the cascade question bank is keyed on canonical provider,
+/// not on credential type.
 fn resolve_provider_model(alias: &str) -> Result<(String, String), String> {
     let conn = open_connection_readonly()?;
 
-    let row: Option<String> = conn
+    // Personal API key first — entries.provider_code is the canonical
+    // provider id we want.
+    let api_key_row: Option<String> = conn
         .query_row(
             "SELECT provider_code FROM entries WHERE alias = ?1",
             rusqlite::params![alias],
@@ -405,24 +501,47 @@ fn resolve_provider_model(alias: &str) -> Result<(String, String), String> {
         )
         .ok();
 
-    let provider = row.ok_or_else(|| {
+    // OAuth fallback — provider_accounts.provider is the OAuth provider
+    // code (claude / codex / kimi_code). Look up by either the
+    // user-renamed `local_alias` or the immutable `display_identity`
+    // (email / external_id); same alias may be either depending on
+    // whether the user ran `aikey rename`.
+    let oauth_row: Option<String> = if api_key_row.is_some() {
+        None
+    } else {
+        conn.query_row(
+            "SELECT provider FROM provider_accounts \
+             WHERE local_alias = ?1 OR display_identity = ?1",
+            rusqlite::params![alias],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    };
+
+    let provider = api_key_row.or(oauth_row).ok_or_else(|| {
         format!(
             "alias '{}' not found in vault. Run `aikey list` to see available aliases.",
             alias
         )
     })?;
 
-    let model = match provider.as_str() {
-        "anthropic" => "claude-opus-4-7",
-        "openai" => "gpt-4o",
-        "kimi" => "kimi-k2-instruct-0905",
-        other => return Err(format!(
-            "no default model for provider '{}' (M4: add --model flag if you need this)",
-            other
-        )),
+    // Map OAuth provider codes onto the same canonical provider as their
+    // API-key sibling: `claude` (Claude Pro/Max OAuth) → anthropic;
+    // `codex` (ChatGPT OAuth) → openai; `kimi_code` → kimi. The cascade
+    // question bank is keyed on the canonical id, not the auth method.
+    let (canonical_provider, model) = match provider.as_str() {
+        "anthropic" | "claude" => ("anthropic", "claude-opus-4-7"),
+        "openai"    | "codex"  => ("openai",    "gpt-4o"),
+        "kimi"      | "kimi_code" => ("kimi",   "kimi-k2-instruct-0905"),
+        other => {
+            return Err(format!(
+                "no default model for provider '{}' (M4: add --model flag if you need this)",
+                other
+            ))
+        }
     };
 
-    Ok((provider, model.to_string()))
+    Ok((canonical_provider.to_string(), model.to_string()))
 }
 
 /// Translate a ureq error into an actionable user-facing message.

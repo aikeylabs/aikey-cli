@@ -28,6 +28,7 @@ pub mod parse;
 pub mod rules;
 pub mod init;
 pub mod hook_op;
+pub mod app;
 pub mod internal_log;
 
 #[cfg(test)]
@@ -65,6 +66,13 @@ pub enum InternalAction {
     /// Distinct from vault-op because no vault_key needed (only touches
     /// ~/.aikey/hook.* and ~/.zshrc); uses its own envelope shape in hook_op.rs.
     HookOp(StdinOnlyArgs),
+
+    /// Phase 4 third-party Agent management (web "Connected Apps" UI).
+    /// envelope.action ∈ {list, get, route, revoke, pause, resume, rotate}.
+    /// All sub-actions wrap public `commands_app` pub fn cores; this
+    /// module owns only JSON I/O + slug validation.
+    /// See commands_internal/app.rs head doc for full sub-action table.
+    App(StdinOnlyArgs),
 }
 
 /// 所有 `_internal` 子命令都只接受 `--stdin-json`，JSON 从 stdin 读
@@ -109,6 +117,7 @@ pub fn dispatch(action: &InternalAction) {
         InternalAction::UpdateAlias(_) => "update-alias",
         InternalAction::Parse(_)       => "parse",
         InternalAction::Rules(_)       => "rules",
+        InternalAction::App(_)         => "app",
         InternalAction::Init(_)        => unreachable!("handled above"),
         InternalAction::HookOp(_)      => unreachable!("handled above"),
     };
@@ -135,6 +144,7 @@ pub fn dispatch(action: &InternalAction) {
         InternalAction::UpdateAlias(_) => update_alias::handle(env),
         InternalAction::Parse(_) => parse::handle(env),
         InternalAction::Rules(_) => rules::handle(env),
+        InternalAction::App(_) => app::handle(env),
         InternalAction::Init(_) => unreachable!("handled above"),
         InternalAction::HookOp(_) => unreachable!("handled above"),
     }

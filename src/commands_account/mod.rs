@@ -1118,6 +1118,124 @@ pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> 
     Ok(())
 }
 
+/// `aikey web {start|stop|restart}` — control the local web service.
+///
+/// Why this lives under `aikey web` rather than a new `aikey service`
+/// command: the only thing the CLI needs to start / stop / restart on
+/// a user's host is the process that serves the web UI (local-server
+/// on Personal, full-trial on Trial). Folding it into `aikey web`
+/// keeps the surface area small ("aikey web" opens the page, "aikey
+/// web restart" reboots its backend) without inventing a new noun.
+///
+/// Edition-aware: detects Personal vs Trial from install-state.json
+/// and dispatches to the right binary (aikey-local-server vs
+/// aikey-full-trial). Uses direct process management (nohup-style
+/// spawn + port-based PID lookup + SIGTERM/SIGKILL) rather than
+/// launchctl/systemctl because that's what local-install.sh and
+/// trial-install.sh actually do — neither installer registers the
+/// web service with the OS service manager. See bugfix:
+/// workflow/CI/bugfix/2026-05-21-aikey-web-auto-start-launchctl-noop.md
+///
+/// Refuses on Production (or any host where neither edition is
+/// installed) with an actionable message — the cli has no business
+/// touching server-install's docker-compose stack.
+pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let edition = match crate::local_server_probe::detect_edition() {
+        Some(e) => e,
+        None => {
+            let msg = "no local web service installed on this host. \
+                       `aikey web start/stop/restart` is for Personal \
+                       (aikey-local-server) and Trial (aikey-trial-server) \
+                       editions only. Production servers are managed by the \
+                       server-install runbook (docker-compose / systemd on \
+                       the server host).";
+            if json_mode {
+                crate::json_output::print_json(serde_json::json!({
+                    "ok": false,
+                    "error": "no_local_web_service",
+                    "action": action,
+                    "detail": msg,
+                }));
+            } else {
+                eprintln!("{}", msg);
+            }
+            return Err(msg.into());
+        }
+    };
+
+    let result = match action {
+        "start" => crate::local_server_probe::spawn_start_command(),
+        "stop" => crate::local_server_probe::spawn_stop_command(),
+        "restart" => crate::local_server_probe::spawn_restart_command(),
+        other => {
+            return Err(format!("unknown web action `{}` (use start, stop, or restart)", other).into());
+        }
+    };
+
+    match result {
+        Ok(()) => {
+            // For start / restart, follow with a reachability probe so
+            // we don't claim success while the service is still booting.
+            // Stop has no symmetric probe — we trust the service manager.
+            let final_state = if matches!(action, "start" | "restart") {
+                match crate::local_server_probe::read_local_server_port() {
+                    Ok(port) => crate::local_server_probe::wait_for_reachable(
+                        port, std::time::Duration::from_secs(8))
+                        .map(|()| Some(port)),
+                    Err(e) => Err(e),
+                }
+            } else {
+                Ok(None)
+            };
+
+            if json_mode {
+                let (ok, detail) = match &final_state {
+                    Ok(_) => (true, String::new()),
+                    Err(e) => (false, e.clone()),
+                };
+                crate::json_output::print_json(serde_json::json!({
+                    "ok": ok,
+                    "action": action,
+                    "edition": edition.label(),
+                    "port": final_state.as_ref().ok().and_then(|p| *p),
+                    "detail": detail,
+                }));
+            } else {
+                match &final_state {
+                    Ok(Some(port)) => println!(
+                        "{}: {} succeeded (reachable on port {})",
+                        edition.label(), action, port),
+                    Ok(None) => println!("{}: {} succeeded", edition.label(), action),
+                    Err(e) => eprintln!(
+                        "{}: {} dispatched but service did not come up: {}",
+                        edition.label(), action, e),
+                }
+            }
+
+            match final_state {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        }
+        Err(e) => {
+            if json_mode {
+                crate::json_output::print_json(serde_json::json!({
+                    "ok": false,
+                    "action": action,
+                    "edition": edition.label(),
+                    "error": "service_command_failed",
+                    "detail": &e,
+                }));
+            } else {
+                eprintln!("{}: {} failed — {}", edition.label(), action, e);
+                eprintln!("Manual command: {}",
+                    crate::local_server_probe::service_command_hint(edition, action));
+            }
+            Err(e.into())
+        }
+    }
+}
+
 /// `aikey master [page] [--port PORT]` — open Master Console in the default browser.
 ///
 /// Resolves the control panel URL from install-state.json or the stored
@@ -1941,6 +2059,13 @@ fn apply_snapshot_to_cache(
             supported_providers:  item.supported_providers.clone(),
             provider_base_urls:   item.provider_base_urls.clone(),
             owner_account_id:     Some(current_account_id.to_string()),
+            // Sync writers MUST always set extra: None. The value is
+            // ignored by upsert (extra is omitted from the UPSERT's
+            // DO UPDATE SET — see upsert_virtual_key_cache doc); the
+            // None here is purely a struct-literal completeness
+            // requirement. Putting any other value here would be
+            // misleading, not destructive.
+            extra:                None,
         };
 
         let _ = storage::upsert_virtual_key_cache(&entry);
@@ -2157,6 +2282,10 @@ pub fn run_full_snapshot_sync_with_vault_key(vault_key: &[u8; crypto::KEY_SIZE])
                             supported_providers:  sync_supported_providers,
                             provider_base_urls:   sync_provider_base_urls,
                             owner_account_id:     account_id.clone(),
+                            // Sync writers MUST always pass extra: None;
+                            // upsert ignores this field. See doc on
+                            // VirtualKeyCacheEntry::extra.
+                            extra:                None,
                         };
                         let _ = storage::upsert_virtual_key_cache(&updated);
 
@@ -2320,6 +2449,9 @@ pub fn sync_managed_key_metadata() -> bool {
             supported_providers,
             provider_base_urls,
             owner_account_id: Some(acc.account_id.clone()),
+            // Sync writers MUST always pass extra: None; upsert ignores
+            // this field. See doc on VirtualKeyCacheEntry::extra.
+            extra: None,
         };
         let _ = storage::upsert_virtual_key_cache(&entry);
 

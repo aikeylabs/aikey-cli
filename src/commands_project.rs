@@ -899,6 +899,82 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
+    // ── 7.5. degrade-detector trust-local + rhythm observer ──
+    //
+    // Optional service. Two independent checks:
+    //   a) trust-local HTTP /healthz on :8801 — service running?
+    //   b) aikey-proxy's rhythm observer — was it built? (silent
+    //      failure mode is the proxy boots fine but the observer
+    //      dies due to missing DEGRADE_DETECTOR_PROXY_TOKEN /
+    //      ALLOW_DIRECT_AUTH env). doctor used to be blind to this.
+    //
+    // Skip the section entirely when trust-local binary isn't
+    // installed — many users never opt into degrade-detector and
+    // shouldn't see "✗" rows for a feature they didn't choose.
+    {
+        let trust_local_bin = std::path::Path::new(
+            &std::env::var("HOME").unwrap_or_default()
+        ).join(".aikey/bin/trust-local");
+        if trust_local_bin.exists() {
+            // (a) trust-local service liveness.
+            let trust_local_url = "http://127.0.0.1:8801/healthz";
+            let tl_ok = ureq::get(trust_local_url)
+                .timeout(std::time::Duration::from_secs(2))
+                .call()
+                .map(|r| r.status() == 200)
+                .unwrap_or(false);
+            if tl_ok {
+                emit("trust-local", true, "running on :8801", None);
+            } else {
+                emit("trust-local", false, "not reachable on :8801",
+                    Some("start it: aikey trust-local start  (or: launchctl kickstart -k gui/$UID/aikey.trust-local)"));
+            }
+
+            // (b) rhythm observer health — read the freshest line
+            // out of aikey-proxy's log. The build outcome shows up
+            // as `proxy.observer.built` (good) or
+            // `proxy.observer.build_failed` (bad) within the first
+            // few hundred lines after a restart.
+            let log_path = std::path::Path::new(
+                &std::env::var("HOME").unwrap_or_default()
+            ).join(".aikey/logs/aikey-proxy/current.jsonl");
+            let observer_state = if log_path.exists() {
+                std::fs::read_to_string(&log_path).ok().and_then(|s| {
+                    // Take the LAST observer line (most recent
+                    // restart's verdict). build_failed > built > unknown.
+                    s.lines()
+                     .filter(|l| l.contains("proxy.observer.build") || l.contains("rhythm.observer"))
+                     .last()
+                     .map(String::from)
+                })
+            } else {
+                None
+            };
+            match observer_state {
+                Some(line) if line.contains("proxy.observer.built") || line.contains("rhythm.observer.built") => {
+                    emit("rhythm observer", true, "built + reporting", None);
+                }
+                Some(line) if line.contains("build_failed") => {
+                    // Try to pluck error.message out of the JSON line
+                    // for a more actionable detail.
+                    let reason = serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .and_then(|v| v.get("error.message").and_then(|s| s.as_str()).map(String::from))
+                        .unwrap_or_else(|| "build_failed (see proxy log)".to_string());
+                    emit("rhythm observer", false, "inactive",
+                        Some(&format!("reason: {}; reinstall via: curl -fsSL https://raw.githubusercontent.com/aikeylabs/degrade-detector/main/scripts/install_service.sh | bash", reason)));
+                }
+                _ => {
+                    // No observer line in log = proxy started before
+                    // observer registry, or trust-local was installed
+                    // after proxy. Hint at a restart.
+                    emit("rhythm observer", false, "state unknown",
+                        Some("restart proxy: aikey proxy restart"));
+                }
+            }
+        }
+    }
+
     // ── 8. SQLite WAL size ──────────────────────────────────
     {
         if let Ok(vault_path) = storage::get_vault_path() {

@@ -17,5 +17,5 @@ pub(crate) mod client;
 pub(crate) mod commands;
 
 pub(crate) use commands::{
-    handle_history, handle_status, handle_sync, handle_verify,
+    handle_history, handle_refresh, handle_status, handle_sync, handle_verify,
 };

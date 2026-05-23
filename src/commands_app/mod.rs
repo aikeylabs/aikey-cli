@@ -3,9 +3,13 @@
 //! These commands write the `app_records` + `app_keys` tables (schema added
 //! by migrations.rs v1_0_0_baseline.upgrade() tail block, AKL-101) and the
 //! `user_profile_provider_bindings` table with `profile_id = 'app:<slug>'`
-//! scope. After every write, the change-seq is bumped and
-//! `maybe_warn_stale()` triggers a proxy restart so the new state is loaded
-//! into the in-memory Registry.
+//! scope. After every write, `storage::bump_vault_change_seq()` advances
+//! the change-seq counter; aikey-proxy's `syncManagedKeys` loop (5s tick)
+//! detects the bump and atomically rebuilds the registry — `aikey app
+//! rotate / revoke / pause / resume / register / route` take effect
+//! within 5s without `aikey proxy restart`. `maybe_warn_stale()` is left
+//! as an informational helper (no auto-restart since 2026-05-22).
+//! See memory: no-proxy-restart-for-vault-mutations.
 //!
 //! Scope (AKL-106 P0):
 //!   - `register`   — UPSERT app_records (no token issued)
@@ -28,10 +32,12 @@ use crate::storage;
 use rusqlite::{params, Connection};
 
 mod handlers;
+mod install;
 pub use handlers::{
     handle_list, handle_pause, handle_register, handle_resume, handle_revoke,
     handle_rotate, handle_route,
 };
+pub use install::handle_install;
 
 #[cfg(test)]
 mod tests;
@@ -763,6 +769,108 @@ pub fn get_active_bindings(
                 // Schema-unknown values aren't actionable here; skip with a
                 // log line on stderr per CLAUDE.md "失败要显眼" but don't
                 // abort the picker (other rows may be fine).
+                eprintln!(
+                    "[aikey app] WARN: binding for profile={} provider={} has unknown \
+                     key_source_type={:?}; skipping",
+                    profile_id, p, other
+                );
+                continue;
+            }
+        };
+        out.push((p, typed, kr));
+    }
+    Ok(out)
+}
+
+/// Return the bindings the runtime resolver will ACTUALLY use for `slug`,
+/// not the snapshot stored in `app:<slug>` at register time.
+///
+/// Why this function exists separately from [`get_active_bindings`]:
+///
+///   - `get_active_bindings(slug)` ALWAYS queries `app:<slug>` profile.
+///     That row is what `aikey app route` wrote (or was never written if
+///     follow_user_active=true). It's the right answer when you want
+///     "what the per-app binding row literally is" — e.g. for copying
+///     into a bearer's `initial_bindings` at first authorize time, or
+///     for the interactive picker showing what the user previously
+///     chose.
+///
+///   - But the proxy's actual resolver branches on follow_user_active
+///     (see 20260519-降智检测-follow-active-模式.md §how): when true,
+///     it reads `profile_id='default'` — i.e. tracks the user's
+///     current `aikey use` selection dynamically. For first-party apps
+///     like degrade-detector this is the whole point of the mode.
+///
+///   - The display path (Web Apps page; `aikey app list` / `get`)
+///     should reflect what the resolver will actually do — otherwise
+///     the UI lies about which key the app is using. That's what this
+///     function returns.
+///
+/// Internal state operations (snapshot copy, picker, bearer issuance)
+/// keep calling [`get_active_bindings`]. Only DISPLAY paths switch to
+/// this function.
+pub fn get_effective_bindings(
+    slug: &str,
+) -> Result<Vec<(String, CredentialType, String)>, String> {
+    let rec = get_app_record(slug)?
+        .ok_or_else(|| format!("app '{}' not found", slug))?;
+
+    let profile_id = if rec.follow_user_active {
+        // First-party + follow-active: resolver reads default profile.
+        // Show what's there so the UI matches runtime behavior.
+        "default".to_string()
+    } else {
+        format!("app:{}", slug)
+    };
+
+    let conn = storage::open_connection()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT provider_code, key_source_type, key_source_ref
+               FROM user_profile_provider_bindings
+              WHERE profile_id = ?1
+              ORDER BY provider_code",
+        )
+        .map_err(|e| {
+            if e.to_string().contains("no such table") {
+                "no such table".to_string()
+            } else {
+                format!("prepare get_effective_bindings: {}", e)
+            }
+        })?;
+    if stmt.column_count() == 0 {
+        return Ok(Vec::new());
+    }
+
+    // For follow-active apps, filter the default profile down to the
+    // upstreams the app actually declared at register time. Without
+    // this, an app declaring only "anthropic" but with a default
+    // profile that also covers "openai" / "kimi" would show three
+    // rows — none of which are used by this app for non-anthropic
+    // models. Filtering matches what the UI's per-upstream rendering
+    // expects ("one row per declared upstream").
+    let declared: std::collections::HashSet<&str> =
+        rec.upstreams.iter().map(|s| s.as_str()).collect();
+
+    let rows = stmt
+        .query_map(params![profile_id], |r| {
+            let provider: String = r.get(0)?;
+            let key_source_type: String = r.get(1)?;
+            let key_source_ref: String = r.get(2)?;
+            Ok((provider, key_source_type, key_source_ref))
+        })
+        .map_err(|e| format!("query get_effective_bindings: {}", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (p, kt, kr) = row.map_err(|e| format!("scan get_effective_bindings: {}", e))?;
+        if rec.follow_user_active && !declared.contains(p.as_str()) {
+            continue;
+        }
+        let typed = match kt.as_str() {
+            "personal" | "personal_api_key" => CredentialType::PersonalApiKey,
+            "team" | "managed_virtual_key" => CredentialType::ManagedVirtualKey,
+            "personal_oauth_account" => CredentialType::PersonalOAuthAccount,
+            other => {
                 eprintln!(
                     "[aikey app] WARN: binding for profile={} provider={} has unknown \
                      key_source_type={:?}; skipping",

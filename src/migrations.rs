@@ -402,6 +402,22 @@ pub mod v1_0_0_baseline {
                 "owner_account_id",
                 "ALTER TABLE managed_virtual_keys_cache ADD COLUMN owner_account_id TEXT",
             ),
+            // 2026-05-22: generic per-key extension JSON blob, scoped to
+            // metadata that isn't worth its own column (transient,
+            // user-driven, or open-ended). Single column keeps the schema
+            // surface narrow — any future per-key fact (favourites, tags,
+            // notes, custom labels, …) nests under a top-level key without
+            // requiring a migration. First consumer is connectivity-test
+            // results at `$.last_test`:
+            //   { last_test: { at, status, latency_ms, error_code?,
+            //                  error_message?, suggestion?, suite_results? } }
+            // Writers must use SQLite's `json_set(COALESCE(extra,'{}'),
+            // '$.<key>', json(?))` so concurrent updates to different
+            // subkeys don't clobber each other.
+            (
+                "extra",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN extra TEXT",
+            ),
         ] {
             ensure_column(conn, "managed_virtual_keys_cache", col, ddl)?;
         }
@@ -413,6 +429,25 @@ pub mod v1_0_0_baseline {
                 "ALTER TABLE entries ADD COLUMN provider_code TEXT",
             ),
             ("base_url", "ALTER TABLE entries ADD COLUMN base_url TEXT"),
+            // 2026-05-22 retrofit for an old-vault gap: storage.rs's
+            // query_entries_with_metadata expected `last_used_at` and
+            // `use_count` columns (v1.0.6+ telemetry), but the baseline
+            // CREATE TABLE for `entries` never declared them and there
+            // was no ALTER retrofit either. Old vaults silently fell
+            // through to a column-projection fallback that aliased the
+            // entire trailing range (including `extra`!) to literal
+            // NULLs — so the Vault page's Last test column never
+            // rendered any data, regardless of whether the write side
+            // had stamped it correctly. Adding the explicit ALTERs here
+            // closes the gap; storage.rs cascade still has the literal
+            // fallbacks as belt-and-braces for any vault we can't reach
+            // through a write conn.
+            ("last_used_at", "ALTER TABLE entries ADD COLUMN last_used_at INTEGER"),
+            ("use_count", "ALTER TABLE entries ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0"),
+            // 2026-05-22: see managed_virtual_keys_cache.extra above for the
+            // generic-extension-blob rationale; same shape and same
+            // json_set() write contract apply here.
+            ("extra", "ALTER TABLE entries ADD COLUMN extra TEXT"),
         ] {
             ensure_column(conn, "entries", col, ddl)?;
         }
@@ -484,6 +519,17 @@ pub mod v1_0_0_baseline {
                 "provider_accounts",
                 "local_alias",
                 "ALTER TABLE provider_accounts ADD COLUMN local_alias TEXT",
+            )?;
+
+            // 2026-05-22: generic per-key extension JSON blob — see
+            // managed_virtual_keys_cache.extra (above) for the rationale and
+            // json_set() write contract. Same gating as route_token /
+            // local_alias above: only run when provider_accounts exists.
+            ensure_column(
+                conn,
+                "provider_accounts",
+                "extra",
+                "ALTER TABLE provider_accounts ADD COLUMN extra TEXT",
             )?;
         }
 
@@ -601,6 +647,37 @@ pub mod v1_0_0_baseline {
                 upstreams TEXT NOT NULL,
                 app_kind TEXT NOT NULL DEFAULT 'third-party',
                 follow_user_active INTEGER NOT NULL DEFAULT 0,
+                -- B-mode (credential-mode-architecture SPEC §1.1 + §3.1):
+                --   bound_alias = snapshot of the active key at install time;
+                --   first-party apps that want a stable identity reference
+                --   (without following later aikey use changes) set this and
+                --   clear follow_user_active. Mutex with follow_user_active
+                --   enforced by ensure_first_party_app_keys self-heal +
+                --   aikey app create/update command validation (see SPEC §3.2).
+                --   Not a DDL CHECK because retrofitting one on an existing
+                --   table requires a costly table rebuild and the SPEC
+                --   explicitly assigns enforcement to the migrations + CLI
+                --   layer.
+                bound_alias TEXT,
+                bound_at INTEGER,
+                -- D-mode (observe_user_active, SPEC §1.4 / §3.1):
+                --   observe_streams      — JSON array, simple-string or
+                --                          object form (payload_level).
+                --   observe_consent_*    — audit fields for payload_level=full.
+                observe_streams TEXT,
+                observe_consent_at INTEGER,
+                observe_consent_email TEXT,
+                -- E-mode (sync_filter, SPEC §1.5.4):
+                --   filter_stages         — JSON array of stage names
+                --                           (pre_forward today). Non-empty
+                --                           rows return 501 today (no impl);
+                --                           shipped now to lock the contract
+                --                           for P4.
+                --   filter_priority       — chain ordering; smaller = earlier.
+                --   filter_timeout_policy — fail_open | fail_closed.
+                filter_stages TEXT,
+                filter_priority INTEGER,
+                filter_timeout_policy TEXT,
                 requested_permissions TEXT,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
@@ -610,6 +687,17 @@ pub mod v1_0_0_baseline {
             [],
         )
         .map_err(|e| format!("Failed to ensure app_records: {}", e))?;
+
+        // No ALTER TABLE retrofit for `app_records` columns: this table was
+        // added 2026-05-20 and is still pre-GA, so the project convention
+        // (see `entries` ALTER history vs the Kimi-split fold note at the
+        // top of this file) is "modify CREATE TABLE in-place, dev users
+        // uninstall+reinstall". The B/D/E columns sit in the CREATE TABLE
+        // statement above as the single source of truth.
+        //
+        // Drift防退化: keep the CREATE TABLE column list in lockstep with
+        // the Go side's pragma_table_info fence test
+        // (app_pipeline_tables_created_by_baseline below).
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS app_keys (
@@ -651,7 +739,288 @@ pub mod v1_0_0_baseline {
             conn.execute(ddl, [])
                 .map_err(|e| format!("Failed to ensure index {}: {}", name, e))?;
         }
+
+        // Zero-config first-party app registration. The `degrade-detector`
+        // app's Bearer is a compiled-in CONSTANT, not a per-install
+        // random — every vault gets the same row on baseline upgrade.
+        //
+        // Why: trust-local was repeatedly losing its env-injected Bearer
+        // across launchd restarts (no plist mechanism to persist it),
+        // causing silent Check failures. Decision 2026-05-22 (user):
+        // 稳定性 > Bearer 唯一性. The Bearer is NOT a secret —
+        // aikey-proxy is loopback-only and vault holds the actual
+        // upstream credentials. See requirements/
+        // 2026-05-22-l3-rhythm-signal-design-rules.md §1.3.
+        //
+        // Coupling: the constant below MUST match
+        // `degrade-detector/server_local/services/check_orchestrator.py
+        // ::FIRST_PARTY_APP_KEY`. Renaming requires updating both.
+        ensure_first_party_app_keys(conn)?;
         Ok(())
+    }
+
+    /// First-party Bearer registered by baseline upgrade. Same on every
+    /// install (zero-config trust-local). Human-readable for log
+    /// inspection — does NOT match the strict `aikey_app_<64 hex>` form
+    /// that aikey-proxy's ClassifyToken normally enforces.
+    ///
+    /// Acceptance: aikey-proxy explicitly whitelists this exact value in
+    /// `firstPartyAppBearerWhitelist` across 3 packages (dispatch /
+    /// vault / supervisor). Vault Registry loader + proxy dispatch both
+    /// short-circuit the strict-form check when the token matches the
+    /// whitelist. See SPEC §1.3 for the security model.
+    ///
+    /// Twin constant lives at
+    /// `degrade-detector/server_local/services/check_orchestrator.py::FIRST_PARTY_APP_KEY`;
+    /// both must change together (plus all 3 Go whitelist entries).
+    pub(super) const DEGRADE_DETECTOR_FIRST_PARTY_BEARER: &str =
+        "aikey_app_internal_degrade_detector_v1";
+
+    /// Ensure the first-party `degrade-detector` app + Bearer exists in
+    /// vault AND is in `status='active'`.
+    ///
+    /// **Self-healing behavior** (2026-05-23 fix): if a prior
+    /// `aikey app rotate degrade-detector` or `aikey app revoke
+    /// degrade-detector` marked the constant Bearer row `status='revoked'`,
+    /// this function flips it back to `'active'` on every aikey-cli
+    /// command run. Otherwise the zero-config zero-touch promise breaks
+    /// the moment a user runs any bulk-revoke command — they'd then
+    /// need to know there's an internal magic key to manually revive.
+    ///
+    /// Idempotent: when the row already exists with `status='active'`,
+    /// the UPDATE matches zero rows changed (no-op) and INSERT OR IGNORE
+    /// keeps the existing PK / route_token.
+    fn ensure_first_party_app_keys(conn: &Connection) -> Result<(), String> {
+        // app_records row — INSERT OR IGNORE keeps any existing row's
+        // app_kind / follow_user_active untouched (idempotent on PK=slug).
+        conn.execute(
+            "INSERT OR IGNORE INTO app_records
+             (slug, name, vendor, upstreams, app_kind, follow_user_active)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "degrade-detector",
+                // User-facing display name follows the project naming
+                // convention pinned 2026-05-23 in trust-check/index.tsx:
+                // user-facing UI uses "Trust Check" (action name + sidebar
+                // + route + CSS namespace). "Degrade Detector" stays as
+                // the marketing / repo-path / manifest name only. This
+                // INSERT is the "vault row exists" fallback for paths
+                // where install_service.sh's upsert never runs (vault
+                // locked, CLI missing, etc.) — must match the install
+                // script's --name "Trust Check" to avoid display drift.
+                "Trust Check",
+                "AiKey Labs",
+                r#"["anthropic"]"#, // JSON array, matches register/list code
+                "first-party",
+                1_i64,              // follow_user_active = true
+            ],
+        )
+        .map_err(|e| format!("ensure first-party app_record: {}", e))?;
+
+        // 1. INSERT (or skip if already there).
+        conn.execute(
+            "INSERT OR IGNORE INTO app_keys
+             (key_id, app_slug, route_token, status)
+             VALUES (?1, ?2, ?3, 'active')",
+            params![
+                "internal-degrade-detector-v1",
+                "degrade-detector",
+                DEGRADE_DETECTOR_FIRST_PARTY_BEARER,
+            ],
+        )
+        .map_err(|e| format!("ensure first-party app_key (insert): {}", e))?;
+
+        // 2. Self-heal: if the row was previously revoked / paused (e.g.
+        // by `aikey app rotate degrade-detector` bulk-revoking all
+        // existing keys before issuing a new one), flip it back to
+        // active. The constant Bearer is the zero-config promise; users
+        // shouldn't have to know it exists to "un-revoke" it.
+        conn.execute(
+            "UPDATE app_keys SET status='active'
+             WHERE key_id=?1 AND status != 'active'",
+            params!["internal-degrade-detector-v1"],
+        )
+        .map_err(|e| format!("ensure first-party app_key (self-heal): {}", e))?;
+
+        // 2b. D-mode default subscription (2026-05-23, SPEC §3.3):
+        //
+        // degrade-detector's L1 rhythm fingerprint is sourced from the
+        // user_chat event stream (real conversations the user has via
+        // their primary credential), so the first-party row must always
+        // declare that subscription. Self-heal pattern matches the
+        // B-mode upgrade below — set only when observe_streams is NULL
+        // (covers fresh-install + pre-P3 retrofit), never overwrite a
+        // user-customised value.
+        //
+        // payload_level defaults to "metadata"; observe_consent_* stay
+        // NULL because metadata-level subscriptions don't carry body
+        // bytes (SPEC §1.4.2). If a future Agent (e.g., compliance)
+        // wants `full` body, it must go through `aikey app create
+        // --observe-full <stream>` which prompts the user explicitly.
+        conn.execute(
+            "UPDATE app_records
+                SET observe_streams = '[\"user_chat\"]',
+                    updated_at      = strftime('%s', 'now')
+              WHERE slug='degrade-detector'
+                AND observe_streams IS NULL",
+            [],
+        )
+        .map_err(|e| format!("ensure first-party observe_streams: {}", e))?;
+
+        // 3. B-mode self-upgrade — DISABLED 2026-05-23 ("Mode A trial"):
+        //
+        // Per product decision 2026-05-23, the Trust Check (degrade-detector)
+        // app reverts to Mode A so its bound credential dynamically follows
+        // `aikey use` instead of staying snapshotted. The day-to-day UX
+        // win is "the binding shown on /user/apps matches the key the user
+        // currently has active". Trade-off: SPEC §6.1's "alias↔active
+        // label deception" guard is partially re-introduced for App pipeline
+        // traffic (the manual Check button is unaffected because it uses
+        // Mode C `/probe/<alias>/v1/messages` which carries the alias
+        // explicitly — see degrade-detector/server_local/services/
+        // check_orchestrator.py:312-318). When M2 lands real L3 cascade
+        // verify that calls `/apps/degrade-detector/v1/messages`, the L3
+        // baseline-stability question must be revisited — either pin Mode
+        // B back on, or design L3 to tolerate active-key switches.
+        //
+        // Why we ENFORCE Mode A instead of just not running the upgrade:
+        // existing vaults that already went through the now-disabled
+        // upgrade path carry stale `bound_alias` values. The proxy
+        // resolver short-circuits on non-empty bound_alias even when
+        // follow_user_active=1, so we MUST clear bound_alias to actually
+        // reach the default-profile lookup. Idempotent: rows already in
+        // A mode with NULL bound_alias are a no-op.
+        enforce_mode_a_for_degrade_detector(conn)?;
+
+        Ok(())
+    }
+
+    /// 2026-05-23 — Mode A enforcement for degrade-detector. Counter-
+    /// migration to `self_upgrade_degrade_detector_to_b_mode` (now
+    /// disabled): flip any row in Mode B back to Mode A. Must run on
+    /// every CLI startup so a stray `aikey app register --first-party
+    /// --follow-user-active=false` re-create can't silently land users
+    /// back in Mode B.
+    fn enforce_mode_a_for_degrade_detector(conn: &Connection) -> Result<(), String> {
+        conn.execute(
+            "UPDATE app_records
+                SET follow_user_active = 1,
+                    bound_alias        = NULL,
+                    bound_at           = NULL,
+                    updated_at         = strftime('%s', 'now')
+              WHERE slug='degrade-detector'
+                AND (follow_user_active = 0 OR bound_alias IS NOT NULL)",
+            [],
+        )
+        .map_err(|e| format!("enforce Mode A for degrade-detector: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Try to flip the degrade-detector app_records row from A mode
+    /// (follow_user_active=1, bound_alias IS NULL) to B mode by
+    /// snapshotting the user's current active credential.
+    ///
+    /// Returns Ok(()) in three cases:
+    ///   - row not in A mode (already B mode, or row absent) → no-op
+    ///   - no active key set yet → no-op (will retry next time)
+    ///   - active key is a team key → no-op (B mode only supports
+    ///     personal + OAuth aliases; team-active users stay in A mode)
+    ///   - upgrade performed → row patched, returns Ok
+    ///
+    /// Surfaces error only on real DB failures.
+    fn self_upgrade_degrade_detector_to_b_mode(conn: &Connection) -> Result<(), String> {
+        // Read the current row state. If the row is not in A mode (i.e.
+        // already in B mode, or revoked/missing), there's nothing to do.
+        let in_legacy_a_mode: bool = conn
+            .query_row(
+                "SELECT 1 FROM app_records
+                  WHERE slug='degrade-detector'
+                    AND follow_user_active=1
+                    AND bound_alias IS NULL",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !in_legacy_a_mode {
+            return Ok(());
+        }
+
+        // Resolve the user's active credential to a probe-pipeline-style
+        // alias name. None means "no active set" or "team-active" — both
+        // map to "stay in A mode" (no-op).
+        let Some(alias_name) = resolve_active_alias_for_b_mode(conn)? else {
+            return Ok(());
+        };
+
+        conn.execute(
+            "UPDATE app_records
+                SET follow_user_active = 0,
+                    bound_alias = ?1,
+                    bound_at = strftime('%s', 'now'),
+                    updated_at = strftime('%s', 'now')
+              WHERE slug='degrade-detector'
+                AND follow_user_active = 1
+                AND bound_alias IS NULL",
+            params![alias_name],
+        )
+        .map_err(|e| format!("upgrade degrade-detector to B mode: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Read the user's current active credential and return its alias
+    /// form (suitable for vault.GetAliasCredential lookup in aikey-proxy).
+    ///
+    /// Maps:
+    ///   - active_key_type='personal'               → active_key_ref (already an alias)
+    ///   - active_key_type='personal_oauth_account' → provider_accounts.local_alias (if set, non-empty)
+    ///                                                else display_identity
+    ///   - active_key_type='team'                   → None (team aliases unsupported)
+    ///   - missing config rows / unknown type       → None
+    fn resolve_active_alias_for_b_mode(conn: &Connection) -> Result<Option<String>, String> {
+        let read_text = |key: &str| -> Result<Option<String>, String> {
+            conn.query_row(
+                "SELECT CAST(value AS TEXT) FROM config WHERE key=?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(format!("read config {}: {}", key, other)),
+            })
+        };
+
+        let (Some(key_type), Some(key_ref)) =
+            (read_text("active_key_type")?, read_text("active_key_ref")?)
+        else {
+            return Ok(None);
+        };
+
+        match key_type.as_str() {
+            "personal" => Ok(Some(key_ref)),
+            "personal_oauth_account" => {
+                let alias: Option<String> = conn
+                    .query_row(
+                        "SELECT COALESCE(NULLIF(local_alias, ''), display_identity)
+                           FROM provider_accounts
+                          WHERE provider_account_id = ?1",
+                        params![key_ref],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                        other => Err(format!(
+                            "lookup oauth alias for account_id={}: {}",
+                            key_ref, other
+                        )),
+                    })?;
+                Ok(alias.filter(|s| !s.is_empty()))
+            }
+            // team / unknown → stay in A mode
+            _ => Ok(None),
+        }
     }
 
     /// One-time migration: carry legacy active_key_config into provider
@@ -1001,11 +1370,25 @@ mod tests {
                 "upstreams",
                 "app_kind",
                 "follow_user_active",
+                // 2026-05-23 P2: B-mode columns (credential-mode-architecture SPEC §3.1).
+                "bound_alias",
+                "bound_at",
+                // 2026-05-23 P3: D-mode columns (observe_user_active, SPEC §1.4 / §3.1).
+                "observe_streams",
+                "observe_consent_at",
+                "observe_consent_email",
+                // 2026-05-23 P3: E-mode columns — protocol-contract only,
+                // proxy returns 501 when any row has filter_stages set
+                // (SPEC §1.5.7). Columns ship now to lock the schema
+                // before the implementation lands in P4.
+                "filter_stages",
+                "filter_priority",
+                "filter_timeout_policy",
                 "requested_permissions",
                 "created_at",
                 "updated_at",
             ],
-            "app_records columns drifted — 2026-05-21 Phase 2 schema (protocols → upstreams) 不再一致"
+            "app_records columns drifted — keep in lockstep with credential-mode-architecture SPEC §3.1"
         );
 
         let app_keys_cols: Vec<String> = conn
@@ -1039,6 +1422,491 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx_count, 3, "app_keys must have 3 named indexes");
+    }
+
+    /// Zero-config first-party Bearer is registered by baseline upgrade.
+    /// The `degrade-detector` app + its compiled-in Bearer must exist
+    /// in vault after `upgrade_all()` so trust-local can talk to
+    /// aikey-proxy without env-injection ceremony. See SPEC
+    /// requirements/2026-05-22-l3-rhythm-signal-design-rules.md §1.3
+    /// and the matching Python constant in trust-local.
+    #[test]
+    fn first_party_app_keys_registered_by_baseline() {
+        let conn = fresh_vault();
+
+        // app_records row present, marked first-party + follow_user_active.
+        let (slug, name, app_kind, follow): (String, String, String, i64) = conn
+            .query_row(
+                "SELECT slug, name, app_kind, follow_user_active
+                   FROM app_records WHERE slug='degrade-detector'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("degrade-detector app_records row missing after baseline upgrade");
+        assert_eq!(slug, "degrade-detector");
+        assert_eq!(name, "Trust Check");
+        assert_eq!(app_kind, "first-party");
+        assert_eq!(follow, 1);
+
+        // app_keys row present, status=active, with the compiled-in
+        // Bearer constant. The route_token MUST equal the Python
+        // FIRST_PARTY_APP_KEY in
+        // degrade-detector/server_local/services/check_orchestrator.py
+        // — drift here breaks zero-config trust-local.
+        let (route_token, status): (String, String) = conn
+            .query_row(
+                "SELECT route_token, status FROM app_keys
+                  WHERE app_slug='degrade-detector'
+                    AND key_id='internal-degrade-detector-v1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("first-party Bearer row missing after baseline upgrade");
+        assert_eq!(route_token, "aikey_app_internal_degrade_detector_v1");
+        assert_eq!(status, "active");
+        // Format note: this value DOES NOT match the strict
+        // `aikey_app_<64 hex>` form — it relies on aikey-proxy's
+        // `firstPartyAppBearerWhitelist` to be accepted. The 3 Go
+        // whitelist entries (proxy/dispatch, vault/route_token_form,
+        // supervisor/team_token_normalize) and the Python twin in
+        // check_orchestrator.py must all carry this exact string.
+        assert!(route_token.starts_with("aikey_app_"));
+    }
+
+    /// Self-heal: if the constant Bearer row is `status='revoked'`
+    /// (e.g. after `aikey app rotate degrade-detector` or a manual
+    /// `aikey app revoke`), the next baseline-upgrade run MUST flip
+    /// it back to `'active'`. Zero-config promise: users never need
+    /// to know this internal key exists.
+    ///
+    /// Origin: 2026-05-23 — `aikey app rotate` bulk-revoked all 17
+    /// degrade-detector app_keys including ours, breaking the Check
+    /// button with APP_KEY_NOT_FOUND. INSERT OR IGNORE skipped the
+    /// revoked row, leaving it inactive.
+    #[test]
+    fn first_party_app_key_self_heals_if_revoked() {
+        let conn = fresh_vault();
+
+        // Pre-condition: baseline already left the row in active state.
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM app_keys WHERE key_id='internal-degrade-detector-v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+
+        // Simulate `aikey app rotate / revoke` flipping it.
+        conn.execute(
+            "UPDATE app_keys SET status='revoked'
+             WHERE key_id='internal-degrade-detector-v1'",
+            [],
+        )
+        .unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM app_keys WHERE key_id='internal-degrade-detector-v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "revoked", "fixture step failed");
+
+        // Re-run baseline upgrade.
+        super::upgrade_all(&conn).unwrap();
+
+        // Row should be back to active.
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM app_keys WHERE key_id='internal-degrade-detector-v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "active",
+            "ensure_first_party_app_keys must self-heal revoked rows"
+        );
+    }
+
+    /// Re-running baseline upgrade must NOT clobber existing app_keys —
+    /// idempotent INSERT OR IGNORE. If a user has rotated to a custom
+    /// Bearer, that row stays alongside the constant.
+    #[test]
+    fn first_party_app_keys_idempotent_across_runs() {
+        let conn = fresh_vault();
+
+        // First baseline upgrade ran via fresh_vault. Add a synthetic
+        // "custom" Bearer row (mimicking a `aikey app register` from
+        // before this migration shipped) and re-run upgrade.
+        conn.execute(
+            "INSERT INTO app_keys (key_id, app_slug, route_token, status)
+             VALUES ('synthetic-rotated', 'degrade-detector', 'aikey_app_synthetic', 'active')",
+            [],
+        )
+        .unwrap();
+
+        // Re-run baseline upgrade — must be a no-op for both rows.
+        super::upgrade_all(&conn).unwrap();
+
+        // Both rows still present.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM app_keys WHERE app_slug='degrade-detector'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "constant + synthetic Bearers must coexist");
+    }
+
+    // ---------------------------------------------------------------------
+    // P2 mode B self-upgrade tests (2026-05-23, credential-mode-architecture
+    // SPEC §3.3 / §6.1). The degrade-detector row must auto-flip from A
+    // mode (follow_user_active=1, bound_alias=NULL) to B mode whenever
+    // a personal or OAuth active credential is set — but stay in A mode
+    // when there's no active or the active is a team key.
+    // ---------------------------------------------------------------------
+
+    /// No-active case: a brand-new vault with `aikey use` never run leaves
+    /// degrade-detector in A mode. The self-upgrade is a no-op (will retry
+    /// next CLI run, after the first `aikey use`).
+    #[test]
+    fn degrade_detector_stays_in_a_mode_when_no_active() {
+        let conn = fresh_vault();
+
+        // No active_key_* rows inserted → upgrade_all is essentially a re-run.
+        super::upgrade_all(&conn).unwrap();
+
+        let (follow, bound): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT follow_user_active, bound_alias FROM app_records WHERE slug='degrade-detector'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(follow, 1, "no active → must stay in A mode (follow=1)");
+        assert!(bound.is_none(), "no active → bound_alias must be NULL");
+    }
+
+    /// Personal-active case: `aikey use my-personal-key` (active_key_type=personal,
+    /// active_key_ref=alias) — self-upgrade picks the alias verbatim as
+    /// bound_alias and flips to B mode.
+    #[test]
+    #[ignore = "Mode A trial 2026-05-23: B-mode self-upgrade currently disabled — see migrations.rs enforce_mode_a_for_degrade_detector. Re-enable when M2 L3 cascade lands and baseline stability needs Mode B back."]
+    fn degrade_detector_upgrades_to_b_mode_for_personal_active() {
+        let conn = fresh_vault();
+
+        // Simulate `aikey use my-personal-key` writes.
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_type', 'personal')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_ref', 'my-personal-key')",
+            [],
+        )
+        .unwrap();
+
+        super::upgrade_all(&conn).unwrap();
+
+        let (follow, bound, bound_at): (i64, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT follow_user_active, bound_alias, bound_at FROM app_records WHERE slug='degrade-detector'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(follow, 0, "personal active → must flip to B mode (follow=0)");
+        assert_eq!(
+            bound.as_deref(),
+            Some("my-personal-key"),
+            "bound_alias must be the personal alias verbatim"
+        );
+        assert!(bound_at.is_some(), "bound_at must be set when transitioning to B mode");
+    }
+
+    /// OAuth-active case: active_key_ref is the provider_account_id, not the
+    /// alias. The self-upgrade must dereference it to local_alias (or
+    /// display_identity fallback) so bound_alias is suitable for
+    /// vault.GetAliasCredential lookup in aikey-proxy.
+    #[test]
+    #[ignore = "Mode A trial 2026-05-23: see degrade_detector_upgrades_to_b_mode_for_personal_active"]
+    fn degrade_detector_upgrades_to_b_mode_for_oauth_active_uses_display_identity() {
+        let conn = fresh_vault();
+
+        // Seed an OAuth account row + corresponding active config.
+        conn.execute(
+            "INSERT INTO provider_accounts \
+             (provider_account_id, provider, auth_type, display_identity, status) \
+             VALUES ('acct-abc', 'anthropic', 'oauth', 'user@host.com', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_type', 'personal_oauth_account')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_ref', 'acct-abc')",
+            [],
+        )
+        .unwrap();
+
+        super::upgrade_all(&conn).unwrap();
+
+        let bound: Option<String> = conn
+            .query_row(
+                "SELECT bound_alias FROM app_records WHERE slug='degrade-detector'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bound.as_deref(),
+            Some("user@host.com"),
+            "OAuth active → bound_alias must dereference to display_identity (suitable for GetAliasCredential)"
+        );
+    }
+
+    /// OAuth-active with local_alias rename takes precedence over display_identity.
+    #[test]
+    #[ignore = "Mode A trial 2026-05-23: see degrade_detector_upgrades_to_b_mode_for_personal_active"]
+    fn degrade_detector_upgrades_to_b_mode_oauth_local_alias_wins() {
+        let conn = fresh_vault();
+
+        conn.execute(
+            "INSERT INTO provider_accounts \
+             (provider_account_id, provider, auth_type, display_identity, local_alias, status) \
+             VALUES ('acct-xyz', 'anthropic', 'oauth', 'noisy@email.com', 'my-renamed', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_type', 'personal_oauth_account')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_ref', 'acct-xyz')",
+            [],
+        )
+        .unwrap();
+
+        super::upgrade_all(&conn).unwrap();
+
+        let bound: Option<String> = conn
+            .query_row(
+                "SELECT bound_alias FROM app_records WHERE slug='degrade-detector'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bound.as_deref(),
+            Some("my-renamed"),
+            "local_alias must win over display_identity when set"
+        );
+    }
+
+    /// Team-active case: bound_alias requires GetAliasCredential support,
+    /// which only resolves personal + OAuth today. Team users stay in A mode
+    /// — graceful fallback rather than picking a non-resolvable alias.
+    #[test]
+    fn degrade_detector_stays_in_a_mode_for_team_active() {
+        let conn = fresh_vault();
+
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_type', 'team')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_ref', 'vk-team-123')",
+            [],
+        )
+        .unwrap();
+
+        super::upgrade_all(&conn).unwrap();
+
+        let (follow, bound): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT follow_user_active, bound_alias FROM app_records WHERE slug='degrade-detector'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(follow, 1, "team active → stay in A mode (follow=1)");
+        assert!(bound.is_none(), "team active → bound_alias must remain NULL");
+    }
+
+    /// Mode A trial 2026-05-23: enforce_mode_a_for_degrade_detector
+    /// must keep degrade-detector in A mode (follow=1, bound_alias=NULL)
+    /// even when an active credential is set — explicit counter-test to
+    /// the (now-ignored) `degrade_detector_upgrades_to_b_mode_*` cases.
+    #[test]
+    fn degrade_detector_stays_in_a_mode_under_mode_a_trial() {
+        let conn = fresh_vault();
+
+        // Simulate `aikey use my-personal-key` — under the legacy B-mode
+        // self-upgrade this would have flipped to follow=0 + bound_alias.
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_type', 'personal')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_ref', 'my-personal-key')",
+            [],
+        )
+        .unwrap();
+        super::upgrade_all(&conn).unwrap();
+
+        // Second run simulates a subsequent CLI invocation after the user
+        // switched active to a different key. Mode A enforcement must keep
+        // the row in A regardless of intervening state.
+        conn.execute(
+            "UPDATE config SET value='other-key' WHERE key='active_key_ref'",
+            [],
+        )
+        .unwrap();
+        super::upgrade_all(&conn).unwrap();
+
+        let (follow, bound, bound_at): (i64, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT follow_user_active, bound_alias, bound_at FROM app_records WHERE slug='degrade-detector'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(follow, 1, "Mode A trial: follow_user_active must remain 1");
+        assert!(bound.is_none(), "Mode A trial: bound_alias must be NULL so proxy resolver falls through to default profile");
+        assert!(bound_at.is_none(), "Mode A trial: bound_at must be cleared when bound_alias is cleared");
+    }
+
+    /// Idempotence: once a row is in B mode, subsequent upgrade_all runs
+    /// MUST NOT overwrite bound_alias even if active has changed since.
+    /// The user's snapshot is sticky — that's the whole point of B mode.
+    #[test]
+    #[ignore = "Mode A trial 2026-05-23: see degrade_detector_upgrades_to_b_mode_for_personal_active"]
+    fn degrade_detector_b_mode_sticky_across_runs() {
+        let conn = fresh_vault();
+
+        // First active → upgrade to B mode with bound_alias='first-key'.
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_type', 'personal')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('active_key_ref', 'first-key')",
+            [],
+        )
+        .unwrap();
+        super::upgrade_all(&conn).unwrap();
+
+        // Simulate `aikey use second-key` → active_key_ref changes.
+        conn.execute(
+            "UPDATE config SET value='second-key' WHERE key='active_key_ref'",
+            [],
+        )
+        .unwrap();
+        super::upgrade_all(&conn).unwrap();
+
+        let bound: Option<String> = conn
+            .query_row(
+                "SELECT bound_alias FROM app_records WHERE slug='degrade-detector'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bound.as_deref(),
+            Some("first-key"),
+            "bound_alias must stay sticky on subsequent runs — re-binding requires explicit aikey app update"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // P3 mode D + E schema tests (2026-05-23, credential-mode-architecture
+    // SPEC §1.4 / §1.5 / §3.1). The columns ship on every install and the
+    // degrade-detector row gets a default ["user_chat"] subscription so
+    // its L1 rhythm fingerprint pipeline has a guaranteed data source.
+    // ---------------------------------------------------------------------
+
+    /// Fresh install: degrade-detector subscribes to user_chat by default
+    /// (metadata-level — no consent fields needed).
+    #[test]
+    fn degrade_detector_default_subscribes_to_user_chat() {
+        let conn = fresh_vault();
+
+        let (streams, consent_at, consent_email): (Option<String>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT observe_streams, observe_consent_at, observe_consent_email
+                   FROM app_records WHERE slug='degrade-detector'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            streams.as_deref(),
+            Some(r#"["user_chat"]"#),
+            "first-party self-heal must default-subscribe to user_chat (metadata-level)"
+        );
+        assert!(consent_at.is_none(), "metadata-only subscription must not require consent");
+        assert!(consent_email.is_none(), "metadata-only subscription must not require consent");
+    }
+
+    /// Stickiness: if the user customises observe_streams (e.g. adds the
+    /// probe stream too), the self-heal must NOT overwrite it on every
+    /// CLI run.
+    #[test]
+    fn degrade_detector_observe_streams_sticky_across_runs() {
+        let conn = fresh_vault();
+
+        // User manually expands the subscription.
+        conn.execute(
+            r#"UPDATE app_records SET observe_streams = '["user_chat","probe"]' WHERE slug='degrade-detector'"#,
+            [],
+        )
+        .unwrap();
+
+        super::upgrade_all(&conn).unwrap();
+
+        let streams: Option<String> = conn
+            .query_row(
+                "SELECT observe_streams FROM app_records WHERE slug='degrade-detector'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            streams.as_deref(),
+            Some(r#"["user_chat","probe"]"#),
+            "self-heal must not overwrite a user-customised observe_streams"
+        );
+    }
+
+    /// E-mode contract columns exist and default to NULL (no app is a
+    /// filter app on fresh install).
+    #[test]
+    fn e_mode_contract_columns_default_null() {
+        let conn = fresh_vault();
+
+        let (stages, priority, timeout): (Option<String>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT filter_stages, filter_priority, filter_timeout_policy
+                   FROM app_records WHERE slug='degrade-detector'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(stages.is_none(), "filter_stages must default NULL — degrade-detector is NOT a filter app");
+        assert!(priority.is_none(), "filter_priority must default NULL when filter_stages is NULL");
+        assert!(timeout.is_none(), "filter_timeout_policy must default NULL when filter_stages is NULL");
     }
 
     /// ON DELETE CASCADE: deleting an app_records row must cascade-delete

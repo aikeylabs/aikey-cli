@@ -261,6 +261,12 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
                 "created_at": 0,
                 "last_used_at": serde_json::Value::Null,
                 "use_count": 0,
+                // 2026-05-22: extra JSON blob surfaced from
+                // managed_virtual_keys_cache.extra. Web reads
+                // `record.extra?.last_test` for the Last test column.
+                // Cloned (rather than moved) because t is iterated via
+                // .map(|t| ...) and `last_test` lives behind a Ref.
+                "extra": t.extra.clone(),
             })
         })
         .collect()
@@ -638,6 +644,10 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
             "route_token": m.route_token,
             "last_used_at": m.last_used_at,
             "use_count": m.use_count.unwrap_or(0),
+            // 2026-05-22: generic extension JSON blob — see SecretMetadata::extra.
+            // Web reads `record.extra?.last_test` for the connectivity-test
+            // snapshot; any future subkey (favourites, tags, …) lands here too.
+            "extra": m.extra,
             // in_use_for: per-(record, provider) — empty list means not bound
             // anywhere; non-empty list = active for those specific providers.
             // in_use: bool kept for back-compat with older Web bundles, derived
@@ -788,6 +798,8 @@ fn handle_list_oauth(env: StdinEnvelope) {
             "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
             "route_url": route_url_for(&a.provider),
             "route_token": route_token,
+            // 2026-05-22: same contract as list_personal — see SecretMetadata::extra.
+            "extra": a.extra,
         })
     }).collect();
 
@@ -917,6 +929,11 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "secret_prefix": serde_json::Value::Null,
                     "secret_suffix": serde_json::Value::Null,
                     "secret_len": serde_json::Value::Null,
+                    // 2026-05-22: `extra` is plaintext metadata (status +
+                    // timestamp + error_code under $.last_test), safe in
+                    // locked mode so the list view shows "Last test" even
+                    // before unlock.
+                    "extra": m.extra,
                 }));
             }
         }
@@ -979,6 +996,9 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     // an opaque bearer the proxy accepts; emitting null preserves
                     // the TS shape contract `route_token: string | null`.
                     "route_token": serde_json::Value::Null,
+                    // 2026-05-22: same rationale as personal above —
+                    // plaintext metadata, safe in locked mode.
+                    "extra": a.extra,
                 }));
             }
             accounts.len()

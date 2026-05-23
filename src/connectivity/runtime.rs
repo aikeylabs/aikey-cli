@@ -389,8 +389,9 @@ pub fn test_provider_connectivity(
     provider_code: &str,
     base_url: &str,
     api_key: &str,
+    kind: CredentialKind,
 ) -> ConnectivityResult {
-    test_provider_connectivity_with_progress(provider_code, base_url, api_key, |_, _| {})
+    test_provider_connectivity_with_progress(provider_code, base_url, api_key, kind, |_, _| {})
 }
 
 /// Same probe pipeline as `test_provider_connectivity` but emits a
@@ -406,6 +407,7 @@ pub fn test_provider_connectivity_with_progress<F>(
     provider_code: &str,
     base_url: &str,
     api_key: &str,
+    kind: CredentialKind,
     mut on_phase: F,
 ) -> ConnectivityResult
 where
@@ -552,7 +554,33 @@ where
             // red and points the operator at the actual fix.
             let is_local_registry_miss = code == 401
                 && body.as_deref().map(body_indicates_registry_miss).unwrap_or(false);
-            (!is_local_registry_miss, Some(code), body)
+            // 404 handling — TWO subclasses, treated differently:
+            //
+            //   (a) Upstream-business 404: JSON envelope like
+            //       `{"error":{"type":"not_found_error",...}}` — the upstream
+            //       reached us but the resource (model/route/etc.) is gone.
+            //       Surfaces as a genuine misconfiguration (e.g. wrong
+            //       base_url, deleted upstream route). Vault page used to
+            //       paint "API OK ✓" here behind a green chip; the 5/22
+            //       guard correctly turns this into red fail.
+            //
+            //   (b) Gateway-layer 404: plain "404 page not found" body from
+            //       Go's net/http when the gateway doesn't register that
+            //       specific path. The gateway IS alive — it just only
+            //       proxies POST /v1/messages, not GET /v1/models. Aicoding
+            //       and other anthropic-compatible byok proxies fall here.
+            //       This is transport-OK; keep it green so user isn't
+            //       misled into thinking the credential is broken.
+            //
+            // Bugfix 20260523 round-2 (strict-allowlist version):
+            // keep the 5/22 main-path guard intact, but exempt a small
+            // explicit allowlist of literal gateway-layer 404 bodies
+            // (see `is_known_benign_gateway_404` above). This is a
+            // **special case**, not a generalization — DO NOT inline,
+            // DO NOT broaden the match.
+            let is_path_missing = code == 404
+                && !is_known_benign_gateway_404(code, body.as_deref());
+            (!(is_local_registry_miss || is_path_missing), Some(code), body)
         }
         Err(_) => (false, None, None),
     };
@@ -575,42 +603,17 @@ where
     // Minimal completion request (max_tokens=1). Short-circuit on API
     // failure prevents this from hammering an upstream that just rejected
     // our auth — some providers count that against rate limits.
-    // Why ?beta=true: Claude OAuth API requires this query param. Without it,
-    // Anthropic returns 429 business rejection (not real rate limit).
-    // `is_via_proxy` is the same determination as `via_aikey_proxy` above;
-    // kept as a local for readability where it drives persona tweaks.
-    let is_via_proxy = via_aikey_proxy;
-
-    let (chat_url, body) = if provider_code == "openai" && is_via_proxy {
-        // Codex OAuth: uses Responses API via chatgpt.com/backend-api/codex.
-        // Required fields: model=gpt-5.4, instructions, input=array, store=false, stream=true
-        // Why gpt-5.4: ChatGPT accounts only support Codex-specific models (not gpt-4o-mini).
-        // Why stream=true + store=false: Codex API enforces these for ChatGPT accounts.
-        // Ref: verified 2026-04-16 against chatgpt.com/backend-api/codex/responses
-        let url = format!("{}/responses", base_url.trim_end_matches('/'));
-        let body = serde_json::json!({
-            "model": "gpt-5.4",
-            "instructions": "Say hi.",
-            "input": [{"role": "user", "content": "hi"}],
-            "store": false,
-            "stream": true
-        });
-        (url, body)
-    } else if provider_code == "anthropic" && is_via_proxy {
-        // Claude OAuth: requires ?beta=true + metadata.user_id
-        let url = format!("{}{}?beta=true", base_url.trim_end_matches('/'), chat_suffix(provider_code, base_url));
-        let mut body = chat_body(provider_code);
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("metadata".to_string(), serde_json::json!({"user_id": "aikey_doctor_probe"}));
-        }
-        (url, body)
-    } else if provider_code == "google" {
-        let url = format!("{}{}?key={}", base_url.trim_end_matches('/'), chat_suffix(provider_code, base_url), api_key);
-        (url, chat_body(provider_code))
-    } else {
-        let url = format!("{}{}", base_url.trim_end_matches('/'), chat_suffix(provider_code, base_url));
-        (url, chat_body(provider_code))
-    };
+    //
+    // Bugfix 20260523: previously this branch used `is_via_proxy` (a
+    // proxy-variable that's TRUE for ANY credential routed through
+    // aikey-proxy) as a stand-in for "is OAuth flow". That misjudged
+    // personal API keys whose base_url legitimately points at the local
+    // proxy (e.g. routed to a custom anthropic gateway like aicoding) —
+    // they got the OAuth-only `?beta=true` query and the gateway returned
+    // 404. Fix: drive protocol addons off `kind == OAuth` via a config
+    // table (see protocol_addons.rs), kept as the single source of truth
+    // for future proxy outbound-transform middleware too.
+    let (chat_url, body) = build_chat_probe(provider_code, base_url, api_key, kind);
     let (chat_auth_key, chat_auth_val) = probe_auth(provider_code, api_key);
 
     let chat_agent = build_proxy_aware_agent(Duration::from_secs(15));
@@ -880,6 +883,62 @@ fn probe_suffix(provider_code: &str, base_url: &str) -> String {
 
 /// Build the chat completion URL suffix for a provider.
 /// Checks if base_url already ends with /v1 to avoid double /v1/v1.
+/// Build the (URL, body) tuple for the chat probe.
+///
+/// **OAuth credentials**: look up `oauth_addons_for(provider)` to apply protocol
+/// addons (e.g. anthropic `?beta=true` + metadata.user_id, Codex `/responses`
+/// path + Responses API body). Personal API keys and managed-team credentials
+/// always take the clean path — they MUST NOT inherit OAuth-only protocol
+/// quirks, since a personal API key routed via aikey-proxy may forward to a
+/// custom anthropic gateway (e.g. aicoding) that doesn't implement the OAuth
+/// variant (bugfix 20260523).
+///
+/// **Google special case**: personal-API uses `?key=<api_key>` URL auth (not a
+/// protocol addon, an alternative auth scheme). Kept inline because it depends
+/// on `api_key` runtime value, not provider-static config.
+///
+/// Extracted as a standalone fn so unit tests can pin the URL/body shape per
+/// (provider × kind) combination without spinning up a real HTTP probe.
+pub(crate) fn build_chat_probe(
+    provider_code: &str,
+    base_url: &str,
+    api_key: &str,
+    kind: CredentialKind,
+) -> (String, serde_json::Value) {
+    // OAuth: consult the protocol-addons registry (single source of truth).
+    if matches!(kind, CredentialKind::OAuth) {
+        if let Some(addons) = super::protocol_addons::oauth_addons_for(provider_code) {
+            let default_path = chat_suffix(provider_code, base_url);
+            let url = addons.url(base_url, &default_path);
+            let body = addons.body(chat_body(provider_code));
+            return (url, body);
+        }
+        // OAuth provider not in registry yet — fall through to default path.
+        // The probe will likely 4xx, but we don't crash. Adding a new OAuth
+        // provider = adding one entry in `oauth_addons_for`.
+    }
+
+    // Google personal-API: ?key= query auth, no other addons.
+    if provider_code == "google" {
+        let url = format!(
+            "{}{}?key={}",
+            base_url.trim_end_matches('/'),
+            chat_suffix(provider_code, base_url),
+            api_key,
+        );
+        return (url, chat_body(provider_code));
+    }
+
+    // Default: clean URL + standard chat body. Covers PersonalApi / ManagedTeam
+    // for all providers, and any OAuth provider not yet in the addons registry.
+    let url = format!(
+        "{}{}",
+        base_url.trim_end_matches('/'),
+        chat_suffix(provider_code, base_url),
+    );
+    (url, chat_body(provider_code))
+}
+
 fn chat_suffix(provider_code: &str, base_url: &str) -> String {
     let base_has_v1 = base_url.trim_end_matches('/').ends_with("/v1");
     match provider_code {
@@ -968,6 +1027,82 @@ pub fn body_indicates_registry_miss(body: &str) -> bool {
     body.contains("not found in registry") || body.contains("TOKEN_INVALID")
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// SPECIAL CASE — known-benign gateway 404 allowlist.
+//
+// DO NOT MERGE INTO `api_ok` MAIN PATH.  DO NOT GENERALIZE THIS LIST.
+// DO NOT CONVERT TO substring / regex / HTML detection.
+//
+// Why this exists:
+//   The 2026-05-22 "code == 404 → api_ok=false" guard was added to catch
+//   vault-page false positives where a misconfigured base_url silently
+//   showed "API OK ✓". That guard is correct for the vast majority of
+//   404s (upstream-business "resource not found" JSON envelopes).
+//
+//   BUT it accidentally fails legitimate anthropic-compatible byok
+//   gateways (e.g. aicoding) that only proxy `POST /v1/messages` and
+//   return Go's `net/http` default `"404 page not found"` on the probe's
+//   `GET /v1/models`. The gateway is alive, the credential is valid,
+//   Chat probe succeeds — but the API column lights up red and exit
+//   code is 2. See bugfix 20260523 round-2 and the failed R2 attempt
+//   that over-generalized this match.
+//
+// Why a separate, *strict-equality* allowlist:
+//   The first attempt (R2) used a fuzzy heuristic — empty body /
+//   leading-char inspection / lowercase substring match. Within hours
+//   the design reviewer (user) flagged it as "patch-style, will be
+//   over-fitted again". The lesson: every generalization here is a
+//   re-opening of the original vault-page hole.
+//
+//   This allowlist keeps two properties intact:
+//     1. Main path is untouched — every other 404 still fails as 5/22
+//        intended; vault-page false-positive fix remains in force.
+//     2. Each entry is a literal string, traceable to a specific
+//        observed gateway. To add a new one you must:
+//          (a) capture the exact body bytes from a real reproduction
+//          (b) append a new `#[test]` case asserting the literal
+//          (c) keep the list short — if it grows past ~5 entries the
+//              right fix is no longer this allowlist but a redesign
+//              of the API probe (drop /v1/models entirely; see the
+//              "Future direction" note in the bugfix doc).
+//
+// Removal rule:
+//   When the API probe path is redesigned to not depend on /v1/models
+//   (the proper systemic fix), delete this entire section together with
+//   its callsite. Until then DO NOT touch the main path; touch this
+//   section.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Literal 404 bodies known to be returned by **legitimate** anthropic /
+/// openai-compatible byok gateways that only proxy chat completions and
+/// don't implement `/v1/models`. Adding to this list is an explicit
+/// per-gateway opt-in; never generalize.
+const KNOWN_BENIGN_GATEWAY_404_BODIES: &[&str] = &[
+    // Go `net/http` default 404 — covers aicoding (aicoding.2233.ai) and
+    // most byok proxies built on Go. The trailing newline is what
+    // ServeMux::serveError actually writes; the trimmed form covers the
+    // case where the body reader stripped trailing whitespace.
+    "404 page not found",
+    "404 page not found\n",
+];
+
+/// Is this (status, body) pair a known-benign gateway-layer 404 that
+/// should bypass the 2026-05-22 "404 → fail" guard?
+///
+/// Strict equality only — see the section comment above for why no
+/// substring / regex / shape inference is allowed here.
+pub fn is_known_benign_gateway_404(status: u16, body: Option<&str>) -> bool {
+    if status != 404 {
+        return false;
+    }
+    let Some(body) = body else {
+        return false;
+    };
+    KNOWN_BENIGN_GATEWAY_404_BODIES
+        .iter()
+        .any(|exact| body == *exact || body.trim_end() == exact.trim_end())
+}
+
 pub fn chat_status_hint(status: u16, body: Option<&str>) -> String {
     // Disambiguate "local proxy didn't recognize the bearer" from "upstream
     // says key is invalid" — both surface as 401 but the operator action is
@@ -1019,16 +1154,21 @@ pub fn api_status_hint(status: u16, body: Option<&str>) -> String {
     match status {
         200 => "valid key".to_string(),
         401 | 403 => "reachable, key rejected".to_string(),
-        // Why 405 is treated like 404 (both = "reachable"):
-        // The API probe does a GET against each provider's base path to
-        // minimise side effects. Anthropic's `/v1/messages` is POST-only,
-        // so every probe against it returns 405 — that's a proof the
-        // endpoint is reachable, not a failure. Showing the raw "HTTP 405"
-        // read as a bug to users ("is 405 normal?"); folding it into
-        // "reachable" keeps Anthropic's row visually consistent with
-        // OpenAI/Kimi (which return 200/404). The actual auth verdict is
-        // decided by the Chat column, not this one.
-        404 | 405 => "reachable".to_string(),
+        // 405: API probe is GET, but Anthropic /v1/messages is POST-only,
+        // so 405 here = "endpoint exists and rejected our verb" = reachable.
+        405 => "reachable".to_string(),
+        // 404 — split between the strict-allowlist benign case (e.g.
+        // aicoding-class byok proxies that only forward POST /v1/messages)
+        // and everything else (treated as upstream-business misconfig, the
+        // 5/22 vault-page false-positive case). See SPECIAL CASE comment
+        // above `KNOWN_BENIGN_GATEWAY_404_BODIES`.
+        404 => {
+            if is_known_benign_gateway_404(status, body) {
+                "reachable (gateway alive, /v1/models not implemented)".to_string()
+            } else {
+                "HTTP 404 — upstream resource missing (check base_url / model availability)".to_string()
+            }
+        }
         _ => format!("HTTP {}", status),
     }
 }
@@ -1063,27 +1203,40 @@ pub fn run_connectivity_suite(
     // ── JSON mode: probe all, collect, return; no stderr output. ─────────
     if json_mode {
         for t in &targets {
-            let r = test_provider_connectivity(&t.provider_code, &t.base_url, &t.bearer);
+            let r = test_provider_connectivity(&t.provider_code, &t.base_url, &t.bearer, t.kind);
             if r.chat_ok { any_chat_ok = true; }
             if r.ping_ok { any_reachable = true; }
+            // Truncate body snippets to 400 chars per row before serialising.
+            // The probe layer already caps at ~512, but the Web popup
+            // only needs enough to read upstream error JSON ({"error":
+            // {"message": "...", "type": "invalid_request_error"}})
+            // — a longer paste pushes the table off-screen on small
+            // viewports. We surface BOTH api_body_snippet and
+            // chat_body_snippet so a 200/401 mix (API auth OK, Chat
+            // rejected) shows the exact reason at each stage.
+            let trunc = |opt: &Option<String>| -> Option<String> {
+                opt.as_ref().map(|s| s.chars().take(400).collect::<String>())
+            };
             json_results.push(serde_json::json!({
-                "provider":      t.provider_code,
-                "kind":          match t.kind {
+                "provider":           t.provider_code,
+                "kind":               match t.kind {
                     CredentialKind::PersonalApi  => "personal_api",
                     CredentialKind::ManagedTeam  => "managed_team",
                     CredentialKind::OAuth        => "oauth",
                 },
-                "source_ref":    t.source_ref,
-                "base_url":      t.base_url,
-                "via_proxy":     t.kind.via_proxy(),
-                "ping_ok":       r.ping_ok,
-                "ping_ms":       r.ping_ms,
-                "api_ok":        r.api_ok,
-                "api_ms":        r.api_ms,
-                "api_status":    r.api_status,
-                "chat_ok":       r.chat_ok,
-                "chat_ms":       r.chat_ms,
-                "chat_status":   r.chat_status,
+                "source_ref":         t.source_ref,
+                "base_url":           t.base_url,
+                "via_proxy":          t.kind.via_proxy(),
+                "ping_ok":            r.ping_ok,
+                "ping_ms":            r.ping_ms,
+                "api_ok":             r.api_ok,
+                "api_ms":             r.api_ms,
+                "api_status":         r.api_status,
+                "api_body_snippet":   trunc(&r.api_body_snippet),
+                "chat_ok":            r.chat_ok,
+                "chat_ms":            r.chat_ms,
+                "chat_status":        r.chat_status,
+                "chat_body_snippet":  trunc(&r.chat_body_snippet),
             }));
             rows.push((t.clone(), r));
         }
@@ -1302,6 +1455,7 @@ pub fn run_connectivity_suite(
         let provider_code = t.provider_code.clone();
         let base_url = t.base_url.clone();
         let bearer = t.bearer.clone();
+        let kind = t.kind;
         let r = animate_blinking_while(
             &[W_PD, W_PING, W_API, W_CHAT_ANIM],
             format_cell,
@@ -1310,6 +1464,7 @@ pub fn run_connectivity_suite(
                     &provider_code,
                     &base_url,
                     &bearer,
+                    kind,
                     |phase, stage| {
                         let col = phase.column_index();
                         match stage {
@@ -1475,6 +1630,204 @@ pub fn render_cannot_test_block(errors: &[BuildTargetError], json_mode: bool) {
         .max(12);
     for e in errors {
         eprintln!("  {:<w$}  {}", e.label().bold(), e.reason().dimmed(), w = w);
+    }
+}
+
+#[cfg(test)]
+mod build_chat_probe_tests {
+    //! Regression guard for bugfix
+    //! 20260523-aikey-test-anthropic-via-proxy-misadds-beta-query.md.
+    //!
+    //! Before the fix, the OAuth-only `?beta=true` + metadata.user_id addons
+    //! were applied to ANY anthropic request via aikey-proxy — including
+    //! personal API keys whose base_url happens to point at the proxy. That
+    //! made `aikey test claude` fail with 404 against custom anthropic
+    //! gateways (e.g. aicoding) which don't implement the OAuth variant.
+    //!
+    //! Post-fix: protocol addons are driven by `kind == OAuth` via the
+    //! `protocol_addons` config table. These tests pin three load-bearing
+    //! cases.
+    use super::*;
+
+    #[test]
+    fn anthropic_oauth_via_proxy_gets_beta_query_and_metadata() {
+        let (url, body) = build_chat_probe(
+            "anthropic",
+            "http://127.0.0.1:27200/anthropic",
+            "aikey_probe_some-account-id",
+            CredentialKind::OAuth,
+        );
+        assert!(url.contains("?beta=true"),
+            "anthropic OAuth must add ?beta=true; got: {}", url);
+        let meta = body.get("metadata").expect("OAuth body must inject metadata.user_id");
+        assert_eq!(meta["user_id"], "aikey_doctor_probe");
+    }
+
+    /// **Bug 1 regression**: a personal API key whose vault entry happens to
+    /// have base_url forwarded through aikey-proxy (e.g. user-defined
+    /// `https://aicoding.example.com/anthropic/v1` exposed as a personal
+    /// alias) MUST NOT get the OAuth-only `?beta=true` addon. Aicoding-class
+    /// gateways do not implement the OAuth variant and return 404.
+    #[test]
+    fn anthropic_personal_via_proxy_does_not_add_beta_query() {
+        let (url, body) = build_chat_probe(
+            "anthropic",
+            "http://127.0.0.1:27200/anthropic",
+            "aikey_probe_my-claude",
+            CredentialKind::PersonalApi,
+        );
+        assert!(!url.contains("beta=true"),
+            "personal API key MUST NOT add OAuth-only ?beta=true; got: {}", url);
+        assert!(body.get("metadata").is_none(),
+            "personal API key MUST NOT inject metadata.user_id; got body: {}", body);
+        // body still carries the normal anthropic chat shape
+        assert!(body.get("messages").is_some());
+        assert_eq!(body.get("max_tokens").and_then(|v| v.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn anthropic_personal_direct_does_not_add_beta_query() {
+        // Even when base_url is the official Anthropic API host directly (not via proxy),
+        // personal API keys still take the clean path.
+        let (url, body) = build_chat_probe(
+            "anthropic",
+            "https://api.anthropic.com",
+            "sk-ant-api03-real-key",
+            CredentialKind::PersonalApi,
+        );
+        assert!(!url.contains("beta=true"),
+            "personal-direct anthropic MUST NOT add ?beta=true; got: {}", url);
+        assert!(body.get("metadata").is_none());
+    }
+
+    #[test]
+    fn codex_oauth_uses_responses_path_and_responses_body() {
+        let (url, body) = build_chat_probe(
+            "openai",
+            "http://127.0.0.1:27200/openai",
+            "aikey_probe_chatgpt-account",
+            CredentialKind::OAuth,
+        );
+        assert!(url.ends_with("/responses"),
+            "Codex OAuth must use /responses; got: {}", url);
+        assert_eq!(body["model"], "gpt-5.4");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn openai_personal_via_proxy_uses_chat_completions_clean() {
+        // Symmetric of the anthropic case: openai personal API key
+        // must NOT take the Codex Responses-API path.
+        let (url, body) = build_chat_probe(
+            "openai",
+            "http://127.0.0.1:27200/openai",
+            "aikey_probe_my-openai",
+            CredentialKind::PersonalApi,
+        );
+        assert!(!url.contains("/responses"),
+            "personal openai MUST NOT use Codex /responses path; got: {}", url);
+        assert!(url.ends_with("/chat/completions") || url.ends_with("/v1/chat/completions"),
+            "personal openai must hit chat/completions; got: {}", url);
+        // standard chat body — not Responses API
+        assert!(body.get("messages").is_some());
+        assert!(body.get("input").is_none());
+    }
+
+    #[test]
+    fn google_personal_appends_key_query_param() {
+        let (url, _body) = build_chat_probe(
+            "google",
+            "https://generativelanguage.googleapis.com",
+            "AIzaSy-fake-key",
+            CredentialKind::PersonalApi,
+        );
+        assert!(url.contains("?key=AIzaSy-fake-key"),
+            "google personal must use ?key= auth query; got: {}", url);
+    }
+
+    // ── 404 special-case allowlist (bugfix 20260523 round-2, revised) ──
+    //
+    // Strict-equality allowlist. Each entry MUST be a literal body
+    // observed from a real byok gateway. DO NOT add substring / shape
+    // checks here — see the SPECIAL CASE comment above
+    // `KNOWN_BENIGN_GATEWAY_404_BODIES`.
+
+    #[test]
+    fn allowlist_exempts_exact_go_default_404() {
+        // Both forms (with and without trailing newline) — Go ServeMux's
+        // serveError writes "...\n", the body reader may or may not strip it.
+        assert!(is_known_benign_gateway_404(404, Some("404 page not found")));
+        assert!(is_known_benign_gateway_404(404, Some("404 page not found\n")));
+    }
+
+    #[test]
+    fn allowlist_rejects_anything_not_an_exact_literal_match() {
+        // Other 404 body shapes — even if they look "404-ish" — MUST stay
+        // on the main fail path, preserving the 2026-05-22 vault-page
+        // false-positive guard.
+        let cases = [
+            // JSON business envelope
+            r#"{"error":{"type":"not_found_error","message":"model not found"}}"#,
+            // HTML page (nginx default etc.)
+            "<html><title>404 Not Found</title></html>",
+            // Plain text variations — explicitly NOT exempted, because
+            // any unconfirmed "looks like Go" body could be a real
+            // upstream business message.
+            "Not Found",
+            "404 not found",
+            "Page Not Found",
+            // Empty body — explicitly NOT exempted.
+            "",
+            "   ",
+        ];
+        for body in cases {
+            assert!(!is_known_benign_gateway_404(404, Some(body)),
+                "unallowlisted body must NOT be exempted (kept on main fail path): {:?}",
+                body);
+        }
+    }
+
+    #[test]
+    fn allowlist_only_applies_to_404_status() {
+        // The allowlist is gated on 404. Same body text on other status
+        // codes is irrelevant to the gateway-404 exception.
+        for status in [200, 401, 403, 405, 500] {
+            assert!(!is_known_benign_gateway_404(status, Some("404 page not found")),
+                "allowlist must not bypass non-404 statuses (got status={})", status);
+        }
+    }
+
+    #[test]
+    fn api_status_hint_404_differentiates_allowlisted_vs_other() {
+        // Allowlisted gateway-default body — hint reads as reachable.
+        let gateway = api_status_hint(404, Some("404 page not found"));
+        assert!(gateway.contains("reachable"),
+            "allowlisted gateway 404 must read as reachable, got: {}", gateway);
+        assert!(gateway.contains("not implemented") || gateway.contains("gateway alive"),
+            "allowlisted gateway 404 hint must explain why, got: {}", gateway);
+
+        // Non-allowlisted body — falls through to the upstream-business hint.
+        let upstream = api_status_hint(404, Some(r#"{"error":{"type":"not_found_error"}}"#));
+        assert!(upstream.starts_with("HTTP 404"),
+            "non-allowlisted 404 must surface as visible HTTP 404, got: {}", upstream);
+        assert!(upstream.contains("base_url") || upstream.contains("model"),
+            "non-allowlisted 404 hint must guide operator to check config, got: {}", upstream);
+    }
+
+    #[test]
+    fn managed_team_credential_takes_clean_anthropic_path() {
+        // Team-managed virtual keys are not OAuth — they MUST take the same
+        // clean URL as personal API keys, regardless of proxy routing.
+        let (url, body) = build_chat_probe(
+            "anthropic",
+            "http://127.0.0.1:27200/anthropic",
+            "aikey_team_vk_xxx",
+            CredentialKind::ManagedTeam,
+        );
+        assert!(!url.contains("beta=true"),
+            "ManagedTeam MUST NOT add OAuth-only ?beta=true; got: {}", url);
+        assert!(body.get("metadata").is_none());
     }
 }
 

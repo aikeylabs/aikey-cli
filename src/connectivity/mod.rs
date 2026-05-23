@@ -16,6 +16,8 @@ use secrecy::SecretString;
 // local scope with a plain `use`.
 pub mod targets;
 pub mod runtime;
+pub mod persist;
+pub mod protocol_addons;
 
 // Why `#[allow(unused_imports)]`: `main.rs` declares `mod connectivity;` with
 // `#[allow(dead_code)]` (needed because main.rs re-declares crate-shared
@@ -40,6 +42,11 @@ pub use runtime::{
     test_provider_connectivity, test_proxy_connectivity,
     api_status_hint, chat_status_hint, proxy_status_hint,
     run_connectivity_suite, render_cannot_test_block,
+};
+#[allow(unused_imports)]
+pub use persist::{
+    aggregate_test_outcome, persist_test_outcome,
+    AggregatedTestRecord, PersistedTestResult,
 };
 
 // (pub use above brings default_base_url / ConnectivityResult / etc. into

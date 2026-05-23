@@ -44,6 +44,21 @@ pub struct SecretMetadata {
     /// Added v1.0.6-alpha.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub use_count: Option<i64>,
+    /// Generic per-entry extension JSON blob. See the column-level doc on
+    /// `migrations.rs` (search for `extra` column) for the rationale and
+    /// shape contract. Current known subkeys:
+    ///   - `$.last_test = { at, status, latency_ms, error_code?,
+    ///       error_message?, suggestion?, suite_results? }` —
+    ///     written by `_internal vault-op record_test_result`, surfaced
+    ///     as the Vault page "Last test" column.
+    /// Any other future per-key fact (favourites, tags, notes, …) nests
+    /// here as a sibling subkey without a column-level migration. Writers
+    /// MUST use SQLite's `json_set(COALESCE(extra,'{}'), '$.<subkey>',
+    /// json(?))` so concurrent updates of different subkeys don't clobber
+    /// each other. None until any subkey has been set; old vaults without
+    /// the column also report None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Value>,
 }
 
 /// Subdirectory under `~/.aikey/` that holds the vault data file.
@@ -90,9 +105,26 @@ pub fn get_vault_path() -> Result<PathBuf, String> {
 /// executor.rs ALSO call upgrade_all() before dispatch — that's
 /// belt-and-braces; the second call is a complete no-op due to
 /// idempotency.
+///
+/// Migration failures are eprintln'd to stderr BEFORE propagating the Err,
+/// so the WARN survives even when callers do `.unwrap_or_default()` (which
+/// `aikey list`, `aikey status`, `aikey whoami` historically do — see
+/// bugfix `workflow/CI/bugfix/2026-05-23-migration-failure-silent-swallow.md`).
+/// Without this, a stale-schema vault renders an empty Personal/Team list
+/// that looks like data loss; the eprintln makes the underlying schema
+/// drift loud + actionable.
 pub(crate) fn open_connection() -> Result<Connection, String> {
     let conn = open_connection_raw()?;
-    crate::migrations::upgrade_all(&conn)?;
+    if let Err(e) = crate::migrations::upgrade_all(&conn) {
+        eprintln!("⚠️  vault migration failed: {}", e);
+        eprintln!(
+            "    Subsequent list / status output may show 0 entries; \
+             this is NOT data loss — the underlying schema is out of sync. \
+             Backup ~/.aikey/data/vault.db first, then check recent \
+             aikey-cli/src/migrations.rs changes."
+        );
+        return Err(e);
+    }
     Ok(conn)
 }
 
@@ -732,15 +764,16 @@ pub fn list_entries_with_metadata_readonly() -> Result<Vec<SecretMetadata>, Stri
 
 fn query_entries_with_metadata(conn: &Connection) -> Result<Vec<SecretMetadata>, String> {
     // provider_code, base_url, supported_providers may not exist on older vaults.
-    // route_token (v1.0.4+) and last_used_at/use_count (v1.0.6+) are selected
-    // in the preferred path; older DDL fallbacks project NULL / 0 so the
-    // parse path stays uniform regardless of vault age.
+    // route_token (v1.0.4+), last_used_at/use_count (v1.0.6+), and extra
+    // (2026-05-22) are selected in the preferred path; older DDL fallbacks
+    // project NULL / 0 so the parse path stays uniform regardless of vault age.
     let mut stmt = conn
-        .prepare("SELECT alias, created_at, provider_code, base_url, supported_providers, route_token, last_used_at, use_count FROM entries ORDER BY alias")
-        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, supported_providers, route_token, NULL, 0 FROM entries ORDER BY alias"))
-        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, supported_providers, NULL, NULL, 0 FROM entries ORDER BY alias"))
-        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, NULL, NULL, NULL, 0 FROM entries ORDER BY alias"))
-        .or_else(|_| conn.prepare("SELECT alias, created_at, NULL, NULL, NULL, NULL, NULL, 0 FROM entries ORDER BY alias"))
+        .prepare("SELECT alias, created_at, provider_code, base_url, supported_providers, route_token, last_used_at, use_count, extra FROM entries ORDER BY alias")
+        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, supported_providers, route_token, last_used_at, use_count, NULL FROM entries ORDER BY alias"))
+        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, supported_providers, route_token, NULL, 0, NULL FROM entries ORDER BY alias"))
+        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, supported_providers, NULL, NULL, 0, NULL FROM entries ORDER BY alias"))
+        .or_else(|_| conn.prepare("SELECT alias, created_at, provider_code, base_url, NULL, NULL, NULL, 0, NULL FROM entries ORDER BY alias"))
+        .or_else(|_| conn.prepare("SELECT alias, created_at, NULL, NULL, NULL, NULL, NULL, 0, NULL FROM entries ORDER BY alias"))
         .map_err(|e| format!("Failed to prepare query: {}", e))?;
 
     let metadata: Vec<SecretMetadata> = stmt
@@ -748,6 +781,13 @@ fn query_entries_with_metadata(conn: &Connection) -> Result<Vec<SecretMetadata>,
             let sp_json: Option<String> = row.get(4).ok().flatten();
             let supported_providers = sp_json
                 .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+            // `extra` is stored as TEXT (JSON object); parse opportunistically
+            // — a corrupt blob (shouldn't happen, writers always use
+            // json_set which keeps it valid) is treated the same as None
+            // so it can't break the list query.
+            let extra_json: Option<String> = row.get(8).ok().flatten();
+            let extra = extra_json
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
             Ok(SecretMetadata {
                 alias:               row.get(0)?,
                 created_at:          row.get(1).ok(),
@@ -757,6 +797,7 @@ fn query_entries_with_metadata(conn: &Connection) -> Result<Vec<SecretMetadata>,
                 route_token:         row.get(5).ok().flatten(),
                 last_used_at:        row.get(6).ok().flatten(),
                 use_count:           row.get(7).ok(),
+                extra,
             })
         })
         .map_err(|e| format!("Failed to query entries: {}", e))?
@@ -782,6 +823,22 @@ pub fn bump_entry_usage(alias: &str, ts: i64) -> Result<usize, String> {
         rusqlite::params![ts, alias],
     )
     .map_err(|e| format!("bump_entry_usage UPDATE: {}", e))
+}
+
+/// Atomically merge a value into the `extra` JSON column at the given JSON
+/// path (e.g. `$.last_test`). Uses SQLite's `json_set` so concurrent writes
+/// to different subkeys don't clobber each other — every writer touches
+/// only its subkey and leaves the rest of the object intact. `value_json`
+/// is the raw JSON string of the value to set (must be valid JSON; caller
+/// `record_test_result` serialises with serde_json so this holds).
+/// Returns rows affected; 0 means alias missing.
+pub fn merge_entry_extra(alias: &str, json_path: &str, value_json: &str) -> Result<usize, String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE entries SET extra = json_set(COALESCE(extra, '{}'), ?1, json(?2)) WHERE alias = ?3",
+        rusqlite::params![json_path, value_json, alias],
+    )
+    .map_err(|e| format!("merge_entry_extra UPDATE: {}", e))
 }
 
 /// Deletes an entry from the vault

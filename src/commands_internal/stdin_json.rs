@@ -64,12 +64,25 @@ pub fn read_envelope() -> Result<StdinEnvelope, (&'static str, String)> {
     let env: StdinEnvelope = serde_json::from_str(&buf)
         .map_err(|e| ("I_STDIN_INVALID_JSON", format!("stdin is not valid JSON: {}", e)))?;
 
-    // vault_key_hex 必须 64 chars（32 bytes）
-    if env.vault_key_hex.len() != 64 {
+    // vault_key_hex 校验：空字符串允许通过 —— 表示 caller (Go local-server)
+    // 故意没带 key，这种情况只用于 metadata-only read 操作（例如 `_internal
+    // app list / get`，不需要解密任何东西）。如果带了非空 hex，必须是 64 chars
+    // (32 bytes)，否则后续 decode_vault_key 也会 fail。
+    //
+    // Why 放宽这层校验:
+    //   - 旧逻辑要求所有 _internal action 都带 vault_key，但 app.list / app.get
+    //     这类只读元数据查询本身不需要 key（见 commands_app::list_apps、
+    //     get_app_record —— 纯 SQL SELECT，不调 decode_vault_key）。
+    //   - 真正需要 key 的 action (vault_op / query / parse / update_alias) 都
+    //     在自己内部 `decode_vault_key(&env.vault_key_hex)`，如果传空会 fail
+    //     fast in `I_VAULT_KEY_MALFORMED` —— 安全语义不变。
+    //   - 这样 Go 侧可以按"需不需要 unlock"对路由分组：read 路径 (list/get)
+    //     不走 RequireUnlock 中间件，传空 vault_key_hex 给 CLI 即可。
+    if !env.vault_key_hex.is_empty() && env.vault_key_hex.len() != 64 {
         return Err((
             "I_VAULT_KEY_MALFORMED",
             format!(
-                "vault_key_hex must be 64 hex characters (got {})",
+                "vault_key_hex must be 64 hex characters or empty (got {})",
                 env.vault_key_hex.len()
             ),
         ));
