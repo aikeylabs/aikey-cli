@@ -1182,7 +1182,27 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
                     Ok(port) => crate::local_server_probe::wait_for_reachable(
                         port, std::time::Duration::from_secs(8))
                         .map(|()| Some(port)),
-                    Err(e) => Err(e),
+                    // Bugfix 20260524-aikey-service-restart-web-port-undiscoverable.md:
+                    // `read_local_server_port()` returns a Bulk-Import-flavored
+                    // error string prefixed with `I_CLI_NOT_AVAILABLE` when the
+                    // YAML config is missing. That wording is wrong here on two
+                    // axes: (1) the CLI is plainly available (we just used it
+                    // to spawn the binary one stack frame up), (2) the user is
+                    // running `aikey service restart web`, not Bulk Import.
+                    // Rewrite with a code/message that names the actual
+                    // failure: spawn succeeded but the CLI cannot determine
+                    // the listen port to verify health. The spawn itself
+                    // already returned Ok, so the service is most likely up;
+                    // the user just needs the YAML config or a re-render.
+                    Err(_inner) => Err(
+                        "I_PORT_UNDISCOVERABLE service spawned, but cannot \
+                         determine its listen port to verify health. The CLI \
+                         reads ~/.aikey/config/control-trial.yaml `listen:` \
+                         field; if that file is missing or corrupted, re-run \
+                         the installer or `aikey-config-tool render`. The \
+                         service itself may already be running — check \
+                         http://127.0.0.1:8090/healthz manually.".to_string()
+                    ),
                 }
             } else {
                 Ok(None)
