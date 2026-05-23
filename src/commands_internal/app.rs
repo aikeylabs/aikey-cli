@@ -52,6 +52,7 @@ pub fn handle(env: StdinEnvelope) {
         "pause" => handle_pause(env),
         "resume" => handle_resume(env),
         "rotate" => handle_rotate(env),
+        "uninstall" => handle_uninstall(env),
         other => emit_error(
             req_id,
             "I_UNKNOWN_ACTION",
@@ -322,6 +323,39 @@ fn handle_rotate(env: StdinEnvelope) {
             }),
         )),
         Err(e) => emit_error(req_id, "I_APP_ROTATE_FAILED", format!("rotate: {}", e)),
+    }
+}
+
+/// `uninstall` — whole-system removal: stop the service via the plugin's
+/// own install_service.sh --uninstall, then wipe vault rows
+/// (app_keys + app_records + bindings). Inverse of `install`.
+///
+/// Added 2026-05-23 alongside the rc.5 default-install flip — users who
+/// got degrade-detector auto-installed need a single Web button to opt
+/// out. Bypasses the mutationLockedSlugs revoke/rotate guard in
+/// aikey-control because uninstall stops the service BEFORE removing
+/// the bearer, so there's no partial-state to guard against.
+fn handle_uninstall(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+    let slug = match parse_slug_only(&env, &req_id) {
+        Some(s) => s,
+        None => return,
+    };
+    // Run the full install.rs::handle_uninstall flow: curl-pipe-shell
+    // the service installer with --uninstall, then delete_all_app_state.
+    // json_mode=true so we don't pollute stdout with the CLI's user-
+    // facing println! lines (the Web bridge expects clean stdin/stdout
+    // for the result envelope).
+    match commands_app::handle_uninstall(&slug, /* json_mode */ true) {
+        Ok(()) => emit(&ResultEnvelope::ok(
+            req_id,
+            json!({ "slug": slug, "status": "uninstalled" }),
+        )),
+        Err(e) => emit_error(
+            req_id,
+            "I_APP_UNINSTALL_FAILED",
+            format!("uninstall: {}", e),
+        ),
     }
 }
 

@@ -855,3 +855,92 @@ fn classify_register_extra_default_not_in_upstreams_ignored() {
     assert!(outcome.preserved.is_empty());
     assert!(outcome.missing.is_empty());
 }
+
+#[test]
+fn delete_all_app_state_wipes_keys_bindings_and_record() {
+    // F1 of the 2026-05-23 default-install flip: `aikey app uninstall`
+    // must remove app_keys + bindings + app_records for the slug, and
+    // leave other apps untouched.
+    let mut conn = fresh_test_vault();
+
+    // Seed two apps so we can fence-check isolation.
+    upsert_app_record_with_conn(
+        &conn,
+        "target-app",
+        "Target",
+        "v1",
+        &["openai".into()],
+        "third-party",
+        false,
+        &[],
+    )
+    .unwrap();
+    upsert_app_record_with_conn(
+        &conn,
+        "keeper-app",
+        "Keeper",
+        "v1",
+        &["openai".into()],
+        "third-party",
+        false,
+        &[],
+    )
+    .unwrap();
+
+    let bindings = vec![(
+        "openai".to_string(),
+        CredentialType::PersonalApiKey,
+        "alias-x".to_string(),
+    )];
+    authorize_atomic_with_conn(&mut conn, "target-app", &bindings).unwrap();
+    authorize_atomic_with_conn(&mut conn, "keeper-app", &bindings).unwrap();
+
+    // Pre-state sanity: both apps have rows. Inline query helper (not a
+    // closure capturing `&conn`) because we'll need a mutable borrow of
+    // `conn` for the act-step below.
+    fn count(conn: &Connection, sql: &str, slug: &str) -> i64 {
+        conn.query_row(sql, [slug], |r| r.get(0)).unwrap_or(0)
+    }
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1", "target-app"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1", "keeper-app"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_records WHERE slug = ?1", "target-app"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_records WHERE slug = ?1", "keeper-app"), 1);
+
+    // Act: uninstall target-app's vault state.
+    let counts = super::delete_all_app_state_with_conn(&mut conn, "target-app")
+        .expect("delete_all_app_state");
+
+    // Caller-side counts must reflect what was deleted.
+    assert_eq!(counts.app_keys_deleted, 1);
+    assert_eq!(counts.bindings_deleted, 1);
+    assert_eq!(counts.app_records_deleted, 1);
+
+    // target-app gone.
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1", "target-app"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_records WHERE slug = ?1", "target-app"), 0);
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM user_profile_provider_bindings WHERE profile_id = ?1", "app:target-app"),
+        0
+    );
+
+    // keeper-app untouched — fence catches a regression to a bare
+    // DELETE without WHERE slug filter.
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1", "keeper-app"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_records WHERE slug = ?1", "keeper-app"), 1);
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM user_profile_provider_bindings WHERE profile_id = ?1", "app:keeper-app"),
+        1
+    );
+}
+
+#[test]
+fn delete_all_app_state_idempotent_on_unknown_slug() {
+    // Re-running uninstall on a never-installed slug must not error;
+    // all delete counts come back as 0.
+    let mut conn = fresh_test_vault();
+    let counts = super::delete_all_app_state_with_conn(&mut conn, "ghost-app")
+        .expect("idempotent uninstall on absent slug");
+    assert_eq!(counts.app_keys_deleted, 0);
+    assert_eq!(counts.app_records_deleted, 0);
+    assert_eq!(counts.bindings_deleted, 0);
+}

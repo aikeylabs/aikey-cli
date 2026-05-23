@@ -3046,6 +3046,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             cli::AppAction::Install { slug } => {
                 commands_app::handle_install(slug, cli.json)?;
             }
+            cli::AppAction::Uninstall { slug } => {
+                commands_app::handle_uninstall(slug, cli.json)?;
+            }
         },
         Commands::Service { action } => {
             // `aikey service` is the unified service-control namespace.

@@ -214,6 +214,189 @@ pub fn handle_install(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::er
 }
 
 // ---------------------------------------------------------------------------
+// Uninstall (2026-05-23, paired with rc.5 default-on flip).
+// ---------------------------------------------------------------------------
+
+/// Implements `aikey app uninstall <slug>`. Inverse of `handle_install`:
+///
+///   1. Validate slug ∈ TRUSTED_APPS (same trust anchor as install).
+///   2. Resolve service-installer URL — first from cached manifest at
+///      `~/.aikey/apps-cache/<slug>/manifest.json` (the file install
+///      wrote), then fall back to re-fetching + re-verifying if the
+///      cache is missing (e.g. user manually deleted apps-cache).
+///   3. Run the same shell script with `--uninstall` flag — the plugin's
+///      install_service.sh already handles this (verified for
+///      degrade-detector). The script stops the launchd / systemd
+///      service, removes the binary, and exits.
+///   4. Delete every vault row tied to the slug (`delete_all_app_state`).
+///      This bypasses the `mutationLockedSlugs` revoke/rotate guard on
+///      aikey-control — uninstall is whole-system (service down +
+///      vault clean), not a partial revoke that would leave a running
+///      agent with no bearer.
+///   5. (Best-effort) remove the cached manifest dir so a future install
+///      starts clean.
+///
+/// Idempotent: running on a never-installed slug succeeds with zero
+/// rows deleted + script exit 0 (install_service.sh --uninstall is
+/// itself idempotent — see the script's own `ok` lines that fire
+/// only on actual file existence).
+pub fn handle_uninstall(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let trusted = TRUSTED_APPS
+        .iter()
+        .find(|t| t.slug == slug)
+        .ok_or_else(|| {
+            format!(
+                "slug '{}' is not in the built-in trusted-apps list. \
+                 Only first-party apps can be uninstalled via this command; \
+                 third-party apps clean up via their own tooling.",
+                slug,
+            )
+        })?;
+
+    if !json_mode {
+        println!("→ Uninstalling {} (first-party app)", slug);
+    }
+
+    // Step 2: resolve installer URL — prefer cache (install wrote it),
+    // fall back to fresh fetch + verify.
+    let installer_url = match read_cached_manifest(slug)? {
+        Some(m) => {
+            if !json_mode {
+                println!("→ Using cached manifest from previous install");
+            }
+            m.service_installer.url
+        }
+        None => {
+            if !json_mode {
+                println!("→ Cached manifest missing — re-fetching for uninstall");
+            }
+            let manifest = fetch_and_verify_manifest(trusted, json_mode)?;
+            manifest.service_installer.url
+        }
+    };
+
+    // Step 3: run the installer script with --uninstall. The script's
+    // own --uninstall path is idempotent (no-op when nothing is
+    // installed), so we don't gate this on prior install state.
+    if !json_mode {
+        println!("→ Running service uninstaller: {} --uninstall", installer_url);
+    }
+    run_service_uninstall(&installer_url, json_mode)?;
+
+    // Step 4: wipe vault rows. Bypasses the mutationLockedSlugs lock
+    // on aikey-control because that lock is for revoke/rotate (partial
+    // state breaking), not for whole-system uninstall (full removal).
+    let counts = crate::commands_app::delete_all_app_state(slug)?;
+    if !json_mode {
+        println!(
+            "✓ Vault cleaned: app_keys={}, bindings={}, app_records={}",
+            counts.app_keys_deleted,
+            counts.bindings_deleted,
+            counts.app_records_deleted,
+        );
+    }
+
+    // Step 5: best-effort cache cleanup. If this fails (e.g. file
+    // perms shifted), we don't abort — the install/uninstall lifecycle
+    // already succeeded.
+    if let Err(e) = remove_cached_manifest(slug) {
+        if !json_mode {
+            eprintln!("⚠ Failed to remove cached manifest (non-fatal): {}", e);
+        }
+    }
+
+    if !json_mode {
+        println!("✓ {} uninstall complete", slug);
+        println!(
+            "  Re-install any time with: aikey app install {}",
+            slug
+        );
+    }
+    Ok(())
+}
+
+/// Read the manifest cache file written by `cache_manifest()` at install
+/// time. Returns Ok(None) when the file doesn't exist (clean fallback —
+/// caller re-fetches). Returns Err on parse failure (corrupt cache,
+/// caller decides whether to bail).
+fn read_cached_manifest(slug: &str) -> Result<Option<Manifest>, Box<dyn std::error::Error>> {
+    let path = apps_cache_dir()?.join(slug).join("manifest.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)
+        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let manifest: Manifest = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("parse cached manifest {}: {}", path.display(), e))?;
+    Ok(Some(manifest))
+}
+
+/// Remove the cached manifest directory for the slug. No-op if absent.
+fn remove_cached_manifest(slug: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = apps_cache_dir()?.join(slug);
+    if dir.exists() {
+        fs::remove_dir_all(&dir)
+            .map_err(|e| format!("remove {}: {}", dir.display(), e))?;
+    }
+    Ok(())
+}
+
+/// Inverse of `run_curl_pipe_shell` — same download path but invokes the
+/// script with `--uninstall` instead of `--tag <version>`. Kept as a
+/// separate function so the install path stays a clean two-arg
+/// signature and uninstall semantics are explicit at the call site.
+fn run_service_uninstall(
+    url: &str,
+    _json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tmp_dir = std::env::temp_dir();
+    let tmp_path = tmp_dir.join(format!(
+        "aikey-app-uninstaller-{}.sh",
+        std::process::id()
+    ));
+    let cleanup = TmpPath(tmp_path.clone());
+
+    let download = Command::new("curl")
+        .arg("-fsSL")
+        .arg("--max-time")
+        .arg("120")
+        .arg("-o")
+        .arg(&tmp_path)
+        .arg(url)
+        .status()
+        .map_err(|e| format!("failed to spawn curl: {}", e))?;
+    if !download.success() {
+        return Err(format!(
+            "service uninstaller download failed (curl exit {}): {}",
+            download.code().map(|c| c.to_string()).unwrap_or_else(|| "<signal>".into()),
+            url
+        )
+        .into());
+    }
+
+    let meta = fs::metadata(&tmp_path)
+        .map_err(|e| format!("stat downloaded uninstaller: {}", e))?;
+    if meta.len() == 0 {
+        return Err(format!("downloaded uninstaller is empty (0 bytes): {}", url).into());
+    }
+
+    let exec = Command::new("sh")
+        .arg(&tmp_path)
+        .arg("--uninstall")
+        .status()
+        .map_err(|e| format!("failed to spawn shell: {}", e))?;
+    drop(cleanup);
+    if !exec.success() {
+        return Err(format!(
+            "service uninstaller exited with status {}",
+            exec.code().map(|c| c.to_string()).unwrap_or_else(|| "<signal>".into())
+        )
+        .into());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Manifest fetch + verify.
 // ---------------------------------------------------------------------------
 

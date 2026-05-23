@@ -37,7 +37,7 @@ pub use handlers::{
     handle_list, handle_pause, handle_register, handle_resume, handle_revoke,
     handle_rotate, handle_route,
 };
-pub use install::handle_install;
+pub use install::{handle_install, handle_uninstall};
 
 #[cfg(test)]
 mod tests;
@@ -647,6 +647,83 @@ pub fn resume_paused_keys_with_conn(conn: &Connection, slug: &str) -> Result<usi
 /// then insert new), a proxy restart racing the inserts could load an empty
 /// Registry between the two writes — the Agent's old bearer rejected AND
 /// no new bearer available → 401 storm. Single transaction prevents that.
+/// DELETE every vault row tied to this slug: app_keys + app_records +
+/// user_profile_provider_bindings whose profile_id == "app:<slug>".
+/// Returns counts per table for caller-side audit (CLI prints them).
+///
+/// Used by `aikey app uninstall` (2026-05-23). Separate from revoke
+/// because uninstall is the OPPOSITE of install — we want zero traces
+/// left so a future `aikey app install <slug>` starts from a clean
+/// state without "ghost" rows from a prior life. Audit trail lives in
+/// usage events / events.db, not in the app management tables.
+///
+/// CRITICAL: this bypasses the `mutationLockedSlugs` revoke/rotate
+/// guard on aikey-control. The lock exists to prevent the user from
+/// half-breaking a running first-party app (revoke kills the bearer,
+/// the agent crashes). Uninstall is whole-system: it stops the
+/// service first (via install_service.sh --uninstall in the plugin's
+/// own helper), then removes vault rows. No half-state.
+pub fn delete_all_app_state(slug: &str) -> Result<UninstallCounts, String> {
+    let mut conn = storage::open_connection()?;
+    let counts = delete_all_app_state_with_conn(&mut conn, slug)?;
+    let _ = storage::bump_vault_change_seq();
+    Ok(counts)
+}
+
+#[derive(Debug, Default)]
+pub struct UninstallCounts {
+    pub app_keys_deleted: usize,
+    pub app_records_deleted: usize,
+    pub bindings_deleted: usize,
+}
+
+pub fn delete_all_app_state_with_conn(
+    conn: &mut Connection,
+    slug: &str,
+) -> Result<UninstallCounts, String> {
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("begin uninstall tx for slug={:?}: {}", slug, e))?;
+
+    let app_keys_deleted = tx
+        .execute(
+            "DELETE FROM app_keys WHERE app_slug = ?1",
+            params![slug],
+        )
+        .map_err(|e| format!("DELETE app_keys for slug={:?}: {}", slug, e))?;
+
+    // FK on user_profile_provider_bindings.profile_id references
+    // user_profiles.id; we use the synthetic profile id "app:<slug>"
+    // for app-scoped bindings (set by authorize_atomic). Delete those
+    // FIRST so app_records FK doesn't trip if we ever add such a
+    // constraint later. The synthetic user_profiles row (is_active=0)
+    // is left in place — other apps may reuse the profile slot, and
+    // a stale "ghost" profile row with no bindings is harmless.
+    let profile_id = format!("app:{}", slug);
+    let bindings_deleted = tx
+        .execute(
+            "DELETE FROM user_profile_provider_bindings WHERE profile_id = ?1",
+            params![profile_id],
+        )
+        .map_err(|e| format!("DELETE bindings for profile={:?}: {}", profile_id, e))?;
+
+    let app_records_deleted = tx
+        .execute(
+            "DELETE FROM app_records WHERE slug = ?1",
+            params![slug],
+        )
+        .map_err(|e| format!("DELETE app_records for slug={:?}: {}", slug, e))?;
+
+    tx.commit()
+        .map_err(|e| format!("commit uninstall tx for slug={:?}: {}", slug, e))?;
+
+    Ok(UninstallCounts {
+        app_keys_deleted,
+        app_records_deleted,
+        bindings_deleted,
+    })
+}
+
 pub fn rotate_app_key(slug: &str) -> Result<(String, String), String> {
     let mut conn = storage::open_connection()?;
     let result = rotate_app_key_with_conn(&mut conn, slug)?;

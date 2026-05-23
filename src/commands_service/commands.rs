@@ -101,16 +101,18 @@ mod trust_local {
     const SERVICE_NAME: &str = "aikey.trust-local";
 
     pub(super) fn dispatch(verb: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-        // Refuse if trust-local binary isn't installed — installing it
-        // is a separate user action (`--with-degrade-detector` at
-        // installer time) and we shouldn't paper over that.
+        // Refuse if trust-local binary isn't installed. Since rc.5 it's
+        // installed by default — if it's missing the user either ran
+        // `--no-degrade-detector` at install time or `aikey app
+        // uninstall degrade-detector` later. Either way the simplest
+        // path back is `aikey app install`, not the curl-pipe.
         let trust_local_bin = std::path::Path::new(
             &std::env::var("HOME").unwrap_or_default()
         ).join(".aikey/bin/trust-local");
         if !trust_local_bin.exists() {
             let msg = format!(
                 "trust-local binary not found at {}. Install via: \
-                 curl -fsSL https://raw.githubusercontent.com/aikeylabs/degrade-detector/main/scripts/install_service.sh | bash",
+                 aikey app install degrade-detector",
                 trust_local_bin.display()
             );
             if json {

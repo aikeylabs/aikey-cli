@@ -767,6 +767,25 @@ pub(crate) enum AppAction {
         /// allow-list (currently: degrade-detector).
         slug: String,
     },
+    /// Uninstall a first-party app: stop its service, remove its binary,
+    /// and clean up its vault rows (app_keys + app_records + bindings).
+    ///
+    /// Added 2026-05-23 alongside the rc.5 default-install flip for
+    /// degrade-detector — users who got the service auto-installed need
+    /// a single command to opt out cleanly. Bypasses the revoke/rotate
+    /// lock (mutationLockedSlugs in aikey-control) because uninstall is
+    /// whole-system: the service goes down BEFORE the bearer is
+    /// removed, so there's no half-state where a running agent has no
+    /// bearer (the failure mode the revoke lock guards against).
+    ///
+    /// Re-install any time with `aikey app install <slug>`.
+    Uninstall {
+        /// Trusted app slug. Must match an entry in CLI's built-in
+        /// allow-list (currently: degrade-detector). Third-party apps
+        /// have to clean up via their own tooling — CLI doesn't know
+        /// their service-installer URL.
+        slug: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1260,6 +1279,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 AppAction::Resume { .. } => "app.resume".to_string(),
                 AppAction::Rotate { .. } => "app.rotate".to_string(),
                 AppAction::Install { .. } => "app.install".to_string(),
+                AppAction::Uninstall { .. } => "app.uninstall".to_string(),
             },
             Commands::Service { action } => match action {
                 ServiceAction::Start { .. } => "service.start".to_string(),
