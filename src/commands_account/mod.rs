@@ -1178,31 +1178,19 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
             // we don't claim success while the service is still booting.
             // Stop has no symmetric probe — we trust the service manager.
             let final_state = if matches!(action, "start" | "restart") {
-                match crate::local_server_probe::read_local_server_port() {
+                // Use `_or_default` (not the strict variant): we're on a host
+                // that just spawned the local-server binary one frame up, so
+                // local-server IS installed. If YAML config is missing the
+                // binary still runs on its built-in default 8090 — falling
+                // back here matches binary behavior. Strict variant would
+                // surface a Bulk-Import-flavored "not installed" message
+                // (BR-rc.5-47); bugfix
+                // 20260524-aikey-service-restart-web-port-undiscoverable.md.
+                match crate::local_server_probe::read_local_server_port_or_default() {
                     Ok(port) => crate::local_server_probe::wait_for_reachable(
                         port, std::time::Duration::from_secs(8))
                         .map(|()| Some(port)),
-                    // Bugfix 20260524-aikey-service-restart-web-port-undiscoverable.md:
-                    // `read_local_server_port()` returns a Bulk-Import-flavored
-                    // error string prefixed with `I_CLI_NOT_AVAILABLE` when the
-                    // YAML config is missing. That wording is wrong here on two
-                    // axes: (1) the CLI is plainly available (we just used it
-                    // to spawn the binary one stack frame up), (2) the user is
-                    // running `aikey service restart web`, not Bulk Import.
-                    // Rewrite with a code/message that names the actual
-                    // failure: spawn succeeded but the CLI cannot determine
-                    // the listen port to verify health. The spawn itself
-                    // already returned Ok, so the service is most likely up;
-                    // the user just needs the YAML config or a re-render.
-                    Err(_inner) => Err(
-                        "I_PORT_UNDISCOVERABLE service spawned, but cannot \
-                         determine its listen port to verify health. The CLI \
-                         reads ~/.aikey/config/control-trial.yaml `listen:` \
-                         field; if that file is missing or corrupted, re-run \
-                         the installer or `aikey-config-tool render`. The \
-                         service itself may already be running — check \
-                         http://127.0.0.1:8090/healthz manually.".to_string()
-                    ),
+                    Err(strict_err) => Err(strict_err),
                 }
             } else {
                 Ok(None)
@@ -1450,13 +1438,17 @@ enum BrowseLocalPreflight {
 ///     error + a stderr hint pointing at non-JSON mode (decision C-b).
 fn local_server_preflight_for_browse(json_mode: bool) -> BrowseLocalPreflight {
     // Resolve port once — both probe and prompt need it.
-    let port = match crate::local_server_probe::read_local_server_port() {
+    // `_or_default`: this preflight only fires when try_local_browse_url
+    // returned Some(local URL), meaning local-server is installed. YAML
+    // missing → fall back to 8090 (matches binary's built-in default).
+    // Strict variant would emit Bulk-Import wording here. Bugfix
+    // 20260524-aikey-service-restart-web-port-undiscoverable.md.
+    let port = match crate::local_server_probe::read_local_server_port_or_default() {
         Ok(p) => p,
         Err(e) => {
-            // Discovery failed (yaml missing, config.json bad). In this
-            // state try_local_browse_url shouldn't have returned Some,
-            // but if it did, surface the real reason instead of opening
-            // a half-baked URL.
+            // local-server isn't installed at all (rare — try_local_browse_url
+            // should already have rejected this case). Surface the real
+            // reason instead of opening a half-baked URL.
             let msg = format!("local-server configuration unreadable: {}", e);
             if json_mode {
                 crate::json_output::print_json(serde_json::json!({

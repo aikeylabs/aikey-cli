@@ -1114,8 +1114,12 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // Skip silently on editions without local-server (Personal CLI-only,
     // Production) — there's nothing actionable to report.
     if crate::local_server_probe::is_local_server_installed() {
+        // `_or_default`: outer guard already verified install — YAML
+        // missing should fall back to 8090, not surface Bulk-Import
+        // wording. Bugfix 20260524-aikey-service-restart-web-port-
+        // undiscoverable.md.
         let (label, ok_for_json, detail, hint) =
-            match crate::local_server_probe::read_local_server_port() {
+            match crate::local_server_probe::read_local_server_port_or_default() {
                 Ok(port) => {
                     let base = format!("http://127.0.0.1:{}", port);
                     match crate::local_server_probe::probe_vault_status(&base) {

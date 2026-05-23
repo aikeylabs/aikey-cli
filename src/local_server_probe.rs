@@ -32,6 +32,19 @@ pub const ERR_I_CLI_NOT_AVAILABLE: &str = "I_CLI_NOT_AVAILABLE";
 const YAML_CONFIG_REL: &str = ".aikey/config/control-trial.yaml";
 const JSON_CONFIG_REL: &str = ".aikey/config/config.json";
 
+/// Canonical default listen port for Personal / Trial local-server when
+/// no YAML config + no localhost-flavored JSON `controlPanelUrl` can be
+/// resolved. Both installer scripts (`local-install.sh`,
+/// `trial-install.sh`) render `listen: 127.0.0.1:8090` into the YAML and
+/// the local-server binary itself defaults to 8090 internally, so falling
+/// back here is just the CLI matching what the binary would already pick.
+///
+/// Only used by `read_local_server_port_or_default()` — the strict
+/// variant `read_local_server_port()` still errors out for Bulk Import
+/// flows that want "not installed" semantics. Bugfix
+/// 20260524-aikey-service-restart-web-port-undiscoverable.md.
+pub const DEFAULT_PERSONAL_TRIAL_LOCAL_SERVER_PORT: u16 = 8090;
+
 /// Which local web service is installed on this host.
 ///
 /// Personal = `aikey-local-server` (per-user, no privilege).
@@ -88,7 +101,16 @@ pub fn detect_edition() -> Option<Edition> {
 
 /// Resolve local-server's listen port from the canonical config file,
 /// falling back to a localhost `controlPanelUrl` in `config.json`.
-/// Returns an edition-aware error if neither source yields a local port.
+///
+/// **Strict variant** — returns an edition-aware error (with
+/// `I_CLI_NOT_AVAILABLE` prefix + Bulk-Import-flavored install hint) when
+/// neither source yields a local port. Right semantic for the Bulk
+/// Import flow ("user genuinely has no local-server, tell them how to
+/// install"). **Wrong** for service-lifecycle / status / browse flows
+/// where the caller already knows local-server is installed and just
+/// needs a port to probe — use `read_local_server_port_or_default()`
+/// there. Bugfix
+/// 20260524-aikey-service-restart-web-port-undiscoverable.md.
 pub fn read_local_server_port() -> Result<u16, String> {
     // Stage 2.1 windows-compat: route through the single home-resolver so
     // sandbox tests (HOME-override) and Windows (USERPROFILE-only) take
@@ -102,7 +124,35 @@ pub fn read_local_server_port() -> Result<u16, String> {
         return Ok(port);
     }
     let remote_hint = read_remote_control_url(&home.join(JSON_CONFIG_REL));
-    Err(build_not_installed_error(remote_hint))
+    Err(build_bulk_import_unavailable_error(remote_hint))
+}
+
+/// Resolve local-server's listen port like `read_local_server_port()`,
+/// but on discovery failure return the canonical default
+/// (`DEFAULT_PERSONAL_TRIAL_LOCAL_SERVER_PORT`) **iff** install-state
+/// reports local-server / full-trial as installed. Returns an error
+/// only when local-server isn't installed at all — in which case the
+/// caller had no business asking for its port anyway.
+///
+/// Why this exists (split from the strict variant):
+/// `aikey service restart web`, `aikey status`, and the browse preflight
+/// all happen on hosts that just spawned the local-server binary; the
+/// binary internally defaults to 8090 and runs fine without the YAML
+/// even existing. Forcing the CLI to error when YAML is missing is a
+/// false-negative (BR-rc.5-47) that misleads users into thinking the
+/// service failed. Bulk Import keeps the strict variant because its
+/// semantic IS "user must have a real local-server install".
+pub fn read_local_server_port_or_default() -> Result<u16, String> {
+    match read_local_server_port() {
+        Ok(port) => Ok(port),
+        Err(strict_err) => {
+            if is_local_server_installed() {
+                Ok(DEFAULT_PERSONAL_TRIAL_LOCAL_SERVER_PORT)
+            } else {
+                Err(strict_err)
+            }
+        }
+    }
 }
 
 /// HTTP probe of `<base>/health`. Returns Ok(()) on 2xx, Err with an
@@ -475,7 +525,12 @@ fn find_listening_pid(port: u16) -> Option<u32> {
 ///   - "local-server: NOT RUNNING on port N\n    Start:  <hint>"
 ///   - "local-server: NOT CONFIGURED — <discovery error>"
 pub fn local_server_status_line() -> String {
-    match read_local_server_port() {
+    // `_or_default`: if the host has local-server installed but the YAML
+    // hasn't been rendered, falling back to the canonical default port
+    // gives the user accurate vault state instead of a Bulk-Import-
+    // flavored "NOT CONFIGURED" error. Bugfix
+    // 20260524-aikey-service-restart-web-port-undiscoverable.md.
+    match read_local_server_port_or_default() {
         Err(e) => format!("local-server: NOT CONFIGURED — {}", e),
         Ok(port) => {
             let base = format!("http://127.0.0.1:{}", port);
@@ -553,7 +608,23 @@ fn localhost_port_of(url: &str) -> Option<u16> {
     port_str.parse::<u16>().ok()
 }
 
-fn build_not_installed_error(remote_hint: Option<String>) -> String {
+/// Build the strict "no local-server here" error message — **specific to
+/// the Bulk Import flow** ("user genuinely lacks a local-server install,
+/// tell them how to install one or point at remote control panel").
+///
+/// **Do NOT call this from non-Bulk-Import paths.** The wording assumes
+/// the user is trying to do Bulk Import; bubbling it from
+/// service-lifecycle, status, or browse flows mis-attributes the failure
+/// and steers users at the wrong fix (see BR-rc.5-47 root cause —
+/// `aikey service restart web` got this error and the message said
+/// "Local Bulk Import requires aikey-local-server..." which was nonsense
+/// in that context). The name now encodes the constraint so a future
+/// maintainer notices before adding a third caller.
+///
+/// If you need a port to probe but haven't actually verified local-server
+/// is installed, use `read_local_server_port_or_default()` instead — it
+/// falls back to the canonical default port without ever calling this.
+fn build_bulk_import_unavailable_error(remote_hint: Option<String>) -> String {
     match remote_hint {
         Some(url) if !url.starts_with("http://127.0.0.1")
                     && !url.starts_with("http://localhost") => {
@@ -703,24 +774,24 @@ mod tests {
     }
 
     #[test]
-    fn build_not_installed_error_with_remote_url_mentions_it() {
-        let err = build_not_installed_error(Some("https://control.example.com".to_string()));
+    fn build_bulk_import_unavailable_error_with_remote_url_mentions_it() {
+        let err = build_bulk_import_unavailable_error(Some("https://control.example.com".to_string()));
         assert!(err.contains("https://control.example.com"),
             "remote hint should be embedded verbatim in error: {}", err);
         assert!(err.contains(ERR_I_CLI_NOT_AVAILABLE));
     }
 
     #[test]
-    fn build_not_installed_error_treats_localhost_remote_as_no_remote() {
-        let err = build_not_installed_error(Some("http://127.0.0.1:9999".to_string()));
+    fn build_bulk_import_unavailable_error_treats_localhost_remote_as_no_remote() {
+        let err = build_bulk_import_unavailable_error(Some("http://127.0.0.1:9999".to_string()));
         assert!(!err.contains("team vault"),
             "localhost-as-remote must not trigger production messaging: {}", err);
         assert!(err.contains("aikey-local-server"));
     }
 
     #[test]
-    fn build_not_installed_error_without_remote_suggests_install() {
-        let err = build_not_installed_error(None);
+    fn build_bulk_import_unavailable_error_without_remote_suggests_install() {
+        let err = build_bulk_import_unavailable_error(None);
         assert!(err.contains("local-install.sh") || err.contains("trial-install.sh"));
     }
 
@@ -1036,6 +1107,90 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         with_home(tmp.path(), || {
             assert_eq!(detect_edition(), None);
+        });
+    }
+
+    // ── read_local_server_port_or_default ────────────────────────────
+    //
+    // Pin the BR-rc.5-47 contract: when install-state says local-server
+    // is present but YAML config is missing, fall back to 8090 silently
+    // instead of bubbling a Bulk-Import-flavored "not installed" error.
+    // If local-server isn't installed at all, the strict error is still
+    // surfaced (Bulk-Import-flavored is correct in that case).
+
+    #[test]
+    fn or_default_returns_yaml_port_when_yaml_present() {
+        // YAML present → strict and _or_default agree on the YAML port.
+        // Default fallback is NOT consulted.
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_install_state(tmp.path(),
+            r#"{"installed_components":["aikey-cli","local-server"]}"#);
+        write_yaml_under(tmp.path(), 9999);
+        with_home(tmp.path(), || {
+            assert_eq!(read_local_server_port_or_default().unwrap(), 9999);
+        });
+    }
+
+    #[test]
+    fn or_default_falls_back_to_8090_when_yaml_missing_but_installed() {
+        // YAML absent + install-state says local-server installed → default.
+        // This is the BR-rc.5-47 regression pin: must NOT propagate the
+        // strict error (which would say "Local Bulk Import requires...").
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_install_state(tmp.path(),
+            r#"{"installed_components":["aikey-cli","local-server"]}"#);
+        with_home(tmp.path(), || {
+            assert_eq!(
+                read_local_server_port_or_default().unwrap(),
+                DEFAULT_PERSONAL_TRIAL_LOCAL_SERVER_PORT,
+            );
+        });
+    }
+
+    #[test]
+    fn or_default_falls_back_to_8090_for_trial_too() {
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_install_state(tmp.path(),
+            r#"{"installed_components":["full-trial"]}"#);
+        with_home(tmp.path(), || {
+            assert_eq!(
+                read_local_server_port_or_default().unwrap(),
+                DEFAULT_PERSONAL_TRIAL_LOCAL_SERVER_PORT,
+            );
+        });
+    }
+
+    #[test]
+    fn or_default_still_errors_when_local_server_not_installed() {
+        // install-state has no local-server / no full-trial → fall back
+        // should NOT kick in. The strict Bulk-Import wording is correct
+        // semantically: the user has no local-server install.
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_install_state(tmp.path(),
+            r#"{"installed_components":["aikey-cli"]}"#);
+        with_home(tmp.path(), || {
+            let err = read_local_server_port_or_default().unwrap_err();
+            assert!(err.contains(ERR_I_CLI_NOT_AVAILABLE),
+                "fallback must NOT kick in when local-server not installed; got: {}", err);
+        });
+    }
+
+    #[test]
+    fn or_default_still_errors_when_install_state_missing() {
+        // No install-state.json at all → treated as "not installed",
+        // strict error surfaces. Important: an upgrade or fresh-clone
+        // host without the state file shouldn't silently default to a
+        // port that doesn't exist.
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        with_home(tmp.path(), || {
+            let err = read_local_server_port_or_default().unwrap_err();
+            assert!(err.contains(ERR_I_CLI_NOT_AVAILABLE),
+                "missing install-state must NOT trigger default fallback; got: {}", err);
         });
     }
 
