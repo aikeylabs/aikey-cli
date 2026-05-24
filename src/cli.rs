@@ -265,9 +265,10 @@ pub(crate) enum Commands {
     /// web service with `start` / `stop` / `restart`.
     #[command(alias = "browse", display_order = 6)]
     Web {
-        /// Page to open: overview (default), keys, vault, account, usage, import.
-        /// Also accepts aliases (virtual-keys, team-keys, secrets, profile,
-        /// usage-ledger, bulk-import, quick-import) — resolved by the web UI.
+        /// Page to open: overview (default), keys, vault, account, usage, import,
+        /// referrals, trust-check. Also accepts aliases (virtual-keys, team-keys,
+        /// secrets, profile, usage-ledger, bulk-import, quick-import, trust) —
+        /// resolved by the web UI.
         ///
         /// Service control: pass `start`, `stop`, or `restart` instead of a
         /// page name to start / stop / restart the local web service
@@ -1404,7 +1405,7 @@ Notes:
 
         "web" | "browse" => Some("\
 Notes:
-    - PAGE: overview | keys | vault | account | usage | import | referrals
+    - PAGE: overview | keys | vault | account | usage | import | referrals | trust-check
     - Service control: PAGE = start | stop | restart  →  controls the local
       web service (aikey-local-server on Personal, aikey-trial-server on Trial).
       Bare `aikey web` opens the browser; `aikey web restart` reboots the backend.
@@ -1735,9 +1736,9 @@ Detailed Commands
     aikey browse
 
   Arguments:
-    PAGE: overview | keys | vault | account | usage | import | referrals
+    PAGE: overview | keys | vault | account | usage | import | referrals | trust-check
           (also: virtual-keys, team-keys, secrets, my-vault, profile,
-          usage-ledger, bulk-import, quick-import — resolved by the web UI)
+          usage-ledger, bulk-import, quick-import, trust — resolved by the web UI)
 
   Flags:
     --vault    Shortcut for `aikey web vault` — opens the Personal Vault

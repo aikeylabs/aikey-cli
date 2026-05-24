@@ -87,41 +87,133 @@ struct TrustedApp {
 /// release tag instead of a separate `manifests-vX.Y.Z` tag, since the
 /// manifest version tracks the CLI release 1:1 in this RC).
 ///
-/// Published 2026-05-23: served-asset sha256 verified equal to the
-/// canonical committed file at aikeylabs/launch/manifests/degrade-detector.manifest.json.
+/// Published 2026-05-23 (v1) / 2026-05-24 (v2): served-asset sha256
+/// verified equal to the canonical committed file at
+/// aikeylabs/launch/manifests/degrade-detector.manifest.json.
+///
+/// v2 manifest adds `service_installers.windows` for Windows host support
+/// (BR-rc.5-56 follow-up). When the v2 manifest is republished, this pin
+/// must change in lockstep — see workflow/CI/bugfix/<TODO>.md if this
+/// regression repeats.
 const TRUSTED_APPS: &[TrustedApp] = &[
     TrustedApp {
         slug: "degrade-detector",
         manifest_url:
             "https://github.com/aikeylabs/launch/releases/download/v1.0.0-rc.5/degrade-detector.manifest.json",
-        manifest_sha256: "39de932ff058b2d129fea82c77a229695564ae53c474f7d7d66490efda5cc5f3",
+        manifest_sha256: "7b96e1b16ba849a1f705d2206f100cd29291924f137dcd01c11214efd31eea09",
     },
 ];
 
 // ---------------------------------------------------------------------------
-// Manifest schema (kept minimal — see file header §Design).
+// Manifest schema.
 // ---------------------------------------------------------------------------
+//
+// Schema versions:
+//
+//   v1 (legacy):  `service_installer: ServiceInstaller` (singular)
+//                 - Single URL, implicitly assumed to be a shell script
+//                   runnable via `sh`. Worked for macOS / Linux only;
+//                   Windows users got 404 / bash-not-found.
+//
+//   v2 (current): `service_installers: ServiceInstallers` (plural)
+//                 - Per-platform entries (`unix`, `windows`) keyed off the
+//                   client's current OS at runtime. Same URL/kind shape
+//                   per entry; resolver picks the right one.
+//
+// `Manifest` deserializes both — v1's singular field is mirrored into
+// `service_installers.unix` at parse time so downstream code only has to
+// handle the v2 shape. See `Manifest::resolve_for_current_os()`.
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct Manifest {
     pub schema_version: String,
     pub slug: String,
     pub version: String,
-    pub service_installer: ServiceInstaller,
+    /// v2 plural — present when schema_version >= "2".
+    #[serde(default)]
+    pub service_installers: Option<ServiceInstallers>,
+    /// v1 singular — present when schema_version == "1". Read for
+    /// backward-compat; new manifests should populate v2 instead.
+    #[serde(default)]
+    pub service_installer: Option<ServiceInstaller>,
     #[serde(default)]
     pub doc_url: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct ServiceInstallers {
+    /// macOS / Linux installer (curl-pipe-shell). Required — every
+    /// platform-mappable plugin must support at least Unix.
+    pub unix: ServiceInstaller,
+    /// Windows installer (powershell-iwr-iex). Optional — plugins that
+    /// don't support Windows yet can omit this and `aikey app install`
+    /// will surface a clean `I_PLATFORM_UNSUPPORTED` error on Win hosts
+    /// instead of trying to bash-exec a .ps1.
+    #[serde(default)]
+    pub windows: Option<ServiceInstaller>,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub(crate) struct ServiceInstaller {
-    /// MVP supports only `"curl-pipe-shell"`. Anything else aborts with
-    /// `I_UNSUPPORTED_INSTALLER_KIND` — we want explicit opt-in for new
-    /// installer protocols (binary download, package manager, etc).
+    /// Supported kinds:
+    ///   - "curl-pipe-shell"     (Unix): runs URL via `sh <tmp_file>`
+    ///   - "powershell-iwr-iex"  (Windows): runs URL via
+    ///     `powershell -ExecutionPolicy Bypass -File <tmp_file>`
+    /// Anything else aborts with `I_UNSUPPORTED_INSTALLER_KIND` — we
+    /// want explicit opt-in for new installer protocols (binary
+    /// download, package manager, etc).
     pub kind: String,
-    /// HTTPS URL pointing at a shell script. Pinned to a git tag (not
-    /// `main`) per §11.B so mid-flight branch updates can't introduce
+    /// HTTPS URL pointing at the installer script. Pinned to a git tag
+    /// (not `main`) per §11.B so mid-flight branch updates can't introduce
     /// surprises after the manifest is published.
     pub url: String,
+}
+
+impl Manifest {
+    /// Pick the right ServiceInstaller for the host OS.
+    ///
+    /// Resolution priority:
+    ///   1. v2 `service_installers.{unix|windows}` — preferred
+    ///   2. v1 `service_installer` fallback — assumed to be Unix
+    ///
+    /// Windows hosts with a v1-only manifest get
+    /// `I_PLATFORM_UNSUPPORTED` rather than trying to bash-exec a .sh
+    /// (which used to silently 404 / fail at runtime).
+    pub fn resolve_for_current_os(&self) -> Result<&ServiceInstaller, String> {
+        let is_windows = cfg!(target_os = "windows");
+        if let Some(installers) = &self.service_installers {
+            if is_windows {
+                installers.windows.as_ref().ok_or_else(|| {
+                    format!(
+                        "I_PLATFORM_UNSUPPORTED: plugin '{}' (manifest v{}) declares no Windows \
+                         service_installer. Plugin owner must add 'service_installers.windows' \
+                         to the manifest, or run the Unix-side installer manually under WSL.",
+                        self.slug, self.schema_version
+                    )
+                })
+            } else {
+                Ok(&installers.unix)
+            }
+        } else if let Some(legacy) = &self.service_installer {
+            if is_windows {
+                Err(format!(
+                    "I_PLATFORM_UNSUPPORTED: plugin '{}' uses legacy schema v1 (Unix-only). \
+                     Plugin owner must upgrade to schema v2 with a 'service_installers.windows' \
+                     entry. Workaround: install on macOS / Linux, or run install_service.ps1 \
+                     manually from the plugin's release assets.",
+                    self.slug
+                ))
+            } else {
+                Ok(legacy)
+            }
+        } else {
+            Err(format!(
+                "manifest for '{}' has neither 'service_installers' (v2) nor 'service_installer' \
+                 (v1). Manifest is malformed; plugin owner must fix.",
+                self.slug
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,18 +257,26 @@ pub fn handle_install(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::er
 
     cache_manifest(slug, &manifest)?;
 
-    if manifest.service_installer.kind != "curl-pipe-shell" {
-        return Err(format!(
-            "I_UNSUPPORTED_INSTALLER_KIND: '{}' (only 'curl-pipe-shell' is supported in MVP)",
-            manifest.service_installer.kind
-        )
-        .into());
+    let installer = manifest.resolve_for_current_os().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // Per-kind dispatch. The kind→runner mapping is the contract surface
+    // we extend when new installer protocols ship; an unknown kind aborts
+    // with I_UNSUPPORTED_INSTALLER_KIND rather than guessing.
+    match installer.kind.as_str() {
+        "curl-pipe-shell" | "powershell-iwr-iex" => { /* recognized — dispatch below */ }
+        other => {
+            return Err(format!(
+                "I_UNSUPPORTED_INSTALLER_KIND: '{}' (supported: 'curl-pipe-shell', 'powershell-iwr-iex')",
+                other
+            )
+            .into());
+        }
     }
 
     if !json_mode {
         println!(
             "→ Running service installer: {} (--tag {})",
-            manifest.service_installer.url, manifest.version
+            installer.url, manifest.version
         );
         println!(
             "  (the installer is owned by the plugin — it will set up its own service,\n\
@@ -198,11 +298,11 @@ pub fn handle_install(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::er
     // Plugin autonomy still holds: CLI doesn't tell the script HOW to
     // install — only WHICH version. The script can ignore --tag and
     // do its own resolution if a future iteration prefers that.
-    run_curl_pipe_shell(
-        &manifest.service_installer.url,
-        &manifest.version,
-        json_mode,
-    )?;
+    if installer.kind == "powershell-iwr-iex" {
+        run_powershell_installer(&installer.url, &manifest.version, json_mode)?;
+    } else {
+        run_curl_pipe_shell(&installer.url, &manifest.version, json_mode)?;
+    }
 
     if !json_mode {
         println!("✓ {} install complete", slug);
@@ -257,31 +357,36 @@ pub fn handle_uninstall(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::
         println!("→ Uninstalling {} (first-party app)", slug);
     }
 
-    // Step 2: resolve installer URL — prefer cache (install wrote it),
-    // fall back to fresh fetch + verify.
-    let installer_url = match read_cached_manifest(slug)? {
+    // Step 2: resolve installer URL + kind for current OS — prefer cache
+    // (install wrote it), fall back to fresh fetch + verify.
+    let manifest = match read_cached_manifest(slug)? {
         Some(m) => {
             if !json_mode {
                 println!("→ Using cached manifest from previous install");
             }
-            m.service_installer.url
+            m
         }
         None => {
             if !json_mode {
                 println!("→ Cached manifest missing — re-fetching for uninstall");
             }
-            let manifest = fetch_and_verify_manifest(trusted, json_mode)?;
-            manifest.service_installer.url
+            fetch_and_verify_manifest(trusted, json_mode)?
         }
     };
+    let installer = manifest
+        .resolve_for_current_os()
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let installer_url = installer.url.clone();
+    let installer_kind = installer.kind.clone();
 
-    // Step 3: run the installer script with --uninstall. The script's
-    // own --uninstall path is idempotent (no-op when nothing is
-    // installed), so we don't gate this on prior install state.
+    // Step 3: run the installer script with --uninstall (Unix) / -Uninstall
+    // (Windows). The script's own uninstall path is idempotent (no-op when
+    // nothing is installed), so we don't gate this on prior install state.
     if !json_mode {
-        println!("→ Running service uninstaller: {} --uninstall", installer_url);
+        let flag = if installer_kind == "powershell-iwr-iex" { "-Uninstall" } else { "--uninstall" };
+        println!("→ Running service uninstaller: {} {}", installer_url, flag);
     }
-    run_service_uninstall(&installer_url, json_mode)?;
+    run_service_uninstall(&installer_url, &installer_kind, json_mode)?;
 
     // Step 4: wipe vault rows. Bypasses the mutationLockedSlugs lock
     // on aikey-control because that lock is for revoke/rotate (partial
@@ -341,22 +446,32 @@ fn remove_cached_manifest(slug: &str) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Inverse of `run_curl_pipe_shell` — same download path but invokes the
-/// script with `--uninstall` instead of `--tag <version>`. Kept as a
-/// separate function so the install path stays a clean two-arg
-/// signature and uninstall semantics are explicit at the call site.
+/// Inverse of the install-path runners — same download path but invokes
+/// the script with `--uninstall` (Unix sh) or `-Uninstall` (PowerShell)
+/// instead of `--tag <version>`. Kept as a separate function so the
+/// install path stays a clean two-arg signature and uninstall semantics
+/// are explicit at the call site.
+///
+/// `kind` selects the runner:
+///   - "curl-pipe-shell"     → `sh <tmp>.sh --uninstall`
+///   - "powershell-iwr-iex"  → `powershell -File <tmp>.ps1 -Uninstall`
 fn run_service_uninstall(
     url: &str,
+    kind: &str,
     _json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tmp_dir = std::env::temp_dir();
+    let is_ps = kind == "powershell-iwr-iex";
+    let suffix = if is_ps { "ps1" } else { "sh" };
     let tmp_path = tmp_dir.join(format!(
-        "aikey-app-uninstaller-{}.sh",
-        std::process::id()
+        "aikey-app-uninstaller-{}.{}",
+        std::process::id(),
+        suffix
     ));
     let cleanup = TmpPath(tmp_path.clone());
 
-    let download = Command::new("curl")
+    let curl_bin = if is_ps { "curl.exe" } else { "curl" };
+    let download = Command::new(curl_bin)
         .arg("-fsSL")
         .arg("--max-time")
         .arg("120")
@@ -364,10 +479,11 @@ fn run_service_uninstall(
         .arg(&tmp_path)
         .arg(url)
         .status()
-        .map_err(|e| format!("failed to spawn curl: {}", e))?;
+        .map_err(|e| format!("failed to spawn {}: {}", curl_bin, e))?;
     if !download.success() {
         return Err(format!(
-            "service uninstaller download failed (curl exit {}): {}",
+            "service uninstaller download failed ({} exit {}): {}",
+            curl_bin,
             download.code().map(|c| c.to_string()).unwrap_or_else(|| "<signal>".into()),
             url
         )
@@ -380,11 +496,23 @@ fn run_service_uninstall(
         return Err(format!("downloaded uninstaller is empty (0 bytes): {}", url).into());
     }
 
-    let exec = Command::new("sh")
-        .arg(&tmp_path)
-        .arg("--uninstall")
-        .status()
-        .map_err(|e| format!("failed to spawn shell: {}", e))?;
+    let exec = if is_ps {
+        Command::new("powershell.exe")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-NoProfile")
+            .arg("-File")
+            .arg(&tmp_path)
+            .arg("-Uninstall")
+            .status()
+            .map_err(|e| format!("failed to spawn powershell.exe: {}", e))?
+    } else {
+        Command::new("sh")
+            .arg(&tmp_path)
+            .arg("--uninstall")
+            .status()
+            .map_err(|e| format!("failed to spawn shell: {}", e))?
+    };
     drop(cleanup);
     if !exec.success() {
         return Err(format!(
@@ -477,18 +605,26 @@ fn fetch_and_verify_manifest(
 fn dev_manifest_for_slug(slug: &str) -> Option<Manifest> {
     match slug {
         "degrade-detector" => Some(Manifest {
-            schema_version: "1".into(),
+            schema_version: "2".into(),
             slug: "degrade-detector".into(),
             version: "v1.0.0-rc.5".into(),
-            service_installer: ServiceInstaller {
-                kind: "curl-pipe-shell".into(),
-                // Points at aikeylabs/launch v1.0.0-rc.5 pre-release.
-                // The script is uploaded as a release asset by the
-                // degrade-detector GH Actions workflow
-                // (.github/workflows/release-trust-local.yml).
-                url: "https://github.com/aikeylabs/launch/releases/download/v1.0.0-rc.5/install_service.sh"
-                    .into(),
-            },
+            service_installers: Some(ServiceInstallers {
+                unix: ServiceInstaller {
+                    kind: "curl-pipe-shell".into(),
+                    // Points at aikeylabs/launch v1.0.0-rc.5 pre-release.
+                    // The .sh / .ps1 scripts are uploaded as release assets
+                    // by release.sh Step 7.7 (release-windows-addon.sh +
+                    // install_service.{sh,ps1} staging).
+                    url: "https://github.com/aikeylabs/launch/releases/download/v1.0.0-rc.5/install_service.sh"
+                        .into(),
+                },
+                windows: Some(ServiceInstaller {
+                    kind: "powershell-iwr-iex".into(),
+                    url: "https://github.com/aikeylabs/launch/releases/download/v1.0.0-rc.5/install_service.ps1"
+                        .into(),
+                }),
+            }),
+            service_installer: None,
             doc_url: Some("https://github.com/aikeylabs/launch".into()),
         }),
         _ => None,
@@ -611,6 +747,91 @@ impl Drop for TmpPath {
     }
 }
 
+/// Windows-side peer of `run_curl_pipe_shell`. Downloads a `.ps1`
+/// installer to `%TEMP%`, then execs it via PowerShell.
+///
+/// We use `curl.exe` (bundled in Windows 10 / Server 2019+ since
+/// build 17063) rather than `iwr | iex` because curl gives us
+/// deterministic exit codes, --max-time, and SHA-verifiable output
+/// (same observability as the Unix path).
+///
+/// PowerShell exec flags:
+///   `-ExecutionPolicy Bypass`  — don't refuse an unsigned script.
+///                                The script's authenticity is already
+///                                bound by the manifest SHA-256 we
+///                                verified upstream.
+///   `-NoProfile`               — skip $PROFILE / Modules autoload
+///                                so 3rd-party PS modules can't inject.
+///   `-File <path>`             — execute as a script (not as a string,
+///                                which would interpret -Tag etc as PS
+///                                operators rather than args).
+fn run_powershell_installer(
+    url: &str,
+    version_tag: &str,
+    _json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tmp_dir = std::env::temp_dir();
+    let tmp_path = tmp_dir.join(format!(
+        "aikey-app-installer-{}.ps1",
+        std::process::id()
+    ));
+    let cleanup = TmpPath(tmp_path.clone());
+
+    // curl.exe is bundled in Windows 10 1803+ / Server 2019+. We
+    // explicitly call curl.exe (not just "curl") because PowerShell's
+    // built-in `curl` alias shadows the binary and points at
+    // Invoke-WebRequest, which has different semantics + can hang in
+    // non-interactive sessions (writing progress to a non-existent
+    // console handle). Always call curl.exe by full name.
+    let download = Command::new("curl.exe")
+        .arg("-fsSL")
+        .arg("--max-time")
+        .arg("120")
+        .arg("-o")
+        .arg(&tmp_path)
+        .arg(url)
+        .status()
+        .map_err(|e| format!("failed to spawn curl.exe: {}", e))?;
+    if !download.success() {
+        return Err(format!(
+            "service installer download failed (curl exit {}): {}",
+            download
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<signal>".into()),
+            url
+        )
+        .into());
+    }
+
+    let meta = fs::metadata(&tmp_path)
+        .map_err(|e| format!("stat downloaded installer: {}", e))?;
+    if meta.len() == 0 {
+        return Err(format!("downloaded installer is empty (0 bytes): {}", url).into());
+    }
+
+    // PowerShell exec — see fn-level comment for why these flags.
+    let exec = Command::new("powershell.exe")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-NoProfile")
+        .arg("-File")
+        .arg(&tmp_path)
+        .arg("-Tag")
+        .arg(version_tag)
+        .status()
+        .map_err(|e| format!("failed to spawn powershell.exe: {}", e))?;
+    drop(cleanup);
+    if !exec.success() {
+        return Err(format!(
+            "service installer exited with status {}",
+            exec.code().map(|c| c.to_string()).unwrap_or_else(|| "<signal>".into())
+        )
+        .into());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -631,10 +852,54 @@ mod tests {
     fn dev_manifest_returns_degrade_detector() {
         let m = dev_manifest_for_slug("degrade-detector").expect("present");
         assert_eq!(m.slug, "degrade-detector");
-        assert_eq!(m.schema_version, "1");
-        assert_eq!(m.service_installer.kind, "curl-pipe-shell");
+        assert_eq!(m.schema_version, "2");
+        let installers = m.service_installers.as_ref().expect("v2 must populate service_installers");
+        assert_eq!(installers.unix.kind, "curl-pipe-shell");
         // Pin a substring so accidental URL renames are caught.
-        assert!(m.service_installer.url.contains("install_service.sh"));
+        assert!(installers.unix.url.contains("install_service.sh"));
+        let win = installers.windows.as_ref().expect("Windows entry must exist for degrade-detector v2");
+        assert_eq!(win.kind, "powershell-iwr-iex");
+        assert!(win.url.contains("install_service.ps1"));
+    }
+
+    #[test]
+    fn manifest_v1_legacy_resolves_for_unix_but_rejects_windows() {
+        // Backward-compat: v1 manifests in the wild (or in caches) should
+        // still install on Unix, while clearly failing on Windows hosts
+        // (rather than silently bash-execing a .sh that 404s).
+        let v1 = Manifest {
+            schema_version: "1".into(),
+            slug: "legacy-app".into(),
+            version: "v0.1.0".into(),
+            service_installers: None,
+            service_installer: Some(ServiceInstaller {
+                kind: "curl-pipe-shell".into(),
+                url: "https://example.com/legacy.sh".into(),
+            }),
+            doc_url: None,
+        };
+        let resolved = v1.resolve_for_current_os();
+        if cfg!(target_os = "windows") {
+            assert!(resolved.is_err(), "v1 manifest on Windows should error with I_PLATFORM_UNSUPPORTED");
+            let msg = format!("{}", resolved.unwrap_err());
+            assert!(msg.contains("I_PLATFORM_UNSUPPORTED"), "msg was: {}", msg);
+        } else {
+            let i = resolved.expect("v1 manifest on Unix should resolve to legacy field");
+            assert_eq!(i.kind, "curl-pipe-shell");
+        }
+    }
+
+    #[test]
+    fn manifest_v2_resolves_by_target_os() {
+        let m = dev_manifest_for_slug("degrade-detector").expect("present");
+        let resolved = m.resolve_for_current_os().expect("v2 with both platforms should resolve");
+        if cfg!(target_os = "windows") {
+            assert_eq!(resolved.kind, "powershell-iwr-iex");
+            assert!(resolved.url.ends_with(".ps1"));
+        } else {
+            assert_eq!(resolved.kind, "curl-pipe-shell");
+            assert!(resolved.url.ends_with(".sh"));
+        }
     }
 
     #[test]

@@ -106,9 +106,11 @@ mod trust_local {
         // `--no-degrade-detector` at install time or `aikey app
         // uninstall degrade-detector` later. Either way the simplest
         // path back is `aikey app install`, not the curl-pipe.
-        let trust_local_bin = std::path::Path::new(
-            &std::env::var("HOME").unwrap_or_default()
-        ).join(".aikey/bin/trust-local");
+        //
+        // Path resolution is cross-platform:
+        //   Unix:    $HOME/.aikey/bin/trust-local
+        //   Windows: %USERPROFILE%\.aikey\bin\trust-local.exe
+        let trust_local_bin = aikey_home_bin_path();
         if !trust_local_bin.exists() {
             let msg = format!(
                 "trust-local binary not found at {}. Install via: \
@@ -125,16 +127,34 @@ mod trust_local {
             return Err(msg.into());
         }
 
-        let uid = current_uid();
         let result = match std::env::consts::OS {
             "macos" => match verb {
-                "start" | "restart" => launchctl_kickstart(uid),
-                "stop"              => launchctl_kill(uid),
+                "start" | "restart" => launchctl_kickstart(current_uid()),
+                "stop"              => launchctl_kill(current_uid()),
                 _ => return Err(format!("unknown verb '{}'", verb).into()),
             },
             "linux" => systemctl_user(verb),
-            other   => return Err(format!(
-                "platform '{}' not supported (service control is macOS / Linux only)",
+            "windows" => match verb {
+                "start" | "stop" => sc_action(verb),
+                // Windows `sc.exe` has no atomic restart; do stop + wait-for-STOPPED
+                // + start. We can't just sleep a fixed interval because `sc.exe stop`
+                // is async (returns STOP_PENDING immediately while the service exits);
+                // starting before STOPPED → `sc.exe start` returns "1056: service is
+                // already running" / "1056: service has been marked for deletion".
+                "restart" => {
+                    let _ = sc_action("stop");
+                    // Poll for STOPPED state up to 10s. Match NSSM's stop timeout.
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while Instant::now() < deadline {
+                        if sc_is_stopped() { break; }
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                    sc_action("start")
+                }
+                _ => return Err(format!("unknown verb '{}'", verb).into()),
+            },
+            other => return Err(format!(
+                "platform '{}' not supported (service control is macOS / Linux / Windows)",
                 other
             ).into()),
         };
@@ -178,6 +198,48 @@ mod trust_local {
 
     fn systemctl_user(verb: &str) -> Result<(), String> {
         run("systemctl", &["--user", verb, SERVICE_NAME])
+    }
+
+    /// Windows: drive the NSSM-wrapped service via Windows SCM.
+    ///
+    /// install_service.ps1 registers the service via `nssm install`, which
+    /// produces a real Windows service that responds to `sc.exe` SCM calls.
+    /// We use `sc.exe` (Windows-bundled) rather than `nssm.exe` directly to
+    /// avoid hard-depending on NSSM being on PATH from this CLI's perspective
+    /// (nssm is installed to System32 by setup-aliyun-win-build.ps1, but if
+    /// an end-user installed trust-local via the published install_service.ps1
+    /// it lands wherever the script placed it).
+    fn sc_action(verb: &str) -> Result<(), String> {
+        run("sc.exe", &[verb, SERVICE_NAME])
+    }
+
+    /// Returns true when `sc.exe query <SERVICE_NAME>` reports `STATE :
+    /// 1  STOPPED`. Used by the restart loop to wait for an async `sc.exe
+    /// stop` to actually finish before re-firing `sc.exe start` (otherwise
+    /// start races stop and returns 1056 / 1062).
+    fn sc_is_stopped() -> bool {
+        match std::process::Command::new("sc.exe")
+            .args(["query", SERVICE_NAME])
+            .output()
+        {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                s.contains("STOPPED")
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// `~/.aikey/bin/trust-local` (Unix) or `%USERPROFILE%\.aikey\bin\trust-local.exe`
+    /// (Windows). Mirrors install_service.ps1's `$BinaryPath` resolution.
+    fn aikey_home_bin_path() -> std::path::PathBuf {
+        let home = if cfg!(windows) {
+            std::env::var("USERPROFILE").unwrap_or_default()
+        } else {
+            std::env::var("HOME").unwrap_or_default()
+        };
+        let binary_name = if cfg!(windows) { "trust-local.exe" } else { "trust-local" };
+        std::path::PathBuf::from(home).join(".aikey").join("bin").join(binary_name)
     }
 
     fn run(cmd: &str, args: &[&str]) -> Result<(), String> {

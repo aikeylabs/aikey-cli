@@ -29,7 +29,31 @@ use std::path::{Path, PathBuf};
 // Surfaced as part of error messages so scripts can grep for it.
 pub const ERR_I_CLI_NOT_AVAILABLE: &str = "I_CLI_NOT_AVAILABLE";
 
-const YAML_CONFIG_REL: &str = ".aikey/config/control-trial.yaml";
+/// Candidate YAML config paths the local-server may be using.
+///
+/// Personal edition renders to `control.yaml` (post 2026-05-13 binary-
+/// isolation refactor, commit a928cd4); Trial edition keeps the legacy
+/// `control-trial.yaml`. The CLI doesn't know edition at probe time
+/// (would require an install-state.json read every call), so we try
+/// the new name first and fall back to the legacy name — whichever
+/// exists is the active config.
+///
+/// Order matters:
+/// - `control.yaml` first → Personal hosts return immediately (no
+///   useless stat of legacy path)
+/// - `control-trial.yaml` fallback → Trial hosts find their config;
+///   also covers pre-rename Personal users who haven't run the new
+///   installer yet (legacy file not yet mv'd)
+///
+/// Adding a new edition's config filename → add one entry here. Bugfix
+/// 20260524-personal-install-console-failed-to-start.md captures the
+/// scope-fidelity lesson: a928cd4 renamed the file but missed updating
+/// hardcoded read paths; the list shape makes future renames a single-
+/// point edit.
+const YAML_CONFIG_REL_CANDIDATES: &[&str] = &[
+    ".aikey/config/control.yaml",        // Personal (post 2026-05-13)
+    ".aikey/config/control-trial.yaml",  // Trial (legacy name preserved)
+];
 const JSON_CONFIG_REL: &str = ".aikey/config/config.json";
 
 /// Canonical default listen port for Personal / Trial local-server when
@@ -117,8 +141,13 @@ pub fn read_local_server_port() -> Result<u16, String> {
     // the same code path the rest of the CLI uses.
     let home = crate::commands_account::resolve_user_home();
 
-    if let Some(port) = read_yaml_listen_port(&home.join(YAML_CONFIG_REL))? {
-        return Ok(port);
+    // BR-rc.5-58 fix: try each candidate YAML path in order. Personal's
+    // control.yaml first (new name from 2026-05-13 binary-isolation),
+    // control-trial.yaml fallback (Trial + pre-rename Personal hosts).
+    for rel in YAML_CONFIG_REL_CANDIDATES {
+        if let Some(port) = read_yaml_listen_port(&home.join(rel))? {
+            return Ok(port);
+        }
     }
     if let Some(port) = read_localhost_port_from_config_json(&home.join(JSON_CONFIG_REL)) {
         return Ok(port);
@@ -338,7 +367,6 @@ fn start_service(edition: Edition) -> Result<(), String> {
     let bin_file = bin_name.to_string();
 
     let bin = home.join(".aikey").join("bin").join(&bin_file);
-    let cfg = home.join(".aikey").join("config").join("control-trial.yaml");
 
     if !bin.exists() {
         return Err(format!(
@@ -348,7 +376,18 @@ fn start_service(edition: Edition) -> Result<(), String> {
         ));
     }
 
-    spawn_detached(&bin, &cfg)
+    // BR-rc.5-58 fix (2026-05-24): no `--config` arg. The binary's
+    // cmd/local/main.go (Personal) sets AIKEY_CONFIG_DEFAULT_NAME=
+    // control.yaml in its own startup, and cmd/full/main.go (Trial)
+    // leaves it unset so config.go DefaultConfigPath() falls back to
+    // control-trial.yaml. Either way, NOT passing --config lets the
+    // binary use its own edition-correct default — symmetric with the
+    // installer fix in workflow/CD/installer/local-install.sh:1493
+    // (also removed --config). Hardcoded `control-trial.yaml` was a
+    // hangover from before 2026-05-13 binary-isolation refactor (commit
+    // a928cd4 missed this read-side site). See bugfix
+    // 20260524-personal-install-console-failed-to-start.md.
+    spawn_detached(&bin)
 }
 
 fn stop_service() -> Result<(), String> {
@@ -371,12 +410,13 @@ fn stop_service() -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn spawn_detached(bin: &Path, cfg: &Path) -> Result<(), String> {
+fn spawn_detached(bin: &Path) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
+    // No --config: binary uses env-driven DefaultConfigPath. See caller
+    // start_service() docblock for full rationale (BR-rc.5-58).
     let mut cmd = Command::new(bin);
-    cmd.arg("--config").arg(cfg);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -396,15 +436,15 @@ fn spawn_detached(bin: &Path, cfg: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn spawn_detached(bin: &Path, cfg: &Path) -> Result<(), String> {
+fn spawn_detached(bin: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
 
     // CREATE_NO_WINDOW (0x08000000) | DETACHED_PROCESS (0x00000008) —
     // child survives parent exit and has no console window.
+    // No --config: binary uses env-driven DefaultConfigPath (BR-rc.5-58).
     const DETACHED_NO_WINDOW: u32 = 0x0800_0008;
     Command::new(bin)
-        .arg("--config").arg(cfg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -415,7 +455,7 @@ fn spawn_detached(bin: &Path, cfg: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn spawn_detached(_bin: &Path, _cfg: &Path) -> Result<(), String> {
+fn spawn_detached(_bin: &Path) -> Result<(), String> {
     Err("service start not supported on this platform".to_string())
 }
 
@@ -838,6 +878,68 @@ mod tests {
         assert!(err.contains("host:port") || err.contains("u16"));
     }
 
+    // ── YAML_CONFIG_REL_CANDIDATES fence tests (BR-rc.5-58) ──────────
+    //
+    // Pin the candidate-list contract:
+    //   1. `control.yaml` exists alone → port read from it (Personal)
+    //   2. `control-trial.yaml` exists alone → fallback (Trial / pre-rename)
+    //   3. Both exist → `control.yaml` wins (Personal post-renamed host
+    //      where mv left both — defensive ordering)
+    //   4. Neither exists → strict variant errors; _or_default falls back
+    //      to 8090 when local-server is installed (covered by existing
+    //      or_default_falls_back_to_8090_when_yaml_missing_but_installed)
+    //
+    // These tests would have caught BR-rc.5-58 had they existed pre-
+    // 2026-05-13 rename — `control-trial.yaml`-only fixture passing while
+    // a Personal-shaped host (control.yaml) silently returned no port.
+
+    #[test]
+    fn read_local_server_port_picks_control_yaml_personal_path() {
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_personal_yaml_under(tmp.path(), 8091);
+        with_home(tmp.path(), || {
+            assert_eq!(read_local_server_port().unwrap(), 8091);
+        });
+    }
+
+    #[test]
+    fn read_local_server_port_falls_back_to_control_trial_yaml() {
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        // Only the legacy / Trial name exists
+        write_yaml_under(tmp.path(), 9092);
+        with_home(tmp.path(), || {
+            assert_eq!(read_local_server_port().unwrap(), 9092);
+        });
+    }
+
+    #[test]
+    fn read_local_server_port_prefers_control_yaml_when_both_present() {
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_personal_yaml_under(tmp.path(), 8093); // control.yaml
+        write_yaml_under(tmp.path(), 7777);          // control-trial.yaml (legacy)
+        with_home(tmp.path(), || {
+            // Personal (control.yaml) wins — first in CANDIDATES list.
+            // Defensive against a host where mv migration was interrupted
+            // and both files coexist; the new name should still be the
+            // authoritative source.
+            assert_eq!(read_local_server_port().unwrap(), 8093);
+        });
+    }
+
+    #[test]
+    fn yaml_config_rel_candidates_order_is_control_then_control_trial() {
+        // Pin the order — `control.yaml` first (Personal post-rename),
+        // `control-trial.yaml` fallback. Re-ordering would silently
+        // change behavior for hosts where both files exist.
+        assert_eq!(
+            YAML_CONFIG_REL_CANDIDATES,
+            &[".aikey/config/control.yaml", ".aikey/config/control-trial.yaml"]
+        );
+    }
+
     #[test]
     fn read_localhost_port_from_config_json_extracts_localhost() {
         let tmp = tempfile::tempdir().unwrap();
@@ -915,7 +1017,17 @@ mod tests {
     fn write_yaml_under(home: &std::path::Path, port: u16) {
         let cfg = home.join(".aikey/config");
         std::fs::create_dir_all(&cfg).unwrap();
+        // Default to control-trial.yaml (legacy / Trial name) — existing
+        // tests rely on this path. Personal-specific tests use the
+        // dedicated `write_personal_yaml_under` helper below.
         std::fs::write(cfg.join("control-trial.yaml"),
+            format!("listen: 127.0.0.1:{}\n", port)).unwrap();
+    }
+
+    fn write_personal_yaml_under(home: &std::path::Path, port: u16) {
+        let cfg = home.join(".aikey/config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("control.yaml"),
             format!("listen: 127.0.0.1:{}\n", port)).unwrap();
     }
 

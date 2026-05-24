@@ -989,8 +989,16 @@ fn web_page_alias(page: Option<&str>) -> Result<&'static str, String> {
         Some("usage" | "usage-ledger")                           => Ok("usage"),
         Some("import" | "bulk-import" | "quick-import")          => Ok("import"),
         Some("referrals")                                        => Ok("referrals"),
+        // Degrade-detector M5 trust-check page (/user/trust-check) —
+        // added 2026-05-24 after user surfaced that the page was
+        // reachable via the sidebar / URL but `aikey web trust-check`
+        // errored "Unknown page". The page is Personal-only at the
+        // sidebar level, but the CLI doesn't edition-gate page names
+        // (matches existing pattern); the web side decides what to
+        // render on Trial / Production hosts.
+        Some("trust-check" | "trust")                            => Ok("trust-check"),
         Some(other) => Err(format!(
-            "Unknown page '{}'. Available: overview, keys, vault, account, usage, import, referrals",
+            "Unknown page '{}'. Available: overview, keys, vault, account, usage, import, referrals, trust-check",
             other
         )),
     }
