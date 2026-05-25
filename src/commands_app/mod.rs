@@ -35,7 +35,7 @@ mod handlers;
 mod install;
 pub use handlers::{
     handle_list, handle_pause, handle_register, handle_resume, handle_revoke, handle_rotate,
-    handle_route,
+    handle_route, register_core, RegisterResult,
 };
 pub use install::{handle_install, handle_uninstall};
 
@@ -700,6 +700,7 @@ pub fn delete_all_app_state(slug: &str) -> Result<UninstallCounts, String> {
 #[derive(Debug, Default)]
 pub struct UninstallCounts {
     pub app_keys_deleted: usize,
+    pub app_keys_revoked: usize,
     pub app_records_deleted: usize,
     pub bindings_deleted: usize,
 }
@@ -740,9 +741,119 @@ pub fn delete_all_app_state_with_conn(
 
     Ok(UninstallCounts {
         app_keys_deleted,
+        app_keys_revoked: 0,
         app_records_deleted,
         bindings_deleted,
     })
+}
+
+/// Third-party variant of uninstall: revoke active app_keys (keep history
+/// rows) + delete bindings + delete app_records. Unlike `delete_all_app_state`
+/// (used by first-party `aikey app uninstall`), this preserves
+/// `app_keys` rows by flipping their status to 'revoked', so an audit
+/// trail of "which tokens were ever issued for this slug" survives the
+/// uninstall.
+///
+/// Why the asymmetry vs first-party (per 2026-05-25 user decision):
+/// - first-party uninstall is whole-system removal (service binary +
+///   vault). Audit lives in service logs + usage_event_ods.
+/// - third-party uninstall is identity-only (the third-party agent's own
+///   binary is not managed by AiKey). Retaining `app_keys` rows lets the
+///   user later see "ah, I once had a token issued to slug=X" in vault
+///   inspection tools.
+///
+/// Caveat for re-registration with same slug: with FK enforcement OFF
+/// (current `PRAGMA foreign_keys = 0`), DELETE on app_records does NOT
+/// cascade to app_keys. The revoked rows remain pointing at slug=X by
+/// `app_slug` column. If the user later re-registers slug=X, the new
+/// active `app_keys` row coexists with the old revoked ones — they share
+/// the slug but were issued under separate "app instances". For audit
+/// queries that need cross-reregistration provenance, prefer
+/// `usage_event_ods.app_slug + virtual_key_hash` (which is per-request and
+/// not affected by uninstall).
+pub fn delete_third_party_app_identity(slug: &str) -> Result<UninstallCounts, String> {
+    let mut conn = storage::open_connection()?;
+    let counts = delete_third_party_app_identity_with_conn(&mut conn, slug)?;
+    let _ = storage::bump_vault_change_seq();
+    Ok(counts)
+}
+
+pub fn delete_third_party_app_identity_with_conn(
+    conn: &mut Connection,
+    slug: &str,
+) -> Result<UninstallCounts, String> {
+    // FK enforcement guard: the baseline schema declares
+    //   app_keys.app_slug REFERENCES app_records(slug) ON DELETE CASCADE
+    // which would erase the `app_keys` audit rows we want to preserve when
+    // we DELETE the parent `app_records` row. Production currently runs
+    // with `foreign_keys=OFF` (the cascade doesn't fire there), but tests
+    // run with `foreign_keys=ON`, and prod could be flipped on for safety
+    // in the future. To keep "preserve app_keys for audit" reliable
+    // regardless of the runtime PRAGMA, we explicitly turn FK off for
+    // the duration of this operation and restore the original setting
+    // after. SQLite forbids PRAGMA foreign_keys inside a transaction, so
+    // the save/set/restore happens outside the tx boundary.
+    let prior_fk: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .map_err(|e| format!("read foreign_keys PRAGMA: {}", e))?;
+    if prior_fk != 0 {
+        conn.execute_batch("PRAGMA foreign_keys = OFF")
+            .map_err(|e| format!("disable foreign_keys: {}", e))?;
+    }
+
+    let result = (|| -> Result<UninstallCounts, String> {
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("begin third-party uninstall tx for slug={:?}: {}", slug, e))?;
+
+        // Revoke (don't delete) all currently-non-revoked app_keys rows.
+        // Audit trail: row count + revocation timestamp would be useful but
+        // current app_keys schema has no `revoked_at` column — status flip
+        // is sufficient since `created_at` is preserved + the implicit
+        // ordering is by key_id (UUIDv4) which sorts roughly by time.
+        let app_keys_revoked = tx
+            .execute(
+                "UPDATE app_keys SET status = 'revoked' \
+                 WHERE app_slug = ?1 AND status != 'revoked'",
+                params![slug],
+            )
+            .map_err(|e| format!("UPDATE app_keys for slug={:?}: {}", slug, e))?;
+
+        let profile_id = format!("app:{}", slug);
+        let bindings_deleted = tx
+            .execute(
+                "DELETE FROM user_profile_provider_bindings WHERE profile_id = ?1",
+                params![profile_id],
+            )
+            .map_err(|e| format!("DELETE bindings for profile={:?}: {}", profile_id, e))?;
+
+        let app_records_deleted = tx
+            .execute("DELETE FROM app_records WHERE slug = ?1", params![slug])
+            .map_err(|e| format!("DELETE app_records for slug={:?}: {}", slug, e))?;
+
+        tx.commit()
+            .map_err(|e| format!("commit third-party uninstall tx for slug={:?}: {}", slug, e))?;
+
+        Ok(UninstallCounts {
+            app_keys_deleted: 0,
+            app_keys_revoked,
+            app_records_deleted,
+            bindings_deleted,
+        })
+    })();
+
+    // Restore the PRAGMA regardless of result so we don't leak the
+    // weakened FK state into subsequent operations on this connection.
+    if prior_fk != 0 {
+        if let Err(e) = conn.execute_batch("PRAGMA foreign_keys = ON") {
+            // We only log because the primary operation succeeded; failing
+            // to flip the PRAGMA back is a developer-environment issue
+            // (e.g. weird platform behavior), not a vault data issue.
+            eprintln!("⚠ failed to restore foreign_keys=ON after uninstall: {}", e);
+        }
+    }
+
+    result
 }
 
 pub fn rotate_app_key(slug: &str) -> Result<(String, String), String> {

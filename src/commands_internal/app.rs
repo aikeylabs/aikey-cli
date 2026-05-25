@@ -47,6 +47,7 @@ pub fn handle(env: StdinEnvelope) {
     match env.action.as_str() {
         "list" => handle_list(env),
         "get" => handle_get(env),
+        "register" => handle_register(env),
         "route" => handle_route(env),
         "revoke" => handle_revoke(env),
         "pause" => handle_pause(env),
@@ -189,6 +190,173 @@ fn handle_get(env: StdinEnvelope) {
         })).collect::<Vec<_>>(),
     });
     emit(&ResultEnvelope::ok(req_id, data));
+}
+
+/// `register` — Web UI third-party app registration (added 2026-05-25).
+///
+/// Wraps `commands_app::handlers::register_core` with three security
+/// invariants HARDCODED at this layer to keep the Web path narrow:
+///
+///   - `first_party = false`           → never grants the first-party
+///     privilege from a Web request. First-party slugs are reserved for
+///     `FIRST_PARTY_SLUGS` (currently degrade-detector); the CLI
+///     `validate_first_party_invariants` would reject mis-claims at
+///     write time, but rejecting here means we never even touch the
+///     vault on a malformed Web call.
+///   - `follow_user_active = false`    → third-party apps cannot
+///     dynamically follow `aikey use`. Per
+///     `2026-05-23-credential-mode-architecture.md` SPEC §29 + user
+///     decision 2026-05-25, third-party should be Mode B-equivalent
+///     (snapshot from default at register time, then independent).
+///   - `rotate_bearer = false`         → re-register reuses the existing
+///     active bearer (per 2026-05-21 §5.C C1). Rotation is a separate
+///     intent, exposed via the dedicated `rotate` IPC action / UI button.
+///
+/// Web payload accepts only the safe fields: slug, name, vendor (opt),
+/// upstreams, requested_permissions (opt). Anything else (first_party,
+/// follow_user_active, rotate_bearer, app_kind) is ignored — server-
+/// hardcoded above.
+///
+/// Reserved-slug pre-check: returns 400 `I_FIRST_PARTY_SLUG_RESERVED`
+/// if the requested slug is in `FIRST_PARTY_SLUGS`, so the user gets a
+/// clean "pick a different slug" instead of a generic permission error
+/// from inside `register_core`.
+fn handle_register(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+
+    #[derive(Deserialize)]
+    struct Payload {
+        slug: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        vendor: String,
+        upstreams: Vec<String>,
+        #[serde(default)]
+        requested_permissions: Vec<String>,
+    }
+    let p: Payload = match serde_json::from_value(env.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_error(req_id, "I_BAD_PAYLOAD", format!("decode payload: {}", e));
+            return;
+        }
+    };
+
+    // Pre-flight: slug shape (register_core also runs this, but checking
+    // here lets us return I_INVALID_SLUG before the reserved-slug check
+    // — clearer error precedence: format > policy).
+    if let Err(e) = commands_app::validate_slug(&p.slug) {
+        emit_error(req_id, "I_INVALID_SLUG", e);
+        return;
+    }
+
+    // Block reserved first-party slugs from Web registration. CLI users
+    // who legitimately need to add a first-party slug go through code:
+    // they update FIRST_PARTY_SLUGS, recompile, then `aikey app register
+    // --first-party`. There is no Web path to that privilege.
+    if commands_app::is_first_party(&p.slug) {
+        emit_error(
+            req_id,
+            "I_FIRST_PARTY_SLUG_RESERVED",
+            format!(
+                "slug '{}' is reserved for built-in first-party apps. \
+                 Choose a different slug for third-party registration.",
+                p.slug
+            ),
+        );
+        return;
+    }
+
+    // Web UI register must always declare at least one upstream — empty
+    // upstreams would let the user create a phantom app that can't route.
+    if p.upstreams.is_empty() {
+        emit_error(
+            req_id,
+            "I_NO_UPSTREAMS",
+            "upstreams list cannot be empty — pick at least one provider \
+             (e.g. \"anthropic\", \"openai\")"
+                .to_string(),
+        );
+        return;
+    }
+
+    // Fall back to slug as display name when caller omits it (vendor
+    // installers typically pass --name; manual Web Add lets users skip).
+    let effective_name = if p.name.is_empty() {
+        p.slug.clone()
+    } else {
+        p.name.clone()
+    };
+
+    let result = match commands_app::register_core(
+        &p.slug,
+        &effective_name,
+        &p.vendor,
+        &p.upstreams,
+        /* first_party */ false,
+        /* follow_user_active */ false,
+        &p.requested_permissions,
+        /* rotate_bearer */ false,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            emit_error(req_id, "I_APP_REGISTER_FAILED", format!("register: {}", e));
+            return;
+        }
+    };
+
+    // Project the typed binding tuples into JSON arrays. Re-uses the
+    // same shape as handle_register's CLI JSON output (see
+    // commands_app::handlers::handle_register json_mode branch), so the
+    // Web UI and the CLI consumers parse identical wire format.
+    let snapshotted: Vec<Value> = result
+        .snapshotted_bindings
+        .iter()
+        .map(|(u, t, r)| {
+            json!({
+                "upstream": u,
+                "key_source_type": t.as_str(),
+                "key_source_ref": r,
+            })
+        })
+        .collect();
+    let preserved: Vec<Value> = result
+        .preserved_bindings
+        .iter()
+        .map(|(u, t, r)| {
+            json!({
+                "upstream": u,
+                "key_source_type": t.as_str(),
+                "key_source_ref": r,
+            })
+        })
+        .collect();
+
+    emit(&ResultEnvelope::ok(
+        req_id,
+        json!({
+            "slug": result.slug,
+            "name": result.name,
+            "vendor": result.vendor,
+            "upstreams": result.upstreams,
+            "app_kind": result.app_kind,
+            "follow_user_active": result.follow_user_active,
+            "requested_permissions": result.requested_permissions,
+            "action": if result.inserted { "inserted" } else { "updated" },
+            "key_id": result.key_id,
+            // route_token is the one-time-shown bearer. Web UI surfaces
+            // this in a token-reveal modal with a Copy button and a
+            // "this will not be shown again" warning.
+            "route_token": result.route_token,
+            "base_url": result.base_url,
+            "base_url_protocol": result.base_url_protocol,
+            "bearer_was_new": result.bearer_was_new,
+            "snapshotted_bindings": snapshotted,
+            "preserved_bindings": preserved,
+            "missing_upstreams_for_aikey_use": result.missing_upstreams,
+        }),
+    ));
 }
 
 /// `route` — UPSERT a per-upstream binding. Equivalent to the

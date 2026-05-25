@@ -343,18 +343,29 @@ pub fn handle_install(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::er
 /// itself idempotent — see the script's own `ok` lines that fire
 /// only on actual file existence).
 pub fn handle_uninstall(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let trusted = TRUSTED_APPS
-        .iter()
-        .find(|t| t.slug == slug)
-        .ok_or_else(|| {
-            format!(
-                "slug '{}' is not in the built-in trusted-apps list. \
-                 Only first-party apps can be uninstalled via this command; \
-                 third-party apps clean up via their own tooling.",
-                slug,
-            )
-        })?;
+    // 2026-05-25: uninstall now supports both first-party (via TRUSTED_APPS,
+    // full lifecycle: service binary removal + vault wipe) and third-party
+    // (identity-only: revoke app_keys for audit + delete app_records +
+    // delete bindings). The two paths differ deliberately — first-party is
+    // whole-system (AiKey owns the agent binary), third-party is
+    // AiKey-side-only (third-party agent binary is user-managed).
+    match TRUSTED_APPS.iter().find(|t| t.slug == slug) {
+        Some(trusted) => handle_uninstall_first_party(slug, trusted, json_mode),
+        None => handle_uninstall_third_party(slug, json_mode),
+    }
+}
 
+/// First-party uninstall path: runs the agent's own install_service.sh
+/// `--uninstall` (which stops the launchd/systemd service + removes the
+/// binary), then deletes ALL vault rows for the slug (app_keys included),
+/// then clears the manifest cache. The vault wipe bypasses the
+/// `mutationLockedSlugs` lock — that lock is for revoke/rotate (partial
+/// state breaking), not for whole-system uninstall.
+fn handle_uninstall_first_party(
+    slug: &str,
+    trusted: &TrustedApp,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !json_mode {
         println!("→ Uninstalling {} (first-party app)", slug);
     }
@@ -394,9 +405,9 @@ pub fn handle_uninstall(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::
     }
     run_service_uninstall(&installer_url, &installer_kind, json_mode)?;
 
-    // Step 4: wipe vault rows. Bypasses the mutationLockedSlugs lock
-    // on aikey-control because that lock is for revoke/rotate (partial
-    // state breaking), not for whole-system uninstall (full removal).
+    // Step 4: wipe vault rows (all three tables). First-party uninstall is
+    // whole-system so the audit trail isn't needed at vault level (it lives
+    // in service logs + usage_event_ods).
     let counts = crate::commands_app::delete_all_app_state(slug)?;
     if !json_mode {
         println!(
@@ -417,6 +428,62 @@ pub fn handle_uninstall(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::
     if !json_mode {
         println!("✓ {} uninstall complete", slug);
         println!("  Re-install any time with: aikey app install {}", slug);
+    }
+    Ok(())
+}
+
+/// Third-party uninstall path: AiKey-side identity removal only.
+///
+/// Per 2026-05-25 user decision (plan doc
+/// `roadmap20260320/技术实现/update/2026-05-25-third-party-app-web-ui-add.md`
+/// §5 decision E): removes `app_records` + `user_profile_provider_bindings`
+/// rows for the slug, but RETAINS `app_keys` rows by flipping their
+/// `status` column to 'revoked'. The retained rows give audit history of
+/// "which tokens were ever issued for this slug" without keeping any
+/// token in an active state. The third-party agent's own binary is
+/// user-managed and not touched by this command.
+///
+/// Pre-condition: the slug must EXIST in app_records (idempotency tolerates
+/// "already partially uninstalled" state — re-running on a slug with no
+/// active bindings + no app_records row is OK and reports zero counts —
+/// but a slug that never existed at all yields a not-found error so
+/// users don't think they cleaned up state they didn't have).
+fn handle_uninstall_third_party(
+    slug: &str,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Check existence so we can give an actionable "not registered" error
+    // instead of silently succeeding with zero counts. Look at app_records
+    // (the identity table); app_keys may be entirely absent for slugs that
+    // were registered but never authorized (legacy two-step flow).
+    let existed = crate::commands_app::get_app_record(slug)
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("check existence for slug={:?}: {}", slug, e).into()
+        })?
+        .is_some();
+    if !existed {
+        return Err(format!(
+            "slug '{}' is not registered. Run `aikey app list` to see registered apps.",
+            slug,
+        )
+        .into());
+    }
+
+    if !json_mode {
+        println!("→ Uninstalling {} (third-party app)", slug);
+        println!("  AiKey-side identity removal only. Your agent's own binary");
+        println!("  (if any) is user-managed and not touched.");
+    }
+
+    let counts = crate::commands_app::delete_third_party_app_identity(slug)?;
+    if !json_mode {
+        println!(
+            "✓ Vault updated: app_keys revoked={} (history preserved), \
+             bindings deleted={}, app_records deleted={}",
+            counts.app_keys_revoked, counts.bindings_deleted, counts.app_records_deleted,
+        );
+        println!("✓ {} uninstall complete", slug);
+        println!("  Re-register any time with: aikey app register --slug {} ...", slug);
     }
     Ok(())
 }

@@ -1118,3 +1118,268 @@ fn delete_all_app_state_idempotent_on_unknown_slug() {
     assert_eq!(counts.app_records_deleted, 0);
     assert_eq!(counts.bindings_deleted, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Third-party uninstall — Phase 1a (2026-05-25)
+//
+// Asymmetric design vs first-party:
+//   - first-party `delete_all_app_state` removes ALL rows (whole-system
+//     uninstall, audit lives in service logs + usage_event_ods).
+//   - third-party `delete_third_party_app_identity` deletes app_records +
+//     bindings but RETAINS `app_keys` rows by flipping status='revoked'.
+//     The retained rows give per-vault audit history of "which tokens were
+//     ever issued for slug X" without leaving any token active.
+//
+// Caveat with FK enforcement: the schema has `app_keys.app_slug REFERENCES
+// app_records(slug) ON DELETE CASCADE`. The test fixture enables
+// `foreign_keys=ON`, so a naive `DELETE FROM app_records` would cascade and
+// erase the audit rows we just revoked. To make the audit-preservation
+// behavior reliable independent of the runtime PRAGMA setting, the
+// `delete_third_party_app_identity_with_conn` implementation explicitly
+// disables FK enforcement for the duration of its transaction. These tests
+// fence that contract with `foreign_keys=ON` in the fixture, which is the
+// stricter setting and would catch a regression that drops the explicit
+// FK disable.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn third_party_uninstall_revokes_keys_and_deletes_identity() {
+    let mut conn = fresh_test_vault();
+
+    // Seed two apps to fence isolation.
+    upsert_app_record_with_conn(
+        &conn,
+        "target-app",
+        "Target",
+        "v1",
+        &["openai".into()],
+        "third-party",
+        false,
+        &[],
+    )
+    .unwrap();
+    upsert_app_record_with_conn(
+        &conn,
+        "keeper-app",
+        "Keeper",
+        "v1",
+        &["openai".into()],
+        "third-party",
+        false,
+        &[],
+    )
+    .unwrap();
+    let bindings = vec![(
+        "openai".to_string(),
+        CredentialType::PersonalApiKey,
+        "alias-x".to_string(),
+    )];
+    authorize_atomic_with_conn(&mut conn, "target-app", &bindings).unwrap();
+    authorize_atomic_with_conn(&mut conn, "keeper-app", &bindings).unwrap();
+
+    fn count(conn: &Connection, sql: &str, slug: &str) -> i64 {
+        conn.query_row(sql, [slug], |r| r.get(0)).unwrap_or(0)
+    }
+
+    // Act
+    let counts =
+        super::delete_third_party_app_identity_with_conn(&mut conn, "target-app").expect("uninstall");
+
+    // 1 key revoked, 1 binding + 1 app_record deleted, 0 keys deleted
+    assert_eq!(counts.app_keys_revoked, 1, "should revoke 1 active key");
+    assert_eq!(counts.app_keys_deleted, 0, "should not delete any key");
+    assert_eq!(counts.bindings_deleted, 1);
+    assert_eq!(counts.app_records_deleted, 1);
+
+    // target-app's app_keys row STILL EXISTS (audit), but status='revoked'
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1",
+            "target-app"
+        ),
+        1,
+        "third-party uninstall must preserve app_keys row for audit"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1 AND status = 'revoked'",
+            "target-app"
+        ),
+        1,
+        "preserved row must be marked revoked"
+    );
+
+    // target-app's app_records + bindings GONE
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_records WHERE slug = ?1",
+            "target-app"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM user_profile_provider_bindings WHERE profile_id = ?1",
+            "app:target-app"
+        ),
+        0
+    );
+
+    // keeper-app untouched (isolation fence)
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1 AND status = 'active'",
+            "keeper-app"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_records WHERE slug = ?1",
+            "keeper-app"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM user_profile_provider_bindings WHERE profile_id = ?1",
+            "app:keeper-app"
+        ),
+        1
+    );
+}
+
+#[test]
+fn third_party_uninstall_idempotent_on_partial_state() {
+    // Re-running on a slug with NO active keys (already revoked) and
+    // existing app_records must still complete cleanly: 0 revoked + 1
+    // app_records deleted. This covers the resume-after-failure case.
+    let mut conn = fresh_test_vault();
+    upsert_app_record_with_conn(
+        &conn,
+        "half-app",
+        "Half",
+        "v1",
+        &["openai".into()],
+        "third-party",
+        false,
+        &[],
+    )
+    .unwrap();
+    // No authorize_atomic — so app_keys is empty.
+
+    let counts = super::delete_third_party_app_identity_with_conn(&mut conn, "half-app")
+        .expect("idempotent on partial state");
+    assert_eq!(counts.app_keys_revoked, 0);
+    assert_eq!(counts.bindings_deleted, 0); // never had any
+    assert_eq!(counts.app_records_deleted, 1);
+}
+
+#[test]
+fn third_party_uninstall_zero_state_on_unknown_slug() {
+    // Re-running on a fully unknown slug returns all-zero counts (no row
+    // matched in any table). The handler-level wrapper turns this into an
+    // error message, but the with_conn variant stays neutral so callers
+    // can compose it.
+    let mut conn = fresh_test_vault();
+    let counts = super::delete_third_party_app_identity_with_conn(&mut conn, "ghost-app")
+        .expect("clean on unknown slug");
+    assert_eq!(counts.app_keys_revoked, 0);
+    assert_eq!(counts.app_records_deleted, 0);
+    assert_eq!(counts.bindings_deleted, 0);
+}
+
+#[test]
+fn third_party_uninstall_then_re_register_same_slug_is_safe() {
+    // Edge case fenced in plan doc §1a "Caveat for re-registration":
+    // after third-party uninstall, the slug's app_records row is gone but
+    // historical revoked app_keys rows persist. Re-registering with the
+    // same slug must (1) succeed, (2) create a new app_records row, and
+    // (3) issue a NEW app_keys row coexisting with the old revoked one
+    // (NOT recycle the revoked row).
+    let mut conn = fresh_test_vault();
+    upsert_app_record_with_conn(
+        &conn,
+        "phoenix-app",
+        "Phoenix",
+        "v1",
+        &["openai".into()],
+        "third-party",
+        false,
+        &[],
+    )
+    .unwrap();
+    let bindings = vec![(
+        "openai".to_string(),
+        CredentialType::PersonalApiKey,
+        "alias-x".to_string(),
+    )];
+    authorize_atomic_with_conn(&mut conn, "phoenix-app", &bindings).unwrap();
+
+    // Capture the first token so we can prove it doesn't get reused.
+    let first_token: String = conn
+        .query_row(
+            "SELECT route_token FROM app_keys WHERE app_slug = ?1 AND status = 'active'",
+            ["phoenix-app"],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    // Uninstall (revokes first token).
+    super::delete_third_party_app_identity_with_conn(&mut conn, "phoenix-app").unwrap();
+
+    // Re-register the same slug.
+    upsert_app_record_with_conn(
+        &conn,
+        "phoenix-app",
+        "Phoenix",
+        "v2",
+        &["openai".into()],
+        "third-party",
+        false,
+        &[],
+    )
+    .unwrap();
+    authorize_atomic_with_conn(&mut conn, "phoenix-app", &bindings).unwrap();
+
+    // Two app_keys rows exist now: 1 revoked (old) + 1 active (new). The
+    // new active token MUST differ from the first one.
+    let active_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1 AND status = 'active'",
+            ["phoenix-app"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let revoked_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1 AND status = 'revoked'",
+            ["phoenix-app"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_count, 1, "re-register issues a fresh active token");
+    assert_eq!(
+        revoked_count, 1,
+        "old revoked row preserved across re-registration (audit)"
+    );
+
+    let new_token: String = conn
+        .query_row(
+            "SELECT route_token FROM app_keys WHERE app_slug = ?1 AND status = 'active'",
+            ["phoenix-app"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_ne!(
+        first_token, new_token,
+        "post-re-register token must be different from the original (no recycling)"
+    );
+}

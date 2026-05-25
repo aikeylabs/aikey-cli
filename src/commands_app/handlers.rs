@@ -69,6 +69,164 @@ pub fn handle_register(
     rotate_bearer: bool,
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let r = register_core(
+        slug,
+        name,
+        vendor,
+        upstreams,
+        first_party,
+        follow_user_active,
+        requested_permissions,
+        rotate_bearer,
+    )?;
+
+    if json_mode {
+        // json_output::success calls process::exit; nothing after this runs
+        // in JSON mode. The IPC layer takes a different path entirely
+        // (calls register_core directly + emits its own envelope), so
+        // this exit is fine for the CLI public-facing path.
+        json_output::success(serde_json::json!({
+            "slug": r.slug,
+            "name": r.name,
+            "vendor": r.vendor,
+            "upstreams": r.upstreams,
+            "app_kind": r.app_kind,
+            "follow_user_active": r.follow_user_active,
+            "requested_permissions": r.requested_permissions,
+            "action": if r.inserted { "inserted" } else { "updated" },
+            "key_id": r.key_id,
+            "api_key": r.route_token,
+            "base_url": r.base_url,
+            "bearer_was_new": r.bearer_was_new,
+            "snapshotted_bindings": render_bindings_json(&r.snapshotted_bindings),
+            "preserved_bindings": render_bindings_json(&r.preserved_bindings),
+            "missing_upstreams_for_aikey_use": r.missing_upstreams,
+            "base_url_protocol": r.base_url_protocol,
+        }));
+    }
+
+    let action = if r.inserted { "Registered" } else { "Updated" };
+    println!(
+        "{} app '{}' ({}, upstreams={})",
+        action,
+        r.slug,
+        r.app_kind,
+        r.upstreams.join(",")
+    );
+    if r.bearer_was_new {
+        println!("✓ Issued bearer for '{}':", r.name);
+    } else {
+        println!(
+            "✓ Reusing existing bearer for '{}' (pass --rotate-bearer to rotate):",
+            r.name
+        );
+    }
+    println!();
+    println!("    OPENAI_API_KEY={}", r.route_token);
+    println!("    OPENAI_BASE_URL={}", r.base_url);
+    println!();
+
+    if r.follow_user_active {
+        println!(
+            "Mode: ⚠ follow-user-active (this app dynamically tracks your `aikey use` selection)."
+        );
+        println!("    Any change you make via `aikey use` will affect this app immediately.");
+        if r.cleaned_stale_bindings > 0 {
+            println!(
+                "    Cleanup: removed {} stale app-specific binding(s) from a prior register.",
+                r.cleaned_stale_bindings
+            );
+        }
+        println!();
+    } else {
+        let nothing_to_say = r.snapshotted_bindings.is_empty()
+            && r.preserved_bindings.is_empty()
+            && r.missing_upstreams.is_empty();
+        if nothing_to_say {
+            println!("(no upstreams declared — pass --upstreams to register one)");
+        } else {
+            if !r.snapshotted_bindings.is_empty() {
+                println!("Snapshotted from your `aikey use` selection (this register):");
+                for (u, t, kr) in &r.snapshotted_bindings {
+                    println!("    {} → {}={}", u, t.as_str(), kr);
+                }
+            }
+            if !r.preserved_bindings.is_empty() {
+                if !r.snapshotted_bindings.is_empty() {
+                    println!();
+                }
+                println!("Preserved your previous per-app override (Bug 1 fix 2026-05-21):");
+                for (u, t, kr) in &r.preserved_bindings {
+                    println!("    {} → {}={}  (kept — re-register did NOT touch your `aikey app route` choice)", u, t.as_str(), kr);
+                }
+            }
+            if !r.missing_upstreams.is_empty() {
+                println!();
+                println!("⚠️  No active key for these declared upstreams:");
+                for u in &r.missing_upstreams {
+                    println!("       - {}", u);
+                }
+                println!("    The app will fail at request time until you set bindings.");
+                println!("    Option A (recommended): aikey use            # set globally, all apps inherit");
+                println!(
+                    "    Option B:               aikey app route {}    # set per-app override",
+                    r.slug
+                );
+            } else if r.snapshotted_bindings.is_empty() && !r.preserved_bindings.is_empty() {
+                // All bindings preserved, none new — nothing more to say.
+            } else {
+                println!();
+                println!("To override per app: `aikey app route {}`", r.slug);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Output of `register_core`. Carries every piece of data needed by either
+/// the CLI user-facing output or the `_internal app.register` IPC envelope.
+/// Kept as plain data so callers can format it however they need without
+/// re-doing SQL.
+pub struct RegisterResult {
+    pub slug: String,
+    pub name: String,
+    pub vendor: String,
+    pub upstreams: Vec<String>,
+    pub app_kind: String,
+    pub follow_user_active: bool,
+    pub requested_permissions: Vec<String>,
+    pub inserted: bool,
+    pub key_id: String,
+    pub route_token: String,
+    pub bearer_was_new: bool,
+    pub snapshotted_bindings: Vec<(String, CredentialType, String)>,
+    pub preserved_bindings: Vec<(String, CredentialType, String)>,
+    pub missing_upstreams: Vec<String>,
+    pub cleaned_stale_bindings: usize,
+    pub base_url: String,
+    pub base_url_protocol: String,
+}
+
+/// Pure (side-effecting on vault, but no stdout output) register logic.
+/// All SQL writes + bearer issuance + binding snapshot/cleanup happen
+/// here. Emits a single stderr line via `commands_proxy::maybe_warn_stale`
+/// when the proxy needs to re-sync — that's the only printf.
+///
+/// Both the public CLI handler (`handle_register`) and the IPC dispatch
+/// (`commands_internal::app::handle_register`) call this. Per CLAUDE.md
+/// "_internal 隐藏命令必须复用公开命令逻辑" — single implementation,
+/// two presentation shells.
+pub fn register_core(
+    slug: &str,
+    name: &str,
+    vendor: &str,
+    upstreams: &[String],
+    first_party: bool,
+    follow_user_active: bool,
+    requested_permissions: &[String],
+    rotate_bearer: bool,
+) -> Result<RegisterResult, Box<dyn std::error::Error>> {
     validate_slug(slug).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     validate_upstreams(upstreams).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     validate_first_party_invariants(slug, first_party, follow_user_active)
@@ -126,104 +284,25 @@ pub fn handle_register(
     let base_url_protocol = upstreams.first().map(String::as_str).unwrap_or("openai");
     let base_url = format!("http://127.0.0.1:27200/apps/{}/v1", slug);
 
-    if json_mode {
-        json_output::success(serde_json::json!({
-            "slug": slug,
-            "name": name,
-            "vendor": vendor,
-            "upstreams": upstreams,
-            "app_kind": app_kind,
-            "follow_user_active": follow_user_active,
-            "requested_permissions": requested_permissions,
-            "action": if inserted { "inserted" } else { "updated" },
-            "key_id": key_id,
-            "api_key": route_token,
-            "base_url": base_url,
-            "bearer_was_new": bearer_was_new,
-            "snapshotted_bindings": render_bindings_json(&outcome.snapshotted),
-            "preserved_bindings": render_bindings_json(&outcome.preserved),
-            "missing_upstreams_for_aikey_use": outcome.missing,
-            "base_url_protocol": base_url_protocol,
-        }));
-    }
-
-    let action = if inserted { "Registered" } else { "Updated" };
-    println!(
-        "{} app '{}' ({}, upstreams={})",
-        action,
-        slug,
-        app_kind,
-        upstreams.join(",")
-    );
-    if bearer_was_new {
-        println!("✓ Issued bearer for '{}':", name);
-    } else {
-        println!(
-            "✓ Reusing existing bearer for '{}' (pass --rotate-bearer to rotate):",
-            name
-        );
-    }
-    println!();
-    println!("    OPENAI_API_KEY={}", route_token);
-    println!("    OPENAI_BASE_URL={}", base_url);
-    println!();
-
-    if follow_user_active {
-        println!(
-            "Mode: ⚠ follow-user-active (this app dynamically tracks your `aikey use` selection)."
-        );
-        println!("    Any change you make via `aikey use` will affect this app immediately.");
-        if cleaned_stale > 0 {
-            println!(
-                "    Cleanup: removed {} stale app-specific binding(s) from a prior register.",
-                cleaned_stale
-            );
-        }
-        println!();
-    } else {
-        let nothing_to_say = outcome.snapshotted.is_empty()
-            && outcome.preserved.is_empty()
-            && outcome.missing.is_empty();
-        if nothing_to_say {
-            println!("(no upstreams declared — pass --upstreams to register one)");
-        } else {
-            if !outcome.snapshotted.is_empty() {
-                println!("Snapshotted from your `aikey use` selection (this register):");
-                for (u, t, r) in &outcome.snapshotted {
-                    println!("    {} → {}={}", u, t.as_str(), r);
-                }
-            }
-            if !outcome.preserved.is_empty() {
-                if !outcome.snapshotted.is_empty() {
-                    println!();
-                }
-                println!("Preserved your previous per-app override (Bug 1 fix 2026-05-21):");
-                for (u, t, r) in &outcome.preserved {
-                    println!("    {} → {}={}  (kept — re-register did NOT touch your `aikey app route` choice)", u, t.as_str(), r);
-                }
-            }
-            if !outcome.missing.is_empty() {
-                println!();
-                println!("⚠️  No active key for these declared upstreams:");
-                for u in &outcome.missing {
-                    println!("       - {}", u);
-                }
-                println!("    The app will fail at request time until you set bindings.");
-                println!("    Option A (recommended): aikey use            # set globally, all apps inherit");
-                println!(
-                    "    Option B:               aikey app route {}    # set per-app override",
-                    slug
-                );
-            } else if outcome.snapshotted.is_empty() && !outcome.preserved.is_empty() {
-                // All bindings preserved, none new — nothing more to say.
-            } else {
-                println!();
-                println!("To override per app: `aikey app route {}`", slug);
-            }
-        }
-    }
-
-    Ok(())
+    Ok(RegisterResult {
+        slug: slug.to_string(),
+        name: name.to_string(),
+        vendor: vendor.to_string(),
+        upstreams: upstreams.to_vec(),
+        app_kind: app_kind.to_string(),
+        follow_user_active,
+        requested_permissions: requested_permissions.to_vec(),
+        inserted,
+        key_id,
+        route_token,
+        bearer_was_new,
+        snapshotted_bindings: outcome.snapshotted,
+        preserved_bindings: outcome.preserved,
+        missing_upstreams: outcome.missing,
+        cleaned_stale_bindings: cleaned_stale,
+        base_url,
+        base_url_protocol: base_url_protocol.to_string(),
+    })
 }
 
 /// UX 2 cleanup (2026-05-21): when register's follow_user_active=true,
