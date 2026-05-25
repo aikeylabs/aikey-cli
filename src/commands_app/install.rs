@@ -587,14 +587,41 @@ fn fetch_and_verify_manifest(
 
     let manifest: Manifest = serde_json::from_slice(&bytes)
         .map_err(|e| format!("manifest JSON parse failed: {}", e))?;
-    if manifest.schema_version != "1" {
-        return Err(format!(
-            "I_UNSUPPORTED_MANIFEST_SCHEMA: '{}'. This CLI supports schema_version=1 only — upgrade aikey-cli to install this app.",
-            manifest.schema_version
-        )
-        .into());
-    }
+    validate_manifest_schema_version(&manifest.schema_version)?;
     Ok(manifest)
+}
+
+/// Manifest schema versions this CLI knows how to deserialize +
+/// dispatch on. Adding a new version: add one entry here AND ensure
+/// `Manifest::resolve_for_current_os()` handles the new shape AND add
+/// a fence test in `tests::manifest_v<N>_accepted`. Bugfix
+/// 20260525-aikey-cli-manifest-v2-guard-not-updated.md captures why
+/// list-based (not chained `&&`) — `git grep` for this const surfaces
+/// every gating decision in one shot.
+const SUPPORTED_MANIFEST_SCHEMA_VERSIONS: &[&str] = &["1", "2"];
+
+/// Validate that `schema_version` is one this CLI knows how to handle.
+///
+/// BR-rc.5-59 fix (2026-05-25): extracted from
+/// `fetch_and_verify_manifest` so fence tests can call it directly
+/// without needing HTTP mocking. Pre-fix the guard inline was hardcoded
+/// `!= "1"` — the v2 manifest shape was fully implemented in this file
+/// at line 132-170 + tested at line 893/915 in the same commit
+/// (d7ba0b1), but this guard was missed → Released v2 manifest +
+/// Released CLI → 100% `I_UNSUPPORTED_MANIFEST_SCHEMA: '2'` on fresh
+/// install. List-based guard avoids the chained `&&` anti-pattern
+/// (CLAUDE.md "采用配置表的形式进行穷举") — adding v3 is a single
+/// entry edit. Mirrors `YAML_CONFIG_REL_CANDIDATES` pattern in
+/// `local_server_probe.rs` (BR-rc.5-58, same release cycle).
+fn validate_manifest_schema_version(version: &str) -> Result<(), String> {
+    if SUPPORTED_MANIFEST_SCHEMA_VERSIONS.contains(&version) {
+        return Ok(());
+    }
+    Err(format!(
+        "I_UNSUPPORTED_MANIFEST_SCHEMA: '{}'. This CLI supports schema_version=[{}] — upgrade aikey-cli to install this app.",
+        version,
+        SUPPORTED_MANIFEST_SCHEMA_VERSIONS.join(", "),
+    ))
 }
 
 /// Dev-mode fallback manifest, used while `manifest_sha256 ==
@@ -914,5 +941,58 @@ mod tests {
         // 第三方Agent自助接入与应用级Key方案.md` §11.B trusted list.
         assert_eq!(TRUSTED_APPS.len(), 1);
         assert_eq!(TRUSTED_APPS[0].slug, "degrade-detector");
+    }
+
+    // ─── BR-rc.5-59 fence tests ────────────────────────────────────────
+    //
+    // Released v2 manifest + released CLI rejected v2 with
+    // `I_UNSUPPORTED_MANIFEST_SCHEMA: '2'` because the guard at line 590
+    // was missed during the v2-aware refactor (commit d7ba0b1). These
+    // pin the guard contract so the regression can't recur:
+    //   - v2 (current) and v1 (legacy) both pass
+    //   - any other version rejected with the documented error code
+    //   - SUPPORTED_MANIFEST_SCHEMA_VERSIONS list is exactly ["1", "2"]
+    //     (changing it requires also updating Manifest::resolve_for_
+    //     current_os to handle the new shape)
+
+    #[test]
+    fn manifest_v2_accepted() {
+        // Direct release-team-requested regression pin.
+        assert!(validate_manifest_schema_version("2").is_ok(),
+            "v2 manifest must be accepted; this is the BR-rc.5-59 regression case");
+    }
+
+    #[test]
+    fn manifest_v1_still_accepted() {
+        // Backward-compat: don't regress v1 while adding v2.
+        assert!(validate_manifest_schema_version("1").is_ok(),
+            "v1 manifest must still be accepted (legacy compat)");
+    }
+
+    #[test]
+    fn manifest_unknown_version_rejected_with_i_unsupported_code() {
+        // Boundary: unknown versions (current target: v3, v0, "", etc)
+        // must error with the documented I_UNSUPPORTED_MANIFEST_SCHEMA
+        // code so scripts can grep for it deterministically.
+        for bad in &["3", "0", "", "v2", "1.0", "two"] {
+            let err = validate_manifest_schema_version(bad)
+                .expect_err(&format!("version {:?} must be rejected", bad));
+            assert!(err.contains("I_UNSUPPORTED_MANIFEST_SCHEMA"),
+                "version {:?} error must contain I_UNSUPPORTED_MANIFEST_SCHEMA; got: {}", bad, err);
+            assert!(err.contains(bad),
+                "error must echo back the offending version {:?}; got: {}", bad, err);
+        }
+    }
+
+    #[test]
+    fn supported_manifest_schema_versions_list_pinned() {
+        // Pin the exact accepted-versions list. Re-ordering or adding
+        // an entry should force a test edit so reviewers see the
+        // contract change. When adding v3:
+        //   1. Update SUPPORTED_MANIFEST_SCHEMA_VERSIONS
+        //   2. Update Manifest::resolve_for_current_os() to handle v3
+        //   3. Add tests::manifest_v3_accepted
+        //   4. Update this assertion
+        assert_eq!(SUPPORTED_MANIFEST_SCHEMA_VERSIONS, &["1", "2"]);
     }
 }
