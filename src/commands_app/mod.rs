@@ -34,8 +34,8 @@ use rusqlite::{params, Connection};
 mod handlers;
 mod install;
 pub use handlers::{
-    handle_list, handle_pause, handle_register, handle_resume, handle_revoke, handle_rotate,
-    handle_route, register_core, RegisterResult,
+    handle_list, handle_pause, handle_register, handle_resume, handle_reveal_token, handle_revoke,
+    handle_rotate, handle_route, register_core, RegisterResult,
 };
 pub use install::{handle_install, handle_uninstall};
 
@@ -936,6 +936,71 @@ pub fn list_app_active_keys(slug: &str) -> Result<Vec<ActiveAppKeyInfo>, String>
         out.push(row.map_err(|e| format!("scan list_app_active_keys: {}", e))?);
     }
     Ok(out)
+}
+
+/// Active token info returned by `get_active_route_token`. Carries the
+/// plaintext bearer + its key_id + the proxy base_url so callers can
+/// surface a complete "what to put in the agent's env" picture without
+/// a second round-trip. Plaintext value: the caller is responsible for
+/// audit-log + display masking — this helper is the only legitimate
+/// way to re-read an issued bearer after register/rotate time.
+#[derive(Debug, Clone)]
+pub struct ActiveAppToken {
+    pub slug: String,
+    pub key_id: String,
+    pub route_token: String,
+    pub base_url: String,
+}
+
+/// SELECT the most-recent active app_keys row for a slug and return its
+/// plaintext route_token + key_id + the computed base_url.
+///
+/// Semantics: app_keys.status='active' is the gate (revoked/paused rows
+/// are excluded). Schema allows N active rows during a rotation window;
+/// we ORDER BY created_at DESC LIMIT 1 to consistently return THE freshly
+/// issued one. This matches `read_active_route_token` (the older
+/// private helper that callers like `issue_or_reuse_bearer` use) — kept
+/// as a separate pub fn so the reveal-token feature (2026-05-25) has a
+/// stable public API to wrap, without forcing the private helper to
+/// grow a richer return type.
+///
+/// Errors:
+///   - "no active token" — slug has no app_keys row with status='active'
+///     (either never authorized, or all keys revoked). Caller maps to
+///     I_NO_ACTIVE_TOKEN at the IPC envelope layer.
+///
+/// Why pub: consumed by `commands_internal::app::handle_reveal_token`
+/// (Web UI bridge) and the new `aikey app reveal-token` public command,
+/// per CLAUDE.md `_internal 隐藏命令必须复用公开命令逻辑` — one SQL,
+/// two callers.
+pub fn get_active_route_token(slug: &str) -> Result<ActiveAppToken, String> {
+    let conn = storage::open_connection()?;
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT key_id, route_token FROM app_keys
+              WHERE app_slug = ?1 AND status = 'active'
+              ORDER BY created_at DESC
+              LIMIT 1",
+            params![slug],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok();
+    let (key_id, route_token) = row.ok_or_else(|| {
+        format!(
+            "no active token for slug={:?} — register or rotate first",
+            slug
+        )
+    })?;
+    // Match the base_url format used by `handle_register` / `handle_rotate`
+    // so all three commands emit the same shape and the Web UI doesn't
+    // need to special-case the reveal payload.
+    let base_url = format!("http://127.0.0.1:27200/apps/{}/v1", slug);
+    Ok(ActiveAppToken {
+        slug: slug.to_string(),
+        key_id,
+        route_token,
+        base_url,
+    })
 }
 
 /// SELECT all current provider bindings for the app's profile_id

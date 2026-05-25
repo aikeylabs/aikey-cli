@@ -480,6 +480,50 @@ fn issue_or_reuse_bearer(
     Ok((key_id, route_token, true))
 }
 
+// ---------------------------------------------------------------------------
+// reveal-token (2026-05-25) — re-read the active bearer plaintext
+// ---------------------------------------------------------------------------
+
+/// Implements `aikey app reveal-token <slug>` (CLI surface for the
+/// 2026-05-25 token-reveal feature). Reads the most-recent active
+/// `app_keys.route_token` plaintext + the matching key_id + computed
+/// base_url.
+///
+/// Output shape:
+///   - default (no `--json`): single line on stdout containing JUST the
+///     plaintext token, no metadata, no trailing newline beyond what
+///     println! adds. This is the form scripts use:
+///       `OPENAI_API_KEY=$(aikey app reveal-token claude-mem)`
+///   - `--json`: full envelope `{slug, key_id, route_token, base_url}`
+///     matching what `aikey app rotate --json` emits, so existing
+///     consumers can drop in either command.
+///
+/// Why no consent prompt: the value is already accessible via direct
+/// `sqlite3 ~/.aikey/data/vault.db ...` query for anyone with shell
+/// access (same user, same machine). Prompting would only block scripts
+/// without adding security. The reveal is gated by vault-unlock
+/// indirectly: `storage::open_connection` (under `get_active_route_token`)
+/// requires an unlocked vault.
+pub fn handle_reveal_token(
+    slug: &str,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_slug(slug).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let info = super::get_active_route_token(slug)?;
+
+    if json_mode {
+        json_output::success(serde_json::json!({
+            "slug": info.slug,
+            "key_id": info.key_id,
+            "route_token": info.route_token,
+            "base_url": info.base_url,
+        }));
+    }
+
+    println!("{}", info.route_token);
+    Ok(())
+}
+
 /// Read the active route_token for the given slug (one expected, but
 /// schema allows N — return the most recent created).
 fn read_active_route_token(slug: &str) -> Result<String, String> {

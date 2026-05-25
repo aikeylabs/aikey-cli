@@ -773,6 +773,27 @@ pub(crate) enum AppAction {
         /// their service-installer URL.
         slug: String,
     },
+    /// Print the currently-active route token (plaintext bearer) for an
+    /// already-registered app. Use when you've misplaced the value
+    /// originally shown by `aikey app register` and don't want to
+    /// disrupt the running agent with `aikey app rotate`.
+    ///
+    /// Why this exists (2026-05-25): the token IS stored in vault
+    /// plaintext (`app_keys.route_token`) and accessible to any process
+    /// the user owns. Forcing rotate-only recovery added more friction
+    /// than security on a single-user local toolchain. The reveal path
+    /// is gated by vault unlock; auditing lives in shell history (CLI)
+    /// or audit log (Web — handler emits an audit event).
+    ///
+    /// Output (default): just the token on stdout for easy `$(aikey app
+    /// reveal-token foo)` substitution. With `--json`, returns a richer
+    /// envelope `{slug, key_id, route_token, base_url}` matching the
+    /// shape of `aikey app rotate --json` so scripts can swap freely.
+    RevealToken {
+        /// App slug. Must match an existing registered app (any kind:
+        /// first-party or third-party).
+        slug: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1291,6 +1312,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 AppAction::Rotate { .. } => "app.rotate".to_string(),
                 AppAction::Install { .. } => "app.install".to_string(),
                 AppAction::Uninstall { .. } => "app.uninstall".to_string(),
+                AppAction::RevealToken { .. } => "app.reveal-token".to_string(),
             },
             Commands::Service { action } => match action {
                 ServiceAction::Start { .. } => "service.start".to_string(),

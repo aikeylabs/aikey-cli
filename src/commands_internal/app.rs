@@ -54,6 +54,7 @@ pub fn handle(env: StdinEnvelope) {
         "resume" => handle_resume(env),
         "rotate" => handle_rotate(env),
         "uninstall" => handle_uninstall(env),
+        "reveal-token" => handle_reveal_token(env),
         other => emit_error(
             req_id,
             "I_UNKNOWN_ACTION",
@@ -526,6 +527,56 @@ fn handle_uninstall(env: StdinEnvelope) {
             format!("uninstall: {}", e),
         ),
     }
+}
+
+/// `reveal-token` — re-read the active bearer plaintext for a slug
+/// (added 2026-05-25). Mirrors `aikey app reveal-token <slug>` but
+/// emits the result as an envelope (rather than printing the bare token
+/// to stdout) so the Web bridge can parse it.
+///
+/// Security note: this is gated by vault unlock on the Go side via
+/// `Store.RequireUnlock`. The CLI side itself does not prompt because
+/// it runs as a subprocess of the trusted Go bridge — the bridge has
+/// already verified the user's session. Stand-alone CLI invocations of
+/// `_internal app.reveal-token` would require an unlocked vault to
+/// open the SQLite connection (same as every other vault read).
+///
+/// Error codes:
+///   - I_INVALID_SLUG       — slug shape rejected
+///   - I_NO_ACTIVE_TOKEN    — slug has no app_keys row with status='active'
+///   - I_APP_REVEAL_FAILED  — generic vault error (open/query/etc.)
+fn handle_reveal_token(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+    let slug = match parse_slug_only(&env, &req_id) {
+        Some(s) => s,
+        None => return,
+    };
+    let info = match commands_app::get_active_route_token(&slug) {
+        Ok(t) => t,
+        Err(e) => {
+            // Distinguish "no active token" (a normal state — user never
+            // registered, or all keys revoked) from genuine vault errors
+            // (file missing, locked, corrupted). The error message from
+            // get_active_route_token is the only signal we have, so
+            // pattern-match its prefix.
+            let code = if e.contains("no active token") {
+                "I_NO_ACTIVE_TOKEN"
+            } else {
+                "I_APP_REVEAL_FAILED"
+            };
+            emit_error(req_id, code, e);
+            return;
+        }
+    };
+    emit(&ResultEnvelope::ok(
+        req_id,
+        json!({
+            "slug": info.slug,
+            "key_id": info.key_id,
+            "route_token": info.route_token,
+            "base_url": info.base_url,
+        }),
+    ));
 }
 
 // ---------------------------------------------------------------------------
