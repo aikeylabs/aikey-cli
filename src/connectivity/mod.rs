@@ -345,6 +345,26 @@ pub struct SuiteOptions {
     /// (single-key or Primary-binding modes have one row per provider, so
     /// the protocol column already disambiguates).
     pub show_key_column: bool,
+    /// 2026-05-26 (spec: roadmap20260320/技术实现/update/20260526-pre-save-
+    /// proxy-probe-raw.md): pre-save probe bearer override. When `Some`, the
+    /// proxy row probe sends `Authorization: Bearer aikey_probe_raw_<provider>`
+    /// + `X-Aikey-Probe-Bearer: <this value>` and proxy uses the value as the
+    /// upstream credential (no vault binding lookup). When `None`, falls back
+    /// to the legacy `aikey_active_<provider>` path (tests whatever's currently
+    /// active in vault binding).
+    ///
+    /// Use `Some(...)` only from pre-save call sites (`aikey add`,
+    /// `vault-op test_raw`) where the key being tested is not in vault yet.
+    /// Post-save call sites (`aikey test <alias>`, `vault-op test` by id)
+    /// MUST leave this `None` — testing the active binding is correct
+    /// semantics for those flows.
+    pub probe_raw_bearer: Option<String>,
+    /// 2026-05-26: optional upstream base URL override for probe_raw mode.
+    /// When `probe_raw_bearer` is `Some`, sends `X-Aikey-Probe-BaseURL: <this>`
+    /// so proxy uses this as the upstream instead of `providerDefaultBaseURL`.
+    /// Forwarded only when `probe_raw_bearer` is `Some` (no effect on the
+    /// legacy active-sentinel path).
+    pub probe_raw_base_url: Option<String>,
 }
 
 /// Aggregate outcome of one suite run.

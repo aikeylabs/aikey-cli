@@ -808,59 +808,215 @@ pub struct ProxyProbeResult {
     pub ok: bool,
     pub ms: u128,
     pub status: Option<u16>,
+    /// 2026-05-26 (spec: 20260526-pre-save-proxy-probe-raw.md §5.3): when set,
+    /// carries a stable error_code categorizing the proxy's response so callers
+    /// can render specific user-actionable hints. Set only in probe_raw mode
+    /// (when bearer_override was Some). Variants today:
+    ///
+    /// - `"PROXY_TOO_OLD_NO_PROBE_RAW"` — proxy returned 401 + TOKEN_INVALID
+    ///   body. Means proxy hasn't been upgraded to a version that understands
+    ///   `aikey_probe_raw_*`. NO fallback per user decision 2026-05-26 (the
+    ///   legacy `aikey_active_*` path tests the wrong key, so silently falling
+    ///   back would just produce a different misleading result). User must
+    ///   `aikey service restart proxy` after upgrading aikey.
+    ///
+    /// - `"PROBE_RAW_DISABLED"` — new proxy with AIKEY_PROBE_RAW_DISABLED=1.
+    ///   Operator turned the feature off (defense rollback flag).
+    ///
+    /// - `"PROBE_HEADER_REQUIRED"` — defense; proxy says we sent the token
+    ///   without `X-Aikey-Probe: 1`. Indicates a caller bug (we always send
+    ///   it) — surface so we can find regressions early.
+    ///
+    /// `None` for: post-save legacy active-sentinel mode (always), or
+    /// probe_raw mode where proxy returned an unsurprising status.
+    pub error_code: Option<String>,
 }
 
-/// Test a key through the proxy (full chain: CLI → proxy → provider).
-/// Uses the active key's token for authentication.
-pub fn test_proxy_connectivity(proxy_addr: &str, provider_code: &str) -> ProxyProbeResult {
+/// Test the proxy → provider chain. Two modes selected by `bearer_override`:
+///
+/// **Mode 1 — Active sentinel (post-save, `bearer_override = None`)**:
+///   Sends `aikey_active_<provider>` Tier3 sentinel. Proxy resolves
+///   `GetProviderBinding(canonical)` and forwards using whatever key is
+///   CURRENTLY ACTIVE for that provider. Used by `aikey test [<alias>]`,
+///   `aikey doctor`, web "Test connection" (post-save). Tests "what `aikey use`
+///   would route to right now". The probe row does NOT test the alias the
+///   caller named — that's a known semantic for post-save where active
+///   binding IS what matters operationally.
+///
+/// **Mode 2 — Pre-save probe_raw (`bearer_override = Some(plaintext_key)`)**:
+///   Sends `aikey_probe_raw_<provider>` Tier2ProbeRaw token + the plaintext
+///   key in `X-Aikey-Probe-Bearer` header. Proxy skips vault entirely and uses
+///   the header bearer directly. Used by `aikey add` + web Add Key Test
+///   connectivity — tests "does THIS specific key the user is adding work
+///   through this machine's proxy?". Spec:
+///   roadmap20260320/技术实现/update/20260526-pre-save-proxy-probe-raw.md
+///
+/// Common: `X-Aikey-Probe: 1` suppresses usage-event emission either way
+/// (see aikey-proxy middleware.go::isAikeyProbe).
+///
+/// 2026-04-22 regression history (do not silently drop `.set_proxy(None)` —
+/// see workflow/CI/bugfix/2026-04-22-connectivity-probe-through-proxy.md):
+/// must NOT use `ureq::get()` shortcut, which inherits `https_proxy` env and
+/// routes localhost through Clash → bogus failures.
+pub fn test_proxy_connectivity(
+    proxy_addr: &str,
+    provider_code: &str,
+    bearer_override: Option<&str>,
+    base_url_override: Option<&str>,
+) -> ProxyProbeResult {
     use std::time::{Duration, Instant};
 
     // Proxy strips the provider prefix and forwards to the real provider.
     // The proxy's upstream base_url never ends with /v1, so use full /v1/... paths.
     let proxy_base = format!("http://{}/{}", proxy_addr, provider_code);
     let proxy_url = format!("{}{}", proxy_base, probe_suffix(provider_code, &proxy_base));
-    // 2026-04-29 prefix rename + 评审 #3 (Low) 收紧:
-    // Probe ALL credential types via the active sentinel (tier 3 fallthrough),
-    // including team. This matches the `aikey use` runtime-switching model —
-    // probe should test "what `aikey use` would actually route to right now",
-    // NOT "this specific team key works in isolation". Earlier asymmetry
-    // (team via static bearer, personal/OAuth via active sentinel) was a
-    // legacy of the pre-rename "team is locked" model and no longer applies.
-    //
-    // The proxy resolves the active binding via path's canonical provider,
-    // independent of credential type — so this probe exercises exactly the
-    // path real claude/codex/kimi requests take.
-    let _active_cfg = crate::storage::get_active_key_config().ok().flatten();
-    let bearer = format!("aikey_active_{}", provider_code);
+
+    // Token form differs by mode (see fn docstring).
+    let (bearer, extra_headers) = match bearer_override {
+        Some(raw) => {
+            // Mode 2 — probe_raw. Token suffix is canonical provider code.
+            // Plaintext key rides in X-Aikey-Probe-Bearer (NOT Authorization);
+            // proxy reads the header to use as upstream credential.
+            let mut headers: Vec<(&'static str, String)> = vec![
+                ("X-Aikey-Probe-Bearer", raw.to_string()),
+            ];
+            if let Some(base) = base_url_override {
+                if !base.is_empty() {
+                    headers.push(("X-Aikey-Probe-BaseURL", base.to_string()));
+                }
+            }
+            (format!("aikey_probe_raw_{}", provider_code), headers)
+        }
+        None => {
+            // Mode 1 — active sentinel (legacy / post-save). No extra headers.
+            // _active_cfg read kept for compatibility — call site relied on it
+            // historically as a vault-presence probe; preserved for byte-equivalent
+            // behavior with pre-2026-05-26 callers.
+            let _active_cfg = crate::storage::get_active_key_config().ok().flatten();
+            (format!("aikey_active_{}", provider_code), Vec::new())
+        }
+    };
 
     let (auth_key, auth_val) = probe_auth(provider_code, &bearer);
-    // Explicit no-proxy agent. Must NOT use `ureq::get()` shortcut — it
-    // inherits the user's `https_proxy` / `http_proxy` env, which routes
-    // localhost (127.0.0.1:<proxy>) through Clash / corporate proxies and
-    // produces a bogus "failed (10 ms)" bottom row. Regression history:
-    // workflow/CI/bugfix/2026-04-22-connectivity-probe-through-proxy.md.
-    //
-    // X-Aikey-Probe: 1 suppresses usage-event emission on the proxy side
-    // (see aikey-proxy/internal/proxy/middleware.go::isAikeyProbe). Without
-    // this header every `aikey test` run pollutes the collector with a
-    // billing event for the synthetic probe.
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
         .build();
     let start = Instant::now();
-    let result = agent
+    let mut req = agent
         .get(&proxy_url)
         .set(auth_key, &auth_val)
-        .set("X-Aikey-Probe", "1")
-        .call();
+        .set("X-Aikey-Probe", "1");
+    // Anthropic requires anthropic-version header on /v1/models too — without
+    // it, even valid keys get 400 ("anthropic-version: header is required"),
+    // which probe_status_hint renders as a non-specific "routing ok".
+    // Sending the header lets a valid key produce a clean 200 (or 401 for
+    // bad keys), giving the user a precise verdict. Mirrors the existing
+    // chat-probe path (runtime.rs:640). Allowlisted on proxy side.
+    if provider_code == "anthropic" {
+        req = req.set("anthropic-version", "2023-06-01");
+    }
+    for (k, v) in &extra_headers {
+        req = req.set(k, v);
+    }
+    let result = req.call();
     let ms = start.elapsed().as_millis();
 
-    let (ok, status) = match result {
-        Ok(r) => (true, Some(r.status())),
-        Err(ureq::Error::Status(code, _)) => (true, Some(code)),
-        Err(_) => (false, None),
+    // Body inspection differs by mode (spec 20260526-pre-save-proxy-probe-raw.md §2.4):
+    //   - Active sentinel mode (None): proxy is a pass-through; r.status() IS
+    //     the upstream status. No body parse needed.
+    //   - probe_raw mode (Some): proxy ALWAYS returns 200 when its chain
+    //     succeeded, putting upstream's real status in body {"upstream_status":...}.
+    //     Client MUST extract this to give caller the right signal ("key valid"
+    //     vs "key rejected"). Without this, status_hint would always read
+    //     "routing ok, key valid" even for 401-rejected keys.
+    //
+    // Error path: also peek body to distinguish old-proxy TOKEN_INVALID,
+    // flag-disabled, etc. — same body shape, different fields read.
+    let is_probe_raw = bearer_override.is_some();
+    let (ok, status, error_code) = match result {
+        Ok(r) => {
+            // Happy path. In probe_raw mode, body carries upstream_status.
+            if is_probe_raw {
+                let upstream = extract_probe_raw_upstream_status(r);
+                // upstream None → proxy chain worked but body parse failed
+                // (defensive). Fall back to outer status (200) so caller
+                // still sees ok-but-unknown.
+                (true, upstream.or(Some(200)), None)
+            } else {
+                (true, Some(r.status()), None)
+            }
+        }
+        Err(ureq::Error::Status(code, response)) => {
+            let err_code = if is_probe_raw {
+                classify_probe_raw_error(code, response)
+            } else {
+                None
+            };
+            (true, Some(code), err_code)
+        }
+        Err(_) => (false, None, None),
     };
-    ProxyProbeResult { ok, ms, status }
+    ProxyProbeResult {
+        ok,
+        ms,
+        status,
+        error_code,
+    }
+}
+
+/// 2026-05-26 — extract `upstream_status` field from proxy's probe_raw
+/// success response body. Returns None when body parse fails (defensive).
+///
+/// Body shape per spec §2.4:
+/// ```json
+/// {"probe_ok": true, "upstream_status": 200, "latency_ms": 187, ...}
+/// ```
+fn extract_probe_raw_upstream_status(response: ureq::Response) -> Option<u16> {
+    let body = response.into_string().ok()?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    json.get("upstream_status")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u16::try_from(n).ok())
+}
+
+/// 2026-05-26 — classify a non-2xx response from the proxy when in probe_raw
+/// mode. Reads up to 1KB of body, parses the proxy's standard JSON error
+/// shape (`{"error":{"code":"..."}}`), returns a stable error_code string.
+///
+/// Returns None when the body doesn't conform to the proxy error shape
+/// (defensive — proxy returns this shape consistently per middleware.go,
+/// but we don't want to crash on edge cases like proxy bug / network mid-stream
+/// truncation).
+fn classify_probe_raw_error(status: u16, response: ureq::Response) -> Option<String> {
+    // Bounded body read: error payloads are < 1KB. Limit defends against
+    // a malicious / buggy proxy streaming an unbounded body.
+    let body = response
+        .into_string()
+        .ok()
+        .map(|s| s.chars().take(2048).collect::<String>())
+        .unwrap_or_default();
+
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let proxy_code = json
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str())?;
+
+    match (status, proxy_code) {
+        // Old proxy (no probe_raw support): classifies aikey_probe_raw_* as
+        // TokenInvalid → 401 + TOKEN_INVALID. This is the most common Phase 2
+        // failure mode (user updated aikey CLI but didn't restart proxy).
+        (401, "TOKEN_INVALID") => Some("PROXY_TOO_OLD_NO_PROBE_RAW".to_string()),
+        // New proxy with operator-disabled flag (defense rollback).
+        (503, "PROBE_RAW_DISABLED") => Some("PROBE_RAW_DISABLED".to_string()),
+        // Defense: we always send X-Aikey-Probe: 1; this should never fire.
+        // If it does, it's a caller-side bug worth surfacing loud.
+        (401, "PROBE_HEADER_REQUIRED") => Some("PROBE_HEADER_REQUIRED".to_string()),
+        // Other recognized proxy error codes pass through as-is (lets CLI
+        // / web display them verbatim instead of swallowing).
+        (_, code) if code.starts_with("PROBE_") => Some(code.to_string()),
+        _ => None,
+    }
 }
 
 /// Format a proxy probe status code into a human-readable hint.
@@ -871,6 +1027,35 @@ pub fn proxy_status_hint(status: u16) -> String {
         401 | 403 => "routing ok, key rejected by provider".to_string(),
         503 => "proxy has no active key for this provider".to_string(),
         _ => format!("HTTP {}", status),
+    }
+}
+
+/// 2026-05-26 — full-result hint that takes precedence of `error_code` over
+/// raw status mapping. Use this from probe_raw call sites; legacy callers
+/// that only have `status: u16` can keep using `proxy_status_hint`.
+///
+/// When `error_code` is `Some`, returns a user-actionable string explaining
+/// what to do next (no automatic fallback — per spec §5.3 user decision
+/// 2026-05-26: silently retrying with `aikey_active_*` would mask the issue
+/// and produce a misleading result. Surface loud + tell user what to do.).
+pub fn proxy_probe_full_hint(r: &ProxyProbeResult) -> String {
+    if let Some(code) = &r.error_code {
+        return match code.as_str() {
+            "PROXY_TOO_OLD_NO_PROBE_RAW" => {
+                "aikey-proxy too old for pre-save probe — run `aikey service restart proxy`".to_string()
+            }
+            "PROBE_RAW_DISABLED" => {
+                "pre-save probe disabled by operator (AIKEY_PROBE_RAW_DISABLED=1)".to_string()
+            }
+            "PROBE_HEADER_REQUIRED" => {
+                "BUG: client missed X-Aikey-Probe header — please report".to_string()
+            }
+            other => format!("proxy error: {}", other),
+        };
+    }
+    match r.status {
+        Some(s) => proxy_status_hint(s),
+        None => "unreachable".to_string(),
     }
 }
 
@@ -1282,7 +1467,12 @@ pub fn run_connectivity_suite(
                 .find(|t| t.provider_code != "custom")
                 .map(|t| t.provider_code.as_str());
             prov.map(|p| {
-                let r = test_proxy_connectivity(&proxy_addr, p);
+                let r = test_proxy_connectivity(
+                    &proxy_addr,
+                    p,
+                    opts.probe_raw_bearer.as_deref(),
+                    opts.probe_raw_base_url.as_deref(),
+                );
                 json_results.push(serde_json::json!({
                     "provider":   "proxy",
                     "proxy_addr": proxy_addr,
@@ -1681,17 +1871,37 @@ pub fn run_connectivity_suite(
                 // so the helper paints the result the moment the probe ends.
                 let proxy_addr_owned = proxy_addr.clone();
                 let prov_owned = p.to_string();
+                // Move bearer/base_url options into closure as owned values
+                // (animate_blinking_while runs the worker fn on a worker thread).
+                let probe_bearer_owned = opts.probe_raw_bearer.clone();
+                let probe_base_url_owned = opts.probe_raw_base_url.clone();
                 let format_proxy_cell = |_col: usize, r: &ProxyProbeResult| -> String {
+                    // 2026-05-26 — use proxy_probe_full_hint so probe_raw
+                    // error_codes (PROXY_TOO_OLD_NO_PROBE_RAW etc) surface
+                    // as user-actionable text instead of opaque "HTTP 401".
+                    let h = proxy_probe_full_hint(r);
                     if r.ok {
-                        let h = r.status.map(|s| proxy_status_hint(s)).unwrap_or_default();
-                        format!("{} ({} ms, {})", "ok".green(), r.ms, h)
+                        // For probe_raw mode with PROXY_TOO_OLD_NO_PROBE_RAW the
+                        // status comes back as 401 (TokenInvalid) — ok=true is
+                        // misleading (proxy returned, but with the wrong verdict).
+                        // Render as "failed" when error_code is set.
+                        if r.error_code.is_some() {
+                            format!("{} ({} ms, {})", "failed".red(), r.ms, h)
+                        } else {
+                            format!("{} ({} ms, {})", "ok".green(), r.ms, h)
+                        }
                     } else {
                         format!("{} ({} ms)", "failed".red(), r.ms)
                     }
                 };
                 let r = animate_blinking_while(&[12], format_proxy_cell, move |tx| {
                     let _ = tx.send((0, AnimEvent::Started));
-                    let r = test_proxy_connectivity(&proxy_addr_owned, &prov_owned);
+                    let r = test_proxy_connectivity(
+                        &proxy_addr_owned,
+                        &prov_owned,
+                        probe_bearer_owned.as_deref(),
+                        probe_base_url_owned.as_deref(),
+                    );
                     let _ = tx.send((0, AnimEvent::Finished(r.clone())));
                     r
                 });
@@ -2144,5 +2354,623 @@ mod probe_model_kimi_split_tests {
     fn probe_model_unknown_falls_back_to_gpt_4o_mini() {
         // 未知 provider 走 fallback,大多数 OpenAI-compat gateway 都接受 gpt-4o-mini。
         assert_eq!(probe_model("some-new-aggregator"), "gpt-4o-mini");
+    }
+}
+
+#[cfg(test)]
+mod probe_raw_request_shape_tests {
+    //! 2026-05-26 — Pin the on-wire request shape of `test_proxy_connectivity`
+    //! in both modes. These tests use a mock HTTP server to capture exactly
+    //! what header set the function sends, validating the contract from
+    //! roadmap20260320/技术实现/update/20260526-pre-save-proxy-probe-raw.md §5.1
+    //! without depending on a running aikey-proxy.
+    //!
+    //! Two invariants pinned:
+    //!
+    //! (A) **None mode = byte-equivalent legacy**: `bearer_override = None`
+    //!     emits the exact wire shape that pre-2026-05-26 code did —
+    //!     `Authorization: Bearer aikey_active_<provider>` + `X-Aikey-Probe: 1`
+    //!     and NO X-Aikey-Probe-Bearer / -BaseURL headers. Regression-locks
+    //!     the 5 post-save call sites (aikey test, doctor, vault-op test).
+    //!
+    //! (B) **Some mode emits probe_raw shape**: `bearer_override = Some(raw)`
+    //!     emits `Authorization: Bearer aikey_probe_raw_<provider>` (NOT
+    //!     active) + `X-Aikey-Probe: 1` + `X-Aikey-Probe-Bearer: <raw>` +
+    //!     optionally `X-Aikey-Probe-BaseURL: <base>`. Regression-locks
+    //!     the 2 pre-save call sites (aikey add, vault-op test_raw).
+
+    use super::test_proxy_connectivity;
+    use std::sync::{Arc, Mutex};
+
+    // Mini HTTP server that captures the first request's headers + path,
+    // returns a canned 200 response, then closes. No external deps (re-uses
+    // std::net so we don't pull in hyper/tokio for fence tests).
+    fn capture_one_request() -> (String, Arc<Mutex<Option<CapturedRequest>>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local_addr").to_string();
+        let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Set read timeout so test doesn't hang on hung client.
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut req_line = String::new();
+                let _ = reader.read_line(&mut req_line);
+
+                let mut headers = Vec::new();
+                loop {
+                    let mut h = String::new();
+                    let n = reader.read_line(&mut h).unwrap_or(0);
+                    if n == 0 || h == "\r\n" || h == "\n" {
+                        break;
+                    }
+                    headers.push(h.trim_end_matches(['\r', '\n']).to_string());
+                }
+                // Drain any body so the client's write completes (we don't care
+                // about body content for these tests).
+                let mut buf = [0u8; 1024];
+                let _ = reader.get_mut().set_read_timeout(Some(std::time::Duration::from_millis(50)));
+                let _ = reader.get_mut().read(&mut buf);
+
+                let captured_req = CapturedRequest {
+                    request_line: req_line.trim_end_matches(['\r', '\n']).to_string(),
+                    headers,
+                };
+                *captured_clone.lock().unwrap() = Some(captured_req);
+
+                // Reply 200 OK with a minimal body.
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        (addr, captured)
+    }
+
+    #[derive(Debug)]
+    struct CapturedRequest {
+        request_line: String,
+        headers: Vec<String>,
+    }
+
+    impl CapturedRequest {
+        fn header_value(&self, name: &str) -> Option<String> {
+            let target = name.to_ascii_lowercase();
+            self.headers.iter().find_map(|h| {
+                let mut parts = h.splitn(2, ':');
+                let k = parts.next()?.trim().to_ascii_lowercase();
+                let v = parts.next()?.trim().to_string();
+                if k == target { Some(v) } else { None }
+            })
+        }
+
+        fn has_header(&self, name: &str) -> bool {
+            self.header_value(name).is_some()
+        }
+    }
+
+    // Helper: poll captured until set, with timeout (probe call is sync from
+    // the test thread's perspective so this typically returns immediately).
+    fn wait_for_capture(
+        captured: &Arc<Mutex<Option<CapturedRequest>>>,
+    ) -> CapturedRequest {
+        for _ in 0..50 {
+            if let Some(c) = captured.lock().unwrap().take() {
+                return c;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("mock server did not capture any request within timeout");
+    }
+
+    // ───── Invariant (A): None mode = legacy aikey_active_* shape ─────
+
+    #[test]
+    fn none_mode_emits_legacy_active_sentinel_shape() {
+        let (addr, captured) = capture_one_request();
+
+        // Run probe in None mode (mirrors all 5 post-save call sites).
+        let _ = test_proxy_connectivity(&addr, "anthropic", None, None);
+
+        let req = wait_for_capture(&captured);
+
+        // Path goes /anthropic/v1/messages (or whatever probe_suffix picks
+        // for anthropic). Critical part is the URL has /anthropic/ prefix.
+        assert!(
+            req.request_line.contains("/anthropic/"),
+            "request path missing /anthropic/ prefix: {}",
+            req.request_line
+        );
+
+        // X-Aikey-Probe: 1 ALWAYS present (suppresses reporter on proxy side).
+        assert_eq!(
+            req.header_value("X-Aikey-Probe").as_deref(),
+            Some("1"),
+            "X-Aikey-Probe: 1 missing — would let probe traffic hit reporter"
+        );
+
+        // Anthropic uses x-api-key; bearer value MUST be the active sentinel.
+        let key = req.header_value("x-api-key").expect("x-api-key missing");
+        assert_eq!(
+            key, "aikey_active_anthropic",
+            "None mode must emit aikey_active_<provider>, got: {}",
+            key
+        );
+
+        // Critical regression fence: NO probe_raw headers must appear in None mode.
+        // If these leak, the 5 post-save call sites silently change semantics.
+        assert!(
+            !req.has_header("X-Aikey-Probe-Bearer"),
+            "X-Aikey-Probe-Bearer leaked into None-mode request (silent regression of 5 post-save call sites)"
+        );
+        assert!(
+            !req.has_header("X-Aikey-Probe-BaseURL"),
+            "X-Aikey-Probe-BaseURL leaked into None-mode request"
+        );
+    }
+
+    #[test]
+    fn none_mode_openai_emits_authorization_bearer_active() {
+        let (addr, captured) = capture_one_request();
+
+        let _ = test_proxy_connectivity(&addr, "openai", None, None);
+
+        let req = wait_for_capture(&captured);
+
+        // OpenAI uses Authorization: Bearer <token>.
+        let auth = req
+            .header_value("Authorization")
+            .expect("Authorization missing");
+        assert_eq!(
+            auth, "Bearer aikey_active_openai",
+            "openai None mode must emit Bearer aikey_active_<provider>, got: {}",
+            auth
+        );
+
+        assert!(!req.has_header("X-Aikey-Probe-Bearer"));
+        assert!(!req.has_header("X-Aikey-Probe-BaseURL"));
+    }
+
+    // ───── Invariant (B): Some mode emits probe_raw shape ─────
+
+    #[test]
+    fn some_mode_emits_probe_raw_token_and_bearer_header() {
+        let (addr, captured) = capture_one_request();
+        let plaintext_key = "sk-ant-PRE-SAVE-PROBE-KEY";
+
+        // Mirrors `aikey add` / `vault-op test_raw` call site after Phase 2.B/C.
+        let _ = test_proxy_connectivity(&addr, "anthropic", Some(plaintext_key), None);
+
+        let req = wait_for_capture(&captured);
+
+        // Bearer is probe_raw token, NOT active sentinel.
+        let key = req.header_value("x-api-key").expect("x-api-key missing");
+        assert_eq!(
+            key, "aikey_probe_raw_anthropic",
+            "Some mode must emit aikey_probe_raw_<provider>, got: {}",
+            key
+        );
+
+        // X-Aikey-Probe: 1 still present.
+        assert_eq!(req.header_value("X-Aikey-Probe").as_deref(), Some("1"));
+
+        // X-Aikey-Probe-Bearer carries the plaintext key (proxy uses this
+        // value to authenticate to upstream; never falls to vault).
+        assert_eq!(
+            req.header_value("X-Aikey-Probe-Bearer").as_deref(),
+            Some(plaintext_key),
+            "X-Aikey-Probe-Bearer missing or wrong value"
+        );
+
+        // base_url_override = None → no BaseURL header.
+        assert!(
+            !req.has_header("X-Aikey-Probe-BaseURL"),
+            "BaseURL header set despite None override"
+        );
+    }
+
+    #[test]
+    fn some_mode_with_base_url_emits_baseurl_header() {
+        let (addr, captured) = capture_one_request();
+        let plaintext_key = "sk-test";
+        let custom_base = "https://my-enterprise-gateway.example.com/v1";
+
+        let _ = test_proxy_connectivity(
+            &addr,
+            "anthropic",
+            Some(plaintext_key),
+            Some(custom_base),
+        );
+
+        let req = wait_for_capture(&captured);
+
+        assert_eq!(
+            req.header_value("X-Aikey-Probe-BaseURL").as_deref(),
+            Some(custom_base),
+            "X-Aikey-Probe-BaseURL not set when base_url_override is Some"
+        );
+    }
+
+    #[test]
+    fn some_mode_empty_base_url_does_not_send_baseurl_header() {
+        // Defense: pre-trimmed empty string should NOT emit empty BaseURL header
+        // (would confuse proxy's empty-vs-missing check). vault_op.rs::handle_test_raw
+        // pre-filters this with `if .is_empty() { None }` but defense-in-depth.
+        let (addr, captured) = capture_one_request();
+        let _ = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), Some(""));
+
+        let req = wait_for_capture(&captured);
+        assert!(
+            !req.has_header("X-Aikey-Probe-BaseURL"),
+            "empty base_url override leaked as empty BaseURL header — proxy should not see empty values"
+        );
+    }
+
+    #[test]
+    fn probe_raw_anthropic_always_sends_anthropic_version_header() {
+        // E2E finding 2026-05-26 (run #2): without anthropic-version header,
+        // Anthropic returns 400 "anthropic-version: header is required" even
+        // for valid keys. Send the header in both modes so probe_raw can
+        // distinguish "valid key + endpoint happy (200)" from "key rejected
+        // (401)". Allowlisted on proxy side (probe_raw.go::outboundHeaderAllowlist).
+        let (addr, captured) = capture_one_request();
+        let _ = test_proxy_connectivity(&addr, "anthropic", Some("sk-ant-test"), None);
+        let req = wait_for_capture(&captured);
+        assert_eq!(
+            req.header_value("anthropic-version").as_deref(),
+            Some("2023-06-01"),
+            "anthropic probe_raw must send anthropic-version header so upstream returns clear verdict (200 valid / 401 rejected) instead of 400 'header required'"
+        );
+    }
+
+    #[test]
+    fn probe_raw_anthropic_sends_anthropic_version_in_none_mode_too() {
+        // Defense: the header is sent regardless of mode (matches behavior in
+        // existing chat probe path runtime.rs:640). post-save active sentinel
+        // mode also benefits — but we mainly care that no regression here.
+        let (addr, captured) = capture_one_request();
+        let _ = test_proxy_connectivity(&addr, "anthropic", None, None);
+        let req = wait_for_capture(&captured);
+        assert_eq!(
+            req.header_value("anthropic-version").as_deref(),
+            Some("2023-06-01"),
+        );
+    }
+
+    #[test]
+    fn probe_raw_non_anthropic_provider_does_not_send_anthropic_version() {
+        // openai etc shouldn't receive an Anthropic-specific header — would
+        // be ignored but pollutes the wire. Pin per-provider exclusivity.
+        let (addr, captured) = capture_one_request();
+        let _ = test_proxy_connectivity(&addr, "openai", Some("sk-test"), None);
+        let req = wait_for_capture(&captured);
+        assert!(
+            !req.has_header("anthropic-version"),
+            "non-anthropic provider must not send anthropic-version header"
+        );
+    }
+
+    #[test]
+    fn some_mode_openai_provider_emits_authorization_bearer_probe_raw() {
+        let (addr, captured) = capture_one_request();
+        let _ = test_proxy_connectivity(&addr, "openai", Some("sk-openai-test"), None);
+
+        let req = wait_for_capture(&captured);
+
+        let auth = req
+            .header_value("Authorization")
+            .expect("Authorization missing");
+        assert_eq!(
+            auth, "Bearer aikey_probe_raw_openai",
+            "openai Some mode must emit Bearer aikey_probe_raw_<provider>, got: {}",
+            auth
+        );
+        assert_eq!(
+            req.header_value("X-Aikey-Probe-Bearer").as_deref(),
+            Some("sk-openai-test")
+        );
+    }
+}
+
+#[cfg(test)]
+mod probe_raw_error_classification_tests {
+    //! 2026-05-26 — Phase 2.D: pin the user-experience contract for the
+    //! "no fallback" decision. When proxy returns specific errors, CLI must
+    //! produce stable `error_code` strings that downstream (UI / CLI hints)
+    //! can render as user-actionable text.
+    //!
+    //! No-fallback fence: the test for `PROXY_TOO_OLD_NO_PROBE_RAW` is
+    //! particularly important — it pins that we DO NOT silently retry with
+    //! `aikey_active_*` per user decision 2026-05-26 (silent fallback would
+    //! mask "test the wrong key" with another wrong-key test).
+
+    use super::{test_proxy_connectivity, proxy_probe_full_hint, ProxyProbeResult};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    /// Mock proxy returning a single canned JSON-error response.
+    /// Used to simulate (a) old proxy returning TOKEN_INVALID,
+    /// (b) new proxy with flag off returning PROBE_RAW_DISABLED,
+    /// (c) defensive 401 PROBE_HEADER_REQUIRED.
+    fn mock_proxy_returning(status: u16, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local_addr").to_string();
+        let body_owned = body.to_string();
+
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                // Drain request line + headers.
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                loop {
+                    let mut line = String::new();
+                    let n = reader.read_line(&mut line).unwrap_or(0);
+                    if n == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+                let reason = match status {
+                    401 => "Unauthorized",
+                    503 => "Service Unavailable",
+                    _ => "Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    status,
+                    reason,
+                    body_owned.len(),
+                    body_owned
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        addr
+    }
+
+    // ───── Old proxy: 401 + TOKEN_INVALID → PROXY_TOO_OLD_NO_PROBE_RAW ─────
+    //
+    // CRITICAL FENCE per user decision 2026-05-26: no silent fallback.
+    // Old proxy treats aikey_probe_raw_* as TokenInvalid. We must surface
+    // PROXY_TOO_OLD_NO_PROBE_RAW so user knows to restart proxy, NOT silently
+    // re-call with aikey_active_* (which tests the wrong key).
+
+    #[test]
+    fn old_proxy_returns_token_invalid_classified_as_too_old() {
+        let addr = mock_proxy_returning(
+            401,
+            r#"{"error":{"code":"TOKEN_INVALID","message":"unknown token form","type":"authentication_error"}}"#,
+        );
+
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-pre-save"), None);
+
+        assert_eq!(
+            r.error_code.as_deref(),
+            Some("PROXY_TOO_OLD_NO_PROBE_RAW"),
+            "401 + TOKEN_INVALID in probe_raw mode must classify as PROXY_TOO_OLD_NO_PROBE_RAW"
+        );
+        assert_eq!(r.status, Some(401));
+    }
+
+    #[test]
+    fn proxy_too_old_hint_tells_user_to_restart_proxy() {
+        // proxy_probe_full_hint must render this in actionable text — not
+        // just regurgitate the error code.
+        let r = ProxyProbeResult {
+            ok: true,
+            ms: 50,
+            status: Some(401),
+            error_code: Some("PROXY_TOO_OLD_NO_PROBE_RAW".to_string()),
+        };
+        let hint = proxy_probe_full_hint(&r);
+        assert!(
+            hint.contains("aikey service restart proxy"),
+            "hint must include the recovery action, got: {}",
+            hint
+        );
+        assert!(
+            hint.contains("too old"),
+            "hint must explain why (proxy too old), got: {}",
+            hint
+        );
+    }
+
+    // ───── PROBE_RAW_DISABLED: defense rollback flag ─────
+
+    #[test]
+    fn flag_disabled_503_classified_as_probe_raw_disabled() {
+        let addr = mock_proxy_returning(
+            503,
+            r#"{"error":{"code":"PROBE_RAW_DISABLED","message":"flag off","type":"server_error"}}"#,
+        );
+
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
+
+        assert_eq!(
+            r.error_code.as_deref(),
+            Some("PROBE_RAW_DISABLED"),
+            "503 + PROBE_RAW_DISABLED must classify as PROBE_RAW_DISABLED"
+        );
+    }
+
+    // ───── PROBE_HEADER_REQUIRED: caller-side bug defense ─────
+
+    #[test]
+    fn missing_probe_header_401_classified_as_probe_header_required() {
+        // We always send X-Aikey-Probe: 1 — this fence catches regression where
+        // a future code change accidentally strips it. proxy_probe_full_hint
+        // surfaces this as a BUG indicator, not a user-actionable error.
+        let addr = mock_proxy_returning(
+            401,
+            r#"{"error":{"code":"PROBE_HEADER_REQUIRED","message":"missing X-Aikey-Probe","type":"authentication_error"}}"#,
+        );
+
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
+
+        assert_eq!(
+            r.error_code.as_deref(),
+            Some("PROBE_HEADER_REQUIRED"),
+        );
+        let hint = proxy_probe_full_hint(&r);
+        assert!(
+            hint.contains("BUG"),
+            "PROBE_HEADER_REQUIRED hint must signal client bug, got: {}",
+            hint
+        );
+    }
+
+    // ───── None mode (post-save) — error_code NEVER set ─────
+    //
+    // Critical fence: we only classify probe_raw errors. The 5 post-save
+    // call sites (aikey test [<alias>], doctor, vault-op test) must not
+    // suddenly start getting error_code populated — that would change
+    // their existing UX.
+
+    #[test]
+    fn none_mode_never_sets_error_code_even_on_401() {
+        let addr = mock_proxy_returning(
+            401,
+            r#"{"error":{"code":"TOKEN_INVALID","message":"x","type":"y"}}"#,
+        );
+
+        let r = test_proxy_connectivity(&addr, "anthropic", None, None);
+
+        assert_eq!(
+            r.error_code, None,
+            "None mode (post-save) must NEVER set error_code — would change existing UX of 5 call sites"
+        );
+    }
+
+    // ───── Unknown error code in probe_raw mode: pass through PROBE_* prefix ─────
+
+    #[test]
+    fn unknown_probe_error_code_passes_through_when_prefixed() {
+        // Defense: if proxy adds a new PROBE_* error code in a future version,
+        // it should still surface (not be swallowed). Our `proxy_probe_full_hint`
+        // renders "proxy error: <code>" so even unknown codes get displayed.
+        let addr = mock_proxy_returning(
+            400,
+            r#"{"error":{"code":"PROBE_FUTURE_ERROR","message":"x","type":"y"}}"#,
+        );
+
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
+
+        assert_eq!(r.error_code.as_deref(), Some("PROBE_FUTURE_ERROR"));
+    }
+
+    // ───── Non-PROBE_ error codes in probe_raw mode: do NOT capture (no false matches) ─────
+
+    #[test]
+    fn non_probe_error_codes_not_captured() {
+        // Vault errors, provider errors etc shouldn't be mistakenly classified.
+        // Only PROBE_* prefix and the specific (401, TOKEN_INVALID) case match.
+        let addr = mock_proxy_returning(
+            500,
+            r#"{"error":{"code":"VAULT_ERROR","message":"x","type":"server_error"}}"#,
+        );
+
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
+
+        assert_eq!(r.error_code, None, "VAULT_ERROR must not be captured as probe_raw error");
+        assert_eq!(r.status, Some(500), "but raw status should still surface");
+    }
+
+    // ───── proxy_status_hint legacy callers unaffected ─────
+
+    #[test]
+    fn legacy_proxy_status_hint_unchanged() {
+        // 5 post-save call sites still use proxy_status_hint(s) via the
+        // closure's `r.status.map(...)` path when error_code is None.
+        // Pin existing return strings.
+        use super::proxy_status_hint;
+        assert_eq!(proxy_status_hint(200), "routing ok, key valid");
+        assert_eq!(proxy_status_hint(401), "routing ok, key rejected by provider");
+        assert_eq!(proxy_status_hint(503), "proxy has no active key for this provider");
+    }
+
+    // ───── probe_raw upstream_status extraction (E2E-2 finding fix) ─────
+    //
+    // Pin spec §2.4 contract:proxy ALWAYS returns 200 on chain success,
+    // putting upstream's real status in body {"upstream_status":...}. Client
+    // MUST extract this; otherwise status_hint always reads "key valid" even
+    // for 401-rejected keys. Caught live during E2E-2 (real Anthropic 401
+    // for bad key was being hidden by proxy's 200 outer status).
+
+    #[test]
+    fn probe_raw_extracts_upstream_status_401_from_body() {
+        // Mock proxy returns 200 (chain ok) + body says upstream rejected with 401.
+        let addr = mock_proxy_returning(
+            200,
+            r#"{"probe_ok":true,"upstream_status":401,"latency_ms":150,"provider":"anthropic","status_hint":"routing ok, key rejected by upstream"}"#,
+        );
+
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-ant-fake"), None);
+
+        // Outer was 200 but client surfaces upstream (401) so caller sees real verdict.
+        assert_eq!(
+            r.status,
+            Some(401),
+            "probe_raw mode must surface upstream_status (401), not proxy outer status (200). Bug from E2E-2: real upstream rejection was being hidden as 'key valid'."
+        );
+        assert!(r.error_code.is_none(), "401 from upstream is NOT an error_code situation");
+    }
+
+    #[test]
+    fn probe_raw_extracts_upstream_status_200_happy_path() {
+        let addr = mock_proxy_returning(
+            200,
+            r#"{"probe_ok":true,"upstream_status":200,"latency_ms":420,"provider":"anthropic","status_hint":"routing ok, key valid"}"#,
+        );
+
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-ant-valid"), None);
+
+        assert_eq!(r.status, Some(200), "happy path: upstream_status=200 surfaces");
+        assert!(r.error_code.is_none());
+    }
+
+    #[test]
+    fn probe_raw_falls_back_to_200_when_body_missing_upstream_status() {
+        // Defense: proxy returns 200 but body parse fails / field missing.
+        // Client must not panic; fall back to outer status so caller sees ok signal.
+        let addr = mock_proxy_returning(200, r#"{}"#);
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
+        assert_eq!(
+            r.status,
+            Some(200),
+            "missing upstream_status field → fall back to outer 200 (still signals proxy chain ok)"
+        );
+    }
+
+    #[test]
+    fn none_mode_unaffected_by_upstream_status_extraction() {
+        // CRITICAL: extraction only happens in probe_raw mode (bearer_override Some).
+        // 5 post-save call sites use None → path returns r.status() unchanged.
+        // Mock returns 200 + body that LOOKS like probe_raw shape — None mode
+        // must NOT parse it.
+        let addr = mock_proxy_returning(
+            200,
+            r#"{"probe_ok":true,"upstream_status":401}"#,  // would mislead a confused parser
+        );
+
+        // Notice: bearer_override is None here.
+        let r = test_proxy_connectivity(&addr, "anthropic", None, None);
+
+        assert_eq!(
+            r.status,
+            Some(200),
+            "None mode (post-save) must NOT extract upstream_status — would change UX of 5 post-save call sites silently"
+        );
     }
 }

@@ -1515,12 +1515,22 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 );
                 if !targets.is_empty() {
                     eprintln!();
+                    // 2026-05-26 Phase 2.C (spec: roadmap20260320/技术实现/
+                    // update/20260526-pre-save-proxy-probe-raw.md): pass the
+                    // new key as probe_raw_bearer so the proxy row tests THIS
+                    // key (not whatever's currently active for the provider).
+                    // Pre-2026-05-26 this passed None and proxy ended up testing
+                    // the old active binding — see spec §1 sender history.
                     let opts = commands_project::SuiteOptions {
                         show_proxy_row: true,
                         header_label: None,
                         password: None,
                         proxy_port: commands_proxy::proxy_port(),
                         show_key_column: false,
+                        probe_raw_bearer: Some(secret.trim().to_string()),
+                        probe_raw_base_url: resolved_base_url
+                            .as_ref()
+                            .map(|s| s.to_string()),
                     };
                     let outcome = commands_project::run_connectivity_suite(targets, opts, false);
                     if !outcome.any_chat_ok {
@@ -2093,6 +2103,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     // is identifiable. Single-alias / Primary-binding modes
                     // never see this case.
                     show_key_column: true,
+                    // None — `aikey test --all` is post-save (testing active bindings).
+                    probe_raw_bearer: None,
+                    probe_raw_base_url: None,
                 };
                 let outcome = if cli.json {
                     commands_project::run_connectivity_suite(targets, opts, true)
@@ -2155,6 +2168,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     password: None,
                     proxy_port,
                     show_key_column: false,
+                    // None — `aikey test <alias>` is post-save by alias.
+                    probe_raw_bearer: None,
+                    probe_raw_base_url: None,
                 };
                 let outcome = if cli.json {
                     commands_project::run_connectivity_suite(targets, opts, true)
@@ -2222,6 +2238,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     password: None,
                     proxy_port,
                     show_key_column: false,
+                    // None — `aikey test` (no alias) is post-save active-bindings test.
+                    probe_raw_bearer: None,
+                    probe_raw_base_url: None,
                 };
                 let outcome = if cli.json {
                     commands_project::run_connectivity_suite(targets, opts, true)

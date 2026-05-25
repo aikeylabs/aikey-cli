@@ -1235,6 +1235,8 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 password: None, // PersonalApi plaintext is already baked into each target
                 proxy_port: crate::commands_proxy::proxy_port(),
                 show_key_column: false,
+                probe_raw_bearer: None,
+                probe_raw_base_url: None,
             },
             json_mode,
         );

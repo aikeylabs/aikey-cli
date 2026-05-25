@@ -216,6 +216,41 @@ pub fn aggregate_test_outcome(outcome: &SuiteOutcome) -> Vec<AggregatedTestRecor
             .collect();
         record.insert("suite_results".into(), json!(suite_rows));
 
+        // 2026-05-26 (spec 20260526-pre-save-proxy-probe-raw.md §6.2):
+        // surface the proxy probe result into each record's last_test JSON so
+        // the Web Add Key modal (and any other Web caller) can render a real
+        // Proxy row instead of hard-coding "skipped".
+        //
+        // Pure-addition: pre-2026-05-26 last_test had no proxy_* fields, so
+        // old consumers ignore these. Web pre-Step-Phase-2.E hard-coded
+        // "skipped" regardless of testResult content; post-2.E reads these.
+        //
+        // All records in the same SuiteOutcome share the same proxy probe
+        // (one probe per suite run, applies to whichever provider was tested
+        // first). Duplicating the data into every record keeps the consumer
+        // simple — they read these fields off the record they already have,
+        // no separate field lookup.
+        if let Some(p) = &outcome.proxy {
+            // proxy_ok = real chain success: proxy returned 2xx AND no
+            // probe_raw error_code (PROXY_TOO_OLD_NO_PROBE_RAW etc must NOT
+            // render as "ok" even though `ok: true` because the probe came
+            // back from the proxy at all).
+            let chain_ok = p.ok && p.error_code.is_none();
+            record.insert("proxy_ok".into(), json!(chain_ok));
+            record.insert("proxy_ms".into(), json!(p.ms as i64));
+            if let Some(status) = p.status {
+                record.insert("proxy_status".into(), json!(status));
+            }
+            if let Some(code) = &p.error_code {
+                record.insert("proxy_error_code".into(), json!(code));
+            }
+            // Pre-rendered user-facing hint string — same logic CLI uses,
+            // so terminal + web display identical text. Web doesn't have to
+            // duplicate the error_code → user-action mapping.
+            let hint = crate::connectivity::runtime::proxy_probe_full_hint(p);
+            record.insert("proxy_status_hint".into(), json!(hint));
+        }
+
         let record_value = serde_json::Value::Object(record);
         records.push(AggregatedTestRecord {
             target_kind: kind,
@@ -633,5 +668,108 @@ mod tests {
             agg[0].last_test["latency_ms"], 350,
             "fail path = slowest hop"
         );
+    }
+
+    // ─── 2026-05-26 Phase 2.E — proxy fields surfaced into last_test ───
+    //
+    // Pin spec §6.2 (20260526-pre-save-proxy-probe-raw.md): aggregator must
+    // serialize outcome.proxy into per-record last_test so the Web Add Key
+    // modal can render a real Proxy row instead of hard-coding "skipped".
+
+    use crate::connectivity::runtime::ProxyProbeResult;
+
+    fn outcome_with_proxy(rows: Vec<(TestTarget, ConnectivityResult)>, p: ProxyProbeResult) -> SuiteOutcome {
+        SuiteOutcome {
+            rows,
+            proxy: Some(p),
+            build_errors: vec![],
+            any_chat_ok: false,
+            json_results: vec![],
+        }
+    }
+
+    #[test]
+    fn proxy_fields_surface_when_proxy_probe_succeeded() {
+        let r = ConnectivityResult { ping_ok: true, api_ok: true, chat_ok: true, ..Default::default() };
+        let so = outcome_with_proxy(
+            vec![(target("k1", CredentialKind::PersonalApi), r)],
+            ProxyProbeResult { ok: true, ms: 187, status: Some(200), error_code: None },
+        );
+        let agg = aggregate_test_outcome(&so);
+        let lt = &agg[0].last_test;
+        assert_eq!(lt["proxy_ok"], true, "proxy_ok must surface when probe succeeded");
+        assert_eq!(lt["proxy_ms"], 187);
+        assert_eq!(lt["proxy_status"], 200);
+        assert!(lt.get("proxy_error_code").is_none(), "no error_code → field absent");
+        let hint = lt["proxy_status_hint"].as_str().expect("hint missing");
+        assert!(hint.contains("routing ok"), "200 hint should mention routing ok, got: {}", hint);
+    }
+
+    #[test]
+    fn proxy_old_proxy_error_surfaces_as_not_ok_with_specific_hint() {
+        // Critical fence: even when ProxyProbeResult.ok=true (proxy responded),
+        // the presence of error_code (PROXY_TOO_OLD_NO_PROBE_RAW etc) must
+        // render as proxy_ok=FALSE so the Web Proxy row shows red/warning.
+        let r = ConnectivityResult { ping_ok: true, api_ok: true, chat_ok: true, ..Default::default() };
+        let so = outcome_with_proxy(
+            vec![(target("k1", CredentialKind::PersonalApi), r)],
+            ProxyProbeResult {
+                ok: true,
+                ms: 12,
+                status: Some(401),
+                error_code: Some("PROXY_TOO_OLD_NO_PROBE_RAW".to_string()),
+            },
+        );
+        let agg = aggregate_test_outcome(&so);
+        let lt = &agg[0].last_test;
+        assert_eq!(
+            lt["proxy_ok"], false,
+            "error_code present must override ok=true so Web renders as failure"
+        );
+        assert_eq!(lt["proxy_error_code"], "PROXY_TOO_OLD_NO_PROBE_RAW");
+        let hint = lt["proxy_status_hint"].as_str().expect("hint missing");
+        assert!(
+            hint.contains("aikey service restart proxy"),
+            "old-proxy hint must include recovery action, got: {}",
+            hint
+        );
+    }
+
+    #[test]
+    fn proxy_fields_absent_when_outcome_has_no_proxy() {
+        // Pre-2026-05-26 callers (and post-save paths that don't set
+        // show_proxy_row) produce SuiteOutcome { proxy: None, ... }.
+        // Aggregator must NOT inject proxy_* fields with default 0/false
+        // — leave them entirely absent so Web can distinguish "no proxy
+        // probe ran" from "proxy probe ran with ok=false".
+        let r = ConnectivityResult { ping_ok: true, api_ok: true, chat_ok: true, ..Default::default() };
+        let so = outcome(vec![(target("k1", CredentialKind::PersonalApi), r)]);
+        let agg = aggregate_test_outcome(&so);
+        let lt = &agg[0].last_test;
+        assert!(lt.get("proxy_ok").is_none(), "no probe → proxy_ok absent");
+        assert!(lt.get("proxy_ms").is_none());
+        assert!(lt.get("proxy_status").is_none());
+        assert!(lt.get("proxy_status_hint").is_none());
+        assert!(lt.get("proxy_error_code").is_none());
+    }
+
+    #[test]
+    fn proxy_fields_surface_with_disabled_flag_error() {
+        // Operator-disabled flag returns 503 + PROBE_RAW_DISABLED.
+        let r = ConnectivityResult { ping_ok: true, api_ok: true, chat_ok: true, ..Default::default() };
+        let so = outcome_with_proxy(
+            vec![(target("k1", CredentialKind::PersonalApi), r)],
+            ProxyProbeResult {
+                ok: true,
+                ms: 5,
+                status: Some(503),
+                error_code: Some("PROBE_RAW_DISABLED".to_string()),
+            },
+        );
+        let agg = aggregate_test_outcome(&so);
+        let lt = &agg[0].last_test;
+        assert_eq!(lt["proxy_error_code"], "PROBE_RAW_DISABLED");
+        let hint = lt["proxy_status_hint"].as_str().unwrap();
+        assert!(hint.contains("disabled"), "hint must mention disabled, got: {}", hint);
     }
 }

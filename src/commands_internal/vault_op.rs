@@ -18,7 +18,6 @@ use serde_json::json;
 use crate::audit::{self, AuditOperation};
 use crate::credential_type::CredentialType;
 use crate::crypto;
-use crate::profile_activation;
 use crate::storage;
 // storage_platform is a submodule re-exported via `pub use storage::*`
 // on storage. Call its functions through `storage::...` directly.
@@ -980,15 +979,52 @@ fn handle_delete_target(env: StdinEnvelope) {
                 );
                 return;
             }
+            // BR-rc.5 fix (2026-05-25, Phase A.2 of vault-oauth web↔CLI
+            // path parity audit): apply Removed lifecycle — was missing
+            // here while the "personal" branch above (line ~936) had it.
+            // Without this, deleting an OAuth account via Web vault
+            // page left:
+            //   - orphan rows in user_profile_provider_bindings still
+            //     pointing at the now-deleted provider_account_id
+            //     (`aikey use` interactive picker would surface them as
+            //     "active binding to source_ref=… but provider_accounts
+            //     row absent")
+            //   - ~/.aikey/active.env still referencing the deleted
+            //     OAuth's route_token (shell env stale → claude/codex/
+            //     kimi commands would 401)
+            //   - ~/.claude/settings.json / ~/.codex/config.toml /
+            //     ~/.kimi/config.toml still pointing at the deleted
+            //     account_id (third-party CLI configs not reconciled)
+            //
+            // source_type is "personal_oauth_account" (DB canonical
+            // string per credential_type.rs:23). Same pattern as the
+            // CLI-side `aikey auth logout` path: lifecycle reconciles
+            // bindings to a replacement primary if one exists, else
+            // clears the binding.
+            //
+            // See bugfix 20260525-vault-oauth-delete-missing-lifecycle.md
+            // and the sibling bug 20260525-vault-oauth-route-token-not-
+            // generated-by-web-broker.md (same web↔CLI asymmetry pattern,
+            // different missing call).
+            let lifecycle = crate::commands_account::apply_credential_lifecycle(
+                crate::commands_account::CredentialLifecycleEvent::Removed {
+                    source_type: "personal_oauth_account",
+                    source_ref: &payload.id,
+                },
+            )
+            .unwrap_or_default();
             let audit_logged = try_log_audit(&key, AuditOperation::Delete, Some(&payload.id), true);
             emit(&ResultEnvelope::ok(
                 req_id,
-                merge_hook_status(json!({
-                    "target": "oauth",
-                    "id": payload.id,
-                    "action_taken": "deleted",
-                    "audit_logged": audit_logged,
-                })),
+                merge_hook_status_from_outcome(
+                    json!({
+                        "target": "oauth",
+                        "id": payload.id,
+                        "action_taken": "deleted",
+                        "audit_logged": audit_logged,
+                    }),
+                    &lifecycle,
+                ),
             ));
         }
         "team" => {
@@ -1335,6 +1371,10 @@ fn handle_test(env: StdinEnvelope) {
         password: None,
         proxy_port,
         show_key_column: false,
+        // None — `_internal vault-op test` (post-save by alias) is single-cred
+        // post-save semantics, mirrors `aikey test <alias>` (proxy row off).
+        probe_raw_bearer: None,
+        probe_raw_base_url: None,
     };
     let outcome =
         crate::commands_project::run_connectivity_suite(targets, opts, /*json_mode*/ true);
@@ -1499,17 +1539,32 @@ fn handle_test_raw(env: StdinEnvelope) {
         return;
     }
 
-    // show_proxy_row=false: pre-save probe never has a valid proxy
-    // sentinel route (the key isn't in vault yet), so the Proxy row
-    // would always show "skipped" — better to omit than to mislead.
-    // The Web spec's 4-phase table renders Proxy as "skipped" client-
-    // side when last_test carries no Proxy row.
+    // 2026-05-26 (spec: roadmap20260320/技术实现/update/20260526-pre-save-
+    // proxy-probe-raw.md, Phase 2.B): turn proxy row ON for pre-save probes,
+    // using the new aikey_probe_raw_* path. The plaintext key flows to proxy
+    // via X-Aikey-Probe-Bearer header (kept off vault, off reporter); proxy
+    // forwards using that bearer directly without binding lookup. Net effect:
+    // user sees a real "this key + proxy → provider" health signal in the
+    // Web Test connectivity modal, not a hard-coded "skipped" row.
+    //
+    // Pre-2026-05-26 behavior (kept here as a comment for soul-reading why):
+    //   show_proxy_row: false + UI hard-coded "skipped"
+    //   rationale (turned out wrong): "proxy row would always show skipped
+    //   because the key isn't in vault yet". Actually proxy's old aikey_active_*
+    //   path tests whatever's currently active — not the new key — which is
+    //   misleading semantics, not "skipped". probe_raw fixes the root cause.
     let opts = crate::commands_project::SuiteOptions {
-        show_proxy_row: false,
+        show_proxy_row: true,
         header_label: None,
         password: None,
         proxy_port: crate::commands_proxy::proxy_port(),
         show_key_column: false,
+        probe_raw_bearer: Some(payload.secret.trim().to_string()),
+        probe_raw_base_url: if payload.base_url.trim().is_empty() {
+            None
+        } else {
+            Some(payload.base_url.trim().to_string())
+        },
     };
     let outcome =
         crate::commands_project::run_connectivity_suite(targets, opts, /*json_mode*/ true);
