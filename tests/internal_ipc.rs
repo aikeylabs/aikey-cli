@@ -6,8 +6,8 @@
 //! - 非 0 exit 只在进程崩溃时；其它情况 exit 0 + error envelope
 //! - vault_key_hex 必须 64 chars / 有效 hex
 
-use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin;
+use assert_cmd::Command;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -133,7 +133,7 @@ fn verify_fails_with_wrong_key() {
         .args(["_internal", "vault-op", "--stdin-json"])
         .write_stdin(req.to_string())
         .assert()
-        .success()  // 协议约定：exit 0 + error envelope
+        .success() // 协议约定：exit 0 + error envelope
         .get_output()
         .clone();
 
@@ -245,7 +245,10 @@ fn internal_subcommand_hidden_from_help() {
         .get_output()
         .clone();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(!text.contains("_internal"), "_internal should be hidden from --help");
+    assert!(
+        !text.contains("_internal"),
+        "_internal should be hidden from --help"
+    );
 }
 
 // ========== Phase B: add / batch_import / update_secret / delete ==========
@@ -279,16 +282,19 @@ fn add_creates_new_credential() {
     let key_hex = env.vault_key_hex();
     let before = count_entries(&env);
 
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "add",
-        "request_id": "add-1",
-        "payload": {
-            "alias": "claude-test",
-            "secret_plaintext": "sk-ant-api03-test",
-            "provider": "anthropic",
-        }
-    }));
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "add",
+            "request_id": "add-1",
+            "payload": {
+                "alias": "claude-test",
+                "secret_plaintext": "sk-ant-api03-test",
+                "provider": "anthropic",
+            }
+        }),
+    );
     assert_eq!(v["status"], "ok", "response: {}", v);
     assert_eq!(v["data"]["action_taken"], "inserted");
     assert_eq!(v["data"]["alias"], "claude-test");
@@ -303,19 +309,25 @@ fn add_rejects_duplicate_by_default() {
     let key_hex = env.vault_key_hex();
 
     // 第一次 ok
-    let v1 = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "add",
-        "payload": {"alias": "dup", "secret_plaintext": "first"}
-    }));
+    let v1 = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "add",
+            "payload": {"alias": "dup", "secret_plaintext": "first"}
+        }),
+    );
     assert_eq!(v1["status"], "ok");
 
     // 第二次冲突
-    let v2 = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "add",
-        "payload": {"alias": "dup", "secret_plaintext": "second"}
-    }));
+    let v2 = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "add",
+            "payload": {"alias": "dup", "secret_plaintext": "second"}
+        }),
+    );
     assert_eq!(v2["status"], "error");
     assert_eq!(v2["error_code"], "I_CREDENTIAL_CONFLICT");
 }
@@ -327,17 +339,23 @@ fn add_with_on_conflict_replace_overwrites() {
     let key_hex = env.vault_key_hex();
 
     // 第一次
-    run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "add",
-        "payload": {"alias": "replace-me", "secret_plaintext": "v1"}
-    }));
+    run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "add",
+            "payload": {"alias": "replace-me", "secret_plaintext": "v1"}
+        }),
+    );
     let before = count_entries(&env);
     // 第二次 on_conflict=replace
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "add",
-        "payload": {"alias": "replace-me", "secret_plaintext": "v2", "on_conflict": "replace"}
-    }));
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "add",
+            "payload": {"alias": "replace-me", "secret_plaintext": "v2", "on_conflict": "replace"}
+        }),
+    );
     assert_eq!(v["status"], "ok");
     assert_eq!(v["data"]["action_taken"], "replaced");
     // 数量不变（更新不是插入）
@@ -351,17 +369,20 @@ fn batch_import_inserts_multiple() {
     let key_hex = env.vault_key_hex();
     let before = count_entries(&env);
 
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "batch_import",
-        "payload": {
-            "items": [
-                {"alias": "batch-1", "secret_plaintext": "s1", "provider": "anthropic"},
-                {"alias": "batch-2", "secret_plaintext": "s2", "provider": "openai"},
-                {"alias": "batch-3", "secret_plaintext": "s3"},
-            ]
-        }
-    }));
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "batch_import",
+            "payload": {
+                "items": [
+                    {"alias": "batch-1", "secret_plaintext": "s1", "provider": "anthropic"},
+                    {"alias": "batch-2", "secret_plaintext": "s2", "provider": "openai"},
+                    {"alias": "batch-3", "secret_plaintext": "s3"},
+                ]
+            }
+        }),
+    );
     assert_eq!(v["status"], "ok", "{}", v);
     assert_eq!(v["data"]["total"], 3);
     assert_eq!(v["data"]["inserted"], 3);
@@ -375,23 +396,29 @@ fn batch_import_error_on_conflict_aborts() {
     env.init_vault();
     let key_hex = env.vault_key_hex();
     // 先种一个
-    run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "add",
-        "payload": {"alias": "batch-seed", "secret_plaintext": "seed"}
-    }));
+    run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "add",
+            "payload": {"alias": "batch-seed", "secret_plaintext": "seed"}
+        }),
+    );
     let before = count_entries(&env);
 
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "batch_import",
-        "payload": {
-            "items": [
-                {"alias": "batch-new-1", "secret_plaintext": "x"},
-                {"alias": "batch-seed", "secret_plaintext": "conflict"},  // 冲突
-            ]
-            // on_conflict 默认 "error"
-        }
-    }));
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "batch_import",
+            "payload": {
+                "items": [
+                    {"alias": "batch-new-1", "secret_plaintext": "x"},
+                    {"alias": "batch-seed", "secret_plaintext": "conflict"},  // 冲突
+                ]
+                // on_conflict 默认 "error"
+            }
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_CREDENTIAL_CONFLICT");
     // 冲突预检在写任何之前做 → entries 数应不变（batch 是原子的）
@@ -403,23 +430,29 @@ fn batch_import_skip_on_conflict() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
-    run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "add",
-        "payload": {"alias": "skip-seed", "secret_plaintext": "seed"}
-    }));
+    run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "add",
+            "payload": {"alias": "skip-seed", "secret_plaintext": "seed"}
+        }),
+    );
     let before = count_entries(&env);
 
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "batch_import",
-        "payload": {
-            "items": [
-                {"alias": "skip-new", "secret_plaintext": "x"},
-                {"alias": "skip-seed", "secret_plaintext": "conflict"},
-            ],
-            "on_conflict": "skip",
-        }
-    }));
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "batch_import",
+            "payload": {
+                "items": [
+                    {"alias": "skip-new", "secret_plaintext": "x"},
+                    {"alias": "skip-seed", "secret_plaintext": "conflict"},
+                ],
+                "on_conflict": "skip",
+            }
+        }),
+    );
     assert_eq!(v["status"], "ok");
     assert_eq!(v["data"]["inserted"], 1);
     assert_eq!(v["data"]["skipped"], 1);
@@ -433,24 +466,33 @@ fn update_secret_requires_existing_alias() {
     let key_hex = env.vault_key_hex();
 
     // 不存在 → I_CREDENTIAL_NOT_FOUND
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "update_secret",
-        "payload": {"alias": "does-not-exist", "new_secret_plaintext": "x"}
-    }));
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "update_secret",
+            "payload": {"alias": "does-not-exist", "new_secret_plaintext": "x"}
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_CREDENTIAL_NOT_FOUND");
 
     // 创建 → update → ok
-    run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "add",
-        "payload": {"alias": "upd-target", "secret_plaintext": "v1"}
-    }));
-    let v2 = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "update_secret",
-        "payload": {"alias": "upd-target", "new_secret_plaintext": "v2"}
-    }));
+    run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "add",
+            "payload": {"alias": "upd-target", "secret_plaintext": "v1"}
+        }),
+    );
+    let v2 = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "update_secret",
+            "payload": {"alias": "upd-target", "new_secret_plaintext": "v2"}
+        }),
+    );
     assert_eq!(v2["status"], "ok");
     assert_eq!(v2["data"]["action_taken"], "updated");
 }
@@ -460,17 +502,23 @@ fn delete_removes_credential() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
-    run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "add",
-        "payload": {"alias": "del-me", "secret_plaintext": "x"}
-    }));
+    run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "add",
+            "payload": {"alias": "del-me", "secret_plaintext": "x"}
+        }),
+    );
     let before = count_entries(&env);
 
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "delete",
-        "payload": {"alias": "del-me"}
-    }));
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "delete",
+            "payload": {"alias": "del-me"}
+        }),
+    );
     assert_eq!(v["status"], "ok");
     assert_eq!(v["data"]["action_taken"], "deleted");
     assert_eq!(count_entries(&env), before - 1);
@@ -482,11 +530,14 @@ fn delete_nonexistent_returns_not_found() {
     env.init_vault();
     let key_hex = env.vault_key_hex();
 
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "delete",
-        "payload": {"alias": "never-existed"}
-    }));
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "delete",
+            "payload": {"alias": "never-existed"}
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_CREDENTIAL_NOT_FOUND");
 }
@@ -537,11 +588,14 @@ fn query_list_returns_all_aliases() {
     let key_hex = env.vault_key_hex();
     seed_credentials(&env, &key_hex);
 
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "list",
-        "request_id": "list-1",
-    }));
+    let v = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "list",
+            "request_id": "list-1",
+        }),
+    );
     assert_eq!(v["status"], "ok");
     let aliases = v["data"]["aliases"].as_array().expect("aliases array");
     // init_vault 种了 _ipc_bootstrap_，加上 3 个 seed → 至少 4 条
@@ -556,10 +610,13 @@ fn query_list_returns_all_aliases() {
 fn query_list_rejects_wrong_key() {
     let env = InternalTestEnv::new();
     env.init_vault();
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": "0".repeat(64),
-        "action": "list",
-    }));
+    let v = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": "0".repeat(64),
+            "action": "list",
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_VAULT_KEY_INVALID");
 }
@@ -571,13 +628,19 @@ fn query_list_with_metadata_includes_provider() {
     let key_hex = env.vault_key_hex();
     seed_credentials(&env, &key_hex);
 
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "list_with_metadata",
-    }));
+    let v = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "list_with_metadata",
+        }),
+    );
     assert_eq!(v["status"], "ok");
     let entries = v["data"]["entries"].as_array().expect("entries array");
-    let claude = entries.iter().find(|e| e["alias"] == "q-claude").expect("q-claude present");
+    let claude = entries
+        .iter()
+        .find(|e| e["alias"] == "q-claude")
+        .expect("q-claude present");
     assert_eq!(claude["provider_code"], "anthropic");
     // list_with_metadata 必须**不**含 secret_plaintext
     assert!(claude.get("secret_plaintext").is_none());
@@ -590,16 +653,22 @@ fn query_get_metadata_only_by_default() {
     let key_hex = env.vault_key_hex();
     seed_credentials(&env, &key_hex);
 
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "get",
-        "payload": {"alias": "q-claude"},
-        // 无 include_secret → 默认 false
-    }));
+    let v = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "get",
+            "payload": {"alias": "q-claude"},
+            // 无 include_secret → 默认 false
+        }),
+    );
     assert_eq!(v["status"], "ok");
     assert_eq!(v["data"]["alias"], "q-claude");
     assert_eq!(v["data"]["provider_code"], "anthropic");
-    assert!(v["data"].get("secret_plaintext").is_none(), "默认不返回 plaintext");
+    assert!(
+        v["data"].get("secret_plaintext").is_none(),
+        "默认不返回 plaintext"
+    );
 }
 
 #[test]
@@ -615,11 +684,14 @@ fn query_get_ignores_include_secret_flag_and_returns_metadata_only() {
     let key_hex = env.vault_key_hex();
     seed_credentials(&env, &key_hex);
 
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "get",
-        "payload": {"alias": "q-claude", "include_secret": true},
-    }));
+    let v = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "get",
+            "payload": {"alias": "q-claude", "include_secret": true},
+        }),
+    );
     assert_eq!(v["status"], "ok");
     assert_eq!(v["data"]["provider_code"], "anthropic");
     assert!(
@@ -634,11 +706,14 @@ fn query_get_returns_not_found_for_missing_alias() {
     env.init_vault();
     let key_hex = env.vault_key_hex();
 
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "get",
-        "payload": {"alias": "never-existed"},
-    }));
+    let v = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "get",
+            "payload": {"alias": "never-existed"},
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_CREDENTIAL_NOT_FOUND");
 }
@@ -651,19 +726,25 @@ fn query_check_alias_exists_does_not_need_key() {
     seed_credentials(&env, &key_hex);
 
     // 用 wrong key 也能 check_alias_exists（该 action 只查 alias 本身，不涉及解密）
-    let v1 = run_query(&env, serde_json::json!({
-        "vault_key_hex": "0".repeat(64),
-        "action": "check_alias_exists",
-        "payload": {"alias": "q-claude"},
-    }));
+    let v1 = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": "0".repeat(64),
+            "action": "check_alias_exists",
+            "payload": {"alias": "q-claude"},
+        }),
+    );
     assert_eq!(v1["status"], "ok");
     assert_eq!(v1["data"]["exists"], true);
 
-    let v2 = run_query(&env, serde_json::json!({
-        "vault_key_hex": "0".repeat(64),
-        "action": "check_alias_exists",
-        "payload": {"alias": "never-existed"},
-    }));
+    let v2 = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": "0".repeat(64),
+            "action": "check_alias_exists",
+            "payload": {"alias": "never-existed"},
+        }),
+    );
     assert_eq!(v2["status"], "ok");
     assert_eq!(v2["data"]["exists"], false);
 }
@@ -674,10 +755,13 @@ fn query_unknown_action_returns_error() {
     env.init_vault();
     let key_hex = env.vault_key_hex();
 
-    let v = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "not_a_real_query_action",
-    }));
+    let v = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "not_a_real_query_action",
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_UNKNOWN_ACTION");
 }
@@ -723,26 +807,35 @@ fn rename_alias_updates_primary_key() {
     let key_hex = env.vault_key_hex();
     seed_credentials(&env, &key_hex);
 
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "rename_alias",
-        "payload": {"old_alias": "q-claude", "new_alias": "q-claude-renamed"}
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "rename_alias",
+            "payload": {"old_alias": "q-claude", "new_alias": "q-claude-renamed"}
+        }),
+    );
     assert_eq!(v["status"], "ok", "{}", v);
     assert_eq!(v["data"]["action_taken"], "renamed");
 
     // 老名不存在、新名存在
-    let v1 = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "check_alias_exists",
-        "payload": {"alias": "q-claude"}
-    }));
+    let v1 = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "check_alias_exists",
+            "payload": {"alias": "q-claude"}
+        }),
+    );
     assert_eq!(v1["data"]["exists"], false);
-    let v2 = run_query(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "check_alias_exists",
-        "payload": {"alias": "q-claude-renamed"}
-    }));
+    let v2 = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "check_alias_exists",
+            "payload": {"alias": "q-claude-renamed"}
+        }),
+    );
     assert_eq!(v2["data"]["exists"], true);
 }
 
@@ -754,11 +847,14 @@ fn rename_alias_rejects_conflict() {
     seed_credentials(&env, &key_hex);
 
     // q-claude 和 q-openai 都已存在
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "rename_alias",
-        "payload": {"old_alias": "q-claude", "new_alias": "q-openai"}
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "rename_alias",
+            "payload": {"old_alias": "q-claude", "new_alias": "q-openai"}
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_CREDENTIAL_CONFLICT");
 }
@@ -768,11 +864,14 @@ fn rename_alias_not_found() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "rename_alias",
-        "payload": {"old_alias": "nope", "new_alias": "x"}
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "rename_alias",
+            "payload": {"old_alias": "nope", "new_alias": "x"}
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_CREDENTIAL_NOT_FOUND");
 }
@@ -783,11 +882,14 @@ fn rename_alias_rejects_identical_names() {
     env.init_vault();
     let key_hex = env.vault_key_hex();
     seed_credentials(&env, &key_hex);
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "rename_alias",
-        "payload": {"old_alias": "q-claude", "new_alias": "q-claude"}
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "rename_alias",
+            "payload": {"old_alias": "q-claude", "new_alias": "q-claude"}
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_STDIN_INVALID_JSON");
 }
@@ -803,11 +905,14 @@ fn set_provider_updates_field() {
     let meta0 = read_entry_meta(&env, "q-kimi");
     assert!(meta0["provider_code"].is_null());
 
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "set_provider",
-        "payload": {"alias": "q-kimi", "provider": "moonshot"}
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "set_provider",
+            "payload": {"alias": "q-kimi", "provider": "moonshot"}
+        }),
+    );
     assert_eq!(v["status"], "ok");
     assert_eq!(v["data"]["provider_code"], "moonshot");
 
@@ -822,11 +927,14 @@ fn set_provider_null_clears() {
     let key_hex = env.vault_key_hex();
     seed_credentials(&env, &key_hex);
 
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "set_provider",
-        "payload": {"alias": "q-claude", "provider": null}
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "set_provider",
+            "payload": {"alias": "q-claude", "provider": null}
+        }),
+    );
     assert_eq!(v["status"], "ok");
     let meta = read_entry_meta(&env, "q-claude");
     assert!(meta["provider_code"].is_null());
@@ -839,11 +947,14 @@ fn set_base_url_updates_field() {
     let key_hex = env.vault_key_hex();
     seed_credentials(&env, &key_hex);
 
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "set_base_url",
-        "payload": {"alias": "q-openai", "base_url": "https://api.internal.corp/v1"}
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "set_base_url",
+            "payload": {"alias": "q-openai", "base_url": "https://api.internal.corp/v1"}
+        }),
+    );
     assert_eq!(v["status"], "ok");
     let meta = read_entry_meta(&env, "q-openai");
     assert_eq!(meta["base_url"], "https://api.internal.corp/v1");
@@ -856,11 +967,14 @@ fn set_supported_providers_json_array() {
     let key_hex = env.vault_key_hex();
     seed_credentials(&env, &key_hex);
 
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "set_supported_providers",
-        "payload": {"alias": "q-claude", "providers": ["anthropic", "openai-compat"]}
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "set_supported_providers",
+            "payload": {"alias": "q-claude", "providers": ["anthropic", "openai-compat"]}
+        }),
+    );
     assert_eq!(v["status"], "ok");
     let meta = read_entry_meta(&env, "q-claude");
     // 存储为 JSON string
@@ -876,14 +990,17 @@ fn set_metadata_roundtrip() {
     let key_hex = env.vault_key_hex();
     seed_credentials(&env, &key_hex);
 
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "set_metadata",
-        "payload": {
-            "alias": "q-kimi",
-            "metadata": {"tag": "prod", "note": "月底到期", "enabled": true}
-        }
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "set_metadata",
+            "payload": {
+                "alias": "q-kimi",
+                "metadata": {"tag": "prod", "note": "月底到期", "enabled": true}
+            }
+        }),
+    );
     assert_eq!(v["status"], "ok");
     let meta = read_entry_meta(&env, "q-kimi");
     let stored: String = meta["metadata"].as_str().unwrap().to_string();
@@ -901,15 +1018,21 @@ fn set_metadata_null_clears() {
     seed_credentials(&env, &key_hex);
 
     // 先设置
-    run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "set_metadata",
-        "payload": {"alias": "q-kimi", "metadata": {"tag": "x"}}
-    }));
+    run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "set_metadata",
+            "payload": {"alias": "q-kimi", "metadata": {"tag": "x"}}
+        }),
+    );
     // 再清空
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "set_metadata",
-        "payload": {"alias": "q-kimi", "metadata": null}
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "set_metadata",
+            "payload": {"alias": "q-kimi", "metadata": null}
+        }),
+    );
     assert_eq!(v["status"], "ok");
     let meta = read_entry_meta(&env, "q-kimi");
     assert!(meta["metadata"].is_null());
@@ -923,11 +1046,14 @@ fn update_alias_rejects_wrong_key() {
     seed_credentials(&env, &key_hex);
     let before = read_entry_meta(&env, "q-claude");
 
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": "0".repeat(64),
-        "action": "set_provider",
-        "payload": {"alias": "q-claude", "provider": "malicious"}
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": "0".repeat(64),
+            "action": "set_provider",
+            "payload": {"alias": "q-claude", "provider": "malicious"}
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_VAULT_KEY_INVALID");
 
@@ -941,10 +1067,13 @@ fn update_alias_unknown_action() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "fake",
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "fake",
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_UNKNOWN_ACTION");
 }
@@ -970,18 +1099,28 @@ fn parse_extracts_email_url_and_secret_from_simple_text() {
     let key_hex = env.vault_key_hex();
 
     let text = "alice@example.com\nhttps://api.claude.ai/v1\nsk-ant-api03-abcdef123456SECRET";
-    let v = run_parse(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "parse",
-        "request_id": "parse-1",
-        "payload": {"text": text}
-    }));
+    let v = run_parse(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "parse",
+            "request_id": "parse-1",
+            "payload": {"text": text}
+        }),
+    );
     assert_eq!(v["status"], "ok", "{}", v);
     let cands = v["data"]["candidates"].as_array().expect("candidates");
     // 应含 1 email + 1 url + 1 secret
-    assert!(cands.iter().any(|c| c["kind"] == "email" && c["value"] == "alice@example.com"));
-    assert!(cands.iter().any(|c| c["kind"] == "url" && c["value"].as_str().unwrap().starts_with("https://")));
-    assert!(cands.iter().any(|c| c["kind"] == "secret_like" && c["value"].as_str().unwrap().starts_with("sk-ant-api03-")));
+    assert!(cands
+        .iter()
+        .any(|c| c["kind"] == "email" && c["value"] == "alice@example.com"));
+    assert!(cands
+        .iter()
+        .any(|c| c["kind"] == "url" && c["value"].as_str().unwrap().starts_with("https://")));
+    assert!(cands
+        .iter()
+        .any(|c| c["kind"] == "secret_like"
+            && c["value"].as_str().unwrap().starts_with("sk-ant-api03-")));
     // Stage 2 所有 rule 命中都是 confirmed tier
     for c in cands {
         assert_eq!(c["tier"], "confirmed");
@@ -995,14 +1134,20 @@ fn parse_returns_stable_source_hash() {
     let key_hex = env.vault_key_hex();
 
     let text = "some arbitrary text";
-    let v1 = run_parse(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "parse",
-        "payload": {"text": text}
-    }));
-    let v2 = run_parse(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "parse",
-        "payload": {"text": text}
-    }));
+    let v1 = run_parse(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "parse",
+            "payload": {"text": text}
+        }),
+    );
+    let v2 = run_parse(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "parse",
+            "payload": {"text": text}
+        }),
+    );
     // 幂等：同 text → 同 source_hash
     assert_eq!(v1["data"]["source_hash"], v2["data"]["source_hash"]);
     let h = v1["data"]["source_hash"].as_str().unwrap();
@@ -1017,10 +1162,13 @@ fn parse_dedups_cross_pattern_matches() {
     env.init_vault();
     let key_hex = env.vault_key_hex();
     let text = "key sk-ant-api03-ABCDEFGHIJ1234567890xyz";
-    let v = run_parse(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "parse",
-        "payload": {"text": text}
-    }));
+    let v = run_parse(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "parse",
+            "payload": {"text": text}
+        }),
+    );
     let cands = v["data"]["candidates"].as_array().unwrap();
     let secret_count = cands.iter().filter(|c| c["kind"] == "secret_like").count();
     assert_eq!(secret_count, 1, "should dedup, got: {:?}", cands);
@@ -1031,34 +1179,41 @@ fn parse_returns_layer_versions_and_warnings() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
-    let v = run_parse(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "parse",
-        "payload": {"text": "bob@foo.com"}
-    }));
+    let v = run_parse(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "parse",
+            "payload": {"text": "bob@foo.com"}
+        }),
+    );
     // Stage 3 Phase 2：rules = 2.0-full（4 层规则齐活）；crf / fingerprint 仍 disabled
     let warnings = v["data"]["warnings"].as_array().unwrap();
     let warn_strs: Vec<&str> = warnings.iter().filter_map(|w| w.as_str()).collect();
     // 任一 stage-* 标签即可（Phase 2/3/4 会演进）
     assert!(
         warn_strs.iter().any(|w| w.starts_with("stage-")),
-        "expected a stage-* warning; got: {:?}", warn_strs
+        "expected a stage-* warning; got: {:?}",
+        warn_strs
     );
     // rules 应从 1.0-lite 升到 2.0-full（Phase 2 落地）
     let rules_ver = v["data"]["layer_versions"]["rules"].as_str().unwrap();
     assert!(
         rules_ver == "2.0-full" || rules_ver == "1.0-lite",
-        "rules version {} unexpected (should be 2.0-full or legacy 1.0-lite)", rules_ver
+        "rules version {} unexpected (should be 2.0-full or legacy 1.0-lite)",
+        rules_ver
     );
     // CRF / Fingerprint 版本字段允许 Stage 3 各 Phase 演进；仅验证格式合法
     let crf_ver = v["data"]["layer_versions"]["crf"].as_str().unwrap();
     assert!(
         crf_ver == "1.0" || crf_ver == "disabled",
-        "crf version {} unexpected", crf_ver
+        "crf version {} unexpected",
+        crf_ver
     );
     let fp_ver = v["data"]["layer_versions"]["fingerprint"].as_str().unwrap();
     assert!(
         fp_ver == "1.0" || fp_ver == "disabled",
-        "fingerprint version {} unexpected", fp_ver
+        "fingerprint version {} unexpected",
+        fp_ver
     );
 }
 
@@ -1068,10 +1223,13 @@ fn parse_fills_orphans_from_every_candidate_stage2() {
     env.init_vault();
     let key_hex = env.vault_key_hex();
     let text = "c@d.io\nhttps://x.y\nsk-ant-api03-abcdefghij1234567890";
-    let v = run_parse(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "parse",
-        "payload": {"text": text}
-    }));
+    let v = run_parse(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "parse",
+            "payload": {"text": text}
+        }),
+    );
     let cands = v["data"]["candidates"].as_array().unwrap();
     let orphans = v["data"]["orphans"].as_array().unwrap();
     let drafts = v["data"]["drafts"].as_array().unwrap();
@@ -1079,15 +1237,25 @@ fn parse_fills_orphans_from_every_candidate_stage2() {
     // Stage 3+ 已上线 grouper,大多数 candidates 被 drafts 持有,orphans 接近 0。
     // 更新断言:验证核心语义 —— parse 管道产出 3 个候选(email/url/api_key),
     // 每个 candidate 要么被 draft 持有要么落 orphans(并集覆盖所有 cand)。
-    assert_eq!(cands.len(), 3, "should parse email + url + api_key (got: {:?})", cands);
+    assert_eq!(
+        cands.len(),
+        3,
+        "should parse email + url + api_key (got: {:?})",
+        cands
+    );
     assert!(
-        orphans.len() + drafts.iter().map(|d| {
-            let f = &d["fields"];
-            [ "email", "api_key", "password", "base_url" ]
+        orphans.len()
+            + drafts
                 .iter()
-                .filter(|k| !f.get(*k).unwrap_or(&serde_json::Value::Null).is_null())
-                .count()
-        }).sum::<usize>() >= cands.len(),
+                .map(|d| {
+                    let f = &d["fields"];
+                    ["email", "api_key", "password", "base_url"]
+                        .iter()
+                        .filter(|k| !f.get(*k).unwrap_or(&serde_json::Value::Null).is_null())
+                        .count()
+                })
+                .sum::<usize>()
+            >= cands.len(),
         "drafts + orphans should cover every candidate"
     );
 }
@@ -1097,10 +1265,13 @@ fn parse_rejects_empty_text() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
-    let v = run_parse(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "parse",
-        "payload": {"text": ""}
-    }));
+    let v = run_parse(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "parse",
+            "payload": {"text": ""}
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_STDIN_INVALID_JSON");
 }
@@ -1110,13 +1281,20 @@ fn parse_does_not_require_valid_vault_key() {
     // parse 不读 vault → 错的 key 也能 parse；但 key 格式必须合法
     let env = InternalTestEnv::new();
     env.init_vault();
-    let v = run_parse(&env, serde_json::json!({
-        "vault_key_hex": "0".repeat(64),
-        "action": "parse",
-        "payload": {"text": "alice@x.com"}
-    }));
+    let v = run_parse(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": "0".repeat(64),
+            "action": "parse",
+            "payload": {"text": "alice@x.com"}
+        }),
+    );
     // parse 不校验 key 是否匹配 vault → ok
-    assert_eq!(v["status"], "ok", "parse should succeed with any well-formed key: {}", v);
+    assert_eq!(
+        v["status"], "ok",
+        "parse should succeed with any well-formed key: {}",
+        v
+    );
 }
 
 #[test]
@@ -1124,11 +1302,14 @@ fn parse_requires_wellformed_vault_key() {
     // 但 key 必须格式合法（协议一致性）
     let env = InternalTestEnv::new();
     env.init_vault();
-    let v = run_parse(&env, serde_json::json!({
-        "vault_key_hex": "short",
-        "action": "parse",
-        "payload": {"text": "x"}
-    }));
+    let v = run_parse(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": "short",
+            "action": "parse",
+            "payload": {"text": "x"}
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_VAULT_KEY_MALFORMED");
 }
@@ -1139,13 +1320,23 @@ fn parse_respects_max_candidates_cap() {
     env.init_vault();
     let key_hex = env.vault_key_hex();
     // 构造 20 个 email
-    let text = (1..=20).map(|i| format!("user{}@domain.com", i)).collect::<Vec<_>>().join("\n");
-    let v = run_parse(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "parse",
-        "payload": {"text": text, "max_candidates": 5}
-    }));
+    let text = (1..=20)
+        .map(|i| format!("user{}@domain.com", i))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let v = run_parse(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "parse",
+            "payload": {"text": text, "max_candidates": 5}
+        }),
+    );
     let cands = v["data"]["candidates"].as_array().unwrap();
-    assert!(cands.len() <= 5, "cap should be enforced, got {}", cands.len());
+    assert!(
+        cands.len() <= 5,
+        "cap should be enforced, got {}",
+        cands.len()
+    );
 }
 
 // ========== Phase F: audit_log wiring ==========
@@ -1170,11 +1361,14 @@ fn add_writes_audit_log() {
     let key_hex = env.vault_key_hex();
     let before = count_table(&env, "audit_log");
 
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex,
-        "action": "add",
-        "payload": {"alias": "audit-test-1", "secret_plaintext": "secret"}
-    }));
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "add",
+            "payload": {"alias": "audit-test-1", "secret_plaintext": "secret"}
+        }),
+    );
     assert_eq!(v["status"], "ok");
     assert_eq!(v["data"]["audit_logged"], true);
     // audit_log 应该多了一行
@@ -1186,15 +1380,21 @@ fn delete_writes_audit_log() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
-    run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "add",
-        "payload": {"alias": "audit-del", "secret_plaintext": "x"}
-    }));
+    run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "add",
+            "payload": {"alias": "audit-del", "secret_plaintext": "x"}
+        }),
+    );
     let before = count_table(&env, "audit_log");
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "delete",
-        "payload": {"alias": "audit-del"}
-    }));
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "delete",
+            "payload": {"alias": "audit-del"}
+        }),
+    );
     assert_eq!(v["data"]["audit_logged"], true);
     assert!(count_table(&env, "audit_log") > before);
 }
@@ -1204,14 +1404,20 @@ fn update_secret_writes_audit_log() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
-    run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "add",
-        "payload": {"alias": "audit-upd", "secret_plaintext": "v1"}
-    }));
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "update_secret",
-        "payload": {"alias": "audit-upd", "new_secret_plaintext": "v2"}
-    }));
+    run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "add",
+            "payload": {"alias": "audit-upd", "secret_plaintext": "v1"}
+        }),
+    );
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "update_secret",
+            "payload": {"alias": "audit-upd", "new_secret_plaintext": "v2"}
+        }),
+    );
     assert_eq!(v["data"]["audit_logged"], true);
 }
 
@@ -1223,10 +1429,13 @@ fn update_alias_actions_write_audit() {
     seed_credentials(&env, &key_hex);
     let before = count_table(&env, "audit_log");
 
-    let v = run_update_alias(&env, serde_json::json!({
-        "vault_key_hex": key_hex, "action": "set_provider",
-        "payload": {"alias": "q-kimi", "provider": "moonshot"}
-    }));
+    let v = run_update_alias(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex, "action": "set_provider",
+            "payload": {"alias": "q-kimi", "provider": "moonshot"}
+        }),
+    );
     assert_eq!(v["data"]["audit_logged"], true);
     assert!(count_table(&env, "audit_log") > before);
 }
@@ -1245,11 +1454,14 @@ fn mutating_actions_reject_wrong_key() {
     let before = count_entries(&env);
 
     // add 应在写之前 reject
-    let v = run_vault_op(&env, serde_json::json!({
-        "vault_key_hex": wrong_key,
-        "action": "add",
-        "payload": {"alias": "should-not-land", "secret_plaintext": "x"}
-    }));
+    let v = run_vault_op(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": wrong_key,
+            "action": "add",
+            "payload": {"alias": "should-not-land", "secret_plaintext": "x"}
+        }),
+    );
     assert_eq!(v["status"], "error");
     assert_eq!(v["error_code"], "I_VAULT_KEY_INVALID");
     assert_eq!(count_entries(&env), before, "wrong key must not write");

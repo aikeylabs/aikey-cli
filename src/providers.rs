@@ -25,12 +25,12 @@ impl Provider {
     /// Parse a provider name string (case-insensitive) into a Provider variant.
     pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
-            "openai"    => Provider::OpenAI,
+            "openai" => Provider::OpenAI,
             "anthropic" => Provider::Anthropic,
-            "google"    => Provider::Google,
-            "cohere"    => Provider::Cohere,
-            "mistral"   => Provider::Mistral,
-            other       => Provider::Custom(other.to_string()),
+            "google" => Provider::Google,
+            "cohere" => Provider::Cohere,
+            "mistral" => Provider::Mistral,
+            other => Provider::Custom(other.to_string()),
         }
     }
 
@@ -38,11 +38,11 @@ impl Provider {
     #[allow(dead_code)]
     pub fn name(&self) -> &str {
         match self {
-            Provider::OpenAI    => "openai",
+            Provider::OpenAI => "openai",
             Provider::Anthropic => "anthropic",
-            Provider::Google    => "google",
-            Provider::Cohere    => "cohere",
-            Provider::Mistral   => "mistral",
+            Provider::Google => "google",
+            Provider::Cohere => "cohere",
+            Provider::Mistral => "mistral",
             Provider::Custom(n) => n.as_str(),
         }
     }
@@ -50,11 +50,11 @@ impl Provider {
     /// The environment variable name the provider's SDK reads.
     pub fn env_var(&self) -> String {
         match self {
-            Provider::OpenAI    => "OPENAI_API_KEY".to_string(),
+            Provider::OpenAI => "OPENAI_API_KEY".to_string(),
             Provider::Anthropic => "ANTHROPIC_API_KEY".to_string(),
-            Provider::Google    => "GOOGLE_API_KEY".to_string(),
-            Provider::Cohere    => "COHERE_API_KEY".to_string(),
-            Provider::Mistral   => "MISTRAL_API_KEY".to_string(),
+            Provider::Google => "GOOGLE_API_KEY".to_string(),
+            Provider::Cohere => "COHERE_API_KEY".to_string(),
+            Provider::Mistral => "MISTRAL_API_KEY".to_string(),
             Provider::Custom(n) => format!("AIKEY_{}_API_KEY", n.to_uppercase()),
         }
     }
@@ -66,11 +66,11 @@ mod tests {
 
     #[test]
     fn test_known_providers_env_vars() {
-        assert_eq!(Provider::OpenAI.env_var(),    "OPENAI_API_KEY");
+        assert_eq!(Provider::OpenAI.env_var(), "OPENAI_API_KEY");
         assert_eq!(Provider::Anthropic.env_var(), "ANTHROPIC_API_KEY");
-        assert_eq!(Provider::Google.env_var(),    "GOOGLE_API_KEY");
-        assert_eq!(Provider::Cohere.env_var(),    "COHERE_API_KEY");
-        assert_eq!(Provider::Mistral.env_var(),   "MISTRAL_API_KEY");
+        assert_eq!(Provider::Google.env_var(), "GOOGLE_API_KEY");
+        assert_eq!(Provider::Cohere.env_var(), "COHERE_API_KEY");
+        assert_eq!(Provider::Mistral.env_var(), "MISTRAL_API_KEY");
     }
 
     #[test]
@@ -91,7 +91,7 @@ mod tests {
         // Documented (mis)behaviour: parse() doesn't know about OAuth aliases.
         // Callers (executor.rs / active.env writers) MUST canonicalize first.
         assert_eq!(Provider::parse("claude"), Provider::Custom("claude".into()));
-        assert_eq!(Provider::parse("codex"),  Provider::Custom("codex".into()));
+        assert_eq!(Provider::parse("codex"), Provider::Custom("codex".into()));
         assert_eq!(Provider::parse("gemini"), Provider::Custom("gemini".into()));
     }
 
@@ -101,24 +101,30 @@ mod tests {
         // Mirrors the executor.rs fix: anyone constructing a Provider from
         // a raw value must route through `oauth_provider_to_canonical`.
         use crate::commands_account::oauth_provider_to_canonical as canon;
-        assert_eq!(Provider::parse(canon("claude")).env_var(), "ANTHROPIC_API_KEY");
-        assert_eq!(Provider::parse(canon("codex")).env_var(),  "OPENAI_API_KEY");
+        assert_eq!(
+            Provider::parse(canon("claude")).env_var(),
+            "ANTHROPIC_API_KEY"
+        );
+        assert_eq!(Provider::parse(canon("codex")).env_var(), "OPENAI_API_KEY");
         assert_eq!(Provider::parse(canon("gemini")).env_var(), "GOOGLE_API_KEY");
         // Idempotence: canonical input passes through unchanged.
-        assert_eq!(Provider::parse(canon("anthropic")).env_var(), "ANTHROPIC_API_KEY");
-        assert_eq!(Provider::parse(canon("openai")).env_var(),    "OPENAI_API_KEY");
+        assert_eq!(
+            Provider::parse(canon("anthropic")).env_var(),
+            "ANTHROPIC_API_KEY"
+        );
+        assert_eq!(Provider::parse(canon("openai")).env_var(), "OPENAI_API_KEY");
     }
 
     #[test]
     fn test_from_str_case_insensitive() {
-        assert_eq!(Provider::parse("OpenAI"),    Provider::OpenAI);
+        assert_eq!(Provider::parse("OpenAI"), Provider::OpenAI);
         assert_eq!(Provider::parse("ANTHROPIC"), Provider::Anthropic);
-        assert_eq!(Provider::parse("Google"),    Provider::Google);
+        assert_eq!(Provider::parse("Google"), Provider::Google);
     }
 
     #[test]
     fn test_provider_name() {
-        assert_eq!(Provider::OpenAI.name(),    "openai");
+        assert_eq!(Provider::OpenAI.name(), "openai");
         assert_eq!(Provider::Anthropic.name(), "anthropic");
         assert_eq!(Provider::Custom("foo".to_string()).name(), "foo");
     }

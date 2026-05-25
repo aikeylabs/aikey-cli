@@ -39,7 +39,9 @@ fn generate_route_token_always_lowercase_hex() {
         let suffix = &t[15..];
         assert_eq!(suffix.len(), 64, "iter {}: suffix not 64 chars: {}", i, t);
         assert!(
-            suffix.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
             "iter {}: suffix has non-lowercase-hex char: {}",
             i,
             t
@@ -64,7 +66,7 @@ fn team_token_from_vk_id_is_idempotent_under_repeated_application() {
         "vk_xyz",
         "team-with-dashes",
         "12345",
-        "a",  // single char
+        "a", // single char
     ];
     for raw in inputs {
         let first = team_token_from_vk_id(raw).unwrap();

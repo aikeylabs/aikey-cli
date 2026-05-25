@@ -127,12 +127,9 @@ pub fn apply_credential_lifecycle_batch(
                 providers,
             } => {
                 if !providers.is_empty() {
-                    let primaries = auto_assign_primaries_for_key(
-                        source_type,
-                        source_ref,
-                        providers,
-                    )
-                    .unwrap_or_default();
+                    let primaries =
+                        auto_assign_primaries_for_key(source_type, source_ref, providers)
+                            .unwrap_or_default();
                     outcome.newly_primary = primaries;
                     // Treat presence of providers as a binding touch so
                     // downstream toml apply re-runs even when no auto-promote
@@ -159,11 +156,8 @@ pub fn apply_credential_lifecycle_batch(
                 source_type,
                 source_ref,
             } => {
-                let actions = reconcile_provider_primary_after_key_removal(
-                    source_type,
-                    source_ref,
-                )
-                .unwrap_or_default();
+                let actions = reconcile_provider_primary_after_key_removal(source_type, source_ref)
+                    .unwrap_or_default();
                 if !actions.is_empty() {
                     any_binding_touched = true;
                 }
@@ -193,10 +187,7 @@ pub fn apply_credential_lifecycle_batch(
                 .iter()
                 .map(|b| b.provider_code.clone())
                 .collect();
-            crate::commands_account::apply_third_party_cli_configs(
-                &active_providers,
-                proxy_port,
-            );
+            crate::commands_account::apply_third_party_cli_configs(&active_providers, proxy_port);
             // Layer 1 hook file — write once, share result across batch
             // outcomes. Best-effort: failure here surfaces via
             // `hook_failure_reason` for the Web envelope but doesn't

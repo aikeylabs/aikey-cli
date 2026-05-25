@@ -135,7 +135,10 @@ fn multi_provider_no_override_errors() {
     let providers = vec!["anthropic".to_string(), "openai".to_string()];
     let result = resolve_single_provider("key1", &providers, None);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("multiple providers"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("multiple providers"));
 }
 
 #[test]
@@ -157,9 +160,14 @@ fn provider_override_not_supported() {
 fn multi_provider_error_includes_example_command() {
     // L3: error should show a copy-paste-ready command, not just "specify --provider".
     let providers = vec!["anthropic".to_string(), "openai".to_string()];
-    let err = resolve_single_provider("my-key", &providers, None).unwrap_err().to_string();
-    assert!(err.contains("aikey activate my-key --provider anthropic"),
-        "error should include full command example, got: {}", err);
+    let err = resolve_single_provider("my-key", &providers, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("aikey activate my-key --provider anthropic"),
+        "error should include full command example, got: {}",
+        err
+    );
 }
 
 // ── Canonicalization regression (bugfix 2026-04-25) ─────────────────────
@@ -176,17 +184,23 @@ fn multi_provider_error_includes_example_command() {
 fn single_provider_oauth_claude_canonicalized() {
     let providers = vec!["claude".to_string()];
     let result = resolve_single_provider("user@example.com", &providers, None);
-    assert_eq!(result.unwrap(), "anthropic",
+    assert_eq!(
+        result.unwrap(),
+        "anthropic",
         "OAuth `claude` provider must canonicalize to `anthropic` so the \
-         shell hook's preflight wrapper finds it in AIKEY_ACTIVE_KEYS");
+         shell hook's preflight wrapper finds it in AIKEY_ACTIVE_KEYS"
+    );
 }
 
 #[test]
 fn single_provider_oauth_codex_canonicalized() {
     let providers = vec!["codex".to_string()];
     let result = resolve_single_provider("user@example.com", &providers, None);
-    assert_eq!(result.unwrap(), "openai",
-        "OAuth `codex` provider must canonicalize to `openai`");
+    assert_eq!(
+        result.unwrap(),
+        "openai",
+        "OAuth `codex` provider must canonicalize to `openai`"
+    );
 }
 
 #[test]
@@ -251,9 +265,20 @@ fn provider_canonical_codes_unchanged() {
     // 2026-05-08 Kimi 双平台拆分: "kimi" 已变成 deprecated alias of "kimi_code"
     // (per registry oauth_aliases),不再 pass-through 不变;改用 "kimi_code"
     // 作为 canonical 测试目标。其他 canonical codes 仍 pass-through。
-    for code in ["anthropic", "openai", "google", "kimi_code", "moonshot", "deepseek"] {
-        assert_eq!(provider_canonical(code), code,
-            "canonical code {} should pass through unchanged", code);
+    for code in [
+        "anthropic",
+        "openai",
+        "google",
+        "kimi_code",
+        "moonshot",
+        "deepseek",
+    ] {
+        assert_eq!(
+            provider_canonical(code),
+            code,
+            "canonical code {} should pass through unchanged",
+            code
+        );
     }
 }
 
@@ -332,16 +357,26 @@ fn route_and_activate_paths_agree_all_known_providers() {
     // used by `aikey route` (provider_proxy_path) must equal the one used by
     // `aikey activate` (commands_account::provider_proxy_prefix_pub).
     for code in &[
-        "anthropic", "claude",
-        "openai", "codex", "gpt", "chatgpt",
-        "google", "gemini",
-        "kimi", "moonshot", "deepseek",
+        "anthropic",
+        "claude",
+        "openai",
+        "codex",
+        "gpt",
+        "chatgpt",
+        "google",
+        "gemini",
+        "kimi",
+        "moonshot",
+        "deepseek",
     ] {
         let route_path = provider_proxy_path(code);
         let activate_path = commands_account::provider_proxy_prefix_pub(code);
-        assert_eq!(route_path, activate_path,
+        assert_eq!(
+            route_path, activate_path,
             "route and activate should emit the same URL path for '{}', \
-             got route={:?} activate={:?}", code, route_path, activate_path);
+             got route={:?} activate={:?}",
+            code, route_path, activate_path
+        );
     }
 }
 
@@ -350,13 +385,19 @@ fn route_activate_paths_identical_for_kimi_after_l5() {
     // Explicit regression test for the original kimi divergence that motivated L5.
     // This replaces the old `route_and_activate_paths_currently_diverge_for_kimi`.
     assert_eq!(provider_proxy_path("kimi"), "kimi/v1");
-    assert_eq!(commands_account::provider_proxy_prefix_pub("kimi"), "kimi/v1");
+    assert_eq!(
+        commands_account::provider_proxy_prefix_pub("kimi"),
+        "kimi/v1"
+    );
 }
 
 #[test]
 fn route_activate_paths_identical_for_moonshot_after_l5() {
     assert_eq!(provider_proxy_path("moonshot"), "moonshot/v1");
-    assert_eq!(commands_account::provider_proxy_prefix_pub("moonshot"), "moonshot/v1");
+    assert_eq!(
+        commands_account::provider_proxy_prefix_pub("moonshot"),
+        "moonshot/v1"
+    );
 }
 
 // ── ProviderInfo: all fields set consistently per provider ─────────────
@@ -370,14 +411,26 @@ fn provider_info_returns_none_for_unknown() {
 #[test]
 fn provider_info_aliases_share_canonical_code() {
     // All aliases of the same provider must have identical canonical_code.
-    let anthropic = commands_account::provider_info("anthropic").unwrap().canonical_code;
-    let claude    = commands_account::provider_info("claude").unwrap().canonical_code;
+    let anthropic = commands_account::provider_info("anthropic")
+        .unwrap()
+        .canonical_code;
+    let claude = commands_account::provider_info("claude")
+        .unwrap()
+        .canonical_code;
     assert_eq!(anthropic, claude);
 
-    let openai    = commands_account::provider_info("openai").unwrap().canonical_code;
-    let codex     = commands_account::provider_info("codex").unwrap().canonical_code;
-    let gpt       = commands_account::provider_info("gpt").unwrap().canonical_code;
-    let chatgpt   = commands_account::provider_info("chatgpt").unwrap().canonical_code;
+    let openai = commands_account::provider_info("openai")
+        .unwrap()
+        .canonical_code;
+    let codex = commands_account::provider_info("codex")
+        .unwrap()
+        .canonical_code;
+    let gpt = commands_account::provider_info("gpt")
+        .unwrap()
+        .canonical_code;
+    let chatgpt = commands_account::provider_info("chatgpt")
+        .unwrap()
+        .canonical_code;
     assert_eq!(openai, codex);
     assert_eq!(openai, gpt);
     assert_eq!(openai, chatgpt);
@@ -390,15 +443,17 @@ fn provider_info_kimi_and_moonshot_distinct_codes_share_family() {
     // base_urls),只共享 'kimi' family (UI 分组用)。'kimi' 字面值是 deprecated
     // alias,经 registry alias 解析到 kimi_code。
     let kimi_alias = commands_account::provider_info("kimi").unwrap();
-    let kimi_code  = commands_account::provider_info("kimi_code").unwrap();
-    let moonshot   = commands_account::provider_info("moonshot").unwrap();
+    let kimi_code = commands_account::provider_info("kimi_code").unwrap();
+    let moonshot = commands_account::provider_info("moonshot").unwrap();
 
     // canonical_code: 各自独立,不互相折叠
     assert_eq!(kimi_alias.canonical_code, "kimi_code"); // alias → canonical
     assert_eq!(kimi_code.canonical_code, "kimi_code");
     assert_eq!(moonshot.canonical_code, "moonshot");
-    assert_ne!(kimi_code.canonical_code, moonshot.canonical_code,
-        "kimi_code 与 moonshot 不能折叠成同一 canonical_code (review fix [高] #1)");
+    assert_ne!(
+        kimi_code.canonical_code, moonshot.canonical_code,
+        "kimi_code 与 moonshot 不能折叠成同一 canonical_code (review fix [高] #1)"
+    );
 
     // family: 三者共享 'kimi' (UI 分组)
     assert_eq!(kimi_code.family, "kimi");
@@ -408,11 +463,15 @@ fn provider_info_kimi_and_moonshot_distinct_codes_share_family() {
     // 2026-05-08 Kimi family 互斥后(详见 update/20260508-Kimi-family互斥-active-env
     // 统一KIMI写入.md 决策 #8): kimi_code 与 moonshot 共享同一 env vars (KIMI_*),
     // 区分上游路由由 proxy_path 决定。**不再**断言 env_vars 各自独立。
-    assert_eq!(kimi_code.env_vars, moonshot.env_vars,
-        "Kimi family unified to KIMI_API_KEY/KIMI_BASE_URL post family-mutex");
+    assert_eq!(
+        kimi_code.env_vars, moonshot.env_vars,
+        "Kimi family unified to KIMI_API_KEY/KIMI_BASE_URL post family-mutex"
+    );
     // proxy_path 仍然各自独立 (kimi/v1 vs moonshot/v1)
-    assert_ne!(kimi_code.proxy_path, moonshot.proxy_path,
-        "proxy_path differentiates upstream (kimi.com/coding vs moonshot.cn)");
+    assert_ne!(
+        kimi_code.proxy_path, moonshot.proxy_path,
+        "proxy_path differentiates upstream (kimi.com/coding vs moonshot.cn)"
+    );
 }
 
 #[test]
@@ -423,26 +482,49 @@ fn provider_info_all_known_have_env_vars_and_path() {
     // The aliases section below keeps the old hand-picked list covered too.
     for code in &[
         // Original 6 canonical + 5 aliases
-        "anthropic", "claude",
-        "openai", "codex", "gpt", "chatgpt",
-        "google", "gemini",
-        "kimi", "moonshot", "deepseek",
+        "anthropic",
+        "claude",
+        "openai",
+        "codex",
+        "gpt",
+        "chatgpt",
+        "google",
+        "gemini",
+        "kimi",
+        "moonshot",
+        "deepseek",
         // P0 (2026-04-24)
         "groq",
-        "xai", "grok", "xai_grok",
+        "xai",
+        "grok",
+        "xai_grok",
         "openrouter",
-        "perplexity", "pplx",
+        "perplexity",
+        "pplx",
         // P1 (2026-04-24)
-        "zhipu", "glm", "zhipuai",
-        "qwen", "dashscope", "tongyi",
-        "doubao", "ark", "volcengine",
+        "zhipu",
+        "glm",
+        "zhipuai",
+        "qwen",
+        "dashscope",
+        "tongyi",
+        "doubao",
+        "ark",
+        "volcengine",
         "siliconflow",
     ] {
         let info = commands_account::provider_info(code)
             .unwrap_or_else(|| panic!("provider_info('{}') returned None", code));
-        assert!(!info.canonical_code.is_empty(), "{}: canonical_code empty", code);
+        assert!(
+            !info.canonical_code.is_empty(),
+            "{}: canonical_code empty",
+            code
+        );
         assert!(!info.proxy_path.is_empty(), "{}: proxy_path empty", code);
-        assert!(!info.env_vars.0.is_empty() && !info.env_vars.1.is_empty(),
-            "{}: env_vars empty", code);
+        assert!(
+            !info.env_vars.0.is_empty() && !info.env_vars.1.is_empty(),
+            "{}: env_vars empty",
+            code
+        );
     }
 }

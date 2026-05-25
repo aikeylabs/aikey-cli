@@ -66,7 +66,10 @@ pub enum ResolveError {
     /// No provider name or logical model was given
     MissingInput,
     /// No alias could be found for the provider in any config layer
-    NoAliasFound { provider: String, profile: Option<String> },
+    NoAliasFound {
+        provider: String,
+        profile: Option<String>,
+    },
     /// Logical model not found in envMappings
     LogicalModelNotFound { logical_model: String, env: String },
 }
@@ -74,8 +77,9 @@ pub enum ResolveError {
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResolveError::MissingInput =>
-                write!(f, "either provider name or logical model is required"),
+            ResolveError::MissingInput => {
+                write!(f, "either provider name or logical model is required")
+            }
             ResolveError::NoAliasFound { provider, profile } => {
                 let profile_str = profile.as_deref().unwrap_or("default");
                 write!(f, "Missing key: {}:<keyAlias> in profile '{}'.\nFix: run 'aikey provider add --key-alias <alias> {}' or 'aikey quickstart'", provider, profile_str, provider)
@@ -110,7 +114,10 @@ pub fn resolve(
         let (provider, model) = if has_logical_model {
             resolve_logical_model_metadata(request, config)?
         } else {
-            (request.provider.clone(), resolve_model_provider_first(request, config))
+            (
+                request.provider.clone(),
+                resolve_model_provider_first(request, config),
+            )
         };
 
         let provider_obj = Provider::parse(&provider);
@@ -151,7 +158,10 @@ pub fn resolve(
                     return Ok(ResolveResult {
                         key_alias,
                         env_var,
-                        model: request.model.clone().or_else(|| mapping.provider_model_id.clone()),
+                        model: request
+                            .model
+                            .clone()
+                            .or_else(|| mapping.provider_model_id.clone()),
                         provider: mapping.provider.clone(),
                         source: ResolveSource::LogicalModel,
                     });
@@ -194,7 +204,9 @@ pub fn resolve(
 
         // Step 3 – base provider mapping
         if let Some(provider_cfg) = cfg.providers.get(&request.provider) {
-            let model = request.model.clone()
+            let model = request
+                .model
+                .clone()
                 .or_else(|| provider_cfg.default_model.clone());
             return Ok(ResolveResult {
                 key_alias: provider_cfg.key_alias.clone(),
@@ -222,7 +234,9 @@ fn resolve_logical_model_metadata(
         if let Some(cfg) = config {
             if let Some(env_map) = cfg.env_mappings.get(env) {
                 if let Some(mapping) = env_map.get(logical_model) {
-                    let model = request.model.clone()
+                    let model = request
+                        .model
+                        .clone()
                         .or_else(|| mapping.provider_model_id.clone());
                     return Ok((mapping.provider.clone(), model));
                 }
@@ -237,12 +251,16 @@ fn resolve_logical_model_metadata(
 }
 
 /// Resolve the model for provider-first resolution: request > config default > None
-fn resolve_model_provider_first(request: &ResolveRequest, config: Option<&ProjectConfig>) -> Option<String> {
+fn resolve_model_provider_first(
+    request: &ResolveRequest,
+    config: Option<&ProjectConfig>,
+) -> Option<String> {
     if request.model.is_some() {
         return request.model.clone();
     }
     config.and_then(|cfg| {
-        cfg.providers.get(&request.provider)
+        cfg.providers
+            .get(&request.provider)
             .and_then(|p| p.default_model.clone())
     })
 }
@@ -250,19 +268,25 @@ fn resolve_model_provider_first(request: &ResolveRequest, config: Option<&Projec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ProjectConfig, ProviderConfig, LogicalModelMapping};
+    use crate::config::{LogicalModelMapping, ProjectConfig, ProviderConfig};
     use std::collections::HashMap;
 
     fn make_config() -> ProjectConfig {
         let mut providers = HashMap::new();
-        providers.insert("openai".to_string(), ProviderConfig {
-            key_alias: "work-openai".to_string(),
-            default_model: Some("gpt-4o".to_string()),
-        });
-        providers.insert("anthropic".to_string(), ProviderConfig {
-            key_alias: "personal-claude".to_string(),
-            default_model: Some("claude-opus-4-6".to_string()),
-        });
+        providers.insert(
+            "openai".to_string(),
+            ProviderConfig {
+                key_alias: "work-openai".to_string(),
+                default_model: Some("gpt-4o".to_string()),
+            },
+        );
+        providers.insert(
+            "anthropic".to_string(),
+            ProviderConfig {
+                key_alias: "personal-claude".to_string(),
+                default_model: Some("claude-opus-4-6".to_string()),
+            },
+        );
 
         let mut tenant_map = HashMap::new();
         tenant_map.insert("openai".to_string(), "acme-openai".to_string());
@@ -272,33 +296,47 @@ mod tests {
         // P1: Add envMappings for logical-model-first resolution
         let mut env_mappings = HashMap::new();
         let mut dev_mappings = HashMap::new();
-        dev_mappings.insert("chat-main".to_string(), LogicalModelMapping {
-            provider: "openai".to_string(),
-            provider_model_id: Some("gpt-4o-mini".to_string()),
-            key_alias: "openai:dev".to_string(),
-            impl_id: None,
-        });
-        dev_mappings.insert("chat-advanced".to_string(), LogicalModelMapping {
-            provider: "anthropic".to_string(),
-            provider_model_id: Some("claude-opus-4-6".to_string()),
-            key_alias: "anthropic:dev".to_string(),
-            impl_id: None,
-        });
+        dev_mappings.insert(
+            "chat-main".to_string(),
+            LogicalModelMapping {
+                provider: "openai".to_string(),
+                provider_model_id: Some("gpt-4o-mini".to_string()),
+                key_alias: "openai:dev".to_string(),
+                impl_id: None,
+            },
+        );
+        dev_mappings.insert(
+            "chat-advanced".to_string(),
+            LogicalModelMapping {
+                provider: "anthropic".to_string(),
+                provider_model_id: Some("claude-opus-4-6".to_string()),
+                key_alias: "anthropic:dev".to_string(),
+                impl_id: None,
+            },
+        );
         env_mappings.insert("dev".to_string(), dev_mappings);
 
         let mut prod_mappings = HashMap::new();
-        prod_mappings.insert("chat-main".to_string(), LogicalModelMapping {
-            provider: "openai".to_string(),
-            provider_model_id: Some("gpt-4o".to_string()),
-            key_alias: "openai:prod".to_string(),
-            impl_id: None,
-        });
+        prod_mappings.insert(
+            "chat-main".to_string(),
+            LogicalModelMapping {
+                provider: "openai".to_string(),
+                provider_model_id: Some("gpt-4o".to_string()),
+                key_alias: "openai:prod".to_string(),
+                impl_id: None,
+            },
+        );
         env_mappings.insert("prod".to_string(), prod_mappings);
 
         ProjectConfig {
             version: "1".to_string(),
-            project: crate::config::ProjectInfo { id: None, name: "test".to_string() },
-            env: crate::config::EnvConfig { target: ".env".to_string() },
+            project: crate::config::ProjectInfo {
+                id: None,
+                name: "test".to_string(),
+            },
+            env: crate::config::EnvConfig {
+                target: ".env".to_string(),
+            },
             required_vars: vec![],
             bindings: HashMap::new(),
             defaults: crate::config::Defaults { profile: None },
@@ -414,10 +452,13 @@ mod tests {
             ..Default::default()
         };
         let err = resolve(&req, Some(&cfg)).unwrap_err();
-        assert_eq!(err, ResolveError::LogicalModelNotFound {
-            logical_model: "nonexistent".to_string(),
-            env: "dev".to_string(),
-        });
+        assert_eq!(
+            err,
+            ResolveError::LogicalModelNotFound {
+                logical_model: "nonexistent".to_string(),
+                env: "dev".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -429,10 +470,13 @@ mod tests {
             ..Default::default()
         };
         let err = resolve(&req, Some(&cfg)).unwrap_err();
-        assert_eq!(err, ResolveError::LogicalModelNotFound {
-            logical_model: "chat-main".to_string(),
-            env: "staging".to_string(),
-        });
+        assert_eq!(
+            err,
+            ResolveError::LogicalModelNotFound {
+                logical_model: "chat-main".to_string(),
+                env: "staging".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -450,7 +494,13 @@ mod tests {
             ..Default::default()
         };
         let err = resolve(&req, Some(&cfg)).unwrap_err();
-        assert_eq!(err, ResolveError::NoAliasFound { provider: "cohere".to_string(), profile: None });
+        assert_eq!(
+            err,
+            ResolveError::NoAliasFound {
+                provider: "cohere".to_string(),
+                profile: None
+            }
+        );
     }
 
     #[test]
@@ -503,6 +553,12 @@ mod tests {
             ..Default::default()
         };
         let err = resolve(&req, None).unwrap_err();
-        assert_eq!(err, ResolveError::NoAliasFound { provider: "openai".to_string(), profile: None });
+        assert_eq!(
+            err,
+            ResolveError::NoAliasFound {
+                provider: "openai".to_string(),
+                profile: None
+            }
+        );
     }
 }

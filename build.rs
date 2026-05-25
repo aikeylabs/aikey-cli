@@ -35,12 +35,15 @@ fn main() {
     //    fingerprint env var guarantees a recompile when templates change.
     println!("cargo:rerun-if-changed=src/templates/hook.zsh");
     println!("cargo:rerun-if-changed=src/templates/hook.bash");
-    let hook_zsh   = std::fs::read("src/templates/hook.zsh").unwrap_or_default();
-    let hook_bash  = std::fs::read("src/templates/hook.bash").unwrap_or_default();
-    let hook_fp    = fnv1a_64(&hook_zsh).wrapping_mul(0x100000001b3) ^ fnv1a_64(&hook_bash);
+    let hook_zsh = std::fs::read("src/templates/hook.zsh").unwrap_or_default();
+    let hook_bash = std::fs::read("src/templates/hook.bash").unwrap_or_default();
+    let hook_fp = fnv1a_64(&hook_zsh).wrapping_mul(0x100000001b3) ^ fnv1a_64(&hook_bash);
     // shell_integration.rs references this via `env!()` so changing it
     // forces that module to recompile.
-    println!("cargo:rustc-env=AIKEY_HOOK_TEMPLATES_FINGERPRINT={:016x}", hook_fp);
+    println!(
+        "cargo:rustc-env=AIKEY_HOOK_TEMPLATES_FINGERPRINT={:016x}",
+        hook_fp
+    );
 
     // === Revision ===
     let revision = std::env::var("AIKEY_BUILD_REVISION").unwrap_or_else(|_| {

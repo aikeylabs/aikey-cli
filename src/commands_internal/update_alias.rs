@@ -23,18 +23,23 @@
 use serde::Deserialize;
 use serde_json::json;
 
+use super::protocol::{ResultEnvelope, StdinEnvelope};
+use super::stdin_json::{decode_vault_key, emit, emit_error};
 use crate::audit::{self, AuditOperation};
 use crate::commands_account::{apply_rename_core, RenameTarget};
 use crate::storage;
-use super::protocol::{ResultEnvelope, StdinEnvelope};
-use super::stdin_json::{decode_vault_key, emit, emit_error};
 
 /// best-effort audit（同 vault_op 的 try_log_audit）
 fn try_log_audit(key: &[u8; 32], op: AuditOperation, alias: Option<&str>, success: bool) -> bool {
     match audit::log_audit_event_from_vault_key(key, op, alias, success) {
         Ok(_) => true,
         Err(e) => {
-            eprintln!("[_internal update-alias audit WARN] {} {:?}: {}", op.as_str(), alias, e);
+            eprintln!(
+                "[_internal update-alias audit WARN] {} {:?}: {}",
+                op.as_str(),
+                alias,
+                e
+            );
             false
         }
     }
@@ -90,7 +95,10 @@ fn prepare(env: &StdinEnvelope) -> Option<([u8; 32], rusqlite::Connection)> {
     // 只要 key 能匹配 password_hash 就放行
     let key = match decode_vault_key(&env.vault_key_hex) {
         Ok(k) => k,
-        Err((c, m)) => { emit_error(req_id, c, m); return None; }
+        Err((c, m)) => {
+            emit_error(req_id, c, m);
+            return None;
+        }
     };
     if let Err(e) = storage::ensure_vault_exists() {
         emit_error(req_id, "I_VAULT_NOT_INITIALIZED", format!("{}", e));
@@ -98,7 +106,10 @@ fn prepare(env: &StdinEnvelope) -> Option<([u8; 32], rusqlite::Connection)> {
     }
     let conn = match storage::open_connection() {
         Ok(c) => c,
-        Err(e) => { emit_error(req_id, "I_VAULT_OPEN_FAILED", format!("{}", e)); return None; }
+        Err(e) => {
+            emit_error(req_id, "I_VAULT_OPEN_FAILED", format!("{}", e));
+            return None;
+        }
     };
     // key verify (password_hash 或空 vault 兜底)
     let stored: Result<Vec<u8>, rusqlite::Error> = conn.query_row(
@@ -118,18 +129,20 @@ fn prepare(env: &StdinEnvelope) -> Option<([u8; 32], rusqlite::Connection)> {
         }
         Err(_) => {
             // 无 password_hash（兼容旧 vault）
-            let entry: Result<(Vec<u8>, Vec<u8>), rusqlite::Error> = conn.query_row(
-                "SELECT nonce, ciphertext FROM entries LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            );
+            let entry: Result<(Vec<u8>, Vec<u8>), rusqlite::Error> =
+                conn.query_row("SELECT nonce, ciphertext FROM entries LIMIT 1", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                });
             match entry {
                 Ok((nonce, ciphertext)) => {
                     if crate::crypto::decrypt(&key, &nonce, &ciphertext).is_ok() {
                         Some((key, conn))
                     } else {
-                        emit_error(req_id, "I_VAULT_KEY_INVALID",
-                            "vault_key failed to decrypt any entry".to_string());
+                        emit_error(
+                            req_id,
+                            "I_VAULT_KEY_INVALID",
+                            "vault_key failed to decrypt any entry".to_string(),
+                        );
                         None
                     }
                 }
@@ -178,12 +191,26 @@ fn handle_rename_alias(env: StdinEnvelope) {
     let req_id = env.request_id.clone();
     let payload: RenamePayload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
-        Err(e) => { emit_error(req_id, "I_STDIN_INVALID_JSON", format!("rename_alias payload: {}", e)); return; }
+        Err(e) => {
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("rename_alias payload: {}", e),
+            );
+            return;
+        }
     };
 
-    let (key, _conn) = match prepare(&env) { Some(p) => p, None => return };
+    let (key, _conn) = match prepare(&env) {
+        Some(p) => p,
+        None => return,
+    };
 
-    match apply_rename_core(RenameTarget::Personal, &payload.old_alias, &payload.new_alias) {
+    match apply_rename_core(
+        RenameTarget::Personal,
+        &payload.old_alias,
+        &payload.new_alias,
+    ) {
         Ok(outcome) => {
             let audit_logged = try_log_audit(&key, AuditOperation::Update, Some(&outcome.id), true);
             emit(&ResultEnvelope::ok(
@@ -211,7 +238,11 @@ fn handle_rename_target(env: StdinEnvelope) {
     let payload: RenameTargetPayload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON", format!("rename_target payload: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("rename_target payload: {}", e),
+            );
             return;
         }
     };
@@ -221,13 +252,19 @@ fn handle_rename_target(env: StdinEnvelope) {
         "oauth" => RenameTarget::Oauth,
         "team" => RenameTarget::Team,
         other => {
-            emit_error(req_id, "I_UNKNOWN_TARGET",
-                format!("unknown target '{}' (expected personal|oauth|team)", other));
+            emit_error(
+                req_id,
+                "I_UNKNOWN_TARGET",
+                format!("unknown target '{}' (expected personal|oauth|team)", other),
+            );
             return;
         }
     };
 
-    let (key, _conn) = match prepare(&env) { Some(p) => p, None => return };
+    let (key, _conn) = match prepare(&env) {
+        Some(p) => p,
+        None => return,
+    };
 
     match apply_rename_core(target, &payload.id, &payload.new_value) {
         Ok(outcome) => {
@@ -267,11 +304,23 @@ fn handle_set_metadata(env: StdinEnvelope) {
     let req_id = env.request_id.clone();
     let payload: SetMetadataPayload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
-        Err(e) => { emit_error(req_id, "I_STDIN_INVALID_JSON", format!("set_metadata payload: {}", e)); return; }
+        Err(e) => {
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("set_metadata payload: {}", e),
+            );
+            return;
+        }
     };
 
-    let (key, conn) = match prepare(&env) { Some(p) => p, None => return };
-    if !must_alias_exist(&conn, &req_id, &payload.alias) { return; }
+    let (key, conn) = match prepare(&env) {
+        Some(p) => p,
+        None => return,
+    };
+    if !must_alias_exist(&conn, &req_id, &payload.alias) {
+        return;
+    }
 
     // metadata 列允许 NULL；payload.metadata==null → 清空
     let stored: Option<String> = if payload.metadata.is_null() {
@@ -279,7 +328,10 @@ fn handle_set_metadata(env: StdinEnvelope) {
     } else {
         match serde_json::to_string(&payload.metadata) {
             Ok(s) => Some(s),
-            Err(e) => { emit_error(req_id, "I_INTERNAL", format!("serialize metadata: {}", e)); return; }
+            Err(e) => {
+                emit_error(req_id, "I_INTERNAL", format!("serialize metadata: {}", e));
+                return;
+            }
         }
     };
 
@@ -289,7 +341,8 @@ fn handle_set_metadata(env: StdinEnvelope) {
     );
     match affected {
         Ok(1) => {
-            let audit_logged = try_log_audit(&key, AuditOperation::Update, Some(&payload.alias), true);
+            let audit_logged =
+                try_log_audit(&key, AuditOperation::Update, Some(&payload.alias), true);
             emit(&ResultEnvelope::ok(
                 req_id,
                 json!({
@@ -318,6 +371,9 @@ fn must_alias_exist(conn: &rusqlite::Connection, req_id: &Option<String>, alias:
             );
             false
         }
-        Err((c, m)) => { emit_error(req_id.clone(), c, m); false }
+        Err((c, m)) => {
+            emit_error(req_id.clone(), c, m);
+            false
+        }
     }
 }

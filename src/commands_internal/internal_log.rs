@@ -35,15 +35,15 @@
 //! blast radius of a logging bug small.
 
 use std::fs::OpenOptions;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use sha2::{Digest, Sha256};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::protocol::StdinEnvelope;
 
@@ -66,12 +66,16 @@ impl Writer {
         // in `resolve_user_home` keeps degraded environments writing to
         // cwd rather than silently dropping logs.
         let dir = crate::commands_account::resolve_aikey_dir()
-            .join("logs").join("aikey-cli");
+            .join("logs")
+            .join("aikey-cli");
         // create_dir_all is idempotent and safe across concurrent processes.
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("internal.jsonl");
         let bytes_written = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        Some(Self { path, bytes_written })
+        Some(Self {
+            path,
+            bytes_written,
+        })
     }
 
     fn rotate_if_needed(&mut self) {
@@ -81,7 +85,7 @@ impl Writer {
         // Shift: .2 → drop; .1 → .2; current → .1.
         for i in (1..KEEP_ROTATIONS).rev() {
             let from = self.path.with_extension(format!("jsonl.{}", i));
-            let to   = self.path.with_extension(format!("jsonl.{}", i + 1));
+            let to = self.path.with_extension(format!("jsonl.{}", i + 1));
             let _ = std::fs::rename(&from, &to);
         }
         let first_rotation = self.path.with_extension("jsonl.1");
@@ -94,14 +98,20 @@ impl Writer {
         let mut opts = OpenOptions::new();
         opts.create(true).append(true);
         #[cfg(unix)]
-        { opts.mode(0o600); }  // tighter than current.jsonl (0644) — payloads are sensitive
+        {
+            opts.mode(0o600);
+        } // tighter than current.jsonl (0644) — payloads are sensitive
         let mut file = match opts.open(&self.path) {
             Ok(f) => f,
             Err(_) => return, // logging failures never propagate to the caller
         };
         let bytes = line.as_bytes();
-        if file.write_all(bytes).is_err() { return; }
-        if file.write_all(b"\n").is_err() { return; }
+        if file.write_all(bytes).is_err() {
+            return;
+        }
+        if file.write_all(b"\n").is_err() {
+            return;
+        }
         self.bytes_written += (bytes.len() + 1) as u64;
     }
 }
@@ -125,31 +135,40 @@ where
 fn iso_now() -> String {
     // Produce a stable ISO-8601 UTC timestamp without pulling in chrono.
     // Matches current.jsonl format closely enough for grep/jq.
-    let d = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+    let d = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = d.as_secs();
     let nanos = d.subsec_nanos();
     let days = (secs / 86400) as i64;
     let mut rem = (secs % 86400) as i64;
-    let hour = rem / 3600; rem -= hour * 3600;
-    let min = rem / 60;    rem -= min * 60;
+    let hour = rem / 3600;
+    rem -= hour * 3600;
+    let min = rem / 60;
+    rem -= min * 60;
     let sec = rem;
     // Calendar from epoch — naive but fine for log sort order.
     let (y, mo, da) = epoch_days_to_ymd(days);
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
-            y, mo, da, hour, min, sec, nanos)
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+        y, mo, da, hour, min, sec, nanos
+    )
 }
 
 fn epoch_days_to_ymd(mut days: i64) -> (i32, u32, u32) {
     // Civil-from-days algorithm (Howard Hinnant, public domain).
     days += 719468;
-    let era = if days >= 0 { days / 146097 } else { (days - 146096) / 146097 };
+    let era = if days >= 0 {
+        days / 146097
+    } else {
+        (days - 146096) / 146097
+    };
     let doe = (days - era * 146097) as u64;
-    let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe as i64 + era * 400;
-    let doy = doe - (365*yoe + yoe/4 - yoe/100);
-    let mp = (5*doy + 2) / 153;
-    let d = doy - (153*mp + 2)/5 + 1;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y_final = if m <= 2 { y + 1 } else { y };
     (y_final as i32, m as u32, d as u32)
@@ -178,13 +197,13 @@ fn redact_payload(v: &Value) -> Value {
             "master_password",
             "vault_key",
             "vault_key_hex",
-            "secret",             // covers secret_plaintext, secret_value
+            "secret", // covers secret_plaintext, secret_value
             "plaintext",
             "bearer",
             "api_key",
             "authorization",
             "token",
-            "oauth_identity",     // email
+            "oauth_identity", // email
             "display_identity",
             "email",
             "refresh_token",
@@ -200,7 +219,9 @@ fn redact_payload(v: &Value) -> Value {
             "input",
             "body",
             "raw",
-        ].iter().any(|needle| k.contains(needle))
+        ]
+        .iter()
+        .any(|needle| k.contains(needle))
     }
     match v {
         Value::Object(map) => {
@@ -240,7 +261,12 @@ pub fn log_dispatch_start(action_name: &str, env: &StdinEnvelope) {
 
 /// Log a successful dispatch outcome. Called from
 /// `stdin_json::emit` right before the ok envelope is printed to stdout.
-pub fn log_dispatch_success(action_name: &str, request_id: Option<&str>, data: &Value, duration_ms: u128) {
+pub fn log_dispatch_success(
+    action_name: &str,
+    request_id: Option<&str>,
+    data: &Value,
+    duration_ms: u128,
+) {
     let data_raw = serde_json::to_string(data).unwrap_or_default();
     let entry = json!({
         "ts":         iso_now(),
@@ -317,7 +343,13 @@ mod tests {
 
     #[test]
     fn redact_catches_case_variants_of_password() {
-        let cases = ["password", "PASSWORD", "Password", "oldPassword", "master_password"];
+        let cases = [
+            "password",
+            "PASSWORD",
+            "Password",
+            "oldPassword",
+            "master_password",
+        ];
         for k in cases {
             let v = json!({ k: "secret" });
             let r = redact_payload(&v);
@@ -336,7 +368,9 @@ mod tests {
         let r = redact_payload(&parse_payload);
         assert_eq!(r["text"], "<redacted>",
             "parse.payload.text must be redacted — it is raw user paste and routinely contains secrets");
-        assert_eq!(r["source_type"], "paste",
-            "non-sensitive metadata must survive redaction");
+        assert_eq!(
+            r["source_type"], "paste",
+            "non-sensitive metadata must survive redaction"
+        );
     }
 }

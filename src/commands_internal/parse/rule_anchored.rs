@@ -43,16 +43,47 @@ pub fn extract(
     seen: &mut std::collections::HashSet<String>,
 ) {
     let stopwords: std::collections::HashSet<&str> = [
-        "is", "the", "for", "as", "and", "use", "my", "new", "set",
-        "login", "email", "password", "passwd", "pass", "pwd",
-        "key", "apikey", "token", "mail", "account", "acct",
-        "secret", "api", "claude", "openai",
+        "is",
+        "the",
+        "for",
+        "as",
+        "and",
+        "use",
+        "my",
+        "new",
+        "set",
+        "login",
+        "email",
+        "password",
+        "passwd",
+        "pass",
+        "pwd",
+        "key",
+        "apikey",
+        "token",
+        "mail",
+        "account",
+        "acct",
+        "secret",
+        "api",
+        "claude",
+        "openai",
         // 中文停用词
-        "\u{5BC6}\u{7801}", "\u{90AE}\u{7BB1}", "\u{8D26}\u{53F7}",
-        "\u{5BC6}\u{94A5}", "\u{8BBE}\u{4E3A}", "\u{4ECA}\u{5929}",
-        "\u{65B0}\u{7684}", "\u{8FD8}\u{6709}", "\u{6FC0}\u{6D3B}\u{94FE}\u{63A5}",
-        "\u{767B}\u{5F55}", "\u{6CE8}\u{518C}",
-    ].iter().copied().collect();
+        "\u{5BC6}\u{7801}",
+        "\u{90AE}\u{7BB1}",
+        "\u{8D26}\u{53F7}",
+        "\u{5BC6}\u{94A5}",
+        "\u{8BBE}\u{4E3A}",
+        "\u{4ECA}\u{5929}",
+        "\u{65B0}\u{7684}",
+        "\u{8FD8}\u{6709}",
+        "\u{6FC0}\u{6D3B}\u{94FE}\u{63A5}",
+        "\u{767B}\u{5F55}",
+        "\u{6CE8}\u{518C}",
+    ]
+    .iter()
+    .copied()
+    .collect();
 
     // === Step 1: 找出所有锚点行（含 email 或 secret）===
     let lines: Vec<&str> = text.lines().collect();
@@ -62,8 +93,12 @@ pub fn extract(
         let has_secret = re_any_secret().is_match(line);
         if has_email || has_secret {
             anchor_lines.insert(i);
-            if i > 0 { anchor_lines.insert(i - 1); }
-            if i + 1 < lines.len() { anchor_lines.insert(i + 1); }
+            if i > 0 {
+                anchor_lines.insert(i - 1);
+            }
+            if i + 1 < lines.len() {
+                anchor_lines.insert(i + 1);
+            }
         }
     }
 
@@ -99,7 +134,9 @@ pub fn extract(
                 try_push(cands, seen, Kind::SecretLike, &tok, None);
                 continue;
             }
-            if !is_password_shape(&tok, line_text, &stopwords) { continue; }
+            if !is_password_shape(&tok, line_text, &stopwords) {
+                continue;
+            }
             try_push(cands, seen, Kind::PasswordLike, &tok, None);
         }
     }
@@ -115,13 +152,21 @@ pub fn extract(
 /// Why 下限 28：短于 28 字符的 hex 形 secret 很可能是普通 password / UUID 片段，不走此路径
 fn is_anchored_secret_shape(tok: &str) -> bool {
     let len = tok.chars().count();
-    if len < 28 || len > 80 { return false; }
-    let is_pure_alnum = tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    if len < 28 || len > 80 {
+        return false;
+    }
+    let is_pure_alnum = tok
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         && tok.chars().any(|c| c.is_ascii_alphabetic())
         && tok.chars().any(|c| c.is_ascii_digit());
-    if !is_pure_alnum { return false; }
-    if len > 32 { return true; }  // 33-80 带内：纯 alnum+alpha+digit 即可
-    // 28-32 带内：要求 hex-dominant
+    if !is_pure_alnum {
+        return false;
+    }
+    if len > 32 {
+        return true;
+    } // 33-80 带内：纯 alnum+alpha+digit 即可
+      // 28-32 带内：要求 hex-dominant
     let hex_ratio = tok.chars().filter(|c| c.is_ascii_hexdigit()).count() as f32 / len as f32;
     hex_ratio >= 0.70
 }
@@ -135,41 +180,65 @@ fn passes_shape_filters(
 ) -> bool {
     let lc = tok.to_lowercase();
     // email / URL / 已知 secret 前缀
-    if tok.contains('@') { return false; }
-    if lc.starts_with("http") { return false; }
-    if looks_like_known_secret(tok) { return false; }
+    if tok.contains('@') {
+        return false;
+    }
+    if lc.starts_with("http") {
+        return false;
+    }
+    if looks_like_known_secret(tok) {
+        return false;
+    }
     // stopwords
-    if stopwords.contains(lc.as_str()) { return false; }
+    if stopwords.contains(lc.as_str()) {
+        return false;
+    }
     // v4.1 placeholder denylist
-    if is_placeholder_token(tok) { return false; }
+    if is_placeholder_token(tok) {
+        return false;
+    }
     // v4.1 Post-Stage4: label_shape (kebab / token: / provider-prefix+digits)
-    if is_label_shape(tok, line) { return false; }
+    if is_label_shape(tok, line) {
+        return false;
+    }
     // v4.1 M4 post-fix: trailing _- 截断
-    if tok.ends_with('_') || tok.ends_with('-') { return false; }
+    if tok.ends_with('_') || tok.ends_with('-') {
+        return false;
+    }
     // 全非 ASCII（CJK only）
-    if tok.chars().all(|c| !c.is_ascii()) { return false; }
+    if tok.chars().all(|c| !c.is_ascii()) {
+        return false;
+    }
     // contains slash
-    if tok.contains('/') { return false; }
+    if tok.contains('/') {
+        return false;
+    }
     // shell var ref
-    if tok.starts_with('$') { return false; }
+    if tok.starts_with('$') {
+        return false;
+    }
     true
 }
 
-fn is_password_shape(
-    tok: &str,
-    line: &str,
-    stopwords: &std::collections::HashSet<&str>,
-) -> bool {
+fn is_password_shape(tok: &str, line: &str, stopwords: &std::collections::HashSet<&str>) -> bool {
     let lc = tok.to_lowercase();
     let len = tok.chars().count();
 
     // 长度范围
-    if len < 6 || len > 32 { return false; }
+    if len < 6 || len > 32 {
+        return false;
+    }
 
     // 排除：email / URL / 已知 secret 前缀
-    if tok.contains('@') { return false; }
-    if lc.starts_with("http") { return false; }
-    if looks_like_known_secret(tok) { return false; }
+    if tok.contains('@') {
+        return false;
+    }
+    if lc.starts_with("http") {
+        return false;
+    }
+    if looks_like_known_secret(tok) {
+        return false;
+    }
 
     // v4.1 anchored path 的 CJK 拒识比 label/dash/pipe 路径宽松 ——
     //   仅拒"纯非 ASCII"（`chars().all(|c| !c.is_ascii())`），
@@ -177,35 +246,57 @@ fn is_password_shape(
     //   Why: CLI 测试用例 H-K-01 有 `CnPwd测试99` 这类 mixed-ASCII-CJK password，
     //   V4.1 spike 在 anchored 层会通过（通过 rule_extract_anchored::non_ascii_only 检查），
     //   只在 label/dash/pipe 路径上严格拒（避免中文描述文字碎片作 password FP）
-    if tok.chars().all(|c| !c.is_ascii()) { return false; }
+    if tok.chars().all(|c| !c.is_ascii()) {
+        return false;
+    }
     // v4.1 placeholder denylist
-    if is_placeholder_token(tok) { return false; }
+    if is_placeholder_token(tok) {
+        return false;
+    }
     // v4.1 M4 post-fix: trailing `_-` 几乎必是 ellipsis 截断 (`LTAI5t_doubao_` 类 fragment)
-    if tok.ends_with('_') || tok.ends_with('-') { return false; }
+    if tok.ends_with('_') || tok.ends_with('-') {
+        return false;
+    }
     // v4.1 ISSUE-3 补丁: `email/password` 类 slash token 不是 password
-    if tok.contains('/') { return false; }
+    if tok.contains('/') {
+        return false;
+    }
     // v4.1 Method B shell var ref: `$OPENAI_API_KEY` / `${VAR}`
-    if tok.starts_with('$') { return false; }
+    if tok.starts_with('$') {
+        return false;
+    }
 
     // 停用词
-    if stopwords.contains(lc.as_str()) { return false; }
+    if stopwords.contains(lc.as_str()) {
+        return false;
+    }
 
     // v4.1 Post-Stage4: label_shape 拒识 (claude2: SF → claude2 是 label;
     //   kebab-case 别名;provider keyword + 数字/dash 后缀)
-    if is_label_shape(tok, line) { return false; }
+    if is_label_shape(tok, line) {
+        return false;
+    }
 
     // 排除纯 hex 长串（secret 残影，应该已被 Layer 1 hex_long 抓走）
-    if len >= 28 && tok.chars().all(|c| c.is_ascii_hexdigit()) { return false; }
+    if len >= 28 && tok.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
 
     let has_digit = tok.chars().any(|c| c.is_ascii_digit());
     let has_alpha = tok.chars().any(|c| c.is_alphabetic());
-    let has_special = tok.chars().any(|c| "!@#$%^&*()_+-=[]{}|;:,.<>?/~`".contains(c));
+    let has_special = tok
+        .chars()
+        .any(|c| "!@#$%^&*()_+-=[]{}|;:,.<>?/~`".contains(c));
 
-    if !has_alpha { return false; }
+    if !has_alpha {
+        return false;
+    }
     if !has_digit {
         // 无数字：只接受 alpha + special 且长度 ≥ 12
         // Why 12：markdown 残留 `[Moonshot`（len 9）应拒绝，`ProdPass!Strong`（len 15）应接受
-        if !has_special || len < 12 { return false; }
+        if !has_special || len < 12 {
+            return false;
+        }
     }
     true
 }

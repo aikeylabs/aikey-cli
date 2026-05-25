@@ -7,7 +7,7 @@
 
 use crate::cli::AuthAction;
 use crate::credential_type::CredentialType;
-use crate::storage as storage;
+use crate::storage;
 use colored::Colorize;
 use std::io::{self, BufRead, Write};
 use std::process::Command as ProcessCommand;
@@ -25,9 +25,15 @@ fn pick_oauth_provider() -> Result<String, Box<dyn std::error::Error>> {
     // 旧标签会让用户误以为选的是 Moonshot,实际登录的是 Kimi Code。改为
     // 明确写 "Kimi Code (kimi_code)" 并加 hint 说 Moonshot 不支持 OAuth。
     let choices = [
-        ("Claude    (Anthropic) — requires Pro or Max subscription", "claude"),
+        (
+            "Claude    (Anthropic) — requires Pro or Max subscription",
+            "claude",
+        ),
         ("Codex     (OpenAI)    — requires ChatGPT Pro/Plus", "codex"),
-        ("Kimi Code (kimi_code) — Moonshot uses API key only (aikey add)", "kimi"),
+        (
+            "Kimi Code (kimi_code) — Moonshot uses API key only (aikey add)",
+            "kimi",
+        ),
     ];
 
     let items: Vec<String> = choices.iter().map(|(label, _)| label.to_string()).collect();
@@ -65,7 +71,12 @@ pub fn handle_auth_command(
 // aikey auth login <provider>
 // ============================================================================
 
-fn handle_login(provider: &str, alias: Option<&str>, proxy_port: u16, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_login(
+    provider: &str,
+    alias: Option<&str>,
+    proxy_port: u16,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Check proxy is running
     check_proxy_running(proxy_port)?;
 
@@ -84,7 +95,8 @@ fn handle_login(provider: &str, alias: Option<&str>, proxy_port: u16, json_mode:
              aikey add <alias> --provider moonshot\n\
              (For Kimi Code OAuth, run: aikey auth login kimi_code)",
             "--"
-        ).into());
+        )
+        .into());
     }
     let provider = match lower.as_str() {
         "anthropic" | "claude" => "claude",
@@ -120,17 +132,46 @@ fn handle_login(provider: &str, alias: Option<&str>, proxy_port: u16, json_mode:
     let flow_type = resp["flow_type"].as_str().unwrap_or("");
 
     match flow_type {
-        "setup_token" => login_setup_token(&base, &session_id, &resp, provider, alias, proxy_port, json_mode),
-        "auth_code" => login_auth_code(&base, &session_id, &resp, provider, alias, proxy_port, json_mode),
-        "device_code" => login_device_code(&base, &session_id, &resp, provider, alias, proxy_port, json_mode),
+        "setup_token" => login_setup_token(
+            &base,
+            &session_id,
+            &resp,
+            provider,
+            alias,
+            proxy_port,
+            json_mode,
+        ),
+        "auth_code" => login_auth_code(
+            &base,
+            &session_id,
+            &resp,
+            provider,
+            alias,
+            proxy_port,
+            json_mode,
+        ),
+        "device_code" => login_device_code(
+            &base,
+            &session_id,
+            &resp,
+            provider,
+            alias,
+            proxy_port,
+            json_mode,
+        ),
         _ => Err(format!("Unknown flow type: {}", flow_type).into()),
     }
 }
 
 /// Claude: Setup Token — open browser, user pastes code#state
 fn login_setup_token(
-    base: &str, session_id: &str, resp: &serde_json::Value,
-    provider: &str, alias: Option<&str>, _proxy_port: u16, json_mode: bool,
+    base: &str,
+    session_id: &str,
+    resp: &serde_json::Value,
+    provider: &str,
+    alias: Option<&str>,
+    _proxy_port: u16,
+    json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_url = resp["auth_url"].as_str().unwrap_or("");
 
@@ -138,13 +179,23 @@ fn login_setup_token(
 
     if !json_mode {
         eprintln!();
-        eprintln!("  {} Note: Claude OAuth requires a Pro or Max subscription.", "\u{25c6}".cyan());
-        eprintln!("  {} Open this URL and click 'Authorize':", "\u{2502}".dimmed());
+        eprintln!(
+            "  {} Note: Claude OAuth requires a Pro or Max subscription.",
+            "\u{25c6}".cyan()
+        );
+        eprintln!(
+            "  {} Open this URL and click 'Authorize':",
+            "\u{2502}".dimmed()
+        );
         eprintln!("  {}", "\u{2502}".dimmed());
         eprintln!("  {}   {}", "\u{2502}".dimmed(), auth_url);
         eprintln!("  {}", "\u{2502}".dimmed());
         if clipboard_ok {
-            eprintln!("  {} {}", "\u{2502}".dimmed(), "Auth URL copied to clipboard.".dimmed());
+            eprintln!(
+                "  {} {}",
+                "\u{2502}".dimmed(),
+                "Auth URL copied to clipboard.".dimmed()
+            );
             eprintln!("  {}", "\u{2502}".dimmed());
         }
     }
@@ -181,7 +232,9 @@ enum PasteCheck {
 }
 
 fn classify_paste(expected_state: Option<&str>, pasted: &str) -> PasteCheck {
-    let Some(expected) = expected_state else { return PasteCheck::Accept };
+    let Some(expected) = expected_state else {
+        return PasteCheck::Accept;
+    };
     if expected.is_empty() {
         return PasteCheck::Accept;
     }
@@ -207,8 +260,15 @@ fn classify_paste(expected_state: Option<&str>, pasted: &str) -> PasteCheck {
 /// - Match (or no expected state available) → return the pasted code.
 ///
 /// Returns `Err` when the user cancels, runs out of attempts, or hits an I/O error.
-fn read_code_with_retry(auth_url: &str, json_mode: bool) -> Result<String, Box<dyn std::error::Error>> {
-    let expected_state = if json_mode { None } else { extract_state_param(auth_url) };
+fn read_code_with_retry(
+    auth_url: &str,
+    json_mode: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let expected_state = if json_mode {
+        None
+    } else {
+        extract_state_param(auth_url)
+    };
 
     for attempt in 1..=MAX_PASTE_ATTEMPTS {
         let prompt = if attempt == 1 {
@@ -219,8 +279,8 @@ fn read_code_with_retry(auth_url: &str, json_mode: bool) -> Result<String, Box<d
                 attempt, MAX_PASTE_ATTEMPTS
             )
         };
-        let pasted = crate::prompt_hidden(&prompt)
-            .map_err(|e| format!("Failed to read code: {}", e))?;
+        let pasted =
+            crate::prompt_hidden(&prompt).map_err(|e| format!("Failed to read code: {}", e))?;
         let pasted = pasted.trim().to_string();
 
         if pasted.is_empty() {
@@ -292,8 +352,13 @@ fn try_copy_to_clipboard(text: &str) -> bool {
 
 /// Codex: Auth Code — open browser, localhost callback auto-receives code
 fn login_auth_code(
-    base: &str, session_id: &str, resp: &serde_json::Value,
-    provider: &str, alias: Option<&str>, _proxy_port: u16, json_mode: bool,
+    base: &str,
+    session_id: &str,
+    resp: &serde_json::Value,
+    provider: &str,
+    alias: Option<&str>,
+    _proxy_port: u16,
+    json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth_url = resp["auth_url"].as_str().unwrap_or("");
 
@@ -301,16 +366,27 @@ fn login_auth_code(
 
     if !json_mode {
         eprintln!();
-        eprintln!("  {} Opening browser for {} login...", "\u{25c6}".cyan(), provider);
+        eprintln!(
+            "  {} Opening browser for {} login...",
+            "\u{25c6}".cyan(),
+            provider
+        );
         if clipboard_ok {
-            eprintln!("  {} {}", "\u{2502}".dimmed(), "Auth URL copied to clipboard.".dimmed());
+            eprintln!(
+                "  {} {}",
+                "\u{2502}".dimmed(),
+                "Auth URL copied to clipboard.".dimmed()
+            );
         }
         eprintln!("  {}", "\u{2502}".dimmed());
     }
     let _ = open_browser(auth_url);
 
     if !json_mode {
-        eprintln!("  {} Waiting for authorization... (Ctrl+C to cancel)", "\u{2502}".dimmed());
+        eprintln!(
+            "  {} Waiting for authorization... (Ctrl+C to cancel)",
+            "\u{2502}".dimmed()
+        );
     }
 
     // Poll for completion (proxy handles the callback)
@@ -319,8 +395,13 @@ fn login_auth_code(
 
 /// Kimi: Device Code — show user_code, poll for completion
 fn login_device_code(
-    base: &str, session_id: &str, resp: &serde_json::Value,
-    provider: &str, alias: Option<&str>, _proxy_port: u16, json_mode: bool,
+    base: &str,
+    session_id: &str,
+    resp: &serde_json::Value,
+    provider: &str,
+    alias: Option<&str>,
+    _proxy_port: u16,
+    json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let user_code = resp["user_code"].as_str().unwrap_or("");
     let verify_url = resp["verification_url"].as_str().unwrap_or("");
@@ -333,7 +414,11 @@ fn login_device_code(
         eprintln!("  {}   URL:  {}", "\u{2502}".dimmed(), verify_url);
         eprintln!("  {}   Code: {}", "\u{2502}".dimmed(), user_code.bold());
         if clipboard_ok {
-            eprintln!("  {}   {}", "\u{2502}".dimmed(), "Verification URL copied to clipboard.".dimmed());
+            eprintln!(
+                "  {}   {}",
+                "\u{2502}".dimmed(),
+                "Verification URL copied to clipboard.".dimmed()
+            );
         }
         eprintln!("  {}", "\u{2502}".dimmed());
     }
@@ -351,16 +436,23 @@ fn login_device_code(
 
 /// Submit code#state and handle the result (used by setup_token flow).
 fn submit_code_and_finish(
-    base: &str, session_id: &str, code_state: &str,
-    provider: &str, alias: Option<&str>, json_mode: bool,
+    base: &str,
+    session_id: &str,
+    code_state: &str,
+    provider: &str,
+    alias: Option<&str>,
+    json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let http_result = ureq::post(&format!("{}/oauth/login", base))
         .set("Content-Type", "application/json")
-        .send_string(&serde_json::json!({
-            "provider": provider,
-            "code": code_state,
-            "session_id": session_id,
-        }).to_string());
+        .send_string(
+            &serde_json::json!({
+                "provider": provider,
+                "code": code_state,
+                "session_id": session_id,
+            })
+            .to_string(),
+        );
 
     let resp: serde_json::Value = match http_result {
         Ok(r) => r.into_json()?,
@@ -442,8 +534,13 @@ fn submit_code_and_finish(
         println!("{}", serde_json::to_string_pretty(&resp)?);
     } else {
         let days = expires_in / 86400;
-        eprintln!("  {} Logged in as {} ({}), expires in {} days",
-            "\u{25c6}".green(), display.bold(), provider, days);
+        eprintln!(
+            "  {} Logged in as {} ({}), expires in {} days",
+            "\u{25c6}".green(),
+            display.bold(),
+            provider,
+            days
+        );
 
         // Stage 11+: --alias 非空则直接写;否则旧逻辑(display 为空/非 email 时 prompt)
         if alias.is_some() || display.is_empty() || !display.contains('@') {
@@ -462,7 +559,11 @@ fn submit_code_and_finish(
 
 /// Poll GET /oauth/status until success or failure (for auth_code and device_code flows).
 fn poll_login_status(
-    base: &str, session_id: &str, provider: &str, alias: Option<&str>, json_mode: bool,
+    base: &str,
+    session_id: &str,
+    provider: &str,
+    alias: Option<&str>,
+    json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = std::time::Duration::from_secs(120);
     let start = std::time::Instant::now();
@@ -475,13 +576,14 @@ fn poll_login_status(
         }
 
         // Per-request timeout prevents hanging on network issues.
-        let resp: serde_json::Value = match ureq::get(&format!("{}/oauth/status?session_id={}", base, session_id))
-            .timeout(std::time::Duration::from_secs(10))
-            .call()
-        {
-            Ok(r) => r.into_json()?,
-            Err(_) => continue,
-        };
+        let resp: serde_json::Value =
+            match ureq::get(&format!("{}/oauth/status?session_id={}", base, session_id))
+                .timeout(std::time::Duration::from_secs(10))
+                .call()
+            {
+                Ok(r) => r.into_json()?,
+                Err(_) => continue,
+            };
 
         let status = resp["status"].as_str().unwrap_or("");
         match status {
@@ -523,7 +625,12 @@ fn poll_login_status(
                 if json_mode {
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                 } else {
-                    eprintln!("{} Logged in as {} ({})", "\u{25c6}".green(), display.bold(), provider);
+                    eprintln!(
+                        "{} Logged in as {} ({})",
+                        "\u{25c6}".green(),
+                        display.bold(),
+                        provider
+                    );
 
                     // Stage 11+: --alias 非空则直接写;否则旧逻辑
                     if alias.is_some() || display.is_empty() || !display.contains('@') {
@@ -569,7 +676,11 @@ fn poll_login_status(
 /// Each call triggers one poll attempt against the provider's token endpoint.
 /// Returns when the user authorizes in browser or timeout is reached.
 fn poll_device_code(
-    base: &str, session_id: &str, provider: &str, alias: Option<&str>, json_mode: bool,
+    base: &str,
+    session_id: &str,
+    provider: &str,
+    alias: Option<&str>,
+    json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timeout = std::time::Duration::from_secs(300); // Device code flows allow longer timeout
     let start = std::time::Instant::now();
@@ -595,9 +706,12 @@ fn poll_device_code(
         let resp_result = ureq::post(&format!("{}/oauth/poll", base))
             .timeout(request_timeout)
             .set("Content-Type", "application/json")
-            .send_string(&serde_json::json!({
-                "session_id": session_id,
-            }).to_string());
+            .send_string(
+                &serde_json::json!({
+                    "session_id": session_id,
+                })
+                .to_string(),
+            );
 
         match resp_result {
             Ok(r) => {
@@ -618,7 +732,12 @@ fn poll_device_code(
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                 } else {
                     eprintln!();
-                    eprintln!("{} Logged in as {} ({})", "\u{25c6}".green(), display.bold(), provider);
+                    eprintln!(
+                        "{} Logged in as {} ({})",
+                        "\u{25c6}".green(),
+                        display.bold(),
+                        provider
+                    );
 
                     // Stage 11+: --alias 非空则直接写;否则旧逻辑
                     if alias.is_some() || display.is_empty() || !display.contains('@') {
@@ -652,7 +771,9 @@ fn poll_device_code(
                 }
 
                 // Non-retryable error (session expired, flow failed, etc.)
-                let msg = body["message"].as_str().unwrap_or("Device code login failed");
+                let msg = body["message"]
+                    .as_str()
+                    .unwrap_or("Device code login failed");
                 if !json_mode {
                     eprintln!();
                     eprintln!("{} {} (HTTP {})", "\u{25c6}".red(), msg, code);
@@ -665,16 +786,30 @@ fn poll_device_code(
                 if net_error_count >= MAX_CONSECUTIVE_NET_ERRORS {
                     if !json_mode {
                         eprintln!();
-                        eprintln!("  {} Network errors during polling ({} in a row): {}",
-                            "\u{25c6}".red(), net_error_count, e);
+                        eprintln!(
+                            "  {} Network errors during polling ({} in a row): {}",
+                            "\u{25c6}".red(),
+                            net_error_count,
+                            e
+                        );
                         eprintln!("  \u{2502} Check: proxy is running, network is reachable");
                     }
-                    return Err(format!("Polling aborted after {} network errors: {}", net_error_count, e).into());
+                    return Err(format!(
+                        "Polling aborted after {} network errors: {}",
+                        net_error_count, e
+                    )
+                    .into());
                 }
                 if !json_mode {
                     eprintln!();
-                    eprintln!("  {} network error ({}), retrying in {}s... [{}/{}]",
-                        "\u{25c6}".yellow(), e, backoff.as_secs(), net_error_count, MAX_CONSECUTIVE_NET_ERRORS);
+                    eprintln!(
+                        "  {} network error ({}), retrying in {}s... [{}/{}]",
+                        "\u{25c6}".yellow(),
+                        e,
+                        backoff.as_secs(),
+                        net_error_count,
+                        MAX_CONSECUTIVE_NET_ERRORS
+                    );
                 }
                 std::thread::sleep(backoff);
                 backoff = std::cmp::min(backoff * 2, std::time::Duration::from_secs(60));
@@ -717,23 +852,35 @@ fn resolve_display_identity(
 }
 
 /// 写入 display_identity 到 broker(alias 已确定,跳过交互 prompt)
-fn set_display_identity(base: &str, account_id: &str, alias: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn set_display_identity(
+    base: &str,
+    account_id: &str,
+    alias: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     const MAX_DISPLAY_LEN: usize = 256;
     let input = alias.trim();
     if input.is_empty() {
         return Err("--alias is empty after trim.".into());
     }
     if input.len() > MAX_DISPLAY_LEN {
-        return Err(format!("--alias too long ({} chars, max {}).", input.len(), MAX_DISPLAY_LEN).into());
+        return Err(format!(
+            "--alias too long ({} chars, max {}).",
+            input.len(),
+            MAX_DISPLAY_LEN
+        )
+        .into());
     }
     if input.chars().any(|c| c.is_control()) {
         return Err("--alias contains control characters.".into());
     }
 
-    let resp = ureq::post(&format!("{}/oauth/accounts/{}/display-identity", base, account_id))
-        .timeout(std::time::Duration::from_secs(10))
-        .set("Content-Type", "application/json")
-        .send_string(&serde_json::json!({"display_identity": input}).to_string());
+    let resp = ureq::post(&format!(
+        "{}/oauth/accounts/{}/display-identity",
+        base, account_id
+    ))
+    .timeout(std::time::Duration::from_secs(10))
+    .set("Content-Type", "application/json")
+    .send_string(&serde_json::json!({"display_identity": input}).to_string());
 
     match resp {
         Ok(_) => {
@@ -764,17 +911,25 @@ fn prompt_display_identity(base: &str, account_id: &str) -> Result<(), Box<dyn s
         return Ok(());
     }
     if input.len() > MAX_DISPLAY_LEN {
-        return Err(format!("Display name too long ({} chars, max {}).", input.len(), MAX_DISPLAY_LEN).into());
+        return Err(format!(
+            "Display name too long ({} chars, max {}).",
+            input.len(),
+            MAX_DISPLAY_LEN
+        )
+        .into());
     }
     // Reject control chars that would corrupt logs/display.
     if input.chars().any(|c| c.is_control()) {
         return Err("Display name contains control characters.".into());
     }
 
-    let resp = ureq::post(&format!("{}/oauth/accounts/{}/display-identity", base, account_id))
-        .timeout(std::time::Duration::from_secs(10))
-        .set("Content-Type", "application/json")
-        .send_string(&serde_json::json!({"display_identity": input}).to_string());
+    let resp = ureq::post(&format!(
+        "{}/oauth/accounts/{}/display-identity",
+        base, account_id
+    ))
+    .timeout(std::time::Duration::from_secs(10))
+    .set("Content-Type", "application/json")
+    .send_string(&serde_json::json!({"display_identity": input}).to_string());
 
     match resp {
         Ok(_) => {
@@ -805,15 +960,18 @@ fn handle_list(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if json_mode {
-        let json: Vec<serde_json::Value> = accounts.iter().map(|a| {
-            serde_json::json!({
-                "provider_account_id": a.provider_account_id,
-                "provider": a.provider,
-                "status": a.status,
-                "display_identity": a.display_identity,
-                "account_tier": a.account_tier,
+        let json: Vec<serde_json::Value> = accounts
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "provider_account_id": a.provider_account_id,
+                    "provider": a.provider,
+                    "status": a.status,
+                    "display_identity": a.display_identity,
+                    "account_tier": a.account_tier,
+                })
             })
-        }).collect();
+            .collect();
         println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
         let now = std::time::SystemTime::now()
@@ -822,52 +980,99 @@ fn handle_list(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
             .as_secs() as i64;
 
         // Build display data
-        let display_rows: Vec<(String, String, String, String, String)> = accounts.iter().map(|a| {
-            let identity = a.display_identity.as_deref()
-                .filter(|s| !s.is_empty())
-                .or_else(|| a.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
-                .unwrap_or("-").to_string();
-            let tier = a.account_tier.as_deref().unwrap_or("-").to_string();
-            let token_expires = storage::get_provider_token_expires_at(&a.provider_account_id)
-                .ok().flatten();
-            let expires = token_expires
-                .map(|exp| {
-                    let rem = exp - now;
-                    if rem <= 0 { "expired".to_string() }
-                    else if rem > 86400 { format!("{}d", rem / 86400) }
-                    else if rem > 3600 { format!("{}h", rem / 3600) }
-                    else { format!("{}m", rem / 60) }
-                }).unwrap_or_else(|| "-".to_string());
-            // Unified status: valid (empty), expired, invalid — same as `aikey list`
-            let status_display = match a.status.as_str() {
-                "active" | "idle" => {
-                    if token_expires.map_or(false, |exp| exp <= now) {
-                        "expired".to_string()
-                    } else {
-                        String::new() // valid → not displayed
+        let display_rows: Vec<(String, String, String, String, String)> = accounts
+            .iter()
+            .map(|a| {
+                let identity = a
+                    .display_identity
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        a.external_id
+                            .as_deref()
+                            .map(|s| if s.len() > 12 { &s[..12] } else { s })
+                    })
+                    .unwrap_or("-")
+                    .to_string();
+                let tier = a.account_tier.as_deref().unwrap_or("-").to_string();
+                let token_expires = storage::get_provider_token_expires_at(&a.provider_account_id)
+                    .ok()
+                    .flatten();
+                let expires = token_expires
+                    .map(|exp| {
+                        let rem = exp - now;
+                        if rem <= 0 {
+                            "expired".to_string()
+                        } else if rem > 86400 {
+                            format!("{}d", rem / 86400)
+                        } else if rem > 3600 {
+                            format!("{}h", rem / 3600)
+                        } else {
+                            format!("{}m", rem / 60)
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+                // Unified status: valid (empty), expired, invalid — same as `aikey list`
+                let status_display = match a.status.as_str() {
+                    "active" | "idle" => {
+                        if token_expires.map_or(false, |exp| exp <= now) {
+                            "expired".to_string()
+                        } else {
+                            String::new() // valid → not displayed
+                        }
                     }
-                }
-                "reauth_required" | "expired" => "expired".to_string(),
-                _ => "invalid".to_string(),
-            };
-            (identity, a.provider.clone(), status_display, tier, expires)
-        }).collect();
+                    "reauth_required" | "expired" => "expired".to_string(),
+                    _ => "invalid".to_string(),
+                };
+                (identity, a.provider.clone(), status_display, tier, expires)
+            })
+            .collect();
 
         // Dynamic widths
         let pad = 2;
-        let w_id   = "IDENTITY".len().max(display_rows.iter().map(|r| r.0.len()).max().unwrap_or(0)) + pad;
-        let w_prov = "PROVIDER".len().max(display_rows.iter().map(|r| r.1.len()).max().unwrap_or(0)) + pad;
-        let w_st   = "STATUS".len().max(display_rows.iter().map(|r| r.2.len()).max().unwrap_or(0)) + pad;
-        let w_tier = "TIER".len().max(display_rows.iter().map(|r| r.3.len()).max().unwrap_or(0)) + pad;
+        let w_id = "IDENTITY"
+            .len()
+            .max(display_rows.iter().map(|r| r.0.len()).max().unwrap_or(0))
+            + pad;
+        let w_prov = "PROVIDER"
+            .len()
+            .max(display_rows.iter().map(|r| r.1.len()).max().unwrap_or(0))
+            + pad;
+        let w_st = "STATUS"
+            .len()
+            .max(display_rows.iter().map(|r| r.2.len()).max().unwrap_or(0))
+            + pad;
+        let w_tier = "TIER"
+            .len()
+            .max(display_rows.iter().map(|r| r.3.len()).max().unwrap_or(0))
+            + pad;
 
         println!("\n  Provider Accounts (OAuth):");
-        println!("  {:<wi$}{:<wp$}{:<ws$}{:<wt$}{}",
-            "IDENTITY", "PROVIDER", "STATUS", "TIER", "EXPIRES",
-            wi = w_id, wp = w_prov, ws = w_st, wt = w_tier);
+        println!(
+            "  {:<wi$}{:<wp$}{:<ws$}{:<wt$}{}",
+            "IDENTITY",
+            "PROVIDER",
+            "STATUS",
+            "TIER",
+            "EXPIRES",
+            wi = w_id,
+            wp = w_prov,
+            ws = w_st,
+            wt = w_tier
+        );
         for r in &display_rows {
-            println!("  {:<wi$}{:<wp$}{:<ws$}{:<wt$}{}",
-                r.0, r.1, r.2, r.3, r.4,
-                wi = w_id, wp = w_prov, ws = w_st, wt = w_tier);
+            println!(
+                "  {:<wi$}{:<wp$}{:<ws$}{:<wt$}{}",
+                r.0,
+                r.1,
+                r.2,
+                r.3,
+                r.4,
+                wi = w_id,
+                wp = w_prov,
+                ws = w_st,
+                wt = w_tier
+            );
         }
         println!();
     }
@@ -878,7 +1083,11 @@ fn handle_list(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
 // aikey auth use <account>
 // ============================================================================
 
-fn handle_use(account: &str, _proxy_port: u16, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_use(
+    account: &str,
+    _proxy_port: u16,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Match account: exact ID or fuzzy display_identity
     let target = find_account(account)?;
 
@@ -886,14 +1095,17 @@ fn handle_use(account: &str, _proxy_port: u16, json_mode: bool) -> Result<(), Bo
         return Err(format!(
             "Account {} has status '{}'. Run: aikey auth login {}",
             account, target.status, target.provider
-        ).into());
+        )
+        .into());
     }
 
     // Map OAuth provider to canonical code (claude→anthropic, codex→openai)
     let canonical = oauth_provider_to_canonical(&target.provider);
 
     // Get old binding for the provider (for replacement notice)
-    let old_binding = storage::get_provider_binding("default", canonical).ok().flatten();
+    let old_binding = storage::get_provider_binding("default", canonical)
+        .ok()
+        .flatten();
 
     // Single funnel: Switched event runs write_bindings_canonical →
     // refresh → apply_third_party_cli_configs.
@@ -917,20 +1129,34 @@ fn handle_use(account: &str, _proxy_port: u16, json_mode: bool) -> Result<(), Bo
     let _ = crate::commands_proxy::post_admin_reload();
 
     // Output
-    let display = target.display_identity.as_deref().unwrap_or(&target.provider_account_id);
+    let display = target
+        .display_identity
+        .as_deref()
+        .unwrap_or(&target.provider_account_id);
     if json_mode {
-        println!("{}", serde_json::json!({
-            "ok": true,
-            "provider": target.provider,
-            "account_id": target.provider_account_id,
-            "display_identity": display,
-        }));
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "provider": target.provider,
+                "account_id": target.provider_account_id,
+                "display_identity": display,
+            })
+        );
     } else {
-        eprintln!("{} Now using {}/{} (OAuth) for {}",
-            "\u{25c6}".green(), target.provider, display.bold(), canonical);
+        eprintln!(
+            "{} Now using {}/{} (OAuth) for {}",
+            "\u{25c6}".green(),
+            target.provider,
+            display.bold(),
+            canonical
+        );
         if let Some(old) = old_binding {
             if old.key_source_ref != target.provider_account_id {
-                eprintln!("     Replaced: {} ({})", old.key_source_ref, old.key_source_type);
+                eprintln!(
+                    "     Replaced: {} ({})",
+                    old.key_source_ref, old.key_source_type
+                );
             }
         }
     }
@@ -942,9 +1168,16 @@ fn handle_use(account: &str, _proxy_port: u16, json_mode: bool) -> Result<(), Bo
 // aikey auth logout <target>
 // ============================================================================
 
-fn handle_logout(target: &str, proxy_port: u16, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_logout(
+    target: &str,
+    proxy_port: u16,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let acct = find_account(target)?;
-    let display = acct.display_identity.as_deref().unwrap_or(&acct.provider_account_id);
+    let display = acct
+        .display_identity
+        .as_deref()
+        .unwrap_or(&acct.provider_account_id);
 
     // Confirm
     if !json_mode {
@@ -963,7 +1196,9 @@ fn handle_logout(target: &str, proxy_port: u16, json_mode: bool) -> Result<(), B
     let base = proxy_base(proxy_port);
     let _ = ureq::post(&format!("{}/oauth/logout", base))
         .set("Content-Type", "application/json")
-        .send_string(&serde_json::json!({"provider_account_id": acct.provider_account_id}).to_string());
+        .send_string(
+            &serde_json::json!({"provider_account_id": acct.provider_account_id}).to_string(),
+        );
 
     // Also clean up local bindings
     let _ = storage::delete_provider_account(&acct.provider_account_id);
@@ -982,7 +1217,9 @@ fn handle_logout(target: &str, proxy_port: u16, json_mode: bool) -> Result<(), B
     // If this was the *global* active credential (legacy single-active concept,
     // separate from per-provider bindings above), clear it too and reload proxy.
     if let Ok(Some(cfg)) = storage::get_active_key_config() {
-        if cfg.key_type == CredentialType::PersonalOAuthAccount && cfg.key_ref == acct.provider_account_id {
+        if cfg.key_type == CredentialType::PersonalOAuthAccount
+            && cfg.key_ref == acct.provider_account_id
+        {
             let _ = storage::set_active_key_config(&storage::ActiveKeyConfig {
                 key_type: CredentialType::PersonalApiKey,
                 key_ref: String::new(),
@@ -995,7 +1232,12 @@ fn handle_logout(target: &str, proxy_port: u16, json_mode: bool) -> Result<(), B
     if json_mode {
         println!("{}", serde_json::json!({"ok": true}));
     } else {
-        eprintln!("{} Logged out from {}/{}", "\u{25c6}".green(), acct.provider, display);
+        eprintln!(
+            "{} Logged out from {}/{}",
+            "\u{25c6}".green(),
+            acct.provider,
+            display
+        );
     }
     Ok(())
 }
@@ -1004,7 +1246,11 @@ fn handle_logout(target: &str, proxy_port: u16, json_mode: bool) -> Result<(), B
 // aikey auth status / doctor
 // ============================================================================
 
-fn handle_status(account: Option<&str>, proxy_port: u16, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_status(
+    account: Option<&str>,
+    proxy_port: u16,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     match account {
         None => {
             // Show all accounts
@@ -1015,9 +1261,10 @@ fn handle_status(account: Option<&str>, proxy_port: u16, json_mode: bool) -> Res
             let base = proxy_base(proxy_port);
             let acct = find_account(id)?;
 
-            let resp: serde_json::Value = ureq::get(
-                &format!("{}/oauth/accounts/{}/health", base, acct.provider_account_id)
-            )
+            let resp: serde_json::Value = ureq::get(&format!(
+                "{}/oauth/accounts/{}/health",
+                base, acct.provider_account_id
+            ))
             .call()
             .map_err(|e| format!("Failed to get health: {}", e))?
             .into_json()?;
@@ -1025,10 +1272,16 @@ fn handle_status(account: Option<&str>, proxy_port: u16, json_mode: bool) -> Res
             if json_mode {
                 println!("{}", serde_json::to_string_pretty(&resp)?);
             } else {
-                let display = acct.display_identity.as_deref().unwrap_or(&acct.provider_account_id);
+                let display = acct
+                    .display_identity
+                    .as_deref()
+                    .unwrap_or(&acct.provider_account_id);
                 eprintln!("  Account:     {}/{}", acct.provider, display);
                 eprintln!("  Status:      {}", resp["status"].as_str().unwrap_or("-"));
-                eprintln!("  Token:       {}", resp["token_status"].as_str().unwrap_or("-"));
+                eprintln!(
+                    "  Token:       {}",
+                    resp["token_status"].as_str().unwrap_or("-")
+                );
                 let expires_in = resp["expires_in"].as_i64().unwrap_or(0);
                 if expires_in > 86400 {
                     eprintln!("  Expires in:  {} days", expires_in / 86400);
@@ -1043,13 +1296,20 @@ fn handle_status(account: Option<&str>, proxy_port: u16, json_mode: bool) -> Res
     }
 }
 
-fn handle_doctor(provider: Option<&str>, proxy_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_doctor(
+    provider: Option<&str>,
+    proxy_port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     let _provider = provider.unwrap_or("all");
     eprintln!("  Checking proxy...");
 
     // [1] Proxy running
     match check_proxy_running(proxy_port) {
-        Ok(_) => eprintln!("  {} Proxy running on port {}", "\u{2713}".green(), proxy_port),
+        Ok(_) => eprintln!(
+            "  {} Proxy running on port {}",
+            "\u{2713}".green(),
+            proxy_port
+        ),
         Err(e) => {
             eprintln!("  {} Proxy not running: {}", "\u{2717}".red(), e);
             return Ok(());
@@ -1061,7 +1321,11 @@ fn handle_doctor(provider: Option<&str>, proxy_port: u16) -> Result<(), Box<dyn 
     if accounts.is_empty() {
         eprintln!("  {} No OAuth accounts", "\u{25c6}".cyan());
     } else {
-        eprintln!("  {} {} OAuth account(s) found", "\u{2713}".green(), accounts.len());
+        eprintln!(
+            "  {} {} OAuth account(s) found",
+            "\u{2713}".green(),
+            accounts.len()
+        );
         for a in &accounts {
             // Show the user-facing label (local_alias if renamed, else
             // upstream email) instead of just display_identity, so the
@@ -1098,7 +1362,9 @@ fn check_proxy_running(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn find_account(id_or_display: &str) -> Result<storage::ProviderAccountInfo, Box<dyn std::error::Error>> {
+fn find_account(
+    id_or_display: &str,
+) -> Result<storage::ProviderAccountInfo, Box<dyn std::error::Error>> {
     // Try exact ID match first (fastest path).
     if let Ok(Some(acct)) = storage::get_provider_account(id_or_display) {
         return Ok(acct);
@@ -1112,12 +1378,13 @@ fn find_account(id_or_display: &str) -> Result<storage::ProviderAccountInfo, Box
     // Tier 1: exact match on local_alias, display_identity, or provider_account_id.
     // v1.0.1-alpha.1 added local_alias so a renamed account is reachable
     // by its new label (e.g. `aikey auth logout my-renamed-claude`).
-    let exact: Vec<_> = all.iter()
-        .filter(|a|
+    let exact: Vec<_> = all
+        .iter()
+        .filter(|a| {
             a.local_alias.as_deref() == Some(id_or_display)
-            || a.display_identity.as_deref() == Some(id_or_display)
-            || a.provider_account_id == id_or_display
-        )
+                || a.display_identity.as_deref() == Some(id_or_display)
+                || a.provider_account_id == id_or_display
+        })
         .cloned()
         .collect();
     if exact.len() == 1 {
@@ -1128,7 +1395,8 @@ fn find_account(id_or_display: &str) -> Result<storage::ProviderAccountInfo, Box
     }
 
     // Tier 2: exact provider match (e.g. `claude` matches all Claude accounts).
-    let by_provider: Vec<_> = all.iter()
+    let by_provider: Vec<_> = all
+        .iter()
         .filter(|a| a.provider == id_or_display)
         .cloned()
         .collect();
@@ -1141,21 +1409,33 @@ fn find_account(id_or_display: &str) -> Result<storage::ProviderAccountInfo, Box
 
     // Tier 3: prefix match on local_alias, display_identity, or provider_account_id.
     // Safer than contains — `alice` matches `alice@x.com` but NOT `malice@x.com`.
-    let prefix: Vec<_> = all.into_iter()
-        .filter(|a|
-            a.local_alias.as_deref().map_or(false, |d| d.starts_with(id_or_display))
-            || a.display_identity.as_deref().map_or(false, |d| d.starts_with(id_or_display))
-            || a.provider_account_id.starts_with(id_or_display)
-        )
+    let prefix: Vec<_> = all
+        .into_iter()
+        .filter(|a| {
+            a.local_alias
+                .as_deref()
+                .map_or(false, |d| d.starts_with(id_or_display))
+                || a.display_identity
+                    .as_deref()
+                    .map_or(false, |d| d.starts_with(id_or_display))
+                || a.provider_account_id.starts_with(id_or_display)
+        })
         .collect();
     match prefix.len() {
-        0 => Err(format!("Account '{}' not found. Run: aikey auth list", id_or_display).into()),
+        0 => Err(format!(
+            "Account '{}' not found. Run: aikey auth list",
+            id_or_display
+        )
+        .into()),
         1 => Ok(prefix.into_iter().next().unwrap()),
         _ => Err(ambiguous_match_err(id_or_display, &prefix)),
     }
 }
 
-fn ambiguous_match_err(needle: &str, matches: &[storage::ProviderAccountInfo]) -> Box<dyn std::error::Error> {
+fn ambiguous_match_err(
+    needle: &str,
+    matches: &[storage::ProviderAccountInfo],
+) -> Box<dyn std::error::Error> {
     eprintln!("Multiple accounts match '{}':", needle);
     for a in matches {
         let display = a.display_identity.as_deref().unwrap_or("-");
@@ -1172,11 +1452,19 @@ use crate::commands_account::oauth_provider_to_canonical;
 /// Open a URL in the default browser (cross-platform).
 fn open_browser(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
-    { let _ = ProcessCommand::new("open").arg(url).spawn(); }
+    {
+        let _ = ProcessCommand::new("open").arg(url).spawn();
+    }
     #[cfg(target_os = "linux")]
-    { let _ = ProcessCommand::new("xdg-open").arg(url).spawn(); }
+    {
+        let _ = ProcessCommand::new("xdg-open").arg(url).spawn();
+    }
     #[cfg(target_os = "windows")]
-    { let _ = ProcessCommand::new("rundll32").args(["url.dll,FileProtocolHandler", url]).spawn(); }
+    {
+        let _ = ProcessCommand::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn();
+    }
     Ok(())
 }
 
@@ -1209,14 +1497,20 @@ mod tests {
     fn classify_paste_accepts_when_expected_state_unknown() {
         // json_mode and malformed auth_url both produce expected_state=None;
         // we must not hold up the user — submit and let the broker decide.
-        assert_eq!(classify_paste(None, "raw_code_without_hash"), PasteCheck::Accept);
+        assert_eq!(
+            classify_paste(None, "raw_code_without_hash"),
+            PasteCheck::Accept
+        );
         assert_eq!(classify_paste(None, "code#anything"), PasteCheck::Accept);
     }
 
     #[test]
     fn classify_paste_accepts_when_expected_state_empty_string() {
         // Defensive: extract_state_param returned Some("") — treat same as None.
-        assert_eq!(classify_paste(Some(""), "code#whatever"), PasteCheck::Accept);
+        assert_eq!(
+            classify_paste(Some(""), "code#whatever"),
+            PasteCheck::Accept
+        );
     }
 
     #[test]

@@ -25,18 +25,18 @@
 //! 只校验 vault_key_hex 格式合法，不校验是否匹配 vault（parse 不需要解锁）。
 
 pub mod candidate;
-pub mod tokenize;
 pub mod rule;
+pub mod rule_anchored;
 pub mod rule_labeled;
 pub mod rule_pem;
-pub mod rule_anchored;
+pub mod tokenize;
 // v4.2 Layer 5: block-first-line natural-language title extraction.
 // Emits Kind::Title candidates which the grouper attaches to the draft owning
 // the same block (by line_range overlap). Doesn't touch credential recall —
 // see TITLE_ABLATION_REPORT for zero-regression validation on 5 dimensions.
-pub mod rule_title;
-pub mod provider_fingerprint;
 pub mod crf;
+pub mod provider_fingerprint;
+pub mod rule_title;
 // v4.1 spike migration (Stage 1): line_class 基础设施 —— LineKind 6 类 + LineFlags 9 bit
 // 现阶段未被 rule/candidate 主干消费；Stage 2-3 并入。
 pub mod line_class;
@@ -72,7 +72,9 @@ struct ParsePayload {
     max_candidates: usize,
 }
 
-fn default_max_candidates() -> usize { 5000 }
+fn default_max_candidates() -> usize {
+    5000
+}
 
 /// 文本字节上限:1 MiB。
 ///
@@ -95,10 +97,21 @@ pub fn handle(env: StdinEnvelope) {
 
     let payload: ParsePayload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
-        Err(e) => { emit_error(req_id, "I_STDIN_INVALID_JSON", format!("parse payload: {}", e)); return; }
+        Err(e) => {
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("parse payload: {}", e),
+            );
+            return;
+        }
     };
     if payload.text.is_empty() {
-        emit_error(req_id, "I_STDIN_INVALID_JSON", "parse requires non-empty text");
+        emit_error(
+            req_id,
+            "I_STDIN_INVALID_JSON",
+            "parse requires non-empty text",
+        );
         return;
     }
     if payload.text.len() > MAX_TEXT_BYTES {
@@ -139,18 +152,25 @@ fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'st
     // 命中 shape filter 才保留，避免 narrative 里 UUID 误判成 key。
     //
     // 去重策略：同 (kind, value) 已被规则抓到则跳过 —— confirmed tier 优先保留。
-    let rule_seen: std::collections::HashSet<String> = all.iter()
+    let rule_seen: std::collections::HashSet<String> = all
+        .iter()
         .map(|c| format!("{}\x00{}", c.kind.as_str(), c.value))
         .collect();
     for crf_cand in crf::extract(text) {
         let key = format!("{}\x00{}", crf_cand.kind.as_str(), crf_cand.value);
-        if rule_seen.contains(&key) { continue; }
-        if all.len() >= max { break; }
+        if rule_seen.contains(&key) {
+            continue;
+        }
+        if all.len() >= max {
+            break;
+        }
         all.push(crf_cand);
     }
 
     // 限流（超大文本 DoS 防护）
-    if all.len() > max { all.truncate(max); }
+    if all.len() > max {
+        all.truncate(max);
+    }
 
     // 重新编号 id（规则内部的 seq 和最终顺序可能不同，保证 id 稳定）
     for (i, c) in all.iter_mut().enumerate() {
@@ -160,14 +180,17 @@ fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'st
     // === H 层 Provider Fingerprint（Phase 3）===
     // 对每个 secret_like 候选跑分类器，填 provider 字段 + 调整 tier。
     // 用同文档 URL 域名做 ambiguous 消歧（比如 sk-* + moonshot.cn → kimi）。
-    let url_domains: Vec<String> = all.iter()
+    let url_domains: Vec<String> = all
+        .iter()
         .filter(|c| c.kind == candidate::Kind::Url)
         .filter_map(|c| extract_url_domain(&c.value))
         .collect();
 
     let classifier = provider_fingerprint::instance();
     for c in all.iter_mut() {
-        if c.kind != candidate::Kind::SecretLike { continue; }
+        if c.kind != candidate::Kind::SecretLike {
+            continue;
+        }
         let (entry, suggest) = classifier.classify_with_context(&c.value, &url_domains);
         if let Some(e) = entry {
             let final_id = suggest.clone().unwrap_or_else(|| e.id.clone());
@@ -181,9 +204,9 @@ fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'st
                 display: e.display.clone(),
                 tier: match e.tier {
                     provider_fingerprint::Tier::Confirmed => candidate::ProviderTier::Confirmed,
-                    provider_fingerprint::Tier::Likely    => candidate::ProviderTier::Confirmed,
+                    provider_fingerprint::Tier::Likely => candidate::ProviderTier::Confirmed,
                     provider_fingerprint::Tier::Ambiguous => candidate::ProviderTier::Ambiguous,
-                    provider_fingerprint::Tier::Warn      => candidate::ProviderTier::Warn,
+                    provider_fingerprint::Tier::Warn => candidate::ProviderTier::Warn,
                 },
                 hint: e.hint.clone(),
                 siblings: e.siblings.clone(),
@@ -241,26 +264,45 @@ fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'st
                 let mut n = 2usize;
                 loop {
                     let c = format!("{}-{}", base, n);
-                    if !used.contains(&c) { break c; }
+                    if !used.contains(&c) {
+                        break c;
+                    }
                     n += 1;
                 }
             }
         } else {
             // 其他:走 {provider}_{type}_{N} 模板
-            let prefix = d.inferred_provider.clone()
+            let prefix = d
+                .inferred_provider
+                .clone()
                 .or_else(|| d.provider_hint.clone().map(|s| s.to_lowercase()))
                 .unwrap_or_else(|| "import".to_string());
             // sanitize prefix: 仅保留 alnum + _/-,其他替换为 _
-            let clean_prefix: String = prefix.chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            let clean_prefix: String = prefix
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
                 .collect();
-            let clean_prefix = clean_prefix.trim_matches(|c| c == '_' || c == '-').to_string();
-            let clean_prefix = if clean_prefix.is_empty() { "import".to_string() } else { clean_prefix };
+            let clean_prefix = clean_prefix
+                .trim_matches(|c| c == '_' || c == '-')
+                .to_string();
+            let clean_prefix = if clean_prefix.is_empty() {
+                "import".to_string()
+            } else {
+                clean_prefix
+            };
             let type_suffix = if is_oauth { "oauth" } else { "key" };
             let mut n = 1usize;
             loop {
                 let c = format!("{}_{}_{}", clean_prefix, type_suffix, n);
-                if !used.contains(&c) { break c; }
+                if !used.contains(&c) {
+                    break c;
+                }
                 n += 1;
             }
         };
@@ -274,25 +316,39 @@ fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'st
         if let Some(family) = &d.inferred_provider {
             d.login_url = classifier.login_url_for_family(family);
 
-            let route = d.fields.base_url.as_deref()
+            let route = d
+                .fields
+                .base_url
+                .as_deref()
                 .and_then(extract_url_domain)
                 .map(|h| h.to_lowercase())
                 .and_then(|h| classifier.route_for_host(&h))
                 .or_else(|| classifier.route_for_provider(family));
-            d.official_base_url = route.map(provider_fingerprint::FingerprintClassifier::official_url_for_route);
+            d.official_base_url =
+                route.map(provider_fingerprint::FingerprintClassifier::official_url_for_route);
         }
     }
 
     // orphans schema: 既保留原 candidate id 列表 (老 UI 兼容),
     // 也暴露候选本身 (每个 orphan 是完整 Candidate JSON 的子集),新 UI 可选择消费。
     let orphan_ids: Vec<String> = orphan_cands.iter().map(|c| c.id.clone()).collect();
-    let orphans_json: Vec<serde_json::Value> = orphan_cands.iter()
+    let orphans_json: Vec<serde_json::Value> = orphan_cands
+        .iter()
         .map(|c| json!({ "id": c.id, "kind": c.kind.as_str(), "value": c.value }))
         .collect();
 
-    let candidates_json: Vec<serde_json::Value> = all.iter().map(|c| serde_json::to_value(c).unwrap()).collect();
-    let drafts_json: Vec<serde_json::Value> = drafts.iter().map(|d| serde_json::to_value(d).unwrap()).collect();
-    let groups_json: Vec<serde_json::Value> = groups.iter().map(|g| serde_json::to_value(g).unwrap()).collect();
+    let candidates_json: Vec<serde_json::Value> = all
+        .iter()
+        .map(|c| serde_json::to_value(c).unwrap())
+        .collect();
+    let drafts_json: Vec<serde_json::Value> = drafts
+        .iter()
+        .map(|d| serde_json::to_value(d).unwrap())
+        .collect();
+    let groups_json: Vec<serde_json::Value> = groups
+        .iter()
+        .map(|g| serde_json::to_value(g).unwrap())
+        .collect();
 
     Ok(json!({
         "source_hash": source_hash,
@@ -314,8 +370,16 @@ fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'st
 
 /// 从 URL 抽 domain（`https://platform.moonshot.cn/x/y` → `platform.moonshot.cn`）
 fn extract_url_domain(url: &str) -> Option<String> {
-    let after_scheme = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
-    let end = after_scheme.find(['/', '?', '#', ':']).unwrap_or(after_scheme.len());
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let end = after_scheme
+        .find(['/', '?', '#', ':'])
+        .unwrap_or(after_scheme.len());
     let domain = &after_scheme[..end];
-    if domain.is_empty() { None } else { Some(domain.to_string()) }
+    if domain.is_empty() {
+        None
+    } else {
+        Some(domain.to_string())
+    }
 }

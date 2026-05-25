@@ -27,18 +27,18 @@ pub enum ErrorCode {
     // 用于 `aikey _internal *` 子命令组的 stdin-json 协议。
     // 这些错误码通过 stdout JSON 返回给 Go local-server（不是 exit code）。
     // 新增时：同步更新 as_str() / code() 映射 + docs/VAULT_SPEC.md 错误码表。
-    InternalStdinInvalidJson,       // I_STDIN_INVALID_JSON
-    InternalStdinReadFailed,        // I_STDIN_READ_FAILED
-    InternalVaultKeyMalformed,      // I_VAULT_KEY_MALFORMED（hex 长度/格式错）
-    InternalVaultKeyInvalid,        // I_VAULT_KEY_INVALID（key 不匹配 vault）
-    InternalVaultNotInitialized,    // I_VAULT_NOT_INITIALIZED
-    InternalVaultOpenFailed,        // I_VAULT_OPEN_FAILED
-    InternalUnknownAction,          // I_UNKNOWN_ACTION（envelope.action 不认识）
-    InternalNotImplemented,         // I_NOT_IMPLEMENTED（Phase 占位）
-    InternalCredentialNotFound,     // I_CREDENTIAL_NOT_FOUND
-    InternalCredentialConflict,     // I_CREDENTIAL_CONFLICT（add 时 alias 已存在）
-    InternalParseFailed,            // I_PARSE_FAILED（解析引擎三层流水失败）
-    InternalIo,                     // I_INTERNAL（serialize/io 等意外内部错误）
+    InternalStdinInvalidJson,    // I_STDIN_INVALID_JSON
+    InternalStdinReadFailed,     // I_STDIN_READ_FAILED
+    InternalVaultKeyMalformed,   // I_VAULT_KEY_MALFORMED（hex 长度/格式错）
+    InternalVaultKeyInvalid,     // I_VAULT_KEY_INVALID（key 不匹配 vault）
+    InternalVaultNotInitialized, // I_VAULT_NOT_INITIALIZED
+    InternalVaultOpenFailed,     // I_VAULT_OPEN_FAILED
+    InternalUnknownAction,       // I_UNKNOWN_ACTION（envelope.action 不认识）
+    InternalNotImplemented,      // I_NOT_IMPLEMENTED（Phase 占位）
+    InternalCredentialNotFound,  // I_CREDENTIAL_NOT_FOUND
+    InternalCredentialConflict,  // I_CREDENTIAL_CONFLICT（add 时 alias 已存在）
+    InternalParseFailed,         // I_PARSE_FAILED（解析引擎三层流水失败）
+    InternalIo,                  // I_INTERNAL（serialize/io 等意外内部错误）
 }
 
 impl ErrorCode {
@@ -112,7 +112,10 @@ impl ErrorCode {
             ErrorCode::AliasExists
         } else if msg.contains("not found") || msg.contains("does not exist") {
             ErrorCode::AliasNotFound
-        } else if msg.contains("password") || msg.contains("authentication") || msg.contains("locked") {
+        } else if msg.contains("password")
+            || msg.contains("authentication")
+            || msg.contains("locked")
+        {
             ErrorCode::VaultLocked
         } else if msg.contains("profile") {
             ErrorCode::NoActiveProfile
@@ -163,19 +166,31 @@ impl Error {
     }
 
     pub fn alias_exists(name: &str) -> Self {
-        Self::new(ErrorCode::AliasExists, format!("Secret already exists: {}", name))
+        Self::new(
+            ErrorCode::AliasExists,
+            format!("Secret already exists: {}", name),
+        )
     }
 
     pub fn alias_not_found(name: &str) -> Self {
-        Self::new(ErrorCode::AliasNotFound, format!("Secret not found: {}", name))
+        Self::new(
+            ErrorCode::AliasNotFound,
+            format!("Secret not found: {}", name),
+        )
     }
 
     pub fn vault_locked() -> Self {
-        Self::new(ErrorCode::VaultLocked, "Vault is locked or password is incorrect")
+        Self::new(
+            ErrorCode::VaultLocked,
+            "Vault is locked or password is incorrect",
+        )
     }
 
     pub fn no_active_profile() -> Self {
-        Self::new(ErrorCode::NoActiveProfile, "No active profile is configured")
+        Self::new(
+            ErrorCode::NoActiveProfile,
+            "No active profile is configured",
+        )
     }
 
     pub fn invalid_input(msg: impl Into<String>) -> Self {
@@ -187,11 +202,17 @@ impl Error {
     }
 
     pub fn vault_not_initialized() -> Self {
-        Self::new(ErrorCode::VaultNotInitialized, "Vault not initialized. Run any aikey command to initialize it automatically.")
+        Self::new(
+            ErrorCode::VaultNotInitialized,
+            "Vault not initialized. Run any aikey command to initialize it automatically.",
+        )
     }
 
     pub fn profile_not_found(name: &str) -> Self {
-        Self::new(ErrorCode::ProfileNotFound, format!("Profile not found: {}", name))
+        Self::new(
+            ErrorCode::ProfileNotFound,
+            format!("Profile not found: {}", name),
+        )
     }
 
     pub fn internal_error(msg: impl Into<String>) -> Self {

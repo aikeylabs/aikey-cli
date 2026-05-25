@@ -326,7 +326,9 @@ pub fn maybe_configure_backend() {
     eprintln!("  Session cache: avoid re-entering your master password for 30 minutes.");
     let is_macos = cfg!(target_os = "macos");
     if is_macos {
-        eprintln!("  [k] macOS Keychain  (secure; macOS may occasionally prompt for its own password)");
+        eprintln!(
+            "  [k] macOS Keychain  (secure; macOS may occasionally prompt for its own password)"
+        );
         eprintln!("  [f] Encrypted file  (no system prompts; stored in ~/.aikey, chmod 600)");
         eprintln!("  [n] Disabled        (always prompt)");
         eprint!("  Choice [K/f/n] (default K): ");
@@ -364,7 +366,10 @@ pub fn maybe_configure_backend() {
         }
     };
     crate::storage::set_session_backend_pref(pref);
-    eprintln!("  Session backend set to '{}'. You can change this with: aikey config session-backend", pref);
+    eprintln!(
+        "  Session backend set to '{}'. You can change this with: aikey config session-backend",
+        pref
+    );
 }
 
 /// Cache the master password and create a new 30-minute session.
@@ -557,7 +562,10 @@ mod tests {
             invalidate();
 
             let path = session_meta_path().unwrap();
-            assert!(!path.exists(), "meta file should be removed after invalidate");
+            assert!(
+                !path.exists(),
+                "meta file should be removed after invalidate"
+            );
         });
     }
 }

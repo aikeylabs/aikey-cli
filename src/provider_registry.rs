@@ -131,7 +131,8 @@ fn state() -> &'static RegistryState {
             Box::leak(boxed)
         }
         fn leak_extras(v: Vec<ExtraEnvVarRaw>) -> &'static [(&'static str, &'static str)] {
-            let boxed: Box<[(&'static str, &'static str)]> = v.into_iter()
+            let boxed: Box<[(&'static str, &'static str)]> = v
+                .into_iter()
                 .map(|e| (leak(e.var), leak(e.value)))
                 .collect();
             Box::leak(boxed)
@@ -266,8 +267,12 @@ pub fn family_display(family: &str) -> (&'static str, Option<&'static str>) {
     for e in &s.entries {
         if e.family == family {
             count += 1;
-            if count == 1 { sole = Some(e); }
-            if count > 1 { break; }
+            if count == 1 {
+                sole = Some(e);
+            }
+            if count > 1 {
+                break;
+            }
         }
     }
     match count {
@@ -308,7 +313,11 @@ mod tests {
     fn registry_loads_without_panic() {
         let es = entries();
         assert!(!es.is_empty(), "registry loaded zero entries");
-        assert!(es.len() >= 14, "expected >= 14 entries after P0+P1, got {}", es.len());
+        assert!(
+            es.len() >= 14,
+            "expected >= 14 entries after P0+P1, got {}",
+            es.len()
+        );
     }
 
     #[test]
@@ -343,7 +352,11 @@ mod tests {
         assert_eq!(code, "custom-aggregator");
         // Second call returns the same 'static str (cached)
         let code2 = canonical("custom-aggregator");
-        assert_eq!(code.as_ptr(), code2.as_ptr(), "cache should return same ptr");
+        assert_eq!(
+            code.as_ptr(),
+            code2.as_ptr(),
+            "cache should return same ptr"
+        );
     }
 
     #[test]
@@ -411,11 +424,20 @@ mod tests {
     #[test]
     fn kimi_has_extra_env_vars_for_sdk() {
         let e = lookup("kimi").unwrap();
-        assert!(e.extra_env_vars.iter().any(|(k, _)| *k == "KIMI_MODEL_NAME"));
-        assert!(e.extra_env_vars.iter().any(|(k, _)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE"));
+        assert!(e
+            .extra_env_vars
+            .iter()
+            .any(|(k, _)| *k == "KIMI_MODEL_NAME"));
+        assert!(e
+            .extra_env_vars
+            .iter()
+            .any(|(k, _)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE"));
         // moonshot shares the same extras (same SDK expectations).
         let m = lookup("moonshot").unwrap();
-        assert!(m.extra_env_vars.iter().any(|(k, _)| *k == "KIMI_MODEL_NAME"));
+        assert!(m
+            .extra_env_vars
+            .iter()
+            .any(|(k, _)| *k == "KIMI_MODEL_NAME"));
     }
 
     #[test]

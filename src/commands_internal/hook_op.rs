@@ -19,9 +19,9 @@ use std::io::{self, Read, Write};
 
 use serde::Deserialize;
 
-use crate::commands_account::{wire_rc_with_consent, HookFailureReason, shell_rc_has_aikey_block};
 use super::internal_log;
 use super::protocol::ResultEnvelope;
+use crate::commands_account::{shell_rc_has_aikey_block, wire_rc_with_consent, HookFailureReason};
 
 #[derive(Debug, Deserialize)]
 struct HookOpEnvelope {

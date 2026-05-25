@@ -71,7 +71,6 @@ fn re_jwt() -> &'static Regex {
 
 /// 从原文抽取所有候选（已 dedup + 合并四层）
 pub fn rule_extract(text: &str) -> Vec<Candidate> {
-
     let mut cands: Vec<Candidate> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Why dedup by (kind, value): 同 value 可能被多条 regex 同时命中（sk-ant-xxx 也匹配 sk-），避免重复
@@ -156,9 +155,15 @@ fn push_matches_guarded(
     seen: &mut std::collections::HashSet<String>,
 ) {
     for m in re.find_iter(text) {
-        if is_comment_at_offset(text, m.start()) { continue; }
-        if is_in_reject_context(text, m.start()) { continue; }
-        if is_placeholder_token(m.as_str()) { continue; }
+        if is_comment_at_offset(text, m.start()) {
+            continue;
+        }
+        if is_in_reject_context(text, m.start()) {
+            continue;
+        }
+        if is_placeholder_token(m.as_str()) {
+            continue;
+        }
         try_push(cands, seen, kind, m.as_str(), Some([m.start(), m.end()]));
     }
 }
@@ -194,9 +199,13 @@ pub(super) fn try_push(
 /// rule_anchored / rule_labeled 用它过滤"已被 Layer 1 抓走"的 token
 pub(super) fn looks_like_known_secret(s: &str) -> bool {
     let lc = s.to_lowercase();
-    lc.starts_with("sk-") || lc.starts_with("xai-") || lc.starts_with("rk-")
-        || lc.starts_with("ghp_") || lc.starts_with("akia")
-        || lc.starts_with("sg.") || lc.starts_with("eyj")
+    lc.starts_with("sk-")
+        || lc.starts_with("xai-")
+        || lc.starts_with("rk-")
+        || lc.starts_with("ghp_")
+        || lc.starts_with("akia")
+        || lc.starts_with("sg.")
+        || lc.starts_with("eyj")
 }
 
 // ============ `----` 分隔 password 启发式 ============
@@ -208,9 +217,14 @@ fn dash_separated_password_heuristic(
     seen: &mut std::collections::HashSet<String>,
 ) {
     for line in text.lines() {
-        if !line.contains("----") { continue; }
+        if !line.contains("----") {
+            continue;
+        }
         // v4.1 ISSUE-4: 注释行的 dash_split password 启发式跳过
-        if super::line_class::line_class(line).flags.contains(super::line_class::LineFlags::IS_COMMENT) {
+        if super::line_class::line_class(line)
+            .flags
+            .contains(super::line_class::LineFlags::IS_COMMENT)
+        {
             continue;
         }
         let parts: Vec<&str> = line.split("----").map(str::trim).collect();
@@ -234,13 +248,20 @@ fn pipe_separated_password_heuristic(
     seen: &mut std::collections::HashSet<String>,
 ) {
     for line in text.lines() {
-        if !line.contains(" | ") { continue; }
+        if !line.contains(" | ") {
+            continue;
+        }
         // v4.1 ISSUE-4: 注释行跳过
-        if super::line_class::line_class(line).flags.contains(super::line_class::LineFlags::IS_COMMENT) {
+        if super::line_class::line_class(line)
+            .flags
+            .contains(super::line_class::LineFlags::IS_COMMENT)
+        {
             continue;
         }
         let parts: Vec<&str> = line.split(" | ").map(str::trim).collect();
-        if parts.len() < 3 { continue; }
+        if parts.len() < 3 {
+            continue;
+        }
         for (i, p) in parts.iter().enumerate() {
             if re_email.is_match(p) && i + 1 < parts.len() {
                 let pwd = parts[i + 1];
@@ -259,19 +280,29 @@ fn explicit_label_password_heuristic(
 ) {
     // label 后紧跟冒号 / 等号的形态
     let labels_with_punct: &[&str] = &[
-        "\u{5BC6}\u{7801}:", "\u{5BC6}\u{7801}\u{FF1A}",
-        "password:", "pass:", "passwd:", "pwd:", "pw:",
-        "pw=", "pass=", "password=", "passwd=", "pwd=",
+        "\u{5BC6}\u{7801}:",
+        "\u{5BC6}\u{7801}\u{FF1A}",
+        "password:",
+        "pass:",
+        "passwd:",
+        "pwd:",
+        "pw:",
+        "pw=",
+        "pass=",
+        "password=",
+        "passwd=",
+        "pwd=",
         "login:",
     ];
     // label 后紧跟空格的形态
-    let labels_with_space: &[&str] = &[
-        "\u{5BC6}\u{7801} ", "password ", "pwd ", "pass ",
-    ];
+    let labels_with_space: &[&str] = &["\u{5BC6}\u{7801} ", "password ", "pwd ", "pass "];
 
     for line in text.lines() {
         // v4.1 ISSUE-4: 注释行跳过 label password 启发式
-        if super::line_class::line_class(line).flags.contains(super::line_class::LineFlags::IS_COMMENT) {
+        if super::line_class::line_class(line)
+            .flags
+            .contains(super::line_class::LineFlags::IS_COMMENT)
+        {
             continue;
         }
         let lower = line.to_lowercase();
@@ -302,28 +333,59 @@ fn explicit_label_password_heuristic(
 fn first_token_stripped(s: &str) -> Option<String> {
     let tok = s.trim().split_whitespace().next()?.to_string();
     let tok = tok.trim_matches(|c: char| {
-        c == '*' || c == '`' || c == '"' || c == '\''
-            || c == ',' || c == '.' || c == ';' || c == '|' || c == ':' || c == '~'
-            || c == '[' || c == ']' || c == '(' || c == ')'
+        c == '*'
+            || c == '`'
+            || c == '"'
+            || c == '\''
+            || c == ','
+            || c == '.'
+            || c == ';'
+            || c == '|'
+            || c == ':'
+            || c == '~'
+            || c == '['
+            || c == ']'
+            || c == '('
+            || c == ')'
     });
-    if tok.is_empty() { None } else { Some(tok.to_string()) }
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok.to_string())
+    }
 }
 
 /// 判断一个字符串是否形态上像 password（非已知 secret、长度合理、含字母）
 fn is_plausible_password(s: &str) -> bool {
     use super::v41_guards::{is_placeholder_token, token_has_cjk_or_fullwidth};
     let len = s.chars().count();
-    if len < 3 || len > 64 { return false; }
-    if looks_like_known_secret(s) { return false; }
-    if s.contains('@') { return false; } // 不是 email
-    if s.starts_with("http") { return false; } // 不是 URL
-    // v4.1 ISSUE-3: CJK / 全角标点 不是真 password（中文描述文字被误抓的 FP 源头）
-    if token_has_cjk_or_fullwidth(s) { return false; }
+    if len < 3 || len > 64 {
+        return false;
+    }
+    if looks_like_known_secret(s) {
+        return false;
+    }
+    if s.contains('@') {
+        return false;
+    } // 不是 email
+    if s.starts_with("http") {
+        return false;
+    } // 不是 URL
+      // v4.1 ISSUE-3: CJK / 全角标点 不是真 password（中文描述文字被误抓的 FP 源头）
+    if token_has_cjk_or_fullwidth(s) {
+        return false;
+    }
     // v4.1 placeholder denylist: changeme / your_api_key / sk-example 等占位不算 password
-    if is_placeholder_token(s) { return false; }
+    if is_placeholder_token(s) {
+        return false;
+    }
     // v4.1 ISSUE-3 补丁: `email/password` 类描述性 slash token 不是 password
-    if s.contains('/') { return false; }
+    if s.contains('/') {
+        return false;
+    }
     // v4.1 M4 post-fix: trailing `_-` 几乎必是 `...truncated_...` ellipsis 截断
-    if s.ends_with('_') || s.ends_with('-') { return false; }
+    if s.ends_with('_') || s.ends_with('-') {
+        return false;
+    }
     true
 }

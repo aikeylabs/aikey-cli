@@ -114,8 +114,12 @@ fn infer_provider_from_url(url: &str) -> Option<String> {
 
 fn normalize_url(u: &str) -> String {
     let mut s = u.to_string();
-    if let Some(q) = s.find('?') { s.truncate(q); }
-    if let Some(h) = s.find('#') { s.truncate(h); }
+    if let Some(q) = s.find('?') {
+        s.truncate(q);
+    }
+    if let Some(h) = s.find('#') {
+        s.truncate(h);
+    }
     s.trim_end_matches('/').to_string()
 }
 
@@ -156,11 +160,21 @@ fn classify_gap(
     anchor_block: usize,
     blocks: &[Block],
 ) -> BlockGap {
-    let Some(db) = draft_block else { return BlockGap::Far; };
-    if db == anchor_block { return BlockGap::Same; }
-    if anchor_block == usize::MAX { return BlockGap::Far; }
-    if anchor_block >= db { return BlockGap::Far; }
-    if db - anchor_block > 1 { return BlockGap::Far; }
+    let Some(db) = draft_block else {
+        return BlockGap::Far;
+    };
+    if db == anchor_block {
+        return BlockGap::Same;
+    }
+    if anchor_block == usize::MAX {
+        return BlockGap::Far;
+    }
+    if anchor_block >= db {
+        return BlockGap::Far;
+    }
+    if db - anchor_block > 1 {
+        return BlockGap::Far;
+    }
 
     let lines: Vec<&str> = text.lines().collect();
     let gap_start = blocks[anchor_block].end_line + 1;
@@ -168,7 +182,9 @@ fn classify_gap(
     let mut saw_separator = false;
     let mut saw_title = false;
     for ln in gap_start..gap_end {
-        if ln >= lines.len() { continue; }
+        if ln >= lines.len() {
+            continue;
+        }
         let k = classify_line(lines[ln]);
         match k {
             LineKind::Separator => saw_separator = true,
@@ -245,13 +261,19 @@ fn find_best_url(
     for a in anchors {
         let gap = classify_gap(text, draft_block, a.block_id, blocks);
         let d = gap.score();
-        if d == 0.0 { continue; }
+        if d == 0.0 {
+            continue;
+        }
         let anchor_provider = infer_provider_from_url(&a.url);
         let pm = classify_match(Some(draft_provider.as_str()), anchor_provider.as_deref());
         let p = pm.score();
-        if p == 0.0 { continue; }
+        if p == 0.0 {
+            continue;
+        }
         let score = d * p;
-        if score < STICKY_THRESHOLD { continue; }
+        if score < STICKY_THRESHOLD {
+            continue;
+        }
 
         let reason = match gap {
             BlockGap::Same => {
@@ -293,14 +315,18 @@ pub fn cluster_endpoints(
     let mut key_to_idx: HashMap<(String, Option<String>), usize> = HashMap::new();
 
     for draft in drafts {
-        let (base_url, reason, conf) =
-            find_best_url(text, draft, &url_anchors, blocks, registry);
+        let (base_url, reason, conf) = find_best_url(text, draft, &url_anchors, blocks, registry);
         let provider = Some(normalize_provider_with_registry(draft, registry));
-        let key = (provider.clone().unwrap(), base_url.as_ref().map(|u| normalize_url(u)));
+        let key = (
+            provider.clone().unwrap(),
+            base_url.as_ref().map(|u| normalize_url(u)),
+        );
 
         if let Some(&idx) = key_to_idx.get(&key) {
             groups[idx].member_draft_ids.push(draft.id.clone());
-            if conf < groups[idx].confidence { groups[idx].confidence = conf; }
+            if conf < groups[idx].confidence {
+                groups[idx].confidence = conf;
+            }
         } else {
             let next_id = groups.len() + 1;
             let idx = groups.len();
@@ -321,10 +347,10 @@ pub fn cluster_endpoints(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::commands_internal::parse::candidate::{make_id, Candidate, Kind, Tier as CTier};
     use super::super::block::split_into_blocks;
     use super::super::group_candidates;
+    use super::*;
+    use crate::commands_internal::parse::candidate::{make_id, Candidate, Kind, Tier as CTier};
 
     fn cand(kind: Kind, value: &str) -> Candidate {
         Candidate {
@@ -347,14 +373,20 @@ mod tests {
         let cands = vec![
             cand(Kind::Email, "alice@acme.io"),
             cand(Kind::Url, "https://api.anthropic.com/v1"),
-            cand(Kind::SecretLike, "sk-ant-api03-Fake_AAA_BBB_CCC_DDD_EEE_FFF_GGG_HHH_III_JJJ_KKK_LLL_valid"),
+            cand(
+                Kind::SecretLike,
+                "sk-ant-api03-Fake_AAA_BBB_CCC_DDD_EEE_FFF_GGG_HHH_III_JJJ_KKK_LLL_valid",
+            ),
         ];
         let (drafts, _) = group_candidates(text, &cands);
         let blocks = split_into_blocks(text);
         let groups = cluster_endpoints(text, &drafts, &blocks);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].reason, ClusterReason::Explicit);
-        assert_eq!(groups[0].base_url.as_deref(), Some("https://api.anthropic.com/v1"));
+        assert_eq!(
+            groups[0].base_url.as_deref(),
+            Some("https://api.anthropic.com/v1")
+        );
         assert_eq!(groups[0].provider.as_deref(), Some("anthropic"));
     }
 
@@ -364,15 +396,23 @@ mod tests {
         let text = "OpenAI:\nhttps://api.openai.com/v1\nsk-proj-FakeKey_A_aBcDeFgHiJ_kLmNoPqRsT_uVwXyZ_1234567890_abcdef\nsk-proj-FakeKey_B_xYzWvUtSrQ_pOnMlKjIhG_fEdCbA_0987654321_fedcba";
         let cands = vec![
             cand(Kind::Url, "https://api.openai.com/v1"),
-            cand(Kind::SecretLike, "sk-proj-FakeKey_A_aBcDeFgHiJ_kLmNoPqRsT_uVwXyZ_1234567890_abcdef"),
-            cand(Kind::SecretLike, "sk-proj-FakeKey_B_xYzWvUtSrQ_pOnMlKjIhG_fEdCbA_0987654321_fedcba"),
+            cand(
+                Kind::SecretLike,
+                "sk-proj-FakeKey_A_aBcDeFgHiJ_kLmNoPqRsT_uVwXyZ_1234567890_abcdef",
+            ),
+            cand(
+                Kind::SecretLike,
+                "sk-proj-FakeKey_B_xYzWvUtSrQ_pOnMlKjIhG_fEdCbA_0987654321_fedcba",
+            ),
         ];
         let (drafts, _) = group_candidates(text, &cands);
         let blocks = split_into_blocks(text);
         let groups = cluster_endpoints(text, &drafts, &blocks);
         assert!(!groups.is_empty(), "expected at least 1 group");
         // 至少应有一个 openai group 包含两 drafts
-        let openai_group = groups.iter().find(|g| g.provider.as_deref() == Some("openai"));
+        let openai_group = groups
+            .iter()
+            .find(|g| g.provider.as_deref() == Some("openai"));
         assert!(openai_group.is_some(), "expected openai group");
         assert!(openai_group.unwrap().member_draft_ids.len() >= 1);
     }
@@ -382,21 +422,35 @@ mod tests {
         let text = "claude:\nhttps://api.anthropic.com/v1\nsk-ant-api03-Claude_Key_A_aBcDeFgHiJk_LmNoPqRsT_uVwXyZ_RealishFormat_123\n\nopenai:\nhttps://api.openai.com/v1\nsk-proj-OpenAI_Key_A_xYzWvUtSrQp_OnMlKjIhG_fEdCbA_DifferentFormat_456_fin";
         let cands = vec![
             cand(Kind::Url, "https://api.anthropic.com/v1"),
-            cand(Kind::SecretLike, "sk-ant-api03-Claude_Key_A_aBcDeFgHiJk_LmNoPqRsT_uVwXyZ_RealishFormat_123"),
+            cand(
+                Kind::SecretLike,
+                "sk-ant-api03-Claude_Key_A_aBcDeFgHiJk_LmNoPqRsT_uVwXyZ_RealishFormat_123",
+            ),
             cand(Kind::Url, "https://api.openai.com/v1"),
-            cand(Kind::SecretLike, "sk-proj-OpenAI_Key_A_xYzWvUtSrQp_OnMlKjIhG_fEdCbA_DifferentFormat_456_fin"),
+            cand(
+                Kind::SecretLike,
+                "sk-proj-OpenAI_Key_A_xYzWvUtSrQp_OnMlKjIhG_fEdCbA_DifferentFormat_456_fin",
+            ),
         ];
         let (drafts, _) = group_candidates(text, &cands);
         let blocks = split_into_blocks(text);
         let groups = cluster_endpoints(text, &drafts, &blocks);
         // 至少 2 groups (anthropic / openai)
-        assert!(groups.len() >= 2, "expected ≥2 groups, got {}", groups.len());
+        assert!(
+            groups.len() >= 2,
+            "expected ≥2 groups, got {}",
+            groups.len()
+        );
     }
 
     #[test]
     fn draft_without_url_default_group() {
-        let text = "just some note\nsk-ant-api03-LonelyKey_Anthropic_NoUrlNearby_0000_1111_2222_3333_fin";
-        let cands = vec![cand(Kind::SecretLike, "sk-ant-api03-LonelyKey_Anthropic_NoUrlNearby_0000_1111_2222_3333_fin")];
+        let text =
+            "just some note\nsk-ant-api03-LonelyKey_Anthropic_NoUrlNearby_0000_1111_2222_3333_fin";
+        let cands = vec![cand(
+            Kind::SecretLike,
+            "sk-ant-api03-LonelyKey_Anthropic_NoUrlNearby_0000_1111_2222_3333_fin",
+        )];
         let (drafts, _) = group_candidates(text, &cands);
         let blocks = split_into_blocks(text);
         let groups = cluster_endpoints(text, &drafts, &blocks);
@@ -407,12 +461,18 @@ mod tests {
 
     #[test]
     fn normalize_url_strips_query_and_trailing_slash() {
-        assert_eq!(normalize_url("https://api.openai.com/v1/"), "https://api.openai.com/v1");
+        assert_eq!(
+            normalize_url("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1"
+        );
         assert_eq!(
             normalize_url("https://api.openai.com/v1?key=abc#frag"),
             "https://api.openai.com/v1"
         );
-        assert_eq!(normalize_url("https://api.openai.com"), "https://api.openai.com");
+        assert_eq!(
+            normalize_url("https://api.openai.com"),
+            "https://api.openai.com"
+        );
     }
 
     #[test]

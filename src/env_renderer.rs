@@ -35,10 +35,7 @@ impl EnvRenderer {
 
     /// Merge new variables with existing .env file content
     /// Per Stage 0 P0 requirement: .env must NEVER contain provider secrets.
-    pub fn merge_env_file(
-        existing_content: Option<&str>,
-        resolved: &[ResolvedVar],
-    ) -> String {
+    pub fn merge_env_file(existing_content: Option<&str>, resolved: &[ResolvedVar]) -> String {
         let mut lines = Vec::new();
         let mut processed_keys = std::collections::HashSet::new();
 
@@ -94,8 +91,7 @@ impl EnvRenderer {
             Self::render_env_file(resolved)
         };
 
-        fs::write(path, content)
-            .map_err(|e| format!("Failed to write .env file: {}", e))?;
+        fs::write(path, content).map_err(|e| format!("Failed to write .env file: {}", e))?;
 
         Ok(())
     }
@@ -194,14 +190,12 @@ mod tests {
 
     #[test]
     fn test_merge_env_file_no_existing() {
-        let resolved = vec![
-            ResolvedVar {
-                name: "AIKEY_PROFILE".to_string(),
-                value: Some("work".to_string()),
-                source: VarSource::Profile,
-                is_sensitive: false,
-            },
-        ];
+        let resolved = vec![ResolvedVar {
+            name: "AIKEY_PROFILE".to_string(),
+            value: Some("work".to_string()),
+            source: VarSource::Profile,
+            is_sensitive: false,
+        }];
 
         let content = EnvRenderer::merge_env_file(None, &resolved);
         assert_eq!(content, "AIKEY_PROFILE=work");
@@ -210,14 +204,12 @@ mod tests {
     #[test]
     fn test_merge_env_file_preserves_comments() {
         let existing = "# This is a comment\nAIKEY_PROJECT=old_value\n# Another comment\nUNKNOWN_KEY=keep_this";
-        let resolved = vec![
-            ResolvedVar {
-                name: "AIKEY_PROJECT".to_string(),
-                value: Some("new_value".to_string()),
-                source: VarSource::Profile,
-                is_sensitive: false,
-            },
-        ];
+        let resolved = vec![ResolvedVar {
+            name: "AIKEY_PROJECT".to_string(),
+            value: Some("new_value".to_string()),
+            source: VarSource::Profile,
+            is_sensitive: false,
+        }];
 
         let content = EnvRenderer::merge_env_file(Some(existing), &resolved);
         assert!(content.contains("# This is a comment"));

@@ -141,24 +141,25 @@ fn log_dir() -> PathBuf {
 }
 
 fn ensure_log_file() -> Option<&'static Mutex<std::fs::File>> {
-    LOG_FILE.get_or_init(|| {
-        let dir = log_dir();
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("current.jsonl");
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap_or_else(|_| {
-                // If we can't open the log file, open /dev/null as a sink.
-                OpenOptions::new()
-                    .write(true)
-                    .open(if cfg!(unix) { "/dev/null" } else { "NUL" })
-                    .expect("cannot open null device")
-            });
-        Mutex::new(file)
-    })
-    .into()
+    LOG_FILE
+        .get_or_init(|| {
+            let dir = log_dir();
+            let _ = fs::create_dir_all(&dir);
+            let path = dir.join("current.jsonl");
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap_or_else(|_| {
+                    // If we can't open the log file, open /dev/null as a sink.
+                    OpenOptions::new()
+                        .write(true)
+                        .open(if cfg!(unix) { "/dev/null" } else { "NUL" })
+                        .expect("cannot open null device")
+                });
+            Mutex::new(file)
+        })
+        .into()
 }
 
 /// Writes one structured JSON line to `~/.aikey/logs/aikey-cli/current.jsonl`.
@@ -215,12 +216,31 @@ pub fn write_log(
 
 /// Convenience macro-like function: log at INFO with an event name.
 pub fn log_event(event_name: &str, message: &str) {
-    write_log(Level::Info, message, Some(event_name), None, None, BTreeMap::new());
+    write_log(
+        Level::Info,
+        message,
+        Some(event_name),
+        None,
+        None,
+        BTreeMap::new(),
+    );
 }
 
 /// Convenience function: log a command failure with error context.
-pub fn log_error_event(event_name: &str, message: &str, error_code: Option<&str>, error_msg: Option<&str>) {
-    write_log(Level::Error, message, Some(event_name), error_code, error_msg, BTreeMap::new());
+pub fn log_error_event(
+    event_name: &str,
+    message: &str,
+    error_code: Option<&str>,
+    error_msg: Option<&str>,
+) {
+    write_log(
+        Level::Error,
+        message,
+        Some(event_name),
+        error_code,
+        error_msg,
+        BTreeMap::new(),
+    );
 }
 
 // ── Event name constants ──────────────────────────────────────────────────────

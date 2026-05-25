@@ -3,7 +3,7 @@
 //! Extracted from `storage.rs` for maintainability — all items are re-exported
 //! by the parent module so existing callers are unaffected.
 
-use super::{open_connection, open_connection_readonly, get_vault_path};
+use super::{get_vault_path, open_connection, open_connection_readonly};
 use crate::credential_type::CredentialType;
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
@@ -23,11 +23,11 @@ use serde::{Deserialize, Serialize};
 pub struct PlatformAccount {
     pub account_id: String,
     pub email: String,
-    pub jwt_token: String,         // current access_token (Bearer)
+    pub jwt_token: String, // current access_token (Bearer)
     pub control_url: String,
     pub logged_in_at: i64,
-    pub refresh_token: Option<String>,    // OAuth refresh token; None on legacy rows
-    pub token_expires_at: Option<i64>,    // Unix epoch when access_token expires
+    pub refresh_token: Option<String>, // OAuth refresh token; None on legacy rows
+    pub token_expires_at: Option<i64>, // Unix epoch when access_token expires
 }
 
 /// Upserts the singleton platform_account row (id = 1).
@@ -109,7 +109,14 @@ pub fn save_oauth_session(
              (id, account_id, email, jwt_token, control_url, logged_in_at,
               refresh_token, token_expires_at)
          VALUES (1, ?1, ?2, ?3, ?4, strftime('%s', 'now'), ?5, ?6)",
-        params![account_id, email, access_token, control_url, refresh_token, token_expires_at],
+        params![
+            account_id,
+            email,
+            access_token,
+            control_url,
+            refresh_token,
+            token_expires_at
+        ],
     )
     .map_err(|e| format!("Failed to save OAuth session: {}", e))?;
     Ok(())
@@ -318,12 +325,13 @@ pub fn disable_keys_for_account_scope(new_account_id: &str) -> Result<(), String
 /// Clears all three active key config rows (no key active).
 pub fn clear_active_key_config() -> Result<(), String> {
     let conn = open_connection()?;
-    for k in &[ACTIVE_KEY_TYPE_KEY, ACTIVE_KEY_REF_KEY, ACTIVE_KEY_PROVIDERS_KEY] {
-        conn.execute(
-            "DELETE FROM config WHERE key = ?1",
-            params![k],
-        )
-        .map_err(|e| format!("Failed to clear active key config '{}': {}", k, e))?;
+    for k in &[
+        ACTIVE_KEY_TYPE_KEY,
+        ACTIVE_KEY_REF_KEY,
+        ACTIVE_KEY_PROVIDERS_KEY,
+    ] {
+        conn.execute("DELETE FROM config WHERE key = ?1", params![k])
+            .map_err(|e| format!("Failed to clear active key config '{}': {}", k, e))?;
     }
     Ok(())
 }
@@ -346,7 +354,8 @@ pub fn get_text_config(key: &str) -> Option<String> {
         "SELECT CAST(value AS TEXT) FROM config WHERE key = ?",
         params![key],
         |row| row.get::<_, String>(0),
-    ).ok()
+    )
+    .ok()
 }
 
 /// Write a plain-text config value. Silent on failure.
@@ -503,10 +512,10 @@ pub struct VirtualKeyCacheEntry {
 /// the key is accepted.
 pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), String> {
     let conn = open_connection()?;
-    let supported_providers_json = serde_json::to_string(&entry.supported_providers)
-        .unwrap_or_else(|_| "[]".to_string());
-    let provider_base_urls_json = serde_json::to_string(&entry.provider_base_urls)
-        .unwrap_or_else(|_| "{}".to_string());
+    let supported_providers_json =
+        serde_json::to_string(&entry.supported_providers).unwrap_or_else(|_| "[]".to_string());
+    let provider_base_urls_json =
+        serde_json::to_string(&entry.provider_base_urls).unwrap_or_else(|_| "{}".to_string());
     conn.execute(
         "INSERT INTO managed_virtual_keys_cache (
              virtual_key_id, org_id, seat_id, alias,
@@ -582,25 +591,31 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
 
 /// Parses a JSON array string into a `Vec<String>`, returning empty vec on failure.
 fn parse_providers_json(json: Option<String>) -> Vec<String> {
-    json.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    json.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Parses a JSON object string into a `HashMap<String, String>`, returning empty map on failure.
 fn parse_base_urls_json(json: Option<String>) -> std::collections::HashMap<String, String> {
-    json.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    json.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
 }
 
 /// Returns all cached virtual key entries (write connection with migrations).
 pub fn list_virtual_key_cache() -> Result<Vec<VirtualKeyCacheEntry>, String> {
     let db_path = get_vault_path()?;
-    if !db_path.exists() { return Ok(vec![]); }
+    if !db_path.exists() {
+        return Ok(vec![]);
+    }
     query_virtual_key_cache(&open_connection()?)
 }
 
 /// Returns all cached virtual key entries (read-only, no migrations).
 pub fn list_virtual_key_cache_readonly() -> Result<Vec<VirtualKeyCacheEntry>, String> {
     let db_path = get_vault_path()?;
-    if !db_path.exists() { return Ok(vec![]); }
+    if !db_path.exists() {
+        return Ok(vec![]);
+    }
     query_virtual_key_cache(&open_connection_readonly()?)
 }
 
@@ -615,8 +630,7 @@ pub fn list_virtual_key_cache_readonly() -> Result<Vec<VirtualKeyCacheEntry>, St
 // the column for read-only callers. The fallback prepare lets the
 // read-only client serve old vaults uniformly while the next write opens
 // a write conn and triggers ensure_column.
-const VK_CACHE_COLUMNS_FULL: &str =
-    "virtual_key_id, org_id, seat_id, alias, \
+const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
      credential_id, credential_revision, virtual_key_revision, \
      key_status, share_status, local_state, \
@@ -624,8 +638,7 @@ const VK_CACHE_COLUMNS_FULL: &str =
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
      provider_base_urls, owner_account_id, extra";
-const VK_CACHE_COLUMNS_LEGACY: &str =
-    "virtual_key_id, org_id, seat_id, alias, \
+const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
      credential_id, credential_revision, virtual_key_revision, \
      key_status, share_status, local_state, \
@@ -679,10 +692,12 @@ fn query_virtual_key_cache(conn: &Connection) -> Result<Vec<VirtualKeyCacheEntry
             "SELECT {} FROM managed_virtual_keys_cache ORDER BY COALESCE(local_alias, alias)",
             VK_CACHE_COLUMNS_FULL
         ))
-        .or_else(|_| conn.prepare(&format!(
-            "SELECT {} FROM managed_virtual_keys_cache ORDER BY COALESCE(local_alias, alias)",
-            VK_CACHE_COLUMNS_LEGACY
-        )))
+        .or_else(|_| {
+            conn.prepare(&format!(
+                "SELECT {} FROM managed_virtual_keys_cache ORDER BY COALESCE(local_alias, alias)",
+                VK_CACHE_COLUMNS_LEGACY
+            ))
+        })
         .map_err(|e| format!("Failed to prepare list query: {}", e))?;
 
     let rows = stmt
@@ -760,7 +775,10 @@ pub fn get_virtual_key_cache_by_alias(alias: &str) -> Result<Option<VirtualKeyCa
     match result {
         Ok(entry) => Ok(Some(entry)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(format!("Failed to get virtual key cache entry by alias: {}", e)),
+        Err(e) => Err(format!(
+            "Failed to get virtual key cache entry by alias: {}",
+            e
+        )),
     }
 }
 
@@ -803,11 +821,12 @@ pub fn get_entry_provider_code(alias: &str) -> Result<Option<String>, String> {
 /// Pass `None` to clear the provider code.
 pub fn set_entry_provider_code(alias: &str, provider_code: Option<&str>) -> Result<(), String> {
     let conn = open_connection()?;
-    let rows = conn.execute(
-        "UPDATE entries SET provider_code = ?1 WHERE alias = ?2",
-        params![provider_code, alias],
-    )
-    .map_err(|e| format!("Failed to set entry provider_code: {}", e))?;
+    let rows = conn
+        .execute(
+            "UPDATE entries SET provider_code = ?1 WHERE alias = ?2",
+            params![provider_code, alias],
+        )
+        .map_err(|e| format!("Failed to set entry provider_code: {}", e))?;
     if rows == 0 {
         return Err(format!("Entry '{}' not found", alias));
     }
@@ -829,11 +848,15 @@ pub(crate) fn set_entry_supported_providers_on_conn(
 ) -> Result<(), String> {
     let json = serde_json::to_string(providers)
         .map_err(|e| format!("Failed to serialize providers: {}", e))?;
-    let rows = conn.execute(
-        "UPDATE entries SET supported_providers = ?1 WHERE alias = ?2",
-        params![json, alias],
-    ).map_err(|e| format!("Failed to set supported_providers: {}", e))?;
-    if rows == 0 { return Err(format!("Entry '{}' not found", alias)); }
+    let rows = conn
+        .execute(
+            "UPDATE entries SET supported_providers = ?1 WHERE alias = ?2",
+            params![json, alias],
+        )
+        .map_err(|e| format!("Failed to set supported_providers: {}", e))?;
+    if rows == 0 {
+        return Err(format!("Entry '{}' not found", alias));
+    }
     Ok(())
 }
 
@@ -871,11 +894,12 @@ pub(crate) fn set_entry_base_url_on_conn(
     alias: &str,
     base_url: Option<&str>,
 ) -> Result<(), String> {
-    let rows = conn.execute(
-        "UPDATE entries SET base_url = ?1 WHERE alias = ?2",
-        params![base_url, alias],
-    )
-    .map_err(|e| format!("Failed to set entry base_url: {}", e))?;
+    let rows = conn
+        .execute(
+            "UPDATE entries SET base_url = ?1 WHERE alias = ?2",
+            params![base_url, alias],
+        )
+        .map_err(|e| format!("Failed to set entry base_url: {}", e))?;
     if rows == 0 {
         return Err(format!("Entry '{}' not found", alias));
     }
@@ -936,7 +960,7 @@ pub struct ProviderBinding {
     pub profile_id: String,
     pub provider_code: String,
     pub key_source_type: CredentialType,
-    pub key_source_ref: String,    // alias (personal), virtual_key_id (team), or provider_account_id (oauth)
+    pub key_source_ref: String, // alias (personal), virtual_key_id (team), or provider_account_id (oauth)
     pub updated_at: Option<i64>,
 }
 
@@ -958,7 +982,10 @@ pub fn list_provider_bindings_readonly(profile_id: &str) -> Result<Vec<ProviderB
     query_provider_bindings(&open_connection_readonly()?, profile_id)
 }
 
-fn query_provider_bindings(conn: &Connection, profile_id: &str) -> Result<Vec<ProviderBinding>, String> {
+fn query_provider_bindings(
+    conn: &Connection,
+    profile_id: &str,
+) -> Result<Vec<ProviderBinding>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT profile_id, provider_code, key_source_type, key_source_ref, updated_at
@@ -972,11 +999,11 @@ fn query_provider_bindings(conn: &Connection, profile_id: &str) -> Result<Vec<Pr
         .query_map(params![profile_id], |row| {
             let raw_type: String = row.get(2)?;
             Ok(ProviderBinding {
-                profile_id:      row.get(0)?,
-                provider_code:   row.get(1)?,
+                profile_id: row.get(0)?,
+                provider_code: row.get(1)?,
                 key_source_type: CredentialType::from_db_str(&raw_type),
-                key_source_ref:  row.get(3)?,
-                updated_at:      row.get(4).ok(),
+                key_source_ref: row.get(3)?,
+                updated_at: row.get(4).ok(),
             })
         })
         .map_err(|e| format!("Failed to query provider bindings: {}", e))?
@@ -1000,11 +1027,11 @@ pub fn get_provider_binding(
         |row| {
             let raw_type: String = row.get(2)?;
             Ok(ProviderBinding {
-                profile_id:      row.get(0)?,
-                provider_code:   row.get(1)?,
+                profile_id: row.get(0)?,
+                provider_code: row.get(1)?,
                 key_source_type: CredentialType::from_db_str(&raw_type),
-                key_source_ref:  row.get(3)?,
-                updated_at:      row.get(4).ok(),
+                key_source_ref: row.get(3)?,
+                updated_at: row.get(4).ok(),
             })
         },
     );
@@ -1078,16 +1105,14 @@ pub fn set_provider_binding(
     )
     .map_err(|e| format!("Failed to set provider binding: {}", e))?;
 
-    tx.commit().map_err(|e| format!("commit binding tx: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("commit binding tx: {}", e))?;
     Ok(())
 }
 
 /// Removes a provider binding from a profile.
 /// Returns true if a row was actually deleted.
-pub fn remove_provider_binding(
-    profile_id: &str,
-    provider_code: &str,
-) -> Result<bool, String> {
+pub fn remove_provider_binding(profile_id: &str, provider_code: &str) -> Result<bool, String> {
     let conn = open_connection()?;
     let rows = conn
         .execute(
@@ -1156,9 +1181,10 @@ pub fn remove_bindings_by_key_source(
         .map_err(|e| format!("Failed to prepare binding cleanup query: {}", e))?;
 
     let affected: Vec<String> = stmt
-        .query_map(params![profile_id, key_source_type, key_source_ref], |row| {
-            row.get(0)
-        })
+        .query_map(
+            params![profile_id, key_source_type, key_source_ref],
+            |row| row.get(0),
+        )
         .map_err(|e| format!("Failed to query affected bindings: {}", e))?
         .collect::<SqlResult<Vec<String>>>()
         .map_err(|e| format!("Failed to collect affected bindings: {}", e))?;
@@ -1247,18 +1273,18 @@ fn row_to_provider_account(row: &rusqlite::Row) -> rusqlite::Result<ProviderAcco
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
     Ok(ProviderAccountInfo {
         provider_account_id: row.get(0)?,
-        provider:            row.get(1)?,
-        auth_type:           row.get(2)?,
-        credential_type:     CredentialType::from_db_str(&raw_ctype),
-        status:              row.get(4)?,
-        external_id:         row.get(5)?,
-        display_identity:    row.get(6)?,
-        org_uuid:            row.get(7)?,
-        account_tier:        row.get(8)?,
-        created_at:          row.get(9)?,
-        last_used_at:        row.get(10)?,
-        use_count:           row.get(11).ok(),
-        local_alias:         row.get(12).ok().flatten(),
+        provider: row.get(1)?,
+        auth_type: row.get(2)?,
+        credential_type: CredentialType::from_db_str(&raw_ctype),
+        status: row.get(4)?,
+        external_id: row.get(5)?,
+        display_identity: row.get(6)?,
+        org_uuid: row.get(7)?,
+        account_tier: row.get(8)?,
+        created_at: row.get(9)?,
+        last_used_at: row.get(10)?,
+        use_count: row.get(11).ok(),
+        local_alias: row.get(12).ok().flatten(),
         extra,
     })
 }
@@ -1397,7 +1423,9 @@ pub fn get_provider_account(id: &str) -> Result<Option<ProviderAccountInfo>, Str
 }
 
 /// Find provider accounts by provider code (e.g., "claude", "codex", "kimi").
-pub fn get_provider_accounts_by_provider(provider: &str) -> Result<Vec<ProviderAccountInfo>, String> {
+pub fn get_provider_accounts_by_provider(
+    provider: &str,
+) -> Result<Vec<ProviderAccountInfo>, String> {
     let conn = open_connection()?;
     let mut stmt = conn
         .prepare(&format!(
@@ -1484,7 +1512,10 @@ pub fn get_provider_account_by_external_id(
     match result {
         Ok(info) => Ok(Some(info)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(format!("Failed to get provider account by external_id: {}", e)),
+        Err(e) => Err(format!(
+            "Failed to get provider account by external_id: {}",
+            e
+        )),
     }
 }
 
@@ -1526,7 +1557,11 @@ pub fn merge_oauth_extra(id: &str, json_path: &str, value_json: &str) -> Result<
 /// and only became safe to surface after the 2026-05-22 upsert refactor
 /// (see `upsert_virtual_key_cache` doc): under the old INSERT OR REPLACE
 /// every `aikey key sync` would wipe whatever this writer just wrote.
-pub fn merge_team_extra(virtual_key_id: &str, json_path: &str, value_json: &str) -> Result<usize, String> {
+pub fn merge_team_extra(
+    virtual_key_id: &str,
+    json_path: &str,
+    value_json: &str,
+) -> Result<usize, String> {
     let conn = open_connection()?;
     conn.execute(
         "UPDATE managed_virtual_keys_cache SET extra = json_set(COALESCE(extra, '{}'), ?1, json(?2)) WHERE virtual_key_id = ?3",

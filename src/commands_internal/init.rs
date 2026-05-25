@@ -14,9 +14,9 @@ use std::io::{self, Read, Write};
 use secrecy::SecretString;
 use serde::Deserialize;
 
-use crate::commands_init::core as init_core;
 use super::internal_log;
 use super::protocol::ResultEnvelope;
+use crate::commands_init::core as init_core;
 
 #[derive(Debug, Deserialize)]
 struct InitEnvelope {

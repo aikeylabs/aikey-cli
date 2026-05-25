@@ -62,10 +62,9 @@ pub fn load_config() -> Result<GlobalConfig, String> {
         return Ok(GlobalConfig::default());
     }
 
-    let content = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read global config: {}", e))?;
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse global config: {}", e))
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read global config: {}", e))?;
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse global config: {}", e))
 }
 
 pub fn save_config(config: &GlobalConfig) -> Result<(), String> {
@@ -77,8 +76,7 @@ pub fn save_config(config: &GlobalConfig) -> Result<(), String> {
 
     let content = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize global config: {}", e))?;
-    fs::write(&path, content)
-        .map_err(|e| format!("Failed to write global config: {}", e))?;
+    fs::write(&path, content).map_err(|e| format!("Failed to write global config: {}", e))?;
 
     Ok(())
 }
@@ -104,4 +102,3 @@ pub fn get_current_env() -> Result<Option<String>, String> {
     let config = load_config()?;
     Ok(config.current_env)
 }
-

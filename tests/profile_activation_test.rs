@@ -13,7 +13,7 @@
 //! ```
 
 use aikeylabs_aikey_cli::credential_type::CredentialType;
-use aikeylabs_aikey_cli::profile_activation::{self, DEFAULT_PROFILE, ReconcileOutcome};
+use aikeylabs_aikey_cli::profile_activation::{self, ReconcileOutcome, DEFAULT_PROFILE};
 use aikeylabs_aikey_cli::storage;
 use secrecy::SecretString;
 use tempfile::TempDir;
@@ -65,8 +65,7 @@ fn auto_assign_does_not_overwrite_existing_primary() {
     let _dir = setup();
 
     // Pre-populate anthropic with an existing primary.
-    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "old-key")
-        .unwrap();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "old-key").unwrap();
 
     // Now add a new key that also supports anthropic + openai.
     let assigned = profile_activation::auto_assign_primaries_for_key(
@@ -90,12 +89,9 @@ fn auto_assign_does_not_overwrite_existing_primary() {
 fn auto_assign_team_key() {
     let _dir = setup();
 
-    let assigned = profile_activation::auto_assign_primaries_for_key(
-        "team",
-        "vk_abc",
-        &["google".into()],
-    )
-    .unwrap();
+    let assigned =
+        profile_activation::auto_assign_primaries_for_key("team", "vk_abc", &["google".into()])
+            .unwrap();
 
     assert_eq!(assigned, vec!["google"]);
 
@@ -115,13 +111,13 @@ fn team_sync_reconcile_fills_gaps() {
     let _dir = setup();
 
     // anthropic already has a primary.
-    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "my-claude")
-        .unwrap();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "my-claude").unwrap();
 
     // Sync brings in a team key that supports anthropic + openai.
-    let synced = vec![
-        ("vk_team_1".to_string(), vec!["anthropic".to_string(), "openai".to_string()]),
-    ];
+    let synced = vec![(
+        "vk_team_1".to_string(),
+        vec!["anthropic".to_string(), "openai".to_string()],
+    )];
     let results =
         profile_activation::reconcile_provider_primaries_after_team_key_sync(&synced).unwrap();
 
@@ -144,9 +140,10 @@ fn team_sync_reconcile_no_op_when_all_taken() {
     storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "a").unwrap();
     storage::set_provider_binding(DEFAULT_PROFILE, "openai", "personal", "b").unwrap();
 
-    let synced = vec![
-        ("vk_x".to_string(), vec!["anthropic".to_string(), "openai".to_string()]),
-    ];
+    let synced = vec![(
+        "vk_x".to_string(),
+        vec!["anthropic".to_string(), "openai".to_string()],
+    )];
     let results =
         profile_activation::reconcile_provider_primaries_after_team_key_sync(&synced).unwrap();
 
@@ -161,16 +158,13 @@ fn team_sync_reconcile_no_op_when_all_taken() {
 fn removal_clears_binding_when_no_replacement() {
     let _dir = setup();
 
-    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "only-key")
-        .unwrap();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "only-key").unwrap();
 
     // The only personal key — no replacement available.
     // (We don't add any entries to the entries table, so find_replacement will find nothing.)
-    let actions = profile_activation::reconcile_provider_primary_after_key_removal(
-        "personal",
-        "only-key",
-    )
-    .unwrap();
+    let actions =
+        profile_activation::reconcile_provider_primary_after_key_removal("personal", "only-key")
+            .unwrap();
 
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].provider_code, "anthropic");
@@ -194,20 +188,20 @@ fn removal_promotes_replacement_personal_key() {
     storage::set_entry_supported_providers("key-b", &["anthropic".into()]).unwrap();
 
     // key-a is the current primary.
-    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "key-a")
-        .unwrap();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "key-a").unwrap();
 
     // Remove key-a.
-    let actions = profile_activation::reconcile_provider_primary_after_key_removal(
-        "personal",
-        "key-a",
-    )
-    .unwrap();
+    let actions =
+        profile_activation::reconcile_provider_primary_after_key_removal("personal", "key-a")
+            .unwrap();
 
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].provider_code, "anthropic");
     match &actions[0].outcome {
-        ReconcileOutcome::Replaced { new_source_type, new_source_ref } => {
+        ReconcileOutcome::Replaced {
+            new_source_type,
+            new_source_ref,
+        } => {
             assert_eq!(new_source_type, "personal");
             assert_eq!(new_source_ref, "key-b");
         }
@@ -233,16 +227,17 @@ fn removal_of_multi_provider_key_reconciles_each_provider() {
     storage::store_entry("backup-openai", &[0u8; 12], &[1u8; 32]).unwrap();
     storage::set_entry_supported_providers("backup-openai", &["openai".into()]).unwrap();
 
-    let actions = profile_activation::reconcile_provider_primary_after_key_removal(
-        "personal",
-        "gateway",
-    )
-    .unwrap();
+    let actions =
+        profile_activation::reconcile_provider_primary_after_key_removal("personal", "gateway")
+            .unwrap();
 
     assert_eq!(actions.len(), 2);
 
     // openai should be replaced with backup-openai.
-    let openai_action = actions.iter().find(|a| a.provider_code == "openai").unwrap();
+    let openai_action = actions
+        .iter()
+        .find(|a| a.provider_code == "openai")
+        .unwrap();
     match &openai_action.outcome {
         ReconcileOutcome::Replaced { new_source_ref, .. } => {
             assert_eq!(new_source_ref, "backup-openai");
@@ -251,8 +246,14 @@ fn removal_of_multi_provider_key_reconciles_each_provider() {
     }
 
     // anthropic has no replacement — cleared.
-    let anthropic_action = actions.iter().find(|a| a.provider_code == "anthropic").unwrap();
-    assert!(matches!(anthropic_action.outcome, ReconcileOutcome::Cleared));
+    let anthropic_action = actions
+        .iter()
+        .find(|a| a.provider_code == "anthropic")
+        .unwrap();
+    assert!(matches!(
+        anthropic_action.outcome,
+        ReconcileOutcome::Cleared
+    ));
 }
 
 // Canonicalization regression (bugfix 2026-04-25, audit follow-up):
@@ -274,24 +275,26 @@ fn replacement_search_finds_personal_entry_with_raw_oauth_provider_code() {
     storage::store_entry("legacy-claude", &[0u8; 12], &[1u8; 32]).unwrap();
     storage::set_entry_supported_providers("legacy-claude", &["claude".into()]).unwrap();
 
-    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "primary")
-        .unwrap();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "primary").unwrap();
 
-    let actions = profile_activation::reconcile_provider_primary_after_key_removal(
-        "personal",
-        "primary",
-    )
-    .unwrap();
+    let actions =
+        profile_activation::reconcile_provider_primary_after_key_removal("personal", "primary")
+            .unwrap();
 
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].provider_code, "anthropic");
     match &actions[0].outcome {
-        ReconcileOutcome::Replaced { new_source_type, new_source_ref } => {
+        ReconcileOutcome::Replaced {
+            new_source_type,
+            new_source_ref,
+        } => {
             assert_eq!(new_source_type, "personal");
-            assert_eq!(new_source_ref, "legacy-claude",
+            assert_eq!(
+                new_source_ref, "legacy-claude",
                 "raw `claude` provider on the candidate must be canonicalized to \
                  `anthropic` for the match — otherwise the replacement is silently \
-                 missed (same family as the 2026-04-25 activate bug)");
+                 missed (same family as the 2026-04-25 activate bug)"
+            );
         }
         other => panic!("Expected Replaced, got {:?}", other),
     }
@@ -305,15 +308,15 @@ fn replacement_search_finds_personal_entry_with_raw_oauth_provider_code() {
 fn refresh_writes_active_env_for_all_bindings() {
     let _dir = setup();
 
-    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "my-claude")
-        .unwrap();
-    storage::set_provider_binding(DEFAULT_PROFILE, "openai", "team", "vk_openai")
-        .unwrap();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "my-claude").unwrap();
+    storage::set_provider_binding(DEFAULT_PROFILE, "openai", "team", "vk_openai").unwrap();
 
     let result = profile_activation::refresh_implicit_profile_activation().unwrap();
 
     assert_eq!(result.activated_providers.len(), 2);
-    assert!(result.activated_providers.contains(&"anthropic".to_string()));
+    assert!(result
+        .activated_providers
+        .contains(&"anthropic".to_string()));
     assert!(result.activated_providers.contains(&"openai".to_string()));
 
     // Read the active.env file.
@@ -327,16 +330,20 @@ fn refresh_writes_active_env_for_all_bindings() {
     // Alias info still surfaces via the separate AIKEY_ACTIVE_KEYS=anthropic=my-claude,...
     assert!(contents.contains("ANTHROPIC_API_KEY=\"aikey_active_anthropic\""));
     assert!(contents.contains("OPENAI_API_KEY=\"aikey_active_openai\""));
-    assert!(contents.contains("anthropic=my-claude"),
-        "AIKEY_ACTIVE_KEYS must surface the bound personal alias for anthropic");
+    assert!(
+        contents.contains("anthropic=my-claude"),
+        "AIKEY_ACTIVE_KEYS must surface the bound personal alias for anthropic"
+    );
     assert!(contents.contains("ANTHROPIC_BASE_URL="));
     // OPENAI_BASE_URL is deliberately NOT written: Codex v0.118+ warns when it's
     // set, because Codex now reads `openai_base_url` from ~/.codex/config.toml
     // (which aikey injects via configure_codex_cli). See profile_activation.rs
     // line 51-61 for the skip_base_url rationale.
-    assert!(!contents.contains("OPENAI_BASE_URL="),
+    assert!(
+        !contents.contains("OPENAI_BASE_URL="),
         "OPENAI_BASE_URL should be omitted to avoid Codex deprecation warning, got:\n{}",
-        contents);
+        contents
+    );
 }
 
 #[test]
@@ -372,8 +379,7 @@ fn refresh_writes_empty_env_when_no_bindings() {
 #[test]
 fn refresh_writes_aikey_active_seq_near_top() {
     let _dir = setup();
-    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "my-claude")
-        .unwrap();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "my-claude").unwrap();
     profile_activation::refresh_implicit_profile_activation().unwrap();
 
     let home = std::env::var("HOME").unwrap();
@@ -384,7 +390,8 @@ fn refresh_writes_aikey_active_seq_near_top() {
     // `grep -m1 -oE 'AIKEY_ACTIVE_SEQ="[0-9]+"' ... | grep -oE '[0-9]+'`,
     // so this exact shape matters — pin both the export prefix and the
     // quoted-digits payload.
-    let line = contents.lines()
+    let line = contents
+        .lines()
         .find(|l| l.starts_with("export AIKEY_ACTIVE_SEQ="))
         .expect("active.env must contain export AIKEY_ACTIVE_SEQ= line");
     assert!(
@@ -405,7 +412,8 @@ fn refresh_writes_aikey_active_seq_near_top() {
     // We're stricter than the smoke (top 5 lines) — pin to top 3.
     let head: Vec<&str> = contents.lines().take(3).collect();
     assert!(
-        head.iter().any(|l| l.starts_with("export AIKEY_ACTIVE_SEQ=")),
+        head.iter()
+            .any(|l| l.starts_with("export AIKEY_ACTIVE_SEQ=")),
         "AIKEY_ACTIVE_SEQ must appear in the first 3 lines, got:\n{}",
         head.join("\n")
     );
@@ -414,17 +422,19 @@ fn refresh_writes_aikey_active_seq_near_top() {
 #[test]
 fn refresh_seq_advances_monotonically() {
     let _dir = setup();
-    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "k1")
-        .unwrap();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "k1").unwrap();
 
     let read_seq = || -> u64 {
         let home = std::env::var("HOME").unwrap();
         let env_path = std::path::PathBuf::from(&home).join(".aikey/active.env");
         let contents = std::fs::read_to_string(&env_path).unwrap();
-        let line = contents.lines()
+        let line = contents
+            .lines()
             .find(|l| l.starts_with("export AIKEY_ACTIVE_SEQ="))
             .expect("seq line must exist");
-        let v = line.trim_start_matches("export AIKEY_ACTIVE_SEQ=\"").trim_end_matches('"');
+        let v = line
+            .trim_start_matches("export AIKEY_ACTIVE_SEQ=\"")
+            .trim_end_matches('"');
         v.parse().expect("seq must parse as u64")
     };
 
@@ -445,8 +455,7 @@ fn refresh_seq_advances_monotonically() {
 #[test]
 fn refresh_writes_active_env_flat_for_windows() {
     let _dir = setup();
-    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "my-claude")
-        .unwrap();
+    storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "my-claude").unwrap();
     profile_activation::refresh_implicit_profile_activation().unwrap();
 
     let home = std::env::var("HOME").unwrap();
@@ -458,24 +467,39 @@ fn refresh_writes_active_env_flat_for_windows() {
     // / cmd parse it as `[Environment]::SetEnvironmentVariable($1, $2)`,
     // so any `${...}` literal would land as broken text in user env.
     for line in flat.lines() {
-        if line.is_empty() { continue; }
-        assert!(!line.starts_with("export "),
-            "flat must not contain shell `export` prefix, got: {}", line);
-        assert!(!line.contains("${"),
-            "flat must not contain shell expansion ${{...}}, got: {}", line);
+        if line.is_empty() {
+            continue;
+        }
+        assert!(
+            !line.starts_with("export "),
+            "flat must not contain shell `export` prefix, got: {}",
+            line
+        );
+        assert!(
+            !line.contains("${"),
+            "flat must not contain shell expansion ${{...}}, got: {}",
+            line
+        );
         // Each non-empty line is KEY=VALUE; nothing else.
-        assert!(line.contains('='),
-            "flat line must be KEY=VALUE, got: {}", line);
+        assert!(
+            line.contains('='),
+            "flat line must be KEY=VALUE, got: {}",
+            line
+        );
     }
 
     // Same payload as active.env but in flat form — the seq must be there
     // too so a Windows precmd-equivalent (when added) can use it.
-    assert!(flat.contains("AIKEY_ACTIVE_SEQ="),
+    assert!(
+        flat.contains("AIKEY_ACTIVE_SEQ="),
         "flat must carry AIKEY_ACTIVE_SEQ for Windows precmd parity, got:\n{}",
-        flat);
-    assert!(flat.contains("ANTHROPIC_API_KEY=aikey_active_anthropic"),
+        flat
+    );
+    assert!(
+        flat.contains("ANTHROPIC_API_KEY=aikey_active_anthropic"),
         "flat must carry the same env vars as active.env (no quoting), got:\n{}",
-        flat);
+        flat
+    );
 }
 
 #[test]
@@ -500,12 +524,20 @@ fn refresh_no_bindings_writes_flat_with_only_seq() {
 
     let home = std::env::var("HOME").unwrap();
     let flat_path = std::path::PathBuf::from(&home).join(".aikey/active.env.flat");
-    assert!(flat_path.exists(),
-        "no bindings should still write .flat (carrying AIKEY_ACTIVE_SEQ)");
+    assert!(
+        flat_path.exists(),
+        "no bindings should still write .flat (carrying AIKEY_ACTIVE_SEQ)"
+    );
 
     let flat = std::fs::read_to_string(&flat_path).unwrap();
-    assert!(flat.contains("AIKEY_ACTIVE_SEQ="),
-        ".flat with no bindings should still carry the seq, got:\n{}", flat);
-    assert!(!flat.contains("API_KEY"),
-        ".flat with no bindings must not contain provider env, got:\n{}", flat);
+    assert!(
+        flat.contains("AIKEY_ACTIVE_SEQ="),
+        ".flat with no bindings should still carry the seq, got:\n{}",
+        flat
+    );
+    assert!(
+        !flat.contains("API_KEY"),
+        ".flat with no bindings must not contain provider env, got:\n{}",
+        flat
+    );
 }

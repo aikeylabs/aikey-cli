@@ -117,7 +117,9 @@ impl UsageEvent {
         let ev_secs = self.finished_at_unix()?;
         let now_secs = now.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
         let delta = now_secs.saturating_sub(ev_secs);
-        if delta < 0 { return None; }
+        if delta < 0 {
+            return None;
+        }
         Some(Duration::from_secs(delta as u64))
     }
 }
@@ -238,7 +240,9 @@ impl Default for ScanOptions {
 /// true; the scan is then bounded purely by `max_lines`. Factored out so
 /// both `scan_wal_backward` and `collect_wal_backward` share the semantics.
 fn compute_cutoff(max_age: Option<Duration>) -> i64 {
-    let Some(max_age) = max_age else { return i64::MIN; };
+    let Some(max_age) = max_age else {
+        return i64::MIN;
+    };
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64 - max_age.as_secs() as i64)
@@ -254,7 +258,11 @@ fn compute_cutoff(max_age: Option<Duration>) -> i64 {
 /// `resolve_user_home` has a `"."` last-resort fallback so the caller
 /// never gets `None` from a missing HOME.
 pub fn default_wal_dir() -> Option<PathBuf> {
-    Some(crate::commands_account::resolve_aikey_dir().join("data").join("usage-wal"))
+    Some(
+        crate::commands_account::resolve_aikey_dir()
+            .join("data")
+            .join("usage-wal"),
+    )
 }
 
 /// Scan WAL files newest-first, invoking `match_fn` on each entry.  Returns
@@ -292,7 +300,12 @@ where
         // than the cutoff, everything inside is older still — skip the open.
         // (Disabled for simplicity: we rely on the per-entry age check
         // below, which is accurate. The file-level skip is a future optimization.)
-        let scanned = scan_file_backward(&path, cutoff_secs, opts.max_lines - lines_scanned, &mut match_fn)?;
+        let scanned = scan_file_backward(
+            &path,
+            cutoff_secs,
+            opts.max_lines - lines_scanned,
+            &mut match_fn,
+        )?;
         lines_scanned += scanned.lines;
         if let Some(found) = scanned.found {
             return Ok(Some(found));
@@ -324,20 +337,28 @@ where
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Ok(FileScanResult { found: None, lines: 0, hit_cutoff: false });
+            return Ok(FileScanResult {
+                found: None,
+                lines: 0,
+                hit_cutoff: false,
+            });
         }
         Err(e) => return Err(e),
     };
     let size = file.metadata()?.len();
     if size == 0 {
-        return Ok(FileScanResult { found: None, lines: 0, hit_cutoff: false });
+        return Ok(FileScanResult {
+            found: None,
+            lines: 0,
+            hit_cutoff: false,
+        });
     }
 
     const CHUNK: usize = 8 * 1024;
     let mut buf: Vec<u8> = Vec::with_capacity(CHUNK * 2);
     let mut pos = size;
-    let mut remainder: Vec<u8> = Vec::new();  // bytes from previous chunk that
-                                              // belonged to a line not yet terminated
+    let mut remainder: Vec<u8> = Vec::new(); // bytes from previous chunk that
+                                             // belonged to a line not yet terminated
     let mut lines_scanned = 0usize;
     let mut hit_cutoff = false;
 
@@ -363,12 +384,28 @@ where
             if combined[i] == b'\n' {
                 let line = &combined[i + 1..line_end];
                 line_end = i;
-                if line.is_empty() { continue; }
-                if let Some(res) = process_line(line, cutoff_secs, match_fn, &mut lines_scanned, &mut hit_cutoff) {
-                    return Ok(FileScanResult { found: Some(res), lines: lines_scanned, hit_cutoff });
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(res) = process_line(
+                    line,
+                    cutoff_secs,
+                    match_fn,
+                    &mut lines_scanned,
+                    &mut hit_cutoff,
+                ) {
+                    return Ok(FileScanResult {
+                        found: Some(res),
+                        lines: lines_scanned,
+                        hit_cutoff,
+                    });
                 }
                 if hit_cutoff || lines_scanned >= max_lines {
-                    return Ok(FileScanResult { found: None, lines: lines_scanned, hit_cutoff });
+                    return Ok(FileScanResult {
+                        found: None,
+                        lines: lines_scanned,
+                        hit_cutoff,
+                    });
                 }
             }
         }
@@ -382,12 +419,26 @@ where
     // When we reach the start of the file, the leftover remainder IS the
     // first line and may still be unprocessed.
     if !remainder.is_empty() && lines_scanned < max_lines {
-        if let Some(res) = process_line(&remainder, cutoff_secs, match_fn, &mut lines_scanned, &mut hit_cutoff) {
-            return Ok(FileScanResult { found: Some(res), lines: lines_scanned, hit_cutoff });
+        if let Some(res) = process_line(
+            &remainder,
+            cutoff_secs,
+            match_fn,
+            &mut lines_scanned,
+            &mut hit_cutoff,
+        ) {
+            return Ok(FileScanResult {
+                found: Some(res),
+                lines: lines_scanned,
+                hit_cutoff,
+            });
         }
     }
 
-    Ok(FileScanResult { found: None, lines: lines_scanned, hit_cutoff })
+    Ok(FileScanResult {
+        found: None,
+        lines: lines_scanned,
+        hit_cutoff,
+    })
 }
 
 fn process_line<T, F>(
@@ -402,7 +453,7 @@ where
 {
     *lines_scanned += 1;
     let Ok(entry) = serde_json::from_slice::<WalEntry>(line) else {
-        return None;  // bad line → skip
+        return None; // bad line → skip
     };
     let ev = &entry.event_json;
     if let Some(ts) = ev.finished_at_unix() {
@@ -529,8 +580,18 @@ where
             if combined[i] == b'\n' {
                 let line = &combined[i + 1..line_end];
                 line_end = i;
-                if line.is_empty() { continue; }
-                process_line_collect(line, file_name, cutoff_secs, match_fn, &mut lines_scanned, &mut hit_cutoff, out);
+                if line.is_empty() {
+                    continue;
+                }
+                process_line_collect(
+                    line,
+                    file_name,
+                    cutoff_secs,
+                    match_fn,
+                    &mut lines_scanned,
+                    &mut hit_cutoff,
+                    out,
+                );
                 if hit_cutoff || lines_scanned >= max_lines {
                     return Ok((hit_cutoff, lines_scanned));
                 }
@@ -542,7 +603,15 @@ where
     }
 
     if !remainder.is_empty() && lines_scanned < max_lines {
-        process_line_collect(&remainder, file_name, cutoff_secs, match_fn, &mut lines_scanned, &mut hit_cutoff, out);
+        process_line_collect(
+            &remainder,
+            file_name,
+            cutoff_secs,
+            match_fn,
+            &mut lines_scanned,
+            &mut hit_cutoff,
+            out,
+        );
     }
 
     Ok((hit_cutoff, lines_scanned))
@@ -560,7 +629,9 @@ fn process_line_collect<F>(
     F: FnMut(&WalHit) -> bool,
 {
     *lines_scanned += 1;
-    let Ok(entry) = serde_json::from_slice::<WalEntry>(line) else { return; };
+    let Ok(entry) = serde_json::from_slice::<WalEntry>(line) else {
+        return;
+    };
     if let Some(ts) = entry.event_json.finished_at_unix() {
         if ts < cutoff_secs {
             *hit_cutoff = true;
@@ -606,16 +677,41 @@ fn parse_rfc3339_secs(s: &str) -> Option<i64> {
     // We don't need millisecond precision — statusline filtering is at
     // second granularity, so a lightweight parser avoids pulling chrono in.
     let bytes = s.as_bytes();
-    if bytes.len() < 19 { return None; }
+    if bytes.len() < 19 {
+        return None;
+    }
     let (y, mo, d, h, mi, sec) = (
-        std::str::from_utf8(&bytes[0..4]).ok()?.parse::<i32>().ok()?,
-        std::str::from_utf8(&bytes[5..7]).ok()?.parse::<u32>().ok()?,
-        std::str::from_utf8(&bytes[8..10]).ok()?.parse::<u32>().ok()?,
-        std::str::from_utf8(&bytes[11..13]).ok()?.parse::<u32>().ok()?,
-        std::str::from_utf8(&bytes[14..16]).ok()?.parse::<u32>().ok()?,
-        std::str::from_utf8(&bytes[17..19]).ok()?.parse::<u32>().ok()?,
+        std::str::from_utf8(&bytes[0..4])
+            .ok()?
+            .parse::<i32>()
+            .ok()?,
+        std::str::from_utf8(&bytes[5..7])
+            .ok()?
+            .parse::<u32>()
+            .ok()?,
+        std::str::from_utf8(&bytes[8..10])
+            .ok()?
+            .parse::<u32>()
+            .ok()?,
+        std::str::from_utf8(&bytes[11..13])
+            .ok()?
+            .parse::<u32>()
+            .ok()?,
+        std::str::from_utf8(&bytes[14..16])
+            .ok()?
+            .parse::<u32>()
+            .ok()?,
+        std::str::from_utf8(&bytes[17..19])
+            .ok()?
+            .parse::<u32>()
+            .ok()?,
     );
-    if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
         return None;
     }
     // Find timezone: skip optional fractional seconds (.123456).
@@ -633,8 +729,14 @@ fn parse_rfc3339_secs(s: &str) -> Option<i64> {
                 if bytes.len() < idx + 6 || bytes[idx + 3] != b':' {
                     return None;
                 }
-                let hh = std::str::from_utf8(&bytes[idx + 1..idx + 3]).ok()?.parse::<i64>().ok()?;
-                let mm = std::str::from_utf8(&bytes[idx + 4..idx + 6]).ok()?.parse::<i64>().ok()?;
+                let hh = std::str::from_utf8(&bytes[idx + 1..idx + 3])
+                    .ok()?
+                    .parse::<i64>()
+                    .ok()?;
+                let mm = std::str::from_utf8(&bytes[idx + 4..idx + 6])
+                    .ok()?
+                    .parse::<i64>()
+                    .ok()?;
                 let signed = (hh * 3600 + mm * 60) * if bytes[idx] == b'+' { 1 } else { -1 };
                 signed
             }
@@ -654,7 +756,9 @@ fn parse_rfc3339_secs(s: &str) -> Option<i64> {
 /// Gregorian calendar date to number of days since 1970-01-01.  Copied
 /// here to avoid a chrono dependency just for one parse helper.
 fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
-    if !(1..=12).contains(&m) || d == 0 || d > 31 { return None; }
+    if !(1..=12).contains(&m) || d == 0 || d > 31 {
+        return None;
+    }
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y / 400 } else { (y - 399) / 400 };
     let yoe = (y - era * 400) as i64;
@@ -702,7 +806,10 @@ mod tests {
     fn usage_event_v5_fields() {
         let raw = br#"{"event_id":"abc","event_time":"2026-04-17T15:23:45Z","session_id":"f47ac10b-58cc-4372-a567-0e02b2c3d479","key_label":"aikeyfounder@gmail.com","completion":"complete","virtual_key_id":"oauth:acct","provider_code":"anthropic","route_source":"oauth","model":"claude-sonnet-4-5","input_tokens":100,"output_tokens":50}"#;
         let ev: UsageEvent = serde_json::from_slice(raw).unwrap();
-        assert_eq!(ev.session_id.as_deref(), Some("f47ac10b-58cc-4372-a567-0e02b2c3d479"));
+        assert_eq!(
+            ev.session_id.as_deref(),
+            Some("f47ac10b-58cc-4372-a567-0e02b2c3d479")
+        );
         assert_eq!(ev.key_label.as_deref(), Some("aikeyfounder@gmail.com"));
         assert_eq!(ev.completion.as_deref(), Some("complete"));
     }
@@ -725,23 +832,50 @@ mod tests {
         let old = tmp.path().join("usage-20260417-14.jsonl");
         {
             let mut f = std::fs::File::create(&old).unwrap();
-            f.write_all(&make_line("sess-a", "claude-sonnet-4-5", "2026-04-17T14:50:00Z")).unwrap();
-            f.write_all(&make_line("sess-b", "claude-sonnet-4-5", "2026-04-17T14:55:00Z")).unwrap();
+            f.write_all(&make_line(
+                "sess-a",
+                "claude-sonnet-4-5",
+                "2026-04-17T14:50:00Z",
+            ))
+            .unwrap();
+            f.write_all(&make_line(
+                "sess-b",
+                "claude-sonnet-4-5",
+                "2026-04-17T14:55:00Z",
+            ))
+            .unwrap();
         }
         // Newer file: newest event for sess-a
         let new = tmp.path().join("usage-20260417-15.jsonl");
         {
             let mut f = std::fs::File::create(&new).unwrap();
-            f.write_all(&make_line("sess-a", "claude-sonnet-4-5", "2026-04-17T15:00:00Z")).unwrap();
+            f.write_all(&make_line(
+                "sess-a",
+                "claude-sonnet-4-5",
+                "2026-04-17T15:00:00Z",
+            ))
+            .unwrap();
         }
 
         // Disable the age filter so the old (2026-04-17) fixture events
         // aren't pruned. Production callers pick an explicit age bound; the
         // test needs `None` for a stable offline fixture.
-        let opts = ScanOptions { max_age: None, max_lines: 500 };
-        let found: Option<UsageEvent> = scan_wal_backward(tmp.path(), |ev| {
-            if ev.session_id.as_deref() == Some("sess-a") { Some(ev.clone()) } else { None }
-        }, opts).unwrap();
+        let opts = ScanOptions {
+            max_age: None,
+            max_lines: 500,
+        };
+        let found: Option<UsageEvent> = scan_wal_backward(
+            tmp.path(),
+            |ev| {
+                if ev.session_id.as_deref() == Some("sess-a") {
+                    Some(ev.clone())
+                } else {
+                    None
+                }
+            },
+            opts,
+        )
+        .unwrap();
 
         let ev = found.expect("should find newest sess-a event");
         // 2026-04-17T15:00:00Z → 1776438000 s → 1776438000000 ms.
@@ -784,7 +918,12 @@ mod tests {
         write_envelope(&mut f, 3, "sess-a", "kimi", &now, 30, 15);
         drop(f);
 
-        let hits = collect_wal_backward(tmp.path(), |hit| hit.event.session_id.as_deref() == Some("sess-a"), ScanOptions::default()).unwrap();
+        let hits = collect_wal_backward(
+            tmp.path(),
+            |hit| hit.event.session_id.as_deref() == Some("sess-a"),
+            ScanOptions::default(),
+        )
+        .unwrap();
         assert_eq!(hits.len(), 3);
         // newest-first: Vec[0] is seq=3
         assert_eq!(hits[0].wal_seq, 3);
@@ -800,7 +939,7 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         let now = rfc3339_now();
         write_envelope(&mut f, 1, "sess-a", "kimi", &now, 10, 5);
-        write_envelope(&mut f, 2, "sess-b", "kimi", &now, 99, 99);   // different session
+        write_envelope(&mut f, 2, "sess-b", "kimi", &now, 99, 99); // different session
         write_envelope(&mut f, 3, "sess-a", "anthropic", &now, 50, 50); // different provider
         write_envelope(&mut f, 4, "sess-a", "kimi", &now, 20, 10);
         drop(f);
@@ -831,14 +970,21 @@ mod tests {
         }
         drop(f);
 
-        let opts = ScanOptions { max_lines: 5, ..ScanOptions::default() };
+        let opts = ScanOptions {
+            max_lines: 5,
+            ..ScanOptions::default()
+        };
         let hits = collect_wal_backward(tmp.path(), |_| true, opts).unwrap();
         // We can examine at most 5 lines; some may match, some may be
         // filtered by budget before examination — so we expect ≤5.
         assert!(hits.len() <= 5, "got {} hits, expected ≤5", hits.len());
         // And they should still be newest-first.
         for w in hits.windows(2) {
-            assert!(w[0].wal_seq > w[1].wal_seq, "hits not newest-first: {:?}", hits.iter().map(|h| h.wal_seq).collect::<Vec<_>>());
+            assert!(
+                w[0].wal_seq > w[1].wal_seq,
+                "hits not newest-first: {:?}",
+                hits.iter().map(|h| h.wal_seq).collect::<Vec<_>>()
+            );
         }
     }
 
@@ -915,7 +1061,10 @@ mod tests {
         let unbounded_hits = collect_wal_backward(
             tmp.path(),
             |h| h.event.session_id.as_deref() == Some("sess-long"),
-            ScanOptions { max_age: None, max_lines: 500 },
+            ScanOptions {
+                max_age: None,
+                max_lines: 500,
+            },
         )
         .unwrap();
         assert_eq!(
@@ -929,7 +1078,10 @@ mod tests {
 
     fn rfc3339_now() -> String {
         // "good enough" RFC3339 string for test fixtures; uses current time.
-        let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         // Approximate — days since epoch for "today" in UTC.
         let days_from_epoch = (secs / 86400) as i64;
         let sec_of_day = secs % 86400;
@@ -950,11 +1102,11 @@ mod tests {
         let z = days + 719468;
         let era = if z >= 0 { z } else { z - 146096 } / 146097;
         let doe = (z - era * 146097) as u32;
-        let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
         let y = (yoe as i32) + (era as i32) * 400;
-        let doy = doe - (365*yoe + yoe/4 - yoe/100);
-        let mp = (5*doy + 2) / 153;
-        let d = doy - (153*mp + 2)/5 + 1;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
         let m = if mp < 10 { mp + 3 } else { mp - 9 };
         let y = y + if m <= 2 { 1 } else { 0 };
         (y, m, d)

@@ -56,11 +56,16 @@ struct Expected {
 
 #[derive(Debug, Default, Deserialize)]
 struct ExpectedDraft {
-    #[serde(default)] email: Option<String>,
-    #[serde(default)] password_like: Option<String>,
-    #[serde(default)] secret_like: Option<String>,
-    #[serde(default)] url: Option<String>,
-    #[serde(default)] base_url: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    password_like: Option<String>,
+    #[serde(default)]
+    secret_like: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -81,20 +86,28 @@ struct DimStats {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let model_path = parse_flag(&args, "--model")
-        .unwrap_or_else(|| PathBuf::from("data/crf-phase1.bin"));
-    let samples_dir = parse_flag(&args, "--samples")
-        .unwrap_or_else(|| PathBuf::from("../workflow/CI/research/ablation/ablation-spike-v4.1/samples"));
+    let model_path =
+        parse_flag(&args, "--model").unwrap_or_else(|| PathBuf::from("data/crf-phase1.bin"));
+    let samples_dir = parse_flag(&args, "--samples").unwrap_or_else(|| {
+        PathBuf::from("../workflow/CI/research/ablation/ablation-spike-v4.1/samples")
+    });
 
     // Model file sanity check. Empty .bin 意味着 train_crf 未运行 —— 明确报错。
     let model_bytes = match fs::read(&model_path) {
         Ok(b) if b.is_empty() => {
-            eprintln!("[validate-crf] ERROR: model file {} is empty — run train_crf first", model_path.display());
+            eprintln!(
+                "[validate-crf] ERROR: model file {} is empty — run train_crf first",
+                model_path.display()
+            );
             process::exit(2);
         }
         Ok(b) => b,
         Err(e) => {
-            eprintln!("[validate-crf] ERROR: read({}): {}", model_path.display(), e);
+            eprintln!(
+                "[validate-crf] ERROR: read({}): {}",
+                model_path.display(),
+                e
+            );
             process::exit(2);
         }
     };
@@ -106,11 +119,11 @@ fn main() {
 
     // 5 维度样本集 (与 TITLE_ABLATION_REPORT 对齐)
     let dimensions = [
-        ("holdout",        "holdout.jsonl"),
-        ("ood-apikey",     "ood-apikey.jsonl"),
-        ("ood-realworld",  "ood-realworld.jsonl"),
-        ("ood-layouts",    "ood.jsonl"),  // spike 里这个文件存 layouts 维度
-        ("adversarial",    "adversarial.jsonl"),
+        ("holdout", "holdout.jsonl"),
+        ("ood-apikey", "ood-apikey.jsonl"),
+        ("ood-realworld", "ood-realworld.jsonl"),
+        ("ood-layouts", "ood.jsonl"), // spike 里这个文件存 layouts 维度
+        ("adversarial", "adversarial.jsonl"),
     ];
 
     let mut per_dim: Vec<(String, DimStats)> = Vec::new();
@@ -188,7 +201,9 @@ fn eval_dimension(path: &Path, is_adversarial: bool) -> DimStats {
     };
 
     for line in content.lines() {
-        if line.trim().is_empty() { continue; }
+        if line.trim().is_empty() {
+            continue;
+        }
         let sample: Sample = match serde_json::from_str(line) {
             Ok(s) => s,
             Err(e) => {
@@ -201,11 +216,21 @@ fn eval_dimension(path: &Path, is_adversarial: bool) -> DimStats {
         // Expected 字段集合(把 5 类字段扁平成一个 HashSet<String>)
         let mut expected_values: HashSet<String> = HashSet::new();
         for d in &sample.expected.drafts {
-            if let Some(v) = &d.email         { expected_values.insert(v.clone()); }
-            if let Some(v) = &d.password_like { expected_values.insert(v.clone()); }
-            if let Some(v) = &d.secret_like   { expected_values.insert(v.clone()); }
-            if let Some(v) = &d.url           { expected_values.insert(v.clone()); }
-            if let Some(v) = &d.base_url      { expected_values.insert(v.clone()); }
+            if let Some(v) = &d.email {
+                expected_values.insert(v.clone());
+            }
+            if let Some(v) = &d.password_like {
+                expected_values.insert(v.clone());
+            }
+            if let Some(v) = &d.secret_like {
+                expected_values.insert(v.clone());
+            }
+            if let Some(v) = &d.url {
+                expected_values.insert(v.clone());
+            }
+            if let Some(v) = &d.base_url {
+                expected_values.insert(v.clone());
+            }
         }
         stats.expected_total += expected_values.len();
 
@@ -213,7 +238,8 @@ fn eval_dimension(path: &Path, is_adversarial: bool) -> DimStats {
         let rule_cands = rule::rule_extract(&sample.text);
         let rule_values: HashSet<String> = rule_cands.iter().map(|c| c.value.clone()).collect();
         // CRF 候选单独来(去重策略同 parse.rs:137-145);记录 rule 未命中的 CRF-only 子集
-        let rule_seen_kv: HashSet<String> = rule_cands.iter()
+        let rule_seen_kv: HashSet<String> = rule_cands
+            .iter()
             .map(|c| format!("{}\x00{}", c.kind.as_str(), c.value))
             .collect();
         let mut crf_only_values: HashSet<String> = HashSet::new();

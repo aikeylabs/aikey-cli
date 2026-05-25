@@ -54,14 +54,26 @@ mod tests {
 
     #[test]
     fn from_db_str_personal() {
-        assert_eq!(CredentialType::from_db_str("personal"), CredentialType::PersonalApiKey);
-        assert_eq!(CredentialType::from_db_str("personal_api_key"), CredentialType::PersonalApiKey);
+        assert_eq!(
+            CredentialType::from_db_str("personal"),
+            CredentialType::PersonalApiKey
+        );
+        assert_eq!(
+            CredentialType::from_db_str("personal_api_key"),
+            CredentialType::PersonalApiKey
+        );
     }
 
     #[test]
     fn from_db_str_team() {
-        assert_eq!(CredentialType::from_db_str("team"), CredentialType::ManagedVirtualKey);
-        assert_eq!(CredentialType::from_db_str("managed_virtual_key"), CredentialType::ManagedVirtualKey);
+        assert_eq!(
+            CredentialType::from_db_str("team"),
+            CredentialType::ManagedVirtualKey
+        );
+        assert_eq!(
+            CredentialType::from_db_str("managed_virtual_key"),
+            CredentialType::ManagedVirtualKey
+        );
     }
 
     #[test]
@@ -74,8 +86,14 @@ mod tests {
 
     #[test]
     fn from_db_str_unknown_defaults_to_personal() {
-        assert_eq!(CredentialType::from_db_str(""), CredentialType::PersonalApiKey);
-        assert_eq!(CredentialType::from_db_str("garbage"), CredentialType::PersonalApiKey);
+        assert_eq!(
+            CredentialType::from_db_str(""),
+            CredentialType::PersonalApiKey
+        );
+        assert_eq!(
+            CredentialType::from_db_str("garbage"),
+            CredentialType::PersonalApiKey
+        );
     }
 
     #[test]

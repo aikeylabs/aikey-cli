@@ -27,9 +27,11 @@ const FIXTURE_JSON: &str = include_str!("fixtures/team_token_normalize.json");
 
 #[test]
 fn golden_cases_all_pass() {
-    let fixture: Fixture = serde_json::from_str(FIXTURE_JSON)
-        .expect("fixture JSON parse failed");
-    assert!(!fixture.cases.is_empty(), "fixture must contain at least one case");
+    let fixture: Fixture = serde_json::from_str(FIXTURE_JSON).expect("fixture JSON parse failed");
+    assert!(
+        !fixture.cases.is_empty(),
+        "fixture must contain at least one case"
+    );
 
     let mut failed: Vec<String> = Vec::new();
 

@@ -46,11 +46,9 @@ use std::mem::MaybeUninit;
 
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, ReadConsoleInputW, SetConsoleMode,
-    INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD,
-    ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-    STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+    GetConsoleMode, GetStdHandle, ReadConsoleInputW, SetConsoleMode, ENABLE_ECHO_INPUT,
+    ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, INPUT_RECORD,
+    KEY_EVENT, KEY_EVENT_RECORD, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
 };
 // Note: deliberately NOT importing `ENABLE_VIRTUAL_TERMINAL_INPUT` even
 // though the module-level docstring discusses it — we use ReadConsoleInputW
@@ -58,10 +56,9 @@ use windows_sys::Win32::System::Console::{
 
 use crate::ui_select::{
     build_tree_rows, compute_inner_w, family_aware_select, family_aware_toggle_expanded,
-    format_multi_row, format_row, format_tree_row,
-    is_focusable, max_candidate_label_width, next_selectable, redraw_multi_one,
-    redraw_multi_two, redraw_two,
-    Key, MultiSelectResult, ProviderGroup, ProviderTreeResult, SelectResult, TreeRow,
+    format_multi_row, format_row, format_tree_row, is_focusable, max_candidate_label_width,
+    next_selectable, redraw_multi_one, redraw_multi_two, redraw_two, Key, MultiSelectResult,
+    ProviderGroup, ProviderTreeResult, SelectResult, TreeRow,
 };
 
 // Width / padding helpers live in ui_frame (cross-platform).
@@ -79,15 +76,15 @@ mod tests {
     fn vk_constants_match_win32_abi() {
         assert_eq!(VK_RETURN, 0x0D);
         assert_eq!(VK_ESCAPE, 0x1B);
-        assert_eq!(VK_SPACE,  0x20);
-        assert_eq!(VK_UP,     0x26);
-        assert_eq!(VK_DOWN,   0x28);
+        assert_eq!(VK_SPACE, 0x20);
+        assert_eq!(VK_UP, 0x26);
+        assert_eq!(VK_DOWN, 0x28);
     }
 
     /// Pin the modifier-key state bits. Same rationale as VK constants.
     #[test]
     fn ctrl_modifier_bits_match_win32_abi() {
-        assert_eq!(LEFT_CTRL_PRESSED,  0x0008);
+        assert_eq!(LEFT_CTRL_PRESSED, 0x0008);
         assert_eq!(RIGHT_CTRL_PRESSED, 0x0004);
     }
 
@@ -120,7 +117,8 @@ mod tests {
                 assert_eq!(
                     e.kind(),
                     std::io::ErrorKind::NotConnected,
-                    "expected NotConnected when stdin/stderr aren't real consoles; got {:?}", e.kind()
+                    "expected NotConnected when stdin/stderr aren't real consoles; got {:?}",
+                    e.kind()
                 );
             }
         }
@@ -135,13 +133,13 @@ mod tests {
 // new feature for one constant each.
 const VK_RETURN: u16 = 0x0D;
 const VK_ESCAPE: u16 = 0x1B;
-const VK_SPACE:  u16 = 0x20;
-const VK_UP:     u16 = 0x26;
-const VK_DOWN:   u16 = 0x28;
+const VK_SPACE: u16 = 0x20;
+const VK_UP: u16 = 0x26;
+const VK_DOWN: u16 = 0x28;
 
 // Modifier-state bits inside KEY_EVENT_RECORD::dwControlKeyState.
 // Stable Win32 values; same rationale as the VK constants above.
-const LEFT_CTRL_PRESSED:  u32 = 0x0008;
+const LEFT_CTRL_PRESSED: u32 = 0x0008;
 const RIGHT_CTRL_PRESSED: u32 = 0x0004;
 
 /// RAII guard that captures the original input + output console modes,
@@ -316,9 +314,8 @@ pub(crate) fn read_key_windows(rc: &RawConsole) -> io::Result<Key> {
             std::ptr::read_unaligned((&key_event.uChar) as *const _ as *const u16)
         };
 
-        let ctrl_pressed = (key_event.dwControlKeyState
-            & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED))
-            != 0;
+        let ctrl_pressed =
+            (key_event.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
 
         if uchar == 0x03 || (ctrl_pressed && (uchar == b'C' as u16 || uchar == b'c' as u16)) {
             return Ok(Key::CtrlC);
@@ -382,7 +379,11 @@ pub(crate) fn interactive_select_windows(
         write!(out, "  \x1b[90m{}\x1b[0m\r\n", rule)?;
     } else {
         write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
-        write!(out, "  \u{2502}  {}  \u{2502}\r\n", pad_visible(header, pad_target))?;
+        write!(
+            out,
+            "  \u{2502}  {}  \u{2502}\r\n",
+            pad_visible(header, pad_target)
+        )?;
         let sep = "\u{2500}".repeat(pad_target + 2);
         write!(out, "  \u{2502} {} \u{2502}\r\n", sep)?;
     }
@@ -403,7 +404,10 @@ pub(crate) fn interactive_select_windows(
         write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
     }
 
-    write!(out, "  [\u{2191}\u{2193} move, \x1b[1;33mEnter\x1b[0m select, Esc cancel]")?;
+    write!(
+        out,
+        "  [\u{2191}\u{2193} move, \x1b[1;33mEnter\x1b[0m select, Esc cancel]"
+    )?;
     out.flush()?;
 
     let total = items.len();
@@ -449,7 +453,9 @@ pub(crate) fn interactive_multi_select_windows(
     let icon_title = format!("\u{2611} {}", title);
     let items_max = items.iter().map(|s| visible_len(s) + 8).max().unwrap_or(20);
     let max_inner = crate::ui_frame::term_width().saturating_sub(6);
-    let inner_w = (visible_len(&icon_title) + 4).max(items_max + 10).min(max_inner);
+    let inner_w = (visible_len(&icon_title) + 4)
+        .max(items_max + 10)
+        .min(max_inner);
     let border = "\u{2500}".repeat(inner_w);
     let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
     let title_bar = format!("\u{2500} {} {}", icon_title, "\u{2500}".repeat(title_fill));
@@ -468,15 +474,27 @@ pub(crate) fn interactive_multi_select_windows(
 
     let mut has_moved = false;
     let pick_hint = |checked: &[bool], cursor: usize, moved: bool| -> &'static str {
-        if !checked.iter().any(|&c| c) { return HINT_INITIAL; }
-        if !moved { return HINT_TOGGLE; }
-        if checked[cursor] { HINT_TOGGLE } else { HINT_SELECT_MORE }
+        if !checked.iter().any(|&c| c) {
+            return HINT_INITIAL;
+        }
+        if !moved {
+            return HINT_TOGGLE;
+        }
+        if checked[cursor] {
+            HINT_TOGGLE
+        } else {
+            HINT_SELECT_MORE
+        }
     };
 
     write!(out, "\x1b[?25l")?;
     write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
     for (i, item) in items.iter().enumerate() {
-        write!(out, "{}\r\n", format_multi_row(item, i, i == cursor, checked[i], inner_w))?;
+        write!(
+            out,
+            "{}\r\n",
+            format_multi_row(item, i, i == cursor, checked[i], inner_w)
+        )?;
     }
     write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
     write!(out, "{}", pick_hint(&checked, cursor, has_moved))?;
@@ -487,7 +505,8 @@ pub(crate) fn interactive_multi_select_windows(
             Key::Up => {
                 if cursor > 0 {
                     has_moved = true;
-                    let old = cursor; cursor -= 1;
+                    let old = cursor;
+                    cursor -= 1;
                     redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?;
                     write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?;
                     out.flush()?;
@@ -496,7 +515,8 @@ pub(crate) fn interactive_multi_select_windows(
             Key::Down => {
                 if cursor + 1 < total {
                     has_moved = true;
-                    let old = cursor; cursor += 1;
+                    let old = cursor;
+                    cursor += 1;
                     redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?;
                     write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?;
                     out.flush()?;
@@ -510,7 +530,13 @@ pub(crate) fn interactive_multi_select_windows(
                 for i in 0..total {
                     if i != cursor && checked[i] != prev[i] {
                         let n = (total - i) + 1;
-                        write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[i], i, false, checked[i], inner_w), n)?;
+                        write!(
+                            out,
+                            "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r",
+                            n,
+                            format_multi_row(&items[i], i, false, checked[i], inner_w),
+                            n
+                        )?;
                     }
                 }
                 write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?;
@@ -519,7 +545,12 @@ pub(crate) fn interactive_multi_select_windows(
             Key::Enter => {
                 if checked.iter().any(|&c| c) {
                     break MultiSelectResult::Confirmed(
-                        checked.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect()
+                        checked
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, &c)| c)
+                            .map(|(i, _)| i)
+                            .collect(),
                     );
                 } else {
                     checked[cursor] = true;
@@ -537,7 +568,8 @@ pub(crate) fn interactive_multi_select_windows(
                     checked[idx] = !checked[idx];
                     crate::ui_select::apply_mutex_on_toggle(&mut checked, idx, mutex_groups);
                     if cursor != idx {
-                        let old = cursor; cursor = idx;
+                        let old = cursor;
+                        cursor = idx;
                         redraw_multi_two(&mut out, old, cursor, items, &checked, inner_w, total)?;
                     } else {
                         redraw_multi_one(&mut out, cursor, items, &checked, inner_w, total)?;
@@ -545,7 +577,13 @@ pub(crate) fn interactive_multi_select_windows(
                     for i in 0..total {
                         if i != cursor && i != idx && checked[i] != prev[i] {
                             let n = (total - i) + 1;
-                            write!(out, "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r", n, format_multi_row(&items[i], i, false, checked[i], inner_w), n)?;
+                            write!(
+                                out,
+                                "\x1b[{}A\r\x1b[2K{}\x1b[{}B\r",
+                                n,
+                                format_multi_row(&items[i], i, false, checked[i], inner_w),
+                                n
+                            )?;
                         }
                     }
                     write!(out, "\r\x1b[2K{}", pick_hint(&checked, cursor, has_moved))?;
@@ -581,14 +619,25 @@ pub(crate) fn interactive_provider_tree_windows(
         let total = rows.len();
         let max_inner = crate::ui_frame::term_width().saturating_sub(6);
         let label_col_w = max_candidate_label_width(groups) + 2;
-        let max_type_w = groups.iter()
+        let max_type_w = groups
+            .iter()
             .flat_map(|g| g.candidates.iter())
-            .map(|c| c.display_type.as_deref().unwrap_or(
-                if c.source_type == "personal_oauth_account" { "oauth" } else { &c.source_type }
-            ).len())
-            .max().unwrap_or(8);
+            .map(|c| {
+                c.display_type
+                    .as_deref()
+                    .unwrap_or(if c.source_type == "personal_oauth_account" {
+                        "oauth"
+                    } else {
+                        &c.source_type
+                    })
+                    .len()
+            })
+            .max()
+            .unwrap_or(8);
         let content_min_w = 17 + label_col_w + max_type_w;
-        let inner_w = (visible_len(&icon_title) + 4).max(content_min_w).min(max_inner);
+        let inner_w = (visible_len(&icon_title) + 4)
+            .max(content_min_w)
+            .min(max_inner);
         let border = "\u{2500}".repeat(inner_w);
         let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
         let title_bar = format!("\u{2500} {} {}", icon_title, "\u{2500}".repeat(title_fill));
@@ -600,7 +649,11 @@ pub(crate) fn interactive_provider_tree_windows(
         write!(out, "\x1b[?25l")?;
         write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
         for (i, row) in rows.iter().enumerate() {
-            write!(out, "{}\r\n", format_tree_row(row, groups, i == cursor, inner_w, label_col_w, max_type_w))?;
+            write!(
+                out,
+                "{}\r\n",
+                format_tree_row(row, groups, i == cursor, inner_w, label_col_w, max_type_w)
+            )?;
         }
         write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
         write!(out, "  [\u{2191}\u{2193} move \u{2022} \x1b[1;33mSpace\x1b[0m select/expand \u{2022} \x1b[1;33mEnter\x1b[0m confirm \u{2022} \x1b[1;33mEsc\x1b[0m cancel]\r\n")?;
@@ -618,17 +671,27 @@ pub(crate) fn interactive_provider_tree_windows(
             Key::Up => {
                 let mut n = cursor;
                 loop {
-                    if n == 0 { break; }
+                    if n == 0 {
+                        break;
+                    }
                     n -= 1;
-                    if is_focusable(&rows[n]) { cursor = n; break; }
+                    if is_focusable(&rows[n]) {
+                        cursor = n;
+                        break;
+                    }
                 }
             }
             Key::Down => {
                 let mut n = cursor;
                 loop {
-                    if n + 1 >= total { break; }
+                    if n + 1 >= total {
+                        break;
+                    }
                     n += 1;
-                    if is_focusable(&rows[n]) { cursor = n; break; }
+                    if is_focusable(&rows[n]) {
+                        cursor = n;
+                        break;
+                    }
                 }
             }
             // 2026-05-08 V-layer family-grouping: Space 键 family-aware (与 ui_select.rs Unix
@@ -639,15 +702,16 @@ pub(crate) fn interactive_provider_tree_windows(
                 _ => {}
             },
             Key::Enter => {
-                write!(out, "\x1b[?25h")?; out.flush()?;
+                write!(out, "\x1b[?25h")?;
+                out.flush()?;
                 return Ok(ProviderTreeResult::Confirmed(groups.clone()));
             }
             Key::Escape | Key::CtrlC => {
-                write!(out, "\x1b[?25h")?; out.flush()?;
+                write!(out, "\x1b[?25h")?;
+                out.flush()?;
                 return Ok(ProviderTreeResult::Cancelled);
             }
             _ => {}
         }
     }
 }
-

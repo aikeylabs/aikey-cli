@@ -51,18 +51,18 @@
 //! ```
 
 use aikeylabs_aikey_cli::{
+    config::ProjectConfig,
     executor,
     providers::Provider,
     resolver::{resolve, ResolveRequest, ResolveResult},
-    config::ProjectConfig,
 };
 use secrecy::SecretString;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
-use serde::{Deserialize, Serialize};
 
 mod adapters;
-use adapters::{ProviderAdapter, OpenAIAdapter, AnthropicAdapter};
+use adapters::{AnthropicAdapter, OpenAIAdapter, ProviderAdapter};
 
 /// Errors returned by the SDK.
 #[derive(Debug, Error)]
@@ -166,8 +166,7 @@ impl AikeyClient {
     /// Returns the plaintext value wrapped in [`Zeroizing`] so it is wiped
     /// from memory when dropped.
     pub fn get_secret(&self, alias: &str) -> Result<Zeroizing<String>, AikeyError> {
-        executor::get_secret(alias, &self.password)
-            .map_err(AikeyError::Vault)
+        executor::get_secret(alias, &self.password).map_err(AikeyError::Vault)
     }
 
     /// Resolve a provider name to its env-var name and plaintext secret.
@@ -196,8 +195,8 @@ impl AikeyClient {
         let result: ResolveResult = resolve(&request, config.as_ref())
             .map_err(|e| AikeyError::Resolution(e.to_string()))?;
 
-        let secret = executor::get_secret(&result.key_alias, &self.password)
-            .map_err(AikeyError::Vault)?;
+        let secret =
+            executor::get_secret(&result.key_alias, &self.password).map_err(AikeyError::Vault)?;
 
         Ok(ProviderSecret {
             env_var: result.env_var,
@@ -236,8 +235,8 @@ impl AikeyClient {
         let result: ResolveResult = resolve(&request, config.as_ref())
             .map_err(|e| AikeyError::Resolution(e.to_string()))?;
 
-        let secret = executor::get_secret(&result.key_alias, &self.password)
-            .map_err(AikeyError::Vault)?;
+        let secret =
+            executor::get_secret(&result.key_alias, &self.password).map_err(AikeyError::Vault)?;
 
         Ok(ProviderSecret {
             env_var: result.env_var,
@@ -279,19 +278,27 @@ impl AikeyClient {
         let result: ResolveResult = resolve(&request, config.as_ref())
             .map_err(|e| AikeyError::Resolution(e.to_string()))?;
 
-        let secret = executor::get_secret(&result.key_alias, &self.password)
-            .map_err(AikeyError::Vault)?;
+        let secret =
+            executor::get_secret(&result.key_alias, &self.password).map_err(AikeyError::Vault)?;
 
         // Select appropriate adapter based on provider
         let adapter: Box<dyn ProviderAdapter> = match result.provider.as_str() {
             "openai" => Box::new(OpenAIAdapter::new()),
             "anthropic" => Box::new(AnthropicAdapter::new()),
-            _ => return Err(AikeyError::Provider(format!("Unsupported provider: {}", result.provider))),
+            _ => {
+                return Err(AikeyError::Provider(format!(
+                    "Unsupported provider: {}",
+                    result.provider
+                )))
+            }
         };
 
         // Make chat request with retry logic
         let model = result.model.ok_or_else(|| {
-            AikeyError::Resolution(format!("No model specified for logical model '{}'", logical_model))
+            AikeyError::Resolution(format!(
+                "No model specified for logical model '{}'",
+                logical_model
+            ))
         })?;
 
         adapter.chat(&secret, &model, messages)
@@ -311,13 +318,16 @@ mod tests {
 
     #[test]
     fn env_var_for_known_providers() {
-        assert_eq!(AikeyClient::env_var_for("openai"),    "OPENAI_API_KEY");
+        assert_eq!(AikeyClient::env_var_for("openai"), "OPENAI_API_KEY");
         assert_eq!(AikeyClient::env_var_for("anthropic"), "ANTHROPIC_API_KEY");
-        assert_eq!(AikeyClient::env_var_for("google"),    "GOOGLE_API_KEY");
+        assert_eq!(AikeyClient::env_var_for("google"), "GOOGLE_API_KEY");
     }
 
     #[test]
     fn env_var_for_custom_provider() {
-        assert_eq!(AikeyClient::env_var_for("myservice"), "AIKEY_MYSERVICE_API_KEY");
+        assert_eq!(
+            AikeyClient::env_var_for("myservice"),
+            "AIKEY_MYSERVICE_API_KEY"
+        );
     }
 }

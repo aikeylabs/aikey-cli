@@ -12,11 +12,11 @@ use secrecy::SecretString;
 use std::env;
 
 fn main() {
-    let password = env::var("AIKEY_PASSWORD")
-        .expect("Set AIKEY_PASSWORD env var to your master password");
+    let password =
+        env::var("AIKEY_PASSWORD").expect("Set AIKEY_PASSWORD env var to your master password");
 
     let args: Vec<String> = env::args().collect();
-    let alias    = args.get(1).map(String::as_str).unwrap_or("my-openai-key");
+    let alias = args.get(1).map(String::as_str).unwrap_or("my-openai-key");
     let provider = args.get(2).map(String::as_str).unwrap_or("openai");
 
     let client = AikeyClient::new(SecretString::new(password.into()));
@@ -31,7 +31,7 @@ fn main() {
     // 2. Fetch a secret directly by alias
     match client.get_secret(alias) {
         Ok(secret) => println!("[2] get_secret('{}') → <{} chars>", alias, secret.len()),
-        Err(e)     => eprintln!("[2] get_secret('{}') failed: {}", alias, e),
+        Err(e) => eprintln!("[2] get_secret('{}') failed: {}", alias, e),
     }
 
     // 3. Resolve a provider → env-var name + secret (reads aikey.config.json if present)

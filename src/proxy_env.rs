@@ -38,8 +38,7 @@ pub fn parse_env_file(content: &str) -> Result<EnvMap, String> {
         let stripped = trimmed.strip_prefix("export ").unwrap_or(trimmed);
         let (key, value) = parse_kv(stripped)
             .ok_or_else(|| format!("Line {}: invalid format: {}", i + 1, trimmed))?;
-        validate_env_key(&key)
-            .map_err(|e| format!("Line {}: {}", i + 1, e))?;
+        validate_env_key(&key).map_err(|e| format!("Line {}: {}", i + 1, e))?;
         map.insert(key, value);
     }
     Ok(map)
@@ -107,11 +106,17 @@ fn validate_env_key(key: &str) -> Result<(), String> {
     }
     let first = key.chars().next().unwrap();
     if !first.is_ascii_alphabetic() && first != '_' {
-        return Err(format!("Invalid env var name '{}': must start with letter or _", key));
+        return Err(format!(
+            "Invalid env var name '{}': must start with letter or _",
+            key
+        ));
     }
     for c in key.chars() {
         if !c.is_ascii_alphanumeric() && c != '_' {
-            return Err(format!("Invalid env var name '{}': illegal character '{}'", key, c));
+            return Err(format!(
+                "Invalid env var name '{}': illegal character '{}'",
+                key, c
+            ));
         }
     }
     Ok(())
@@ -149,8 +154,7 @@ pub fn write_proxy_env(map: &EnvMap) -> Result<(), String> {
     let path = proxy_env_path()?;
     // Ensure directory exists.
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| format!("Failed to create directory: {}", e))?;
+        std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create directory: {}", e))?;
     }
     let mut content = String::new();
     for (key, value) in map {
@@ -185,9 +189,14 @@ pub fn read_active_env_lines() -> Result<Vec<(String, String)>, String> {
             // (spaces, punctuation, `$`, `(`, etc.) is a shell control line —
             // skip it rather than display shell internals to the user.
             let is_ident = !key.is_empty()
-                && key.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                && key
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
                 && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            if !is_ident { continue; }
+            if !is_ident {
+                continue;
+            }
             let value = strip_quotes(&stripped[eq_pos + 1..]);
             entries.push((key, value));
         }
@@ -204,12 +213,18 @@ pub fn read_active_bypass_summary() -> Option<String> {
     let mut tokens: Vec<String> = Vec::new();
     for raw_line in content.lines() {
         let line = raw_line.trim();
-        if !line.starts_with("case ") { continue; }
+        if !line.starts_with("case ") {
+            continue;
+        }
         // The export clause carries the full bypass list, e.g.
         //   ... *) export no_proxy="127.0.0.1,localhost,${no_proxy}"
-        let export_key = if line.contains("no_proxy=") { "no_proxy=" }
-                         else if line.contains("NO_PROXY=") { "NO_PROXY=" }
-                         else { continue; };
+        let export_key = if line.contains("no_proxy=") {
+            "no_proxy="
+        } else if line.contains("NO_PROXY=") {
+            "NO_PROXY="
+        } else {
+            continue;
+        };
         if let Some(pos) = line.find(export_key) {
             let after = &line[pos + export_key.len()..];
             let after = after.trim_start_matches('"');
@@ -218,28 +233,41 @@ pub fn read_active_bypass_summary() -> Option<String> {
             // Drop shell var expansions like ${no_proxy} / $no_proxy.
             for tok in value.split(',') {
                 let t = tok.trim();
-                if t.is_empty() { continue; }
-                if t.starts_with('$') || t.starts_with("${") { continue; }
+                if t.is_empty() {
+                    continue;
+                }
+                if t.starts_with('$') || t.starts_with("${") {
+                    continue;
+                }
                 if !tokens.iter().any(|s| s == t) {
                     tokens.push(t.to_string());
                 }
             }
         }
     }
-    if tokens.is_empty() { None } else { Some(tokens.join(",")) }
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(","))
+    }
 }
 
 // ── Masking ──────────────────────────────────────────────────────────────────
 
 /// Sensitive key fragments — values for these are always masked.
 const SENSITIVE_FRAGMENTS: &[&str] = &[
-    "key", "token", "secret", "password", "authorization", "cookie",
+    "key",
+    "token",
+    "secret",
+    "password",
+    "authorization",
+    "cookie",
 ];
 
 /// Keys that match SENSITIVE_FRAGMENTS but are NOT sensitive (display values, labels).
 const NON_SENSITIVE_KEYS: &[&str] = &[
-    "aikey_active_keys",     // provider=identity mapping, not a secret
-    "aikey_active_label",    // display label for shell prompt
+    "aikey_active_keys",  // provider=identity mapping, not a secret
+    "aikey_active_label", // display label for shell prompt
 ];
 
 /// Returns true if the key name suggests a sensitive value.
@@ -393,7 +421,10 @@ mod tests {
         assert_eq!(mask_value("MY_SECRET", "abc"), "abc");
         assert_eq!(mask_value("DB_PASSWORD", "abc"), "abc");
         // 19 chars — still ≤21, shown as-is under 15+6 (was masked under 6+4).
-        assert_eq!(mask_value("OPENAI_API_KEY", "sk-1234567890abcdef"), "sk-1234567890abcdef");
+        assert_eq!(
+            mask_value("OPENAI_API_KEY", "sk-1234567890abcdef"),
+            "sk-1234567890abcdef"
+        );
         // 33 chars: first 15 = "sk-proj-abcdefg", last 6 = "90wxyz".
         assert_eq!(
             mask_value("OPENAI_API_KEY", "sk-proj-abcdefghijk1234567890wxyz"),
@@ -428,8 +459,14 @@ mod tests {
         assert_eq!(mask_value("RUST_LOG", "info"), "info");
         // Proxy URLs are not sensitive — they are routing config, not credentials.
         assert_eq!(mask_value("http_proxy", "http://1.2.3.4"), "http://1.2.3.4");
-        assert_eq!(mask_value("https_proxy", "http://1.2.3.4"), "http://1.2.3.4");
-        assert_eq!(mask_value("all_proxy", "socks5://1.2.3.4"), "socks5://1.2.3.4");
+        assert_eq!(
+            mask_value("https_proxy", "http://1.2.3.4"),
+            "http://1.2.3.4"
+        );
+        assert_eq!(
+            mask_value("all_proxy", "socks5://1.2.3.4"),
+            "socks5://1.2.3.4"
+        );
     }
 
     #[test]
@@ -474,7 +511,8 @@ mod tests {
         // `aikey route` output = aikey_personal_<64-hex> — real local-proxy
         // bearer credential. Mask it so an over-the-shoulder glance at
         // `aikey env` doesn't leak a third-party-client token.
-        let bearer = "aikey_personal_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let bearer =
+            "aikey_personal_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert_eq!(bearer.len(), 79);
         let masked = mask_value("ANTHROPIC_AUTH_TOKEN", bearer);
         assert_ne!(masked, bearer);

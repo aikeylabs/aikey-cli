@@ -51,8 +51,8 @@ pub const ERR_I_CLI_NOT_AVAILABLE: &str = "I_CLI_NOT_AVAILABLE";
 /// hardcoded read paths; the list shape makes future renames a single-
 /// point edit.
 const YAML_CONFIG_REL_CANDIDATES: &[&str] = &[
-    ".aikey/config/control.yaml",        // Personal (post 2026-05-13)
-    ".aikey/config/control-trial.yaml",  // Trial (legacy name preserved)
+    ".aikey/config/control.yaml",       // Personal (post 2026-05-13)
+    ".aikey/config/control-trial.yaml", // Trial (legacy name preserved)
 ];
 const JSON_CONFIG_REL: &str = ".aikey/config/config.json";
 
@@ -108,12 +108,12 @@ pub fn detect_edition() -> Option<Edition> {
     // routes; on a trial host the running listener is full-trial, so
     // service-control commands must target that label, not the
     // never-started local-server one.
-    let has_trial = components.iter()
-        .any(|c| c.as_str() == Some("full-trial"));
+    let has_trial = components.iter().any(|c| c.as_str() == Some("full-trial"));
     if has_trial {
         return Some(Edition::Trial);
     }
-    let has_local = components.iter()
+    let has_local = components
+        .iter()
         .any(|c| c.as_str() == Some("local-server"));
     if has_local {
         return Some(Edition::Personal);
@@ -253,11 +253,13 @@ pub fn is_local_server_installed() -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    parsed.get("installed_components")
+    parsed
+        .get("installed_components")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().any(|c| {
-            matches!(c.as_str(), Some("local-server") | Some("full-trial"))
-        }))
+        .map(|arr| {
+            arr.iter()
+                .any(|c| matches!(c.as_str(), Some("local-server") | Some("full-trial")))
+        })
         .unwrap_or(false)
 }
 
@@ -292,15 +294,17 @@ pub fn spawn_start_command() -> Result<(), String> {
 
 /// Stop the local web service. Edition-aware. See `spawn_start_command`.
 pub fn spawn_stop_command() -> Result<(), String> {
-    let edition = detect_edition().ok_or_else(||
-        "neither aikey-local-server nor aikey-trial-server is installed".to_string())?;
+    let edition = detect_edition().ok_or_else(|| {
+        "neither aikey-local-server nor aikey-trial-server is installed".to_string()
+    })?;
     run_service_action(edition, ServiceAction::Stop)
 }
 
 /// Restart the local web service. Edition-aware. See `spawn_start_command`.
 pub fn spawn_restart_command() -> Result<(), String> {
-    let edition = detect_edition().ok_or_else(||
-        "neither aikey-local-server nor aikey-trial-server is installed".to_string())?;
+    let edition = detect_edition().ok_or_else(|| {
+        "neither aikey-local-server nor aikey-trial-server is installed".to_string()
+    })?;
     run_service_action(edition, ServiceAction::Restart)
 }
 
@@ -391,8 +395,8 @@ fn start_service(edition: Edition) -> Result<(), String> {
 }
 
 fn stop_service() -> Result<(), String> {
-    let port = read_local_server_port()
-        .map_err(|e| format!("cannot resolve service port: {}", e))?;
+    let port =
+        read_local_server_port().map_err(|e| format!("cannot resolve service port: {}", e))?;
     let pid = match find_listening_pid(port) {
         Some(p) => p,
         None => return Ok(()), // already stopped
@@ -493,8 +497,12 @@ fn signal_terminate(pid: u32) -> Result<(), String> {
         .args(["/PID", &pid.to_string()])
         .status()
         .map_err(|e| format!("invoke taskkill: {}", e))
-        .and_then(|s| if s.success() { Ok(()) } else {
-            Err(format!("taskkill exit {}", s.code().unwrap_or(-1)))
+        .and_then(|s| {
+            if s.success() {
+                Ok(())
+            } else {
+                Err(format!("taskkill exit {}", s.code().unwrap_or(-1)))
+            }
         })
 }
 
@@ -505,8 +513,12 @@ fn signal_kill(pid: u32) -> Result<(), String> {
         .args(["/PID", &pid.to_string(), "/F"])
         .status()
         .map_err(|e| format!("invoke taskkill: {}", e))
-        .and_then(|s| if s.success() { Ok(()) } else {
-            Err(format!("taskkill /F exit {}", s.code().unwrap_or(-1)))
+        .and_then(|s| {
+            if s.success() {
+                Ok(())
+            } else {
+                Err(format!("taskkill /F exit {}", s.code().unwrap_or(-1)))
+            }
         })
 }
 
@@ -545,14 +557,23 @@ fn find_listening_pid(port: u16) -> Option<u32> {
         use std::process::Command;
         // `netstat -ano` lines look like:
         //   "  TCP    127.0.0.1:8090   0.0.0.0:0    LISTENING    1234"
-        let out = Command::new("netstat").args(["-ano", "-p", "TCP"]).output().ok()?;
+        let out = Command::new("netstat")
+            .args(["-ano", "-p", "TCP"])
+            .output()
+            .ok()?;
         let s = String::from_utf8_lossy(&out.stdout);
         for line in s.lines() {
-            if !line.contains("LISTENING") { continue; }
+            if !line.contains("LISTENING") {
+                continue;
+            }
             let needle = format!(":{} ", port);
-            if !line.contains(&needle) { continue; }
+            if !line.contains(&needle) {
+                continue;
+            }
             if let Some(pid_str) = line.split_whitespace().last() {
-                if let Ok(pid) = pid_str.parse::<u32>() { return Some(pid); }
+                if let Ok(pid) = pid_str.parse::<u32>() {
+                    return Some(pid);
+                }
             }
         }
         None
@@ -603,19 +624,21 @@ fn read_yaml_listen_port(path: &Path) -> Result<Option<u16>, String> {
     // Why serde_yaml over regex: the yaml has ~10 fields and users may
     // reformat / reorder freely; regex on "^listen:" is fragile to
     // indentation / multi-line shapes.
-    let doc: serde_yaml::Value = serde_yaml::from_str(&raw)
-        .map_err(|e| format!("parse {}: {}", path.display(), e))?;
-    let listen = doc.get("listen").and_then(|v| v.as_str()).ok_or_else(|| {
-        format!("{} has no `listen:` field", path.display())
-    })?;
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    let listen = doc
+        .get("listen")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("{} has no `listen:` field", path.display()))?;
     // Shape: "127.0.0.1:8090" — split on last ':' so IPv6-style hosts
     // like "[::1]:8090" are tolerated.
-    let port_str = listen.rsplit_once(':').map(|(_, p)| p).ok_or_else(|| {
-        format!("listen `{}` is not host:port", listen)
-    })?;
-    let port: u16 = port_str.parse().map_err(|e| {
-        format!("listen port `{}` is not a u16: {}", port_str, e)
-    })?;
+    let port_str = listen
+        .rsplit_once(':')
+        .map(|(_, p)| p)
+        .ok_or_else(|| format!("listen `{}` is not host:port", listen))?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|e| format!("listen port `{}` is not a u16: {}", port_str, e))?;
     Ok(Some(port))
 }
 
@@ -636,7 +659,8 @@ fn read_remote_control_url(path: &PathBuf) -> Option<String> {
 }
 
 fn localhost_port_of(url: &str) -> Option<u16> {
-    let after_scheme = url.strip_prefix("http://")
+    let after_scheme = url
+        .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
         .unwrap_or(url);
     let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
@@ -666,8 +690,9 @@ fn localhost_port_of(url: &str) -> Option<u16> {
 /// falls back to the canonical default port without ever calling this.
 fn build_bulk_import_unavailable_error(remote_hint: Option<String>) -> String {
     match remote_hint {
-        Some(url) if !url.starts_with("http://127.0.0.1")
-                    && !url.starts_with("http://localhost") => {
+        Some(url)
+            if !url.starts_with("http://127.0.0.1") && !url.starts_with("http://localhost") =>
+        {
             format!(
                 "{} Local Bulk Import is not available on this host \
                  (Personal/Trial editions only).\n\
@@ -715,11 +740,11 @@ fn ureq_get_with_timeout(url: &str, timeout_secs: u64) -> Result<String, String>
         "GET {} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
         path, host
     );
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
-    let mut buf = String::new();
     stream
-        .read_to_string(&mut buf)
+        .write_all(req.as_bytes())
         .map_err(|e| e.to_string())?;
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).map_err(|e| e.to_string())?;
     let status_ok = buf.starts_with("HTTP/1.0 2") || buf.starts_with("HTTP/1.1 2");
     if !status_ok {
         let status_line = buf.lines().next().unwrap_or("<empty>");
@@ -737,7 +762,8 @@ fn parse_local_url(url: &str) -> Result<(String, u16, String), String> {
         .split_once('/')
         .map(|(h, p)| (h, format!("/{}", p)))
         .unwrap_or((without_scheme, "/".to_string()));
-    let (host, port) = host_port.split_once(':')
+    let (host, port) = host_port
+        .split_once(':')
         .ok_or_else(|| format!("URL missing port: {}", url))?;
     let port: u16 = port.parse().map_err(|e| format!("bad port: {}", e))?;
     Ok((host.to_string(), port, path))
@@ -810,22 +836,32 @@ mod tests {
     #[test]
     fn start_command_hint_is_nonempty_on_current_platform() {
         let hint = start_command_hint();
-        assert!(!hint.trim().is_empty(), "start_command_hint must not be empty");
+        assert!(
+            !hint.trim().is_empty(),
+            "start_command_hint must not be empty"
+        );
     }
 
     #[test]
     fn build_bulk_import_unavailable_error_with_remote_url_mentions_it() {
-        let err = build_bulk_import_unavailable_error(Some("https://control.example.com".to_string()));
-        assert!(err.contains("https://control.example.com"),
-            "remote hint should be embedded verbatim in error: {}", err);
+        let err =
+            build_bulk_import_unavailable_error(Some("https://control.example.com".to_string()));
+        assert!(
+            err.contains("https://control.example.com"),
+            "remote hint should be embedded verbatim in error: {}",
+            err
+        );
         assert!(err.contains(ERR_I_CLI_NOT_AVAILABLE));
     }
 
     #[test]
     fn build_bulk_import_unavailable_error_treats_localhost_remote_as_no_remote() {
         let err = build_bulk_import_unavailable_error(Some("http://127.0.0.1:9999".to_string()));
-        assert!(!err.contains("team vault"),
-            "localhost-as-remote must not trigger production messaging: {}", err);
+        assert!(
+            !err.contains("team vault"),
+            "localhost-as-remote must not trigger production messaging: {}",
+            err
+        );
         assert!(err.contains("aikey-local-server"));
     }
 
@@ -919,7 +955,7 @@ mod tests {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         write_personal_yaml_under(tmp.path(), 8093); // control.yaml
-        write_yaml_under(tmp.path(), 7777);          // control-trial.yaml (legacy)
+        write_yaml_under(tmp.path(), 7777); // control-trial.yaml (legacy)
         with_home(tmp.path(), || {
             // Personal (control.yaml) wins — first in CANDIDATES list.
             // Defensive against a host where mv migration was interrupted
@@ -936,7 +972,10 @@ mod tests {
         // change behavior for hosts where both files exist.
         assert_eq!(
             YAML_CONFIG_REL_CANDIDATES,
-            &[".aikey/config/control.yaml", ".aikey/config/control-trial.yaml"]
+            &[
+                ".aikey/config/control.yaml",
+                ".aikey/config/control-trial.yaml"
+            ]
         );
     }
 
@@ -976,7 +1015,8 @@ mod tests {
                 let _ = sock.read(&mut buf);
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body
+                    body.len(),
+                    body
                 );
                 let _ = sock.write_all(resp.as_bytes());
             }
@@ -1020,15 +1060,21 @@ mod tests {
         // Default to control-trial.yaml (legacy / Trial name) — existing
         // tests rely on this path. Personal-specific tests use the
         // dedicated `write_personal_yaml_under` helper below.
-        std::fs::write(cfg.join("control-trial.yaml"),
-            format!("listen: 127.0.0.1:{}\n", port)).unwrap();
+        std::fs::write(
+            cfg.join("control-trial.yaml"),
+            format!("listen: 127.0.0.1:{}\n", port),
+        )
+        .unwrap();
     }
 
     fn write_personal_yaml_under(home: &std::path::Path, port: u16) {
         let cfg = home.join(".aikey/config");
         std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::write(cfg.join("control.yaml"),
-            format!("listen: 127.0.0.1:{}\n", port)).unwrap();
+        std::fs::write(
+            cfg.join("control.yaml"),
+            format!("listen: 127.0.0.1:{}\n", port),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1042,8 +1088,11 @@ mod tests {
 
         let line = local_server_status_line();
 
-        if let Some(h) = prev_home { std::env::set_var("HOME", h); }
-        else { std::env::remove_var("HOME"); }
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
 
         assert!(line.contains(&format!("port {}", port)), "got: {}", line);
         assert!(line.contains("running"), "got: {}", line);
@@ -1061,11 +1110,18 @@ mod tests {
 
         let line = local_server_status_line();
 
-        if let Some(h) = prev_home { std::env::set_var("HOME", h); }
-        else { std::env::remove_var("HOME"); }
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
 
         assert!(line.contains("running"), "got: {}", line);
-        assert!(line.contains("locked") && !line.contains("unlocked"), "got: {}", line);
+        assert!(
+            line.contains("locked") && !line.contains("unlocked"),
+            "got: {}",
+            line
+        );
     }
 
     #[test]
@@ -1079,8 +1135,11 @@ mod tests {
 
         let line = local_server_status_line();
 
-        if let Some(h) = prev_home { std::env::set_var("HOME", h); }
-        else { std::env::remove_var("HOME"); }
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
 
         assert!(line.contains("NOT RUNNING"), "got: {}", line);
         assert!(line.contains("Start:"), "got: {}", line);
@@ -1118,16 +1177,21 @@ mod tests {
         let prev = std::env::var("HOME").ok();
         std::env::set_var("HOME", home);
         f();
-        if let Some(h) = prev { std::env::set_var("HOME", h); }
-        else { std::env::remove_var("HOME"); }
+        if let Some(h) = prev {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 
     #[test]
     fn is_local_server_installed_true_for_personal_with_console() {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        write_install_state(tmp.path(),
-            r#"{"installed_components":["aikey-cli","local-server"]}"#);
+        write_install_state(
+            tmp.path(),
+            r#"{"installed_components":["aikey-cli","local-server"]}"#,
+        );
         with_home(tmp.path(), || {
             assert!(is_local_server_installed());
         });
@@ -1137,8 +1201,7 @@ mod tests {
     fn is_local_server_installed_true_for_trial() {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        write_install_state(tmp.path(),
-            r#"{"installed_components":["full-trial"]}"#);
+        write_install_state(tmp.path(), r#"{"installed_components":["full-trial"]}"#);
         with_home(tmp.path(), || {
             assert!(is_local_server_installed());
         });
@@ -1148,8 +1211,7 @@ mod tests {
     fn is_local_server_installed_false_for_cli_only() {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        write_install_state(tmp.path(),
-            r#"{"installed_components":["aikey-cli"]}"#);
+        write_install_state(tmp.path(), r#"{"installed_components":["aikey-cli"]}"#);
         with_home(tmp.path(), || {
             assert!(!is_local_server_installed());
         });
@@ -1170,8 +1232,10 @@ mod tests {
     fn detect_edition_returns_personal_for_local_server_only() {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        write_install_state(tmp.path(),
-            r#"{"installed_components":["aikey-cli","local-server"]}"#);
+        write_install_state(
+            tmp.path(),
+            r#"{"installed_components":["aikey-cli","local-server"]}"#,
+        );
         with_home(tmp.path(), || {
             assert_eq!(detect_edition(), Some(Edition::Personal));
         });
@@ -1181,8 +1245,7 @@ mod tests {
     fn detect_edition_returns_trial_for_full_trial() {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        write_install_state(tmp.path(),
-            r#"{"installed_components":["full-trial"]}"#);
+        write_install_state(tmp.path(), r#"{"installed_components":["full-trial"]}"#);
         with_home(tmp.path(), || {
             assert_eq!(detect_edition(), Some(Edition::Trial));
         });
@@ -1195,8 +1258,10 @@ mod tests {
         // listener is full-trial, so service control must target Trial.
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        write_install_state(tmp.path(),
-            r#"{"installed_components":["local-server","full-trial"]}"#);
+        write_install_state(
+            tmp.path(),
+            r#"{"installed_components":["local-server","full-trial"]}"#,
+        );
         with_home(tmp.path(), || {
             assert_eq!(detect_edition(), Some(Edition::Trial));
         });
@@ -1206,8 +1271,7 @@ mod tests {
     fn detect_edition_none_for_cli_only() {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        write_install_state(tmp.path(),
-            r#"{"installed_components":["aikey-cli"]}"#);
+        write_install_state(tmp.path(), r#"{"installed_components":["aikey-cli"]}"#);
         with_home(tmp.path(), || {
             assert_eq!(detect_edition(), None);
         });
@@ -1236,8 +1300,10 @@ mod tests {
         // Default fallback is NOT consulted.
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        write_install_state(tmp.path(),
-            r#"{"installed_components":["aikey-cli","local-server"]}"#);
+        write_install_state(
+            tmp.path(),
+            r#"{"installed_components":["aikey-cli","local-server"]}"#,
+        );
         write_yaml_under(tmp.path(), 9999);
         with_home(tmp.path(), || {
             assert_eq!(read_local_server_port_or_default().unwrap(), 9999);
@@ -1251,8 +1317,10 @@ mod tests {
         // strict error (which would say "Local Bulk Import requires...").
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        write_install_state(tmp.path(),
-            r#"{"installed_components":["aikey-cli","local-server"]}"#);
+        write_install_state(
+            tmp.path(),
+            r#"{"installed_components":["aikey-cli","local-server"]}"#,
+        );
         with_home(tmp.path(), || {
             assert_eq!(
                 read_local_server_port_or_default().unwrap(),
@@ -1265,8 +1333,7 @@ mod tests {
     fn or_default_falls_back_to_8090_for_trial_too() {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        write_install_state(tmp.path(),
-            r#"{"installed_components":["full-trial"]}"#);
+        write_install_state(tmp.path(), r#"{"installed_components":["full-trial"]}"#);
         with_home(tmp.path(), || {
             assert_eq!(
                 read_local_server_port_or_default().unwrap(),
@@ -1282,12 +1349,14 @@ mod tests {
         // semantically: the user has no local-server install.
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        write_install_state(tmp.path(),
-            r#"{"installed_components":["aikey-cli"]}"#);
+        write_install_state(tmp.path(), r#"{"installed_components":["aikey-cli"]}"#);
         with_home(tmp.path(), || {
             let err = read_local_server_port_or_default().unwrap_err();
-            assert!(err.contains(ERR_I_CLI_NOT_AVAILABLE),
-                "fallback must NOT kick in when local-server not installed; got: {}", err);
+            assert!(
+                err.contains(ERR_I_CLI_NOT_AVAILABLE),
+                "fallback must NOT kick in when local-server not installed; got: {}",
+                err
+            );
         });
     }
 
@@ -1301,8 +1370,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         with_home(tmp.path(), || {
             let err = read_local_server_port_or_default().unwrap_err();
-            assert!(err.contains(ERR_I_CLI_NOT_AVAILABLE),
-                "missing install-state must NOT trigger default fallback; got: {}", err);
+            assert!(
+                err.contains(ERR_I_CLI_NOT_AVAILABLE),
+                "missing install-state must NOT trigger default fallback; got: {}",
+                err
+            );
         });
     }
 
@@ -1317,8 +1389,13 @@ mod tests {
         for action in ["start", "stop", "restart"] {
             for ed in [Edition::Personal, Edition::Trial] {
                 let h = service_command_hint(ed, action);
-                assert_eq!(h, format!("aikey web {}", action),
-                    "hint should be `aikey web {}`, got: {}", action, h);
+                assert_eq!(
+                    h,
+                    format!("aikey web {}", action),
+                    "hint should be `aikey web {}`, got: {}",
+                    action,
+                    h
+                );
             }
         }
     }
@@ -1353,8 +1430,11 @@ mod tests {
 
         let line = local_server_status_line();
 
-        if let Some(h) = prev_home { std::env::set_var("HOME", h); }
-        else { std::env::remove_var("HOME"); }
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
 
         assert!(line.contains("NOT CONFIGURED"), "got: {}", line);
     }

@@ -6,9 +6,15 @@ use crate::cli::ServiceAction;
 /// whitelist is the security boundary for the web equivalent endpoint
 /// `/api/internal/services/<name>/<action>` — both share this table.
 const SUPPORTED_SERVICES: &[(&str, &str)] = &[
-    ("trust-local", "AiKey trust-local (degrade-detector observer + scoring)"),
-    ("web",         "AiKey local-server (Personal Web Console on :8090)"),
-    ("proxy",       "AiKey local proxy (:27200, BYOK routing + observer host)"),
+    (
+        "trust-local",
+        "AiKey trust-local (degrade-detector observer + scoring)",
+    ),
+    ("web", "AiKey local-server (Personal Web Console on :8090)"),
+    (
+        "proxy",
+        "AiKey local proxy (:27200, BYOK routing + observer host)",
+    ),
 ];
 
 /// Entry point — invoked from main.rs Commands::Service { action } arm.
@@ -46,7 +52,8 @@ pub(crate) fn handle_service(
                 .join(", "),
         );
         if json {
-            println!("{}",
+            println!(
+                "{}",
                 serde_json::json!({"ok": false, "error": "UNKNOWN_SERVICE", "detail": msg})
             );
         } else {
@@ -57,8 +64,8 @@ pub(crate) fn handle_service(
 
     match name {
         "trust-local" => trust_local::dispatch(verb, json),
-        "web"         => web::dispatch(verb, json),
-        "proxy"       => proxy::dispatch(verb, json, password_stdin),
+        "web" => web::dispatch(verb, json),
+        "proxy" => proxy::dispatch(verb, json, password_stdin),
         _ => unreachable!("guarded by is_supported() above"),
     }
 }
@@ -73,9 +80,7 @@ fn print_supported(json: bool) {
             .iter()
             .map(|(name, label)| serde_json::json!({"name": name, "description": label}))
             .collect();
-        println!("{}",
-            serde_json::json!({"supported_services": payload})
-        );
+        println!("{}", serde_json::json!({"supported_services": payload}));
     } else {
         println!("Supported services:");
         for (name, label) in SUPPORTED_SERVICES {
@@ -118,7 +123,8 @@ mod trust_local {
                 trust_local_bin.display()
             );
             if json {
-                println!("{}",
+                println!(
+                    "{}",
                     serde_json::json!({"ok": false, "error": "TRUST_LOCAL_NOT_INSTALLED", "detail": msg})
                 );
             } else {
@@ -130,7 +136,7 @@ mod trust_local {
         let result = match std::env::consts::OS {
             "macos" => match verb {
                 "start" | "restart" => launchctl_kickstart(current_uid()),
-                "stop"              => launchctl_kill(current_uid()),
+                "stop" => launchctl_kill(current_uid()),
                 _ => return Err(format!("unknown verb '{}'", verb).into()),
             },
             "linux" => systemctl_user(verb),
@@ -146,17 +152,22 @@ mod trust_local {
                     // Poll for STOPPED state up to 10s. Match NSSM's stop timeout.
                     let deadline = Instant::now() + Duration::from_secs(10);
                     while Instant::now() < deadline {
-                        if sc_is_stopped() { break; }
+                        if sc_is_stopped() {
+                            break;
+                        }
                         std::thread::sleep(Duration::from_millis(250));
                     }
                     sc_action("start")
                 }
                 _ => return Err(format!("unknown verb '{}'", verb).into()),
             },
-            other => return Err(format!(
-                "platform '{}' not supported (service control is macOS / Linux / Windows)",
-                other
-            ).into()),
+            other => {
+                return Err(format!(
+                    "platform '{}' not supported (service control is macOS / Linux / Windows)",
+                    other
+                )
+                .into())
+            }
         };
 
         // Reachability probe after start/restart. Stop has no probe —
@@ -182,7 +193,9 @@ mod trust_local {
     // checks. BR-rc.5-50 — `libc::getuid` is Unix-only and broke Windows
     // build under the rc.5 hotfix re-release.
     #[cfg(not(unix))]
-    fn current_uid() -> u32 { 0 }
+    fn current_uid() -> u32 {
+        0
+    }
 
     fn launchctl_kickstart(uid: u32) -> Result<(), String> {
         // -k flag = kill running and start again; idempotent for
@@ -238,8 +251,15 @@ mod trust_local {
         } else {
             std::env::var("HOME").unwrap_or_default()
         };
-        let binary_name = if cfg!(windows) { "trust-local.exe" } else { "trust-local" };
-        std::path::PathBuf::from(home).join(".aikey").join("bin").join(binary_name)
+        let binary_name = if cfg!(windows) {
+            "trust-local.exe"
+        } else {
+            "trust-local"
+        };
+        std::path::PathBuf::from(home)
+            .join(".aikey")
+            .join("bin")
+            .join(binary_name)
     }
 
     fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
@@ -280,7 +300,8 @@ mod trust_local {
                 Ok(()) => (true, String::new()),
                 Err(e) => (false, e.clone()),
             };
-            println!("{}",
+            println!(
+                "{}",
                 serde_json::json!({
                     "ok": ok,
                     "action": verb,

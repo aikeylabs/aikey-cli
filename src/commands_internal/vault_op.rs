@@ -51,8 +51,7 @@ fn try_log_audit(key: &[u8; 32], op: AuditOperation, alias: Option<&str>, succes
 /// Independently of Layer 1, `hook_rc_wired` is always read from disk
 /// here — it's a passive grep of `~/.zshrc`/`~/.bashrc`, not a write.
 fn hook_status_for_envelope() -> serde_json::Value {
-    let (file_installed, failure_reason) =
-        crate::commands_account::web_install_hook_file_layer1();
+    let (file_installed, failure_reason) = crate::commands_account::web_install_hook_file_layer1();
     let rc_wired = crate::commands_account::shell_rc_has_aikey_block();
     json!({
         "hook_file_installed": file_installed,
@@ -70,7 +69,9 @@ fn hook_status_for_envelope() -> serde_json::Value {
 /// fresh Layer 1 render when `outcome` reports the tail didn't run
 /// (e.g. no-op event with no binding touch) — guards against vault_op
 /// emitting `file_installed=false` for pure passive operations.
-fn hook_status_from_outcome(outcome: &crate::commands_account::LifecycleOutcome) -> serde_json::Value {
+fn hook_status_from_outcome(
+    outcome: &crate::commands_account::LifecycleOutcome,
+) -> serde_json::Value {
     let rc_wired = crate::commands_account::shell_rc_has_aikey_block();
     if outcome.active_env_refreshed {
         // Tail ran — outcome carries authoritative fields.
@@ -201,7 +202,9 @@ struct DeletePayload {
     alias: String,
 }
 
-fn default_on_conflict() -> String { "error".to_string() }
+fn default_on_conflict() -> String {
+    "error".to_string()
+}
 
 // ========== dispatch ==========
 
@@ -285,9 +288,11 @@ fn verify_key_against_vault(
 }
 
 /// 把 plaintext 加密为 (nonce, ciphertext)
-fn encrypt_with_key(key: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), (&'static str, String)> {
-    crypto::encrypt(key, plaintext)
-        .map_err(|e| ("I_INTERNAL", format!("encrypt failed: {}", e)))
+fn encrypt_with_key(
+    key: &[u8; 32],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), (&'static str, String)> {
+    crypto::encrypt(key, plaintext).map_err(|e| ("I_INTERNAL", format!("encrypt failed: {}", e)))
 }
 
 /// 检查 alias 是否已存在
@@ -357,15 +362,16 @@ fn handle_metadata(env: StdinEnvelope) {
         |r| r.get(0),
     ) {
         Ok(v) => v,
-        Err(_) => match conn.query_row(
-            "SELECT value FROM config WHERE key = 'salt'",
-            [],
-            |r| r.get(0),
-        ) {
+        Err(_) => match conn.query_row("SELECT value FROM config WHERE key = 'salt'", [], |r| {
+            r.get(0)
+        }) {
             Ok(v) => v,
             Err(e) => {
-                emit_error(req_id, "I_VAULT_NOT_INITIALIZED",
-                    format!("vault missing master_salt: {}", e));
+                emit_error(
+                    req_id,
+                    "I_VAULT_NOT_INITIALIZED",
+                    format!("vault missing master_salt: {}", e),
+                );
                 return;
             }
         },
@@ -373,11 +379,13 @@ fn handle_metadata(env: StdinEnvelope) {
 
     // KDF params: stored as 4-byte LE uint32, default to Argon2id params if absent.
     let read_u32 = |k: &str, default: u32| -> u32 {
-        conn.query_row("SELECT value FROM config WHERE key = ?", [k], |r| r.get::<_, Vec<u8>>(0))
-            .ok()
-            .filter(|v| v.len() == 4)
-            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
-            .unwrap_or(default)
+        conn.query_row("SELECT value FROM config WHERE key = ?", [k], |r| {
+            r.get::<_, Vec<u8>>(0)
+        })
+        .ok()
+        .filter(|v| v.len() == 4)
+        .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+        .unwrap_or(default)
     };
     let m_cost = read_u32("kdf_m_cost", 65536);
     let t_cost = read_u32("kdf_t_cost", 3);
@@ -406,7 +414,11 @@ fn handle_add(env: StdinEnvelope) {
     let payload: AddPayload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON", format!("add payload invalid: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("add payload invalid: {}", e),
+            );
             return;
         }
     };
@@ -417,7 +429,9 @@ fn handle_add(env: StdinEnvelope) {
     };
 
     // Resolve providers: `providers` (multi, preferred) > `provider` (single, legacy)
-    let providers_input: Vec<String> = payload.providers.clone()
+    let providers_input: Vec<String> = payload
+        .providers
+        .clone()
         .or_else(|| payload.provider.clone().map(|p| vec![p]))
         .unwrap_or_default();
 
@@ -447,7 +461,9 @@ fn handle_add(env: StdinEnvelope) {
             // human text. Everything else falls through as I_INTERNAL.
             let code = if msg.contains("already exists") {
                 "I_CREDENTIAL_CONFLICT"
-            } else if msg.contains("alias") && (msg.contains("empty") || msg.contains("exceeds") || msg.contains("control")) {
+            } else if msg.contains("alias")
+                && (msg.contains("empty") || msg.contains("exceeds") || msg.contains("control"))
+            {
                 "I_STDIN_INVALID_JSON"
             } else {
                 "I_INTERNAL"
@@ -481,7 +497,8 @@ fn handle_add(env: StdinEnvelope) {
             source_ref: &outcome.alias,
             providers: &outcome.providers,
         },
-    ).unwrap_or_default();
+    )
+    .unwrap_or_default();
     let newly_primary = lifecycle.newly_primary.clone();
     let active_env_refreshed = lifecycle.active_env_refreshed;
 
@@ -489,15 +506,18 @@ fn handle_add(env: StdinEnvelope) {
 
     emit(&ResultEnvelope::ok(
         req_id,
-        merge_hook_status_from_outcome(json!({
-            "alias": outcome.alias,
-            "action_taken": outcome.action.as_str(),
-            "provider": outcome.primary_provider,
-            "providers": outcome.providers,
-            "newly_primary_providers": newly_primary,
-            "active_env_refreshed": active_env_refreshed,
-            "audit_logged": audit_logged,
-        }), &lifecycle),
+        merge_hook_status_from_outcome(
+            json!({
+                "alias": outcome.alias,
+                "action_taken": outcome.action.as_str(),
+                "provider": outcome.primary_provider,
+                "providers": outcome.providers,
+                "newly_primary_providers": newly_primary,
+                "active_env_refreshed": active_env_refreshed,
+                "audit_logged": audit_logged,
+            }),
+            &lifecycle,
+        ),
     ));
 }
 
@@ -508,7 +528,11 @@ fn handle_batch_import(env: StdinEnvelope) {
     let payload: BatchImportPayload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON", format!("batch_import payload invalid: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("batch_import payload invalid: {}", e),
+            );
             return;
         }
     };
@@ -556,7 +580,11 @@ fn handle_batch_import(env: StdinEnvelope) {
     let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
         Ok(t) => t,
         Err(e) => {
-            emit_error(req_id, "I_INTERNAL", format!("begin batch transaction: {}", e));
+            emit_error(
+                req_id,
+                "I_INTERNAL",
+                format!("begin batch transaction: {}", e),
+            );
             return;
         }
     };
@@ -636,7 +664,11 @@ fn handle_batch_import(env: StdinEnvelope) {
 
     // Commit — all writes land atomically.
     if let Err(e) = tx.commit() {
-        emit_error(req_id, "I_INTERNAL", format!("commit batch transaction: {}", e));
+        emit_error(
+            req_id,
+            "I_INTERNAL",
+            format!("commit batch transaction: {}", e),
+        );
         return;
     }
 
@@ -664,15 +696,16 @@ fn handle_batch_import(env: StdinEnvelope) {
     // Failure here doesn't roll back the entries write; the binding
     // can be reconciled later by `aikey use <alias>` (matches the
     // best-effort posture of vault_op handle_add).
-    let lifecycle_events: Vec<crate::commands_account::CredentialLifecycleEvent> =
-        lifecycle_inputs
-            .iter()
-            .map(|(alias, providers)| crate::commands_account::CredentialLifecycleEvent::Added {
+    let lifecycle_events: Vec<crate::commands_account::CredentialLifecycleEvent> = lifecycle_inputs
+        .iter()
+        .map(
+            |(alias, providers)| crate::commands_account::CredentialLifecycleEvent::Added {
                 source_type: "personal",
                 source_ref: alias.as_str(),
                 providers: providers.as_slice(),
-            })
-            .collect();
+            },
+        )
+        .collect();
     let lifecycle_outcomes =
         crate::commands_account::apply_credential_lifecycle_batch(&lifecycle_events)
             .unwrap_or_default();
@@ -694,17 +727,20 @@ fn handle_batch_import(env: StdinEnvelope) {
 
     emit(&ResultEnvelope::ok(
         req_id,
-        merge_hook_status_from_outcome(json!({
-            "total": payload.items.len(),
-            "inserted": inserted,
-            "replaced": replaced,
-            "skipped": skipped,
-            "items": item_reports,
-            "audit_logged": audit_failures == 0,
-            "audit_failures": audit_failures,
-            "newly_primary_providers": total_newly_primary,
-            "active_env_refreshed": active_env_refreshed,
-        }), &representative_outcome),
+        merge_hook_status_from_outcome(
+            json!({
+                "total": payload.items.len(),
+                "inserted": inserted,
+                "replaced": replaced,
+                "skipped": skipped,
+                "items": item_reports,
+                "audit_logged": audit_failures == 0,
+                "audit_failures": audit_failures,
+                "newly_primary_providers": total_newly_primary,
+                "active_env_refreshed": active_env_refreshed,
+            }),
+            &representative_outcome,
+        ),
     ));
 }
 
@@ -715,7 +751,11 @@ fn handle_update_secret(env: StdinEnvelope) {
     let payload: UpdateSecretPayload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON", format!("update_secret payload invalid: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("update_secret payload invalid: {}", e),
+            );
             return;
         }
     };
@@ -731,17 +771,27 @@ fn handle_update_secret(env: StdinEnvelope) {
             emit_error(
                 req_id,
                 "I_CREDENTIAL_NOT_FOUND",
-                format!("alias '{}' does not exist (use add to create)", payload.alias),
+                format!(
+                    "alias '{}' does not exist (use add to create)",
+                    payload.alias
+                ),
             );
             return;
         }
-        Err((c, m)) => { emit_error(req_id, c, m); return; }
+        Err((c, m)) => {
+            emit_error(req_id, c, m);
+            return;
+        }
         Ok(true) => {}
     }
 
-    let (nonce, ciphertext) = match encrypt_with_key(&key, payload.new_secret_plaintext.as_bytes()) {
+    let (nonce, ciphertext) = match encrypt_with_key(&key, payload.new_secret_plaintext.as_bytes())
+    {
         Ok(t) => t,
-        Err((c, m)) => { emit_error(req_id, c, m); return; }
+        Err((c, m)) => {
+            emit_error(req_id, c, m);
+            return;
+        }
     };
     if let Err(e) = storage::store_entry(&payload.alias, &nonce, &ciphertext) {
         emit_error(req_id, "I_INTERNAL", format!("store_entry failed: {}", e));
@@ -767,7 +817,11 @@ fn handle_delete(env: StdinEnvelope) {
     let payload: DeletePayload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON", format!("delete payload invalid: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("delete payload invalid: {}", e),
+            );
             return;
         }
     };
@@ -786,7 +840,10 @@ fn handle_delete(env: StdinEnvelope) {
             );
             return;
         }
-        Err((c, m)) => { emit_error(req_id, c, m); return; }
+        Err((c, m)) => {
+            emit_error(req_id, c, m);
+            return;
+        }
         Ok(true) => {}
     }
 
@@ -835,7 +892,11 @@ fn handle_delete_target(env: StdinEnvelope) {
     let payload: Payload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON", format!("delete_target payload invalid: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("delete_target payload invalid: {}", e),
+            );
             return;
         }
     };
@@ -854,11 +915,17 @@ fn handle_delete_target(env: StdinEnvelope) {
             // id == alias for personal target
             match alias_exists(&conn, &payload.id) {
                 Ok(false) => {
-                    emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
-                        format!("alias '{}' does not exist", payload.id));
+                    emit_error(
+                        req_id,
+                        "I_CREDENTIAL_NOT_FOUND",
+                        format!("alias '{}' does not exist", payload.id),
+                    );
                     return;
                 }
-                Err((c, m)) => { emit_error(req_id, c, m); return; }
+                Err((c, m)) => {
+                    emit_error(req_id, c, m);
+                    return;
+                }
                 Ok(true) => {}
             }
             if let Err(e) = storage::delete_entry(&payload.id) {
@@ -871,16 +938,20 @@ fn handle_delete_target(env: StdinEnvelope) {
                     source_type: "personal",
                     source_ref: &payload.id,
                 },
-            ).unwrap_or_default();
+            )
+            .unwrap_or_default();
             let audit_logged = try_log_audit(&key, AuditOperation::Delete, Some(&payload.id), true);
             emit(&ResultEnvelope::ok(
                 req_id,
-                merge_hook_status_from_outcome(json!({
-                    "target": "personal",
-                    "id": payload.id,
-                    "action_taken": "deleted",
-                    "audit_logged": audit_logged,
-                }), &lifecycle),
+                merge_hook_status_from_outcome(
+                    json!({
+                        "target": "personal",
+                        "id": payload.id,
+                        "action_taken": "deleted",
+                        "audit_logged": audit_logged,
+                    }),
+                    &lifecycle,
+                ),
             ));
         }
         "oauth" => {
@@ -888,15 +959,25 @@ fn handle_delete_target(env: StdinEnvelope) {
             match storage::get_provider_account(&payload.id) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
-                    emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
-                        format!("provider_account_id '{}' does not exist", payload.id));
+                    emit_error(
+                        req_id,
+                        "I_CREDENTIAL_NOT_FOUND",
+                        format!("provider_account_id '{}' does not exist", payload.id),
+                    );
                     return;
                 }
-                Err(e) => { emit_error(req_id, "I_INTERNAL", format!("get_provider_account: {}", e)); return; }
+                Err(e) => {
+                    emit_error(req_id, "I_INTERNAL", format!("get_provider_account: {}", e));
+                    return;
+                }
             }
             // storage::delete_provider_account cascades provider_account_tokens.
             if let Err(e) = storage::delete_provider_account(&payload.id) {
-                emit_error(req_id, "I_INTERNAL", format!("delete_provider_account failed: {}", e));
+                emit_error(
+                    req_id,
+                    "I_INTERNAL",
+                    format!("delete_provider_account failed: {}", e),
+                );
                 return;
             }
             let audit_logged = try_log_audit(&key, AuditOperation::Delete, Some(&payload.id), true);
@@ -911,12 +992,18 @@ fn handle_delete_target(env: StdinEnvelope) {
             ));
         }
         "team" => {
-            emit_error(req_id, "I_UNKNOWN_TARGET",
-                "target 'team' is reserved for future use and not implemented in v1.0");
+            emit_error(
+                req_id,
+                "I_UNKNOWN_TARGET",
+                "target 'team' is reserved for future use and not implemented in v1.0",
+            );
         }
         other => {
-            emit_error(req_id, "I_UNKNOWN_TARGET",
-                format!("unknown target '{}' (expected personal|oauth|team)", other));
+            emit_error(
+                req_id,
+                "I_UNKNOWN_TARGET",
+                format!("unknown target '{}' (expected personal|oauth|team)", other),
+            );
         }
     }
 }
@@ -952,7 +1039,11 @@ fn handle_record_usage(env: StdinEnvelope) {
     let payload: Payload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON", format!("record_usage payload: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("record_usage payload: {}", e),
+            );
             return;
         }
     };
@@ -975,15 +1066,21 @@ fn handle_record_usage(env: StdinEnvelope) {
 
     let affected = match payload.target.as_str() {
         "personal" => storage::bump_entry_usage(&payload.id, ts),
-        "oauth"    => storage::bump_oauth_usage(&payload.id, ts),
+        "oauth" => storage::bump_oauth_usage(&payload.id, ts),
         "team" => {
-            emit_error(req_id, "I_UNKNOWN_TARGET",
-                "target 'team' is reserved for future use and not implemented in v1.0");
+            emit_error(
+                req_id,
+                "I_UNKNOWN_TARGET",
+                "target 'team' is reserved for future use and not implemented in v1.0",
+            );
             return;
         }
         other => {
-            emit_error(req_id, "I_UNKNOWN_TARGET",
-                format!("unknown target '{}' (expected personal|oauth|team)", other));
+            emit_error(
+                req_id,
+                "I_UNKNOWN_TARGET",
+                format!("unknown target '{}' (expected personal|oauth|team)", other),
+            );
             return;
         }
     };
@@ -1051,8 +1148,11 @@ fn handle_record_test_result(env: StdinEnvelope) {
     let payload: Payload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON",
-                format!("record_test_result payload: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("record_test_result payload: {}", e),
+            );
             return;
         }
     };
@@ -1061,8 +1161,11 @@ fn handle_record_test_result(env: StdinEnvelope) {
         return;
     }
     if !payload.result.is_object() {
-        emit_error(req_id, "I_STDIN_INVALID_JSON",
-            "result must be a JSON object");
+        emit_error(
+            req_id,
+            "I_STDIN_INVALID_JSON",
+            "result must be a JSON object",
+        );
         return;
     }
 
@@ -1074,19 +1177,21 @@ fn handle_record_test_result(env: StdinEnvelope) {
     let result_json = match serde_json::to_string(&payload.result) {
         Ok(s) => s,
         Err(e) => {
-            emit_error(req_id, "I_INTERNAL",
-                format!("serialise result: {}", e));
+            emit_error(req_id, "I_INTERNAL", format!("serialise result: {}", e));
             return;
         }
     };
 
     let affected = match payload.target.as_str() {
         "personal" => storage::merge_entry_extra(&payload.id, "$.last_test", &result_json),
-        "oauth"    => storage::merge_oauth_extra(&payload.id, "$.last_test", &result_json),
-        "team"     => storage::merge_team_extra(&payload.id, "$.last_test", &result_json),
-        other      => {
-            emit_error(req_id, "I_UNKNOWN_TARGET",
-                format!("unknown target '{}' (expected personal|oauth|team)", other));
+        "oauth" => storage::merge_oauth_extra(&payload.id, "$.last_test", &result_json),
+        "team" => storage::merge_team_extra(&payload.id, "$.last_test", &result_json),
+        other => {
+            emit_error(
+                req_id,
+                "I_UNKNOWN_TARGET",
+                format!("unknown target '{}' (expected personal|oauth|team)", other),
+            );
             return;
         }
     };
@@ -1152,8 +1257,11 @@ fn handle_test(env: StdinEnvelope) {
     let payload: Payload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON",
-                format!("test payload: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("test payload: {}", e),
+            );
             return;
         }
     };
@@ -1162,8 +1270,14 @@ fn handle_test(env: StdinEnvelope) {
         return;
     }
     if !matches!(payload.target.as_str(), "personal" | "oauth" | "team") {
-        emit_error(req_id, "I_UNKNOWN_TARGET",
-            format!("unknown target '{}' (expected personal|oauth|team)", payload.target));
+        emit_error(
+            req_id,
+            "I_UNKNOWN_TARGET",
+            format!(
+                "unknown target '{}' (expected personal|oauth|team)",
+                payload.target
+            ),
+        );
         return;
     }
 
@@ -1175,8 +1289,11 @@ fn handle_test(env: StdinEnvelope) {
     // Proxy must be up — the suite probes via proxy for every credential
     // kind. Same exit-condition as `aikey test`'s pre-flight.
     if !crate::commands_proxy::proxy_is_running_managed() {
-        emit_error(req_id, "I_PROXY_NOT_RUNNING",
-            "aikey-proxy is not running. Run `aikey proxy start` and retry.");
+        emit_error(
+            req_id,
+            "I_PROXY_NOT_RUNNING",
+            "aikey-proxy is not running. Run `aikey proxy start` and retry.",
+        );
         return;
     }
     let proxy_port = crate::commands_proxy::proxy_port();
@@ -1185,22 +1302,27 @@ fn handle_test(env: StdinEnvelope) {
     // personal → team → oauth; we filter to the caller's declared target
     // kind so a Web-side "test this OAuth key" doesn't accidentally hit a
     // personal alias that happens to share the same name.
-    let mut targets = crate::commands_project::targets_from_alias(
-        &payload.id, None, None, proxy_port,
-    );
+    let mut targets =
+        crate::commands_project::targets_from_alias(&payload.id, None, None, proxy_port);
     use crate::commands_project::CredentialKind;
     let expected_kind = match payload.target.as_str() {
         "personal" => Some(CredentialKind::PersonalApi),
-        "oauth"    => Some(CredentialKind::OAuth),
-        "team"     => Some(CredentialKind::ManagedTeam),
-        _          => None,
+        "oauth" => Some(CredentialKind::OAuth),
+        "team" => Some(CredentialKind::ManagedTeam),
+        _ => None,
     };
     if let Some(want) = expected_kind {
         targets.retain(|t| t.kind == want);
     }
     if targets.is_empty() {
-        emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
-            format!("no {} credential matches id '{}'", payload.target, payload.id));
+        emit_error(
+            req_id,
+            "I_CREDENTIAL_NOT_FOUND",
+            format!(
+                "no {} credential matches id '{}'",
+                payload.target, payload.id
+            ),
+        );
         return;
     }
 
@@ -1208,13 +1330,14 @@ fn handle_test(env: StdinEnvelope) {
     // popup's per-provider breakdown. No interactive output — the second
     // arg to run_connectivity_suite controls that.
     let opts = crate::commands_project::SuiteOptions {
-        show_proxy_row:  false,
-        header_label:    None,
-        password:        None,
+        show_proxy_row: false,
+        header_label: None,
+        password: None,
         proxy_port,
         show_key_column: false,
     };
-    let outcome = crate::commands_project::run_connectivity_suite(targets, opts, /*json_mode*/ true);
+    let outcome =
+        crate::commands_project::run_connectivity_suite(targets, opts, /*json_mode*/ true);
 
     // Aggregate + persist via the shared helper. Same code path the
     // public `aikey test` CLI uses, so the row a Web user sees after
@@ -1229,9 +1352,9 @@ fn handle_test(env: StdinEnvelope) {
     // == id to stay correct if `targets_from_alias` ever resolves to
     // multiple credentials of the same kind.
     let expected_kind_filter = expected_kind;
-    let matched = persisted_results.into_iter().find(|p| {
-        Some(p.target_kind) == expected_kind_filter && p.source_ref == payload.id
-    });
+    let matched = persisted_results
+        .into_iter()
+        .find(|p| Some(p.target_kind) == expected_kind_filter && p.source_ref == payload.id);
     let (persisted, last_test) = match matched {
         Some(p) => (p.persisted, p.last_test),
         None => {
@@ -1241,17 +1364,22 @@ fn handle_test(env: StdinEnvelope) {
             // payload's id, which can occur if targets_from_alias did
             // alias→canonical translation), fall back to a synthesized
             // record so the caller still sees a structured failure.
-            eprintln!("[_internal test WARN] no persisted result matched (target={}, id={})",
-                payload.target, payload.id);
-            (false, json!({
-                "at": std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0),
-                "status": "fail",
-                "error_code": "I_INTERNAL_NO_MATCH",
-                "error_message": "probe completed but result aggregation didn't match the requested target",
-            }))
+            eprintln!(
+                "[_internal test WARN] no persisted result matched (target={}, id={})",
+                payload.target, payload.id
+            );
+            (
+                false,
+                json!({
+                    "at": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                    "status": "fail",
+                    "error_code": "I_INTERNAL_NO_MATCH",
+                    "error_message": "probe completed but result aggregation didn't match the requested target",
+                }),
+            )
         }
     };
 
@@ -1315,20 +1443,29 @@ fn handle_test_raw(env: StdinEnvelope) {
     let payload: Payload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON",
-                format!("test_raw payload: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("test_raw payload: {}", e),
+            );
             return;
         }
     };
 
     if payload.providers.is_empty() {
-        emit_error(req_id, "I_STDIN_INVALID_JSON",
-            "test_raw requires at least one provider");
+        emit_error(
+            req_id,
+            "I_STDIN_INVALID_JSON",
+            "test_raw requires at least one provider",
+        );
         return;
     }
     if payload.secret.trim().is_empty() {
-        emit_error(req_id, "I_STDIN_INVALID_JSON",
-            "test_raw requires a non-empty secret");
+        emit_error(
+            req_id,
+            "I_STDIN_INVALID_JSON",
+            "test_raw requires a non-empty secret",
+        );
         return;
     }
 
@@ -1354,8 +1491,11 @@ fn handle_test_raw(env: StdinEnvelope) {
         base_url_override,
     );
     if targets.is_empty() {
-        emit_error(req_id, "I_INTERNAL",
-            "test_raw: target construction yielded zero targets");
+        emit_error(
+            req_id,
+            "I_INTERNAL",
+            "test_raw: target construction yielded zero targets",
+        );
         return;
     }
 
@@ -1366,31 +1506,34 @@ fn handle_test_raw(env: StdinEnvelope) {
     // side when last_test carries no Proxy row.
     let opts = crate::commands_project::SuiteOptions {
         show_proxy_row: false,
-        header_label:   None,
-        password:       None,
-        proxy_port:     crate::commands_proxy::proxy_port(),
+        header_label: None,
+        password: None,
+        proxy_port: crate::commands_proxy::proxy_port(),
         show_key_column: false,
     };
-    let outcome = crate::commands_project::run_connectivity_suite(
-        targets, opts, /*json_mode*/ true,
-    );
+    let outcome =
+        crate::commands_project::run_connectivity_suite(targets, opts, /*json_mode*/ true);
 
     // Aggregate WITHOUT persisting. With targets_from_new_personal_key
     // producing one PersonalApi TestTarget per provider — all sharing
     // the same source_ref=alias_hint — aggregate collapses them into
     // exactly one record per spec §10.5 any-ok semantics.
     let records = crate::commands_project::aggregate_test_outcome(&outcome);
-    let last_test = records.into_iter().next()
+    let last_test = records
+        .into_iter()
+        .next()
         .map(|r| r.last_test)
-        .unwrap_or_else(|| json!({
-            "at": std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
-            "status": "fail",
-            "error_code": "I_INTERNAL_NO_AGGREGATE",
-            "error_message": "probe completed but aggregation produced no record",
-        }));
+        .unwrap_or_else(|| {
+            json!({
+                "at": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+                "status": "fail",
+                "error_code": "I_INTERNAL_NO_AGGREGATE",
+                "error_message": "probe completed but aggregation produced no record",
+            })
+        });
 
     emit(&ResultEnvelope::ok(
         req_id,
@@ -1441,7 +1584,11 @@ fn handle_use(env: StdinEnvelope) {
     let payload: Payload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON", format!("use payload invalid: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("use payload invalid: {}", e),
+            );
             return;
         }
     };
@@ -1461,22 +1608,30 @@ fn handle_use(env: StdinEnvelope) {
             let metas = match storage::list_entries_with_metadata() {
                 Ok(v) => v,
                 Err(e) => {
-                    emit_error(req_id, "I_INTERNAL", format!("list_entries_with_metadata: {}", e));
+                    emit_error(
+                        req_id,
+                        "I_INTERNAL",
+                        format!("list_entries_with_metadata: {}", e),
+                    );
                     return;
                 }
             };
             let meta = match metas.into_iter().find(|m| m.alias == payload.id) {
                 Some(m) => m,
                 None => {
-                    emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
-                        format!("alias '{}' does not exist", payload.id));
+                    emit_error(
+                        req_id,
+                        "I_CREDENTIAL_NOT_FOUND",
+                        format!("alias '{}' does not exist", payload.id),
+                    );
                     return;
                 }
             };
             // Prefer the v1.0.2+ multi-provider list; fall back to the legacy
             // single provider_code. An entry with neither is unbindable —
             // refuse rather than silently no-op.
-            let providers: Vec<String> = meta.supported_providers
+            let providers: Vec<String> = meta
+                .supported_providers
                 .clone()
                 .filter(|v| !v.is_empty())
                 .or_else(|| meta.provider_code.clone().map(|p| vec![p]))
@@ -1492,8 +1647,11 @@ fn handle_use(env: StdinEnvelope) {
             let acct = match storage::get_provider_account(&payload.id) {
                 Ok(Some(a)) => a,
                 Ok(None) => {
-                    emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
-                        format!("provider_account_id '{}' does not exist", payload.id));
+                    emit_error(
+                        req_id,
+                        "I_CREDENTIAL_NOT_FOUND",
+                        format!("provider_account_id '{}' does not exist", payload.id),
+                    );
                     return;
                 }
                 Err(e) => {
@@ -1517,24 +1675,38 @@ fn handle_use(env: StdinEnvelope) {
             let entries = match storage::list_virtual_key_cache() {
                 Ok(v) => v,
                 Err(e) => {
-                    emit_error(req_id, "I_INTERNAL",
-                        format!("list_virtual_key_cache: {}", e));
+                    emit_error(
+                        req_id,
+                        "I_INTERNAL",
+                        format!("list_virtual_key_cache: {}", e),
+                    );
                     return;
                 }
             };
             // Resolution order: exact virtual_key_id → local_alias → server alias.
             // Exact id wins so a user who typed the canonical vk_xxx form is
             // never ambiguous with a local nickname.
-            let entry = entries.iter().find(|e| e.virtual_key_id == payload.id)
-                .or_else(|| entries.iter().find(|e|
-                    e.local_alias.as_deref() == Some(payload.id.as_str())))
+            let entry = entries
+                .iter()
+                .find(|e| e.virtual_key_id == payload.id)
+                .or_else(|| {
+                    entries
+                        .iter()
+                        .find(|e| e.local_alias.as_deref() == Some(payload.id.as_str()))
+                })
                 .or_else(|| entries.iter().find(|e| e.alias == payload.id))
                 .cloned();
             let entry = match entry {
                 Some(e) => e,
                 None => {
-                    emit_error(req_id, "I_CREDENTIAL_NOT_FOUND",
-                        format!("team key '{}' not found in local cache (run `aikey key sync`)", payload.id));
+                    emit_error(
+                        req_id,
+                        "I_CREDENTIAL_NOT_FOUND",
+                        format!(
+                            "team key '{}' not found in local cache (run `aikey key sync`)",
+                            payload.id
+                        ),
+                    );
                     return;
                 }
             };
@@ -1558,24 +1730,45 @@ fn handle_use(env: StdinEnvelope) {
                 | "disabled_by_account_status"
                 | "disabled_by_seat_status"
                 | "disabled_by_key_status" => {
-                    emit_error(req_id, "I_KEY_DISABLED",
-                        format!("team key '{}' is disabled (state={})", payload.id, entry.local_state));
+                    emit_error(
+                        req_id,
+                        "I_KEY_DISABLED",
+                        format!(
+                            "team key '{}' is disabled (state={})",
+                            payload.id, entry.local_state
+                        ),
+                    );
                     return;
                 }
                 "stale" => {
-                    emit_error(req_id, "I_KEY_STALE",
-                        format!("team key '{}' is stale (run `aikey key sync` to refresh)", payload.id));
+                    emit_error(
+                        req_id,
+                        "I_KEY_STALE",
+                        format!(
+                            "team key '{}' is stale (run `aikey key sync` to refresh)",
+                            payload.id
+                        ),
+                    );
                     return;
                 }
                 other => {
-                    emit_error(req_id, "I_KEY_DISABLED",
-                        format!("team key '{}' is not usable (state={})", payload.id, other));
+                    emit_error(
+                        req_id,
+                        "I_KEY_DISABLED",
+                        format!("team key '{}' is not usable (state={})", payload.id, other),
+                    );
                     return;
                 }
             }
             if entry.key_status != "active" {
-                emit_error(req_id, "I_KEY_DISABLED",
-                    format!("team key '{}' has server status '{}'", payload.id, entry.key_status));
+                emit_error(
+                    req_id,
+                    "I_KEY_DISABLED",
+                    format!(
+                        "team key '{}' has server status '{}'",
+                        payload.id, entry.key_status
+                    ),
+                );
                 return;
             }
             // Phase 3B (2026-05-11): if the local cache has metadata but
@@ -1596,7 +1789,9 @@ fn handle_use(env: StdinEnvelope) {
                     Ok(_) => {
                         // Re-read the entry — the sync may have populated
                         // ciphertext + flipped local_state.
-                        if let Ok(Some(refreshed)) = storage::get_virtual_key_cache(&entry.virtual_key_id) {
+                        if let Ok(Some(refreshed)) =
+                            storage::get_virtual_key_cache(&entry.virtual_key_id)
+                        {
                             entry = refreshed;
                         }
                     }
@@ -1604,15 +1799,23 @@ fn handle_use(env: StdinEnvelope) {
                         // Sync attempt itself failed (network / token expired).
                         // Fall through to the ciphertext check below — we'll
                         // emit a clearer error there if still missing.
-                        eprintln!("[vault_op handle_use WARN] auto-sync for team key '{}' failed: {}",
-                            entry.alias, e);
+                        eprintln!(
+                            "[vault_op handle_use WARN] auto-sync for team key '{}' failed: {}",
+                            entry.alias, e
+                        );
                     }
                 }
                 if entry.provider_key_ciphertext.is_none() {
-                    emit_error(req_id, "I_KEY_NOT_DELIVERED",
-                        format!("Team key '{}' was not delivered (ciphertext missing). \
+                    emit_error(
+                        req_id,
+                        "I_KEY_NOT_DELIVERED",
+                        format!(
+                            "Team key '{}' was not delivered (ciphertext missing). \
                                 Try running `aikey key sync` in a terminal, or contact \
-                                your team admin to re-issue the key.", entry.alias));
+                                your team admin to re-issue the key.",
+                            entry.alias
+                        ),
+                    );
                     return;
                 }
             }
@@ -1624,8 +1827,11 @@ fn handle_use(env: StdinEnvelope) {
             } else if !entry.provider_code.is_empty() {
                 vec![entry.provider_code.clone()]
             } else {
-                emit_error(req_id, "I_KEY_NO_PROVIDER",
-                    format!("team key '{}' has no provider assignment", payload.id));
+                emit_error(
+                    req_id,
+                    "I_KEY_NO_PROVIDER",
+                    format!("team key '{}' has no provider assignment", payload.id),
+                );
                 return;
             };
             // Use the canonical vk_id as the binding's key_source_ref —
@@ -1636,8 +1842,11 @@ fn handle_use(env: StdinEnvelope) {
             (CredentialType::ManagedVirtualKey, providers)
         }
         other => {
-            emit_error(req_id, "I_UNKNOWN_TARGET",
-                format!("unknown target '{}' (expected personal|oauth|team)", other));
+            emit_error(
+                req_id,
+                "I_UNKNOWN_TARGET",
+                format!("unknown target '{}' (expected personal|oauth|team)", other),
+            );
             return;
         }
     };
@@ -1648,13 +1857,18 @@ fn handle_use(env: StdinEnvelope) {
     let canonical_key_ref: String = match payload.target.as_str() {
         "team" => {
             // Safe to expect: we already validated entry exists above.
-            storage::list_virtual_key_cache().ok().and_then(|v| {
-                v.into_iter().find(|e|
-                    e.virtual_key_id == payload.id
-                    || e.local_alias.as_deref() == Some(payload.id.as_str())
-                    || e.alias == payload.id
-                ).map(|e| e.virtual_key_id)
-            }).unwrap_or_else(|| payload.id.clone())
+            storage::list_virtual_key_cache()
+                .ok()
+                .and_then(|v| {
+                    v.into_iter()
+                        .find(|e| {
+                            e.virtual_key_id == payload.id
+                                || e.local_alias.as_deref() == Some(payload.id.as_str())
+                                || e.alias == payload.id
+                        })
+                        .map(|e| e.virtual_key_id)
+                })
+                .unwrap_or_else(|| payload.id.clone())
         }
         _ => payload.id.clone(),
     };
@@ -1680,14 +1894,17 @@ fn handle_use(env: StdinEnvelope) {
 
     emit(&ResultEnvelope::ok(
         req_id,
-        merge_hook_status_from_outcome(json!({
-            "target": payload.target,
-            "id": canonical_key_ref,
-            "input_id": payload.id,
-            "activated_providers": providers,
-            "active_env_refreshed": refresh_ok,
-            "audit_logged": audit_logged,
-        }), &lifecycle),
+        merge_hook_status_from_outcome(
+            json!({
+                "target": payload.target,
+                "id": canonical_key_ref,
+                "input_id": payload.id,
+                "activated_providers": providers,
+                "active_env_refreshed": refresh_ok,
+                "audit_logged": audit_logged,
+            }),
+            &lifecycle,
+        ),
     ));
 }
 
@@ -1823,7 +2040,10 @@ mod hook_envelope_tests {
         });
 
         assert_eq!(json["hook_file_installed"], serde_json::json!(false));
-        assert_eq!(json["hook_failure_reason"], serde_json::json!("aikey_no_hook"));
+        assert_eq!(
+            json["hook_failure_reason"],
+            serde_json::json!("aikey_no_hook")
+        );
     }
 
     #[test]
@@ -1853,7 +2073,10 @@ mod hook_envelope_tests {
 
         // Base fields preserved
         assert_eq!(merged["alias"], serde_json::json!("foo"));
-        assert_eq!(merged["newly_primary_providers"], serde_json::json!(["anthropic"]));
+        assert_eq!(
+            merged["newly_primary_providers"],
+            serde_json::json!(["anthropic"])
+        );
         // Three hook fields added — exact key set, no others
         assert!(merged.get("hook_file_installed").is_some());
         assert!(merged.get("hook_rc_wired").is_some());

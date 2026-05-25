@@ -111,7 +111,10 @@ use super::query::team_effective_status;
 
 #[test]
 fn team_effective_status_active_when_active_claimed_active() {
-    assert_eq!(team_effective_status("active", "claimed", "active"), "active");
+    assert_eq!(
+        team_effective_status("active", "claimed", "active"),
+        "active"
+    );
 }
 
 #[test]

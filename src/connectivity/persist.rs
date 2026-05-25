@@ -125,7 +125,7 @@ pub fn aggregate_test_outcome(outcome: &SuiteOutcome) -> Vec<AggregatedTestRecor
         // the popup.
         let group_rows: Vec<&(_, _)> = idxs.iter().map(|&i| &outcome.rows[i]).collect();
         let ping_ok = group_rows.iter().any(|(_t, r)| r.ping_ok);
-        let api_ok  = group_rows.iter().any(|(_t, r)| r.api_ok);
+        let api_ok = group_rows.iter().any(|(_t, r)| r.api_ok);
         let chat_ok = group_rows.iter().any(|(_t, r)| r.chat_ok);
         // Overall status keeps the old pass/fail signal for back-compat
         // with anything reading just `status`; new code should read the
@@ -161,7 +161,8 @@ pub fn aggregate_test_outcome(outcome: &SuiteOutcome) -> Vec<AggregatedTestRecor
             // earlier api 200. Previously this always read api_body_snippet,
             // which silently hid every chat-stage failure.
             let cap_280 = |opt: &Option<String>| -> Option<String> {
-                opt.as_ref().map(|s| s.chars().take(280).collect::<String>())
+                opt.as_ref()
+                    .map(|s| s.chars().take(280).collect::<String>())
             };
             if let Some((_, r)) = group_rows.iter().find(|(_, r)| !r.ping_ok) {
                 let _ = r;
@@ -238,7 +239,11 @@ pub fn persist_test_outcome(outcome: &SuiteOutcome) -> Vec<PersistedTestResult> 
     let records = aggregate_test_outcome(outcome);
     let mut results: Vec<PersistedTestResult> = Vec::with_capacity(records.len());
     for record in records {
-        let AggregatedTestRecord { target_kind, source_ref, last_test } = record;
+        let AggregatedTestRecord {
+            target_kind,
+            source_ref,
+            last_test,
+        } = record;
 
         let record_json = match serde_json::to_string(&last_test) {
             Ok(s) => s,
@@ -360,7 +365,10 @@ mod tests {
         assert_eq!(lt["api_ok"], true);
         assert_eq!(lt["chat_ok"], true);
         assert_eq!(lt["latency_ms"], 186);
-        assert!(lt.get("error_code").is_none(), "pass row must NOT carry error_code");
+        assert!(
+            lt.get("error_code").is_none(),
+            "pass row must NOT carry error_code"
+        );
     }
 
     #[test]
@@ -370,18 +378,31 @@ mod tests {
         // realistic when an aggregator key (openrouter, yunwu) serves > 1
         // protocol.
         let mut r1 = ConnectivityResult::default();
-        r1.ping_ok = true; r1.api_ok = true; r1.api_ms = 500;
-        r1.chat_ok = true; r1.chat_status = Some(200);
+        r1.ping_ok = true;
+        r1.api_ok = true;
+        r1.api_ms = 500;
+        r1.chat_ok = true;
+        r1.chat_status = Some(200);
         let mut r2 = ConnectivityResult::default();
-        r2.ping_ok = true; r2.api_ok = true; r2.api_ms = 120;
-        r2.chat_ok = true; r2.chat_status = Some(200);
+        r2.ping_ok = true;
+        r2.api_ok = true;
+        r2.api_ms = 120;
+        r2.chat_ok = true;
+        r2.chat_status = Some(200);
         let so = outcome(vec![
             (target("agg-1", CredentialKind::PersonalApi), r1),
             (target("agg-1", CredentialKind::PersonalApi), r2),
         ]);
         let agg = aggregate_test_outcome(&so);
-        assert_eq!(agg.len(), 1, "two rows for same credential must collapse into one record");
-        assert_eq!(agg[0].last_test["latency_ms"], 120, "min api_ms across passing rows");
+        assert_eq!(
+            agg.len(),
+            1,
+            "two rows for same credential must collapse into one record"
+        );
+        assert_eq!(
+            agg[0].last_test["latency_ms"], 120,
+            "min api_ms across passing rows"
+        );
     }
 
     #[test]
@@ -399,8 +420,14 @@ mod tests {
         let lt = &agg[0].last_test;
         assert_eq!(lt["status"], "fail");
         assert_eq!(lt["error_code"], "PROXY_UPSTREAM_UNREACHABLE");
-        assert!(lt["error_message"].as_str().unwrap().contains("aikey-proxy could not reach"));
-        assert!(lt.get("latency_ms").is_none(), "ping_ms=0 must omit latency_ms (spec §5.1 fail path)");
+        assert!(lt["error_message"]
+            .as_str()
+            .unwrap()
+            .contains("aikey-proxy could not reach"));
+        assert!(
+            lt.get("latency_ms").is_none(),
+            "ping_ms=0 must omit latency_ms (spec §5.1 fail path)"
+        );
     }
 
     #[test]
@@ -422,14 +449,19 @@ mod tests {
         assert_eq!(lt["status"], "fail");
         assert_eq!(lt["error_code"], "HTTP_401");
         assert_eq!(lt["error_message"], "Invalid API key");
-        assert_eq!(lt["latency_ms"], 50, "fail path latency_ms = max ping_ms across rows");
+        assert_eq!(
+            lt["latency_ms"], 50,
+            "fail path latency_ms = max ping_ms across rows"
+        );
     }
 
     #[test]
     fn api_failure_without_status_emits_no_http_status_sentinel() {
         let r = ConnectivityResult {
-            ping_ok: true, ping_ms: 30,
-            api_ok: false, api_status: None,
+            ping_ok: true,
+            ping_ms: 30,
+            api_ok: false,
+            api_status: None,
             chat_ok: false,
             ..Default::default()
         };
@@ -444,26 +476,39 @@ mod tests {
         // 200 + chat 401 reported as success). First-failing-phase chain
         // must walk Ping → API → Chat and stop at the first !*_ok.
         let r = ConnectivityResult {
-            ping_ok: true, ping_ms: 40,
-            api_ok: true, api_ms: 80, api_status: Some(200),
+            ping_ok: true,
+            ping_ms: 40,
+            api_ok: true,
+            api_ms: 80,
+            api_status: Some(200),
             api_body_snippet: Some("{\"models\": []}".into()),
-            chat_ok: false, chat_status: Some(400),
+            chat_ok: false,
+            chat_status: Some(400),
             chat_body_snippet: Some("invalid model".into()),
             ..Default::default()
         };
         let agg = aggregate_test_outcome(&single(CredentialKind::PersonalApi, r));
         let lt = &agg[0].last_test;
         assert_eq!(lt["status"], "fail");
-        assert_eq!(lt["error_code"], "HTTP_400", "chat 400 must win, NOT api 200");
-        assert_eq!(lt["error_message"], "invalid model", "must read chat_body_snippet, not api_body_snippet");
+        assert_eq!(
+            lt["error_code"], "HTTP_400",
+            "chat 400 must win, NOT api 200"
+        );
+        assert_eq!(
+            lt["error_message"], "invalid model",
+            "must read chat_body_snippet, not api_body_snippet"
+        );
     }
 
     #[test]
     fn chat_failure_without_status_emits_no_http_status_sentinel() {
         let r = ConnectivityResult {
-            ping_ok: true, ping_ms: 40,
-            api_ok: true, api_status: Some(200),
-            chat_ok: false, chat_status: None,
+            ping_ok: true,
+            ping_ms: 40,
+            api_ok: true,
+            api_status: Some(200),
+            chat_ok: false,
+            chat_status: None,
             ..Default::default()
         };
         let agg = aggregate_test_outcome(&single(CredentialKind::PersonalApi, r));
@@ -478,7 +523,8 @@ mod tests {
         let long = "x".repeat(500);
         let r = ConnectivityResult {
             ping_ok: true,
-            api_ok: false, api_status: Some(502),
+            api_ok: false,
+            api_status: Some(502),
             api_body_snippet: Some(long.clone()),
             chat_ok: false,
             ..Default::default()
@@ -495,8 +541,11 @@ mod tests {
         // same (kind, source_ref): one fully pass, one fully fail → overall
         // status=pass and all three phase booleans=true.
         let mut pass = ConnectivityResult::default();
-        pass.ping_ok = true; pass.api_ok = true; pass.api_ms = 100;
-        pass.chat_ok = true; pass.chat_status = Some(200);
+        pass.ping_ok = true;
+        pass.api_ok = true;
+        pass.api_ms = 100;
+        pass.chat_ok = true;
+        pass.chat_status = Some(200);
         let fail = ConnectivityResult::default(); // all false
         let so = outcome(vec![
             (target("multi", CredentialKind::PersonalApi), fail),
@@ -517,7 +566,12 @@ mod tests {
         // this group's source_ref. Proxy row has provider="proxy" + no
         // source_ref → naturally drops. Regression guard against showing
         // unrelated rows in the popup's per-provider breakdown.
-        let r = ConnectivityResult { ping_ok: true, api_ok: true, chat_ok: true, ..Default::default() };
+        let r = ConnectivityResult {
+            ping_ok: true,
+            api_ok: true,
+            chat_ok: true,
+            ..Default::default()
+        };
         let so = SuiteOutcome {
             rows: vec![(target("kimi-1", CredentialKind::PersonalApi), r)],
             proxy: None,
@@ -531,7 +585,11 @@ mod tests {
         };
         let agg = aggregate_test_outcome(&so);
         let rows = agg[0].last_test["suite_results"].as_array().unwrap();
-        assert_eq!(rows.len(), 1, "only the row matching source_ref must be kept");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the row matching source_ref must be kept"
+        );
         assert_eq!(rows[0]["source_ref"], "kimi-1");
     }
 
@@ -547,8 +605,11 @@ mod tests {
         // assert via the surrounding behavior: if all phases ok, no
         // error_code key is emitted.
         let r = ConnectivityResult {
-            ping_ok: true, api_ok: true, chat_ok: true,
-            api_status: Some(200), chat_status: Some(200),
+            ping_ok: true,
+            api_ok: true,
+            chat_ok: true,
+            api_status: Some(200),
+            chat_status: Some(200),
             ..Default::default()
         };
         let agg = aggregate_test_outcome(&single(CredentialKind::PersonalApi, r));
@@ -558,14 +619,19 @@ mod tests {
     #[test]
     fn fail_path_latency_takes_max_ping_ms_across_rows() {
         let mut r1 = ConnectivityResult::default();
-        r1.ping_ok = false; r1.ping_ms = 100;
+        r1.ping_ok = false;
+        r1.ping_ms = 100;
         let mut r2 = ConnectivityResult::default();
-        r2.ping_ok = false; r2.ping_ms = 350;
+        r2.ping_ok = false;
+        r2.ping_ms = 350;
         let so = outcome(vec![
             (target("x", CredentialKind::PersonalApi), r1),
             (target("x", CredentialKind::PersonalApi), r2),
         ]);
         let agg = aggregate_test_outcome(&so);
-        assert_eq!(agg[0].last_test["latency_ms"], 350, "fail path = slowest hop");
+        assert_eq!(
+            agg[0].last_test["latency_ms"], 350,
+            "fail path = slowest hop"
+        );
     }
 }

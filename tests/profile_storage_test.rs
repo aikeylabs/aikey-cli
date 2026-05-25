@@ -121,7 +121,9 @@ fn remove_provider_binding_works() {
 
     storage::set_provider_binding("default", "openai", "personal", "a").unwrap();
     assert!(storage::remove_provider_binding("default", "openai").unwrap());
-    assert!(storage::get_provider_binding("default", "openai").unwrap().is_none());
+    assert!(storage::get_provider_binding("default", "openai")
+        .unwrap()
+        .is_none());
 
     // Removing non-existent returns false
     assert!(!storage::remove_provider_binding("default", "openai").unwrap());
@@ -144,10 +146,16 @@ fn remove_bindings_by_key_source_cleans_all_providers() {
     assert!(affected.contains(&"anthropic".to_string()));
 
     // google untouched
-    assert!(storage::get_provider_binding("default", "google").unwrap().is_some());
+    assert!(storage::get_provider_binding("default", "google")
+        .unwrap()
+        .is_some());
     // openai + anthropic gone
-    assert!(storage::get_provider_binding("default", "openai").unwrap().is_none());
-    assert!(storage::get_provider_binding("default", "anthropic").unwrap().is_none());
+    assert!(storage::get_provider_binding("default", "openai")
+        .unwrap()
+        .is_none());
+    assert!(storage::get_provider_binding("default", "anthropic")
+        .unwrap()
+        .is_none());
 }
 
 // ============================================================================
@@ -275,11 +283,17 @@ fn migration_carries_over_legacy_active_key() {
     let bindings = storage::list_provider_bindings("default").unwrap();
 
     assert_eq!(bindings.len(), 2);
-    let anthropic = bindings.iter().find(|b| b.provider_code == "anthropic").unwrap();
+    let anthropic = bindings
+        .iter()
+        .find(|b| b.provider_code == "anthropic")
+        .unwrap();
     assert_eq!(anthropic.key_source_type, CredentialType::PersonalApiKey);
     assert_eq!(anthropic.key_source_ref, "my-claude");
 
-    let openai = bindings.iter().find(|b| b.provider_code == "openai").unwrap();
+    let openai = bindings
+        .iter()
+        .find(|b| b.provider_code == "openai")
+        .unwrap();
     assert_eq!(openai.key_source_type, CredentialType::PersonalApiKey);
     assert_eq!(openai.key_source_ref, "my-claude");
 }

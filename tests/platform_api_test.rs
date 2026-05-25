@@ -1,6 +1,5 @@
 /// Platform API v0.2 Integration Tests
 /// Tests for the new secret set, profile current, and error code features
-
 use assert_cmd::Command;
 use serde_json::Value;
 use std::fs;
@@ -138,7 +137,7 @@ fn test_secret_set_empty_value_error() {
         .arg("--password-stdin")
         .arg("--json")
         .env("HOME", temp_dir.path())
-        .env_remove("AK_TEST_PASSWORD")  // Ensure we don't use the test env var
+        .env_remove("AK_TEST_PASSWORD") // Ensure we don't use the test env var
         .write_stdin("test_password_123\n")
         .assert()
         .success();
@@ -153,8 +152,8 @@ fn test_secret_set_empty_value_error() {
         .arg("--password-stdin")
         .arg("--json")
         .env("HOME", temp_dir.path())
-        .env_remove("AK_TEST_PASSWORD")  // Ensure we don't use the test env var
-        .write_stdin("test_password_123\n\n")  // password + empty secret value
+        .env_remove("AK_TEST_PASSWORD") // Ensure we don't use the test env var
+        .write_stdin("test_password_123\n\n") // password + empty secret value
         .output()
         .unwrap();
 
@@ -187,7 +186,7 @@ fn test_error_code_vault_locked() {
         .arg("--password-stdin")
         .arg("--json")
         .env("HOME", temp_dir.path())
-        .env_remove("AK_TEST_PASSWORD")  // Remove to force stdin password reading
+        .env_remove("AK_TEST_PASSWORD") // Remove to force stdin password reading
         .write_stdin("wrong_password\ntest_value\n")
         .output()
         .unwrap();
@@ -200,7 +199,11 @@ fn test_error_code_vault_locked() {
     assert_eq!(json["ok"], false);
     // Check that we got an error message about authentication
     let message = json["message"].as_str().unwrap();
-    assert!(message.contains("Invalid master password") || message.contains("authentication") || message.contains("corrupted vault"));
+    assert!(
+        message.contains("Invalid master password")
+            || message.contains("authentication")
+            || message.contains("corrupted vault")
+    );
 }
 
 #[test]
@@ -217,7 +220,7 @@ fn test_secret_set_integration_with_get() {
         .arg("--password-stdin")
         .arg("--json")
         .env("HOME", temp_dir.path())
-        .env_remove("AK_TEST_PASSWORD")  // Remove to force stdin password reading
+        .env_remove("AK_TEST_PASSWORD") // Remove to force stdin password reading
         .write_stdin("test_password_123\nintegration_value\n")
         .assert()
         .success();
@@ -231,7 +234,7 @@ fn test_secret_set_integration_with_get() {
         .arg("--json")
         .env("HOME", temp_dir.path())
         .env("AK_NO_CLIPBOARD", "1")
-        .env_remove("AK_TEST_PASSWORD")  // Remove to force stdin password reading
+        .env_remove("AK_TEST_PASSWORD") // Remove to force stdin password reading
         .write_stdin("test_password_123\n")
         .output()
         .unwrap();

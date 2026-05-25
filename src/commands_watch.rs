@@ -54,8 +54,7 @@ pub fn run() -> io::Result<()> {
     }
 
     use std::io::IsTerminal;
-    let force_snapshot = !std::io::stdout().is_terminal()
-        || !terminal_supports_alt_screen();
+    let force_snapshot = !std::io::stdout().is_terminal() || !terminal_supports_alt_screen();
 
     if force_snapshot {
         let now = SystemTime::now();
@@ -147,7 +146,10 @@ pub(crate) struct Aggregator {
 
 impl Aggregator {
     fn new() -> Self {
-        Self { by_key: HashMap::new(), last_event_at: None }
+        Self {
+            by_key: HashMap::new(),
+            last_event_at: None,
+        }
     }
 
     /// Fold one event into the aggregator.  Idempotency is the caller's
@@ -164,11 +166,16 @@ impl Aggregator {
             return;
         }
 
-        let Some(ts_secs) = ev.finished_at_unix() else { return; };
+        let Some(ts_secs) = ev.finished_at_unix() else {
+            return;
+        };
         let ts = UNIX_EPOCH + Duration::from_secs(ts_secs as u64);
 
         let key_id = aggregate_key_id(ev);
-        let entry = self.by_key.entry(key_id.clone()).or_insert_with(|| KeyAggregate::empty(ev));
+        let entry = self
+            .by_key
+            .entry(key_id.clone())
+            .or_insert_with(|| KeyAggregate::empty(ev));
         entry.apply(ev, ts);
 
         match self.last_event_at {
@@ -185,7 +192,8 @@ impl Aggregator {
         rows.sort_by(|a, b| {
             let ta = a.today.in_tokens + a.today.out_tokens;
             let tb = b.today.in_tokens + b.today.out_tokens;
-            tb.cmp(&ta).then_with(|| b.last_event_at.cmp(&a.last_event_at))
+            tb.cmp(&ta)
+                .then_with(|| b.last_event_at.cmp(&a.last_event_at))
         });
         rows
     }
@@ -193,11 +201,9 @@ impl Aggregator {
     /// Most recent events seen during ingestion, newest first, bounded
     /// by `limit`.  Backs the "recent" section at the bottom of the TUI.
     pub(crate) fn recent_events(&self, limit: usize) -> Vec<&UsageEvent> {
-        let mut all: Vec<&UsageEvent> = self.by_key.values()
-            .flat_map(|k| k.recent.iter())
-            .collect();
-        all.sort_by(|a, b|
-            b.finished_at_unix().cmp(&a.finished_at_unix()));
+        let mut all: Vec<&UsageEvent> =
+            self.by_key.values().flat_map(|k| k.recent.iter()).collect();
+        all.sort_by(|a, b| b.finished_at_unix().cmp(&a.finished_at_unix()));
         all.truncate(limit);
         all
     }
@@ -207,9 +213,13 @@ impl Aggregator {
 /// Claude/Codex/Kimi account); for team/personal keys we use virtual_key_id
 /// which is guaranteed stable across rotations.
 fn aggregate_key_id(ev: &UsageEvent) -> String {
-    if !ev.virtual_key_id.is_empty() { ev.virtual_key_id.clone() }
-    else if let Some(oid) = ev.oauth_identity.as_deref() { oid.to_string() }
-    else { "(unknown)".to_string() }
+    if !ev.virtual_key_id.is_empty() {
+        ev.virtual_key_id.clone()
+    } else if let Some(oid) = ev.oauth_identity.as_deref() {
+        oid.to_string()
+    } else {
+        "(unknown)".to_string()
+    }
 }
 
 /// Proxy writes synthetic probe events at startup and on a timer to exercise
@@ -262,20 +272,30 @@ impl KeyAggregate {
         self.today.add(ts, in_tok, out_tok);
 
         self.session_latest = Some(match self.session_latest.take() {
-            Some(mut s) if ts.duration_since(s.last_event_at).unwrap_or(Duration::ZERO) <= SESSION_GAP => {
+            Some(mut s)
+                if ts.duration_since(s.last_event_at).unwrap_or(Duration::ZERO) <= SESSION_GAP =>
+            {
                 s.calls += 1;
                 s.in_tokens += in_tok;
                 s.out_tokens += out_tok;
                 s.last_event_at = ts;
                 s
             }
-            _ => Session { started_at: ts, last_event_at: ts, calls: 1, in_tokens: in_tok, out_tokens: out_tok },
+            _ => Session {
+                started_at: ts,
+                last_event_at: ts,
+                calls: 1,
+                in_tokens: in_tok,
+                out_tokens: out_tok,
+            },
         });
 
         self.last_event_at = Some(ts);
         // Latency isn't persisted in the WAL schema yet (see design doc
         // Future Directions §11); placeholder fields stay zero until then.
-        if let Some(code) = ev.http_status_code { self.last_status = Some(code); }
+        if let Some(code) = ev.http_status_code {
+            self.last_status = Some(code);
+        }
 
         if self.recent.len() >= RECENT_PER_KEY_CAP {
             // Keep only the most recent: drop oldest when full.
@@ -304,17 +324,35 @@ impl KeyIdentity {
     }
     fn update(&mut self, ev: &UsageEvent) {
         let label = best_label(ev);
-        if !label.is_empty() { self.label = label.to_string(); }
-        if !ev.route_source.is_empty() { self.key_type = ev.route_source.clone(); }
-        if !ev.provider_code.is_empty() { self.provider = ev.provider_code.clone(); }
-        if !ev.model.is_empty() { self.last_model = ev.model.clone(); }
+        if !label.is_empty() {
+            self.label = label.to_string();
+        }
+        if !ev.route_source.is_empty() {
+            self.key_type = ev.route_source.clone();
+        }
+        if !ev.provider_code.is_empty() {
+            self.provider = ev.provider_code.clone();
+        }
+        if !ev.model.is_empty() {
+            self.last_model = ev.model.clone();
+        }
     }
 }
 
 fn best_label(ev: &UsageEvent) -> &str {
-    if let Some(s) = ev.key_label.as_deref() { if !s.is_empty() { return s; } }
-    if let Some(s) = ev.oauth_identity.as_deref() { if !s.is_empty() { return s; } }
-    if !ev.virtual_key_id.is_empty() { return ev.virtual_key_id.as_str(); }
+    if let Some(s) = ev.key_label.as_deref() {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    if let Some(s) = ev.oauth_identity.as_deref() {
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    if !ev.virtual_key_id.is_empty() {
+        return ev.virtual_key_id.as_str();
+    }
     "(unknown)"
 }
 
@@ -349,14 +387,18 @@ pub(crate) struct MinuteBuckets {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Bucket {
-    minute_secs: u64,  // unix seconds / 60, 0 when slot unused
+    minute_secs: u64, // unix seconds / 60, 0 when slot unused
     calls: u32,
     in_tokens: u64,
     out_tokens: u64,
 }
 
 impl MinuteBuckets {
-    fn new() -> Self { Self { buckets: [Bucket::default(); 60] } }
+    fn new() -> Self {
+        Self {
+            buckets: [Bucket::default(); 60],
+        }
+    }
 
     fn add(&mut self, ts: SystemTime, in_tok: u64, out_tok: u64) {
         // Drop events already outside the 1h window: without this guard,
@@ -365,12 +407,19 @@ impl MinuteBuckets {
         // (collision frequency = 1/60 per event pair), silently losing data.
         let m = minute_index(ts);
         let now_m = minute_index(SystemTime::now());
-        if now_m.saturating_sub(m) >= 60 { return; }
+        if now_m.saturating_sub(m) >= 60 {
+            return;
+        }
 
         let slot = (m % 60) as usize;
         let b = &mut self.buckets[slot];
         if b.minute_secs != m {
-            *b = Bucket { minute_secs: m, calls: 0, in_tokens: 0, out_tokens: 0 };
+            *b = Bucket {
+                minute_secs: m,
+                calls: 0,
+                in_tokens: 0,
+                out_tokens: 0,
+            };
         }
         b.calls += 1;
         b.in_tokens += in_tok;
@@ -385,7 +434,9 @@ impl MinuteBuckets {
         let now_m = minute_index(now);
         let mut out = Counters::default();
         for b in &self.buckets {
-            if b.minute_secs == 0 { continue; }
+            if b.minute_secs == 0 {
+                continue;
+            }
             let delta = now_m.saturating_sub(b.minute_secs);
             if delta < 60 {
                 out.calls += b.calls as u64;
@@ -398,21 +449,30 @@ impl MinuteBuckets {
 }
 
 fn minute_index(ts: SystemTime) -> u64 {
-    ts.duration_since(UNIX_EPOCH).map(|d| d.as_secs() / 60).unwrap_or(0)
+    ts.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() / 60)
+        .unwrap_or(0)
 }
 
 /// Per-key today-total, keyed by local calendar date.  When the date
 /// advances, counters reset — matches a user's mental model of "today".
 #[derive(Debug, Clone)]
 pub(crate) struct DayCounters {
-    local_date: String,  // YYYY-MM-DD; empty until first event seen
+    local_date: String, // YYYY-MM-DD; empty until first event seen
     pub(crate) calls: u64,
     pub(crate) in_tokens: u64,
     pub(crate) out_tokens: u64,
 }
 
 impl DayCounters {
-    fn empty() -> Self { Self { local_date: String::new(), calls: 0, in_tokens: 0, out_tokens: 0 } }
+    fn empty() -> Self {
+        Self {
+            local_date: String::new(),
+            calls: 0,
+            in_tokens: 0,
+            out_tokens: 0,
+        }
+    }
     fn add(&mut self, ts: SystemTime, in_tok: u64, out_tok: u64) {
         let d = local_date_string(ts);
         if self.local_date != d {
@@ -441,7 +501,9 @@ pub(crate) struct Session {
 
 impl Session {
     pub(crate) fn is_active(&self, now: SystemTime) -> bool {
-        now.duration_since(self.last_event_at).unwrap_or(Duration::ZERO) < SESSION_GAP
+        now.duration_since(self.last_event_at)
+            .unwrap_or(Duration::ZERO)
+            < SESSION_GAP
     }
 }
 
@@ -451,7 +513,10 @@ impl Session {
 
 pub(crate) fn load_aggregator(wal_dir: &Path, now: SystemTime) -> io::Result<Aggregator> {
     let cutoff = now.checked_sub(LOOKBACK).unwrap_or(now);
-    let cutoff_secs = cutoff.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let cutoff_secs = cutoff
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
 
     let mut agg = Aggregator::new();
     let files = collect_wal_files(wal_dir)?;
@@ -469,13 +534,18 @@ fn collect_wal_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if let Some(name) = entry.path().file_name().and_then(|n| n.to_str()).map(str::to_string) {
+        if let Some(name) = entry
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        {
             if name.starts_with("usage-") && name.ends_with(".jsonl") {
                 paths.push(entry.path());
             }
         }
     }
-    paths.sort();  // file names are YYYYMMDD-HH → lexical sort = chronological
+    paths.sort(); // file names are YYYYMMDD-HH → lexical sort = chronological
     Ok(paths)
 }
 
@@ -488,11 +558,20 @@ fn ingest_file(path: &Path, cutoff_secs: i64, agg: &mut Aggregator) -> io::Resul
     };
     let reader = std::io::BufReader::new(file);
     for line in reader.lines() {
-        let line = match line { Ok(l) => l, Err(_) => continue };
-        if line.is_empty() { continue; }
-        let Ok(entry) = serde_json::from_str::<WalEnvelope>(&line) else { continue };
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<WalEnvelope>(&line) else {
+            continue;
+        };
         if let Some(ts) = entry.event_json.finished_at_unix() {
-            if ts < cutoff_secs { continue; }
+            if ts < cutoff_secs {
+                continue;
+            }
         }
         agg.apply(&entry.event_json);
     }
@@ -515,7 +594,10 @@ fn local_date_string(ts: SystemTime) -> String {
     // day-bucketing.  Correctness caveat: on a machine that crosses DST
     // during a session, "today" may shift by an hour at the boundary — we
     // treat that as acceptable for a UI dashboard, not accounting.
-    let secs = ts.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let secs = ts
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let local = secs + current_tz_offset_secs();
     let days = local / 86400;
     let (y, m, d) = civil_from_days(days);
@@ -570,7 +652,9 @@ fn current_tz_offset_secs() -> i64 {
         offset_minutes * 60
     }
     #[cfg(not(any(unix, windows)))]
-    { 0 }
+    {
+        0
+    }
 }
 
 /// Howard Hinnant's civil_from_days algorithm — inverse of
@@ -578,7 +662,11 @@ fn current_tz_offset_secs() -> i64 {
 /// a public helper when both modules only need one direction each.
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
     let z = days + 719468;
-    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 };
+    let era = if z >= 0 {
+        z / 146097
+    } else {
+        (z - 146096) / 146097
+    };
     let doe = (z - era * 146097) as u64;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe as i64 + era * 400;
@@ -600,15 +688,20 @@ fn render_snapshot(agg: &Aggregator, now: SystemTime) {
     println!();
     // Title / meta / keys — same three-tier structure as the TUI header so
     // the two modes feel visually related.
-    println!("  {} {} {}",
+    println!(
+        "  {} {} {}",
         "aikey watch".bold().truecolor(100, 210, 200),
         "—".truecolor(130, 130, 130),
-        format!("{} keys active in last 24h", rows.len()).truecolor(130, 130, 130));
+        format!("{} keys active in last 24h", rows.len()).truecolor(130, 130, 130)
+    );
     println!();
 
     if rows.is_empty() {
         println!("  {}", "No activity in the last 24 hours.".dimmed());
-        println!("  {}", "Make a request through aikey-proxy, then re-run.".dimmed());
+        println!(
+            "  {}",
+            "Make a request through aikey-proxy, then re-run.".dimmed()
+        );
         return;
     }
 
@@ -631,12 +724,27 @@ fn render_snapshot(agg: &Aggregator, now: SystemTime) {
     let n = recent.len();
     for (idx, ev) in recent.iter().enumerate() {
         let ts_secs = ev.finished_at_unix().unwrap_or(0);
-        let ago = now.duration_since(UNIX_EPOCH + Duration::from_secs(ts_secs as u64))
-            .map(humanize_duration).unwrap_or_else(|_| "-".into());
+        let ago = now
+            .duration_since(UNIX_EPOCH + Duration::from_secs(ts_secs as u64))
+            .map(humanize_duration)
+            .unwrap_or_else(|_| "-".into());
         let (i, o) = token_pair(ev);
         let label = best_label(ev);
         let label_trunc = shorten_str(label, 25);
-        println!("{}", recent_fade(&recent_row(&ago, &label_trunc, ev.provider_code.as_str(), i as u64, o as u64), idx, n));
+        println!(
+            "{}",
+            recent_fade(
+                &recent_row(
+                    &ago,
+                    &label_trunc,
+                    ev.provider_code.as_str(),
+                    i as u64,
+                    o as u64
+                ),
+                idx,
+                n
+            )
+        );
     }
 
     println!();
@@ -655,7 +763,8 @@ fn render_snapshot(agg: &Aggregator, now: SystemTime) {
         // Reached only when terminal_supports_alt_screen() returned false
         // for capability reasons (TERM=dumb / old Apple_Terminal / etc.).
         "(snapshot mode — terminal doesn't support alt-screen reliably; \
-         set AIKEY_WATCH_FORCE_TUI=1 to override)".to_string()
+         set AIKEY_WATCH_FORCE_TUI=1 to override)"
+            .to_string()
     };
     println!("  {}", hint.dimmed());
 }
@@ -670,12 +779,19 @@ fn render_snapshot(agg: &Aggregator, now: SystemTime) {
 /// Using a helper keeps snapshot + TUI renderers in lockstep.
 fn recent_row(ago: &str, label: &str, provider: &str, in_tok: u64, out_tok: u64) -> String {
     let tokens = format!("↑{} ↓{}", humanize_tokens(in_tok), humanize_tokens(out_tok));
-    format!("    {:>7}  {:<26}  {:<9}  {:<13}", ago, label, provider, tokens)
+    format!(
+        "    {:>7}  {:<26}  {:<9}  {:<13}",
+        ago, label, provider, tokens
+    )
 }
 
 fn humanize_tokens(n: u64) -> String {
-    if n < 10_000 { return n.to_string(); }
-    if n < 1_000_000 { return format!("{:.1}K", n as f64 / 1_000.0); }
+    if n < 10_000 {
+        return n.to_string();
+    }
+    if n < 1_000_000 {
+        return format!("{:.1}K", n as f64 / 1_000.0);
+    }
     format!("{:.1}M", n as f64 / 1_000_000.0)
 }
 
@@ -701,12 +817,16 @@ fn recent_fade(line: &str, index: usize, total: usize) -> String {
     // primary text — the recent strip is ancillary, so it shouldn't compete
     // for the eye with the main table above it.
     const TOP: f32 = 175.0; // newest
-    const BOT: f32 = 90.0;  // oldest
-    // 0.2 produces ~100 drop between row 0 and row 1 (225 → ~125) and then
-    // settles to small single-digit drops for the tail, which is the "sharp
-    // focus on newest" feel we want.
+    const BOT: f32 = 90.0; // oldest
+                           // 0.2 produces ~100 drop between row 0 and row 1 (225 → ~125) and then
+                           // settles to small single-digit drops for the tail, which is the "sharp
+                           // focus on newest" feel we want.
     const CURVE: f32 = 0.2;
-    let t = if total <= 1 { 0.0 } else { index as f32 / (total - 1) as f32 };
+    let t = if total <= 1 {
+        0.0
+    } else {
+        index as f32 / (total - 1) as f32
+    };
     let shaped = t.powf(CURVE);
     let v = (TOP + (BOT - TOP) * shaped).round() as u8;
     line.truecolor(v, v, v).to_string()
@@ -714,9 +834,15 @@ fn recent_fade(line: &str, index: usize, total: usize) -> String {
 
 fn humanize_duration(d: Duration) -> String {
     let s = d.as_secs();
-    if s < 60 { return format!("{}s ago", s); }
-    if s < 3600 { return format!("{}m ago", s / 60); }
-    if s < 86400 { return format!("{}h ago", s / 3600); }
+    if s < 60 {
+        return format!("{}s ago", s);
+    }
+    if s < 3600 {
+        return format!("{}m ago", s / 60);
+    }
+    if s < 86400 {
+        return format!("{}h ago", s / 3600);
+    }
     format!("{}d ago", s / 86400)
 }
 
@@ -826,7 +952,8 @@ impl TuiState {
         let sort = self.sort;
         rows.sort_by(|a, b| {
             let (ka, kb) = (sort_value(a, sort, now), sort_value(b, sort, now));
-            kb.cmp(&ka).then_with(|| b.last_event_at.cmp(&a.last_event_at))
+            kb.cmp(&ka)
+                .then_with(|| b.last_event_at.cmp(&a.last_event_at))
         });
         rows
     }
@@ -834,7 +961,11 @@ impl TuiState {
     fn refresh_proxy_alive(&mut self, now: SystemTime) {
         // Re-check at most every 2s to avoid hammering the filesystem /
         // kill syscall on every redraw tick.
-        if now.duration_since(self.proxy_checked_at).unwrap_or(Duration::ZERO) < Duration::from_secs(2) {
+        if now
+            .duration_since(self.proxy_checked_at)
+            .unwrap_or(Duration::ZERO)
+            < Duration::from_secs(2)
+        {
             return;
         }
         self.proxy_checked_at = now;
@@ -844,13 +975,18 @@ impl TuiState {
     }
 
     fn run_gc(&mut self, now: SystemTime) {
-        if now.duration_since(self.last_gc_at).unwrap_or(Duration::ZERO) < Duration::from_secs(60) {
+        if now
+            .duration_since(self.last_gc_at)
+            .unwrap_or(Duration::ZERO)
+            < Duration::from_secs(60)
+        {
             return;
         }
         self.last_gc_at = now;
         let cutoff = now.checked_sub(LOOKBACK).unwrap_or(now);
-        self.agg.by_key.retain(|_, v|
-            v.last_event_at.map(|t| t >= cutoff).unwrap_or(false));
+        self.agg
+            .by_key
+            .retain(|_, v| v.last_event_at.map(|t| t >= cutoff).unwrap_or(false));
     }
 }
 
@@ -861,10 +997,19 @@ fn sort_value(k: &KeyAggregate, sort: SortKey, now: SystemTime) -> u64 {
             let c = k.window_1h.sum(now);
             c.in_tokens + c.out_tokens
         }
-        SortKey::SessionTokens => k.session_latest.as_ref()
-            .map(|s| s.in_tokens + s.out_tokens).unwrap_or(0),
-        SortKey::LastCalled => k.last_event_at
-            .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs()).unwrap_or(0),
+        SortKey::SessionTokens => k
+            .session_latest
+            .as_ref()
+            .map(|s| s.in_tokens + s.out_tokens)
+            .unwrap_or(0),
+        SortKey::LastCalled => k
+            .last_event_at
+            .map(|t| {
+                t.duration_since(UNIX_EPOCH)
+                    .unwrap_or(Duration::ZERO)
+                    .as_secs()
+            })
+            .unwrap_or(0),
     }
 }
 
@@ -905,7 +1050,12 @@ fn run_tui(wal_dir: &Path) -> io::Result<()> {
             state.refresh_proxy_alive(now);
             state.run_gc(now);
 
-            if state.dirty || now.duration_since(state.last_render).unwrap_or(Duration::ZERO) >= TICK_INTERVAL {
+            if state.dirty
+                || now
+                    .duration_since(state.last_render)
+                    .unwrap_or(Duration::ZERO)
+                    >= TICK_INTERVAL
+            {
                 render_tui(&mut stdout, &state, now)?;
                 state.last_render = now;
                 state.dirty = false;
@@ -915,8 +1065,13 @@ fn run_tui(wal_dir: &Path) -> io::Result<()> {
             // We OR the two so macOS FSEvents misses don't leave the user
             // staring at stale data — the periodic poll backstops it.
             let mut had_notify = false;
-            while watch_rx.try_recv().is_ok() { had_notify = true; }
-            let poll_due = now.duration_since(state.last_drain_at).unwrap_or(Duration::ZERO) >= DRAIN_INTERVAL;
+            while watch_rx.try_recv().is_ok() {
+                had_notify = true;
+            }
+            let poll_due = now
+                .duration_since(state.last_drain_at)
+                .unwrap_or(Duration::ZERO)
+                >= DRAIN_INTERVAL;
             if had_notify || poll_due {
                 let before = state.agg.last_event_at;
                 drain_wal_changes(wal_dir, &mut file_tails, &mut state.agg)?;
@@ -930,7 +1085,9 @@ fn run_tui(wal_dir: &Path) -> io::Result<()> {
 
             if event::poll(POLL_TIMEOUT)? {
                 match event::read()? {
-                    Event::Key(KeyEvent { code, modifiers, .. }) => {
+                    Event::Key(KeyEvent {
+                        code, modifiers, ..
+                    }) => {
                         match (code, modifiers) {
                             (KeyCode::Char('q') | KeyCode::Esc, _) => break,
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
@@ -980,7 +1137,7 @@ fn run_tui(wal_dir: &Path) -> io::Result<()> {
 struct FileTail {
     path: PathBuf,
     offset: u64,
-    leftover: Vec<u8>,  // bytes after the last '\n' from a prior read
+    leftover: Vec<u8>, // bytes after the last '\n' from a prior read
 }
 
 /// Record current sizes of every WAL file so that subsequent tail passes
@@ -991,10 +1148,21 @@ fn snapshot_file_tails(dir: &Path) -> io::Result<HashMap<PathBuf, FileTail>> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        if !name.starts_with("usage-") || !name.ends_with(".jsonl") { continue; }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("usage-") || !name.ends_with(".jsonl") {
+            continue;
+        }
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        map.insert(path.clone(), FileTail { path, offset: size, leftover: Vec::new() });
+        map.insert(
+            path.clone(),
+            FileTail {
+                path,
+                offset: size,
+                leftover: Vec::new(),
+            },
+        );
     }
     Ok(map)
 }
@@ -1013,10 +1181,16 @@ fn drain_wal_changes(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        if !name.starts_with("usage-") || !name.ends_with(".jsonl") { continue; }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("usage-") || !name.ends_with(".jsonl") {
+            continue;
+        }
         tails.entry(path.clone()).or_insert_with(|| FileTail {
-            path, offset: 0, leftover: Vec::new(),
+            path,
+            offset: 0,
+            leftover: Vec::new(),
         });
     }
 
@@ -1032,7 +1206,9 @@ fn drain_wal_changes(
             tail.offset = 0;
             tail.leftover.clear();
         }
-        if size == tail.offset { continue; }
+        if size == tail.offset {
+            continue;
+        }
 
         file.seek(SeekFrom::Start(tail.offset))?;
         let mut buf = Vec::with_capacity((size - tail.offset) as usize);
@@ -1049,7 +1225,9 @@ fn drain_wal_changes(
             if combined[i] == b'\n' {
                 let line = &combined[start..i];
                 start = i + 1;
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
                 if let Ok(entry) = serde_json::from_slice::<WalEnvelope>(line) {
                     agg.apply(&entry.event_json);
                 }
@@ -1097,9 +1275,16 @@ fn spawn_wal_watcher(
 /// file / dead process both produce alive=false; the TUI renders the
 /// difference visually.
 fn probe_proxy() -> (Option<u32>, bool) {
-    let Some(home) = std::env::var_os("HOME") else { return (None, false); };
-    let pid_path = PathBuf::from(home).join(".aikey").join("run").join("proxy.pid");
-    let Ok(content) = std::fs::read_to_string(&pid_path) else { return (None, false); };
+    let Some(home) = std::env::var_os("HOME") else {
+        return (None, false);
+    };
+    let pid_path = PathBuf::from(home)
+        .join(".aikey")
+        .join("run")
+        .join("proxy.pid");
+    let Ok(content) = std::fs::read_to_string(&pid_path) else {
+        return (None, false);
+    };
     let pid: u32 = match content.trim().parse() {
         Ok(n) => n,
         Err(_) => return (None, false),
@@ -1119,11 +1304,7 @@ fn probe_proxy() -> (Option<u32>, bool) {
 // TUI rendering.
 // ---------------------------------------------------------------------------
 
-fn render_tui(
-    stdout: &mut io::Stdout,
-    state: &TuiState,
-    now: SystemTime,
-) -> io::Result<()> {
+fn render_tui(stdout: &mut io::Stdout, state: &TuiState, now: SystemTime) -> io::Result<()> {
     use colored::Colorize;
     use crossterm::{
         cursor::MoveTo,
@@ -1151,8 +1332,10 @@ fn render_tui(
     let n = recent.len();
     for (idx, ev) in recent.iter().enumerate() {
         let ts_secs = ev.finished_at_unix().unwrap_or(0);
-        let ago = now.duration_since(UNIX_EPOCH + Duration::from_secs(ts_secs as u64))
-            .map(humanize_duration).unwrap_or_else(|_| "-".into());
+        let ago = now
+            .duration_since(UNIX_EPOCH + Duration::from_secs(ts_secs as u64))
+            .map(humanize_duration)
+            .unwrap_or_else(|_| "-".into());
         let (i, o) = token_pair(ev);
         let label = best_label(ev);
         let label_trunc = shorten_str(label, 25);
@@ -1167,7 +1350,8 @@ fn render_tui(
     // keeps the two state fields from appearing to "fall off" the line.
     let footer = format!(
         "  [q quit · r refresh · s sort · v view · Esc exit]    sort={} view={:?}",
-        state.sort.label(), state.view
+        state.sort.label(),
+        state.view
     );
     writeln!(stdout, "{}\r", footer.truecolor(85, 85, 85))?;
     stdout.flush()?;
@@ -1204,7 +1388,10 @@ fn render_header(
         (None, _) => {
             let text = match state.agg.last_event_at {
                 Some(t) => {
-                    let ago = now.duration_since(t).map(humanize_duration).unwrap_or_else(|_| "-".into());
+                    let ago = now
+                        .duration_since(t)
+                        .map(humanize_duration)
+                        .unwrap_or_else(|_| "-".into());
                     format!("proxy: pid unknown · last event {}", ago)
                 }
                 None => "proxy: no activity recorded".to_string(),
@@ -1250,7 +1437,10 @@ fn render_compact(
     writeln!(stdout, "  {}\r", table_header_line(sort))?;
     writeln!(stdout, "  {}\r", table_divider())?;
     if rows.is_empty() {
-        writeln!(stdout, "  (no activity in the last 24 hours — make a request and come back)\r")?;
+        writeln!(
+            stdout,
+            "  (no activity in the last 24 hours — make a request and come back)\r"
+        )?;
         return Ok(());
     }
     for k in rows {
@@ -1275,8 +1465,11 @@ fn render_compact(
 fn table_header_line(sort: SortKey) -> String {
     use colored::Colorize;
     let paint = |padded: String, active: bool| -> String {
-        if active { padded.truecolor(210, 210, 210).bold().to_string() }
-        else { padded.truecolor(150, 150, 150).to_string() }
+        if active {
+            padded.truecolor(210, 210, 210).bold().to_string()
+        } else {
+            padded.truecolor(150, 150, 150).to_string()
+        }
     };
 
     // SESSION column is active for two different SortKey variants:
@@ -1287,21 +1480,29 @@ fn table_header_line(sort: SortKey) -> String {
     let sess_active = sort == SortKey::SessionTokens || sort == SortKey::LastCalled;
     let sess_label = match sort {
         SortKey::SessionTokens => "SESSION ↓".to_string(),
-        SortKey::LastCalled    => "SESSION ↓ recency".to_string(),
-        _                      => "SESSION".to_string(),
+        SortKey::LastCalled => "SESSION ↓ recency".to_string(),
+        _ => "SESSION".to_string(),
     };
 
     let h1_active = sort == SortKey::HourTokens;
     let today_active = sort == SortKey::TodayTokens;
-    let h1_label    = if h1_active    { "1H ↓".to_string() }    else { "1H".to_string() };
-    let today_label = if today_active { "TODAY ↓".to_string() } else { "TODAY".to_string() };
+    let h1_label = if h1_active {
+        "1H ↓".to_string()
+    } else {
+        "1H".to_string()
+    };
+    let today_label = if today_active {
+        "TODAY ↓".to_string()
+    } else {
+        "TODAY".to_string()
+    };
 
-    let key_h   = paint(format!("{:<w$}", "KEY",      w = COL_KEY),      false);
-    let type_h  = paint(format!("{:<w$}", "TYPE",     w = COL_TYPE),     false);
-    let prov_h  = paint(format!("{:<w$}", "PROTOCOL", w = COL_PROVIDER), false);
-    let h1_h    = paint(format!("{:>w$}", h1_label,    w = COL_TOKENS),  h1_active);
-    let today_h = paint(format!("{:>w$}", today_label, w = COL_TOKENS),  today_active);
-    let sess_h  = paint(format!("{:<w$}", sess_label,  w = COL_SESSION), sess_active);
+    let key_h = paint(format!("{:<w$}", "KEY", w = COL_KEY), false);
+    let type_h = paint(format!("{:<w$}", "TYPE", w = COL_TYPE), false);
+    let prov_h = paint(format!("{:<w$}", "PROTOCOL", w = COL_PROVIDER), false);
+    let h1_h = paint(format!("{:>w$}", h1_label, w = COL_TOKENS), h1_active);
+    let today_h = paint(format!("{:>w$}", today_label, w = COL_TOKENS), today_active);
+    let sess_h = paint(format!("{:<w$}", sess_label, w = COL_SESSION), sess_active);
     format!("{key_h} {type_h} {prov_h} {h1_h} {today_h}  {sess_h}")
 }
 
@@ -1330,7 +1531,8 @@ fn table_data_line(k: &KeyAggregate, now: SystemTime, sort: SortKey) -> String {
 
     let key_cell = format!("{:<w$}", label, w = COL_KEY);
     let type_cell = format!("{:<w$}", k.identity.key_type, w = COL_TYPE).truecolor(140, 140, 140);
-    let prov_cell = format!("{:<w$}", k.identity.provider, w = COL_PROVIDER).truecolor(140, 140, 140);
+    let prov_cell =
+        format!("{:<w$}", k.identity.provider, w = COL_PROVIDER).truecolor(140, 140, 140);
 
     let h1_raw = format!("{:>w$}", humanize_tokens(hour_total), w = COL_TOKENS);
     let h1_cell = if sort == SortKey::HourTokens {
@@ -1371,13 +1573,17 @@ fn decorate_session(cell: &str) -> String {
 /// still live, `<tokens> · <age> ago` when it has closed. A missing session
 /// prints `-` rather than the ambiguous empty string the old format produced.
 fn session_cell(sess: Option<&Session>, now: SystemTime) -> String {
-    let Some(s) = sess else { return "-".to_string(); };
+    let Some(s) = sess else {
+        return "-".to_string();
+    };
     let tokens = humanize_tokens(s.in_tokens + s.out_tokens);
     if s.is_active(now) {
         let elapsed = now.duration_since(s.started_at).unwrap_or(Duration::ZERO);
         format!("{} · active {}", tokens, humanize_duration_short(elapsed))
     } else {
-        let ago = now.duration_since(s.last_event_at).unwrap_or(Duration::ZERO);
+        let ago = now
+            .duration_since(s.last_event_at)
+            .unwrap_or(Duration::ZERO);
         format!("{} · {}", tokens, humanize_duration(ago))
     }
 }
@@ -1387,7 +1593,9 @@ fn session_cell(sess: Option<&Session>, now: SystemTime) -> String {
 /// multi-byte char (e.g. Chinese aliases, ASCII trumping was only coincidental).
 fn shorten_str(s: &str, max: usize) -> String {
     let n = s.chars().count();
-    if n <= max { return s.to_string(); }
+    if n <= max {
+        return s.to_string();
+    }
     let keep: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{keep}…")
 }
@@ -1405,29 +1613,46 @@ fn render_expanded(
     for k in rows {
         let h1 = k.window_1h.sum(now);
         let today = &k.today;
-        writeln!(stdout, "  {}   {} · {}\r",
-            k.identity.label, k.identity.key_type, k.identity.provider)?;
-        writeln!(stdout, "    ever:    {:>5} calls  ↑{} ↓{}\r",
+        writeln!(
+            stdout,
+            "  {}   {} · {}\r",
+            k.identity.label, k.identity.key_type, k.identity.provider
+        )?;
+        writeln!(
+            stdout,
+            "    ever:    {:>5} calls  ↑{} ↓{}\r",
             k.lifetime.calls,
             humanize_tokens(k.lifetime.in_tokens),
-            humanize_tokens(k.lifetime.out_tokens))?;
-        writeln!(stdout, "    1h:      {:>5} calls  ↑{} ↓{}\r",
+            humanize_tokens(k.lifetime.out_tokens)
+        )?;
+        writeln!(
+            stdout,
+            "    1h:      {:>5} calls  ↑{} ↓{}\r",
             h1.calls,
             humanize_tokens(h1.in_tokens),
-            humanize_tokens(h1.out_tokens))?;
-        writeln!(stdout, "    today:   {:>5} calls  ↑{} ↓{}\r",
+            humanize_tokens(h1.out_tokens)
+        )?;
+        writeln!(
+            stdout,
+            "    today:   {:>5} calls  ↑{} ↓{}\r",
             today.calls,
             humanize_tokens(today.in_tokens),
-            humanize_tokens(today.out_tokens))?;
+            humanize_tokens(today.out_tokens)
+        )?;
         if let Some(s) = k.session_latest.as_ref() {
             let state = if s.is_active(now) { "active" } else { "ended" };
-            let span = now.duration_since(s.last_event_at).unwrap_or(Duration::ZERO);
-            writeln!(stdout, "    session: {:>5} calls  ↑{} ↓{}  ({}, {})\r",
+            let span = now
+                .duration_since(s.last_event_at)
+                .unwrap_or(Duration::ZERO);
+            writeln!(
+                stdout,
+                "    session: {:>5} calls  ↑{} ↓{}  ({}, {})\r",
                 s.calls,
                 humanize_tokens(s.in_tokens),
                 humanize_tokens(s.out_tokens),
                 state,
-                humanize_duration(span))?;
+                humanize_duration(span)
+            )?;
         }
         writeln!(stdout, "\r")?;
     }
@@ -1436,9 +1661,15 @@ fn render_expanded(
 
 fn humanize_duration_short(d: Duration) -> String {
     let s = d.as_secs();
-    if s < 60 { return format!("{}s", s); }
-    if s < 3600 { return format!("{}m", s / 60); }
-    if s < 86400 { return format!("{}h", s / 3600); }
+    if s < 60 {
+        return format!("{}s", s);
+    }
+    if s < 3600 {
+        return format!("{}m", s / 60);
+    }
+    if s < 86400 {
+        return format!("{}h", s / 3600);
+    }
     format!("{}d", s / 86400)
 }
 
@@ -1540,7 +1771,11 @@ mod tests {
         // Real event should still land
         agg.apply(&ev("2026-04-17T15:02:00Z", "s1", "k1", "claude", 10, 20));
 
-        assert_eq!(agg.by_key.len(), 1, "only the real event should be aggregated");
+        assert_eq!(
+            agg.by_key.len(),
+            1,
+            "only the real event should be aggregated"
+        );
         assert!(agg.by_key.contains_key("k1"));
         assert!(!agg.by_key.contains_key("__canary__"));
         assert!(!agg.by_key.contains_key("other-vk"));
@@ -1552,7 +1787,7 @@ mod tests {
         let now = now_ts();
         // `heavy` has lots of tokens; `fresh` was used more recently but with fewer tokens.
         agg.apply(&make_event(now - 3600, "heavy", 1000, 1000));
-        agg.apply(&make_event(now - 60,   "fresh", 10,   10));
+        agg.apply(&make_event(now - 60, "fresh", 10, 10));
         let rows = agg.rows_sorted();
         assert_eq!(rows[0].identity.label, "heavy");
         assert_eq!(rows[1].identity.label, "fresh");
@@ -1562,8 +1797,8 @@ mod tests {
     fn minute_buckets_roll_off_after_hour() {
         let mut bk = MinuteBuckets::new();
         let now = SystemTime::now();
-        bk.add(now - Duration::from_secs(30 * 60), 100, 200);  // 30min ago
-        bk.add(now - Duration::from_secs(90 * 60), 400, 800);  // 90min ago — past window
+        bk.add(now - Duration::from_secs(30 * 60), 100, 200); // 30min ago
+        bk.add(now - Duration::from_secs(90 * 60), 400, 800); // 90min ago — past window
         let sum = bk.sum(now);
         assert_eq!(sum.calls, 1);
         assert_eq!(sum.in_tokens, 100);
@@ -1574,9 +1809,9 @@ mod tests {
     fn session_closes_after_gap() {
         let mut agg = Aggregator::new();
         let now = now_ts();
-        agg.apply(&make_event(now - 20*60, "k", 10, 10));  // 20min ago — starts session A
-        agg.apply(&make_event(now - 19*60, "k", 20, 20));  // still session A
-        agg.apply(&make_event(now -  1*60, "k", 30, 30));  // 18min gap > 15min → new session
+        agg.apply(&make_event(now - 20 * 60, "k", 10, 10)); // 20min ago — starts session A
+        agg.apply(&make_event(now - 19 * 60, "k", 20, 20)); // still session A
+        agg.apply(&make_event(now - 1 * 60, "k", 30, 30)); // 18min gap > 15min → new session
 
         let k = &agg.by_key["k"];
         let s = k.session_latest.as_ref().expect("session present");
@@ -1590,8 +1825,8 @@ mod tests {
         let now = SystemTime::now();
         let now_secs = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-        let recent_iso = iso_for(now_secs - 60);       // 1 min ago — kept
-        let old_iso    = iso_for(now_secs - 48*3600);  // 2 days ago — dropped
+        let recent_iso = iso_for(now_secs - 60); // 1 min ago — kept
+        let old_iso = iso_for(now_secs - 48 * 3600); // 2 days ago — dropped
 
         // Create one WAL file with both entries.
         let path = tmp.path().join("usage-20260417-00.jsonl");
@@ -1599,19 +1834,31 @@ mod tests {
         for (iso, kid) in [(recent_iso.as_str(), "recent"), (old_iso.as_str(), "old")] {
             let line = format!(
                 r#"{{"wal_seq":1,"written_at":"{iso}","schema_version":1,"event_json":{{"event_id":"e","event_time":"{iso}","session_id":"s","key_label":"{kid}","virtual_key_id":"{kid}","provider_code":"anthropic","route_source":"oauth","model":"m","input_tokens":1,"output_tokens":1,"request_status":"success","http_status_code":200}}}}"#,
-                iso = iso, kid = kid,
+                iso = iso,
+                kid = kid,
             );
             writeln!(f, "{}", line).unwrap();
         }
 
         let agg = load_aggregator(tmp.path(), now).unwrap();
-        assert!(agg.by_key.contains_key("recent"), "recent event must be ingested");
-        assert!(!agg.by_key.contains_key("old"),   "old event must be filtered out");
+        assert!(
+            agg.by_key.contains_key("recent"),
+            "recent event must be ingested"
+        );
+        assert!(
+            !agg.by_key.contains_key("old"),
+            "old event must be filtered out"
+        );
     }
 
     // -- helpers -----------------------------------------------------
 
-    fn now_ts() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() }
+    fn now_ts() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
 
     fn make_event(ts_secs: u64, label: &str, i: i64, o: i64) -> UsageEvent {
         UsageEvent {

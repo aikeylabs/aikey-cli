@@ -14,10 +14,10 @@ use secrecy::SecretString;
 // Submodule declarations + flatten re-export.  The factories defined in this
 // file reference `default_base_url` from `runtime`, so we also bring it into
 // local scope with a plain `use`.
-pub mod targets;
-pub mod runtime;
 pub mod persist;
 pub mod protocol_addons;
+pub mod runtime;
+pub mod targets;
 
 // Why `#[allow(unused_imports)]`: `main.rs` declares `mod connectivity;` with
 // `#[allow(dead_code)]` (needed because main.rs re-declares crate-shared
@@ -27,27 +27,20 @@ pub mod protocol_addons;
 // *is* the intended API surface — the lint is a false positive in this
 // setup. Without this allow, every build emits 7 warnings.
 #[allow(unused_imports)]
-pub use targets::{
-    target_from_binding,
-    targets_from_active_bindings,
-    targets_from_alias,
-    targets_from_all_keys,
-    targets_from_new_personal_key,
+pub use persist::{
+    aggregate_test_outcome, persist_test_outcome, AggregatedTestRecord, PersistedTestResult,
 };
 #[allow(unused_imports)]
 pub use runtime::{
-    ConnectivityResult, ProxyProbeResult,
-    build_proxy_aware_agent,
-    provider_defaults, default_base_url,
-    tcp_ping,
-    test_provider_connectivity, test_proxy_connectivity,
-    api_status_hint, chat_status_hint, proxy_status_hint,
-    run_connectivity_suite, render_cannot_test_block,
+    api_status_hint, build_proxy_aware_agent, chat_status_hint, default_base_url,
+    provider_defaults, proxy_status_hint, render_cannot_test_block, run_connectivity_suite,
+    tcp_ping, test_provider_connectivity, test_proxy_connectivity, ConnectivityResult,
+    ProxyProbeResult,
 };
 #[allow(unused_imports)]
-pub use persist::{
-    aggregate_test_outcome, persist_test_outcome,
-    AggregatedTestRecord, PersistedTestResult,
+pub use targets::{
+    target_from_binding, targets_from_active_bindings, targets_from_alias, targets_from_all_keys,
+    targets_from_new_personal_key,
 };
 
 // (pub use above brings default_base_url / ConnectivityResult / etc. into
@@ -102,7 +95,7 @@ impl CredentialKind {
         match self {
             CredentialKind::PersonalApi => "",
             CredentialKind::ManagedTeam => " (team)",
-            CredentialKind::OAuth       => " (oauth)",
+            CredentialKind::OAuth => " (oauth)",
         }
     }
 
@@ -110,7 +103,9 @@ impl CredentialKind {
     /// the local proxy — personal via probe sentinel, team via static team
     /// bearer, OAuth via probe sentinel. Kept as a function in case a future
     /// kind reintroduces a direct path.
-    pub fn via_proxy(self) -> bool { true }
+    pub fn via_proxy(self) -> bool {
+        true
+    }
 }
 
 /// One (provider, URL, bearer) triple ready for `test_provider_connectivity`.
@@ -129,14 +124,14 @@ impl CredentialKind {
 #[derive(Clone, Debug)]
 pub struct TestTarget {
     pub provider_code: String,
-    pub base_url:      String,
-    pub bearer:        String,
-    pub kind:          CredentialKind,
+    pub base_url: String,
+    pub bearer: String,
+    pub kind: CredentialKind,
     /// Reference to the source row: vault alias, virtual_key_id, or
     /// provider_account_id. Used for JSON payloads, error messages, and the
     /// proxy probe sentinel/bearer construction. **Never** mutated to a
     /// friendlier label — that would break routing.
-    pub source_ref:    String,
+    pub source_ref: String,
     /// Human-readable label for the optional Key column in `aikey test --all`
     /// — `key-335923591-0011-1` for team keys, `email@domain.com` (or
     /// local_alias) for OAuth, vault alias for personal. Separate from
@@ -156,7 +151,11 @@ impl TestTarget {
     /// `source_ref` when no separate alias is recorded (e.g. personal
     /// targets where alias == source_ref by definition).
     pub fn key_display(&self) -> &str {
-        if self.display_alias.is_empty() { &self.source_ref } else { &self.display_alias }
+        if self.display_alias.is_empty() {
+            &self.source_ref
+        } else {
+            &self.display_alias
+        }
     }
 }
 
@@ -181,18 +180,14 @@ impl TestTarget {
 /// server-side via `GetPersonalKeyByAlias`.
 ///
 /// 2026-04-29 prefix rename: legacy probe sentinel form replaced by `aikey_probe_*`.
-pub fn personal_target(
-    source_ref: &str,
-    provider_code: &str,
-    proxy_port: u16,
-) -> TestTarget {
+pub fn personal_target(source_ref: &str, provider_code: &str, proxy_port: u16) -> TestTarget {
     let prefix = crate::commands_account::provider_proxy_prefix_pub(provider_code);
     TestTarget {
         provider_code: provider_code.to_string(),
-        base_url:      format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
-        bearer:        format!("aikey_probe_{}", source_ref),
-        kind:          CredentialKind::PersonalApi,
-        source_ref:    source_ref.to_string(),
+        base_url: format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
+        bearer: format!("aikey_probe_{}", source_ref),
+        kind: CredentialKind::PersonalApi,
+        source_ref: source_ref.to_string(),
         display_alias: String::new(), // personal: alias == source_ref, no separate label needed
     }
 }
@@ -214,9 +209,9 @@ pub fn personal_target_direct(
     TestTarget {
         provider_code: provider_code.to_string(),
         base_url,
-        bearer:        plaintext.trim().to_string(),
-        kind:          CredentialKind::PersonalApi,
-        source_ref:    source_ref.to_string(),
+        bearer: plaintext.trim().to_string(),
+        kind: CredentialKind::PersonalApi,
+        source_ref: source_ref.to_string(),
         display_alias: String::new(), // personal: alias == source_ref, no separate label needed
     }
 }
@@ -225,11 +220,7 @@ pub fn personal_target_direct(
 /// local-proxy URL. Goes through the shared `team_token_from_vk_id` helper
 /// so any historical-prefix residue in the cached vk_id is normalized away;
 /// matches the form `handle_route` and `resolve_activate_key` emit.
-pub fn team_target(
-    virtual_key_id: &str,
-    provider_code: &str,
-    proxy_port: u16,
-) -> TestTarget {
+pub fn team_target(virtual_key_id: &str, provider_code: &str, proxy_port: u16) -> TestTarget {
     let prefix = crate::commands_account::provider_proxy_prefix_pub(provider_code);
     // Empty vk_id is upstream bug; helper returns Err. Fall back to a clearly
     // invalid bearer so the test row surfaces the issue rather than silently
@@ -238,10 +229,10 @@ pub fn team_target(
         .unwrap_or_else(|_| "aikey_team_<empty-vk_id>".to_string());
     TestTarget {
         provider_code: provider_code.to_string(),
-        base_url:      format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
+        base_url: format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
         bearer,
-        kind:          CredentialKind::ManagedTeam,
-        source_ref:    virtual_key_id.to_string(),
+        kind: CredentialKind::ManagedTeam,
+        source_ref: virtual_key_id.to_string(),
         display_alias: String::new(), // populated by callers that have access to the alias row
     }
 }
@@ -256,20 +247,15 @@ pub fn team_target(
 /// that keeps the `TestTarget.provider_code` canonical invariant honest.
 ///
 /// 2026-04-29 prefix rename: legacy OAuth sentinel form replaced by `aikey_probe_<account_id>`.
-pub fn oauth_target(
-    account_id: &str,
-    raw_provider: &str,
-    proxy_port: u16,
-) -> TestTarget {
-    let provider = crate::commands_account::oauth_provider_to_canonical(raw_provider)
-        .to_string();
+pub fn oauth_target(account_id: &str, raw_provider: &str, proxy_port: u16) -> TestTarget {
+    let provider = crate::commands_account::oauth_provider_to_canonical(raw_provider).to_string();
     let prefix = crate::commands_account::provider_proxy_prefix_pub(&provider);
     TestTarget {
         provider_code: provider,
-        base_url:      format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
-        bearer:        format!("aikey_probe_{}", account_id),
-        kind:          CredentialKind::OAuth,
-        source_ref:    account_id.to_string(),
+        base_url: format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
+        bearer: format!("aikey_probe_{}", account_id),
+        kind: CredentialKind::OAuth,
+        source_ref: account_id.to_string(),
         display_alias: String::new(), // populated by callers (email / local_alias / display_identity)
     }
 }
@@ -292,7 +278,10 @@ pub enum BuildTargetError {
     DecryptFailed { alias: String, detail: String },
     /// Team virtual key is assigned to the account but the encrypted key
     /// material has not reached the local cache yet — run `aikey key sync`.
-    TeamKeyNotDelivered { virtual_key_id: String, display: String },
+    TeamKeyNotDelivered {
+        virtual_key_id: String,
+        display: String,
+    },
     /// OAuth account is registered but currently in a non-usable state
     /// (`reauth_required` / `subscription_required` / etc.). Re-login.
     OAuthUnhealthy { account: String, status: String },
@@ -304,28 +293,33 @@ impl BuildTargetError {
     /// Short label for the "cannot test" table ("anthropic (oauth)" etc).
     pub fn label(&self) -> &str {
         match self {
-            BuildTargetError::ProxyNotRunning { label }            => label,
-            BuildTargetError::PasswordRequired { alias }           => alias,
-            BuildTargetError::DecryptFailed { alias, .. }          => alias,
-            BuildTargetError::TeamKeyNotDelivered { display, .. }  => display,
-            BuildTargetError::OAuthUnhealthy { account, .. }       => account,
-            BuildTargetError::Unknown { label, .. }                => label,
+            BuildTargetError::ProxyNotRunning { label } => label,
+            BuildTargetError::PasswordRequired { alias } => alias,
+            BuildTargetError::DecryptFailed { alias, .. } => alias,
+            BuildTargetError::TeamKeyNotDelivered { display, .. } => display,
+            BuildTargetError::OAuthUnhealthy { account, .. } => account,
+            BuildTargetError::Unknown { label, .. } => label,
         }
     }
 
     /// One-line reason + hint for display beneath the suite table.
     pub fn reason(&self) -> String {
         match self {
-            BuildTargetError::ProxyNotRunning { .. } =>
-                "proxy required — run `aikey proxy start`".to_string(),
-            BuildTargetError::PasswordRequired { .. } =>
-                "vault password needed — rerun this command in an interactive terminal".to_string(),
-            BuildTargetError::DecryptFailed { detail, .. } =>
-                format!("decrypt failed: {}", detail),
-            BuildTargetError::TeamKeyNotDelivered { virtual_key_id, .. } =>
-                format!("team key not yet delivered ({}) — run `aikey key sync`", virtual_key_id),
-            BuildTargetError::OAuthUnhealthy { status, .. } =>
-                format!("OAuth status '{}' — run `aikey auth login <provider>`", status),
+            BuildTargetError::ProxyNotRunning { .. } => {
+                "proxy required — run `aikey proxy start`".to_string()
+            }
+            BuildTargetError::PasswordRequired { .. } => {
+                "vault password needed — rerun this command in an interactive terminal".to_string()
+            }
+            BuildTargetError::DecryptFailed { detail, .. } => format!("decrypt failed: {}", detail),
+            BuildTargetError::TeamKeyNotDelivered { virtual_key_id, .. } => format!(
+                "team key not yet delivered ({}) — run `aikey key sync`",
+                virtual_key_id
+            ),
+            BuildTargetError::OAuthUnhealthy { status, .. } => format!(
+                "OAuth status '{}' — run `aikey auth login <provider>`",
+                status
+            ),
             BuildTargetError::Unknown { detail, .. } => detail.clone(),
         }
     }
@@ -386,26 +380,35 @@ mod connectivity_suite_tests {
         // 2026-04-29 prefix rename), matching how team and OAuth already
         // worked. `via_proxy()` is `true` for every variant — pinned so a
         // future refactor can't silently reintroduce a direct-upstream path.
-        assert!(CredentialKind::PersonalApi.via_proxy(),
-            "personal keys route via proxy probe sentinel");
-        assert!(CredentialKind::ManagedTeam.via_proxy(),
-            "team keys route via proxy with static team bearer");
-        assert!(CredentialKind::OAuth.via_proxy(),
-            "OAuth routes via proxy so token refresh + persona headers apply");
+        assert!(
+            CredentialKind::PersonalApi.via_proxy(),
+            "personal keys route via proxy probe sentinel"
+        );
+        assert!(
+            CredentialKind::ManagedTeam.via_proxy(),
+            "team keys route via proxy with static team bearer"
+        );
+        assert!(
+            CredentialKind::OAuth.via_proxy(),
+            "OAuth routes via proxy so token refresh + persona headers apply"
+        );
     }
 
     #[test]
     fn test_target_display_label_shapes() {
         let personal = TestTarget {
             provider_code: "kimi".into(),
-            base_url:      "https://api.kimi.com/coding/v1".into(),
-            bearer:        "sk-redacted".into(),
-            kind:          CredentialKind::PersonalApi,
-            source_ref:    "kimi-local".into(),
+            base_url: "https://api.kimi.com/coding/v1".into(),
+            bearer: "sk-redacted".into(),
+            kind: CredentialKind::PersonalApi,
+            source_ref: "kimi-local".into(),
             display_alias: String::new(),
         };
-        assert_eq!(personal.display_label(), "kimi",
-            "personal keys: just the provider code, no suffix");
+        assert_eq!(
+            personal.display_label(),
+            "kimi",
+            "personal keys: just the provider code, no suffix"
+        );
 
         let team = TestTarget {
             kind: CredentialKind::ManagedTeam,
@@ -440,11 +443,17 @@ mod connectivity_suite_tests {
         assert_eq!(targets.len(), 1);
         let t = &targets[0];
         assert_eq!(t.provider_code, "kimi");
-        assert_eq!(t.bearer, "sk-plaintext", "bearer must be trimmed before probe");
+        assert_eq!(
+            t.bearer, "sk-plaintext",
+            "bearer must be trimmed before probe"
+        );
         assert_eq!(t.kind, CredentialKind::PersonalApi);
         assert_eq!(t.source_ref, "my-kimi");
-        assert!(t.base_url.starts_with("https://api.kimi.com"),
-            "default base URL for kimi expected, got {:?}", t.base_url);
+        assert!(
+            t.base_url.starts_with("https://api.kimi.com"),
+            "default base URL for kimi expected, got {:?}",
+            t.base_url
+        );
     }
 
     #[test]
@@ -455,8 +464,10 @@ mod connectivity_suite_tests {
             &["kimi".to_string()],
             Some("https://example.corp/proxy"),
         );
-        assert_eq!(targets[0].base_url, "https://example.corp/proxy",
-            "caller-supplied override must win over provider default");
+        assert_eq!(
+            targets[0].base_url, "https://example.corp/proxy",
+            "caller-supplied override must win over provider default"
+        );
     }
 
     #[test]
@@ -467,11 +478,17 @@ mod connectivity_suite_tests {
             &["openai".into(), "anthropic".into(), "kimi".into()],
             None,
         );
-        assert_eq!(targets.len(), 3,
-            "one target per selected provider — no dedup, no merge");
+        assert_eq!(
+            targets.len(),
+            3,
+            "one target per selected provider — no dedup, no merge"
+        );
         let providers: Vec<&str> = targets.iter().map(|t| t.provider_code.as_str()).collect();
-        assert_eq!(providers, vec!["openai", "anthropic", "kimi"],
-            "target order must mirror caller input — stable for UX");
+        assert_eq!(
+            providers,
+            vec!["openai", "anthropic", "kimi"],
+            "target order must mirror caller input — stable for UX"
+        );
     }
 
     #[test]
@@ -485,8 +502,10 @@ mod connectivity_suite_tests {
         assert_eq!(targets.len(), 1);
         // The suite will report ping fail on this URL, but the target still
         // gets built — caller decides whether to surface as error.
-        assert!(targets[0].base_url.starts_with("https://"),
-            "unknown provider still gets a well-formed URL (not an empty string)");
+        assert!(
+            targets[0].base_url.starts_with("https://"),
+            "unknown provider still gets a well-formed URL (not an empty string)"
+        );
     }
 
     // ── BuildTargetError messages ────────────────────────────────────────
@@ -496,23 +515,34 @@ mod connectivity_suite_tests {
 
     #[test]
     fn build_target_error_reasons_are_actionable() {
-        let e = BuildTargetError::ProxyNotRunning { label: "kimi (team)".into() };
-        assert!(e.reason().contains("aikey proxy start"),
-            "ProxyNotRunning must tell user exactly what to run, got: {:?}", e.reason());
+        let e = BuildTargetError::ProxyNotRunning {
+            label: "kimi (team)".into(),
+        };
+        assert!(
+            e.reason().contains("aikey proxy start"),
+            "ProxyNotRunning must tell user exactly what to run, got: {:?}",
+            e.reason()
+        );
 
         let e = BuildTargetError::TeamKeyNotDelivered {
             virtual_key_id: "vk_abc".into(),
-            display:        "alice-key".into(),
+            display: "alice-key".into(),
         };
-        assert!(e.reason().contains("aikey key sync"),
-            "team-key-not-delivered must reference the sync command: {:?}", e.reason());
+        assert!(
+            e.reason().contains("aikey key sync"),
+            "team-key-not-delivered must reference the sync command: {:?}",
+            e.reason()
+        );
 
         let e = BuildTargetError::OAuthUnhealthy {
             account: "alice@example.com".into(),
-            status:  "reauth_required".into(),
+            status: "reauth_required".into(),
         };
-        assert!(e.reason().contains("aikey auth login"),
-            "OAuth unhealthy must point at re-login: {:?}", e.reason());
+        assert!(
+            e.reason().contains("aikey auth login"),
+            "OAuth unhealthy must point at re-login: {:?}",
+            e.reason()
+        );
     }
 
     #[test]
@@ -521,15 +551,39 @@ mod connectivity_suite_tests {
         // must produce a non-empty label so the table doesn't render blank
         // rows.
         for e in [
-            BuildTargetError::ProxyNotRunning { label: "anthropic (oauth)".into() },
-            BuildTargetError::PasswordRequired { alias: "my-key".into() },
-            BuildTargetError::DecryptFailed { alias: "my-key".into(), detail: "wrong password".into() },
-            BuildTargetError::TeamKeyNotDelivered { virtual_key_id: "vk1".into(), display: "team-a".into() },
-            BuildTargetError::OAuthUnhealthy { account: "a@b.com".into(), status: "expired".into() },
-            BuildTargetError::Unknown { label: "mystery".into(), detail: "-".into() },
+            BuildTargetError::ProxyNotRunning {
+                label: "anthropic (oauth)".into(),
+            },
+            BuildTargetError::PasswordRequired {
+                alias: "my-key".into(),
+            },
+            BuildTargetError::DecryptFailed {
+                alias: "my-key".into(),
+                detail: "wrong password".into(),
+            },
+            BuildTargetError::TeamKeyNotDelivered {
+                virtual_key_id: "vk1".into(),
+                display: "team-a".into(),
+            },
+            BuildTargetError::OAuthUnhealthy {
+                account: "a@b.com".into(),
+                status: "expired".into(),
+            },
+            BuildTargetError::Unknown {
+                label: "mystery".into(),
+                detail: "-".into(),
+            },
         ] {
-            assert!(!e.label().is_empty(), "variant {:?} produced empty label", e);
-            assert!(!e.reason().is_empty(), "variant {:?} produced empty reason", e);
+            assert!(
+                !e.label().is_empty(),
+                "variant {:?} produced empty label",
+                e
+            );
+            assert!(
+                !e.reason().is_empty(),
+                "variant {:?} produced empty reason",
+                e
+            );
         }
     }
 
@@ -545,14 +599,11 @@ mod connectivity_suite_tests {
     fn alias_unknown_source_returns_empty_vec_not_error() {
         // When an alias matches nothing, callers should see an empty Vec
         // and print "not found" guidance — not a panic or an Err.
-        let targets = targets_from_alias(
-            "definitely-not-a-real-alias-9f8e7d6c",
-            None,
-            None,
-            27200,
+        let targets = targets_from_alias("definitely-not-a-real-alias-9f8e7d6c", None, None, 27200);
+        assert!(
+            targets.is_empty(),
+            "unknown alias must produce an empty target list"
         );
-        assert!(targets.is_empty(),
-            "unknown alias must produce an empty target list");
     }
 
     // ── OAuth provider canonicalization ──────────────────────────────────
@@ -576,7 +627,8 @@ mod connectivity_suite_tests {
             "anthropic",
             "targets_from_alias must canonicalize before driving persona tweaks — \
              Claude OAuth chat probe needs provider_code == \"anthropic\" so the \
-             `?beta=true` + metadata.user_id branch triggers");
+             `?beta=true` + metadata.user_id branch triggers"
+        );
     }
 
     #[test]
@@ -586,7 +638,8 @@ mod connectivity_suite_tests {
             "openai",
             "Codex OAuth chat probe needs provider_code == \"openai\" + \
              is_via_proxy so it picks the Responses API path (/responses) \
-             rather than generic chat completions");
+             rather than generic chat completions"
+        );
     }
 
     #[test]
@@ -597,11 +650,13 @@ mod connectivity_suite_tests {
         // 一致到同一字符串,GetProviderBinding 不再 miss。
         assert_eq!(
             crate::commands_account::oauth_provider_to_canonical("kimi"),
-            "kimi_code");
+            "kimi_code"
+        );
         // Unknown providers still pass through unchanged (custom user codes).
         assert_eq!(
             crate::commands_account::oauth_provider_to_canonical("something-new"),
-            "something-new");
+            "something-new"
+        );
     }
 
     // ── Factory invariants ──────────────────────────────────────────────
@@ -615,15 +670,23 @@ mod connectivity_suite_tests {
     #[test]
     fn oauth_target_canonicalizes_claude_input() {
         let t = oauth_target("acc_123", "claude", 27200);
-        assert_eq!(t.provider_code, "anthropic",
+        assert_eq!(
+            t.provider_code, "anthropic",
             "oauth_target MUST normalize broker vocab so downstream persona \
-             tweaks key on the canonical code");
+             tweaks key on the canonical code"
+        );
         assert_eq!(t.kind, CredentialKind::OAuth);
         assert_eq!(t.bearer, "aikey_probe_acc_123");
-        assert!(t.base_url.starts_with("http://127.0.0.1:27200/"),
-            "OAuth targets always route via local proxy, got: {}", t.base_url);
-        assert_eq!(t.display_label(), "anthropic (oauth)",
-            "display label uses the canonical code (matches `aikey test` over bindings)");
+        assert!(
+            t.base_url.starts_with("http://127.0.0.1:27200/"),
+            "OAuth targets always route via local proxy, got: {}",
+            t.base_url
+        );
+        assert_eq!(
+            t.display_label(),
+            "anthropic (oauth)",
+            "display label uses the canonical code (matches `aikey test` over bindings)"
+        );
     }
 
     #[test]
@@ -661,10 +724,15 @@ mod connectivity_suite_tests {
         // 2026-04-29 prefix rename: legacy probe sentinel → aikey_probe_<alias>
         let t = personal_target("my-key", "kimi", 27200);
         assert_eq!(t.kind, CredentialKind::PersonalApi);
-        assert_eq!(t.bearer, "aikey_probe_my-key",
-            "bearer must be the probe sentinel, not plaintext — CLI never decrypts");
-        assert!(t.base_url.starts_with("http://127.0.0.1:27200/"),
-            "personal keys route through local proxy, got: {}", t.base_url);
+        assert_eq!(
+            t.bearer, "aikey_probe_my-key",
+            "bearer must be the probe sentinel, not plaintext — CLI never decrypts"
+        );
+        assert!(
+            t.base_url.starts_with("http://127.0.0.1:27200/"),
+            "personal keys route through local proxy, got: {}",
+            t.base_url
+        );
         assert_eq!(t.display_label(), "kimi");
     }
 
@@ -675,15 +743,19 @@ mod connectivity_suite_tests {
         // because the alias row doesn't exist in vault yet).
         let t = personal_target_direct("my-key", "sk-plaintext", "kimi", None);
         assert_eq!(t.bearer, "sk-plaintext");
-        assert!(t.base_url.starts_with("https://api.kimi.com"),
-            "direct variant must hit upstream, not proxy");
+        assert!(
+            t.base_url.starts_with("https://api.kimi.com"),
+            "direct variant must hit upstream, not proxy"
+        );
     }
 
     #[test]
     fn personal_target_direct_trims_bearer_whitespace() {
         let t = personal_target_direct("x", "  sk-padded\n", "openai", None);
-        assert_eq!(t.bearer, "sk-padded",
-            "factory must trim so the Authorization header is valid");
+        assert_eq!(
+            t.bearer, "sk-padded",
+            "factory must trim so the Authorization header is valid"
+        );
     }
 
     // ── ConnectivityResult shape (Stage 2, 2026-04-22) ──────────────────
@@ -698,15 +770,25 @@ mod connectivity_suite_tests {
         // names. If someone renames/drops ping_direct_ok this test fails to
         // compile — early warning.
         let r = ConnectivityResult {
-            ping_direct_ok: false, ping_direct_ms: 0,
-            ping_ok: false, ping_ms: 0,
-            api_ok: false, api_ms: 0, api_status: None, api_body_snippet: None,
-            chat_ok: false, chat_ms: 0, chat_status: None, chat_body_snippet: None,
+            ping_direct_ok: false,
+            ping_direct_ms: 0,
+            ping_ok: false,
+            ping_ms: 0,
+            api_ok: false,
+            api_ms: 0,
+            api_status: None,
+            api_body_snippet: None,
+            chat_ok: false,
+            chat_ms: 0,
+            chat_status: None,
+            chat_body_snippet: None,
         };
         // Ping(DIRECT) must not participate in success bookkeeping —
         // it's informational only. Main overall-success logic keys on API.
-        assert!(!r.api_ok,
-            "zero result should not accidentally report API success");
+        assert!(
+            !r.api_ok,
+            "zero result should not accidentally report API success"
+        );
     }
 
     #[test]
@@ -715,12 +797,22 @@ mod connectivity_suite_tests {
         // (laptop can reach upstream; proxy is broken) or vice-versa.
         // The struct must let both states coexist.
         let r = ConnectivityResult {
-            ping_direct_ok: true, ping_direct_ms: 10,
-            ping_ok: false, ping_ms: 3000,
-            api_ok: false, api_ms: 0, api_status: None, api_body_snippet: None,
-            chat_ok: false, chat_ms: 0, chat_status: None, chat_body_snippet: None,
+            ping_direct_ok: true,
+            ping_direct_ms: 10,
+            ping_ok: false,
+            ping_ms: 3000,
+            api_ok: false,
+            api_ms: 0,
+            api_status: None,
+            api_body_snippet: None,
+            chat_ok: false,
+            chat_ms: 0,
+            chat_status: None,
+            chat_body_snippet: None,
         };
-        assert!(r.ping_direct_ok && !r.ping_ok,
-            "struct must represent 'laptop ok, proxy broken' as a valid state");
+        assert!(
+            r.ping_direct_ok && !r.ping_ok,
+            "struct must represent 'laptop ok, proxy broken' as a valid state"
+        );
     }
 }

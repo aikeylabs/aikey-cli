@@ -1,11 +1,10 @@
-use crate::config::{ProjectConfig, ProviderConfig, EnvTemplate, LogicalModelMapping};
-use crate::json_output;
+use crate::config::{EnvTemplate, LogicalModelMapping, ProjectConfig, ProviderConfig};
 use crate::global_config;
+use crate::json_output;
 use crate::storage;
 use secrecy::SecretString;
-use zeroize::Zeroizing;
 use std::io::{self, Write};
-
+use zeroize::Zeroizing;
 
 // Connectivity test code moved to `crate::connectivity` in 2026-04-21. The
 // `pub use` below preserves callsite paths (`commands_project::TestTarget`
@@ -137,7 +136,9 @@ pub fn handle_project_init(json_mode: bool) -> Result<(), Box<dyn std::error::Er
         println!("\n✓ Created aikey.config.json");
         println!("\nNext steps:");
         println!("  1. Run 'aikey add <provider>:<alias>' to add provider keys (e.g. aikey add anthropic:default)");
-        println!("  2. Run 'aikey env generate' to create/update your .env file (non-sensitive only)");
+        println!(
+            "  2. Run 'aikey env generate' to create/update your .env file (non-sensitive only)"
+        );
         println!("  3. Use 'aikey run -- <command>' to run with secrets injected");
         println!("  4. Use 'aikey project status' to check configuration");
     }
@@ -152,17 +153,24 @@ pub fn handle_project_status(json_mode: bool) -> Result<(), Box<dyn std::error::
         Some(pair) => pair,
         None => {
             if json_mode {
-                json_output::print_json_exit(serde_json::json!({
-                    "ok": false,
-                    "code": crate::error_codes::ErrorCode::InvalidInput.as_str(),
-                    "message": "No aikey.config.json found in current directory or parent directories"
-                }), 1);
+                json_output::print_json_exit(
+                    serde_json::json!({
+                        "ok": false,
+                        "code": crate::error_codes::ErrorCode::InvalidInput.as_str(),
+                        "message": "No aikey.config.json found in current directory or parent directories"
+                    }),
+                    1,
+                );
             }
-            return Err(Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found in current directory or parent directories")));
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No aikey.config.json found in current directory or parent directories",
+            )));
         }
     };
 
-    let template_parts: Vec<String> = config.required_vars
+    let template_parts: Vec<String> = config
+        .required_vars
         .iter()
         .map(|var| format!("{}={{{}}}", var, var))
         .collect();
@@ -228,10 +236,14 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
 
     // Gather state. All queries tolerate a missing/unreadable vault by
     // returning empty results — the landing page still works pre-vault.
-    let vault_exists = storage::get_vault_path().map(|p| p.exists()).unwrap_or(false);
+    let vault_exists = storage::get_vault_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
     let personal_count = if vault_exists {
         storage::list_entries().map(|v| v.len()).unwrap_or(0)
-    } else { 0 };
+    } else {
+        0
+    };
     let team_active = storage::list_virtual_key_cache()
         .map(|v| v.into_iter().filter(|k| k.key_status == "active").count())
         .unwrap_or(0);
@@ -268,15 +280,20 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
 
     // Helper: print a command + inline description with consistent spacing.
     let tip = |cmd: &str, desc: &str| {
-        println!("     {}  {}",
+        println!(
+            "     {}  {}",
             format!("{:<50}", cmd).cyan(),
-            format!("# {}", desc).dimmed());
+            format!("# {}", desc).dimmed()
+        );
     };
 
     // --- Banner --------------------------------------------------------
     println!();
     println!("  \u{1F680} {}", "AiKey Quickstart".bold());
-    println!("  {}", "Next steps tailored to your current state.".dimmed());
+    println!(
+        "  {}",
+        "Next steps tailored to your current state.".dimmed()
+    );
     println!("  {}", "\u{2500}".repeat(68).dimmed());
     println!();
 
@@ -289,8 +306,11 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
 
     // --- Section 2: has key → activate + review ----------------------
     if total_keys > 0 {
-        let summary = format!("You have {} key{}",
-            total_keys, if total_keys == 1 { "" } else { "s" });
+        let summary = format!(
+            "You have {} key{}",
+            total_keys,
+            if total_keys == 1 { "" } else { "s" }
+        );
         println!("  {} {}", "\u{2713}".green().bold(), summary.bold());
         tip("aikey use", "pick which key to activate for routing");
         tip("aikey list", "review every credential");
@@ -307,14 +327,20 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
     // --- Section 4: not logged into a team → offer team login ------
     if !logged_in {
         println!("  {}", "\u{1F465} Join your team".bold());
-        tip("aikey login --control-url https://your.team.host", "team-managed keys auto-sync");
+        tip(
+            "aikey login --control-url https://your.team.host",
+            "team-managed keys auto-sync",
+        );
         println!();
     }
 
     // --- Section 5: two or more credentials → show route picker ----
     if total_credentials >= 2 {
         println!("  {}", "\u{1F517} Multiple routes available".bold());
-        tip("aikey route", "pick a base_url + api_key for your IDE or CLI");
+        tip(
+            "aikey route",
+            "pick a base_url + api_key for your IDE or CLI",
+        );
         println!();
     }
 
@@ -341,7 +367,6 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-
 /// Handle `aikey project map` — bind a required var to a vault alias, and optionally
 /// add an envMappings entry when --env, --provider, and --key-alias are provided.
 pub fn handle_project_map(
@@ -355,17 +380,23 @@ pub fn handle_project_map(
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Verify master password before mutating config
-    let prompt_str = if json_mode { "" } else { "\u{1F512} Enter Master Password: " };
+    let prompt_str = if json_mode {
+        ""
+    } else {
+        "\u{1F512} Enter Master Password: "
+    };
     let password = crate::prompt_hidden(prompt_str)?;
     let password_raw = Zeroizing::new(password);
     let secret = SecretString::new(password_raw.trim().to_string());
 
     // Verify the password is correct by attempting to list secrets
-    crate::executor::list_secrets(&secret)
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)) as Box<dyn std::error::Error>)?;
+    crate::executor::list_secrets(&secret).map_err(|e| {
+        Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+            as Box<dyn std::error::Error>
+    })?;
 
-    let (config_path, mut config) = ProjectConfig::discover()?
-        .ok_or("No aikey.config.json found")?;
+    let (config_path, mut config) =
+        ProjectConfig::discover()?.ok_or("No aikey.config.json found")?;
 
     // Always update bindings / required_vars
     config.bindings.insert(var.to_string(), alias.to_string());
@@ -411,13 +442,16 @@ pub fn handle_provider_add(
     default_model: Option<&str>,
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (config_path, mut config) = ProjectConfig::discover()?
-        .ok_or("No aikey.config.json found")?;
+    let (config_path, mut config) =
+        ProjectConfig::discover()?.ok_or("No aikey.config.json found")?;
 
-    config.providers.insert(name.to_string(), ProviderConfig {
-        key_alias: key_alias.to_string(),
-        default_model: default_model.map(|s| s.to_string()),
-    });
+    config.providers.insert(
+        name.to_string(),
+        ProviderConfig {
+            key_alias: key_alias.to_string(),
+            default_model: default_model.map(|s| s.to_string()),
+        },
+    );
 
     config.save(&config_path)?;
 
@@ -436,22 +470,24 @@ pub fn handle_provider_add(
 }
 
 /// Handle `aikey provider rm` — remove a provider from the profile config
-pub fn handle_provider_rm(
-    name: &str,
-    json_mode: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (config_path, mut config) = ProjectConfig::discover()?
-        .ok_or("No aikey.config.json found")?;
+pub fn handle_provider_rm(name: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (config_path, mut config) =
+        ProjectConfig::discover()?.ok_or("No aikey.config.json found")?;
 
     if !json_mode {
-        let key_alias = config.providers.get(name)
+        let key_alias = config
+            .providers
+            .get(name)
             .map(|p| p.key_alias.as_str())
             .unwrap_or(name);
         let profile = global_config::get_current_profile()
             .ok()
             .flatten()
             .unwrap_or_else(|| "default".to_string());
-        print!("Remove {}:{} from profile '{}' config? (y/N) ", name, key_alias, profile);
+        print!(
+            "Remove {}:{} from profile '{}' config? (y/N) ",
+            name, key_alias, profile
+        );
         io::stdout().flush().ok();
         let mut response = String::new();
         io::stdin().read_line(&mut response).ok();
@@ -464,10 +500,13 @@ pub fn handle_provider_rm(
     if config.providers.remove(name).is_none() {
         let msg = format!("Provider '{}' not found in config", name);
         if json_mode {
-            json_output::print_json_exit(serde_json::json!({
-                "ok": false,
-                "message": msg
-            }), 1);
+            json_output::print_json_exit(
+                serde_json::json!({
+                    "ok": false,
+                    "message": msg
+                }),
+                1,
+            );
         }
         return Err(msg.into());
     }
@@ -488,17 +527,20 @@ pub fn handle_provider_rm(
 
 /// Handle `aikey provider ls` — list providers in the project config
 pub fn handle_provider_ls(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (_, config) = ProjectConfig::discover()?
-        .ok_or("No aikey.config.json found")?;
+    let (_, config) = ProjectConfig::discover()?.ok_or("No aikey.config.json found")?;
 
     if json_mode {
-        let providers: Vec<_> = config.providers.iter().map(|(name, cfg)| {
-            serde_json::json!({
-                "name": name,
-                "key_alias": cfg.key_alias,
-                "default_model": cfg.default_model
+        let providers: Vec<_> = config
+            .providers
+            .iter()
+            .map(|(name, cfg)| {
+                serde_json::json!({
+                    "name": name,
+                    "key_alias": cfg.key_alias,
+                    "default_model": cfg.default_model
+                })
             })
-        }).collect();
+            .collect();
         json_output::print_json(serde_json::json!({ "ok": true, "providers": providers }));
     } else if config.providers.is_empty() {
         println!("No protocols configured.");
@@ -545,9 +587,11 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         if !json_mode {
             if is_sub {
                 let trimmed = label.trim_start();
-                println!("    {} {}",
+                println!(
+                    "    {} {}",
                     format!("↳ {:<16}", trimmed).dimmed(),
-                    detail.dimmed());
+                    detail.dimmed()
+                );
                 if let Some(h) = hint {
                     println!("      {}", format!("· {}", h).dimmed());
                 }
@@ -567,7 +611,9 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         }));
         // Only top-level failures bubble up to overall status; sub-rows are
         // already captured via their parent.
-        if !ok && !is_sub { any_failed = true; }
+        if !ok && !is_sub {
+            any_failed = true;
+        }
     };
 
     if !json_mode {
@@ -592,7 +638,8 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         match ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_millis(500))
             .build()
-            .get(&proxy_url).call()
+            .get(&proxy_url)
+            .call()
         {
             Ok(resp) => {
                 if let Ok(body) = resp.into_string() {
@@ -606,9 +653,14 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                             format!("{}+{}.{}", ver, rev, bid)
                         };
                         let matched = cli_bid != "unknown" && bid != "unknown" && cli_bid == bid;
-                        let mismatch_hint = if cli_bid != "unknown" && bid != "unknown" && cli_bid != bid {
+                        let mismatch_hint = if cli_bid != "unknown"
+                            && bid != "unknown"
+                            && cli_bid != bid
+                        {
                             Some("BuildID mismatch — CLI and proxy from different builds. Run: make restart")
-                        } else { None };
+                        } else {
+                            None
+                        };
                         emit("proxy version", true, &proxy_str, mismatch_hint);
                         if matched {
                             emit("build match", true, &format!("BuildID={}", bid), None);
@@ -617,7 +669,12 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 }
             }
             Err(_) => {
-                emit("proxy version", false, "proxy not reachable", Some("proxy /version check will retry after proxy starts"));
+                emit(
+                    "proxy version",
+                    false,
+                    "proxy not reachable",
+                    Some("proxy /version check will retry after proxy starts"),
+                );
             }
         }
 
@@ -627,14 +684,13 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         // local-server is checked separately below (after drop(emit)) so
         // its NOT-RUNNING case can render as a ⚠ warning with a start
         // hint, rather than being silently skipped.
-        for (name, port) in &[
-            ("control", 8080u16), ("collector", 27300), ("query", 27310),
-        ] {
+        for (name, port) in &[("control", 8080u16), ("collector", 27300), ("query", 27310)] {
             let url = format!("http://127.0.0.1:{}/version", port);
             match ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_millis(500))
                 .build()
-                .get(&url).call()
+                .get(&url)
+                .call()
             {
                 Ok(resp) => {
                     if let Ok(body) = resp.into_string() {
@@ -666,15 +722,27 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // direct TCP to 1.1.1.1:443 is blocked, causing a false "unreachable".
     {
         let start = Instant::now();
-        let ok = crate::connectivity::runtime::build_proxy_aware_agent(std::time::Duration::from_secs(5))
-            .head("https://www.gstatic.com/generate_204")
-            .call()
-            .is_ok();
+        let ok = crate::connectivity::runtime::build_proxy_aware_agent(
+            std::time::Duration::from_secs(5),
+        )
+        .head("https://www.gstatic.com/generate_204")
+        .call()
+        .is_ok();
         let ms = start.elapsed().as_millis();
-        emit("internet",
+        emit(
+            "internet",
             ok,
-            &if ok { format!("reachable  ({} ms)", ms) } else { "unreachable".to_string() },
-            if ok { None } else { Some("check network connection or VPN") });
+            &if ok {
+                format!("reachable  ({} ms)", ms)
+            } else {
+                "unreachable".to_string()
+            },
+            if ok {
+                None
+            } else {
+                Some("check network connection or VPN")
+            },
+        );
     }
 
     // ── 2. Vault ─────────────────────────────────────────────
@@ -686,17 +754,31 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             Some(p) => format!("not found  ({})", p.display()),
             None => "cannot resolve path".to_string(),
         };
-        emit("vault", exists, &detail,
-            if exists { None } else { Some("run 'aikey init' to create your vault") });
+        emit(
+            "vault",
+            exists,
+            &detail,
+            if exists {
+                None
+            } else {
+                Some("run 'aikey init' to create your vault")
+            },
+        );
     }
 
     // ── 3. Session cache ─────────────────────────────────────
     {
         let cached = crate::session::try_get().is_some();
-        emit("session",
-            true,  // not a failure either way — just informational
-            if cached { "password cached" } else { "no cache  (will prompt on next command)" },
-            None);
+        emit(
+            "session",
+            true, // not a failure either way — just informational
+            if cached {
+                "password cached"
+            } else {
+                "no cache  (will prompt on next command)"
+            },
+            None,
+        );
     }
 
     // ── 3.5. Lifecycle state consistency ─────────────────────
@@ -722,8 +804,16 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         let drift_hint = format!(
             "run \x1b[1;36maikey use <alias>\x1b[0m\x1b[2m to force a reconcile, or \x1b[1;36maikey doctor --detail\x1b[0m\x1b[2m for per-source diff",
         );
-        emit("active state sync", report.is_consistent, &report.summary,
-            if report.is_consistent { None } else { Some(&drift_hint) });
+        emit(
+            "active state sync",
+            report.is_consistent,
+            &report.summary,
+            if report.is_consistent {
+                None
+            } else {
+                Some(&drift_hint)
+            },
+        );
         if !report.is_consistent {
             for d in &report.diffs {
                 let label = format!("  {}", d.source.label());
@@ -789,7 +879,11 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                     Some("run 'aikey proxy restart' to recover"),
                 );
             }
-            ProxyState::OrphanedPort { port, owner_pid, reason } => {
+            ProxyState::OrphanedPort {
+                port,
+                owner_pid,
+                reason,
+            } => {
                 // Diagnostic-only: no auto-restart, no password prompt.
                 // Doing either would be wasted user input — Layer 2
                 // can't manage the foreign owner.
@@ -802,7 +896,9 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             }
             ProxyState::Crashed { .. } | ProxyState::Stopped => {
                 let detail = match &initial_state {
-                    ProxyState::Crashed { stale_pid } => format!("stale pidfile (was: {stale_pid})"),
+                    ProxyState::Crashed { stale_pid } => {
+                        format!("stale pidfile (was: {stale_pid})")
+                    }
                     _ => "not running".to_string(),
                 };
                 emit("proxy", false, &detail, Some("attempting restart..."));
@@ -814,8 +910,12 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                         proxy_up = true;
                         emit("proxy restart", true, "proxy restarted successfully", None);
                     } else {
-                        emit("proxy restart", false, "restart failed",
-                            Some("run 'aikey proxy start' manually to debug"));
+                        emit(
+                            "proxy restart",
+                            false,
+                            "restart failed",
+                            Some("run 'aikey proxy start' manually to debug"),
+                        );
                     }
                 }
             }
@@ -828,15 +928,17 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // execution happens below the emit closure to avoid the &mut results
     // borrow conflict that predates this refactor.
     if proxy_up {
-        let bindings = storage::list_provider_bindings(
-            crate::profile_activation::DEFAULT_PROFILE,
-        ).unwrap_or_default();
+        let bindings = storage::list_provider_bindings(crate::profile_activation::DEFAULT_PROFILE)
+            .unwrap_or_default();
 
         if bindings.is_empty() {
             if !json_mode {
-                println!("  {} {:<18} {}",
-                    "·".dimmed(), "protocols",
-                    "no protocol bindings — run 'aikey add' first".dimmed());
+                println!(
+                    "  {} {:<18} {}",
+                    "·".dimmed(),
+                    "protocols",
+                    "no protocol bindings — run 'aikey add' first".dimmed()
+                );
             }
         } else {
             // Plan D (2026-04-22): all probes (including personal) go via
@@ -849,9 +951,12 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
 
             if targets.is_empty() && build_errors.is_empty() {
                 if !json_mode {
-                    println!("  {} {:<18} {}",
-                        "\u{b7}".dimmed(), "protocols",
-                        "no protocol bindings configured".dimmed());
+                    println!(
+                        "  {} {:<18} {}",
+                        "\u{b7}".dimmed(),
+                        "protocols",
+                        "no protocol bindings configured".dimmed()
+                    );
                 }
             } else {
                 // Deferred: run after emit closure is dropped (borrow conflict).
@@ -872,8 +977,11 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             // Check .bashrc first, then .bash_profile.
             let bashrc = format!("{}/.bashrc", home);
             let profile = format!("{}/.bash_profile", home);
-            if std::path::Path::new(&bashrc).exists() { Some(bashrc) }
-            else { Some(profile) }
+            if std::path::Path::new(&bashrc).exists() {
+                Some(bashrc)
+            } else {
+                Some(profile)
+            }
         } else {
             None
         };
@@ -887,15 +995,23 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         if installed {
             emit("shell hook", true, "installed", None);
         } else if rc_file.is_some() {
-            emit("shell hook", false, "not installed",
-                Some("installing shell hook..."));
+            emit(
+                "shell hook",
+                false,
+                "not installed",
+                Some("installing shell hook..."),
+            );
             // Trigger installation (prompts user in TTY mode).
             if !json_mode {
                 let _ = crate::commands_account::ensure_shell_hook(false);
             }
         } else {
-            emit("shell hook", false, "unsupported shell",
-                Some("add 'source ~/.aikey/active.env' to your shell config manually"));
+            emit(
+                "shell hook",
+                false,
+                "unsupported shell",
+                Some("add 'source ~/.aikey/active.env' to your shell config manually"),
+            );
         }
     }
 
@@ -912,9 +1028,8 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // installed — many users never opt into degrade-detector and
     // shouldn't see "✗" rows for a feature they didn't choose.
     {
-        let trust_local_bin = std::path::Path::new(
-            &std::env::var("HOME").unwrap_or_default()
-        ).join(".aikey/bin/trust-local");
+        let trust_local_bin = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+            .join(".aikey/bin/trust-local");
         if trust_local_bin.exists() {
             // (a) trust-local service liveness.
             let trust_local_url = "http://127.0.0.1:8801/healthz";
@@ -935,23 +1050,27 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             // as `proxy.observer.built` (good) or
             // `proxy.observer.build_failed` (bad) within the first
             // few hundred lines after a restart.
-            let log_path = std::path::Path::new(
-                &std::env::var("HOME").unwrap_or_default()
-            ).join(".aikey/logs/aikey-proxy/current.jsonl");
+            let log_path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
+                .join(".aikey/logs/aikey-proxy/current.jsonl");
             let observer_state = if log_path.exists() {
                 std::fs::read_to_string(&log_path).ok().and_then(|s| {
                     // Take the LAST observer line (most recent
                     // restart's verdict). build_failed > built > unknown.
                     s.lines()
-                     .filter(|l| l.contains("proxy.observer.build") || l.contains("rhythm.observer"))
-                     .last()
-                     .map(String::from)
+                        .filter(|l| {
+                            l.contains("proxy.observer.build") || l.contains("rhythm.observer")
+                        })
+                        .last()
+                        .map(String::from)
                 })
             } else {
                 None
             };
             match observer_state {
-                Some(line) if line.contains("proxy.observer.built") || line.contains("rhythm.observer.built") => {
+                Some(line)
+                    if line.contains("proxy.observer.built")
+                        || line.contains("rhythm.observer.built") =>
+                {
                     emit("rhythm observer", true, "built + reporting", None);
                 }
                 Some(line) if line.contains("build_failed") => {
@@ -959,7 +1078,11 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                     // for a more actionable detail.
                     let reason = serde_json::from_str::<serde_json::Value>(&line)
                         .ok()
-                        .and_then(|v| v.get("error.message").and_then(|s| s.as_str()).map(String::from))
+                        .and_then(|v| {
+                            v.get("error.message")
+                                .and_then(|s| s.as_str())
+                                .map(String::from)
+                        })
                         .unwrap_or_else(|| "build_failed (see proxy log)".to_string());
                     emit("rhythm observer", false, "inactive",
                         Some(&format!("reason: {}; reinstall via: curl -fsSL https://raw.githubusercontent.com/aikeylabs/degrade-detector/main/scripts/install_service.sh | bash", reason)));
@@ -968,8 +1091,12 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                     // No observer line in log = proxy started before
                     // observer registry, or trust-local was installed
                     // after proxy. Hint at a restart.
-                    emit("rhythm observer", false, "state unknown",
-                        Some("restart proxy: aikey proxy restart"));
+                    emit(
+                        "rhythm observer",
+                        false,
+                        "state unknown",
+                        Some("restart proxy: aikey proxy restart"),
+                    );
                 }
             }
         }
@@ -980,17 +1107,14 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         if let Ok(vault_path) = storage::get_vault_path() {
             let wal_path = vault_path.with_extension("db-wal");
             if wal_path.exists() {
-                let wal_size = std::fs::metadata(&wal_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
                 let wal_mb = wal_size / (1024 * 1024);
                 if wal_mb >= 1000 {
                     emit("vault WAL", false,
                         &format!("{}MB — needs checkpoint", wal_mb),
                         Some("run: sqlite3 ~/.aikey/data/vault.db 'PRAGMA wal_checkpoint(TRUNCATE);'"));
                 } else {
-                    emit("vault WAL", true,
-                        &format!("{}MB", wal_mb), None);
+                    emit("vault WAL", true, &format!("{}MB", wal_mb), None);
                 }
             }
         }
@@ -1007,8 +1131,16 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         } else {
             format!("unreachable  ({})", account.control_url)
         };
-        emit("control service", ok, &detail,
-            if ok { None } else { Some("check network or try 'aikey login' again") });
+        emit(
+            "control service",
+            ok,
+            &detail,
+            if ok {
+                None
+            } else {
+                Some("check network or try 'aikey login' again")
+            },
+        );
     }
 
     // ── 10. Usage pipeline health ─────────────────────────────
@@ -1030,9 +1162,14 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         // a) Proxy reporter metrics
         let proxy_metrics = if proxy_up {
             let url = format!("http://{}/metrics", proxy_addr);
-            agent.get(&url).call().ok()
+            agent
+                .get(&url)
+                .call()
+                .ok()
                 .and_then(|r| r.into_string().ok())
-        } else { None };
+        } else {
+            None
+        };
 
         // b) Diagnostics — served by collector-service. In trial, control and
         //    collector live on the same port so {control_url}/v1/diagnostics/
@@ -1040,25 +1177,33 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         //    collector container which is reachable via an endpoint advertised
         //    by {control_url}/system/status under endpoints.collector.
         //    Discovery order: system/status → collector → fallback to control.
-        let diag_json = storage::get_platform_account().ok().flatten()
+        let diag_json = storage::get_platform_account()
+            .ok()
+            .flatten()
             .and_then(|acct| {
                 let control_base = acct.control_url.trim_end_matches('/').to_string();
 
                 // Probe /system/status for a collector endpoint (production path).
                 let collector_base: String = agent
                     .get(&format!("{}/system/status", control_base))
-                    .call().ok()
+                    .call()
+                    .ok()
                     .and_then(|r| r.into_string().ok())
                     .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-                    .and_then(|v| v.get("endpoints")
-                        .and_then(|e| e.get("collector"))
-                        .and_then(|c| c.get("url"))
-                        .and_then(|u| u.as_str())
-                        .map(|s| s.trim_end_matches('/').to_string()))
+                    .and_then(|v| {
+                        v.get("endpoints")
+                            .and_then(|e| e.get("collector"))
+                            .and_then(|c| c.get("url"))
+                            .and_then(|u| u.as_str())
+                            .map(|s| s.trim_end_matches('/').to_string())
+                    })
                     .unwrap_or_else(|| control_base.clone());
 
                 let url = format!("{}/v1/diagnostics/pipeline", collector_base);
-                let resp = agent.get(&url).call().ok()
+                let resp = agent
+                    .get(&url)
+                    .call()
+                    .ok()
                     .and_then(|r| r.into_string().ok());
                 // Fallback: some older deployments serve diagnostics under
                 // control_url. If collector probe failed, try control as a
@@ -1067,16 +1212,15 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                     resp
                 } else {
                     let fallback = format!("{}/v1/diagnostics/pipeline", control_base);
-                    agent.get(&fallback).call().ok()
+                    agent
+                        .get(&fallback)
+                        .call()
+                        .ok()
                         .and_then(|r| r.into_string().ok())
                 }
             });
 
-        check_usage_pipeline(
-            proxy_metrics.as_deref(),
-            diag_json.as_deref(),
-            &mut emit,
-        );
+        check_usage_pipeline(proxy_metrics.as_deref(), diag_json.as_deref(), &mut emit);
     }
 
     // Drop emit to release &mut results, then run the deferred suite.
@@ -1088,7 +1232,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             SuiteOptions {
                 show_proxy_row: true,
                 header_label: Some("Connectivity Test"),
-                password: None,   // PersonalApi plaintext is already baked into each target
+                password: None, // PersonalApi plaintext is already baked into each target
                 proxy_port: crate::commands_proxy::proxy_port(),
                 show_key_column: false,
             },
@@ -1126,9 +1270,11 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                         Ok(unlocked) => (
                             "local-server",
                             true,
-                            format!("running on port {} (vault: {})",
+                            format!(
+                                "running on port {} (vault: {})",
                                 port,
-                                if unlocked { "unlocked" } else { "locked" }),
+                                if unlocked { "unlocked" } else { "locked" }
+                            ),
                             None,
                         ),
                         Err(_) => (
@@ -1148,7 +1294,11 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             };
 
         if !json_mode {
-            let icon = if ok_for_json { "✓".green() } else { "⚠".yellow() };
+            let icon = if ok_for_json {
+                "✓".green()
+            } else {
+                "⚠".yellow()
+            };
             println!("{} {:<18} {}", icon, label, detail);
             if let Some(ref h) = hint {
                 println!("  {}", format!("↳ Start: {}", h).dimmed());
@@ -1186,7 +1336,6 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-
 // ---------------------------------------------------------------------------
 // Usage pipeline health check for `aikey doctor`
 // ---------------------------------------------------------------------------
@@ -1202,23 +1351,28 @@ fn check_usage_pipeline(
     diag_json: Option<&str>,
     emit: &mut dyn FnMut(&str, bool, &str, Option<&str>),
 ) {
-    let metrics: Option<serde_json::Value> = proxy_metrics
-        .and_then(|s| serde_json::from_str(s).ok());
-    let diag: Option<serde_json::Value> = diag_json
-        .and_then(|s| serde_json::from_str(s).ok());
+    let metrics: Option<serde_json::Value> =
+        proxy_metrics.and_then(|s| serde_json::from_str(s).ok());
+    let diag: Option<serde_json::Value> = diag_json.and_then(|s| serde_json::from_str(s).ok());
 
     // --- Header: use diagnostics health if available, fall back to reporter state ---
-    let diag_health = diag.as_ref()
+    let diag_health = diag
+        .as_ref()
         .and_then(|d| d.get("watermark_health").and_then(|v| v.as_str()));
-    let diag_stale = diag.as_ref()
+    let diag_stale = diag
+        .as_ref()
         .and_then(|d| d.get("stale_stage").and_then(|v| v.as_str()));
 
-    let reporter = metrics.as_ref()
-        .and_then(|m| m.get("reporter"));
+    let reporter = metrics.as_ref().and_then(|m| m.get("reporter"));
 
     // If neither source is available
     if reporter.is_none() && diag.is_none() {
-        emit("usage-pipeline", true, "reporter not enabled (standalone mode)", None);
+        emit(
+            "usage-pipeline",
+            true,
+            "reporter not enabled (standalone mode)",
+            None,
+        );
         return;
     }
 
@@ -1227,11 +1381,13 @@ fn check_usage_pipeline(
     // only sees watermark freshness (DWD has recent canary → healthy), but misses
     // canary probe failures at the query stage. Doctor has both data sources and
     // must combine them to avoid "healthy overall but canary probe failed" contradiction.
-    let canary_status = metrics.as_ref()
+    let canary_status = metrics
+        .as_ref()
         .and_then(|m| m.get("canary"))
         .and_then(|c| c.get("status").and_then(|v| v.as_str()))
         .unwrap_or("");
-    let canary_stage = metrics.as_ref()
+    let canary_stage = metrics
+        .as_ref()
         .and_then(|m| m.get("canary"))
         .and_then(|c| c.get("failed_stage").and_then(|v| v.as_str()))
         .unwrap_or("");
@@ -1241,7 +1397,10 @@ fn check_usage_pipeline(
 
     let (pipeline_ok, health_label) = if canary_is_failure && !canary_stage.is_empty() {
         // Canary probe failure overrides watermark health
-        (false, format!("degraded — canary failed at {}", canary_stage))
+        (
+            false,
+            format!("degraded — canary failed at {}", canary_stage),
+        )
     } else {
         match diag_health {
             Some("healthy") => (true, "healthy".to_string()),
@@ -1255,10 +1414,15 @@ fn check_usage_pipeline(
             }
             _ => {
                 // Fall back to reporter consecutive failures
-                let consecutive = reporter.and_then(|r| r.get("consecutive_failures"))
-                    .and_then(|v| v.as_i64()).unwrap_or(0);
-                if consecutive >= 5 { (false, "degraded".to_string()) }
-                else { (true, "healthy".to_string()) }
+                let consecutive = reporter
+                    .and_then(|r| r.get("consecutive_failures"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                if consecutive >= 5 {
+                    (false, "degraded".to_string())
+                } else {
+                    (true, "healthy".to_string())
+                }
             }
         }
     };
@@ -1266,7 +1430,10 @@ fn check_usage_pipeline(
     // Override label to "idle" if reporter exists but no events have flowed yet.
     // Avoids showing "healthy" when nothing has been verified.
     let reporter_idle = reporter
-        .and_then(|r| r.get("usage_events_generated_total").and_then(|v| v.as_i64()))
+        .and_then(|r| {
+            r.get("usage_events_generated_total")
+                .and_then(|v| v.as_i64())
+        })
         .map(|g| g == 0)
         .unwrap_or(false);
     let (pipeline_ok, health_label) = if pipeline_ok && reporter_idle {
@@ -1277,25 +1444,64 @@ fn check_usage_pipeline(
 
     let hint = if !pipeline_ok {
         Some("run: curl http://127.0.0.1:8090/v1/diagnostics/pipeline")
-    } else { None };
+    } else {
+        None
+    };
     emit("usage-pipeline", pipeline_ok, &health_label, hint);
 
     // --- Reporter stats (from proxy /metrics) ---
     if let Some(r) = reporter {
-        let generated = r.get("usage_events_generated_total").and_then(|v| v.as_i64()).unwrap_or(0);
-        let uploaded = r.get("usage_events_upload_success_total").and_then(|v| v.as_i64()).unwrap_or(0);
-        let failed = r.get("usage_events_upload_failed_total").and_then(|v| v.as_i64()).unwrap_or(0);
-        let dropped = r.get("usage_events_dropped_total").and_then(|v| v.as_i64()).unwrap_or(0);
-        let consecutive = r.get("consecutive_failures").and_then(|v| v.as_i64()).unwrap_or(0);
-        let terminal = r.get("terminal_fail_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        let last_status = r.get("last_upload_status").and_then(|v| v.as_str()).unwrap_or("");
-        let last_upload = r.get("last_upload_at").and_then(|v| v.as_str()).unwrap_or("");
-        let last_error_code = r.get("last_error_code").and_then(|v| v.as_i64()).unwrap_or(0);
-        let queue_depth = r.get("usage_queue_depth").and_then(|v| v.as_i64()).unwrap_or(0);
-        let wal_fail = r.get("usage_wal_append_failed_total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let generated = r
+            .get("usage_events_generated_total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let uploaded = r
+            .get("usage_events_upload_success_total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let failed = r
+            .get("usage_events_upload_failed_total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let dropped = r
+            .get("usage_events_dropped_total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let consecutive = r
+            .get("consecutive_failures")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let terminal = r
+            .get("terminal_fail_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let last_status = r
+            .get("last_upload_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let last_upload = r
+            .get("last_upload_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let last_error_code = r
+            .get("last_error_code")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let queue_depth = r
+            .get("usage_queue_depth")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let wal_fail = r
+            .get("usage_wal_append_failed_total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
 
         let upload_time = format_time_short(last_upload);
-        let status_display = if last_status.is_empty() { "idle" } else { last_status };
+        let status_display = if last_status.is_empty() {
+            "idle"
+        } else {
+            last_status
+        };
 
         // Reporter is ok if currently healthy (consecutive < 5 and last status not terminal).
         // Historical failures with last_status=ok means it recovered — show ✓ with hint.
@@ -1306,29 +1512,51 @@ fn check_usage_pipeline(
             Some("terminal failures — check collector_token")
         } else if failed > 0 {
             Some("retryable failures detected")
-        } else { None };
-        emit("  reporter", reporter_ok,
-            &format!("{} generated, {} uploaded, {} failed, {} dropped",
-                generated, uploaded, failed, dropped),
-            reporter_hint);
+        } else {
+            None
+        };
+        emit(
+            "  reporter",
+            reporter_ok,
+            &format!(
+                "{} generated, {} uploaded, {} failed, {} dropped",
+                generated, uploaded, failed, dropped
+            ),
+            reporter_hint,
+        );
         let upload_hint = if consecutive > 0 {
-            Some(format!("{} consecutive failures, last HTTP {}", consecutive, last_error_code))
-        } else { None };
-        emit("  last upload", reporter_ok,
+            Some(format!(
+                "{} consecutive failures, last HTTP {}",
+                consecutive, last_error_code
+            ))
+        } else {
+            None
+        };
+        emit(
+            "  last upload",
+            reporter_ok,
             &format!("{} ({})", upload_time, status_display),
-            upload_hint.as_deref());
+            upload_hint.as_deref(),
+        );
 
         if queue_depth > 0 || wal_fail > 0 {
             let mut parts = Vec::new();
-            if queue_depth > 0 { parts.push(format!("{} queued", queue_depth)); }
-            if wal_fail > 0 { parts.push(format!("{} WAL write failures", wal_fail)); }
+            if queue_depth > 0 {
+                parts.push(format!("{} queued", queue_depth));
+            }
+            if wal_fail > 0 {
+                parts.push(format!("{} WAL write failures", wal_fail));
+            }
             emit("  queue/WAL", wal_fail == 0, &parts.join(", "), None);
         }
 
         if terminal > 0 {
-            emit("  dead letters", false,
+            emit(
+                "  dead letters",
+                false,
                 &format!("{} events", terminal),
-                Some("review ~/.aikey/data/usage-wal/dead_letter.jsonl"));
+                Some("review ~/.aikey/data/usage-wal/dead_letter.jsonl"),
+            );
         }
     }
 
@@ -1337,10 +1565,22 @@ fn check_usage_pipeline(
         let biz = d.get("business_watermarks");
         let canary_wm = d.get("canary_watermarks");
 
-        let biz_ods = biz.and_then(|w| w.get("ods_latest_ingested_at")).and_then(|v| v.as_str()).unwrap_or("");
-        let biz_dwd = biz.and_then(|w| w.get("dwd_latest_projected_at")).and_then(|v| v.as_str()).unwrap_or("");
-        let can_ods = canary_wm.and_then(|w| w.get("ods_latest_ingested_at")).and_then(|v| v.as_str()).unwrap_or("");
-        let can_dwd = canary_wm.and_then(|w| w.get("dwd_latest_projected_at")).and_then(|v| v.as_str()).unwrap_or("");
+        let biz_ods = biz
+            .and_then(|w| w.get("ods_latest_ingested_at"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let biz_dwd = biz
+            .and_then(|w| w.get("dwd_latest_projected_at"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let can_ods = canary_wm
+            .and_then(|w| w.get("ods_latest_ingested_at"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let can_dwd = canary_wm
+            .and_then(|w| w.get("dwd_latest_projected_at"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         let biz_ods_t = format_time_short(biz_ods);
         let biz_dwd_t = format_time_short(biz_dwd);
@@ -1350,24 +1590,41 @@ fn check_usage_pipeline(
         // Why "(UTC)": watermarks come from SQLite datetime('now') which is UTC,
         // while proxy reporter timestamps are local time. Label prevents confusion.
         if biz_ods_t != "never" || biz_dwd_t != "never" {
-            emit("  watermarks", true,
+            emit(
+                "  watermarks",
+                true,
                 &format!("ODS: {}, DWD: {} (UTC)", biz_ods_t, biz_dwd_t),
-                None);
+                None,
+            );
         }
 
         // Show canary watermark
         if can_dwd_t != "never" {
-            emit("  canary last seen", true,
-                &format!("ODS: {}, DWD: {} (UTC)", format_time_short(can_ods), can_dwd_t),
-                None);
+            emit(
+                "  canary last seen",
+                true,
+                &format!(
+                    "ODS: {}, DWD: {} (UTC)",
+                    format_time_short(can_ods),
+                    can_dwd_t
+                ),
+                None,
+            );
         }
 
         // Show lag if present
-        if let Some(lag) = d.get("lag").and_then(|l| l.get("ods_to_dwd_seconds")).and_then(|v| v.as_i64()) {
+        if let Some(lag) = d
+            .get("lag")
+            .and_then(|l| l.get("ods_to_dwd_seconds"))
+            .and_then(|v| v.as_i64())
+        {
             if lag > 60 {
-                emit("  lag", false,
+                emit(
+                    "  lag",
+                    false,
                     &format!("ODS→DWD: {}s", lag),
-                    Some("projector may be stalled"));
+                    Some("projector may be stalled"),
+                );
             }
         }
     }
@@ -1376,17 +1633,28 @@ fn check_usage_pipeline(
     let canary = metrics.as_ref().and_then(|m| m.get("canary"));
 
     if let Some(c) = canary {
-        let status = c.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let status = c
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         let round_trip = c.get("round_trip_ms").and_then(|v| v.as_i64()).unwrap_or(0);
         let failed_stage = c.get("failed_stage").and_then(|v| v.as_str()).unwrap_or("");
-        let ods = c.get("ods_received").and_then(|v| v.as_bool()).unwrap_or(false);
-        let dwd = c.get("dwd_projected").and_then(|v| v.as_bool()).unwrap_or(false);
+        let ods = c
+            .get("ods_received")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let dwd = c
+            .get("dwd_projected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let ok = status == "ok";
         // Canary checks ODS and DWD only (no query-stage check yet — P2/P3).
-        let stages = format!("ODS {} DWD {}",
+        let stages = format!(
+            "ODS {} DWD {}",
             if ods { "✓" } else { "✗" },
-            if dwd { "✓" } else { "✗" });
+            if dwd { "✓" } else { "✗" }
+        );
 
         let detail = if status == "unavailable" {
             format!("diagnostics endpoint not available  ({})", failed_stage)
@@ -1404,7 +1672,9 @@ fn check_usage_pipeline(
                 "projection" => "ODS ok but DWD stalled — check projector worker",
                 _ => "run: curl http://127.0.0.1:8090/v1/diagnostics/pipeline",
             })
-        } else { None };
+        } else {
+            None
+        };
 
         emit("  canary probe", ok, &detail, hint);
     }
@@ -1422,8 +1692,14 @@ fn format_time_short(ts: &str) -> String {
         // Truncate to HH:MM:SS — drop sub-seconds, timezone offset
         let base = clean.split('+').next().unwrap_or(clean);
         let base = if let Some(p) = base.rfind('-') {
-            if p > 0 { &base[..p] } else { base }
-        } else { base };
+            if p > 0 {
+                &base[..p]
+            } else {
+                base
+            }
+        } else {
+            base
+        };
         // Drop fractional seconds (everything after first '.')
         if let Some(dot) = base.find('.') {
             base[..dot].to_string()
@@ -1478,7 +1754,11 @@ pub fn handle_doctor_detail() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("{}", dim_rule);
     println!("{}", "🔍 4xx body captures".bold());
-    println!("{}  {}", dim_rule, "from aikey-proxy current.jsonl".dimmed());
+    println!(
+        "{}  {}",
+        dim_rule,
+        "from aikey-proxy current.jsonl".dimmed()
+    );
     render_4xx_captures();
 
     println!();
@@ -1499,7 +1779,10 @@ fn render_recent_failures() {
     };
     let db_path = home.join(TRIAL_DB_PATH);
     if !db_path.exists() {
-        println!("{}", "  (trial DB not present — trial-server hasn't run on this machine)".dimmed());
+        println!(
+            "{}",
+            "  (trial DB not present — trial-server hasn't run on this machine)".dimmed()
+        );
         return;
     }
 
@@ -1510,7 +1793,10 @@ fn render_recent_failures() {
     ) {
         Ok(c) => c,
         Err(e) => {
-            println!("  {}", format!("(open {}: {})", db_path.display(), e).dimmed());
+            println!(
+                "  {}",
+                format!("(open {}: {})", db_path.display(), e).dimmed()
+            );
             return;
         }
     };
@@ -1521,20 +1807,25 @@ fn render_recent_failures() {
     // when the user most needs the recent-failures view to be readable.
     // Section 2 (ingest health) will still call out the drift; Section 1
     // gracefully degrades by substituting '' for any absent optional column.
-    let cols: std::collections::HashSet<String> = match conn.prepare(
-        "SELECT name FROM pragma_table_info('usage_event_ods')",
-    ) {
-        Ok(mut stmt) => stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .and_then(|it| it.collect::<Result<std::collections::HashSet<_>, _>>())
-            .unwrap_or_default(),
-        Err(_) => {
-            println!("  {}", "(usage_event_ods table not found — trial-server never bootstrapped)".dimmed());
-            return;
-        }
-    };
+    let cols: std::collections::HashSet<String> =
+        match conn.prepare("SELECT name FROM pragma_table_info('usage_event_ods')") {
+            Ok(mut stmt) => stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .and_then(|it| it.collect::<Result<std::collections::HashSet<_>, _>>())
+                .unwrap_or_default(),
+            Err(_) => {
+                println!(
+                    "  {}",
+                    "(usage_event_ods table not found — trial-server never bootstrapped)".dimmed()
+                );
+                return;
+            }
+        };
     if !cols.contains("ods_id") || !cols.contains("request_status") {
-        println!("  {}", "(usage_event_ods missing required columns — schema not initialized)".dimmed());
+        println!(
+            "  {}",
+            "(usage_event_ods missing required columns — schema not initialized)".dimmed()
+        );
         return;
     }
 
@@ -1543,14 +1834,33 @@ fn render_recent_failures() {
     // `''` if it doesn't. Order is stable so the row tuple reads the same
     // positions regardless of which optionals were present.
     let opt = |c: &str| -> String {
-        if cols.contains(c) { format!("COALESCE({}, '')", c) } else { "''".to_string() }
+        if cols.contains(c) {
+            format!("COALESCE({}, '')", c)
+        } else {
+            "''".to_string()
+        }
     };
-    let absent: Vec<&str> = ["model", "virtual_key_id", "oauth_identity", "error_code", "error_message", "upstream_request_id"]
-        .iter().copied().filter(|c| !cols.contains(*c)).collect();
+    let absent: Vec<&str> = [
+        "model",
+        "virtual_key_id",
+        "oauth_identity",
+        "error_code",
+        "error_message",
+        "upstream_request_id",
+    ]
+    .iter()
+    .copied()
+    .filter(|c| !cols.contains(*c))
+    .collect();
     if !absent.is_empty() {
-        println!("  {}",
-            format!("(schema partial: {} absent — see Ingest health below for fix)", absent.join(", "))
-                .yellow());
+        println!(
+            "  {}",
+            format!(
+                "(schema partial: {} absent — see Ingest health below for fix)",
+                absent.join(", ")
+            )
+            .yellow()
+        );
     }
 
     let sql = format!(
@@ -1561,11 +1871,11 @@ fn render_recent_failures() {
          ORDER BY ods_id DESC
          LIMIT 5",
         model = opt("model"),
-        vk    = opt("virtual_key_id"),
+        vk = opt("virtual_key_id"),
         oauth = opt("oauth_identity"),
-        ec    = opt("error_code"),
-        em    = opt("error_message"),
-        urid  = opt("upstream_request_id"),
+        ec = opt("error_code"),
+        em = opt("error_message"),
+        urid = opt("upstream_request_id"),
     );
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
@@ -1575,12 +1885,28 @@ fn render_recent_failures() {
         }
     };
 
-    let rows: Vec<(i64, i64, i64, String, String, String, String, String, String)> = stmt
+    let rows: Vec<(
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )> = stmt
         .query_map([], |row| {
             Ok((
-                row.get(0)?, row.get(1)?, row.get(2)?,
-                row.get(3)?, row.get(4)?, row.get(5)?,
-                row.get(6)?, row.get(7)?, row.get(8)?,
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
             ))
         })
         .and_then(|i| i.collect::<Result<Vec<_>, _>>())
@@ -1598,15 +1924,25 @@ fn render_recent_failures() {
         } else if !vk.is_empty() {
             // Hide bulk of vk hash, keep prefix for orientation.
             let max_len = 48;
-            if vk.len() > max_len { format!("{}…", &vk[..max_len]) } else { vk }
+            if vk.len() > max_len {
+                format!("{}…", &vk[..max_len])
+            } else {
+                vk
+            }
         } else {
             "(unknown)".to_string()
         };
         let when = format_local_time_hms(recv_ms);
-        println!("  {}  HTTP {}  {}  {}",
+        println!(
+            "  {}  HTTP {}  {}  {}",
             when.bold(),
             status.to_string().yellow(),
-            if model.is_empty() { "(model?)".to_string() } else { model.clone() }.dimmed(),
+            if model.is_empty() {
+                "(model?)".to_string()
+            } else {
+                model.clone()
+            }
+            .dimmed(),
             label.dimmed(),
         );
         println!("    {} {}", "ods_id:".dimmed(), ods_id.to_string().dimmed());
@@ -1614,16 +1950,25 @@ fn render_recent_failures() {
             println!("    {} {}", "error_code:".dimmed(), error_code);
         }
         if !up_req_id.is_empty() {
-            println!("    {} {}",
+            println!(
+                "    {} {}",
                 "upstream_request_id:".dimmed(),
-                up_req_id.cyan());
+                up_req_id.cyan()
+            );
         } else {
-            println!("    {}", "upstream_request_id:  (proxy didn't capture — check provider headers)".dimmed());
+            println!(
+                "    {}",
+                "upstream_request_id:  (proxy didn't capture — check provider headers)".dimmed()
+            );
         }
         if !error_msg.is_empty() {
             // Truncate long messages; full content is one query away in the DB.
             let trimmed: String = error_msg.chars().take(280).collect();
-            let extra = if error_msg.chars().count() > 280 { "…" } else { "" };
+            let extra = if error_msg.chars().count() > 280 {
+                "…"
+            } else {
+                ""
+            };
             println!("    {} {}{}", "error_message:".dimmed(), trimmed, extra);
         }
         println!();
@@ -1638,7 +1983,10 @@ fn render_ingest_health() {
     let Some(home) = dirs::home_dir() else { return };
     let log_path = home.join(TRIAL_LOG_PATH);
     if !log_path.exists() {
-        println!("{}", "  (no trial-server log — service hasn't run on this machine)".dimmed());
+        println!(
+            "{}",
+            "  (no trial-server log — service hasn't run on this machine)".dimmed()
+        );
         return;
     }
 
@@ -1679,7 +2027,11 @@ fn render_ingest_health() {
     }
 
     if any_insert_fail == 0 {
-        println!("{} {}", "✓".green(), "no insert failures in recent log window");
+        println!(
+            "{} {}",
+            "✓".green(),
+            "no insert failures in recent log window"
+        );
         return;
     }
 
@@ -1719,13 +2071,26 @@ fn render_ingest_health() {
         let mut entries = missing_live.clone();
         entries.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
         for (col, n) in entries {
-            println!("   collector tried to write column {} but DB doesn't have it", col.yellow());
-            println!("   {} {} occurrences in tail window", "↳".dimmed(), n.to_string().dimmed());
+            println!(
+                "   collector tried to write column {} but DB doesn't have it",
+                col.yellow()
+            );
+            println!(
+                "   {} {} occurrences in tail window",
+                "↳".dimmed(),
+                n.to_string().dimmed()
+            );
         }
         let trial_db = home.join(TRIAL_DB_PATH);
-        println!("   {} {}", "FIX:".bold(),
-            format!("aikey-config-tool db upgrade --edition trial --db-path {}",
-                trial_db.display()).cyan());
+        println!(
+            "   {} {}",
+            "FIX:".bold(),
+            format!(
+                "aikey-config-tool db upgrade --edition trial --db-path {}",
+                trial_db.display()
+            )
+            .cyan()
+        );
     }
     // Historical-only drift: column absent in past log lines but present in
     // current schema → migration already ran. Surface as info-level so the
@@ -1736,38 +2101,61 @@ fn render_ingest_health() {
         let mut entries = missing_historical;
         entries.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
         let total: usize = entries.iter().map(|(_, n)| **n).sum();
-        let cols_str = entries.iter()
+        let cols_str = entries
+            .iter()
             .map(|(c, n)| format!("{} ({}×)", c, n))
             .collect::<Vec<_>>()
             .join(", ");
-        println!("{} {} historical insert failures (already fixed — column now present in DB):",
-            "ℹ".cyan(), total.to_string().dimmed());
+        println!(
+            "{} {} historical insert failures (already fixed — column now present in DB):",
+            "ℹ".cyan(),
+            total.to_string().dimmed()
+        );
         println!("   {}", cols_str.dimmed());
         println!("   {} log retains pre-fix entries; run a fresh canary or `aikey doctor --detail` later to confirm clean tail",
             "↳".dimmed());
     }
     if !not_null_cols.is_empty() {
         printed_any = true;
-        println!("{} NOT NULL violations (collector emitted NULL where schema requires value):", "✗".red());
+        println!(
+            "{} NOT NULL violations (collector emitted NULL where schema requires value):",
+            "✗".red()
+        );
         let mut entries: Vec<_> = not_null_cols.iter().collect();
         entries.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
         for (col, n) in entries {
-            println!("   {}: {} occurrences", col.yellow(), n.to_string().dimmed());
+            println!(
+                "   {}: {} occurrences",
+                col.yellow(),
+                n.to_string().dimmed()
+            );
         }
-        println!("   {} usually means proxy emitted an event with a missing field — check reportable.go", "↳".dimmed());
+        println!(
+            "   {} usually means proxy emitted an event with a missing field — check reportable.go",
+            "↳".dimmed()
+        );
     }
     if !check_violations.is_empty() {
         printed_any = true;
         println!("{} CHECK constraint violations:", "✗".red());
         for (constraint, n) in check_violations {
-            println!("   {}: {} occurrences", constraint.yellow(), n.to_string().dimmed());
+            println!(
+                "   {}: {} occurrences",
+                constraint.yellow(),
+                n.to_string().dimmed()
+            );
         }
-        println!("   {} an enum value drifted out of allowed range — check provider extractor", "↳".dimmed());
+        println!(
+            "   {} an enum value drifted out of allowed range — check provider extractor",
+            "↳".dimmed()
+        );
     }
     if !printed_any {
-        println!("{} {} insert failures matched no known pattern (regex needs updating)",
+        println!(
+            "{} {} insert failures matched no known pattern (regex needs updating)",
             "⚠".yellow(),
-            any_insert_fail.to_string());
+            any_insert_fail.to_string()
+        );
         println!("   {} grep ~/.aikey/logs/control-trial.log for 'insert event failed' to inspect raw lines",
             "↳".dimmed());
     }
@@ -1780,7 +2168,10 @@ fn render_4xx_captures() {
     let Some(home) = dirs::home_dir() else { return };
     let jsonl_path = home.join(PROXY_JSONL_PATH);
     if !jsonl_path.exists() {
-        println!("{}", "  (proxy jsonl not present — proxy hasn't run on this machine)".dimmed());
+        println!(
+            "{}",
+            "  (proxy jsonl not present — proxy hasn't run on this machine)".dimmed()
+        );
         return;
     }
 
@@ -1795,7 +2186,9 @@ fn render_4xx_captures() {
 
     let mut captures: Vec<serde_json::Value> = Vec::new();
     for line in tail.lines() {
-        if !line.contains("4xx_body_capture") { continue; }
+        if !line.contains("4xx_body_capture") {
+            continue;
+        }
         let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => continue,
@@ -1809,7 +2202,10 @@ fn render_4xx_captures() {
     if captures.is_empty() {
         println!("{}", "  (no 4xx body captures in tail window)".dimmed());
         println!("  {}", "to enable for next 4xx:".dimmed());
-        println!("    {}", "AIKEY_PROXY_DEBUG_4XX_BODIES=1 aikey proxy stop && aikey proxy start".cyan());
+        println!(
+            "    {}",
+            "AIKEY_PROXY_DEBUG_4XX_BODIES=1 aikey proxy stop && aikey proxy start".cyan()
+        );
         return;
     }
 
@@ -1819,14 +2215,27 @@ fn render_4xx_captures() {
         let ts = v.get("ts").and_then(|x| x.as_str()).unwrap_or("?");
         let status = v.get("status_code").and_then(|x| x.as_i64()).unwrap_or(0);
         let provider = v.get("provider").and_then(|x| x.as_str()).unwrap_or("?");
-        let path = v.get("request_path").and_then(|x| x.as_str()).unwrap_or("?");
-        let up_id = v.get("upstream_request_id").and_then(|x| x.as_str()).unwrap_or("");
+        let path = v
+            .get("request_path")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?");
+        let up_id = v
+            .get("upstream_request_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
         let req_body = v.get("request_body").and_then(|x| x.as_str()).unwrap_or("");
-        let resp_body = v.get("response_body").and_then(|x| x.as_str()).unwrap_or("");
+        let resp_body = v
+            .get("response_body")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
 
-        println!("  {}  HTTP {}  {}  {}",
-            ts.bold(), status.to_string().yellow(),
-            path.dimmed(), provider.dimmed());
+        println!(
+            "  {}  HTTP {}  {}  {}",
+            ts.bold(),
+            status.to_string().yellow(),
+            path.dimmed(),
+            provider.dimmed()
+        );
         if !up_id.is_empty() {
             println!("    {} {}", "upstream_request_id:".dimmed(), up_id.cyan());
         }
@@ -1859,7 +2268,9 @@ fn read_tail_bytes(path: &std::path::Path, cap: u64) -> std::io::Result<String> 
 /// Render an int64 unix-millis timestamp as `HH:MM:SS` in the local TZ.
 /// Display-only — used for the recent-failures rows. Invalid / zero → "?".
 fn format_local_time_hms(unix_ms: i64) -> String {
-    if unix_ms <= 0 { return "?".to_string(); }
+    if unix_ms <= 0 {
+        return "?".to_string();
+    }
     let secs = unix_ms / 1000;
     // Local-time conversion using the chrono crate if it's already available.
     // chrono is in the workspace via aikeytime; using a raw cast keeps this
@@ -1891,7 +2302,9 @@ mod doctor_detail_tests {
     fn ingest_health_extracts_missing_column() {
         let re = regex::Regex::new(r#"no column named (\w+)"#).unwrap();
         let line = r#"{"level":"ERROR","msg":"insert event failed","error":"insert ods event canary-x: SQL logic error: table usage_event_ods has no column named oauth_identity (1)"}"#;
-        let cap = re.captures(line).expect("regex must match real log line shape");
+        let cap = re
+            .captures(line)
+            .expect("regex must match real log line shape");
         assert_eq!(&cap[1], "oauth_identity");
     }
 
@@ -1917,4 +2330,3 @@ mod doctor_detail_tests {
 // not tested here — they require a running proxy / upstream and belong in
 // tests/e2e_*.
 // ---------------------------------------------------------------------------
-

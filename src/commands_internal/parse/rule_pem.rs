@@ -23,13 +23,19 @@ pub fn extract(
     seen: &mut std::collections::HashSet<String>,
 ) {
     // (?s) 让 `.` 匹配换行；但我们用 [\s\S] 显式跨行更稳
-    let re = Regex::new(
-        r"(-----BEGIN [A-Z ]+-----[\s\S]+?-----END [A-Z ]+-----)"
-    ).unwrap();
+    let re = Regex::new(r"(-----BEGIN [A-Z ]+-----[\s\S]+?-----END [A-Z ]+-----)").unwrap();
     for m in re.find_iter(text) {
         // v4.1 ISSUE-4: 注释块起始行的 PEM block 不抽（教程 / 示例 / 已轮换 key 的 // 标记）
-        if is_comment_at_offset(text, m.start()) { continue; }
-        try_push(cands, seen, Kind::SecretLike, m.as_str(), Some([m.start(), m.end()]));
+        if is_comment_at_offset(text, m.start()) {
+            continue;
+        }
+        try_push(
+            cands,
+            seen,
+            Kind::SecretLike,
+            m.as_str(),
+            Some([m.start(), m.end()]),
+        );
     }
 }
 
@@ -50,8 +56,12 @@ suffix";
         super::extract(text, &mut cands, &mut seen);
         assert_eq!(cands.len(), 1);
         assert_eq!(cands[0].kind, Kind::SecretLike);
-        assert!(cands[0].value.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
-        assert!(cands[0].value.ends_with("-----END OPENSSH PRIVATE KEY-----"));
+        assert!(cands[0]
+            .value
+            .starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assert!(cands[0]
+            .value
+            .ends_with("-----END OPENSSH PRIVATE KEY-----"));
     }
 
     #[test]

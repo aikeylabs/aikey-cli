@@ -142,8 +142,7 @@ impl Drop for Env {
 impl Env {
     fn try_new(tag: &str) -> Option<Self> {
         let proxy_bin = proxy_binary()?;
-        let tmp = std::env::temp_dir()
-            .join(format!("aikey-e2e-v6-{}-{}", tag, std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("aikey-e2e-v6-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join(".aikey/data")).expect("mkdir");
         std::fs::create_dir_all(tmp.join(".aikey/config")).expect("mkdir config");
@@ -175,7 +174,11 @@ impl Env {
         write_test_config(&tmp.join(".aikey/config"), port, &vault, Some(-1));
         assert!(cfg.exists());
 
-        Some(Self { tmp, port, proxy_bin })
+        Some(Self {
+            tmp,
+            port,
+            proxy_bin,
+        })
     }
 
     fn cmd(&self) -> Command {
@@ -331,8 +334,8 @@ fn w2_start_with_external_port_holder_returns_error() {
     };
 
     // Pin port BEFORE start.
-    let _holder = TcpListener::bind(format!("127.0.0.1:{}", env.port))
-        .expect("bind external holder");
+    let _holder =
+        TcpListener::bind(format!("127.0.0.1:{}", env.port)).expect("bind external holder");
 
     let out = env.cmd().args(["proxy", "start"]).output().expect("spawn");
     let combined = format!(
@@ -373,8 +376,8 @@ fn w2b_start_with_external_port_holder_drifts_to_next_port() {
 
     // Pin the configured port BEFORE start, forcing the proxy to drift
     // to env.port+1.
-    let _holder = TcpListener::bind(format!("127.0.0.1:{}", env.port))
-        .expect("bind external holder");
+    let _holder =
+        TcpListener::bind(format!("127.0.0.1:{}", env.port)).expect("bind external holder");
 
     let out = env.cmd().args(["proxy", "start"]).output().expect("spawn");
     let combined = format!(
@@ -397,8 +400,7 @@ fn w2b_start_with_external_port_holder_drifts_to_next_port() {
         snap_path
     );
     let snap_text = std::fs::read_to_string(&snap_path).expect("read runtime.json");
-    let snap: serde_json::Value =
-        serde_json::from_str(&snap_text).expect("parse runtime.json");
+    let snap: serde_json::Value = serde_json::from_str(&snap_text).expect("parse runtime.json");
 
     let pid = snap.get("pid").and_then(|v| v.as_i64()).unwrap_or(-1);
     assert!(pid > 0, "runtime.json pid must be positive, got {}", pid);
@@ -508,20 +510,34 @@ fn w4_start_then_stop_then_start_succeeds_immediately() {
     };
 
     assert!(
-        env.cmd().args(["proxy", "start"]).output().unwrap().status.success(),
+        env.cmd()
+            .args(["proxy", "start"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
         "first start failed"
     );
     assert!(env.wait_status(true, 10));
 
     assert!(
-        env.cmd().args(["proxy", "stop"]).output().unwrap().status.success(),
+        env.cmd()
+            .args(["proxy", "stop"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
         "stop failed"
     );
 
     // No sleep — Round-6 fix #2 says we must trust Layer-1 Stopped
     // and NOT do a defensive port_is_bound pre-check that races
     // macOS TIME_WAIT.
-    let out = env.cmd().args(["proxy", "start"]).output().expect("second start");
+    let out = env
+        .cmd()
+        .args(["proxy", "start"])
+        .output()
+        .expect("second start");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -571,7 +587,10 @@ fn w5_concurrent_starts_at_most_one_spawns() {
     );
 
     // CRITICAL: in the end there must be exactly one running proxy.
-    assert!(env.wait_status(true, 10), "no proxy running after concurrent starts");
+    assert!(
+        env.wait_status(true, 10),
+        "no proxy running after concurrent starts"
+    );
 
     // Either: any non-success output mentions LockBusy / "in flight";
     // OR: every output succeeded (idempotent fast-path) which is
@@ -638,13 +657,16 @@ fn l4_state_unresponsive_when_health_hangs() {
         "listen_addr": format!("127.0.0.1:{}", env.port),
         "written_at": "2026-04-28T00:00:00Z",
     });
-    std::fs::write(env.meta_path(), serde_json::to_vec_pretty(&meta).unwrap())
-        .expect("write meta");
+    std::fs::write(env.meta_path(), serde_json::to_vec_pretty(&meta).unwrap()).expect("write meta");
 
     // Wait briefly for the mock to bind.
     std::thread::sleep(Duration::from_millis(300));
 
-    let out = env.cmd().args(["proxy", "status"]).output().expect("status");
+    let out = env
+        .cmd()
+        .args(["proxy", "status"])
+        .output()
+        .expect("status");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -661,7 +683,10 @@ fn l4_state_unresponsive_when_health_hangs() {
     // is correct ("not Running, can't manage") and proves the decision
     // tree is exercising the bound-port + bad-/health code path.
     assert!(
-        lower.contains("unresponsive") || lower.contains("orphan") || lower.contains("not running") || lower.contains("stopped"),
+        lower.contains("unresponsive")
+            || lower.contains("orphan")
+            || lower.contains("not running")
+            || lower.contains("stopped"),
         "status should classify a bound-but-unresponsive port as non-Running; got:\n{}",
         combined
     );
@@ -679,8 +704,8 @@ fn l6_state_orphaned_when_pid_recycled_to_non_proxy() {
 
     // External holder so the port is reachable (otherwise we'd hit
     // Stopped or Crashed before identity check).
-    let _holder = TcpListener::bind(format!("127.0.0.1:{}", env.port))
-        .expect("bind external holder");
+    let _holder =
+        TcpListener::bind(format!("127.0.0.1:{}", env.port)).expect("bind external holder");
 
     // Pidfile points at PID 1 (init / launchd) — guaranteed to be
     // alive on any Unix system but is NOT aikey-proxy.
@@ -688,7 +713,11 @@ fn l6_state_orphaned_when_pid_recycled_to_non_proxy() {
     // No sidecar — triggers the LegacyPidfileNoSidecar OR
     // PidRecycledToNonProxy reason depending on identity check ordering.
 
-    let out = env.cmd().args(["proxy", "status"]).output().expect("status");
+    let out = env
+        .cmd()
+        .args(["proxy", "status"])
+        .output()
+        .expect("status");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -725,7 +754,12 @@ fn l8_state_orphaned_when_legacy_pidfile_no_sidecar() {
 
     // Start real proxy normally.
     assert!(
-        env.cmd().args(["proxy", "start"]).output().unwrap().status.success(),
+        env.cmd()
+            .args(["proxy", "start"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
         "proxy start failed"
     );
     assert!(env.wait_status(true, 10));
@@ -741,7 +775,11 @@ fn l8_state_orphaned_when_legacy_pidfile_no_sidecar() {
     std::fs::remove_file(env.meta_path()).expect("remove sidecar");
     assert!(env.pid_path().exists(), "pidfile should still exist");
 
-    let out = env.cmd().args(["proxy", "status"]).output().expect("status");
+    let out = env
+        .cmd()
+        .args(["proxy", "status"])
+        .output()
+        .expect("status");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -750,7 +788,10 @@ fn l8_state_orphaned_when_legacy_pidfile_no_sidecar() {
 
     // Production proxy should still be alive (we never signaled it).
     let alive = unsafe { libc::kill(real_pid as libc::pid_t, 0) } == 0;
-    assert!(alive, "real proxy (PID {real_pid}) was killed by status read!");
+    assert!(
+        alive,
+        "real proxy (PID {real_pid}) was killed by status read!"
+    );
 
     let lower = combined.to_lowercase();
     assert!(
@@ -788,7 +829,11 @@ fn l9_state_stopped_when_orphan_sidecar_no_pidfile() {
     });
     std::fs::write(env.meta_path(), serde_json::to_vec_pretty(&meta).unwrap()).expect("write meta");
 
-    let out = env.cmd().args(["proxy", "status"]).output().expect("status");
+    let out = env
+        .cmd()
+        .args(["proxy", "status"])
+        .output()
+        .expect("status");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -824,8 +869,8 @@ fn o1_stop_returns_err_for_external_port_holder() {
         None => return skip("AIKEY_PROXY_BIN not found"),
     };
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", env.port))
-        .expect("bind external holder");
+    let listener =
+        TcpListener::bind(format!("127.0.0.1:{}", env.port)).expect("bind external holder");
 
     let out = env.cmd().args(["proxy", "stop"]).output().expect("stop");
     let combined = format!(
@@ -861,8 +906,8 @@ fn o2_start_does_not_signal_external_port_holder() {
         None => return skip("AIKEY_PROXY_BIN not found"),
     };
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", env.port))
-        .expect("bind external holder");
+    let listener =
+        TcpListener::bind(format!("127.0.0.1:{}", env.port)).expect("bind external holder");
 
     let out = env.cmd().args(["proxy", "start"]).output().expect("start");
     let combined = format!(
@@ -894,7 +939,12 @@ fn o3_legacy_proxy_stop_returns_err() {
     };
 
     assert!(
-        env.cmd().args(["proxy", "start"]).output().unwrap().status.success(),
+        env.cmd()
+            .args(["proxy", "start"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
         "proxy start failed"
     );
     assert!(env.wait_status(true, 10));
@@ -1095,11 +1145,29 @@ fn e1a_events_log_records_full_lifecycle() {
     };
 
     // start → restart → stop
-    assert!(env.cmd().args(["proxy", "start"]).output().unwrap().status.success());
+    assert!(env
+        .cmd()
+        .args(["proxy", "start"])
+        .output()
+        .unwrap()
+        .status
+        .success());
     assert!(env.wait_status(true, 10));
-    assert!(env.cmd().args(["proxy", "restart"]).output().unwrap().status.success());
+    assert!(env
+        .cmd()
+        .args(["proxy", "restart"])
+        .output()
+        .unwrap()
+        .status
+        .success());
     assert!(env.wait_status(true, 10));
-    assert!(env.cmd().args(["proxy", "stop"]).output().unwrap().status.success());
+    assert!(env
+        .cmd()
+        .args(["proxy", "stop"])
+        .output()
+        .unwrap()
+        .status
+        .success());
 
     let events = env.events_log_lines();
     assert!(
@@ -1151,7 +1219,13 @@ fn c1_ensure_running_warm_path_is_fast() {
     };
 
     // Warm up: start proxy.
-    assert!(env.cmd().args(["proxy", "start"]).output().unwrap().status.success());
+    assert!(env
+        .cmd()
+        .args(["proxy", "start"])
+        .output()
+        .unwrap()
+        .status
+        .success());
     assert!(env.wait_status(true, 10));
 
     // Run ensure-running 5 times; the warm runs should all be fast.
@@ -1164,7 +1238,10 @@ fn c1_ensure_running_warm_path_is_fast() {
             .output()
             .expect("ensure-running");
         elapsed_ms.push(start.elapsed().as_millis());
-        assert!(out.status.success(), "ensure-running warm path must succeed");
+        assert!(
+            out.status.success(),
+            "ensure-running warm path must succeed"
+        );
     }
 
     // The slowest of the 4 warm runs should still be reasonable (<2s).
@@ -1219,7 +1296,10 @@ fn i1_installer_legacy_upgrade_path_with_stale_lifecycle_files() {
          start MUST succeed. Got:\n{}",
         combined
     );
-    assert!(env.wait_status(true, 10), "proxy not running after upgrade-path start");
+    assert!(
+        env.wait_status(true, 10),
+        "proxy not running after upgrade-path start"
+    );
 
     // Both files now exist, owned by Layer 2.
     assert!(env.pid_path().exists());
@@ -1325,8 +1405,14 @@ fn i3_foreground_forwards_sigterm_to_child() {
     // Read the proxy child's PID from sidecar.
     let meta_content = std::fs::read_to_string(env.meta_path()).expect("read meta");
     let meta: serde_json::Value = serde_json::from_str(&meta_content).expect("parse meta");
-    let proxy_pid = meta.get("pid").and_then(|v| v.as_u64()).expect("pid in meta") as u32;
-    assert_ne!(cli_pid, proxy_pid, "CLI and proxy must be different processes");
+    let proxy_pid = meta
+        .get("pid")
+        .and_then(|v| v.as_u64())
+        .expect("pid in meta") as u32;
+    assert_ne!(
+        cli_pid, proxy_pid,
+        "CLI and proxy must be different processes"
+    );
 
     // Send SIGTERM to the CLI (simulating systemctl stop).
     unsafe {
@@ -1358,4 +1444,3 @@ fn i3_foreground_forwards_sigterm_to_child() {
 // (per v6 §5 platform matrix; Windows variants are out of scope).
 #[cfg(not(unix))]
 compile_error!("e2e_proxy_lifecycle_v6 is Unix-only by design (v6 §5 platform matrix)");
-

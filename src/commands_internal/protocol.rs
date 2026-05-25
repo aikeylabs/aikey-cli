@@ -82,7 +82,7 @@ impl ResultEnvelope {
         }
     }
 
-    #[allow(dead_code)]  // Phase B-E vault-op actions 会用到
+    #[allow(dead_code)] // Phase B-E vault-op actions 会用到
     pub fn ok_empty(request_id: Option<String>) -> Self {
         Self {
             request_id,
@@ -93,7 +93,11 @@ impl ResultEnvelope {
         }
     }
 
-    pub fn error(request_id: Option<String>, code: &'static str, message: impl Into<String>) -> Self {
+    pub fn error(
+        request_id: Option<String>,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             request_id,
             status: "error",

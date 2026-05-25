@@ -416,9 +416,7 @@ pub(crate) enum Commands {
     },
     /// Update an existing secret
     #[command(display_order = 16)]
-    Update {
-        alias: String,
-    },
+    Update { alias: String },
     /// Delete one or more API Keys from the vault
     ///
     /// Batch mode: pass multiple aliases at once — `ak delete alias1 alias2 alias3`.
@@ -536,13 +534,9 @@ pub(crate) enum ServiceAction {
         name: Option<String>,
     },
     /// Stop a registered AiKey service.
-    Stop {
-        name: Option<String>,
-    },
+    Stop { name: Option<String> },
     /// Restart a registered AiKey service.
-    Restart {
-        name: Option<String>,
-    },
+    Restart { name: Option<String> },
 }
 
 /// Subcommands for `aikey trust` (M4).
@@ -718,24 +712,16 @@ pub(crate) enum AppAction {
     /// Revoke ALL active bearer tokens for an app. History rows are
     /// preserved for audit; the app stays registered. Re-issue by
     /// running `aikey app route <slug>` again.
-    Revoke {
-        slug: String,
-    },
+    Revoke { slug: String },
     /// Mark all active keys for an app as paused (state column flipped
     /// to 'paused'). Pause is reversible via `aikey app resume`.
-    Pause {
-        slug: String,
-    },
+    Pause { slug: String },
     /// Re-activate all paused keys for an app (state 'paused' → 'active').
-    Resume {
-        slug: String,
-    },
+    Resume { slug: String },
     /// Rotate the bearer: in one atomic transaction, revoke the current
     /// active key and issue a new one with the same bindings. Used when
     /// you suspect the bearer was leaked.
-    Rotate {
-        slug: String,
-    },
+    Rotate { slug: String },
     /// Install a first-party / deep-partner app from the aikeylabs/launch
     /// manifest registry.
     ///
@@ -1149,20 +1135,26 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
         None => "unknown".to_string(),
         Some(c) => match c {
             Commands::Init => "init".to_string(),
-            Commands::Db { action } => format!("db.{}", match action {
-                DbAction::Upgrade => "upgrade",
-                DbAction::Rollback { .. } => "rollback",
-            }),
-            Commands::Internal { action } => format!("_internal.{}", match action {
-                crate::commands_internal::InternalAction::VaultOp(_) => "vault-op",
-                crate::commands_internal::InternalAction::Query(_) => "query",
-                crate::commands_internal::InternalAction::UpdateAlias(_) => "update-alias",
-                crate::commands_internal::InternalAction::Parse(_) => "parse",
-                crate::commands_internal::InternalAction::Rules(_) => "rules",
-                crate::commands_internal::InternalAction::App(_) => "app",
-                crate::commands_internal::InternalAction::Init(_) => "init",
-                crate::commands_internal::InternalAction::HookOp(_) => "hook-op",
-            }),
+            Commands::Db { action } => format!(
+                "db.{}",
+                match action {
+                    DbAction::Upgrade => "upgrade",
+                    DbAction::Rollback { .. } => "rollback",
+                }
+            ),
+            Commands::Internal { action } => format!(
+                "_internal.{}",
+                match action {
+                    crate::commands_internal::InternalAction::VaultOp(_) => "vault-op",
+                    crate::commands_internal::InternalAction::Query(_) => "query",
+                    crate::commands_internal::InternalAction::UpdateAlias(_) => "update-alias",
+                    crate::commands_internal::InternalAction::Parse(_) => "parse",
+                    crate::commands_internal::InternalAction::Rules(_) => "rules",
+                    crate::commands_internal::InternalAction::App(_) => "app",
+                    crate::commands_internal::InternalAction::Init(_) => "init",
+                    crate::commands_internal::InternalAction::HookOp(_) => "hook-op",
+                }
+            ),
             Commands::Add { .. } => "add".to_string(),
             Commands::Get { .. } => "get".to_string(),
             Commands::Delete { .. } => "delete".to_string(),
@@ -1172,26 +1164,35 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Export { .. } => "export".to_string(),
             Commands::Run { .. } => "run".to_string(),
             Commands::ChangePassword => "change-password".to_string(),
-            Commands::Secret { action } => format!("secret.{}", match action {
-                SecretAction::Set { .. } => "set",
-                SecretAction::Upsert { .. } => "upsert",
-                SecretAction::List => "list",
-                SecretAction::Delete { .. } => "delete",
-            }),
-            Commands::Project { action } => format!("project.{}", match action {
-                ProjectAction::Init => "init",
-                ProjectAction::Status => "status",
-                ProjectAction::Map { .. } => "map",
-            }),
+            Commands::Secret { action } => format!(
+                "secret.{}",
+                match action {
+                    SecretAction::Set { .. } => "set",
+                    SecretAction::Upsert { .. } => "upsert",
+                    SecretAction::List => "list",
+                    SecretAction::Delete { .. } => "delete",
+                }
+            ),
+            Commands::Project { action } => format!(
+                "project.{}",
+                match action {
+                    ProjectAction::Init => "init",
+                    ProjectAction::Status => "status",
+                    ProjectAction::Map { .. } => "map",
+                }
+            ),
             Commands::Quickstart => "quickstart".to_string(),
             Commands::Logs { .. } => "logs".to_string(),
-            Commands::Key { action } => format!("key.{}", match action {
-                KeyAction::Rotate { .. } => "rotate",
-                KeyAction::List => "list",
-                KeyAction::Sync { .. } => "sync",
-                KeyAction::Use { .. } => "use",
-                KeyAction::Alias { .. } => "alias",
-            }),
+            Commands::Key { action } => format!(
+                "key.{}",
+                match action {
+                    KeyAction::Rotate { .. } => "rotate",
+                    KeyAction::List => "list",
+                    KeyAction::Sync { .. } => "sync",
+                    KeyAction::Use { .. } => "use",
+                    KeyAction::Alias { .. } => "alias",
+                }
+            ),
             Commands::Use { .. } => "key.use".to_string(),
             Commands::Unuse { .. } => "key.unuse".to_string(),
             Commands::Activate { .. } => "activate".to_string(),
@@ -1199,12 +1200,15 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Route { .. } => "route".to_string(),
             Commands::Status => "status".to_string(),
             Commands::Whoami => "whoami".to_string(),
-            Commands::Account { action } => format!("account.{}", match action {
-                AccountAction::Login { .. } => "login",
-                AccountAction::Status => "status",
-                AccountAction::Logout => "logout",
-                AccountAction::SetUrl { .. } => "set-url",
-            }),
+            Commands::Account { action } => format!(
+                "account.{}",
+                match action {
+                    AccountAction::Login { .. } => "login",
+                    AccountAction::Status => "status",
+                    AccountAction::Logout => "logout",
+                    AccountAction::SetUrl { .. } => "set-url",
+                }
+            ),
             Commands::Login { .. } => "account.login".to_string(),
             Commands::Logout => "account.logout".to_string(),
             Commands::Env { .. } => "env".to_string(),
@@ -1212,23 +1216,29 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Master { .. } => "master".to_string(),
             Commands::Import { .. } => "import".to_string(),
             Commands::Doctor { .. } => "doctor".to_string(),
-            Commands::Proxy { action } => format!("proxy.{}", match action {
-                ProxyAction::Start { .. } => "start",
-                ProxyAction::Stop => "stop",
-                ProxyAction::Status => "status",
-                ProxyAction::Restart { .. } => "restart",
-                ProxyAction::Verify => "verify",
-                ProxyAction::ReplayDeadLetter => "replay-dead-letter",
-                ProxyAction::EnsureRunning => "ensure-running",
-            }),
-            Commands::Auth { action } => format!("auth.{}", match action {
-                AuthAction::Login { .. } => "login",
-                AuthAction::Logout { .. } => "logout",
-                AuthAction::List => "list",
-                AuthAction::Use { .. } => "use",
-                AuthAction::Status { .. } => "status",
-                AuthAction::Doctor { .. } => "doctor",
-            }),
+            Commands::Proxy { action } => format!(
+                "proxy.{}",
+                match action {
+                    ProxyAction::Start { .. } => "start",
+                    ProxyAction::Stop => "stop",
+                    ProxyAction::Status => "status",
+                    ProxyAction::Restart { .. } => "restart",
+                    ProxyAction::Verify => "verify",
+                    ProxyAction::ReplayDeadLetter => "replay-dead-letter",
+                    ProxyAction::EnsureRunning => "ensure-running",
+                }
+            ),
+            Commands::Auth { action } => format!(
+                "auth.{}",
+                match action {
+                    AuthAction::Login { .. } => "login",
+                    AuthAction::Logout { .. } => "logout",
+                    AuthAction::List => "list",
+                    AuthAction::Use { .. } => "use",
+                    AuthAction::Status { .. } => "status",
+                    AuthAction::Doctor { .. } => "doctor",
+                }
+            ),
             Commands::Version => "version".to_string(),
             Commands::Statusline { action } => match action {
                 None => "statusline".to_string(),
@@ -1299,9 +1309,15 @@ pub(crate) fn validate_secret_name(name: &str) -> Result<(), String> {
         return Err("Secret name cannot be empty.".to_string());
     }
     if name.len() > 256 {
-        return Err(format!("Secret name is too long ({} chars). Maximum is 256 characters.", name.len()));
+        return Err(format!(
+            "Secret name is too long ({} chars). Maximum is 256 characters.",
+            name.len()
+        ));
     }
-    if let Some(bad) = name.chars().find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | ':' | '.')) {
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !matches!(c, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | ':' | '.'))
+    {
         return Err(format!(
             "Secret name contains invalid character '{bad}'. \
              Allowed: letters, digits, '_', '-', ':', '.'"
@@ -1535,7 +1551,8 @@ Notes:
 pub(crate) fn print_short_help() {
     let b = "\x1b[1m";
     let r = "\x1b[0m";
-    println!("\
+    println!(
+        "\
 AiKey - Secure local-first secret management
 
 Usage: aikey [OPTIONS] [COMMAND]
@@ -1579,7 +1596,8 @@ Options:
       --json            Output in JSON format (where supported)
   -V, --version         Print version information
   -h, --help            Print help
-      --detail          Print detailed help for all commands");
+      --detail          Print detailed help for all commands"
+    );
 }
 
 pub(crate) fn print_detailed_help() {
@@ -2159,7 +2177,6 @@ Detailed Commands
 ");
 }
 
-
 // Build-time constants injected by build.rs.
 const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_REVISION: &str = env!("AIKEY_BUILD_REVISION");
@@ -2212,15 +2229,20 @@ fn probe_proxy_version() -> Option<serde_json::Value> {
     use std::net::TcpStream;
     use std::time::Duration;
 
-    let mut stream = TcpStream::connect_timeout(
-        &"127.0.0.1:27200".parse().ok()?,
-        Duration::from_millis(500),
-    ).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(1000))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_millis(500))).ok()?;
+    let mut stream =
+        TcpStream::connect_timeout(&"127.0.0.1:27200".parse().ok()?, Duration::from_millis(500))
+            .ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(1000)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .ok()?;
 
     use std::io::Write;
-    stream.write_all(b"GET /version HTTP/1.1\r\nHost: 127.0.0.1:27200\r\nConnection: close\r\n\r\n").ok()?;
+    stream
+        .write_all(b"GET /version HTTP/1.1\r\nHost: 127.0.0.1:27200\r\nConnection: close\r\n\r\n")
+        .ok()?;
 
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).ok()?;
@@ -2235,10 +2257,12 @@ fn probe_proxy_version() -> Option<serde_json::Value> {
 // animation. Centralizing them keeps the two paths byte-identical — a drift
 // here would make the "reopen" frame look visibly different from the static
 // eyes the banner first printed.
-const BANNER_EYE_OPEN: &str = "\u{254D}\u{2588}  \u{27E8}\u{29BF}\u{27E9} \u{27E8}\u{29BF}\u{27E9}  \u{2588}\u{254D}";
+const BANNER_EYE_OPEN: &str =
+    "\u{254D}\u{2588}  \u{27E8}\u{29BF}\u{27E9} \u{27E8}\u{29BF}\u{27E9}  \u{2588}\u{254D}";
 // Closed eye uses `—` (U+2014 em dash) for a flat, "squint shut" look that
 // reads more as a blink than a filled dot would.
-const BANNER_EYE_SHUT: &str = "\u{254D}\u{2588}  \u{27E8}\u{2014}\u{27E9} \u{27E8}\u{2014}\u{27E9}  \u{2588}\u{254D}";
+const BANNER_EYE_SHUT: &str =
+    "\u{254D}\u{2588}  \u{27E8}\u{2014}\u{27E9} \u{27E8}\u{2014}\u{27E9}  \u{2588}\u{254D}";
 const BANNER_EYE_RIGHT: &str = "------------------------------------";
 
 // Muted gold: RGB(160, 135, 75). Defined here so both functions colorize
@@ -2268,11 +2292,15 @@ pub(crate) fn print_banner() {
         banner_gold("\u{256D}\u{2588}\u{2588}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2588}\u{2588}\u{256E}"),
         "AiKey CLI".bold(),
         version);
-    eprintln!("  {}       {}",
+    eprintln!(
+        "  {}       {}",
         banner_gold(BANNER_EYE_OPEN),
-        BANNER_EYE_RIGHT.dimmed());
-    eprintln!("  {}        FinOps & AI Governance Center",
-        banner_gold("\u{254D}\u{2588}     \u{25BC}     \u{2588}\u{254D}"));
+        BANNER_EYE_RIGHT.dimmed()
+    );
+    eprintln!(
+        "  {}        FinOps & AI Governance Center",
+        banner_gold("\u{254D}\u{2588}     \u{25BC}     \u{2588}\u{254D}")
+    );
     eprintln!("   {}       {}",
         banner_gold("\u{2570}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2588}\u{2588}\u{256F}"),
         aikey_home);
@@ -2299,7 +2327,9 @@ pub(crate) fn animate_banner_blink(extra_lines: usize) {
 
     let enabled = std::io::stderr().is_terminal()
         && std::env::var("AIKEY_NO_ANIMATION").map_or(true, |v| v != "1" && v != "true");
-    if !enabled { return; }
+    if !enabled {
+        return;
+    }
 
     let up = 5 + extra_lines;
     let right = BANNER_EYE_RIGHT.dimmed();
@@ -2316,18 +2346,22 @@ pub(crate) fn animate_banner_blink(extra_lines: usize) {
     // motion rather than a blocking delay.
     let render = |eyes: colored::ColoredString| {
         // Each frame: jump to eye row, clear, rewrite, jump back.
-        format!("\x1b[{n}A\r\x1b[2K  {eyes}       {right}\r\x1b[{n}B",
-            n = up, eyes = eyes, right = right)
+        format!(
+            "\x1b[{n}A\r\x1b[2K  {eyes}       {right}\r\x1b[{n}B",
+            n = up,
+            eyes = eyes,
+            right = right
+        )
     };
     let shut = render(banner_gold(BANNER_EYE_SHUT));
     let open = render(banner_gold(BANNER_EYE_OPEN));
 
     let frames: [(&str, u64); 5] = [
-        (&shut, 1000),  // F1 pause, then F2 snap shut
-        (&open, 120),   // F3 reopen
-        (&shut, 180),   // F4 snap shut again
-        (&open, 120),   // settle back to open
-        ("",    500),   // tail pause with open eyes before returning
+        (&shut, 1000), // F1 pause, then F2 snap shut
+        (&open, 120),  // F3 reopen
+        (&shut, 180),  // F4 snap shut again
+        (&open, 120),  // settle back to open
+        ("", 500),     // tail pause with open eyes before returning
     ];
 
     for (frame, pre_sleep_ms) in frames {
@@ -2341,7 +2375,7 @@ pub(crate) fn animate_banner_blink(extra_lines: usize) {
 
 /// Format a unix timestamp as YYYY/MM/DD.
 pub(crate) fn format_date(ts: i64) -> String {
-    use std::time::{UNIX_EPOCH, Duration};
+    use std::time::{Duration, UNIX_EPOCH};
     let d = UNIX_EPOCH + Duration::from_secs(ts as u64);
     let secs = d.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     // Days since epoch → year/month/day (civil calendar).
@@ -2361,9 +2395,15 @@ pub(crate) fn format_date(ts: i64) -> String {
 }
 
 pub(crate) fn similarity(a: &str, b: &str) -> f64 {
-    if a.is_empty() || b.is_empty() { return 0.0; }
-    if a == b { return 1.0; }
-    if b.starts_with(a) || a.starts_with(b) { return 0.95; }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    if a == b {
+        return 1.0;
+    }
+    if b.starts_with(a) || a.starts_with(b) {
+        return 0.95;
+    }
 
     // Edit distance (insertions/deletions/substitutions), normalised.
     let ed = edit_distance(a, b);
@@ -2378,10 +2418,16 @@ pub(crate) fn similarity(a: &str, b: &str) -> f64 {
         }
         let ba = bigrams(a);
         let bb = bigrams(b);
-        if ba.is_empty() || bb.is_empty() { 0.0 } else {
+        if ba.is_empty() || bb.is_empty() {
+            0.0
+        } else {
             let i = ba.intersection(&bb).count() as f64;
             let u = ba.union(&bb).count() as f64;
-            if u == 0.0 { 0.0 } else { i / u }
+            if u == 0.0 {
+                0.0
+            } else {
+                i / u
+            }
         }
     };
 
@@ -2395,14 +2441,18 @@ pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let (m, n) = (a.len(), b.len());
     let mut dp = vec![vec![0usize; n + 1]; m + 1];
-    for i in 0..=m { dp[i][0] = i; }
-    for j in 0..=n { dp[0][j] = j; }
+    for i in 0..=m {
+        dp[i][0] = i;
+    }
+    for j in 0..=n {
+        dp[0][j] = j;
+    }
     for i in 1..=m {
         for j in 1..=n {
-            dp[i][j] = if a[i-1] == b[j-1] {
-                dp[i-1][j-1]
+            dp[i][j] = if a[i - 1] == b[j - 1] {
+                dp[i - 1][j - 1]
             } else {
-                1 + dp[i-1][j].min(dp[i][j-1]).min(dp[i-1][j-1])
+                1 + dp[i - 1][j].min(dp[i][j - 1]).min(dp[i - 1][j - 1])
             };
         }
     }
@@ -2486,7 +2536,11 @@ mod tests {
         assert!(score >= 0.5, "Expected >= 0.5, got {}", score);
 
         let score_unrelated = similarity("xyz", "add");
-        assert!(score_unrelated < 0.5, "Expected < 0.5, got {}", score_unrelated);
+        assert!(
+            score_unrelated < 0.5,
+            "Expected < 0.5, got {}",
+            score_unrelated
+        );
     }
 
     #[test]
@@ -2517,15 +2571,29 @@ mod tests {
     fn test_command_name_simple() {
         assert_eq!(command_name(Some(&Commands::Init)), "init");
         assert_eq!(command_name(Some(&Commands::List)), "list");
-        assert_eq!(command_name(Some(&Commands::ChangePassword)), "change-password");
+        assert_eq!(
+            command_name(Some(&Commands::ChangePassword)),
+            "change-password"
+        );
     }
 
     #[test]
     fn test_command_name_nested() {
-        let cmd = Commands::Account { action: AccountAction::Login { url: None, token: None, email: None, resend: false } };
+        let cmd = Commands::Account {
+            action: AccountAction::Login {
+                url: None,
+                token: None,
+                email: None,
+                resend: false,
+            },
+        };
         assert_eq!(command_name(Some(&cmd)), "account.login");
 
-        let cmd = Commands::Key { action: KeyAction::Sync { force_reencrypt: false } };
+        let cmd = Commands::Key {
+            action: KeyAction::Sync {
+                force_reencrypt: false,
+            },
+        };
         assert_eq!(command_name(Some(&cmd)), "key.sync");
     }
 
@@ -2573,7 +2641,10 @@ mod tests {
             Some(Commands::Web { page, .. }) => {
                 assert_eq!(page.as_deref(), Some("start"));
             }
-            other => panic!("expected Web {{ page: Some(\"start\") }}, got {:?}", command_name(other.as_ref())),
+            other => panic!(
+                "expected Web {{ page: Some(\"start\") }}, got {:?}",
+                command_name(other.as_ref())
+            ),
         }
     }
 
@@ -2585,7 +2656,10 @@ mod tests {
             Some(Commands::Proxy { action }) => {
                 assert!(matches!(action, ProxyAction::Start { .. }));
             }
-            other => panic!("expected Proxy Start, got {:?}", command_name(other.as_ref())),
+            other => panic!(
+                "expected Proxy Start, got {:?}",
+                command_name(other.as_ref())
+            ),
         }
     }
 
@@ -2623,7 +2697,9 @@ mod tests {
     fn aikey_service_start_no_name() {
         let cli = Cli::try_parse_from(["aikey", "service", "start"]).expect("parse");
         match cli.command {
-            Some(Commands::Service { action: ServiceAction::Start { name } }) => {
+            Some(Commands::Service {
+                action: ServiceAction::Start { name },
+            }) => {
                 assert!(name.is_none());
             }
             _ => panic!("expected ServiceAction::Start with name=None"),
@@ -2661,7 +2737,9 @@ mod tests {
     #[test]
     fn fence_command_name_for_service() {
         let cmd = Commands::Service {
-            action: ServiceAction::Start { name: Some("trust-local".to_string()) },
+            action: ServiceAction::Start {
+                name: Some("trust-local".to_string()),
+            },
         };
         assert_eq!(command_name(Some(&cmd)), "service.start");
 
@@ -2671,7 +2749,9 @@ mod tests {
         assert_eq!(command_name(Some(&cmd)), "service.stop");
 
         let cmd = Commands::Service {
-            action: ServiceAction::Restart { name: Some("proxy".to_string()) },
+            action: ServiceAction::Restart {
+                name: Some("proxy".to_string()),
+            },
         };
         assert_eq!(command_name(Some(&cmd)), "service.restart");
     }

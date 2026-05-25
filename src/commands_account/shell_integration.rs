@@ -88,9 +88,10 @@ fn strip_legacy_kimi_default_model(content: &str) -> String {
         // and we shouldn't touch those.
         let is_our_legacy = !seen_table
             && trimmed.starts_with("default_model")
-            && AIKEY_LEGACY_DEFAULTS
-                .iter()
-                .any(|v| trimmed.contains(&format!("= \"{}\"", v)) || trimmed.contains(&format!("=\"{}\"", v)));
+            && AIKEY_LEGACY_DEFAULTS.iter().any(|v| {
+                trimmed.contains(&format!("= \"{}\"", v))
+                    || trimmed.contains(&format!("=\"{}\"", v))
+            });
         if is_our_legacy {
             continue;
         }
@@ -194,9 +195,7 @@ pub fn injected_provider_toml_paths() -> Vec<(&'static str, std::path::PathBuf)>
     // same "Injected provider configs" listing for `aikey env`. The path
     // honors `$CLAUDE_CONFIG_DIR` so users with multiple Claude personas
     // see whichever one their current shell points at.
-    if let Some(claude_settings) =
-        crate::commands_statusline::injected_claude_settings_path()
-    {
+    if let Some(claude_settings) = crate::commands_statusline::injected_claude_settings_path() {
         out.push(("claude", claude_settings));
     }
     out
@@ -336,7 +335,9 @@ pub fn configure_kimi_cli(proxy_port: u16) {
     use std::io::{IsTerminal, Write};
 
     let (config_path, backup_path) = kimi_config_paths();
-    let config_dir = config_path.parent().map(|p| p.to_path_buf())
+    let config_dir = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
         .unwrap_or_else(|| resolve_user_home().join(".kimi"));
 
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
@@ -415,7 +416,10 @@ pub fn configure_kimi_cli(proxy_port: u16) {
                     format!("         (provider/models come from env vars)"),
                 ];
                 if !existing.is_empty() {
-                    r.push(format!("Backup:  {}", display_path(".kimi/config.aikey_backup.toml")));
+                    r.push(format!(
+                        "Backup:  {}",
+                        display_path(".kimi/config.aikey_backup.toml")
+                    ));
                 }
                 r
             };
@@ -424,10 +428,11 @@ pub fn configure_kimi_cli(proxy_port: u16) {
             io::stderr().flush().ok();
 
             let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_ok()
-                && input.trim().eq_ignore_ascii_case("n")
-            {
-                eprintln!("  {}", "Skipped. Run 'aikey use kimi' again to retry.".dimmed());
+            if io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("n") {
+                eprintln!(
+                    "  {}",
+                    "Skipped. Run 'aikey use kimi' again to retry.".dimmed()
+                );
                 return;
             }
         }
@@ -483,7 +488,9 @@ pub fn configure_kimi_cli(proxy_port: u16) {
 /// the marker region.
 pub fn unconfigure_kimi_cli() {
     let (config_path, backup_path) = kimi_config_paths();
-    let config_dir = config_path.parent().map(|p| p.to_path_buf())
+    let config_dir = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
         .unwrap_or_else(|| resolve_user_home().join(".kimi"));
 
     // Path 1: backup exists — rename overwrites atomically.
@@ -492,7 +499,9 @@ pub fn unconfigure_kimi_cli() {
         return;
     }
 
-    let Ok(content) = std::fs::read_to_string(&config_path) else { return };
+    let Ok(content) = std::fs::read_to_string(&config_path) else {
+        return;
+    };
 
     // Path 2: strip the new-style managed region if present.
     if let Some(stripped) = strip_managed_region(&content) {
@@ -644,8 +653,7 @@ fn upsert_codex_managed_line(content: &str, key: &str, value: &str) -> String {
 /// would bind to the wrong table.
 fn upsert_codex_region(content: &str, new_region: &str) -> String {
     if content.contains(AIKEY_BEGIN) {
-        return replace_managed_region(content, new_region)
-            .unwrap_or_else(|| content.to_string());
+        return replace_managed_region(content, new_region).unwrap_or_else(|| content.to_string());
     }
     let mut out = content.trim_end().to_string();
     if !out.is_empty() {
@@ -702,7 +710,9 @@ pub fn configure_codex_cli(proxy_port: u16) {
     use std::io::{IsTerminal, Write};
 
     let (config_path, backup_path) = codex_config_paths();
-    let config_dir = config_path.parent().map(|p| p.to_path_buf())
+    let config_dir = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
         .unwrap_or_else(|| resolve_user_home().join(".codex"));
 
     let base_url = format!("http://127.0.0.1:{}/openai", proxy_port);
@@ -721,15 +731,16 @@ pub fn configure_codex_cli(proxy_port: u16) {
             format!("         env_key = \"OPENAI_API_KEY\" (per-shell token)"),
         ];
         if !existing.is_empty() {
-            rows.push(format!("Backup:  {}", display_path(".codex/config.aikey_backup.toml")));
+            rows.push(format!(
+                "Backup:  {}",
+                display_path(".codex/config.aikey_backup.toml")
+            ));
         }
         crate::ui_frame::eprint_box("\u{2753}", "Configure Codex CLI", &rows);
         eprint!("  Proceed? [Y/n] (default Y): ");
         io::stderr().flush().ok();
         let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_ok()
-            && input.trim().eq_ignore_ascii_case("n")
-        {
+        if io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("n") {
             eprintln!("  {}", "Skipped. Run 'aikey use' again to retry.".dimmed());
             return;
         }
@@ -755,8 +766,7 @@ pub fn configure_codex_cli(proxy_port: u16) {
         );
         eprintln!(
             "    {}",
-            "aikey provider block installed but NOT activated. To route through aikey:"
-                .dimmed()
+            "aikey provider block installed but NOT activated. To route through aikey:".dimmed()
         );
         eprintln!(
             "    {}",
@@ -833,7 +843,9 @@ pub fn unconfigure_codex_cli() {
         return;
     }
 
-    let Ok(content) = std::fs::read_to_string(&config_path) else { return };
+    let Ok(content) = std::fs::read_to_string(&config_path) else {
+        return;
+    };
 
     // Path 2: strip region + any single-line markers (covers both the new v3
     // codex format and the legacy per-line-marker-only format from before
@@ -1008,8 +1020,12 @@ pub fn shell_kind() -> ShellKind {
         // separators, so the "ends_with('/zsh')" check from earlier
         // drafts was dead code.
         let leaf = s.trim().rsplit(['/', '\\']).next().unwrap_or("");
-        if leaf == "zsh" { return ShellKind::Zsh; }
-        if leaf == "bash" { return ShellKind::Bash; }
+        if leaf == "zsh" {
+            return ShellKind::Zsh;
+        }
+        if leaf == "bash" {
+            return ShellKind::Bash;
+        }
     }
     // Win32: PowerShell sessions set PSModulePath; cmd.exe doesn't. Both
     // set ComSpec, so we check PSModulePath first.
@@ -1074,8 +1090,8 @@ pub fn display_aikey_path(relative: &str) -> String {
 }
 
 pub(super) fn write_active_env(
-    _key_type: &str,  // legacy parameter — token is now per-provider sentinel (see body)
-    _key_ref: &str,   // legacy parameter — see _key_type
+    _key_type: &str, // legacy parameter — token is now per-provider sentinel (see body)
+    _key_ref: &str,  // legacy parameter — see _key_type
     display_name: &str,
     providers: &[String],
     proxy_port: u16,
@@ -1113,7 +1129,11 @@ pub(super) fn write_active_env(
             // key_type / key_ref unused here but kept in signature for caller
             // ergonomics. Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md
             let token_value = format!("aikey_active_{}", provider);
-            let base_url = format!("http://127.0.0.1:{}/{}", proxy_port, super::provider_proxy_prefix(provider));
+            let base_url = format!(
+                "http://127.0.0.1:{}/{}",
+                proxy_port,
+                super::provider_proxy_prefix(provider)
+            );
             kv_pairs.push((api_key_var.to_string(), token_value));
             kv_pairs.push((base_url_var.to_string(), base_url));
             // Provider-specific extras (e.g. KIMI_MODEL_NAME for the
@@ -1166,7 +1186,8 @@ pub(super) fn write_active_env(
     // Why: PowerShell/cmd deactivate needs to restore env vars but cannot parse
     // sh-style ${...} expressions. This file contains only literal values.
     let flat_path = aikey_dir.join("active.env.flat");
-    let flat_lines: Vec<String> = kv_pairs.iter()
+    let flat_lines: Vec<String> = kv_pairs
+        .iter()
         .map(|(k, v)| format!("{}={}", k, v))
         .collect();
     std::fs::write(&flat_path, flat_lines.join("\n") + "\n")?;
@@ -1245,7 +1266,7 @@ const _HOOK_TEMPLATES_FINGERPRINT: &str = env!("AIKEY_HOOK_TEMPLATES_FINGERPRINT
 /// reports.
 pub fn hook_template_hash(kind: HookKind) -> String {
     let content = match kind {
-        HookKind::Zsh  => hook_zsh_content(),
+        HookKind::Zsh => hook_zsh_content(),
         HookKind::Bash => hook_bash_content(),
         HookKind::PowerShell => hook_ps1_content(),
     };
@@ -1275,7 +1296,7 @@ pub enum HookKind {
 /// first few lines pick it up without descending into the body.
 fn hook_content_with_hash_header(kind: HookKind) -> String {
     let raw = match kind {
-        HookKind::Zsh  => hook_zsh_content(),
+        HookKind::Zsh => hook_zsh_content(),
         HookKind::Bash => hook_bash_content(),
         HookKind::PowerShell => hook_ps1_content(),
     };
@@ -1342,9 +1363,7 @@ fn v3_rc_block(hook_filename: &str) -> String {
 // so this `use` MUST be cross-platform — gating it `#[cfg(windows)]`
 // would break `cargo test` on macOS.
 #[cfg(test)]
-use super::shell_integration_windows::{
-    powershell_profile_candidates, v3_rc_block_powershell,
-};
+use super::shell_integration_windows::{powershell_profile_candidates, v3_rc_block_powershell};
 
 /// Atomically write `~/.aikey/hook.{zsh,bash}` (write to tmp + rename).
 ///
@@ -1418,17 +1437,27 @@ fn backup_rc_file(rc: &std::path::Path) -> io::Result<std::path::PathBuf> {
 
 /// Replace the text between `begin` and `end` markers (inclusive) in `contents`.
 /// Returns the replaced content, or None if markers not found.
-pub(super) fn replace_between_markers(contents: &str, begin: &str, end: &str, replacement: &str) -> Option<String> {
+pub(super) fn replace_between_markers(
+    contents: &str,
+    begin: &str,
+    end: &str,
+    replacement: &str,
+) -> Option<String> {
     let start_idx = contents.find(begin)?;
     let end_idx = contents.find(end)?;
-    if end_idx <= start_idx { return None; }
-    let end_line_end = contents[end_idx..].find('\n')
+    if end_idx <= start_idx {
+        return None;
+    }
+    let end_line_end = contents[end_idx..]
+        .find('\n')
         .map(|i| end_idx + i + 1)
         .unwrap_or(contents.len());
     let mut result = String::with_capacity(contents.len());
     result.push_str(&contents[..start_idx]);
     result.push_str(replacement);
-    if !replacement.ends_with('\n') { result.push('\n'); }
+    if !replacement.ends_with('\n') {
+        result.push('\n');
+    }
     result.push_str(&contents[end_line_end..]);
     Some(result)
 }
@@ -1453,7 +1482,11 @@ pub(super) fn replace_between_markers(contents: &str, begin: &str, end: &str, re
 /// mutation**, use [`refresh_hook_file_only`] instead — that's the
 /// non-interactive entry point used by `aikey hook update`.
 pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
-    if no_hook || std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
+    if no_hook
+        || std::env::var("AIKEY_NO_HOOK")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
         return None;
     }
 
@@ -1476,11 +1509,16 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         // and PowerShell is handled above; the existing message is
         // accurate for the remaining cases.
         return Some(
-            "  Shell not recognized (need zsh/bash). Source ~/.aikey/active.env manually.".to_string(),
+            "  Shell not recognized (need zsh/bash). Source ~/.aikey/active.env manually."
+                .to_string(),
         );
     }
 
-    let hook_kind = if is_zsh { HookKind::Zsh } else { HookKind::Bash };
+    let hook_kind = if is_zsh {
+        HookKind::Zsh
+    } else {
+        HookKind::Bash
+    };
     let hook_filename = hook_filename_for_kind(hook_kind);
 
     // Layer 1 (~/.aikey/hook.{zsh,bash}) lives in our own directory and
@@ -1490,7 +1528,10 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
     // `ensure_shell_hook_refuses_rc_append_in_non_tty` asserts L1 lands
     // even when L2 is refused.
     if let Err(e) = write_hook_file(&home, hook_kind) {
-        return Some(format!("  Could not write ~/.aikey/{}: {}", hook_filename, e));
+        return Some(format!(
+            "  Could not write ~/.aikey/{}: {}",
+            hook_filename, e
+        ));
     }
     cleanup_legacy_hook_files(&home);
 
@@ -1615,7 +1656,8 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
                     bash_profile_shim_added,
                 } => {
                     let extra = if bash_profile_shim_added {
-                        "\n  Also wired ~/.bash_profile → source ~/.bashrc (macOS login shells).".to_string()
+                        "\n  Also wired ~/.bash_profile → source ~/.bashrc (macOS login shells)."
+                            .to_string()
                     } else {
                         String::new()
                     };
@@ -1678,22 +1720,31 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
 /// `$SHELL`; if neither matches, returns an error message rather than
 /// silently writing both files.
 pub fn refresh_hook_file_only(shell: Option<&str>) -> Result<std::path::PathBuf, String> {
-    if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("AIKEY_NO_HOOK")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         return Err("AIKEY_NO_HOOK=1 set in environment; refresh skipped".to_string());
     }
     // Stage 3.3 windows-compat: route HOME through `resolve_user_home`
     // so PowerShell on Windows (no $HOME, only %USERPROFILE%) can refresh
     // hook.ps1 without erroring out at the env probe.
     let home_path = resolve_user_home();
-    let home = home_path.to_str().ok_or_else(|| "HOME path not UTF-8".to_string())?.to_string();
+    let home = home_path
+        .to_str()
+        .ok_or_else(|| "HOME path not UTF-8".to_string())?
+        .to_string();
 
     let kind = match shell {
         Some("zsh") => HookKind::Zsh,
         Some("bash") => HookKind::Bash,
         Some("powershell") | Some("pwsh") => HookKind::PowerShell,
-        Some(other) => return Err(format!(
-            "unsupported shell '{}' (need zsh, bash, or powershell)", other
-        )),
+        Some(other) => {
+            return Err(format!(
+                "unsupported shell '{}' (need zsh, bash, or powershell)",
+                other
+            ))
+        }
         None => {
             // Stage 3.3: shell_kind() honours PowerShell via $PSModulePath
             // — no $SHELL needed. Falls through to "could not auto-detect"
@@ -1713,8 +1764,7 @@ pub fn refresh_hook_file_only(shell: Option<&str>) -> Result<std::path::PathBuf,
         }
     };
 
-    write_hook_file(&home, kind)
-        .map_err(|e| format!("failed to write hook file: {}", e))
+    write_hook_file(&home, kind).map_err(|e| format!("failed to write hook file: {}", e))
 }
 
 /// Reason code for `refresh_hook_file_only` failures, for Web envelope
@@ -1738,10 +1788,10 @@ impl HookFailureReason {
     /// Stable string token for the Web envelope.
     pub fn as_envelope_str(&self) -> &'static str {
         match self {
-            Self::AikeyNoHook       => "aikey_no_hook",
-            Self::HomeUnset         => "home_unset",
+            Self::AikeyNoHook => "aikey_no_hook",
+            Self::HomeUnset => "home_unset",
             Self::ShellUndetectable => "shell_undetectable",
-            Self::IoError           => "io_error",
+            Self::IoError => "io_error",
         }
     }
 }
@@ -1756,7 +1806,10 @@ impl HookFailureReason {
 /// Wraps `refresh_hook_file_only(None)` and classifies its String error
 /// into the typed `HookFailureReason`.
 pub fn web_install_hook_file_layer1() -> (bool, Option<HookFailureReason>) {
-    if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("AIKEY_NO_HOOK")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         return (false, Some(HookFailureReason::AikeyNoHook));
     }
     // Stage 3.3 windows-compat: probe through `resolve_user_home` instead
@@ -2057,7 +2110,10 @@ pub(super) fn apply_bash_profile_shim_if_needed(home: &str, kind: HookKind) -> b
 /// Web that path is currently surfaced as `ShellUndetectable` since it
 /// needs $PROFILE handling that doesn't fit this POSIX-rc shape.
 pub fn wire_rc_with_consent() -> Result<(), HookFailureReason> {
-    if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("AIKEY_NO_HOOK")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         return Err(HookFailureReason::AikeyNoHook);
     }
     let home = std::env::var("HOME").map_err(|_| HookFailureReason::HomeUnset)?;
@@ -2219,7 +2275,10 @@ mod hook_tests {
     fn hook_zsh_contains_wrappers_and_registrations() {
         let c = hook_zsh_content();
         assert!(c.contains("aikey()"));
-        assert!(c.contains("ak()"), "zsh hook must define ak() short-alias wrapper");
+        assert!(
+            c.contains("ak()"),
+            "zsh hook must define ak() short-alias wrapper"
+        );
         assert!(c.contains("activate|deactivate"));
         assert!(c.contains("--shell zsh"));
         assert!(c.contains("AIKEY_ACTIVE_LABEL"));
@@ -2235,7 +2294,10 @@ mod hook_tests {
     fn hook_bash_contains_wrappers_and_registrations() {
         let c = hook_bash_content();
         assert!(c.contains("aikey()"));
-        assert!(c.contains("ak()"), "bash hook must define ak() short-alias wrapper");
+        assert!(
+            c.contains("ak()"),
+            "bash hook must define ak() short-alias wrapper"
+        );
         assert!(c.contains("--shell bash"));
         assert!(c.contains("AIKEY_ACTIVE_LABEL"));
         // No leading underscore — see bugfix 2026-05-05.
@@ -2301,67 +2363,99 @@ mod hook_tests {
         // with `_` when rebuilding shells in subprocesses, breaking the
         // `function codex` wrapper (it would call a missing helper). See
         // bugfix 2026-05-05-codex-wrapper-injects-model-provider-arg.md.
-        assert!(c.contains("aikey_preflight") && !c.contains("_aikey_preflight"),
+        assert!(
+            c.contains("aikey_preflight") && !c.contains("_aikey_preflight"),
             "zsh hook must define aikey_preflight helper (no underscore prefix — \
-             snapshot tools filter `_*` private-function names)");
+             snapshot tools filter `_*` private-function names)"
+        );
         // stdin redirect /dev/null is still required — it's a safety belt
         // against any regression that would reintroduce a password prompt
         // under the wrapper (plan D eliminated the normal path; this
         // guards the edge case).
-        assert!(c.contains("command aikey test") && c.contains("</dev/null"),
+        assert!(
+            c.contains("command aikey test") && c.contains("</dev/null"),
             "preflight must invoke `command aikey test ... </dev/null` so \
-             any future interactive prompt fails fast, not hangs");
+             any future interactive prompt fails fast, not hangs"
+        );
         // Stderr MUST NOT be redirected — users need to see the
         // Ping/API/Chat table (both on success and failure); a silent
         // 1-2s pause before claude starts looks like a shell hang.
-        assert!(!c.contains("command aikey test \"$id\" </dev/null >/dev/null")
-             && !c.contains("command aikey test \"$id\" </dev/null 2>/dev/null"),
+        assert!(
+            !c.contains("command aikey test \"$id\" </dev/null >/dev/null")
+                && !c.contains("command aikey test \"$id\" </dev/null 2>/dev/null"),
             "preflight must NOT suppress aikey test output — users need the \
-             table rendered both for success confirmation and failure diagnosis");
+             table rendered both for success confirmation and failure diagnosis"
+        );
         // Wrappers must be guarded same as `ak` — never overwrite a user's
         // own claude/codex function or alias.
-        assert!(c.contains("${+functions[claude]}") && c.contains("alias claude"),
-            "zsh hook must guard claude() behind function+alias existence check");
-        assert!(c.contains("${+functions[codex]}") && c.contains("alias codex"),
-            "zsh hook must guard codex() behind function+alias existence check");
+        assert!(
+            c.contains("${+functions[claude]}") && c.contains("alias claude"),
+            "zsh hook must guard claude() behind function+alias existence check"
+        );
+        assert!(
+            c.contains("${+functions[codex]}") && c.contains("alias codex"),
+            "zsh hook must guard codex() behind function+alias existence check"
+        );
         // Must use the `function` keyword form for parse-time alias safety.
-        assert!(c.contains("function claude"),
-            "zsh claude wrapper must use `function` keyword form");
-        assert!(c.contains("function codex"),
-            "zsh codex wrapper must use `function` keyword form");
+        assert!(
+            c.contains("function claude"),
+            "zsh claude wrapper must use `function` keyword form"
+        );
+        assert!(
+            c.contains("function codex"),
+            "zsh codex wrapper must use `function` keyword form"
+        );
         // Must delegate to the real binary via `command` to avoid recursion.
-        assert!(c.contains("command claude \"$@\""),
-            "claude wrapper must call `command claude \"$@\"` to reach the real binary");
+        assert!(
+            c.contains("command claude \"$@\""),
+            "claude wrapper must call `command claude \"$@\"` to reach the real binary"
+        );
         // Codex wrapper must inject `-c model_provider=aikey` so codex routes
         // through the aikey provider block at runtime regardless of any
         // pre-existing `model_provider = "ollama"` etc. in ~/.codex/config.toml.
         // See bugfix 2026-05-05-codex-wrapper-injects-model-provider-arg.md.
-        assert!(c.contains("command codex -c model_provider=aikey \"$@\""),
+        assert!(
+            c.contains("command codex -c model_provider=aikey \"$@\""),
             "codex wrapper must inject `-c model_provider=aikey` so codex \
-             always uses the aikey provider block, regardless of toml top-level state");
+             always uses the aikey provider block, regardless of toml top-level state"
+        );
     }
 
     #[test]
     fn hook_bash_defines_claude_and_codex_preflight_wrappers() {
         let c = hook_bash_content();
-        assert!(c.contains("aikey_preflight") && !c.contains("_aikey_preflight"),
+        assert!(
+            c.contains("aikey_preflight") && !c.contains("_aikey_preflight"),
             "bash hook must define aikey_preflight helper (no underscore prefix — \
-             snapshot tools filter `_*` names; see bugfix 2026-05-05)");
-        assert!(c.contains("command aikey test") && c.contains("</dev/null"),
-            "bash preflight must invoke `command aikey test ... </dev/null`");
+             snapshot tools filter `_*` names; see bugfix 2026-05-05)"
+        );
+        assert!(
+            c.contains("command aikey test") && c.contains("</dev/null"),
+            "bash preflight must invoke `command aikey test ... </dev/null`"
+        );
         // Stderr must not be redirected — table output is the user-visible
         // feedback. See zsh test for rationale.
-        assert!(!c.contains("command aikey test \"$id\" </dev/null >/dev/null")
-             && !c.contains("command aikey test \"$id\" </dev/null 2>/dev/null"),
-            "bash preflight must NOT suppress aikey test output");
-        assert!(c.contains("declare -F claude") && c.contains("alias claude"),
-            "bash hook must guard claude() behind declare -F + alias check");
-        assert!(c.contains("declare -F codex") && c.contains("alias codex"),
-            "bash hook must guard codex() behind declare -F + alias check");
-        assert!(c.contains("command claude \"$@\""),
-            "claude wrapper must delegate to real binary via `command`");
-        assert!(c.contains("command codex -c model_provider=aikey \"$@\""),
-            "codex wrapper must inject `-c model_provider=aikey` (see bugfix 2026-05-05)");
+        assert!(
+            !c.contains("command aikey test \"$id\" </dev/null >/dev/null")
+                && !c.contains("command aikey test \"$id\" </dev/null 2>/dev/null"),
+            "bash preflight must NOT suppress aikey test output"
+        );
+        assert!(
+            c.contains("declare -F claude") && c.contains("alias claude"),
+            "bash hook must guard claude() behind declare -F + alias check"
+        );
+        assert!(
+            c.contains("declare -F codex") && c.contains("alias codex"),
+            "bash hook must guard codex() behind declare -F + alias check"
+        );
+        assert!(
+            c.contains("command claude \"$@\""),
+            "claude wrapper must delegate to real binary via `command`"
+        );
+        assert!(
+            c.contains("command codex -c model_provider=aikey \"$@\""),
+            "codex wrapper must inject `-c model_provider=aikey` (see bugfix 2026-05-05)"
+        );
     }
 
     // ── Sentinel-gated codex `-c` injection ─────────────────────────────
@@ -2377,27 +2471,49 @@ mod hook_tests {
     #[test]
     fn zsh_codex_wrapper_gates_inject_on_active_sentinel() {
         let c = hook_zsh_content();
-        let codex_block = c.split("function codex").nth(1).unwrap_or("")
-            .split("\nfi\n").next().unwrap_or("");
-        assert!(codex_block.contains(r#"[[ "$OPENAI_API_KEY" == aikey_active_*"#),
+        let codex_block = c
+            .split("function codex")
+            .nth(1)
+            .unwrap_or("")
+            .split("\nfi\n")
+            .next()
+            .unwrap_or("");
+        assert!(
+            codex_block.contains(r#"[[ "$OPENAI_API_KEY" == aikey_active_*"#),
             "zsh codex wrapper must gate `-c model_provider=aikey` on the \
-             active.env sentinel; block was:\n{}", codex_block);
-        assert!(codex_block.contains("command codex \"$@\""),
+             active.env sentinel; block was:\n{}",
+            codex_block
+        );
+        assert!(
+            codex_block.contains("command codex \"$@\""),
             "zsh codex wrapper must have an else-branch that calls codex \
-             without `-c`; block was:\n{}", codex_block);
+             without `-c`; block was:\n{}",
+            codex_block
+        );
     }
 
     #[test]
     fn bash_codex_wrapper_gates_inject_on_active_sentinel() {
         let c = hook_bash_content();
-        let codex_block = c.split("codex() {").nth(1).unwrap_or("")
-            .split("\nfi\n").next().unwrap_or("");
-        assert!(codex_block.contains(r#"[[ "$OPENAI_API_KEY" == aikey_active_*"#),
+        let codex_block = c
+            .split("codex() {")
+            .nth(1)
+            .unwrap_or("")
+            .split("\nfi\n")
+            .next()
+            .unwrap_or("");
+        assert!(
+            codex_block.contains(r#"[[ "$OPENAI_API_KEY" == aikey_active_*"#),
             "bash codex wrapper must gate `-c model_provider=aikey` on the \
-             active.env sentinel; block was:\n{}", codex_block);
-        assert!(codex_block.contains("command codex \"$@\""),
+             active.env sentinel; block was:\n{}",
+            codex_block
+        );
+        assert!(
+            codex_block.contains("command codex \"$@\""),
             "bash codex wrapper must have an else-branch that calls codex \
-             without `-c`; block was:\n{}", codex_block);
+             without `-c`; block was:\n{}",
+            codex_block
+        );
     }
 
     // ── Wrapper reload semantics ────────────────────────────────────────
@@ -2413,53 +2529,82 @@ mod hook_tests {
     #[test]
     fn zsh_hook_has_reload_cleanup_loop() {
         let c = hook_zsh_content();
-        assert!(c.contains("for _aikey_wrap in claude codex kimi"),
-            "hook.zsh must iterate the three known wrappers in the cleanup loop");
-        assert!(c.contains("aikey_clear_before_tui_handoff"),
+        assert!(
+            c.contains("for _aikey_wrap in claude codex kimi"),
+            "hook.zsh must iterate the three known wrappers in the cleanup loop"
+        );
+        assert!(
+            c.contains("aikey_clear_before_tui_handoff"),
             "hook.zsh cleanup loop must identify aikey-owned wrappers via the \
-             `aikey_clear_before_tui_handoff` body marker");
-        assert!(c.contains("unfunction \"$_aikey_wrap\""),
-            "hook.zsh cleanup loop must drop the function with `unfunction`");
+             `aikey_clear_before_tui_handoff` body marker"
+        );
+        assert!(
+            c.contains("unfunction \"$_aikey_wrap\""),
+            "hook.zsh cleanup loop must drop the function with `unfunction`"
+        );
     }
 
     #[test]
     fn bash_hook_has_reload_cleanup_loop() {
         let c = hook_bash_content();
-        assert!(c.contains("for _aikey_wrap in claude codex kimi"),
-            "hook.bash must iterate the three known wrappers in the cleanup loop");
-        assert!(c.contains("aikey_clear_before_tui_handoff"),
+        assert!(
+            c.contains("for _aikey_wrap in claude codex kimi"),
+            "hook.bash must iterate the three known wrappers in the cleanup loop"
+        );
+        assert!(
+            c.contains("aikey_clear_before_tui_handoff"),
             "hook.bash cleanup loop must identify aikey-owned wrappers via the \
-             `aikey_clear_before_tui_handoff` body marker");
-        assert!(c.contains("unset -f \"$_aikey_wrap\""),
-            "hook.bash cleanup loop must drop the function with `unset -f`");
+             `aikey_clear_before_tui_handoff` body marker"
+        );
+        assert!(
+            c.contains("unset -f \"$_aikey_wrap\""),
+            "hook.bash cleanup loop must drop the function with `unset -f`"
+        );
     }
 
     #[test]
     fn ps1_hook_has_reload_cleanup_loop() {
         let c = hook_ps1_content();
-        assert!(c.contains("foreach ($_aikey_wrap in @('claude','codex','kimi'))"),
-            "hook.ps1 must iterate the three known wrappers in the cleanup loop");
-        assert!(c.contains("aikey_clear_before_tui_handoff"),
+        assert!(
+            c.contains("foreach ($_aikey_wrap in @('claude','codex','kimi'))"),
+            "hook.ps1 must iterate the three known wrappers in the cleanup loop"
+        );
+        assert!(
+            c.contains("aikey_clear_before_tui_handoff"),
             "hook.ps1 cleanup loop must identify aikey-owned wrappers via the \
-             `aikey_clear_before_tui_handoff` Definition marker");
-        assert!(c.contains("Remove-Item (\"Function:\\\" + $_aikey_wrap)"),
-            "hook.ps1 cleanup loop must drop the function with `Remove-Item Function:...`");
+             `aikey_clear_before_tui_handoff` Definition marker"
+        );
+        assert!(
+            c.contains("Remove-Item (\"Function:\\\" + $_aikey_wrap)"),
+            "hook.ps1 cleanup loop must drop the function with `Remove-Item Function:...`"
+        );
     }
 
     #[test]
     fn ps1_codex_wrapper_gates_inject_on_active_sentinel() {
         let c = hook_ps1_content();
-        let codex_block = c.split("function global:codex").nth(1).unwrap_or("")
-            .split("\nfunction global:kimi").next().unwrap_or("");
-        assert!(codex_block.contains(r#"$env:OPENAI_API_KEY"#)
-             && codex_block.contains(r#"StartsWith("aikey_active_")"#),
+        let codex_block = c
+            .split("function global:codex")
+            .nth(1)
+            .unwrap_or("")
+            .split("\nfunction global:kimi")
+            .next()
+            .unwrap_or("");
+        assert!(
+            codex_block.contains(r#"$env:OPENAI_API_KEY"#)
+                && codex_block.contains(r#"StartsWith("aikey_active_")"#),
             "ps1 codex wrapper must gate `-c model_provider=aikey` on the \
-             active.env sentinel; block was:\n{}", codex_block);
+             active.env sentinel; block was:\n{}",
+            codex_block
+        );
         // Else branch must invoke codex without the `-c` flag — split on
         // newline+spaces and assert at least one `& $real @RemArgs` line.
-        assert!(codex_block.contains("& $real @RemArgs"),
+        assert!(
+            codex_block.contains("& $real @RemArgs"),
             "ps1 codex wrapper must have an else-branch that calls codex \
-             without `-c`; block was:\n{}", codex_block);
+             without `-c`; block was:\n{}",
+            codex_block
+        );
     }
 
     #[test]
@@ -2476,27 +2621,37 @@ mod hook_tests {
             ("hook.zsh", hook_zsh_content()),
             ("hook.bash", hook_bash_content()),
         ] {
-            assert!(c.contains("aikey statusline ensure"),
+            assert!(
+                c.contains("aikey statusline ensure"),
                 "{label}: claude wrapper must call `aikey statusline ensure` \
-                 so the receipt statusLine follows CLAUDE_CONFIG_DIR");
-            assert!(c.contains("AIKEY_DISABLE_STATUSLINE_ENSURE"),
+                 so the receipt statusLine follows CLAUDE_CONFIG_DIR"
+            );
+            assert!(
+                c.contains("AIKEY_DISABLE_STATUSLINE_ENSURE"),
                 "{label}: wrapper must document AIKEY_DISABLE_STATUSLINE_ENSURE \
-                 opt-out alongside the ensure call");
+                 opt-out alongside the ensure call"
+            );
             // Must not abort the wrapper if ensure fails (network-less
             // CI, read-only FS, etc.). The `|| true` guard is load-bearing.
-            assert!(c.contains("aikey statusline ensure >/dev/null 2>&1 || true"),
+            assert!(
+                c.contains("aikey statusline ensure >/dev/null 2>&1 || true"),
                 "{label}: ensure must be fire-and-forget — failures must \
-                 not block `claude` startup");
+                 not block `claude` startup"
+            );
         }
     }
 
     #[test]
     fn hook_ps1_claude_wrapper_calls_statusline_ensure() {
         let c = hook_ps1_content();
-        assert!(c.contains("aikey statusline ensure"),
-            "hook.ps1: claude wrapper must call `aikey statusline ensure`");
-        assert!(c.contains("AIKEY_DISABLE_STATUSLINE_ENSURE"),
-            "hook.ps1: wrapper must document AIKEY_DISABLE_STATUSLINE_ENSURE opt-out");
+        assert!(
+            c.contains("aikey statusline ensure"),
+            "hook.ps1: claude wrapper must call `aikey statusline ensure`"
+        );
+        assert!(
+            c.contains("AIKEY_DISABLE_STATUSLINE_ENSURE"),
+            "hook.ps1: wrapper must document AIKEY_DISABLE_STATUSLINE_ENSURE opt-out"
+        );
     }
 
     #[test]
@@ -2505,10 +2660,12 @@ mod hook_tests {
         // `AIKEY_PREFLIGHT=off` makes the preflight a no-op. This is the
         // only env-var knob on the wrapper — keep the surface small.
         for c in [hook_zsh_content(), hook_bash_content()] {
-            assert!(c.contains("AIKEY_PREFLIGHT") && c.contains("\"off\""),
+            assert!(
+                c.contains("AIKEY_PREFLIGHT") && c.contains("\"off\""),
                 "hook must honour AIKEY_PREFLIGHT=off escape hatch — CI / \
                  offline users can't afford an interactive prompt before \
-                 every claude invocation");
+                 every claude invocation"
+            );
         }
     }
 
@@ -2521,13 +2678,19 @@ mod hook_tests {
         for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
             // The prompt text must signal default=No (the "[y/N]" convention
             // — capital N indicating default).
-            assert!(c.contains("[y/N]"),
-                "{}: prompt must show [y/N] to signal default=No", label);
+            assert!(
+                c.contains("[y/N]"),
+                "{}: prompt must show [y/N] to signal default=No",
+                label
+            );
             // The affirmative branch must match only y/Y/yes/YES, never an
             // empty reply or anything else.
-            assert!(c.contains("y|Y|yes|YES"),
+            assert!(
+                c.contains("y|Y|yes|YES"),
                 "{}: only y/Y/yes/YES must proceed — empty reply is NOT a \
-                 proceed signal (would defeat the whole safety purpose)", label);
+                 proceed signal (would defeat the whole safety purpose)",
+                label
+            );
         }
     }
 
@@ -2539,13 +2702,22 @@ mod hook_tests {
         // `aikey use`. The wrapper emits one stderr line naming the fix.
         // Pinned so a future simplification can't quietly drop it.
         for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
-            assert!(c.contains("no active binding"),
-                "{}: preflight must print an advisory when AIKEY_ACTIVE_KEYS is empty", label);
-            assert!(c.contains("aikey use"),
-                "{}: advisory must name the command to run (`aikey use <alias>`)", label);
-            assert!(c.contains("preflight skipped"),
+            assert!(
+                c.contains("no active binding"),
+                "{}: preflight must print an advisory when AIKEY_ACTIVE_KEYS is empty",
+                label
+            );
+            assert!(
+                c.contains("aikey use"),
+                "{}: advisory must name the command to run (`aikey use <alias>`)",
+                label
+            );
+            assert!(
+                c.contains("preflight skipped"),
                 "{}: advisory must state the preflight was skipped (so the user \
-                 knows why claude/codex still starts despite no binding)", label);
+                 knows why claude/codex still starts despite no binding)",
+                label
+            );
         }
     }
 
@@ -2564,9 +2736,12 @@ mod hook_tests {
         // update the requirement + the bugfix record + remove this guard
         // first.
         for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
-            assert!(!c.contains("aikey_preflight kimi"),
+            assert!(
+                !c.contains("aikey_preflight kimi"),
                 "{}: kimi is intentionally out of scope for the 2026-04-22 \
-                 diagnostic preflight — see the bugfix record before adding", label);
+                 diagnostic preflight — see the bugfix record before adding",
+                label
+            );
         }
     }
 
@@ -2583,14 +2758,19 @@ mod hook_tests {
         // preflight error. See `aikey test --provider` (cli.rs::Test) for
         // the filter that honours this arg server-side.
         for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
-            assert!(c.contains(r#"--provider "$prov""#),
+            assert!(
+                c.contains(r#"--provider "$prov""#),
                 "{}: aikey_preflight must pass --provider \"$prov\" so a \
-                 multi-protocol alias only probes the active wrapper's lane", label);
+                 multi-protocol alias only probes the active wrapper's lane",
+                label
+            );
         }
         // PowerShell uses the parameter name $Provider (capital P, no $prov shadow var).
         let ps1 = hook_ps1_content();
-        assert!(ps1.contains("--provider $Provider"),
-            "hook.ps1: aikey_preflight must pass --provider $Provider to narrow probe");
+        assert!(
+            ps1.contains("--provider $Provider"),
+            "hook.ps1: aikey_preflight must pass --provider $Provider to narrow probe"
+        );
     }
 
     #[test]
@@ -2603,13 +2783,19 @@ mod hook_tests {
         // ever lifted (e.g. kimi's chat probe stops false-positiving),
         // collapse this test into the claude/codex preflight test.
         for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
-            assert!(c.contains("aikey proxy ensure-running"),
+            assert!(
+                c.contains("aikey proxy ensure-running"),
                 "{}: kimi wrapper must call `aikey proxy ensure-running` so \
-                 the user's first kimi invocation starts the proxy if it's down", label);
+                 the user's first kimi invocation starts the proxy if it's down",
+                label
+            );
             // Also assert there IS some kimi function definition. Lightweight
             // check — exact function-form differs by shell (function kimi vs kimi()).
-            assert!(c.contains("kimi"),
-                "{}: hook must reference kimi at all (wrapper + preexec label)", label);
+            assert!(
+                c.contains("kimi"),
+                "{}: hook must reference kimi at all (wrapper + preexec label)",
+                label
+            );
         }
     }
 
@@ -2688,7 +2874,10 @@ mod hook_tests {
         assert!(out.contains(V3_END));
         assert!(out.contains("export FOO=bar"));
         assert!(out.contains("# user code"));
-        assert!(!out.contains("# aikey shell hook\n"), "v1 header must be gone");
+        assert!(
+            !out.contains("# aikey shell hook\n"),
+            "v1 header must be gone"
+        );
     }
 
     #[test]
@@ -2743,10 +2932,26 @@ mod hook_tests {
         assert!(r.contains("event = \"Stop\""));
         assert!(r.contains("statusline render kimi"));
         // Must NOT contain provider/model scaffolding anymore.
-        assert!(!r.contains("[providers.kimi]"), "region should not include provider block:\n{}", r);
-        assert!(!r.contains("[models."), "region should not include model blocks:\n{}", r);
-        assert!(!r.contains("api_key"), "region should not include api_key:\n{}", r);
-        assert!(!r.contains("base_url"), "region should not include base_url:\n{}", r);
+        assert!(
+            !r.contains("[providers.kimi]"),
+            "region should not include provider block:\n{}",
+            r
+        );
+        assert!(
+            !r.contains("[models."),
+            "region should not include model blocks:\n{}",
+            r
+        );
+        assert!(
+            !r.contains("api_key"),
+            "region should not include api_key:\n{}",
+            r
+        );
+        assert!(
+            !r.contains("base_url"),
+            "region should not include base_url:\n{}",
+            r
+        );
     }
 
     #[test]
@@ -2754,14 +2959,19 @@ mod hook_tests {
         // Port no longer appears in the region (base_url is env-var-driven).
         let a = build_kimi_managed_region(27200);
         let b = build_kimi_managed_region(19999);
-        assert_eq!(a, b, "region content must not depend on proxy_port:\nA={}\nB={}", a, b);
+        assert_eq!(
+            a, b,
+            "region content must not depend on proxy_port:\nA={}\nB={}",
+            a, b
+        );
         assert!(!a.contains("27200"));
         assert!(!a.contains("19999"));
     }
 
     #[test]
     fn kimi_strip_legacy_default_model_removes_matching_top_level() {
-        let input = "default_model = \"kimi-k2-5\"\ndefault_thinking = false\n[loop_control]\nmax = 10\n";
+        let input =
+            "default_model = \"kimi-k2-5\"\ndefault_thinking = false\n[loop_control]\nmax = 10\n";
         let out = strip_legacy_kimi_default_model(input);
         assert!(!out.contains("default_model = \"kimi-k2-5\""));
         assert!(out.contains("default_thinking = false"));
@@ -2901,7 +3111,10 @@ mod hook_tests {
         // Exactly one model_provider line (user's, untouched here)
         let mp_count = out
             .lines()
-            .filter(|l| l.trim_start().starts_with("model_provider ") || l.trim_start().starts_with("model_provider="))
+            .filter(|l| {
+                l.trim_start().starts_with("model_provider ")
+                    || l.trim_start().starts_with("model_provider=")
+            })
             .count();
         assert_eq!(mp_count, 1, "model_provider duplicated:\n{}", out);
     }
@@ -2913,7 +3126,11 @@ mod hook_tests {
         let out = upsert_codex_managed_line(existing, "model_provider", "aikey");
         let key_pos = out.find("model_provider").unwrap();
         let table_pos = out.find("[projects.x]").unwrap();
-        assert!(key_pos < table_pos, "model_provider must come before table header:\n{}", out);
+        assert!(
+            key_pos < table_pos,
+            "model_provider must come before table header:\n{}",
+            out
+        );
     }
 
     #[test]
@@ -2965,7 +3182,8 @@ mod hook_tests {
 
     #[test]
     fn codex_upsert_region_replaces_existing() {
-        let old_region = format!("{AIKEY_BEGIN}\n[model_providers.aikey]\napi_key = \"old\"\n{AIKEY_END}");
+        let old_region =
+            format!("{AIKEY_BEGIN}\n[model_providers.aikey]\napi_key = \"old\"\n{AIKEY_END}");
         let existing = format!("model = \"gpt-5\"\n\n{old_region}\n");
         let new_region = build_codex_managed_region(27200);
         let out = upsert_codex_region(&existing, &new_region);
@@ -3033,7 +3251,8 @@ mod hook_tests {
             head.join("\n"),
         );
         assert!(
-            head.iter().any(|l| l.starts_with("_AIKEY_HOOK_LOADED_HASH=")),
+            head.iter()
+                .any(|l| l.starts_with("_AIKEY_HOOK_LOADED_HASH=")),
             "_AIKEY_HOOK_LOADED_HASH should appear in the first 5 lines, got:\n{}",
             head.join("\n"),
         );
@@ -3070,9 +3289,8 @@ mod hook_tests {
         // both injected lines. Catches a regression where someone bypasses
         // hook_content_with_hash_header in the write path.
         use std::io::Read;
-        let tmp = std::env::temp_dir().join(format!(
-            "aikey-test-write-hook-{}", std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("aikey-test-write-hook-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let path = write_hook_file(tmp.to_str().unwrap(), HookKind::Zsh).expect("write zsh hook");
         let mut f = std::fs::File::open(&path).expect("open written hook");
@@ -3223,7 +3441,9 @@ mod hook_tests {
         let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
         let prev_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", tmp.path().to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("HOME", tmp.path().to_str().unwrap());
+        }
 
         let msg = ensure_shell_hook(true);
 
@@ -3236,7 +3456,8 @@ mod hook_tests {
 
         assert!(
             msg.is_none(),
-            "--no-hook should return None (silent skip), got: {:?}", msg
+            "--no-hook should return None (silent skip), got: {:?}",
+            msg
         );
         assert!(
             !tmp.path().join(".aikey/hook.zsh").exists(),
@@ -3539,8 +3760,11 @@ mod wire_rc_with_consent_tests {
         // exists, no TTY prompt asked (this whole path skips the H1.5 gate).
         let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(tmp.path().join(".zshrc"), "# user content\nexport FOO=bar\n")
-            .expect("seed zshrc");
+        std::fs::write(
+            tmp.path().join(".zshrc"),
+            "# user content\nexport FOO=bar\n",
+        )
+        .expect("seed zshrc");
         let result = run_wire_rc(tmp.path(), "/bin/zsh", false);
         assert_eq!(result, Ok(()));
         let zshrc = std::fs::read_to_string(tmp.path().join(".zshrc")).expect("read zshrc");
@@ -3610,7 +3834,10 @@ mod wire_rc_with_consent_tests {
         let result = run_wire_rc(tmp.path(), "/bin/zsh", true /* AIKEY_NO_HOOK */);
         assert_eq!(result, Err(HookFailureReason::AikeyNoHook));
         let zshrc = std::fs::read_to_string(tmp.path().join(".zshrc")).expect("read zshrc");
-        assert!(!zshrc.contains(V3_BEGIN), "rc must not be touched when opted out");
+        assert!(
+            !zshrc.contains(V3_BEGIN),
+            "rc must not be touched when opted out"
+        );
     }
 
     #[test]
@@ -3724,8 +3951,10 @@ mod path_helper_tests {
         // Stage 2.4 review fix: empty rel must not produce a trailing
         // separator like `~/` or `%USERPROFILE%\`.
         let s = display_path("");
-        assert!(!s.ends_with('/') && !s.ends_with('\\'),
-                "empty rel produced trailing separator: {s:?}");
+        assert!(
+            !s.ends_with('/') && !s.ends_with('\\'),
+            "empty rel produced trailing separator: {s:?}"
+        );
     }
 
     #[cfg(not(windows))]
@@ -3816,7 +4045,10 @@ mod path_helper_tests {
         std::env::set_var("HOME", "/tmp/aikey-kimi-base");
         let (config, backup) = kimi_config_paths();
         assert!(config.ends_with("config.toml"), "got {config:?}");
-        assert!(backup.ends_with("config.aikey_backup.toml"), "got {backup:?}");
+        assert!(
+            backup.ends_with("config.aikey_backup.toml"),
+            "got {backup:?}"
+        );
         // Both must live under .kimi/ off the resolved home.
         assert!(
             config.iter().any(|c| c == std::ffi::OsStr::new(".kimi")),
@@ -3897,11 +4129,11 @@ mod stage3_powershell_hook_tests {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            let prev = vars
-                .iter()
-                .map(|v| (*v, std::env::var_os(v)))
-                .collect();
-            Self { _guard: guard, prev }
+            let prev = vars.iter().map(|v| (*v, std::env::var_os(v))).collect();
+            Self {
+                _guard: guard,
+                prev,
+            }
         }
     }
 
@@ -3920,9 +4152,8 @@ mod stage3_powershell_hook_tests {
 
     #[test]
     fn shell_kind_override_wins() {
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::set_var("AIKEY_SHELL_OVERRIDE", "powershell");
         std::env::set_var("SHELL", "/bin/zsh"); // would otherwise win
         assert_eq!(shell_kind(), ShellKind::PowerShell);
@@ -3930,9 +4161,8 @@ mod stage3_powershell_hook_tests {
 
     #[test]
     fn shell_kind_recognises_zsh_path() {
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::remove_var("AIKEY_SHELL_OVERRIDE");
         std::env::set_var("SHELL", "/usr/local/bin/zsh");
         std::env::remove_var("PSModulePath");
@@ -3942,9 +4172,8 @@ mod stage3_powershell_hook_tests {
 
     #[test]
     fn shell_kind_recognises_bash_path() {
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::remove_var("AIKEY_SHELL_OVERRIDE");
         std::env::set_var("SHELL", "/bin/bash");
         std::env::remove_var("PSModulePath");
@@ -3956,12 +4185,14 @@ mod stage3_powershell_hook_tests {
     fn shell_kind_powershell_via_psmodulepath() {
         // The Windows PowerShell signature: PSModulePath set, SHELL absent.
         // (Most PowerShell sessions on Windows match this.)
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::remove_var("AIKEY_SHELL_OVERRIDE");
         std::env::remove_var("SHELL");
-        std::env::set_var("PSModulePath", r"C:\Users\michael\Documents\PowerShell\Modules");
+        std::env::set_var(
+            "PSModulePath",
+            r"C:\Users\michael\Documents\PowerShell\Modules",
+        );
         // ComSpec is also typically set on Windows, but PSModulePath wins.
         std::env::set_var("ComSpec", r"C:\Windows\System32\cmd.exe");
         assert_eq!(shell_kind(), ShellKind::PowerShell);
@@ -3972,9 +4203,8 @@ mod stage3_powershell_hook_tests {
         // cmd.exe also sets ComSpec but NOT PSModulePath. The check order
         // (PSModulePath first) is essential — getting it wrong would
         // mis-classify every PowerShell session as cmd.
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::remove_var("AIKEY_SHELL_OVERRIDE");
         std::env::remove_var("SHELL");
         std::env::remove_var("PSModulePath");
@@ -3984,9 +4214,8 @@ mod stage3_powershell_hook_tests {
 
     #[test]
     fn shell_kind_unknown_when_nothing_matches() {
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::remove_var("AIKEY_SHELL_OVERRIDE");
         std::env::remove_var("SHELL");
         std::env::remove_var("PSModulePath");
@@ -4051,11 +4280,18 @@ mod stage3_powershell_hook_tests {
     #[test]
     fn hook_ps1_template_defines_aikey_wrapper() {
         let c = hook_ps1_content();
-        assert!(c.contains("function global:aikey"),
-                "hook.ps1 must define the global aikey wrapper function");
-        assert!(c.contains("--shell"), "hook.ps1 wrapper must pass --shell flag");
-        assert!(c.contains("powershell"),
-                "hook.ps1 wrapper must specify --shell powershell");
+        assert!(
+            c.contains("function global:aikey"),
+            "hook.ps1 must define the global aikey wrapper function"
+        );
+        assert!(
+            c.contains("--shell"),
+            "hook.ps1 wrapper must pass --shell flag"
+        );
+        assert!(
+            c.contains("powershell"),
+            "hook.ps1 wrapper must specify --shell powershell"
+        );
     }
 
     #[test]
@@ -4064,10 +4300,14 @@ mod stage3_powershell_hook_tests {
         // to the user's pre-existing definition rather than overwrite —
         // same contract as bash/zsh hook.
         let c = hook_ps1_content();
-        assert!(c.contains("Get-Command ak"),
-                "hook.ps1 must guard the ak alias with Get-Command");
-        assert!(c.contains("function global:ak"),
-                "hook.ps1 must define the ak short-alias function");
+        assert!(
+            c.contains("Get-Command ak"),
+            "hook.ps1 must guard the ak alias with Get-Command"
+        );
+        assert!(
+            c.contains("function global:ak"),
+            "hook.ps1 must define the ak short-alias function"
+        );
     }
 
     #[test]
@@ -4076,24 +4316,36 @@ mod stage3_powershell_hook_tests {
         // spawns binary and compares. Both must be present.
         let c = hook_ps1_content();
         // No leading underscore — see bugfix 2026-05-05.
-        assert!(c.contains("aikey_hook_check_once") && !c.contains("_aikey_hook_check_once"),
-                "hook.ps1 must define aikey_hook_check_once for drift detection \
-                 (no underscore prefix — snapshot tools filter `_*` names)");
-        assert!(c.contains("_hook-hash powershell"),
-                "drift detector layer 2 must spawn `aikey _hook-hash powershell`");
-        assert!(c.contains("Hook-Template-Hash:"),
-                "drift detector layer 1 must grep the disk hash header");
+        assert!(
+            c.contains("aikey_hook_check_once") && !c.contains("_aikey_hook_check_once"),
+            "hook.ps1 must define aikey_hook_check_once for drift detection \
+                 (no underscore prefix — snapshot tools filter `_*` names)"
+        );
+        assert!(
+            c.contains("_hook-hash powershell"),
+            "drift detector layer 2 must spawn `aikey _hook-hash powershell`"
+        );
+        assert!(
+            c.contains("Hook-Template-Hash:"),
+            "drift detector layer 1 must grep the disk hash header"
+        );
     }
 
     #[test]
     fn hook_ps1_template_wraps_prompt_for_cross_shell_sync() {
         let c = hook_ps1_content();
-        assert!(c.contains("function global:prompt"),
-                "hook.ps1 must wrap the prompt function for cross-shell sync");
-        assert!(c.contains("aikey_precmd_powershell") && !c.contains("_aikey_precmd_powershell"),
-                "hook.ps1 prompt wrap must call aikey_precmd_powershell (no underscore prefix)");
-        assert!(c.contains("_aikeyOrigPromptForHook"),
-                "hook.ps1 must capture the original prompt to chain");
+        assert!(
+            c.contains("function global:prompt"),
+            "hook.ps1 must wrap the prompt function for cross-shell sync"
+        );
+        assert!(
+            c.contains("aikey_precmd_powershell") && !c.contains("_aikey_precmd_powershell"),
+            "hook.ps1 prompt wrap must call aikey_precmd_powershell (no underscore prefix)"
+        );
+        assert!(
+            c.contains("_aikeyOrigPromptForHook"),
+            "hook.ps1 must capture the original prompt to chain"
+        );
     }
 
     // ── Wrapper preflight (claude / codex / kimi) — Stage 1.2-followup
@@ -4104,7 +4356,8 @@ mod stage3_powershell_hook_tests {
     fn hook_ps1_defines_aikey_preflight_function() {
         let c = hook_ps1_content();
         assert!(
-            c.contains("function global:aikey_preflight") && !c.contains("function global:_aikey_preflight"),
+            c.contains("function global:aikey_preflight")
+                && !c.contains("function global:_aikey_preflight"),
             "hook.ps1 must define aikey_preflight (parity with hook.bash aikey_preflight, \
              no underscore prefix — see bugfix 2026-05-05)",
         );
@@ -4144,16 +4397,25 @@ mod stage3_powershell_hook_tests {
     fn hook_ps1_wraps_claude_codex_kimi_with_guards() {
         let c = hook_ps1_content();
         // Each of the three CLIs must have a function wrapper.
-        for cli in ["function global:claude", "function global:codex", "function global:kimi"] {
-            assert!(c.contains(cli),
-                "hook.ps1 must wrap {} (parity with hook.bash claude()/codex()/kimi())", cli);
+        for cli in [
+            "function global:claude",
+            "function global:codex",
+            "function global:kimi",
+        ] {
+            assert!(
+                c.contains(cli),
+                "hook.ps1 must wrap {} (parity with hook.bash claude()/codex()/kimi())",
+                cli
+            );
         }
         // Each wrapper must be guarded — checking via Get-Command -CommandType
         // Function, Alias — so we don't clobber a user's pre-existing function
         // / alias of the same name (kubectl-style 'codex', etc.).
-        for guard in ["Get-Command claude -CommandType Function, Alias",
-                      "Get-Command codex -CommandType Function, Alias",
-                      "Get-Command kimi -CommandType Function, Alias"] {
+        for guard in [
+            "Get-Command claude -CommandType Function, Alias",
+            "Get-Command codex -CommandType Function, Alias",
+            "Get-Command kimi -CommandType Function, Alias",
+        ] {
             assert!(c.contains(guard),
                 "hook.ps1 must guard wrappers via Get-Command -CommandType Function,Alias check; missing: {}", guard);
         }
@@ -4170,25 +4432,27 @@ mod stage3_powershell_hook_tests {
         // Find the claude wrapper body and assert preflight call.
         let claude_block = c
             .split("function global:claude")
-            .nth(1).unwrap_or("")
+            .nth(1)
+            .unwrap_or("")
             .split("function global:codex")
-            .next().unwrap_or("");
+            .next()
+            .unwrap_or("");
         assert!(
             claude_block.contains("aikey_preflight"),
             "claude wrapper must invoke aikey_preflight",
         );
         let codex_block = c
             .split("function global:codex")
-            .nth(1).unwrap_or("")
+            .nth(1)
+            .unwrap_or("")
             .split("function global:kimi")
-            .next().unwrap_or("");
+            .next()
+            .unwrap_or("");
         assert!(
             codex_block.contains("aikey_preflight"),
             "codex wrapper must invoke aikey_preflight",
         );
-        let kimi_block = c
-            .split("function global:kimi")
-            .nth(1).unwrap_or("");
+        let kimi_block = c.split("function global:kimi").nth(1).unwrap_or("");
         assert!(
             !kimi_block.contains("aikey_preflight"),
             "kimi wrapper must NOT invoke aikey_preflight (carve-out: kimi-cli has its own probe)",
@@ -4206,15 +4470,21 @@ mod stage3_powershell_hook_tests {
         // function (otherwise infinite recursion).
         let c = hook_ps1_content();
         assert!(
-            c.matches("Get-Command claude -CommandType Application").count() >= 1,
+            c.matches("Get-Command claude -CommandType Application")
+                .count()
+                >= 1,
             "claude wrapper must use Get-Command -CommandType Application to find real binary",
         );
         assert!(
-            c.matches("Get-Command codex -CommandType Application").count() >= 1,
+            c.matches("Get-Command codex -CommandType Application")
+                .count()
+                >= 1,
             "codex wrapper must use Get-Command -CommandType Application",
         );
         assert!(
-            c.matches("Get-Command kimi -CommandType Application").count() >= 1,
+            c.matches("Get-Command kimi -CommandType Application")
+                .count()
+                >= 1,
             "kimi wrapper must use Get-Command -CommandType Application",
         );
     }
@@ -4224,8 +4494,10 @@ mod stage3_powershell_hook_tests {
         // active.env is sh-syntax (export ...). PowerShell can't parse it.
         // The Stage 3 hook must read active.env.flat (plain KEY=VALUE).
         let c = hook_ps1_content();
-        assert!(c.contains("active.env.flat"),
-                "hook.ps1 must read active.env.flat (sh-syntax active.env is unparseable)");
+        assert!(
+            c.contains("active.env.flat"),
+            "hook.ps1 must read active.env.flat (sh-syntax active.env is unparseable)"
+        );
     }
 
     #[test]
@@ -4252,7 +4524,9 @@ mod stage3_powershell_hook_tests {
                 // a string literal. The hook template doesn't have `#`
                 // inside strings so the simple strip is safe.
                 let trimmed = line.trim_start();
-                if trimmed.starts_with('#') { return 0; }
+                if trimmed.starts_with('#') {
+                    return 0;
+                }
                 let code = match line.split_once('#') {
                     Some((before, _comment)) => before,
                     None => line,
@@ -4275,8 +4549,10 @@ mod stage3_powershell_hook_tests {
         // expect `^[a-f0-9]{16}$`.
         let h = hook_template_hash(HookKind::PowerShell);
         assert_eq!(h.len(), 16);
-        assert!(h.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
-                "PowerShell hook hash must be lowercase hex; got: {h}");
+        assert!(
+            h.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "PowerShell hook hash must be lowercase hex; got: {h}"
+        );
     }
 
     #[test]
@@ -4309,8 +4585,10 @@ mod stage3_powershell_hook_tests {
             .expect("write powershell hook");
         assert!(path.ends_with("hook.ps1"));
         let body = std::fs::read_to_string(&path).expect("read written hook");
-        assert!(body.contains("function global:aikey"),
-                "written hook.ps1 must contain the wrapper function");
+        assert!(
+            body.contains("function global:aikey"),
+            "written hook.ps1 must contain the wrapper function"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4361,8 +4639,10 @@ mod stage3_powershell_hook_tests {
 
         let path = result.expect("write_hook_file must succeed after holder releases");
         let body = std::fs::read_to_string(&path).expect("read written hook");
-        assert!(body.contains("function global:aikey"),
-                "post-retry content must be the new template, not the stale stub");
+        assert!(
+            body.contains("function global:aikey"),
+            "post-retry content must be the new template, not the stale stub"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -4371,20 +4651,32 @@ mod stage3_powershell_hook_tests {
     #[test]
     fn v3_rc_block_powershell_has_marker_pair() {
         let block = v3_rc_block_powershell();
-        assert!(block.contains(V3_BEGIN), "PowerShell v3 block must include begin marker");
-        assert!(block.contains(V3_END), "PowerShell v3 block must include end marker");
+        assert!(
+            block.contains(V3_BEGIN),
+            "PowerShell v3 block must include begin marker"
+        );
+        assert!(
+            block.contains(V3_END),
+            "PowerShell v3 block must include end marker"
+        );
     }
 
     #[test]
     fn v3_rc_block_powershell_uses_powershell_syntax_not_bash() {
         let block = v3_rc_block_powershell();
         // Must use Test-Path + dot-source, not bash `[[ -f ... ]] && source`.
-        assert!(block.contains("Test-Path") && block.contains(". $_aikeyHookFile"),
-                "PowerShell rc block must use Test-Path + . to source the hook");
-        assert!(!block.contains("[[ -f"),
-                "PowerShell rc block must NOT contain bash test syntax");
-        assert!(!block.contains("source ~/.aikey"),
-                "PowerShell rc block must NOT contain bash `source` syntax");
+        assert!(
+            block.contains("Test-Path") && block.contains(". $_aikeyHookFile"),
+            "PowerShell rc block must use Test-Path + . to source the hook"
+        );
+        assert!(
+            !block.contains("[[ -f"),
+            "PowerShell rc block must NOT contain bash test syntax"
+        );
+        assert!(
+            !block.contains("source ~/.aikey"),
+            "PowerShell rc block must NOT contain bash `source` syntax"
+        );
     }
 
     #[test]
@@ -4392,7 +4684,8 @@ mod stage3_powershell_hook_tests {
         // Verify the markers play nicely with the existing
         // replace_between_markers helper that bash/zsh path uses for
         // idempotent rewrites.
-        let original = "before\n# aikey shell hook v3 begin\nold-content\n# aikey shell hook v3 end\nafter\n";
+        let original =
+            "before\n# aikey shell hook v3 begin\nold-content\n# aikey shell hook v3 end\nafter\n";
         let new_block = v3_rc_block_powershell();
         let updated = replace_between_markers(original, V3_BEGIN, V3_END, &new_block).unwrap();
         assert!(updated.contains("before"));
@@ -4408,8 +4701,10 @@ mod stage3_powershell_hook_tests {
         // Always returns at least one path — the install needs to know
         // where to write even on a fresh machine without pwsh installed.
         let candidates = powershell_profile_candidates();
-        assert!(!candidates.is_empty(),
-                "powershell_profile_candidates must always return at least one path");
+        assert!(
+            !candidates.is_empty(),
+            "powershell_profile_candidates must always return at least one path"
+        );
     }
 
     #[cfg(windows)]
@@ -4417,11 +4712,13 @@ mod stage3_powershell_hook_tests {
     fn powershell_profile_candidates_windows_includes_documents_powershell() {
         let candidates = powershell_profile_candidates();
         let s: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
-        let any_pwsh7 = s.iter().any(|p|
+        let any_pwsh7 = s.iter().any(|p| {
             p.contains("Documents") && p.contains("PowerShell") && !p.contains("WindowsPowerShell")
+        });
+        assert!(
+            any_pwsh7,
+            "Windows candidates must include pwsh-7+ Documents\\PowerShell; got: {s:?}"
         );
-        assert!(any_pwsh7,
-                "Windows candidates must include pwsh-7+ Documents\\PowerShell; got: {s:?}");
     }
 
     #[cfg(windows)]
@@ -4430,8 +4727,10 @@ mod stage3_powershell_hook_tests {
         let candidates = powershell_profile_candidates();
         let s: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
         let any_5_1 = s.iter().any(|p| p.contains("WindowsPowerShell"));
-        assert!(any_5_1,
-                "Windows candidates must include legacy WindowsPowerShell 5.1; got: {s:?}");
+        assert!(
+            any_5_1,
+            "Windows candidates must include legacy WindowsPowerShell 5.1; got: {s:?}"
+        );
     }
 }
 
@@ -4461,7 +4760,10 @@ mod stage3_review_fix_tests {
                 Err(p) => p.into_inner(),
             };
             let prev = vars.iter().map(|v| (*v, std::env::var_os(v))).collect();
-            Self { _guard: guard, prev }
+            Self {
+                _guard: guard,
+                prev,
+            }
         }
     }
     impl Drop for EnvSnapshot {
@@ -4482,9 +4784,8 @@ mod stage3_review_fix_tests {
     /// to auto-detection. Post-fix: trim() catches it.
     #[test]
     fn shell_override_trims_trailing_whitespace() {
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::set_var("AIKEY_SHELL_OVERRIDE", "  powershell  ");
         std::env::remove_var("SHELL");
         std::env::remove_var("PSModulePath");
@@ -4497,9 +4798,8 @@ mod stage3_review_fix_tests {
     /// match the literal "zsh". Post-fix: trim() before split.
     #[test]
     fn shell_var_trims_whitespace_before_leaf_extraction() {
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::remove_var("AIKEY_SHELL_OVERRIDE");
         std::env::set_var("SHELL", "  /bin/zsh  ");
         std::env::remove_var("PSModulePath");
@@ -4516,9 +4816,8 @@ mod stage3_review_fix_tests {
     /// would mis-classify `/opt/myzsh-fork/bin/myshell`).
     #[test]
     fn shell_name_with_version_suffix_is_unknown_not_zsh() {
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::remove_var("AIKEY_SHELL_OVERRIDE");
         std::env::set_var("SHELL", "/usr/bin/zsh-5.9");
         std::env::remove_var("PSModulePath");
@@ -4536,9 +4835,8 @@ mod stage3_review_fix_tests {
     /// rather than falling through to a misleading Unknown fallback.
     #[test]
     fn unsupported_shells_classified_as_unknown() {
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::remove_var("AIKEY_SHELL_OVERRIDE");
         for unsup in ["/usr/bin/fish", "/bin/tcsh", "/bin/ksh", "/bin/dash"] {
             std::env::set_var("SHELL", unsup);
@@ -4560,9 +4858,8 @@ mod stage3_review_fix_tests {
     /// Post-fix: returns just an "open a new terminal" advisory.
     #[test]
     fn reload_hint_unknown_does_not_emit_source_keyword() {
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::remove_var("AIKEY_SHELL_OVERRIDE");
         std::env::remove_var("SHELL");
         std::env::remove_var("PSModulePath");
@@ -4590,9 +4887,8 @@ mod stage3_review_fix_tests {
             ("powershell", true),
             ("cmd", false),
         ] {
-            let _snap = EnvSnapshot::take(&[
-                "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-            ]);
+            let _snap =
+                EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
             std::env::set_var("AIKEY_SHELL_OVERRIDE", over);
             assert_eq!(
                 reload_hint_has_runnable_command(),
@@ -4604,9 +4900,8 @@ mod stage3_review_fix_tests {
 
     #[test]
     fn reload_hint_runnable_flag_false_for_unknown() {
-        let _snap = EnvSnapshot::take(&[
-            "AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec",
-        ]);
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
         std::env::remove_var("AIKEY_SHELL_OVERRIDE");
         std::env::remove_var("SHELL");
         std::env::remove_var("PSModulePath");
@@ -4638,7 +4933,9 @@ mod stage3_review_fix_tests {
         // Extract the body of `function global:aikey { ... }` (the
         // activate/deactivate wrapper) by walking braces.
         let needle = "function global:aikey {";
-        let start = full.find(needle).expect("hook.ps1 must define function global:aikey");
+        let start = full
+            .find(needle)
+            .expect("hook.ps1 must define function global:aikey");
         let body_start = start + needle.len();
         let mut depth: i32 = 1;
         let mut end = body_start;
@@ -4773,7 +5070,8 @@ mod stage3_review_fix_tests {
         // (not ReadLines): ..." doesn't trip the assertion. Block-comment
         // syntax doesn't exist in PowerShell line-by-line lexing for our
         // purposes here, so a simple split-on-`#` is sufficient.
-        let code_only: String = c.lines()
+        let code_only: String = c
+            .lines()
             .map(|line| line.split_once('#').map(|(b, _)| b).unwrap_or(line))
             .collect::<Vec<_>>()
             .join("\n");
@@ -4809,10 +5107,8 @@ mod stage3_review_fix_tests {
         // parent-exists preference logic (replicated here as a pure fn
         // since `ensure_powershell_hook` is private and writes to the
         // real `$PROFILE` on success).
-        let tmp = std::env::temp_dir().join(format!(
-            "aikey-ps-5-1-only-{}",
-            rand::random::<u64>(),
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("aikey-ps-5-1-only-{}", rand::random::<u64>(),));
         std::fs::create_dir_all(tmp.join("Documents/WindowsPowerShell")).unwrap();
         // Documents/PowerShell intentionally NOT created.
 

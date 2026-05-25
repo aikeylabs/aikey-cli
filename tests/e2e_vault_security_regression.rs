@@ -26,8 +26,8 @@ impl Drop for Env {
 
 impl Env {
     fn new(tag: &str) -> Self {
-        let tmp = std::env::temp_dir()
-            .join(format!("aikey-e2e-sec-{}-{}", tag, std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("aikey-e2e-sec-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join(".aikey/data")).expect("mkdir");
         Self { tmp }
@@ -60,8 +60,12 @@ impl Env {
             .env("AK_TEST_SECRET", secret)
             .output()
             .expect("spawn add");
-        assert!(out.status.success(),
-            "add {} failed: {}", alias, String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "add {} failed: {}",
+            alias,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Open the SQLite file with rusqlite directly so tests can simulate the
@@ -103,12 +107,14 @@ fn wrong_password_rejected_when_password_hash_missing() {
         .env("AK_TEST_SECRET", "sk-also-real")
         .output()
         .expect("spawn add");
-    assert!(!out.status.success(),
+    assert!(
+        !out.status.success(),
         "wrong password MUST be rejected when password_hash missing — the 2026-04-11 \
          bug allowed ANY password and silently stored it as the new hash.\n\
          stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -138,11 +144,13 @@ fn correct_password_still_works_when_password_hash_missing() {
         .env("AK_TEST_SECRET", "sk-2")
         .output()
         .expect("spawn add");
-    assert!(out.status.success(),
+    assert!(
+        out.status.success(),
         "correct password MUST still work even with password_hash missing.\n\
          stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 // ── aikey db upgrade/rollback smoke ─────────────────────────────────────
@@ -164,10 +172,16 @@ fn db_help_lists_upgrade_and_rollback() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    assert!(h.contains("upgrade"),
-        "db --help should list `upgrade`:\n{}", h);
-    assert!(h.contains("rollback"),
-        "db --help should list `rollback`:\n{}", h);
+    assert!(
+        h.contains("upgrade"),
+        "db --help should list `upgrade`:\n{}",
+        h
+    );
+    assert!(
+        h.contains("rollback"),
+        "db --help should list `rollback`:\n{}",
+        h
+    );
 }
 
 #[test]
@@ -185,11 +199,13 @@ fn db_upgrade_is_idempotent_on_current_vault() {
         .args(["db", "upgrade"])
         .output()
         .expect("spawn db upgrade");
-    assert!(out.status.success(),
+    assert!(
+        out.status.success(),
         "`db upgrade` on current vault should succeed (idempotent), got:\n\
          stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -213,20 +229,21 @@ fn db_upgrade_then_add_leaves_vault_usable() {
         .env("AK_TEST_SECRET", "sk-2")
         .output()
         .unwrap();
-    assert!(add.status.success(),
+    assert!(
+        add.status.success(),
         "add after `db upgrade` must work.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&add.stdout),
-        String::from_utf8_lossy(&add.stderr));
+        String::from_utf8_lossy(&add.stderr)
+    );
 
     // And list must show both keys.
-    let list = env
-        .cmd_with_password("pw")
-        .arg("list")
-        .output()
-        .unwrap();
+    let list = env.cmd_with_password("pw").arg("list").output().unwrap();
     let stdout = String::from_utf8_lossy(&list.stdout);
-    assert!(stdout.contains("k1") && stdout.contains("k2"),
-        "list should show both keys after upgrade:\n{}", stdout);
+    assert!(
+        stdout.contains("k1") && stdout.contains("k2"),
+        "list should show both keys after upgrade:\n{}",
+        stdout
+    );
 }
 
 // ── 2026-04-20: change-password left password_hash at the old key ───────
@@ -254,17 +271,22 @@ fn change_password_same_as_old_is_rejected() {
         .output()
         .expect("spawn change-password");
 
-    assert!(!out.status.success(),
+    assert!(
+        !out.status.success(),
         "running change-password with AK_TEST_PASSWORD set (which makes all \
          three prompts return the same value) must fail — otherwise the flow \
          would rotate salt + password_hash for no reason and any lingering \
          atomicity bug could brick the vault.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.to_lowercase().contains("differ") || stderr.to_lowercase().contains("same"),
-        "rejection message should explain why, got:\n{}", stderr);
+    assert!(
+        stderr.to_lowercase().contains("differ") || stderr.to_lowercase().contains("same"),
+        "rejection message should explain why, got:\n{}",
+        stderr
+    );
 
     // Post-condition: the original password still works.
     let get = env
@@ -272,9 +294,11 @@ fn change_password_same_as_old_is_rejected() {
         .args(["get", "k1"])
         .output()
         .expect("spawn get");
-    assert!(get.status.success(),
+    assert!(
+        get.status.success(),
         "after a rejected same-password change, the original password must \
          still unlock the vault.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&get.stdout),
-        String::from_utf8_lossy(&get.stderr));
+        String::from_utf8_lossy(&get.stderr)
+    );
 }

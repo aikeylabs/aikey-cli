@@ -157,7 +157,11 @@ fn enforce_owner_only(path: &Path, is_dir: bool) -> std::io::Result<()> {
         if !result.status.success() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("icacls /grant:r failed for {} on {}", principal, path.display()),
+                format!(
+                    "icacls /grant:r failed for {} on {}",
+                    principal,
+                    path.display()
+                ),
             ));
         }
     }
@@ -182,7 +186,11 @@ fn enforce_with_username(
         if !result.status.success() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("icacls /grant:r failed for {} on {}", principal, path.display()),
+                format!(
+                    "icacls /grant:r failed for {} on {}",
+                    principal,
+                    path.display()
+                ),
             ));
         }
     }
@@ -224,15 +232,16 @@ mod tests {
             "aikey-storage-acl-no-such-{}",
             rand::random::<u64>()
         ));
-        assert!(!phantom.exists(), "test invariant: phantom path must not exist");
+        assert!(
+            !phantom.exists(),
+            "test invariant: phantom path must not exist"
+        );
 
         // Both file and dir variants accept a non-existent path cleanly.
-        enforce_owner_only_file(&phantom).unwrap_or_else(|e| {
-            panic!("expected ok on nonexistent file path; got {e}")
-        });
-        enforce_owner_only_dir(&phantom).unwrap_or_else(|e| {
-            panic!("expected ok on nonexistent dir path; got {e}")
-        });
+        enforce_owner_only_file(&phantom)
+            .unwrap_or_else(|e| panic!("expected ok on nonexistent file path; got {e}"));
+        enforce_owner_only_dir(&phantom)
+            .unwrap_or_else(|e| panic!("expected ok on nonexistent dir path; got {e}"));
     }
 
     #[test]
@@ -244,9 +253,7 @@ mod tests {
         // accumulate over time.
         let dir = fresh_tempdir("idempotent");
         for round in 1..=3 {
-            enforce_owner_only_dir(&dir).unwrap_or_else(|e| {
-                panic!("round {round} failed: {e}")
-            });
+            enforce_owner_only_dir(&dir).unwrap_or_else(|e| panic!("round {round} failed: {e}"));
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -257,9 +264,7 @@ mod tests {
         let file = dir.join("vault.db");
         fs::write(&file, b"placeholder").unwrap();
         for round in 1..=3 {
-            enforce_owner_only_file(&file).unwrap_or_else(|e| {
-                panic!("round {round} failed: {e}")
-            });
+            enforce_owner_only_file(&file).unwrap_or_else(|e| panic!("round {round} failed: {e}"));
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -298,9 +303,8 @@ mod tests {
         let dir = fresh_tempdir("smoke-file");
         let file = dir.join("vault.db");
         fs::write(&file, b"placeholder").unwrap();
-        enforce_owner_only_file(&file).unwrap_or_else(|e| {
-            panic!("Windows enforce_owner_only_file smoke failed: {e}")
-        });
+        enforce_owner_only_file(&file)
+            .unwrap_or_else(|e| panic!("Windows enforce_owner_only_file smoke failed: {e}"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -308,9 +312,8 @@ mod tests {
     #[test]
     fn windows_smoke_succeeds_on_real_dir() {
         let dir = fresh_tempdir("smoke-dir");
-        enforce_owner_only_dir(&dir).unwrap_or_else(|e| {
-            panic!("Windows enforce_owner_only_dir smoke failed: {e}")
-        });
+        enforce_owner_only_dir(&dir)
+            .unwrap_or_else(|e| panic!("Windows enforce_owner_only_dir smoke failed: {e}"));
         let _ = fs::remove_dir_all(&dir);
     }
 

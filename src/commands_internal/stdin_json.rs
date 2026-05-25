@@ -41,7 +41,11 @@ pub fn set_dispatch_context(action: &'static str, request_id: Option<String>) {
 fn take_dispatch_context() -> Option<(&'static str, Option<String>, u128)> {
     let mut g = DISPATCH_CTX.lock().ok()?;
     let ctx = g.take()?;
-    Some((ctx.action, ctx.request_id, ctx.started_at.elapsed().as_millis()))
+    Some((
+        ctx.action,
+        ctx.request_id,
+        ctx.started_at.elapsed().as_millis(),
+    ))
 }
 
 /// 从 stdin 读全部字节并解析为 `StdinEnvelope`
@@ -50,9 +54,12 @@ fn take_dispatch_context() -> Option<(&'static str, Option<String>, u128)> {
 /// 调用方应立刻 `emit_error` 并退出。
 pub fn read_envelope() -> Result<StdinEnvelope, (&'static str, String)> {
     let mut buf = String::new();
-    io::stdin()
-        .read_to_string(&mut buf)
-        .map_err(|e| ("I_STDIN_READ_FAILED", format!("failed to read stdin: {}", e)))?;
+    io::stdin().read_to_string(&mut buf).map_err(|e| {
+        (
+            "I_STDIN_READ_FAILED",
+            format!("failed to read stdin: {}", e),
+        )
+    })?;
 
     if buf.trim().is_empty() {
         return Err((
@@ -61,8 +68,12 @@ pub fn read_envelope() -> Result<StdinEnvelope, (&'static str, String)> {
         ));
     }
 
-    let env: StdinEnvelope = serde_json::from_str(&buf)
-        .map_err(|e| ("I_STDIN_INVALID_JSON", format!("stdin is not valid JSON: {}", e)))?;
+    let env: StdinEnvelope = serde_json::from_str(&buf).map_err(|e| {
+        (
+            "I_STDIN_INVALID_JSON",
+            format!("stdin is not valid JSON: {}", e),
+        )
+    })?;
 
     // vault_key_hex 校验：空字符串允许通过 —— 表示 caller (Go local-server)
     // 故意没带 key，这种情况只用于 metadata-only read 操作（例如 `_internal
@@ -110,7 +121,13 @@ pub fn emit(env: &ResultEnvelope) {
             _ => {
                 let code = env.error_code.unwrap_or("I_UNKNOWN");
                 let msg = env.error_message.clone().unwrap_or_default();
-                internal_log::log_dispatch_error(action, req_id.as_deref(), code, &msg, duration_ms);
+                internal_log::log_dispatch_error(
+                    action,
+                    req_id.as_deref(),
+                    code,
+                    &msg,
+                    duration_ms,
+                );
             }
         }
     }
@@ -132,12 +149,19 @@ pub fn emit_error(request_id: Option<String>, code: &'static str, message: impl 
 
 /// 把 `vault_key_hex` 解码为 32 字节 key
 pub fn decode_vault_key(hex_str: &str) -> Result<[u8; 32], (&'static str, String)> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| ("I_VAULT_KEY_MALFORMED", format!("vault_key_hex decode failed: {}", e)))?;
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        (
+            "I_VAULT_KEY_MALFORMED",
+            format!("vault_key_hex decode failed: {}", e),
+        )
+    })?;
     if bytes.len() != 32 {
         return Err((
             "I_VAULT_KEY_MALFORMED",
-            format!("vault_key_hex decoded to {} bytes, expected 32", bytes.len()),
+            format!(
+                "vault_key_hex decoded to {} bytes, expected 32",
+                bytes.len()
+            ),
         ));
     }
     let mut key = [0u8; 32];

@@ -16,11 +16,7 @@ fn bin_path() -> PathBuf {
 /// Build a Command in a throwaway HOME with an empty vault path. No AK_TEST
 /// secret is set — commands that only query state must work without one.
 fn cmd_in_tmp(tag: &str) -> Command {
-    let home = std::env::temp_dir().join(format!(
-        "aikey-e2e-smoke-{}-{}",
-        tag,
-        std::process::id()
-    ));
+    let home = std::env::temp_dir().join(format!("aikey-e2e-smoke-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).expect("mkdir tmp");
     let vault = home.join(".aikey/data/vault.db");
@@ -52,13 +48,18 @@ fn version_prints_semver_style_version() {
     // `aikey version` prints to stderr so a shell alias like
     // `aikey version | grep ...` doesn't silently pollute stdout consumers.
     let output = String::from_utf8_lossy(&out.stderr);
-    assert!(output.contains("Version:"),
-        "version output missing 'Version:' line:\n{}", output);
+    assert!(
+        output.contains("Version:"),
+        "version output missing 'Version:' line:\n{}",
+        output
+    );
     assert!(
         output.split_whitespace().any(|tok| {
             let base = tok.split('-').next().unwrap_or("");
             base.split('.').count() >= 3
-                && base.split('.').all(|p| p.chars().any(|c| c.is_ascii_digit()))
+                && base
+                    .split('.')
+                    .all(|p| p.chars().any(|c| c.is_ascii_digit()))
         }),
         "version output didn't contain a numeric semver:\n{}",
         output
@@ -83,10 +84,19 @@ fn version_json_has_expected_keys() {
     let start = blob.find('{').expect("no `{` in version --json output");
     let end = blob.rfind('}').expect("no `}` in version --json output");
     let json_slice = &blob[start..=end];
-    let v: serde_json::Value = serde_json::from_str(json_slice)
-        .unwrap_or_else(|e| panic!("version --json not valid JSON: {}\n--- raw ---\n{}", e, blob));
+    let v: serde_json::Value = serde_json::from_str(json_slice).unwrap_or_else(|e| {
+        panic!(
+            "version --json not valid JSON: {}\n--- raw ---\n{}",
+            e, blob
+        )
+    });
     for key in &["version", "revision", "build_time"] {
-        assert!(v.get(key).is_some(), "missing key '{}' in version JSON: {}", key, json_slice);
+        assert!(
+            v.get(key).is_some(),
+            "missing key '{}' in version JSON: {}",
+            key,
+            json_slice
+        );
     }
 }
 
@@ -94,7 +104,10 @@ fn version_json_has_expected_keys() {
 
 #[test]
 fn status_on_clean_env_shows_gateway_and_login_sections() {
-    let out = cmd_in_tmp("status-clean").arg("status").output().expect("run status");
+    let out = cmd_in_tmp("status-clean")
+        .arg("status")
+        .output()
+        .expect("run status");
     // Exit code may be 0 or non-zero depending on health; we care about the
     // output shape being stable. At minimum the command must not panic.
     let combined = format!(
@@ -102,37 +115,58 @@ fn status_on_clean_env_shows_gateway_and_login_sections() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(combined.contains("Gateway") || combined.contains("gateway"),
-        "status output missing Gateway section:\n{}", combined);
-    assert!(combined.contains("Login") || combined.contains("login"),
-        "status output missing Login section:\n{}", combined);
+    assert!(
+        combined.contains("Gateway") || combined.contains("gateway"),
+        "status output missing Gateway section:\n{}",
+        combined
+    );
+    assert!(
+        combined.contains("Login") || combined.contains("login"),
+        "status output missing Login section:\n{}",
+        combined
+    );
 }
 
 // ── whoami ──────────────────────────────────────────────────────────────
 
 #[test]
 fn whoami_on_clean_env_reports_not_logged_in() {
-    let out = cmd_in_tmp("whoami-clean").arg("whoami").output().expect("run whoami");
+    let out = cmd_in_tmp("whoami-clean")
+        .arg("whoami")
+        .output()
+        .expect("run whoami");
     // whoami on empty state should succeed and hint how to proceed.
-    assert!(out.status.success(), "whoami should succeed on clean env, got:\nstdout: {}\nstderr: {}",
+    assert!(
+        out.status.success(),
+        "whoami should succeed on clean env, got:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr)
+    );
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(combined.contains("not logged in") || combined.contains("Account:"),
-        "whoami output should show login status:\n{}", combined);
-    assert!(combined.contains("aikey login"),
-        "whoami should hint `aikey login`:\n{}", combined);
+    assert!(
+        combined.contains("not logged in") || combined.contains("Account:"),
+        "whoami output should show login status:\n{}",
+        combined
+    );
+    assert!(
+        combined.contains("aikey login"),
+        "whoami should hint `aikey login`:\n{}",
+        combined
+    );
 }
 
 // ── doctor ──────────────────────────────────────────────────────────────
 
 #[test]
 fn doctor_runs_and_reports_check_lines() {
-    let out = cmd_in_tmp("doctor").arg("doctor").output().expect("run doctor");
+    let out = cmd_in_tmp("doctor")
+        .arg("doctor")
+        .output()
+        .expect("run doctor");
     // Doctor may exit non-zero when the environment is unhealthy (expected
     // on a clean tmpdir without a proxy). We only require that it runs to
     // completion and emits recognisable check output.
@@ -143,15 +177,18 @@ fn doctor_runs_and_reports_check_lines() {
     );
     assert!(
         combined.contains("cli version") || combined.contains("CLI"),
-        "doctor output missing 'cli version' line:\n{}", combined
+        "doctor output missing 'cli version' line:\n{}",
+        combined
     );
     assert!(
         combined.contains("vault") || combined.contains("Vault"),
-        "doctor output missing vault check:\n{}", combined
+        "doctor output missing vault check:\n{}",
+        combined
     );
     assert!(
         combined.contains("proxy") || combined.contains("Proxy"),
-        "doctor output missing proxy check:\n{}", combined
+        "doctor output missing proxy check:\n{}",
+        combined
     );
 }
 
@@ -170,13 +207,27 @@ fn help_lists_core_user_commands() {
     // with NO_COLOR set. Strip ANSI escape sequences before substring matching.
     let raw = String::from_utf8_lossy(&out.stdout).into_owned();
     let stripped = strip_ansi(&raw);
-    for cmd in &["add", "list", "use", "route", "activate", "deactivate",
-                 "doctor", "status", "whoami", "proxy", "run"] {
+    for cmd in &[
+        "add",
+        "list",
+        "use",
+        "route",
+        "activate",
+        "deactivate",
+        "doctor",
+        "status",
+        "whoami",
+        "proxy",
+        "run",
+    ] {
         // Commands appear in the form "  <cmd> " or "  <cmd>\n" in --help.
-        let found = stripped.contains(&format!("  {} ", cmd))
-            || stripped.contains(&format!("  {}\n", cmd));
-        assert!(found,
-            "--help missing documented command '{}':\n{}", cmd, stripped);
+        let found =
+            stripped.contains(&format!("  {} ", cmd)) || stripped.contains(&format!("  {}\n", cmd));
+        assert!(
+            found,
+            "--help missing documented command '{}':\n{}",
+            cmd, stripped
+        );
     }
 }
 

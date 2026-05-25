@@ -553,10 +553,8 @@ pub fn compute_proxy_state(inputs: &StateInputs) -> ProxyState {
                 // Our PID owns the port. Check /health to distinguish
                 // Running (admin handler responding) from Unresponsive
                 // (port bound but handler not yet up / hung).
-                let healthy = crate::proxy_proc::http_health_ok(
-                    port,
-                    std::time::Duration::from_millis(500),
-                );
+                let healthy =
+                    crate::proxy_proc::http_health_ok(port, std::time::Duration::from_millis(500));
                 if healthy {
                     ProxyState::Running {
                         pid,
@@ -634,8 +632,8 @@ fn classify_dead_pid(stale_pid: u32, port: u16) -> ProxyState {
 pub fn proxy_state(listen_addr: &str) -> ProxyState {
     let pid_path = pidfile_path()
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/_aikey_proxy_pidpath_unset"));
-    let meta_path =
-        meta_path().unwrap_or_else(|_| std::path::PathBuf::from("/tmp/_aikey_proxy_metapath_unset"));
+    let meta_path = meta_path()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/_aikey_proxy_metapath_unset"));
     let inputs = StateInputs {
         pid_path,
         meta_path,
@@ -686,9 +684,18 @@ mod tests {
         // resolve it. Pinning the format so future edits keep both.
         let r = OrphanReason::PortHeldByExternal;
         let hint = r.hint(27200, Some(99999));
-        assert!(hint.contains("27200"), "hint must name the conflicting port");
-        assert!(hint.contains("99999"), "hint must name the owner PID for forensics");
-        assert!(hint.contains("listen.port"), "hint must point users at the config knob");
+        assert!(
+            hint.contains("27200"),
+            "hint must name the conflicting port"
+        );
+        assert!(
+            hint.contains("99999"),
+            "hint must name the owner PID for forensics"
+        );
+        assert!(
+            hint.contains("listen.port"),
+            "hint must point users at the config knob"
+        );
     }
 
     #[test]
@@ -715,10 +722,7 @@ mod tests {
         // future "let's drop derive(PartialEq)" refactor that would break
         // every Stage 1/2 unit test silently.
         assert_eq!(ProxyState::Stopped, ProxyState::Stopped);
-        assert_ne!(
-            ProxyState::Stopped,
-            ProxyState::Crashed { stale_pid: 1 },
-        );
+        assert_ne!(ProxyState::Stopped, ProxyState::Crashed { stale_pid: 1 },);
     }
 
     // ── Sidecar meta IO + ownership tests ─────────────────────────────
@@ -862,8 +866,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = temp_meta_path(tmp.path());
         let me = std::process::id();
-        let live_token = crate::proxy_proc::process_birth_token(me)
-            .expect("self birth_token must succeed");
+        let live_token =
+            crate::proxy_proc::process_birth_token(me).expect("self birth_token must succeed");
         let m = sample_meta(me, &live_token);
         write_meta_atomic_at(&m, &path).unwrap();
         assert!(
@@ -921,7 +925,9 @@ mod tests {
         std::fs::write(&inputs.pid_path, "999999999").unwrap();
         assert_eq!(
             compute_proxy_state(&inputs),
-            ProxyState::Crashed { stale_pid: 999999999 }
+            ProxyState::Crashed {
+                stale_pid: 999999999
+            }
         );
     }
 
@@ -971,7 +977,10 @@ mod tests {
         // assert the OrphanedPort outer branch — both reasons produce
         // identical Layer 2 behavior (do not touch).
         match compute_proxy_state(&inputs) {
-            ProxyState::OrphanedPort { owner_pid: Some(pid), .. } => {
+            ProxyState::OrphanedPort {
+                owner_pid: Some(pid),
+                ..
+            } => {
                 assert_eq!(pid, me, "OrphanedPort owner_pid should be the pidfile pid");
             }
             other => panic!("expected OrphanedPort, got {other:?}"),

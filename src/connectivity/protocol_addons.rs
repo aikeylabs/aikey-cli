@@ -137,11 +137,17 @@ mod tests {
     fn anthropic_oauth_adds_beta_query_and_metadata() {
         let a = oauth_addons_for("anthropic").expect("anthropic OAuth addons must exist");
         let url = a.url("http://127.0.0.1:27200/anthropic", "/v1/messages");
-        assert!(url.ends_with("/v1/messages?beta=true"),
-            "anthropic OAuth must end with ?beta=true; got: {}", url);
+        assert!(
+            url.ends_with("/v1/messages?beta=true"),
+            "anthropic OAuth must end with ?beta=true; got: {}",
+            url
+        );
 
-        let body = a.body(serde_json::json!({"model": "claude-haiku-4-5-20251001", "max_tokens": 1}));
-        let meta = body.get("metadata").expect("metadata field must be injected");
+        let body =
+            a.body(serde_json::json!({"model": "claude-haiku-4-5-20251001", "max_tokens": 1}));
+        let meta = body
+            .get("metadata")
+            .expect("metadata field must be injected");
         assert_eq!(meta["user_id"], "aikey_doctor_probe");
         // 原有字段保留
         assert_eq!(body["model"], "claude-haiku-4-5-20251001");
@@ -152,23 +158,35 @@ mod tests {
         let a = oauth_addons_for("openai").expect("openai OAuth addons must exist");
         let url = a.url("http://127.0.0.1:27200/openai", "/v1/chat/completions");
         // path_override 取代了默认
-        assert!(url.ends_with("/responses"),
-            "Codex OAuth must use /responses; got: {}", url);
+        assert!(
+            url.ends_with("/responses"),
+            "Codex OAuth must use /responses; got: {}",
+            url
+        );
         // 无 query
-        assert!(!url.contains('?'), "Codex OAuth should not add query params; got: {}", url);
+        assert!(
+            !url.contains('?'),
+            "Codex OAuth should not add query params; got: {}",
+            url
+        );
 
         let body = a.body(serde_json::json!({"unused": "default body should be replaced"}));
         // body_override 完全替换
         assert_eq!(body["model"], "gpt-5.4");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
-        assert!(body.get("unused").is_none(), "body_override must drop default body");
+        assert!(
+            body.get("unused").is_none(),
+            "body_override must drop default body"
+        );
     }
 
     #[test]
     fn unknown_provider_returns_none() {
-        assert!(oauth_addons_for("kimi_code").is_none(),
-            "kimi_code OAuth not yet in registry — should return None until explicitly added");
+        assert!(
+            oauth_addons_for("kimi_code").is_none(),
+            "kimi_code OAuth not yet in registry — should return None until explicitly added"
+        );
         assert!(oauth_addons_for("gemini").is_none());
         assert!(oauth_addons_for("").is_none());
     }

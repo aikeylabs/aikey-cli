@@ -124,7 +124,9 @@ impl OpenAIAdapter {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(AikeyError::Provider(format!(
                 "OpenAI API error ({}): {}",
                 status, error_text
@@ -275,7 +277,9 @@ impl AnthropicAdapter {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+            let error_text = response
+                .text()
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(AikeyError::Provider(format!(
                 "Anthropic API error ({}): {}",
                 status, error_text

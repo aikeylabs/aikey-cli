@@ -69,7 +69,8 @@ pub struct ExpectedRecord {
 
 /// `note` 字段可以是 string 或 array — 兼容两种形态
 fn note_or_array<'de, D>(de: D) -> Result<Option<Vec<String>>, D::Error>
-where D: serde::Deserializer<'de>
+where
+    D: serde::Deserializer<'de>,
 {
     use serde::de::Error;
     let v = serde_json::Value::deserialize(de)?;
@@ -77,15 +78,22 @@ where D: serde::Deserializer<'de>
         serde_json::Value::Null => Ok(None),
         serde_json::Value::String(s) => Ok(Some(vec![s])),
         serde_json::Value::Array(arr) => {
-            let strs: Result<Vec<String>, _> = arr.into_iter()
+            let strs: Result<Vec<String>, _> = arr
+                .into_iter()
                 .map(|e| match e {
                     serde_json::Value::String(s) => Ok(s),
-                    other => Err(D::Error::custom(format!("note array item not string: {:?}", other))),
+                    other => Err(D::Error::custom(format!(
+                        "note array item not string: {:?}",
+                        other
+                    ))),
                 })
                 .collect();
             Ok(Some(strs?))
         }
-        other => Err(D::Error::custom(format!("note must be string|array|null, got {:?}", other))),
+        other => Err(D::Error::custom(format!(
+            "note must be string|array|null, got {:?}",
+            other
+        ))),
     }
 }
 
@@ -94,7 +102,9 @@ where D: serde::Deserializer<'de>
 // ============================================================
 
 pub fn testdata_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("testdata")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("testdata")
 }
 
 pub fn load_samples(path: &Path) -> Vec<Sample> {
@@ -104,11 +114,15 @@ pub fn load_samples(path: &Path) -> Vec<Sample> {
         .filter(|l| !l.trim().is_empty())
         .enumerate()
         .map(|(idx, line)| {
-            serde_json::from_str::<Sample>(line)
-                .unwrap_or_else(|e| panic!(
+            serde_json::from_str::<Sample>(line).unwrap_or_else(|e| {
+                panic!(
                     "parse {} line {} failed: {}\ncontent: {}",
-                    path.display(), idx + 1, e, line
-                ))
+                    path.display(),
+                    idx + 1,
+                    e,
+                    line
+                )
+            })
         })
         .collect()
 }
@@ -132,11 +146,20 @@ fn load_samples_smoke() {
     let dir = testdata_dir();
     for (file, _) in EXPECTED_SIZES {
         let samples = load_samples(&dir.join(file));
-        assert!(!samples.is_empty() || *file == "adversarial.jsonl", "{} parsed 0 samples", file);
+        assert!(
+            !samples.is_empty() || *file == "adversarial.jsonl",
+            "{} parsed 0 samples",
+            file
+        );
         // 每条 sample 有非空 id 和 type
         for s in &samples {
             assert!(!s.id.is_empty(), "{}: empty id", file);
-            assert!(!s.sample_type.is_empty(), "{}: empty type for {}", file, s.id);
+            assert!(
+                !s.sample_type.is_empty(),
+                "{}: empty type for {}",
+                file,
+                s.id
+            );
         }
     }
 }
@@ -148,9 +171,12 @@ fn sample_count_matches_ablation_spike_baseline() {
     for (file, expected) in EXPECTED_SIZES {
         let samples = load_samples(&dir.join(file));
         assert_eq!(
-            samples.len(), *expected,
+            samples.len(),
+            *expected,
             "{} has {} samples, expected {}",
-            file, samples.len(), expected
+            file,
+            samples.len(),
+            expected
         );
     }
 }
@@ -159,7 +185,8 @@ fn sample_count_matches_ablation_spike_baseline() {
 fn total_sample_count() {
     // 总数应该是 96（30 train + 66 test + adversarial）
     let dir = testdata_dir();
-    let total: usize = EXPECTED_SIZES.iter()
+    let total: usize = EXPECTED_SIZES
+        .iter()
         .map(|(f, _)| load_samples(&dir.join(f)).len())
         .sum();
     assert_eq!(total, 96, "total sample count drifted from baseline");
@@ -177,14 +204,17 @@ fn total_sample_count() {
 fn train_test_no_leak_v1_text_level() {
     let dir = testdata_dir();
     let train = load_samples(&dir.join("train.jsonl"));
-    let train_texts: std::collections::HashSet<&str> = train.iter().map(|s| s.text.as_str()).collect();
+    let train_texts: std::collections::HashSet<&str> =
+        train.iter().map(|s| s.text.as_str()).collect();
 
     for (file, _) in EXPECTED_SIZES.iter().filter(|(f, _)| *f != "train.jsonl") {
         let test_set = load_samples(&dir.join(file));
         for s in &test_set {
             assert!(
                 !train_texts.contains(s.text.as_str()),
-                "LEAK: train text appears verbatim in {} sample '{}'", file, s.id
+                "LEAK: train text appears verbatim in {} sample '{}'",
+                file,
+                s.id
             );
         }
     }
@@ -200,8 +230,12 @@ fn train_test_no_leak_v1_secret_value_level() {
     let mut train_secrets: std::collections::HashSet<String> = std::collections::HashSet::new();
     for s in &train {
         for r in &s.expected.drafts {
-            if let Some(v) = &r.secret_like { train_secrets.insert(v.clone()); }
-            if let Some(v) = &r.password_like { train_secrets.insert(v.clone()); }
+            if let Some(v) = &r.secret_like {
+                train_secrets.insert(v.clone());
+            }
+            if let Some(v) = &r.password_like {
+                train_secrets.insert(v.clone());
+            }
         }
     }
 
@@ -210,14 +244,22 @@ fn train_test_no_leak_v1_secret_value_level() {
         for s in &test_set {
             for r in &s.expected.drafts {
                 if let Some(v) = &r.secret_like {
-                    assert!(!train_secrets.contains(v),
+                    assert!(
+                        !train_secrets.contains(v),
                         "LEAK: secret value '{}' from {} sample '{}' also appears in train",
-                        v, file, s.id);
+                        v,
+                        file,
+                        s.id
+                    );
                 }
                 if let Some(v) = &r.password_like {
-                    assert!(!train_secrets.contains(v),
+                    assert!(
+                        !train_secrets.contains(v),
                         "LEAK: password value '{}' from {} sample '{}' also appears in train",
-                        v, file, s.id);
+                        v,
+                        file,
+                        s.id
+                    );
                 }
             }
         }
@@ -234,12 +276,21 @@ fn expected_provider_labels_present_on_apikey_set() {
     // 两种样本。Phase 1 只要求至少 5 个样本有显式 provider 标签（保证 fingerprint
     // 分类器在 Phase 3 时有足够 ground-truth 样本可跑准确率门控）。
     let samples = load_samples(&testdata_dir().join("ood_apikey.jsonl"));
-    let with_label = samples.iter()
-        .filter(|s| s.expected.drafts.iter().any(|r| r.expected_provider.is_some()))
+    let with_label = samples
+        .iter()
+        .filter(|s| {
+            s.expected
+                .drafts
+                .iter()
+                .any(|r| r.expected_provider.is_some())
+        })
         .count();
-    assert!(with_label >= 5,
+    assert!(
+        with_label >= 5,
         "expected_provider labeled samples must be ≥ 5 for fingerprint accuracy test; got {}/{}",
-        with_label, samples.len());
+        with_label,
+        samples.len()
+    );
 }
 
 #[test]
@@ -247,8 +298,11 @@ fn adversarial_samples_have_empty_drafts() {
     // 对抗样本按定义 expected.drafts 必须为空（否则不是对抗）
     let samples = load_samples(&testdata_dir().join("adversarial.jsonl"));
     for s in &samples {
-        assert!(s.expected.drafts.is_empty(),
-            "adversarial sample '{}' has non-empty drafts — not adversarial by definition", s.id);
+        assert!(
+            s.expected.drafts.is_empty(),
+            "adversarial sample '{}' has non-empty drafts — not adversarial by definition",
+            s.id
+        );
     }
 }
 
@@ -259,8 +313,8 @@ fn adversarial_samples_have_empty_drafts() {
 // 通过 `_internal parse` 子命令跑当前规则引擎 v2，统计 recall / precision / FP。
 // 双轨门控（百分比 OR 绝对计数）：解决 97 样本下单次 miss 造成大百分比波动的问题。
 
-use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin;
+use assert_cmd::Command;
 
 /// 统计单个测试集的 recall + FP（用于 adversarial）
 struct EvalResult {
@@ -293,7 +347,8 @@ fn run_parse_via_cli(text: &str) -> serde_json::Value {
         .get_output()
         .clone();
     let s = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str(s.trim()).unwrap_or_else(|e| panic!("parse stdout failed: {} raw={}", e, s))
+    serde_json::from_str(s.trim())
+        .unwrap_or_else(|e| panic!("parse stdout failed: {} raw={}", e, s))
 }
 
 /// 对一个测试集跑 evaluate：比对 parse 输出 candidates 与 expected 字段
@@ -307,14 +362,18 @@ fn evaluate_rule_only(path: &std::path::Path) -> EvalResult {
 
     for s in &samples {
         let response = run_parse_via_cli(&s.text);
-        let cands = response["data"]["candidates"].as_array().cloned().unwrap_or_default();
+        let cands = response["data"]["candidates"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
 
         // 收集抽取到的 value，按 kind 分桶
         let mut found: std::collections::HashMap<String, std::collections::HashSet<String>> =
             std::collections::HashMap::new();
         for c in &cands {
             if let (Some(kind), Some(value)) = (c["kind"].as_str(), c["value"].as_str()) {
-                found.entry(kind.to_string())
+                found
+                    .entry(kind.to_string())
                     .or_default()
                     .insert(value.to_string());
             }
@@ -327,7 +386,9 @@ fn evaluate_rule_only(path: &std::path::Path) -> EvalResult {
             // 勾选也不自动导入。用户看到橙色警示需主动确认 —— 不算"静默误导入"。
             for c in &cands {
                 let tier = c["tier"].as_str().unwrap_or("unknown");
-                if tier == "warn" { continue; }
+                if tier == "warn" {
+                    continue;
+                }
                 adv_fp += 1;
                 if let (Some(k), Some(v)) = (c["kind"].as_str(), c["value"].as_str()) {
                     adv_fp_items.push((s.id.clone(), k.to_string(), v.to_string()));
@@ -363,28 +424,43 @@ fn evaluate_rule_only(path: &std::path::Path) -> EvalResult {
         }
     }
 
-    EvalResult { recall_hit: hit, recall_total: total, adversarial_fp: adv_fp, misses, adv_fp_items }
+    EvalResult {
+        recall_hit: hit,
+        recall_total: total,
+        adversarial_fp: adv_fp,
+        misses,
+        adv_fp_items,
+    }
 }
 
 /// 双轨门控：recall 百分比 OR 绝对 miss 计数（任一成立即过）
-fn assert_recall_dual_gate(
-    label: &str,
-    result: &EvalResult,
-    min_recall: f64,
-    max_miss: usize,
-) {
+fn assert_recall_dual_gate(label: &str, result: &EvalResult, min_recall: f64, max_miss: usize) {
     let miss = result.recall_total.saturating_sub(result.recall_hit);
-    let rate = if result.recall_total == 0 { 1.0 }
-               else { result.recall_hit as f64 / result.recall_total as f64 };
+    let rate = if result.recall_total == 0 {
+        1.0
+    } else {
+        result.recall_hit as f64 / result.recall_total as f64
+    };
     assert!(
         rate >= min_recall || miss <= max_miss,
         "{}: recall {}/{} = {:.3} < {:.3} AND miss {} > {}",
-        label, result.recall_hit, result.recall_total, rate, min_recall, miss, max_miss
+        label,
+        result.recall_hit,
+        result.recall_total,
+        rate,
+        min_recall,
+        miss,
+        max_miss
     );
     eprintln!(
         "[{}] R={}/{}={:.1}% miss={} (gate: ≥{:.0}% OR ≤{})",
-        label, result.recall_hit, result.recall_total, rate * 100.0,
-        miss, min_recall * 100.0, max_miss
+        label,
+        result.recall_hit,
+        result.recall_total,
+        rate * 100.0,
+        miss,
+        min_recall * 100.0,
+        max_miss
     );
 }
 
@@ -450,12 +526,19 @@ fn evaluate_fingerprint(path: &std::path::Path) -> FingerprintEval {
     for s in &samples {
         // 只评估带 expected_provider 标签的 draft
         for r in &s.expected.drafts {
-            let Some(expected) = r.expected_provider.as_ref() else { continue };
-            let Some(expected_secret) = r.secret_like.as_ref() else { continue };
+            let Some(expected) = r.expected_provider.as_ref() else {
+                continue;
+            };
+            let Some(expected_secret) = r.secret_like.as_ref() else {
+                continue;
+            };
             total += 1;
 
             let response = run_parse_via_cli(&s.text);
-            let cands = response["data"]["candidates"].as_array().cloned().unwrap_or_default();
+            let cands = response["data"]["candidates"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             // 在 candidates 里找 value == expected_secret 的 secret_like 候选
             let hit = cands.iter().find(|c| {
                 c["kind"].as_str() == Some("secret_like")
@@ -486,18 +569,30 @@ fn evaluate_fingerprint(path: &std::path::Path) -> FingerprintEval {
         }
     }
 
-    FingerprintEval { correct, total_labeled: total, mismatches }
+    FingerprintEval {
+        correct,
+        total_labeled: total,
+        mismatches,
+    }
 }
 
 /// 判定分类是否 valid。接受精确匹配 + "ambiguous 基类 → siblings 精化"
 fn is_valid_classification(expected: &str, actual: &str) -> bool {
-    if expected == actual { return true; }
+    if expected == actual {
+        return true;
+    }
     // generic_sk 可被 URL 上下文精化为具体 provider（与 YAML siblings 字段对齐）
     if expected == "generic_sk" {
         return [
-            "kimi", "deepseek", "yunwu", "zeroeleven",
-            "mistral", "siliconflow", "generic_other",
-        ].contains(&actual);
+            "kimi",
+            "deepseek",
+            "yunwu",
+            "zeroeleven",
+            "mistral",
+            "siliconflow",
+            "generic_other",
+        ]
+        .contains(&actual);
     }
     // zhipu_glm 类似
     if expected == "zhipu_glm" {
@@ -510,16 +605,28 @@ fn is_valid_classification(expected: &str, actual: &str) -> bool {
 fn fingerprint_accuracy_on_ood_apikey_gate() {
     let r = evaluate_fingerprint(&testdata_dir().join("ood_apikey.jsonl"));
     let miss = r.total_labeled.saturating_sub(r.correct);
-    let rate = if r.total_labeled == 0 { 1.0 } else { r.correct as f64 / r.total_labeled as f64 };
-    eprintln!("[fingerprint.ood_apikey] {}/{} = {:.1}% miss={}",
-        r.correct, r.total_labeled, rate * 100.0, miss);
+    let rate = if r.total_labeled == 0 {
+        1.0
+    } else {
+        r.correct as f64 / r.total_labeled as f64
+    };
+    eprintln!(
+        "[fingerprint.ood_apikey] {}/{} = {:.1}% miss={}",
+        r.correct,
+        r.total_labeled,
+        rate * 100.0,
+        miss
+    );
     for (id, exp, got, tok) in &r.mismatches {
         eprintln!("  ✗ {}  exp={}  got={}  tok={}", id, exp, got, tok);
     }
     assert!(
         rate >= 0.95 || miss <= 1,
         "fingerprint.ood_apikey accuracy {}/{} ({:.1}%) miss={}: gate ≥95% OR miss≤1",
-        r.correct, r.total_labeled, rate * 100.0, miss
+        r.correct,
+        r.total_labeled,
+        rate * 100.0,
+        miss
     );
 }
 
@@ -527,16 +634,28 @@ fn fingerprint_accuracy_on_ood_apikey_gate() {
 fn fingerprint_accuracy_on_ood_realworld_gate() {
     let r = evaluate_fingerprint(&testdata_dir().join("ood_realworld.jsonl"));
     let miss = r.total_labeled.saturating_sub(r.correct);
-    let rate = if r.total_labeled == 0 { 1.0 } else { r.correct as f64 / r.total_labeled as f64 };
-    eprintln!("[fingerprint.ood_realworld] {}/{} = {:.1}% miss={}",
-        r.correct, r.total_labeled, rate * 100.0, miss);
+    let rate = if r.total_labeled == 0 {
+        1.0
+    } else {
+        r.correct as f64 / r.total_labeled as f64
+    };
+    eprintln!(
+        "[fingerprint.ood_realworld] {}/{} = {:.1}% miss={}",
+        r.correct,
+        r.total_labeled,
+        rate * 100.0,
+        miss
+    );
     for (id, exp, got, tok) in &r.mismatches {
         eprintln!("  ✗ {}  exp={}  got={}  tok={}", id, exp, got, tok);
     }
     assert!(
         rate >= 0.95 || miss <= 1,
         "fingerprint.ood_realworld accuracy {}/{} ({:.1}%) miss={}: gate ≥95% OR miss≤1",
-        r.correct, r.total_labeled, rate * 100.0, miss
+        r.correct,
+        r.total_labeled,
+        rate * 100.0,
+        miss
     );
 }
 
@@ -554,9 +673,12 @@ fn rule_v2_plus_crf_in_dist_recall_100() {
     // CRF 启用后，in-dist 期望 100%（而非 89.7%）
     // Why：Phase 2 的 in_dist miss 主要是 `d853aXYZ999` 这种中等长度混合 hex —— CRF 专门救这种
     let r = evaluate_rule_only(&testdata_dir().join("in_dist.jsonl"));
-    eprintln!("[c3_in_dist] {}/{}={}%",
-        r.recall_hit, r.recall_total,
-        (r.recall_hit as f64 / r.recall_total as f64 * 100.0) as i64);
+    eprintln!(
+        "[c3_in_dist] {}/{}={}%",
+        r.recall_hit,
+        r.recall_total,
+        (r.recall_hit as f64 / r.recall_total as f64 * 100.0) as i64
+    );
     for (id, kind, value) in &r.misses {
         eprintln!("  ✗ {} {} = {}", id, kind, value);
     }
@@ -577,7 +699,8 @@ fn rule_v2_plus_crf_adversarial_fp_cap() {
     }
     assert!(
         r.adversarial_fp <= 1,
-        "C3 adversarial FP = {} exceeds cap of 1 (shape filter regression?)", r.adversarial_fp
+        "C3 adversarial FP = {} exceeds cap of 1 (shape filter regression?)",
+        r.adversarial_fp
     );
 }
 
@@ -590,7 +713,12 @@ fn pipeline_e2e_golden_all_samples_full_recall() {
     // 端到端断言：对 97 样本里的每一条，parse 响应的 candidates 必须覆盖
     // expected.drafts 里所有非空字段（email / password_like / secret_like / url / base_url）。
     // adversarial 集合单独在 c3_adversarial 门控检验，此测试跳过。
-    let files = ["in_dist.jsonl", "ood_layouts.jsonl", "ood_apikey.jsonl", "ood_realworld.jsonl"];
+    let files = [
+        "in_dist.jsonl",
+        "ood_layouts.jsonl",
+        "ood_apikey.jsonl",
+        "ood_realworld.jsonl",
+    ];
     let dir = testdata_dir();
     let mut total_expected = 0usize;
     let mut total_hit = 0usize;
@@ -606,9 +734,15 @@ fn pipeline_e2e_golden_all_samples_full_recall() {
     }
 
     let rate = total_hit as f64 / total_expected as f64;
-    eprintln!("[e2e_golden] total recall {}/{} = {:.2}%",
-        total_hit, total_expected, rate * 100.0);
-    for f in &sample_failures { eprintln!("  ✗ {}", f); }
+    eprintln!(
+        "[e2e_golden] total recall {}/{} = {:.2}%",
+        total_hit,
+        total_expected,
+        rate * 100.0
+    );
+    for f in &sample_failures {
+        eprintln!("  ✗ {}", f);
+    }
 
     // Stage 3 Phase 4 退出基线：4 个正样本集综合 recall = 100%
     assert_eq!(
@@ -626,12 +760,13 @@ fn fingerprint_coverage_audit() {
 
     // 解析 YAML（直接读文件，避免 cli 依赖）
     let yaml_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("data").join("provider_fingerprint.yaml");
-    let yaml_text = std::fs::read_to_string(&yaml_path)
-        .expect("provider_fingerprint.yaml missing");
+        .join("data")
+        .join("provider_fingerprint.yaml");
+    let yaml_text = std::fs::read_to_string(&yaml_path).expect("provider_fingerprint.yaml missing");
     let yaml: serde_yaml::Value = serde_yaml::from_str(&yaml_text).expect("parse yaml");
     let providers = yaml["providers"].as_sequence().expect("providers array");
-    let all_ids: Vec<(String, String)> = providers.iter()
+    let all_ids: Vec<(String, String)> = providers
+        .iter()
         .filter_map(|p| {
             let id = p["id"].as_str()?.to_string();
             let tier = p["tier"].as_str()?.to_string();
@@ -642,7 +777,12 @@ fn fingerprint_coverage_audit() {
     // 收集 testdata 的 expected_provider 标签
     let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
     let dir = testdata_dir();
-    for file in ["in_dist.jsonl", "ood_layouts.jsonl", "ood_apikey.jsonl", "ood_realworld.jsonl"] {
+    for file in [
+        "in_dist.jsonl",
+        "ood_layouts.jsonl",
+        "ood_apikey.jsonl",
+        "ood_realworld.jsonl",
+    ] {
         for s in load_samples(&dir.join(file)) {
             for r in &s.expected.drafts {
                 if let Some(p) = &r.expected_provider {
@@ -662,38 +802,56 @@ fn fingerprint_coverage_audit() {
         }
     }
 
-    eprintln!("[fingerprint_coverage] {}/{} providers covered by testdata",
-        covered_count, all_ids.len());
+    eprintln!(
+        "[fingerprint_coverage] {}/{} providers covered by testdata",
+        covered_count,
+        all_ids.len()
+    );
     eprintln!("  covered: {:?}", covered);
     if !uncovered_confirmed.is_empty() {
         eprintln!("  uncovered confirmed-tier providers (expect in Stage 3.1+ sample expansion):");
-        for id in &uncovered_confirmed { eprintln!("    - {}", id); }
+        for id in &uncovered_confirmed {
+            eprintln!("    - {}", id);
+        }
     }
 
     // Stage 3 Phase 4 不硬性要求 100% 覆盖（POC 样本是已知子集）。
     // 但至少 5 个 confirmed 必须被 covered 才能保证 Phase 3 准确率门控有代表性样本。
-    let confirmed_covered = all_ids.iter()
+    let confirmed_covered = all_ids
+        .iter()
         .filter(|(id, t)| t == "confirmed" && covered.contains(id))
         .count();
-    assert!(confirmed_covered >= 5,
+    assert!(
+        confirmed_covered >= 5,
         "only {} confirmed-tier providers have testdata; need ≥5 for fingerprint gate validity",
-        confirmed_covered);
+        confirmed_covered
+    );
 }
 
 #[test]
 fn fingerprint_warn_tier_signal_for_uuid() {
     // APK-04 的 expected_provider 是 "uuid"（warn tier）；UI 需要拿到 warn 信号
     let samples = load_samples(&testdata_dir().join("ood_apikey.jsonl"));
-    let apk04 = samples.iter().find(|s| s.id == "APK-04").expect("APK-04 exists");
+    let apk04 = samples
+        .iter()
+        .find(|s| s.id == "APK-04")
+        .expect("APK-04 exists");
     let response = run_parse_via_cli(&apk04.text);
-    let cands = response["data"]["candidates"].as_array().cloned().unwrap_or_default();
+    let cands = response["data"]["candidates"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
 
     let uuid_val = "550e8400-e29b-41d4-a716-446655440000";
     let uuid_cand = cands.iter().find(|c| c["value"].as_str() == Some(uuid_val));
     if let Some(c) = uuid_cand {
         // candidate.tier 应该升级为 warn
-        assert_eq!(c["tier"].as_str(), Some("warn"),
-            "UUID candidate should have tier=warn, got: {:?}", c["tier"]);
+        assert_eq!(
+            c["tier"].as_str(),
+            Some("warn"),
+            "UUID candidate should have tier=warn, got: {:?}",
+            c["tier"]
+        );
         // provider.id 应该是 uuid
         assert_eq!(c["provider"]["id"].as_str(), Some("uuid"));
     }

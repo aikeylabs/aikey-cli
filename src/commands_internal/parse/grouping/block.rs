@@ -28,36 +28,46 @@ pub fn split_into_blocks(text: &str) -> Vec<Block> {
         // v4.1 M1:注释行视为 block 间隔,不进任何 block
         //   `# dev-old@acme.cn` 被软删除的凭证不应装配成 Draft
         if lc.flags.contains(LineFlags::IS_COMMENT) {
-            if let Some(b) = cur.take() { blocks.push(b); }
+            if let Some(b) = cur.take() {
+                blocks.push(b);
+            }
             continue;
         }
         let k = lc.kind;
         match k {
             LineKind::Empty | LineKind::Separator => {
-                if let Some(b) = cur.take() { blocks.push(b); }
+                if let Some(b) = cur.take() {
+                    blocks.push(b);
+                }
             }
             LineKind::Title => {
-                if let Some(b) = cur.take() { blocks.push(b); }
+                if let Some(b) = cur.take() {
+                    blocks.push(b);
+                }
                 let trimmed = line.trim();
                 let first = trimmed.split_whitespace().next().unwrap_or("");
                 let is_kebab_alias_first = first.len() >= 5
                     && first.contains('-')
-                    && first.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-                let hint_text = if first.len() > 1
-                    && (first.ends_with(':') || first.ends_with('\u{FF1A}'))
-                {
-                    first.trim_end_matches(':').trim_end_matches('\u{FF1A}').to_string()
-                } else if is_kebab_alias_first {
-                    first.to_string()
-                } else {
-                    trimmed
-                        .trim_end_matches(':')
-                        .trim_end_matches('\u{FF1A}')
-                        .trim()
-                        .trim_matches(|c: char| c == '=' || c == '#' || c == '*')
-                        .trim()
-                        .to_string()
-                };
+                    && first
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+                let hint_text =
+                    if first.len() > 1 && (first.ends_with(':') || first.ends_with('\u{FF1A}')) {
+                        first
+                            .trim_end_matches(':')
+                            .trim_end_matches('\u{FF1A}')
+                            .to_string()
+                    } else if is_kebab_alias_first {
+                        first.to_string()
+                    } else {
+                        trimmed
+                            .trim_end_matches(':')
+                            .trim_end_matches('\u{FF1A}')
+                            .trim()
+                            .trim_matches(|c: char| c == '=' || c == '#' || c == '*')
+                            .trim()
+                            .to_string()
+                    };
                 cur = Some(Block {
                     start_line: i,
                     end_line: i,
@@ -74,23 +84,20 @@ pub fn split_into_blocks(text: &str) -> Vec<Block> {
                     None => {
                         // 兜底:新 block 无 Title 开头,但首行 Credential 且首 token 带 `:` 结尾
                         // (如 `OpenAI: sk-proj-...`),把 token 作 provider_hint
-                        let hint = line.trim()
-                            .split_whitespace()
-                            .next()
-                            .and_then(|first| {
-                                if first.len() > 1
-                                    && (first.ends_with(':') || first.ends_with('\u{FF1A}'))
-                                {
-                                    Some(
-                                        first
-                                            .trim_end_matches(':')
-                                            .trim_end_matches('\u{FF1A}')
-                                            .to_string(),
-                                    )
-                                } else {
-                                    None
-                                }
-                            });
+                        let hint = line.trim().split_whitespace().next().and_then(|first| {
+                            if first.len() > 1
+                                && (first.ends_with(':') || first.ends_with('\u{FF1A}'))
+                            {
+                                Some(
+                                    first
+                                        .trim_end_matches(':')
+                                        .trim_end_matches('\u{FF1A}')
+                                        .to_string(),
+                                )
+                            } else {
+                                None
+                            }
+                        });
                         cur = Some(Block {
                             start_line: i,
                             end_line: i,
@@ -102,7 +109,9 @@ pub fn split_into_blocks(text: &str) -> Vec<Block> {
             }
         }
     }
-    if let Some(b) = cur { blocks.push(b); }
+    if let Some(b) = cur {
+        blocks.push(b);
+    }
     blocks
 }
 

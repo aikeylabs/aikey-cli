@@ -82,7 +82,10 @@ fn open_browser_or_print(url: &str, as_json: bool) -> Result<(), String> {
         }
     } else {
         if as_json {
-            println!(r#"{{"status":"ok","url":"{}","browser":"print_only"}}"#, url);
+            println!(
+                r#"{{"status":"ok","url":"{}","browser":"print_only"}}"#,
+                url
+            );
         } else {
             println!(
                 "Browser could not be opened. Paste this URL into your browser manually:\n  {}",
@@ -143,11 +146,8 @@ fn run_headless(
     _provider: Option<&str>,
     as_json: bool,
 ) -> Result<(), String> {
-    let path = file.ok_or_else(|| {
-        "--non-interactive requires a FILE argument".to_string()
-    })?;
-    let _text = fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let path = file.ok_or_else(|| "--non-interactive requires a FILE argument".to_string())?;
+    let _text = fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
 
     // Headless parse+confirm requires an authenticated session cookie plus a
     // pre-unlocked vault. That machinery is a v1.1 item per the
@@ -164,5 +164,8 @@ fn run_headless(
     } else {
         eprintln!("{}", msg);
     }
-    Err(format!("{} headless import not implemented in v1.0", ERR_I_NOT_IMPLEMENTED))
+    Err(format!(
+        "{} headless import not implemented in v1.0",
+        ERR_I_NOT_IMPLEMENTED
+    ))
 }

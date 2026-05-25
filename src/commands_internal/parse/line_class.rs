@@ -98,17 +98,28 @@ pub fn line_class(line: &str) -> LineClass {
     let t = line.trim();
     let mut flags = LineFlags::empty();
     if t.is_empty() {
-        return LineClass { kind: LineKind::Empty, flags };
+        return LineClass {
+            kind: LineKind::Empty,
+            flags,
+        };
     }
 
     let has_email = re_email().is_match(t);
     let has_secret = re_any_secret().is_match(t);
     let has_url = re_url().is_match(t);
 
-    if has_email { flags |= LineFlags::HAS_EMAIL; }
-    if has_secret { flags |= LineFlags::HAS_SECRET; }
-    if has_url { flags |= LineFlags::HAS_URL; }
-    if t.contains("----") { flags |= LineFlags::HAS_DASH_RUN; }
+    if has_email {
+        flags |= LineFlags::HAS_EMAIL;
+    }
+    if has_secret {
+        flags |= LineFlags::HAS_SECRET;
+    }
+    if has_url {
+        flags |= LineFlags::HAS_URL;
+    }
+    if t.contains("----") {
+        flags |= LineFlags::HAS_DASH_RUN;
+    }
 
     // v3.1 M1: 注释标记（`#` 含 Markdown heading; `//` 编程; `;` ini/conf; `<!--` HTML）
     //   Heading + 下面 commented-out secret 的粘贴笔记里，用户写 # 就是想"软删除"
@@ -118,7 +129,10 @@ pub fn line_class(line: &str) -> LineClass {
 
     let lower = t.to_lowercase();
     for lbl in &["密码", "password:", "pwd:", "pw:", "pass:"] {
-        if lower.contains(lbl) { flags |= LineFlags::HAS_PWD_LABEL; break; }
+        if lower.contains(lbl) {
+            flags |= LineFlags::HAS_PWD_LABEL;
+            break;
+        }
     }
 
     // 首 token 以 `:` 结尾？
@@ -127,8 +141,14 @@ pub fn line_class(line: &str) -> LineClass {
         flags |= LineFlags::HAS_LABEL_COLON;
     }
     // 项目符号
-    if first == "-" || first == "*" || first == "\u{2022}"
-        || first.ends_with(')') && first.trim_end_matches(')').chars().all(|c| c.is_ascii_digit())
+    if first == "-"
+        || first == "*"
+        || first == "\u{2022}"
+        || first.ends_with(')')
+            && first
+                .trim_end_matches(')')
+                .chars()
+                .all(|c| c.is_ascii_digit())
     {
         flags |= LineFlags::STARTS_BULLET;
     }
@@ -140,10 +160,16 @@ pub fn line_class(line: &str) -> LineClass {
 
     // Priority 1 — 有凭证内容优先（避免 "----hunter2----sk-..." 被错判为 Separator）
     if t.contains("----") && (has_email || has_secret) {
-        return LineClass { kind: LineKind::Complex, flags };
+        return LineClass {
+            kind: LineKind::Complex,
+            flags,
+        };
     }
     if has_email || has_secret {
-        return LineClass { kind: LineKind::Credential, flags };
+        return LineClass {
+            kind: LineKind::Credential,
+            flags,
+        };
     }
 
     // Priority 2 — 分隔符行
@@ -151,36 +177,57 @@ pub fn line_class(line: &str) -> LineClass {
     //   (b) banner `---- PROD ----` / `=== DEV ===`
     //   (c) 注释包裹 banner `# --- 公司项目 ---` —— kind 升 Separator, flags 保留 IS_COMMENT
     if re_pure_sep().is_match(t) {
-        return LineClass { kind: LineKind::Separator, flags };
+        return LineClass {
+            kind: LineKind::Separator,
+            flags,
+        };
     }
     if re_banner_sep().is_match(t) {
-        return LineClass { kind: LineKind::Separator, flags };
+        return LineClass {
+            kind: LineKind::Separator,
+            flags,
+        };
     }
     // (c) 注释包裹 banner
     if flags.contains(LineFlags::IS_COMMENT) {
-        let body = t.trim_start_matches(|c: char| c == '#' || c == '/' || c == ';').trim();
+        let body = t
+            .trim_start_matches(|c: char| c == '#' || c == '/' || c == ';')
+            .trim();
         if !body.is_empty() {
             if re_pure_sep().is_match(body) || re_banner_sep().is_match(body) {
-                return LineClass { kind: LineKind::Separator, flags };
+                return LineClass {
+                    kind: LineKind::Separator,
+                    flags,
+                };
             }
         }
     }
 
     // Priority 3 — 关键字 label 行
-    for lbl in &["密码", "password", "email", "邮箱", "pwd", "pw:", "pass:",
-                 "apikey", "api key", "api_key", "token", "key:", "key=",
-                 "login:", "密钥", "base_url", "endpoint"] {
+    for lbl in &[
+        "密码", "password", "email", "邮箱", "pwd", "pw:", "pass:", "apikey", "api key", "api_key",
+        "token", "key:", "key=", "login:", "密钥", "base_url", "endpoint",
+    ] {
         if lower.contains(lbl) {
-            return LineClass { kind: LineKind::Credential, flags };
+            return LineClass {
+                kind: LineKind::Credential,
+                flags,
+            };
         }
     }
 
     // Priority 4 — Title：首 token 以 `:` 结尾 或 全行以 `:` 结尾
     if flags.contains(LineFlags::HAS_LABEL_COLON) {
-        return LineClass { kind: LineKind::Title, flags };
+        return LineClass {
+            kind: LineKind::Title,
+            flags,
+        };
     }
     if t.ends_with(':') || t.ends_with('\u{FF1A}') {
-        return LineClass { kind: LineKind::Title, flags };
+        return LineClass {
+            kind: LineKind::Title,
+            flags,
+        };
     }
 
     // Priority 4.5 — alias 独行形态（soft Title）
@@ -188,24 +235,34 @@ pub fn line_class(line: &str) -> LineClass {
     //   Why 要求 kebab: 避免把普通句子首词误抓
     let is_kebab_alias = first.len() >= 5
         && first.contains('-')
-        && first.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        && first
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
     if is_kebab_alias {
         let rest_start = first.len();
         let rest = t.get(rest_start..).unwrap_or("").trim_start();
-        let is_paren_or_empty = rest.is_empty()
-            || rest.starts_with('(')
-            || rest.starts_with('\u{FF08}');
+        let is_paren_or_empty =
+            rest.is_empty() || rest.starts_with('(') || rest.starts_with('\u{FF08}');
         if is_paren_or_empty {
-            return LineClass { kind: LineKind::Title, flags };
+            return LineClass {
+                kind: LineKind::Title,
+                flags,
+            };
         }
     }
 
     // Priority 5 — 括号注释（`(pro-04/15)`）
     if t.starts_with('(') || t.starts_with('\u{FF08}') {
-        return LineClass { kind: LineKind::Note, flags };
+        return LineClass {
+            kind: LineKind::Note,
+            flags,
+        };
     }
 
-    LineClass { kind: LineKind::Note, flags }
+    LineClass {
+        kind: LineKind::Note,
+        flags,
+    }
 }
 
 #[cfg(test)]

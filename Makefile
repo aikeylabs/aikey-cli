@@ -145,6 +145,15 @@ security-check-batch-import:
 test-import-recall:
 	@$(BUILD_ENV) $(CARGO) test --release --test import_recall -- --nocapture --test-threads=1
 
+## Fence: build_proxy_aware_agent must honor lowercase https_proxy /
+## http_proxy / all_proxy env. Regression risk: install.rs and other
+## reqwest/ureq call sites silently bypass user-configured proxies on
+## Mac (Clash / V2Ray export lowercase only) → 30s timeout on first
+## install. Bugfix: 20260525-aikey-cli-install-bypasses-proxy-aware-agent.md.
+## Single-threaded because the test mutates process env briefly.
+test-proxy-env-routing:
+	@$(CARGO) test --test proxy_aware_agent_env_routing -- --test-threads=1
+
 ## Build the controlled-behavior mock_proxy Go binary used by lifecycle E2E
 ## tests for scenarios the real proxy cannot easily emulate (BIND_FAIL,
 ## HANG_INIT, DRAIN_DELAY, IGNORE_SIGTERM). Cached at target/test-bin/mock_proxy.

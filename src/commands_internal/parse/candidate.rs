@@ -157,6 +157,6 @@ pub enum Source {
     LabeledSecret,
     PemBlock,
     AnchoredPassword,
-    AnchoredSecret,     // v4.1 Method B Phase 4
+    AnchoredSecret, // v4.1 Method B Phase 4
     CrfArbiter,
 }

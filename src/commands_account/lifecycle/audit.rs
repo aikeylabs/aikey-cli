@@ -90,8 +90,19 @@ pub struct DiffEntry {
 impl DiffEntry {
     pub fn describe(&self) -> String {
         match &self.provider {
-            Some(p) => format!("{} ({}): {} vs {}", self.source.label(), p, self.a_says, self.b_says),
-            None => format!("{}: {} vs {}", self.source.label(), self.a_says, self.b_says),
+            Some(p) => format!(
+                "{} ({}): {} vs {}",
+                self.source.label(),
+                p,
+                self.a_says,
+                self.b_says
+            ),
+            None => format!(
+                "{}: {} vs {}",
+                self.source.label(),
+                self.a_says,
+                self.b_says
+            ),
         }
     }
 }
@@ -116,8 +127,7 @@ pub struct AuditReport {
 /// up, returns Warning + skip when down. Default false in doctor's
 /// summary mode; only true under `--detail`.
 pub fn audit_credential_lifecycle(include_proxy: bool) -> AuditReport {
-    let bindings = storage::list_provider_bindings_readonly("default")
-        .unwrap_or_default();
+    let bindings = storage::list_provider_bindings_readonly("default").unwrap_or_default();
     let active_env_lines = proxy_env::read_active_env_lines().unwrap_or_default();
     let injected_tomls = shell_integration::injected_provider_toml_paths();
 
@@ -145,11 +155,15 @@ pub fn audit_credential_lifecycle(include_proxy: bool) -> AuditReport {
         }
     }
 
-    let is_consistent = diffs
+    let is_consistent = diffs.iter().all(|d| d.severity == DiffSeverity::Warning);
+    let critical_count = diffs
         .iter()
-        .all(|d| d.severity == DiffSeverity::Warning);
-    let critical_count = diffs.iter().filter(|d| d.severity == DiffSeverity::Critical).count();
-    let warn_count = diffs.iter().filter(|d| d.severity == DiffSeverity::Warning).count();
+        .filter(|d| d.severity == DiffSeverity::Critical)
+        .count();
+    let warn_count = diffs
+        .iter()
+        .filter(|d| d.severity == DiffSeverity::Warning)
+        .count();
 
     let summary = if diffs.is_empty() {
         format!(
@@ -177,10 +191,7 @@ pub fn audit_credential_lifecycle(include_proxy: bool) -> AuditReport {
 // Pure diff helpers — unit-testable
 // ============================================================================
 
-fn bindings_has_provider(
-    bindings: &[storage::ProviderBinding],
-    candidates: &[&str],
-) -> bool {
+fn bindings_has_provider(bindings: &[storage::ProviderBinding], candidates: &[&str]) -> bool {
     bindings.iter().any(|b| {
         let c = b.provider_code.to_lowercase();
         candidates.iter().any(|x| *x == c.as_str())
@@ -249,7 +260,10 @@ fn diff_db_vs_active_env(
                 a_says: format!("DB has binding(s) for {}", missing.join(",")),
                 b_says: "active.env AIKEY_ACTIVE_KEYS missing entry".into(),
                 severity: DiffSeverity::Critical,
-                hint: Some(format!("run {} or restart proxy to refresh active.env", cmd("aikey use <alias>"))),
+                hint: Some(format!(
+                    "run {} or restart proxy to refresh active.env",
+                    cmd("aikey use <alias>")
+                )),
             });
         }
         if !extra.is_empty() {
@@ -259,7 +273,10 @@ fn diff_db_vs_active_env(
                 a_says: "no DB binding".into(),
                 b_says: format!("active.env still has {}", extra.join(",")),
                 severity: DiffSeverity::Critical,
-                hint: Some(format!("phantom env entry — run {} to force a refresh", cmd("aikey use <alias>"))),
+                hint: Some(format!(
+                    "phantom env entry — run {} to force a refresh",
+                    cmd("aikey use <alias>")
+                )),
             });
         }
         if missing.is_empty() && extra.is_empty() {
@@ -347,7 +364,8 @@ fn diff_active_env_vs_provider_toml(
                 severity: DiffSeverity::Critical,
                 hint: Some(format!(
                     "{} won't route through aikey-proxy — run {} to re-inject region",
-                    provider_label, cmd("aikey use <alias>"),
+                    provider_label,
+                    cmd("aikey use <alias>"),
                 )),
             });
         }
@@ -360,7 +378,8 @@ fn diff_active_env_vs_provider_toml(
                 severity: DiffSeverity::Critical,
                 hint: Some(format!(
                     "stale aikey region — run {} or re-run {} to reconcile",
-                    cmd("aikey hook update"), cmd("aikey use"),
+                    cmd("aikey hook update"),
+                    cmd("aikey use"),
                 )),
             });
         }
@@ -393,9 +412,7 @@ fn diff_active_env_vs_provider_toml(
 
 /// Query proxy admin endpoint for in-memory binding cache and compare to DB.
 /// Returns `None` when proxy is unreachable (Warning is emitted by caller).
-fn diff_db_vs_proxy_cache(
-    _bindings: &[storage::ProviderBinding],
-) -> Option<Vec<DiffEntry>> {
+fn diff_db_vs_proxy_cache(_bindings: &[storage::ProviderBinding]) -> Option<Vec<DiffEntry>> {
     // Phase A scope: stub returning `Some(vec![])` (proxy comparison
     // logic is non-trivial — proxy /admin/status doesn't currently
     // expose a binding-level dump; that's a follow-up). Returning
@@ -427,7 +444,10 @@ mod tests {
     }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     // --- expected_active_keys ---
@@ -481,7 +501,11 @@ mod tests {
     #[test]
     fn db_vs_env_oauth_value_mismatch_warning() {
         // Same provider set; just account_id vs display_identity rendering.
-        let b = vec![binding("kimi", "session_xyz", CredentialType::PersonalOAuthAccount)];
+        let b = vec![binding(
+            "kimi",
+            "session_xyz",
+            CredentialType::PersonalOAuthAccount,
+        )];
         let e = env(&[("AIKEY_ACTIVE_KEYS", "kimi=user@example.com")]);
         let diffs = diff_db_vs_active_env(&b, &e);
         assert_eq!(diffs.len(), 1);
@@ -560,8 +584,14 @@ mod tests {
     fn diff_source_labels_stable() {
         // Pin label strings — doctor depends on these for output formatting.
         assert_eq!(DiffSource::DbVsActiveEnv.label(), "DB ↔ active.env");
-        assert_eq!(DiffSource::ActiveEnvVsKimiToml.label(), "active.env ↔ kimi.toml");
-        assert_eq!(DiffSource::ActiveEnvVsCodexToml.label(), "active.env ↔ codex.toml");
+        assert_eq!(
+            DiffSource::ActiveEnvVsKimiToml.label(),
+            "active.env ↔ kimi.toml"
+        );
+        assert_eq!(
+            DiffSource::ActiveEnvVsCodexToml.label(),
+            "active.env ↔ codex.toml"
+        );
         assert_eq!(DiffSource::DbVsProxyCache.label(), "DB ↔ proxy cache");
     }
 }

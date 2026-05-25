@@ -54,9 +54,26 @@ const THRESHOLD: f32 = 0.5;
 /// 保持一致。任何修改请先在 spike 验证(CLAUDE.md "Import 解析流改动强制走 research 验证")。
 fn line_label_zone(line: &str) -> &str {
     const SECRET_PREFIXES: &[&str] = &[
-        "sk-ant-", "sk-proj-", "sk-admin-", "sk-svcacct-", "sk-or-v1-", "sk-",
-        "AIza", "AKIA", "xai-", "gsk_", "eyJ", "ghp_", "github_pat", "hf_",
-        "pplx-", "SG.", "rk_live_", "sk_live_", "xoxb-", "xoxp-",
+        "sk-ant-",
+        "sk-proj-",
+        "sk-admin-",
+        "sk-svcacct-",
+        "sk-or-v1-",
+        "sk-",
+        "AIza",
+        "AKIA",
+        "xai-",
+        "gsk_",
+        "eyJ",
+        "ghp_",
+        "github_pat",
+        "hf_",
+        "pplx-",
+        "SG.",
+        "rk_live_",
+        "sk_live_",
+        "xoxb-",
+        "xoxp-",
     ];
     let mut cut: Option<usize> = None;
     for prefix in SECRET_PREFIXES {
@@ -68,7 +85,11 @@ fn line_label_zone(line: &str) -> &str {
         return &line[..idx];
     }
     // 无 secret 前缀 → 取首 40 char (多语言 safe 用 char_indices)
-    let end = line.char_indices().nth(40).map(|(i, _)| i).unwrap_or(line.len());
+    let end = line
+        .char_indices()
+        .nth(40)
+        .map(|(i, _)| i)
+        .unwrap_or(line.len());
     &line[..end]
 }
 
@@ -103,11 +124,13 @@ pub fn enrich_drafts(
         let evidence = collect_evidence(d, &lines, blocks, registry);
 
         // ── Tier 1: strong evidence 硬规则短路 ──
-        let url_evidence: Vec<&(String, InferenceSource)> = evidence.iter()
-            .filter(|(_, s)| matches!(s, InferenceSource::UrlHostPattern{..}))
+        let url_evidence: Vec<&(String, InferenceSource)> = evidence
+            .iter()
+            .filter(|(_, s)| matches!(s, InferenceSource::UrlHostPattern { .. }))
             .collect();
-        let confirmed_evidence: Vec<&(String, InferenceSource)> = evidence.iter()
-            .filter(|(_, s)| matches!(s, InferenceSource::FingerprintConfirmed{..}))
+        let confirmed_evidence: Vec<&(String, InferenceSource)> = evidence
+            .iter()
+            .filter(|(_, s)| matches!(s, InferenceSource::FingerprintConfirmed { .. }))
             .collect();
 
         // URL host 优先级 > prefix (决策 #3 priority list);任一边触发即锁定
@@ -121,7 +144,8 @@ pub fn enrich_drafts(
 
         if let Some(family) = chosen_family {
             // 同 family 多 strong evidence 全部列入(UI transparency,Q2 决策)
-            let supporting: Vec<InferenceSource> = url_evidence.iter()
+            let supporting: Vec<InferenceSource> = url_evidence
+                .iter()
                 .chain(confirmed_evidence.iter())
                 .filter(|(f, _)| f == &family)
                 .map(|(_, s)| s.clone())
@@ -140,7 +164,8 @@ pub fn enrich_drafts(
             // 防御性: Tier 1 已处理 strong evidence,这里跳过(理论上 Tier 1 已 continue)
             if matches!(
                 src,
-                InferenceSource::UrlHostPattern{..} | InferenceSource::FingerprintConfirmed{..}
+                InferenceSource::UrlHostPattern { .. }
+                    | InferenceSource::FingerprintConfirmed { .. }
             ) {
                 continue;
             }
@@ -209,15 +234,17 @@ fn collect_evidence(
     }
 
     // E3: section heading —— 向 draft 所在 block 前后扫 Note/Title 行含 keyword
-    let draft_block = blocks.iter().position(|b| {
-        draft.line_range.0 >= b.start_line && draft.line_range.1 <= b.end_line
-    });
+    let draft_block = blocks
+        .iter()
+        .position(|b| draft.line_range.0 >= b.start_line && draft.line_range.1 <= b.end_line);
     let mut heading_fired = false;
     if let Some(bi) = draft_block {
         // 1) 块内 Note/Title 行(block_start 到首个 Credential/Complex)
         let b = &blocks[bi];
         for ln in b.start_line..=b.end_line {
-            if ln >= lines.len() { break; }
+            if ln >= lines.len() {
+                break;
+            }
             let cls = line_class(lines[ln]);
             if matches!(cls.kind, LineKind::Credential | LineKind::Complex) {
                 break;
@@ -228,10 +255,7 @@ fn collect_evidence(
             if let Some((family, keyword)) = text_keyword_family_and_keyword(lines[ln]) {
                 out.push((
                     family,
-                    InferenceSource::SectionHeadingKeyword {
-                        line: ln,
-                        keyword,
-                    },
+                    InferenceSource::SectionHeadingKeyword { line: ln, keyword },
                 ));
                 heading_fired = true;
                 break;
@@ -245,7 +269,10 @@ fn collect_evidence(
                 let line = lines[ln as usize];
                 let cls = line_class(line);
                 match cls.kind {
-                    LineKind::Empty => { ln -= 1; continue; }
+                    LineKind::Empty => {
+                        ln -= 1;
+                        continue;
+                    }
                     LineKind::Separator => break,
                     LineKind::Credential | LineKind::Complex => break,
                     LineKind::Note | LineKind::Title => {
@@ -261,7 +288,9 @@ fn collect_evidence(
                         }
                         // Title 无 keyword → 硬停(属别的块)
                         // Note 无 keyword → 跳过继续扫上
-                        if cls.kind == LineKind::Title { break; }
+                        if cls.kind == LineKind::Title {
+                            break;
+                        }
                         ln -= 1;
                     }
                 }
@@ -279,15 +308,14 @@ fn collect_evidence(
     //   与 spike `grouping.rs::collect_evidence` E6 段语义一致(CLAUDE.md 强制同步改动)。
     if !heading_fired {
         for ln in draft.line_range.0..=draft.line_range.1 {
-            if ln >= lines.len() { continue; }
+            if ln >= lines.len() {
+                continue;
+            }
             let zone = line_label_zone(lines[ln]);
             if let Some((family, keyword)) = text_keyword_family_and_keyword(zone) {
                 out.push((
                     family,
-                    InferenceSource::InlineLabelKeyword {
-                        line: ln,
-                        keyword,
-                    },
+                    InferenceSource::InlineLabelKeyword { line: ln, keyword },
                 ));
                 break; // 每 draft 只打一次 E6
             }
@@ -296,7 +324,9 @@ fn collect_evidence(
 
     // E4: shell var 名 `export FOO_KEY=` / `FOO=value`
     for ln in draft.line_range.0..=draft.line_range.1 {
-        if ln >= lines.len() { continue; }
+        if ln >= lines.len() {
+            continue;
+        }
         for cap in re_var().captures_iter(lines[ln]) {
             if let Some(var) = cap.get(1) {
                 let var_name = var.as_str();
@@ -331,11 +361,11 @@ fn collect_evidence(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::candidate::{make_id, Candidate, Kind, Tier as CTier};
     use super::super::super::provider_fingerprint;
     use super::super::block::split_into_blocks;
     use super::super::group_candidates;
+    use super::*;
 
     fn cand(kind: Kind, value: &str) -> Candidate {
         Candidate {
@@ -356,7 +386,10 @@ mod tests {
         let text = "claude3:\nalice@acme.io\nsk-ant-api03-FakeProd_key_AAA_BBB_CCC_DDD_EEE_FFF_GGG_HHH_III_JJJ_KKK_LLL";
         let cands = vec![
             cand(Kind::Email, "alice@acme.io"),
-            cand(Kind::SecretLike, "sk-ant-api03-FakeProd_key_AAA_BBB_CCC_DDD_EEE_FFF_GGG_HHH_III_JJJ_KKK_LLL"),
+            cand(
+                Kind::SecretLike,
+                "sk-ant-api03-FakeProd_key_AAA_BBB_CCC_DDD_EEE_FFF_GGG_HHH_III_JJJ_KKK_LLL",
+            ),
         ];
         let (mut drafts, _) = group_candidates(text, &cands);
         let blocks = split_into_blocks(text);
@@ -374,7 +407,10 @@ mod tests {
         let text = "Kimi11\nhttps://platform.moonshot.cn/console/api-keys\nsk-RzORWDtmGsXbqcVhPZCg0WYPqujfSpjAaHQYLJP2TRUaPo3i";
         let cands = vec![
             cand(Kind::Url, "https://platform.moonshot.cn/console/api-keys"),
-            cand(Kind::SecretLike, "sk-RzORWDtmGsXbqcVhPZCg0WYPqujfSpjAaHQYLJP2TRUaPo3i"),
+            cand(
+                Kind::SecretLike,
+                "sk-RzORWDtmGsXbqcVhPZCg0WYPqujfSpjAaHQYLJP2TRUaPo3i",
+            ),
         ];
         let (mut drafts, _) = group_candidates(text, &cands);
         let blocks = split_into_blocks(text);
@@ -387,10 +423,14 @@ mod tests {
 
     #[test]
     fn e5_url_host_anthropic() {
-        let text = "https://api.anthropic.com/v1\nsk-proj-unknown-but-anthropic-url_abcd1234567890efghij";
+        let text =
+            "https://api.anthropic.com/v1\nsk-proj-unknown-but-anthropic-url_abcd1234567890efghij";
         let cands = vec![
             cand(Kind::Url, "https://api.anthropic.com/v1"),
-            cand(Kind::SecretLike, "sk-proj-unknown-but-anthropic-url_abcd1234567890efghij"),
+            cand(
+                Kind::SecretLike,
+                "sk-proj-unknown-but-anthropic-url_abcd1234567890efghij",
+            ),
         ];
         let (mut drafts, _) = group_candidates(text, &cands);
         let blocks = split_into_blocks(text);
@@ -410,9 +450,10 @@ mod tests {
         // 无 E6 的话 inferred_provider = None(spike 验证过)。E6 InlineLabelKeyword 兜底 → moonshot
         // (2026-05-08 Kimi 双平台拆分后,decision #4: keyword "kimi" 单字默认 moonshot)。
         let text = "\u{1F511} kimi: sk-moonshot_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO";
-        let cands = vec![
-            cand(Kind::SecretLike, "sk-moonshot_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO"),
-        ];
+        let cands = vec![cand(
+            Kind::SecretLike,
+            "sk-moonshot_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO",
+        )];
         let (mut drafts, _) = group_candidates(text, &cands);
         let blocks = split_into_blocks(text);
         enrich_drafts(&mut drafts, text, &blocks, provider_fingerprint::instance());
@@ -427,9 +468,10 @@ mod tests {
         // BUG-05 regression guard: `🔑 yunwu: sk-...` 行内 label 识别 aggregator family。
         // 合约:yunwu ∈ aggregator_families → protocol_types = [](UI 让用户手选)。
         let text = "\u{1F511} yunwu: sk-yunwugenericAAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLL";
-        let cands = vec![
-            cand(Kind::SecretLike, "sk-yunwugenericAAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLL"),
-        ];
+        let cands = vec![cand(
+            Kind::SecretLike,
+            "sk-yunwugenericAAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLL",
+        )];
         let (mut drafts, _) = group_candidates(text, &cands);
         let blocks = split_into_blocks(text);
         enrich_drafts(&mut drafts, text, &blocks, provider_fingerprint::instance());
@@ -444,9 +486,10 @@ mod tests {
         // 保底反例:secret 值内部的 "kimi" 不应触发 E6(label_zone 截断到 secret 前缀)。
         // `sk-kimi_...` 前没有任何 label text,label_zone 只剩空串 → 不命中。
         let text = "sk-kimi_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOOPPP";
-        let cands = vec![
-            cand(Kind::SecretLike, "sk-kimi_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOOPPP"),
-        ];
+        let cands = vec![cand(
+            Kind::SecretLike,
+            "sk-kimi_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOOPPP",
+        )];
         let (mut drafts, _) = group_candidates(text, &cands);
         let blocks = split_into_blocks(text);
         enrich_drafts(&mut drafts, text, &blocks, provider_fingerprint::instance());
@@ -456,7 +499,10 @@ mod tests {
         // 此处允许 None 或别的 family,只要不是 "kimi" 源自 E6
         for ev in &drafts[0].inference_evidence {
             if let InferenceSource::InlineLabelKeyword { keyword, .. } = ev {
-                panic!("E6 incorrectly fired on secret-internal keyword: {}", keyword);
+                panic!(
+                    "E6 incorrectly fired on secret-internal keyword: {}",
+                    keyword
+                );
             }
         }
     }
@@ -467,7 +513,10 @@ mod tests {
         let text = "alice@acme.io\nsk-ant-api03-UnmatchedRandomStringNoProviderCluesWhatsoever1234";
         let cands = vec![
             cand(Kind::Email, "alice@acme.io"),
-            cand(Kind::SecretLike, "sk-ant-api03-UnmatchedRandomStringNoProviderCluesWhatsoever1234"),
+            cand(
+                Kind::SecretLike,
+                "sk-ant-api03-UnmatchedRandomStringNoProviderCluesWhatsoever1234",
+            ),
         ];
         let (mut drafts, _) = group_candidates(text, &cands);
         let blocks = split_into_blocks(text);
@@ -497,14 +546,22 @@ mod tests {
         let text = "Kimi-official:\nbase_url: https://api.kimi.com/coding/v1\napi_key: sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM";
         let cands = vec![
             cand(Kind::Url, "https://api.kimi.com/coding/v1"),
-            cand(Kind::SecretLike, "sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM"),
+            cand(
+                Kind::SecretLike,
+                "sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM",
+            ),
         ];
         let drafts = run_enrich(text, cands);
         assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("kimi_code"),
-            "W1: title 'Kimi-official' keyword 不能翻盘 confirmed prefix + URL host");
-        assert!((drafts[0].inference_confidence - 1.0).abs() < 0.001,
-            "Tier 1 confidence = 1.0");
+        assert_eq!(
+            drafts[0].inferred_provider.as_deref(),
+            Some("kimi_code"),
+            "W1: title 'Kimi-official' keyword 不能翻盘 confirmed prefix + URL host"
+        );
+        assert!(
+            (drafts[0].inference_confidence - 1.0).abs() < 0.001,
+            "Tier 1 confidence = 1.0"
+        );
     }
 
     #[test]
@@ -514,12 +571,18 @@ mod tests {
         let text = "Mixed:\nbase_url: https://api.moonshot.cn/v1\napi_key: sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM";
         let cands = vec![
             cand(Kind::Url, "https://api.moonshot.cn/v1"),
-            cand(Kind::SecretLike, "sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM"),
+            cand(
+                Kind::SecretLike,
+                "sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM",
+            ),
         ];
         let drafts = run_enrich(text, cands);
         assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("moonshot"),
-            "W2: URL host 优先于 prefix (决策 #3 priority list)");
+        assert_eq!(
+            drafts[0].inferred_provider.as_deref(),
+            Some("moonshot"),
+            "W2: URL host 优先于 prefix (决策 #3 priority list)"
+        );
     }
 
     #[test]
@@ -528,7 +591,10 @@ mod tests {
         let text = "Moonshot key:\nbase_url: https://api.moonshot.cn/v1\napi_key: sk-XVmmhF9Yv4qf24bEHa6SrDMsAa94oeMdkKLd1gLuuTcQGqaq";
         let cands = vec![
             cand(Kind::Url, "https://api.moonshot.cn/v1"),
-            cand(Kind::SecretLike, "sk-XVmmhF9Yv4qf24bEHa6SrDMsAa94oeMdkKLd1gLuuTcQGqaq"),
+            cand(
+                Kind::SecretLike,
+                "sk-XVmmhF9Yv4qf24bEHa6SrDMsAa94oeMdkKLd1gLuuTcQGqaq",
+            ),
         ];
         let drafts = run_enrich(text, cands);
         assert_eq!(drafts.len(), 1);
@@ -539,9 +605,10 @@ mod tests {
     fn w4_weak_keyword_only_kimi_defaults_moonshot_per_decision_4() {
         // Tier 2 加权回退 → keyword "kimi" → moonshot (决策 #4)
         let text = "kimi: sk-XVmmhF9Yv4qf24bEHa6SrDMsAa94oeMdkKLd1gLuuTcQGqaq";
-        let cands = vec![
-            cand(Kind::SecretLike, "sk-XVmmhF9Yv4qf24bEHa6SrDMsAa94oeMdkKLd1gLuuTcQGqaq"),
-        ];
+        let cands = vec![cand(
+            Kind::SecretLike,
+            "sk-XVmmhF9Yv4qf24bEHa6SrDMsAa94oeMdkKLd1gLuuTcQGqaq",
+        )];
         let drafts = run_enrich(text, cands);
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].inferred_provider.as_deref(), Some("moonshot"));
@@ -551,13 +618,17 @@ mod tests {
     fn w5_strong_prefix_alone_kimi_code_wins_keyword() {
         // sk-kimi-* (E1 confirmed) + 关键词 "kimi" → Tier 1 锁定 kimi_code
         let text = "Some kimi note\nsk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM";
-        let cands = vec![
-            cand(Kind::SecretLike, "sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM"),
-        ];
+        let cands = vec![cand(
+            Kind::SecretLike,
+            "sk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM",
+        )];
         let drafts = run_enrich(text, cands);
         assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("kimi_code"),
-            "W5: confirmed prefix 锁定 kimi_code,即使 title 含 'kimi' keyword(→moonshot)");
+        assert_eq!(
+            drafts[0].inferred_provider.as_deref(),
+            Some("kimi_code"),
+            "W5: confirmed prefix 锁定 kimi_code,即使 title 含 'kimi' keyword(→moonshot)"
+        );
         assert!((drafts[0].inference_confidence - 1.0).abs() < 0.001);
     }
 
@@ -569,12 +640,18 @@ mod tests {
         let text = "rk-kimi adversarial:\nbase_url: https://api.kimi.com/coding/v1\napi_key: rk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM";
         let cands = vec![
             cand(Kind::Url, "https://api.kimi.com/coding/v1"),
-            cand(Kind::SecretLike, "rk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM"),
+            cand(
+                Kind::SecretLike,
+                "rk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLLMMMM",
+            ),
         ];
         let drafts = run_enrich(text, cands);
         assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].inferred_provider.as_deref(), Some("kimi_code"),
-            "W6: URL host strong evidence 锁定 kimi_code,keyword 不参与");
+        assert_eq!(
+            drafts[0].inferred_provider.as_deref(),
+            Some("kimi_code"),
+            "W6: URL host strong evidence 锁定 kimi_code,keyword 不参与"
+        );
     }
 
     #[test]
@@ -583,15 +660,22 @@ mod tests {
         let text = "Claude:\nhttps://api.anthropic.com\nsk-ant-api03-Fake_AAA_BBB_CCC_DDD_EEE_FFF_GGG_HHH_III_JJJ_KKK_LLL_valid";
         let cands = vec![
             cand(Kind::Url, "https://api.anthropic.com"),
-            cand(Kind::SecretLike, "sk-ant-api03-Fake_AAA_BBB_CCC_DDD_EEE_FFF_GGG_HHH_III_JJJ_KKK_LLL_valid"),
+            cand(
+                Kind::SecretLike,
+                "sk-ant-api03-Fake_AAA_BBB_CCC_DDD_EEE_FFF_GGG_HHH_III_JJJ_KKK_LLL_valid",
+            ),
         ];
         let drafts = run_enrich(text, cands);
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].inferred_provider.as_deref(), Some("anthropic"));
-        let has_url = drafts[0].inference_evidence.iter()
-            .any(|e| matches!(e, InferenceSource::UrlHostPattern{..}));
-        let has_prefix = drafts[0].inference_evidence.iter()
-            .any(|e| matches!(e, InferenceSource::FingerprintConfirmed{..}));
+        let has_url = drafts[0]
+            .inference_evidence
+            .iter()
+            .any(|e| matches!(e, InferenceSource::UrlHostPattern { .. }));
+        let has_prefix = drafts[0]
+            .inference_evidence
+            .iter()
+            .any(|e| matches!(e, InferenceSource::FingerprintConfirmed { .. }));
         assert!(has_url, "W7: must include UrlHostPattern evidence");
         assert!(has_prefix, "W7: must include FingerprintConfirmed evidence");
     }

@@ -117,9 +117,7 @@ pub(crate) fn read_password_with_stars_windows() -> std::io::Result<String> {
             // and would require buffering across reads. If they ever matter
             // we extend with a 2-unit lookahead).
             c if c >= 0x20 => {
-                if let Some(Ok(decoded)) =
-                    std::char::decode_utf16(std::iter::once(c)).next()
-                {
+                if let Some(Ok(decoded)) = std::char::decode_utf16(std::iter::once(c)).next() {
                     password.push(decoded);
                     eprint!("*");
                     let _ = std::io::stderr().flush();

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -58,7 +58,11 @@ pub struct ProjectConfig {
     pub hooks: HashMap<String, Vec<String>>,
     /// env → logicalModel → LogicalModelMapping
     /// e.g. envMappings["dev"]["chat-main"] = { provider: "openai", providerModelId: "gpt-4o-mini", keyAlias: "openai:default" }
-    #[serde(default, rename = "envMappings", skip_serializing_if = "HashMap::is_empty")]
+    #[serde(
+        default,
+        rename = "envMappings",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
     pub env_mappings: HashMap<String, HashMap<String, LogicalModelMapping>>,
 }
 
@@ -150,10 +154,11 @@ impl ProjectConfig {
 
     /// Load config from a file
     pub fn load(path: &Path) -> Result<Self, String> {
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read config file: {}", e))?;
+        let content =
+            fs::read_to_string(path).map_err(|e| format!("Failed to read config file: {}", e))?;
 
-        let filename = path.file_name()
+        let filename = path
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("config");
 
@@ -180,11 +185,21 @@ impl ProjectConfig {
         // Check for secret-like field names in the raw JSON
         // This is a defense-in-depth check since our schema shouldn't allow these anyway
         let secret_patterns = [
-            "apiKey", "api_key", "apikey",
-            "token", "accessToken", "access_token",
-            "secret", "secretKey", "secret_key",
-            "password", "passwd", "pwd",
-            "key", "privateKey", "private_key",
+            "apiKey",
+            "api_key",
+            "apikey",
+            "token",
+            "accessToken",
+            "access_token",
+            "secret",
+            "secretKey",
+            "secret_key",
+            "password",
+            "passwd",
+            "pwd",
+            "key",
+            "privateKey",
+            "private_key",
         ];
 
         // We need to re-parse as Value to check for unexpected fields
@@ -193,13 +208,17 @@ impl ProjectConfig {
 
         // Check provider configs for suspicious patterns
         for (provider_name, provider_config) in &self.providers {
-            if secret_patterns.iter().any(|p| provider_config.key_alias.to_lowercase().contains(p)) {
+            if secret_patterns
+                .iter()
+                .any(|p| provider_config.key_alias.to_lowercase().contains(p))
+            {
                 // This is actually OK - keyAlias is supposed to reference a vault entry
                 // But if it looks like an actual secret value, warn
-                if provider_config.key_alias.len() > 32 &&
-                   (provider_config.key_alias.starts_with("sk-") ||
-                    provider_config.key_alias.starts_with("pk-") ||
-                    provider_config.key_alias.contains("secret")) {
+                if provider_config.key_alias.len() > 32
+                    && (provider_config.key_alias.starts_with("sk-")
+                        || provider_config.key_alias.starts_with("pk-")
+                        || provider_config.key_alias.contains("secret"))
+                {
                     return Err(format!(
                         "SECURITY WARNING: Provider '{}' keyAlias looks like an actual secret value.\n\
                         keyAlias should be a vault reference (e.g. 'openai:default'), not the actual API key.\n\
@@ -212,11 +231,12 @@ impl ProjectConfig {
 
         // Check bindings for suspicious values
         for (var_name, binding_value) in &self.bindings {
-            if binding_value.len() > 32 &&
-               (binding_value.starts_with("sk-") ||
-                binding_value.starts_with("pk-") ||
-                binding_value.starts_with("Bearer ") ||
-                binding_value.starts_with("ghp_")) {
+            if binding_value.len() > 32
+                && (binding_value.starts_with("sk-")
+                    || binding_value.starts_with("pk-")
+                    || binding_value.starts_with("Bearer ")
+                    || binding_value.starts_with("ghp_"))
+            {
                 return Err(format!(
                     "SECURITY WARNING: Binding '{}' appears to contain an actual secret.\n\
                     Bindings should reference vault entries (e.g. 'db:prod'), not actual secrets.\n\
@@ -231,7 +251,8 @@ impl ProjectConfig {
 
     /// Save config to a file
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let filename = path.file_name()
+        let filename = path
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("config");
 
@@ -250,13 +271,12 @@ impl ProjectConfig {
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
 
-        fs::write(path, content)
-            .map_err(|e| format!("Failed to write config file: {}", e))?;
+        fs::write(path, content).map_err(|e| format!("Failed to write config file: {}", e))?;
 
         #[cfg(unix)]
         {
-            let metadata = fs::metadata(path)
-                .map_err(|e| format!("Failed to read config metadata: {}", e))?;
+            let metadata =
+                fs::metadata(path).map_err(|e| format!("Failed to read config metadata: {}", e))?;
             let mut perms = metadata.permissions();
             perms.set_mode(0o644); // Config is not secret, can be world-readable
             fs::set_permissions(path, perms)
@@ -290,10 +310,7 @@ impl EnvTemplate {
     }
 
     pub fn other_vars() -> Vec<&'static str> {
-        vec![
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-        ]
+        vec!["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
     }
 }
 

@@ -257,7 +257,9 @@ pub fn handle_install(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::er
 
     cache_manifest(slug, &manifest)?;
 
-    let installer = manifest.resolve_for_current_os().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let installer = manifest
+        .resolve_for_current_os()
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // Per-kind dispatch. The kind→runner mapping is the contract surface
     // we extend when new installer protocols ship; an unknown kind aborts
@@ -383,7 +385,11 @@ pub fn handle_uninstall(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::
     // (Windows). The script's own uninstall path is idempotent (no-op when
     // nothing is installed), so we don't gate this on prior install state.
     if !json_mode {
-        let flag = if installer_kind == "powershell-iwr-iex" { "-Uninstall" } else { "--uninstall" };
+        let flag = if installer_kind == "powershell-iwr-iex" {
+            "-Uninstall"
+        } else {
+            "--uninstall"
+        };
         println!("→ Running service uninstaller: {} {}", installer_url, flag);
     }
     run_service_uninstall(&installer_url, &installer_kind, json_mode)?;
@@ -395,9 +401,7 @@ pub fn handle_uninstall(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::
     if !json_mode {
         println!(
             "✓ Vault cleaned: app_keys={}, bindings={}, app_records={}",
-            counts.app_keys_deleted,
-            counts.bindings_deleted,
-            counts.app_records_deleted,
+            counts.app_keys_deleted, counts.bindings_deleted, counts.app_records_deleted,
         );
     }
 
@@ -412,10 +416,7 @@ pub fn handle_uninstall(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::
 
     if !json_mode {
         println!("✓ {} uninstall complete", slug);
-        println!(
-            "  Re-install any time with: aikey app install {}",
-            slug
-        );
+        println!("  Re-install any time with: aikey app install {}", slug);
     }
     Ok(())
 }
@@ -429,8 +430,7 @@ fn read_cached_manifest(slug: &str) -> Result<Option<Manifest>, Box<dyn std::err
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = fs::read(&path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let bytes = fs::read(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let manifest: Manifest = serde_json::from_slice(&bytes)
         .map_err(|e| format!("parse cached manifest {}: {}", path.display(), e))?;
     Ok(Some(manifest))
@@ -440,8 +440,7 @@ fn read_cached_manifest(slug: &str) -> Result<Option<Manifest>, Box<dyn std::err
 fn remove_cached_manifest(slug: &str) -> Result<(), Box<dyn std::error::Error>> {
     let dir = apps_cache_dir()?.join(slug);
     if dir.exists() {
-        fs::remove_dir_all(&dir)
-            .map_err(|e| format!("remove {}: {}", dir.display(), e))?;
+        fs::remove_dir_all(&dir).map_err(|e| format!("remove {}: {}", dir.display(), e))?;
     }
     Ok(())
 }
@@ -484,14 +483,17 @@ fn run_service_uninstall(
         return Err(format!(
             "service uninstaller download failed ({} exit {}): {}",
             curl_bin,
-            download.code().map(|c| c.to_string()).unwrap_or_else(|| "<signal>".into()),
+            download
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<signal>".into()),
             url
         )
         .into());
     }
 
-    let meta = fs::metadata(&tmp_path)
-        .map_err(|e| format!("stat downloaded uninstaller: {}", e))?;
+    let meta =
+        fs::metadata(&tmp_path).map_err(|e| format!("stat downloaded uninstaller: {}", e))?;
     if meta.len() == 0 {
         return Err(format!("downloaded uninstaller is empty (0 bytes): {}", url).into());
     }
@@ -517,7 +519,9 @@ fn run_service_uninstall(
     if !exec.success() {
         return Err(format!(
             "service uninstaller exited with status {}",
-            exec.code().map(|c| c.to_string()).unwrap_or_else(|| "<signal>".into())
+            exec.code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<signal>".into())
         )
         .into());
     }
@@ -551,9 +555,8 @@ fn fetch_and_verify_manifest(
                 trusted.slug
             );
         }
-        return dev_manifest_for_slug(trusted.slug).ok_or_else(|| {
-            format!("no dev manifest available for '{}'", trusted.slug).into()
-        });
+        return dev_manifest_for_slug(trusted.slug)
+            .ok_or_else(|| format!("no dev manifest available for '{}'", trusted.slug).into());
     }
 
     if !json_mode {
@@ -566,29 +569,24 @@ fn fetch_and_verify_manifest(
     // exported only. The builder consults proxy.env first, then env
     // (lowercase + uppercase variants).
     // Bugfix: 20260525-aikey-cli-install-bypasses-proxy-aware-agent.md
-    let agent = crate::connectivity::build_proxy_aware_agent(
-        std::time::Duration::from_secs(15),
-    );
-    let resp = agent
-        .get(trusted.manifest_url)
-        .call()
-        .map_err(|e| {
-            // Surface the most common cause for Mac users so they can
-            // self-diagnose without reading source. The hint only adds
-            // value when a TCP connect actually timed out (proxy unset
-            // or pointing at a dead listener); for HTTP-level errors
-            // we keep the raw ureq message intact.
-            let msg = e.to_string();
-            let proxy_hint = if msg.contains("timed out")
-                || msg.contains("Connect error")
-                || msg.contains("dns error")
-            {
-                proxy_misconfiguration_hint()
-            } else {
-                String::new()
-            };
-            format!("manifest fetch failed: {}{}", e, proxy_hint)
-        })?;
+    let agent = crate::connectivity::build_proxy_aware_agent(std::time::Duration::from_secs(15));
+    let resp = agent.get(trusted.manifest_url).call().map_err(|e| {
+        // Surface the most common cause for Mac users so they can
+        // self-diagnose without reading source. The hint only adds
+        // value when a TCP connect actually timed out (proxy unset
+        // or pointing at a dead listener); for HTTP-level errors
+        // we keep the raw ureq message intact.
+        let msg = e.to_string();
+        let proxy_hint = if msg.contains("timed out")
+            || msg.contains("Connect error")
+            || msg.contains("dns error")
+        {
+            proxy_misconfiguration_hint()
+        } else {
+            String::new()
+        };
+        format!("manifest fetch failed: {}{}", e, proxy_hint)
+    })?;
 
     let mut bytes = Vec::with_capacity(8 * 1024);
     resp.into_reader()
@@ -610,8 +608,8 @@ fn fetch_and_verify_manifest(
         .into());
     }
 
-    let manifest: Manifest = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("manifest JSON parse failed: {}", e))?;
+    let manifest: Manifest =
+        serde_json::from_slice(&bytes).map_err(|e| format!("manifest JSON parse failed: {}", e))?;
     validate_manifest_schema_version(&manifest.schema_version)?;
     Ok(manifest)
 }
@@ -758,8 +756,7 @@ fn cache_manifest(slug: &str, manifest: &Manifest) -> Result<(), Box<dyn std::er
         .map_err(|e| format!("create apps-cache dir {}: {}", dir.display(), e))?;
     let path = dir.join("manifest.json");
     let json = serde_json::to_string_pretty(manifest)?;
-    let mut f = fs::File::create(&path)
-        .map_err(|e| format!("write {}: {}", path.display(), e))?;
+    let mut f = fs::File::create(&path).map_err(|e| format!("write {}: {}", path.display(), e))?;
     f.write_all(json.as_bytes())?;
     Ok(())
 }
@@ -794,10 +791,7 @@ fn run_curl_pipe_shell(
     _json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!(
-        "aikey-app-installer-{}.sh",
-        std::process::id()
-    ));
+    let tmp_path = tmp_dir.join(format!("aikey-app-installer-{}.sh", std::process::id()));
     let cleanup = TmpPath(tmp_path.clone());
 
     let download = Command::new("curl")
@@ -812,7 +806,10 @@ fn run_curl_pipe_shell(
     if !download.success() {
         return Err(format!(
             "service installer download failed (curl exit {}): {}",
-            download.code().map(|c| c.to_string()).unwrap_or_else(|| "<signal>".into()),
+            download
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<signal>".into()),
             url
         )
         .into());
@@ -821,8 +818,7 @@ fn run_curl_pipe_shell(
     // Sanity: empty file is also a "successful download" per curl exit
     // code, but a no-op shell script is never what a plugin owner
     // intends to ship. Bail loudly rather than silently "succeed".
-    let meta = fs::metadata(&tmp_path)
-        .map_err(|e| format!("stat downloaded installer: {}", e))?;
+    let meta = fs::metadata(&tmp_path).map_err(|e| format!("stat downloaded installer: {}", e))?;
     if meta.len() == 0 {
         return Err(format!("downloaded installer is empty (0 bytes): {}", url).into());
     }
@@ -842,7 +838,9 @@ fn run_curl_pipe_shell(
     if !exec.success() {
         return Err(format!(
             "service installer exited with status {}",
-            exec.code().map(|c| c.to_string()).unwrap_or_else(|| "<signal>".into())
+            exec.code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<signal>".into())
         )
         .into());
     }
@@ -883,10 +881,7 @@ fn run_powershell_installer(
     _json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!(
-        "aikey-app-installer-{}.ps1",
-        std::process::id()
-    ));
+    let tmp_path = tmp_dir.join(format!("aikey-app-installer-{}.ps1", std::process::id()));
     let cleanup = TmpPath(tmp_path.clone());
 
     // curl.exe is bundled in Windows 10 1803+ / Server 2019+. We
@@ -916,8 +911,7 @@ fn run_powershell_installer(
         .into());
     }
 
-    let meta = fs::metadata(&tmp_path)
-        .map_err(|e| format!("stat downloaded installer: {}", e))?;
+    let meta = fs::metadata(&tmp_path).map_err(|e| format!("stat downloaded installer: {}", e))?;
     if meta.len() == 0 {
         return Err(format!("downloaded installer is empty (0 bytes): {}", url).into());
     }
@@ -937,7 +931,9 @@ fn run_powershell_installer(
     if !exec.success() {
         return Err(format!(
             "service installer exited with status {}",
-            exec.code().map(|c| c.to_string()).unwrap_or_else(|| "<signal>".into())
+            exec.code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "<signal>".into())
         )
         .into());
     }
@@ -954,8 +950,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_slug() {
-        let err = handle_install("not-a-real-app", true)
-            .expect_err("should reject unknown slug");
+        let err = handle_install("not-a-real-app", true).expect_err("should reject unknown slug");
         let msg = format!("{}", err);
         assert!(msg.contains("trusted-apps list"), "msg was: {}", msg);
     }
@@ -965,11 +960,17 @@ mod tests {
         let m = dev_manifest_for_slug("degrade-detector").expect("present");
         assert_eq!(m.slug, "degrade-detector");
         assert_eq!(m.schema_version, "2");
-        let installers = m.service_installers.as_ref().expect("v2 must populate service_installers");
+        let installers = m
+            .service_installers
+            .as_ref()
+            .expect("v2 must populate service_installers");
         assert_eq!(installers.unix.kind, "curl-pipe-shell");
         // Pin a substring so accidental URL renames are caught.
         assert!(installers.unix.url.contains("install_service.sh"));
-        let win = installers.windows.as_ref().expect("Windows entry must exist for degrade-detector v2");
+        let win = installers
+            .windows
+            .as_ref()
+            .expect("Windows entry must exist for degrade-detector v2");
         assert_eq!(win.kind, "powershell-iwr-iex");
         assert!(win.url.contains("install_service.ps1"));
     }
@@ -992,7 +993,10 @@ mod tests {
         };
         let resolved = v1.resolve_for_current_os();
         if cfg!(target_os = "windows") {
-            assert!(resolved.is_err(), "v1 manifest on Windows should error with I_PLATFORM_UNSUPPORTED");
+            assert!(
+                resolved.is_err(),
+                "v1 manifest on Windows should error with I_PLATFORM_UNSUPPORTED"
+            );
             let msg = format!("{}", resolved.unwrap_err());
             assert!(msg.contains("I_PLATFORM_UNSUPPORTED"), "msg was: {}", msg);
         } else {
@@ -1004,7 +1008,9 @@ mod tests {
     #[test]
     fn manifest_v2_resolves_by_target_os() {
         let m = dev_manifest_for_slug("degrade-detector").expect("present");
-        let resolved = m.resolve_for_current_os().expect("v2 with both platforms should resolve");
+        let resolved = m
+            .resolve_for_current_os()
+            .expect("v2 with both platforms should resolve");
         if cfg!(target_os = "windows") {
             assert_eq!(resolved.kind, "powershell-iwr-iex");
             assert!(resolved.url.ends_with(".ps1"));
@@ -1043,15 +1049,19 @@ mod tests {
     #[test]
     fn manifest_v2_accepted() {
         // Direct release-team-requested regression pin.
-        assert!(validate_manifest_schema_version("2").is_ok(),
-            "v2 manifest must be accepted; this is the BR-rc.5-59 regression case");
+        assert!(
+            validate_manifest_schema_version("2").is_ok(),
+            "v2 manifest must be accepted; this is the BR-rc.5-59 regression case"
+        );
     }
 
     #[test]
     fn manifest_v1_still_accepted() {
         // Backward-compat: don't regress v1 while adding v2.
-        assert!(validate_manifest_schema_version("1").is_ok(),
-            "v1 manifest must still be accepted (legacy compat)");
+        assert!(
+            validate_manifest_schema_version("1").is_ok(),
+            "v1 manifest must still be accepted (legacy compat)"
+        );
     }
 
     #[test]
@@ -1062,10 +1072,18 @@ mod tests {
         for bad in &["3", "0", "", "v2", "1.0", "two"] {
             let err = validate_manifest_schema_version(bad)
                 .expect_err(&format!("version {:?} must be rejected", bad));
-            assert!(err.contains("I_UNSUPPORTED_MANIFEST_SCHEMA"),
-                "version {:?} error must contain I_UNSUPPORTED_MANIFEST_SCHEMA; got: {}", bad, err);
-            assert!(err.contains(bad),
-                "error must echo back the offending version {:?}; got: {}", bad, err);
+            assert!(
+                err.contains("I_UNSUPPORTED_MANIFEST_SCHEMA"),
+                "version {:?} error must contain I_UNSUPPORTED_MANIFEST_SCHEMA; got: {}",
+                bad,
+                err
+            );
+            assert!(
+                err.contains(bad),
+                "error must echo back the offending version {:?}; got: {}",
+                bad,
+                err
+            );
         }
     }
 

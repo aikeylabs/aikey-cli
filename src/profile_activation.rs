@@ -13,7 +13,9 @@
 
 use std::collections::HashSet;
 
-use crate::commands_account::{provider_env_vars_pub, provider_extra_env_vars_pub, provider_proxy_prefix_pub};
+use crate::commands_account::{
+    provider_env_vars_pub, provider_extra_env_vars_pub, provider_proxy_prefix_pub,
+};
 use crate::commands_proxy;
 use crate::credential_type;
 use crate::storage::{self, ProviderBinding};
@@ -48,13 +50,12 @@ fn append_unset_lines_for_inactive_providers(
     // protocol family). HashSet::insert returns true the first time only,
     // doubling as the "should we emit?" gate.
     let mut already_unset: HashSet<&'static str> = HashSet::new();
-    let mut emit = |env_lines: &mut Vec<String>,
-                    var: &'static str,
-                    already: &mut HashSet<&'static str>| {
-        if !emitted_export_vars.contains(var) && already.insert(var) {
-            env_lines.push(format!("unset {} 2>/dev/null", var));
-        }
-    };
+    let mut emit =
+        |env_lines: &mut Vec<String>, var: &'static str, already: &mut HashSet<&'static str>| {
+            if !emitted_export_vars.contains(var) && already.insert(var) {
+                env_lines.push(format!("unset {} 2>/dev/null", var));
+            }
+        };
     for entry in crate::provider_registry::entries() {
         let (api_key_var, base_url_var) = entry.env_vars;
         emit(env_lines, api_key_var, &mut already_unset);
@@ -111,7 +112,8 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
     //   ② 跳过所有 Kimi family 的 KIMI_* / MODEL_* exports
     //   ③ 仍正常写非 Kimi family 的其它 provider exports(让用户能继续用 Claude/OpenAI)
     //   ④ 不整体 panic / abort active.env(不阻断其它 family 的 prompt activation)
-    let kimi_family_active: Vec<&str> = bindings.iter()
+    let kimi_family_active: Vec<&str> = bindings
+        .iter()
         .filter(|b| storage::KIMI_FAMILY_CODES.contains(&b.provider_code.as_str()))
         .map(|b| b.provider_code.as_str())
         .collect();
@@ -128,9 +130,7 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
 
     for b in &bindings {
         // family corrupt state 跳过整个 Kimi family
-        if kimi_family_corrupt
-            && storage::KIMI_FAMILY_CODES.contains(&b.provider_code.as_str())
-        {
+        if kimi_family_corrupt && storage::KIMI_FAMILY_CODES.contains(&b.provider_code.as_str()) {
             continue;
         }
 
@@ -218,7 +218,8 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
         let display = match b.key_source_type {
             credential_type::CredentialType::PersonalOAuthAccount => {
                 if let Ok(Some(acct)) = storage::get_provider_account(&b.key_source_ref) {
-                    acct.display_identity.as_deref()
+                    acct.display_identity
+                        .as_deref()
                         .filter(|s| !s.is_empty())
                         .or_else(|| acct.external_id.as_deref().filter(|s| !s.is_empty()))
                         .unwrap_or(&b.key_source_ref)
@@ -230,7 +231,8 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             credential_type::CredentialType::ManagedVirtualKey => {
                 // Team key: try to resolve local alias, fallback to virtual_key_id
                 storage::get_virtual_key_cache(&b.key_source_ref)
-                    .ok().flatten()
+                    .ok()
+                    .flatten()
                     .map(|e| e.local_alias.unwrap_or(e.alias))
                     .unwrap_or_else(|| b.key_source_ref.clone())
             }
@@ -239,7 +241,10 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
         active_pairs.push(format!("{}={}", b.provider_code, display));
     }
     if !active_pairs.is_empty() {
-        env_lines.push(format!("export AIKEY_ACTIVE_KEYS=\"{}\"", active_pairs.join(",")));
+        env_lines.push(format!(
+            "export AIKEY_ACTIVE_KEYS=\"{}\"",
+            active_pairs.join(",")
+        ));
     } else {
         env_lines.push("unset AIKEY_ACTIVE_KEYS 2>/dev/null".to_string());
     }
@@ -335,9 +340,8 @@ pub fn auto_assign_primaries_for_key(
     let mut newly_assigned: Vec<String> = Vec::new();
 
     for raw in providers {
-        let canonical = crate::commands_account::oauth_provider_to_canonical(
-            &raw.to_lowercase()
-        ).to_string();
+        let canonical =
+            crate::commands_account::oauth_provider_to_canonical(&raw.to_lowercase()).to_string();
 
         // Kimi family fill-empty-only: family 已有 primary 就跳过。
         if storage::KIMI_FAMILY_CODES.contains(&canonical.as_str()) && kimi_family_has_primary {
@@ -517,8 +521,7 @@ fn sentinel_token(canonical_provider: &str) -> String {
 fn write_active_env_file(lines: &[String]) -> Result<(), String> {
     // Use resolve_aikey_dir for consistent HOME → USERPROFILE → "." fallback.
     let aikey_dir = crate::commands_account::resolve_aikey_dir();
-    std::fs::create_dir_all(&aikey_dir)
-        .map_err(|e| format!("Failed to create ~/.aikey: {}", e))?;
+    std::fs::create_dir_all(&aikey_dir).map_err(|e| format!("Failed to create ~/.aikey: {}", e))?;
     let env_path = aikey_dir.join("active.env");
 
     let content = lines.join("\n") + "\n";
@@ -532,7 +535,8 @@ fn write_active_env_file(lines: &[String]) -> Result<(), String> {
     // Also write active.env.flat (plain KEY=VALUE, no shell syntax) for Windows.
     // PowerShell/cmd deactivate reads this file instead of parsing sh-style active.env.
     let flat_path = aikey_dir.join("active.env.flat");
-    let flat_lines: Vec<String> = lines.iter()
+    let flat_lines: Vec<String> = lines
+        .iter()
         .filter_map(|line| {
             // Extract KEY="VALUE" from `export KEY="VALUE"` lines.
             let line = line.trim();
@@ -598,9 +602,8 @@ fn write_claude_json_approvals(bindings: &[ProviderBinding]) -> Result<(), Strin
     // Dedupe inside this batch (one provider may appear once; defensive).
     let mut tails: Vec<String> = Vec::new();
     for b in bindings {
-        let canonical = crate::commands_account::oauth_provider_to_canonical(
-            &b.provider_code.to_lowercase(),
-        );
+        let canonical =
+            crate::commands_account::oauth_provider_to_canonical(&b.provider_code.to_lowercase());
         if canonical != "anthropic" {
             continue;
         }
@@ -624,8 +627,7 @@ fn write_claude_json_approvals(bindings: &[ProviderBinding]) -> Result<(), Strin
         return Ok(());
     }
 
-    let claude_json_path =
-        crate::commands_account::resolve_user_home().join(".claude.json");
+    let claude_json_path = crate::commands_account::resolve_user_home().join(".claude.json");
     apply_claude_json_approvals_at(&claude_json_path, &tails)
 }
 
@@ -750,7 +752,10 @@ pub(crate) fn atomic_write(target: &std::path::Path, content: &[u8]) -> std::io:
     let parent = target.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent dir")
     })?;
-    let file_name = target.file_name().and_then(|s| s.to_str()).unwrap_or("active");
+    let file_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("active");
     // Per-pid suffix avoids collisions if two `aikey` processes refresh
     // concurrently. Last writer wins on rename — that's the seq's job to
     // record the order, the file content is a snapshot either way.
@@ -903,17 +908,17 @@ fn find_replacement_candidate(
 
     // Search personal keys, sorted by created_at (oldest first) for
     // deterministic "earliest added" backfill order.
-    let mut entries = storage::list_entries_with_metadata()
-        .unwrap_or_default();
+    let mut entries = storage::list_entries_with_metadata().unwrap_or_default();
     entries.sort_by_key(|e| e.created_at.unwrap_or(i64::MAX));
     for entry in &entries {
         if entry.alias == excluded_ref && excluded_type == "personal" {
             continue;
         }
         let providers = resolve_providers_for_entry(entry);
-        if providers.iter().any(|p|
-            crate::commands_account::oauth_provider_to_canonical(p) == target
-        ) {
+        if providers
+            .iter()
+            .any(|p| crate::commands_account::oauth_provider_to_canonical(p) == target)
+        {
             return Ok(Some(("personal".to_string(), entry.alias.clone())));
         }
     }
@@ -942,9 +947,10 @@ fn find_replacement_candidate(
         } else {
             continue;
         };
-        if providers.iter().any(|p|
-            crate::commands_account::oauth_provider_to_canonical(p) == target
-        ) {
+        if providers
+            .iter()
+            .any(|p| crate::commands_account::oauth_provider_to_canonical(p) == target)
+        {
             return Ok(Some(("team".to_string(), vk.virtual_key_id.clone())));
         }
     }
@@ -996,21 +1002,24 @@ mod unset_inactive_tests {
         // 2026-05-08 Kimi family 互斥落地: moonshot 改写 KIMI_* (与 kimi_code 一致),
         // MOONSHOT_API_KEY/MOONSHOT_BASE_URL 不再出现在 registry env_api_key/env_base_url
         // 字段里,故从此处 assertion 移除 — registry-driven unset 自然不会包含它们。
-        for var in [
-            "KIMI_API_KEY", "KIMI_BASE_URL",
-            "OPENAI_API_KEY",
-        ] {
+        for var in ["KIMI_API_KEY", "KIMI_BASE_URL", "OPENAI_API_KEY"] {
             assert!(
                 blob.contains(&format!("unset {} 2>/dev/null", var)),
-                "expected `unset {}` line, got:\n{}", var, blob,
+                "expected `unset {}` line, got:\n{}",
+                var,
+                blob,
             );
         }
 
         // Active ones must NOT be unset.
-        assert!(!blob.contains("unset ANTHROPIC_API_KEY"),
-            "ANTHROPIC_API_KEY was exported, should not be unset");
-        assert!(!blob.contains("unset ANTHROPIC_BASE_URL"),
-            "ANTHROPIC_BASE_URL was exported, should not be unset");
+        assert!(
+            !blob.contains("unset ANTHROPIC_API_KEY"),
+            "ANTHROPIC_API_KEY was exported, should not be unset"
+        );
+        assert!(
+            !blob.contains("unset ANTHROPIC_BASE_URL"),
+            "ANTHROPIC_BASE_URL was exported, should not be unset"
+        );
     }
 
     #[test]
@@ -1024,13 +1033,12 @@ mod unset_inactive_tests {
         append_unset_lines_for_inactive_providers(&mut lines, &exported);
         let blob = lines.join("\n");
 
-        for var in [
-            "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
-            "OPENAI_API_KEY",
-        ] {
+        for var in ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY"] {
             assert!(
                 blob.contains(&format!("unset {} 2>/dev/null", var)),
-                "expected `unset {}`, got:\n{}", var, blob,
+                "expected `unset {}`, got:\n{}",
+                var,
+                blob,
             );
         }
 
@@ -1053,7 +1061,8 @@ mod unset_inactive_tests {
             assert!(
                 blob.contains(&format!("unset {} 2>/dev/null", api_key_var)),
                 "missing `unset {}` for empty-active state, got:\n{}",
-                api_key_var, blob,
+                api_key_var,
+                blob,
             );
         }
     }
@@ -1072,9 +1081,11 @@ mod unset_inactive_tests {
             }
         }
         append_unset_lines_for_inactive_providers(&mut lines, &exported);
-        assert!(lines.is_empty(),
+        assert!(
+            lines.is_empty(),
             "no unsets expected when everything is active, got:\n{}",
-            lines.join("\n"));
+            lines.join("\n")
+        );
     }
 }
 
@@ -1088,9 +1099,8 @@ mod atomic_write_tests {
 
     #[test]
     fn atomic_write_creates_target_with_content() {
-        let dir = std::env::temp_dir().join(format!(
-            "aikey-atomic-test-create-{}", std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aikey-atomic-test-create-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("active.env");
         atomic_write(&target, b"hello\n").expect("write");
@@ -1100,9 +1110,8 @@ mod atomic_write_tests {
 
     #[test]
     fn atomic_write_replaces_existing_content() {
-        let dir = std::env::temp_dir().join(format!(
-            "aikey-atomic-test-replace-{}", std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aikey-atomic-test-replace-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("active.env");
         std::fs::write(&target, b"old content\n").unwrap();
@@ -1149,9 +1158,8 @@ mod atomic_write_tests {
     fn atomic_write_retries_through_transient_sharing_violation() {
         use std::os::windows::fs::OpenOptionsExt;
 
-        let dir = std::env::temp_dir().join(format!(
-            "aikey-atomic-test-retry-{}", std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aikey-atomic-test-retry-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("active.env.flat");
         std::fs::write(&target, b"AIKEY_ACTIVE_SEQ=1\nold=value\n").unwrap();
@@ -1187,7 +1195,8 @@ mod atomic_write_tests {
 
         // Cleanup must still run — assert no stale .tmp.<pid> debris from
         // the failed attempts before the holder released.
-        let stale_tmps: Vec<_> = std::fs::read_dir(&dir).unwrap()
+        let stale_tmps: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
@@ -1216,8 +1225,10 @@ mod atomic_write_tests {
     #[cfg(not(windows))]
     #[test]
     fn is_running_elevated_is_false_off_windows() {
-        assert!(!super::is_running_elevated(),
-            "non-Windows builds must always report false");
+        assert!(
+            !super::is_running_elevated(),
+            "non-Windows builds must always report false"
+        );
     }
 
     #[test]
@@ -1225,13 +1236,13 @@ mod atomic_write_tests {
         // The whole point of temp+rename: post-rename, the .tmp.<pid> file
         // must not exist. Otherwise drift detection / cleanup logic that
         // greps the directory could trip over stale temps.
-        let dir = std::env::temp_dir().join(format!(
-            "aikey-atomic-test-cleanup-{}", std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("aikey-atomic-test-cleanup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("active.env");
         atomic_write(&target, b"x\n").expect("write");
-        let entries: Vec<String> = std::fs::read_dir(&dir).unwrap()
+        let entries: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
@@ -1278,7 +1289,11 @@ mod claude_json_tests {
     fn approved_array(v: &Value) -> Vec<String> {
         v.pointer("/customApiKeyResponses/approved")
             .and_then(|a| a.as_array())
-            .map(|arr| arr.iter().filter_map(|e| e.as_str().map(String::from)).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1292,7 +1307,10 @@ mod claude_json_tests {
         // Exactly n chars → whole string.
         // Fixture is content-irrelevant; we test length math, not token shape —
         // intentionally non-aikey-prefixed to keep prefix-rename-gate clean.
-        assert_eq!(last_n_chars("abcdefghij0123456789", 20), "abcdefghij0123456789");
+        assert_eq!(
+            last_n_chars("abcdefghij0123456789", 20),
+            "abcdefghij0123456789"
+        );
         // Longer than n → last n.
         let s = "this_is_a_long_fixture_string_more_than_twenty_chars";
         assert_eq!(last_n_chars(s, 20).chars().count(), 20);
@@ -1309,7 +1327,10 @@ mod claude_json_tests {
             .expect("write");
 
         let v = read_json(&path);
-        assert_eq!(approved_array(&v), vec!["tail-twenty-chars-aaa".to_string()]);
+        assert_eq!(
+            approved_array(&v),
+            vec!["tail-twenty-chars-aaa".to_string()]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1386,10 +1407,16 @@ mod claude_json_tests {
 
         let v = read_json(&path);
         let approved = approved_array(&v);
-        assert!(approved.contains(&"existing-tail-1234567".to_string()),
-            "existing tail must be preserved, got {:?}", approved);
-        assert!(approved.contains(&"new-tail-aaaaaaaaaaa".to_string()),
-            "new tail must be appended, got {:?}", approved);
+        assert!(
+            approved.contains(&"existing-tail-1234567".to_string()),
+            "existing tail must be preserved, got {:?}",
+            approved
+        );
+        assert!(
+            approved.contains(&"new-tail-aaaaaaaaaaa".to_string()),
+            "new tail must be appended, got {:?}",
+            approved
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1407,8 +1434,11 @@ mod claude_json_tests {
             .expect("must not propagate parse error");
 
         // File content must be byte-identical.
-        assert_eq!(std::fs::read(&path).unwrap(), original,
-            "malformed file must not be overwritten");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "malformed file must not be overwritten"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1513,10 +1543,7 @@ mod claude_json_tests {
             drop(holder);
         });
 
-        let result = apply_claude_json_approvals_at(
-            &path,
-            &["xxxxxxxxxxxxxxxxxxx1".to_string()],
-        );
+        let result = apply_claude_json_approvals_at(&path, &["xxxxxxxxxxxxxxxxxxx1".to_string()]);
         releaser.join().unwrap();
 
         result.expect("write_claude_json_approvals must ride past transient hold");
@@ -1525,4 +1552,3 @@ mod claude_json_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

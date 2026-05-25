@@ -1,0 +1,5 @@
+# Pin rustfmt edition to match Cargo.toml so multiple developers /
+# CI runs produce identical formatting and `make fmt-check` (now
+# wired into release.sh by BR-rc.5-61 hotfix bundle) doesn't drift
+# between rustfmt versions.
+edition = "2021"

@@ -94,8 +94,14 @@ fn validate_upstreams_requires_known_values() {
     assert!(validate_upstreams(&["kimi".into()]).is_ok());
     assert!(validate_upstreams(&["openrouter".into()]).is_ok());
     // gemini upstream not supported yet (different wire, no translator pair).
-    assert!(validate_upstreams(&["gemini".into()]).is_err(), "unsupported upstream must reject");
-    assert!(validate_upstreams(&["OpenAI".into()]).is_err(), "case-sensitive: uppercase rejected");
+    assert!(
+        validate_upstreams(&["gemini".into()]).is_err(),
+        "unsupported upstream must reject"
+    );
+    assert!(
+        validate_upstreams(&["OpenAI".into()]).is_err(),
+        "case-sensitive: uppercase rejected"
+    );
     assert!(
         validate_upstreams(&["openai".into(), "nonexistent-vendor".into()]).is_err(),
         "one unknown in the set must reject the whole list"
@@ -119,18 +125,28 @@ fn r2_blocklist_third_party_cannot_follow_user_active() {
     //         → reject (跨字段规则: follow_user_active 要求 first_party=true)
     let err = validate_first_party_invariants("random-agent", false, true)
         .expect_err("third-party cannot follow_user_active");
-    assert!(err.contains("--follow-user-active"), "msg should explain the rule: {}", err);
+    assert!(
+        err.contains("--follow-user-active"),
+        "msg should explain the rule: {}",
+        err
+    );
 
     // 路径 2: third-party slug + --first-party + --follow-user-active=true
     //         → reject (slug 白名单 fail)
     let err = validate_first_party_invariants("random-agent", true, true)
         .expect_err("third-party slug claiming first-party must reject");
-    assert!(err.contains("whitelist"), "msg should mention whitelist: {}", err);
+    assert!(
+        err.contains("whitelist"),
+        "msg should mention whitelist: {}",
+        err
+    );
 
     // 路径 3: first-party 白名单内 slug + --first-party + --follow-user-active=true
     //         → 允许 (这是唯一合法路径)
-    assert!(validate_first_party_invariants("degrade-detector", true, true).is_ok(),
-            "first-party + follow_user_active=true must be allowed for whitelisted slug");
+    assert!(
+        validate_first_party_invariants("degrade-detector", true, true).is_ok(),
+        "first-party + follow_user_active=true must be allowed for whitelisted slug"
+    );
 }
 
 #[test]
@@ -209,7 +225,10 @@ fn upsert_app_record_inserts_then_updates() {
         .expect("row");
     assert_eq!(rec2.name, "Agent A Renamed");
     assert_eq!(rec2.vendor, "new-vendor");
-    assert_eq!(rec2.upstreams, vec!["openai".to_string(), "anthropic".to_string()]);
+    assert_eq!(
+        rec2.upstreams,
+        vec!["openai".to_string(), "anthropic".to_string()]
+    );
 }
 
 #[test]
@@ -281,13 +300,11 @@ fn authorize_atomic_inserts_key_and_bindings() {
     )
     .unwrap();
 
-    let initial_bindings = vec![
-        (
-            "openai".to_string(),
-            CredentialType::PersonalApiKey,
-            "my-key-alias".to_string(),
-        ),
-    ];
+    let initial_bindings = vec![(
+        "openai".to_string(),
+        CredentialType::PersonalApiKey,
+        "my-key-alias".to_string(),
+    )];
 
     let (key_id, route_token) =
         authorize_atomic_with_conn(&mut conn, "agent-a", &initial_bindings).expect("authorize");
@@ -362,7 +379,10 @@ fn authorize_atomic_empty_bindings_still_writes_key() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(binding_count, 0, "no bindings should be created with empty slice");
+    assert_eq!(
+        binding_count, 0,
+        "no bindings should be created with empty slice"
+    );
 }
 
 #[test]
@@ -382,9 +402,11 @@ fn authorize_atomic_rolls_back_on_binding_failure() {
     // pointing at a slug whose FK is not satisfied.
     let mut conn = fresh_test_vault();
 
-    let initial_bindings = vec![
-        ("openai".to_string(), CredentialType::PersonalApiKey, "ref-a".to_string()),
-    ];
+    let initial_bindings = vec![(
+        "openai".to_string(),
+        CredentialType::PersonalApiKey,
+        "ref-a".to_string(),
+    )];
 
     // No app_records row for "ghost-slug" → FK violation on app_keys insert.
     let err = authorize_atomic_with_conn(&mut conn, "ghost-slug", &initial_bindings)
@@ -412,7 +434,10 @@ fn authorize_atomic_rolls_back_on_binding_failure() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(binding_count, 0, "failed authorize must leave 0 binding rows");
+    assert_eq!(
+        binding_count, 0,
+        "failed authorize must leave 0 binding rows"
+    );
 }
 
 #[test]
@@ -447,7 +472,10 @@ fn revoke_active_keys_flips_status_preserves_history() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(status, "revoked", "row preserved with revoked status (audit trail)");
+    assert_eq!(
+        status, "revoked",
+        "row preserved with revoked status (audit trail)"
+    );
 
     // app_records row also preserved — user can re-authorize without re-registering.
     assert!(
@@ -506,7 +534,9 @@ fn list_apps_returns_records_with_active_key_join() {
         )
         .unwrap();
     let rows: Vec<(String, Option<String>)> = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
@@ -546,7 +576,14 @@ fn route_token_is_strict_aikey_app_form() {
 fn pause_active_key_then_resume_returns_to_active() {
     let mut conn = fresh_test_vault();
     upsert_app_record_with_conn(
-        &conn, "agent-pause", "P", "v", &["openai".into()], "third-party", false, &[],
+        &conn,
+        "agent-pause",
+        "P",
+        "v",
+        &["openai".into()],
+        "third-party",
+        false,
+        &[],
     )
     .unwrap();
     let (key_id, _) = authorize_atomic_with_conn(&mut conn, "agent-pause", &[]).unwrap();
@@ -585,7 +622,14 @@ fn pause_does_not_affect_revoked_keys() {
     // currently-active rows are paused.
     let mut conn = fresh_test_vault();
     upsert_app_record_with_conn(
-        &conn, "agent-mix", "M", "v", &["openai".into()], "third-party", false, &[],
+        &conn,
+        "agent-mix",
+        "M",
+        "v",
+        &["openai".into()],
+        "third-party",
+        false,
+        &[],
     )
     .unwrap();
 
@@ -615,14 +659,24 @@ fn pause_does_not_affect_revoked_keys() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(revoked_count, 1, "pause must not change revoked rows' status");
+    assert_eq!(
+        revoked_count, 1,
+        "pause must not change revoked rows' status"
+    );
 }
 
 #[test]
 fn rotate_atomic_replaces_old_active_with_new() {
     let mut conn = fresh_test_vault();
     upsert_app_record_with_conn(
-        &conn, "agent-rot", "R", "v", &["openai".into()], "third-party", false, &[],
+        &conn,
+        "agent-rot",
+        "R",
+        "v",
+        &["openai".into()],
+        "third-party",
+        false,
+        &[],
     )
     .unwrap();
     let (old_key, old_token) = authorize_atomic_with_conn(&mut conn, "agent-rot", &[]).unwrap();
@@ -631,7 +685,10 @@ fn rotate_atomic_replaces_old_active_with_new() {
 
     // Different key_id + different route_token.
     assert_ne!(old_key, new_key, "rotate must produce a NEW key_id");
-    assert_ne!(old_token, new_token, "rotate must produce a NEW route_token");
+    assert_ne!(
+        old_token, new_token,
+        "rotate must produce a NEW route_token"
+    );
 
     // Old key must be revoked, new key must be active. Exactly one active.
     let old_status: String = conn
@@ -641,7 +698,10 @@ fn rotate_atomic_replaces_old_active_with_new() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(old_status, "revoked", "old key after rotate should be revoked");
+    assert_eq!(
+        old_status, "revoked",
+        "old key after rotate should be revoked"
+    );
 
     let new_status: String = conn
         .query_row(
@@ -671,7 +731,14 @@ fn rotate_atomicity_no_window_with_two_active() {
     // is also encoded in rotate_app_key_with_conn's `tx.commit()`.)
     let mut conn = fresh_test_vault();
     upsert_app_record_with_conn(
-        &conn, "agent-atom", "A", "v", &["openai".into()], "third-party", false, &[],
+        &conn,
+        "agent-atom",
+        "A",
+        "v",
+        &["openai".into()],
+        "third-party",
+        false,
+        &[],
     )
     .unwrap();
 
@@ -699,7 +766,10 @@ fn rotate_atomicity_no_window_with_two_active() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(total, 6, "expected 6 history rows (1 authorize + 5 rotations)");
+    assert_eq!(
+        total, 6,
+        "expected 6 history rows (1 authorize + 5 rotations)"
+    );
 }
 
 #[test]
@@ -711,7 +781,10 @@ fn route_tokens_are_unique_across_calls() {
     let mut seen = HashSet::new();
     for _ in 0..100 {
         let t = storage::generate_app_route_token();
-        assert!(seen.insert(t), "duplicate route_token in 100 calls — OsRng broken?");
+        assert!(
+            seen.insert(t),
+            "duplicate route_token in 100 calls — OsRng broken?"
+        );
     }
 }
 
@@ -743,16 +816,33 @@ fn classify_register_all_from_default_snapshot() {
     let upstreams = vec!["anthropic".to_string(), "openai".to_string()];
     let existing_app: Vec<ProviderBinding> = vec![];
     let default = vec![
-        binding("default", "anthropic", CredentialType::PersonalApiKey, "my-anthropic"),
-        binding("default", "openai", CredentialType::PersonalApiKey, "my-openai"),
+        binding(
+            "default",
+            "anthropic",
+            CredentialType::PersonalApiKey,
+            "my-anthropic",
+        ),
+        binding(
+            "default",
+            "openai",
+            CredentialType::PersonalApiKey,
+            "my-openai",
+        ),
     ];
-    let RegisterBindingOutcome { snapshotted, preserved, missing } =
-        classify_upstreams_for_register(&upstreams, &existing_app, &default);
+    let RegisterBindingOutcome {
+        snapshotted,
+        preserved,
+        missing,
+    } = classify_upstreams_for_register(&upstreams, &existing_app, &default);
     assert_eq!(snapshotted.len(), 2);
     assert!(preserved.is_empty());
     assert!(missing.is_empty());
-    assert!(snapshotted.iter().any(|(u, _, r)| u == "anthropic" && r == "my-anthropic"));
-    assert!(snapshotted.iter().any(|(u, _, r)| u == "openai" && r == "my-openai"));
+    assert!(snapshotted
+        .iter()
+        .any(|(u, _, r)| u == "anthropic" && r == "my-anthropic"));
+    assert!(snapshotted
+        .iter()
+        .any(|(u, _, r)| u == "openai" && r == "my-openai"));
 }
 
 #[test]
@@ -769,15 +859,25 @@ fn classify_register_preserves_user_override_bug_1_regression() {
         "my-work-anthropic", // ← user's override
     )];
     let default = vec![
-        binding("default", "anthropic", CredentialType::PersonalApiKey, "my-anthropic"),
-        binding("default", "openai", CredentialType::PersonalApiKey, "my-openai"),
+        binding(
+            "default",
+            "anthropic",
+            CredentialType::PersonalApiKey,
+            "my-anthropic",
+        ),
+        binding(
+            "default",
+            "openai",
+            CredentialType::PersonalApiKey,
+            "my-openai",
+        ),
     ];
     let outcome = classify_upstreams_for_register(&upstreams, &existing_app, &default);
     // anthropic: preserved (user override wins), NOT snapshotted.
     assert_eq!(outcome.preserved.len(), 1);
     assert_eq!(outcome.preserved[0].0, "anthropic");
     assert_eq!(outcome.preserved[0].2, "my-work-anthropic"); // user's choice
-    // openai: snapshotted (no override existed).
+                                                             // openai: snapshotted (no override existed).
     assert_eq!(outcome.snapshotted.len(), 1);
     assert_eq!(outcome.snapshotted[0].0, "openai");
     assert_eq!(outcome.snapshotted[0].2, "my-openai");
@@ -845,8 +945,18 @@ fn classify_register_extra_default_not_in_upstreams_ignored() {
     let upstreams = vec!["anthropic".to_string()];
     let existing_app: Vec<ProviderBinding> = vec![];
     let default = vec![
-        binding("default", "anthropic", CredentialType::PersonalApiKey, "my-anthropic"),
-        binding("default", "openai", CredentialType::PersonalApiKey, "my-openai"),
+        binding(
+            "default",
+            "anthropic",
+            CredentialType::PersonalApiKey,
+            "my-anthropic",
+        ),
+        binding(
+            "default",
+            "openai",
+            CredentialType::PersonalApiKey,
+            "my-openai",
+        ),
         binding("default", "kimi", CredentialType::PersonalApiKey, "my-kimi"),
     ];
     let outcome = classify_upstreams_for_register(&upstreams, &existing_app, &default);
@@ -901,10 +1011,38 @@ fn delete_all_app_state_wipes_keys_bindings_and_record() {
     fn count(conn: &Connection, sql: &str, slug: &str) -> i64 {
         conn.query_row(sql, [slug], |r| r.get(0)).unwrap_or(0)
     }
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1", "target-app"), 1);
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1", "keeper-app"), 1);
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_records WHERE slug = ?1", "target-app"), 1);
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_records WHERE slug = ?1", "keeper-app"), 1);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1",
+            "target-app"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1",
+            "keeper-app"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_records WHERE slug = ?1",
+            "target-app"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_records WHERE slug = ?1",
+            "keeper-app"
+        ),
+        1
+    );
 
     // Act: uninstall target-app's vault state.
     let counts = super::delete_all_app_state_with_conn(&mut conn, "target-app")
@@ -916,19 +1054,55 @@ fn delete_all_app_state_wipes_keys_bindings_and_record() {
     assert_eq!(counts.app_records_deleted, 1);
 
     // target-app gone.
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1", "target-app"), 0);
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_records WHERE slug = ?1", "target-app"), 0);
     assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM user_profile_provider_bindings WHERE profile_id = ?1", "app:target-app"),
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1",
+            "target-app"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_records WHERE slug = ?1",
+            "target-app"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM user_profile_provider_bindings WHERE profile_id = ?1",
+            "app:target-app"
+        ),
         0
     );
 
     // keeper-app untouched — fence catches a regression to a bare
     // DELETE without WHERE slug filter.
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1", "keeper-app"), 1);
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM app_records WHERE slug = ?1", "keeper-app"), 1);
     assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM user_profile_provider_bindings WHERE profile_id = ?1", "app:keeper-app"),
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_keys WHERE app_slug = ?1",
+            "keeper-app"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM app_records WHERE slug = ?1",
+            "keeper-app"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM user_profile_provider_bindings WHERE profile_id = ?1",
+            "app:keeper-app"
+        ),
         1
     );
 }

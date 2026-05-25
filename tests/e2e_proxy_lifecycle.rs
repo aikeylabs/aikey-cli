@@ -24,11 +24,15 @@ fn bin_path() -> PathBuf {
 fn proxy_binary() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("AIKEY_PROXY_BIN") {
         let path = PathBuf::from(p);
-        if path.exists() { return Some(path); }
+        if path.exists() {
+            return Some(path);
+        }
     }
     if let Ok(real_home) = std::env::var("HOME") {
         let candidate = PathBuf::from(real_home).join(".aikey/bin/aikey-proxy");
-        if candidate.exists() { return Some(candidate); }
+        if candidate.exists() {
+            return Some(candidate);
+        }
     }
     None
 }
@@ -37,8 +41,7 @@ fn proxy_binary() -> Option<PathBuf> {
 /// Caveat: TOCTOU — in rare races the port may be taken by the time proxy
 /// starts. Re-running the test is the documented recovery.
 fn pick_free_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port
@@ -97,8 +100,8 @@ impl Env {
     /// Returns Some(Env) or None if prerequisites are missing (skip).
     fn try_new(tag: &str) -> Option<Self> {
         let proxy_bin = proxy_binary()?;
-        let tmp = std::env::temp_dir()
-            .join(format!("aikey-e2e-proxy-{}-{}", tag, std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("aikey-e2e-proxy-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join(".aikey/data")).expect("mkdir");
         std::fs::create_dir_all(tmp.join(".aikey/config")).expect("mkdir config");
@@ -128,7 +131,11 @@ impl Env {
         write_test_config(&tmp.join(".aikey/config"), port, &vault);
         assert!(cfg.exists());
 
-        Some(Self { tmp, port, proxy_bin })
+        Some(Self {
+            tmp,
+            port,
+            proxy_bin,
+        })
     }
 
     /// Build a Command isolated to this test's HOME + proxy binary + port.
@@ -175,8 +182,10 @@ impl Env {
 /// Print a "skipped" marker and succeed. Cargo doesn't have a built-in
 /// skip mechanism for integration tests; this is the idiomatic workaround.
 fn skip_because_no_proxy_bin() {
-    eprintln!("[skip] AIKEY_PROXY_BIN not set and ~/.aikey/bin/aikey-proxy not found — \
-               skipping proxy lifecycle test (build/install aikey-proxy to enable)");
+    eprintln!(
+        "[skip] AIKEY_PROXY_BIN not set and ~/.aikey/bin/aikey-proxy not found — \
+               skipping proxy lifecycle test (build/install aikey-proxy to enable)"
+    );
 }
 
 // ── tests ───────────────────────────────────────────────────────────────
@@ -194,10 +203,13 @@ fn proxy_status_on_clean_env_reports_not_running() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    assert!(combined.contains("not running")
+    assert!(
+        combined.contains("not running")
             || combined.contains("stopped")
             || combined.contains("not reachable"),
-        "proxy status on clean env should say 'not running', got:\n{}", combined);
+        "proxy status on clean env should say 'not running', got:\n{}",
+        combined
+    );
 }
 
 #[test]
@@ -207,23 +219,39 @@ fn proxy_start_then_stop_round_trip() {
         None => return skip_because_no_proxy_bin(),
     };
 
-    let start = env.cmd().args(["proxy", "start"]).output().expect("spawn start");
-    assert!(start.status.success(),
+    let start = env
+        .cmd()
+        .args(["proxy", "start"])
+        .output()
+        .expect("spawn start");
+    assert!(
+        start.status.success(),
         "proxy start failed.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&start.stdout),
-        String::from_utf8_lossy(&start.stderr));
+        String::from_utf8_lossy(&start.stderr)
+    );
 
-    assert!(env.wait_status(true, 10),
-        "proxy status did not become 'running' within 10s after start");
+    assert!(
+        env.wait_status(true, 10),
+        "proxy status did not become 'running' within 10s after start"
+    );
 
-    let stop = env.cmd().args(["proxy", "stop"]).output().expect("spawn stop");
-    assert!(stop.status.success(),
+    let stop = env
+        .cmd()
+        .args(["proxy", "stop"])
+        .output()
+        .expect("spawn stop");
+    assert!(
+        stop.status.success(),
         "proxy stop failed.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&stop.stdout),
-        String::from_utf8_lossy(&stop.stderr));
+        String::from_utf8_lossy(&stop.stderr)
+    );
 
-    assert!(env.wait_status(false, 5),
-        "proxy status did not become 'not running' within 5s after stop");
+    assert!(
+        env.wait_status(false, 5),
+        "proxy status did not become 'not running' within 5s after stop"
+    );
 }
 
 #[test]
@@ -234,11 +262,19 @@ fn proxy_start_is_idempotent() {
         None => return skip_because_no_proxy_bin(),
     };
 
-    let first = env.cmd().args(["proxy", "start"]).output().expect("start 1");
+    let first = env
+        .cmd()
+        .args(["proxy", "start"])
+        .output()
+        .expect("start 1");
     assert!(first.status.success(), "first proxy start failed");
     assert!(env.wait_status(true, 10));
 
-    let second = env.cmd().args(["proxy", "start"]).output().expect("start 2");
+    let second = env
+        .cmd()
+        .args(["proxy", "start"])
+        .output()
+        .expect("start 2");
     // Second start should either succeed (no-op) or exit with an "already
     // running" message — both are acceptable. What's NOT acceptable is a
     // crash or a mismatched-port process.
@@ -248,15 +284,20 @@ fn proxy_start_is_idempotent() {
         String::from_utf8_lossy(&second.stderr),
     );
     if !second.status.success() {
-        assert!(combined.contains("already")
+        assert!(
+            combined.contains("already")
                 || combined.contains("running")
                 || combined.contains("exists"),
             "second start should be idempotent or report 'already running', got:\n{}",
-            combined);
+            combined
+        );
     }
 
     // Regardless, status must still report running.
-    assert!(env.wait_status(true, 5), "proxy not running after second start");
+    assert!(
+        env.wait_status(true, 5),
+        "proxy not running after second start"
+    );
 }
 
 #[test]
@@ -271,14 +312,15 @@ fn proxy_restart_leaves_proxy_running() {
     assert!(env.wait_status(true, 10));
 
     let restart = env.cmd().args(["proxy", "restart"]).output().unwrap();
-    assert!(restart.status.success(),
+    assert!(
+        restart.status.success(),
         "proxy restart failed.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&restart.stdout),
-        String::from_utf8_lossy(&restart.stderr));
+        String::from_utf8_lossy(&restart.stderr)
+    );
 
     // After restart the proxy must be reachable again.
-    assert!(env.wait_status(true, 10),
-        "proxy not running after restart");
+    assert!(env.wait_status(true, 10), "proxy not running after restart");
 }
 
 /// Extract the PID from `aikey proxy status` output. Looks for a line like
@@ -289,9 +331,11 @@ fn pid_from_status(text: &str) -> Option<u32> {
         if !lower.contains("pid") {
             continue;
         }
-        if let Some(num) = line.split_whitespace()
-            .find_map(|w| w.trim_matches(|c: char| !c.is_ascii_digit()).parse::<u32>().ok())
-        {
+        if let Some(num) = line.split_whitespace().find_map(|w| {
+            w.trim_matches(|c: char| !c.is_ascii_digit())
+                .parse::<u32>()
+                .ok()
+        }) {
             if num > 1 {
                 return Some(num);
             }
@@ -329,8 +373,11 @@ fn proxy_kill9_warns_on_next_cli_command() {
 
     // Start the proxy and confirm it's running.
     let start = env.cmd().args(["proxy", "start"]).output().unwrap();
-    assert!(start.status.success(), "proxy start failed: {}",
-        String::from_utf8_lossy(&start.stderr));
+    assert!(
+        start.status.success(),
+        "proxy start failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
     assert!(env.wait_status(true, 10), "proxy never came up");
 
     // Pull the PID from `aikey proxy status` output.
@@ -364,23 +411,24 @@ fn proxy_kill9_warns_on_next_cli_command() {
         .output()
         .expect("spawn list");
     let stderr = String::from_utf8_lossy(&list.stderr);
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&list.stdout),
-        &stderr,
-    );
+    let combined = format!("{}{}", String::from_utf8_lossy(&list.stdout), &stderr,);
 
     // Match both anchors: the fix adds BOTH "Proxy is not running" AND the
     // `aikey proxy start` hint. Requiring both prevents false positives from
     // unrelated stderr chatter.
-    assert!(combined.contains("Proxy is not running")
-            || combined.contains("proxy is not running"),
+    assert!(
+        combined.contains("Proxy is not running") || combined.contains("proxy is not running"),
         "kill -9 of proxy MUST trigger 'Proxy is not running' warning on \
          the next CLI command (regression: 2026-04-05 bugfix).\n\
-         combined output:\n{}", combined);
-    assert!(combined.contains("aikey proxy start"),
+         combined output:\n{}",
+        combined
+    );
+    assert!(
+        combined.contains("aikey proxy start"),
         "warning should include the `aikey proxy start` hint so users know \
-         how to recover.\ncombined output:\n{}", combined);
+         how to recover.\ncombined output:\n{}",
+        combined
+    );
 }
 
 /// Round-10 review fix #1 (Finding 1) regression test:
@@ -420,14 +468,20 @@ fn doctor_under_orphaned_port_does_not_attempt_restart() {
     drop(listener); // release external holder
 
     let lower = combined.to_lowercase();
-    assert!(lower.contains("orphan"),
+    assert!(
+        lower.contains("orphan"),
         "doctor MUST report 'orphaned' when external port holder is detected \
-         (regression: Round-10 Finding 1).\ncombined output:\n{}", combined);
-    assert!(!combined.contains("attempting restart"),
+         (regression: Round-10 Finding 1).\ncombined output:\n{}",
+        combined
+    );
+    assert!(
+        !combined.contains("attempting restart"),
         "doctor MUST NOT enter the restart path when the port is held by a \
          foreign process — Layer 2 cannot manage it, and a vault password \
          prompt would be wasted user input. (regression: Round-10 Finding 1).\n\
-         combined output:\n{}", combined);
+         combined output:\n{}",
+        combined
+    );
 }
 
 /// Round-10 review fix #2 (Finding 2) regression test:
@@ -472,9 +526,12 @@ fn warn_if_proxy_down_under_foreign_owner_emits_warning() {
     // also used by handle_status / status_rows / handle_verify, so this
     // matches the unified diagnostic surface).
     let lower = combined.to_lowercase();
-    assert!(lower.contains("cannot manage") || lower.contains("orphan"),
+    assert!(
+        lower.contains("cannot manage") || lower.contains("orphan"),
         "warn_if_proxy_down MUST emit the OrphanedPort warning when the \
          port is held by an external process — pre-fix relied on \
          port_reachable() and was silent in this case. (regression: \
-         Round-10 Finding 2).\ncombined output:\n{}", combined);
+         Round-10 Finding 2).\ncombined output:\n{}",
+        combined
+    );
 }

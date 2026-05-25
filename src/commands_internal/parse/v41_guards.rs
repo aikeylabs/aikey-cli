@@ -19,7 +19,9 @@ pub fn locate_line_by_offset(text: &str, byte_off: usize) -> Option<&str> {
     let mut cur = 0usize;
     for line in text.lines() {
         let line_end = cur + line.len();
-        if byte_off >= cur && byte_off <= line_end { return Some(line); }
+        if byte_off >= cur && byte_off <= line_end {
+            return Some(line);
+        }
         cur = line_end + 1; // +1 for \n
     }
     None
@@ -50,13 +52,14 @@ pub fn is_comment_at_offset(text: &str, byte_off: usize) -> bool {
 ///
 /// 对应 V4.1: `provider_fingerprint.rs::is_context_rejected` 实现。
 pub fn is_in_reject_context(text: &str, byte_off: usize) -> bool {
-    let Some(line) = locate_line_by_offset(text, byte_off) else { return false; };
+    let Some(line) = locate_line_by_offset(text, byte_off) else {
+        return false;
+    };
     let trimmed_lc = line.trim().to_lowercase();
 
     // 与 v4.1 spike YAML `generic_hex_long.context_reject_labels` 对齐
     const REJECT_LABELS: &[&str] = &[
-        "commit", "sha", "sha-1", "sha1",
-        "sha-256", "sha256", "sha-512",
+        "commit", "sha", "sha-1", "sha1", "sha-256", "sha256", "sha-512",
     ];
 
     for lbl in REJECT_LABELS {
@@ -69,7 +72,9 @@ pub fn is_in_reject_context(text: &str, byte_off: usize) -> bool {
                     let after = rest.trim_start();
                     let nx = after.chars().next();
                     // 形态 1 变体: `label : value` / `label = value`
-                    if matches!(nx, Some(':') | Some('=')) { return true; }
+                    if matches!(nx, Some(':') | Some('=')) {
+                        return true;
+                    }
                     // 形态 2: `commit abc123` —— 空格后直接 alnum（hash-like）
                     if nx.map(|c| c.is_ascii_alphanumeric()).unwrap_or(false) {
                         return true;
@@ -94,7 +99,7 @@ pub fn token_has_cjk_or_fullwidth(s: &str) -> bool {
         ('\u{4E00}'..='\u{9FFF}').contains(&ch)   // CJK Unified
             || ('\u{3400}'..='\u{4DBF}').contains(&ch)   // CJK Ext-A
             || ('\u{3000}'..='\u{303F}').contains(&ch)   // CJK punct
-            || ('\u{FF00}'..='\u{FFEF}').contains(&ch)   // 全角标点
+            || ('\u{FF00}'..='\u{FFEF}').contains(&ch) // 全角标点
     })
 }
 
@@ -112,8 +117,12 @@ pub fn token_has_cjk_or_fullwidth(s: &str) -> bool {
 pub fn is_label_shape(tok: &str, line: &str) -> bool {
     // (a) 纯 kebab-case
     let is_kebab = tok.contains('-')
-        && tok.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if is_kebab { return true; }
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if is_kebab {
+        return true;
+    }
 
     // (b) token + `:` / `=` (短 token)
     if tok.chars().count() < 16 {
@@ -128,17 +137,36 @@ pub fn is_label_shape(tok: &str, line: &str) -> bool {
 
     // (c) provider keyword 前缀 + 数字/dash 后缀
     const PROVIDER_KEYWORDS: &[&str] = &[
-        "claude", "anthropic", "openai", "gpt", "kimi", "moonshot",
-        "gemini", "groq", "deepseek", "xai", "grok", "zhipu", "glm",
-        "doubao", "silicon", "huggingface", "perplexity", "openrouter",
+        "claude",
+        "anthropic",
+        "openai",
+        "gpt",
+        "kimi",
+        "moonshot",
+        "gemini",
+        "groq",
+        "deepseek",
+        "xai",
+        "grok",
+        "zhipu",
+        "glm",
+        "doubao",
+        "silicon",
+        "huggingface",
+        "perplexity",
+        "openrouter",
     ];
     let lc = tok.to_lowercase();
     for kw in PROVIDER_KEYWORDS {
-        if !lc.starts_with(kw) || lc.len() == kw.len() { continue; }
+        if !lc.starts_with(kw) || lc.len() == kw.len() {
+            continue;
+        }
         let suffix = &lc[kw.len()..];
         let all_digits = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
         let dashed = suffix.starts_with('-');
-        if all_digits || dashed { return true; }
+        if all_digits || dashed {
+            return true;
+        }
     }
     false
 }
@@ -153,37 +181,60 @@ pub fn is_placeholder_token(tok: &str) -> bool {
     let lc = tok.to_lowercase();
     // 明显占位词（substring 匹配，case-insensitive）
     const PLACEHOLDER_SUBSTR: &[&str] = &[
-        "changeme", "change_me", "change-me",
-        "placeholder", "place_holder",
-        "your_key", "your-key", "yourkey",
-        "your_api", "your-api",
-        "your_token", "your-token",
-        "your_password", "your-password",
-        "please_replace", "please-replace",
-        "replace_with", "replace-with",
-        "replace_this", "replace-this",
-        "sk-example", "sk_example",
-        "ak-example", "example-key", "example_key",
-        "fake_key", "fake-key",
-        "todo", "fixme",
-        "yourapikey", "your_api_key",
+        "changeme",
+        "change_me",
+        "change-me",
+        "placeholder",
+        "place_holder",
+        "your_key",
+        "your-key",
+        "yourkey",
+        "your_api",
+        "your-api",
+        "your_token",
+        "your-token",
+        "your_password",
+        "your-password",
+        "please_replace",
+        "please-replace",
+        "replace_with",
+        "replace-with",
+        "replace_this",
+        "replace-this",
+        "sk-example",
+        "sk_example",
+        "ak-example",
+        "example-key",
+        "example_key",
+        "fake_key",
+        "fake-key",
+        "todo",
+        "fixme",
+        "yourapikey",
+        "your_api_key",
     ];
     for p in PLACEHOLDER_SUBSTR {
-        if lc.contains(p) { return true; }
+        if lc.contains(p) {
+            return true;
+        }
     }
     // 纯重复字符 (xxxx / ????/ ...)
     let first_ch = tok.chars().next().unwrap_or('\0');
     if tok.len() >= 4 && tok.chars().all(|c| c == first_ch) {
-        if matches!(first_ch, 'x' | 'X' | '?' | '.' | '*' | '0') { return true; }
+        if matches!(first_ch, 'x' | 'X' | '?' | '.' | '*' | '0') {
+            return true;
+        }
     }
     // 中文典型占位
     const CN_PLACEHOLDER: &[&str] = &[
-        "\u{8FD8}\u{6CA1}\u{60F3}\u{597D}",  // 还没想好
-        "\u{5F85}\u{586B}",                     // 待填
-        "\u{5360}\u{4F4D}",                     // 占位
+        "\u{8FD8}\u{6CA1}\u{60F3}\u{597D}", // 还没想好
+        "\u{5F85}\u{586B}",                 // 待填
+        "\u{5360}\u{4F4D}",                 // 占位
     ];
     for p in CN_PLACEHOLDER {
-        if tok.contains(p) { return true; }
+        if tok.contains(p) {
+            return true;
+        }
     }
     // 角括号包裹（`<your_key>` / `<请填入>`）
     if (tok.starts_with('<') && tok.ends_with('>'))
@@ -217,8 +268,8 @@ mod tests {
 
     #[test]
     fn cjk_rejected() {
-        assert!(token_has_cjk_or_fullwidth("\u{5BC6}\u{7801}"));  // 密码
-        assert!(token_has_cjk_or_fullwidth("test\u{FF09}"));       // test）
+        assert!(token_has_cjk_or_fullwidth("\u{5BC6}\u{7801}")); // 密码
+        assert!(token_has_cjk_or_fullwidth("test\u{FF09}")); // test）
         assert!(!token_has_cjk_or_fullwidth("password"));
         assert!(!token_has_cjk_or_fullwidth("Str0ng_P@ss!"));
     }

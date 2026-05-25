@@ -77,8 +77,9 @@ const DEFAULT_BINDING_DOMAIN: &str = "default";
 
 /// Returns the full path to the vault database
 pub fn get_vault_path() -> Result<PathBuf, String> {
-    if let Ok(test_path) = std::env::var("AK_VAULT_PATH")
-        .or_else(|_| std::env::var("AK_STORAGE_PATH")) {
+    if let Ok(test_path) =
+        std::env::var("AK_VAULT_PATH").or_else(|_| std::env::var("AK_STORAGE_PATH"))
+    {
         let path = PathBuf::from(test_path);
         if path.extension().and_then(|e| e.to_str()) == Some("db") {
             return Ok(path);
@@ -137,8 +138,7 @@ pub(crate) fn open_connection_readonly() -> Result<Connection, String> {
 /// Shared connection setup: open DB + security pragmas. No migrations.
 fn open_connection_raw() -> Result<Connection, String> {
     let db_path = get_vault_path()?;
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
 
     // SECURITY: Enable secure delete on every connection
     conn.pragma_update(None, "secure_delete", "ON")
@@ -184,18 +184,28 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
 /// Priority: `supported_providers` JSON > single `provider_code` > empty.
 pub fn resolve_supported_providers(alias: &str) -> Result<Vec<String>, String> {
     let conn = open_connection()?;
-    let row: (Option<String>, Option<String>) = conn.query_row(
-        "SELECT supported_providers, provider_code FROM entries WHERE alias = ?1", params![alias], |r| Ok((r.get(0)?, r.get(1)?)),
-    ).map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => format!("Entry '{}' not found", alias),
-        other => format!("query providers '{}': {}", alias, other),
-    })?;
+    let row: (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT supported_providers, provider_code FROM entries WHERE alias = ?1",
+            params![alias],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => format!("Entry '{}' not found", alias),
+            other => format!("query providers '{}': {}", alias, other),
+        })?;
     if let Some(json) = row.0 {
         if let Ok(providers) = serde_json::from_str::<Vec<String>>(&json) {
-            if !providers.is_empty() { return Ok(providers); }
+            if !providers.is_empty() {
+                return Ok(providers);
+            }
         }
     }
-    if let Some(code) = row.1 { if !code.is_empty() { return Ok(vec![code]); } }
+    if let Some(code) = row.1 {
+        if !code.is_empty() {
+            return Ok(vec![code]);
+        }
+    }
     Ok(vec![])
 }
 
@@ -204,7 +214,10 @@ pub fn ensure_vault_exists() -> Result<(), String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
     Ok(())
@@ -212,14 +225,15 @@ pub fn ensure_vault_exists() -> Result<(), String> {
 
 /// Initializes the vault database with proper permissions
 pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), String> {
-    let test_path_result = std::env::var("AK_VAULT_PATH")
-        .or_else(|_| std::env::var("AK_STORAGE_PATH"));
+    let test_path_result =
+        std::env::var("AK_VAULT_PATH").or_else(|_| std::env::var("AK_STORAGE_PATH"));
 
     let (vault_dir, db_path) = if let Ok(test_path) = test_path_result {
         let path = PathBuf::from(test_path);
         if path.extension().and_then(|e| e.to_str()) == Some("db") {
             // Path is a direct database file path
-            let parent = path.parent()
+            let parent = path
+                .parent()
                 .ok_or("Invalid database path: no parent directory")?
                 .to_path_buf();
             (parent, path)
@@ -249,23 +263,24 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
     // If the DB file exists, check whether it was fully initialized (has master_salt).
     // The file may exist without salt if session-backend selection created it first.
     if db_path.exists() {
-        let probe = Connection::open(&db_path)
-            .map_err(|e| format!("Failed to open database: {}", e))?;
+        let probe =
+            Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
         let has_salt: bool = probe
             .query_row(
                 "SELECT COUNT(*) FROM config WHERE key = 'master_salt'",
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .unwrap_or(0) > 0;
+            .unwrap_or(0)
+            > 0;
         if has_salt {
             return Err("Vault already initialized. If you need a fresh vault, delete the local vault file and run 'aikey init' again.".to_string());
         }
         // DB exists but no salt — fall through to complete initialization
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to create database: {}", e))?;
+    let conn =
+        Connection::open(&db_path).map_err(|e| format!("Failed to create database: {}", e))?;
 
     // Stage 2.4 windows-compat: belt-and-suspenders — vault_dir's ACL
     // already inherits owner-only to vault.db on Windows, but we set it
@@ -378,8 +393,7 @@ pub fn needs_migration() -> Result<bool, String> {
         return Ok(false);
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
 
     let table_exists: bool = conn
         .query_row(
@@ -476,11 +490,8 @@ fn migrate_database(conn: &Connection) -> Result<(), String> {
         .unwrap_or(false);
 
     if !has_metadata {
-        conn.execute(
-            "ALTER TABLE entries ADD COLUMN metadata TEXT",
-            [],
-        )
-        .map_err(|e| format!("Failed to add metadata column: {}", e))?;
+        conn.execute("ALTER TABLE entries ADD COLUMN metadata TEXT", [])
+            .map_err(|e| format!("Failed to add metadata column: {}", e))?;
     }
 
     let has_created_at: bool = conn
@@ -528,7 +539,10 @@ pub fn get_salt() -> Result<Vec<u8>, String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
     let conn = open_connection()?;
@@ -558,7 +572,10 @@ pub fn get_kdf_params() -> Result<(u32, u32, u32), String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
     let conn = open_connection()?;
@@ -571,7 +588,11 @@ pub fn get_kdf_params() -> Result<(u32, u32, u32), String> {
             |row| {
                 let bytes: Vec<u8> = row.get(0)?;
                 Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| {
-                    rusqlite::Error::InvalidColumnType(0, "kdf_m_cost".to_string(), rusqlite::types::Type::Blob)
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        "kdf_m_cost".to_string(),
+                        rusqlite::types::Type::Blob,
+                    )
                 })?))
             },
         )
@@ -584,7 +605,11 @@ pub fn get_kdf_params() -> Result<(u32, u32, u32), String> {
             |row| {
                 let bytes: Vec<u8> = row.get(0)?;
                 Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| {
-                    rusqlite::Error::InvalidColumnType(0, "kdf_t_cost".to_string(), rusqlite::types::Type::Blob)
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        "kdf_t_cost".to_string(),
+                        rusqlite::types::Type::Blob,
+                    )
                 })?))
             },
         )
@@ -597,7 +622,11 @@ pub fn get_kdf_params() -> Result<(u32, u32, u32), String> {
             |row| {
                 let bytes: Vec<u8> = row.get(0)?;
                 Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| {
-                    rusqlite::Error::InvalidColumnType(0, "kdf_p_cost".to_string(), rusqlite::types::Type::Blob)
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        "kdf_p_cost".to_string(),
+                        rusqlite::types::Type::Blob,
+                    )
                 })?))
             },
         )
@@ -662,7 +691,10 @@ pub fn store_entry(alias: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<(), S
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
     let conn = open_connection()?;
@@ -703,7 +735,10 @@ pub fn get_entry(alias: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
     let conn = open_connection()?;
@@ -726,7 +761,10 @@ pub fn list_entries() -> Result<Vec<String>, String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
     let conn = open_connection()?;
@@ -748,7 +786,10 @@ pub fn list_entries() -> Result<Vec<String>, String> {
 pub fn list_entries_with_metadata() -> Result<Vec<SecretMetadata>, String> {
     let db_path = get_vault_path()?;
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
     query_entries_with_metadata(&open_connection()?)
 }
@@ -779,24 +820,23 @@ fn query_entries_with_metadata(conn: &Connection) -> Result<Vec<SecretMetadata>,
     let metadata: Vec<SecretMetadata> = stmt
         .query_map([], |row| {
             let sp_json: Option<String> = row.get(4).ok().flatten();
-            let supported_providers = sp_json
-                .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+            let supported_providers =
+                sp_json.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
             // `extra` is stored as TEXT (JSON object); parse opportunistically
             // — a corrupt blob (shouldn't happen, writers always use
             // json_set which keeps it valid) is treated the same as None
             // so it can't break the list query.
             let extra_json: Option<String> = row.get(8).ok().flatten();
-            let extra = extra_json
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+            let extra = extra_json.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
             Ok(SecretMetadata {
-                alias:               row.get(0)?,
-                created_at:          row.get(1).ok(),
-                provider_code:       row.get(2).ok().flatten(),
-                base_url:            row.get(3).ok().flatten(),
+                alias: row.get(0)?,
+                created_at: row.get(1).ok(),
+                provider_code: row.get(2).ok().flatten(),
+                base_url: row.get(3).ok().flatten(),
                 supported_providers,
-                route_token:         row.get(5).ok().flatten(),
-                last_used_at:        row.get(6).ok().flatten(),
-                use_count:           row.get(7).ok(),
+                route_token: row.get(5).ok().flatten(),
+                last_used_at: row.get(6).ok().flatten(),
+                use_count: row.get(7).ok(),
                 extra,
             })
         })
@@ -846,7 +886,10 @@ pub fn delete_entry(alias: &str) -> Result<(), String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
     let conn = open_connection()?;
@@ -863,11 +906,17 @@ pub fn delete_entry(alias: &str) -> Result<(), String> {
 }
 
 /// Changes the master password by re-encrypting all entries
-pub fn change_password(old_password: &SecretString, new_password: &SecretString) -> Result<(), String> {
+pub fn change_password(
+    old_password: &SecretString,
+    new_password: &SecretString,
+) -> Result<(), String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
     // Why: short-circuit when new == old. Running the full flow would still
@@ -883,8 +932,9 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
     let (m_cost, t_cost, p_cost) = get_kdf_params()?;
 
     // Derive old key to verify password
-    let old_key = crate::crypto::derive_key_with_params(old_password, &salt, m_cost, t_cost, p_cost)
-        .map_err(|e| format!("Failed to derive old key: {}", e))?;
+    let old_key =
+        crate::crypto::derive_key_with_params(old_password, &salt, m_cost, t_cost, p_cost)
+            .map_err(|e| format!("Failed to derive old key: {}", e))?;
 
     // Verify old password against the stored password_hash first (authoritative
     // source). Fall back to entry decryption for legacy vaults that predate
@@ -907,11 +957,10 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
         None => {
             // Legacy vault: verify by decrypting the first entry (same fallback
             // as executor::verify_password_internal).
-            let test_result: Result<(Vec<u8>, Vec<u8>), rusqlite::Error> = conn.query_row(
-                "SELECT nonce, ciphertext FROM entries LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            );
+            let test_result: Result<(Vec<u8>, Vec<u8>), rusqlite::Error> =
+                conn.query_row("SELECT nonce, ciphertext FROM entries LIMIT 1", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                });
             if let Ok((nonce, ciphertext)) = test_result {
                 crate::crypto::decrypt(&old_key, &nonce, &ciphertext)
                     .map_err(|_| "Incorrect password".to_string())?;
@@ -1004,22 +1053,31 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
             .map_err(|e| format!("Failed to prepare managed_virtual_keys_cache select: {}", e))?;
         let mapped = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
             })
             .map_err(|e| format!("Failed to query managed_virtual_keys_cache: {}", e))?;
         let collected: Result<Vec<_>, _> = mapped.collect();
-        collected.map_err(|e| format!("Failed to collect managed_virtual_keys_cache rows: {}", e))?
+        collected
+            .map_err(|e| format!("Failed to collect managed_virtual_keys_cache rows: {}", e))?
     };
     for (vk_id, old_nonce, old_ciphertext) in mvk_rows {
-        let plaintext = crate::crypto::decrypt(&old_key, &old_nonce, &old_ciphertext)
-            .map_err(|e| format!(
-                "Failed to decrypt team key '{vk}' during password change: {err}. \
+        let plaintext =
+            crate::crypto::decrypt(&old_key, &old_nonce, &old_ciphertext).map_err(|e| {
+                format!(
+                    "Failed to decrypt team key '{vk}' during password change: {err}. \
                  This row's ciphertext was written with a different vault_key than \
                  the current password_hash — change-password cannot rotate it. \
                  Recover by running `aikey key sync --force-reencrypt` first \
                  (clears stale ciphertext + re-downloads under the current key), \
                  then retry `aikey change-password`.",
-                vk = vk_id, err = e))?;
+                    vk = vk_id,
+                    err = e
+                )
+            })?;
         let (new_nonce, new_ciphertext) = crate::crypto::encrypt(&new_key, &plaintext)
             .map_err(|e| format!("Failed to re-encrypt team key '{}': {}", vk_id, e))?;
         tx.execute(
@@ -1038,7 +1096,13 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
     // refresh-cycle and force the user through `aikey auth login` again. The
     // access_token/refresh_token pairs are independently nullable, so we
     // re-encrypt each non-null pair in place.
-    let oauth_rows: Vec<(String, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = {
+    let oauth_rows: Vec<(
+        String,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    )> = {
         let mut stmt = tx
             .prepare(
                 "SELECT provider_account_id,
@@ -1073,14 +1137,22 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
 
         let (new_at_nonce, new_at_ct) = if has_access {
             let pt = crate::crypto::decrypt(&old_key, &at_nonce.unwrap(), &at_ct.unwrap())
-                .map_err(|e| format!(
-                    "Failed to decrypt OAuth access_token for account '{acc}': {err}. \
+                .map_err(|e| {
+                    format!(
+                        "Failed to decrypt OAuth access_token for account '{acc}': {err}. \
                      This token was encrypted with a vault_key that doesn't match \
                      the current password_hash. Run `aikey auth login <provider>` to \
                      re-issue, then retry change-password.",
-                    acc = account_id, err = e))?;
-            let (n, c) = crate::crypto::encrypt(&new_key, &pt)
-                .map_err(|e| format!("Failed to re-encrypt OAuth access_token for '{}': {}", account_id, e))?;
+                        acc = account_id,
+                        err = e
+                    )
+                })?;
+            let (n, c) = crate::crypto::encrypt(&new_key, &pt).map_err(|e| {
+                format!(
+                    "Failed to re-encrypt OAuth access_token for '{}': {}",
+                    account_id, e
+                )
+            })?;
             (Some(n), Some(c))
         } else {
             (None, None)
@@ -1088,14 +1160,22 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
 
         let (new_rt_nonce, new_rt_ct) = if has_refresh {
             let pt = crate::crypto::decrypt(&old_key, &rt_nonce.unwrap(), &rt_ct.unwrap())
-                .map_err(|e| format!(
-                    "Failed to decrypt OAuth refresh_token for account '{acc}': {err}. \
+                .map_err(|e| {
+                    format!(
+                        "Failed to decrypt OAuth refresh_token for account '{acc}': {err}. \
                      This token was encrypted with a vault_key that doesn't match \
                      the current password_hash. Run `aikey auth login <provider>` to \
                      re-issue, then retry change-password.",
-                    acc = account_id, err = e))?;
-            let (n, c) = crate::crypto::encrypt(&new_key, &pt)
-                .map_err(|e| format!("Failed to re-encrypt OAuth refresh_token for '{}': {}", account_id, e))?;
+                        acc = account_id,
+                        err = e
+                    )
+                })?;
+            let (n, c) = crate::crypto::encrypt(&new_key, &pt).map_err(|e| {
+                format!(
+                    "Failed to re-encrypt OAuth refresh_token for '{}': {}",
+                    account_id, e
+                )
+            })?;
             (Some(n), Some(c))
         } else {
             (None, None)
@@ -1121,19 +1201,28 @@ pub fn change_password(old_password: &SecretString, new_password: &SecretString)
     // Update KDF parameters to default values (stored as binary)
     tx.execute(
         "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-        params!["kdf_m_cost", &crate::crypto::ARGON2_M_COST.to_le_bytes()[..]],
+        params![
+            "kdf_m_cost",
+            &crate::crypto::ARGON2_M_COST.to_le_bytes()[..]
+        ],
     )
     .map_err(|e| format!("Failed to update m_cost: {}", e))?;
 
     tx.execute(
         "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-        params!["kdf_t_cost", &crate::crypto::ARGON2_T_COST.to_le_bytes()[..]],
+        params![
+            "kdf_t_cost",
+            &crate::crypto::ARGON2_T_COST.to_le_bytes()[..]
+        ],
     )
     .map_err(|e| format!("Failed to update t_cost: {}", e))?;
 
     tx.execute(
         "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-        params!["kdf_p_cost", &crate::crypto::ARGON2_P_COST.to_le_bytes()[..]],
+        params![
+            "kdf_p_cost",
+            &crate::crypto::ARGON2_P_COST.to_le_bytes()[..]
+        ],
     )
     .map_err(|e| format!("Failed to update p_cost: {}", e))?;
 
@@ -1160,7 +1249,10 @@ pub fn get_entries_with_metadata(
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
     let conn = open_connection()?;
@@ -1202,11 +1294,13 @@ pub fn get_entry_with_metadata(
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
 
     conn.query_row(
         "SELECT nonce, ciphertext, version_tag, created_at, created_at as updated_at, metadata
@@ -1245,11 +1339,13 @@ pub fn update_entry_full(
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("Failed to open database: {}", e))?;
+    let conn = Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
 
     conn.execute(
         "UPDATE entries
@@ -1275,7 +1371,10 @@ pub fn insert_entry_full(
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
     let conn = open_connection()?;
@@ -1310,7 +1409,10 @@ pub fn get_all_entries() -> Result<Vec<(String, Vec<u8>, Vec<u8>)>, String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
-        return Err("Vault not initialized. Run any aikey command to initialize it automatically.".to_string());
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
     }
 
     let conn = open_connection()?;
@@ -1505,7 +1607,12 @@ pub fn set_provider_account_route_token(account_id: &str, token: &str) -> Result
             "UPDATE provider_accounts SET route_token = ?1 WHERE provider_account_id = ?2",
             params![token, account_id],
         )
-        .map_err(|e| format!("Failed to set route_token for account '{}': {}", account_id, e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to set route_token for account '{}': {}",
+                account_id, e
+            )
+        })?;
     if rows == 0 {
         return Err(format!("Provider account '{}' not found", account_id));
     }
@@ -1518,11 +1625,16 @@ pub fn get_provider_account_route_token(account_id: &str) -> Result<Option<Strin
 }
 
 /// Gets the route_token for a provider (OAuth) account (read-only, no migrations).
-pub fn get_provider_account_route_token_readonly(account_id: &str) -> Result<Option<String>, String> {
+pub fn get_provider_account_route_token_readonly(
+    account_id: &str,
+) -> Result<Option<String>, String> {
     query_provider_account_route_token(&open_connection_readonly()?, account_id)
 }
 
-fn query_provider_account_route_token(conn: &Connection, account_id: &str) -> Result<Option<String>, String> {
+fn query_provider_account_route_token(
+    conn: &Connection,
+    account_id: &str,
+) -> Result<Option<String>, String> {
     if !has_column(conn, "provider_accounts", "route_token") {
         return Ok(None);
     }
@@ -1533,7 +1645,10 @@ fn query_provider_account_route_token(conn: &Connection, account_id: &str) -> Re
     ) {
         Ok(token) => Ok(token),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(format!("Failed to get route_token for account '{}': {}", account_id, e)),
+        Err(e) => Err(format!(
+            "Failed to get route_token for account '{}': {}",
+            account_id, e
+        )),
     }
 }
 
@@ -1571,7 +1686,8 @@ pub fn backfill_route_tokens() -> Result<usize, String> {
             let mut stmt = tx
                 .prepare("SELECT alias FROM entries WHERE route_token IS NULL")
                 .map_err(|e| format!("backfill query entries: {}", e))?;
-            let rows: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(0))
+            let rows: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|e| format!("backfill iter entries: {}", e))?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -1591,9 +1707,12 @@ pub fn backfill_route_tokens() -> Result<usize, String> {
     if has_accounts_col {
         let ids: Vec<String> = {
             let mut stmt = tx
-                .prepare("SELECT provider_account_id FROM provider_accounts WHERE route_token IS NULL")
+                .prepare(
+                    "SELECT provider_account_id FROM provider_accounts WHERE route_token IS NULL",
+                )
                 .map_err(|e| format!("backfill query provider_accounts: {}", e))?;
-            let rows: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(0))
+            let rows: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(0))
                 .map_err(|e| format!("backfill iter provider_accounts: {}", e))?
                 .filter_map(|r| r.ok())
                 .collect();
@@ -1646,11 +1765,17 @@ mod tests {
 
     /// Sets up an isolated vault DB via `AK_VAULT_PATH`.
     /// Returns the TempDir guard (must stay alive), the DB path, and the mutex guard.
-    fn setup_vault() -> (TempDir, std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
+    fn setup_vault() -> (
+        TempDir,
+        std::path::PathBuf,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
         let guard = VAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("vault.db");
-        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
         let mut salt = [0u8; 16];
         crate::crypto::generate_salt(&mut salt).expect("salt");
         let pw = SecretString::new("test_password".to_string());
@@ -1786,7 +1911,10 @@ mod tests {
         set_active_key_config(&cfg).expect("set");
 
         let got = get_active_key_config().unwrap().expect("should exist");
-        assert_eq!(got.key_type, crate::credential_type::CredentialType::PersonalApiKey);
+        assert_eq!(
+            got.key_type,
+            crate::credential_type::CredentialType::PersonalApiKey
+        );
         assert_eq!(got.key_ref, "my-key");
         assert_eq!(got.providers, vec!["openai".to_string()]);
 
@@ -1803,8 +1931,13 @@ mod tests {
 
         assert!(get_platform_account().unwrap().is_none());
 
-        save_platform_account("acc-1", "user@example.com", "jwt-token", "http://localhost:3000")
-            .expect("save");
+        save_platform_account(
+            "acc-1",
+            "user@example.com",
+            "jwt-token",
+            "http://localhost:3000",
+        )
+        .expect("save");
 
         let acc = get_platform_account().unwrap().expect("should exist");
         assert_eq!(acc.account_id, "acc-1");
@@ -1868,11 +2001,13 @@ mod tests {
         let salt_before = read_config_blob(
             &rusqlite::Connection::open(&db_path).unwrap(),
             "master_salt",
-        ).expect("salt present");
+        )
+        .expect("salt present");
         let hash_before = read_config_blob(
             &rusqlite::Connection::open(&db_path).unwrap(),
             "password_hash",
-        ).expect("hash present");
+        )
+        .expect("hash present");
 
         change_password(&old, &new).expect("change_password ok");
 
@@ -1881,8 +2016,10 @@ mod tests {
         let hash_after = read_config_blob(&conn, "password_hash").expect("hash after");
 
         assert_ne!(salt_before, salt_after, "salt must rotate");
-        assert_ne!(hash_before, hash_after,
-            "password_hash MUST rotate — leaving it at the old value bricks the vault");
+        assert_ne!(
+            hash_before, hash_after,
+            "password_hash MUST rotate — leaving it at the old value bricks the vault"
+        );
 
         // password_hash must equal derive(new_password, new_salt) with default params.
         let expected = crate::crypto::derive_key_with_params(
@@ -1891,11 +2028,15 @@ mod tests {
             crate::crypto::ARGON2_M_COST,
             crate::crypto::ARGON2_T_COST,
             crate::crypto::ARGON2_P_COST,
-        ).expect("derive new");
-        assert_eq!(hash_after.as_slice(), expected.as_slice(),
+        )
+        .expect("derive new");
+        assert_eq!(
+            hash_after.as_slice(),
+            expected.as_slice(),
             "password_hash must match derive(new_password, new_salt) so \
              executor::verify_password_internal / aikey-proxy vault.go can \
-             open the vault with the new password");
+             open the vault with the new password"
+        );
     }
 
     #[test]
@@ -1903,10 +2044,12 @@ mod tests {
         let (_dir, _, _lock) = setup_vault();
         let same = SecretString::new("test_password".to_string());
 
-        let err = change_password(&same, &same)
-            .expect_err("same-password change must be rejected");
-        assert!(err.to_lowercase().contains("differ") || err.to_lowercase().contains("same"),
-            "rejection message should explain why, got: {}", err);
+        let err = change_password(&same, &same).expect_err("same-password change must be rejected");
+        assert!(
+            err.to_lowercase().contains("differ") || err.to_lowercase().contains("same"),
+            "rejection message should explain why, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -1916,10 +2059,12 @@ mod tests {
         let wrong = SecretString::new("not-the-real-password".to_string());
         let new = SecretString::new("new_password_xyz".to_string());
 
-        let err = change_password(&wrong, &new)
-            .expect_err("wrong old password must be rejected");
-        assert!(err.to_lowercase().contains("incorrect") || err.to_lowercase().contains("invalid"),
-            "rejection message should mention password validity, got: {}", err);
+        let err = change_password(&wrong, &new).expect_err("wrong old password must be rejected");
+        assert!(
+            err.to_lowercase().contains("incorrect") || err.to_lowercase().contains("invalid"),
+            "rejection message should mention password validity, got: {}",
+            err
+        );
 
         // Hash must NOT have been touched by a failed attempt.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1932,9 +2077,13 @@ mod tests {
             crate::crypto::ARGON2_M_COST,
             crate::crypto::ARGON2_T_COST,
             crate::crypto::ARGON2_P_COST,
-        ).expect("derive");
-        assert_eq!(hash_after.as_slice(), expected.as_slice(),
-            "failed change attempt must not mutate password_hash");
+        )
+        .expect("derive");
+        assert_eq!(
+            hash_after.as_slice(),
+            expected.as_slice(),
+            "failed change attempt must not mutate password_hash"
+        );
     }
 
     // ── change_password re-encrypts ALL ciphertext tables (2026-05-11 fix) ─
@@ -2006,8 +2155,11 @@ mod tests {
         let new_key = derive_current("new_password_xyz");
         let recovered = crate::crypto::decrypt(&new_key, &new_nonce, &new_ct)
             .expect("decrypt with new vault_key must succeed");
-        assert_eq!(recovered.as_slice(), plaintext,
-            "team key plaintext must round-trip across change_password");
+        assert_eq!(
+            recovered.as_slice(),
+            plaintext,
+            "team key plaintext must round-trip across change_password"
+        );
 
         // The old vault_key must NOT decrypt anymore — proves a real rotate.
         assert!(
@@ -2034,7 +2186,8 @@ mod tests {
                 (provider_account_id, provider, auth_type, display_identity, created_at)
              VALUES ('acct-1','claude','oauth','user@example.com', strftime('%s','now'))",
             [],
-        ).expect("insert provider_account");
+        )
+        .expect("insert provider_account");
         conn.execute(
             "INSERT INTO provider_account_tokens
                 (provider_account_id,
@@ -2043,7 +2196,8 @@ mod tests {
                  token_expires_at, updated_at)
              VALUES ('acct-1', ?1, ?2, ?3, ?4, 9999999999, strftime('%s','now'))",
             params![at_n, at_c, rt_n, rt_c],
-        ).expect("insert tokens");
+        )
+        .expect("insert tokens");
 
         let old = SecretString::new("test_password".to_string());
         let new = SecretString::new("new_password_xyz".to_string());
@@ -2077,7 +2231,8 @@ mod tests {
         // Simulate the 2026-05-11 incident: insert team key ciphertext
         // encrypted under a vault_key that does NOT match password_hash.
         let bogus_key = [0u8; 32];
-        let (nonce, ct) = crate::crypto::encrypt(&bogus_key, b"unknown-plaintext").expect("encrypt");
+        let (nonce, ct) =
+            crate::crypto::encrypt(&bogus_key, b"unknown-plaintext").expect("encrypt");
         let conn = open_connection().expect("open");
         conn.execute(
             "INSERT INTO managed_virtual_keys_cache
@@ -2089,7 +2244,8 @@ mod tests {
                      'https://api.anthropic.com','c','r','v',
                      'active','claimed','synced_inactive', ?1, ?2, strftime('%s','now'))",
             params![nonce, ct],
-        ).expect("seed bad row");
+        )
+        .expect("seed bad row");
 
         let old = SecretString::new("test_password".to_string());
         let new = SecretString::new("new_password_xyz".to_string());
@@ -2111,8 +2267,10 @@ mod tests {
             )
             .expect("hash present");
         let original = derive_current("test_password");
-        assert_eq!(hash_after, original,
-            "transaction must roll back: password_hash stays on the old key");
+        assert_eq!(
+            hash_after, original,
+            "transaction must roll back: password_hash stays on the old key"
+        );
     }
 
     // ── force-reencrypt + verify_vault_key (2026-05-11 fix) ──
@@ -2139,17 +2297,24 @@ mod tests {
                     ('vk-C','o','s','C','anthropic','anthropic','u','c','r','v',
                      'active','pending_claim','synced_inactive', NULL, NULL, 0)",
             params![n, c],
-        ).expect("seed");
+        )
+        .expect("seed");
 
         let cleared = crate::storage::clear_managed_key_ciphertexts().expect("clear");
-        assert_eq!(cleared, 1, "only vk-A (active + non-disabled + has ct) is cleared");
+        assert_eq!(
+            cleared, 1,
+            "only vk-A (active + non-disabled + has ct) is cleared"
+        );
 
         // vk-A: cleared
         let conn = open_connection().expect("reopen");
         let a_ct: Option<Vec<u8>> = conn.query_row(
             "SELECT provider_key_ciphertext FROM managed_virtual_keys_cache WHERE virtual_key_id='vk-A'",
             [], |row| row.get(0)).expect("vk-A");
-        assert!(a_ct.is_none(), "vk-A ciphertext must be NULL after force-reencrypt");
+        assert!(
+            a_ct.is_none(),
+            "vk-A ciphertext must be NULL after force-reencrypt"
+        );
 
         // vk-B: still has ct (disabled rows untouched — server-owned lifecycle)
         let b_ct: Option<Vec<u8>> = conn.query_row(
@@ -2166,8 +2331,11 @@ mod tests {
 
         let wrong = [0u8; 32];
         let err = verify_vault_key(&wrong).expect_err("wrong key must reject");
-        assert!(err.contains("password_hash"),
-            "rejection message must reference password_hash, got: {}", err);
+        assert!(
+            err.contains("password_hash"),
+            "rejection message must reference password_hash, got: {}",
+            err
+        );
 
         // Length mismatch is a programmer error, not a credential error.
         assert!(verify_vault_key(&[0u8; 31]).is_err());
@@ -2180,13 +2348,16 @@ mod tests {
         // fallback this would silently accept any key on an empty-entries
         // vault — the precise hole the 2026-05-11 fix closes.
         let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute("DELETE FROM config WHERE key='password_hash'", []).unwrap();
+        conn.execute("DELETE FROM config WHERE key='password_hash'", [])
+            .unwrap();
 
         let any_key = [0u8; 32];
         let err = verify_vault_key(&any_key)
             .expect_err("missing password_hash must REJECT (no silent accept)");
-        assert!(err.contains("password_hash") && err.contains("init"),
-            "rejection must explain missing hash + point at `aikey init`, got: {}", err);
+        assert!(
+            err.contains("password_hash") && err.contains("init"),
+            "rejection must explain missing hash + point at `aikey init`, got: {}",
+            err
+        );
     }
 }
-

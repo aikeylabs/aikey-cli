@@ -13,9 +13,9 @@ use aikeylabs_aikey_cli::storage::{ActiveKeyConfig, ProviderBinding};
 fn src_type_from_str(s: &str) -> Option<CredentialType> {
     match s {
         "personal" => Some(CredentialType::PersonalApiKey),
-        "team"     => Some(CredentialType::ManagedVirtualKey),
-        "oauth"    => Some(CredentialType::PersonalOAuthAccount),
-        _          => None,
+        "team" => Some(CredentialType::ManagedVirtualKey),
+        "oauth" => Some(CredentialType::PersonalOAuthAccount),
+        _ => None,
     }
 }
 
@@ -41,8 +41,14 @@ fn single_personal_binding_injects_correct_env() {
 
     assert!(!used_legacy);
     assert_eq!(providers, vec!["anthropic"]);
-    assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "aikey_active_anthropic");
-    assert_eq!(env.get("ANTHROPIC_BASE_URL").unwrap(), "http://127.0.0.1:27200/anthropic");
+    assert_eq!(
+        env.get("ANTHROPIC_API_KEY").unwrap(),
+        "aikey_active_anthropic"
+    );
+    assert_eq!(
+        env.get("ANTHROPIC_BASE_URL").unwrap(),
+        "http://127.0.0.1:27200/anthropic"
+    );
     // Should only have 2 env vars (API_KEY + BASE_URL) for one provider.
     assert_eq!(env.len(), 2);
 }
@@ -54,7 +60,10 @@ fn single_team_binding_injects_vk_token() {
 
     assert_eq!(providers, vec!["openai"]);
     assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "aikey_active_openai");
-    assert_eq!(env.get("OPENAI_BASE_URL").unwrap(), "http://127.0.0.1:27200/openai");
+    assert_eq!(
+        env.get("OPENAI_BASE_URL").unwrap(),
+        "http://127.0.0.1:27200/openai"
+    );
 }
 
 // ============================================================================
@@ -74,16 +83,28 @@ fn multi_provider_mixed_sources() {
     assert_eq!(providers.len(), 3);
 
     // Anthropic: team key
-    assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "aikey_active_anthropic");
-    assert_eq!(env.get("ANTHROPIC_BASE_URL").unwrap(), "http://127.0.0.1:27200/anthropic");
+    assert_eq!(
+        env.get("ANTHROPIC_API_KEY").unwrap(),
+        "aikey_active_anthropic"
+    );
+    assert_eq!(
+        env.get("ANTHROPIC_BASE_URL").unwrap(),
+        "http://127.0.0.1:27200/anthropic"
+    );
 
     // OpenAI: personal key
     assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "aikey_active_openai");
-    assert_eq!(env.get("OPENAI_BASE_URL").unwrap(), "http://127.0.0.1:27200/openai");
+    assert_eq!(
+        env.get("OPENAI_BASE_URL").unwrap(),
+        "http://127.0.0.1:27200/openai"
+    );
 
     // Google: personal key
     assert_eq!(env.get("GOOGLE_API_KEY").unwrap(), "aikey_active_google");
-    assert_eq!(env.get("GOOGLE_BASE_URL").unwrap(), "http://127.0.0.1:27200/google");
+    assert_eq!(
+        env.get("GOOGLE_BASE_URL").unwrap(),
+        "http://127.0.0.1:27200/google"
+    );
 
     // 3 providers * 2 vars each = 6
     assert_eq!(env.len(), 6);
@@ -117,7 +138,10 @@ fn legacy_fallback_team_key() {
     assert!(used_legacy);
     assert_eq!(providers, vec!["anthropic", "openai"]);
     // Both providers get the same team token (legacy single-key behavior).
-    assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "aikey_active_anthropic");
+    assert_eq!(
+        env.get("ANTHROPIC_API_KEY").unwrap(),
+        "aikey_active_anthropic"
+    );
     assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "aikey_active_anthropic");
 }
 
@@ -132,7 +156,10 @@ fn legacy_fallback_personal_key() {
 
     assert!(used_legacy);
     assert_eq!(providers, vec!["anthropic"]);
-    assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "aikey_active_anthropic");
+    assert_eq!(
+        env.get("ANTHROPIC_API_KEY").unwrap(),
+        "aikey_active_anthropic"
+    );
 }
 
 #[test]
@@ -170,7 +197,10 @@ fn bindings_override_legacy_config() {
     // New model wins — legacy is ignored.
     assert!(!used_legacy);
     assert_eq!(providers, vec!["anthropic"]);
-    assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "aikey_active_anthropic");
+    assert_eq!(
+        env.get("ANTHROPIC_API_KEY").unwrap(),
+        "aikey_active_anthropic"
+    );
     // OpenAI should NOT be injected (only anthropic has a binding).
     assert!(env.get("OPENAI_API_KEY").is_none());
 }
@@ -211,5 +241,8 @@ fn custom_proxy_port_in_base_url() {
     let bindings = vec![make_binding("openai", "personal", "k1")];
     let (env, _, _) = build_run_env(&bindings, None, 31337).unwrap();
 
-    assert_eq!(env.get("OPENAI_BASE_URL").unwrap(), "http://127.0.0.1:31337/openai");
+    assert_eq!(
+        env.get("OPENAI_BASE_URL").unwrap(),
+        "http://127.0.0.1:31337/openai"
+    );
 }

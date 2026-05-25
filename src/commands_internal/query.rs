@@ -47,7 +47,11 @@ use super::stdin_json::{decode_vault_key, emit, emit_error};
 /// vault Web drawer as `route_url`.
 fn route_url_for(provider_code: &str) -> Option<String> {
     let info = provider_info(provider_code)?;
-    Some(format!("http://127.0.0.1:{}/{}", proxy_port(), info.proxy_path))
+    Some(format!(
+        "http://127.0.0.1:{}/{}",
+        proxy_port(),
+        info.proxy_path
+    ))
 }
 
 // ========== in-use detection ==========
@@ -200,7 +204,11 @@ pub(crate) fn team_effective_status(
         && share_status == "claimed"
         && !local_state.starts_with("disabled_")
         && local_state != "stale";
-    if is_usable { "active" } else { "inactive" }
+    if is_usable {
+        "active"
+    } else {
+        "inactive"
+    }
 }
 
 fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Value> {
@@ -280,10 +288,16 @@ fn load_active_binding_refs() -> (ActiveBindingMap, ActiveBindingMap, ActiveBind
         for b in bindings {
             match b.key_source_type {
                 CredentialType::PersonalApiKey => {
-                    personal.entry(b.key_source_ref).or_default().push(b.provider_code);
+                    personal
+                        .entry(b.key_source_ref)
+                        .or_default()
+                        .push(b.provider_code);
                 }
                 CredentialType::PersonalOAuthAccount => {
-                    oauth.entry(b.key_source_ref).or_default().push(b.provider_code);
+                    oauth
+                        .entry(b.key_source_ref)
+                        .or_default()
+                        .push(b.provider_code);
                 }
                 // Phase 3B (2026-05-11): team (ManagedVirtualKey) bindings
                 // also captured. Map keyed by virtual_key_id so the Web
@@ -294,7 +308,9 @@ fn load_active_binding_refs() -> (ActiveBindingMap, ActiveBindingMap, ActiveBind
                 // the Web showed no Active state, making it look like Use
                 // had no effect.
                 CredentialType::ManagedVirtualKey => {
-                    team.entry(b.key_source_ref).or_default().push(b.provider_code);
+                    team.entry(b.key_source_ref)
+                        .or_default()
+                        .push(b.provider_code);
                 }
             }
         }
@@ -349,10 +365,8 @@ pub fn handle(env: StdinEnvelope) {
 /// 校验 vault_key（与 vault_op.rs 同款逻辑，但不依赖 prepare_vault 因为 query 有的 action 不需要 key）
 fn verify_key(env: &StdinEnvelope) -> Result<[u8; 32], (&'static str, String)> {
     let key = decode_vault_key(&env.vault_key_hex)?;
-    storage::ensure_vault_exists()
-        .map_err(|e| ("I_VAULT_NOT_INITIALIZED", format!("{}", e)))?;
-    let conn = storage::open_connection()
-        .map_err(|e| ("I_VAULT_OPEN_FAILED", format!("{}", e)))?;
+    storage::ensure_vault_exists().map_err(|e| ("I_VAULT_NOT_INITIALIZED", format!("{}", e)))?;
+    let conn = storage::open_connection().map_err(|e| ("I_VAULT_OPEN_FAILED", format!("{}", e)))?;
 
     let stored_hash: Result<Vec<u8>, rusqlite::Error> = conn.query_row(
         "SELECT value FROM config WHERE key = 'password_hash'",
@@ -367,18 +381,19 @@ fn verify_key(env: &StdinEnvelope) -> Result<[u8; 32], (&'static str, String)> {
         )),
         Err(_) => {
             // 无 password_hash：尝试解一条 entry 兜底
-            let entry: Result<(Vec<u8>, Vec<u8>), rusqlite::Error> = conn.query_row(
-                "SELECT nonce, ciphertext FROM entries LIMIT 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            );
+            let entry: Result<(Vec<u8>, Vec<u8>), rusqlite::Error> =
+                conn.query_row("SELECT nonce, ciphertext FROM entries LIMIT 1", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                });
             match entry {
                 Ok((nonce, ciphertext)) => crypto::decrypt(&key, &nonce, &ciphertext)
                     .map(|_| key)
-                    .map_err(|_| (
-                        "I_VAULT_KEY_INVALID",
-                        "vault_key failed to decrypt any entry".to_string(),
-                    )),
+                    .map_err(|_| {
+                        (
+                            "I_VAULT_KEY_INVALID",
+                            "vault_key failed to decrypt any entry".to_string(),
+                        )
+                    }),
                 Err(_) => Ok(key), // 空 vault 兜底
             }
         }
@@ -417,13 +432,18 @@ fn handle_list_with_metadata(env: StdinEnvelope) {
 
     match storage::list_entries_with_metadata() {
         Ok(entries) => {
-            let arr: Vec<_> = entries.iter().map(|m| json!({
-                "alias": m.alias,
-                "created_at": m.created_at,
-                "provider_code": m.provider_code,
-                "base_url": m.base_url,
-                "supported_providers": m.supported_providers,
-            })).collect();
+            let arr: Vec<_> = entries
+                .iter()
+                .map(|m| {
+                    json!({
+                        "alias": m.alias,
+                        "created_at": m.created_at,
+                        "provider_code": m.provider_code,
+                        "base_url": m.base_url,
+                        "supported_providers": m.supported_providers,
+                    })
+                })
+                .collect();
             emit(&ResultEnvelope::ok(
                 req_id,
                 json!({"count": arr.len(), "entries": arr}),
@@ -444,7 +464,11 @@ fn handle_get(env: StdinEnvelope) {
     let payload: GetPayload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
         Err(e) => {
-            emit_error(req_id, "I_STDIN_INVALID_JSON", format!("get payload invalid: {}", e));
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("get payload invalid: {}", e),
+            );
             return;
         }
     };
@@ -483,8 +507,7 @@ fn handle_get(env: StdinEnvelope) {
         }
     };
 
-    let official_base_url =
-        meta.provider_code.as_deref().and_then(default_base_url);
+    let official_base_url = meta.provider_code.as_deref().and_then(default_base_url);
     let data = json!({
         "alias": meta.alias,
         "created_at": meta.created_at,
@@ -522,11 +545,7 @@ fn handle_check_alias_exists(env: StdinEnvelope) {
     // 查哪些 alias 已存在）。只读 alias 本身（无 secret 内容），不涉及解密路径。
     // 仍需 vault 存在。
     if let Err(e) = storage::ensure_vault_exists() {
-        emit_error(
-            req_id,
-            "I_VAULT_NOT_INITIALIZED",
-            format!("{}", e),
-        );
+        emit_error(req_id, "I_VAULT_NOT_INITIALIZED", format!("{}", e));
         return;
     }
 
@@ -548,11 +567,7 @@ fn handle_check_alias_exists(env: StdinEnvelope) {
             req_id,
             json!({"alias": payload.alias, "exists": n > 0}),
         )),
-        Err(e) => emit_error(
-            req_id,
-            "I_INTERNAL",
-            format!("count alias failed: {}", e),
-        ),
+        Err(e) => emit_error(req_id, "I_INTERNAL", format!("count alias failed: {}", e)),
     }
 }
 
@@ -578,13 +593,20 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
 
     let key = match verify_key(&env) {
         Ok(k) => k,
-        Err((c, m)) => { emit_error(req_id, c, m); return; }
+        Err((c, m)) => {
+            emit_error(req_id, c, m);
+            return;
+        }
     };
 
     let metas = match storage::list_entries_with_metadata() {
         Ok(v) => v,
         Err(e) => {
-            emit_error(req_id, "I_INTERNAL", format!("list_entries_with_metadata failed: {}", e));
+            emit_error(
+                req_id,
+                "I_INTERNAL",
+                format!("list_entries_with_metadata failed: {}", e),
+            );
             return;
         }
     };
@@ -603,14 +625,20 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
                 // Skip the entry instead of failing the whole list — a single
                 // corrupted row shouldn't black-hole the Web page. Log via
                 // stderr so operators can see it.
-                eprintln!("[_internal query list_personal_with_masked WARN] get_entry '{}' failed: {}", m.alias, e);
+                eprintln!(
+                    "[_internal query list_personal_with_masked WARN] get_entry '{}' failed: {}",
+                    m.alias, e
+                );
                 continue;
             }
         };
         let plaintext = match crypto::decrypt(&key, &nonce, &ciphertext) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("[_internal query list_personal_with_masked WARN] decrypt '{}' failed: {}", m.alias, e);
+                eprintln!(
+                    "[_internal query list_personal_with_masked WARN] decrypt '{}' failed: {}",
+                    m.alias, e
+                );
                 continue;
             }
         };
@@ -627,8 +655,7 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
         // rather than a new /v1/registry endpoint: "慎重新建 API" —
         // extending an existing payload is lower blast radius than
         // adding a new endpoint for a 6-row lookup table.
-        let official_base_url =
-            m.provider_code.as_deref().and_then(default_base_url);
+        let official_base_url = m.provider_code.as_deref().and_then(default_base_url);
         out.push(json!({
             "target": "personal",
             "id": m.alias,
@@ -741,7 +768,11 @@ fn handle_list_oauth(env: StdinEnvelope) {
     let accounts = match storage::list_provider_accounts() {
         Ok(v) => v,
         Err(e) => {
-            emit_error(req_id, "I_INTERNAL", format!("list_provider_accounts failed: {}", e));
+            emit_error(
+                req_id,
+                "I_INTERNAL",
+                format!("list_provider_accounts failed: {}", e),
+            );
             return;
         }
     };
@@ -753,55 +784,83 @@ fn handle_list_oauth(env: StdinEnvelope) {
     let expires_map = load_oauth_expires_map().unwrap_or_default();
     let (_active_personal, active_oauth, active_team) = load_active_binding_refs();
 
-    let arr: Vec<_> = accounts.iter().map(|a| {
-        // route_url + route_token mirror the personal-key payload (2026-05-06).
-        // Why: the user/vault drawer needs the same SDK-base-url + opaque token
-        // pair for OAuth accounts that it already shows for personal keys, so
-        // the values match `aikey route` exactly. Generation logic is identical
-        // — `route_url_for` + `provider_proxy_path` already canonicalize aliases
-        // (claude → anthropic, moonshot → moonshot/v1) the same way `aikey route`
-        // does in handle_route. route_token is the server-issued opaque
-        // identifier stored on the account; absent only on pre-route-token
-        // vaults (returns null in that case, drawer hides the row).
-        let route_token = storage::get_provider_account_route_token_readonly(&a.provider_account_id)
-            .ok()
-            .flatten();
-        // Effective alias = local_alias if user has renamed, else
-        // display_identity. v1.0.1-alpha.1 split the two so the
-        // "alias differs from identity ⇒ render Identity row separately"
-        // UI rule has a real signal — pre-split they were always equal.
-        let effective_alias = a
-            .local_alias
-            .clone()
-            .or_else(|| a.display_identity.clone());
-        json!({
-            "target": "oauth",
-            "id": a.provider_account_id,
-            "provider_account_id": a.provider_account_id,
-            "provider": a.provider,
-            "protocol_family": protocol_family_of(Some(&a.provider)),
-            "auth_type": a.auth_type,
-            "credential_type": a.credential_type.as_str(),
-            "display_identity": a.display_identity,
-            "alias": effective_alias,
-            "local_alias": a.local_alias,
-            "external_id": a.external_id,
-            "org_uuid": a.org_uuid,
-            "account_tier": a.account_tier,
-            "status": a.status,
-            "created_at": a.created_at,
-            "last_used_at": a.last_used_at,
-            "use_count": a.use_count.unwrap_or(0),
-            // See list_personal handler for the in_use_for / in_use rationale.
-            "in_use_for": active_oauth.get(&a.provider_account_id).cloned().unwrap_or_default(),
-            "in_use": active_oauth.contains_key(&a.provider_account_id),
-            "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
-            "route_url": route_url_for(&a.provider),
-            "route_token": route_token,
-            // 2026-05-22: same contract as list_personal — see SecretMetadata::extra.
-            "extra": a.extra,
+    let arr: Vec<_> = accounts
+        .iter()
+        .map(|a| {
+            // route_url + route_token mirror the personal-key payload (2026-05-06).
+            // Why: the user/vault drawer needs the same SDK-base-url + opaque token
+            // pair for OAuth accounts that it already shows for personal keys, so
+            // the values match `aikey route` exactly. Generation logic is identical
+            // — `route_url_for` + `provider_proxy_path` already canonicalize aliases
+            // (claude → anthropic, moonshot → moonshot/v1) the same way `aikey route`
+            // does in handle_route. route_token is the server-issued opaque
+            // identifier stored on the account.
+            //
+            // BR-rc.5 fix (2026-05-25): when route_token is missing, lazy-
+            // backfill via `ensure_provider_account_route_token` instead of
+            // returning null. Two reasons:
+            //   1. Web OAuthBrokerCard adds via `VaultAccountStore.Save`
+            //      which (pre-fix) didn't write route_token — accounts that
+            //      pre-date the Go-side fix have NULL here and would
+            //      otherwise show "Unlock vault to reveal" in the drawer
+            //      even when the vault is unlocked (UX misleading).
+            //   2. Pre-v1.0.4 vaults that never had route_token column at
+            //      all are also covered by `ensure_*` (it handles the missing
+            //      column case via `has_column` guard in storage.rs).
+            //
+            // Safe to write here: `handle_list_oauth` already called
+            // `verify_key(&env)` at function entry (line 736), which fails
+            // fast if vault is locked. So at this point vault is unlocked
+            // and `ensure_provider_account_route_token` (which opens a
+            // write connection) won't trigger a password prompt or fail.
+            //
+            // Failures (write conn open, etc) fall through to None — the
+            // drawer's "no token" state is graceful (just hides the row /
+            // shows the masked placeholder), no user-visible crash.
+            //
+            // See bugfix 20260525-vault-oauth-route-token-not-generated-by-
+            // web-broker.md.
+            let route_token =
+                match storage::get_provider_account_route_token_readonly(&a.provider_account_id) {
+                    Ok(Some(token)) => Some(token),
+                    Ok(None) | Err(_) => {
+                        storage::ensure_provider_account_route_token(&a.provider_account_id).ok()
+                    }
+                };
+            // Effective alias = local_alias if user has renamed, else
+            // display_identity. v1.0.1-alpha.1 split the two so the
+            // "alias differs from identity ⇒ render Identity row separately"
+            // UI rule has a real signal — pre-split they were always equal.
+            let effective_alias = a.local_alias.clone().or_else(|| a.display_identity.clone());
+            json!({
+                "target": "oauth",
+                "id": a.provider_account_id,
+                "provider_account_id": a.provider_account_id,
+                "provider": a.provider,
+                "protocol_family": protocol_family_of(Some(&a.provider)),
+                "auth_type": a.auth_type,
+                "credential_type": a.credential_type.as_str(),
+                "display_identity": a.display_identity,
+                "alias": effective_alias,
+                "local_alias": a.local_alias,
+                "external_id": a.external_id,
+                "org_uuid": a.org_uuid,
+                "account_tier": a.account_tier,
+                "status": a.status,
+                "created_at": a.created_at,
+                "last_used_at": a.last_used_at,
+                "use_count": a.use_count.unwrap_or(0),
+                // See list_personal handler for the in_use_for / in_use rationale.
+                "in_use_for": active_oauth.get(&a.provider_account_id).cloned().unwrap_or_default(),
+                "in_use": active_oauth.contains_key(&a.provider_account_id),
+                "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
+                "route_url": route_url_for(&a.provider),
+                "route_token": route_token,
+                // 2026-05-22: same contract as list_personal — see SecretMetadata::extra.
+                "extra": a.extra,
+            })
         })
-    }).collect();
+        .collect();
 
     emit(&ResultEnvelope::ok(
         req_id,
@@ -829,7 +888,9 @@ fn load_oauth_expires_map() -> Result<std::collections::HashMap<String, Option<i
         .prepare("SELECT provider_account_id, token_expires_at FROM provider_account_tokens")
         .map_err(|e| format!("prepare: {}", e))?;
     let rows: Vec<(String, Option<i64>)> = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+        })
         .map_err(|e| format!("query_map: {}", e))?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| format!("collect: {}", e))?;
@@ -892,8 +953,7 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                 // the real provider endpoint in locked mode too (the
                 // locked view is still the page users see before they
                 // unlock, and copying the default URL is read-only).
-                let official_base_url =
-                    m.provider_code.as_deref().and_then(default_base_url);
+                let official_base_url = m.provider_code.as_deref().and_then(default_base_url);
                 // route_token is blanked in the locked-state response. It is
                 // a personal-bearer token accepted directly by aikey-proxy;
                 // exposing the real value to anonymous local_bypass callers
@@ -962,10 +1022,7 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                 // Effective alias = local_alias if user has renamed, else
                 // display_identity. Same rule as the unlocked-mode handler;
                 // see comment in handle_list_oauth.
-                let effective_alias = a
-                    .local_alias
-                    .clone()
-                    .or_else(|| a.display_identity.clone());
+                let effective_alias = a.local_alias.clone().or_else(|| a.display_identity.clone());
                 out.push(json!({
                     "target": "oauth",
                     "id": a.provider_account_id,
@@ -1077,7 +1134,9 @@ mod active_binding_refs_tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().expect("tempdir");
         let db_path = dir.path().join("vault.db");
-        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
         let mut salt = [0u8; 16];
         crate::crypto::generate_salt(&mut salt).expect("salt");
         let pw = secrecy::SecretString::new("test_password".to_string());
@@ -1087,7 +1146,13 @@ mod active_binding_refs_tests {
         //   1. `aikey auth login claude` → binding(anthropic, oauth, acct-OAUTH)
         //   2. (key added via web) → no binding yet
         //   3. click `use` on openai-only personal key → binding(openai, personal, zeroeleven_key_1)
-        storage::set_provider_binding("default", "anthropic", "personal_oauth_account", "acct-OAUTH").unwrap();
+        storage::set_provider_binding(
+            "default",
+            "anthropic",
+            "personal_oauth_account",
+            "acct-OAUTH",
+        )
+        .unwrap();
         storage::set_provider_binding("default", "openai", "personal", "zeroeleven_key_1").unwrap();
 
         let (personal, oauth, _team) = load_active_binding_refs();
@@ -1100,7 +1165,9 @@ mod active_binding_refs_tests {
         // Personal alias is bound for OPENAI only — must NOT show up in any
         // anthropic-grouped Web row's in_use computation. This is the
         // assertion that would have caught the user's bug.
-        let openai_personal_providers = personal.get("zeroeleven_key_1").expect("personal ref present");
+        let openai_personal_providers = personal
+            .get("zeroeleven_key_1")
+            .expect("personal ref present");
         assert_eq!(openai_personal_providers, &vec!["openai".to_string()]);
 
         // Cross-check: alias does NOT appear in oauth map (different
@@ -1124,13 +1191,16 @@ mod active_binding_refs_tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().expect("tempdir");
         let db_path = dir.path().join("vault.db");
-        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
         let mut salt = [0u8; 16];
         crate::crypto::generate_salt(&mut salt).expect("salt");
         let pw = secrecy::SecretString::new("test_password".to_string());
         storage::initialize_vault(&salt, &pw).expect("init vault");
 
-        storage::set_provider_binding("default", "anthropic", "personal", "openrouter_key").unwrap();
+        storage::set_provider_binding("default", "anthropic", "personal", "openrouter_key")
+            .unwrap();
         storage::set_provider_binding("default", "openai", "personal", "openrouter_key").unwrap();
 
         let (personal, _oauth, _team) = load_active_binding_refs();
@@ -1158,7 +1228,9 @@ mod active_binding_refs_tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().expect("tempdir");
         let db_path = dir.path().join("vault.db");
-        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
         let mut salt = [0u8; 16];
         crate::crypto::generate_salt(&mut salt).expect("salt");
         let pw = secrecy::SecretString::new("test_password".to_string());
@@ -1166,16 +1238,27 @@ mod active_binding_refs_tests {
 
         // Mix of three binding types, simulating a user who has personal +
         // OAuth + team bindings active simultaneously.
-        storage::set_provider_binding("default", "anthropic", "managed_virtual_key", "vk_team_anthropic").unwrap();
-        storage::set_provider_binding("default", "google", "managed_virtual_key", "vk_team_gemini").unwrap();
+        storage::set_provider_binding(
+            "default",
+            "anthropic",
+            "managed_virtual_key",
+            "vk_team_anthropic",
+        )
+        .unwrap();
+        storage::set_provider_binding("default", "google", "managed_virtual_key", "vk_team_gemini")
+            .unwrap();
         storage::set_provider_binding("default", "openai", "personal", "personal_key").unwrap();
-        storage::set_provider_binding("default", "kimi_code", "personal_oauth_account", "oauth_acct_id").unwrap();
+        storage::set_provider_binding(
+            "default",
+            "kimi_code",
+            "personal_oauth_account",
+            "oauth_acct_id",
+        )
+        .unwrap();
 
         // Bulk-wipe team bindings.
-        let cleared = storage::remove_bindings_by_key_source_type(
-            "default",
-            "managed_virtual_key",
-        ).unwrap();
+        let cleared =
+            storage::remove_bindings_by_key_source_type("default", "managed_virtual_key").unwrap();
 
         // Both team rows surfaced.
         assert_eq!(cleared.len(), 2);
@@ -1186,9 +1269,18 @@ mod active_binding_refs_tests {
 
         // Personal + OAuth bindings preserved.
         let (personal, oauth, team) = load_active_binding_refs();
-        assert!(personal.contains_key("personal_key"), "personal binding wiped accidentally");
-        assert!(oauth.contains_key("oauth_acct_id"), "oauth binding wiped accidentally");
-        assert!(team.is_empty(), "team bindings should be empty after bulk wipe");
+        assert!(
+            personal.contains_key("personal_key"),
+            "personal binding wiped accidentally"
+        );
+        assert!(
+            oauth.contains_key("oauth_acct_id"),
+            "oauth binding wiped accidentally"
+        );
+        assert!(
+            team.is_empty(),
+            "team bindings should be empty after bulk wipe"
+        );
 
         drop(guard);
     }
@@ -1214,7 +1306,9 @@ mod active_binding_refs_tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().expect("tempdir");
         let db_path = dir.path().join("vault.db");
-        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
         let mut salt = [0u8; 16];
         crate::crypto::generate_salt(&mut salt).expect("salt");
         let pw = secrecy::SecretString::new("test_password".to_string());
@@ -1224,17 +1318,28 @@ mod active_binding_refs_tests {
         // openai binding owned by a personal alias. Both rows live in the
         // same `user_profile_provider_bindings` table — only key_source_type
         // distinguishes them. This is exactly the shape our team-merge UX hit.
-        storage::set_provider_binding("default", "anthropic", "managed_virtual_key", "vk_team_anthropic_xxx").unwrap();
-        storage::set_provider_binding("default", "openai", "personal", "personal_openai_alias").unwrap();
+        storage::set_provider_binding(
+            "default",
+            "anthropic",
+            "managed_virtual_key",
+            "vk_team_anthropic_xxx",
+        )
+        .unwrap();
+        storage::set_provider_binding("default", "openai", "personal", "personal_openai_alias")
+            .unwrap();
 
         let (personal, oauth, team) = load_active_binding_refs();
 
         // Team binding extracted into the third map.
-        let team_providers = team.get("vk_team_anthropic_xxx").expect("team vk_id present");
+        let team_providers = team
+            .get("vk_team_anthropic_xxx")
+            .expect("team vk_id present");
         assert_eq!(team_providers, &vec!["anthropic".to_string()]);
 
         // Personal binding extracted into the personal map.
-        let personal_providers = personal.get("personal_openai_alias").expect("personal alias present");
+        let personal_providers = personal
+            .get("personal_openai_alias")
+            .expect("personal alias present");
         assert_eq!(personal_providers, &vec!["openai".to_string()]);
 
         // Cross-partition guard: team vk_id MUST NOT appear in the personal

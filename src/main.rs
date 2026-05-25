@@ -1,61 +1,89 @@
-#[allow(dead_code)] mod active_env_migration;
-#[allow(dead_code)] mod credential_type;
-#[allow(dead_code)] mod team_token_normalize;
-#[allow(dead_code)] mod storage;
-#[allow(dead_code)] mod storage_acl;
-#[allow(dead_code)] mod provider_registry;
-mod crypto;
-mod session;
-mod executor;
-#[allow(dead_code)] mod synapse;
-#[allow(dead_code)] mod audit;
-mod ratelimit;
-#[allow(dead_code)] mod json_output;
-#[allow(dead_code)] mod error_codes;
+#[allow(dead_code)]
+mod active_env_migration;
+#[allow(dead_code)]
+mod audit;
+#[allow(dead_code)]
+mod commands_project;
 mod config;
-#[allow(dead_code)] mod env_resolver;
-#[allow(dead_code)] mod env_renderer;
-#[allow(dead_code)] mod commands_project;
-#[allow(dead_code)] mod connectivity;
+#[allow(dead_code)]
+mod connectivity;
+#[allow(dead_code)]
+mod credential_type;
+mod crypto;
+#[allow(dead_code)]
+mod env_renderer;
+#[allow(dead_code)]
+mod env_resolver;
+#[allow(dead_code)]
+mod error_codes;
+mod executor;
+#[allow(dead_code)]
+mod json_output;
+#[allow(dead_code)]
+mod provider_registry;
+mod ratelimit;
+mod session;
+#[allow(dead_code)]
+mod storage;
+#[allow(dead_code)]
+mod storage_acl;
+#[allow(dead_code)]
+mod synapse;
+#[allow(dead_code)]
+mod team_token_normalize;
 // mod commands_env; // removed: env commands dropped
 mod commands_proxy;
 // Layer 1 (state-machine read path) + Layer 2 (write path). Stage 1-2
 // of proxy lifecycle state machine refactor; commands_proxy.rs is in
 // the process of being migrated to thin shells over these.
-mod proxy_state;
-mod proxy_proc;
-mod proxy_lifecycle;
+#[allow(dead_code)]
+mod commands_account;
 mod proxy_events;
-#[allow(dead_code)] mod commands_account;
+mod proxy_lifecycle;
+mod proxy_proc;
+mod proxy_state;
 // migrations module is in lib.rs (used by both main.rs and executor.rs)
 use aikeylabs_aikey_cli::commands_app;
 use aikeylabs_aikey_cli::migrations;
-#[allow(dead_code)] mod platform_client;
+#[allow(dead_code)]
+mod platform_client;
 // mod profiles; // removed: profile commands dropped
 // mod core; // removed: profile-based resolver dropped
-#[allow(dead_code)] mod global_config;
-mod providers;
-mod resolver;
-#[allow(dead_code)] mod events;
-#[allow(dead_code)] mod observability;
-mod ui_frame;
-#[allow(dead_code)] mod ui_select;
-#[cfg(windows)] #[allow(dead_code)] mod ui_select_windows;
-#[cfg(windows)] #[allow(dead_code)] mod prompt_hidden_windows;
-#[cfg(windows)] #[allow(dead_code)] mod ui_frame_windows;
-mod proxy_env;
-#[allow(dead_code)] mod profile_activation;
+mod cli;
 mod commands_auth;
-mod commands_statusline;
-mod commands_watch;
-mod commands_internal;
 mod commands_import;
 mod commands_init;
-mod commands_trust;
+mod commands_internal;
 mod commands_service;
+mod commands_statusline;
+mod commands_trust;
+mod commands_watch;
+#[allow(dead_code)]
+mod events;
+#[allow(dead_code)]
+mod global_config;
 mod local_server_probe;
-#[allow(dead_code)] mod usage_wal;
-mod cli;
+#[allow(dead_code)]
+mod observability;
+#[allow(dead_code)]
+mod profile_activation;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod prompt_hidden_windows;
+mod providers;
+mod proxy_env;
+mod resolver;
+mod ui_frame;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod ui_frame_windows;
+#[allow(dead_code)]
+mod ui_select;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod ui_select_windows;
+#[allow(dead_code)]
+mod usage_wal;
 
 // Crate-wide test-env mutex (see src/test_env_lock.rs). Declared in both
 // main.rs and lib.rs because session / commands_account are pulled into
@@ -64,13 +92,13 @@ mod cli;
 #[cfg(test)]
 mod test_env_lock;
 
-use cli::*;
+use aikeylabs_aikey_cli::prompt_hidden;
 use clap::Parser;
+use cli::*;
 use secrecy::{ExposeSecret, SecretString};
 use std::env;
 use std::io::{self, IsTerminal, Write};
 use zeroize::Zeroizing;
-use aikeylabs_aikey_cli::prompt_hidden;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialise process-global trace context (trace_id, span_id, command_id).
@@ -95,16 +123,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Subcommand help — print clap's output, then append detailed notes.
             // Extract command path from "Usage: aikey <cmd> ..." line.
-            let cmd_path = rendered.lines()
+            let cmd_path = rendered
+                .lines()
                 .find(|l| l.starts_with("Usage: aikey "))
                 .and_then(|l| {
                     // "Usage: aikey add [OPTIONS] <ALIAS>" → extract "add"
                     // "Usage: aikey proxy start [OPTIONS]" → extract "proxy start"
                     let after = l.strip_prefix("Usage: aikey ")?;
-                    let parts: Vec<&str> = after.split_whitespace()
-                        .take_while(|w| !w.starts_with('[') && !w.starts_with('<') && !w.starts_with('-'))
+                    let parts: Vec<&str> = after
+                        .split_whitespace()
+                        .take_while(|w| {
+                            !w.starts_with('[') && !w.starts_with('<') && !w.starts_with('-')
+                        })
                         .collect();
-                    if parts.is_empty() { None } else { Some(parts.join(" ")) }
+                    if parts.is_empty() {
+                        None
+                    } else {
+                        Some(parts.join(" "))
+                    }
                 });
 
             // Print clap's rendered help first.
@@ -120,28 +156,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(0);
         }
 
-        if matches!(err.kind(), ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument) {
+        if matches!(
+            err.kind(),
+            ErrorKind::InvalidSubcommand | ErrorKind::UnknownArgument
+        ) {
             // Extract the bad token from the error message (clap embeds it in single quotes).
             let bad = err.to_string();
-            let token = bad
-                .split('\'')
-                .nth(1)
-                .unwrap_or("?")
-                .to_string();
+            let token = bad.split('\'').nth(1).unwrap_or("?").to_string();
 
             // All top-level subcommand names for fuzzy matching.
             const KNOWN: &[&str] = &[
-                "add", "get", "delete", "list", "update", "test", "export",
-                "run", "use", "whoami", "login", "logout", "web", "browse", "master",
-                "init", "doctor", "env", "key", "account", "secret",
-                "project", "proxy",
-                "change-password", "quickstart", "logs",
+                "add",
+                "get",
+                "delete",
+                "list",
+                "update",
+                "test",
+                "export",
+                "run",
+                "use",
+                "whoami",
+                "login",
+                "logout",
+                "web",
+                "browse",
+                "master",
+                "init",
+                "doctor",
+                "env",
+                "key",
+                "account",
+                "secret",
+                "project",
+                "proxy",
+                "change-password",
+                "quickstart",
+                "logs",
             ];
 
-            let suggestion = KNOWN.iter()
+            let suggestion = KNOWN
+                .iter()
                 .filter_map(|s| {
                     let score = similarity(&token.to_lowercase(), s);
-                    if score >= 0.5 { Some((*s, score)) } else { None }
+                    if score >= 0.5 {
+                        Some((*s, score))
+                    } else {
+                        None
+                    }
                 })
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
@@ -162,21 +223,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(pos) = argv.iter().position(|a| a == "auth") {
                 let rest = &argv[pos + 1..];
                 let sub = rest.first().map(String::as_str);
-                let takes_single_positional = matches!(sub, Some("logout") | Some("use") | Some("status"));
+                let takes_single_positional =
+                    matches!(sub, Some("logout") | Some("use") | Some("status"));
                 // Count positional args after the sub (stop at first flag).
-                let positionals = rest.iter().skip(1)
+                let positionals = rest
+                    .iter()
+                    .skip(1)
                     .take_while(|a| !a.starts_with('-'))
                     .count();
                 if takes_single_positional && positionals >= 2 {
-                    let joined = rest.iter().skip(1)
+                    let joined = rest
+                        .iter()
+                        .skip(1)
                         .take_while(|a| !a.starts_with('-'))
                         .cloned()
                         .collect::<Vec<_>>()
                         .join(" ");
                     eprintln!();
-                    eprintln!("  Hint: if this is an OAuth account display name with spaces, quote it:");
+                    eprintln!(
+                        "  Hint: if this is an OAuth account display name with spaces, quote it:"
+                    );
                     eprintln!("      aikey auth {} \"{}\"", sub.unwrap(), joined);
-                    eprintln!("  Or pass the account ID (see `aikey auth list`) which never has spaces.");
+                    eprintln!(
+                        "  Or pass the account ID (see `aikey auth list`) which never has spaces."
+                    );
                 }
             }
 
@@ -213,12 +283,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             print_banner();
             eprintln!();
             eprintln!("  {}", "Get started:".bold());
-            eprintln!("    aikey quickstart                       {}", "See what to do next (state-aware)".dimmed());
-            eprintln!("    aikey add                              {}", "Add a personal API key to the local vault".dimmed());
-            eprintln!("    aikey auth login <claude|codex|kimi>   {}", "Sign in with an OAuth provider account".dimmed());
-            eprintln!("    aikey list                             {}", "Show your keys (personal, team, OAuth)".dimmed());
-            eprintln!("    aikey route                            {}", "Print proxy config for AI clients".dimmed());
-            eprintln!("    aikey web                              {}", "Open the User Console in the browser".dimmed());
+            eprintln!(
+                "    aikey quickstart                       {}",
+                "See what to do next (state-aware)".dimmed()
+            );
+            eprintln!(
+                "    aikey add                              {}",
+                "Add a personal API key to the local vault".dimmed()
+            );
+            eprintln!(
+                "    aikey auth login <claude|codex|kimi>   {}",
+                "Sign in with an OAuth provider account".dimmed()
+            );
+            eprintln!(
+                "    aikey list                             {}",
+                "Show your keys (personal, team, OAuth)".dimmed()
+            );
+            eprintln!(
+                "    aikey route                            {}",
+                "Print proxy config for AI clients".dimmed()
+            );
+            eprintln!(
+                "    aikey web                              {}",
+                "Open the User Console in the browser".dimmed()
+            );
             eprintln!();
             eprintln!("  {}", "Run 'aikey --help' for all commands.".dimmed());
             // Blink runs AFTER the full screen is painted so the user sees
@@ -297,7 +385,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("        Clearing the session cache will NOT help — either:");
                         eprintln!("          • unset the env var so the next command prompts you:");
                         eprintln!("              unset AK_TEST_PASSWORD AIKEY_MASTER_PASSWORD");
-                        eprintln!("          • or set AIKEY_MASTER_PASSWORD to the correct password.");
+                        eprintln!(
+                            "          • or set AIKEY_MASTER_PASSWORD to the correct password."
+                        );
                     } else {
                         eprintln!("  Hint: Session cache cleared — next command will prompt for your password.");
                     }
@@ -317,7 +407,12 @@ fn handle_stats(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(entries) = std::fs::read_dir(".") {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && path.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with("aikey.config.")) {
+            if path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or(false, |n| n.starts_with("aikey.config."))
+            {
                 project_count += 1;
             }
         }
@@ -357,7 +452,14 @@ fn handle_stats(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("======================");
         println!("Projects (current dir): {}", project_count);
         println!("Profiles: {}", profile_count);
-        println!("Vault: {}", if vault_exists { "initialized" } else { "not initialized" });
+        println!(
+            "Vault: {}",
+            if vault_exists {
+                "initialized"
+            } else {
+                "not initialized"
+            }
+        );
         println!("\nNote: These statistics are local-only and do not involve any remote calls.");
     }
 
@@ -378,7 +480,9 @@ fn run_unified_list(
     // Force sync when local cache is empty but user is logged in —
     // version match alone is insufficient (cache may have been cleared
     // or previously synced under the wrong identity).
-    let cache_empty = storage::list_virtual_key_cache().map(|c| c.is_empty()).unwrap_or(true);
+    let cache_empty = storage::list_virtual_key_cache()
+        .map(|c| c.is_empty())
+        .unwrap_or(true);
     let logged_in = storage::get_platform_account().ok().flatten().is_some();
     let needs_sync = if cache_empty && logged_in {
         true
@@ -416,40 +520,73 @@ fn run_unified_list(
     } else {
         use colored::Colorize;
 
-        let bindings = storage::list_provider_bindings(
-            profile_activation::DEFAULT_PROFILE
-        ).unwrap_or_default();
+        let bindings = storage::list_provider_bindings(profile_activation::DEFAULT_PROFILE)
+            .unwrap_or_default();
 
         // Collect row data for auto-width calculation.
         // `active` = has at least one provider binding routing to this key.
         // Matches the `aikey route` convention: if the proxy is currently
         // serving some provider via this key, it's considered active.
-        struct RowData { alias: String, providers: String, primary_for: String, has_primary: bool, status: String, created: String, suffix: String, active: bool }
+        struct RowData {
+            alias: String,
+            providers: String,
+            primary_for: String,
+            has_primary: bool,
+            status: String,
+            created: String,
+            suffix: String,
+            active: bool,
+        }
         let mut personal_rows: Vec<RowData> = Vec::new();
         let mut team_rows: Vec<RowData> = Vec::new();
 
         for entry in &entries {
             let providers = if let Some(ref sp) = entry.supported_providers {
-                if !sp.is_empty() { sp.join(",") } else { entry.provider_code.clone().unwrap_or_default() }
-            } else { entry.provider_code.clone().unwrap_or_default() };
-            let pf: Vec<&str> = bindings.iter()
-                .filter(|b| b.key_source_type == credential_type::CredentialType::PersonalApiKey && b.key_source_ref == entry.alias)
-                .map(|b| b.provider_code.as_str()).collect();
+                if !sp.is_empty() {
+                    sp.join(",")
+                } else {
+                    entry.provider_code.clone().unwrap_or_default()
+                }
+            } else {
+                entry.provider_code.clone().unwrap_or_default()
+            };
+            let pf: Vec<&str> = bindings
+                .iter()
+                .filter(|b| {
+                    b.key_source_type == credential_type::CredentialType::PersonalApiKey
+                        && b.key_source_ref == entry.alias
+                })
+                .map(|b| b.provider_code.as_str())
+                .collect();
             let is_active = !pf.is_empty();
             personal_rows.push(RowData {
-                alias: entry.alias.clone(), providers,
-                primary_for: pf.join(","), has_primary: !pf.is_empty(),
+                alias: entry.alias.clone(),
+                providers,
+                primary_for: pf.join(","),
+                has_primary: !pf.is_empty(),
                 status: String::new(), // valid → not displayed
-                created: entry.created_at.map(|ts| format_date(ts)).unwrap_or_default(),
+                created: entry
+                    .created_at
+                    .map(|ts| format_date(ts))
+                    .unwrap_or_default(),
                 suffix: String::new(),
                 active: is_active,
             });
         }
         for e in &managed {
-            let display = e.local_alias.as_deref().unwrap_or(e.alias.as_str()).to_string();
-            let pf: Vec<&str> = bindings.iter()
-                .filter(|b| b.key_source_type == credential_type::CredentialType::ManagedVirtualKey && b.key_source_ref == e.virtual_key_id)
-                .map(|b| b.provider_code.as_str()).collect();
+            let display = e
+                .local_alias
+                .as_deref()
+                .unwrap_or(e.alias.as_str())
+                .to_string();
+            let pf: Vec<&str> = bindings
+                .iter()
+                .filter(|b| {
+                    b.key_source_type == credential_type::CredentialType::ManagedVirtualKey
+                        && b.key_source_ref == e.virtual_key_id
+                })
+                .map(|b| b.provider_code.as_str())
+                .collect();
             // Unified status display: valid (hidden), expired, invalid, pending.
             let status = if e.provider_key_ciphertext.is_none() {
                 "pending".to_string() // key not yet delivered to local vault
@@ -460,17 +597,27 @@ fn run_unified_list(
                         "expired" => "expired".to_string(),
                         _ => "invalid".to_string(), // revoked, recycled, etc.
                     },
-                    "disabled_by_account_scope" | "disabled_by_account_status"
-                    | "disabled_by_seat_status" | "disabled_by_key_status" => "invalid".to_string(),
+                    "disabled_by_account_scope"
+                    | "disabled_by_account_status"
+                    | "disabled_by_seat_status"
+                    | "disabled_by_key_status" => "invalid".to_string(),
                     _ => "invalid".to_string(),
                 }
             };
-            let suffix = if e.local_alias.is_some() { format!(" (\u{2190} {})", e.alias) } else { String::new() };
+            let suffix = if e.local_alias.is_some() {
+                format!(" (\u{2190} {})", e.alias)
+            } else {
+                String::new()
+            };
             let is_active = !pf.is_empty();
             team_rows.push(RowData {
-                alias: display, providers: e.provider_code.clone(),
-                primary_for: pf.join(","), has_primary: !pf.is_empty(),
-                status, created: format_date(e.synced_at), suffix,
+                alias: display,
+                providers: e.provider_code.clone(),
+                primary_for: pf.join(","),
+                has_primary: !pf.is_empty(),
+                status,
+                created: format_date(e.synced_at),
+                suffix,
                 active: is_active,
             });
         }
@@ -478,43 +625,103 @@ fn run_unified_list(
         let all_data: Vec<&RowData> = personal_rows.iter().chain(team_rows.iter()).collect();
         let headers = ["ALIAS", "PROTOCOLS", "USING FOR", "STATUS", "CREATED"];
         let pad = 2;
-        let w_alias   = headers[0].len().max(all_data.iter().map(|r| r.alias.len()).max().unwrap_or(0)) + pad;
-        let w_prov    = headers[1].len().max(all_data.iter().map(|r| r.providers.len()).max().unwrap_or(0)) + pad;
-        let w_primary = headers[2].len().max(all_data.iter().map(|r| r.primary_for.len()).max().unwrap_or(0)) + pad;
-        let w_status  = headers[3].len().max(all_data.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
+        let w_alias = headers[0]
+            .len()
+            .max(all_data.iter().map(|r| r.alias.len()).max().unwrap_or(0))
+            + pad;
+        let w_prov = headers[1].len().max(
+            all_data
+                .iter()
+                .map(|r| r.providers.len())
+                .max()
+                .unwrap_or(0),
+        ) + pad;
+        let w_primary = headers[2].len().max(
+            all_data
+                .iter()
+                .map(|r| r.primary_for.len())
+                .max()
+                .unwrap_or(0),
+        ) + pad;
+        let w_status = headers[3]
+            .len()
+            .max(all_data.iter().map(|r| r.status.len()).max().unwrap_or(0))
+            + pad;
 
         // Row format: `● ALIAS ...` when active, `  ALIAS ...` otherwise.
         // The 2-char prefix (marker + space) is shared with the header so
         // columns line up across Personal / Team / OAuth sections.
         let fmt_row = |r: &RowData| -> String {
-            let marker = if r.active { "●".green().to_string() } else { " ".to_string() };
+            let marker = if r.active {
+                "●".green().to_string()
+            } else {
+                " ".to_string()
+            };
             let pf_padded = format!("{:<w$}", r.primary_for, w = w_primary);
-            let pf_col = if r.has_primary { pf_padded.green().to_string() } else { pf_padded };
+            let pf_col = if r.has_primary {
+                pf_padded.green().to_string()
+            } else {
+                pf_padded
+            };
             let created_col = format!("\x1b[90m{}\x1b[0m", r.created);
             let prov_display = if r.providers.len() > w_prov {
                 format!("{}...", &r.providers[..w_prov - 3])
-            } else { r.providers.clone() };
-            format!("{} {:<wa$}  {:<wp$}  {}  {:<ws$}  {}{}",
-                marker, r.alias, prov_display, pf_col, r.status, created_col, r.suffix,
-                wa = w_alias, wp = w_prov, ws = w_status)
+            } else {
+                r.providers.clone()
+            };
+            format!(
+                "{} {:<wa$}  {:<wp$}  {}  {:<ws$}  {}{}",
+                marker,
+                r.alias,
+                prov_display,
+                pf_col,
+                r.status,
+                created_col,
+                r.suffix,
+                wa = w_alias,
+                wp = w_prov,
+                ws = w_status
+            )
         };
         // +2 accounts for the `● ` marker prefix that the row renderer adds.
         let sep_width = 2 + w_alias + 2 + w_prov + 2 + w_primary + 2 + w_status + 2 + 10;
 
         let mut rows: Vec<String> = Vec::new();
-        rows.push(format!("\u{1F464} Personal \x1b[90m({})\x1b[0m", entries.len()));
-        rows.push(format!("\x1b[2m  {:<wa$}  {:<wp$}  {:<wf$}  {:<ws$}  {}\x1b[0m",
-            headers[0], headers[1], headers[2], headers[3], headers[4],
-            wa = w_alias, wp = w_prov, wf = w_primary, ws = w_status));
+        rows.push(format!(
+            "\u{1F464} Personal \x1b[90m({})\x1b[0m",
+            entries.len()
+        ));
+        rows.push(format!(
+            "\x1b[2m  {:<wa$}  {:<wp$}  {:<wf$}  {:<ws$}  {}\x1b[0m",
+            headers[0],
+            headers[1],
+            headers[2],
+            headers[3],
+            headers[4],
+            wa = w_alias,
+            wp = w_prov,
+            wf = w_primary,
+            ws = w_status
+        ));
         rows.push("\u{2500}".repeat(sep_width));
-        if personal_rows.is_empty() { rows.push("(none)".to_string()); }
-        else { for r in &personal_rows { rows.push(fmt_row(r)); } }
+        if personal_rows.is_empty() {
+            rows.push("(none)".to_string());
+        } else {
+            for r in &personal_rows {
+                rows.push(fmt_row(r));
+            }
+        }
 
         rows.push(String::new());
         rows.push(format!("\u{1F465} Team \x1b[90m({})\x1b[0m", managed.len()));
         rows.push("\u{2500}".repeat(sep_width));
-        if team_rows.is_empty() { rows.push("(none)".to_string()); }
-        else { for r in &team_rows { rows.push(fmt_row(r)); } }
+        if team_rows.is_empty() {
+            rows.push("(none)".to_string());
+        } else {
+            for r in &team_rows {
+                rows.push(fmt_row(r));
+            }
+        }
 
         // D7: OAuth accounts section
         let oauth_accounts = storage::list_provider_accounts().unwrap_or_default();
@@ -524,89 +731,186 @@ fn run_unified_list(
                 .unwrap_or_default()
                 .as_secs() as i64;
             // Build row data for dynamic width calculation
-            struct OAuthRow { identity: String, provider: String, use_for: String, has_use: bool, status: String, tier: String, expires: String }
-            let oauth_rows: Vec<OAuthRow> = oauth_accounts.iter().map(|acct| {
-                // Precedence: local_alias (rename) → display_identity →
-                // truncated external_id → "-". v1.0.1-alpha.1 added
-                // local_alias on top so a renamed account shows the new
-                // label, while still falling back to the upstream
-                // email/UUID when neither alias nor display_identity is
-                // populated.
-                let identity = acct.local_alias.as_deref()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| acct.display_identity.as_deref().filter(|s| !s.is_empty()))
-                    .or_else(|| acct.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
-                    .unwrap_or("-").to_string();
-                let uf: Vec<&str> = bindings.iter()
-                    .filter(|b| b.key_source_type == credential_type::CredentialType::PersonalOAuthAccount && b.key_source_ref == acct.provider_account_id)
-                    .map(|b| b.provider_code.as_str()).collect();
-                let token_expires = storage::get_provider_token_expires_at(&acct.provider_account_id)
-                    .ok().flatten();
-                let expires = token_expires
-                    .map(|exp| {
-                        let rem = exp - now;
-                        if rem <= 0 { "expired".to_string() }
-                        else if rem > 86400 { format!("{}d", rem / 86400) }
-                        else if rem > 3600 { format!("{}h", rem / 3600) }
-                        else { format!("{}m", rem / 60) }
-                    }).unwrap_or_else(|| "-".to_string());
-                // Unified status display: valid (hidden), expired, invalid.
-                let status = match acct.status.as_str() {
-                    "active" | "idle" => {
-                        // Check token expiry for more precise status
-                        if token_expires.map_or(false, |exp| exp <= now) {
-                            "expired".to_string() // token expired, needs refresh
-                        } else {
-                            String::new() // valid → not displayed
+            struct OAuthRow {
+                identity: String,
+                provider: String,
+                use_for: String,
+                has_use: bool,
+                status: String,
+                tier: String,
+                expires: String,
+            }
+            let oauth_rows: Vec<OAuthRow> = oauth_accounts
+                .iter()
+                .map(|acct| {
+                    // Precedence: local_alias (rename) → display_identity →
+                    // truncated external_id → "-". v1.0.1-alpha.1 added
+                    // local_alias on top so a renamed account shows the new
+                    // label, while still falling back to the upstream
+                    // email/UUID when neither alias nor display_identity is
+                    // populated.
+                    let identity = acct
+                        .local_alias
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| acct.display_identity.as_deref().filter(|s| !s.is_empty()))
+                        .or_else(|| {
+                            acct.external_id
+                                .as_deref()
+                                .map(|s| if s.len() > 12 { &s[..12] } else { s })
+                        })
+                        .unwrap_or("-")
+                        .to_string();
+                    let uf: Vec<&str> = bindings
+                        .iter()
+                        .filter(|b| {
+                            b.key_source_type
+                                == credential_type::CredentialType::PersonalOAuthAccount
+                                && b.key_source_ref == acct.provider_account_id
+                        })
+                        .map(|b| b.provider_code.as_str())
+                        .collect();
+                    let token_expires =
+                        storage::get_provider_token_expires_at(&acct.provider_account_id)
+                            .ok()
+                            .flatten();
+                    let expires = token_expires
+                        .map(|exp| {
+                            let rem = exp - now;
+                            if rem <= 0 {
+                                "expired".to_string()
+                            } else if rem > 86400 {
+                                format!("{}d", rem / 86400)
+                            } else if rem > 3600 {
+                                format!("{}h", rem / 3600)
+                            } else {
+                                format!("{}m", rem / 60)
+                            }
+                        })
+                        .unwrap_or_else(|| "-".to_string());
+                    // Unified status display: valid (hidden), expired, invalid.
+                    let status = match acct.status.as_str() {
+                        "active" | "idle" => {
+                            // Check token expiry for more precise status
+                            if token_expires.map_or(false, |exp| exp <= now) {
+                                "expired".to_string() // token expired, needs refresh
+                            } else {
+                                String::new() // valid → not displayed
+                            }
                         }
+                        "reauth_required" | "expired" => "expired".to_string(),
+                        _ => "invalid".to_string(), // revoked, subscription_required, etc.
+                    };
+                    OAuthRow {
+                        identity,
+                        provider: acct.provider.clone(),
+                        use_for: uf.join(","),
+                        has_use: !uf.is_empty(),
+                        status,
+                        tier: acct.account_tier.as_deref().unwrap_or("-").to_string(),
+                        expires,
                     }
-                    "reauth_required" | "expired" => "expired".to_string(),
-                    _ => "invalid".to_string(), // revoked, subscription_required, etc.
-                };
-                OAuthRow {
-                    identity,
-                    provider: acct.provider.clone(),
-                    use_for: uf.join(","), has_use: !uf.is_empty(),
-                    status,
-                    tier: acct.account_tier.as_deref().unwrap_or("-").to_string(),
-                    expires,
-                }
-            }).collect();
+                })
+                .collect();
 
             // Dynamic column widths
             let pad = 2;
-            let w_id   = "IDENTITY".len().max(oauth_rows.iter().map(|r| r.identity.len()).max().unwrap_or(0)) + pad;
-            let w_prov = "PROTOCOL".len().max(oauth_rows.iter().map(|r| r.provider.len()).max().unwrap_or(0)) + pad;
-            let w_uf   = "USING FOR".len().max(oauth_rows.iter().map(|r| r.use_for.len()).max().unwrap_or(0)) + pad;
-            let w_st   = "STATUS".len().max(oauth_rows.iter().map(|r| r.status.len()).max().unwrap_or(0)) + pad;
-            let w_tier = "TIER".len().max(oauth_rows.iter().map(|r| r.tier.len()).max().unwrap_or(0)) + pad;
-            let _w_exp = "EXPIRES".len().max(oauth_rows.iter().map(|r| r.expires.len()).max().unwrap_or(0)) + pad;
+            let w_id = "IDENTITY".len().max(
+                oauth_rows
+                    .iter()
+                    .map(|r| r.identity.len())
+                    .max()
+                    .unwrap_or(0),
+            ) + pad;
+            let w_prov = "PROTOCOL".len().max(
+                oauth_rows
+                    .iter()
+                    .map(|r| r.provider.len())
+                    .max()
+                    .unwrap_or(0),
+            ) + pad;
+            let w_uf = "USING FOR".len().max(
+                oauth_rows
+                    .iter()
+                    .map(|r| r.use_for.len())
+                    .max()
+                    .unwrap_or(0),
+            ) + pad;
+            let w_st = "STATUS"
+                .len()
+                .max(oauth_rows.iter().map(|r| r.status.len()).max().unwrap_or(0))
+                + pad;
+            let w_tier = "TIER"
+                .len()
+                .max(oauth_rows.iter().map(|r| r.tier.len()).max().unwrap_or(0))
+                + pad;
+            let _w_exp = "EXPIRES".len().max(
+                oauth_rows
+                    .iter()
+                    .map(|r| r.expires.len())
+                    .max()
+                    .unwrap_or(0),
+            ) + pad;
 
             rows.push(String::new());
-            rows.push(format!("\u{1F517} OAuth Accounts \x1b[90m({})\x1b[0m", oauth_accounts.len()));
-            rows.push(format!("\x1b[2m  {:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}\x1b[0m",
-                "IDENTITY", "PROTOCOL", "USING FOR", "STATUS", "TIER", "EXPIRES",
-                wi = w_id, wp = w_prov, wu = w_uf, ws = w_st, wt = w_tier));
+            rows.push(format!(
+                "\u{1F517} OAuth Accounts \x1b[90m({})\x1b[0m",
+                oauth_accounts.len()
+            ));
+            rows.push(format!(
+                "\x1b[2m  {:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}\x1b[0m",
+                "IDENTITY",
+                "PROTOCOL",
+                "USING FOR",
+                "STATUS",
+                "TIER",
+                "EXPIRES",
+                wi = w_id,
+                wp = w_prov,
+                wu = w_uf,
+                ws = w_st,
+                wt = w_tier
+            ));
             rows.push("\u{2500}".repeat(sep_width));
             for r in &oauth_rows {
                 let uf_padded = format!("{:<w$}", r.use_for, w = w_uf);
-                let uf_col = if r.has_use { uf_padded.green().to_string() } else { uf_padded };
+                let uf_col = if r.has_use {
+                    uf_padded.green().to_string()
+                } else {
+                    uf_padded
+                };
                 let tier_dim = format!("\x1b[90m{:<w$}\x1b[0m", r.tier, w = w_tier);
                 let expires_dim = format!("\x1b[90m{}\x1b[0m", r.expires);
                 // Active when this account is currently serving at least
                 // one provider (matches the `aikey route` convention).
-                let marker = if r.has_use { "●".green().to_string() } else { " ".to_string() };
-                rows.push(format!("{} {:<wi$}{:<wp$}  {}  {:<ws$}  {}  {}",
-                    marker, r.identity, r.provider, uf_col, r.status, tier_dim, expires_dim,
-                    wi = w_id, wp = w_prov, ws = w_st));
+                let marker = if r.has_use {
+                    "●".green().to_string()
+                } else {
+                    " ".to_string()
+                };
+                rows.push(format!(
+                    "{} {:<wi$}{:<wp$}  {}  {:<ws$}  {}  {}",
+                    marker,
+                    r.identity,
+                    r.provider,
+                    uf_col,
+                    r.status,
+                    tier_dim,
+                    expires_dim,
+                    wi = w_id,
+                    wp = w_prov,
+                    ws = w_st
+                ));
             }
         }
 
         ui_frame::print_box("\u{1F511}", "Keys", &rows);
         // Legend lives outside the box so the frame stays focused on data.
-        println!("  {} {}",
+        println!(
+            "  {} {}",
             "●".green(),
-            "= active (set by `aikey use`)".dimmed());
+            "= active (set by `aikey use`)".dimmed()
+        );
 
         // Web console deeplink. URL is taken from the logged-in
         // platform_account (control_url) and falls back to the trial-
@@ -623,12 +927,16 @@ fn run_unified_list(
             .filter(|u| !u.is_empty())
             .unwrap_or_else(|| "http://127.0.0.1:8090".to_string());
         let vault_url = format!("{}/user/vault", vault_url);
-        println!("  {} {}",
+        println!(
+            "  {} {}",
             "↗".dimmed(),
-            format!("Open in browser: {}", vault_url).dimmed());
-        println!("  {} {}",
+            format!("Open in browser: {}", vault_url).dimmed()
+        );
+        println!(
+            "  {} {}",
             "↗".dimmed(),
-            "or run `aikey web --vault`".dimmed());
+            "or run `aikey web --vault`".dimmed()
+        );
     }
 
     // Post-operation: warn if proxy is unreachable (e.g. after kill -9).
@@ -690,8 +998,21 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // is available in the environment.  Skipped for proxy lifecycle commands which
     // manage the process themselves, and for version/init which predate the proxy.
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Statusline { action: Some(cli::StatuslineAction::Ensure) } | Commands::Watch => {}
-        _ => { commands_proxy::try_auto_start_from_env(); }
+        Commands::Proxy { .. }
+        | Commands::Init
+        | Commands::Db { .. }
+        | Commands::Version
+        | Commands::Statusline { action: None }
+        | Commands::Statusline {
+            action: Some(cli::StatuslineAction::Render { .. }),
+        }
+        | Commands::Statusline {
+            action: Some(cli::StatuslineAction::Ensure),
+        }
+        | Commands::Watch => {}
+        _ => {
+            commands_proxy::try_auto_start_from_env();
+        }
     }
 
     // Non-blocking snapshot sync: checks server sync_version and pulls fresh
@@ -699,8 +1020,21 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // lifecycle and init commands which either predate the vault or manage the
     // process themselves.
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Statusline { action: Some(cli::StatuslineAction::Ensure) } | Commands::Watch => {}
-        _ => { commands_account::try_background_snapshot_sync(); }
+        Commands::Proxy { .. }
+        | Commands::Init
+        | Commands::Db { .. }
+        | Commands::Version
+        | Commands::Statusline { action: None }
+        | Commands::Statusline {
+            action: Some(cli::StatuslineAction::Render { .. }),
+        }
+        | Commands::Statusline {
+            action: Some(cli::StatuslineAction::Ensure),
+        }
+        | Commands::Watch => {}
+        _ => {
+            commands_account::try_background_snapshot_sync();
+        }
     }
 
     // Auto-apply pending vault schema migrations (idempotent).
@@ -708,7 +1042,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Skipped for init/proxy/db which manage their own lifecycle.
     // Only runs if vault.db exists (no-op on fresh install).
     match command {
-        Commands::Proxy { .. } | Commands::Init | Commands::Db { .. } | Commands::Version | Commands::Statusline { action: None } | Commands::Statusline { action: Some(cli::StatuslineAction::Render { .. }) } | Commands::Statusline { action: Some(cli::StatuslineAction::Ensure) } | Commands::Watch => {}
+        Commands::Proxy { .. }
+        | Commands::Init
+        | Commands::Db { .. }
+        | Commands::Version
+        | Commands::Statusline { action: None }
+        | Commands::Statusline {
+            action: Some(cli::StatuslineAction::Render { .. }),
+        }
+        | Commands::Statusline {
+            action: Some(cli::StatuslineAction::Ensure),
+        }
+        | Commands::Watch => {}
         _ => {
             if let Ok(vault_path) = storage::get_vault_path() {
                 if vault_path.exists() {
@@ -734,7 +1079,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // same core is reused by `_internal vault-op init` for the
             // web-driven first-run flow (per
             // 20260430-个人vault-Web首次设置-方案A.md).
-            let password = prompt_password_secure("\u{1F512} Set Master Password: ", cli.password_stdin, cli.json)?;
+            let password = prompt_password_secure(
+                "\u{1F512} Set Master Password: ",
+                cli.password_stdin,
+                cli.json,
+            )?;
 
             if !cli.json {
                 println!("Initializing vault...");
@@ -760,36 +1109,34 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         // Why hidden: operational tool for install scripts and rollback automation,
         // not for end-user daily use. rollback.sh calls `aikey db rollback --to <ver>`
         // using the CURRENT binary BEFORE restoring the old binary from backup.
-        Commands::Db { action } => {
-            match action {
-                DbAction::Upgrade => {
-                    eprintln!("[db upgrade] Applying pending vault schema upgrades...");
-                    let vault_path = storage::get_vault_path()
-                        .map_err(|e| format!("Failed to resolve vault path: {}", e))?;
-                    if !vault_path.exists() {
-                        eprintln!("[db upgrade] No vault.db found — nothing to upgrade");
-                        return Ok(());
-                    }
-                    let conn = rusqlite::Connection::open(&vault_path)
-                        .map_err(|e| format!("Failed to open vault: {}", e))?;
-                    migrations::upgrade_all(&conn)?;
-                    eprintln!("[db upgrade] Done");
+        Commands::Db { action } => match action {
+            DbAction::Upgrade => {
+                eprintln!("[db upgrade] Applying pending vault schema upgrades...");
+                let vault_path = storage::get_vault_path()
+                    .map_err(|e| format!("Failed to resolve vault path: {}", e))?;
+                if !vault_path.exists() {
+                    eprintln!("[db upgrade] No vault.db found — nothing to upgrade");
+                    return Ok(());
                 }
-                DbAction::Rollback { to } => {
-                    eprintln!("[db rollback] Rolling back vault schema to {}", to);
-                    let vault_path = storage::get_vault_path()
-                        .map_err(|e| format!("Failed to resolve vault path: {}", e))?;
-                    if !vault_path.exists() {
-                        eprintln!("[db rollback] No vault.db found — nothing to rollback");
-                        return Ok(());
-                    }
-                    let conn = rusqlite::Connection::open(&vault_path)
-                        .map_err(|e| format!("Failed to open vault: {}", e))?;
-                    migrations::rollback_to(&conn, &to)?;
-                    eprintln!("[db rollback] Vault schema rolled back to {}", to);
-                }
+                let conn = rusqlite::Connection::open(&vault_path)
+                    .map_err(|e| format!("Failed to open vault: {}", e))?;
+                migrations::upgrade_all(&conn)?;
+                eprintln!("[db upgrade] Done");
             }
-        }
+            DbAction::Rollback { to } => {
+                eprintln!("[db rollback] Rolling back vault schema to {}", to);
+                let vault_path = storage::get_vault_path()
+                    .map_err(|e| format!("Failed to resolve vault path: {}", e))?;
+                if !vault_path.exists() {
+                    eprintln!("[db rollback] No vault.db found — nothing to rollback");
+                    return Ok(());
+                }
+                let conn = rusqlite::Connection::open(&vault_path)
+                    .map_err(|e| format!("Failed to open vault: {}", e))?;
+                migrations::rollback_to(&conn, &to)?;
+                eprintln!("[db rollback] Vault schema rolled back to {}", to);
+            }
+        },
         // `_internal` IPC 子命令组：Go local-server spawn 调用，stdin-json 协议
         // 永远返回 Ok(()) —— 成功/失败都通过 stdout JSON 表达（见 commands_internal::dispatch 文档）
         Commands::Internal { action } => {
@@ -799,12 +1146,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         // drift-check can compare against the on-disk hook file header.
         Commands::HookHash { shell } => {
             let kind = match shell.as_str() {
-                "zsh"  => commands_account::HookKind::Zsh,
+                "zsh" => commands_account::HookKind::Zsh,
                 "bash" => commands_account::HookKind::Bash,
                 "powershell" | "pwsh" => commands_account::HookKind::PowerShell,
-                other  => return Err(format!(
-                    "unknown shell '{}' — expected 'zsh', 'bash', or 'powershell'", other
-                ).into()),
+                other => {
+                    return Err(format!(
+                        "unknown shell '{}' — expected 'zsh', 'bash', or 'powershell'",
+                        other
+                    )
+                    .into())
+                }
             };
             println!("{}", commands_account::hook_template_hash(kind));
         }
@@ -843,13 +1194,20 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Hook { action } => {
             handle_hook_command(action)?;
         }
-        Commands::Add { alias, provider, providers, no_hook } => {
+        Commands::Add {
+            alias,
+            provider,
+            providers,
+            no_hook,
+        } => {
             // Reject empty / whitespace-only alias before any interactive prompt.
             // Why: an empty alias writes a ghost entry that is hard to target with
             // later commands (`get ""`, `delete ""`) and pollutes `list --json`.
             if alias.trim().is_empty() {
                 let msg = "alias must not be empty";
-                if cli.json { json_output::error(msg, 1); }
+                if cli.json {
+                    json_output::error(msg, 1);
+                }
                 return Err(msg.into());
             }
             let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
@@ -860,7 +1218,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // interactive flow only to fail at the final write step.
             if storage::get_salt().is_ok() {
                 if let Err(e) = executor::verify_vault_password(&password) {
-                    if cli.json { json_output::error(&e, 1); } else { return Err(e.into()); }
+                    if cli.json {
+                        json_output::error(&e, 1);
+                    } else {
+                        return Err(e.into());
+                    }
                 }
 
                 // Early alias check: fail fast before asking for API key, provider, etc.
@@ -868,8 +1230,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // provider selection, connectivity test, confirmation) only to get
                 // "already exists" at the final write step.
                 if let Ok(true) = storage::entry_exists(alias) {
-                    let msg = format!("API Key '{}' already exists. Use 'aikey update {}' to modify it.", alias, alias);
-                    if cli.json { json_output::error(&msg, 1); } else { return Err(msg.into()); }
+                    let msg = format!(
+                        "API Key '{}' already exists. Use 'aikey update {}' to modify it.",
+                        alias, alias
+                    );
+                    if cli.json {
+                        json_output::error(&msg, 1);
+                    } else {
+                        return Err(msg.into());
+                    }
                 }
             }
 
@@ -910,20 +1279,25 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let (resolved_providers, resolved_base_url): (Vec<String>, Option<String>) =
                 if !providers.is_empty() {
                     // dedupe + lowercase,保持用户输入顺序
-                    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                    let cleaned: Vec<String> = providers.iter()
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    let cleaned: Vec<String> = providers
+                        .iter()
                         .map(|p| p.trim().to_lowercase())
                         .filter(|p| !p.is_empty() && seen.insert(p.clone()))
                         .collect();
                     if cleaned.is_empty() {
-                        return Err("--providers given but all entries were empty after trim.".into());
+                        return Err(
+                            "--providers given but all entries were empty after trim.".into()
+                        );
                     }
 
                     // 2026-05-08 Kimi family select 互斥(非交互路径):
                     // --providers kimi_code,moonshot 这种命令行直接传两个 Kimi family
                     // 成员被 input 层拒绝(同 Web ProviderMultiSelect / CLI 交互 picker 互斥
                     // 决策)。详见 update/20260508-Kimi-family互斥-active-env统一KIMI写入.md 决策 #3。
-                    let kimi_in_cleaned: Vec<String> = cleaned.iter()
+                    let kimi_in_cleaned: Vec<String> = cleaned
+                        .iter()
                         .filter(|c| ["kimi_code", "moonshot", "kimi"].contains(&c.as_str()))
                         .cloned()
                         .collect();
@@ -934,7 +1308,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                              aikey add <alias> --provider kimi_code\n  \
                              aikey add <alias> --provider moonshot",
                             kimi_in_cleaned.join(", ")
-                        ).into());
+                        )
+                        .into());
                     }
 
                     (cleaned, None)
@@ -942,7 +1317,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     (vec![code.to_lowercase()], None)
                 } else if std::io::stdin().is_terminal() && !cli.json {
                     use colored::Colorize;
-                    let mut items: Vec<String> = known_providers.iter().map(|(n, _)| n.to_string()).collect();
+                    let mut items: Vec<String> =
+                        known_providers.iter().map(|(n, _)| n.to_string()).collect();
                     items.push("Other protocol types...".to_string());
                     let custom_idx = known_providers.len();
                     let mut selected: Vec<String>;
@@ -953,7 +1329,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     // Why 仅这一条预选: 'sk-kimi-' 是稳定独占前缀(confirmed-tier);其他
                     // sk-* 形态因 Moonshot 没有稳定前缀,无法可靠预选,留给用户手选。
                     if secret.trim().starts_with("sk-kimi-") {
-                        if let Some(idx) = picker_entries.iter().position(|e| e.code == "kimi_code") {
+                        if let Some(idx) = picker_entries.iter().position(|e| e.code == "kimi_code")
+                        {
                             if idx < checked_state.len() {
                                 checked_state[idx] = true;
                             }
@@ -965,7 +1342,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     // at-most-one at toggle time (mirrors Web ProviderMultiSelect).
                     // Indices are computed off picker_entries since item order = entry
                     // declaration order in provider_registry.yaml.
-                    let kimi_mutex_group: Vec<usize> = picker_entries.iter()
+                    let kimi_mutex_group: Vec<usize> = picker_entries
+                        .iter()
                         .enumerate()
                         .filter(|(_, e)| matches!(e.code, "kimi_code" | "moonshot" | "kimi"))
                         .map(|(i, _)| i)
@@ -977,12 +1355,24 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     loop {
-                        let selected_indices = match ui_select::box_multi_select("Select protocol type(s)", &items, &checked_state, &mutex_groups)? {
+                        let selected_indices = match ui_select::box_multi_select(
+                            "Select protocol type(s)",
+                            &items,
+                            &checked_state,
+                            &mutex_groups,
+                        )? {
                             ui_select::MultiSelectResult::Confirmed(idx) => idx,
-                            ui_select::MultiSelectResult::Cancelled => { eprintln!("  Cancelled."); return Ok(()); }
+                            ui_select::MultiSelectResult::Cancelled => {
+                                eprintln!("  Cancelled.");
+                                return Ok(());
+                            }
                         };
                         checked_state = vec![false; items.len()];
-                        for &i in &selected_indices { if i < checked_state.len() { checked_state[i] = true; } }
+                        for &i in &selected_indices {
+                            if i < checked_state.len() {
+                                checked_state[i] = true;
+                            }
+                        }
                         selected = Vec::new();
                         let mut wants_custom = false;
                         for &idx in &selected_indices {
@@ -996,8 +1386,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                     .copied()
                                     .unwrap_or(display_label)
                                     .to_string();
-                                if !selected.contains(&canonical_code) { selected.push(canonical_code); }
-                            } else if idx == custom_idx { wants_custom = true; }
+                                if !selected.contains(&canonical_code) {
+                                    selected.push(canonical_code);
+                                }
+                            } else if idx == custom_idx {
+                                wants_custom = true;
+                            }
                         }
                         if wants_custom {
                             print!("  \u{25c6} Other protocol type(s), comma-separated: ");
@@ -1005,7 +1399,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             let mut custom = String::new();
                             io::stdin().read_line(&mut custom)?;
                             for code in custom.split(',').map(|s| s.trim().to_lowercase()) {
-                                if !code.is_empty() && !selected.contains(&code) { selected.push(code); }
+                                if !code.is_empty() && !selected.contains(&code) {
+                                    selected.push(code);
+                                }
                             }
                         }
 
@@ -1014,30 +1410,46 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         // arrive here. The custom-protocol "Other..." path could still
                         // pull in conflicting codes; that's a niche escape hatch we
                         // accept for now (the Custom prompt is power-user territory).
-                        if !selected.is_empty() { break; }
+                        if !selected.is_empty() {
+                            break;
+                        }
                         use colored::Colorize;
-                        eprintln!("  {} At least one protocol is required.\n", "\u{25c6}".yellow());
+                        eprintln!(
+                            "  {} At least one protocol is required.\n",
+                            "\u{25c6}".yellow()
+                        );
                     }
 
                     // Show default base URLs for selected providers so the user
                     // knows what they're accepting when pressing Enter.
-                    let default_urls: Vec<String> = selected.iter()
-                        .filter_map(|code| commands_project::default_base_url(code)
-                            .map(|u| format!("{}: {}", code, u)))
+                    let default_urls: Vec<String> = selected
+                        .iter()
+                        .filter_map(|code| {
+                            commands_project::default_base_url(code)
+                                .map(|u| format!("{}: {}", code, u))
+                        })
                         .collect();
                     if !default_urls.is_empty() {
                         eprintln!("  \u{2502} Default Base URLs:");
-                        for u in &default_urls { eprintln!("  \u{2502}   {}", u); }
+                        for u in &default_urls {
+                            eprintln!("  \u{2502}   {}", u);
+                        }
                     }
                     print!("  \u{25c6} Base URL (press Enter to use defaults above): ");
                     io::stdout().flush()?;
                     let mut url_input = String::new();
                     io::stdin().read_line(&mut url_input)?;
                     let url_input = url_input.trim().to_string();
-                    let base_url = if url_input.is_empty() { None } else { Some(url_input) };
+                    let base_url = if url_input.is_empty() {
+                        None
+                    } else {
+                        Some(url_input)
+                    };
 
                     eprintln!("  \u{2502} Protocols: {}", selected.join(", ").bold());
-                    if let Some(ref u) = base_url { eprintln!("  \u{2502} Base URL:  {}", u.dimmed()); }
+                    if let Some(ref u) = base_url {
+                        eprintln!("  \u{2502} Base URL:  {}", u.dimmed());
+                    }
                     (selected, base_url)
                 } else {
                     return Err("--provider <CODE> or --providers <c1,c2,...> is required in non-interactive mode.".into());
@@ -1059,20 +1471,30 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // or OAuth alias). The registry is broader than the picker list
                 // — e.g. "claude" aliases "anthropic" so both are considered
                 // known and skip the typo warning.
-                let unknown: Vec<&String> = resolved_providers.iter()
+                let unknown: Vec<&String> = resolved_providers
+                    .iter()
                     .filter(|p| provider_registry::lookup(p.as_str()).is_none())
                     .collect();
                 if !unknown.is_empty() {
                     use colored::Colorize;
-                    let unk_list = unknown.iter().map(|s| format!("'{}'", s)).collect::<Vec<_>>().join(", ");
+                    let unk_list = unknown
+                        .iter()
+                        .map(|s| format!("'{}'", s))
+                        .collect::<Vec<_>>()
+                        .join(", ");
                     eprintln!(
                         "  {} {} is not a built-in provider code.",
-                        "warning:".yellow().bold(), unk_list
+                        "warning:".yellow().bold(),
+                        unk_list
                     );
                     let known_codes: Vec<&'static str> = provider_registry::entries()
-                        .iter().map(|e| e.code).collect();
+                        .iter()
+                        .map(|e| e.code)
+                        .collect();
                     eprintln!("  built-in: {}", known_codes.join(", "));
-                    eprintln!("  If this is a custom provider / gateway, this is fine — continuing.");
+                    eprintln!(
+                        "  If this is a custom provider / gateway, this is fine — continuing."
+                    );
                     eprintln!("  If it was a typo, Ctrl+C and retry with --provider <built-in>.");
                     eprintln!();
                 }
@@ -1095,9 +1517,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!();
                     let opts = commands_project::SuiteOptions {
                         show_proxy_row: true,
-                        header_label:   None,
-                        password:       None,
-                        proxy_port:     commands_proxy::proxy_port(),
+                        header_label: None,
+                        password: None,
+                        proxy_port: commands_proxy::proxy_port(),
                         show_key_column: false,
                     };
                     let outcome = commands_project::run_connectivity_suite(targets, opts, false);
@@ -1108,7 +1530,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         let mut input = String::new();
                         io::stdin().read_line(&mut input)?;
                         if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
-                            eprintln!("  Cancelled."); return Ok(());
+                            eprintln!("  Cancelled.");
+                            return Ok(());
                         }
                     }
                     eprintln!();
@@ -1127,14 +1550,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let vault_key = match executor::derive_vault_key(&password) {
                 Ok(k) => k,
                 Err(e) => {
-                    if cli.json { json_output::error(&e, 1); }
+                    if cli.json {
+                        json_output::error(&e, 1);
+                    }
                     return Err(e.into());
                 }
             };
             let conn = match storage::open_connection() {
                 Ok(c) => c,
                 Err(e) => {
-                    if cli.json { json_output::error(&e, 1); }
+                    if cli.json {
+                        json_output::error(&e, 1);
+                    }
                     return Err(e.into());
                 }
             };
@@ -1149,13 +1576,25 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             ) {
                 Ok(o) => o,
                 Err(e) => {
-                    let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(alias), false);
-                    if cli.json { json_output::error(&e, 1); }
+                    let _ = audit::log_audit_event(
+                        &password,
+                        audit::AuditOperation::Add,
+                        Some(alias),
+                        false,
+                    );
+                    if cli.json {
+                        json_output::error(&e, 1);
+                    }
                     return Err(e.into());
                 }
             };
             let _ = storage::bump_vault_change_seq();
-            let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(&outcome.alias), true);
+            let _ = audit::log_audit_event(
+                &password,
+                audit::AuditOperation::Add,
+                Some(&outcome.alias),
+                true,
+            );
 
             // Generate route token for per-request proxy routing (API gateway).
             // Outside the core because `ensure_entry_route_token` opens its
@@ -1174,7 +1613,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     source_ref: alias,
                     providers: &resolved_providers,
                 },
-            ).unwrap_or_default();
+            )
+            .unwrap_or_default();
             let newly_primary = lifecycle.newly_primary;
 
             // Hook coverage v1 §H1: install shell hook on `aikey add` too,
@@ -1200,10 +1640,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 use colored::Colorize;
                 eprintln!("  {} API Key '{}' added.", "\u{25c6}".green(), alias.bold());
-                eprintln!("  \u{2502} providers: {}", resolved_providers.join(", ").dimmed());
-                if let Some(ref url) = resolved_base_url { eprintln!("  \u{2502} base_url:  {}", url.dimmed()); }
+                eprintln!(
+                    "  \u{2502} providers: {}",
+                    resolved_providers.join(", ").dimmed()
+                );
+                if let Some(ref url) = resolved_base_url {
+                    eprintln!("  \u{2502} base_url:  {}", url.dimmed());
+                }
                 if !newly_primary.is_empty() {
-                    eprintln!("  \u{2502} {} Primary for: {}", "\u{2B50}".yellow(), newly_primary.join(", ").bold());
+                    eprintln!(
+                        "  \u{2502} {} Primary for: {}",
+                        "\u{2B50}".yellow(),
+                        newly_primary.join(", ").bold()
+                    );
                 }
                 eprintln!("  \u{2502} Added key and refreshed current default activation.");
                 if let Some(ref msg) = hook_msg {
@@ -1230,7 +1679,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Get { alias, timeout } => {
             let password = prompt_vault_password(cli.password_stdin, cli.json)?;
             let result = executor::get_secret(alias, &password);
-            let _ = audit::log_audit_event(&password, audit::AuditOperation::Get, Some(alias), result.is_ok());
+            let _ = audit::log_audit_event(
+                &password,
+                audit::AuditOperation::Get,
+                Some(alias),
+                result.is_ok(),
+            );
 
             let secret = match result {
                 Ok(s) => s,
@@ -1282,7 +1736,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Dedupe while preserving order (user might type the same alias twice).
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let ordered: Vec<String> = aliases.iter()
+            let ordered: Vec<String> = aliases
+                .iter()
                 .filter(|a| seen.insert((*a).clone()))
                 .cloned()
                 .collect();
@@ -1291,11 +1746,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Confirm once — batched prompt. Skip in JSON / non-interactive modes.
             if !cli.json && std::io::stdin().is_terminal() {
                 if batch == 1 {
-                    eprint!("  Delete API Key '{}'? This cannot be undone. [y/N] (default N): ",
-                        ordered[0].bold());
+                    eprint!(
+                        "  Delete API Key '{}'? This cannot be undone. [y/N] (default N): ",
+                        ordered[0].bold()
+                    );
                 } else {
-                    eprint!("  Delete {} API Keys ({})? This cannot be undone. [y/N] (default N): ",
-                        batch, ordered.join(", ").bold());
+                    eprint!(
+                        "  Delete {} API Keys ({})? This cannot be undone. [y/N] (default N): ",
+                        batch,
+                        ordered.join(", ").bold()
+                    );
                 }
                 io::stdout().flush()?;
                 let mut input = String::new();
@@ -1317,8 +1777,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // apply_credential_lifecycle_batch (Removed event per successful
             // delete). reconcile_actions come back per-event so we can render
             // the "⭐ promoted X" / "⚠ no replacement" lines per alias.
-            let mut per_alias: Vec<(String, Result<(), String>, Vec<profile_activation::ReconcileAction>)>
-                = Vec::with_capacity(batch);
+            let mut per_alias: Vec<(
+                String,
+                Result<(), String>,
+                Vec<profile_activation::ReconcileAction>,
+            )> = Vec::with_capacity(batch);
             let mut events: Vec<commands_account::CredentialLifecycleEvent> = Vec::new();
             // Two passes: first do the entry-level deletes, then funnel
             // successful ones through apply_credential_lifecycle_batch.
@@ -1326,7 +1789,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             for alias in &ordered {
                 let result = executor::delete_secret(alias, &password);
                 let _ = audit::log_audit_event(
-                    &password, audit::AuditOperation::Delete, Some(alias), result.is_ok(),
+                    &password,
+                    audit::AuditOperation::Delete,
+                    Some(alias),
+                    result.is_ok(),
                 );
                 if result.is_ok() {
                     events.push(commands_account::CredentialLifecycleEvent::Removed {
@@ -1338,8 +1804,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             // Single funnel — runs reconcile per event, refresh + apply once.
             if !events.is_empty() {
-                let outcomes = commands_account::apply_credential_lifecycle_batch(&events)
-                    .unwrap_or_default();
+                let outcomes =
+                    commands_account::apply_credential_lifecycle_batch(&events).unwrap_or_default();
                 // Walk outcomes in lockstep with successful per_alias rows
                 // and copy reconcile_actions back so the UX renderer below
                 // can show them per-alias.
@@ -1357,12 +1823,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let fail_count = batch - ok_count;
 
             if cli.json {
-                let items: Vec<serde_json::Value> = per_alias.iter().map(|(a, r, _)| {
-                    match r {
-                        Ok(_)  => serde_json::json!({"alias": a, "ok": true}),
+                let items: Vec<serde_json::Value> = per_alias
+                    .iter()
+                    .map(|(a, r, _)| match r {
+                        Ok(_) => serde_json::json!({"alias": a, "ok": true}),
                         Err(e) => serde_json::json!({"alias": a, "ok": false, "error": e}),
-                    }
-                }).collect();
+                    })
+                    .collect();
                 let payload = serde_json::json!({
                     "deleted": ok_count,
                     "failed":  fail_count,
@@ -1382,9 +1849,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("  {} API Key '{}' deleted.", "\u{2713}".green(), alias);
                             for action in actions {
                                 match &action.outcome {
-                                    profile_activation::ReconcileOutcome::Replaced { new_source_ref, .. } => {
-                                        eprintln!("    {} '{}' promoted to Primary for {}",
-                                            "\u{2B50}".yellow(), new_source_ref.bold(), action.provider_code);
+                                    profile_activation::ReconcileOutcome::Replaced {
+                                        new_source_ref,
+                                        ..
+                                    } => {
+                                        eprintln!(
+                                            "    {} '{}' promoted to Primary for {}",
+                                            "\u{2B50}".yellow(),
+                                            new_source_ref.bold(),
+                                            action.provider_code
+                                        );
                                     }
                                     profile_activation::ReconcileOutcome::Cleared => {
                                         eprintln!("    {} No replacement for {} — provider has no Primary",
@@ -1399,7 +1873,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 if batch > 1 {
-                    eprintln!("  {} deleted, {} failed (of {} requested).", ok_count, fail_count, batch);
+                    eprintln!(
+                        "  {} deleted, {} failed (of {} requested).",
+                        ok_count, fail_count, batch
+                    );
                 }
                 commands_proxy::maybe_warn_stale();
                 // Partial failure → exit 2, total failure → 1, all ok → 0.
@@ -1417,7 +1894,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Confirm before update (skip in JSON / non-interactive / test mode).
             if !cli.json && std::io::stdin().is_terminal() && env::var("AK_TEST_SECRET").is_err() {
                 use colored::Colorize;
-                eprint!("  Update API Key '{}'? The old value will be overwritten. [y/N] (default N): ", alias.bold());
+                eprint!(
+                    "  Update API Key '{}'? The old value will be overwritten. [y/N] (default N): ",
+                    alias.bold()
+                );
                 io::stdout().flush()?;
                 let mut input = String::new();
                 io::stdin().read_line(&mut input)?;
@@ -1432,7 +1912,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Early password validation — same reason as `add`.
             if storage::get_salt().is_ok() {
                 if let Err(e) = executor::verify_vault_password(&password) {
-                    if cli.json { json_output::error(&e, 1); } else { return Err(e.into()); }
+                    if cli.json {
+                        json_output::error(&e, 1);
+                    } else {
+                        return Err(e.into());
+                    }
                 }
             }
 
@@ -1456,7 +1940,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let result = executor::update_secret(alias, secret.trim(), &password);
-            let _ = audit::log_audit_event(&password, audit::AuditOperation::Update, Some(alias), result.is_ok());
+            let _ = audit::log_audit_event(
+                &password,
+                audit::AuditOperation::Update,
+                Some(alias),
+                result.is_ok(),
+            );
 
             if let Err(e) = result {
                 if cli.json {
@@ -1477,7 +1966,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 commands_proxy::maybe_warn_stale();
             }
         }
-        Commands::Test { alias, provider: test_provider, all } => {
+        Commands::Test {
+            alias,
+            provider: test_provider,
+            all,
+        } => {
             // Structured exit codes so shell wrappers (claude/codex/kimi) can
             // branch without parsing output:
             //
@@ -1489,10 +1982,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             //
             // Ping(DIRECT) is informational only — never participates in the
             // exit-code decision.
-            const EXIT_OK:                i32 = 0;
-            const EXIT_PING_FAIL:         i32 = 1;
-            const EXIT_API_FAIL:          i32 = 2;
-            const EXIT_ALIAS_NOT_FOUND:   i32 = 3;
+            const EXIT_OK: i32 = 0;
+            const EXIT_PING_FAIL: i32 = 1;
+            const EXIT_API_FAIL: i32 = 2;
+            const EXIT_ALIAS_NOT_FOUND: i32 = 3;
             const EXIT_PROXY_NOT_RUNNING: i32 = 5;
 
             // Pre-flight: the probe pipeline now ALWAYS goes through the
@@ -1509,8 +2002,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // proceeding with broken probe targets.
             if !commands_proxy::proxy_is_running_managed() {
                 let msg = "aikey-proxy is not running. Run `aikey proxy start` and retry.";
-                if cli.json { json_output::error(msg, EXIT_PROXY_NOT_RUNNING); }
-                else { eprintln!("{}", msg); std::process::exit(EXIT_PROXY_NOT_RUNNING); }
+                if cli.json {
+                    json_output::error(msg, EXIT_PROXY_NOT_RUNNING);
+                } else {
+                    eprintln!("{}", msg);
+                    std::process::exit(EXIT_PROXY_NOT_RUNNING);
+                }
             }
 
             // Plan D (2026-04-22): personal keys probe via proxy using a
@@ -1530,8 +2027,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // success on ANY counts as overall success — matches the
             // `any_chat_ok` semantics used by `aikey add`.
             fn exit_code_from_outcome(outcome: &commands_project::SuiteOutcome) -> i32 {
-                if outcome.rows.iter().any(|(_, r)| r.api_ok) { return EXIT_OK; }
-                if outcome.rows.iter().any(|(_, r)| r.ping_ok) { return EXIT_API_FAIL; }
+                if outcome.rows.iter().any(|(_, r)| r.api_ok) {
+                    return EXIT_OK;
+                }
+                if outcome.rows.iter().any(|(_, r)| r.ping_ok) {
+                    return EXIT_API_FAIL;
+                }
                 EXIT_PING_FAIL
             }
             // Name inside the closure-esque fn needs the consts visible — Rust
@@ -1559,9 +2060,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         // — match against the URL fragment so non-canonical
                         // forms (e.g. `claude` vs `anthropic`) don't slip
                         // through silently.
-                        t.base_url
-                            .to_lowercase()
-                            .contains(&format!("/{}/", f))
+                        t.base_url.to_lowercase().contains(&format!("/{}/", f))
                             || t.base_url.to_lowercase().contains(&format!("/{}", f))
                     });
                 }
@@ -1576,14 +2075,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         "No stored credentials. Add a key with `aikey add` first.".to_string()
                     };
-                    if cli.json { json_output::error(&msg, EXIT_ALIAS_NOT_FOUND); }
-                    else { return Err(msg.into()); }
+                    if cli.json {
+                        json_output::error(&msg, EXIT_ALIAS_NOT_FOUND);
+                    } else {
+                        return Err(msg.into());
+                    }
                 }
 
                 let opts = commands_project::SuiteOptions {
                     show_proxy_row: true,
-                    header_label:   None,
-                    password:       None,
+                    header_label: None,
+                    password: None,
                     proxy_port,
                     // 2026-05-09: --all is the only place where multiple
                     // credentials share a provider (e.g. team + oauth both
@@ -1606,7 +2108,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if !cli.json {
                     let ok_count = persisted.iter().filter(|p| p.persisted).count();
                     if ok_count > 0 {
-                        eprintln!("\n  \u{2192} Recorded Last test for {} credential(s).", ok_count);
+                        eprintln!(
+                            "\n  \u{2192} Recorded Last test for {} credential(s).",
+                            ok_count
+                        );
                     }
                 }
                 if cli.json {
@@ -1634,15 +2139,20 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                          Hints:\n\
                          - run `aikey list` to see all known aliases\n\
                          - for team keys, run `aikey key sync` first in case the cache is stale",
-                        alias);
-                    if cli.json { json_output::error(&msg, EXIT_ALIAS_NOT_FOUND); }
-                    else { eprintln!("{}", msg); std::process::exit(EXIT_ALIAS_NOT_FOUND); }
+                        alias
+                    );
+                    if cli.json {
+                        json_output::error(&msg, EXIT_ALIAS_NOT_FOUND);
+                    } else {
+                        eprintln!("{}", msg);
+                        std::process::exit(EXIT_ALIAS_NOT_FOUND);
+                    }
                 }
 
                 let opts = commands_project::SuiteOptions {
                     show_proxy_row: false,
-                    header_label:   None,
-                    password:       None,
+                    header_label: None,
+                    password: None,
                     proxy_port,
                     show_key_column: false,
                 };
@@ -1652,11 +2162,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     use colored::Colorize;
                     if targets.len() == 1 {
                         let t = &targets[0];
-                        eprintln!("  Testing '{}' ({} \u{2192} {})",
-                            alias.bold(), t.display_label(), t.base_url.dimmed());
+                        eprintln!(
+                            "  Testing '{}' ({} \u{2192} {})",
+                            alias.bold(),
+                            t.display_label(),
+                            t.base_url.dimmed()
+                        );
                     } else {
-                        eprintln!("  Testing '{}' across {} provider(s)",
-                            alias.bold(), targets.len());
+                        eprintln!(
+                            "  Testing '{}' across {} provider(s)",
+                            alias.bold(),
+                            targets.len()
+                        );
                     }
                     eprintln!();
                     commands_project::run_connectivity_suite(targets, opts, false)
@@ -1687,22 +2204,32 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     commands_project::targets_from_active_bindings(None, proxy_port);
 
                 if targets.is_empty() && build_errors.is_empty() {
-                    if cli.json { json_output::error("No active provider bindings. Add a key first.", EXIT_ALIAS_NOT_FOUND); }
-                    else { return Err("No active provider bindings. Add a key with `aikey add` first.".into()); }
+                    if cli.json {
+                        json_output::error(
+                            "No active provider bindings. Add a key first.",
+                            EXIT_ALIAS_NOT_FOUND,
+                        );
+                    } else {
+                        return Err(
+                            "No active provider bindings. Add a key with `aikey add` first.".into(),
+                        );
+                    }
                 }
 
                 let opts = commands_project::SuiteOptions {
                     show_proxy_row: true,
-                    header_label:   None,
-                    password:       None,
+                    header_label: None,
+                    password: None,
                     proxy_port,
                     show_key_column: false,
                 };
                 let outcome = if cli.json {
                     commands_project::run_connectivity_suite(targets, opts, true)
                 } else {
-                    eprintln!("  Testing {} active provider binding(s)...\n",
-                        targets.len() + build_errors.len());
+                    eprintln!(
+                        "  Testing {} active provider binding(s)...\n",
+                        targets.len() + build_errors.len()
+                    );
                     let outcome = commands_project::run_connectivity_suite(targets, opts, false);
                     commands_project::render_cannot_test_block(&build_errors, false);
                     outcome
@@ -1715,7 +2242,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if !cli.json {
                     let ok_count = persisted.iter().filter(|p| p.persisted).count();
                     if ok_count > 0 {
-                        eprintln!("\n  \u{2192} Recorded Last test for {} credential(s).", ok_count);
+                        eprintln!(
+                            "\n  \u{2192} Recorded Last test for {} credential(s).",
+                            ok_count
+                        );
                     }
                 }
                 if cli.json {
@@ -1734,12 +2264,26 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::Export { pattern, output } => {
-            let vault_password = prompt_password_secure("\u{1F512} Enter Master Password: ", cli.password_stdin, cli.json)?;
-            let export_password = prompt_password_secure("\u{1F512} Enter Export Password: ", cli.password_stdin, cli.json)?;
+            let vault_password = prompt_password_secure(
+                "\u{1F512} Enter Master Password: ",
+                cli.password_stdin,
+                cli.json,
+            )?;
+            let export_password = prompt_password_secure(
+                "\u{1F512} Enter Export Password: ",
+                cli.password_stdin,
+                cli.json,
+            )?;
             let output_path = std::path::Path::new(output);
 
-            let result = synapse::export_vault(pattern, output_path, &vault_password, &export_password);
-            let _ = audit::log_audit_event(&vault_password, audit::AuditOperation::Export, Some(pattern), result.is_ok());
+            let result =
+                synapse::export_vault(pattern, output_path, &vault_password, &export_password);
+            let _ = audit::log_audit_event(
+                &vault_password,
+                audit::AuditOperation::Export,
+                Some(pattern),
+                result.is_ok(),
+            );
 
             let count = match result {
                 Ok(c) => c,
@@ -1762,7 +2306,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Exported {} secret(s) to {}", count, output);
             }
         }
-        Commands::Run { provider, logical_model, model, tenant, profile, dry_run, direct, command } => {
+        Commands::Run {
+            provider,
+            logical_model,
+            model,
+            tenant,
+            profile,
+            dry_run,
+            direct,
+            command,
+        } => {
             if command.is_empty() {
                 let err_msg = "No command specified. Use -- to separate command from flags.";
                 if cli.json {
@@ -1808,17 +2361,27 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .ok()
                         .flatten()
                         .map(|(_, cfg)| cfg);
-                    executor::dry_run_provider(provider_name, model.as_deref(), resolved_tenant, project_config.as_ref())?
+                    executor::dry_run_provider(
+                        provider_name,
+                        model.as_deref(),
+                        resolved_tenant,
+                        project_config.as_ref(),
+                    )?
                 } else {
                     let project_config = config::ProjectConfig::discover()
                         .ok()
                         .flatten()
                         .map(|(_, cfg)| cfg);
                     if let Some(cfg) = project_config.as_ref() {
-                        executor::dry_run_project_config(cfg, logical_model.as_deref(), resolved_tenant)?
+                        executor::dry_run_project_config(
+                            cfg,
+                            logical_model.as_deref(),
+                            resolved_tenant,
+                        )?
                     } else {
                         return Err("No aikey.config.json found and no --provider specified.\n\
-                            For dry-run, use: aikey run --provider anthropic --dry-run -- <cmd>".into());
+                            For dry-run, use: aikey run --provider anthropic --dry-run -- <cmd>"
+                            .into());
                     }
                 };
 
@@ -1881,8 +2444,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         .map(|(_, cfg)| cfg);
 
                     if let Some(cfg) = project_config.as_ref() {
-                        executor::run_with_project_config(cfg, &password, command, cli.json, logical_model.as_deref(), resolved_tenant)
-                    } else if !storage::list_provider_bindings("default").unwrap_or_default().is_empty()
+                        executor::run_with_project_config(
+                            cfg,
+                            &password,
+                            command,
+                            cli.json,
+                            logical_model.as_deref(),
+                            resolved_tenant,
+                        )
+                    } else if !storage::list_provider_bindings("default")
+                        .unwrap_or_default()
+                        .is_empty()
                         || storage::get_active_key_config().ok().flatten().is_some()
                     {
                         // Provider bindings exist, or legacy active key — route via proxy.
@@ -1903,11 +2475,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => {
                         // Extract exit code from error message if present
-                        let exit_code = if let Some(code_str) = e.strip_prefix("Command exited with code ") {
-                            code_str.parse::<i32>().unwrap_or(1)
-                        } else {
-                            1
-                        };
+                        let exit_code =
+                            if let Some(code_str) = e.strip_prefix("Command exited with code ") {
+                                code_str.parse::<i32>().unwrap_or(1)
+                            } else {
+                                1
+                            };
 
                         if cli.json {
                             json_output::error_with_data_stderr(
@@ -1915,7 +2488,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 serde_json::json!({
                                     "exit_code": exit_code
                                 }),
-                                exit_code
+                                exit_code,
                             );
                         } else {
                             eprintln!("Error: {}", e);
@@ -1939,9 +2512,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Commands::ChangePassword => {
-            let old_password = prompt_password_secure("\u{1F512} Enter Master Password: ", cli.password_stdin, cli.json)?;
-            let new_password = prompt_password_secure("\u{1F512} Enter New Master Password: ", false, cli.json)?;
-            let confirm_password = prompt_password_secure("\u{1F512} Confirm New Master Password: ", false, cli.json)?;
+            let old_password = prompt_password_secure(
+                "\u{1F512} Enter Master Password: ",
+                cli.password_stdin,
+                cli.json,
+            )?;
+            let new_password =
+                prompt_password_secure("\u{1F512} Enter New Master Password: ", false, cli.json)?;
+            let confirm_password =
+                prompt_password_secure("\u{1F512} Confirm New Master Password: ", false, cli.json)?;
 
             if new_password.expose_secret() != confirm_password.expose_secret() {
                 if cli.json {
@@ -1955,7 +2534,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Changing master password...");
             }
             let result = storage::change_password(&old_password, &new_password);
-            let _ = audit::log_audit_event(&old_password, audit::AuditOperation::Init, None, result.is_ok());
+            let _ = audit::log_audit_event(
+                &old_password,
+                audit::AuditOperation::Init,
+                None,
+                result.is_ok(),
+            );
 
             if let Err(e) = result {
                 if cli.json {
@@ -1978,15 +2562,22 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Secret { action } => {
             match action {
-                SecretAction::Set { name, provider, from_stdin } => {
+                SecretAction::Set {
+                    name,
+                    provider,
+                    from_stdin,
+                } => {
                     if !from_stdin {
                         let err_msg = "The --from-stdin flag is required for security. API Key values must not be passed via command-line arguments.";
                         if cli.json {
-                            json_output::print_json_exit(serde_json::json!({
-                                "ok": false,
-                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
-                                "message": err_msg
-                            }), 1);
+                            json_output::print_json_exit(
+                                serde_json::json!({
+                                    "ok": false,
+                                    "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                    "message": err_msg
+                                }),
+                                1,
+                            );
                         } else {
                             return Err(err_msg.into());
                         }
@@ -1994,11 +2585,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     if let Err(e) = validate_secret_name(name) {
                         if cli.json {
-                            json_output::print_json_exit(serde_json::json!({
-                                "ok": false,
-                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
-                                "message": e
-                            }), 1);
+                            json_output::print_json_exit(
+                                serde_json::json!({
+                                    "ok": false,
+                                    "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                    "message": e
+                                }),
+                                1,
+                            );
                         } else {
                             return Err(e.into());
                         }
@@ -2011,10 +2605,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         Ok(list) => list,
                         Err(e) => {
                             if cli.json {
-                                json_output::print_json_exit(serde_json::json!({
-                                    "ok": false,
-                                    "message": e
-                                }), 1);
+                                json_output::print_json_exit(
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "message": e
+                                    }),
+                                    1,
+                                );
                             } else {
                                 return Err(e.into());
                             }
@@ -2027,11 +2624,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             name, name
                         );
                         if cli.json {
-                            json_output::print_json_exit(serde_json::json!({
-                                "ok": false,
-                                "code": error_codes::ErrorCode::AliasExists.as_str(),
-                                "message": err_msg
-                            }), 1);
+                            json_output::print_json_exit(
+                                serde_json::json!({
+                                    "ok": false,
+                                    "code": error_codes::ErrorCode::AliasExists.as_str(),
+                                    "message": err_msg
+                                }),
+                                1,
+                            );
                         } else {
                             return Err(err_msg.into());
                         }
@@ -2052,24 +2652,35 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if secret_value.is_empty() {
                         let err_msg = "Secret value cannot be empty";
                         if cli.json {
-                            json_output::print_json_exit(serde_json::json!({
-                                "ok": false,
-                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
-                                "message": err_msg
-                            }), 1);
+                            json_output::print_json_exit(
+                                serde_json::json!({
+                                    "ok": false,
+                                    "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                    "message": err_msg
+                                }),
+                                1,
+                            );
                         } else {
                             return Err(err_msg.into());
                         }
                     }
 
                     let result = executor::add_secret(name, secret_value, &password);
-                    let _ = audit::log_audit_event(&password, audit::AuditOperation::Add, Some(name), result.is_ok());
+                    let _ = audit::log_audit_event(
+                        &password,
+                        audit::AuditOperation::Add,
+                        Some(name),
+                        result.is_ok(),
+                    );
 
                     match result {
                         Ok(_) => {
                             // Persist provider_code if supplied.
                             if let Some(code) = provider {
-                                let _ = storage::set_entry_provider_code(name, Some(code.to_lowercase().as_str()));
+                                let _ = storage::set_entry_provider_code(
+                                    name,
+                                    Some(code.to_lowercase().as_str()),
+                                );
                             }
                             if cli.json {
                                 json_output::print_json(serde_json::json!({
@@ -2084,26 +2695,36 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => {
                             if cli.json {
                                 let code = error_codes::ErrorCode::from_error_message(&e);
-                                json_output::print_json_exit(serde_json::json!({
-                                    "ok": false,
-                                    "code": code.as_str(),
-                                    "message": e
-                                }), 1);
+                                json_output::print_json_exit(
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "code": code.as_str(),
+                                        "message": e
+                                    }),
+                                    1,
+                                );
                             } else {
                                 return Err(e.into());
                             }
                         }
                     }
                 }
-                SecretAction::Upsert { name, provider, from_stdin } => {
+                SecretAction::Upsert {
+                    name,
+                    provider,
+                    from_stdin,
+                } => {
                     if !from_stdin {
                         let err_msg = "The --from-stdin flag is required for security. API Key values must not be passed via command-line arguments.";
                         if cli.json {
-                            json_output::print_json_exit(serde_json::json!({
-                                "ok": false,
-                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
-                                "message": err_msg
-                            }), 1);
+                            json_output::print_json_exit(
+                                serde_json::json!({
+                                    "ok": false,
+                                    "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                    "message": err_msg
+                                }),
+                                1,
+                            );
                         } else {
                             return Err(err_msg.into());
                         }
@@ -2111,11 +2732,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     if let Err(e) = validate_secret_name(name) {
                         if cli.json {
-                            json_output::print_json_exit(serde_json::json!({
-                                "ok": false,
-                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
-                                "message": e
-                            }), 1);
+                            json_output::print_json_exit(
+                                serde_json::json!({
+                                    "ok": false,
+                                    "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                    "message": e
+                                }),
+                                1,
+                            );
                         } else {
                             return Err(e.into());
                         }
@@ -2138,11 +2762,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if secret_value.is_empty() {
                         let err_msg = "Secret value cannot be empty";
                         if cli.json {
-                            json_output::print_json_exit(serde_json::json!({
-                                "ok": false,
-                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
-                                "message": err_msg
-                            }), 1);
+                            json_output::print_json_exit(
+                                serde_json::json!({
+                                    "ok": false,
+                                    "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                    "message": err_msg
+                                }),
+                                1,
+                            );
                         } else {
                             return Err(err_msg.into());
                         }
@@ -2155,13 +2782,21 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         executor::add_secret(name, secret_value, &password)
                     };
-                    let _ = audit::log_audit_event(&password, audit::AuditOperation::Update, Some(name), result.is_ok());
+                    let _ = audit::log_audit_event(
+                        &password,
+                        audit::AuditOperation::Update,
+                        Some(name),
+                        result.is_ok(),
+                    );
 
                     match result {
                         Ok(_) => {
                             // Persist provider_code if supplied.
                             if let Some(code) = provider {
-                                let _ = storage::set_entry_provider_code(name, Some(code.to_lowercase().as_str()));
+                                let _ = storage::set_entry_provider_code(
+                                    name,
+                                    Some(code.to_lowercase().as_str()),
+                                );
                             }
                             if cli.json {
                                 json_output::print_json(serde_json::json!({
@@ -2176,11 +2811,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => {
                             if cli.json {
                                 let code = error_codes::ErrorCode::from_error_message(&e);
-                                json_output::print_json_exit(serde_json::json!({
-                                    "ok": false,
-                                    "code": code.as_str(),
-                                    "message": e
-                                }), 1);
+                                json_output::print_json_exit(
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "code": code.as_str(),
+                                        "message": e
+                                    }),
+                                    1,
+                                );
                             } else {
                                 return Err(e.into());
                             }
@@ -2191,7 +2829,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let password = prompt_vault_password(cli.password_stdin, cli.json)?;
 
                     let result = executor::list_secrets_with_metadata(&password);
-                    let _ = audit::log_audit_event(&password, audit::AuditOperation::List, None, result.is_ok());
+                    let _ = audit::log_audit_event(
+                        &password,
+                        audit::AuditOperation::List,
+                        None,
+                        result.is_ok(),
+                    );
 
                     match result {
                         Ok(secrets) => {
@@ -2221,11 +2864,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => {
                             if cli.json {
                                 let code = error_codes::ErrorCode::from_error_message(&e);
-                                json_output::print_json_exit(serde_json::json!({
-                                    "ok": false,
-                                    "code": code.as_str(),
-                                    "message": e
-                                }), 1);
+                                json_output::print_json_exit(
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "code": code.as_str(),
+                                        "message": e
+                                    }),
+                                    1,
+                                );
                             } else {
                                 return Err(e.into());
                             }
@@ -2236,7 +2882,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let password = prompt_vault_password_fresh(cli.password_stdin, cli.json)?;
 
                     let result = executor::delete_secret(name, &password);
-                    let _ = audit::log_audit_event(&password, audit::AuditOperation::Delete, Some(name), result.is_ok());
+                    let _ = audit::log_audit_event(
+                        &password,
+                        audit::AuditOperation::Delete,
+                        Some(name),
+                        result.is_ok(),
+                    );
 
                     match result {
                         Ok(_) => {
@@ -2247,7 +2898,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                     source_type: "personal",
                                     source_ref: name,
                                 },
-                            ).unwrap_or_default();
+                            )
+                            .unwrap_or_default();
                             let actions = outcome.reconcile_actions;
 
                             if cli.json {
@@ -2261,9 +2913,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 println!("API Key '{}' deleted successfully", name);
                                 for action in &actions {
                                     match &action.outcome {
-                                        profile_activation::ReconcileOutcome::Replaced { new_source_ref, .. } => {
-                                            eprintln!("  {} '{}' promoted to Primary for {}",
-                                                "\u{2B50}".yellow(), new_source_ref.bold(), action.provider_code);
+                                        profile_activation::ReconcileOutcome::Replaced {
+                                            new_source_ref,
+                                            ..
+                                        } => {
+                                            eprintln!(
+                                                "  {} '{}' promoted to Primary for {}",
+                                                "\u{2B50}".yellow(),
+                                                new_source_ref.bold(),
+                                                action.provider_code
+                                            );
                                         }
                                         profile_activation::ReconcileOutcome::Cleared => {
                                             eprintln!("  {} No replacement for {} — provider has no Primary",
@@ -2277,11 +2936,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => {
                             if cli.json {
                                 let code = error_codes::ErrorCode::from_error_message(&e);
-                                json_output::print_json_exit(serde_json::json!({
-                                    "ok": false,
-                                    "code": code.as_str(),
-                                    "message": e
-                                }), 1);
+                                json_output::print_json_exit(
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "code": code.as_str(),
+                                        "message": e
+                                    }),
+                                    1,
+                                );
                             } else {
                                 return Err(e.into());
                             }
@@ -2290,19 +2952,34 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Project { action } => {
-            match action {
-                ProjectAction::Init => {
-                    commands_project::handle_project_init(cli.json)?;
-                }
-                ProjectAction::Status => {
-                    commands_project::handle_project_status(cli.json)?;
-                }
-                ProjectAction::Map { var, alias, env, provider, model, key_alias, impl_id } => {
-                    commands_project::handle_project_map(var, alias, env.as_deref(), provider.as_deref(), model.as_deref(), key_alias.as_deref(), impl_id.as_deref(), cli.json)?;
-                }
+        Commands::Project { action } => match action {
+            ProjectAction::Init => {
+                commands_project::handle_project_init(cli.json)?;
             }
-        }
+            ProjectAction::Status => {
+                commands_project::handle_project_status(cli.json)?;
+            }
+            ProjectAction::Map {
+                var,
+                alias,
+                env,
+                provider,
+                model,
+                key_alias,
+                impl_id,
+            } => {
+                commands_project::handle_project_map(
+                    var,
+                    alias,
+                    env.as_deref(),
+                    provider.as_deref(),
+                    model.as_deref(),
+                    key_alias.as_deref(),
+                    impl_id.as_deref(),
+                    cli.json,
+                )?;
+            }
+        },
         Commands::Quickstart => {
             commands_project::handle_quickstart(cli.json)?;
         }
@@ -2351,11 +3028,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if new_value_str.is_empty() {
                         let err_msg = "New key value cannot be empty";
                         if cli.json {
-                            json_output::print_json_exit(serde_json::json!({
-                                "ok": false,
-                                "code": error_codes::ErrorCode::InvalidInput.as_str(),
-                                "message": err_msg
-                            }), 1);
+                            json_output::print_json_exit(
+                                serde_json::json!({
+                                    "ok": false,
+                                    "code": error_codes::ErrorCode::InvalidInput.as_str(),
+                                    "message": err_msg
+                                }),
+                                1,
+                            );
                         } else {
                             return Err(err_msg.into());
                         }
@@ -2368,7 +3048,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         executor::add_secret(name, new_value_str, &password)
                     };
-                    let _ = audit::log_audit_event(&password, audit::AuditOperation::Update, Some(name), result.is_ok());
+                    let _ = audit::log_audit_event(
+                        &password,
+                        audit::AuditOperation::Update,
+                        Some(name),
+                        result.is_ok(),
+                    );
 
                     match result {
                         Ok(_) => {
@@ -2384,11 +3069,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         Err(e) => {
                             if cli.json {
                                 let code = error_codes::ErrorCode::from_error_message(&e);
-                                json_output::print_json_exit(serde_json::json!({
-                                    "ok": false,
-                                    "code": code.as_str(),
-                                    "message": e
-                                }), 1);
+                                json_output::print_json_exit(
+                                    serde_json::json!({
+                                        "ok": false,
+                                        "code": code.as_str(),
+                                        "message": e
+                                    }),
+                                    1,
+                                );
                             } else {
                                 return Err(e.into());
                             }
@@ -2402,39 +3090,52 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let password = prompt_vault_password(cli.password_stdin, cli.json)?;
                     commands_account::handle_key_sync(&password, cli.json, *force_reencrypt)?;
                 }
-                KeyAction::Use { alias_or_id, no_hook } => {
+                KeyAction::Use {
+                    alias_or_id,
+                    no_hook,
+                } => {
                     commands_proxy::ensure_proxy_for_use(cli.password_stdin);
                     commands_account::handle_key_use(alias_or_id, *no_hook, None, cli.json)?;
                     commands_proxy::warn_if_proxy_down();
                 }
-                KeyAction::Alias { old_alias, new_alias } => {
+                KeyAction::Alias {
+                    old_alias,
+                    new_alias,
+                } => {
                     commands_account::handle_key_alias(old_alias, new_alias, cli.json)?;
                 }
             }
         }
-        Commands::Account { action } => {
-            match action {
-                AccountAction::Login { url, token, email, resend } => {
-                    commands_account::handle_login(
-                        cli.json,
-                        url.clone(),
-                        token.clone(),
-                        email.clone(),
-                        *resend,
-                    )?;
-                }
-                AccountAction::Status => {
-                    commands_account::handle_account_status(cli.json)?;
-                }
-                AccountAction::Logout => {
-                    commands_account::handle_logout(cli.json)?;
-                }
-                AccountAction::SetUrl { url } => {
-                    commands_account::handle_set_control_url(url, cli.json)?;
-                }
+        Commands::Account { action } => match action {
+            AccountAction::Login {
+                url,
+                token,
+                email,
+                resend,
+            } => {
+                commands_account::handle_login(
+                    cli.json,
+                    url.clone(),
+                    token.clone(),
+                    email.clone(),
+                    *resend,
+                )?;
             }
-        }
-        Commands::Activate { alias, provider, shell } => {
+            AccountAction::Status => {
+                commands_account::handle_account_status(cli.json)?;
+            }
+            AccountAction::Logout => {
+                commands_account::handle_logout(cli.json)?;
+            }
+            AccountAction::SetUrl { url } => {
+                commands_account::handle_set_control_url(url, cli.json)?;
+            }
+        },
+        Commands::Activate {
+            alias,
+            provider,
+            shell,
+        } => {
             handle_activate(alias.as_deref(), provider.as_deref(), shell.as_deref())?;
         }
         Commands::Deactivate { shell } => {
@@ -2446,13 +3147,28 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Route { label, full } => {
             handle_route(label.as_deref(), *full, cli.json)?;
         }
-        Commands::Login { url, token, email, resend } => {
-            commands_account::handle_login(cli.json, url.clone(), token.clone(), email.clone(), *resend)?;
+        Commands::Login {
+            url,
+            token,
+            email,
+            resend,
+        } => {
+            commands_account::handle_login(
+                cli.json,
+                url.clone(),
+                token.clone(),
+                email.clone(),
+                *resend,
+            )?;
         }
         Commands::Logout => {
             commands_account::handle_logout(cli.json)?;
         }
-        Commands::Use { alias_or_id, no_hook, provider } => {
+        Commands::Use {
+            alias_or_id,
+            no_hook,
+            provider,
+        } => {
             // One-time backfill: generate route_tokens for existing keys that lack them.
             // Why here: `aikey use` is the most common write-path command after upgrade.
             let backfilled = storage::backfill_route_tokens().unwrap_or(0);
@@ -2464,14 +3180,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Some(a) => {
                     // `aikey use <alias>` — provider-level promotion via handle_key_use.
                     commands_proxy::ensure_proxy_for_use(cli.password_stdin);
-                    commands_account::handle_key_use(
-                        a, *no_hook, provider.as_deref(), cli.json,
-                    )?;
+                    commands_account::handle_key_use(a, *no_hook, provider.as_deref(), cli.json)?;
                 }
                 None => {
                     // `aikey use` (no args) — provider-tree interactive editor.
                     if !std::io::stdin().is_terminal() || cli.json {
-                        return Err("alias required in non-interactive mode (usage: aikey use <ALIAS>)".into());
+                        return Err(
+                            "alias required in non-interactive mode (usage: aikey use <ALIAS>)"
+                                .into(),
+                        );
                     }
                     commands_proxy::ensure_proxy_for_use(cli.password_stdin);
                     let changes = pick_providers_interactively()?;
@@ -2512,17 +3229,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         // Re-read bindings for the summary box (display only —
                         // the apply chain already wrote everything). Cheap;
                         // single DB read.
-                        let bindings = storage::list_provider_bindings_readonly("default")
-                            .unwrap_or_default();
+                        let bindings =
+                            storage::list_provider_bindings_readonly("default").unwrap_or_default();
 
                         // Print a summary box showing the final state.
                         use colored::Colorize;
-                        let changed_providers: Vec<&str> = changes.iter()
-                            .map(|(p, _, _)| p.as_str())
-                            .collect();
+                        let changed_providers: Vec<&str> =
+                            changes.iter().map(|(p, _, _)| p.as_str()).collect();
                         let mut box_rows: Vec<String> = Vec::new();
                         for b in &bindings {
-                            let display_name = resolve_binding_display_name(b.key_source_type.as_str(), &b.key_source_ref);
+                            let display_name = resolve_binding_display_name(
+                                b.key_source_type.as_str(),
+                                &b.key_source_ref,
+                            );
                             let is_changed = changed_providers.contains(&b.provider_code.as_str());
                             let value_raw = format!("\u{2192} {}", display_name);
                             let value_padded = format!("{:<28}", value_raw);
@@ -2531,8 +3250,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             } else {
                                 value_padded
                             };
-                            box_rows.push(format!("  {:<14} {} \x1b[90m[{}]\x1b[0m",
-                                b.provider_code, value_col, b.key_source_type));
+                            box_rows.push(format!(
+                                "  {:<14} {} \x1b[90m[{}]\x1b[0m",
+                                b.provider_code, value_col, b.key_source_type
+                            ));
                         }
                         box_rows.push(String::new());
                         box_rows.push(format!("{} Saved provider primary selections and refreshed current activation.",
@@ -2591,9 +3312,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 // conditional `case` blocks (which we hide above).
                                 // The resolved value comes from the file content.
                                 if let Some(bypass) = proxy_env::read_active_bypass_summary() {
-                                    eprintln!("  {}  {}",
+                                    eprintln!(
+                                        "  {}  {}",
                                         "no_proxy (bypass)".to_string(),
-                                        bypass.dimmed());
+                                        bypass.dimmed()
+                                    );
                                 }
                             }
                             Err(e) => eprintln!("  {}", format!("Error: {}", e).red()),
@@ -2616,13 +3339,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                     eprintln!("  {}={}", k, proxy_env::mask_value(k, v).dimmed());
                                 }
                                 eprintln!();
-                                eprintln!("  Entries: {}  Hash: {}",
-                                    map.len(), proxy_env::config_hash(&map).dimmed());
+                                eprintln!(
+                                    "  Entries: {}  Hash: {}",
+                                    map.len(),
+                                    proxy_env::config_hash(&map).dimmed()
+                                );
                             }
                             Err(e) => eprintln!("  {}", format!("Error: {}", e).red()),
                         }
                     } else {
-                        eprintln!("  {}", "(not found — use `aikey env set -- KEY=VALUE` to create)".dimmed());
+                        eprintln!(
+                            "  {}",
+                            "(not found — use `aikey env set -- KEY=VALUE` to create)".dimmed()
+                        );
                     }
 
                     // Shell env (inherited): show proxy-related env vars from the current shell.
@@ -2630,9 +3359,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!();
                     eprintln!("{}", "Shell env (inherited by proxy):".bold());
                     let inherited_keys = [
-                        "http_proxy", "https_proxy", "all_proxy",
-                        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-                        "no_proxy", "NO_PROXY",
+                        "http_proxy",
+                        "https_proxy",
+                        "all_proxy",
+                        "HTTP_PROXY",
+                        "HTTPS_PROXY",
+                        "ALL_PROXY",
+                        "no_proxy",
+                        "NO_PROXY",
                     ];
                     let mut found_any = false;
                     for key in &inherited_keys {
@@ -2702,11 +3436,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     // Read existing, merge, write back.
                     // Why explicit error: if the old file is corrupt, we must not
                     // silently discard it — user should fix it first.
-                    let mut existing = proxy_env::read_proxy_env()
-                        .map_err(|e| format!(
+                    let mut existing = proxy_env::read_proxy_env().map_err(|e| {
+                        format!(
                             "Cannot parse existing ~/.aikey/proxy.env: {}\n\
-                             Fix or remove the file before setting new values.", e
-                        ))?;
+                             Fix or remove the file before setting new values.",
+                            e
+                        )
+                    })?;
                     for (k, v) in &new_entries {
                         existing.insert(k.clone(), v.clone());
                     }
@@ -2725,35 +3461,57 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     if commands_proxy::proxy_is_running_managed() {
                         eprintln!();
                         eprintln!("  Restarting proxy to apply changes...");
-                        let pw = session::try_get()
-                            .or_else(|| std::env::var("AK_TEST_PASSWORD").ok().map(SecretString::new));
+                        let pw = session::try_get().or_else(|| {
+                            std::env::var("AK_TEST_PASSWORD")
+                                .ok()
+                                .map(SecretString::new)
+                        });
                         match pw {
                             Some(password) => {
                                 match commands_proxy::handle_restart(None, &password) {
                                     Ok(()) => {
-                                        eprintln!("  {} Proxy restarted with new env.", "\u{2713}".green());
+                                        eprintln!(
+                                            "  {} Proxy restarted with new env.",
+                                            "\u{2713}".green()
+                                        );
                                     }
                                     Err(e) => {
-                                        eprintln!("  {} Auto-restart failed: {}", "\u{26A0}".yellow(), e);
-                                        eprintln!("  Run manually: {}", "aikey proxy restart".bold());
+                                        eprintln!(
+                                            "  {} Auto-restart failed: {}",
+                                            "\u{26A0}".yellow(),
+                                            e
+                                        );
+                                        eprintln!(
+                                            "  Run manually: {}",
+                                            "aikey proxy restart".bold()
+                                        );
                                     }
                                 }
                             }
                             None => {
-                                eprintln!("  {} Cannot auto-restart (no cached password).",
-                                    "\u{26A0}".yellow());
+                                eprintln!(
+                                    "  {} Cannot auto-restart (no cached password).",
+                                    "\u{26A0}".yellow()
+                                );
                                 eprintln!("  Run manually: {}", "aikey proxy restart".bold());
                             }
                         }
                     } else {
                         eprintln!();
-                        eprintln!("  Proxy not running. Changes will apply on next {}.",
-                            "aikey proxy start".bold());
+                        eprintln!(
+                            "  Proxy not running. Changes will apply on next {}.",
+                            "aikey proxy start".bold()
+                        );
                     }
                 }
             }
         }
-        Commands::Web { page, import, vault, port } => {
+        Commands::Web {
+            page,
+            import,
+            vault,
+            port,
+        } => {
             // Intercept service-control verbs first. `start` / `stop` /
             // `restart` as the positional argument route to service
             // management instead of opening a browser page. This keeps
@@ -2782,9 +3540,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands_account::handle_browse(effective_page, *port, cli.json)?;
         }
         Commands::Master { page, url, port } => {
-            commands_account::handle_master_browse(page.as_deref(), url.as_deref(), *port, cli.json)?;
+            commands_account::handle_master_browse(
+                page.as_deref(),
+                url.as_deref(),
+                *port,
+                cli.json,
+            )?;
         }
-        Commands::Import { file, non_interactive, yes, provider } => {
+        Commands::Import {
+            file,
+            non_interactive,
+            yes,
+            provider,
+        } => {
             commands_import::handle(
                 file.as_deref(),
                 *non_interactive,
@@ -2823,7 +3591,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     // Use --foreground for debugging or when running under a process manager.
                     commands_proxy::handle_start(
                         config.as_deref(),
-                        !*foreground,  // detach = !foreground
+                        !*foreground, // detach = !foreground
                         &password,
                     )?;
                 }
@@ -2858,11 +3626,26 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         // Pretty-print the four key counters; the body is
                         // small enough that even a casual grep is fine.
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                            let scan = v.get("entries_scanned").and_then(|x| x.as_i64()).unwrap_or(0);
-                            let ok = v.get("entries_replayed_ok").and_then(|x| x.as_i64()).unwrap_or(0);
-                            let fail = v.get("entries_still_failing").and_then(|x| x.as_i64()).unwrap_or(0);
-                            let ev_ok = v.get("events_replayed_ok").and_then(|x| x.as_i64()).unwrap_or(0);
-                            let ev_fail = v.get("events_still_failing").and_then(|x| x.as_i64()).unwrap_or(0);
+                            let scan = v
+                                .get("entries_scanned")
+                                .and_then(|x| x.as_i64())
+                                .unwrap_or(0);
+                            let ok = v
+                                .get("entries_replayed_ok")
+                                .and_then(|x| x.as_i64())
+                                .unwrap_or(0);
+                            let fail = v
+                                .get("entries_still_failing")
+                                .and_then(|x| x.as_i64())
+                                .unwrap_or(0);
+                            let ev_ok = v
+                                .get("events_replayed_ok")
+                                .and_then(|x| x.as_i64())
+                                .unwrap_or(0);
+                            let ev_fail = v
+                                .get("events_still_failing")
+                                .and_then(|x| x.as_i64())
+                                .unwrap_or(0);
                             eprintln!("  Replay pass complete:");
                             eprintln!("    entries scanned       : {}", scan);
                             eprintln!("    entries re-delivered  : {}", ok);
@@ -2916,17 +3699,22 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else if entries.is_empty() {
                 println!("No events recorded yet.");
             } else {
-                println!("{:<6} {:<20} {:<10} {:<12} {:<5} {}",
-                    "ID", "TIMESTAMP", "TYPE", "PROTOCOL", "EXIT", "COMMAND");
+                println!(
+                    "{:<6} {:<20} {:<10} {:<12} {:<5} {}",
+                    "ID", "TIMESTAMP", "TYPE", "PROTOCOL", "EXIT", "COMMAND"
+                );
                 println!("{}", "-".repeat(72));
                 for e in &entries {
                     let ts = e.timestamp.to_string();
-                    println!("{:<6} {:<20} {:<10} {:<12} {:<5} {}",
+                    println!(
+                        "{:<6} {:<20} {:<10} {:<12} {:<5} {}",
                         e.id,
                         ts,
                         e.event_type,
                         e.provider.as_deref().unwrap_or("-"),
-                        e.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string()),
+                        e.exit_code
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
                         e.command.as_deref().unwrap_or("-"),
                     );
                 }
@@ -2974,7 +3762,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands_watch::run()?;
         }
         Commands::Trust { action } => match action {
-            cli::TrustAction::Verify { alias, force, no_wait, wait: _ } => {
+            cli::TrustAction::Verify {
+                alias,
+                force,
+                no_wait,
+                wait: _,
+            } => {
                 commands_trust::handle_verify(alias, *force, *no_wait, cli.json)?;
             }
             cli::TrustAction::Status { alias } => {
@@ -3021,7 +3814,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             cli::AppAction::List => {
                 commands_app::handle_list(cli.json)?;
             }
-            cli::AppAction::Route { slug, upstream, key_type, key_ref, yes } => {
+            cli::AppAction::Route {
+                slug,
+                upstream,
+                key_type,
+                key_ref,
+                yes,
+            } => {
                 commands_app::handle_route(
                     slug,
                     upstream.as_deref(),
@@ -3148,13 +3947,16 @@ fn route_type_order(t: &str) -> u8 {
 /// so both surfaces feel consistent.
 fn print_route_config(entries: &[&RouteEntry]) {
     use colored::Colorize;
-    if entries.is_empty() { return; }
+    if entries.is_empty() {
+        return;
+    }
     let head = entries[0];
 
     // Title: label + colored [type] badge + provider(s).
     let providers = {
         let mut ps: Vec<&str> = entries.iter().map(|e| e.provider.as_str()).collect();
-        ps.sort(); ps.dedup();
+        ps.sort();
+        ps.dedup();
         ps.join(", ")
     };
     let type_badge = match head.key_type.as_str() {
@@ -3165,16 +3967,20 @@ fn print_route_config(entries: &[&RouteEntry]) {
     };
 
     println!();
-    println!("  \u{1F511}  {}  {}  {}",
+    println!(
+        "  \u{1F511}  {}  {}  {}",
         head.label.bold(),
         type_badge,
-        format!("\u{2192} {}", providers).dimmed());
+        format!("\u{2192} {}", providers).dimmed()
+    );
     println!("  {}", "\u{2500}".repeat(68).dimmed());
     println!();
 
     // Key/value block. Values are plain (no color) so they survive copy-paste.
     let show_pair = |e: &RouteEntry, prefix: Option<&str>| {
-        if let Some(p) = prefix { println!("  {}", format!("[{}]", p).cyan()); }
+        if let Some(p) = prefix {
+            println!("  {}", format!("[{}]", p).cyan());
+        }
         println!("    {}   {}", "base_url".dimmed(), e.base_url);
         println!("    {}    {}", "api_key".dimmed(), e.api_key);
     };
@@ -3184,7 +3990,9 @@ fn print_route_config(entries: &[&RouteEntry]) {
     } else {
         for (i, e) in entries.iter().enumerate() {
             show_pair(e, Some(&e.provider));
-            if i + 1 < entries.len() { println!(); }
+            if i + 1 < entries.len() {
+                println!();
+            }
         }
     }
 
@@ -3218,7 +4026,8 @@ fn handle_route(
 
     // Pre-index active bindings for O(1) lookup instead of O(N*M) linear scan.
     let bindings = storage::list_provider_bindings_readonly("default").unwrap_or_default();
-    let active_set: std::collections::HashSet<(&'static str, String)> = bindings.iter()
+    let active_set: std::collections::HashSet<(&'static str, String)> = bindings
+        .iter()
         .map(|b| {
             let kind: &'static str = match b.key_source_type {
                 credential_type::CredentialType::ManagedVirtualKey => "team",
@@ -3268,7 +4077,11 @@ fn handle_route(
                 key_type: "team".to_string(),
                 label: display_alias.to_string(),
                 api_key: token.clone(),
-                base_url: format!("http://127.0.0.1:{}/{}", proxy_port, provider_proxy_path(prov)),
+                base_url: format!(
+                    "http://127.0.0.1:{}/{}",
+                    proxy_port,
+                    provider_proxy_path(prov)
+                ),
                 active: is_active("team", &vk.virtual_key_id),
             });
         }
@@ -3276,26 +4089,69 @@ fn handle_route(
 
     // 2. OAuth accounts
     for acct in storage::list_provider_accounts_readonly().unwrap_or_default() {
-        if acct.status != "active" { continue; }
+        if acct.status != "active" {
+            continue;
+        }
         let label_str = acct.effective_label();
-        match storage::get_provider_account_route_token_readonly(&acct.provider_account_id) {
-            Ok(Some(token)) => {
+        // BR-rc.5 fix (2026-05-25, sibling of vault-oauth-route-token-
+        // not-generated-by-web-broker): web OAuthBrokerCard creates
+        // provider_accounts rows via `VaultAccountStore.Save` which
+        // pre-fix didn't write route_token → readonly returns Ok(None)
+        // → the OAuth row was silently dropped from `aikey route`
+        // (`missing_token_count += 1` arm with no fallback). Same NULL
+        // also caused the vault drawer to show "Unlock vault to reveal".
+        //
+        // Match the same lazy-ensure pattern as
+        // `commands_internal/query.rs::handle_list_oauth`: on Ok(None),
+        // call `ensure_provider_account_route_token` to backfill +
+        // return the token. `route_token` is a plaintext column on
+        // `provider_accounts` (not encrypted) so `ensure_*` (which
+        // opens a write connection) doesn't need vault_key — safe to
+        // call from `aikey route` (which doesn't require unlock).
+        //
+        // Failures here fall through to `missing_token_count += 1`
+        // (existing behavior preserved as last-resort safety net).
+        // See bugfix 20260525-vault-oauth-route-token-not-generated-by-
+        // web-broker.md.
+        let token_result = match storage::get_provider_account_route_token_readonly(&acct.provider_account_id) {
+            Ok(Some(t)) => Ok(t),
+            Ok(None) => storage::ensure_provider_account_route_token(&acct.provider_account_id),
+            Err(e) => Err(e),
+        };
+        match token_result {
+            Ok(token) => {
                 entries.push(RouteEntry {
                     provider: provider_canonical(&acct.provider),
                     key_type: "oauth".to_string(),
                     label: label_str.to_string(),
                     api_key: token,
-                    base_url: format!("http://127.0.0.1:{}/{}", proxy_port, provider_proxy_path(&acct.provider)),
+                    base_url: format!(
+                        "http://127.0.0.1:{}/{}",
+                        proxy_port,
+                        provider_proxy_path(&acct.provider)
+                    ),
                     active: is_active("oauth", &acct.provider_account_id),
                 });
             }
-            Ok(None) => { missing_token_count += 1; }
             Err(e) => {
-                eprintln!("  {} Failed to read route token for OAuth account '{}': {}",
-                    "\u{26a0}".yellow(), label_str, e);
+                // Either readonly read failed OR ensure_* (write) failed —
+                // both rare. Surface so users know an OAuth row exists in
+                // vault but couldn't get a usable route token (≠ silent
+                // skip pre-fix).
+                eprintln!(
+                    "  {} Failed to get route token for OAuth account '{}': {}",
+                    "\u{26a0}".yellow(),
+                    label_str,
+                    e
+                );
                 db_error_count += 1;
             }
         }
+        // missing_token_count NOT incremented in the OAuth branch any
+        // more — Ok(None) now goes through ensure_* fallback. Personal
+        // branch below still uses it (entries can legitimately have
+        // no token if backfill never ran). The summary at line ~4387
+        // still works because Personal increments cover the same need.
     }
 
     // 3. Personal keys
@@ -3306,7 +4162,8 @@ fn handle_route(
         }
         match storage::get_entry_route_token_readonly(&meta.alias) {
             Ok(Some(token)) => {
-                let providers: Vec<String> = match (&meta.supported_providers, &meta.provider_code) {
+                let providers: Vec<String> = match (&meta.supported_providers, &meta.provider_code)
+                {
                     (Some(list), _) if !list.is_empty() => list.clone(),
                     (_, Some(p)) => vec![p.clone()],
                     _ => Vec::new(),
@@ -3317,15 +4174,25 @@ fn handle_route(
                         key_type: "personal".to_string(),
                         label: meta.alias.clone(),
                         api_key: token.clone(),
-                        base_url: format!("http://127.0.0.1:{}/{}", proxy_port, provider_proxy_path(prov)),
+                        base_url: format!(
+                            "http://127.0.0.1:{}/{}",
+                            proxy_port,
+                            provider_proxy_path(prov)
+                        ),
                         active: is_active("personal", &meta.alias),
                     });
                 }
             }
-            Ok(None) => { missing_token_count += 1; }
+            Ok(None) => {
+                missing_token_count += 1;
+            }
             Err(e) => {
-                eprintln!("  {} Failed to read route token for personal key '{}': {}",
-                    "\u{26a0}".yellow(), meta.alias, e);
+                eprintln!(
+                    "  {} Failed to read route token for personal key '{}': {}",
+                    "\u{26a0}".yellow(),
+                    meta.alias,
+                    e
+                );
                 db_error_count += 1;
             }
         }
@@ -3334,7 +4201,8 @@ fn handle_route(
     // Sort: team first, then OAuth, then personal. Within each group, alphabetical
     // by label (so multi-provider keys cluster together) and then by provider.
     entries.sort_by(|a, b| {
-        route_type_order(&a.key_type).cmp(&route_type_order(&b.key_type))
+        route_type_order(&a.key_type)
+            .cmp(&route_type_order(&b.key_type))
             .then_with(|| a.label.cmp(&b.label))
             .then_with(|| a.provider.cmp(&b.provider))
     });
@@ -3342,12 +4210,20 @@ fn handle_route(
     // If a specific label was requested, filter and show copy-paste config on stdout
     // so `aikey route my-key | pbcopy` works as documented in the quickstart.
     if let Some(target) = label {
-        let matched: Vec<&RouteEntry> = entries.iter()
+        let matched: Vec<&RouteEntry> = entries
+            .iter()
             .filter(|e| e.label.eq_ignore_ascii_case(target))
             .collect();
         if matched.is_empty() {
-            let msg = format!("Label '{}' not found. Run `aikey route` to see available routes.", target);
-            if json_mode { json_output::error(&msg, 1); } else { return Err(msg.into()); }
+            let msg = format!(
+                "Label '{}' not found. Run `aikey route` to see available routes.",
+                target
+            );
+            if json_mode {
+                json_output::error(&msg, 1);
+            } else {
+                return Err(msg.into());
+            }
         }
         if json_mode {
             json_output::success(serde_json::json!({ "routes": matched }));
@@ -3382,34 +4258,52 @@ fn handle_route(
     // Base-url column width for header separator sizing. Row layout is:
     //   indent(2) + marker(1) + sp + connector(2) + sp + num_col(nw+1) + sp +
     //   provider(pw) + sp + label(li) + sp + token(kw) + sp + base_url
-    let base_url_width = entries.iter()
+    let base_url_width = entries
+        .iter()
         .map(|e| e.base_url.chars().count())
         .max()
         .unwrap_or(0);
-    let total_width = 2 + 1 + 1 + 2 + 1 + (num_width + 1) + 1 + PROVIDER_COL_WIDTH
-        + 1 + label_inner + 1 + TOKEN_DISPLAY_WIDTH + 1 + base_url_width;
+    let total_width = 2
+        + 1
+        + 1
+        + 2
+        + 1
+        + (num_width + 1)
+        + 1
+        + PROVIDER_COL_WIDTH
+        + 1
+        + label_inner
+        + 1
+        + TOKEN_DISPLAY_WIDTH
+        + 1
+        + base_url_width;
 
     // Table header. Spaces stand in for the marker/connector columns so the
     // data column labels line up with their rows:
     //   row: "  {marker} {connector(2)} {num(nw+1)} {prov(pw)} {label(li)} {token(kw)} {base_url}"
     //   hdr: "     {sp(2)}              {#(nw+1)}   {PROVIDER} {LABEL}     {API_KEY}   {BASE URL}"
     eprintln!();
-    eprintln!("    {:<2} {:>nw$} {:<pw$} {:<li$} {:<kw$} {}",
+    eprintln!(
+        "    {:<2} {:>nw$} {:<pw$} {:<li$} {:<kw$} {}",
         "",
         "#".dimmed(),
         "PROTOCOL".dimmed(),
         "LABEL".dimmed(),
         "API_KEY".dimmed(),
         "BASE URL".dimmed(),
-        nw = num_width + 1, pw = PROVIDER_COL_WIDTH, li = label_inner,
-        kw = TOKEN_DISPLAY_WIDTH);
+        nw = num_width + 1,
+        pw = PROVIDER_COL_WIDTH,
+        li = label_inner,
+        kw = TOKEN_DISPLAY_WIDTH
+    );
     eprintln!("  {}", "\u{2500}".repeat(total_width.min(120)).dimmed());
 
     let mut prev_token = String::new();
     let mut i = 0;
     while i < entries.len() {
         let group_type = entries[i].key_type.clone();
-        let group_end = entries[i..].iter()
+        let group_end = entries[i..]
+            .iter()
             .position(|e| e.key_type != group_type)
             .map(|p| i + p)
             .unwrap_or(entries.len());
@@ -3421,7 +4315,11 @@ fn handle_route(
         let last_in_group = group_end - 1;
         for (idx, entry) in entries[i..group_end].iter().enumerate() {
             let real_idx = i + idx;
-            let connector = if real_idx == last_in_group { "└─" } else { "├─" };
+            let connector = if real_idx == last_in_group {
+                "└─"
+            } else {
+                "├─"
+            };
 
             // Collapse duplicate tokens on consecutive rows (same key, different providers).
             let token_display = if entry.api_key == prev_token {
@@ -3429,7 +4327,11 @@ fn handle_route(
             } else if full || entry.api_key.len() <= TOKEN_TRUNCATE_THRESHOLD {
                 entry.api_key.clone()
             } else {
-                format!("{}...{}", &entry.api_key[..15], &entry.api_key[entry.api_key.len()-4..])
+                format!(
+                    "{}...{}",
+                    &entry.api_key[..15],
+                    &entry.api_key[entry.api_key.len() - 4..]
+                )
             };
             prev_token = entry.api_key.clone();
 
@@ -3444,11 +4346,18 @@ fn handle_route(
             let label_display = truncate_to(&entry.label, label_inner);
             // 1-based row number, right-aligned with trailing dot.
             let num_col = format!("{:>nw$}.", real_idx + 1, nw = num_width);
-            eprintln!("  {} {} {} {:<pw$} {:<li$} {} {}",
-                active_marker, connector.dimmed(), num_col.dimmed(),
-                entry.provider, label_display,
-                token_padded.dimmed(), entry.base_url.dimmed(),
-                pw = PROVIDER_COL_WIDTH, li = label_inner);
+            eprintln!(
+                "  {} {} {} {:<pw$} {:<li$} {} {}",
+                active_marker,
+                connector.dimmed(),
+                num_col.dimmed(),
+                entry.provider,
+                label_display,
+                token_padded.dimmed(),
+                entry.base_url.dimmed(),
+                pw = PROVIDER_COL_WIDTH,
+                li = label_inner
+            );
         }
         eprintln!();
         i = group_end;
@@ -3461,22 +4370,39 @@ fn handle_route(
     eprintln!();
     // Legend + summary are dim: they're secondary context, the data above is
     // what the user actually came for.
-    eprintln!("  {}",
-        format!("{} = active (set by `aikey use`),  {} = same token as previous row",
-            "\u{25cf}", "\u{21b3}").dimmed());
-    eprintln!("  {}",
-        format!("{} providers, {} routes available",
-            providers.len(), entries.len()).dimmed());
+    eprintln!(
+        "  {}",
+        format!(
+            "{} = active (set by `aikey use`),  {} = same token as previous row",
+            "\u{25cf}", "\u{21b3}"
+        )
+        .dimmed()
+    );
+    eprintln!(
+        "  {}",
+        format!(
+            "{} providers, {} routes available",
+            providers.len(),
+            entries.len()
+        )
+        .dimmed()
+    );
 
     if missing_token_count > 0 {
         eprintln!();
-        eprintln!("  {} {} keys missing route token. Run `aikey use` or `aikey add` to complete setup.",
-            "\u{26a0}".yellow(), missing_token_count);
+        eprintln!(
+            "  {} {} keys missing route token. Run `aikey use` or `aikey add` to complete setup.",
+            "\u{26a0}".yellow(),
+            missing_token_count
+        );
     }
     if db_error_count > 0 {
         eprintln!();
-        eprintln!("  {} {} database error(s) while reading route tokens — check vault integrity.",
-            "\u{26a0}".red(), db_error_count);
+        eprintln!(
+            "  {} {} database error(s) while reading route tokens — check vault integrity.",
+            "\u{26a0}".red(),
+            db_error_count
+        );
     }
 
     // Round 9 fix #1: was is_proxy_running (PID-only); now uses
@@ -3484,7 +4410,10 @@ fn handle_route(
     // OrphanedPort / Unresponsive scenarios where the proxy is not ours.
     if !commands_proxy::proxy_is_running_managed() {
         eprintln!();
-        eprintln!("  {} Proxy is not running. Start with: aikey proxy start", "\u{26a0}".yellow());
+        eprintln!(
+            "  {} Proxy is not running. Start with: aikey proxy start",
+            "\u{26a0}".yellow()
+        );
     }
 
     // Interactive picker: prompt only in a TTY session (not when output is
@@ -3510,9 +4439,15 @@ fn handle_route(
         const PICKER_TIMEOUT: Duration = Duration::from_secs(10);
 
         eprintln!();
-        eprint!("  {} {} ",
+        eprint!(
+            "  {} {} ",
             "?".cyan().bold(),
-            format!("Show config for route # (1-{}, Enter or 10s to cancel):", entries.len()).bold());
+            format!(
+                "Show config for route # (1-{}, Enter or 10s to cancel):",
+                entries.len()
+            )
+            .bold()
+        );
         let _ = std::io::stderr().flush();
 
         let (tx, rx) = mpsc::channel::<String>();
@@ -3534,15 +4469,21 @@ fn handle_route(
                         print_route_config(&[&entries[n - 1]]);
                     }
                     _ => {
-                        eprintln!("  {} Invalid selection — expected a number between 1 and {}.",
-                            "\u{26a0}".yellow(), entries.len());
+                        eprintln!(
+                            "  {} Invalid selection — expected a number between 1 and {}.",
+                            "\u{26a0}".yellow(),
+                            entries.len()
+                        );
                     }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 eprintln!();
-                eprintln!("  {} No selection within {}s — exiting.",
-                    "\u{23f1}".dimmed(), PICKER_TIMEOUT.as_secs());
+                eprintln!(
+                    "  {} No selection within {}s — exiting.",
+                    "\u{23f1}".dimmed(),
+                    PICKER_TIMEOUT.as_secs()
+                );
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // Reader thread errored before sending (EOF / closed stdin).
@@ -3551,11 +4492,16 @@ fn handle_route(
         }
     } else {
         eprintln!();
-        let example_label = entries.first().map(|e| e.label.as_str()).unwrap_or("my-key");
-        eprintln!("  {} {} {}",
+        let example_label = entries
+            .first()
+            .map(|e| e.label.as_str())
+            .unwrap_or("my-key");
+        eprintln!(
+            "  {} {} {}",
             "\u{27a4}".cyan(),
             "Copy-paste config:".bold(),
-            format!("aikey route {}", example_label).cyan());
+            format!("aikey route {}", example_label).cyan()
+        );
     }
 
     eprintln!();
@@ -3578,7 +4524,10 @@ fn handle_shell_command(json_mode: bool) -> Result<(), Box<dyn std::error::Error
         .flatten()
         .map(|(_, cfg)| cfg);
 
-    let project_name = config.as_ref().map(|c| c.project.name.as_str()).unwrap_or("unknown");
+    let project_name = config
+        .as_ref()
+        .map(|c| c.project.name.as_str())
+        .unwrap_or("unknown");
 
     // Get current environment and profile
     let current_env = global_config::get_current_env().ok().flatten();
@@ -3683,7 +4632,10 @@ fn truncate_email(email: &str, max_user_len: usize) -> String {
 /// Returns the master password, using the 30-minute session cache when available.
 /// Use for LOW-sensitivity commands (list, get, run, key sync, proxy start, ...).
 /// After a successful vault operation the caller should call `session::refresh()`.
-pub(crate) fn prompt_vault_password(password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
+pub(crate) fn prompt_vault_password(
+    password_stdin: bool,
+    json_mode: bool,
+) -> io::Result<SecretString> {
     // Skip cache when reading from stdin or in automated test mode.
     if !password_stdin && std::env::var("AK_TEST_PASSWORD").is_err() {
         if let Some(cached) = session::try_get() {
@@ -3714,7 +4666,11 @@ fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Res
 
     if vault_initialized {
         // Existing vault — just ask for the password
-        prompt_password_secure("\u{1F512} Enter Master Password: ", password_stdin, json_mode)
+        prompt_password_secure(
+            "\u{1F512} Enter Master Password: ",
+            password_stdin,
+            json_mode,
+        )
     } else {
         // No vault or empty vault (fresh install / --clear-install / no keys yet)
         // Why confirm: prevent typos from locking the user out permanently.
@@ -3728,7 +4684,8 @@ fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Res
             // Confirm password to prevent typo lockout
             loop {
                 let pw1 = prompt_password_secure("\u{1F512} Set Master Password: ", false, false)?;
-                let pw2 = prompt_password_secure("\u{1F512} Confirm Master Password: ", false, false)?;
+                let pw2 =
+                    prompt_password_secure("\u{1F512} Confirm Master Password: ", false, false)?;
                 if pw1.expose_secret() == pw2.expose_secret() {
                     return Ok(pw1);
                 }
@@ -3741,7 +4698,11 @@ fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Res
     }
 }
 
-fn prompt_password_secure(prompt: &str, password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
+fn prompt_password_secure(
+    prompt: &str,
+    password_stdin: bool,
+    json_mode: bool,
+) -> io::Result<SecretString> {
     // Check for test password environment variable
     if let Ok(test_password) = std::env::var("AK_TEST_PASSWORD") {
         return Ok(SecretString::new(test_password));
@@ -3805,8 +4766,8 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
 
     // Provider bindings drive the persistent ● (in-use) marker — any key that
     // a binding routes through is "in use", matching `aikey list` / `aikey route`.
-    let bindings = storage::list_provider_bindings(profile_activation::DEFAULT_PROFILE)
-        .unwrap_or_default();
+    let bindings =
+        storage::list_provider_bindings(profile_activation::DEFAULT_PROFILE).unwrap_or_default();
 
     // Build display rows; keep alias/id parallel for lookup after selection.
     // Layout per leaf row (inside the box):
@@ -3828,7 +4789,8 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
     let provider_w = available.saturating_sub(alias_w).max(10).min(40);
 
     // Filter team keys into usable / other-account as before.
-    let visible_team: Vec<_> = team.iter()
+    let visible_team: Vec<_> = team
+        .iter()
         .filter(|e| {
             e.key_status == "active"
                 && e.local_state != "stale"
@@ -3837,22 +4799,36 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
                 && e.local_state != "disabled_by_account_status"
         })
         .collect();
-    let (own_team, other_account_team): (Vec<_>, Vec<_>) = visible_team.into_iter()
+    let (own_team, other_account_team): (Vec<_>, Vec<_>) = visible_team
+        .into_iter()
         .partition(|e| e.local_state != "disabled_by_account_scope");
-    let oauth_usable: Vec<_> = oauth_accounts.iter()
+    let oauth_usable: Vec<_> = oauth_accounts
+        .iter()
         .filter(|a| a.status == "active")
         .collect();
 
     // Helper: build a leaf row. `in_use` renders ●, `is_active` renders ◀ active.
-    let fmt_leaf = |in_use: bool, connector: &str, alias_disp: &str, prov_disp: &str, is_active: bool| -> String {
-        let use_mark = if in_use { "\u{25CF}".green().to_string() } else { " ".to_string() };
+    let fmt_leaf = |in_use: bool,
+                    connector: &str,
+                    alias_disp: &str,
+                    prov_disp: &str,
+                    is_active: bool|
+     -> String {
+        let use_mark = if in_use {
+            "\u{25CF}".green().to_string()
+        } else {
+            " ".to_string()
+        };
         let active_mk = if is_active { " \u{25C0} active" } else { "" };
         format!(
             "{} {} {:<aw$}  {:<pw$}{}",
             use_mark,
             connector.to_string().dimmed(),
-            alias_disp, prov_disp, active_mk,
-            aw = alias_w, pw = provider_w,
+            alias_disp,
+            prov_disp,
+            active_mk,
+            aw = alias_w,
+            pw = provider_w,
         )
     };
 
@@ -3864,19 +4840,34 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
 
         let n = personal.len();
         for (i, entry) in personal.iter().enumerate() {
-            let connector = if i + 1 == n { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
+            let connector = if i + 1 == n {
+                "\u{2514}\u{2500}"
+            } else {
+                "\u{251C}\u{2500}"
+            };
             let provider_col = match (&entry.base_url, &entry.provider_code) {
                 (Some(url), _) if !url.is_empty() => url.clone(),
                 (_, Some(code)) if !code.is_empty() => code.clone(),
                 _ => String::new(),
             };
-            let in_use = bindings.iter().any(|b|
+            let in_use = bindings.iter().any(|b| {
                 b.key_source_type == credential_type::CredentialType::PersonalApiKey
-                && b.key_source_ref == entry.alias);
+                    && b.key_source_ref == entry.alias
+            });
             let is_active = !active_label.is_empty() && active_label == entry.alias;
-            let alias_disp = if entry.alias.len() > alias_w { &entry.alias[..alias_w] } else { &entry.alias };
-            let prov_disp = if provider_col.len() > provider_w { &provider_col[..provider_w] } else { &provider_col };
-            items.push(fmt_leaf(in_use, connector, alias_disp, prov_disp, is_active));
+            let alias_disp = if entry.alias.len() > alias_w {
+                &entry.alias[..alias_w]
+            } else {
+                &entry.alias
+            };
+            let prov_disp = if provider_col.len() > provider_w {
+                &provider_col[..provider_w]
+            } else {
+                &provider_col
+            };
+            items.push(fmt_leaf(
+                in_use, connector, alias_disp, prov_disp, is_active,
+            ));
             aliases.push(entry.alias.clone());
             selectable.push(true);
         }
@@ -3890,15 +4881,30 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
 
         let n = own_team.len();
         for (i, e) in own_team.iter().enumerate() {
-            let connector = if i + 1 == n { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
+            let connector = if i + 1 == n {
+                "\u{2514}\u{2500}"
+            } else {
+                "\u{251C}\u{2500}"
+            };
             let display_name = e.local_alias.as_deref().unwrap_or(e.alias.as_str());
-            let in_use = bindings.iter().any(|b|
+            let in_use = bindings.iter().any(|b| {
                 b.key_source_type == credential_type::CredentialType::ManagedVirtualKey
-                && b.key_source_ref == e.virtual_key_id);
+                    && b.key_source_ref == e.virtual_key_id
+            });
             let is_active = !active_label.is_empty() && active_label == display_name;
-            let alias_disp = if display_name.len() > alias_w { &display_name[..alias_w] } else { display_name };
-            let prov_disp = if e.provider_code.len() > provider_w { &e.provider_code[..provider_w] } else { &e.provider_code };
-            items.push(fmt_leaf(in_use, connector, alias_disp, prov_disp, is_active));
+            let alias_disp = if display_name.len() > alias_w {
+                &display_name[..alias_w]
+            } else {
+                display_name
+            };
+            let prov_disp = if e.provider_code.len() > provider_w {
+                &e.provider_code[..provider_w]
+            } else {
+                &e.provider_code
+            };
+            items.push(fmt_leaf(
+                in_use, connector, alias_disp, prov_disp, is_active,
+            ));
             aliases.push(e.virtual_key_id.clone());
             selectable.push(true);
         }
@@ -3914,15 +4920,28 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
 
         let n = oauth_usable.len();
         for (i, acct) in oauth_usable.iter().enumerate() {
-            let connector = if i + 1 == n { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
+            let connector = if i + 1 == n {
+                "\u{2514}\u{2500}"
+            } else {
+                "\u{251C}\u{2500}"
+            };
             let identity = acct.effective_label();
-            let in_use = bindings.iter().any(|b|
+            let in_use = bindings.iter().any(|b| {
                 b.key_source_type == credential_type::CredentialType::PersonalOAuthAccount
-                && b.key_source_ref == acct.provider_account_id);
+                    && b.key_source_ref == acct.provider_account_id
+            });
             let is_active = !active_label.is_empty()
                 && (active_label == identity || active_label == acct.provider_account_id);
-            let id_disp = if identity.len() > alias_w { &identity[..alias_w] } else { identity };
-            let prov_disp = if acct.provider.len() > provider_w { &acct.provider[..provider_w] } else { &acct.provider };
+            let id_disp = if identity.len() > alias_w {
+                &identity[..alias_w]
+            } else {
+                identity
+            };
+            let prov_disp = if acct.provider.len() > provider_w {
+                &acct.provider[..provider_w]
+            } else {
+                &acct.provider
+            };
             items.push(fmt_leaf(in_use, connector, id_disp, prov_disp, is_active));
             aliases.push(identity.to_string());
             selectable.push(true);
@@ -3938,8 +4957,16 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
 
         for e in &other_account_team {
             let display_name = e.local_alias.as_deref().unwrap_or(e.alias.as_str());
-            let alias_display = if display_name.len() > alias_w { &display_name[..alias_w] } else { display_name };
-            let prov_display = if e.provider_code.len() > provider_w { &e.provider_code[..provider_w] } else { &e.provider_code };
+            let alias_display = if display_name.len() > alias_w {
+                &display_name[..alias_w]
+            } else {
+                display_name
+            };
+            let prov_display = if e.provider_code.len() > provider_w {
+                &e.provider_code[..provider_w]
+            } else {
+                &e.provider_code
+            };
             let raw = format!(
                 "     {:<aw$}  {:<pw$}  [other account]",
                 alias_display,
@@ -3955,7 +4982,13 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
 
     // Header aligns under the alias column: 5 chars of leaf-row prefix
     // (●/space + space + connector + space) stand in for the label-less header.
-    let header = format!("     {:<aw$}  {:<pw$}", "Alias", "Provider / Base URL", aw = alias_w, pw = provider_w);
+    let header = format!(
+        "     {:<aw$}  {:<pw$}",
+        "Alias",
+        "Provider / Base URL",
+        aw = alias_w,
+        pw = provider_w
+    );
 
     // Find initial cursor. Precedence:
     //   1. Terminal-active key (AIKEY_ACTIVE_LABEL env var) — the one the
@@ -3970,18 +5003,24 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
         // activate ran: personal alias, team display name, or OAuth identity.
         (0..aliases.len()).find(|&i| selectable[i] && aliases[i] == active_label)
     };
-    let by_cfg = active_cfg.as_ref().and_then(|cfg| {
-        aliases.iter().position(|a| {
-            (cfg.key_type == credential_type::CredentialType::ManagedVirtualKey && *a == cfg.key_ref)
-                || (cfg.key_type == credential_type::CredentialType::PersonalApiKey && *a == cfg.key_ref)
-                || (cfg.key_type == credential_type::CredentialType::PersonalOAuthAccount
-                    && oauth_usable.iter().any(|o|
-                        o.provider_account_id == cfg.key_ref
-                        && (o.local_alias.as_deref() == Some(a.as_str())
-                            || o.display_identity.as_deref() == Some(a.as_str())
-                            || o.provider_account_id == *a)))
+    let by_cfg = active_cfg
+        .as_ref()
+        .and_then(|cfg| {
+            aliases.iter().position(|a| {
+                (cfg.key_type == credential_type::CredentialType::ManagedVirtualKey
+                    && *a == cfg.key_ref)
+                    || (cfg.key_type == credential_type::CredentialType::PersonalApiKey
+                        && *a == cfg.key_ref)
+                    || (cfg.key_type == credential_type::CredentialType::PersonalOAuthAccount
+                        && oauth_usable.iter().any(|o| {
+                            o.provider_account_id == cfg.key_ref
+                                && (o.local_alias.as_deref() == Some(a.as_str())
+                                    || o.display_identity.as_deref() == Some(a.as_str())
+                                    || o.provider_account_id == *a)
+                        }))
+            })
         })
-    }).and_then(|i| if selectable[i] { Some(i) } else { None });
+        .and_then(|i| if selectable[i] { Some(i) } else { None });
     let initial = by_label
         .or(by_cfg)
         .or_else(|| selectable.iter().position(|&s| s))
@@ -4001,7 +5040,8 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
 
 /// Build provider groups and show the provider-tree interactive editor.
 /// Returns a list of (provider_code, source_type, source_ref) changes to apply.
-fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
+fn pick_providers_interactively(
+) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
     let personal = storage::list_entries_with_metadata().unwrap_or_default();
     let team = storage::list_virtual_key_cache().unwrap_or_default();
     let oauth_accounts = storage::list_provider_accounts().unwrap_or_default();
@@ -4010,9 +5050,8 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
         return Err("No keys found. Add a key with `aikey add`, sync team keys with `aikey key sync`, or login with `aikey auth login <provider>`.".into());
     }
 
-    let bindings = storage::list_provider_bindings(
-        profile_activation::DEFAULT_PROFILE
-    ).unwrap_or_default();
+    let bindings =
+        storage::list_provider_bindings(profile_activation::DEFAULT_PROFILE).unwrap_or_default();
 
     // Collect all known provider codes.
     let mut all_providers: Vec<String> = Vec::new();
@@ -4024,20 +5063,27 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
     };
     for e in &personal {
         if let Some(ref sp) = e.supported_providers {
-            for p in sp { add_prov(p); }
+            for p in sp {
+                add_prov(p);
+            }
         } else if let Some(ref code) = e.provider_code {
             add_prov(code);
         }
     }
-    let usable_team: Vec<_> = team.iter()
-        .filter(|e| e.key_status == "active"
-            && !e.local_state.starts_with("disabled_by_")
-            && e.local_state != "stale"
-            && e.provider_key_ciphertext.is_some())
+    let usable_team: Vec<_> = team
+        .iter()
+        .filter(|e| {
+            e.key_status == "active"
+                && !e.local_state.starts_with("disabled_by_")
+                && e.local_state != "stale"
+                && e.provider_key_ciphertext.is_some()
+        })
         .collect();
     for e in &usable_team {
         if !e.supported_providers.is_empty() {
-            for p in &e.supported_providers { add_prov(p); }
+            for p in &e.supported_providers {
+                add_prov(p);
+            }
         } else {
             add_prov(&e.provider_code);
         }
@@ -4073,12 +5119,14 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
     // `use`, no hint where it went. Print a banner whenever any team key
     // needs sync, regardless of whether other providers are populated.
     // Stays Err only in the truly-empty case.
-    let pending_download: Vec<&str> = team.iter()
-        .filter(|e| e.key_status == "active"
-            && !e.local_state.starts_with("disabled_by_")
-            && e.local_state != "stale"
-            && (e.provider_key_ciphertext.is_none()
-                || e.share_status == "pending_claim"))
+    let pending_download: Vec<&str> = team
+        .iter()
+        .filter(|e| {
+            e.key_status == "active"
+                && !e.local_state.starts_with("disabled_by_")
+                && e.local_state != "stale"
+                && (e.provider_key_ciphertext.is_none() || e.share_status == "pending_claim")
+        })
         .map(|e| e.local_alias.as_deref().unwrap_or(e.alias.as_str()))
         .collect();
 
@@ -4140,7 +5188,11 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
                 vec![e.provider_code.clone()]
             };
             if providers.iter().any(|p| p.to_lowercase() == *prov) {
-                let label = e.local_alias.as_deref().unwrap_or(e.alias.as_str()).to_string();
+                let label = e
+                    .local_alias
+                    .as_deref()
+                    .unwrap_or(e.alias.as_str())
+                    .to_string();
                 candidates.push(ui_select::KeyCandidate {
                     label,
                     source_type: "team".to_string(),
@@ -4157,10 +5209,16 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
             if provider_canonical(&acct.provider) == *prov {
                 // Precedence: local_alias → display_identity → trunc(external_id)
                 // → provider_account_id. v1.0.1-alpha.1 added local_alias on top.
-                let identity = acct.local_alias.as_deref()
+                let identity = acct
+                    .local_alias
+                    .as_deref()
                     .filter(|s| !s.is_empty())
                     .or_else(|| acct.display_identity.as_deref().filter(|s| !s.is_empty()))
-                    .or_else(|| acct.external_id.as_deref().map(|s| if s.len() > 12 { &s[..12] } else { s }))
+                    .or_else(|| {
+                        acct.external_id
+                            .as_deref()
+                            .map(|s| if s.len() > 12 { &s[..12] } else { s })
+                    })
                     .unwrap_or(&acct.provider_account_id);
                 // Truncate long email username for picker display
                 // e.g. "eFOreadeblakeE96j@muslim.com" → "eFOread...@muslim.com"
@@ -4203,15 +5261,17 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
         // 的 binding 也算"该 group 当前 active",候选位置由 candidates 自身命中决定。
         let current_binding = bindings.iter().find(|b| {
             let canon = provider_canonical(&b.provider_code);
-            if canon == *prov || b.provider_code == *prov { return true; }
+            if canon == *prov || b.provider_code == *prov {
+                return true;
+            }
             provider_registry::family_of(&canon) == provider_registry::family_of(prov)
         });
         // Selection 仍按候选 source_type/source_ref 匹配,确保 binding 指向的 entry
         // 必须真的在本 group 的 candidates 列表中才会显示 (*) — 防止跨 group 误标。
         let selected = current_binding.and_then(|b| {
-            candidates.iter().position(|c|
+            candidates.iter().position(|c| {
                 c.source_type == b.key_source_type.as_str() && c.source_ref == b.key_source_ref
-            )
+            })
         });
 
         groups.push(ui_select::ProviderGroup {
@@ -4223,9 +5283,7 @@ fn pick_providers_interactively() -> Result<Vec<(String, String, String)>, Box<d
     }
 
     // Snapshot original selections for diffing.
-    let original_selections: Vec<Option<usize>> = groups.iter()
-        .map(|g| g.selected)
-        .collect();
+    let original_selections: Vec<Option<usize>> = groups.iter().map(|g| g.selected).collect();
 
     match ui_select::provider_tree_select(&mut groups)? {
         ui_select::ProviderTreeResult::Confirmed(updated_groups) => {
@@ -4252,7 +5310,11 @@ fn collect_picker_changes(
         }
         let Some(sel) = g.selected else { continue };
         let c = &g.candidates[sel];
-        changes.push((g.provider_code.clone(), c.source_type.clone(), c.source_ref.clone()));
+        changes.push((
+            g.provider_code.clone(),
+            c.source_type.clone(),
+            c.source_ref.clone(),
+        ));
     }
     Ok(changes)
 }
@@ -4278,7 +5340,9 @@ fn powershell_escape(s: &str) -> String {
 /// Why `+` allowed: email-tag syntax (alice+work@example.com) is common.
 /// Why not more chars: cmd's `set VAR=VALUE` treats `& | ^ > < ( ) % !` specially.
 fn cmd_escape(s: &str) -> Result<String, String> {
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-' | '+')) {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-' | '+'))
+    {
         Ok(s.to_string())
     } else {
         Err(format!(
@@ -4299,11 +5363,13 @@ fn cmd_escape(s: &str) -> Result<String, String> {
 /// true literal display fragile across shell versions. Replacing with `_` yields
 /// a predictable, injection-free cosmetic label.
 fn sanitize_prompt_label(s: &str) -> String {
-    s.chars().map(|c| match c {
-        // Shell re-expansion vectors.
-        '\\' | '$' | '`' | '!' | '\n' | '\r' | '\t' => '_',
-        other => other,
-    }).collect()
+    s.chars()
+        .map(|c| match c {
+            // Shell re-expansion vectors.
+            '\\' | '$' | '`' | '!' | '\n' | '\r' | '\t' => '_',
+            other => other,
+        })
+        .collect()
 }
 
 /// Escape label for safe embedding in zsh PROMPT: strip expansion metacharacters
@@ -4335,7 +5401,10 @@ const ALL_PROVIDER_ENV_PAIRS: &[(&str, &str)] = &[
 
 /// All known provider env var names (flattened from ALL_PROVIDER_ENV_PAIRS).
 fn all_provider_vars() -> Vec<&'static str> {
-    ALL_PROVIDER_ENV_PAIRS.iter().flat_map(|(k, v)| [*k, *v]).collect()
+    ALL_PROVIDER_ENV_PAIRS
+        .iter()
+        .flat_map(|(k, v)| [*k, *v])
+        .collect()
 }
 
 /// Probe all three sources (team, OAuth, personal) to check where `alias` exists.
@@ -4344,8 +5413,14 @@ fn all_provider_vars() -> Vec<&'static str> {
 fn probe_alias_sources(alias: &str) -> Vec<&'static str> {
     let mut sources = Vec::new();
 
-    let team_exists = storage::get_virtual_key_cache(alias).ok().flatten().is_some()
-        || storage::get_virtual_key_cache_by_alias(alias).ok().flatten().is_some();
+    let team_exists = storage::get_virtual_key_cache(alias)
+        .ok()
+        .flatten()
+        .is_some()
+        || storage::get_virtual_key_cache_by_alias(alias)
+            .ok()
+            .flatten()
+            .is_some();
     if team_exists {
         sources.push("team");
     }
@@ -4360,10 +5435,12 @@ fn probe_alias_sources(alias: &str) -> Vec<&'static str> {
         .iter()
         .any(|a| {
             a.provider_account_id.eq_ignore_ascii_case(alias)
-                || a.local_alias.as_deref()
+                || a.local_alias
+                    .as_deref()
                     .map(|d| d.eq_ignore_ascii_case(alias))
                     .unwrap_or(false)
-                || a.display_identity.as_deref()
+                || a.display_identity
+                    .as_deref()
                     .map(|d| d.eq_ignore_ascii_case(alias))
                     .unwrap_or(false)
         });
@@ -4387,15 +5464,19 @@ fn resolve_activate_key(
     provider_override: Option<&str>,
 ) -> Result<(String, String, String), Box<dyn std::error::Error>> {
     // ── 1. Try team managed keys ────────────────────────────────────────────
-    let team_entry = storage::get_virtual_key_cache(alias)?
-        .or_else(|| storage::get_virtual_key_cache_by_alias(alias).ok().flatten());
+    let team_entry = storage::get_virtual_key_cache(alias)?.or_else(|| {
+        storage::get_virtual_key_cache_by_alias(alias)
+            .ok()
+            .flatten()
+    });
 
     if let Some(ref vk) = team_entry {
         if vk.key_status != "active" {
             return Err(format!(
                 "Key '{}' has status '{}' and cannot be activated.",
                 vk.alias, vk.key_status
-            ).into());
+            )
+            .into());
         }
         // Why: must match the same filter used by `aikey route` (local_state == "active")
         // so users never activate a key that is invisible in the route table.
@@ -4403,17 +5484,20 @@ fn resolve_activate_key(
             return Err(format!(
                 "Key '{}' is not available (state: {}). Run 'aikey key sync' to refresh.",
                 vk.alias, vk.local_state
-            ).into());
+            )
+            .into());
         }
         let display = vk.local_alias.as_deref().unwrap_or(&vk.alias).to_string();
         // Team key static bearer — shared helper (same as handle_route's
         // team branch). Empty vk_id is upstream bug; surface it as a user-
         // visible error so they can run `aikey key sync` to refresh.
-        let token = team_token_normalize::team_token_from_vk_id(&vk.virtual_key_id)
-            .map_err(|e| format!(
-                "Team key '{}' has empty vk_id ({}). Run: aikey key sync",
-                vk.alias, e
-            ))?;
+        let token =
+            team_token_normalize::team_token_from_vk_id(&vk.virtual_key_id).map_err(|e| {
+                format!(
+                    "Team key '{}' has empty vk_id ({}). Run: aikey key sync",
+                    vk.alias, e
+                )
+            })?;
         let providers = if !vk.supported_providers.is_empty() {
             vk.supported_providers.clone()
         } else if !vk.provider_code.is_empty() {
@@ -4430,18 +5514,31 @@ fn resolve_activate_key(
     // provider_account_id, mirroring resolve_oauth_account so
     // `aikey activate <new-alias>` works after a rename.
     for acct in storage::list_provider_accounts_readonly().unwrap_or_default() {
-        if acct.status != "active" { continue; }
+        if acct.status != "active" {
+            continue;
+        }
         let matches = acct.provider_account_id.eq_ignore_ascii_case(alias)
-            || acct.local_alias.as_deref()
+            || acct
+                .local_alias
+                .as_deref()
                 .map(|d| d.eq_ignore_ascii_case(alias))
                 .unwrap_or(false)
-            || acct.display_identity.as_deref()
+            || acct
+                .display_identity
+                .as_deref()
                 .map(|d| d.eq_ignore_ascii_case(alias))
                 .unwrap_or(false);
-        if !matches { continue; }
+        if !matches {
+            continue;
+        }
         let identity = acct.effective_label();
         let token = storage::get_provider_account_route_token_readonly(&acct.provider_account_id)?
-            .ok_or_else(|| format!("No route token for '{}'. Run `aikey use` first to generate tokens.", identity))?;
+            .ok_or_else(|| {
+                format!(
+                    "No route token for '{}'. Run `aikey use` first to generate tokens.",
+                    identity
+                )
+            })?;
         let providers = vec![acct.provider.clone()];
         let target = resolve_single_provider(identity, &providers, provider_override)?;
         return Ok((identity.to_string(), token, target));
@@ -4454,10 +5551,15 @@ fn resolve_activate_key(
             return Err(format!(
                 "Key '{}' has no provider configured. Re-add with: aikey add {} --provider <code>",
                 alias, alias
-            ).into());
+            )
+            .into());
         }
-        let token = storage::get_entry_route_token_readonly(alias)?
-            .ok_or_else(|| format!("No route token for '{}'. Run `aikey use` first to generate tokens.", alias))?;
+        let token = storage::get_entry_route_token_readonly(alias)?.ok_or_else(|| {
+            format!(
+                "No route token for '{}'. Run `aikey use` first to generate tokens.",
+                alias
+            )
+        })?;
         let target = resolve_single_provider(alias, &providers, provider_override)?;
         return Ok((alias.to_string(), token, target));
     }
@@ -4466,7 +5568,8 @@ fn resolve_activate_key(
         "Key '{}' not found in team keys, OAuth accounts, or personal keys.\n\
          Run 'aikey list' to see available keys.",
         alias
-    ).into())
+    )
+    .into())
 }
 
 /// Narrow to a single provider. Errors if multi-provider and no override given.
@@ -4505,12 +5608,20 @@ fn resolve_single_provider(
 /// Returns "zsh", "bash", "powershell", "cmd", or None if unrecognized.
 fn detect_shell() -> Option<&'static str> {
     let shell_env = std::env::var("SHELL").unwrap_or_default();
-    if shell_env.contains("zsh") { return Some("zsh"); }
-    if shell_env.contains("bash") { return Some("bash"); }
+    if shell_env.contains("zsh") {
+        return Some("zsh");
+    }
+    if shell_env.contains("bash") {
+        return Some("bash");
+    }
     // Windows: PSModulePath is set in PowerShell sessions.
-    if std::env::var("PSModulePath").is_ok() { return Some("powershell"); }
+    if std::env::var("PSModulePath").is_ok() {
+        return Some("powershell");
+    }
     // Windows cmd: PROMPT env var is typically set.
-    if std::env::var("PROMPT").is_ok() && cfg!(windows) { return Some("cmd"); }
+    if std::env::var("PROMPT").is_ok() && cfg!(windows) {
+        return Some("cmd");
+    }
     None
 }
 
@@ -4519,7 +5630,9 @@ fn detect_shell() -> Option<&'static str> {
 /// generic "could not detect" hint.
 fn detect_unsupported_shell() -> Option<&'static str> {
     let shell_env = std::env::var("SHELL").unwrap_or_default();
-    if shell_env.contains("fish") { return Some("fish"); }
+    if shell_env.contains("fish") {
+        return Some("fish");
+    }
     // Nushell sets $SHELL to the nu binary; also check $NU_VERSION for robustness.
     if shell_env.contains("/nu") || std::env::var("NU_VERSION").is_ok() {
         return Some("nushell");
@@ -4563,7 +5676,7 @@ fn handle_activate(
             use std::io::IsTerminal;
             if !std::io::stderr().is_terminal() {
                 return Err(
-                    "alias required in non-interactive mode (usage: aikey activate <ALIAS>)".into()
+                    "alias required in non-interactive mode (usage: aikey activate <ALIAS>)".into(),
                 );
             }
             picked = pick_key_interactively()?;
@@ -4608,7 +5721,10 @@ fn handle_activate(
         eprintln!("\x1b[1;33m  \u{26a0} Activation needs `eval` to apply env vars to your current shell.\x1b[0m");
         eprintln!();
         eprintln!("  Run:");
-        eprintln!("    \x1b[1;36meval $(aikey activate {} --shell {})\x1b[0m", alias, shell);
+        eprintln!(
+            "    \x1b[1;36meval $(aikey activate {} --shell {})\x1b[0m",
+            alias, shell
+        );
         eprintln!();
         eprintln!("\x1b[90m  (A direct call only prints the eval-able shell snippet — it does NOT activate.)\x1b[0m");
         return Ok(());
@@ -4617,8 +5733,14 @@ fn handle_activate(
     // From here on we know stdout is being captured (eval / pipe / redirect),
     // so the original hint pattern is safe — stderr stays visible to the user
     // while stdout contains only the eval target.
-    eprintln!("\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m", shell);
-    eprintln!("\x1b[90m  eval $(aikey activate {} --shell {})\x1b[0m", alias, shell);
+    eprintln!(
+        "\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m",
+        shell
+    );
+    eprintln!(
+        "\x1b[90m  eval $(aikey activate {} --shell {})\x1b[0m",
+        alias, shell
+    );
 
     // M2: warn if alias collides across sources. Priority (team > OAuth > personal)
     // is preserved by resolve_activate_key, but silent selection can confuse users.
@@ -4685,7 +5807,8 @@ fn handle_activate(
             println!("export {}={}", base_url_var, shell_escape(&base_url));
             println!(
                 "if [ -z \"${op}\" ]; then {op}=\"${pv}\"; fi",
-                op = orig_prompt_var, pv = prompt_var
+                op = orig_prompt_var,
+                pv = prompt_var
             );
             // Activate replaces the prompt with a minimal template that omits
             // user@host — keeps the focus on the active key + working directory.
@@ -4785,12 +5908,16 @@ fn handle_activate(
             return Err(format!(
                 "Unsupported shell '{}'. Supported: zsh, bash, powershell, cmd.",
                 other
-            ).into());
+            )
+            .into());
         }
     }
 
     // Human-readable confirmation on stderr (not captured by wrapper).
-    eprintln!("\x1b[90m  Activated: {} \u{2192} {} ({})\x1b[0m", label, provider, shell);
+    eprintln!(
+        "\x1b[90m  Activated: {} \u{2192} {} ({})\x1b[0m",
+        label, provider, shell
+    );
 
     // Show how to undo. The `quit` shell-local function is defined above for
     // zsh / bash / powershell (it eval's `aikey deactivate` in-place); cmd
@@ -4815,16 +5942,20 @@ fn handle_activate(
 
 /// `aikey deactivate [--shell <shell>]` — output eval-safe unset statements.
 /// When `--shell` is omitted, auto-detects from the SHELL env var.
-fn handle_deactivate(
-    shell: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_deactivate(shell: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let detected;
     let shell = match shell {
         Some(s) => s,
         None => {
             detected = detect_shell().ok_or_else(shell_detection_error)?;
-            eprintln!("\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m", detected);
-            eprintln!("\x1b[90m  eval $(aikey deactivate --shell {})\x1b[0m", detected);
+            eprintln!(
+                "\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m",
+                detected
+            );
+            eprintln!(
+                "\x1b[90m  eval $(aikey deactivate --shell {})\x1b[0m",
+                detected
+            );
             detected
         }
     };
@@ -4843,7 +5974,8 @@ fn handle_deactivate(
             println!("unset {}", provider_vars.join(" "));
             println!(
                 "if [ -n \"${op}\" ]; then {pv}=\"${op}\"; unset {op}; fi",
-                pv = prompt_var, op = orig_prompt_var
+                pv = prompt_var,
+                op = orig_prompt_var
             );
             // Global defaults from active.env first, then user's pre-activate values
             // override (M5). User's manual values thus win over any aikey-managed
@@ -4858,8 +5990,18 @@ fn handle_deactivate(
         }
         "powershell" => {
             // Stage 4: include _AIKEY_EXPLICIT_ALIAS alongside the legacy LABEL.
-            let all_vars: Vec<&str> = provider_vars.iter().copied()
-                .chain(["_AIKEY_EXPLICIT_ALIAS", "AIKEY_ACTIVE_LABEL", "_AIKEY_PROMPT_LABEL"].iter().copied())
+            let all_vars: Vec<&str> = provider_vars
+                .iter()
+                .copied()
+                .chain(
+                    [
+                        "_AIKEY_EXPLICIT_ALIAS",
+                        "AIKEY_ACTIVE_LABEL",
+                        "_AIKEY_PROMPT_LABEL",
+                    ]
+                    .iter()
+                    .copied(),
+                )
                 .collect();
             for var in &all_vars {
                 println!("Remove-Item Env:\\{} -ErrorAction SilentlyContinue", var);
@@ -4882,8 +6024,18 @@ fn handle_deactivate(
         }
         "cmd" => {
             // Stage 4: include _AIKEY_EXPLICIT_ALIAS alongside the legacy LABEL.
-            let all_vars: Vec<&str> = provider_vars.iter().copied()
-                .chain(["_AIKEY_EXPLICIT_ALIAS", "AIKEY_ACTIVE_LABEL", "_AIKEY_PROMPT_LABEL"].iter().copied())
+            let all_vars: Vec<&str> = provider_vars
+                .iter()
+                .copied()
+                .chain(
+                    [
+                        "_AIKEY_EXPLICIT_ALIAS",
+                        "AIKEY_ACTIVE_LABEL",
+                        "_AIKEY_PROMPT_LABEL",
+                    ]
+                    .iter()
+                    .copied(),
+                )
                 .collect();
             for var in &all_vars {
                 println!("set {}=", var);
@@ -4912,11 +6064,15 @@ fn handle_deactivate(
             return Err(format!(
                 "Unsupported shell '{}'. Supported: zsh, bash, powershell, cmd.",
                 other
-            ).into());
+            )
+            .into());
         }
     }
 
-    eprintln!("\x1b[90m  Deactivated: restored global settings ({})\x1b[0m", shell);
+    eprintln!(
+        "\x1b[90m  Deactivated: restored global settings ({})\x1b[0m",
+        shell
+    );
     Ok(())
 }
 
@@ -4985,7 +6141,10 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
         HookAction::Update => {
             // Honor the standard skip env var so CI / installer scripts can
             // disable hook writes globally without a per-command flag.
-            if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
+            if std::env::var("AIKEY_NO_HOOK")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
                 eprintln!("\x1b[90m  Skipped: AIKEY_NO_HOOK=1 set in environment.\x1b[0m");
                 return Ok(());
             }
@@ -5002,10 +6161,16 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             // See bugfix 2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure.md.
             if profile_activation::is_running_elevated() {
                 eprintln!("\x1b[33m  ⚠ Running elevated on Windows.\x1b[0m");
-                eprintln!("\x1b[90m    Elevation does not help `aikey hook update` succeed —\x1b[0m");
+                eprintln!(
+                    "\x1b[90m    Elevation does not help `aikey hook update` succeed —\x1b[0m"
+                );
                 eprintln!("\x1b[90m    EACCES on hook.ps1 is typically caused by another\x1b[0m");
-                eprintln!("\x1b[90m    PowerShell session holding the file open, not by ACL.\x1b[0m");
-                eprintln!("\x1b[90m    If this command fails: close other PS shells, then run\x1b[0m");
+                eprintln!(
+                    "\x1b[90m    PowerShell session holding the file open, not by ACL.\x1b[0m"
+                );
+                eprintln!(
+                    "\x1b[90m    If this command fails: close other PS shells, then run\x1b[0m"
+                );
                 eprintln!("\x1b[90m    `aikey hook update` again WITHOUT sudo.\x1b[0m");
             }
             // Stage 8 / reviewer round-3 fix: use the *pure* refresh path that
@@ -5018,8 +6183,12 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             // <alias>` (when the user is also picking a key).
             match commands_account::refresh_hook_file_only(None) {
                 Ok(path) => {
-                    eprintln!("\x1b[90m  ✓ Regenerated {} from current binary.\x1b[0m", path.display());
-                    let basename = path.file_name()
+                    eprintln!(
+                        "\x1b[90m  ✓ Regenerated {} from current binary.\x1b[0m",
+                        path.display()
+                    );
+                    let basename = path
+                        .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or("hook.zsh");
                     eprintln!("\x1b[90m    Open shells will pick it up via the drift detector on next prompt,\x1b[0m");
@@ -5029,12 +6198,16 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                     // dotfiles), tell them how to install it without us
                     // silently mutating files behind their back.
                     let home = std::env::var("HOME").unwrap_or_default();
-                    let rc_has_source = ["/.zshrc", "/.bashrc", "/.bash_profile"].iter().any(|rc| {
-                        let rc_path = format!("{}{}", home, rc);
-                        std::fs::read_to_string(&rc_path)
-                            .map(|c| c.contains("# BEGIN aikey") || c.contains(&format!("source ~/.aikey/{}", basename)))
-                            .unwrap_or(false)
-                    });
+                    let rc_has_source =
+                        ["/.zshrc", "/.bashrc", "/.bash_profile"].iter().any(|rc| {
+                            let rc_path = format!("{}{}", home, rc);
+                            std::fs::read_to_string(&rc_path)
+                                .map(|c| {
+                                    c.contains("# BEGIN aikey")
+                                        || c.contains(&format!("source ~/.aikey/{}", basename))
+                                })
+                                .unwrap_or(false)
+                        });
                     if !rc_has_source {
                         eprintln!("\x1b[90m    Note: no rc-file `source` line detected. To install it, run\x1b[0m");
                         eprintln!("\x1b[90m      \x1b[36maikey hook install\x1b[0m\x1b[90m            (rc only, no binding change), or\x1b[0m");
@@ -5060,8 +6233,10 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 "bash" => commands_account::HookKind::Bash,
                 "powershell" | "pwsh" => commands_account::HookKind::PowerShell,
                 other => return Err(format!(
-                    "unsupported shell '{}' for hook status — expected zsh, bash, or powershell", other
-                ).into()),
+                    "unsupported shell '{}' for hook status — expected zsh, bash, or powershell",
+                    other
+                )
+                .into()),
             };
             let hook_filename = match kind {
                 commands_account::HookKind::Zsh => "hook.zsh",
@@ -5072,16 +6247,12 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             let aikey_dir = commands_account::resolve_aikey_dir();
             let hook_path = aikey_dir.join(hook_filename);
 
-            let file_hash = std::fs::read_to_string(&hook_path)
-                .ok()
-                .and_then(|c| {
-                    c.lines()
-                        .take(8)
-                        .find_map(|line| {
-                            line.strip_prefix("# Hook-Template-Hash: ")
-                                .map(|s| s.trim().to_string())
-                        })
-                });
+            let file_hash = std::fs::read_to_string(&hook_path).ok().and_then(|c| {
+                c.lines().take(8).find_map(|line| {
+                    line.strip_prefix("# Hook-Template-Hash: ")
+                        .map(|s| s.trim().to_string())
+                })
+            });
             let binary_hash = commands_account::hook_template_hash(kind);
             let loaded_hash = std::env::var("_AIKEY_HOOK_LOADED_HASH").ok();
 
@@ -5093,9 +6264,17 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             );
 
             println!("hook file:   {}", hook_path.display());
-            println!("file hash:   {}", file_hash.as_deref().unwrap_or("<missing or unparseable>"));
+            println!(
+                "file hash:   {}",
+                file_hash.as_deref().unwrap_or("<missing or unparseable>")
+            );
             println!("binary hash: {}", binary_hash);
-            println!("loaded hash: {}", loaded_hash.as_deref().unwrap_or("<not set in this process env>"));
+            println!(
+                "loaded hash: {}",
+                loaded_hash
+                    .as_deref()
+                    .unwrap_or("<not set in this process env>")
+            );
             println!("state:       {}", state);
             Ok(())
         }
@@ -5120,7 +6299,10 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             // the full install path, ensure_shell_hook is currently hard-
             // wired to $SHELL — decoupling rc selection from $SHELL is out
             // of scope for v1.
-            if std::env::var("AIKEY_NO_HOOK").map(|v| v == "1").unwrap_or(false) {
+            if std::env::var("AIKEY_NO_HOOK")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
                 eprintln!("\x1b[90m  Skipped: AIKEY_NO_HOOK=1 set in environment.\x1b[0m");
                 return Ok(());
             }
@@ -5162,9 +6344,7 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 Ok(())
             }
         }
-        HookAction::Reinstall { shell } => {
-            handle_hook_reinstall(shell.as_deref())
-        }
+        HookAction::Reinstall { shell } => handle_hook_reinstall(shell.as_deref()),
     }
 }
 
@@ -5195,7 +6375,10 @@ fn handle_hook_reinstall(shell: Option<&str>) -> Result<(), Box<dyn std::error::
     let l2_msg = commands_account::ensure_shell_hook(false);
     let reload = commands_account::reload_hint_for_shell();
 
-    eprintln!("\x1b[90m  ✓ Hook file regenerated at {}.\x1b[0m", hook_path.display());
+    eprintln!(
+        "\x1b[90m  ✓ Hook file regenerated at {}.\x1b[0m",
+        hook_path.display()
+    );
     match l2_msg {
         Some(msg) => {
             // Legacy migration / fresh-install / error path — surface the
@@ -5326,7 +6509,8 @@ mod hook_command_tests {
         let state = compute_hook_status_state(true, Some("abc"), "abc", None);
         assert!(
             state.starts_with("in-sync") && state.contains("loaded hash unknown"),
-            "got: {}", state
+            "got: {}",
+            state
         );
     }
 }
@@ -5354,7 +6538,9 @@ mod refresh_hook_file_only_tests {
         // default thread scheduling for tests touching process env. The
         // explicit save/restore keeps it well-behaved if a future
         // -j>1 reorganisation lands.
-        unsafe { std::env::set_var("AIKEY_NO_HOOK", "1"); }
+        unsafe {
+            std::env::set_var("AIKEY_NO_HOOK", "1");
+        }
         let res = refresh_hook_file_only(Some("zsh"));
         match prev {
             Some(v) => unsafe { std::env::set_var("AIKEY_NO_HOOK", v) },
@@ -5376,7 +6562,8 @@ mod refresh_hook_file_only_tests {
         match res {
             Err(msg) => assert!(
                 msg.contains("unsupported shell") || msg.contains("AIKEY_NO_HOOK"),
-                "got: {}", msg
+                "got: {}",
+                msg
             ),
             Ok(p) => panic!("expected Err for shell=fish, got Ok({})", p.display()),
         }
@@ -5396,11 +6583,25 @@ mod hook_update_error_hint_tests {
     fn eacces_message_gets_remediation_hint() {
         let raw = "failed to write hook file: 拒绝访问。 (os error 5)";
         let aug = augment_hook_update_error(raw);
-        assert!(aug.starts_with(raw), "original message must be preserved verbatim");
-        assert!(aug.contains("Close ALL other PowerShell"), "missing close-shells step: {}", aug);
-        assert!(aug.contains("without sudo"), "missing no-sudo guidance: {}", aug);
-        assert!(aug.contains("elevation does not help") || aug.contains("elevation does NOT help"),
-            "missing elevation explanation: {}", aug);
+        assert!(
+            aug.starts_with(raw),
+            "original message must be preserved verbatim"
+        );
+        assert!(
+            aug.contains("Close ALL other PowerShell"),
+            "missing close-shells step: {}",
+            aug
+        );
+        assert!(
+            aug.contains("without sudo"),
+            "missing no-sudo guidance: {}",
+            aug
+        );
+        assert!(
+            aug.contains("elevation does not help") || aug.contains("elevation does NOT help"),
+            "missing elevation explanation: {}",
+            aug
+        );
     }
 
     #[test]
@@ -5435,5 +6636,3 @@ mod hook_update_error_hint_tests {
 #[cfg(test)]
 #[path = "activate_tests.rs"]
 mod activate_tests;
-
-

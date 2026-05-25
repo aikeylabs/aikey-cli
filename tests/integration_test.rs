@@ -1,5 +1,5 @@
-use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin;
+use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ impl TestEnv {
         let mut cmd = Command::new(cargo_bin("aikey"));
         cmd.env("HOME", self._temp_dir.path());
         cmd.env("AK_TEST_PASSWORD", &self.test_password);
-        cmd.current_dir(self._temp_dir.path());  // Set working directory to temp dir
+        cmd.current_dir(self._temp_dir.path()); // Set working directory to temp dir
         cmd
     }
 
@@ -98,7 +98,8 @@ impl TestEnv {
 
     /// Create a minimal project config file for testing
     fn create_test_config(&self, required_vars: Vec<&str>) {
-        let required_vars_json: Vec<String> = required_vars.iter().map(|v| format!("\"{}\"", v)).collect();
+        let required_vars_json: Vec<String> =
+            required_vars.iter().map(|v| format!("\"{}\"", v)).collect();
         let config = format!(
             r#"{{
     "schemaVersion": "0.1.0",
@@ -112,11 +113,14 @@ impl TestEnv {
             required_vars_json.join(", ")
         );
         let config_path = self._temp_dir.path().join("aikey.config.json");
-        fs::write(&config_path, config)
-            .expect("Failed to create test config");
+        fs::write(&config_path, config).expect("Failed to create test config");
 
         // Verify the file was created
-        assert!(config_path.exists(), "Config file should exist at {:?}", config_path);
+        assert!(
+            config_path.exists(),
+            "Config file should exist at {:?}",
+            config_path
+        );
     }
 }
 
@@ -139,13 +143,21 @@ fn test_01_initialization() {
             .expect("Failed to get vault metadata")
             .permissions()
             .mode();
-        assert_eq!(vault_perms & 0o777, 0o700, "Vault directory should have 0700 permissions");
+        assert_eq!(
+            vault_perms & 0o777,
+            0o700,
+            "Vault directory should have 0700 permissions"
+        );
 
         let db_perms = fs::metadata(&env.db_path())
             .expect("Failed to get database metadata")
             .permissions()
             .mode();
-        assert_eq!(db_perms & 0o777, 0o600, "Database file should have 0600 permissions");
+        assert_eq!(
+            db_perms & 0o777,
+            0o600,
+            "Database file should have 0600 permissions"
+        );
     }
 
     // Verify database schema
@@ -183,7 +195,10 @@ fn test_01_initialization() {
         )
         .map(|count: i32| count > 0)
         .expect("Failed to check salt");
-    assert!(salt_exists, "Salt should be stored in config (master_salt or legacy salt)");
+    assert!(
+        salt_exists,
+        "Salt should be stored in config (master_salt or legacy salt)"
+    );
 }
 
 #[test]
@@ -209,10 +224,7 @@ fn test_02_crud_operations() {
         .stderr(predicate::str::contains("API Key 'DATABASE_URL' added"));
 
     // Test: List should show both secrets
-    let list_output = env.cmd()
-        .arg("list")
-        .assert()
-        .success();
+    let list_output = env.cmd().arg("list").assert().success();
 
     list_output
         .stdout(predicate::str::contains("TEST_API_KEY"))
@@ -254,11 +266,13 @@ fn test_03_injection_engine() {
 
     // Add test secrets
     env.add_secret("TEST_VAR", "secret_value_123").success();
-    env.add_secret("ANOTHER_VAR", "another_secret_456").success();
+    env.add_secret("ANOTHER_VAR", "another_secret_456")
+        .success();
 
     // Test: Run command with environment variable injection
     // Use 'env' command to print environment variables
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("run")
         .arg("--")
         .arg("sh")
@@ -303,7 +317,10 @@ fn test_04_security_auth_failure() {
         .failure()
         .code(1)
         .stderr(predicate::str::contains("Error"))
-        .stderr(predicate::str::contains("Invalid master password").or(predicate::str::contains("corrupted vault")));
+        .stderr(
+            predicate::str::contains("Invalid master password")
+                .or(predicate::str::contains("corrupted vault")),
+        );
 
     // Wait for rate limit to reset (need to wait 30 seconds)
     std::thread::sleep(std::time::Duration::from_secs(31));
@@ -333,10 +350,7 @@ fn test_05_persistence() {
     drop(env.cmd());
 
     // Create new command instance (simulates new process)
-    let list_output = env.cmd()
-        .arg("list")
-        .assert()
-        .success();
+    let list_output = env.cmd().arg("list").assert().success();
 
     // Verify all secrets still exist
     list_output
@@ -391,7 +405,7 @@ fn test_06_empty_vault_operations() {
         .arg("echo")
         .arg("test")
         .assert()
-        .success()  // Should succeed with 0 injections
+        .success() // Should succeed with 0 injections
         .stderr(predicate::str::contains("Injecting 0 secret(s)"));
 
     // Test: Get non-existent secret
@@ -416,7 +430,8 @@ fn test_07_special_characters_in_secrets() {
     env.add_secret("SPECIAL_CHARS", special_secret).success();
 
     // Verify it can be retrieved via run command
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("run")
         .arg("--")
         .arg("sh")
@@ -481,7 +496,8 @@ fn test_09_update_secret() {
         .stderr(predicate::str::contains("API Key 'UPDATE_TEST' updated"));
 
     // Test: Verify the updated value via run command
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("run")
         .arg("--")
         .arg("sh")
@@ -499,8 +515,10 @@ fn test_09_update_secret() {
         .env("AK_TEST_SECRET", "some_value")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("API Key 'NONEXISTENT' not found")
-            .or(predicate::str::contains("'NONEXISTENT' not found")));
+        .stderr(
+            predicate::str::contains("API Key 'NONEXISTENT' not found")
+                .or(predicate::str::contains("'NONEXISTENT' not found")),
+        );
 
     // Test: Update with wrong password should fail
     let mut cmd = Command::new(cargo_bin("aikey"));

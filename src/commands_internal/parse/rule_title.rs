@@ -34,10 +34,28 @@ use super::candidate::{Candidate, Kind};
 use super::rule::try_push;
 
 const SECRET_PREFIXES: &[&str] = &[
-    "sk-ant-", "sk-proj-", "sk-svcacct-", "sk-admin-", "sk-",
-    "gsk_", "xai-", "sess_", "AIzaSy", "AIza",
-    "AKIA", "ASIA", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
-    "github_pat_", "hf_", "glpat-", "ya29.", "SG.",
+    "sk-ant-",
+    "sk-proj-",
+    "sk-svcacct-",
+    "sk-admin-",
+    "sk-",
+    "gsk_",
+    "xai-",
+    "sess_",
+    "AIzaSy",
+    "AIza",
+    "AKIA",
+    "ASIA",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "hf_",
+    "glpat-",
+    "ya29.",
+    "SG.",
 ];
 
 /// Returns true if `line` (already trimmed, non-empty) looks like a
@@ -159,7 +177,9 @@ mod tests {
 
     #[test]
     fn rejects_url_line() {
-        assert!(!is_natural_title("https://platform.moonshot.cn/console/api-keys"));
+        assert!(!is_natural_title(
+            "https://platform.moonshot.cn/console/api-keys"
+        ));
         assert!(!is_natural_title("http://example.com"));
     }
 

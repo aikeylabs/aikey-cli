@@ -127,7 +127,12 @@ impl FingerprintClassifier {
             reg.aggregator_families.into_iter().collect();
         let family_login_urls = reg.family_login_urls;
         let provider_routes = reg.provider_routes;
-        Self { entries, aggregator_families, family_login_urls, provider_routes }
+        Self {
+            entries,
+            aggregator_families,
+            family_login_urls,
+            provider_routes,
+        }
     }
 
     /// v4.1 Stage 5+: 从 inferred provider family 派生 protocol_types 列表。
@@ -151,7 +156,9 @@ impl FingerprintClassifier {
     /// Returns None if host not in table (UI/proxy treats as "third-party gateway,
     /// no auto routing"; user must declare it via a new yaml row).
     pub fn route_for_host(&self, host: &str) -> Option<&ProviderRoute> {
-        self.provider_routes.iter().find(|r| r.host.eq_ignore_ascii_case(host))
+        self.provider_routes
+            .iter()
+            .find(|r| r.host.eq_ignore_ascii_case(host))
     }
 
     /// v4.3: lookup the FIRST route matching a provider_code. Used as a family-
@@ -159,7 +166,9 @@ impl FingerprintClassifier {
     /// provider chip without pasting a URL). Multi-host providers (kimi)
     /// return their first row's route — caller knows this is heuristic.
     pub fn route_for_provider(&self, provider: &str) -> Option<&ProviderRoute> {
-        self.provider_routes.iter().find(|r| r.provider.eq_ignore_ascii_case(provider))
+        self.provider_routes
+            .iter()
+            .find(|r| r.provider.eq_ignore_ascii_case(provider))
     }
 
     /// v4.3: full official URL = base_url + version (with empty-version edge case).
@@ -206,7 +215,9 @@ impl FingerprintClassifier {
         url_domains: &[String],
     ) -> (Option<&'a ProviderEntry>, Option<String>) {
         let matched = self.classify(token);
-        let Some(entry) = matched else { return (None, None); };
+        let Some(entry) = matched else {
+            return (None, None);
+        };
         if entry.tier != Tier::Ambiguous {
             return (Some(entry), None);
         }
@@ -276,45 +287,45 @@ pub fn text_keyword_family_and_keyword(text: &str) -> Option<(String, String)> {
     // 让行首 label "🔑 yunwu:" 经 E6 InlineLabelKeyword 通路推断到正确 family。
     // 与 spike `provider_fingerprint.yaml::keyword_to_family` 保持一致。
     const MAP: &[(&str, &str)] = &[
-        ("anthropic",     "anthropic"),
-        ("claude",        "anthropic"),
-        ("openrouter",    "openrouter"),
-        ("openai",        "openai"),
-        ("gpt-4o",        "openai"),
-        ("gpt4o",         "openai"),
-        ("gpt-4",         "openai"),
-        ("gemini",        "google_gemini"),
-        ("google ai",     "google_gemini"),
+        ("anthropic", "anthropic"),
+        ("claude", "anthropic"),
+        ("openrouter", "openrouter"),
+        ("openai", "openai"),
+        ("gpt-4o", "openai"),
+        ("gpt4o", "openai"),
+        ("gpt-4", "openai"),
+        ("gemini", "google_gemini"),
+        ("google ai", "google_gemini"),
         // v4.1 family rename: kimi/moonshot → "kimi" (与 connectivity/runtime PROVIDER_DEFAULTS 字典对齐;
         // 旧 family 名 "moonshot_kimi" 与 CLI 其他地方一律叫 "kimi" 不一致,UI Provider 字段直接消费此值)
         // 2026-05-08 Kimi 双平台拆分: provider_code 'kimi' 拆为 'moonshot' + 'kimi_code'。
         //   - keyword "moonshot" → moonshot (精确品牌)
         //   - keyword "kimi" 单字 → moonshot (用户决策 #4: 两个平台都叫 Kimi,默认归 moonshot;
         //     URL 强证据 api.kimi.com / www.kimi.com 走 url_host_family_and_pattern 下钻 kimi_code)
-        ("moonshot",      "moonshot"),
-        ("kimi",          "moonshot"),
-        ("groq",          "groq"),
-        ("deepseek",      "deepseek"),
-        ("mistral",       "mistral"),
-        ("yunwu",         "yunwu"),
-        ("zeroeleven",    "zeroeleven"),
-        ("0011",          "zeroeleven"),
-        ("xai",           "xai_grok"),
-        ("grok",          "xai_grok"),
-        ("zhipu",         "zhipu"),
-        ("glm",           "zhipu"),
-        ("\u{8C46}\u{5305}", "doubao"),       // 豆包
-        ("doubao",        "doubao"),
-        ("volces",        "doubao"),
-        ("silicon",       "siliconflow"),
-        ("\u{7845}\u{57FA}",   "siliconflow"), // 硅基
-        ("huggingface",   "huggingface"),
-        ("perplexity",    "perplexity"),
-        ("sendgrid",      "sendgrid"),
-        ("stripe",        "stripe"),
-        ("slack",         "slack"),
-        ("github",        "github"),
-        ("aws",           "aws"),
+        ("moonshot", "moonshot"),
+        ("kimi", "moonshot"),
+        ("groq", "groq"),
+        ("deepseek", "deepseek"),
+        ("mistral", "mistral"),
+        ("yunwu", "yunwu"),
+        ("zeroeleven", "zeroeleven"),
+        ("0011", "zeroeleven"),
+        ("xai", "xai_grok"),
+        ("grok", "xai_grok"),
+        ("zhipu", "zhipu"),
+        ("glm", "zhipu"),
+        ("\u{8C46}\u{5305}", "doubao"), // 豆包
+        ("doubao", "doubao"),
+        ("volces", "doubao"),
+        ("silicon", "siliconflow"),
+        ("\u{7845}\u{57FA}", "siliconflow"), // 硅基
+        ("huggingface", "huggingface"),
+        ("perplexity", "perplexity"),
+        ("sendgrid", "sendgrid"),
+        ("stripe", "stripe"),
+        ("slack", "slack"),
+        ("github", "github"),
+        ("aws", "aws"),
     ];
     for (kw, family) in MAP {
         if lc.contains(kw) {
@@ -330,12 +341,12 @@ pub fn text_keyword_family_and_keyword(text: &str) -> Option<(String, String)> {
 pub fn shell_var_family_and_pattern(var_name: &str) -> Option<(String, String)> {
     let uc = var_name.to_uppercase();
     const MAP: &[(&str, &str, &str)] = &[
-        ("ANTHROPIC",  "anthropic",     "ANTHROPIC_*"),
-        ("CLAUDE",     "anthropic",     "CLAUDE_*"),
-        ("OPENAI",     "openai",        "OPENAI_*"),
-        ("OPENROUTER", "openrouter",    "OPENROUTER_*"),
-        ("GEMINI",     "google_gemini", "GEMINI_*"),
-        ("GOOGLE_AI",  "google_gemini", "GOOGLE_AI_*"),
+        ("ANTHROPIC", "anthropic", "ANTHROPIC_*"),
+        ("CLAUDE", "anthropic", "CLAUDE_*"),
+        ("OPENAI", "openai", "OPENAI_*"),
+        ("OPENROUTER", "openrouter", "OPENROUTER_*"),
+        ("GEMINI", "google_gemini", "GEMINI_*"),
+        ("GOOGLE_AI", "google_gemini", "GOOGLE_AI_*"),
         // 2026-05-08 Kimi 双平台拆分: MOONSHOT_* / KIMI_* 都映射到 moonshot。
         //
         // 这不只是"按 #4 默认"——而是当前调用链路里**唯一逻辑自洽**的答案。论证:
@@ -350,21 +361,21 @@ pub fn shell_var_family_and_pattern(var_name: &str) -> Option<(String, String)> 
         // 证 #1-#2 前提是否仍成立(Kimi Code 是否还坚持稳定前缀 / kimi_code 规则是否
         // 还在 generic_sk 之前)。否则会引入"KIMI_API_KEY=非kimi-code形态 → 误判 kimi_code"
         // 的回归 bug。decision #4 的命名歧义解释见 text_keyword_family_and_keyword。
-        ("MOONSHOT",   "moonshot",      "MOONSHOT_*"),
-        ("KIMI",       "moonshot",      "KIMI_*"),
-        ("GROQ",       "groq",          "GROQ_*"),
-        ("DEEPSEEK",   "deepseek",      "DEEPSEEK_*"),
-        ("MISTRAL",    "mistral",       "MISTRAL_*"),
-        ("YUNWU",      "yunwu",         "YUNWU_*"),
-        ("XAI",        "xai_grok",      "XAI_*"),
-        ("HUGGINGFACE", "huggingface",  "HUGGINGFACE_*"),
-        ("HF_TOKEN",   "huggingface",   "HF_TOKEN"),
-        ("PERPLEXITY", "perplexity",    "PERPLEXITY_*"),
-        ("SENDGRID",   "sendgrid",      "SENDGRID_*"),
-        ("STRIPE",     "stripe",        "STRIPE_*"),
-        ("SLACK",      "slack",         "SLACK_*"),
-        ("GITHUB",     "github",        "GITHUB_*"),
-        ("AWS_ACCESS", "aws",           "AWS_ACCESS_*"),
+        ("MOONSHOT", "moonshot", "MOONSHOT_*"),
+        ("KIMI", "moonshot", "KIMI_*"),
+        ("GROQ", "groq", "GROQ_*"),
+        ("DEEPSEEK", "deepseek", "DEEPSEEK_*"),
+        ("MISTRAL", "mistral", "MISTRAL_*"),
+        ("YUNWU", "yunwu", "YUNWU_*"),
+        ("XAI", "xai_grok", "XAI_*"),
+        ("HUGGINGFACE", "huggingface", "HUGGINGFACE_*"),
+        ("HF_TOKEN", "huggingface", "HF_TOKEN"),
+        ("PERPLEXITY", "perplexity", "PERPLEXITY_*"),
+        ("SENDGRID", "sendgrid", "SENDGRID_*"),
+        ("STRIPE", "stripe", "STRIPE_*"),
+        ("SLACK", "slack", "SLACK_*"),
+        ("GITHUB", "github", "GITHUB_*"),
+        ("AWS_ACCESS", "aws", "AWS_ACCESS_*"),
     ];
     for (prefix, family, pattern) in MAP {
         if uc.starts_with(prefix) {
@@ -379,40 +390,47 @@ pub fn shell_var_family_and_pattern(var_name: &str) -> Option<(String, String)> 
 /// 从 URL 抽 host,匹配 substring → 返回 (family, matched_pattern)
 pub fn url_host_family_and_pattern(url: &str) -> Option<(String, String)> {
     let host = url
-        .strip_prefix("https://").or_else(|| url.strip_prefix("http://"))
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
         .unwrap_or(url);
-    let host_lc = host.split(['/', '?', '#', ':']).next().unwrap_or("").to_lowercase();
-    if host_lc.is_empty() { return None; }
+    let host_lc = host
+        .split(['/', '?', '#', ':'])
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    if host_lc.is_empty() {
+        return None;
+    }
     const MAP: &[(&str, &str)] = &[
-        ("anthropic.com",        "anthropic"),
-        ("claude.com",           "anthropic"),
-        ("claude.ai",            "anthropic"),
-        ("openai.com",           "openai"),
-        ("openrouter.ai",        "openrouter"),
+        ("anthropic.com", "anthropic"),
+        ("claude.com", "anthropic"),
+        ("claude.ai", "anthropic"),
+        ("openai.com", "openai"),
+        ("openrouter.ai", "openrouter"),
         ("generativelanguage.googleapis.com", "google_gemini"),
-        ("aistudio.google.com",  "google_gemini"),
+        ("aistudio.google.com", "google_gemini"),
         // 2026-05-08 Kimi 双平台拆分: URL host 强证据下钻到具体 provider_code
         //   - moonshot.cn / moonshot.ai → moonshot
         //   - kimi.com (api.kimi.com / www.kimi.com) → kimi_code (Kimi Code 平台)
-        ("moonshot.cn",          "moonshot"),
-        ("moonshot.ai",          "moonshot"),
-        ("kimi.com",             "kimi_code"),
-        ("groq.com",             "groq"),
-        ("deepseek.com",         "deepseek"),
-        ("mistral.ai",           "mistral"),
-        ("yunwu.ai",             "yunwu"),
-        ("0011.ai",              "zeroeleven"),
-        ("x.ai",                 "xai_grok"),
-        ("huggingface.co",       "huggingface"),
-        ("perplexity.ai",        "perplexity"),
-        ("sendgrid.com",         "sendgrid"),
-        ("stripe.com",           "stripe"),
-        ("slack.com",            "slack"),
-        ("github.com",           "github"),
-        ("amazonaws.com",        "aws"),
-        ("bigmodel.cn",          "zhipu"),
-        ("volces.com",           "doubao"),
-        ("siliconflow.cn",       "siliconflow"),
+        ("moonshot.cn", "moonshot"),
+        ("moonshot.ai", "moonshot"),
+        ("kimi.com", "kimi_code"),
+        ("groq.com", "groq"),
+        ("deepseek.com", "deepseek"),
+        ("mistral.ai", "mistral"),
+        ("yunwu.ai", "yunwu"),
+        ("0011.ai", "zeroeleven"),
+        ("x.ai", "xai_grok"),
+        ("huggingface.co", "huggingface"),
+        ("perplexity.ai", "perplexity"),
+        ("sendgrid.com", "sendgrid"),
+        ("stripe.com", "stripe"),
+        ("slack.com", "slack"),
+        ("github.com", "github"),
+        ("amazonaws.com", "aws"),
+        ("bigmodel.cn", "zhipu"),
+        ("volces.com", "doubao"),
+        ("siliconflow.cn", "siliconflow"),
     ];
     for (needle, family) in MAP {
         if host_lc.contains(needle) {
@@ -483,7 +501,9 @@ mod tests {
     #[test]
     fn classify_uuid_is_warn() {
         let c = instance();
-        let e = c.classify("550e8400-e29b-41d4-a716-446655440000").expect("uuid");
+        let e = c
+            .classify("550e8400-e29b-41d4-a716-446655440000")
+            .expect("uuid");
         assert_eq!(e.id, "uuid");
         assert_eq!(e.tier, Tier::Warn);
     }
@@ -498,7 +518,8 @@ mod tests {
     #[test]
     fn classify_pem_block() {
         let c = instance();
-        let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC\n-----END OPENSSH PRIVATE KEY-----";
+        let pem =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC\n-----END OPENSSH PRIVATE KEY-----";
         let e = c.classify(pem).expect("pem");
         assert_eq!(e.id, "pem_block");
     }
@@ -542,11 +563,14 @@ mod tests {
     /// `moonshot.cn` / `moonshot.ai` 下钻到 `moonshot`。
     #[test]
     fn url_host_kimi_com_routes_to_kimi_code() {
-        let (fam, _) = url_host_family_and_pattern("https://api.kimi.com/coding/v1").expect("kimi url");
+        let (fam, _) =
+            url_host_family_and_pattern("https://api.kimi.com/coding/v1").expect("kimi url");
         assert_eq!(fam, "kimi_code");
-        let (fam, _) = url_host_family_and_pattern("https://www.kimi.com/code/console").expect("kimi.com url");
+        let (fam, _) =
+            url_host_family_and_pattern("https://www.kimi.com/code/console").expect("kimi.com url");
         assert_eq!(fam, "kimi_code");
-        let (fam, _) = url_host_family_and_pattern("https://platform.moonshot.cn/console").expect("moonshot url");
+        let (fam, _) = url_host_family_and_pattern("https://platform.moonshot.cn/console")
+            .expect("moonshot url");
         assert_eq!(fam, "moonshot");
     }
 
@@ -557,8 +581,10 @@ mod tests {
     fn url_host_api_moonshot_cn_routes_to_moonshot() {
         let (fam, _) = url_host_family_and_pattern("https://api.moonshot.cn/v1")
             .expect("api.moonshot.cn host should match");
-        assert_eq!(fam, "moonshot",
-            "api.moonshot.cn 必须 family-resolve 到 moonshot,不能误归 kimi_code");
+        assert_eq!(
+            fam, "moonshot",
+            "api.moonshot.cn 必须 family-resolve 到 moonshot,不能误归 kimi_code"
+        );
         // .ai 别名一并锁定
         let (fam, _) = url_host_family_and_pattern("https://api.moonshot.ai")
             .expect("moonshot.ai host should match");
@@ -577,8 +603,10 @@ mod tests {
             .classify("rk-kimi-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHHIIIIJJJJKKKKLLLL")
             .map(|e| e.id.as_str())
             .unwrap_or("<none>");
-        assert_ne!(id, "kimi_code",
-            "rk- 前缀必须不触发 sk-kimi-* confirmed 规则 (对抗样本 regression guard)");
+        assert_ne!(
+            id, "kimi_code",
+            "rk- 前缀必须不触发 sk-kimi-* confirmed 规则 (对抗样本 regression guard)"
+        );
     }
 
     /// shell var KIMI_*/MOONSHOT_* 都默认归 'moonshot' —— 论证见
@@ -588,7 +616,8 @@ mod tests {
     fn shell_var_kimi_and_moonshot_default_to_moonshot() {
         let (fam, _) = shell_var_family_and_pattern("KIMI_API_KEY").expect("KIMI shell var");
         assert_eq!(fam, "moonshot");
-        let (fam, _) = shell_var_family_and_pattern("MOONSHOT_BASE_URL").expect("MOONSHOT shell var");
+        let (fam, _) =
+            shell_var_family_and_pattern("MOONSHOT_BASE_URL").expect("MOONSHOT shell var");
         assert_eq!(fam, "moonshot");
     }
 }

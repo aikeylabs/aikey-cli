@@ -38,13 +38,27 @@ pub fn tokenize_line(line: &str) -> Vec<String> {
             // Why trim '*' / '`': Markdown 粗体 **value** / 代码 `value` 包裹应剥除
             // Why trim '[' ']' '(' ')': Markdown 链接 [text](url) 粘贴残留 `[Moonshot` / `console]`
             let t = t.trim().trim_matches(|c: char| {
-                c == ',' || c == '.' || c == ';' || c == '|'
-                    || c == ':' || c == '~' || c == '"' || c == '\''
-                    || c == '*' || c == '`'
-                    || c == '[' || c == ']' || c == '(' || c == ')'
+                c == ','
+                    || c == '.'
+                    || c == ';'
+                    || c == '|'
+                    || c == ':'
+                    || c == '~'
+                    || c == '"'
+                    || c == '\''
+                    || c == '*'
+                    || c == '`'
+                    || c == '['
+                    || c == ']'
+                    || c == '('
+                    || c == ')'
                     || c == '\u{FF1A}'
             });
-            if t.is_empty() { None } else { Some(t.to_string()) }
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
         })
         .collect()
 }
@@ -97,8 +111,11 @@ mod tests {
     fn tokenize_markdown_backticks_stripped() {
         // 反引号应从 token 两端剥除
         let t = tokenize_line("key `sk-xxx`");
-        assert!(t.iter().any(|s| s == "sk-xxx"),
-            "sk-xxx should survive backtick stripping, got: {:?}", t);
+        assert!(
+            t.iter().any(|s| s == "sk-xxx"),
+            "sk-xxx should survive backtick stripping, got: {:?}",
+            t
+        );
     }
 
     #[test]
@@ -108,7 +125,11 @@ mod tests {
         let t = tokenize_line("[Moonshot](https://x.io)");
         // 至少剥了两端 `[` 和 `)` —— 中间 `](` 保留
         let joined = t.join(" ");
-        assert!(!joined.contains("[Moonshot"), "leading [ not trimmed: {:?}", t);
+        assert!(
+            !joined.contains("[Moonshot"),
+            "leading [ not trimmed: {:?}",
+            t
+        );
         assert!(!joined.ends_with(")"), "trailing ) not trimmed: {:?}", t);
     }
 

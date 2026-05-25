@@ -26,10 +26,10 @@ use crate::json_output;
 use crate::storage;
 
 use super::{
-    authorize_atomic, get_app_record, get_active_bindings, list_apps, pause_active_keys,
-    resume_paused_keys, revoke_active_keys, rotate_app_key, set_app_binding, upsert_app_record,
-    validate_first_party_invariants, validate_slug, validate_upstreams, is_first_party,
-    AppRecord, list_app_active_keys,
+    authorize_atomic, get_active_bindings, get_app_record, is_first_party, list_app_active_keys,
+    list_apps, pause_active_keys, resume_paused_keys, revoke_active_keys, rotate_app_key,
+    set_app_binding, upsert_app_record, validate_first_party_invariants, validate_slug,
+    validate_upstreams, AppRecord,
 };
 
 // ---------------------------------------------------------------------------
@@ -70,12 +70,15 @@ pub fn handle_register(
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_slug(slug).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    validate_upstreams(upstreams)
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    validate_upstreams(upstreams).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     validate_first_party_invariants(slug, first_party, follow_user_active)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let app_kind = if first_party { "first-party" } else { "third-party" };
+    let app_kind = if first_party {
+        "first-party"
+    } else {
+        "third-party"
+    };
 
     let inserted = upsert_app_record(
         slug,
@@ -145,11 +148,20 @@ pub fn handle_register(
     }
 
     let action = if inserted { "Registered" } else { "Updated" };
-    println!("{} app '{}' ({}, upstreams={})", action, slug, app_kind, upstreams.join(","));
+    println!(
+        "{} app '{}' ({}, upstreams={})",
+        action,
+        slug,
+        app_kind,
+        upstreams.join(",")
+    );
     if bearer_was_new {
         println!("✓ Issued bearer for '{}':", name);
     } else {
-        println!("✓ Reusing existing bearer for '{}' (pass --rotate-bearer to rotate):", name);
+        println!(
+            "✓ Reusing existing bearer for '{}' (pass --rotate-bearer to rotate):",
+            name
+        );
     }
     println!();
     println!("    OPENAI_API_KEY={}", route_token);
@@ -157,7 +169,9 @@ pub fn handle_register(
     println!();
 
     if follow_user_active {
-        println!("Mode: ⚠ follow-user-active (this app dynamically tracks your `aikey use` selection).");
+        println!(
+            "Mode: ⚠ follow-user-active (this app dynamically tracks your `aikey use` selection)."
+        );
         println!("    Any change you make via `aikey use` will affect this app immediately.");
         if cleaned_stale > 0 {
             println!(
@@ -196,7 +210,10 @@ pub fn handle_register(
                 }
                 println!("    The app will fail at request time until you set bindings.");
                 println!("    Option A (recommended): aikey use            # set globally, all apps inherit");
-                println!("    Option B:               aikey app route {}    # set per-app override", slug);
+                println!(
+                    "    Option B:               aikey app route {}    # set per-app override",
+                    slug
+                );
             } else if outcome.snapshotted.is_empty() && !outcome.preserved.is_empty() {
                 // All bindings preserved, none new — nothing more to say.
             } else {
@@ -220,7 +237,10 @@ fn cleanup_stale_app_bindings(slug: &str) -> Result<usize, Box<dyn std::error::E
     let existing = match storage::list_provider_bindings(&profile_id) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[aikey app] WARN: failed to list app bindings to clean: {}", e);
+            eprintln!(
+                "[aikey app] WARN: failed to list app bindings to clean: {}",
+                e
+            );
             return Ok(0);
         }
     };
@@ -319,17 +339,16 @@ pub fn resolve_register_bindings(
     slug: &str,
     upstreams: &[String],
 ) -> Result<RegisterBindingOutcome, Box<dyn std::error::Error>> {
-    let existing_app_bindings =
-        match storage::list_provider_bindings(&format!("app:{}", slug)) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!(
-                    "[aikey app] WARN: failed to read app-specific bindings for slug={:?}: {}",
-                    slug, e
-                );
-                Vec::new()
-            }
-        };
+    let existing_app_bindings = match storage::list_provider_bindings(&format!("app:{}", slug)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "[aikey app] WARN: failed to read app-specific bindings for slug={:?}: {}",
+                slug, e
+            );
+            Vec::new()
+        }
+    };
     let default_bindings = match storage::list_provider_bindings("default") {
         Ok(v) => v,
         Err(e) => {
@@ -475,7 +494,10 @@ pub fn handle_route(
                 "upstream '{}' not declared in app's manifest (declared: {}). \
                  Re-register with `aikey app register --slug {} --upstreams {}` \
                  to expand the upstream set (requires re-consent).",
-                u, rec.upstreams.join(","), slug, u
+                u,
+                rec.upstreams.join(","),
+                slug,
+                u
             )
             .into());
         }
@@ -528,12 +550,21 @@ pub fn handle_route(
 
     println!();
     for (u, t, r) in &updated_bindings {
-        println!("Set binding for app '{}' (profile=app:{}): {} → {}={}",
-            slug, slug, u, t.as_str(), r);
+        println!(
+            "Set binding for app '{}' (profile=app:{}): {} → {}={}",
+            slug,
+            slug,
+            u,
+            t.as_str(),
+            r
+        );
     }
     if active_keys.is_empty() {
         println!();
-        println!("⚠ This app has no active bearer. Run `aikey app register --slug {} --upstreams ...`", slug);
+        println!(
+            "⚠ This app has no active bearer. Run `aikey app register --slug {} --upstreams ...`",
+            slug
+        );
         println!("    to issue one. (Route only updates bindings; register issues bearers.)");
     }
     Ok(())
@@ -553,7 +584,8 @@ fn interactive_pick_and_bind(
         println!();
         println!("Bindings for app '{}' ({}):", rec.slug, rec.app_kind);
         for (idx, upstream) in rec.upstreams.iter().enumerate() {
-            let label = current.iter()
+            let label = current
+                .iter()
                 .find(|(p, _, _)| p == upstream)
                 .map(|(_, t, r)| format!("{}={}", t.as_str(), r))
                 .unwrap_or_else(|| "(unbound)".to_string());
@@ -602,15 +634,23 @@ fn prompt_key_for_upstream(
         println!("No keys found for upstream '{}'.", upstream);
         println!("Add one via:");
         println!("    aikey add my-{} --provider {}", upstream, upstream);
-        println!("    aikey auth login {}   # for OAuth-supported providers", upstream);
+        println!(
+            "    aikey auth login {}   # for OAuth-supported providers",
+            upstream
+        );
         return Ok(None);
     }
 
     println!();
     println!("Available keys for upstream '{}':", upstream);
     for (idx, c) in candidates.iter().enumerate() {
-        println!("  [{}] {:<24} {} ({})",
-            idx + 1, c.label, c.kind_display, c.ref_display);
+        println!(
+            "  [{}] {:<24} {} ({})",
+            idx + 1,
+            c.label,
+            c.kind_display,
+            c.ref_display
+        );
     }
     println!("  [s] skip this upstream");
     print!("Pick [1-{}/s]: ", candidates.len());
@@ -662,7 +702,9 @@ fn collect_key_candidates(upstream: &str) -> Result<Vec<KeyCandidate>, Box<dyn s
     )?;
     let like_pattern = format!("%\"{}\"%", upstream);
     let alias_rows = stmt
-        .query_map(rusqlite::params![upstream, like_pattern], |r| r.get::<_, String>(0))?
+        .query_map(rusqlite::params![upstream, like_pattern], |r| {
+            r.get::<_, String>(0)
+        })?
         .filter_map(Result::ok);
     for alias in alias_rows {
         out.push(KeyCandidate {
@@ -728,10 +770,7 @@ fn parse_key_type(s: &str) -> Result<CredentialType, Box<dyn std::error::Error>>
     })
 }
 
-fn print_bearer_consent_prompt(
-    rec: &AppRecord,
-    bindings: &[(String, CredentialType, String)],
-) {
+fn print_bearer_consent_prompt(rec: &AppRecord, bindings: &[(String, CredentialType, String)]) {
     println!();
     println!("─── About to issue bearer token for app ───");
     println!("  slug:      {}", rec.slug);
@@ -776,11 +815,13 @@ fn confirm_yes_no(question: &str, default_yes: bool) -> Result<bool, io::Error> 
 fn render_bindings_json(bindings: &[(String, CredentialType, String)]) -> Vec<serde_json::Value> {
     bindings
         .iter()
-        .map(|(p, t, r)| serde_json::json!({
-            "upstream": p,
-            "key_source_type": t.as_str(),
-            "key_source_ref": r,
-        }))
+        .map(|(p, t, r)| {
+            serde_json::json!({
+                "upstream": p,
+                "key_source_type": t.as_str(),
+                "key_source_ref": r,
+            })
+        })
         .collect()
 }
 
@@ -819,7 +860,10 @@ pub fn handle_list(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("(no apps registered — try `aikey app register --slug ... --name ... --upstreams openai`)");
         return Ok(());
     }
-    println!("{:<24} {:<12} {:<14} {:<18} {}", "SLUG", "KIND", "UPSTREAMS", "ACTIVE KEY", "LAST USED");
+    println!(
+        "{:<24} {:<12} {:<14} {:<18} {}",
+        "SLUG", "KIND", "UPSTREAMS", "ACTIVE KEY", "LAST USED"
+    );
     for (rec, active) in apps {
         let key_label = match &active {
             Some(k) => format!("{}…", &k.key_id[..k.key_id.len().min(8)]),
@@ -967,7 +1011,10 @@ pub fn handle_rotate(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::err
         }));
     }
     println!();
-    println!("Rotated key for app '{}'. The OLD bearer is immediately revoked — update the Agent's env:", slug);
+    println!(
+        "Rotated key for app '{}'. The OLD bearer is immediately revoked — update the Agent's env:",
+        slug
+    );
     println!();
     println!("    OPENAI_API_KEY={}", route_token);
     println!("    OPENAI_BASE_URL={}", base_url);

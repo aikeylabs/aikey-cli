@@ -64,30 +64,56 @@ pub fn run() -> io::Result<()> {
     // `scan_wal_backward` walks newest-first with a bounded budget; see
     // §5.1 of the design doc for why a fixed "tail N" is insufficient.
     let opts = ScanOptions::default();
-    let Some(dir) = default_wal_dir() else { return Ok(()); };
+    let Some(dir) = default_wal_dir() else {
+        return Ok(());
+    };
     if !dir.exists() {
-        return Ok(());  // proxy never wrote a WAL on this machine
+        return Ok(()); // proxy never wrote a WAL on this machine
     }
 
     let sid = ctx.session_id.as_deref().unwrap_or("");
-    let model_id = ctx.model.as_ref().and_then(|m| m.id.as_deref()).unwrap_or("");
+    let model_id = ctx
+        .model
+        .as_ref()
+        .and_then(|m| m.id.as_deref())
+        .unwrap_or("");
 
     // First pass: exact session_id match (正常模式 — covers the vast majority
     // of Claude Code sessions).
     let exact = if !sid.is_empty() {
-        scan_wal_backward(&dir, |ev| {
-            if ev.session_id.as_deref() == Some(sid) { Some(ev.clone()) } else { None }
-        }, opts)?
-    } else { None };
+        scan_wal_backward(
+            &dir,
+            |ev| {
+                if ev.session_id.as_deref() == Some(sid) {
+                    Some(ev.clone())
+                } else {
+                    None
+                }
+            },
+            opts,
+        )?
+    } else {
+        None
+    };
 
     // Second pass: model.id + 5min window fallback (resume / restart edge
     // cases where stdin's session_id diverges from the WAL's — see §14
     // of the design doc for context).
     let fallback = if exact.is_none() && !model_id.is_empty() {
-        scan_wal_backward(&dir, |ev| {
-            if ev.model == model_id { Some(ev.clone()) } else { None }
-        }, opts)?
-    } else { None };
+        scan_wal_backward(
+            &dir,
+            |ev| {
+                if ev.model == model_id {
+                    Some(ev.clone())
+                } else {
+                    None
+                }
+            },
+            opts,
+        )?
+    } else {
+        None
+    };
 
     let Some(ev) = exact.or(fallback) else {
         // Nothing to show — Claude Code hides the row when stdout is empty.
@@ -117,8 +143,10 @@ pub fn run() -> io::Result<()> {
 }
 
 fn env_flag(name: &str) -> bool {
-    matches!(std::env::var(name).ok().as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on"))
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 fn read_stdin_ctx() -> io::Result<ClaudeCodeCtx> {
@@ -148,7 +176,10 @@ fn read_stdin_ctx() -> io::Result<ClaudeCodeCtx> {
 ///     age:        <Ns / Nm / Nh ago>
 pub fn last_active() -> io::Result<()> {
     let Some(dir) = default_wal_dir() else {
-        writeln!(io::stderr(), "aikey statusline: HOME unset, cannot locate WAL")?;
+        writeln!(
+            io::stderr(),
+            "aikey statusline: HOME unset, cannot locate WAL"
+        )?;
         return Ok(());
     };
     if !dir.exists() {
@@ -171,9 +202,18 @@ pub fn last_active() -> io::Result<()> {
         return Ok(());
     };
 
-    let sid = ev.session_id.as_deref().filter(|s| !s.is_empty()).unwrap_or("(none)");
-    let model = if ev.model.is_empty() { "(none)" } else { ev.model.as_str() };
-    let age_str = ev.age(std::time::SystemTime::now())
+    let sid = ev
+        .session_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("(none)");
+    let model = if ev.model.is_empty() {
+        "(none)"
+    } else {
+        ev.model.as_str()
+    };
+    let age_str = ev
+        .age(std::time::SystemTime::now())
         .map(format_age)
         .unwrap_or_else(|| "(unknown)".to_string());
 
@@ -232,7 +272,9 @@ pub fn render_kimi() -> io::Result<()> {
     }
 
     // 2. Resolve WAL and session_dir paths.
-    let Some(wal_dir) = default_wal_dir() else { return Ok(()); };
+    let Some(wal_dir) = default_wal_dir() else {
+        return Ok(());
+    };
     if !wal_dir.exists() {
         return Ok(()); // proxy never ran on this machine; nothing to render
     }
@@ -264,19 +306,26 @@ pub fn render_kimi() -> io::Result<()> {
     let pf = prev_file.clone();
     let has_watermark = !prev_file.is_empty() || prev_seq != 0;
     let opts = if has_watermark {
-        ScanOptions { max_age: None, max_lines: 5000 }
+        ScanOptions {
+            max_age: None,
+            max_lines: 5000,
+        }
     } else {
         ScanOptions::default()
     };
-    let hits = collect_wal_backward(&wal_dir, move |hit| {
-        // 2026-05-08 Kimi 双平台拆分: kimi family 的三个 provider_code 都会被
-        // Kimi CLI Stop hook 触发 statusline 渲染。pre-fix 只过滤 "kimi",
-        // 拆分后 kimi_code/moonshot 事件不被统计 → statusline 空白。
-        let pc = hit.event.provider_code.as_str();
-        (pc == "kimi_code" || pc == "moonshot" || pc == "kimi")
-            && hit.event.session_id.as_deref() == Some(sid.as_str())
-            && tuple_gt(&hit.wal_file_name, hit.wal_seq, &pf, prev_seq)
-    }, opts)?;
+    let hits = collect_wal_backward(
+        &wal_dir,
+        move |hit| {
+            // 2026-05-08 Kimi 双平台拆分: kimi family 的三个 provider_code 都会被
+            // Kimi CLI Stop hook 触发 statusline 渲染。pre-fix 只过滤 "kimi",
+            // 拆分后 kimi_code/moonshot 事件不被统计 → statusline 空白。
+            let pc = hit.event.provider_code.as_str();
+            (pc == "kimi_code" || pc == "moonshot" || pc == "kimi")
+                && hit.event.session_id.as_deref() == Some(sid.as_str())
+                && tuple_gt(&hit.wal_file_name, hit.wal_seq, &pf, prev_seq)
+        },
+        opts,
+    )?;
 
     if hits.is_empty() {
         // Nothing to report; do NOT update watermark (at-least-once).
@@ -312,8 +361,16 @@ pub fn render_kimi() -> io::Result<()> {
         input_tokens: Some(in_sum),
         output_tokens: Some(out_sum),
         total_tokens: Some(in_sum + out_sum),
-        cache_read_input_tokens: if cache_read_sum > 0 { Some(cache_read_sum) } else { None },
-        cache_creation_input_tokens: if cache_write_sum > 0 { Some(cache_write_sum) } else { None },
+        cache_read_input_tokens: if cache_read_sum > 0 {
+            Some(cache_read_sum)
+        } else {
+            None
+        },
+        cache_creation_input_tokens: if cache_write_sum > 0 {
+            Some(cache_write_sum)
+        } else {
+            None
+        },
         stop_reason: newest.event.stop_reason.clone(),
         request_status: newest.event.request_status.clone(),
         http_status_code: newest.event.http_status_code,
@@ -333,7 +390,12 @@ pub fn render_kimi() -> io::Result<()> {
 
     // 8. Advance watermark. Any error here is non-fatal: next turn will
     // re-aggregate these events (at-least-once display).
-    let _ = write_watermark_in(&turns_dir, &ctx.session_id, &newest.wal_file_name, newest.wal_seq);
+    let _ = write_watermark_in(
+        &turns_dir,
+        &ctx.session_id,
+        &newest.wal_file_name,
+        newest.wal_seq,
+    );
 
     // 9. Opportunistic GC (cheap: just stat a few files). Failures ignored.
     let _ = gc_stale_watermarks_in(&turns_dir);
@@ -360,18 +422,26 @@ fn tuple_gt(file_a: &str, seq_a: u64, file_b: &str, seq_b: u64) -> bool {
 /// path lands at `%USERPROFILE%\.kimi\sessions\...` on Windows, matching
 /// what kimi-cli itself reads on Windows.
 fn kimi_session_dir(cwd: &str, session_id: &str) -> PathBuf {
-    use md5::{Md5, Digest};
+    use md5::{Digest, Md5};
     let digest = Md5::digest(cwd.as_bytes());
-    let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let hex = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
     crate::commands_account::resolve_user_home()
-        .join(".kimi").join("sessions").join(hex).join(session_id)
+        .join(".kimi")
+        .join("sessions")
+        .join(hex)
+        .join(session_id)
 }
 
 /// Directory for per-session turn watermarks: `~/.aikey/run/kimi-turns/`.
 /// The `_in` variant takes an explicit base dir so tests can substitute a
 /// tempdir (setting `$HOME` process-wide would collide with parallel tests).
 fn kimi_turns_dir() -> PathBuf {
-    crate::commands_account::resolve_aikey_dir().join("run").join("kimi-turns")
+    crate::commands_account::resolve_aikey_dir()
+        .join("run")
+        .join("kimi-turns")
 }
 
 /// Read the watermark file. **Fail-closed** in every error / corruption
@@ -433,13 +503,19 @@ fn write_watermark_in(
 /// end of render_kimi — cheap (handful of files typically) and avoids a
 /// dedicated daemon.
 fn gc_stale_watermarks_in(dir: &Path) -> io::Result<()> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()); };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
     let cutoff = std::time::SystemTime::now()
         .checked_sub(Duration::from_secs(7 * 24 * 3600))
         .unwrap_or(std::time::UNIX_EPOCH);
     for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else { continue; };
-        let Ok(mtime) = meta.modified() else { continue; };
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
         if mtime < cutoff {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -558,7 +634,9 @@ fn strip_ansi_escapes(s: &str) -> String {
                 // CSI: swallow parameter / intermediate bytes, stop on final (0x40..=0x7E).
                 while let Some(&nc) = chars.peek() {
                     chars.next();
-                    if ('@'..='~').contains(&nc) { break; }
+                    if ('@'..='~').contains(&nc) {
+                        break;
+                    }
                 }
             }
             // Non-CSI escape (e.g. ESC ]) — drop the one introducer byte.
@@ -570,19 +648,33 @@ fn strip_ansi_escapes(s: &str) -> String {
 
 fn format_age(d: Duration) -> String {
     let secs = d.as_secs();
-    if secs < 60 { return format!("{}s ago", secs); }
-    if secs < 3600 { return format!("{}m ago", secs / 60); }
-    if secs < 86400 { return format!("{}h {}m ago", secs / 3600, (secs % 3600) / 60); }
+    if secs < 60 {
+        return format!("{}s ago", secs);
+    }
+    if secs < 3600 {
+        return format!("{}m ago", secs / 60);
+    }
+    if secs < 86400 {
+        return format!("{}h {}m ago", secs / 3600, (secs % 3600) / 60);
+    }
     format!("{}d ago", secs / 86400)
 }
 
 fn render_line(ev: &UsageEvent) -> String {
     use colored::Colorize;
 
-    let raw_label = ev.key_label.as_deref()
+    let raw_label = ev
+        .key_label
+        .as_deref()
         .filter(|s| !s.is_empty())
         .or_else(|| ev.oauth_identity.as_deref().filter(|s| !s.is_empty()))
-        .or_else(|| if !ev.virtual_key_id.is_empty() { Some(ev.virtual_key_id.as_str()) } else { None })
+        .or_else(|| {
+            if !ev.virtual_key_id.is_empty() {
+                Some(ev.virtual_key_id.as_str())
+            } else {
+                None
+            }
+        })
         .unwrap_or("(unknown key)");
     let label = shorten_label(raw_label, 22);
 
@@ -673,9 +765,15 @@ fn render_line(ev: &UsageEvent) -> String {
     // non-empty entries so a missing segment never produces "↑3 ↓22 ·  · m".
     let mut parts: Vec<String> = Vec::with_capacity(5);
     parts.push(format!("{up}{in_s} {down}{out_s}"));
-    if !cache_seg.is_empty() { parts.push(cache_seg); }
-    if !model.is_empty() { parts.push(format!("{}", model.dimmed())); }
-    if !label.is_empty() { parts.push(format!("{}", label.dimmed())); }
+    if !cache_seg.is_empty() {
+        parts.push(cache_seg);
+    }
+    if !model.is_empty() {
+        parts.push(format!("{}", model.dimmed()));
+    }
+    if !label.is_empty() {
+        parts.push(format!("{}", label.dimmed()));
+    }
 
     let brand = "❬⦿·⦿❭".dimmed();
     // Brand becomes the final `·`-joined segment so it aligns visually
@@ -767,24 +865,34 @@ fn event_time_hm(event_time_ms: i64) -> String {
         dwHighDateTime: (ft100ns >> 32) as u32,
     };
     let mut utc_st = SYSTEMTIME {
-        wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0,
-        wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0,
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
     };
     // SAFETY: utc_ft is a valid FILETIME, utc_st is a writable SYSTEMTIME.
     if unsafe { FileTimeToSystemTime(&utc_ft, &mut utc_st) } == 0 {
         return String::new();
     }
     let mut local_st = SYSTEMTIME {
-        wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0,
-        wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0,
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
     };
     // Passing NULL for the TZ info uses the system's current time zone
     // (DST-aware), which matches the wall clock on the user's machine —
     // same semantics as `localtime_r` on Unix.
     // SAFETY: utc_st is a valid SYSTEMTIME, local_st is writable.
-    if unsafe {
-        SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc_st, &mut local_st)
-    } == 0 {
+    if unsafe { SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc_st, &mut local_st) } == 0 {
         return String::new();
     }
     format!("{:02}:{:02}", local_st.wHour, local_st.wMinute)
@@ -813,7 +921,9 @@ fn event_time_hm(event_time_ms: i64) -> String {
 /// The `claude-` prefix is still dropped (ecosystem context makes it
 /// redundant — every Anthropic id starts with it).
 fn shorten_model(model: &str) -> String {
-    if model.is_empty() { return String::new(); }
+    if model.is_empty() {
+        return String::new();
+    }
     let without_prefix = model.strip_prefix("claude-").unwrap_or(model);
     without_prefix.to_string()
 }
@@ -822,7 +932,9 @@ fn shorten_model(model: &str) -> String {
 /// Emails collapse to `prefix…@domain` when the username is too long; anything
 /// else just gets a mid-string ellipsis.
 fn shorten_label(label: &str, max: usize) -> String {
-    if label.chars().count() <= max { return label.to_string(); }
+    if label.chars().count() <= max {
+        return label.to_string();
+    }
 
     // Email: keep first few chars of local + "…" + domain.
     if let Some(at) = label.find('@') {
@@ -948,11 +1060,19 @@ fn install_inner(force: bool, quiet: bool) -> io::Result<InstallOutcome> {
     let claude_dir = settings_path.parent().expect("settings file has a parent");
     if !claude_dir.exists() {
         if !quiet {
-            eprintln!("  {} {}",
+            eprintln!(
+                "  {} {}",
                 "ⓘ".cyan(),
-                format!("Claude Code config directory not found: {}", claude_dir.display()).dimmed());
-            eprintln!("  {}",
-                "Skipping status-line install. Open Claude Code once and re-run.".dimmed());
+                format!(
+                    "Claude Code config directory not found: {}",
+                    claude_dir.display()
+                )
+                .dimmed()
+            );
+            eprintln!(
+                "  {}",
+                "Skipping status-line install. Open Claude Code once and re-run.".dimmed()
+            );
         }
         return Ok(InstallOutcome::NotApplicable);
     }
@@ -961,11 +1081,15 @@ fn install_inner(force: bool, quiet: bool) -> io::Result<InstallOutcome> {
         Ok(v) => v,
         Err(ReadError::Malformed(e)) => {
             // Malformed settings is always user-actionable — print regardless.
-            eprintln!("  {} {}",
+            eprintln!(
+                "  {} {}",
                 "✗".red(),
-                format!("Cannot parse {}: {}", settings_path.display(), e).red());
-            eprintln!("  {}",
-                "Fix or remove the file and re-run `aikey statusline install`.".dimmed());
+                format!("Cannot parse {}: {}", settings_path.display(), e).red()
+            );
+            eprintln!(
+                "  {}",
+                "Fix or remove the file and re-run `aikey statusline install`.".dimmed()
+            );
             return Ok(InstallOutcome::RefusedMalformed);
         }
         Err(ReadError::NotFound) => serde_json::json!({}),
@@ -987,7 +1111,11 @@ fn install_inner(force: bool, quiet: bool) -> io::Result<InstallOutcome> {
         // so `aikey use` / `aikey auth login claude` don't dump this line
         // on every invocation after the initial setup.
         if !quiet {
-            eprintln!("  {} {}", "✓".green(), "Claude Code status line already points to aikey.".dimmed());
+            eprintln!(
+                "  {} {}",
+                "✓".green(),
+                "Claude Code status line already points to aikey.".dimmed()
+            );
         }
         return Ok(InstallOutcome::AlreadyInstalled);
     }
@@ -998,13 +1126,16 @@ fn install_inner(force: bool, quiet: bool) -> io::Result<InstallOutcome> {
         let rows = vec![
             format!("File:     {}", settings_path.display()),
             format!("Existing: {}", existing_cmd.dimmed()),
-            format!("aikey will {}",
-                "not overwrite".yellow()),
+            format!("aikey will {}", "not overwrite".yellow()),
             String::new(),
             format!("To install anyway:  aikey statusline install --force"),
             format!("(the existing value will be backed up)"),
         ];
-        crate::ui_frame::eprint_box("\u{2753}", "Claude Code statusLine already configured", &rows);
+        crate::ui_frame::eprint_box(
+            "\u{2753}",
+            "Claude Code statusLine already configured",
+            &rows,
+        );
         return Ok(InstallOutcome::SkippedExisting);
     }
 
@@ -1018,10 +1149,13 @@ fn install_inner(force: bool, quiet: bool) -> io::Result<InstallOutcome> {
         _ => serde_json::json!({}),
     };
     if let Some(obj) = merged.as_object_mut() {
-        obj.insert("statusLine".into(), serde_json::json!({
-            "type": "command",
-            "command": aikey_cmd,
-        }));
+        obj.insert(
+            "statusLine".into(),
+            serde_json::json!({
+                "type": "command",
+                "command": aikey_cmd,
+            }),
+        );
     }
 
     write_settings_atomic(&settings_path, &merged)?;
@@ -1133,10 +1267,13 @@ pub fn ensure() -> io::Result<()> {
         _ => serde_json::json!({}),
     };
     if let Some(obj) = merged.as_object_mut() {
-        obj.insert("statusLine".into(), serde_json::json!({
-            "type": "command",
-            "command": aikey_statusline_command(),
-        }));
+        obj.insert(
+            "statusLine".into(),
+            serde_json::json!({
+                "type": "command",
+                "command": aikey_statusline_command(),
+            }),
+        );
     }
     write_settings_atomic(&settings_path, &merged)?;
     Ok(())
@@ -1201,20 +1338,33 @@ pub fn uninstall_kimi() -> io::Result<()> {
 pub fn uninstall_claude(quiet: bool) -> io::Result<()> {
     use colored::Colorize;
     let Some(settings_path) = claude_settings_path() else {
-        if !quiet { eprintln!("  {}", "No Claude Code config directory — nothing to uninstall.".dimmed()); }
+        if !quiet {
+            eprintln!(
+                "  {}",
+                "No Claude Code config directory — nothing to uninstall.".dimmed()
+            );
+        }
         return Ok(());
     };
 
     let current = match read_settings(&settings_path) {
         Ok(v) => v,
         Err(ReadError::NotFound) => {
-            if !quiet { eprintln!("  {}", "~/.claude/settings.json does not exist — nothing to uninstall.".dimmed()); }
+            if !quiet {
+                eprintln!(
+                    "  {}",
+                    "~/.claude/settings.json does not exist — nothing to uninstall.".dimmed()
+                );
+            }
             return Ok(());
         }
         Err(ReadError::Malformed(e)) => {
             if !quiet {
-                eprintln!("  {} {}", "✗".red(),
-                    format!("Cannot parse settings.json: {}", e).red());
+                eprintln!(
+                    "  {} {}",
+                    "✗".red(),
+                    format!("Cannot parse settings.json: {}", e).red()
+                );
             }
             return Ok(());
         }
@@ -1229,7 +1379,12 @@ pub fn uninstall_claude(quiet: bool) -> io::Result<()> {
         .unwrap_or(false);
 
     if !points_to_us {
-        if !quiet { eprintln!("  {}", "Claude Code status line is not configured for aikey — nothing to remove.".dimmed()); }
+        if !quiet {
+            eprintln!(
+                "  {}",
+                "Claude Code status line is not configured for aikey — nothing to remove.".dimmed()
+            );
+        }
         return Ok(());
     }
 
@@ -1238,7 +1393,13 @@ pub fn uninstall_claude(quiet: bool) -> io::Result<()> {
     let backup_path = statusline_backup_path(&settings_path);
     if backup_path.exists() {
         std::fs::rename(&backup_path, &settings_path)?;
-        if !quiet { eprintln!("  {} Restored {} from backup.", "✓".green(), settings_path.display()); }
+        if !quiet {
+            eprintln!(
+                "  {} Restored {} from backup.",
+                "✓".green(),
+                settings_path.display()
+            );
+        }
         return Ok(());
     }
 
@@ -1252,10 +1413,22 @@ pub fn uninstall_claude(quiet: bool) -> io::Result<()> {
     // empty `{}` that looks like user-configured state.
     if next.as_object().map(|o| o.is_empty()).unwrap_or(false) {
         std::fs::remove_file(&settings_path)?;
-        if !quiet { eprintln!("  {} Removed {} (file was otherwise empty).", "✓".green(), settings_path.display()); }
+        if !quiet {
+            eprintln!(
+                "  {} Removed {} (file was otherwise empty).",
+                "✓".green(),
+                settings_path.display()
+            );
+        }
     } else {
         write_settings_atomic(&settings_path, &next)?;
-        if !quiet { eprintln!("  {} Removed aikey statusLine from {}.", "✓".green(), settings_path.display()); }
+        if !quiet {
+            eprintln!(
+                "  {} Removed aikey statusLine from {}.",
+                "✓".green(),
+                settings_path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -1298,35 +1471,58 @@ fn print_status_claude() -> io::Result<()> {
         ConfigDirSource::EnvVar => "from CLAUDE_CONFIG_DIR".to_string(),
         ConfigDirSource::Default => "default (~/.claude)".to_string(),
     };
-    println!("  {}: {}", "config dir".dimmed(),
-        format!("{} ({})", config_dir.display(), source_tag));
+    println!(
+        "  {}: {}",
+        "config dir".dimmed(),
+        format!("{} ({})", config_dir.display(), source_tag)
+    );
     println!("  {}: {}", "file".dimmed(), settings_path.display());
-    println!("  {}: {}", "exists".dimmed(), if exists { "yes" } else { "no" });
+    println!(
+        "  {}: {}",
+        "exists".dimmed(),
+        if exists { "yes" } else { "no" }
+    );
     match cmd {
         None => {
             println!("  {}: {}", "statusLine".dimmed(), "not configured".dimmed());
             // Surface why no receipt appears. The shell wrapper's `ensure`
             // installs on next `claude` launch unless opted out.
             if env_flag("AIKEY_DISABLE_STATUSLINE_ENSURE") {
-                println!("  {} {}",
+                println!(
+                    "  {} {}",
                     "ⓘ".cyan(),
-                    "AIKEY_DISABLE_STATUSLINE_ENSURE=1 — wrapper auto-install is disabled.".dimmed());
+                    "AIKEY_DISABLE_STATUSLINE_ENSURE=1 — wrapper auto-install is disabled."
+                        .dimmed()
+                );
             }
         }
         Some(c) if c.contains("aikey statusline") => {
-            println!("  {}: {}", "statusLine".dimmed(), format!("aikey ({c})").green());
+            println!(
+                "  {}: {}",
+                "statusLine".dimmed(),
+                format!("aikey ({c})").green()
+            );
         }
         Some(c) => {
-            println!("  {}: {}", "statusLine".dimmed(), format!("other ({c})").yellow());
+            println!(
+                "  {}: {}",
+                "statusLine".dimmed(),
+                format!("other ({c})").yellow()
+            );
             // Solution 1 (silent on conflict) means the wrapper won't print
             // anything when this slot is occupied — status is the visibility
             // out. Tell the user why their receipt isn't showing.
-            println!("  {} {}",
+            println!(
+                "  {} {}",
                 "ⓘ".cyan(),
-                "Another tool owns the Claude statusLine — aikey receipt is suppressed.".dimmed());
-            println!("    {} {}",
+                "Another tool owns the Claude statusLine — aikey receipt is suppressed.".dimmed()
+            );
+            println!(
+                "    {} {}",
                 "→".dimmed(),
-                "Run `aikey statusline install --force` to take over (existing value backed up).".dimmed());
+                "Run `aikey statusline install --force` to take over (existing value backed up)."
+                    .dimmed()
+            );
         }
     }
     let backup = statusline_backup_path(&settings_path);
@@ -1342,7 +1538,8 @@ fn print_status_kimi() {
     // resolve_user_home falls back through HOME → USERPROFILE → "." so
     // we never hit the bare "HOME not set" path on Windows.
     let config_path = crate::commands_account::resolve_user_home()
-        .join(".kimi").join("config.toml");
+        .join(".kimi")
+        .join("config.toml");
     println!("  {}: {}", "file".dimmed(), config_path.display());
     println!(
         "  {}: {}",
@@ -1414,8 +1611,10 @@ fn claude_config_dir_with_source() -> (PathBuf, ConfigDirSource) {
             return (PathBuf::from(s), ConfigDirSource::EnvVar);
         }
     }
-    (crate::commands_account::resolve_user_home().join(".claude"),
-     ConfigDirSource::Default)
+    (
+        crate::commands_account::resolve_user_home().join(".claude"),
+        ConfigDirSource::Default,
+    )
 }
 
 /// Backup path: `<dir>/settings.aikey_backup.json`.  The backup is always a
@@ -1423,8 +1622,7 @@ fn claude_config_dir_with_source() -> (PathBuf, ConfigDirSource) {
 /// so `uninstall` can restore arbitrary user-written JSON without needing
 /// to preserve formatting.
 fn statusline_backup_path(settings_path: &Path) -> PathBuf {
-    settings_path
-        .with_file_name("settings.aikey_backup.json")
+    settings_path.with_file_name("settings.aikey_backup.json")
 }
 
 #[derive(Debug)]
@@ -1466,9 +1664,9 @@ fn backup_settings(settings_path: &Path) -> io::Result<()> {
 /// snapshot files — Claude Code may be reading settings.json at any moment
 /// as it renders the status line, so we can't tolerate a half-written file.
 fn write_settings_atomic(settings_path: &Path, value: &serde_json::Value) -> io::Result<()> {
-    let parent = settings_path.parent().ok_or_else(|| io::Error::new(
-        io::ErrorKind::InvalidInput, "settings path has no parent",
-    ))?;
+    let parent = settings_path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "settings path has no parent")
+    })?;
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(".settings.aikey.tmp");
     let pretty = serde_json::to_vec_pretty(value)
@@ -1516,7 +1714,9 @@ fn format_number(n: i64) -> String {
         let digits = &s[sign_len..];
         let bytes = digits.as_bytes();
         let mut out = String::with_capacity(s.len() + digits.len() / 3);
-        if sign_len == 1 { out.push('-'); }
+        if sign_len == 1 {
+            out.push('-');
+        }
         for (i, b) in bytes.iter().enumerate() {
             if i > 0 && (bytes.len() - i) % 3 == 0 {
                 out.push(',');
@@ -1535,12 +1735,22 @@ fn format_number(n: i64) -> String {
 mod tests {
     use super::*;
 
-    fn ev(session_id: &str, model: &str, completion: &str, in_tok: i64, out_tok: i64) -> UsageEvent {
+    fn ev(
+        session_id: &str,
+        model: &str,
+        completion: &str,
+        in_tok: i64,
+        out_tok: i64,
+    ) -> UsageEvent {
         UsageEvent {
             event_id: "e1".into(),
             // 2026-04-17T15:23:45Z in Unix millis = 1776439425000
             event_time: 1776439425000,
-            session_id: if session_id.is_empty() { None } else { Some(session_id.into()) },
+            session_id: if session_id.is_empty() {
+                None
+            } else {
+                Some(session_id.into())
+            },
             key_label: Some("aikeyfounder@gmail.com".into()),
             completion: Some(completion.into()),
             virtual_key_id: "oauth:acct".into(),
@@ -1621,8 +1831,14 @@ mod tests {
         // 2026-05-09 contract: keep the date suffix so the user can
         // tell "real Anthropic (dated)" from "gateway echo (no date)"
         // at a glance. Only strip the redundant `claude-` prefix.
-        assert_eq!(shorten_model("claude-sonnet-4-5-20250929"), "sonnet-4-5-20250929");
-        assert_eq!(shorten_model("claude-opus-4-7-20251015"), "opus-4-7-20251015");
+        assert_eq!(
+            shorten_model("claude-sonnet-4-5-20250929"),
+            "sonnet-4-5-20250929"
+        );
+        assert_eq!(
+            shorten_model("claude-opus-4-7-20251015"),
+            "opus-4-7-20251015"
+        );
         // Aggregator-echoed (no date) — preserved verbatim so the
         // missing suffix is itself a visible authenticity signal.
         assert_eq!(shorten_model("claude-opus-4-7"), "opus-4-7");
@@ -1638,7 +1854,10 @@ mod tests {
     fn shorten_label_collapses_long_email() {
         // Long email: keep prefix chars + … + @domain within budget.
         let out = shorten_label("eFOreadeblakeE96j@muslim.com", 22);
-        assert!(out.ends_with("@muslim.com"), "should preserve domain: {out}");
+        assert!(
+            out.ends_with("@muslim.com"),
+            "should preserve domain: {out}"
+        );
         assert!(out.chars().count() <= 22, "should fit budget: {out}");
         assert!(out.starts_with("eFO"), "should keep local prefix: {out}");
         assert!(out.contains('…'));
@@ -1677,7 +1896,13 @@ mod tests {
 
     #[test]
     fn render_line_appends_refresh_timestamp() {
-        let rendered = strip_ansi(&render_line(&ev("s", "claude-sonnet-4-6", "complete", 10, 5)));
+        let rendered = strip_ansi(&render_line(&ev(
+            "s",
+            "claude-sonnet-4-6",
+            "complete",
+            10,
+            5,
+        )));
         // The default ev() uses 1776439425000 millis (= 2026-04-17T15:23:45Z).
         // Post v1.0.3-alpha, event_time_hm renders in the test machine's
         // **local** timezone, so the exact HH:MM depends on TZ. We assert
@@ -1686,12 +1911,25 @@ mod tests {
         // contract this test was protecting.
         // Extract last 5 chars safely (avoids slicing into multi-byte glyphs
         // like the ❬⦿·⦿❭ brand earlier in the line).
-        let tail: String = rendered.chars().rev().take(5).collect::<Vec<char>>().into_iter().rev().collect();
+        let tail: String = rendered
+            .chars()
+            .rev()
+            .take(5)
+            .collect::<Vec<char>>()
+            .into_iter()
+            .rev()
+            .collect();
         assert_eq!(tail.len(), 5, "render too short: {rendered}");
         let tb = tail.as_bytes();
         assert_eq!(tb[2], b':', "clock tail shape HH:MM: {rendered}");
-        assert!(tb[0].is_ascii_digit() && tb[1].is_ascii_digit(), "clock HH digits: {rendered}");
-        assert!(tb[3].is_ascii_digit() && tb[4].is_ascii_digit(), "clock MM digits: {rendered}");
+        assert!(
+            tb[0].is_ascii_digit() && tb[1].is_ascii_digit(),
+            "clock HH digits: {rendered}"
+        );
+        assert!(
+            tb[3].is_ascii_digit() && tb[4].is_ascii_digit(),
+            "clock MM digits: {rendered}"
+        );
         assert!(!rendered.contains("(:"), "no parens around clock");
         assert!(!rendered.contains(":45"), "seconds should be dropped");
     }
@@ -1706,16 +1944,37 @@ mod tests {
         e.cache_read_input_tokens = Some(53_100);
         e.cache_creation_input_tokens = Some(32);
         let rendered = strip_ansi(&render_line(&e));
-        assert!(rendered.contains("⇡70.1K"), "missing total input: {rendered}");
+        assert!(
+            rendered.contains("⇡70.1K"),
+            "missing total input: {rendered}"
+        );
         assert!(rendered.contains("⇣153"), "missing output: {rendered}");
         // New compact form.
-        assert!(rendered.contains("↺53.1K"), "missing cache-read: {rendered}");
-        assert!(rendered.contains("⊕32"), "missing cache-creation: {rendered}");
+        assert!(
+            rendered.contains("↺53.1K"),
+            "missing cache-read: {rendered}"
+        );
+        assert!(
+            rendered.contains("⊕32"),
+            "missing cache-creation: {rendered}"
+        );
         // Old form must not regress.
-        assert!(!rendered.contains(" hit"), "word 'hit' was dropped: {rendered}");
-        assert!(!rendered.contains(" cache)"), "'cache)' suffix was dropped: {rendered}");
-        assert!(!rendered.contains("(↺"), "leading '(' around cache was dropped: {rendered}");
-        assert!(!rendered.contains("+32 "), "bare '+' was replaced by '⊕': {rendered}");
+        assert!(
+            !rendered.contains(" hit"),
+            "word 'hit' was dropped: {rendered}"
+        );
+        assert!(
+            !rendered.contains(" cache)"),
+            "'cache)' suffix was dropped: {rendered}"
+        );
+        assert!(
+            !rendered.contains("(↺"),
+            "leading '(' around cache was dropped: {rendered}"
+        );
+        assert!(
+            !rendered.contains("+32 "),
+            "bare '+' was replaced by '⊕': {rendered}"
+        );
     }
 
     #[test]
@@ -1723,8 +1982,14 @@ mod tests {
         // Kimi-style event: cache fields absent → cache segment fully
         // omitted (no zero-filled `↺0 ⊕0` noise).
         let rendered = strip_ansi(&render_line(&ev("s", "kimi-k2.5", "complete", 8377, 11)));
-        assert!(!rendered.contains("↺"), "should omit cache segment: {rendered}");
-        assert!(!rendered.contains("⊕"), "should omit cache segment: {rendered}");
+        assert!(
+            !rendered.contains("↺"),
+            "should omit cache segment: {rendered}"
+        );
+        assert!(
+            !rendered.contains("⊕"),
+            "should omit cache segment: {rendered}"
+        );
     }
 
     #[test]
@@ -1742,12 +2007,28 @@ mod tests {
         let complete = strip_ansi(&render_line(&ev("s", "kimi-k2.5", "complete", 42, 9)));
         // Clock is the tail — shape HH:MM, exact value depends on the test
         // machine's local timezone (event_time_hm now renders locally).
-        let tail: String = complete.chars().rev().take(5).collect::<Vec<char>>().into_iter().rev().collect();
+        let tail: String = complete
+            .chars()
+            .rev()
+            .take(5)
+            .collect::<Vec<char>>()
+            .into_iter()
+            .rev()
+            .collect();
         assert!(tail.len() == 5, "render too short: {complete}");
         let tb = tail.as_bytes();
-        assert_eq!(tb[2], b':', "clock must be the true tail (HH:MM): {complete}");
-        assert!(tb[0].is_ascii_digit() && tb[1].is_ascii_digit(), "HH digits: {complete}");
-        assert!(tb[3].is_ascii_digit() && tb[4].is_ascii_digit(), "MM digits: {complete}");
+        assert_eq!(
+            tb[2], b':',
+            "clock must be the true tail (HH:MM): {complete}"
+        );
+        assert!(
+            tb[0].is_ascii_digit() && tb[1].is_ascii_digit(),
+            "HH digits: {complete}"
+        );
+        assert!(
+            tb[3].is_ascii_digit() && tb[4].is_ascii_digit(),
+            "MM digits: {complete}"
+        );
         // Brand appears before the clock and after the last `·` segment.
         // Clock's exact HH:MM depends on local tz (renderer is now local),
         // so we anchor on the "HH:MM\0" shape at the end instead of a fixed
@@ -1770,9 +2051,20 @@ mod tests {
             "partial warning must be at the very front: {partial}"
         );
         // Tail is a HH:MM (local tz) — shape check only.
-        let partial_tail: String = partial.chars().rev().take(5).collect::<Vec<char>>().into_iter().rev().collect();
+        let partial_tail: String = partial
+            .chars()
+            .rev()
+            .take(5)
+            .collect::<Vec<char>>()
+            .into_iter()
+            .rev()
+            .collect();
         assert_eq!(partial_tail.len(), 5);
-        assert_eq!(partial_tail.as_bytes()[2], b':', "clock stays at tail even on partial row: {partial}");
+        assert_eq!(
+            partial_tail.as_bytes()[2],
+            b':',
+            "clock stays at tail even on partial row: {partial}"
+        );
         assert!(
             partial.contains("❬⦿·⦿❭"),
             "brand must still appear between warning and clock: {partial}"
@@ -1782,14 +2074,22 @@ mod tests {
     #[test]
     fn render_line_tokens_come_first() {
         let rendered = render_line(&ev("s", "claude-sonnet-4-5", "complete", 3, 22));
-        let plain: String = rendered.chars().filter(|c| *c >= ' ').collect::<String>()
+        let plain: String = rendered
+            .chars()
+            .filter(|c| *c >= ' ')
+            .collect::<String>()
             .replace("\u{1b}[0m", "")
-            .replace("\u{1b}[36m", "").replace("\u{1b}[2m", "").replace("\u{1b}[1m", "");
+            .replace("\u{1b}[36m", "")
+            .replace("\u{1b}[2m", "")
+            .replace("\u{1b}[1m", "");
         // Strip ANSI crudely by keeping visible sequence; assert structural order.
         let stripped = strip_ansi(&rendered);
         let up_idx = stripped.find("⇡").expect("⇡ present");
         let label_idx = stripped.find("aikey").unwrap_or(stripped.len());
-        assert!(up_idx < label_idx, "tokens should render before label: {stripped}");
+        assert!(
+            up_idx < label_idx,
+            "tokens should render before label: {stripped}"
+        );
         assert!(stripped.contains("⇡3"));
         assert!(stripped.contains("⇣22"));
         let _ = plain; // silence warning about unused pre-stripped copy
@@ -1803,7 +2103,9 @@ mod tests {
             if c == '\u{1b}' {
                 while let Some(&nc) = chars.peek() {
                     chars.next();
-                    if ('@'..='~').contains(&nc) { break; }
+                    if ('@'..='~').contains(&nc) {
+                        break;
+                    }
                 }
             } else {
                 out.push(c);
@@ -1819,13 +2121,38 @@ mod tests {
     #[test]
     fn tuple_gt_orders_file_then_seq() {
         // Different files → lexicographic on file wins, seq ignored.
-        assert!(tuple_gt("wal-2026041817.jsonl", 1, "wal-2026041816.jsonl", 9999));
-        assert!(!tuple_gt("wal-2026041816.jsonl", 9999, "wal-2026041817.jsonl", 1));
+        assert!(tuple_gt(
+            "wal-2026041817.jsonl",
+            1,
+            "wal-2026041816.jsonl",
+            9999
+        ));
+        assert!(!tuple_gt(
+            "wal-2026041816.jsonl",
+            9999,
+            "wal-2026041817.jsonl",
+            1
+        ));
         // Same file → seq decides.
-        assert!(tuple_gt("wal-2026041817.jsonl", 5, "wal-2026041817.jsonl", 4));
-        assert!(!tuple_gt("wal-2026041817.jsonl", 4, "wal-2026041817.jsonl", 5));
+        assert!(tuple_gt(
+            "wal-2026041817.jsonl",
+            5,
+            "wal-2026041817.jsonl",
+            4
+        ));
+        assert!(!tuple_gt(
+            "wal-2026041817.jsonl",
+            4,
+            "wal-2026041817.jsonl",
+            5
+        ));
         // Equal tuple is NOT greater — strict inequality.
-        assert!(!tuple_gt("wal-2026041817.jsonl", 5, "wal-2026041817.jsonl", 5));
+        assert!(!tuple_gt(
+            "wal-2026041817.jsonl",
+            5,
+            "wal-2026041817.jsonl",
+            5
+        ));
         // Minimum tuple ("", 0) compares less than any real file.
         assert!(tuple_gt("wal-2026041817.jsonl", 1, "", 0));
         assert!(!tuple_gt("", 0, "wal-2026041817.jsonl", 1));
@@ -1839,7 +2166,10 @@ mod tests {
         let s = path.to_string_lossy();
         // Ends with the session id and contains /.kimi/sessions/.
         assert!(s.ends_with("/abc-123"), "missing session suffix: {s}");
-        assert!(s.contains("/.kimi/sessions/"), "missing .kimi/sessions: {s}");
+        assert!(
+            s.contains("/.kimi/sessions/"),
+            "missing .kimi/sessions: {s}"
+        );
         // The md5 of "/Users/jake/Projects" must appear as a dir component.
         // md5("/Users/jake/Projects") computed independently.
         use md5::{Digest, Md5};
@@ -1847,7 +2177,10 @@ mod tests {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();
-        assert!(s.contains(&format!("/{expect_hex}/")), "md5 hex missing: {s}");
+        assert!(
+            s.contains(&format!("/{expect_hex}/")),
+            "md5 hex missing: {s}"
+        );
     }
 
     #[test]
@@ -1925,11 +2258,7 @@ mod tests {
         }
 
         // Positive control: a well-formed file still round-trips.
-        std::fs::write(
-            dir.join("sess-good.watermark"),
-            "wal-2026042017.jsonl\t42",
-        )
-        .unwrap();
+        std::fs::write(dir.join("sess-good.watermark"), "wal-2026042017.jsonl\t42").unwrap();
         let (f, s) = read_watermark_in(&dir, "sess-good");
         assert_eq!(f, "wal-2026042017.jsonl");
         assert_eq!(s, 42);
@@ -1954,14 +2283,17 @@ mod tests {
         // SetFileTime) so this assertion runs on Windows too.
         let stale = dir.join("stale.watermark");
         std::fs::write(&stale, "old\t1").unwrap();
-        let ten_days_ago = std::time::SystemTime::now()
-            - std::time::Duration::from_secs(10 * 24 * 3600);
+        let ten_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 3600);
         let ft = filetime::FileTime::from_system_time(ten_days_ago);
         filetime::set_file_times(&stale, ft, ft).unwrap();
 
         gc_stale_watermarks_in(&dir).unwrap();
 
-        assert!(dir.join("fresh.watermark").exists(), "fresh file should survive GC");
+        assert!(
+            dir.join("fresh.watermark").exists(),
+            "fresh file should survive GC"
+        );
         assert!(!stale.exists(), "stale file should be purged by GC");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -2063,8 +2395,7 @@ mod tests {
         assert_eq!(event["payload"]["events_folded"], 3);
 
         // delivery.json has a single shell sink in pending state.
-        let delivery_raw =
-            std::fs::read_to_string(entry.path().join("delivery.json")).unwrap();
+        let delivery_raw = std::fs::read_to_string(entry.path().join("delivery.json")).unwrap();
         let delivery: serde_json::Value = serde_json::from_str(&delivery_raw).unwrap();
         assert_eq!(delivery["sinks"]["shell"]["status"], "pending");
         assert!(delivery["sinks"]["shell"]["claimed_at"].is_null());
@@ -2116,8 +2447,11 @@ mod tests {
     fn claude_config_dir_falls_back_to_home_when_env_unset() {
         with_claude_config_dir(None, || {
             let (dir, source) = claude_config_dir_with_source();
-            assert!(dir.ends_with(".claude"),
-                "fallback should be <home>/.claude: {}", dir.display());
+            assert!(
+                dir.ends_with(".claude"),
+                "fallback should be <home>/.claude: {}",
+                dir.display()
+            );
             assert_eq!(source, ConfigDirSource::Default);
         });
     }
@@ -2133,8 +2467,12 @@ mod tests {
             let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
             std::env::set_var("CLAUDE_CONFIG_DIR", empty);
             let (_dir, source) = claude_config_dir_with_source();
-            assert_eq!(source, ConfigDirSource::Default,
-                "empty env {:?} must fall back to default", empty);
+            assert_eq!(
+                source,
+                ConfigDirSource::Default,
+                "empty env {:?} must fall back to default",
+                empty
+            );
             match prev {
                 Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
                 None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
@@ -2164,10 +2502,10 @@ mod tests {
         let expected_cmd = aikey_statusline_command();
         with_claude_config_dir(Some(tmp.path()), || {
             ensure().expect("ensure must succeed on empty slot");
-            let v: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(&settings).unwrap()
-            ).unwrap();
-            let cmd = v.get("statusLine")
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+            let cmd = v
+                .get("statusLine")
                 .and_then(|sl| sl.get("command"))
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
@@ -2175,8 +2513,10 @@ mod tests {
             // right now (binary path varies between prod/test). Substring
             // check on "aikey statusline" is too literal — the test binary
             // is `aikeylabs_aikey_cli-<hash>`, not `aikey`.
-            assert_eq!(cmd, expected_cmd,
-                "empty slot must be filled with current aikey statusline command");
+            assert_eq!(
+                cmd, expected_cmd,
+                "empty slot must be filled with current aikey statusline command"
+            );
         });
     }
 
@@ -2219,12 +2559,14 @@ mod tests {
         let expected_cmd = aikey_statusline_command();
         with_claude_config_dir(Some(tmp.path()), || {
             ensure().expect("ensure must succeed when file missing");
-            assert!(settings.exists(),
-                "ensure should have created settings.json");
-            let v: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(&settings).unwrap()
-            ).unwrap();
-            let cmd = v.get("statusLine")
+            assert!(
+                settings.exists(),
+                "ensure should have created settings.json"
+            );
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+            let cmd = v
+                .get("statusLine")
                 .and_then(|sl| sl.get("command"))
                 .and_then(|c| c.as_str())
                 .unwrap_or("");
@@ -2242,8 +2584,7 @@ mod tests {
         let ghost = tmp.path().join("never-existed");
         with_claude_config_dir(Some(&ghost), || {
             ensure().expect("ensure must succeed (silent no-op)");
-            assert!(!ghost.exists(),
-                "ensure must not create the config dir");
+            assert!(!ghost.exists(), "ensure must not create the config dir");
         });
     }
 
@@ -2266,8 +2607,7 @@ mod tests {
         let pre = std::fs::read(&settings).unwrap();
         ensure().expect("ensure must succeed when opted out");
         let post = std::fs::read(&settings).unwrap();
-        assert_eq!(pre, post,
-            "opt-out flag must short-circuit the install");
+        assert_eq!(pre, post, "opt-out flag must short-circuit the install");
 
         match prev_dir {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
@@ -2286,9 +2626,12 @@ mod tests {
         write_settings_with(&settings, Some("/Users/jake/.aikey/bin/aikey statusline"));
         with_claude_config_dir(Some(tmp.path()), || {
             let got = injected_claude_settings_path();
-            assert_eq!(got, Some(settings.clone()),
+            assert_eq!(
+                got,
+                Some(settings.clone()),
                 "must report the active config dir's settings.json when aikey \
-                 owns the statusLine");
+                 owns the statusLine"
+            );
         });
     }
 
@@ -2298,8 +2641,11 @@ mod tests {
         let settings = tmp.path().join("settings.json");
         write_settings_with(&settings, Some("/usr/local/bin/starship status"));
         with_claude_config_dir(Some(tmp.path()), || {
-            assert_eq!(injected_claude_settings_path(), None,
-                "third-party statusLine must not count as injected by aikey");
+            assert_eq!(
+                injected_claude_settings_path(),
+                None,
+                "third-party statusLine must not count as injected by aikey"
+            );
         });
     }
 
@@ -2331,7 +2677,8 @@ mod tests {
         f: F,
     ) {
         let _lock = crate::test_env_lock::ENV_MUTATION_LOCK
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev_home = std::env::var_os("HOME");
         let prev_ccd = std::env::var_os("CLAUDE_CONFIG_DIR");
         std::env::set_var("HOME", home);
@@ -2359,9 +2706,7 @@ mod tests {
         with_home_and_claude_dir(tmp.path(), &claude_dir, || {
             // Active set has kimi only — no anthropic. The shared chain
             // must uninstall the aikey statusLine.
-            crate::commands_account::apply_third_party_cli_configs(
-                &["kimi".to_string()], 27200,
-            );
+            crate::commands_account::apply_third_party_cli_configs(&["kimi".to_string()], 27200);
         });
 
         // Settings.json may have been removed entirely (if it was otherwise
@@ -2371,10 +2716,13 @@ mod tests {
         match std::fs::read_to_string(&settings) {
             Err(_) => {} // file removed — clean exit
             Ok(content) => {
-                let parsed: serde_json::Value = serde_json::from_str(&content)
-                    .expect("settings.json must be valid JSON");
-                assert!(parsed.get("statusLine").is_none(),
-                    "statusLine key must be removed: {}", content);
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&content).expect("settings.json must be valid JSON");
+                assert!(
+                    parsed.get("statusLine").is_none(),
+                    "statusLine key must be removed: {}",
+                    content
+                );
             }
         }
     }
@@ -2390,7 +2738,8 @@ mod tests {
 
         with_home_and_claude_dir(tmp.path(), &claude_dir, || {
             crate::commands_account::apply_third_party_cli_configs(
-                &["anthropic".to_string()], 27200,
+                &["anthropic".to_string()],
+                27200,
             );
         });
 
@@ -2398,16 +2747,20 @@ mod tests {
         // substring "aikey statusline" does NOT appear contiguously in test
         // builds. Parse JSON and assert on the structural invariant: the
         // statusLine.command was written and ends with the subcommand name.
-        let content = std::fs::read_to_string(&settings)
-            .expect("settings.json must exist after install");
-        let parsed: serde_json::Value = serde_json::from_str(&content)
-            .expect("settings.json must be valid JSON after install");
-        let cmd = parsed.get("statusLine")
+        let content =
+            std::fs::read_to_string(&settings).expect("settings.json must exist after install");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("settings.json must be valid JSON after install");
+        let cmd = parsed
+            .get("statusLine")
             .and_then(|sl| sl.get("command"))
             .and_then(|c| c.as_str())
             .expect("statusLine.command must exist after anthropic activation");
-        assert!(cmd.ends_with(" statusline"),
-            "statusLine.command must end with ' statusline' subcommand: {}", cmd);
+        assert!(
+            cmd.ends_with(" statusline"),
+            "statusLine.command must end with ' statusline' subcommand: {}",
+            cmd
+        );
     }
 
     #[test]
@@ -2424,21 +2777,29 @@ mod tests {
 
         with_home_and_claude_dir(tmp.path(), &claude_dir, || {
             crate::commands_account::apply_third_party_cli_configs(
-                &["anthropic".to_string()], 27200,
+                &["anthropic".to_string()],
+                27200,
             );
         });
 
         let content = std::fs::read_to_string(&settings).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&content)
-            .expect("settings.json must remain valid JSON");
-        let cmd = parsed.get("statusLine")
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("settings.json must remain valid JSON");
+        let cmd = parsed
+            .get("statusLine")
             .and_then(|sl| sl.get("command"))
             .and_then(|c| c.as_str())
             .expect("starship statusLine must still be present");
-        assert!(cmd.contains("starship"),
-            "third-party statusLine must be preserved verbatim: {}", cmd);
-        assert!(!cmd.ends_with(" statusline"),
-            "must not overwrite third-party statusLine with aikey: {}", cmd);
+        assert!(
+            cmd.contains("starship"),
+            "third-party statusLine must be preserved verbatim: {}",
+            cmd
+        );
+        assert!(
+            !cmd.ends_with(" statusline"),
+            "must not overwrite third-party statusLine with aikey: {}",
+            cmd
+        );
     }
 
     #[test]
@@ -2447,21 +2808,31 @@ mod tests {
         // `permissions`), ensure must merge — not overwrite.
         let tmp = tempfile::TempDir::new().unwrap();
         let settings = tmp.path().join("settings.json");
-        std::fs::write(&settings, serde_json::to_vec_pretty(&serde_json::json!({
-            "theme": "dark",
-            "permissions": { "allow": ["Bash(ls)"] }
-        })).unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "theme": "dark",
+                "permissions": { "allow": ["Bash(ls)"] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let expected_cmd = aikey_statusline_command();
         with_claude_config_dir(Some(tmp.path()), || {
             ensure().expect("ensure must succeed and merge");
-            let v: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(&settings).unwrap()
-            ).unwrap();
-            assert_eq!(v.get("theme").and_then(|t| t.as_str()), Some("dark"),
-                "ensure must preserve user's theme");
-            assert!(v.get("permissions").is_some(),
-                "ensure must preserve user's permissions");
-            let cmd = v.get("statusLine")
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+            assert_eq!(
+                v.get("theme").and_then(|t| t.as_str()),
+                Some("dark"),
+                "ensure must preserve user's theme"
+            );
+            assert!(
+                v.get("permissions").is_some(),
+                "ensure must preserve user's permissions"
+            );
+            let cmd = v
+                .get("statusLine")
                 .and_then(|sl| sl.get("command"))
                 .and_then(|c| c.as_str())
                 .unwrap_or("");

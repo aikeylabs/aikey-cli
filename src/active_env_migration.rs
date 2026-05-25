@@ -102,7 +102,8 @@ pub fn backup_active_env() -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
 
-    let parent = current.parent()
+    let parent = current
+        .parent()
         .ok_or_else(|| "active.env path has no parent dir".to_string())?;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -110,9 +111,14 @@ pub fn backup_active_env() -> Result<Option<PathBuf>, String> {
         .unwrap_or(0);
     let backup_path = parent.join(format!("active.env.bak.{}", ts));
 
-    std::fs::copy(&current, &backup_path)
-        .map_err(|e| format!("backup copy failed ({} → {}): {}",
-                             current.display(), backup_path.display(), e))?;
+    std::fs::copy(&current, &backup_path).map_err(|e| {
+        format!(
+            "backup copy failed ({} → {}): {}",
+            current.display(),
+            backup_path.display(),
+            e
+        )
+    })?;
 
     // Best-effort prune: keep latest 3 backups. Failure here is non-fatal
     // (we already backed up the current file successfully).
@@ -172,14 +178,13 @@ pub fn refresh_active_env(if_legacy: bool) -> Result<RefreshOutcome, String> {
     // those environments and silently skip the active.env rewrite, leaving
     // legacy `aikey_vk_*` / `aikey_personal_<alias>` tokens in the file.
     // Closes 2026-04-29 third-party review #4 finding [中].
-    let vault_path = crate::storage::get_vault_path()
-        .map_err(|e| format!("resolve vault path: {}", e))?;
+    let vault_path =
+        crate::storage::get_vault_path().map_err(|e| format!("resolve vault path: {}", e))?;
     if !vault_path.exists() {
         return Ok(RefreshOutcome::NoBindingsToFollow);
     }
 
-    let backup = backup_active_env()
-        .map_err(|e| format!("backup before refresh failed: {}", e))?;
+    let backup = backup_active_env().map_err(|e| format!("backup before refresh failed: {}", e))?;
 
     crate::profile_activation::refresh_implicit_profile_activation()
         .map_err(|e| format!("profile activation refresh failed: {}", e))?;
@@ -223,7 +228,8 @@ export AIKEY_ACTIVE_KEYS="anthropic=my-team-key"
     #[test]
     fn detects_legacy_personal_short_hex_form() {
         // Old form variant: 32-hex (early v1.0.4 random tokens)
-        let env = r#"export ANTHROPIC_AUTH_TOKEN="aikey_personal_0123456789abcdef0123456789abcdef""#;
+        let env =
+            r#"export ANTHROPIC_AUTH_TOKEN="aikey_personal_0123456789abcdef0123456789abcdef""#;
         assert!(contents_have_legacy_form(env));
     }
 
@@ -233,27 +239,37 @@ export AIKEY_ACTIVE_KEYS="anthropic=my-team-key"
 export ANTHROPIC_AUTH_TOKEN="aikey_active_anthropic"
 export OPENAI_API_KEY="aikey_active_openai"
 "#;
-        assert!(!contents_have_legacy_form(env), "new active sentinel must NOT trigger migration");
+        assert!(
+            !contents_have_legacy_form(env),
+            "new active sentinel must NOT trigger migration"
+        );
     }
 
     #[test]
     fn passes_new_personal_bearer_strict_form() {
         // Should NOT trigger — this IS the legitimate new bearer form.
         let env = r#"export ANTHROPIC_AUTH_TOKEN="aikey_personal_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef""#;
-        assert!(!contents_have_legacy_form(env),
-            "strict aikey_personal_<64-hex> bearer is legitimate, not legacy");
+        assert!(
+            !contents_have_legacy_form(env),
+            "strict aikey_personal_<64-hex> bearer is legitimate, not legacy"
+        );
     }
 
     #[test]
     fn passes_new_team_token() {
         let env = r#"export ANTHROPIC_AUTH_TOKEN="aikey_team_acc-1234abc""#;
-        assert!(!contents_have_legacy_form(env), "aikey_team_<vk_id> is current form");
+        assert!(
+            !contents_have_legacy_form(env),
+            "aikey_team_<vk_id> is current form"
+        );
     }
 
     #[test]
     fn passes_empty_or_unset_active_env() {
         assert!(!contents_have_legacy_form(""));
-        assert!(!contents_have_legacy_form("# aikey active key — auto-generated\n"));
+        assert!(!contents_have_legacy_form(
+            "# aikey active key — auto-generated\n"
+        ));
     }
 
     #[test]
@@ -261,18 +277,22 @@ export OPENAI_API_KEY="aikey_active_openai"
         // Uppercase hex isn't strict form — proxy's isTier1Personal would
         // 401 it. Treat as legacy to force regeneration in lowercase.
         let env = r#"export ANTHROPIC_AUTH_TOKEN="aikey_personal_ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789""#;
-        assert!(contents_have_legacy_form(env),
-            "uppercase hex is not strict form; should trigger regeneration");
+        assert!(
+            contents_have_legacy_form(env),
+            "uppercase hex is not strict form; should trigger regeneration"
+        );
     }
 
     #[test]
     fn is_strict_suffix_only_lowercase_hex() {
         assert!(is_strict_personal_bearer_suffix(&"0".repeat(64)));
-        assert!(is_strict_personal_bearer_suffix(&"abcdef0123456789".repeat(4)));
-        assert!(!is_strict_personal_bearer_suffix(&"0".repeat(63)));  // too short
-        assert!(!is_strict_personal_bearer_suffix(&"0".repeat(65)));  // too long
-        assert!(!is_strict_personal_bearer_suffix(&"A".repeat(64)));  // uppercase
-        assert!(!is_strict_personal_bearer_suffix(&"g".repeat(64)));  // non-hex
+        assert!(is_strict_personal_bearer_suffix(
+            &"abcdef0123456789".repeat(4)
+        ));
+        assert!(!is_strict_personal_bearer_suffix(&"0".repeat(63))); // too short
+        assert!(!is_strict_personal_bearer_suffix(&"0".repeat(65))); // too long
+        assert!(!is_strict_personal_bearer_suffix(&"A".repeat(64))); // uppercase
+        assert!(!is_strict_personal_bearer_suffix(&"g".repeat(64))); // non-hex
         assert!(!is_strict_personal_bearer_suffix("alias-with-hyphens"));
         assert!(!is_strict_personal_bearer_suffix(""));
     }

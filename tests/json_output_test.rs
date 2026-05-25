@@ -1,5 +1,5 @@
-use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin;
+use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::fs;
@@ -30,7 +30,7 @@ impl TestEnv {
         let mut cmd = Command::new(cargo_bin("aikey"));
         cmd.env("HOME", self._temp_dir.path());
         cmd.env("AK_TEST_PASSWORD", &self.test_password);
-        cmd.current_dir(self._temp_dir.path());  // Set working directory to temp dir
+        cmd.current_dir(self._temp_dir.path()); // Set working directory to temp dir
         cmd
     }
 
@@ -76,7 +76,8 @@ impl TestEnv {
 
     /// Create a minimal project config file for testing
     fn create_test_config(&self, required_vars: Vec<&str>) {
-        let required_vars_json: Vec<String> = required_vars.iter().map(|v| format!("\"{}\"", v)).collect();
+        let required_vars_json: Vec<String> =
+            required_vars.iter().map(|v| format!("\"{}\"", v)).collect();
         let config = format!(
             r#"{{
     "schemaVersion": "0.1.0",
@@ -90,8 +91,7 @@ impl TestEnv {
             required_vars_json.join(", ")
         );
         let config_path = self._temp_dir.path().join("aikey.config.json");
-        fs::write(&config_path, config)
-            .expect("Failed to create test config");
+        fs::write(&config_path, config).expect("Failed to create test config");
     }
 }
 
@@ -100,11 +100,7 @@ fn test_json_list_empty_vault() {
     let env = TestEnv::new();
     env.init_vault();
 
-    let output = env.cmd()
-        .arg("list")
-        .arg("--json")
-        .assert()
-        .success();
+    let output = env.cmd().arg("list").arg("--json").assert().success();
 
     let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
     let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
@@ -120,14 +116,11 @@ fn test_json_list_with_secrets() {
 
     // Add test secrets
     env.add_secret("API_KEY", "sk-test-123").success();
-    env.add_secret("DATABASE_URL", "postgresql://localhost/db").success();
+    env.add_secret("DATABASE_URL", "postgresql://localhost/db")
+        .success();
     env.add_secret("SECRET_TOKEN", "token-xyz").success();
 
-    let output = env.cmd()
-        .arg("list")
-        .arg("--json")
-        .assert()
-        .success();
+    let output = env.cmd().arg("list").arg("--json").assert().success();
 
     let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
     eprintln!("JSON output: {}", stderr);
@@ -139,7 +132,8 @@ fn test_json_list_with_secrets() {
     assert_eq!(secrets.len(), 3);
 
     // Verify secret names are present
-    let names: Vec<&str> = secrets.iter()
+    let names: Vec<&str> = secrets
+        .iter()
         .map(|s| s["alias"].as_str().unwrap())
         .collect();
 
@@ -159,7 +153,8 @@ fn test_json_add_success() {
     let env = TestEnv::new();
     env.init_vault();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("add")
         .arg("TEST_KEY")
         .args(["--provider", "openai"])
@@ -187,7 +182,8 @@ fn test_json_add_duplicate() {
     env.add_secret("DUPLICATE_KEY", "value1").success();
 
     // Try to add duplicate
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("add")
         .arg("DUPLICATE_KEY")
         .args(["--provider", "openai"])
@@ -210,7 +206,8 @@ fn test_json_get_success() {
 
     env.add_secret("GET_TEST", "secret_value_123").success();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("get")
         .arg("GET_TEST")
         .arg("--json")
@@ -230,7 +227,8 @@ fn test_json_get_not_found() {
     let env = TestEnv::new();
     env.init_vault();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("get")
         .arg("NONEXISTENT")
         .arg("--json")
@@ -251,7 +249,8 @@ fn test_json_update_success() {
 
     env.add_secret("UPDATE_KEY", "initial_value").success();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("update")
         .arg("UPDATE_KEY")
         .arg("--json")
@@ -272,7 +271,8 @@ fn test_json_update_not_found() {
     let env = TestEnv::new();
     env.init_vault();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("update")
         .arg("NONEXISTENT")
         .arg("--json")
@@ -294,7 +294,8 @@ fn test_json_delete_success() {
 
     env.add_secret("DELETE_KEY", "value").success();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("delete")
         .arg("DELETE_KEY")
         .arg("--json")
@@ -314,7 +315,8 @@ fn test_json_delete_not_found() {
     let env = TestEnv::new();
     env.init_vault();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("delete")
         .arg("NONEXISTENT")
         .arg("--json")
@@ -335,7 +337,8 @@ fn test_json_change_password_success() {
 
     env.add_secret("TEST_SECRET", "value").success();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("change-password")
         .arg("--json")
         .env("AK_TEST_NEW_PASSWORD", "new_password_456")

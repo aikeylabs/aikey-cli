@@ -61,24 +61,60 @@ impl EventBuilder {
         }
     }
 
-    pub fn provider(mut self, p: &str) -> Self { self.provider = Some(p.to_string()); self }
+    pub fn provider(mut self, p: &str) -> Self {
+        self.provider = Some(p.to_string());
+        self
+    }
     #[allow(dead_code)]
-    pub fn alias(mut self, a: &str) -> Self { self.alias = Some(a.to_string()); self }
-    pub fn command(mut self, c: &str) -> Self { self.command = Some(c.to_string()); self }
-    pub fn exit_code(mut self, code: i32) -> Self { self.exit_code = Some(code); self }
-    pub fn duration_ms(mut self, ms: i64) -> Self { self.duration_ms = Some(ms); self }
-    pub fn secrets_count(mut self, n: i32) -> Self { self.secrets_count = Some(n); self }
+    pub fn alias(mut self, a: &str) -> Self {
+        self.alias = Some(a.to_string());
+        self
+    }
+    pub fn command(mut self, c: &str) -> Self {
+        self.command = Some(c.to_string());
+        self
+    }
+    pub fn exit_code(mut self, code: i32) -> Self {
+        self.exit_code = Some(code);
+        self
+    }
+    pub fn duration_ms(mut self, ms: i64) -> Self {
+        self.duration_ms = Some(ms);
+        self
+    }
+    pub fn secrets_count(mut self, n: i32) -> Self {
+        self.secrets_count = Some(n);
+        self
+    }
     #[allow(dead_code)]
-    pub fn error(mut self, e: &str) -> Self { self.error = Some(e.to_string()); self }
+    pub fn error(mut self, e: &str) -> Self {
+        self.error = Some(e.to_string());
+        self
+    }
     #[allow(dead_code)]
-    pub fn project(mut self, p: &str) -> Self { self.project = Some(p.to_string()); self }
+    pub fn project(mut self, p: &str) -> Self {
+        self.project = Some(p.to_string());
+        self
+    }
     #[allow(dead_code)]
-    pub fn env(mut self, e: &str) -> Self { self.env = Some(e.to_string()); self }
+    pub fn env(mut self, e: &str) -> Self {
+        self.env = Some(e.to_string());
+        self
+    }
     #[allow(dead_code)]
-    pub fn profile(mut self, p: &str) -> Self { self.profile = Some(p.to_string()); self }
-    pub fn ok(mut self, v: bool) -> Self { self.ok = v; self }
+    pub fn profile(mut self, p: &str) -> Self {
+        self.profile = Some(p.to_string());
+        self
+    }
+    pub fn ok(mut self, v: bool) -> Self {
+        self.ok = v;
+        self
+    }
     #[allow(dead_code)]
-    pub fn error_type(mut self, t: &str) -> Self { self.error_type = Some(t.to_string()); self }
+    pub fn error_type(mut self, t: &str) -> Self {
+        self.error_type = Some(t.to_string());
+        self
+    }
 
     pub fn record(self) -> Result<(), String> {
         let timestamp = std::time::SystemTime::now()

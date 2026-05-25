@@ -34,9 +34,9 @@ use serde_json::{json, Value};
 
 use crate::commands_app;
 
+use super::protocol::ResultEnvelope;
 use super::protocol::StdinEnvelope;
 use super::stdin_json::{emit, emit_error};
-use super::protocol::ResultEnvelope;
 
 // ---------------------------------------------------------------------------
 // Dispatch
@@ -237,13 +237,14 @@ fn handle_route(env: StdinEnvelope) {
         return;
     }
 
-    if let Err(e) = commands_app::set_app_binding(
-        &p.slug,
-        &p.upstream,
-        &p.key_source_type,
-        &p.key_source_ref,
-    ) {
-        emit_error(req_id, "I_APP_ROUTE_FAILED", format!("set_app_binding: {}", e));
+    if let Err(e) =
+        commands_app::set_app_binding(&p.slug, &p.upstream, &p.key_source_type, &p.key_source_ref)
+    {
+        emit_error(
+            req_id,
+            "I_APP_ROUTE_FAILED",
+            format!("set_app_binding: {}", e),
+        );
         return;
     }
     emit(&ResultEnvelope::ok(
@@ -487,12 +488,22 @@ mod tests {
         // Mirrors the match in handle_route's key_source_type guard.
         // If from_db_str's accepted list ever changes, this test catches
         // the drift on the _internal layer side too.
-        let valid = ["personal", "personal_api_key", "team", "managed_virtual_key", "personal_oauth_account"];
+        let valid = [
+            "personal",
+            "personal_api_key",
+            "team",
+            "managed_virtual_key",
+            "personal_oauth_account",
+        ];
         for v in valid {
             assert!(
                 matches!(
                     v,
-                    "personal" | "personal_api_key" | "team" | "managed_virtual_key" | "personal_oauth_account"
+                    "personal"
+                        | "personal_api_key"
+                        | "team"
+                        | "managed_virtual_key"
+                        | "personal_oauth_account"
                 ),
                 "expected key_source_type {:?} to be accepted",
                 v
@@ -502,12 +513,23 @@ mod tests {
 
     #[test]
     fn key_source_type_validator_rejects_garbage() {
-        let invalid = ["", "PERSONAL", "team_managed", "unknown_type", "personal_oauth", " personal "];
+        let invalid = [
+            "",
+            "PERSONAL",
+            "team_managed",
+            "unknown_type",
+            "personal_oauth",
+            " personal ",
+        ];
         for v in invalid {
             assert!(
                 !matches!(
                     v,
-                    "personal" | "personal_api_key" | "team" | "managed_virtual_key" | "personal_oauth_account"
+                    "personal"
+                        | "personal_api_key"
+                        | "team"
+                        | "managed_virtual_key"
+                        | "personal_oauth_account"
                 ),
                 "expected key_source_type {:?} to be rejected, but it matched",
                 v

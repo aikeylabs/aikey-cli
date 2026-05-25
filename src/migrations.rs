@@ -442,8 +442,14 @@ pub mod v1_0_0_baseline {
             // closes the gap; storage.rs cascade still has the literal
             // fallbacks as belt-and-braces for any vault we can't reach
             // through a write conn.
-            ("last_used_at", "ALTER TABLE entries ADD COLUMN last_used_at INTEGER"),
-            ("use_count", "ALTER TABLE entries ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0"),
+            (
+                "last_used_at",
+                "ALTER TABLE entries ADD COLUMN last_used_at INTEGER",
+            ),
+            (
+                "use_count",
+                "ALTER TABLE entries ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0",
+            ),
             // 2026-05-22: see managed_virtual_keys_cache.extra above for the
             // generic-extension-blob rationale; same shape and same
             // json_set() write contract apply here.
@@ -592,7 +598,10 @@ pub mod v1_0_0_baseline {
                 "ok",
                 "ALTER TABLE events ADD COLUMN ok INTEGER NOT NULL DEFAULT 0",
             ),
-            ("error_type", "ALTER TABLE events ADD COLUMN error_type TEXT"),
+            (
+                "error_type",
+                "ALTER TABLE events ADD COLUMN error_type TEXT",
+            ),
         ] {
             ensure_column(conn, "events", col, ddl)?;
         }
@@ -812,7 +821,7 @@ pub mod v1_0_0_baseline {
                 "AiKey Labs",
                 r#"["anthropic"]"#, // JSON array, matches register/list code
                 "first-party",
-                1_i64,              // follow_user_active = true
+                1_i64, // follow_user_active = true
             ],
         )
         .map_err(|e| format!("ensure first-party app_record: {}", e))?;
@@ -1619,13 +1628,19 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(follow, 0, "personal active → must flip to B mode (follow=0)");
+        assert_eq!(
+            follow, 0,
+            "personal active → must flip to B mode (follow=0)"
+        );
         assert_eq!(
             bound.as_deref(),
             Some("my-personal-key"),
             "bound_alias must be the personal alias verbatim"
         );
-        assert!(bound_at.is_some(), "bound_at must be set when transitioning to B mode");
+        assert!(
+            bound_at.is_some(),
+            "bound_at must be set when transitioning to B mode"
+        );
     }
 
     /// OAuth-active case: active_key_ref is the provider_account_id, not the
@@ -1740,7 +1755,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(follow, 1, "team active → stay in A mode (follow=1)");
-        assert!(bound.is_none(), "team active → bound_alias must remain NULL");
+        assert!(
+            bound.is_none(),
+            "team active → bound_alias must remain NULL"
+        );
     }
 
     /// Mode A trial 2026-05-23: enforce_mode_a_for_degrade_detector
@@ -1784,7 +1802,10 @@ mod tests {
             .unwrap();
         assert_eq!(follow, 1, "Mode A trial: follow_user_active must remain 1");
         assert!(bound.is_none(), "Mode A trial: bound_alias must be NULL so proxy resolver falls through to default profile");
-        assert!(bound_at.is_none(), "Mode A trial: bound_at must be cleared when bound_alias is cleared");
+        assert!(
+            bound_at.is_none(),
+            "Mode A trial: bound_at must be cleared when bound_alias is cleared"
+        );
     }
 
     /// Idempotence: once a row is in B mode, subsequent upgrade_all runs
@@ -1843,8 +1864,8 @@ mod tests {
     fn degrade_detector_default_subscribes_to_user_chat() {
         let conn = fresh_vault();
 
-        let (streams, consent_at, consent_email): (Option<String>, Option<i64>, Option<String>) = conn
-            .query_row(
+        let (streams, consent_at, consent_email): (Option<String>, Option<i64>, Option<String>) =
+            conn.query_row(
                 "SELECT observe_streams, observe_consent_at, observe_consent_email
                    FROM app_records WHERE slug='degrade-detector'",
                 [],
@@ -1856,8 +1877,14 @@ mod tests {
             Some(r#"["user_chat"]"#),
             "first-party self-heal must default-subscribe to user_chat (metadata-level)"
         );
-        assert!(consent_at.is_none(), "metadata-only subscription must not require consent");
-        assert!(consent_email.is_none(), "metadata-only subscription must not require consent");
+        assert!(
+            consent_at.is_none(),
+            "metadata-only subscription must not require consent"
+        );
+        assert!(
+            consent_email.is_none(),
+            "metadata-only subscription must not require consent"
+        );
     }
 
     /// Stickiness: if the user customises observe_streams (e.g. adds the
@@ -1904,9 +1931,18 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert!(stages.is_none(), "filter_stages must default NULL — degrade-detector is NOT a filter app");
-        assert!(priority.is_none(), "filter_priority must default NULL when filter_stages is NULL");
-        assert!(timeout.is_none(), "filter_timeout_policy must default NULL when filter_stages is NULL");
+        assert!(
+            stages.is_none(),
+            "filter_stages must default NULL — degrade-detector is NOT a filter app"
+        );
+        assert!(
+            priority.is_none(),
+            "filter_priority must default NULL when filter_stages is NULL"
+        );
+        assert!(
+            timeout.is_none(),
+            "filter_timeout_policy must default NULL when filter_stages is NULL"
+        );
     }
 
     /// ON DELETE CASCADE: deleting an app_records row must cascade-delete
@@ -1934,12 +1970,20 @@ mod tests {
 
         conn.execute(
             "INSERT INTO app_keys (key_id, app_slug, route_token) VALUES (?1, ?2, ?3)",
-            params!["key-uuid-1", "test-agent", "aikey_app_aaaa0000111122223333444455556666777788889999aaaabbbbccccddddeeee"],
+            params![
+                "key-uuid-1",
+                "test-agent",
+                "aikey_app_aaaa0000111122223333444455556666777788889999aaaabbbbccccddddeeee"
+            ],
         )
         .expect("insert app_keys");
 
         let pre: i64 = conn
-            .query_row("SELECT COUNT(*) FROM app_keys WHERE app_slug='test-agent'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM app_keys WHERE app_slug='test-agent'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(pre, 1, "precondition: 1 app_key row inserted");
 
@@ -1951,7 +1995,11 @@ mod tests {
             .expect("delete app_records");
 
         let post: i64 = conn
-            .query_row("SELECT COUNT(*) FROM app_keys WHERE app_slug='test-agent'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM app_keys WHERE app_slug='test-agent'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(
             post, 0,
@@ -1972,14 +2020,20 @@ mod tests {
             "INSERT INTO app_records (slug, name, upstreams, app_kind) VALUES ('x', 'X', '[]', 'admin')",
             [],
         );
-        assert!(bad_kind.is_err(), "app_kind='admin' must be rejected by CHECK");
+        assert!(
+            bad_kind.is_err(),
+            "app_kind='admin' must be rejected by CHECK"
+        );
 
         // follow_user_active must be 0 or 1.
         let bad_follow = conn.execute(
             "INSERT INTO app_records (slug, name, upstreams, follow_user_active) VALUES ('y', 'Y', '[]', 2)",
             [],
         );
-        assert!(bad_follow.is_err(), "follow_user_active=2 must be rejected by CHECK");
+        assert!(
+            bad_follow.is_err(),
+            "follow_user_active=2 must be rejected by CHECK"
+        );
 
         // status must be in {'active', 'paused', 'revoked'}.
         conn.execute(
@@ -1991,7 +2045,10 @@ mod tests {
             "INSERT INTO app_keys (key_id, app_slug, route_token, status) VALUES ('k1', 'z', 'aikey_app_xx', 'deleted')",
             [],
         );
-        assert!(bad_status.is_err(), "status='deleted' must be rejected by CHECK");
+        assert!(
+            bad_status.is_err(),
+            "status='deleted' must be rejected by CHECK"
+        );
 
         // route_token UNIQUE: two app_keys cannot share the same route_token.
         conn.execute(
@@ -2003,6 +2060,9 @@ mod tests {
             "INSERT INTO app_keys (key_id, app_slug, route_token) VALUES ('k2', 'z', 'aikey_app_unique')",
             [],
         );
-        assert!(dup_token.is_err(), "duplicate route_token must be rejected by UNIQUE constraint");
+        assert!(
+            dup_token.is_err(),
+            "duplicate route_token must be rejected by UNIQUE constraint"
+        );
     }
 }

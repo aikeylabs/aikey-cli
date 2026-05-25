@@ -17,9 +17,8 @@
 use crate::storage;
 
 use super::{
+    oauth_target, personal_target, personal_target_direct, provider_defaults, team_target,
     BuildTargetError, TestTarget,
-    personal_target, personal_target_direct, team_target, oauth_target,
-    provider_defaults,
 };
 
 /// Build a TestTarget for a single provider binding.
@@ -40,9 +39,9 @@ pub fn target_from_binding(
     use crate::credential_type::CredentialType;
 
     let label_suffix = match binding.key_source_type {
-        CredentialType::PersonalApiKey        => "",
-        CredentialType::ManagedVirtualKey     => " (team)",
-        CredentialType::PersonalOAuthAccount  => " (oauth)",
+        CredentialType::PersonalApiKey => "",
+        CredentialType::ManagedVirtualKey => " (team)",
+        CredentialType::PersonalOAuthAccount => " (oauth)",
     };
     let row_label = format!("{}{}", binding.provider_code, label_suffix);
 
@@ -81,7 +80,11 @@ pub fn target_from_binding(
                     });
                 }
             }
-            Ok(team_target(&binding.key_source_ref, &binding.provider_code, proxy_port))
+            Ok(team_target(
+                &binding.key_source_ref,
+                &binding.provider_code,
+                proxy_port,
+            ))
         }
 
         // ── OAuth account: route through the local proxy. ──────────────────
@@ -92,7 +95,8 @@ pub fn target_from_binding(
             // Surface OAuth accounts in reauth/subscription_required early.
             // The probe would fail anyway; this tells the user *what to fix*.
             if let Ok(accounts) = storage::list_provider_accounts_readonly() {
-                if let Some(acct) = accounts.iter()
+                if let Some(acct) = accounts
+                    .iter()
                     .find(|a| a.provider_account_id == binding.key_source_ref)
                 {
                     if !matches!(acct.status.as_str(), "active" | "idle") {
@@ -110,7 +114,11 @@ pub fn target_from_binding(
             // Bindings store canonical provider_code already, so the factory's
             // broker-to-canonical normalization is idempotent here — kept in
             // the call path for uniformity (one construction chokepoint).
-            Ok(oauth_target(&binding.key_source_ref, &binding.provider_code, proxy_port))
+            Ok(oauth_target(
+                &binding.key_source_ref,
+                &binding.provider_code,
+                proxy_port,
+            ))
         }
     }
 }
@@ -128,10 +136,10 @@ pub fn targets_from_active_bindings(
         .unwrap_or_default();
 
     let mut targets = Vec::with_capacity(bindings.len());
-    let mut errors  = Vec::new();
+    let mut errors = Vec::new();
     for b in &bindings {
         match target_from_binding(b, None, proxy_port) {
-            Ok(t)  => targets.push(t),
+            Ok(t) => targets.push(t),
             Err(e) => errors.push(e),
         }
     }
@@ -178,31 +186,49 @@ pub fn targets_from_alias(
             vec![p.to_lowercase()]
         } else if let Some(ref m) = meta {
             if let Some(ref sp) = m.supported_providers {
-                if !sp.is_empty() { sp.clone() }
-                else if let Some(ref code) = m.provider_code { vec![code.clone()] }
-                else {
+                if !sp.is_empty() {
+                    sp.clone()
+                } else if let Some(ref code) = m.provider_code {
+                    vec![code.clone()]
+                } else {
                     // Unknown provider + no explicit list: fall back to the
                     // well-known set so the user can see which upstreams the
                     // key reaches.
-                    provider_defaults().iter().map(|(c, _)| c.to_string()).collect()
+                    provider_defaults()
+                        .iter()
+                        .map(|(c, _)| c.to_string())
+                        .collect()
                 }
             } else if let Some(ref code) = m.provider_code {
                 vec![code.clone()]
             } else {
-                provider_defaults().iter().map(|(c, _)| c.to_string()).collect()
+                provider_defaults()
+                    .iter()
+                    .map(|(c, _)| c.to_string())
+                    .collect()
             }
         } else {
-            provider_defaults().iter().map(|(c, _)| c.to_string()).collect()
+            provider_defaults()
+                .iter()
+                .map(|(c, _)| c.to_string())
+                .collect()
         };
 
-        return providers.into_iter().map(|code| {
-            personal_target(alias, &code, proxy_port)
-        }).collect();
+        return providers
+            .into_iter()
+            .map(|code| personal_target(alias, &code, proxy_port))
+            .collect();
     }
 
     // ── 2. Team virtual key (by ID, local_alias, or server alias). ───────
-    let team_entry = storage::get_virtual_key_cache(alias).ok().flatten()
-        .or_else(|| storage::get_virtual_key_cache_by_alias(alias).ok().flatten());
+    let team_entry = storage::get_virtual_key_cache(alias)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            storage::get_virtual_key_cache_by_alias(alias)
+                .ok()
+                .flatten()
+        });
     if let Some(vk) = team_entry {
         if !crate::commands_proxy::proxy_is_running_managed() {
             return Vec::new();
@@ -224,10 +250,12 @@ pub fn targets_from_alias(
     if let Ok(accounts) = storage::list_provider_accounts_readonly() {
         let hit = accounts.iter().find(|a| {
             a.provider_account_id.eq_ignore_ascii_case(alias)
-                || a.local_alias.as_deref()
+                || a.local_alias
+                    .as_deref()
                     .map(|d| d.eq_ignore_ascii_case(alias))
                     .unwrap_or(false)
-                || a.display_identity.as_deref()
+                || a.display_identity
+                    .as_deref()
                     .map(|d| d.eq_ignore_ascii_case(alias))
                     .unwrap_or(false)
         });
@@ -249,7 +277,11 @@ pub fn targets_from_alias(
             let raw_provider = provider_override
                 .map(|p| p.to_lowercase())
                 .unwrap_or_else(|| acct.provider.clone());
-            return vec![oauth_target(&acct.provider_account_id, &raw_provider, proxy_port)];
+            return vec![oauth_target(
+                &acct.provider_account_id,
+                &raw_provider,
+                proxy_port,
+            )];
         }
     }
 
@@ -273,9 +305,7 @@ pub fn targets_from_alias(
 /// Returns the same (targets, build_errors) shape as
 /// `targets_from_active_bindings` so the suite runner doesn't care which
 /// builder produced its inputs.
-pub fn targets_from_all_keys(
-    proxy_port: u16,
-) -> (Vec<TestTarget>, Vec<BuildTargetError>) {
+pub fn targets_from_all_keys(proxy_port: u16) -> (Vec<TestTarget>, Vec<BuildTargetError>) {
     let mut targets = Vec::new();
     let errors: Vec<BuildTargetError> = Vec::new();
 
@@ -352,11 +382,7 @@ pub fn targets_from_all_keys(
                 ) {
                     continue;
                 }
-                let mut t = oauth_target(
-                    &acct.provider_account_id,
-                    &acct.provider,
-                    proxy_port,
-                );
+                let mut t = oauth_target(&acct.provider_account_id, &acct.provider, proxy_port);
                 // Friendly Key column: effective_label = local_alias → display_identity
                 // → account_id. Falls back to source_ref via TestTarget::key_display
                 // when it's empty (rare; only if all three are missing).
@@ -381,8 +407,8 @@ pub fn targets_from_new_personal_key(
     providers: &[String],
     base_url_override: Option<&str>,
 ) -> Vec<TestTarget> {
-    providers.iter()
+    providers
+        .iter()
         .map(|code| personal_target_direct(alias, plaintext, code, base_url_override))
         .collect()
 }
-

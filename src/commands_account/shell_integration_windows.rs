@@ -116,8 +116,16 @@ pub(super) fn powershell_profile_candidates() -> Vec<std::path::PathBuf> {
 
     #[cfg(windows)]
     {
-        out.push(home.join("Documents").join("PowerShell").join("profile.ps1"));
-        out.push(home.join("Documents").join("WindowsPowerShell").join("profile.ps1"));
+        out.push(
+            home.join("Documents")
+                .join("PowerShell")
+                .join("profile.ps1"),
+        );
+        out.push(
+            home.join("Documents")
+                .join("WindowsPowerShell")
+                .join("profile.ps1"),
+        );
     }
     #[cfg(not(windows))]
     {
@@ -144,12 +152,18 @@ pub(super) fn ensure_powershell_hook() -> Option<String> {
 
     let home = match resolve_user_home().to_str() {
         Some(s) => s.to_string(),
-        None => return Some("  Could not resolve home dir for PowerShell hook install.".to_string()),
+        None => {
+            return Some("  Could not resolve home dir for PowerShell hook install.".to_string())
+        }
     };
 
     // 1. Write hook.ps1 — Layer 1 (refresh always, never asks).
     if let Err(e) = write_hook_file(&home, HookKind::PowerShell) {
-        return Some(format!("  Could not write {}: {}", display_aikey_path("hook.ps1"), e));
+        return Some(format!(
+            "  Could not write {}: {}",
+            display_aikey_path("hook.ps1"),
+            e
+        ));
     }
 
     let v3_block = v3_rc_block_powershell();

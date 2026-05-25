@@ -55,7 +55,11 @@ impl ScopedHome {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".aikey")).expect("create .aikey");
         std::env::set_var("HOME", &dir);
-        ScopedHome { _guard: guard, prev, dir }
+        ScopedHome {
+            _guard: guard,
+            prev,
+            dir,
+        }
     }
 
     fn aikey_dir(&self) -> PathBuf {
@@ -116,12 +120,18 @@ fn contract_a_no_legacy_form_is_no_op() {
     let outcome = active_env_migration::refresh_active_env(true)
         .expect("refresh should succeed on no-legacy input");
 
-    assert!(matches!(outcome, RefreshOutcome::NoLegacyDetected),
-        "expected NoLegacyDetected, got {:?}", outcome);
+    assert!(
+        matches!(outcome, RefreshOutcome::NoLegacyDetected),
+        "expected NoLegacyDetected, got {:?}",
+        outcome
+    );
 
     // active.env unchanged.
-    assert_eq!(h.read_active_env(), NEW_FORMAT,
-        "no-op refresh must not modify the file");
+    assert_eq!(
+        h.read_active_env(),
+        NEW_FORMAT,
+        "no-op refresh must not modify the file"
+    );
 }
 
 #[test]
@@ -137,13 +147,18 @@ fn contract_a_no_vault_yields_no_bindings_to_follow() {
     let outcome = active_env_migration::refresh_active_env(true)
         .expect("refresh should succeed (not error) when no vault is present");
 
-    assert!(matches!(outcome, RefreshOutcome::NoBindingsToFollow),
-        "expected NoBindingsToFollow when vault.db absent, got {:?}", outcome);
+    assert!(
+        matches!(outcome, RefreshOutcome::NoBindingsToFollow),
+        "expected NoBindingsToFollow when vault.db absent, got {:?}",
+        outcome
+    );
 
     // active.env still in legacy form (we didn't touch it because there's
     // nothing to follow). User's next `aikey use <key>` will overwrite.
-    assert!(h.read_active_env().contains("aikey_vk_"),
-        "active.env should remain in legacy form when migration is no-op");
+    assert!(
+        h.read_active_env().contains("aikey_vk_"),
+        "active.env should remain in legacy form when migration is no-op"
+    );
 }
 
 #[test]
@@ -151,10 +166,12 @@ fn contract_a_detects_legacy_aikey_vk() {
     let h = ScopedHome::new();
     h.write_active_env(LEGACY_TEAM);
 
-    assert!(active_env_migration::active_env_has_legacy_form(),
-        "must detect 'aikey_vk_' as legacy form");
+    assert!(
+        active_env_migration::active_env_has_legacy_form(),
+        "must detect 'aikey_vk_' as legacy form"
+    );
 
-    let _ = h;  // hold the guard
+    let _ = h; // hold the guard
 }
 
 #[test]
@@ -162,8 +179,10 @@ fn contract_a_detects_legacy_personal_alias() {
     let h = ScopedHome::new();
     h.write_active_env(LEGACY_PERSONAL_ALIAS);
 
-    assert!(active_env_migration::active_env_has_legacy_form(),
-        "must detect 'aikey_personal_<non-hex>' (legacy sentinel form) as legacy");
+    assert!(
+        active_env_migration::active_env_has_legacy_form(),
+        "must detect 'aikey_personal_<non-hex>' (legacy sentinel form) as legacy"
+    );
 
     let _ = h;
 }
@@ -173,8 +192,10 @@ fn contract_a_passes_new_active_sentinel() {
     let h = ScopedHome::new();
     h.write_active_env(NEW_FORMAT);
 
-    assert!(!active_env_migration::active_env_has_legacy_form(),
-        "must NOT classify the new aikey_active_<provider> form as legacy");
+    assert!(
+        !active_env_migration::active_env_has_legacy_form(),
+        "must NOT classify the new aikey_active_<provider> form as legacy"
+    );
 
     let _ = h;
 }
@@ -188,14 +209,17 @@ fn contract_a_creates_backup_before_modification() {
     let h = ScopedHome::new();
     h.write_active_env(LEGACY_TEAM);
 
-    let backup = active_env_migration::backup_active_env()
-        .expect("backup should succeed on a writable dir");
+    let backup =
+        active_env_migration::backup_active_env().expect("backup should succeed on a writable dir");
     let path = backup.expect("backup must return a path when source file existed");
     assert!(path.exists(), "backup file {} must exist", path.display());
 
     // Backup contents match original.
     let backed_up = fs::read_to_string(&path).expect("read backup");
-    assert_eq!(backed_up, LEGACY_TEAM, "backup must be byte-identical to original");
+    assert_eq!(
+        backed_up, LEGACY_TEAM,
+        "backup must be byte-identical to original"
+    );
 
     let _ = h;
 }
@@ -210,7 +234,7 @@ fn contract_a_backup_no_op_when_source_missing() {
 
     let outcome = active_env_migration::backup_active_env();
     match outcome {
-        Ok(None) => {}  // expected
+        Ok(None) => {} // expected
         other => panic!("expected Ok(None), got {:?}", other),
     }
 
@@ -237,13 +261,23 @@ fn contract_a_backup_prunes_to_keep_3() {
     let backup_count = fs::read_dir(h.aikey_dir())
         .expect("read aikey dir")
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("active.env.bak."))
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("active.env.bak.")
+        })
         .count();
 
-    assert!(backup_count <= 3,
-        "expected at most 3 backups after 5 iterations, found {}", backup_count);
-    assert!(backup_count >= 1,
-        "expected at least 1 backup, found {}", backup_count);
+    assert!(
+        backup_count <= 3,
+        "expected at most 3 backups after 5 iterations, found {}",
+        backup_count
+    );
+    assert!(
+        backup_count >= 1,
+        "expected at least 1 backup, found {}",
+        backup_count
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -263,8 +297,10 @@ fn contract_b_safety_net_fires_for_aikey_vk() {
 
     // The safety net at main.rs line ~635 calls `active_env_has_legacy_form()`
     // and conditionally triggers refresh. This test pins the trigger condition.
-    assert!(active_env_migration::active_env_has_legacy_form(),
-        "safety net must fire on aikey_vk_ legacy form");
+    assert!(
+        active_env_migration::active_env_has_legacy_form(),
+        "safety net must fire on aikey_vk_ legacy form"
+    );
 
     let _ = h;
 }
@@ -274,8 +310,10 @@ fn contract_b_safety_net_fires_for_personal_alias() {
     let h = ScopedHome::new();
     h.write_active_env(LEGACY_PERSONAL_ALIAS);
 
-    assert!(active_env_migration::active_env_has_legacy_form(),
-        "safety net must fire on aikey_personal_<non-hex> legacy sentinel form");
+    assert!(
+        active_env_migration::active_env_has_legacy_form(),
+        "safety net must fire on aikey_personal_<non-hex> legacy sentinel form"
+    );
 
     let _ = h;
 }
@@ -287,8 +325,10 @@ fn contract_b_safety_net_silent_on_already_new_format() {
 
     // The safety net branch at main.rs is skipped when this returns false —
     // pin "no spurious migration warning on every command".
-    assert!(!active_env_migration::active_env_has_legacy_form(),
-        "safety net must NOT fire on the new format");
+    assert!(
+        !active_env_migration::active_env_has_legacy_form(),
+        "safety net must NOT fire on the new format"
+    );
 
     let _ = h;
 }
@@ -298,8 +338,10 @@ fn contract_b_safety_net_silent_when_active_env_absent() {
     let h = ScopedHome::new();
     // Don't write active.env — fresh install before any `aikey use`.
 
-    assert!(!active_env_migration::active_env_has_legacy_form(),
-        "safety net must NOT fire when active.env doesn't exist (fresh install)");
+    assert!(
+        !active_env_migration::active_env_has_legacy_form(),
+        "safety net must NOT fire when active.env doesn't exist (fresh install)"
+    );
 
     let _ = h;
 }
@@ -317,8 +359,10 @@ fn safety_net_detects_legacy_in_mixed_active_env() {
     let mixed = format!("{}\n{}", LEGACY_TEAM, NEW_FORMAT);
     h.write_active_env(&mixed);
 
-    assert!(active_env_migration::active_env_has_legacy_form(),
-        "any single legacy line in active.env must trigger safety net");
+    assert!(
+        active_env_migration::active_env_has_legacy_form(),
+        "any single legacy line in active.env must trigger safety net"
+    );
 
     let _ = h;
 }
@@ -377,11 +421,15 @@ fn ak_vault_path_override_is_honored_during_refresh() {
 
     // Confirm vault file is at the override location, and NOT at the
     // hard-coded HOME/.aikey/data/vault.db path that the buggy code probed.
-    assert!(custom_vault_path.exists(),
-        "vault must exist at AK_VAULT_PATH override");
-    assert!(!home.aikey_dir().join("data/vault.db").exists(),
+    assert!(
+        custom_vault_path.exists(),
+        "vault must exist at AK_VAULT_PATH override"
+    );
+    assert!(
+        !home.aikey_dir().join("data/vault.db").exists(),
         "no vault should exist at the hard-coded HOME path; \
-         test invariant is that AK_VAULT_PATH is the only vault location");
+         test invariant is that AK_VAULT_PATH is the only vault location"
+    );
 
     // Stage legacy form in active.env so refresh has something to migrate.
     home.write_active_env(LEGACY_TEAM);
@@ -414,11 +462,14 @@ fn ak_vault_path_override_is_honored_during_refresh() {
         // vault helpers). What we're pinning is *not* NoBindingsToFollow.
         panic!("refresh_active_env returned Err (acceptable for this regression test if it means the vault was opened, but not the path we want to assert): {}", e)
     });
-    assert!(!matches!(outcome, RefreshOutcome::NoBindingsToFollow),
+    assert!(
+        !matches!(outcome, RefreshOutcome::NoBindingsToFollow),
         "refresh must NOT return NoBindingsToFollow when a valid vault exists \
          at AK_VAULT_PATH override (got {:?}); this is the third-party review #4 \
          [中] finding regression — `refresh_active_env` ignored AK_VAULT_PATH \
-         and probed the hard-coded home path instead", outcome);
+         and probed the hard-coded home path instead",
+        outcome
+    );
 }
 
 #[test]
@@ -427,12 +478,17 @@ fn safety_net_distinguishes_uppercase_hex_as_legacy() {
     // (proxy's isTier1Personal rejects uppercase). Treat as legacy to
     // force regeneration in lowercase.
     let h = ScopedHome::new();
-    let upper_hex = "ABCDEF0123456789".repeat(4);  // 64 chars, mixed (uppercase + digits)
-    let env = format!(r#"export ANTHROPIC_AUTH_TOKEN="aikey_personal_{}""#, upper_hex);
+    let upper_hex = "ABCDEF0123456789".repeat(4); // 64 chars, mixed (uppercase + digits)
+    let env = format!(
+        r#"export ANTHROPIC_AUTH_TOKEN="aikey_personal_{}""#,
+        upper_hex
+    );
     h.write_active_env(&env);
 
-    assert!(active_env_migration::active_env_has_legacy_form(),
-        "uppercase hex personal bearer must be classified as legacy");
+    assert!(
+        active_env_migration::active_env_has_legacy_form(),
+        "uppercase hex personal bearer must be classified as legacy"
+    );
 
     let _ = h;
 }
@@ -442,12 +498,17 @@ fn safety_net_passes_strict_64hex_bearer_as_new_form() {
     // The legitimate new bearer form `aikey_personal_<64-lowercase-hex>` is
     // valid and must NOT trigger migration.
     let h = ScopedHome::new();
-    let lower_hex = "0123456789abcdef".repeat(4);  // 64 lowercase hex
-    let env = format!(r#"export ANTHROPIC_AUTH_TOKEN="aikey_personal_{}""#, lower_hex);
+    let lower_hex = "0123456789abcdef".repeat(4); // 64 lowercase hex
+    let env = format!(
+        r#"export ANTHROPIC_AUTH_TOKEN="aikey_personal_{}""#,
+        lower_hex
+    );
     h.write_active_env(&env);
 
-    assert!(!active_env_migration::active_env_has_legacy_form(),
-        "strict 64-hex personal bearer is the legitimate new form, not legacy");
+    assert!(
+        !active_env_migration::active_env_has_legacy_form(),
+        "strict 64-hex personal bearer is the legitimate new form, not legacy"
+    );
 
     let _ = h;
 }

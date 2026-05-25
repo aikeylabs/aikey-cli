@@ -315,9 +315,7 @@ pub fn process_birth_token(pid: u32) -> Result<String, BirthTokenError> {
         // SAFETY: zeroed FILETIME, OpenProcess returns 0 on failure.
         let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if h == 0 {
-            return Err(BirthTokenError::Read(format!(
-                "OpenProcess({pid}) failed"
-            )));
+            return Err(BirthTokenError::Read(format!("OpenProcess({pid}) failed")));
         }
         let mut creation: FILETIME = unsafe { std::mem::zeroed() };
         let mut exit: FILETIME = unsafe { std::mem::zeroed() };
@@ -575,10 +573,7 @@ mod tests {
     fn process_identity_works_for_self() {
         let me = std::process::id();
         let path = process_identity(me);
-        assert!(
-            path.is_some(),
-            "process_identity must succeed for self-PID"
-        );
+        assert!(path.is_some(), "process_identity must succeed for self-PID");
         let p = path.unwrap();
         // The basename is the cargo test binary, *not* aikey-proxy —
         // confirms the call is reading the actual exe path, not a hard-

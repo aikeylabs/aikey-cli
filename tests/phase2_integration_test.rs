@@ -1,5 +1,5 @@
-use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin;
+use assert_cmd::Command;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -35,7 +35,7 @@ impl TestEnv {
         let mut cmd = Command::new(cargo_bin("aikey"));
         cmd.env("HOME", self._temp_dir.path());
         cmd.env("AK_TEST_PASSWORD", &self.test_password);
-        cmd.current_dir(self._temp_dir.path());  // Set working directory to temp dir
+        cmd.current_dir(self._temp_dir.path()); // Set working directory to temp dir
         cmd
     }
 
@@ -44,7 +44,7 @@ impl TestEnv {
         let mut cmd = Command::new(cargo_bin("aikey"));
         cmd.env("HOME", self._temp_dir.path());
         cmd.env("AK_TEST_PASSWORD", &self.test_password);
-        cmd.current_dir(self._temp_dir.path());  // Set working directory to temp dir
+        cmd.current_dir(self._temp_dir.path()); // Set working directory to temp dir
         cmd
     }
 
@@ -89,7 +89,8 @@ impl TestEnv {
 
     /// Create a minimal project config file for testing
     fn create_test_config(&self, required_vars: Vec<&str>) {
-        let required_vars_json: Vec<String> = required_vars.iter().map(|v| format!("\"{}\"", v)).collect();
+        let required_vars_json: Vec<String> =
+            required_vars.iter().map(|v| format!("\"{}\"", v)).collect();
         let config = format!(
             r#"{{
     "schemaVersion": "0.1.0",
@@ -103,8 +104,7 @@ impl TestEnv {
             required_vars_json.join(", ")
         );
         let config_path = self._temp_dir.path().join("aikey.config.json");
-        fs::write(&config_path, config)
-            .expect("Failed to create test config");
+        fs::write(&config_path, config).expect("Failed to create test config");
     }
 }
 
@@ -118,10 +118,7 @@ fn test_aikey_binary_exists() {
     env.init_vault();
 
     // Test that 'aikey' binary works
-    env.cmd()
-        .arg("list")
-        .assert()
-        .success();
+    env.cmd().arg("list").assert().success();
 }
 
 #[test]
@@ -130,10 +127,7 @@ fn test_ak_alias_still_works() {
     env.init_vault();
 
     // Test that 'ak' alias still works
-    env.cmd_ak()
-        .arg("list")
-        .assert()
-        .success();
+    env.cmd_ak().arg("list").assert().success();
 }
 
 #[test]
@@ -144,18 +138,10 @@ fn test_both_binaries_produce_same_output() {
     env.add_secret("TEST_KEY", "test_value").success();
 
     // Get output from aikey
-    let output_aikey = env.cmd()
-        .arg("list")
-        .arg("--json")
-        .assert()
-        .success();
+    let output_aikey = env.cmd().arg("list").arg("--json").assert().success();
 
     // Get output from ak
-    let output_ak = env.cmd_ak()
-        .arg("list")
-        .arg("--json")
-        .assert()
-        .success();
+    let output_ak = env.cmd_ak().arg("list").arg("--json").assert().success();
 
     let json_aikey = parse_json_output(&output_aikey);
     let json_ak = parse_json_output(&output_ak);
@@ -176,11 +162,7 @@ fn test_json_output_list_command() {
     env.add_secret("API_KEY", "sk-test-123").success();
     env.add_secret("DB_URL", "postgresql://localhost").success();
 
-    let output = env.cmd()
-        .arg("list")
-        .arg("--json")
-        .assert()
-        .success();
+    let output = env.cmd().arg("list").arg("--json").assert().success();
 
     let json = parse_json_output(&output);
 
@@ -201,7 +183,8 @@ fn test_json_output_get_command() {
 
     env.add_secret("TEST_SECRET", "secret_value").success();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("get")
         .arg("TEST_SECRET")
         .arg("--json")
@@ -220,7 +203,8 @@ fn test_json_output_add_command() {
     let env = TestEnv::new();
     env.init_vault();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("add")
         .arg("NEW_KEY")
         .args(["--provider", "openai"])
@@ -242,7 +226,8 @@ fn test_json_output_update_command() {
 
     env.add_secret("UPDATE_KEY", "old_value").success();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("update")
         .arg("UPDATE_KEY")
         .arg("--json")
@@ -263,7 +248,8 @@ fn test_json_output_delete_command() {
 
     env.add_secret("DELETE_KEY", "value").success();
 
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("delete")
         .arg("DELETE_KEY")
         .arg("--json")
@@ -282,7 +268,8 @@ fn test_json_output_error_handling() {
     env.init_vault();
 
     // Try to get non-existent secret
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("get")
         .arg("NONEXISTENT")
         .arg("--json")
@@ -305,7 +292,8 @@ fn test_vault_init_idempotency() {
     env.init_vault();
 
     // Try to init again - should fail gracefully
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("init")
         .arg("--json")
         .env("AK_TEST_PASSWORD", "new_password")
@@ -315,7 +303,10 @@ fn test_vault_init_idempotency() {
     let json = parse_json_output(&output);
 
     assert_eq!(json["status"], "error");
-    assert!(json["error"].as_str().unwrap().contains("already initialized"));
+    assert!(json["error"]
+        .as_str()
+        .unwrap()
+        .contains("already initialized"));
 }
 
 #[test]
@@ -334,7 +325,8 @@ fn test_add_update_get_delete_workflow() {
         .success();
 
     // Get
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("get")
         .arg("WORKFLOW_KEY")
         .arg("--json")
@@ -354,7 +346,8 @@ fn test_add_update_get_delete_workflow() {
         .success();
 
     // Get updated value
-    let output = env.cmd()
+    let output = env
+        .cmd()
         .arg("get")
         .arg("WORKFLOW_KEY")
         .arg("--json")
@@ -388,14 +381,11 @@ fn test_list_pagination_and_ordering() {
 
     // Add multiple secrets
     for i in 1..=5 {
-        env.add_secret(&format!("KEY_{}", i), &format!("value_{}", i)).success();
+        env.add_secret(&format!("KEY_{}", i), &format!("value_{}", i))
+            .success();
     }
 
-    let output = env.cmd()
-        .arg("list")
-        .arg("--json")
-        .assert()
-        .success();
+    let output = env.cmd().arg("list").arg("--json").assert().success();
 
     let json = parse_json_output(&output);
 
@@ -403,7 +393,8 @@ fn test_list_pagination_and_ordering() {
     assert_eq!(secrets.len(), 5);
 
     // Verify all keys are present
-    let aliases: Vec<&str> = secrets.iter()
+    let aliases: Vec<&str> = secrets
+        .iter()
         .map(|s| s["alias"].as_str().unwrap())
         .collect();
 
@@ -442,8 +433,12 @@ fn test_json_output_preserves_error_codes() {
         let json = parse_json_output(&output);
 
         assert_eq!(json["status"], "error");
-        assert!(json["error"].as_str().unwrap().contains(expected_error),
-                "Command {} should contain error: {}", command, expected_error);
+        assert!(
+            json["error"].as_str().unwrap().contains(expected_error),
+            "Command {} should contain error: {}",
+            command,
+            expected_error
+        );
     }
 }
 
@@ -488,7 +483,8 @@ fn test_special_characters_in_alias() {
             .assert()
             .success();
 
-        let output = env.cmd()
+        let output = env
+            .cmd()
             .arg("get")
             .arg(alias)
             .arg("--json")
@@ -506,11 +502,7 @@ fn test_empty_vault_operations() {
     env.init_vault();
 
     // List empty vault
-    let output = env.cmd()
-        .arg("list")
-        .arg("--json")
-        .assert()
-        .success();
+    let output = env.cmd().arg("list").arg("--json").assert().success();
 
     let json = parse_json_output(&output);
     assert_eq!(json["secrets"].as_array().unwrap().len(), 0);

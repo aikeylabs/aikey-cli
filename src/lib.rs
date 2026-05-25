@@ -3,54 +3,56 @@
 //! This library provides the core functionality for the AK CLI tool.
 
 pub mod active_env_migration;
+pub mod audit;
+pub mod commands_account;
+pub mod commands_app;
+pub mod commands_import;
+pub mod commands_init;
+pub mod commands_internal;
+pub mod commands_project;
+pub mod commands_proxy;
+pub mod config;
+pub mod connectivity;
 pub mod credential_type;
 pub mod crypto;
-pub mod team_token_normalize;
+pub mod env_renderer;
+pub mod env_resolver;
+pub mod error_codes;
+pub mod events;
+pub mod executor;
+pub mod global_config;
+pub mod json_output;
+pub mod local_server_probe;
+pub mod migrations;
+pub mod observability;
+pub mod platform_client;
 pub mod provider_registry;
+pub mod providers;
+pub mod proxy_events;
+pub mod proxy_lifecycle;
+pub mod proxy_proc;
+pub mod proxy_state;
+pub mod ratelimit;
+pub mod resolver;
+pub mod session;
 pub mod storage;
 pub mod storage_acl;
 pub mod synapse;
-pub mod executor;
-pub mod migrations;
-pub mod audit;
-pub mod ratelimit;
-pub mod config;
-pub mod env_resolver;
-pub mod env_renderer;
-pub mod commands_project;
-pub mod connectivity;
-pub mod json_output;
-pub mod global_config;
-pub mod error_codes;
-pub mod providers;
-pub mod resolver;
-pub mod events;
-pub mod observability;
-pub mod platform_client;
-pub mod commands_account;
-pub mod commands_app;
-pub mod commands_proxy;
-pub mod proxy_state;
-pub mod proxy_proc;
-pub mod proxy_lifecycle;
-pub mod proxy_events;
-pub mod commands_internal;
-pub mod commands_import;
-pub mod local_server_probe;
-pub mod commands_init;
-pub mod session;
+pub mod team_token_normalize;
 pub mod ui_frame;
 // Windows-only siblings — never compile on macOS / Linux. Each module
 // is `#[cfg(windows)]`-internal so the declaration here is a no-op on
 // Unix (cargo skips the file lookup entirely). Strategy A pure — see
 // each module's docstring.
-#[cfg(windows)] pub mod prompt_hidden_windows;
-#[cfg(windows)] pub mod ui_frame_windows;
-pub mod proxy_env;
-pub mod profile_activation;
-pub mod usage_wal;
 pub mod commands_statusline;
 pub mod commands_watch;
+pub mod profile_activation;
+#[cfg(windows)]
+pub mod prompt_hidden_windows;
+pub mod proxy_env;
+#[cfg(windows)]
+pub mod ui_frame_windows;
+pub mod usage_wal;
 
 #[cfg(test)]
 pub(crate) mod test_env_lock;
@@ -97,7 +99,9 @@ fn read_password_with_stars() -> std::io::Result<String> {
     // Why: flush any stale bytes left in the kernel tty input queue by a
     // previous raw-mode session (e.g. the interactive picker). Without this,
     // leftover escape sequences get prepended to the user's paste.
-    unsafe { libc::tcflush(tty_fd, libc::TCIFLUSH); }
+    unsafe {
+        libc::tcflush(tty_fd, libc::TCIFLUSH);
+    }
 
     // Save original terminal settings.
     let orig = unsafe {
@@ -162,7 +166,9 @@ fn read_password_with_stars() -> std::io::Result<String> {
             // Enter (LF or CR)
             b'\n' | b'\r' => break,
             // ESC — start of escape sequence
-            0x1B => { in_esc = 1; }
+            0x1B => {
+                in_esc = 1;
+            }
             // Backspace or DEL
             0x7f | 0x08 => {
                 if !password.is_empty() {
@@ -173,8 +179,13 @@ fn read_password_with_stars() -> std::io::Result<String> {
             }
             // Ctrl-C → abort
             0x03 => {
-                unsafe { libc::tcsetattr(tty_fd, libc::TCSANOW, &orig); }
-                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "interrupted"));
+                unsafe {
+                    libc::tcsetattr(tty_fd, libc::TCSANOW, &orig);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "interrupted",
+                ));
             }
             // Only accept printable ASCII characters.
             c if c >= 0x20 && c < 0x7F => {
@@ -188,7 +199,9 @@ fn read_password_with_stars() -> std::io::Result<String> {
     }
 
     // Restore original terminal settings.
-    unsafe { libc::tcsetattr(tty_fd, libc::TCSANOW, &orig); }
+    unsafe {
+        libc::tcsetattr(tty_fd, libc::TCSANOW, &orig);
+    }
 
     Ok(password)
 }

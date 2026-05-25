@@ -48,7 +48,12 @@ fn setup_vault_with_key(tag: &str, alias: &str, provider: &str) -> PathBuf {
         .stderr(Stdio::null())
         .status()
         .expect("spawn aikey add");
-    assert!(status.success(), "aikey add failed for {}/{}", alias, provider);
+    assert!(
+        status.success(),
+        "aikey add failed for {}/{}",
+        alias,
+        provider
+    );
     home
 }
 
@@ -97,12 +102,21 @@ fn activate_eval_injects_provider_env_vars() {
     assert_eq!(code, 0, "bash script failed: {}", _stderr);
     // 2026-04-29 prefix rename: personal route_token form is now a 79-char
     // string (15-char prefix + 64 lowercase hex).
-    assert!(stdout.contains("API_KEY=aikey_personal_"),
-        "ANTHROPIC_API_KEY not injected or wrong prefix:\n{}", stdout);
-    assert!(stdout.contains("BASE_URL=http://127.0.0.1:"),
-        "ANTHROPIC_BASE_URL not injected:\n{}", stdout);
-    assert!(stdout.contains("LABEL=my-claude"),
-        "AIKEY_ACTIVE_LABEL not set:\n{}", stdout);
+    assert!(
+        stdout.contains("API_KEY=aikey_personal_"),
+        "ANTHROPIC_API_KEY not injected or wrong prefix:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("BASE_URL=http://127.0.0.1:"),
+        "ANTHROPIC_BASE_URL not injected:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("LABEL=my-claude"),
+        "AIKEY_ACTIVE_LABEL not set:\n{}",
+        stdout
+    );
 }
 
 #[test]
@@ -127,11 +141,17 @@ fn deactivate_restores_user_preexisting_env_var() {
     );
     assert_eq!(code, 0, "bash failed: {}", _stderr);
     // Activate should have REPLACED the user's value with the vault token.
-    assert!(stdout.contains("AFTER_ACTIVATE=aikey_personal_"),
-        "activate should replace with vault token, got:\n{}", stdout);
+    assert!(
+        stdout.contains("AFTER_ACTIVATE=aikey_personal_"),
+        "activate should replace with vault token, got:\n{}",
+        stdout
+    );
     // Deactivate should have RESTORED the user's original value.
-    assert!(stdout.contains("AFTER_DEACTIVATE=sk-user-owned-value"),
-        "deactivate should restore user's pre-activate value, got:\n{}", stdout);
+    assert!(
+        stdout.contains("AFTER_DEACTIVATE=sk-user-owned-value"),
+        "deactivate should restore user's pre-activate value, got:\n{}",
+        stdout
+    );
 }
 
 #[test]
@@ -179,13 +199,22 @@ fn nested_activate_preserves_original_prompt_across_switches() {
     );
     assert_eq!(code, 0, "bash failed: {}", stderr);
     // Both activates should embed their label + the ORIGINAL prompt (not nest).
-    assert!(stdout.contains("FIRST=(claude-a) my-original-prompt> "),
-        "first activate should show label+original:\n{}", stdout);
-    assert!(stdout.contains("SECOND=(claude-b) my-original-prompt> "),
-        "second activate should replace label but keep SAME original (not nest):\n{}", stdout);
+    assert!(
+        stdout.contains("FIRST=(claude-a) my-original-prompt> "),
+        "first activate should show label+original:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("SECOND=(claude-b) my-original-prompt> "),
+        "second activate should replace label but keep SAME original (not nest):\n{}",
+        stdout
+    );
     // Deactivate should restore the pristine PS1 (no `(label)` prefix).
-    assert!(stdout.contains("DEACT=my-original-prompt> "),
-        "deactivate should restore pristine PS1:\n{}", stdout);
+    assert!(
+        stdout.contains("DEACT=my-original-prompt> "),
+        "deactivate should restore pristine PS1:\n{}",
+        stdout
+    );
 }
 
 // ── stdout discipline: eval safety ──────────────────────────────────────
@@ -206,8 +235,11 @@ fn activate_stdout_has_no_ansi_when_via_wrapper() {
         .output()
         .expect("spawn activate");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(!stdout.contains('\x1b'),
-        "stdout must not contain ANSI escapes (breaks eval):\n{:?}", stdout);
+    assert!(
+        !stdout.contains('\x1b'),
+        "stdout must not contain ANSI escapes (breaks eval):\n{:?}",
+        stdout
+    );
 }
 
 // ── error path: bad alias via eval exits non-zero ───────────────────────
@@ -230,11 +262,15 @@ fn activate_unknown_alias_returns_nonzero_and_no_exports() {
     );
     // The script always exits 0; non-zero bash exit means something else broke.
     assert_eq!(code, 0, "wrapper script failed: {}", stderr);
-    assert!(!stdout.contains("UNEXPECTED_SUCCESS"),
-        "activate with unknown alias should fail:\n{}", stdout);
+    assert!(
+        !stdout.contains("UNEXPECTED_SUCCESS"),
+        "activate with unknown alias should fail:\n{}",
+        stdout
+    );
     // stdout of the real activate call should be empty (no partial shell code).
     // `wc -c` on macOS pads with leading spaces, so match the numeric tail.
-    let bytes_line = stdout.lines()
+    let bytes_line = stdout
+        .lines()
         .find(|l| l.starts_with("STDOUT_BYTES="))
         .expect("STDOUT_BYTES line missing");
     let count: usize = bytes_line

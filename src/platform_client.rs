@@ -187,7 +187,10 @@ impl DeliveryPayload {
 
     /// Returns the protocol type of the primary slot.
     pub fn primary_protocol_type(&self) -> &str {
-        self.slots.first().map(|s| s.protocol_type.as_str()).unwrap_or("openai_compatible")
+        self.slots
+            .first()
+            .map(|s| s.protocol_type.as_str())
+            .unwrap_or("openai_compatible")
     }
 }
 
@@ -301,7 +304,10 @@ impl PlatformClient {
         session_id: &str,
         login_token: &str,
     ) -> Result<PollResponse, String> {
-        let url = format!("{}/v1/auth/cli/login/exchange", base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/v1/auth/cli/login/exchange",
+            base_url.trim_end_matches('/')
+        );
         let body = serde_json::json!({
             "login_session_id": session_id,
             "login_token": login_token,
@@ -320,7 +326,10 @@ impl PlatformClient {
         base_url: &str,
         refresh_token: &str,
     ) -> Result<RefreshResponse, String> {
-        let url = format!("{}/v1/auth/cli/token/refresh", base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/v1/auth/cli/token/refresh",
+            base_url.trim_end_matches('/')
+        );
         let body = serde_json::json!({ "refresh_token": refresh_token });
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
@@ -371,7 +380,8 @@ impl PlatformClient {
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(2))
             .build();
-        let resp = agent.get(&url)
+        let resp = agent
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
             .map_err(|e| format!("sync-version request failed: {}", e))?;
@@ -388,7 +398,8 @@ impl PlatformClient {
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(2))
             .build();
-        let resp = agent.get(&url)
+        let resp = agent
+            .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
             .map_err(|e| format!("managed-keys-snapshot request failed: {}", e))?;

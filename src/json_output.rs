@@ -1,6 +1,6 @@
+use crate::error_codes::ErrorCode;
 use serde_json::json;
 use std::process;
-use crate::error_codes::ErrorCode;
 
 /// Output a raw JSON payload to stderr without wrapping or exiting
 pub fn print_json(value: serde_json::Value) {

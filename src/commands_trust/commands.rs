@@ -182,9 +182,7 @@ pub(crate) fn handle_status(alias: Option<&str>, json: bool) -> Result<(), Strin
                     serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?
                 );
             } else if list.items.is_empty() {
-                println!(
-                    "(no aliases observed yet — run aikey trust verify <alias> to populate)"
-                );
+                println!("(no aliases observed yet — run aikey trust verify <alias> to populate)");
             } else {
                 print_status_table(&list.items);
             }
@@ -429,7 +427,10 @@ pub(crate) fn handle_refresh(alias: Option<&str>, json: bool) -> Result<(), Stri
             .map_err(|e| e.to_string())?
         );
     } else {
-        println!("refreshed {} alias(es) from local observations", resp.written);
+        println!(
+            "refreshed {} alias(es) from local observations",
+            resp.written
+        );
         for r in &resp.items {
             // Compact one-line per row: alias  s_l1=N  [anomaly]  hits=...
             let l1 = r
@@ -447,16 +448,18 @@ pub(crate) fn handle_refresh(alias: Option<&str>, json: bool) -> Result<(), Stri
                     if map.is_empty() {
                         "no observations in window".to_string()
                     } else {
-                        let mut parts: Vec<String> = map
-                            .iter()
-                            .map(|(k, v)| format!("{}={}", k, v))
-                            .collect();
+                        let mut parts: Vec<String> =
+                            map.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
                         parts.sort();
                         format!("hits={}", parts.join(","))
                     }
                 })
                 .unwrap_or_else(|| "no observations in window".to_string());
-            let anomaly_tag = if r.anomaly_suggested { "  ⚠ANOMALY" } else { "" };
+            let anomaly_tag = if r.anomaly_suggested {
+                "  ⚠ANOMALY"
+            } else {
+                ""
+            };
             println!(
                 "  {} ({}/{}) s_l1={} {}{}",
                 r.alias_name, r.provider_id, r.model, l1, hits_blurb, anomaly_tag,
@@ -531,8 +534,8 @@ fn resolve_provider_model(alias: &str) -> Result<(String, String), String> {
     // question bank is keyed on the canonical id, not the auth method.
     let (canonical_provider, model) = match provider.as_str() {
         "anthropic" | "claude" => ("anthropic", "claude-opus-4-7"),
-        "openai"    | "codex"  => ("openai",    "gpt-4o"),
-        "kimi"      | "kimi_code" => ("kimi",   "kimi-k2-instruct-0905"),
+        "openai" | "codex" => ("openai", "gpt-4o"),
+        "kimi" | "kimi_code" => ("kimi", "kimi-k2-instruct-0905"),
         other => {
             return Err(format!(
                 "no default model for provider '{}' (M4: add --model flag if you need this)",
@@ -559,12 +562,9 @@ fn format_ureq_err(client: &TrustClient, e: ureq::Error, ctx: &str) -> String {
             code,
             resp.into_string().unwrap_or_default()
         ),
-        ureq::Error::Transport(t) => format!(
-            "{}\n{}\n(transport: {})",
-            ctx,
-            client.unreachable_hint(),
-            t
-        ),
+        ureq::Error::Transport(t) => {
+            format!("{}\n{}\n(transport: {})", ctx, client.unreachable_hint(), t)
+        }
     }
 }
 

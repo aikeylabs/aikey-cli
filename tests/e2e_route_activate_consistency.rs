@@ -60,7 +60,10 @@ fn test_api_key() -> String {
 }
 
 fn keep_tmpdir() -> bool {
-    matches!(std::env::var("AIKEY_E2E_KEEP_TMPDIR").as_deref(), Ok("1") | Ok("true"))
+    matches!(
+        std::env::var("AIKEY_E2E_KEEP_TMPDIR").as_deref(),
+        Ok("1") | Ok("true")
+    )
 }
 
 // ── env-isolated CLI harness ────────────────────────────────────────────
@@ -87,14 +90,15 @@ impl TestEnv {
     fn new(test_name: &str) -> Self {
         load_dotenv();
         let bin = PathBuf::from(env!("CARGO_BIN_EXE_aikey"));
-        let tmp = std::env::temp_dir().join(format!(
-            "aikey-e2e-{}-{}",
-            test_name,
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("aikey-e2e-{}-{}", test_name, std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("create tmpdir");
-        Self { tmp, bin, password: test_password() }
+        Self {
+            tmp,
+            bin,
+            password: test_password(),
+        }
     }
 
     /// Build a Command with env isolation. Every call gets fresh env vars so
@@ -119,7 +123,8 @@ impl TestEnv {
 
     /// Register a personal key with a single provider.
     fn add_key(&self, alias: &str, provider: &str) {
-        let mut child = self.cmd()
+        let mut child = self
+            .cmd()
             .args(["add", alias, "--provider", provider])
             .env("AK_TEST_SECRET", test_api_key())
             .stdin(Stdio::piped())
@@ -140,7 +145,8 @@ impl TestEnv {
 
     /// Run `aikey route <alias>` and return stdout.
     fn run_route(&self, alias: &str) -> String {
-        let out = self.cmd()
+        let out = self
+            .cmd()
             .args(["route", alias])
             .output()
             .expect("run aikey route");
@@ -155,7 +161,8 @@ impl TestEnv {
 
     /// Run `aikey activate <alias> --shell bash` and return stdout.
     fn run_activate(&self, alias: &str) -> String {
-        let out = self.cmd()
+        let out = self
+            .cmd()
             .args(["activate", alias, "--shell", "bash"])
             .output()
             .expect("run aikey activate");
@@ -217,15 +224,21 @@ fn assert_base_urls_match(provider: &str, provider_env_prefix: &str) {
     env.add_key(&alias, provider);
 
     let route_out = env.run_route(&alias);
-    let route_url = parse_route_base_url(&route_out)
-        .unwrap_or_else(|| panic!("route output missing base_url\n--- stdout ---\n{}", route_out));
+    let route_url = parse_route_base_url(&route_out).unwrap_or_else(|| {
+        panic!(
+            "route output missing base_url\n--- stdout ---\n{}",
+            route_out
+        )
+    });
 
     let activate_out = env.run_activate(&alias);
-    let activate_url = parse_activate_base_url(&activate_out, provider_env_prefix)
-        .unwrap_or_else(|| panic!(
-            "activate output missing {}_BASE_URL\n--- stdout ---\n{}",
-            provider_env_prefix, activate_out
-        ));
+    let activate_url =
+        parse_activate_base_url(&activate_out, provider_env_prefix).unwrap_or_else(|| {
+            panic!(
+                "activate output missing {}_BASE_URL\n--- stdout ---\n{}",
+                provider_env_prefix, activate_out
+            )
+        });
 
     assert_eq!(
         route_url, activate_url,
@@ -253,8 +266,7 @@ fn base_url_matches_kimi() {
     env.add_key("e2e-kimi", "kimi");
 
     let route_out = env.run_route("e2e-kimi");
-    let route_url = parse_route_base_url(&route_out)
-        .expect("route output missing base_url");
+    let route_url = parse_route_base_url(&route_out).expect("route output missing base_url");
     assert!(
         route_url.ends_with("/kimi/v1"),
         "route should emit /kimi/v1 (L5 fix), got: {}",
@@ -264,7 +276,10 @@ fn base_url_matches_kimi() {
     let activate_out = env.run_activate("e2e-kimi");
     let activate_url = parse_activate_base_url(&activate_out, "KIMI")
         .expect("activate output missing KIMI_BASE_URL");
-    assert_eq!(route_url, activate_url, "route and activate must agree for kimi");
+    assert_eq!(
+        route_url, activate_url,
+        "route and activate must agree for kimi"
+    );
 }
 
 #[test]
@@ -285,9 +300,14 @@ fn activate_stdout_is_eval_safe() {
         out
     );
     // Must contain the expected shell-statement anchors.
-    assert!(out.contains("export OPENAI_API_KEY="),
-        "missing OPENAI_API_KEY export:\n{}", out);
-    assert!(out.contains("export OPENAI_BASE_URL="),
-        "missing OPENAI_BASE_URL export:\n{}", out);
+    assert!(
+        out.contains("export OPENAI_API_KEY="),
+        "missing OPENAI_API_KEY export:\n{}",
+        out
+    );
+    assert!(
+        out.contains("export OPENAI_BASE_URL="),
+        "missing OPENAI_BASE_URL export:\n{}",
+        out
+    );
 }
-

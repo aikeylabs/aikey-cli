@@ -171,17 +171,22 @@ impl std::fmt::Display for StartError {
                 LIFECYCLE_LOCK_TIMEOUT.as_secs()
             ),
             StartError::VaultPasswordRejected(s) => write!(f, "vault password rejected: {s}"),
-            StartError::OrphanedPort { port, owner_pid, reason } => {
-                write!(f, "port {port} not owned by us: {}", reason.hint(*port, *owner_pid))
+            StartError::OrphanedPort {
+                port,
+                owner_pid,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "port {port} not owned by us: {}",
+                    reason.hint(*port, *owner_pid)
+                )
             }
             StartError::BinaryMissing(s) => write!(
                 f,
                 "aikey-proxy binary not found: {s}; reinstall via `aikey proxy install`"
             ),
-            StartError::ConfigMissing(s) => write!(
-                f,
-                "aikey-proxy config not found: {s}"
-            ),
+            StartError::ConfigMissing(s) => write!(f, "aikey-proxy config not found: {s}"),
             StartError::BirthTokenRead(s) => write!(
                 f,
                 "could not read process_birth_token for spawned child: {s} (rare; retry once)"
@@ -244,12 +249,19 @@ pub enum StopError {
 impl std::fmt::Display for StopError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StopError::LockBusy => write!(
-                f,
-                "another aikey proxy command is in flight; retry shortly"
-            ),
-            StopError::NotOurs { port, owner_pid, reason } => {
-                write!(f, "port {port} not owned by us: {}", reason.hint(*port, *owner_pid))
+            StopError::LockBusy => {
+                write!(f, "another aikey proxy command is in flight; retry shortly")
+            }
+            StopError::NotOurs {
+                port,
+                owner_pid,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "port {port} not owned by us: {}",
+                    reason.hint(*port, *owner_pid)
+                )
             }
             StopError::StuckAfterKill { pid, port } => write!(
                 f,
@@ -366,10 +378,8 @@ pub fn persist_ownership_files(
         listen_addr: listen_addr.to_string(),
         written_at: chrono_now_rfc3339(),
     };
-    let meta_p = meta_path()
-        .map_err(|e| StartError::PersistFailed(format!("meta_path: {e}")))?;
-    let pid_p = pid_path()
-        .map_err(|e| StartError::PersistFailed(format!("pid_path: {e}")))?;
+    let meta_p = meta_path().map_err(|e| StartError::PersistFailed(format!("meta_path: {e}")))?;
+    let pid_p = pid_path().map_err(|e| StartError::PersistFailed(format!("pid_path: {e}")))?;
     let meta_bytes = serde_json::to_vec_pretty(&meta)
         .map_err(|e| StartError::PersistFailed(format!("meta serialize: {e}")))?;
     // Write order matters: sidecar first so a CLI crash between the
@@ -536,7 +546,11 @@ impl Drop for StartCleanupGuard {
 fn kill_pid_signal(pid: u32, sigkill: bool) -> Result<(), StopError> {
     #[cfg(unix)]
     {
-        let signal = if sigkill { libc::SIGKILL } else { libc::SIGTERM };
+        let signal = if sigkill {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
         // SAFETY: kill is safe — invalid pid simply returns -1 with errno.
         let ret = unsafe { libc::kill(pid as libc::pid_t, signal) };
         if ret != 0 {
@@ -545,25 +559,33 @@ fn kill_pid_signal(pid: u32, sigkill: bool) -> Result<(), StopError> {
             if err.raw_os_error() == Some(libc::ESRCH) {
                 return Ok(());
             }
-            return Err(StopError::KillFailed(format!("kill({pid}, {signal}): {err}")));
+            return Err(StopError::KillFailed(format!(
+                "kill({pid}, {signal}): {err}"
+            )));
         }
         Ok(())
     }
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
         let _ = sigkill; // Windows: TerminateProcess is always equivalent to SIGKILL
-        // SAFETY: OpenProcess returns 0 on failure; TerminateProcess
-        // accepts the handle; we close after.
+                         // SAFETY: OpenProcess returns 0 on failure; TerminateProcess
+                         // accepts the handle; we close after.
         let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
         if h == 0 {
             return Err(StopError::KillFailed(format!("OpenProcess({pid}) failed")));
         }
         let ok = unsafe { TerminateProcess(h, 1) };
-        unsafe { CloseHandle(h); }
+        unsafe {
+            CloseHandle(h);
+        }
         if ok == 0 {
-            return Err(StopError::KillFailed(format!("TerminateProcess({pid}) failed")));
+            return Err(StopError::KillFailed(format!(
+                "TerminateProcess({pid}) failed"
+            )));
         }
         Ok(())
     }
@@ -873,11 +895,19 @@ fn stop_proxy_locked_inner(
             *entry_port = Some(port);
             (pid, port)
         }
-        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+        ProxyState::OrphanedPort {
+            port,
+            owner_pid,
+            reason,
+        } => {
             *entry_state_label = "OrphanedPort".into();
             *entry_pid = owner_pid;
             *entry_port = Some(port);
-            return Err(StopError::NotOurs { port, owner_pid, reason });
+            return Err(StopError::NotOurs {
+                port,
+                owner_pid,
+                reason,
+            });
         }
     };
     kill_pid_signal(pid, false)?;
@@ -990,9 +1020,17 @@ fn start_proxy_locked_inner(
         listen_addr: opts.listen_addr.clone(),
     };
     match proxy_state::compute_proxy_state(&inputs) {
-        ProxyState::Running { pid, port, listen_addr } => {
+        ProxyState::Running {
+            pid,
+            port,
+            listen_addr,
+        } => {
             *entry_state_label = "Running".into();
-            return Ok(RunningState { pid, port, listen_addr });
+            return Ok(RunningState {
+                pid,
+                port,
+                listen_addr,
+            });
         }
         ProxyState::Crashed { .. } => {
             *entry_state_label = "Crashed".into();
@@ -1021,9 +1059,17 @@ fn start_proxy_locked_inner(
             best_effort_remove(&pid_p);
             best_effort_remove(&meta_p);
         }
-        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+        ProxyState::OrphanedPort {
+            port,
+            owner_pid,
+            reason,
+        } => {
             *entry_state_label = "OrphanedPort".into();
-            return Err(StartError::OrphanedPort { port, owner_pid, reason });
+            return Err(StartError::OrphanedPort {
+                port,
+                owner_pid,
+                reason,
+            });
         }
         ProxyState::Stopped => {
             *entry_state_label = "Stopped".into();
@@ -1041,10 +1087,14 @@ fn start_proxy_locked_inner(
     // stderr log path).
     let port = parse_port(&opts.listen_addr);
     if !opts.binary_path.exists() {
-        return Err(StartError::BinaryMissing(opts.binary_path.display().to_string()));
+        return Err(StartError::BinaryMissing(
+            opts.binary_path.display().to_string(),
+        ));
     }
     if !opts.config_path.exists() {
-        return Err(StartError::ConfigMissing(opts.config_path.display().to_string()));
+        return Err(StartError::ConfigMissing(
+            opts.config_path.display().to_string(),
+        ));
     }
     let mut cmd = std::process::Command::new(&opts.binary_path);
     cmd.arg("--config").arg(&opts.config_path);
@@ -1058,7 +1108,8 @@ fn start_proxy_locked_inner(
         StderrTarget::Null | StderrTarget::Inherit => PathBuf::from("/dev/null"),
     };
     cmd.stderr(opts.stderr_target.into_stdio());
-    let child = cmd.spawn()
+    let child = cmd
+        .spawn()
         .map_err(|e| StartError::SpawnFailed(format!("{e}")))?;
     let child_pid = child.id();
 
@@ -1084,16 +1135,18 @@ fn start_proxy_locked_inner(
         // Map the helper's generic ChildDiedAtStartup (with /dev/null
         // placeholder) to one carrying THIS caller's real stderr log.
         return Err(match e {
-            StartError::ChildDiedAtStartup { .. } => {
-                StartError::ChildDiedAtStartup { stderr_log: stderr_log_path }
-            }
+            StartError::ChildDiedAtStartup { .. } => StartError::ChildDiedAtStartup {
+                stderr_log: stderr_log_path,
+            },
             other => other,
         });
     }
     let deadline = Instant::now() + opts.healthy_deadline;
     loop {
         if !proxy_proc::process_alive(child_pid) {
-            return Err(StartError::ChildDiedAtStartup { stderr_log: stderr_log_path });
+            return Err(StartError::ChildDiedAtStartup {
+                stderr_log: stderr_log_path,
+            });
         }
         if proxy_proc::http_health_ok(port, Duration::from_millis(500)) {
             guard.commit();
@@ -1104,7 +1157,9 @@ fn start_proxy_locked_inner(
             });
         }
         if Instant::now() >= deadline {
-            return Err(StartError::HealthyTimeout { stderr_log: stderr_log_path });
+            return Err(StartError::HealthyTimeout {
+                stderr_log: stderr_log_path,
+            });
         }
         std::thread::sleep(HEALTHY_POLL_INTERVAL);
     }
@@ -1216,7 +1271,12 @@ fn chrono_now_rfc3339() -> String {
     let y = if mo <= 2 { y + 1 } else { y };
     format!(
         "{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z",
-        y = y, mo = mo, d = d, h = h, m = m, s = s
+        y = y,
+        mo = mo,
+        d = d,
+        h = h,
+        m = m,
+        s = s
     )
 }
 

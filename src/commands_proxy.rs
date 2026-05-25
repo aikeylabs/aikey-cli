@@ -42,7 +42,11 @@ const DEFAULT_CONFIG_NAME: &str = "aikey-proxy.yaml";
 /// because stderr went to /dev/null.
 fn startup_log_path() -> PathBuf {
     dirs::home_dir()
-        .map(|h| h.join(".aikey").join("logs").join("aikey-proxy-startup.log"))
+        .map(|h| {
+            h.join(".aikey")
+                .join("logs")
+                .join("aikey-proxy-startup.log")
+        })
         .unwrap_or_else(|| PathBuf::from("/tmp/aikey-proxy-startup.log"))
 }
 
@@ -64,8 +68,7 @@ fn build_start_options(
     let (extra_env, env_keys) = match crate::proxy_env::read_proxy_env() {
         Ok(env_map) => {
             let keys: Vec<String> = env_map.keys().cloned().collect();
-            let pairs: Vec<(String, String)> =
-                env_map.into_iter().collect();
+            let pairs: Vec<(String, String)> = env_map.into_iter().collect();
             (pairs, keys)
         }
         Err(e) => {
@@ -203,7 +206,10 @@ pub(crate) fn is_proxy_listening() -> bool {
 /// would have returned `true`.
 pub fn proxy_is_running_managed() -> bool {
     use crate::proxy_state::{proxy_state, ProxyState};
-    matches!(proxy_state(&proxy_listen_addr(None)), ProxyState::Running { .. })
+    matches!(
+        proxy_state(&proxy_listen_addr(None)),
+        ProxyState::Running { .. }
+    )
 }
 
 /// Sends `POST /admin/reload` to the proxy if it is currently running.
@@ -256,12 +262,13 @@ pub fn try_reload_proxy() {
 pub fn try_auto_start_from_env() {
     use crate::proxy_lifecycle::StderrTarget;
 
-    let pw = std::env::var("AIKEY_MASTER_PASSWORD")
-        .or_else(|_| std::env::var("AK_TEST_PASSWORD"));
+    let pw = std::env::var("AIKEY_MASTER_PASSWORD").or_else(|_| std::env::var("AK_TEST_PASSWORD"));
     let Ok(pw_val) = pw else { return };
 
     let stderr_target = StderrTarget::Log(startup_log_path());
-    let Ok((opts, _)) = build_start_options(None, stderr_target) else { return };
+    let Ok((opts, _)) = build_start_options(None, stderr_target) else {
+        return;
+    };
 
     let _ = crate::proxy_lifecycle::start_proxy(&SecretString::new(pw_val), opts);
 }
@@ -340,7 +347,9 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
             match crate::prompt_hidden("\u{1F512} Enter Master Password: ") {
                 Ok(p) => SecretString::new(p),
                 Err(_) => {
-                    eprintln!("  [aikey] Could not read password — run `aikey proxy start` manually.");
+                    eprintln!(
+                        "  [aikey] Could not read password — run `aikey proxy start` manually."
+                    );
                     return;
                 }
             }
@@ -380,7 +389,11 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
                 let _ = crate::storage::set_proxy_loaded_seq(seq);
             }
         }
-        Err(StartError::OrphanedPort { port, owner_pid: _, reason: _ }) => {
+        Err(StartError::OrphanedPort {
+            port,
+            owner_pid: _,
+            reason: _,
+        }) => {
             eprintln!(
                 "  [aikey] port {port} is in use by another process — \
                  run `aikey proxy status` for details"
@@ -465,10 +478,19 @@ pub fn post_admin_reload() -> Result<(), Box<dyn std::error::Error>> {
         let mut body = String::new();
         let mut in_body = false;
         for line in lines.flatten() {
-            if in_body { body.push_str(&line); body.push('\n'); }
-            else if line.is_empty() { in_body = true; }
+            if in_body {
+                body.push_str(&line);
+                body.push('\n');
+            } else if line.is_empty() {
+                in_body = true;
+            }
         }
-        return Err(format!("proxy reload failed: {} — {}", status_line.trim(), body.trim()).into());
+        return Err(format!(
+            "proxy reload failed: {} — {}",
+            status_line.trim(),
+            body.trim()
+        )
+        .into());
     }
     Ok(())
 }
@@ -525,9 +547,13 @@ pub fn post_admin_replay_dead_letter() -> Result<String, Box<dyn std::error::Err
     // 503 (reporter not configured) is a real-but-expected operator state —
     // surface it cleanly. Other non-2xx is a fault.
     if status_line.contains("503") {
-        return Err(format!("replay unavailable: proxy reporter not configured. \
+        return Err(format!(
+            "replay unavailable: proxy reporter not configured. \
                             Check ~/.aikey/config/aikey-proxy.yaml `events.collector_url` / \
-                            `events.collector_routes` is set.\n  {}", body).into());
+                            `events.collector_routes` is set.\n  {}",
+            body
+        )
+        .into());
     }
     if !status_line.contains("200") {
         return Err(format!("replay failed: {} — {}", status_line.trim(), body).into());
@@ -588,15 +614,23 @@ fn read_yaml_listen_addr(config_path: Option<&std::path::Path>) -> Option<String
     let mut in_listen = false;
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed == "listen:" { in_listen = true; continue; }
+        if trimmed == "listen:" {
+            in_listen = true;
+            continue;
+        }
         if in_listen {
             if trimmed.starts_with("host:") {
-                host = trimmed.trim_start_matches("host:").trim().trim_matches('"').to_string();
+                host = trimmed
+                    .trim_start_matches("host:")
+                    .trim()
+                    .trim_matches('"')
+                    .to_string();
             } else if trimmed.starts_with("port:") {
                 if let Ok(p) = trimmed.trim_start_matches("port:").trim().parse::<u16>() {
                     port = p;
                 }
-            } else if !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with(' ') {
+            } else if !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with(' ')
+            {
                 in_listen = false;
             }
         }
@@ -643,7 +677,11 @@ fn runtime_snapshot_path() -> Option<std::path::PathBuf> {
 // Public entry points
 // ---------------------------------------------------------------------------
 
-pub fn handle_start(config: Option<&str>, detach: bool, password: &SecretString) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_start(
+    config: Option<&str>,
+    detach: bool,
+    password: &SecretString,
+) -> Result<(), Box<dyn std::error::Error>> {
     if detach {
         handle_start_background(config, password)
     } else {
@@ -672,7 +710,11 @@ fn handle_start_background(
     eprintln!("  config: {}", opts.config_path.display());
     eprintln!("  binary: {}", opts.binary_path.display());
     if !env_keys.is_empty() {
-        eprintln!("  proxy.env: {} entries [{}]", env_keys.len(), env_keys.join(", "));
+        eprintln!(
+            "  proxy.env: {} entries [{}]",
+            env_keys.len(),
+            env_keys.join(", ")
+        );
     }
 
     let listen_addr_for_msg = opts.listen_addr.clone();
@@ -694,7 +736,11 @@ fn handle_start_background(
             }
             Ok(())
         }
-        Err(crate::proxy_lifecycle::StartError::OrphanedPort { port, owner_pid: _, reason: _ }) => {
+        Err(crate::proxy_lifecycle::StartError::OrphanedPort {
+            port,
+            owner_pid: _,
+            reason: _,
+        }) => {
             // Preserve legacy error string so e2e tests match.
             Err(format!(
                 "address {} is already in use by another process.\n  \
@@ -774,15 +820,18 @@ fn handle_start_foreground(
     // **Round 9 fix #3**: acquire lifecycle lock for the spawn +
     // persist critical section. Released right after persist returns;
     // the foreground proxy then lives independently of the lock.
-    let _lock = acquire_lifecycle_lock().map_err(|_| {
-        "another aikey proxy command is in flight; retry shortly".to_string()
-    })?;
+    let _lock = acquire_lifecycle_lock()
+        .map_err(|_| "another aikey proxy command is in flight; retry shortly".to_string())?;
 
     // Layer 1 is the source of truth for "is something already there?"
     // — it covers PID-recycle / OrphanedPort cases that the old
     // `read_pid + process_alive` could not.
     match proxy_state(&listen_addr) {
-        ProxyState::Running { pid, listen_addr: addr, .. } => {
+        ProxyState::Running {
+            pid,
+            listen_addr: addr,
+            ..
+        } => {
             eprintln!("proxy already running (pid: {pid})");
             eprintln!("listen: http://{addr}");
             return Ok(());
@@ -794,7 +843,11 @@ fn handle_start_foreground(
             )
             .into());
         }
-        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+        ProxyState::OrphanedPort {
+            port,
+            owner_pid,
+            reason,
+        } => {
             return Err(format!(
                 "cannot start in foreground: port {port} is owned by something \
                  we cannot manage ({})",
@@ -827,7 +880,11 @@ fn handle_start_foreground(
     match crate::proxy_env::read_proxy_env() {
         Ok(env_map) if !env_map.is_empty() => {
             let keys: Vec<&str> = env_map.keys().map(|k| k.as_str()).collect();
-            eprintln!("  proxy.env: {} entries [{}]", env_map.len(), keys.join(", "));
+            eprintln!(
+                "  proxy.env: {} entries [{}]",
+                env_map.len(),
+                keys.join(", ")
+            );
             for (k, v) in &env_map {
                 cmd.env(k, v);
             }
@@ -838,14 +895,16 @@ fn handle_start_foreground(
                 "Failed to parse ~/.aikey/proxy.env: {}\n\
                  Fix the file or remove it, then retry.",
                 e
-            ).into());
+            )
+            .into());
         }
     }
 
     cmd.env("AIKEY_MASTER_PASSWORD", password.expose_secret());
 
     cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("failed to spawn aikey-proxy: {}", e))?;
     let pid = child.id();
 
@@ -958,7 +1017,11 @@ pub fn handle_stop() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
-        Err(StopError::NotOurs { port, owner_pid, reason }) => {
+        Err(StopError::NotOurs {
+            port,
+            owner_pid,
+            reason,
+        }) => {
             // **Round 7 review fix (MEDIUM)**: previously this branch
             // returned Ok(()) so scripts that piped `stop && start`
             // wouldn't break — but that hid a critical truth from
@@ -974,7 +1037,11 @@ pub fn handle_stop() -> Result<(), Box<dyn std::error::Error>> {
             // the port and why we wouldn't touch it.
             Err(format!(
                 "{}",
-                StopError::NotOurs { port, owner_pid, reason }
+                StopError::NotOurs {
+                    port,
+                    owner_pid,
+                    reason
+                }
             )
             .into())
         }
@@ -1016,10 +1083,14 @@ pub fn status_rows() -> Vec<String> {
             rows.push("hint:    run `aikey proxy start` to start".to_string());
         }
         ProxyState::Crashed { stale_pid } => {
-            rows.push(format!("status:  stopped (stale pid file, was: {stale_pid})"));
+            rows.push(format!(
+                "status:  stopped (stale pid file, was: {stale_pid})"
+            ));
             rows.push("hint:    run `aikey proxy start` to clean up and restart".to_string());
         }
-        ProxyState::Running { pid, listen_addr, .. } => {
+        ProxyState::Running {
+            pid, listen_addr, ..
+        } => {
             rows.push("status:  running (healthy)".to_string());
             rows.push(format!("pid:     {pid}"));
             rows.push(format!("listen:  http://{listen_addr}"));
@@ -1035,9 +1106,16 @@ pub fn status_rows() -> Vec<String> {
             rows.push("status:  unresponsive (port bound, /health not responding)".to_string());
             rows.push(format!("pid:     {pid}"));
             rows.push(format!("listen:  http://127.0.0.1:{port}"));
-            rows.push("hint:    could be initializing or hung — wait or `aikey proxy restart`".to_string());
+            rows.push(
+                "hint:    could be initializing or hung — wait or `aikey proxy restart`"
+                    .to_string(),
+            );
         }
-        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+        ProxyState::OrphanedPort {
+            port,
+            owner_pid,
+            reason,
+        } => {
             rows.push("status:  orphaned (port held by something we cannot manage)".to_string());
             if let Some(owner) = owner_pid {
                 rows.push(format!("owner:   pid {owner}"));
@@ -1057,8 +1135,13 @@ pub fn status_rows() -> Vec<String> {
 /// Delegates to Layer 2 [`crate::proxy_lifecycle::restart_proxy`] for
 /// the actual stop+start under shared lock; this shell builds the
 /// StartOptions and translates errors to legacy strings.
-pub fn handle_restart(config: Option<&str>, password: &SecretString) -> Result<(), Box<dyn std::error::Error>> {
-    use crate::proxy_lifecycle::{restart_proxy, RestartError, StartError, StopError, StderrTarget, DEFAULT_STOP_TIMEOUT};
+pub fn handle_restart(
+    config: Option<&str>,
+    password: &SecretString,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::proxy_lifecycle::{
+        restart_proxy, RestartError, StartError, StderrTarget, StopError, DEFAULT_STOP_TIMEOUT,
+    };
 
     let stderr_target = StderrTarget::Log(startup_log_path());
     let (opts, env_keys) = build_start_options(config, stderr_target)?;
@@ -1067,7 +1150,11 @@ pub fn handle_restart(config: Option<&str>, password: &SecretString) -> Result<(
     eprintln!("  config: {}", opts.config_path.display());
     eprintln!("  binary: {}", opts.binary_path.display());
     if !env_keys.is_empty() {
-        eprintln!("  proxy.env: {} entries [{}]", env_keys.len(), env_keys.join(", "));
+        eprintln!(
+            "  proxy.env: {} entries [{}]",
+            env_keys.len(),
+            env_keys.join(", ")
+        );
     }
 
     match restart_proxy(password, opts, DEFAULT_STOP_TIMEOUT, |s| eprintln!("{s}")) {
@@ -1128,8 +1215,10 @@ fn process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
         let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if h == 0 || h == INVALID_HANDLE_VALUE as isize {
             return false;
@@ -1163,27 +1252,39 @@ fn terminate_process(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
         use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
         let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
         if h == 0 {
             return Err(format!("OpenProcess({}) failed", pid).into());
         }
-        unsafe { TerminateProcess(h, 1); CloseHandle(h); }
+        unsafe {
+            TerminateProcess(h, 1);
+            CloseHandle(h);
+        }
         Ok(())
     }
     #[cfg(not(any(unix, windows)))]
     {
-        Err(format!("terminate_process not supported on this platform (pid: {})", pid).into())
+        Err(format!(
+            "terminate_process not supported on this platform (pid: {})",
+            pid
+        )
+        .into())
     }
 }
 
 /// Non-blocking TCP connect to check if the proxy port is reachable.
 fn port_reachable(addr: &str, timeout: Duration) -> bool {
     TcpStream::connect_timeout(
-        &addr.parse().unwrap_or_else(|_| PROXY_HEALTH_ADDR_DEFAULT.parse().unwrap()),
+        &addr
+            .parse()
+            .unwrap_or_else(|_| PROXY_HEALTH_ADDR_DEFAULT.parse().unwrap()),
         timeout,
-    ).is_ok()
+    )
+    .is_ok()
 }
 
 /// Quick connectivity check for overseas AI providers.
@@ -1191,14 +1292,15 @@ fn port_reachable(addr: &str, timeout: Duration) -> bool {
 /// for providers that are unreachable — no output when all is fine.
 fn check_overseas_connectivity() {
     const PROVIDERS: &[(&str, &str)] = &[
-        ("OpenAI",    "api.openai.com:443"),
+        ("OpenAI", "api.openai.com:443"),
         ("Anthropic", "api.anthropic.com:443"),
     ];
     let timeout = Duration::from_secs(5);
     let mut unreachable = Vec::new();
     for &(name, addr) in PROVIDERS {
         if let Ok(sock_addr) = addr.to_socket_addrs().and_then(|mut it| {
-            it.next().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no addr"))
+            it.next()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no addr"))
         }) {
             if TcpStream::connect_timeout(&sock_addr, timeout).is_err() {
                 unreachable.push(name);
@@ -1209,8 +1311,10 @@ fn check_overseas_connectivity() {
     }
     if !unreachable.is_empty() {
         eprintln!();
-        eprintln!("  \x1b[33m[warn]\x1b[0m  Cannot reach: {}",
-            unreachable.join(", "));
+        eprintln!(
+            "  \x1b[33m[warn]\x1b[0m  Cannot reach: {}",
+            unreachable.join(", ")
+        );
         eprintln!("  \x1b[33m[warn]\x1b[0m  If you use these providers, configure HTTP_PROXY / HTTPS_PROXY");
         eprintln!("          and restart the proxy: aikey proxy restart");
     }
@@ -1222,7 +1326,11 @@ fn check_overseas_connectivity() {
 /// 3. `~/.aikey/bin/aikey-proxy` — user-local install
 /// 4. System `PATH` — standard install via `make install`
 fn find_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let bin_name = if cfg!(windows) { "aikey-proxy.exe" } else { "aikey-proxy" };
+    let bin_name = if cfg!(windows) {
+        "aikey-proxy.exe"
+    } else {
+        "aikey-proxy"
+    };
 
     // 1. Explicit override via env var.
     if let Ok(val) = std::env::var("AIKEY_PROXY_BIN") {
@@ -1230,7 +1338,11 @@ fn find_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
         if p.exists() {
             return Ok(p);
         }
-        return Err(format!("AIKEY_PROXY_BIN is set but binary not found: {}", p.display()).into());
+        return Err(format!(
+            "AIKEY_PROXY_BIN is set but binary not found: {}",
+            p.display()
+        )
+        .into());
     }
 
     // 2. Same directory as the current `aikey` binary.
@@ -1267,8 +1379,11 @@ fn find_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
         }
     }
 
-    Err("aikey-proxy not found. Searched: same dir as aikey, ~/.aikey/bin/, system PATH. \
-         Run `make install` in the aikey-proxy project, or set AIKEY_PROXY_BIN.".into())
+    Err(
+        "aikey-proxy not found. Searched: same dir as aikey, ~/.aikey/bin/, system PATH. \
+         Run `make install` in the aikey-proxy project, or set AIKEY_PROXY_BIN."
+            .into(),
+    )
 }
 
 /// Verify current project / env / provider connectivity end-to-end.
@@ -1327,7 +1442,8 @@ pub fn handle_verify(password: &SecretString) -> Result<(), Box<dyn std::error::
         .flatten()
         .map(|(_, cfg)| cfg);
 
-    let project_name = config.as_ref()
+    let project_name = config
+        .as_ref()
         .map(|c| c.project.name.as_str())
         .unwrap_or("(no project config)");
     println!("project:  {}", project_name);
@@ -1363,7 +1479,11 @@ pub fn handle_verify(password: &SecretString) -> Result<(), Box<dyn std::error::
         ProxyState::Running { .. } => {
             println!("proxy:    running (healthy)");
         }
-        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+        ProxyState::OrphanedPort {
+            port,
+            owner_pid,
+            reason,
+        } => {
             // Don't auto-start — we'd OrphanedPort-error. Surface the
             // diagnostic so the user can resolve manually.
             println!("proxy:    orphaned (port {port} held by something we cannot manage)");
@@ -1441,13 +1561,20 @@ pub fn proxy_guard(password: &SecretString) -> bool {
             // with their own bounded wait.
             return true;
         }
-        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+        ProxyState::OrphanedPort {
+            port,
+            owner_pid,
+            reason,
+        } => {
             // Layer 1 says the port is held by something we cannot
             // manage — auto-starting would either OrphanedPort-error
             // out or, worse, race with whoever owns it. Bail with a
             // clear diagnostic so the user can resolve manually.
-            eprintln!("[aikey] cannot auto-start proxy: port {port} is owned by something \
-                       we cannot manage ({})", reason.hint(port, owner_pid));
+            eprintln!(
+                "[aikey] cannot auto-start proxy: port {port} is owned by something \
+                       we cannot manage ({})",
+                reason.hint(port, owner_pid)
+            );
             eprintln!("[aikey] hint: run `aikey proxy status` for details");
             return false;
         }
@@ -1479,7 +1606,10 @@ pub fn proxy_guard(password: &SecretString) -> bool {
                 std::thread::sleep(Duration::from_millis(300));
             };
             if !up {
-                eprintln!("[aikey] warning: proxy started but port {} unreachable", health_addr);
+                eprintln!(
+                    "[aikey] warning: proxy started but port {} unreachable",
+                    health_addr
+                );
                 eprintln!("[aikey] hint:    run `aikey proxy status` to debug");
             }
             up
@@ -1562,7 +1692,8 @@ fn resolve_config(explicit: Option<&str>) -> Result<PathBuf, Box<dyn std::error:
          Run installer (local-install.sh) or `aikey-config-tool render --profile personal`\n  \
          to generate it. Use `--config <path>` to specify an explicit alternative.",
         DEFAULT_CONFIG_NAME,
-    ).into())
+    )
+    .into())
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,7 +1708,8 @@ pub fn doctor_proxy_addr() -> String {
 /// Returns the proxy listen port from config, falling back to 27200.
 pub fn proxy_port() -> u16 {
     let addr = proxy_listen_addr(None);
-    addr.rsplit(':').next()
+    addr.rsplit(':')
+        .next()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(27200)
 }
@@ -1607,17 +1739,28 @@ pub fn warn_if_proxy_down() {
         ProxyState::Running { .. } => {} // happy path: no warning
         ProxyState::Stopped | ProxyState::Crashed { .. } => {
             eprintln!();
-            eprintln!("  \x1b[33m\u{26A0}\x1b[0m  Proxy is not running. Start it with: aikey proxy start");
+            eprintln!(
+                "  \x1b[33m\u{26A0}\x1b[0m  Proxy is not running. Start it with: aikey proxy start"
+            );
         }
         ProxyState::Unresponsive { pid, port } => {
             eprintln!();
-            eprintln!("  \x1b[33m\u{26A0}\x1b[0m  Proxy (pid {pid}) is unresponsive on port {port} \
-                       (port bound, /health failing). Try: aikey proxy restart");
+            eprintln!(
+                "  \x1b[33m\u{26A0}\x1b[0m  Proxy (pid {pid}) is unresponsive on port {port} \
+                       (port bound, /health failing). Try: aikey proxy restart"
+            );
         }
-        ProxyState::OrphanedPort { port, owner_pid, reason } => {
+        ProxyState::OrphanedPort {
+            port,
+            owner_pid,
+            reason,
+        } => {
             eprintln!();
-            eprintln!("  \x1b[33m\u{26A0}\x1b[0m  Port {port} is held by something we cannot manage \
-                       — {}", reason.hint(port, owner_pid));
+            eprintln!(
+                "  \x1b[33m\u{26A0}\x1b[0m  Port {port} is held by something we cannot manage \
+                       — {}",
+                reason.hint(port, owner_pid)
+            );
             eprintln!("       Run `aikey proxy status` for details.");
         }
     }
@@ -1665,7 +1808,8 @@ mod resolve_config_tests {
     #[test]
     fn does_not_pick_up_cwd_yaml_when_present() {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let tmp = tempfile::tempdir().unwrap();
         let stale_yaml = tmp.path().join(DEFAULT_CONFIG_NAME);
@@ -1676,7 +1820,7 @@ mod resolve_config_tests {
         let prev_home = std::env::var_os("HOME");
         let prev_proxy_cfg = std::env::var_os("AIKEY_PROXY_CONFIG");
         let prev_cwd = std::env::current_dir().ok();
-        std::env::set_var("HOME", tmp.path());          // home with no .aikey/config
+        std::env::set_var("HOME", tmp.path()); // home with no .aikey/config
         std::env::remove_var("AIKEY_PROXY_CONFIG");
         std::env::set_current_dir(tmp.path()).unwrap(); // cwd contains stale yaml
 
@@ -1684,10 +1828,17 @@ mod resolve_config_tests {
 
         // Restore process state first so a panic in assertions below
         // doesn't leak HOME / cwd across tests.
-        if let Some(d) = prev_cwd { let _ = std::env::set_current_dir(d); }
-        if let Some(h) = prev_home { std::env::set_var("HOME", h); }
-        else { std::env::remove_var("HOME"); }
-        if let Some(p) = prev_proxy_cfg { std::env::set_var("AIKEY_PROXY_CONFIG", p); }
+        if let Some(d) = prev_cwd {
+            let _ = std::env::set_current_dir(d);
+        }
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(p) = prev_proxy_cfg {
+            std::env::set_var("AIKEY_PROXY_CONFIG", p);
+        }
 
         match resolved {
             Ok(p) => panic!(
@@ -1696,8 +1847,11 @@ mod resolve_config_tests {
             ),
             Err(e) => {
                 let msg = e.to_string();
-                assert!(msg.contains("~/.aikey/config/") || msg.contains(".aikey"),
-                    "error must point user at canonical home location; got: {}", msg);
+                assert!(
+                    msg.contains("~/.aikey/config/") || msg.contains(".aikey"),
+                    "error must point user at canonical home location; got: {}",
+                    msg
+                );
             }
         }
     }
@@ -1718,7 +1872,8 @@ mod resolve_config_tests {
     #[test]
     fn env_override_still_works() {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let tmp = tempfile::tempdir().unwrap();
         let yaml = tmp.path().join("env-pointed.yaml");
@@ -1729,8 +1884,11 @@ mod resolve_config_tests {
 
         let resolved = resolve_config(None);
 
-        if let Some(p) = prev { std::env::set_var("AIKEY_PROXY_CONFIG", p); }
-        else { std::env::remove_var("AIKEY_PROXY_CONFIG"); }
+        if let Some(p) = prev {
+            std::env::set_var("AIKEY_PROXY_CONFIG", p);
+        } else {
+            std::env::remove_var("AIKEY_PROXY_CONFIG");
+        }
 
         assert_eq!(resolved.unwrap(), yaml);
     }
@@ -1739,7 +1897,8 @@ mod resolve_config_tests {
     #[test]
     fn home_default_path_is_absolute_and_under_dot_aikey_config() {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().join(".aikey").join("config");
@@ -1754,14 +1913,29 @@ mod resolve_config_tests {
 
         let resolved = resolve_config(None);
 
-        if let Some(h) = prev_home { std::env::set_var("HOME", h); }
-        else { std::env::remove_var("HOME"); }
-        if let Some(p) = prev_proxy_cfg { std::env::set_var("AIKEY_PROXY_CONFIG", p); }
+        if let Some(h) = prev_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(p) = prev_proxy_cfg {
+            std::env::set_var("AIKEY_PROXY_CONFIG", p);
+        }
 
         let got = resolved.unwrap();
-        assert!(got.is_absolute(), "must return absolute path; got: {}", got.display());
-        assert!(got.to_string_lossy().contains(".aikey"),
-            "must be under .aikey/config; got: {}", got.display());
-        assert_eq!(got.file_name().and_then(|s| s.to_str()), Some(DEFAULT_CONFIG_NAME));
+        assert!(
+            got.is_absolute(),
+            "must return absolute path; got: {}",
+            got.display()
+        );
+        assert!(
+            got.to_string_lossy().contains(".aikey"),
+            "must be under .aikey/config; got: {}",
+            got.display()
+        );
+        assert_eq!(
+            got.file_name().and_then(|s| s.to_str()),
+            Some(DEFAULT_CONFIG_NAME)
+        );
     }
 }

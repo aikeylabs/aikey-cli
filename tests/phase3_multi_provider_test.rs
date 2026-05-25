@@ -3,8 +3,8 @@
 //! Tests the full CLI flow: add → auto-assign → list → use → delete → reconcile.
 //! Uses `AK_TEST_PASSWORD` and `AK_TEST_SECRET` to avoid interactive prompts.
 
-use assert_cmd::Command;
 use assert_cmd::cargo::cargo_bin;
+use assert_cmd::Command;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
@@ -24,7 +24,9 @@ impl TestEnv {
             .write_stdin("test_pass_123\n")
             .assert()
             .success();
-        Self { _temp_dir: temp_dir }
+        Self {
+            _temp_dir: temp_dir,
+        }
     }
 
     fn cmd(&self) -> Command {
@@ -59,7 +61,11 @@ impl TestEnv {
     }
 
     fn db_path(&self) -> PathBuf {
-        self._temp_dir.path().join(".aikey").join("data").join("vault.db")
+        self._temp_dir
+            .path()
+            .join(".aikey")
+            .join("data")
+            .join("vault.db")
     }
 }
 
@@ -77,18 +83,36 @@ fn e2e_add_multi_provider_keys_writes_all_env_vars() {
     env.add_key("gemini-main", "google").success();
 
     let content = env.active_env_content();
-    assert!(content.contains("ANTHROPIC_API_KEY"), "should contain ANTHROPIC_API_KEY");
-    assert!(content.contains("OPENAI_API_KEY"), "should contain OPENAI_API_KEY");
-    assert!(content.contains("GOOGLE_API_KEY"), "should contain GOOGLE_API_KEY");
+    assert!(
+        content.contains("ANTHROPIC_API_KEY"),
+        "should contain ANTHROPIC_API_KEY"
+    );
+    assert!(
+        content.contains("OPENAI_API_KEY"),
+        "should contain OPENAI_API_KEY"
+    );
+    assert!(
+        content.contains("GOOGLE_API_KEY"),
+        "should contain GOOGLE_API_KEY"
+    );
 
     // Anthropic and Google get BASE_URL; OpenAI deliberately omits it because
     // Codex v0.118+ warns on OPENAI_BASE_URL (reads openai_base_url from
     // ~/.codex/config.toml instead). See profile_activation.rs:51-61 for the
     // skip_base_url rationale.
-    assert!(content.contains("ANTHROPIC_BASE_URL"), "should contain ANTHROPIC_BASE_URL");
-    assert!(content.contains("GOOGLE_BASE_URL"), "should contain GOOGLE_BASE_URL");
-    assert!(!content.contains("OPENAI_BASE_URL"),
-        "OPENAI_BASE_URL should be omitted (Codex compat), got:\n{}", content);
+    assert!(
+        content.contains("ANTHROPIC_BASE_URL"),
+        "should contain ANTHROPIC_BASE_URL"
+    );
+    assert!(
+        content.contains("GOOGLE_BASE_URL"),
+        "should contain GOOGLE_BASE_URL"
+    );
+    assert!(
+        !content.contains("OPENAI_BASE_URL"),
+        "OPENAI_BASE_URL should be omitted (Codex compat), got:\n{}",
+        content
+    );
 }
 
 // ============================================================================
@@ -102,13 +126,22 @@ fn e2e_add_same_provider_does_not_overwrite_primary() {
     // First key becomes Primary for anthropic.
     env.add_key("claude-main", "anthropic").success();
     let content1 = env.active_env_content();
-    assert!(content1.contains("anthropic=claude-main"), "first key should be primary");
+    assert!(
+        content1.contains("anthropic=claude-main"),
+        "first key should be primary"
+    );
 
     // Second key for same provider should NOT replace.
     env.add_key("claude-backup", "anthropic").success();
     let content2 = env.active_env_content();
-    assert!(content2.contains("anthropic=claude-main"), "first key should still be primary");
-    assert!(!content2.contains("anthropic=claude-backup"), "backup should not be in active.env");
+    assert!(
+        content2.contains("anthropic=claude-main"),
+        "first key should still be primary"
+    );
+    assert!(
+        !content2.contains("anthropic=claude-backup"),
+        "backup should not be in active.env"
+    );
 }
 
 // ============================================================================
@@ -136,10 +169,15 @@ fn e2e_use_alias_switches_primary() {
 
     // Verify: backup is now Primary.
     let content2 = env.active_env_content();
-    assert!(content2.contains("anthropic=claude-backup"),
-        "backup should now be primary. Content:\n{}", content2);
-    assert!(!content2.contains("anthropic=claude-main"),
-        "main should no longer be in active.env for anthropic");
+    assert!(
+        content2.contains("anthropic=claude-backup"),
+        "backup should now be primary. Content:\n{}",
+        content2
+    );
+    assert!(
+        !content2.contains("anthropic=claude-main"),
+        "main should no longer be in active.env for anthropic"
+    );
 }
 
 // ============================================================================
@@ -167,8 +205,11 @@ fn e2e_delete_primary_auto_backfills() {
 
     // Verify: backup should be auto-promoted.
     let content2 = env.active_env_content();
-    assert!(content2.contains("anthropic=claude-backup"),
-        "backup should be auto-promoted after primary deletion. Content:\n{}", content2);
+    assert!(
+        content2.contains("anthropic=claude-backup"),
+        "backup should be auto-promoted after primary deletion. Content:\n{}",
+        content2
+    );
 }
 
 // ============================================================================
@@ -196,10 +237,16 @@ fn e2e_delete_only_key_clears_provider() {
 
     // Anthropic should be gone from active.env; OpenAI remains.
     let content2 = env.active_env_content();
-    assert!(!content2.contains("ANTHROPIC_API_KEY"),
-        "anthropic should be cleared. Content:\n{}", content2);
-    assert!(content2.contains("OPENAI_API_KEY"),
-        "openai should remain. Content:\n{}", content2);
+    assert!(
+        !content2.contains("ANTHROPIC_API_KEY"),
+        "anthropic should be cleared. Content:\n{}",
+        content2
+    );
+    assert!(
+        content2.contains("OPENAI_API_KEY"),
+        "openai should remain. Content:\n{}",
+        content2
+    );
 }
 
 // ============================================================================
@@ -213,11 +260,7 @@ fn e2e_list_shows_primary_for() {
     env.add_key("claude-main", "anthropic").success();
     env.add_key("gpt-main", "openai").success();
 
-    let output = env.cmd()
-        .arg("list")
-        .arg("--json")
-        .assert()
-        .success();
+    let output = env.cmd().arg("list").arg("--json").assert().success();
 
     // JSON output should contain providers info.
     let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap_or_default();
@@ -225,8 +268,10 @@ fn e2e_list_shows_primary_for() {
     let combined = format!("{}{}", stdout, stderr);
 
     // Should mention both keys.
-    assert!(combined.contains("claude-main") || combined.contains("anthropic"),
-        "list output should mention claude-main or anthropic");
+    assert!(
+        combined.contains("claude-main") || combined.contains("anthropic"),
+        "list output should mention claude-main or anthropic"
+    );
 }
 
 // ============================================================================
@@ -255,13 +300,21 @@ fn e2e_mixed_providers_coexist() {
 
     // Verify: anthropic = claude-main, openai = gpt-backup, google = gemini-main
     let content = env.active_env_content();
-    assert!(content.contains("anthropic=claude-main"),
-        "anthropic should still be claude-main");
-    assert!(content.contains("openai=gpt-backup"),
-        "openai should be switched to gpt-backup");
-    assert!(content.contains("google=gemini-main"),
-        "google should still be gemini-main");
+    assert!(
+        content.contains("anthropic=claude-main"),
+        "anthropic should still be claude-main"
+    );
+    assert!(
+        content.contains("openai=gpt-backup"),
+        "openai should be switched to gpt-backup"
+    );
+    assert!(
+        content.contains("google=gemini-main"),
+        "google should still be gemini-main"
+    );
     // gpt-main should NOT appear.
-    assert!(!content.contains("openai=gpt-main"),
-        "gpt-main should no longer be primary");
+    assert!(
+        !content.contains("openai=gpt-main"),
+        "gpt-main should no longer be primary"
+    );
 }

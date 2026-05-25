@@ -34,8 +34,8 @@ use rusqlite::{params, Connection};
 mod handlers;
 mod install;
 pub use handlers::{
-    handle_list, handle_pause, handle_register, handle_resume, handle_revoke,
-    handle_rotate, handle_route,
+    handle_list, handle_pause, handle_register, handle_resume, handle_revoke, handle_rotate,
+    handle_route,
 };
 pub use install::{handle_install, handle_uninstall};
 
@@ -88,11 +88,25 @@ pub const ALLOWED_UPSTREAMS: &[&str] = &[
     // OpenAI itself.
     "openai",
     // Tier-1 OpenAI-compatible direct providers.
-    "kimi", "moonshot", "deepseek", "qwen",
-    "groq", "together", "perplexity", "fireworks", "deepinfra",
-    "siliconflow", "siliconflow-cn", "zhipu", "doubao", "01ai",
+    "kimi",
+    "moonshot",
+    "deepseek",
+    "qwen",
+    "groq",
+    "together",
+    "perplexity",
+    "fireworks",
+    "deepinfra",
+    "siliconflow",
+    "siliconflow-cn",
+    "zhipu",
+    "doubao",
+    "01ai",
     // Aggregator gateways that forward OpenAI-wire to backends.
-    "openrouter", "openrouter-ai", "litellm", "portkey",
+    "openrouter",
+    "openrouter-ai",
+    "litellm",
+    "portkey",
 ];
 
 /// `slug` form check: 3-64 chars, lowercase letters + digits + dash only,
@@ -109,7 +123,10 @@ pub fn validate_slug(slug: &str) -> Result<(), String> {
     }
     let bytes = slug.as_bytes();
     if !bytes[0].is_ascii_lowercase() {
-        return Err(format!("app slug must start with a lowercase letter: {}", slug));
+        return Err(format!(
+            "app slug must start with a lowercase letter: {}",
+            slug
+        ));
     }
     if bytes[bytes.len() - 1] == b'-' {
         return Err(format!("app slug must not end with '-': {}", slug));
@@ -120,9 +137,7 @@ pub fn validate_slug(slug: &str) -> Result<(), String> {
         if !ok {
             return Err(format!(
                 "app slug char #{} is not [a-z0-9-]: {} (in {})",
-                i,
-                *c as char,
-                slug
+                i, *c as char, slug
             ));
         }
         let is_dash = *c == b'-';
@@ -248,8 +263,8 @@ pub fn upsert_app_record_with_conn(
     follow_user_active: bool,
     requested_permissions: &[String],
 ) -> Result<bool, String> {
-    let upstreams_json = serde_json::to_string(upstreams)
-        .map_err(|e| format!("encode upstreams JSON: {}", e))?;
+    let upstreams_json =
+        serde_json::to_string(upstreams).map_err(|e| format!("encode upstreams JSON: {}", e))?;
     let permissions_json = serde_json::to_string(requested_permissions)
         .map_err(|e| format!("encode requested_permissions JSON: {}", e))?;
 
@@ -298,29 +313,28 @@ pub fn get_app_record_with_conn(
     conn: &Connection,
     slug: &str,
 ) -> Result<Option<AppRecord>, String> {
-    let row = conn
-        .query_row(
-            "SELECT slug, name, vendor, upstreams, app_kind, follow_user_active,
+    let row = conn.query_row(
+        "SELECT slug, name, vendor, upstreams, app_kind, follow_user_active,
                     requested_permissions, created_at, updated_at
                FROM app_records WHERE slug = ?1",
-            params![slug],
-            |r| {
-                let upstreams_json: String = r.get(3)?;
-                let permissions_json: Option<String> = r.get(6)?;
-                let follow: i64 = r.get(5)?;
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    upstreams_json,
-                    r.get::<_, String>(4)?,
-                    follow != 0,
-                    permissions_json,
-                    r.get::<_, i64>(7)?,
-                    r.get::<_, i64>(8)?,
-                ))
-            },
-        );
+        params![slug],
+        |r| {
+            let upstreams_json: String = r.get(3)?;
+            let permissions_json: Option<String> = r.get(6)?;
+            let follow: i64 = r.get(5)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                upstreams_json,
+                r.get::<_, String>(4)?,
+                follow != 0,
+                permissions_json,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)?,
+            ))
+        },
+    );
     let (slug, name, vendor, upstreams_json, app_kind, follow, perms_json, created_at, updated_at) =
         match row {
             Ok(t) => t,
@@ -409,11 +423,21 @@ pub fn list_apps() -> Result<Vec<(AppRecord, Option<ActiveAppKeyInfo>)>, String>
 
     let mut out = Vec::new();
     for row in rows_iter {
-        let (slug, name, vendor, upstreams_json, app_kind, follow, perms_json, created_at,
-             updated_at, key_id, key_created, key_last) =
-            row.map_err(|e| format!("scan list_apps row: {}", e))?;
-        let upstreams: Vec<String> =
-            serde_json::from_str(&upstreams_json).unwrap_or_default();
+        let (
+            slug,
+            name,
+            vendor,
+            upstreams_json,
+            app_kind,
+            follow,
+            perms_json,
+            created_at,
+            updated_at,
+            key_id,
+            key_created,
+            key_last,
+        ) = row.map_err(|e| format!("scan list_apps row: {}", e))?;
+        let upstreams: Vec<String> = serde_json::from_str(&upstreams_json).unwrap_or_default();
         let requested_permissions: Vec<String> = match perms_json {
             Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
             _ => Vec::new(),
@@ -501,7 +525,9 @@ pub fn authorize_atomic_with_conn(
 ) -> Result<(String, String), String> {
     let key_id = uuid_v4_simple();
     let route_token = storage::generate_app_route_token();
-    let tx = conn.transaction().map_err(|e| format!("begin authorize tx: {}", e))?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("begin authorize tx: {}", e))?;
 
     tx.execute(
         "INSERT INTO app_keys (key_id, app_slug, route_token, status) VALUES (?1, ?2, ?3, 'active')",
@@ -533,10 +559,16 @@ pub fn authorize_atomic_with_conn(
                 updated_at      = excluded.updated_at",
             params![profile_id, provider_code, key_type.as_str(), key_ref],
         )
-        .map_err(|e| format!("UPSERT binding profile={} provider={}: {}", profile_id, provider_code, e))?;
+        .map_err(|e| {
+            format!(
+                "UPSERT binding profile={} provider={}: {}",
+                profile_id, provider_code, e
+            )
+        })?;
     }
 
-    tx.commit().map_err(|e| format!("commit authorize tx: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("commit authorize tx: {}", e))?;
     Ok((key_id, route_token))
 }
 
@@ -562,12 +594,7 @@ pub fn set_app_binding(
     .map_err(|e| format!("seed user_profiles row for {}: {}", profile_id, e))?;
     drop(conn);
 
-    storage::set_provider_binding(
-        &profile_id,
-        provider_code,
-        key_source_type,
-        key_source_ref,
-    )?;
+    storage::set_provider_binding(&profile_id, provider_code, key_source_type, key_source_ref)?;
     let _ = storage::bump_vault_change_seq();
     Ok(())
 }
@@ -686,10 +713,7 @@ pub fn delete_all_app_state_with_conn(
         .map_err(|e| format!("begin uninstall tx for slug={:?}: {}", slug, e))?;
 
     let app_keys_deleted = tx
-        .execute(
-            "DELETE FROM app_keys WHERE app_slug = ?1",
-            params![slug],
-        )
+        .execute("DELETE FROM app_keys WHERE app_slug = ?1", params![slug])
         .map_err(|e| format!("DELETE app_keys for slug={:?}: {}", slug, e))?;
 
     // FK on user_profile_provider_bindings.profile_id references
@@ -708,10 +732,7 @@ pub fn delete_all_app_state_with_conn(
         .map_err(|e| format!("DELETE bindings for profile={:?}: {}", profile_id, e))?;
 
     let app_records_deleted = tx
-        .execute(
-            "DELETE FROM app_records WHERE slug = ?1",
-            params![slug],
-        )
+        .execute("DELETE FROM app_records WHERE slug = ?1", params![slug])
         .map_err(|e| format!("DELETE app_records for slug={:?}: {}", slug, e))?;
 
     tx.commit()
@@ -731,10 +752,15 @@ pub fn rotate_app_key(slug: &str) -> Result<(String, String), String> {
     Ok(result)
 }
 
-pub fn rotate_app_key_with_conn(conn: &mut Connection, slug: &str) -> Result<(String, String), String> {
+pub fn rotate_app_key_with_conn(
+    conn: &mut Connection,
+    slug: &str,
+) -> Result<(String, String), String> {
     let new_key_id = uuid_v4_simple();
     let new_route_token = storage::generate_app_route_token();
-    let tx = conn.transaction().map_err(|e| format!("begin rotate tx: {}", e))?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("begin rotate tx: {}", e))?;
 
     // Step 1: revoke existing active key (no-op if none — rotate on a
     // never-authorized app just becomes "first issuance").
@@ -752,7 +778,8 @@ pub fn rotate_app_key_with_conn(conn: &mut Connection, slug: &str) -> Result<(St
     )
     .map_err(|e| format!("INSERT app_keys (rotate step 2): {}", e))?;
 
-    tx.commit().map_err(|e| format!("commit rotate tx: {}", e))?;
+    tx.commit()
+        .map_err(|e| format!("commit rotate tx: {}", e))?;
     Ok((new_key_id, new_route_token))
 }
 
@@ -805,9 +832,7 @@ pub fn list_app_active_keys(slug: &str) -> Result<Vec<ActiveAppKeyInfo>, String>
 /// — matches the shape of authorize_atomic's initial_bindings parameter
 /// so handlers can pass it directly into authorize_atomic at first-route
 /// bearer issuance time.
-pub fn get_active_bindings(
-    slug: &str,
-) -> Result<Vec<(String, CredentialType, String)>, String> {
+pub fn get_active_bindings(slug: &str) -> Result<Vec<(String, CredentialType, String)>, String> {
     let profile_id = format!("app:{}", slug);
     let conn = storage::open_connection()?;
     let mut stmt = conn
@@ -886,11 +911,8 @@ pub fn get_active_bindings(
 /// Internal state operations (snapshot copy, picker, bearer issuance)
 /// keep calling [`get_active_bindings`]. Only DISPLAY paths switch to
 /// this function.
-pub fn get_effective_bindings(
-    slug: &str,
-) -> Result<Vec<(String, CredentialType, String)>, String> {
-    let rec = get_app_record(slug)?
-        .ok_or_else(|| format!("app '{}' not found", slug))?;
+pub fn get_effective_bindings(slug: &str) -> Result<Vec<(String, CredentialType, String)>, String> {
+    let rec = get_app_record(slug)?.ok_or_else(|| format!("app '{}' not found", slug))?;
 
     let profile_id = if rec.follow_user_active {
         // First-party + follow-active: resolver reads default profile.
@@ -985,9 +1007,7 @@ pub fn list_oauth_accounts_for_provider(
     ) {
         Ok(s) => s,
         Err(e) => {
-            if e.to_string().contains("no such table")
-                || e.to_string().contains("no such column")
-            {
+            if e.to_string().contains("no such table") || e.to_string().contains("no such column") {
                 return Ok(Vec::new());
             }
             return Err(format!("prepare list_oauth_accounts: {}", e));
@@ -1017,9 +1037,7 @@ pub struct TeamKeyCandidate {
 
 /// SELECT managed virtual keys (team) for a given provider. Empty Vec
 /// when the cache table isn't present or no matching row.
-pub fn list_team_keys_for_provider(
-    provider: &str,
-) -> Result<Vec<TeamKeyCandidate>, String> {
+pub fn list_team_keys_for_provider(provider: &str) -> Result<Vec<TeamKeyCandidate>, String> {
     let conn = storage::open_connection()?;
     let mut stmt = match conn.prepare(
         "SELECT virtual_key_id, alias
@@ -1030,9 +1048,7 @@ pub fn list_team_keys_for_provider(
     ) {
         Ok(s) => s,
         Err(e) => {
-            if e.to_string().contains("no such table")
-                || e.to_string().contains("no such column")
-            {
+            if e.to_string().contains("no such table") || e.to_string().contains("no such column") {
                 return Ok(Vec::new());
             }
             return Err(format!("prepare list_team_keys: {}", e));

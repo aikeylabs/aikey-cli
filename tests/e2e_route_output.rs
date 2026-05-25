@@ -26,8 +26,8 @@ impl Drop for Env {
 
 impl Env {
     fn new(tag: &str) -> Self {
-        let tmp = std::env::temp_dir()
-            .join(format!("aikey-e2e-route-{}-{}", tag, std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("aikey-e2e-route-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join(".aikey/data")).expect("mkdir");
         Self { tmp }
@@ -55,9 +55,13 @@ impl Env {
             .env("AK_TEST_SECRET", "sk-e2e-fake")
             .output()
             .expect("spawn add");
-        assert!(out.status.success(),
-            "add {}/{} failed: {}", alias, provider,
-            String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "add {}/{} failed: {}",
+            alias,
+            provider,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
 
@@ -68,10 +72,15 @@ fn strip_ansi(s: &str) -> String {
     let mut escape = false;
     for c in s.chars() {
         if escape {
-            if c.is_ascii_alphabetic() { escape = false; }
+            if c.is_ascii_alphabetic() {
+                escape = false;
+            }
             continue;
         }
-        if c == '\x1b' { escape = true; continue; }
+        if c == '\x1b' {
+            escape = true;
+            continue;
+        }
         out.push(c);
     }
     out
@@ -88,17 +97,30 @@ fn route_table_has_expected_columns() {
 
     // Header row is on stderr (table is informational).
     for col in &["PROVIDER", "LABEL", "API_KEY", "BASE URL"] {
-        assert!(stderr.contains(col),
-            "route header missing '{}' column:\n{}", col, stderr);
+        assert!(
+            stderr.contains(col),
+            "route header missing '{}' column:\n{}",
+            col,
+            stderr
+        );
     }
     // A row should contain the alias + a truncated token + the base_url.
-    assert!(stderr.contains("my-openai"),
-        "route row missing alias:\n{}", stderr);
+    assert!(
+        stderr.contains("my-openai"),
+        "route row missing alias:\n{}",
+        stderr
+    );
     // 2026-04-29 prefix rename: route_token form is now aikey_personal_<64-hex>.
-    assert!(stderr.contains("aikey_personal_"),
-        "route row missing token prefix:\n{}", stderr);
-    assert!(stderr.contains("http://127.0.0.1:") && stderr.contains("/openai"),
-        "route row missing proxy base URL:\n{}", stderr);
+    assert!(
+        stderr.contains("aikey_personal_"),
+        "route row missing token prefix:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("http://127.0.0.1:") && stderr.contains("/openai"),
+        "route row missing proxy base URL:\n{}",
+        stderr
+    );
 }
 
 #[test]
@@ -109,8 +131,11 @@ fn route_default_truncates_token_but_full_flag_shows_it_all() {
     let default_out = env.cmd().arg("route").output().unwrap();
     let default_err = strip_ansi(&String::from_utf8_lossy(&default_out.stderr));
     // Truncation uses "..." inside the displayed token.
-    assert!(default_err.contains("..."),
-        "default route should truncate tokens:\n{}", default_err);
+    assert!(
+        default_err.contains("..."),
+        "default route should truncate tokens:\n{}",
+        default_err
+    );
 
     let full_out = env.cmd().args(["route", "--full"]).output().unwrap();
     let full_err = strip_ansi(&String::from_utf8_lossy(&full_out.stderr));
@@ -120,8 +145,11 @@ fn route_default_truncates_token_but_full_flag_shows_it_all() {
             .map(|tail| tail.len() >= 64 && tail.chars().all(|c| c.is_ascii_hexdigit()))
             .unwrap_or(false)
     });
-    assert!(full_token_present,
-        "--full should print the entire 64-hex-char token:\n{}", full_err);
+    assert!(
+        full_token_present,
+        "--full should print the entire 64-hex-char token:\n{}",
+        full_err
+    );
 }
 
 #[test]
@@ -132,11 +160,17 @@ fn route_shows_active_marker_for_selected_key() {
     // The active marker `●` should appear on that row.
     let out = env.cmd().arg("route").output().unwrap();
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-    assert!(stderr.contains('\u{25cf}'),
-        "route should show `●` (active marker) for the key made Primary on add:\n{}", stderr);
+    assert!(
+        stderr.contains('\u{25cf}'),
+        "route should show `●` (active marker) for the key made Primary on add:\n{}",
+        stderr
+    );
     // The legend should explain what `●` means.
-    assert!(stderr.contains("active") || stderr.contains("Active"),
-        "route footer should explain the active marker:\n{}", stderr);
+    assert!(
+        stderr.contains("active") || stderr.contains("Active"),
+        "route footer should explain the active marker:\n{}",
+        stderr
+    );
 }
 
 #[test]
@@ -149,11 +183,17 @@ fn route_empty_vault_prints_friendly_hint() {
     let out = env.cmd().arg("route").output().expect("spawn");
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     // Must not crash; should hint how to add a key.
-    assert!(out.status.success(),
+    assert!(
+        out.status.success(),
         "route on empty vault should exit 0, got: {}\nstderr: {}",
-        out.status, stderr);
-    assert!(stderr.contains("aikey add") || stderr.contains("aikey auth login"),
-        "empty-vault route should guide the user:\n{}", stderr);
+        out.status,
+        stderr
+    );
+    assert!(
+        stderr.contains("aikey add") || stderr.contains("aikey auth login"),
+        "empty-vault route should guide the user:\n{}",
+        stderr
+    );
 }
 
 // ── JSON mode ───────────────────────────────────────────────────────────
@@ -183,12 +223,23 @@ fn route_json_mode_emits_parseable_json_with_schema() {
     assert_eq!(routes.len(), 1, "expected 1 route, got {}", routes.len());
     let r = &routes[0];
     for key in &["label", "provider", "type", "api_key", "base_url", "active"] {
-        assert!(r.get(key).is_some(), "route JSON entry missing '{}' field:\n{}", key, r);
+        assert!(
+            r.get(key).is_some(),
+            "route JSON entry missing '{}' field:\n{}",
+            key,
+            r
+        );
     }
     assert_eq!(r["label"], "json-key");
     assert_eq!(r["provider"], "anthropic");
-    assert!(r["api_key"].as_str().unwrap().starts_with("aikey_personal_"),
-        "api_key should use aikey_personal_ prefix: {}", r["api_key"]);
+    assert!(
+        r["api_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("aikey_personal_"),
+        "api_key should use aikey_personal_ prefix: {}",
+        r["api_key"]
+    );
 }
 
 // ── single-label copy-paste view ────────────────────────────────────────
@@ -203,14 +254,26 @@ fn route_single_label_emits_copy_paste_block_on_stdout() {
     // H1 regression: the copy-paste block must be on STDOUT so
     // `aikey route cp-key | pbcopy` (documented in quickstart) works.
     let stdout = strip_ansi(&String::from_utf8_lossy(&out.stdout));
-    assert!(stdout.contains("base_url"),
-        "single-label route should print 'base_url' on stdout:\n{}", stdout);
-    assert!(stdout.contains("api_key"),
-        "single-label route should print 'api_key' on stdout:\n{}", stdout);
-    assert!(stdout.contains("aikey_personal_"),
-        "single-label route should print the token on stdout:\n{}", stdout);
-    assert!(stdout.contains("http://127.0.0.1:"),
-        "single-label route should print the base URL on stdout:\n{}", stdout);
+    assert!(
+        stdout.contains("base_url"),
+        "single-label route should print 'base_url' on stdout:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("api_key"),
+        "single-label route should print 'api_key' on stdout:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("aikey_personal_"),
+        "single-label route should print the token on stdout:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("http://127.0.0.1:"),
+        "single-label route should print the base URL on stdout:\n{}",
+        stdout
+    );
 }
 
 // ── synced_inactive filter behaviour ────────────────────────────────────
@@ -239,7 +302,12 @@ fn route_single_label_emits_copy_paste_block_on_stdout() {
 // `managed_virtual_keys_cache` — there's no CLI path to that state
 // (the sync pipeline produces it from server responses).
 
-fn insert_team_key(vault_db: &std::path::Path, virtual_key_id: &str, alias: &str, local_state: &str) {
+fn insert_team_key(
+    vault_db: &std::path::Path,
+    virtual_key_id: &str,
+    alias: &str,
+    local_state: &str,
+) {
     let conn = rusqlite::Connection::open(vault_db).expect("open vault.db");
     conn.execute(
         "INSERT INTO managed_virtual_keys_cache (
@@ -266,8 +334,12 @@ fn route_shows_synced_inactive_team_keys() {
     env.add_key("bootstrap-personal", "openai");
     let vault = env.tmp.join(".aikey/data/vault.db");
 
-    insert_team_key(&vault, "synced_inactive_xyz", "team-not-yet-delivered",
-                    "synced_inactive");
+    insert_team_key(
+        &vault,
+        "synced_inactive_xyz",
+        "team-not-yet-delivered",
+        "synced_inactive",
+    );
 
     let out = env.cmd().arg("route").output().expect("spawn route");
     let combined = strip_ansi(&format!(
@@ -276,9 +348,12 @@ fn route_shows_synced_inactive_team_keys() {
         String::from_utf8_lossy(&out.stderr),
     ));
 
-    assert!(combined.contains("team-not-yet-delivered"),
+    assert!(
+        combined.contains("team-not-yet-delivered"),
         "aikey route should show synced_inactive team keys (mirrors aikey list).\n\
-         --- combined ---\n{}", combined);
+         --- combined ---\n{}",
+        combined
+    );
 }
 
 #[test]
@@ -291,27 +366,39 @@ fn activate_rejects_synced_inactive_team_key() {
     env.add_key("bootstrap-personal", "openai");
     let vault = env.tmp.join(".aikey/data/vault.db");
 
-    insert_team_key(&vault, "synced_inactive_reject_abc",
-                    "stale-team-key", "synced_inactive");
+    insert_team_key(
+        &vault,
+        "synced_inactive_reject_abc",
+        "stale-team-key",
+        "synced_inactive",
+    );
 
-    let out = env.cmd()
+    let out = env
+        .cmd()
         .args(["activate", "stale-team-key", "--shell", "bash"])
         .output()
         .expect("spawn activate");
-    assert!(!out.status.success(),
+    assert!(
+        !out.status.success(),
         "activate of synced_inactive key MUST fail (regression: \
          2026-04-16 Bug 4). stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not available")
+    assert!(
+        stderr.contains("not available")
             || stderr.contains("synced_inactive")
             || stderr.contains("not ready"),
-        "activate error should explain the state, got:\n{}", stderr);
-    assert!(stderr.contains("aikey key sync"),
+        "activate error should explain the state, got:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("aikey key sync"),
         "activate error MUST point users at `aikey key sync` to recover, got:\n{}",
-        stderr);
+        stderr
+    );
 }
 
 #[test]
@@ -327,8 +414,11 @@ fn route_shows_team_keys_with_active_state() {
     let out = env.cmd().arg("route").output().expect("spawn route");
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
 
-    assert!(stderr.contains("team-delivered"),
-        "route MUST show team keys with local_state=active:\n{}", stderr);
+    assert!(
+        stderr.contains("team-delivered"),
+        "route MUST show team keys with local_state=active:\n{}",
+        stderr
+    );
 }
 
 #[test]
@@ -337,11 +427,20 @@ fn route_unknown_label_errors_with_guidance() {
     env.add_key("real-key", "openai");
 
     let out = env.cmd().args(["route", "nonexistent"]).output().unwrap();
-    assert!(!out.status.success(),
-        "unknown label should exit non-zero, got: {}", out.status);
+    assert!(
+        !out.status.success(),
+        "unknown label should exit non-zero, got: {}",
+        out.status
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not found") || stderr.contains("Not found"),
-        "unknown label error should say 'not found':\n{}", stderr);
-    assert!(stderr.contains("aikey route"),
-        "error should hint running `aikey route` to list available routes:\n{}", stderr);
+    assert!(
+        stderr.contains("not found") || stderr.contains("Not found"),
+        "unknown label error should say 'not found':\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("aikey route"),
+        "error should hint running `aikey route` to list available routes:\n{}",
+        stderr
+    );
 }

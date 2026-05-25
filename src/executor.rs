@@ -1,20 +1,20 @@
 use crate::audit;
-use crate::crypto;
-use crate::storage;
 use crate::config::ProjectConfig;
-use crate::providers::Provider;
+use crate::crypto;
+use crate::error_codes::msgs;
 use crate::events::EventBuilder;
 use crate::global_config;
-use crate::error_codes::msgs;
+use crate::providers::Provider;
+use crate::storage;
 use arboard::Clipboard;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use rayon::prelude::*;
 use rusqlite::params;
 use secrecy::SecretString;
-use zeroize::Zeroizing;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use rayon::prelude::*;
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use zeroize::Zeroizing;
 
 /// P1-Q4: Dry-run output information
 #[derive(Debug, Clone, Serialize)]
@@ -100,16 +100,17 @@ impl VaultContext {
         }
     }
 
-    fn verify_password_internal(key: &crypto::SecureBuffer<[u8; crypto::KEY_SIZE]>) -> Result<(), String> {
+    fn verify_password_internal(
+        key: &crypto::SecureBuffer<[u8; crypto::KEY_SIZE]>,
+    ) -> Result<(), String> {
         let conn = storage::open_connection()?;
 
         // Try to get stored password hash
-        let stored_hash_result: Result<Vec<u8>, rusqlite::Error> = conn
-            .query_row(
-                "SELECT value FROM config WHERE key = ?",
-                params!["password_hash"],
-                |row| row.get(0),
-            );
+        let stored_hash_result: Result<Vec<u8>, rusqlite::Error> = conn.query_row(
+            "SELECT value FROM config WHERE key = ?",
+            params!["password_hash"],
+            |row| row.get(0),
+        );
 
         match stored_hash_result {
             Ok(stored_hash) => {
@@ -151,18 +152,18 @@ impl VaultContext {
                 }
 
                 let has_entries: bool = conn
-                    .query_row("SELECT COUNT(*) FROM entries", [], |row| row.get::<_, i64>(0))
+                    .query_row("SELECT COUNT(*) FROM entries", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
                     .map(|n| n > 0)
                     .unwrap_or(false);
 
                 if has_entries {
                     // Vault has data — try to decrypt the first entry to verify password
                     let (nonce, ciphertext): (Vec<u8>, Vec<u8>) = conn
-                        .query_row(
-                            "SELECT nonce, ciphertext FROM entries LIMIT 1",
-                            [],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
-                        )
+                        .query_row("SELECT nonce, ciphertext FROM entries LIMIT 1", [], |row| {
+                            Ok((row.get(0)?, row.get(1)?))
+                        })
                         .map_err(|_| msgs::INVALID_PASSWORD.to_string())?;
 
                     crypto::decrypt(key, &nonce, &ciphertext)
@@ -185,7 +186,11 @@ impl VaultContext {
         crypto::encrypt(&self.key, data)
     }
 
-    fn decrypt(&self, nonce: &[u8], ciphertext: &[u8]) -> Result<crypto::SecureBuffer<Vec<u8>>, String> {
+    fn decrypt(
+        &self,
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<crypto::SecureBuffer<Vec<u8>>, String> {
         crypto::decrypt(&self.key, nonce, ciphertext)
             .map_err(|_| msgs::INVALID_PASSWORD.to_string())
     }
@@ -245,12 +250,18 @@ pub fn ensure_vault_integrity_or_quarantine() -> Result<(), String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let backup_dir = vault_path.parent()
+    let backup_dir = vault_path
+        .parent()
         .and_then(|p| p.parent())
         .map(|p| p.join("backups"))
         .ok_or_else(|| "vault path has no parent — cannot quarantine".to_string())?;
-    std::fs::create_dir_all(&backup_dir)
-        .map_err(|e| format!("could not create backups dir {}: {}", backup_dir.display(), e))?;
+    std::fs::create_dir_all(&backup_dir).map_err(|e| {
+        format!(
+            "could not create backups dir {}: {}",
+            backup_dir.display(),
+            e
+        )
+    })?;
     let quarantine_path = backup_dir.join(format!("vault-corrupt-{}.db", ts));
     std::fs::rename(&vault_path, &quarantine_path)
         .map_err(|e| format!("could not quarantine corrupt vault: {}", e))?;
@@ -278,28 +289,39 @@ pub fn verify_vault_password(password: &SecretString) -> Result<(), String> {
 pub fn is_potential_secret(text: &str) -> bool {
     let trimmed = text.trim();
 
-    if trimmed.starts_with("sk-") ||
-       trimmed.starts_with("pk-") ||
-       trimmed.starts_with("rk-") ||
-       trimmed.starts_with("Bearer ") ||
-       trimmed.starts_with("ghp_") ||
-       trimmed.starts_with("gho_") ||
-       trimmed.starts_with("ghs_") ||
-       trimmed.starts_with("github_pat_") ||
-       trimmed.starts_with("glpat-") ||
-       trimmed.starts_with("AKIA") ||
-       trimmed.starts_with("AIza") ||
-       trimmed.starts_with("ya29.") {
+    if trimmed.starts_with("sk-")
+        || trimmed.starts_with("pk-")
+        || trimmed.starts_with("rk-")
+        || trimmed.starts_with("Bearer ")
+        || trimmed.starts_with("ghp_")
+        || trimmed.starts_with("gho_")
+        || trimmed.starts_with("ghs_")
+        || trimmed.starts_with("github_pat_")
+        || trimmed.starts_with("glpat-")
+        || trimmed.starts_with("AKIA")
+        || trimmed.starts_with("AIza")
+        || trimmed.starts_with("ya29.")
+    {
         return true;
     }
 
     let parts: Vec<&str> = trimmed.split('.').collect();
-    if parts.len() == 3 && parts.iter().all(|p| p.len() > 10 && p.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')) {
+    if parts.len() == 3
+        && parts.iter().all(|p| {
+            p.len() > 10
+                && p.chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        })
+    {
         return true;
     }
 
-    if trimmed.len() >= 32 && trimmed.len() <= 512 &&
-       trimmed.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+    if trimmed.len() >= 32
+        && trimmed.len() <= 512
+        && trimmed
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
         return true;
     }
 
@@ -309,7 +331,10 @@ pub fn is_potential_secret(text: &str) -> bool {
 pub fn add_secret(alias: &str, secret: &str, password: &SecretString) -> Result<(), String> {
     // Check if the secret already exists
     if storage::get_entry(alias).is_ok() {
-        return Err(format!("API Key '{}' already exists. Use 'update' command to modify it.", alias));
+        return Err(format!(
+            "API Key '{}' already exists. Use 'update' command to modify it.",
+            alias
+        ));
     }
 
     let ctx = VaultContext::new(password)?;
@@ -341,8 +366,7 @@ pub fn get_secret(alias: &str, password: &SecretString) -> Result<Zeroizing<Stri
     let plaintext = ctx.decrypt(&nonce, &ciphertext)?;
 
     // Wrap plaintext in Zeroizing immediately to protect in memory
-    let secret_string = String::from_utf8(plaintext.to_vec())
-        .map_err(|e| e.to_string())?;
+    let secret_string = String::from_utf8(plaintext.to_vec()).map_err(|e| e.to_string())?;
     Ok(Zeroizing::new(secret_string))
 }
 
@@ -358,20 +382,28 @@ pub fn list_secrets(password: &SecretString) -> Result<Vec<String>, String> {
     storage::list_entries()
 }
 
-pub fn list_secrets_with_metadata(password: &SecretString) -> Result<Vec<storage::SecretMetadata>, String> {
+pub fn list_secrets_with_metadata(
+    password: &SecretString,
+) -> Result<Vec<storage::SecretMetadata>, String> {
     let _ctx = VaultContext::new(password)?;
     storage::list_entries_with_metadata()
 }
 
 #[allow(dead_code)]
 pub fn read_from_clipboard() -> Result<String, String> {
-    let mut clipboard = Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
-    clipboard.get_text().map_err(|e| format!("Failed to read from clipboard: {}", e))
+    let mut clipboard =
+        Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
+    clipboard
+        .get_text()
+        .map_err(|e| format!("Failed to read from clipboard: {}", e))
 }
 
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
-    let mut clipboard = Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
-    clipboard.set_text(text).map_err(|e| format!("Failed to copy to clipboard: {}", e))
+    let mut clipboard =
+        Clipboard::new().map_err(|e| format!("Failed to access clipboard: {}", e))?;
+    clipboard
+        .set_text(text)
+        .map_err(|e| format!("Failed to copy to clipboard: {}", e))
 }
 
 /// Schedule clipboard clearing after a timeout
@@ -409,7 +441,11 @@ pub fn update_secret(alias: &str, new_secret: &str, password: &SecretString) -> 
 }
 
 #[allow(dead_code)]
-pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &str) -> Result<(), String> {
+pub fn run_with_secrets(
+    aliases: &[String],
+    password: &SecretString,
+    command: &str,
+) -> Result<(), String> {
     let ctx = VaultContext::new(password)?;
 
     // Retrieve all secrets into Zeroizing containers
@@ -428,8 +464,8 @@ pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &s
     }
 
     // Parse and execute command
-    let mut parts = shell_words::split(command)
-        .map_err(|e| format!("Failed to parse command: {}", e))?;
+    let mut parts =
+        shell_words::split(command).map_err(|e| format!("Failed to parse command: {}", e))?;
 
     if parts.is_empty() {
         return Err("Empty command".to_string());
@@ -447,7 +483,8 @@ pub fn run_with_secrets(aliases: &[String], password: &SecretString, command: &s
     }
     inject_context_vars(&mut cmd, None);
 
-    let status = cmd.status()
+    let status = cmd
+        .status()
         .map_err(|e| format!("Failed to execute command: {}", e))?;
 
     // Explicit drop to trigger Zeroizing cleanup
@@ -538,8 +575,8 @@ pub fn exec_with_env(
             }
 
             // Fetch secret from vault
-            let (nonce, ciphertext) = storage::get_entry(alias)
-                .map_err(|_| format!("Missing key: {}", alias))?;
+            let (nonce, ciphertext) =
+                storage::get_entry(alias).map_err(|_| format!("Missing key: {}", alias))?;
 
             let plaintext = ctx.decrypt(&nonce, &ciphertext)?;
 
@@ -592,7 +629,8 @@ pub fn exec_with_env(
 
     ctrlc::set_handler(move || {
         r.store(false, Ordering::SeqCst);
-    }).map_err(|e| format!("Failed to set signal handler: {}", e))?;
+    })
+    .map_err(|e| format!("Failed to set signal handler: {}", e))?;
 
     // Spawn child process
     let mut child = cmd
@@ -745,7 +783,8 @@ pub fn run_with_all_secrets(
     }
 
     let t0 = std::time::Instant::now();
-    let status = cmd.status()
+    let status = cmd
+        .status()
         .map_err(|e| format!("Failed to execute command '{}': {}", program, e))?;
 
     // Wipe secrets from memory
@@ -934,7 +973,8 @@ fn compute_injection_set_with_tenant_tracking(
     // Stage0 Decision H & I: Collision detection
     // If same env_var maps to multiple different key_alias values → FAIL FAST
     for (env_var, entries) in &env_var_to_entries {
-        let unique_aliases: std::collections::HashSet<&String> = entries.iter().map(|(_, _, alias)| alias).collect();
+        let unique_aliases: std::collections::HashSet<&String> =
+            entries.iter().map(|(_, _, alias)| alias).collect();
 
         if unique_aliases.len() > 1 {
             // Collision detected: same env_var → multiple different key_alias values
@@ -951,8 +991,11 @@ fn compute_injection_set_with_tenant_tracking(
             }
 
             error_msg.push_str("\nFix:\n");
-            error_msg.push_str("  - Use --logical-model <name> to narrow injection to a single model\n");
-            error_msg.push_str("  - Or update envMappings to use different providers for these models\n");
+            error_msg
+                .push_str("  - Use --logical-model <name> to narrow injection to a single model\n");
+            error_msg.push_str(
+                "  - Or update envMappings to use different providers for these models\n",
+            );
 
             return Err(error_msg);
         }
@@ -989,10 +1032,14 @@ fn compute_injection_set_from_env_mappings(
     logical_model_filter: Option<&str>,
     tenant: Option<&str>,
 ) -> Result<Vec<(String, String, Option<String>)>, String> {
-    compute_injection_set_with_tenant_tracking(config, env, logical_model_filter, tenant)
-        .map(|set| set.into_iter().map(|(provider, key_alias, model, _)| (provider, key_alias, model)).collect())
+    compute_injection_set_with_tenant_tracking(config, env, logical_model_filter, tenant).map(
+        |set| {
+            set.into_iter()
+                .map(|(provider, key_alias, model, _)| (provider, key_alias, model))
+                .collect()
+        },
+    )
 }
-
 
 #[allow(dead_code)]
 pub fn export_secrets(pattern: &str, password: &SecretString) -> Result<String, String> {
@@ -1008,17 +1055,19 @@ pub fn export_secrets(pattern: &str, password: &SecretString) -> Result<String, 
     // Convert to JSON format with updated Base64 API
     let json_entries: Vec<serde_json::Value> = entries
         .into_iter()
-        .map(|(alias, nonce, ciphertext, version_tag, updated_at, created_at, metadata)| {
-            serde_json::json!({
-                "alias": alias,
-                "nonce": BASE64.encode(&nonce),
-                "ciphertext": BASE64.encode(&ciphertext),
-                "version_tag": version_tag,
-                "updated_at": updated_at,
-                "created_at": created_at,
-                "metadata": metadata,
-            })
-        })
+        .map(
+            |(alias, nonce, ciphertext, version_tag, updated_at, created_at, metadata)| {
+                serde_json::json!({
+                    "alias": alias,
+                    "nonce": BASE64.encode(&nonce),
+                    "ciphertext": BASE64.encode(&ciphertext),
+                    "version_tag": version_tag,
+                    "updated_at": updated_at,
+                    "created_at": created_at,
+                    "metadata": metadata,
+                })
+            },
+        )
         .collect();
 
     serde_json::to_string_pretty(&json_entries)
@@ -1026,12 +1075,16 @@ pub fn export_secrets(pattern: &str, password: &SecretString) -> Result<String, 
 }
 
 #[allow(dead_code)]
-pub fn import_secrets(json_data: &str, password: &SecretString, strategy: &str) -> Result<(), String> {
+pub fn import_secrets(
+    json_data: &str,
+    password: &SecretString,
+    strategy: &str,
+) -> Result<(), String> {
     let _ctx = VaultContext::new(password)?;
 
     // Parse JSON data
-    let entries: Vec<serde_json::Value> = serde_json::from_str(json_data)
-        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(json_data).map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
     for entry in entries {
         let alias = entry["alias"]
@@ -1040,19 +1093,17 @@ pub fn import_secrets(json_data: &str, password: &SecretString, strategy: &str) 
             .to_string();
 
         // Updated Base64 API usage
-        let nonce = BASE64.decode(
-            entry["nonce"]
-                .as_str()
-                .ok_or("Missing nonce field")?,
-        )
-        .map_err(|e| format!("Failed to decode nonce: {}", e))?;
+        let nonce = BASE64
+            .decode(entry["nonce"].as_str().ok_or("Missing nonce field")?)
+            .map_err(|e| format!("Failed to decode nonce: {}", e))?;
 
-        let ciphertext = BASE64.decode(
-            entry["ciphertext"]
-                .as_str()
-                .ok_or("Missing ciphertext field")?,
-        )
-        .map_err(|e| format!("Failed to decode ciphertext: {}", e))?;
+        let ciphertext = BASE64
+            .decode(
+                entry["ciphertext"]
+                    .as_str()
+                    .ok_or("Missing ciphertext field")?,
+            )
+            .map_err(|e| format!("Failed to decode ciphertext: {}", e))?;
 
         let version_tag = entry["version_tag"].as_i64().unwrap_or(1);
         let updated_at = entry["updated_at"].as_i64().unwrap_or(0);
@@ -1173,7 +1224,10 @@ pub fn run_with_provider(
 
     let secrets_count = env_secrets.len();
     if !json_mode {
-        eprintln!("Injecting {} secret(s) for provider '{}'", secrets_count, provider);
+        eprintln!(
+            "Injecting {} secret(s) for provider '{}'",
+            secrets_count, provider
+        );
     }
 
     let parsed_parts: Vec<String> = if command.len() == 1 {
@@ -1184,13 +1238,19 @@ pub fn run_with_provider(
     };
 
     let t0 = std::time::Instant::now();
-    let result = spawn_with_env(env_secrets, command, json_mode, config.map(|c| c.project.name.as_str()));
+    let result = spawn_with_env(
+        env_secrets,
+        command,
+        json_mode,
+        config.map(|c| c.project.name.as_str()),
+    );
     let duration_ms = t0.elapsed().as_millis() as i64;
     let exit_code = match &result {
         Ok((_, c)) => *c,
-        Err(e) => e.strip_prefix("Command exited with code ")
+        Err(e) => e
+            .strip_prefix("Command exited with code ")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1)
+            .unwrap_or(1),
     };
 
     // Get context for event recording
@@ -1231,8 +1291,7 @@ pub fn build_run_env(
 ) -> Result<(std::collections::HashMap<String, String>, Vec<String>, bool), String> {
     use crate::commands_account::{provider_env_vars_pub, provider_proxy_prefix_pub};
 
-    let mut env_map: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut env_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut injected_providers: Vec<String> = Vec::new();
     let mut used_legacy = false;
 
@@ -1262,7 +1321,9 @@ pub fn build_run_env(
         used_legacy = true;
         let providers: Vec<String> = if active_cfg.providers.is_empty() {
             vec!["anthropic", "openai", "google", "deepseek", "kimi"]
-                .into_iter().map(String::from).collect()
+                .into_iter()
+                .map(String::from)
+                .collect()
         } else {
             active_cfg.providers.clone()
         };
@@ -1305,10 +1366,7 @@ pub fn build_run_env(
 /// to the legacy `active_key_config` single-key model for backward compat.
 ///
 /// Returns `(secrets_injected, exit_code)`.
-pub fn run_with_active_key(
-    command: &[String],
-    json_mode: bool,
-) -> Result<(usize, i32), String> {
+pub fn run_with_active_key(command: &[String], json_mode: bool) -> Result<(usize, i32), String> {
     let bindings = crate::storage::list_provider_bindings("default")
         .map_err(|e| format!("Failed to read provider bindings: {}", e))?;
 
@@ -1321,7 +1379,10 @@ pub fn run_with_active_key(
         build_run_env(&bindings, legacy_cfg.as_ref(), proxy_port)?;
 
     if injected_providers.is_empty() {
-        return Err("No provider bindings configured. Run `aikey use` to set up provider key bindings.".to_string());
+        return Err(
+            "No provider bindings configured. Run `aikey use` to set up provider key bindings."
+                .to_string(),
+        );
     }
 
     let mut env_secrets: std::collections::HashMap<String, Zeroizing<String>> =
@@ -1331,11 +1392,17 @@ pub fn run_with_active_key(
     }
 
     if !json_mode {
-        eprintln!("Injecting {} provider(s) via proxy:", injected_providers.len());
+        eprintln!(
+            "Injecting {} provider(s) via proxy:",
+            injected_providers.len()
+        );
         if !used_legacy {
             for binding in &bindings {
                 if injected_providers.contains(&binding.provider_code) {
-                    eprintln!("  {} -> {}:{}", binding.provider_code, binding.key_source_type, binding.key_source_ref);
+                    eprintln!(
+                        "  {} -> {}:{}",
+                        binding.provider_code, binding.key_source_type, binding.key_source_ref
+                    );
                 }
             }
         } else {
@@ -1369,9 +1436,7 @@ pub fn run_from_vault(
     let aliases = storage::list_entries().unwrap_or_default();
 
     if aliases.is_empty() {
-        return Err(
-            "No API Keys stored. Add one with:\n  aikey add anthropic:default".to_string()
-        );
+        return Err("No API Keys stored. Add one with:\n  aikey add anthropic:default".to_string());
     }
 
     // Group aliases by provider prefix (format: "provider:name").
@@ -1390,7 +1455,8 @@ pub fn run_from_vault(
     if provider_alias.is_empty() {
         return Err(
             "No provider keys found in vault (expected format: provider:alias).\n\
-             Add one with: aikey add anthropic:default".to_string()
+             Add one with: aikey add anthropic:default"
+                .to_string(),
         );
     }
 
@@ -1411,21 +1477,19 @@ pub fn run_from_vault(
         let canonical = crate::commands_account::oauth_provider_to_canonical(provider_name);
         let env_var = Provider::parse(canonical).env_var();
         match storage::get_entry(key_alias) {
-            Ok((nonce, ciphertext)) => {
-                match ctx.decrypt(&nonce, &ciphertext) {
-                    Ok(plaintext) => {
-                        let secret = std::str::from_utf8(&plaintext)
-                            .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", key_alias, e))?
-                            .to_string();
-                        env_secrets.insert(env_var, Zeroizing::new(secret));
-                    }
-                    Err(e) => {
-                        if !json_mode {
-                            eprintln!("Warning: could not decrypt '{}': {}", key_alias, e);
-                        }
+            Ok((nonce, ciphertext)) => match ctx.decrypt(&nonce, &ciphertext) {
+                Ok(plaintext) => {
+                    let secret = std::str::from_utf8(&plaintext)
+                        .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", key_alias, e))?
+                        .to_string();
+                    env_secrets.insert(env_var, Zeroizing::new(secret));
+                }
+                Err(e) => {
+                    if !json_mode {
+                        eprintln!("Warning: could not decrypt '{}': {}", key_alias, e);
                     }
                 }
-            }
+            },
             Err(e) => {
                 if !json_mode {
                     eprintln!("Warning: could not fetch '{}': {}", key_alias, e);
@@ -1463,7 +1527,8 @@ pub fn run_with_project_config(
 
     // Stage0 Decision I: Mapping-closed injection boundary
     let current_env = crate::global_config::get_current_env().ok().flatten();
-    let has_env_mappings = current_env.as_ref()
+    let has_env_mappings = current_env
+        .as_ref()
         .and_then(|env| config.env_mappings.get(env.as_str()))
         .map(|map| !map.is_empty())
         .unwrap_or(false);
@@ -1480,24 +1545,25 @@ pub fn run_with_project_config(
         for (provider, key_alias, _model) in injection_set {
             let env_var = Provider::parse(&provider).env_var();
             match storage::get_entry(&key_alias) {
-                Ok((nonce, ciphertext)) => {
-                    match ctx.decrypt(&nonce, &ciphertext) {
-                        Ok(plaintext) => {
-                            let secret = std::str::from_utf8(&plaintext)
-                                .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", key_alias, e))?
-                                .to_string();
-                            env_secrets.insert(env_var, Zeroizing::new(secret));
-                        }
-                        Err(e) => {
-                            if !json_mode {
-                                eprintln!("Warning: could not decrypt secret '{}': {}", key_alias, e);
-                            }
+                Ok((nonce, ciphertext)) => match ctx.decrypt(&nonce, &ciphertext) {
+                    Ok(plaintext) => {
+                        let secret = std::str::from_utf8(&plaintext)
+                            .map_err(|e| format!("Invalid UTF-8 in secret '{}': {}", key_alias, e))?
+                            .to_string();
+                        env_secrets.insert(env_var, Zeroizing::new(secret));
+                    }
+                    Err(e) => {
+                        if !json_mode {
+                            eprintln!("Warning: could not decrypt secret '{}': {}", key_alias, e);
                         }
                     }
-                }
+                },
                 Err(e) => {
                     if !json_mode {
-                        eprintln!("Warning: could not fetch secret '{}' for provider '{}': {}", key_alias, provider, e);
+                        eprintln!(
+                            "Warning: could not fetch secret '{}' for provider '{}': {}",
+                            key_alias, provider, e
+                        );
                     }
                 }
             }
@@ -1507,24 +1573,28 @@ pub fn run_with_project_config(
         for (provider_name, provider_cfg) in &config.providers {
             let env_var = Provider::parse(provider_name).env_var();
             match storage::get_entry(&provider_cfg.key_alias) {
-                Ok((nonce, ciphertext)) => {
-                    match ctx.decrypt(&nonce, &ciphertext) {
-                        Ok(plaintext) => {
-                            let secret = std::str::from_utf8(&plaintext)
-                                .map_err(|e| format!("Invalid UTF-8 in secret: {}", e))?
-                                .to_string();
-                            env_secrets.insert(env_var, Zeroizing::new(secret));
-                        }
-                        Err(e) => {
-                            if !json_mode {
-                                eprintln!("Warning: could not decrypt secret '{}': {}", provider_cfg.key_alias, e);
-                            }
+                Ok((nonce, ciphertext)) => match ctx.decrypt(&nonce, &ciphertext) {
+                    Ok(plaintext) => {
+                        let secret = std::str::from_utf8(&plaintext)
+                            .map_err(|e| format!("Invalid UTF-8 in secret: {}", e))?
+                            .to_string();
+                        env_secrets.insert(env_var, Zeroizing::new(secret));
+                    }
+                    Err(e) => {
+                        if !json_mode {
+                            eprintln!(
+                                "Warning: could not decrypt secret '{}': {}",
+                                provider_cfg.key_alias, e
+                            );
                         }
                     }
-                }
+                },
                 Err(e) => {
                     if !json_mode {
-                        eprintln!("Warning: could not fetch secret '{}' for provider '{}': {}", provider_cfg.key_alias, provider_name, e);
+                        eprintln!(
+                            "Warning: could not fetch secret '{}' for provider '{}': {}",
+                            provider_cfg.key_alias, provider_name, e
+                        );
                     }
                 }
             }
@@ -1547,29 +1617,32 @@ pub fn run_with_project_config(
         }
 
         // Use binding if exists, otherwise use var_name as alias
-        let alias = config.bindings.get(var_name)
+        let alias = config
+            .bindings
+            .get(var_name)
             .cloned()
             .unwrap_or_else(|| var_name.clone());
 
         match storage::get_entry(&alias) {
-            Ok((nonce, ciphertext)) => {
-                match ctx.decrypt(&nonce, &ciphertext) {
-                    Ok(plaintext) => {
-                        let secret = std::str::from_utf8(&plaintext)
-                            .map_err(|e| format!("Invalid UTF-8 in secret: {}", e))?
-                            .to_string();
-                        env_secrets.insert(var_name.clone(), Zeroizing::new(secret));
-                    }
-                    Err(e) => {
-                        if !json_mode {
-                            eprintln!("Warning: could not decrypt secret '{}': {}", alias, e);
-                        }
+            Ok((nonce, ciphertext)) => match ctx.decrypt(&nonce, &ciphertext) {
+                Ok(plaintext) => {
+                    let secret = std::str::from_utf8(&plaintext)
+                        .map_err(|e| format!("Invalid UTF-8 in secret: {}", e))?
+                        .to_string();
+                    env_secrets.insert(var_name.clone(), Zeroizing::new(secret));
+                }
+                Err(e) => {
+                    if !json_mode {
+                        eprintln!("Warning: could not decrypt secret '{}': {}", alias, e);
                     }
                 }
-            }
+            },
             Err(e) => {
                 if !json_mode {
-                    eprintln!("Warning: could not fetch secret '{}' for var '{}': {}", alias, var_name, e);
+                    eprintln!(
+                        "Warning: could not fetch secret '{}' for var '{}': {}",
+                        alias, var_name, e
+                    );
                 }
             }
         }
@@ -1577,7 +1650,11 @@ pub fn run_with_project_config(
 
     let secrets_count = env_secrets.len();
     if !json_mode {
-        let mode = if has_env_mappings { "mapping-closed" } else { "provider-fallback" };
+        let mode = if has_env_mappings {
+            "mapping-closed"
+        } else {
+            "provider-fallback"
+        };
         eprintln!("Injecting {} secret(s) ({})", secrets_count, mode);
     }
 
@@ -1589,13 +1666,19 @@ pub fn run_with_project_config(
     };
 
     let t0 = std::time::Instant::now();
-    let result = spawn_with_env(env_secrets, command, json_mode, Some(config.project.name.as_str()));
+    let result = spawn_with_env(
+        env_secrets,
+        command,
+        json_mode,
+        Some(config.project.name.as_str()),
+    );
     let duration_ms = t0.elapsed().as_millis() as i64;
     let exit_code = match &result {
         Ok((_, c)) => *c,
-        Err(e) => e.strip_prefix("Command exited with code ")
+        Err(e) => e
+            .strip_prefix("Command exited with code ")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1)
+            .unwrap_or(1),
     };
 
     // Get current profile from global config for event recording
@@ -1670,7 +1753,9 @@ pub fn dry_run_project_config(
         .flatten()
         .ok_or("No current environment set. Use 'aikey env use <env>'")?;
 
-    let has_env_mappings = config.env_mappings.get(&current_env)
+    let has_env_mappings = config
+        .env_mappings
+        .get(&current_env)
         .map(|map| !map.is_empty())
         .unwrap_or(false);
 
@@ -1729,7 +1814,9 @@ mod verify_password_internal_tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("vault.db");
-        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
         let mut salt = [0u8; 16];
         crypto::generate_salt(&mut salt).expect("salt");
         let pw = SecretString::new("test_password".to_string());
@@ -1742,8 +1829,12 @@ mod verify_password_internal_tests {
         let (m, t, p) = storage::get_kdf_params().expect("kdf");
         let key = crypto::derive_key_with_params(
             &SecretString::new(password.to_string()),
-            &salt, m, t, p,
-        ).expect("derive");
+            &salt,
+            m,
+            t,
+            p,
+        )
+        .expect("derive");
         let mut out = [0u8; 32];
         out.copy_from_slice(key.as_slice());
         out
@@ -1778,17 +1869,21 @@ mod verify_password_internal_tests {
         assert!(
             err.to_lowercase().contains("vault state inconsistent")
                 || err.to_lowercase().contains("password_hash"),
-            "rejection must surface the state mismatch, got: {}", err
+            "rejection must surface the state mismatch, got: {}",
+            err
         );
 
         // password_hash MUST still be missing — verify must not auto-seed.
         let conn = storage::open_connection().expect("reopen");
         let row: Result<Vec<u8>, _> = conn.query_row(
             "SELECT value FROM config WHERE key='password_hash'",
-            [], |r| r.get(0),
+            [],
+            |r| r.get(0),
         );
-        assert!(row.is_err(),
-            "rejected verify must NOT have re-seeded password_hash silently");
+        assert!(
+            row.is_err(),
+            "rejected verify must NOT have re-seeded password_hash silently"
+        );
     }
 
     /// Empty vault (no salt, no entries) is the legitimate pre-init case;
@@ -1802,7 +1897,9 @@ mod verify_password_internal_tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("vault.db");
-        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
 
         // Hand-create an empty vault file with the schema but no salt/hash —
         // mirrors the "session-backend created the file before vault init"
@@ -1811,7 +1908,8 @@ mod verify_password_internal_tests {
         conn.execute(
             "CREATE TABLE config (key TEXT PRIMARY KEY, value BLOB NOT NULL)",
             [],
-        ).expect("create config");
+        )
+        .expect("create config");
         conn.execute(
             "CREATE TABLE entries (
                 id INTEGER PRIMARY KEY,
@@ -1820,7 +1918,8 @@ mod verify_password_internal_tests {
                 ciphertext BLOB NOT NULL
             )",
             [],
-        ).expect("create entries");
+        )
+        .expect("create entries");
         drop(conn);
 
         let any_key = [0xAAu8; 32];
@@ -1828,12 +1927,18 @@ mod verify_password_internal_tests {
         verify_password(&any_key).expect("pre-init fallback must accept");
 
         let conn = rusqlite::Connection::open(&db_path).expect("reopen");
-        let stored: Vec<u8> = conn.query_row(
-            "SELECT value FROM config WHERE key='password_hash'",
-            [], |r| r.get(0),
-        ).expect("hash should be seeded by fallback");
-        assert_eq!(stored.as_slice(), &any_key[..],
-            "fallback persists the supplied key as the new hash");
+        let stored: Vec<u8> = conn
+            .query_row(
+                "SELECT value FROM config WHERE key='password_hash'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("hash should be seeded by fallback");
+        assert_eq!(
+            stored.as_slice(),
+            &any_key[..],
+            "fallback persists the supplied key as the new hash"
+        );
 
         drop(guard);
     }

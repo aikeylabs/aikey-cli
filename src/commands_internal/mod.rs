@@ -19,17 +19,17 @@
 
 use clap::{Args, Subcommand};
 
-pub mod protocol;
-pub mod stdin_json;
-pub mod vault_op;
-pub mod query;
-pub mod update_alias;
-pub mod parse;
-pub mod rules;
-pub mod init;
-pub mod hook_op;
 pub mod app;
+pub mod hook_op;
+pub mod init;
 pub mod internal_log;
+pub mod parse;
+pub mod protocol;
+pub mod query;
+pub mod rules;
+pub mod stdin_json;
+pub mod update_alias;
+pub mod vault_op;
 
 #[cfg(test)]
 mod tests;
@@ -112,14 +112,14 @@ pub fn dispatch(action: &InternalAction) {
     }
 
     let action_name = match action {
-        InternalAction::VaultOp(_)     => "vault-op",
-        InternalAction::Query(_)       => "query",
+        InternalAction::VaultOp(_) => "vault-op",
+        InternalAction::Query(_) => "query",
         InternalAction::UpdateAlias(_) => "update-alias",
-        InternalAction::Parse(_)       => "parse",
-        InternalAction::Rules(_)       => "rules",
-        InternalAction::App(_)         => "app",
-        InternalAction::Init(_)        => unreachable!("handled above"),
-        InternalAction::HookOp(_)      => unreachable!("handled above"),
+        InternalAction::Parse(_) => "parse",
+        InternalAction::Rules(_) => "rules",
+        InternalAction::App(_) => "app",
+        InternalAction::Init(_) => unreachable!("handled above"),
+        InternalAction::HookOp(_) => unreachable!("handled above"),
     };
     let env = match stdin_json::read_envelope() {
         Ok(e) => e,

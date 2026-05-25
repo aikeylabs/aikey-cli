@@ -114,7 +114,13 @@ fn derive_dual_keys(
     m_cost: u32,
     t_cost: u32,
     p_cost: u32,
-) -> Result<(crypto::SecureBuffer<[u8; 32]>, crypto::SecureBuffer<[u8; 32]>), String> {
+) -> Result<
+    (
+        crypto::SecureBuffer<[u8; 32]>,
+        crypto::SecureBuffer<[u8; 32]>,
+    ),
+    String,
+> {
     use argon2::{Argon2, Params, Version};
 
     if salt.len() != crypto::SALT_SIZE {
@@ -176,27 +182,30 @@ pub fn export_vault(
     let (m_cost, t_cost, p_cost) = storage::get_kdf_params()?;
 
     // Derive vault key for decryption
-    let vault_key = crypto::derive_key_with_params(vault_password, &vault_salt, m_cost, t_cost, p_cost)
-        .map_err(|e| format!("Failed to derive vault key: {}", e))?;
+    let vault_key =
+        crypto::derive_key_with_params(vault_password, &vault_salt, m_cost, t_cost, p_cost)
+            .map_err(|e| format!("Failed to derive vault key: {}", e))?;
 
     // Decrypt all entries and convert to serializable format
     let entry_data: Result<Vec<EntryData>, String> = entries
         .into_iter()
-        .map(|(alias, nonce, ciphertext, version_tag, created_at, updated_at, metadata)| {
-            // Decrypt secret value with vault key
-            let secret_value = crypto::decrypt(&vault_key, &nonce, &ciphertext)
-                .map_err(|e| format!("Failed to decrypt entry '{}': {}", alias, e))?;
+        .map(
+            |(alias, nonce, ciphertext, version_tag, created_at, updated_at, metadata)| {
+                // Decrypt secret value with vault key
+                let secret_value = crypto::decrypt(&vault_key, &nonce, &ciphertext)
+                    .map_err(|e| format!("Failed to decrypt entry '{}': {}", alias, e))?;
 
-            Ok(EntryData {
-                schema_version: EntryData::CURRENT_SCHEMA_VERSION,
-                alias,
-                secret_value: secret_value.to_vec(),
-                version_tag,
-                created_at,
-                updated_at,
-                metadata,
-            })
-        })
+                Ok(EntryData {
+                    schema_version: EntryData::CURRENT_SCHEMA_VERSION,
+                    alias,
+                    secret_value: secret_value.to_vec(),
+                    version_tag,
+                    created_at,
+                    updated_at,
+                    metadata,
+                })
+            },
+        )
         .collect();
 
     let entry_data = entry_data?;
@@ -215,11 +224,12 @@ pub fn export_vault(
     };
 
     // Derive dual keys: encryption + HMAC using export password
-    let (enc_key, hmac_key) = derive_dual_keys(export_password, &export_salt, m_cost, t_cost, p_cost)?;
+    let (enc_key, hmac_key) =
+        derive_dual_keys(export_password, &export_salt, m_cost, t_cost, p_cost)?;
 
     // Serialize payload
-    let payload = bincode::serialize(&entry_data)
-        .map_err(|e| format!("Serialization failed: {}", e))?;
+    let payload =
+        bincode::serialize(&entry_data).map_err(|e| format!("Serialization failed: {}", e))?;
 
     // Encrypt payload with AES-256-GCM
     let (nonce, ciphertext) = crypto::encrypt(&*enc_key, &payload)?;
@@ -240,8 +250,8 @@ pub fn export_vault(
     };
 
     // Serialize header to fixed 64 bytes
-    let header_bytes = bincode::serialize(&header)
-        .map_err(|e| format!("Header serialization failed: {}", e))?;
+    let header_bytes =
+        bincode::serialize(&header).map_err(|e| format!("Header serialization failed: {}", e))?;
 
     if header_bytes.len() != HEADER_SIZE {
         return Err(format!(
@@ -266,8 +276,7 @@ pub fn export_vault(
     file_data.extend_from_slice(&hmac_tag);
 
     // Write to file
-    fs::write(output_path, file_data)
-        .map_err(|e| format!("Failed to write file: {}", e))?;
+    fs::write(output_path, file_data).map_err(|e| format!("Failed to write file: {}", e))?;
 
     // Stage 2.4 windows-compat: cross-platform owner-only ACL.
     let _ = crate::storage_acl::enforce_owner_only_file(output_path);
@@ -294,8 +303,7 @@ pub fn import_vault(
     vault_password: &SecretString,
 ) -> Result<ImportResult, Box<dyn std::error::Error>> {
     // Read entire file
-    let file_data = fs::read(input_path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let file_data = fs::read(input_path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     // Validate minimum size: header + hmac
     if file_data.len() < HEADER_SIZE + HMAC_SIZE {
@@ -347,9 +355,8 @@ pub fn import_vault(
         .map_err(|e| format!("HMAC initialization failed: {}", e))?;
     mac.update(&file_data[0..HEADER_SIZE]); // header
     mac.update(ciphertext);
-    mac.verify_slice(stored_hmac).map_err(|_| {
-        "HMAC verification failed: file corrupted, tampered, or wrong password"
-    })?;
+    mac.verify_slice(stored_hmac)
+        .map_err(|_| "HMAC verification failed: file corrupted, tampered, or wrong password")?;
 
     // Decrypt payload
     let plaintext = crypto::decrypt(&*enc_key, &header.encryption_nonce, ciphertext)?;
@@ -363,8 +370,9 @@ pub fn import_vault(
     let (m_cost, t_cost, p_cost) = storage::get_kdf_params()?;
 
     // Derive vault key for re-encryption
-    let vault_key = crypto::derive_key_with_params(vault_password, &vault_salt, m_cost, t_cost, p_cost)
-        .map_err(|e| format!("Failed to derive vault key: {}", e))?;
+    let vault_key =
+        crypto::derive_key_with_params(vault_password, &vault_salt, m_cost, t_cost, p_cost)
+            .map_err(|e| format!("Failed to derive vault key: {}", e))?;
 
     // Import entries with smart merge logic
     let mut result = ImportResult {

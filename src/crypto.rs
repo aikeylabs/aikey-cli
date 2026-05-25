@@ -12,10 +12,10 @@ use aes_gcm::{
 };
 use argon2::{Argon2, Params, Version};
 use rand::RngCore;
-use zeroize::Zeroize;
 use secrecy::{ExposeSecret, SecretString};
-use std::ops::{Deref, DerefMut};
 use std::fmt;
+use std::ops::{Deref, DerefMut};
+use zeroize::Zeroize;
 
 /// Argon2id parameters for key derivation
 /// - Memory: 64 MiB (65536 KiB)
@@ -63,7 +63,10 @@ impl<T: Zeroize> SecureBuffer<T> {
 
         unsafe {
             if libc::mlock(ptr, len) != 0 {
-                return Err(format!("Failed to lock memory: {}", std::io::Error::last_os_error()));
+                return Err(format!(
+                    "Failed to lock memory: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
         }
 
@@ -80,7 +83,10 @@ impl<T: Zeroize> SecureBuffer<T> {
 
         unsafe {
             if VirtualLock(ptr, len) == 0 {
-                return Err(format!("Failed to lock memory: {}", std::io::Error::last_os_error()));
+                return Err(format!(
+                    "Failed to lock memory: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
         }
 
@@ -167,7 +173,10 @@ impl<T: Zeroize> fmt::Debug for SecureBuffer<T> {
 ///
 /// # Returns
 /// A SecureBuffer containing the 32-byte key, locked in RAM
-pub fn derive_key(password: &SecretString, salt: &[u8]) -> Result<SecureBuffer<[u8; KEY_SIZE]>, String> {
+pub fn derive_key(
+    password: &SecretString,
+    salt: &[u8],
+) -> Result<SecureBuffer<[u8; KEY_SIZE]>, String> {
     if salt.len() != SALT_SIZE {
         return Err(format!("Salt must be {} bytes", SALT_SIZE));
     }
@@ -219,8 +228,8 @@ pub fn derive_key_with_params(
 /// # Returns
 /// A tuple of (nonce, ciphertext) where nonce is 12 bytes
 pub fn encrypt(key: &[u8; KEY_SIZE], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| format!("Failed to create cipher: {}", e))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| format!("Failed to create cipher: {}", e))?;
 
     // Generate random nonce
     let mut nonce_bytes = [0u8; NONCE_SIZE];
@@ -252,8 +261,8 @@ pub fn decrypt(
         return Err(format!("Nonce must be {} bytes", NONCE_SIZE));
     }
 
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| format!("Failed to create cipher: {}", e))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| format!("Failed to create cipher: {}", e))?;
 
     let nonce = Nonce::from_slice(nonce);
 
@@ -291,8 +300,8 @@ mod tests {
 
 /// Generates a random salt for key derivation
 pub fn generate_salt(salt: &mut [u8; SALT_SIZE]) -> Result<(), String> {
-    use rand::RngCore;
     use rand::rngs::OsRng;
+    use rand::RngCore;
     OsRng.fill_bytes(salt);
     Ok(())
 }

@@ -72,17 +72,23 @@ pub enum DraftType {
 impl DraftType {
     pub fn classify(fields: &DraftFields) -> Self {
         // email 存在 → Oauth (account-first 语义)
-        if fields.email.is_some()   { return DraftType::Oauth; }
+        if fields.email.is_some() {
+            return DraftType::Oauth;
+        }
         // 无 email 但有 api_key → Key
-        if fields.api_key.is_some() { return DraftType::Key; }
+        if fields.api_key.is_some() {
+            return DraftType::Key;
+        }
         // 只有 password → Oauth
-        if fields.password.is_some() { return DraftType::Oauth; }
+        if fields.password.is_some() {
+            return DraftType::Oauth;
+        }
         DraftType::Key
     }
     #[allow(dead_code)] // 供 trace dump 等调试路径使用
     pub fn as_str(&self) -> &'static str {
         match self {
-            DraftType::Key   => "KEY",
+            DraftType::Key => "KEY",
             DraftType::Oauth => "OAUTH",
         }
     }
@@ -113,22 +119,41 @@ pub enum GroupReason {
 #[allow(dead_code)] // Phase C 不填,Phase D HTTP 透传;Stage 4 才真正生成
 pub enum InferenceSource {
     /// E1: api_key fingerprint 命中 (tier 决定强度)
-    FingerprintConfirmed { provider_id: String },
-    FingerprintLikely    { provider_id: String },
+    FingerprintConfirmed {
+        provider_id: String,
+    },
+    FingerprintLikely {
+        provider_id: String,
+    },
     /// E2: block.provider_hint 字符串里含 provider_label_keywords
-    InlineTitleKeyword   { hint: String, keyword: String },
+    InlineTitleKeyword {
+        hint: String,
+        keyword: String,
+    },
     /// E3: block 之前最近的 ## heading / Note 行含 keyword
-    SectionHeadingKeyword { line: usize, keyword: String },
+    SectionHeadingKeyword {
+        line: usize,
+        keyword: String,
+    },
     /// E4: 该 Draft 所在行 (或 block 内) shell var 名 (CLAUDE_KEY 等)
-    ShellVarPattern      { var_name: String, pattern: String },
+    ShellVarPattern {
+        var_name: String,
+        pattern: String,
+    },
     /// E5: Draft 自带 base_url 的 host 匹配 url_host_patterns
-    UrlHostPattern       { url: String, pattern: String },
+    UrlHostPattern {
+        url: String,
+        pattern: String,
+    },
     /// E6 (BUG-04 fix): Draft 自己 line_range 内某行的 "label 区"（首 secret 前缀之前 /
     /// 首 40 字符）含 provider keyword。
     /// 触发场景:单行 Complex（`🔑 kimi: sk-moonshot_... 邮箱: ...`）— block.provider_hint
     /// 取首 token 丢了 kimi,E2/E3 都打不上;E6 直接扫 label 区兜底。
     /// Why 限定 label zone:防止匹配到 secret 值内部(如 `sk-kimi_...` 的 "kimi")误作 heading 证据。
-    InlineLabelKeyword   { line: usize, keyword: String },
+    InlineLabelKeyword {
+        line: usize,
+        keyword: String,
+    },
 }
 
 impl InferenceSource {
@@ -141,13 +166,13 @@ impl InferenceSource {
         // vote 在 Tier 1 层语义上不正确(强证据被弱关键词数学翻盘是设计错误,详见
         // update/20260508-inference-weights-decision-3-realign.md)。
         match self {
-            InferenceSource::FingerprintConfirmed{..} => 1.0,  // dead code 路径,Tier 1 直接接管
-            InferenceSource::FingerprintLikely{..}    => 0.7,
-            InferenceSource::InlineTitleKeyword{..}   => 0.9,
-            InferenceSource::SectionHeadingKeyword{..} => 0.8,
-            InferenceSource::ShellVarPattern{..}      => 0.85,
-            InferenceSource::UrlHostPattern{..}       => 0.6,  // dead code 路径,Tier 1 直接接管
-            InferenceSource::InlineLabelKeyword{..}   => 0.75,
+            InferenceSource::FingerprintConfirmed { .. } => 1.0, // dead code 路径,Tier 1 直接接管
+            InferenceSource::FingerprintLikely { .. } => 0.7,
+            InferenceSource::InlineTitleKeyword { .. } => 0.9,
+            InferenceSource::SectionHeadingKeyword { .. } => 0.8,
+            InferenceSource::ShellVarPattern { .. } => 0.85,
+            InferenceSource::UrlHostPattern { .. } => 0.6, // dead code 路径,Tier 1 直接接管
+            InferenceSource::InlineLabelKeyword { .. } => 0.75,
         }
     }
 }

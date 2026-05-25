@@ -83,10 +83,13 @@ fn write_login_throttle() -> std::io::Result<()> {
 ///
 /// Stage 2.1 windows-compat: routed through `shell_integration::resolve_aikey_dir()`.
 fn read_control_url_from_config() -> Option<String> {
-    let path = shell_integration::resolve_aikey_dir().join("config").join("config.json");
+    let path = shell_integration::resolve_aikey_dir()
+        .join("config")
+        .join("config.json");
     let data = std::fs::read_to_string(path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
-    parsed["controlPanelUrl"].as_str()
+    parsed["controlPanelUrl"]
+        .as_str()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
 }
@@ -133,7 +136,9 @@ fn read_control_url_from_config() -> Option<String> {
 /// table, and B4's proxy reads it via the supervisor's already-derived
 /// master key (no plaintext refresh_token on disk).
 fn configure_proxy_collector(control_url: &str, json_mode: bool) {
-    let user_config = shell_integration::resolve_aikey_dir().join("config").join("aikey-user.yaml");
+    let user_config = shell_integration::resolve_aikey_dir()
+        .join("config")
+        .join("aikey-user.yaml");
 
     // Collector API is proxied through nginx on the same origin as the control panel.
     // Proxy uploads to {collector_url}/v1/usage-events:batch
@@ -164,7 +169,8 @@ fn configure_proxy_collector(control_url: &str, json_mode: bool) {
     // bundle — a stale access_token in the file should trigger a rewrite
     // even if the URL hasn't changed.
     let current = read_user_yaml_team(&user_config);
-    let url_matches = current.as_ref().and_then(|s| s.url.as_deref()) == Some(collector_url.as_str());
+    let url_matches =
+        current.as_ref().and_then(|s| s.url.as_deref()) == Some(collector_url.as_str());
     let cred_matches = match (&cred_fields, current.as_ref().and_then(|s| s.cred.as_ref())) {
         (Some(new), Some(cur)) => {
             new.access_token == cur.access_token
@@ -178,11 +184,19 @@ fn configure_proxy_collector(control_url: &str, json_mode: bool) {
         return;
     }
 
-    if let Err(e) = write_user_yaml_team_section(&user_config, &collector_url, cred_fields.as_ref()) {
+    if let Err(e) = write_user_yaml_team_section(&user_config, &collector_url, cred_fields.as_ref())
+    {
         if !json_mode {
-            eprintln!("    {} couldn't update {}: {}",
-                "!".yellow(), user_config.display(), e);
-            eprintln!("      Run {} after editing manually.", "'aikey proxy restart'".bold());
+            eprintln!(
+                "    {} couldn't update {}: {}",
+                "!".yellow(),
+                user_config.display(),
+                e
+            );
+            eprintln!(
+                "      Run {} after editing manually.",
+                "'aikey proxy restart'".bold()
+            );
         }
         return;
     }
@@ -190,12 +204,14 @@ fn configure_proxy_collector(control_url: &str, json_mode: bool) {
     if !json_mode {
         eprintln!("    Team usage reporting → {}", collector_url);
         if cred_fields.is_some() {
-            eprintln!("    Team usage credentials → JWT ({})",
+            eprintln!(
+                "    Team usage credentials → JWT ({})",
                 if cred_fields.as_ref().unwrap().expires_at > 0 {
                     "auto-refresh enabled"
                 } else {
                     "first-call refresh on startup"
-                });
+                }
+            );
         }
     }
 
@@ -270,7 +286,11 @@ fn read_user_yaml_team(user_config: &std::path::Path) -> Option<UserYAMLTeamSect
             let access_token = t.get("token")?.as_str()?.to_string();
             let expires_at = t.get("expires_at")?.as_i64()?;
             let refresh_url = t.get("refresh_url")?.as_str()?.to_string();
-            Some(CredentialFields { access_token, expires_at, refresh_url })
+            Some(CredentialFields {
+                access_token,
+                expires_at,
+                refresh_url,
+            })
         });
     Some(UserYAMLTeamSection { url, cred })
 }
@@ -327,7 +347,8 @@ fn write_user_yaml_team_section(
     // Ensure root is a mapping. If the file existed but had a scalar/sequence
     // top-level, refuse to silently overwrite — that's a corruption signal
     // worth surfacing.
-    let root_map = root.as_mapping_mut()
+    let root_map = root
+        .as_mapping_mut()
         .ok_or_else(|| format!("{} top-level is not a mapping", user_config.display()))?;
 
     // Walk / create the proxy.events.{collector_routes, collector_credentials} paths.
@@ -393,8 +414,7 @@ fn write_user_yaml_team_section(
         credentials.remove(serde_yaml::Value::String("team".into()));
     }
 
-    let serialized = serde_yaml::to_string(&root)
-        .map_err(|e| format!("serialize yaml: {}", e))?;
+    let serialized = serde_yaml::to_string(&root).map_err(|e| format!("serialize yaml: {}", e))?;
     std::fs::write(user_config, &serialized)
         .map_err(|e| format!("write {}: {}", user_config.display(), e))?;
 
@@ -413,10 +433,7 @@ fn write_user_yaml_team_section(
 /// the F1-era signature (URL only, no credential) still work unchanged
 /// — they just don't write a credential bundle.
 #[cfg(test)]
-fn write_user_yaml_team_route(
-    user_config: &std::path::Path,
-    team_url: &str,
-) -> Result<(), String> {
+fn write_user_yaml_team_route(user_config: &std::path::Path, team_url: &str) -> Result<(), String> {
     write_user_yaml_team_section(user_config, team_url, None)
 }
 
@@ -442,7 +459,10 @@ fn save_control_url_to_config(url: &str) {
         .unwrap_or_else(|| serde_json::json!({"version": "1"}));
 
     obj["controlPanelUrl"] = serde_json::Value::String(url.to_string());
-    let _ = std::fs::write(&path, serde_json::to_string_pretty(&obj).unwrap_or_default());
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&obj).unwrap_or_default(),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -453,7 +473,10 @@ fn save_control_url_to_config(url: &str) {
 ///
 /// Updates the control panel URL without re-authenticating. Useful when the
 /// server IP changes (e.g. after a reboot with DHCP).
-pub fn handle_set_control_url(url: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_set_control_url(
+    url: &str,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
     let url = url.trim_end_matches('/');
@@ -480,7 +503,11 @@ pub fn handle_set_control_url(url: &str, json_mode: bool) -> Result<(), Box<dyn 
             println!("  {} → {}", old_url.dimmed(), url.bold());
             println!("  Proxy collector URL also updated.");
             println!();
-            println!("  {} Restart proxy to apply: {}", "\u{2192}".dimmed(), "aikey proxy restart".bold());
+            println!(
+                "  {} Restart proxy to apply: {}",
+                "\u{2192}".dimmed(),
+                "aikey proxy restart".bold()
+            );
         }
     } else {
         // Not logged in — only save to config.json.
@@ -493,7 +520,10 @@ pub fn handle_set_control_url(url: &str, json_mode: bool) -> Result<(), Box<dyn 
         } else {
             println!("{} Control URL saved to config.", "\u{2713}".green());
             println!("  URL: {}", url.bold());
-            println!("  Log in with: {}", format!("aikey login --control-url {}", url).cyan());
+            println!(
+                "  Log in with: {}",
+                format!("aikey login --control-url {}", url).cyan()
+            );
         }
     }
     Ok(())
@@ -539,7 +569,8 @@ pub fn handle_login(
     } else if json_mode {
         // Non-interactive: use default (which may come from config/env).
         default_url.clone()
-    } else if std::env::var("AIKEY_CONTROL_URL").is_ok() || read_control_url_from_config().is_some() {
+    } else if std::env::var("AIKEY_CONTROL_URL").is_ok() || read_control_url_from_config().is_some()
+    {
         // Already configured via env or config file — use it directly, no prompt.
         if !json_mode {
             eprintln!("  Control Panel: {}", default_url);
@@ -551,7 +582,11 @@ pub fn handle_login(
         let mut buf = String::new();
         io::stdin().read_line(&mut buf)?;
         let trimmed = buf.trim().to_string();
-        if trimmed.is_empty() { default_url } else { trimmed }
+        if trimmed.is_empty() {
+            default_url
+        } else {
+            trimmed
+        }
     };
 
     // --- Copy-paste fallback: --token SESSION_ID:LOGIN_TOKEN ---
@@ -568,16 +603,29 @@ pub fn handle_login(
     // writes and missing files silently fall through.
     if !flag_resend {
         if let Some(last_started) = read_login_throttle() {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
             if now > 0 && now >= last_started && now - last_started < LOGIN_THROTTLE_SECS {
                 let elapsed = now - last_started;
                 let remaining = LOGIN_THROTTLE_SECS - elapsed;
                 if !json_mode {
                     eprintln!();
-                    eprintln!("  {}", format!("A login email was just sent ({}s ago).", elapsed).yellow());
+                    eprintln!(
+                        "  {}",
+                        format!("A login email was just sent ({}s ago).", elapsed).yellow()
+                    );
                     eprintln!("  • Check your inbox — and your spam folder.");
-                    eprintln!("  • Add {} to your whitelist to avoid future filtering.", "invite@aikeylabs.com".bold());
-                    eprintln!("  • To force a new email, wait {}s or run: {}", remaining, "aikey login --resend".bold());
+                    eprintln!(
+                        "  • Add {} to your whitelist to avoid future filtering.",
+                        "invite@aikeylabs.com".bold()
+                    );
+                    eprintln!(
+                        "  • To force a new email, wait {}s or run: {}",
+                        remaining,
+                        "aikey login --resend".bold()
+                    );
                     eprintln!();
                 }
                 return Ok(());
@@ -589,12 +637,8 @@ pub fn handle_login(
     let client_version = env!("CARGO_PKG_VERSION");
     let os_platform = std::env::consts::OS;
 
-    let session = PlatformClient::init_cli_login(
-        &control_url,
-        client_version,
-        os_platform,
-    )
-    .map_err(|e| format!("Login failed: {}", e))?;
+    let session = PlatformClient::init_cli_login(&control_url, client_version, os_platform)
+        .map_err(|e| format!("Login failed: {}", e))?;
 
     // Record this attempt for the throttle window. Best-effort — any I/O
     // failure is silently ignored (the throttle is a UX nudge, not security).
@@ -621,12 +665,26 @@ pub fn handle_login(
         println!("          {}", login_url.dimmed());
         println!();
         if flag_email.is_some() {
-            println!("{}  Your {} is pre-filled — click {}", step("2"), "email".bold(), "\"Send Login Link\"".bold());
+            println!(
+                "{}  Your {} is pre-filled — click {}",
+                step("2"),
+                "email".bold(),
+                "\"Send Login Link\"".bold()
+            );
         } else {
-            println!("{}  Enter your {} and click {}", step("2"), "email".bold(), "\"Send Login Link\"".bold());
+            println!(
+                "{}  Enter your {} and click {}",
+                step("2"),
+                "email".bold(),
+                "\"Send Login Link\"".bold()
+            );
         }
         println!();
-        println!("{}  Check your inbox and click the {} link", step("3"), "activation".bold());
+        println!(
+            "{}  Check your inbox and click the {} link",
+            step("3"),
+            "activation".bold()
+        );
         println!();
         println!("  {}", "Waiting for confirmation…".dimmed());
     }
@@ -644,8 +702,15 @@ pub fn handle_login(
             if !json_mode {
                 eprintln!();
                 eprintln!("  {}", "Session expired.".yellow());
-                eprintln!("  Tip: copy the one-time {} from the {} page and run:", "token".bold(), "activation".bold());
-                eprintln!("       {}", "aikey login --token SESSION_ID:LOGIN_TOKEN".bold());
+                eprintln!(
+                    "  Tip: copy the one-time {} from the {} page and run:",
+                    "token".bold(),
+                    "activation".bold()
+                );
+                eprintln!(
+                    "       {}",
+                    "aikey login --token SESSION_ID:LOGIN_TOKEN".bold()
+                );
                 eprint!("  Paste token (or press Enter to cancel): ");
                 io::stderr().flush().ok();
                 let mut input = String::new();
@@ -708,9 +773,7 @@ fn exchange_combined_token(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let parts: Vec<&str> = combined.splitn(2, ':').collect();
     if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-        return Err(
-            "Invalid --token format. Expected: SESSION_ID:LOGIN_TOKEN".into(),
-        );
+        return Err("Invalid --token format. Expected: SESSION_ID:LOGIN_TOKEN".into());
     }
     let (session_id, login_token) = (parts[0], parts[1]);
 
@@ -833,7 +896,11 @@ fn finish_login(
         }));
     } else {
         println!();
-        println!("  {} Logged in as {}", "✓".green().bold(), account.email.bold());
+        println!(
+            "  {} Logged in as {}",
+            "✓".green().bold(),
+            account.email.bold()
+        );
         println!("    Run {} to view your team keys.", "'aikey list'".bold());
     }
 
@@ -846,7 +913,6 @@ fn finish_login(
 
     Ok(())
 }
-
 
 // ---------------------------------------------------------------------------
 // Browser helper
@@ -896,10 +962,7 @@ fn try_refresh_if_needed(acc: &storage::PlatformAccount) -> Result<String, Strin
     let resp = PlatformClient::do_refresh_token(&acc.control_url, refresh_token).map_err(|e| {
         let msg = e.to_string();
         if msg.contains("login expired") {
-            format!(
-                "{}. Run 'aikey login' to re-authenticate.",
-                msg
-            )
+            format!("{}. Run 'aikey login' to re-authenticate.", msg)
         } else {
             format!(
                 "Token refresh failed: {}. Check your network or server, then retry. \
@@ -931,9 +994,8 @@ fn try_refresh_if_needed(acc: &storage::PlatformAccount) -> Result<String, Strin
 fn get_authenticated_client() -> Result<PlatformClient, Box<dyn std::error::Error>> {
     let acc = storage::get_platform_account()?
         .ok_or("Not logged in. Run 'aikey account login' first.")?;
-    let token = try_refresh_if_needed(&acc).map_err(|e| -> Box<dyn std::error::Error> {
-        e.into()
-    })?;
+    let token =
+        try_refresh_if_needed(&acc).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     Ok(PlatformClient::new(&acc.control_url, &token))
 }
 
@@ -1018,7 +1080,11 @@ fn web_page_alias(page: Option<&str>) -> Result<&'static str, String> {
 /// When `control_url` points to localhost, automatically probes common dev-server
 /// ports (3000, 5173) and prefers the first one that responds.  This lets
 /// `aikey web` work in both dev and production without extra flags.
-pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_browse(
+    page: Option<&str>,
+    port: Option<u16>,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Validate the page name at the CLI boundary. Doing it here (before
     // the local/JWT branch) means typos fail fast with a clear error
     // regardless of which mode the user is in — instead of silently
@@ -1082,7 +1148,8 @@ pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> 
     // hint instead: reinstall with --with-console to enable a local console.
     if port.is_none() {
         if let Some(state) = read_install_state() {
-            let mode = state.get("control_plane_mode")
+            let mode = state
+                .get("control_plane_mode")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if mode == "none" {
@@ -1097,12 +1164,10 @@ pub fn handle_browse(page: Option<&str>, port: Option<u16>, json_mode: bool) -> 
     }
 
     // JWT-based browse (team/trial mode).
-    let acc = storage::get_platform_account()?
-        .ok_or("Not logged in. Run 'aikey login' first.")?;
+    let acc = storage::get_platform_account()?.ok_or("Not logged in. Run 'aikey login' first.")?;
 
-    let token = try_refresh_if_needed(&acc).map_err(|e| -> Box<dyn std::error::Error> {
-        e.into()
-    })?;
+    let token =
+        try_refresh_if_needed(&acc).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // Build `/go/<alias>` rather than `/user/<page>` so we don't freeze
     // user-facing route paths into CLI binaries.
@@ -1176,7 +1241,11 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
         "stop" => crate::local_server_probe::spawn_stop_command(),
         "restart" => crate::local_server_probe::spawn_restart_command(),
         other => {
-            return Err(format!("unknown web action `{}` (use start, stop, or restart)", other).into());
+            return Err(format!(
+                "unknown web action `{}` (use start, stop, or restart)",
+                other
+            )
+            .into());
         }
     };
 
@@ -1196,8 +1265,10 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
                 // 20260524-aikey-service-restart-web-port-undiscoverable.md.
                 match crate::local_server_probe::read_local_server_port_or_default() {
                     Ok(port) => crate::local_server_probe::wait_for_reachable(
-                        port, std::time::Duration::from_secs(8))
-                        .map(|()| Some(port)),
+                        port,
+                        std::time::Duration::from_secs(8),
+                    )
+                    .map(|()| Some(port)),
                     Err(strict_err) => Err(strict_err),
                 }
             } else {
@@ -1220,11 +1291,17 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
                 match &final_state {
                     Ok(Some(port)) => println!(
                         "{}: {} succeeded (reachable on port {})",
-                        edition.label(), action, port),
+                        edition.label(),
+                        action,
+                        port
+                    ),
                     Ok(None) => println!("{}: {} succeeded", edition.label(), action),
                     Err(e) => eprintln!(
                         "{}: {} dispatched but service did not come up: {}",
-                        edition.label(), action, e),
+                        edition.label(),
+                        action,
+                        e
+                    ),
                 }
             }
 
@@ -1244,8 +1321,10 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
                 }));
             } else {
                 eprintln!("{}: {} failed — {}", edition.label(), action, e);
-                eprintln!("Manual command: {}",
-                    crate::local_server_probe::service_command_hint(edition, action));
+                eprintln!(
+                    "Manual command: {}",
+                    crate::local_server_probe::service_command_hint(edition, action)
+                );
             }
             Err(e.into())
         }
@@ -1261,15 +1340,20 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
 /// either (a) install_profile=="trial" or (b) the user has a stored
 /// platform_account (logged in). Spec: requirements/2026-05-11-aikey-web-
 /// local-first-team-merge.md §R4-pre.
-pub fn handle_master_browse(page: Option<&str>, url_override: Option<&str>, port: Option<u16>, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_master_browse(
+    page: Option<&str>,
+    url_override: Option<&str>,
+    port: Option<u16>,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = match page {
-        Some("seats")                          => "/master/orgs/default/seats",
-        Some("keys" | "virtual-keys")          => "/master/orgs/default/virtual-keys",
-        Some("bindings")                       => "/master/orgs/default/bindings",
+        Some("seats") => "/master/orgs/default/seats",
+        Some("keys" | "virtual-keys") => "/master/orgs/default/virtual-keys",
+        Some("bindings") => "/master/orgs/default/bindings",
         Some("providers" | "provider-accounts") => "/master/orgs/default/provider-accounts",
-        Some("events" | "control-events")      => "/master/orgs/default/control-events",
-        Some("usage" | "usage-ledger")         => "/master/orgs/default/usage-ledger",
-        Some("dashboard") | None               => "/master/dashboard",
+        Some("events" | "control-events") => "/master/orgs/default/control-events",
+        Some("usage" | "usage-ledger") => "/master/orgs/default/usage-ledger",
+        Some("dashboard") | None => "/master/dashboard",
         Some(other) => {
             return Err(format!(
                 "Unknown page '{}'. Available: dashboard, seats, virtual-keys, bindings, providers, events, usage",
@@ -1317,7 +1401,11 @@ pub fn handle_master_browse(page: Option<&str>, url_override: Option<&str>, port
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         let input = input.trim();
-        if input.is_empty() { default.to_string() } else { input.to_string() }
+        if input.is_empty() {
+            default.to_string()
+        } else {
+            input.to_string()
+        }
     } else {
         return Err("No control panel URL found. Use --url <url> or --port <port>.".into());
     };
@@ -1369,7 +1457,10 @@ fn try_local_control_url() -> Option<String> {
 /// unit-tested without touching the filesystem. Profile-driven: see the
 /// caller's comment for the regression history.
 fn derive_local_control_url(state: &serde_json::Value) -> Option<String> {
-    let profile = state.get("install_profile").and_then(|v| v.as_str()).unwrap_or("");
+    let profile = state
+        .get("install_profile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     match profile {
         // trial / local-with-console: ports.trial is canonical (both profiles
         // populate it; they only differ in `install_profile` value).
@@ -1381,13 +1472,21 @@ fn derive_local_control_url(state: &serde_json::Value) -> Option<String> {
         // (BIND_IP + manifest web port), use as the source of truth.
         "server" | "production" => {
             let url = state.get("control_panel_url")?.as_str()?;
-            if url.is_empty() { None } else { Some(url.to_string()) }
+            if url.is_empty() {
+                None
+            } else {
+                Some(url.to_string())
+            }
         }
         // Unknown / blank profile — back-compat fallback to control_panel_url
         // (older install-state.json versions may not carry an install_profile).
         _ => {
             let url = state.get("control_panel_url")?.as_str()?;
-            if url.is_empty() { None } else { Some(url.to_string()) }
+            if url.is_empty() {
+                None
+            } else {
+                Some(url.to_string())
+            }
         }
     }
 }
@@ -1491,24 +1590,28 @@ fn local_server_preflight_for_browse(json_mode: bool) -> BrowseLocalPreflight {
             "port": port,
             "detail": &msg,
         }));
-        eprintln!("Re-run `aikey web` without --json to auto-start local-server, \
+        eprintln!(
+            "Re-run `aikey web` without --json to auto-start local-server, \
                    or start it manually: {}",
-            crate::local_server_probe::start_command_hint());
+            crate::local_server_probe::start_command_hint()
+        );
         return BrowseLocalPreflight::JsonModeError(msg);
     }
 
     // Tty path: prompt to auto-start.
     println!("local-server is not running on port {}.", port);
     if !prompt_yes_no_default_yes("Start local-server now? [Y/n] ") {
-        eprintln!("To start manually:\n    {}",
-            crate::local_server_probe::start_command_hint());
+        eprintln!(
+            "To start manually:\n    {}",
+            crate::local_server_probe::start_command_hint()
+        );
         return BrowseLocalPreflight::DeclineNoOpen;
     }
 
     println!("Starting local-server…");
     let start_result = crate::local_server_probe::spawn_start_command();
-    let wait = crate::local_server_probe::wait_for_reachable(
-        port, std::time::Duration::from_secs(5));
+    let wait =
+        crate::local_server_probe::wait_for_reachable(port, std::time::Duration::from_secs(5));
 
     match (start_result, &wait) {
         (Ok(()), Ok(())) => {
@@ -1520,15 +1623,20 @@ fn local_server_preflight_for_browse(json_mode: bool) -> BrowseLocalPreflight {
             // then continue to open-browser per decision A-a so they
             // see the underlying connection error in context.
             eprintln!("Auto-start failed: {}", e);
-            eprintln!("Continuing to open the browser anyway — it will \
-                       report the connection error directly.");
+            eprintln!(
+                "Continuing to open the browser anyway — it will \
+                       report the connection error directly."
+            );
         }
         (Ok(()), Err(e)) => {
             // Start command succeeded but service didn't come up within
             // 5 s. Could be slow boot or a config error. Open browser
             // per decision A-a.
-            eprintln!("{}. Continuing to open the browser anyway — it \
-                       will report what local-server actually returns.", e);
+            eprintln!(
+                "{}. Continuing to open the browser anyway — it \
+                       will report what local-server actually returns.",
+                e
+            );
         }
     }
 
@@ -1578,9 +1686,8 @@ fn derive_local_browse_url(state: &serde_json::Value, alias: &str) -> Option<Str
         .get("installed_components")
         .and_then(|v| v.as_array())
         .map(|arr| {
-            arr.iter().any(|c| {
-                matches!(c.as_str(), Some("local-server") | Some("full-trial"))
-            })
+            arr.iter()
+                .any(|c| matches!(c.as_str(), Some("local-server") | Some("full-trial")))
         })
         .unwrap_or(false);
     if !has_local_web {
@@ -1607,8 +1714,7 @@ fn master_precondition_satisfied(
     install_state: Option<&serde_json::Value>,
     logged_in: bool,
 ) -> bool {
-    let is_trial = install_state
-        .and_then(|s| s.get("install_profile").and_then(|v| v.as_str()))
+    let is_trial = install_state.and_then(|s| s.get("install_profile").and_then(|v| v.as_str()))
         == Some("trial");
     is_trial || logged_in
 }
@@ -1657,7 +1763,9 @@ fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> Str
                 if TcpStream::connect_timeout(
                     &std::net::SocketAddr::new(ip, p),
                     Duration::from_millis(150),
-                ).is_ok() {
+                )
+                .is_ok()
+                {
                     return format!("http://localhost:{}", p);
                 }
             }
@@ -1682,16 +1790,20 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
 
     let account = storage::get_platform_account().ok().flatten();
     let active_cfg = storage::get_active_key_config().ok().flatten();
-    let vault_exists = storage::get_vault_path().map(|p| p.exists()).unwrap_or(false);
+    let vault_exists = storage::get_vault_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
 
     let local_seen_version = storage::get_local_seen_sync_version();
 
     if json_mode {
-        let active_json = active_cfg.as_ref().map(|cfg| serde_json::json!({
-            "key_type": cfg.key_type,
-            "key_ref":  cfg.key_ref,
-            "providers": cfg.providers,
-        }));
+        let active_json = active_cfg.as_ref().map(|cfg| {
+            serde_json::json!({
+                "key_type": cfg.key_type,
+                "key_ref":  cfg.key_ref,
+                "providers": cfg.providers,
+            })
+        });
         crate::json_output::print_json(serde_json::json!({
             "vault_initialized": vault_exists,
             "logged_in": account.is_some(),
@@ -1719,9 +1831,12 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // ── Account ──────────────────────────────────────────────────────────────
     match &account {
         Some(a) => {
-            println!("{:<16} {} {}", "Account:".bold(),
+            println!(
+                "{:<16} {} {}",
+                "Account:".bold(),
                 a.email.bold(),
-                format!("({})", a.account_id).dimmed());
+                format!("({})", a.account_id).dimmed()
+            );
             println!("{:<16} {}", "Control URL:".bold(), a.control_url.dimmed());
         }
         None => {
@@ -1738,11 +1853,13 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             } else {
                 cfg.providers.join(", ").cyan().to_string()
             };
-            println!("{:<16} {} {} [{}]",
+            println!(
+                "{:<16} {} {} [{}]",
                 "Active key:".bold(),
                 cfg.key_ref.bold(),
                 format!("({})", cfg.key_type).dimmed(),
-                providers);
+                providers
+            );
         }
         None => {
             println!("{:<16} {}", "Active key:".bold(), "none".dimmed());
@@ -1770,7 +1887,9 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
 pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::BTreeSet;
 
-    let vault_exists = storage::get_vault_path().map(|p| p.exists()).unwrap_or(false);
+    let vault_exists = storage::get_vault_path()
+        .map(|p| p.exists())
+        .unwrap_or(false);
     let account = storage::get_platform_account().ok().flatten();
 
     // Collect key counts.
@@ -1780,7 +1899,10 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
         0
     };
     let team_keys = storage::list_virtual_key_cache().unwrap_or_default();
-    let active_team = team_keys.iter().filter(|k| k.local_state == "active").count();
+    let active_team = team_keys
+        .iter()
+        .filter(|k| k.local_state == "active")
+        .count();
     let team_total = team_keys.len();
 
     // Collect unique providers from personal keys + team keys + bindings.
@@ -1818,11 +1940,13 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     let active_cfg = storage::get_active_key_config().ok().flatten();
 
     if json_mode {
-        let active_json = active_cfg.as_ref().map(|cfg| serde_json::json!({
-            "key_type": cfg.key_type,
-            "key_ref":  cfg.key_ref,
-            "providers": cfg.providers,
-        }));
+        let active_json = active_cfg.as_ref().map(|cfg| {
+            serde_json::json!({
+                "key_type": cfg.key_type,
+                "key_ref":  cfg.key_ref,
+                "providers": cfg.providers,
+            })
+        });
         // Round 9 fix #1: was is_proxy_running (PID-only); now Layer 1.
         let proxy_running = crate::commands_proxy::proxy_is_running_managed();
         crate::json_output::print_json(serde_json::json!({
@@ -1872,7 +1996,10 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     // ── Keys ────────────────────────────────────────────────────────────────
     rows.push(format!("\u{1F511} {}", "Keys".bold()));
     rows.push(format!("  personal:  {}", personal_count));
-    rows.push(format!("  team:      {} total, {} active", team_total, active_team));
+    rows.push(format!(
+        "  team:      {} total, {} active",
+        team_total, active_team
+    ));
     match &active_cfg {
         Some(cfg) => {
             let prov_str = if cfg.providers.is_empty() {
@@ -1887,10 +2014,14 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
                     let human = storage::list_provider_accounts()
                         .ok()
                         .and_then(|accts| {
-                            accts.into_iter().find(|a| a.provider_account_id == cfg.key_ref)
-                                .and_then(|a| a.display_identity
-                                    .filter(|s| !s.is_empty())
-                                    .or(a.external_id))
+                            accts
+                                .into_iter()
+                                .find(|a| a.provider_account_id == cfg.key_ref)
+                                .and_then(|a| {
+                                    a.display_identity
+                                        .filter(|s| !s.is_empty())
+                                        .or(a.external_id)
+                                })
                         })
                         .unwrap_or_else(|| cfg.key_ref.clone());
                     (human, "OAuth")
@@ -1902,10 +2033,12 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
                     (cfg.key_ref.clone(), "personal")
                 }
             };
-            rows.push(format!("  active:    {} {} {}",
+            rows.push(format!(
+                "  active:    {} {} {}",
                 label.bold(),
                 format!("({})", type_label).dimmed(),
-                format!("\u{2192} {}", prov_str).cyan()));
+                format!("\u{2192} {}", prov_str).cyan()
+            ));
         }
         None => {
             rows.push(format!("  active:    {}", "none".dimmed()));
@@ -1919,8 +2052,10 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
         rows.push(format!("  {}", "no protocols configured".dimmed()));
         rows.push("  hint:    add a key with `aikey add <alias> --provider <code>`".to_string());
     } else {
-        rows.push(format!("  {}",
-            providers.iter().cloned().collect::<Vec<_>>().join(", ")));
+        rows.push(format!(
+            "  {}",
+            providers.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
     }
 
     crate::ui_frame::print_box("\u{1F4CA}", "Status", &rows);
@@ -1982,7 +2117,10 @@ pub fn handle_logout(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     } else {
         println!("Logged out.");
         if !cleared_team_bindings.is_empty() {
-            println!("  Cleared {} team-key binding(s).", cleared_team_bindings.len());
+            println!(
+                "  Cleared {} team-key binding(s).",
+                cleared_team_bindings.len()
+            );
         }
     }
     Ok(())
@@ -2002,10 +2140,10 @@ fn compute_local_state_from_effective(
     if effective_status != "active" {
         // Server says this key cannot currently be used.
         return match effective_reason {
-            "seat_disabled"                   => "disabled_by_seat_status".to_string(),
-            "key_revoked" | "key_expired"     => "disabled_by_key_status".to_string(),
-            "account_disabled"                => "disabled_by_account_status".to_string(),
-            _                                 => "synced_inactive".to_string(), // e.g. not_claimed
+            "seat_disabled" => "disabled_by_seat_status".to_string(),
+            "key_revoked" | "key_expired" => "disabled_by_key_status".to_string(),
+            "account_disabled" => "disabled_by_account_status".to_string(),
+            _ => "synced_inactive".to_string(), // e.g. not_claimed
         };
     }
 
@@ -2046,10 +2184,15 @@ fn apply_snapshot_to_cache(
             .flatten();
 
         // Preserve local-only fields from the existing cache entry.
-        let local_alias  = existing.as_ref().and_then(|e| e.local_alias.clone());
-        let nonce        = existing.as_ref().and_then(|e| e.provider_key_nonce.clone());
-        let ciphertext   = existing.as_ref().and_then(|e| e.provider_key_ciphertext.clone());
-        let existing_state = existing.as_ref().map(|e| e.local_state.as_str()).unwrap_or("");
+        let local_alias = existing.as_ref().and_then(|e| e.local_alias.clone());
+        let nonce = existing.as_ref().and_then(|e| e.provider_key_nonce.clone());
+        let ciphertext = existing
+            .as_ref()
+            .and_then(|e| e.provider_key_ciphertext.clone());
+        let existing_state = existing
+            .as_ref()
+            .map(|e| e.local_state.as_str())
+            .unwrap_or("");
 
         let local_state = compute_local_state_from_effective(
             &item.effective_status,
@@ -2058,34 +2201,34 @@ fn apply_snapshot_to_cache(
         );
 
         let entry = storage::VirtualKeyCacheEntry {
-            virtual_key_id:       item.virtual_key_id.clone(),
-            org_id:               item.org_id.clone(),
-            seat_id:              item.seat_id.clone(),
-            alias:                item.alias.clone(),
-            provider_code:        item.provider_code.clone(),
-            protocol_type:        item.protocol_type.clone(),
-            base_url:             item.base_url.clone(),
-            credential_id:        item.credential_id.clone(),
-            credential_revision:  item.credential_revision.clone(),
+            virtual_key_id: item.virtual_key_id.clone(),
+            org_id: item.org_id.clone(),
+            seat_id: item.seat_id.clone(),
+            alias: item.alias.clone(),
+            provider_code: item.provider_code.clone(),
+            protocol_type: item.protocol_type.clone(),
+            base_url: item.base_url.clone(),
+            credential_id: item.credential_id.clone(),
+            credential_revision: item.credential_revision.clone(),
             virtual_key_revision: item.virtual_key_revision.clone(),
-            key_status:           item.key_status.clone(),
-            share_status:         item.share_status.clone(),
+            key_status: item.key_status.clone(),
+            share_status: item.share_status.clone(),
             local_state,
-            expires_at:           item.expires_at,
-            provider_key_nonce:   nonce,
+            expires_at: item.expires_at,
+            provider_key_nonce: nonce,
             provider_key_ciphertext: ciphertext,
-            synced_at:            0,
+            synced_at: 0,
             local_alias,
-            supported_providers:  item.supported_providers.clone(),
-            provider_base_urls:   item.provider_base_urls.clone(),
-            owner_account_id:     Some(current_account_id.to_string()),
+            supported_providers: item.supported_providers.clone(),
+            provider_base_urls: item.provider_base_urls.clone(),
+            owner_account_id: Some(current_account_id.to_string()),
             // Sync writers MUST always set extra: None. The value is
             // ignored by upsert (extra is omitted from the UPSERT's
             // DO UPDATE SET — see upsert_virtual_key_cache doc); the
             // None here is purely a struct-literal completeness
             // requirement. Putting any other value here would be
             // misleading, not destructive.
-            extra:                None,
+            extra: None,
         };
 
         let _ = storage::upsert_virtual_key_cache(&entry);
@@ -2094,11 +2237,16 @@ fn apply_snapshot_to_cache(
         // proxy picks up any updated provider list without requiring a restart.
         if !entry.supported_providers.is_empty() {
             if let Ok(Some(active_cfg)) = crate::storage::get_active_key_config() {
-                if active_cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey && active_cfg.key_ref == entry.virtual_key_id {
+                if active_cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey
+                    && active_cfg.key_ref == entry.virtual_key_id
+                {
                     let display = entry.local_alias.as_deref().unwrap_or(entry.alias.as_str());
                     let _ = write_active_env(
-                        "team", &entry.virtual_key_id, display,
-                        &entry.supported_providers, crate::commands_proxy::proxy_port(),
+                        "team",
+                        &entry.virtual_key_id,
+                        display,
+                        &entry.supported_providers,
+                        crate::commands_proxy::proxy_port(),
                     );
                 }
             }
@@ -2119,7 +2267,9 @@ fn apply_snapshot_to_cache(
                 // so the proxy stops routing it on next reload.
                 if entry.local_state == "active" {
                     if let Ok(Some(cfg)) = storage::get_active_key_config() {
-                        if cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey && cfg.key_ref == entry.virtual_key_id {
+                        if cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey
+                            && cfg.key_ref == entry.virtual_key_id
+                        {
                             let _ = storage::clear_active_key_config();
                         }
                     }
@@ -2192,7 +2342,9 @@ pub fn run_full_snapshot_sync(password: &SecretString) -> Result<usize, String> 
 /// vault_key Argon2id step. Caller must guarantee `vault_key` matches
 /// the vault's stored password_hash (the bridge's `prepare_vault`
 /// already enforces this before invoking us).
-pub fn run_full_snapshot_sync_with_vault_key(vault_key: &[u8; crypto::KEY_SIZE]) -> Result<usize, String> {
+pub fn run_full_snapshot_sync_with_vault_key(
+    vault_key: &[u8; crypto::KEY_SIZE],
+) -> Result<usize, String> {
     use colored::Colorize;
 
     // Strict-verify before any encrypt write: a vault_key that does not
@@ -2232,8 +2384,7 @@ pub fn run_full_snapshot_sync_with_vault_key(vault_key: &[u8; crypto::KEY_SIZE])
 
     for entry in &cached {
         // Needs claim: pending_claim but not yet claimed on server.
-        let needs_claim = entry.share_status == "pending_claim"
-            && entry.key_status == "active";
+        let needs_claim = entry.share_status == "pending_claim" && entry.key_status == "active";
         // Needs download: claimed (or about to be) but missing local ciphertext.
         let needs_download = entry.provider_key_ciphertext.is_none()
             && entry.key_status == "active"
@@ -2246,8 +2397,7 @@ pub fn run_full_snapshot_sync_with_vault_key(vault_key: &[u8; crypto::KEY_SIZE])
         // Claim on server first if pending.
         if needs_claim {
             if let Err(e) = client.claim_key(&entry.virtual_key_id) {
-                eprintln!("  {} could not claim {}: {}",
-                    "✗".red(), entry.alias, e);
+                eprintln!("  {} could not claim {}: {}", "✗".red(), entry.alias, e);
                 continue;
             }
         }
@@ -2257,8 +2407,11 @@ pub fn run_full_snapshot_sync_with_vault_key(vault_key: &[u8; crypto::KEY_SIZE])
             Ok(payload) => {
                 match payload.primary_binding() {
                     None => {
-                        eprintln!("  {} key '{}' has no active bindings — skipping.",
-                            "!".yellow(), entry.alias);
+                        eprintln!(
+                            "  {} key '{}' has no active bindings — skipping.",
+                            "!".yellow(),
+                            entry.alias
+                        );
                     }
                     Some(binding) => {
                         let protocol_type = payload.primary_protocol_type().to_string();
@@ -2274,53 +2427,60 @@ pub fn run_full_snapshot_sync_with_vault_key(vault_key: &[u8; crypto::KEY_SIZE])
                             entry.supported_providers.clone()
                         };
                         let sync_provider_base_urls: std::collections::HashMap<String, String> =
-                            payload.slots
+                            payload
+                                .slots
                                 .iter()
                                 .flat_map(|slot| slot.binding_targets.iter())
                                 .map(|b| (b.provider_code.clone(), b.base_url.clone()))
                                 .collect();
 
                         let updated = VirtualKeyCacheEntry {
-                            virtual_key_id:       payload.virtual_key_id.clone(),
-                            org_id:               payload.org_id.clone(),
-                            seat_id:              payload.seat_id.clone(),
-                            alias:                payload.alias.clone(),
-                            provider_code:        binding.provider_code.clone(),
+                            virtual_key_id: payload.virtual_key_id.clone(),
+                            org_id: payload.org_id.clone(),
+                            seat_id: payload.seat_id.clone(),
+                            alias: payload.alias.clone(),
+                            provider_code: binding.provider_code.clone(),
                             protocol_type,
-                            base_url:             binding.base_url.clone(),
-                            credential_id:        binding.credential_id.clone(),
-                            credential_revision:  binding.credential_revision.clone(),
+                            base_url: binding.base_url.clone(),
+                            credential_id: binding.credential_id.clone(),
+                            credential_revision: binding.credential_revision.clone(),
                             virtual_key_revision: payload.current_revision.clone(),
-                            key_status:           payload.key_status.clone(),
-                            share_status:         payload.share_status.clone(),
-                            local_state:          "synced_inactive".to_string(),
-                            expires_at:           entry.expires_at,
-                            provider_key_nonce:   Some(nonce),
+                            key_status: payload.key_status.clone(),
+                            share_status: payload.share_status.clone(),
+                            local_state: "synced_inactive".to_string(),
+                            expires_at: entry.expires_at,
+                            provider_key_nonce: Some(nonce),
                             provider_key_ciphertext: Some(ciphertext),
-                            synced_at:            0,
-                            local_alias:          entry.local_alias.clone(),
-                            supported_providers:  sync_supported_providers,
-                            provider_base_urls:   sync_provider_base_urls,
-                            owner_account_id:     account_id.clone(),
+                            synced_at: 0,
+                            local_alias: entry.local_alias.clone(),
+                            supported_providers: sync_supported_providers,
+                            provider_base_urls: sync_provider_base_urls,
+                            owner_account_id: account_id.clone(),
                             // Sync writers MUST always pass extra: None;
                             // upsert ignores this field. See doc on
                             // VirtualKeyCacheEntry::extra.
-                            extra:                None,
+                            extra: None,
                         };
                         let _ = storage::upsert_virtual_key_cache(&updated);
 
-                        eprintln!("  {} New key: {} {}",
+                        eprintln!(
+                            "  {} New key: {} {}",
                             "✓".green().bold(),
                             payload.alias.bold(),
-                            format!("[{}]", binding.provider_code).dimmed());
+                            format!("[{}]", binding.provider_code).dimmed()
+                        );
 
                         downloaded += 1;
                     }
                 }
             }
             Err(e) => {
-                eprintln!("  {} could not fetch key '{}': {}",
-                    "✗".red(), entry.alias, e);
+                eprintln!(
+                    "  {} could not fetch key '{}': {}",
+                    "✗".red(),
+                    entry.alias,
+                    e
+                );
             }
         }
     }
@@ -2411,7 +2571,10 @@ pub fn sync_managed_key_metadata() -> bool {
         };
         // If the key was scope-disabled (belonged to a different account) but
         // the server is now returning it for the current account, restore it.
-        let existing_state = existing.as_ref().map(|e| e.local_state.as_str()).unwrap_or("");
+        let existing_state = existing
+            .as_ref()
+            .map(|e| e.local_state.as_str())
+            .unwrap_or("");
         let local_state = match (item.key_status.as_str(), existing_state) {
             // Server says key is active; restore scope-disabled back to synced_inactive
             // (the current account now owns it again after re-login).
@@ -2430,21 +2593,39 @@ pub fn sync_managed_key_metadata() -> bool {
         };
         // Preserve key material and delivery-time fields (base_url, credential_id, etc.).
         let nonce = existing.as_ref().and_then(|e| e.provider_key_nonce.clone());
-        let ciphertext = existing.as_ref().and_then(|e| e.provider_key_ciphertext.clone());
-        let base_url = existing.as_ref().map(|e| e.base_url.clone()).unwrap_or_default();
-        let credential_id = existing.as_ref().map(|e| e.credential_id.clone()).unwrap_or_default();
-        let credential_revision = existing.as_ref().map(|e| e.credential_revision.clone()).unwrap_or_default();
-        let virtual_key_revision = existing.as_ref().map(|e| e.virtual_key_revision.clone()).unwrap_or_default();
+        let ciphertext = existing
+            .as_ref()
+            .and_then(|e| e.provider_key_ciphertext.clone());
+        let base_url = existing
+            .as_ref()
+            .map(|e| e.base_url.clone())
+            .unwrap_or_default();
+        let credential_id = existing
+            .as_ref()
+            .map(|e| e.credential_id.clone())
+            .unwrap_or_default();
+        let credential_revision = existing
+            .as_ref()
+            .map(|e| e.credential_revision.clone())
+            .unwrap_or_default();
+        let virtual_key_revision = existing
+            .as_ref()
+            .map(|e| e.virtual_key_revision.clone())
+            .unwrap_or_default();
 
         let local_alias = existing.as_ref().and_then(|e| e.local_alias.clone());
         // Preserve supported_providers from existing cache; update from server if non-empty.
         let supported_providers = if !item.supported_providers.is_empty() {
             item.supported_providers.clone()
         } else {
-            existing.as_ref().map(|e| e.supported_providers.clone()).unwrap_or_default()
+            existing
+                .as_ref()
+                .map(|e| e.supported_providers.clone())
+                .unwrap_or_default()
         };
         // Preserve existing provider_base_urls — server metadata sync doesn't re-deliver base URLs.
-        let provider_base_urls = existing.as_ref()
+        let provider_base_urls = existing
+            .as_ref()
             .map(|e| e.provider_base_urls.clone())
             .unwrap_or_default();
         let entry = VirtualKeyCacheEntry {
@@ -2479,9 +2660,17 @@ pub fn sync_managed_key_metadata() -> bool {
         // Handles the case where sync adds new providers to an already-active key.
         if !entry.supported_providers.is_empty() {
             if let Ok(Some(active_cfg)) = crate::storage::get_active_key_config() {
-                if active_cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey && active_cfg.key_ref == entry.virtual_key_id {
+                if active_cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey
+                    && active_cfg.key_ref == entry.virtual_key_id
+                {
                     let display = entry.local_alias.as_deref().unwrap_or(entry.alias.as_str());
-                    let _ = write_active_env("team", &entry.virtual_key_id, display, &entry.supported_providers, crate::commands_proxy::proxy_port());
+                    let _ = write_active_env(
+                        "team",
+                        &entry.virtual_key_id,
+                        display,
+                        &entry.supported_providers,
+                        crate::commands_proxy::proxy_port(),
+                    );
                 }
             }
         }
@@ -2516,7 +2705,8 @@ pub fn handle_key_sync(
             use colored::Colorize;
             eprintln!(
                 "  {} Cleared local ciphertext on {} active team key(s); re-downloading...",
-                "↻".cyan(), cleared
+                "↻".cyan(),
+                cleared
             );
         }
     }
@@ -2526,16 +2716,27 @@ pub fn handle_key_sync(
 
     // v1.0.2: reconcile provider primaries after sync.
     let cached = storage::list_virtual_key_cache().unwrap_or_default();
-    let synced_keys: Vec<(String, Vec<String>)> = cached.iter()
+    let synced_keys: Vec<(String, Vec<String>)> = cached
+        .iter()
         .filter(|e| e.key_status == "active" && !e.local_state.starts_with("disabled_by_"))
         .map(|e| {
-            let p = if !e.supported_providers.is_empty() { e.supported_providers.clone() }
-                    else if !e.provider_code.is_empty() { vec![e.provider_code.clone()] }
-                    else { vec![] };
+            let p = if !e.supported_providers.is_empty() {
+                e.supported_providers.clone()
+            } else if !e.provider_code.is_empty() {
+                vec![e.provider_code.clone()]
+            } else {
+                vec![]
+            };
             (e.virtual_key_id.clone(), p)
-        }).filter(|(_, p)| !p.is_empty()).collect();
-    let reconciled = crate::profile_activation::reconcile_provider_primaries_after_team_key_sync(&synced_keys).unwrap_or_default();
-    if !reconciled.is_empty() { let _ = crate::profile_activation::refresh_implicit_profile_activation(); }
+        })
+        .filter(|(_, p)| !p.is_empty())
+        .collect();
+    let reconciled =
+        crate::profile_activation::reconcile_provider_primaries_after_team_key_sync(&synced_keys)
+            .unwrap_or_default();
+    if !reconciled.is_empty() {
+        let _ = crate::profile_activation::refresh_implicit_profile_activation();
+    }
 
     if json_mode {
         crate::json_output::print_json(serde_json::json!({
@@ -2548,7 +2749,12 @@ pub fn handle_key_sync(
         println!("Sync complete: {} key(s) downloaded.", downloaded);
         for (vk_id, providers) in &reconciled {
             for p in providers {
-                eprintln!("  {} Team key '{}' auto-activated as Primary for {}", "\u{2B50}".yellow(), vk_id.bold(), p);
+                eprintln!(
+                    "  {} Team key '{}' auto-activated as Primary for {}",
+                    "\u{2B50}".yellow(),
+                    vk_id.bold(),
+                    p
+                );
             }
         }
     }
@@ -2729,7 +2935,7 @@ impl AddAction {
         match self {
             AddAction::Inserted => "inserted",
             AddAction::Replaced => "replaced",
-            AddAction::Skipped  => "skipped",
+            AddAction::Skipped => "skipped",
         }
     }
 }
@@ -2786,7 +2992,9 @@ pub fn normalize_providers(raw: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for p in raw {
         let lower = p.trim().to_lowercase();
-        if lower.is_empty() { continue; }
+        if lower.is_empty() {
+            continue;
+        }
         let canonical = oauth_provider_to_canonical(&lower).to_string();
         if seen.insert(canonical.clone()) {
             out.push(canonical);
@@ -2979,48 +3187,50 @@ pub fn apply_rename_core(
             if id == validated {
                 return Err("old and new alias are identical".to_string());
             }
-            let conn = storage::open_connection()
-                .map_err(|e| format!("open vault: {}", e))?;
+            let conn = storage::open_connection().map_err(|e| format!("open vault: {}", e))?;
 
             // Existence check on old
-            let old_exists = conn.query_row(
-                "SELECT COUNT(*) FROM entries WHERE alias = ?1",
-                rusqlite::params![id],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n > 0)
-            .map_err(|e| format!("check old alias '{}': {}", id, e))?;
+            let old_exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE alias = ?1",
+                    rusqlite::params![id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n > 0)
+                .map_err(|e| format!("check old alias '{}': {}", id, e))?;
             if !old_exists {
                 return Err(format!("alias '{}' not found", id));
             }
 
             // Pre-check conflict on new (UNIQUE column — UPDATE would fail)
-            let new_exists = conn.query_row(
-                "SELECT COUNT(*) FROM entries WHERE alias = ?1",
-                rusqlite::params![&validated],
-                |r| r.get::<_, i64>(0),
-            )
-            .map(|n| n > 0)
-            .map_err(|e| format!("check new alias '{}': {}", validated, e))?;
+            let new_exists = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE alias = ?1",
+                    rusqlite::params![&validated],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n > 0)
+                .map_err(|e| format!("check new alias '{}': {}", validated, e))?;
             if new_exists {
                 return Err(format!("alias '{}' already exists", validated));
             }
 
-            let n = conn.execute(
-                "UPDATE entries SET alias = ?1 WHERE alias = ?2",
-                rusqlite::params![&validated, id],
-            )
-            .map_err(|e| {
-                // Race window: concurrent renames can land between our
-                // pre-check and the UPDATE. SQLite surfaces this as UNIQUE
-                // constraint — translate to the same "already exists"
-                // marker as the pre-check.
-                if format!("{}", e).contains("UNIQUE") {
-                    format!("alias '{}' already exists (UNIQUE)", validated)
-                } else {
-                    format!("UPDATE entries: {}", e)
-                }
-            })?;
+            let n = conn
+                .execute(
+                    "UPDATE entries SET alias = ?1 WHERE alias = ?2",
+                    rusqlite::params![&validated, id],
+                )
+                .map_err(|e| {
+                    // Race window: concurrent renames can land between our
+                    // pre-check and the UPDATE. SQLite surfaces this as UNIQUE
+                    // constraint — translate to the same "already exists"
+                    // marker as the pre-check.
+                    if format!("{}", e).contains("UNIQUE") {
+                        format!("alias '{}' already exists (UNIQUE)", validated)
+                    } else {
+                        format!("UPDATE entries: {}", e)
+                    }
+                })?;
             if n == 0 {
                 return Err(format!("alias '{}' not found (race)", id));
             }
@@ -3080,13 +3290,13 @@ pub fn apply_rename_core(
             if current_effective == new_trimmed {
                 return Err("old and new alias are identical".to_string());
             }
-            let conn = storage::open_connection()
-                .map_err(|e| format!("open vault: {}", e))?;
-            let n = conn.execute(
-                "UPDATE provider_accounts SET local_alias = ?1 WHERE provider_account_id = ?2",
-                rusqlite::params![&new_trimmed, id],
-            )
-            .map_err(|e| format!("UPDATE provider_accounts: {}", e))?;
+            let conn = storage::open_connection().map_err(|e| format!("open vault: {}", e))?;
+            let n = conn
+                .execute(
+                    "UPDATE provider_accounts SET local_alias = ?1 WHERE provider_account_id = ?2",
+                    rusqlite::params![&new_trimmed, id],
+                )
+                .map_err(|e| format!("UPDATE provider_accounts: {}", e))?;
             if n == 0 {
                 return Err(format!("provider_account_id '{}' not found (race)", id));
             }
@@ -3139,10 +3349,8 @@ pub(crate) fn write_bindings_canonical(
             // Best-effort cleanup of any stale non-canonical row. Silent
             // on error — worst case the stale row lingers until the next
             // activation UPSERTs over it via the canonical primary key.
-            let _ = storage::remove_provider_binding(
-                crate::profile_activation::DEFAULT_PROFILE,
-                &raw,
-            );
+            let _ =
+                storage::remove_provider_binding(crate::profile_activation::DEFAULT_PROFILE, &raw);
         }
         storage::set_provider_binding(
             crate::profile_activation::DEFAULT_PROFILE,
@@ -3187,15 +3395,16 @@ pub fn handle_run_direct(
     }
 
     // ── 1. Resolve the active personal key ────────────────────────────────────
-    let active_cfg = storage::get_active_key_config()?
-        .ok_or("No active key. Run `aikey use <alias>` first.")?;
+    let active_cfg =
+        storage::get_active_key_config()?.ok_or("No active key. Run `aikey use <alias>` first.")?;
 
     if active_cfg.key_type != crate::credential_type::CredentialType::PersonalApiKey {
         return Err(format!(
             "--direct only supports personal keys (current active key is type '{}').\n\
              Switch to a personal key first: aikey use <alias>",
             active_cfg.key_type
-        ).into());
+        )
+        .into());
     }
 
     let alias = &active_cfg.key_ref;
@@ -3235,8 +3444,11 @@ pub fn handle_run_direct(
     // ── 6. Print what will be injected (non-JSON mode) ─────────────────────
     if !json_mode {
         use colored::Colorize;
-        println!("{} Running {} with direct key injection (no proxy):",
-            "→".dimmed(), cmd[0].bold());
+        println!(
+            "{} Running {} with direct key injection (no proxy):",
+            "→".dimmed(),
+            cmd[0].bold()
+        );
         for (var, val) in &overrides {
             if var.ends_with("_BASE_URL") {
                 println!("  {:<28} = {}", var.bold(), val.cyan());
@@ -3254,7 +3466,8 @@ pub fn handle_run_direct(
         child.env(var, val);
     }
 
-    let status = child.status()
+    let status = child
+        .status()
         .map_err(|e| format!("Failed to execute '{}': {}", cmd[0], e))?;
 
     std::process::exit(status.code().unwrap_or(1));
@@ -3294,10 +3507,12 @@ fn resolve_oauth_account(alias_or_id: &str) -> Option<storage::ProviderAccountIn
     let accounts = storage::list_provider_accounts_readonly().ok()?;
     accounts.into_iter().find(|a| {
         a.provider_account_id.eq_ignore_ascii_case(alias_or_id)
-            || a.local_alias.as_deref()
+            || a.local_alias
+                .as_deref()
                 .map(|d| d.eq_ignore_ascii_case(alias_or_id))
                 .unwrap_or(false)
-            || a.display_identity.as_deref()
+            || a.display_identity
+                .as_deref()
                 .map(|d| d.eq_ignore_ascii_case(alias_or_id))
                 .unwrap_or(false)
     })
@@ -3319,8 +3534,11 @@ pub fn handle_key_use(
     let proxy_port: u16 = crate::commands_proxy::proxy_port();
 
     // ── 1. Resolve key — try team keys, then personal, then OAuth ────────────
-    let team_entry = storage::get_virtual_key_cache(alias_or_id)?
-        .or_else(|| storage::get_virtual_key_cache_by_alias(alias_or_id).ok().flatten());
+    let team_entry = storage::get_virtual_key_cache(alias_or_id)?.or_else(|| {
+        storage::get_virtual_key_cache_by_alias(alias_or_id)
+            .ok()
+            .flatten()
+    });
 
     let (key_type, key_ref, display_name, providers) = if let Some(ref entry) = team_entry {
         // Team key validation.
@@ -3376,8 +3594,16 @@ pub fn handle_key_use(
             // re-issue" error. Fail-fast surfaces the real client-side
             // password requirement.
             let pw_cached = crate::session::try_get()
-                .or_else(|| std::env::var("AK_TEST_PASSWORD").ok().map(secrecy::SecretString::new))
-                .or_else(|| std::env::var("AIKEY_TEST_MASTER_PASSWORD").ok().map(secrecy::SecretString::new));
+                .or_else(|| {
+                    std::env::var("AK_TEST_PASSWORD")
+                        .ok()
+                        .map(secrecy::SecretString::new)
+                })
+                .or_else(|| {
+                    std::env::var("AIKEY_TEST_MASTER_PASSWORD")
+                        .ok()
+                        .map(secrecy::SecretString::new)
+                });
 
             let pw = match pw_cached {
                 Some(p) => p,
@@ -3388,7 +3614,8 @@ pub fn handle_key_use(
                             "Key '{}' needs to be downloaded but no master password is available. \
                              Set AK_TEST_PASSWORD or run from an interactive terminal.",
                             entry.alias
-                        ).into());
+                        )
+                        .into());
                     }
                     let raw = crate::prompt_hidden("  \u{1F512} Enter Master Password: ")
                         .map_err(|e| format!("prompt: {}", e))?;
@@ -3405,9 +3632,16 @@ pub fn handle_key_use(
             }
 
             // Re-read after sync.
-            let refreshed = storage::get_virtual_key_cache(&entry.virtual_key_id)?
-                .or_else(|| storage::get_virtual_key_cache_by_alias(alias_or_id).ok().flatten());
-            if refreshed.as_ref().and_then(|e| e.provider_key_ciphertext.as_ref()).is_none() {
+            let refreshed = storage::get_virtual_key_cache(&entry.virtual_key_id)?.or_else(|| {
+                storage::get_virtual_key_cache_by_alias(alias_or_id)
+                    .ok()
+                    .flatten()
+            });
+            if refreshed
+                .as_ref()
+                .and_then(|e| e.provider_key_ciphertext.as_ref())
+                .is_none()
+            {
                 // Sync ran but didn't produce ciphertext — the most likely
                 // causes are server-side: no active binding for this VK, key
                 // revoked between snapshot and delivery, or admin hasn't
@@ -3418,12 +3652,17 @@ pub fn handle_key_use(
                      attach a provider credential to it. Retry with `aikey key sync` after \
                      the admin confirms the binding.",
                     entry.alias
-                ).into());
+                )
+                .into());
             }
             drop(refreshed);
             return handle_key_use(alias_or_id, no_hook, provider_override, json_mode);
         }
-        let display = entry.local_alias.as_deref().unwrap_or(&entry.alias).to_string();
+        let display = entry
+            .local_alias
+            .as_deref()
+            .unwrap_or(&entry.alias)
+            .to_string();
         let providers = if !entry.supported_providers.is_empty() {
             entry.supported_providers.clone()
         } else if !entry.provider_code.is_empty() {
@@ -3431,15 +3670,27 @@ pub fn handle_key_use(
         } else {
             vec![]
         };
-        (crate::credential_type::CredentialType::ManagedVirtualKey, entry.virtual_key_id.clone(), display, providers)
+        (
+            crate::credential_type::CredentialType::ManagedVirtualKey,
+            entry.virtual_key_id.clone(),
+            display,
+            providers,
+        )
     } else if storage::entry_exists(alias_or_id).unwrap_or(false) {
         // Personal key — v1.0.2: use resolve_supported_providers.
         let stored = storage::resolve_supported_providers(alias_or_id).unwrap_or_default();
-        let providers = if !stored.is_empty() { stored } else {
+        let providers = if !stored.is_empty() {
+            stored
+        } else {
             const KNOWN: &[&str] = &["anthropic", "openai", "google", "deepseek", "kimi"];
             KNOWN.iter().map(|s| s.to_string()).collect()
         };
-        (crate::credential_type::CredentialType::PersonalApiKey, alias_or_id.to_string(), alias_or_id.to_string(), providers)
+        (
+            crate::credential_type::CredentialType::PersonalApiKey,
+            alias_or_id.to_string(),
+            alias_or_id.to_string(),
+            providers,
+        )
     } else if let Some(acct) = resolve_oauth_account(alias_or_id) {
         // OAuth account — lookup by account_id or display_identity (email).
         //
@@ -3453,19 +3704,29 @@ pub fn handle_key_use(
             return Err(format!(
                 "OAuth account '{}' is in state '{}' and cannot be activated.\n\
                  Run: aikey auth login {}",
-                acct.display_identity.as_deref().unwrap_or(&acct.provider_account_id),
+                acct.display_identity
+                    .as_deref()
+                    .unwrap_or(&acct.provider_account_id),
                 acct.status,
                 acct.provider,
-            ).into());
+            )
+            .into());
         }
-        let display = acct.display_identity.clone()
+        let display = acct
+            .display_identity
+            .clone()
             .unwrap_or_else(|| acct.provider_account_id.clone());
         // OAuth accounts are single-provider by definition (Claude OAuth
         // → anthropic; Codex OAuth → openai; etc.). `provider_override`
         // would be redundant here; we carry the provider through the
         // normal binding flow for uniformity.
         let providers = vec![acct.provider.clone()];
-        (crate::credential_type::CredentialType::PersonalOAuthAccount, acct.provider_account_id.clone(), display, providers)
+        (
+            crate::credential_type::CredentialType::PersonalOAuthAccount,
+            acct.provider_account_id.clone(),
+            display,
+            providers,
+        )
     } else {
         return Err(format!(
             "Key '{}' not found in team keys, personal keys, or OAuth accounts.\n\
@@ -3474,7 +3735,8 @@ pub fn handle_key_use(
              - for team keys, run `aikey key sync` if the cache may be stale\n\
              - for personal keys, re-add with: aikey add {}",
             alias_or_id, alias_or_id
-        ).into());
+        )
+        .into());
     };
 
     if providers.is_empty() {
@@ -3482,7 +3744,8 @@ pub fn handle_key_use(
             "Key '{}' has no supported providers — cannot write env vars.\n\
              Run 'aikey key sync' to refresh, or re-add with '--provider <code>'.",
             display_name
-        ).into());
+        )
+        .into());
     }
 
     // ── 2. Provider-level primary promotion (v1.0.2) ─────────────────────────
@@ -3494,50 +3757,88 @@ pub fn handle_key_use(
         if !ov.is_empty() {
             let code = ov.to_lowercase();
             if !providers.iter().any(|p| p.to_lowercase() == code) {
-                return Err(format!("Key '{}' does not support provider '{}'. Supported: {}", display_name, code, providers.join(", ")).into());
+                return Err(format!(
+                    "Key '{}' does not support provider '{}'. Supported: {}",
+                    display_name,
+                    code,
+                    providers.join(", ")
+                )
+                .into());
             }
             vec![code]
-        } else if providers.len() == 1 { providers.clone() }
-        else {
+        } else if providers.len() == 1 {
+            providers.clone()
+        } else {
             if !std::io::stdin().is_terminal() || json_mode {
                 return Err(format!("This key supports multiple providers: {}. Please specify --provider or choose interactively.", providers.join(", ")).into());
             }
             use colored::Colorize;
             println!("Key '{}' supports multiple providers:", display_name.bold());
-            for (i, p) in providers.iter().enumerate() { println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p); }
+            for (i, p) in providers.iter().enumerate() {
+                println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p);
+            }
             print!("Select protocol(s) to set as Primary (comma-separated): ");
             io::stdout().flush()?;
-            let mut input = String::new(); io::stdin().read_line(&mut input)?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
             let input = input.trim();
-            if input.is_empty() { return Err("No provider selected. Use --provider <code> or select interactively.".into()); }
+            if input.is_empty() {
+                return Err(
+                    "No provider selected. Use --provider <code> or select interactively.".into(),
+                );
+            }
             let mut selected = Vec::new();
             for part in input.split(',').map(|s| s.trim()) {
                 if let Ok(n) = part.parse::<usize>() {
-                    if n >= 1 && n <= providers.len() { let p = providers[n-1].clone(); if !selected.contains(&p) { selected.push(p); } }
+                    if n >= 1 && n <= providers.len() {
+                        let p = providers[n - 1].clone();
+                        if !selected.contains(&p) {
+                            selected.push(p);
+                        }
+                    }
                 }
             }
-            if selected.is_empty() { return Err("Invalid selection. Use --provider <code>.".into()); }
+            if selected.is_empty() {
+                return Err("Invalid selection. Use --provider <code>.".into());
+            }
             selected
         }
-    } else if providers.len() == 1 { providers.clone() }
-    else {
+    } else if providers.len() == 1 {
+        providers.clone()
+    } else {
         if !std::io::stdin().is_terminal() || json_mode {
-            return Err(format!("This key supports multiple providers: {}. Please specify --provider.", providers.join(", ")).into());
+            return Err(format!(
+                "This key supports multiple providers: {}. Please specify --provider.",
+                providers.join(", ")
+            )
+            .into());
         }
         use colored::Colorize;
         println!("Key '{}' supports multiple providers:", display_name.bold());
-        for (i, p) in providers.iter().enumerate() { println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p); }
+        for (i, p) in providers.iter().enumerate() {
+            println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p);
+        }
         print!("Select protocol(s) to set as Primary (comma-separated): ");
         io::stdout().flush()?;
-        let mut input = String::new(); io::stdin().read_line(&mut input)?;
-        if input.trim().is_empty() { return Err("No protocol selected.".into()); }
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if input.trim().is_empty() {
+            return Err("No protocol selected.".into());
+        }
         let mut selected = Vec::new();
         for part in input.trim().split(',').map(|s| s.trim()) {
             if let Ok(n) = part.parse::<usize>() {
-                if n >= 1 && n <= providers.len() { let p = providers[n-1].clone(); if !selected.contains(&p) { selected.push(p); } }
+                if n >= 1 && n <= providers.len() {
+                    let p = providers[n - 1].clone();
+                    if !selected.contains(&p) {
+                        selected.push(p);
+                    }
+                }
             }
         }
-        if selected.is_empty() { return Err("Invalid selection.".into()); }
+        if selected.is_empty() {
+            return Err("Invalid selection.".into());
+        }
         selected
     };
 
@@ -3545,22 +3846,23 @@ pub fn handle_key_use(
     // refresh → apply_third_party_cli_configs. Drive off the refreshed
     // binding set so switching one provider away from kimi/codex correctly
     // unconfigures the corresponding toml region.
-    let _lifecycle = apply_credential_lifecycle(
-        CredentialLifecycleEvent::Switched {
-            source_type: key_type.as_str(),
-            source_ref: &key_ref,
-            providers: &target_providers,
-        },
-    )
+    let _lifecycle = apply_credential_lifecycle(CredentialLifecycleEvent::Switched {
+        source_type: key_type.as_str(),
+        source_ref: &key_ref,
+        providers: &target_providers,
+    })
     .map_err(|e| format!("Failed to apply use: {}", e))?;
 
     // ── 6. Shell hook (one-time, first use) ───────────────────────────────────
-    let hook_msg = if !json_mode { ensure_shell_hook(no_hook) } else { None };
+    let hook_msg = if !json_mode {
+        ensure_shell_hook(no_hook)
+    } else {
+        None
+    };
 
     // Bindings reread for the JSON envelope below (apply already wrote
     // active.env). Cheap; single DB read.
-    let bindings = crate::storage::list_provider_bindings_readonly("default")
-        .unwrap_or_default();
+    let bindings = crate::storage::list_provider_bindings_readonly("default").unwrap_or_default();
     // Suppress unused-warning when json_mode skips the helper apply.
     let _ = proxy_port;
 
@@ -3591,20 +3893,31 @@ pub fn handle_key_use(
         let mut rows: Vec<String> = Vec::new();
         for b in &bindings {
             if let Some((api_key_var, _)) = provider_env_vars(&b.provider_code) {
-                let display_ref = resolve_binding_display_name(b.key_source_type.as_str(), &b.key_source_ref);
+                let display_ref =
+                    resolve_binding_display_name(b.key_source_type.as_str(), &b.key_source_ref);
                 let is_changed = target_providers.contains(&b.provider_code);
                 let arrow_ref = format!("\u{2192} {}", display_ref);
                 let arrow_padded = format!("{:<22}", arrow_ref);
-                let arrow_col = if is_changed { format!("\x1b[32m{}\x1b[0m", arrow_padded) } else { arrow_padded };
-                rows.push(format!("  {:<14} {} \x1b[90m[{}]\x1b[0m",
-                    b.provider_code, arrow_col, b.key_source_type));
+                let arrow_col = if is_changed {
+                    format!("\x1b[32m{}\x1b[0m", arrow_padded)
+                } else {
+                    arrow_padded
+                };
+                rows.push(format!(
+                    "  {:<14} {} \x1b[90m[{}]\x1b[0m",
+                    b.provider_code, arrow_col, b.key_source_type
+                ));
                 let _ = api_key_var;
             }
         }
         rows.push(String::new());
         rows.push(status.to_string());
 
-        let title = format!("Set '{}' as Primary for {}", display_name, target_providers.join(", "));
+        let title = format!(
+            "Set '{}' as Primary for {}",
+            display_name,
+            target_providers.join(", ")
+        );
         crate::ui_frame::print_box("\u{1F7E2}", &title, &rows);
         println!();
     }
@@ -3638,10 +3951,9 @@ pub fn handle_key_unuse(
 
     for raw in providers {
         let canonical = oauth_provider_to_canonical(&raw.to_lowercase());
-        let removed = storage::remove_provider_binding(
-            crate::profile_activation::DEFAULT_PROFILE,
-            canonical,
-        ).map_err(|e| format!("remove binding for {}: {}", canonical, e))?;
+        let removed =
+            storage::remove_provider_binding(crate::profile_activation::DEFAULT_PROFILE, canonical)
+                .map_err(|e| format!("remove binding for {}: {}", canonical, e))?;
 
         if removed {
             unbound.push(canonical.to_string());
@@ -3675,10 +3987,13 @@ pub fn handle_key_unuse(
         }));
     } else {
         if unbound.is_empty() && !already_unbound.is_empty() {
-            println!("No active binding for {}. Nothing to do.",
-                already_unbound.join(", "));
+            println!(
+                "No active binding for {}. Nothing to do.",
+                already_unbound.join(", ")
+            );
         } else if !unbound.is_empty() {
-            let rows: Vec<String> = unbound.iter()
+            let rows: Vec<String> = unbound
+                .iter()
                 .map(|p| format!("  {} {}", "\u{2717}".red(), p))
                 .collect();
             crate::ui_frame::print_box(
@@ -3689,9 +4004,11 @@ pub fn handle_key_unuse(
             println!();
             println!("{}", "\u{2713} active.env and CLI configs updated. Next prompt picks it up automatically.".dimmed());
             if !already_unbound.is_empty() {
-                println!("  {} already had no binding: {}",
+                println!(
+                    "  {} already had no binding: {}",
                     "\u{2139}\u{FE0F}".dimmed(),
-                    already_unbound.join(", "));
+                    already_unbound.join(", ")
+                );
             }
         }
     }
@@ -3711,12 +4028,17 @@ pub fn handle_key_unuse(
 /// Routes through `apply_rename_core`, same helper used by `_internal
 /// update-alias rename_alias` / `rename_target` (single-source-of-truth
 /// rule — `.claude/CLAUDE.md`).
-pub fn handle_key_alias(old_alias: &str, new_alias: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_key_alias(
+    old_alias: &str,
+    new_alias: &str,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
     // Decide target. Personal check is fast (single query); only fall
     // through to team resolution if the alias isn't personal.
-    let is_personal = storage::list_entries().ok()
+    let is_personal = storage::list_entries()
+        .ok()
         .map(|v| v.iter().any(|a| a == old_alias))
         .unwrap_or(false);
 
@@ -3744,7 +4066,10 @@ pub fn handle_key_alias(old_alias: &str, new_alias: &str, json_mode: bool) -> Re
         if matches!(target, RenameTarget::Team) {
             if let Ok(Some(entry)) = storage::get_virtual_key_cache(&outcome.id) {
                 if let Some(obj) = body.as_object_mut() {
-                    obj.insert("virtual_key_id".into(), serde_json::json!(entry.virtual_key_id));
+                    obj.insert(
+                        "virtual_key_id".into(),
+                        serde_json::json!(entry.virtual_key_id),
+                    );
                     obj.insert("server_alias".into(), serde_json::json!(entry.alias));
                     obj.insert("local_alias".into(), serde_json::json!(outcome.new_value));
                 }
@@ -3753,18 +4078,20 @@ pub fn handle_key_alias(old_alias: &str, new_alias: &str, json_mode: bool) -> Re
         crate::json_output::print_json(body);
     } else {
         let suffix = match target {
-            RenameTarget::Team => {
-                storage::get_virtual_key_cache(&outcome.id).ok().flatten()
-                    .map(|e| format!(" (server alias: {})", e.alias))
-                    .unwrap_or_default()
-            }
+            RenameTarget::Team => storage::get_virtual_key_cache(&outcome.id)
+                .ok()
+                .flatten()
+                .map(|e| format!(" (server alias: {})", e.alias))
+                .unwrap_or_default(),
             _ => String::new(),
         };
-        println!("{} Renamed {} → {}  {}",
+        println!(
+            "{} Renamed {} → {}  {}",
             "✓".green().bold(),
             format!("'{}'", old_alias).dimmed(),
             format!("'{}'", outcome.new_value).bold(),
-            suffix.dimmed());
+            suffix.dimmed()
+        );
     }
     Ok(())
 }
@@ -3775,9 +4102,7 @@ pub fn handle_key_alias(old_alias: &str, new_alias: &str, json_mode: bool) -> Re
 
 /// Derives the vault AES key from the master password.
 /// Uses the same salt + KDF parameters stored in the vault DB.
-fn derive_vault_key(
-    password: &SecretString,
-) -> Result<[u8; crypto::KEY_SIZE], String> {
+fn derive_vault_key(password: &SecretString) -> Result<[u8; crypto::KEY_SIZE], String> {
     let salt = storage::get_salt()?;
     let (m, t, p) = storage::get_kdf_params()?;
     let secure_key = crypto::derive_key_with_params(password, &salt, m, t, p)?;
@@ -3837,18 +4162,26 @@ mod provider_mapping_tests {
         // 统一KIMI写入.md)。区分 platform 由 proxy_path 决定 (moonshot 走 /moonshot/v1,
         // 其它走 /kimi/v1),不再由 env var 名区分。
         // pre-fix 时 moonshot 写 MOONSHOT_API_KEY,但实证无消费方,直接停写。
-        assert_eq!(provider_env_vars("kimi"),
-            Some(("KIMI_API_KEY", "KIMI_BASE_URL")));
-        assert_eq!(provider_env_vars("kimi_code"),
-            Some(("KIMI_API_KEY", "KIMI_BASE_URL")));
-        assert_eq!(provider_env_vars("moonshot"),
-            Some(("KIMI_API_KEY", "KIMI_BASE_URL")));
+        assert_eq!(
+            provider_env_vars("kimi"),
+            Some(("KIMI_API_KEY", "KIMI_BASE_URL"))
+        );
+        assert_eq!(
+            provider_env_vars("kimi_code"),
+            Some(("KIMI_API_KEY", "KIMI_BASE_URL"))
+        );
+        assert_eq!(
+            provider_env_vars("moonshot"),
+            Some(("KIMI_API_KEY", "KIMI_BASE_URL"))
+        );
     }
 
     #[test]
     fn env_vars_deepseek() {
-        assert_eq!(provider_env_vars("deepseek"),
-            Some(("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL")));
+        assert_eq!(
+            provider_env_vars("deepseek"),
+            Some(("DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"))
+        );
     }
 
     #[test]
@@ -3918,13 +4251,23 @@ mod provider_mapping_tests {
         // (provider_proxy_prefix falls back to "openai", so it always succeeds.)
         // L5: "codex" is now included because it's a full alias of openai.
         for code in &[
-            "anthropic", "claude",
-            "openai", "codex", "gpt", "chatgpt",
-            "google", "gemini",
-            "kimi", "moonshot", "deepseek",
+            "anthropic",
+            "claude",
+            "openai",
+            "codex",
+            "gpt",
+            "chatgpt",
+            "google",
+            "gemini",
+            "kimi",
+            "moonshot",
+            "deepseek",
         ] {
-            assert!(provider_env_vars(code).is_some(),
-                "provider_env_vars returned None for known code '{}'", code);
+            assert!(
+                provider_env_vars(code).is_some(),
+                "provider_env_vars returned None for known code '{}'",
+                code
+            );
             // Just ensure it returns without panic; the actual value is tested above.
             let _ = provider_proxy_prefix(code);
         }
@@ -3937,16 +4280,31 @@ mod provider_mapping_tests {
         // Legacy wrappers must return the SAME values as ProviderInfo for every
         // known provider. If this fails, the wrappers have drifted from provider_info.
         for code in &[
-            "anthropic", "claude",
-            "openai", "codex", "gpt", "chatgpt",
-            "google", "gemini",
-            "kimi", "moonshot", "deepseek",
+            "anthropic",
+            "claude",
+            "openai",
+            "codex",
+            "gpt",
+            "chatgpt",
+            "google",
+            "gemini",
+            "kimi",
+            "moonshot",
+            "deepseek",
         ] {
             let info = super::provider_info(code).unwrap();
-            assert_eq!(provider_env_vars(code), Some(info.env_vars),
-                "env_vars mismatch for '{}'", code);
-            assert_eq!(provider_proxy_prefix(code), info.proxy_path,
-                "proxy_path mismatch for '{}'", code);
+            assert_eq!(
+                provider_env_vars(code),
+                Some(info.env_vars),
+                "env_vars mismatch for '{}'",
+                code
+            );
+            assert_eq!(
+                provider_proxy_prefix(code),
+                info.proxy_path,
+                "proxy_path mismatch for '{}'",
+                code
+            );
         }
     }
 
@@ -3954,29 +4312,44 @@ mod provider_mapping_tests {
     fn provider_info_aliases_point_to_same_canonical() {
         use super::provider_info;
         // anthropic/claude
-        assert_eq!(provider_info("anthropic").unwrap().canonical_code,
-                   provider_info("claude").unwrap().canonical_code);
+        assert_eq!(
+            provider_info("anthropic").unwrap().canonical_code,
+            provider_info("claude").unwrap().canonical_code
+        );
         // openai family (codex, gpt, chatgpt)
         let openai = provider_info("openai").unwrap().canonical_code;
         for alias in &["codex", "gpt", "chatgpt"] {
-            assert_eq!(provider_info(alias).unwrap().canonical_code, openai,
-                "alias '{}' should canonicalize to openai", alias);
+            assert_eq!(
+                provider_info(alias).unwrap().canonical_code,
+                openai,
+                "alias '{}' should canonicalize to openai",
+                alias
+            );
         }
         // google/gemini
-        assert_eq!(provider_info("google").unwrap().canonical_code,
-                   provider_info("gemini").unwrap().canonical_code);
+        assert_eq!(
+            provider_info("google").unwrap().canonical_code,
+            provider_info("gemini").unwrap().canonical_code
+        );
         // 2026-05-08 Kimi 双平台拆分 review feedback:
         //   - kimi (deprecated alias) canonicalizes → kimi_code (registry alias)
         //   - moonshot is its own canonical (NOT folded to kimi anymore)
         // 共享的是 family ("kimi"),不是 canonical_code。
         assert_eq!(provider_info("kimi").unwrap().canonical_code, "kimi_code");
-        assert_eq!(provider_info("moonshot").unwrap().canonical_code, "moonshot");
-        assert_ne!(provider_info("kimi").unwrap().canonical_code,
-                   provider_info("moonshot").unwrap().canonical_code,
-                   "kimi_code 与 moonshot 是两个独立 provider_code,不能折叠");
+        assert_eq!(
+            provider_info("moonshot").unwrap().canonical_code,
+            "moonshot"
+        );
+        assert_ne!(
+            provider_info("kimi").unwrap().canonical_code,
+            provider_info("moonshot").unwrap().canonical_code,
+            "kimi_code 与 moonshot 是两个独立 provider_code,不能折叠"
+        );
         // family-level: 两者都属 'kimi' family
-        assert_eq!(provider_info("kimi").unwrap().family,
-                   provider_info("moonshot").unwrap().family);
+        assert_eq!(
+            provider_info("kimi").unwrap().family,
+            provider_info("moonshot").unwrap().family
+        );
         assert_eq!(provider_info("kimi_code").unwrap().family, "kimi");
     }
 
@@ -3987,9 +4360,15 @@ mod provider_mapping_tests {
     fn provider_info_canonical_code_is_real_code_not_family() {
         use super::provider_info;
         // moonshot 必须保持 moonshot,不被折叠
-        assert_eq!(provider_info("moonshot").unwrap().canonical_code, "moonshot");
+        assert_eq!(
+            provider_info("moonshot").unwrap().canonical_code,
+            "moonshot"
+        );
         // kimi_code 自身就是 canonical
-        assert_eq!(provider_info("kimi_code").unwrap().canonical_code, "kimi_code");
+        assert_eq!(
+            provider_info("kimi_code").unwrap().canonical_code,
+            "kimi_code"
+        );
         // 'kimi' 字面值 (deprecated alias) → 经 registry alias 解析 → kimi_code
         assert_eq!(provider_info("kimi").unwrap().canonical_code, "kimi_code");
     }
@@ -4007,14 +4386,22 @@ mod provider_mapping_tests {
         //   moonshot  → moonshot-v1-8k / 8192(模型名编码 context 上限,默认配最便宜)
         //   kimi(deprecated)→ 与 kimi_code 一致(经 oauth_alias 解析)
         let kimi_code = provider_extra_env_vars("kimi_code");
-        assert!(kimi_code.iter().any(|(k, v)| *k == "KIMI_MODEL_NAME" && *v == "kimi-k2.5"));
-        assert!(kimi_code.iter().any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "131072"));
+        assert!(kimi_code
+            .iter()
+            .any(|(k, v)| *k == "KIMI_MODEL_NAME" && *v == "kimi-k2.5"));
+        assert!(kimi_code
+            .iter()
+            .any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "131072"));
 
         let moonshot = provider_extra_env_vars("moonshot");
-        assert!(moonshot.iter().any(|(k, v)| *k == "KIMI_MODEL_NAME" && *v == "moonshot-v1-8k"));
+        assert!(moonshot
+            .iter()
+            .any(|(k, v)| *k == "KIMI_MODEL_NAME" && *v == "moonshot-v1-8k"));
         // Moonshot 模型族名字直接编码 context 上限: moonshot-v1-8k=8192, -32k=32768,
         // -128k=131072。default 配 8k 模型必须配 8192 context, 否则 kimi-cli 端会做错截断预估。
-        assert!(moonshot.iter().any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "8192"));
+        assert!(moonshot
+            .iter()
+            .any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "8192"));
 
         // deprecated 'kimi' alias 解析到 kimi_code,继承 kimi-k2.5 / 131072
         let kimi_alias = provider_extra_env_vars("kimi");
@@ -4028,7 +4415,11 @@ mod provider_mapping_tests {
     #[test]
     fn provider_extra_env_vars_returns_empty_for_non_kimi() {
         for p in &["anthropic", "openai", "google", "deepseek"] {
-            assert!(provider_extra_env_vars(p).is_empty(), "{} must have no extras", p);
+            assert!(
+                provider_extra_env_vars(p).is_empty(),
+                "{} must have no extras",
+                p
+            );
         }
     }
 }
@@ -4165,7 +4556,9 @@ mod core_tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("vault.db");
-        unsafe { std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap()); }
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
         let mut salt = [0u8; 16];
         crate::crypto::generate_salt(&mut salt).expect("salt");
         let pw = SecretString::new("test_password".to_string());
@@ -4304,9 +4697,19 @@ mod core_tests {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
         let key = dummy_vault_key();
-        apply_add_core_on_conn(&conn, &key, "dup", b"s1", &["openai".to_string()], None, OnConflict::Error).unwrap();
+        apply_add_core_on_conn(
+            &conn,
+            &key,
+            "dup",
+            b"s1",
+            &["openai".to_string()],
+            None,
+            OnConflict::Error,
+        )
+        .unwrap();
 
-        let err = apply_add_core_on_conn(&conn, &key, "dup", b"s2", &[], None, OnConflict::Error).unwrap_err();
+        let err = apply_add_core_on_conn(&conn, &key, "dup", b"s2", &[], None, OnConflict::Error)
+            .unwrap_err();
         assert!(err.contains("already exists"), "err was: {}", err);
     }
 
@@ -4316,10 +4719,26 @@ mod core_tests {
         let conn = storage::open_connection().expect("open");
         let key = dummy_vault_key();
 
-        apply_add_core_on_conn(&conn, &key, "rep", b"s1", &["openai".to_string()], None, OnConflict::Error).unwrap();
+        apply_add_core_on_conn(
+            &conn,
+            &key,
+            "rep",
+            b"s1",
+            &["openai".to_string()],
+            None,
+            OnConflict::Error,
+        )
+        .unwrap();
         let outcome = apply_add_core_on_conn(
-            &conn, &key, "rep", b"s2", &["anthropic".to_string()], None, OnConflict::Replace,
-        ).expect("replace ok");
+            &conn,
+            &key,
+            "rep",
+            b"s2",
+            &["anthropic".to_string()],
+            None,
+            OnConflict::Replace,
+        )
+        .expect("replace ok");
         assert_eq!(outcome.action, AddAction::Replaced);
         assert_eq!(outcome.primary_provider.as_deref(), Some("anthropic"));
     }
@@ -4330,8 +4749,19 @@ mod core_tests {
         let conn = storage::open_connection().expect("open");
         let key = dummy_vault_key();
 
-        apply_add_core_on_conn(&conn, &key, "keep", b"s1", &["openai".to_string()], None, OnConflict::Error).unwrap();
-        let outcome = apply_add_core_on_conn(&conn, &key, "keep", b"s2", &[], None, OnConflict::Skip).expect("skip ok");
+        apply_add_core_on_conn(
+            &conn,
+            &key,
+            "keep",
+            b"s1",
+            &["openai".to_string()],
+            None,
+            OnConflict::Error,
+        )
+        .unwrap();
+        let outcome =
+            apply_add_core_on_conn(&conn, &key, "keep", b"s2", &[], None, OnConflict::Skip)
+                .expect("skip ok");
         assert_eq!(outcome.action, AddAction::Skipped);
         // Verify original provider was NOT overwritten.
         let metas = storage::list_entries_with_metadata().unwrap();
@@ -4345,7 +4775,10 @@ mod core_tests {
         let conn = storage::open_connection().expect("open");
         let key = dummy_vault_key();
         apply_add_core_on_conn(
-            &conn, &key, "with-url", b"s",
+            &conn,
+            &key,
+            "with-url",
+            b"s",
             &["openai".to_string()],
             Some("https://api.example.com/v1"),
             OnConflict::Error,
@@ -4353,7 +4786,10 @@ mod core_tests {
         .unwrap();
         let metas = storage::list_entries_with_metadata().unwrap();
         let entry = metas.iter().find(|m| m.alias == "with-url").unwrap();
-        assert_eq!(entry.base_url.as_deref(), Some("https://api.example.com/v1"));
+        assert_eq!(
+            entry.base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
     }
 
     #[test]
@@ -4361,14 +4797,18 @@ mod core_tests {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
         let key = dummy_vault_key();
-        let err = apply_add_core_on_conn(
-            &conn, &key, "  ", b"s", &[], None, OnConflict::Error,
-        )
-        .unwrap_err();
+        let err = apply_add_core_on_conn(&conn, &key, "  ", b"s", &[], None, OnConflict::Error)
+            .unwrap_err();
         assert!(err.contains("empty"), "err was: {}", err);
 
         let err2 = apply_add_core_on_conn(
-            &conn, &key, "bad\nalias", b"s", &[], None, OnConflict::Error,
+            &conn,
+            &key,
+            "bad\nalias",
+            b"s",
+            &[],
+            None,
+            OnConflict::Error,
         )
         .unwrap_err();
         assert!(err2.contains("control"), "err was: {}", err2);
@@ -4381,11 +4821,12 @@ mod core_tests {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
         let key = dummy_vault_key();
-        apply_add_core_on_conn(&conn, &key, "old-name", b"s", &[], None, OnConflict::Error).unwrap();
+        apply_add_core_on_conn(&conn, &key, "old-name", b"s", &[], None, OnConflict::Error)
+            .unwrap();
         drop(conn);
 
-        let outcome = apply_rename_core(RenameTarget::Personal, "old-name", "new-name")
-            .expect("rename ok");
+        let outcome =
+            apply_rename_core(RenameTarget::Personal, "old-name", "new-name").expect("rename ok");
         assert_eq!(outcome.target, "personal");
         assert_eq!(outcome.id, "new-name");
         assert_eq!(outcome.old_id, "old-name");
@@ -4396,8 +4837,7 @@ mod core_tests {
     #[test]
     fn apply_rename_core_personal_not_found_errors() {
         let (_dir, _lock) = setup_vault();
-        let err = apply_rename_core(RenameTarget::Personal, "ghost", "something")
-            .unwrap_err();
+        let err = apply_rename_core(RenameTarget::Personal, "ghost", "something").unwrap_err();
         assert!(err.contains("not found"), "err was: {}", err);
     }
 
@@ -4443,10 +4883,17 @@ mod core_tests {
     #[test]
     fn write_bindings_canonical_normalizes_claude_to_anthropic() {
         let (_dir, _lock) = setup_vault();
-        write_bindings_canonical(&["claude".to_string()], "personal_oauth_account", "acct-xyz")
-            .expect("write ok");
+        write_bindings_canonical(
+            &["claude".to_string()],
+            "personal_oauth_account",
+            "acct-xyz",
+        )
+        .expect("write ok");
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
-        let row = bindings.iter().find(|b| b.provider_code == "anthropic").expect("anthropic row");
+        let row = bindings
+            .iter()
+            .find(|b| b.provider_code == "anthropic")
+            .expect("anthropic row");
         assert_eq!(row.key_source_ref, "acct-xyz");
         // The raw "claude" provider_code row must NOT exist.
         assert!(bindings.iter().all(|b| b.provider_code != "claude"));
@@ -4456,19 +4903,33 @@ mod core_tests {
     fn write_bindings_canonical_cleans_stale_alias_row() {
         let (_dir, _lock) = setup_vault();
         // Simulate a pre-fix CLI version that wrote a raw "codex" binding.
-        storage::set_provider_binding("default", "codex", "personal_oauth_account", "stale-uuid").unwrap();
-        assert!(storage::list_provider_bindings_readonly("default").unwrap()
-            .iter().any(|b| b.provider_code == "codex"));
+        storage::set_provider_binding("default", "codex", "personal_oauth_account", "stale-uuid")
+            .unwrap();
+        assert!(storage::list_provider_bindings_readonly("default")
+            .unwrap()
+            .iter()
+            .any(|b| b.provider_code == "codex"));
 
         // Now write canonical via the shared helper.
-        write_bindings_canonical(&["codex".to_string()], "personal_oauth_account", "fresh-uuid").unwrap();
+        write_bindings_canonical(
+            &["codex".to_string()],
+            "personal_oauth_account",
+            "fresh-uuid",
+        )
+        .unwrap();
 
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
         // Stale raw-alias row must be gone.
-        assert!(bindings.iter().all(|b| b.provider_code != "codex"),
-            "expected no 'codex' row after canonical write, got: {:?}", bindings);
+        assert!(
+            bindings.iter().all(|b| b.provider_code != "codex"),
+            "expected no 'codex' row after canonical write, got: {:?}",
+            bindings
+        );
         // Canonical row must exist with the new ref.
-        let row = bindings.iter().find(|b| b.provider_code == "openai").expect("openai row");
+        let row = bindings
+            .iter()
+            .find(|b| b.provider_code == "openai")
+            .expect("openai row");
         assert_eq!(row.key_source_ref, "fresh-uuid");
     }
 
@@ -4493,17 +4954,23 @@ mod core_tests {
 
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
         // ① + ② 最后写入的 'kimi' 经 alias → kimi_code,独占 family
-        assert!(bindings.iter().any(|b| b.provider_code == "kimi_code"),
-            "expected kimi_code (canonical of 'kimi' alias) as final family active");
+        assert!(
+            bindings.iter().any(|b| b.provider_code == "kimi_code"),
+            "expected kimi_code (canonical of 'kimi' alias) as final family active"
+        );
         // mutex 应该已经删除 moonshot binding
         assert!(!bindings.iter().any(|b| b.provider_code == "moonshot"),
             "moonshot should be deactivated by family mutex when 'kimi' (→ kimi_code) was written after");
         // ③ deprecated 'kimi' 字面值不落库
-        assert!(!bindings.iter().any(|b| b.provider_code == "kimi"),
-            "post-split 'kimi' should be canonicalized to 'kimi_code' on write");
+        assert!(
+            !bindings.iter().any(|b| b.provider_code == "kimi"),
+            "post-split 'kimi' should be canonicalized to 'kimi_code' on write"
+        );
         // ④ cross-family 不受 mutex 影响
-        assert!(bindings.iter().any(|b| b.provider_code == "anthropic"),
-            "anthropic binding must survive Kimi family mutex");
+        assert!(
+            bindings.iter().any(|b| b.provider_code == "anthropic"),
+            "anthropic binding must survive Kimi family mutex"
+        );
     }
 
     #[test]
@@ -4512,8 +4979,15 @@ mod core_tests {
         write_bindings_canonical(&["anthropic".to_string()], "personal", "first").unwrap();
         write_bindings_canonical(&["anthropic".to_string()], "personal", "second").unwrap();
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
-        let anthropic_rows: Vec<_> = bindings.iter().filter(|b| b.provider_code == "anthropic").collect();
-        assert_eq!(anthropic_rows.len(), 1, "UPSERT should leave exactly one row per canonical");
+        let anthropic_rows: Vec<_> = bindings
+            .iter()
+            .filter(|b| b.provider_code == "anthropic")
+            .collect();
+        assert_eq!(
+            anthropic_rows.len(),
+            1,
+            "UPSERT should leave exactly one row per canonical"
+        );
         assert_eq!(anthropic_rows[0].key_source_ref, "second");
     }
 
@@ -4557,15 +5031,23 @@ mod core_tests {
         let (m, t, p) = storage::get_kdf_params().expect("kdf");
         let key = crate::crypto::derive_key_with_params(
             &SecretString::new("test_password".to_string()),
-            &salt, m, t, p,
-        ).expect("derive");
+            &salt,
+            m,
+            t,
+            p,
+        )
+        .expect("derive");
         let mut vk = [0u8; 32];
         vk.copy_from_slice(key.as_slice());
 
         // get_platform_account returns None on a fresh vault → snapshot sync
         // returns Ok(0). The verify gate must allow the call through.
         let result = run_full_snapshot_sync_with_vault_key(&vk);
-        assert!(result.is_ok(), "correct vault_key must pass verify; got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "correct vault_key must pass verify; got {:?}",
+            result
+        );
         assert_eq!(result.unwrap(), 0, "no platform account → no downloads");
     }
 }
@@ -4593,12 +5075,14 @@ mod control_url_resolution_tests {
         // + ports.trial=8090 is correct, but control_panel_url=39000 is stale
         // from a prior server install. Profile-driven derivation must IGNORE
         // the stale URL and use ports.trial.
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "trial",
             "control_plane_mode": "trial",
             "control_panel_url": "http://127.0.0.1:39000",
             "ports": {"proxy": 27200, "trial": 8090}
-        }"#);
+        }"#,
+        );
         assert_eq!(
             derive_local_control_url(&s),
             Some("http://127.0.0.1:8090".to_string())
@@ -4612,12 +5096,14 @@ mod control_url_resolution_tests {
         // local installer also writes a matching control_panel_url, but if
         // a stale value is present from a prior server install we still
         // want ports.trial to win.
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "local",
             "control_plane_mode": "local",
             "control_panel_url": "http://stale:39000",
             "ports": {"proxy": 27200, "trial": 8090}
-        }"#);
+        }"#,
+        );
         assert_eq!(
             derive_local_control_url(&s),
             Some("http://127.0.0.1:8090".to_string())
@@ -4629,12 +5115,14 @@ mod control_url_resolution_tests {
         // Personal-only install: no console, no ports.trial. derive returns
         // None and the caller falls through to other resolution paths
         // (interactive prompt, AIKEY_WEB_URL, etc).
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "local",
             "control_plane_mode": "none",
             "control_panel_url": "",
             "ports": {"proxy": 27200}
-        }"#);
+        }"#,
+        );
         assert_eq!(derive_local_control_url(&s), None);
     }
 
@@ -4643,12 +5131,14 @@ mod control_url_resolution_tests {
         // Production: control_panel_url IS the source of truth (externally
         // configured BIND_IP + manifest web port). Don't try to derive from
         // ports — server uses different port keys (web, control, ...).
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "server",
             "control_plane_mode": "remote",
             "control_panel_url": "http://10.0.0.5:39000",
             "ports": {"web": 39000, "control": 39080}
-        }"#);
+        }"#,
+        );
         assert_eq!(
             derive_local_control_url(&s),
             Some("http://10.0.0.5:39000".to_string())
@@ -4657,10 +5147,12 @@ mod control_url_resolution_tests {
 
     #[test]
     fn server_profile_with_empty_url_returns_none() {
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "server",
             "control_panel_url": ""
-        }"#);
+        }"#,
+        );
         assert_eq!(derive_local_control_url(&s), None);
     }
 
@@ -4669,10 +5161,12 @@ mod control_url_resolution_tests {
         // Older install-state.json versions or hand-edited files may have
         // unknown / missing install_profile. Back-compat: still honor
         // control_panel_url if non-empty.
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "ancient-unknown",
             "control_panel_url": "http://legacy:7777"
-        }"#);
+        }"#,
+        );
         assert_eq!(
             derive_local_control_url(&s),
             Some("http://legacy:7777".to_string())
@@ -4681,9 +5175,11 @@ mod control_url_resolution_tests {
 
     #[test]
     fn missing_install_profile_falls_back_to_control_panel_url() {
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "control_panel_url": "http://legacy:7777"
-        }"#);
+        }"#,
+        );
         assert_eq!(
             derive_local_control_url(&s),
             Some("http://legacy:7777".to_string())
@@ -4695,20 +5191,24 @@ mod control_url_resolution_tests {
         // If install-state somehow lacks `ports` entirely (corrupt state),
         // we don't fall back to the stale control_panel_url for trial —
         // returning None forces the caller into safer interactive prompts.
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "trial",
             "control_panel_url": "http://stale:39000"
-        }"#);
+        }"#,
+        );
         assert_eq!(derive_local_control_url(&s), None);
     }
 
     #[test]
     fn trial_with_ports_but_missing_trial_key_returns_none() {
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "trial",
             "ports": {"proxy": 27200},
             "control_panel_url": "http://stale:39000"
-        }"#);
+        }"#,
+        );
         assert_eq!(derive_local_control_url(&s), None);
     }
 }
@@ -4748,7 +5248,10 @@ mod master_precondition_tests {
 
     #[test]
     fn server_without_login_denies() {
-        assert!(!master_precondition_satisfied(Some(&state("server")), false));
+        assert!(!master_precondition_satisfied(
+            Some(&state("server")),
+            false
+        ));
     }
 
     #[test]
@@ -4773,12 +5276,14 @@ mod browse_url_resolution_tests {
     #[test]
     fn personal_with_console_returns_local_go_url() {
         // local-install.sh --with-console writes "local-server" and ports.trial.
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "local",
             "control_plane_mode": "local",
             "installed_components": ["cli", "proxy", "local-server"],
             "ports": {"proxy": 27200, "trial": 8090}
-        }"#);
+        }"#,
+        );
         assert_eq!(
             derive_local_browse_url(&s, "vault"),
             Some("http://127.0.0.1:8090/go/vault".to_string())
@@ -4789,12 +5294,14 @@ mod browse_url_resolution_tests {
     fn trial_returns_local_go_url() {
         // trial-install.sh writes "full-trial" (not "local-server") +
         // ports.trial. Before the 2026-05-11 fix this case returned None.
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "trial",
             "control_plane_mode": "trial",
             "installed_components": ["cli", "proxy", "full-trial"],
             "ports": {"proxy": 27200, "trial": 8090}
-        }"#);
+        }"#,
+        );
         assert_eq!(
             derive_local_browse_url(&s, "vault"),
             Some("http://127.0.0.1:8090/go/vault".to_string())
@@ -4805,11 +5312,13 @@ mod browse_url_resolution_tests {
     fn personal_cli_only_returns_none() {
         // No local web server installed → caller falls back to the
         // mode=="none" guard which shows "No web console" hint.
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "local",
             "control_plane_mode": "none",
             "installed_components": ["cli", "proxy"]
-        }"#);
+        }"#,
+        );
         assert_eq!(derive_local_browse_url(&s, "vault"), None);
     }
 
@@ -4819,23 +5328,27 @@ mod browse_url_resolution_tests {
         // no /go/<alias> route on the server-side machine.
         // (End-user CLI pointing at production has installed_components
         // [cli, proxy] only, identical to personal_cli_only test above.)
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "server",
             "control_plane_mode": "remote",
             "installed_components": ["control-service", "collector-service", "query-service"],
             "control_panel_url": "http://10.0.0.5:39000"
-        }"#);
+        }"#,
+        );
         assert_eq!(derive_local_browse_url(&s, "vault"), None);
     }
 
     #[test]
     fn alias_threads_through_to_path_suffix() {
         // Sanity-check that the alias parameter becomes the path suffix.
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "local",
             "installed_components": ["cli", "proxy", "local-server"],
             "ports": {"proxy": 27200, "trial": 8090}
-        }"#);
+        }"#,
+        );
         assert_eq!(
             derive_local_browse_url(&s, "import"),
             Some("http://127.0.0.1:8090/go/import".to_string())
@@ -4850,10 +5363,12 @@ mod browse_url_resolution_tests {
     fn missing_installed_components_returns_none() {
         // Defensive: older install-state.json formats may not have the
         // field at all — treat as "no local web" rather than crashing.
-        let s = state(r#"{
+        let s = state(
+            r#"{
             "install_profile": "local",
             "ports": {"trial": 8090}
-        }"#);
+        }"#,
+        );
         assert_eq!(derive_local_browse_url(&s, "vault"), None);
     }
 }
@@ -4902,12 +5417,16 @@ mod user_yaml_team_route_tests {
         let v: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
         // trial: section intact
         assert_eq!(
-            v.get("trial").and_then(|t| t.get("jwt_secret")).and_then(|s| s.as_str()),
+            v.get("trial")
+                .and_then(|t| t.get("jwt_secret"))
+                .and_then(|s| s.as_str()),
             Some("dont-touch-me"),
             "trial.jwt_secret must survive the proxy-section write"
         );
         assert_eq!(
-            v.get("trial").and_then(|t| t.get("service_token")).and_then(|s| s.as_str()),
+            v.get("trial")
+                .and_then(|t| t.get("service_token"))
+                .and_then(|s| s.as_str()),
             Some("also-dont"),
         );
         // proxy: section was added
@@ -4925,7 +5444,10 @@ mod user_yaml_team_route_tests {
         let path = dir.path().join("aikey-user.yaml");
         write_user_yaml_team_route(&path, "http://old:3000").unwrap();
         write_user_yaml_team_route(&path, "http://new:3000").unwrap();
-        assert_eq!(read_user_yaml_team_route(&path).as_deref(), Some("http://new:3000"));
+        assert_eq!(
+            read_user_yaml_team_route(&path).as_deref(),
+            Some("http://new:3000")
+        );
     }
 
     /// Reader contract: missing file / missing path returns None rather
@@ -4953,7 +5475,11 @@ mod user_yaml_team_route_tests {
         std::fs::write(&path, "- just\n- a\n- list\n").unwrap();
         let err = write_user_yaml_team_route(&path, "http://x:3000")
             .expect_err("non-mapping root must reject");
-        assert!(err.contains("top-level"), "error must name the shape issue: {}", err);
+        assert!(
+            err.contains("top-level"),
+            "error must name the shape issue: {}",
+            err
+        );
     }
 
     // ── 2026-05-11 B3: collector_credentials.team bundle ─────────────────
@@ -5002,7 +5528,11 @@ mod user_yaml_team_route_tests {
         // The serialized form must include `type: jwt` so future
         // selector logic (multi-credential type) keeps working.
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("type: jwt"), "serialized yaml should declare type: jwt; got:\n{}", raw);
+        assert!(
+            raw.contains("type: jwt"),
+            "serialized yaml should declare type: jwt; got:\n{}",
+            raw
+        );
     }
 
     /// Re-login refreshes the bundle: new access_token + new expires_at
@@ -5015,19 +5545,33 @@ mod user_yaml_team_route_tests {
         super::write_user_yaml_team_section(
             &path,
             "http://192.168.0.113:3000",
-            Some(&make_cred("old-jwt", 1_000_000, "http://192.168.0.113:3000/auth/refresh")),
-        ).unwrap();
+            Some(&make_cred(
+                "old-jwt",
+                1_000_000,
+                "http://192.168.0.113:3000/auth/refresh",
+            )),
+        )
+        .unwrap();
 
         super::write_user_yaml_team_section(
             &path,
             "http://192.168.0.113:3000",
-            Some(&make_cred("new-jwt", 9_999_999, "http://192.168.0.113:3000/auth/refresh")),
-        ).unwrap();
+            Some(&make_cred(
+                "new-jwt",
+                9_999_999,
+                "http://192.168.0.113:3000/auth/refresh",
+            )),
+        )
+        .unwrap();
 
         let got = super::read_user_yaml_team(&path).unwrap();
         assert_eq!(got.cred.unwrap().access_token, "new-jwt");
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("old-jwt"), "old credential must be fully replaced; got:\n{}", raw);
+        assert!(
+            !raw.contains("old-jwt"),
+            "old credential must be fully replaced; got:\n{}",
+            raw
+        );
     }
 
     /// cred == None: the writer leaves the URL but scrubs any prior
@@ -5043,17 +5587,26 @@ mod user_yaml_team_route_tests {
             &path,
             "http://x:3000",
             Some(&make_cred("secret-jwt", 100, "http://x:3000/auth/refresh")),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Logout-like call: same URL, no credential.
         super::write_user_yaml_team_section(&path, "http://x:3000", None).unwrap();
 
         let got = super::read_user_yaml_team(&path).unwrap();
-        assert_eq!(got.url.as_deref(), Some("http://x:3000"), "URL must persist");
+        assert_eq!(
+            got.url.as_deref(),
+            Some("http://x:3000"),
+            "URL must persist"
+        );
         assert!(got.cred.is_none(), "credential bundle must be scrubbed");
 
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(!raw.contains("secret-jwt"), "scrubbed yaml must not contain old jwt; got:\n{}", raw);
+        assert!(
+            !raw.contains("secret-jwt"),
+            "scrubbed yaml must not contain old jwt; got:\n{}",
+            raw
+        );
     }
 
     /// Credential writes preserve sibling sections (`trial:` and the
@@ -5067,22 +5620,28 @@ mod user_yaml_team_route_tests {
         std::fs::write(
             &path,
             "trial:\n  jwt_secret: dont-touch\n  master_key: keep-me\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         super::write_user_yaml_team_section(
             &path,
             "http://x:3000",
             Some(&make_cred("jwt-A", 7777, "http://x:3000/auth/refresh")),
-        ).unwrap();
+        )
+        .unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
         let v: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap();
         assert_eq!(
-            v.get("trial").and_then(|t| t.get("jwt_secret")).and_then(|s| s.as_str()),
+            v.get("trial")
+                .and_then(|t| t.get("jwt_secret"))
+                .and_then(|s| s.as_str()),
             Some("dont-touch"),
         );
         assert_eq!(
-            v.get("trial").and_then(|t| t.get("master_key")).and_then(|s| s.as_str()),
+            v.get("trial")
+                .and_then(|t| t.get("master_key"))
+                .and_then(|s| s.as_str()),
             Some("keep-me"),
         );
     }
@@ -5106,4 +5665,3 @@ mod user_yaml_team_route_tests {
         assert!(super::read_user_yaml_team(&path).is_none());
     }
 }
-

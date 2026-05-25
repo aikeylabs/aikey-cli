@@ -30,35 +30,62 @@ pub fn extract(
     let re = Regex::new(
         r#"(?i)(api[_\s\-]?key|apikey|access[_\s\-]?key|accesskey|accountkey|\
 private[_\s\-]?key[_\s\-]?id|secret[_\s\-]?key|aws[_\s\-]?access[_\s\-]?key[_\s\-]?id|\
-authorization|bearer|token)["']?\s*[:=]\s*["']?([A-Za-z0-9+/_\-\.=]{10,})["']?"#
-    ).unwrap();
+authorization|bearer|token)["']?\s*[:=]\s*["']?([A-Za-z0-9+/_\-\.=]{10,})["']?"#,
+    )
+    .unwrap();
 
     for cap in re.captures_iter(text) {
         let Some(val) = cap.get(2) else { continue };
         // v4.1 ISSUE-4: 注释行的 `api_key: xxx` 类 label 不抽
-        if is_comment_at_offset(text, val.start()) { continue; }
+        if is_comment_at_offset(text, val.start()) {
+            continue;
+        }
         let v = val.as_str();
         // v4.1 placeholder denylist
-        if is_placeholder_token(v) { continue; }
+        if is_placeholder_token(v) {
+            continue;
+        }
         // 过滤：纯字母且长度短（很可能是标签词本身或英文词）
-        if v.len() < 10 { continue; }
-        if v.chars().all(|c| c.is_alphabetic()) && v.len() < 20 { continue; }
+        if v.len() < 10 {
+            continue;
+        }
+        if v.chars().all(|c| c.is_alphabetic()) && v.len() < 20 {
+            continue;
+        }
         // 不处理已被 Layer 1 known-prefix 抓走的（dedup 保证），但也不拦截
         // —— known-prefix 值（如 sk-ant-api03-）**可以**同时被 label=value 匹配，
         // dedup by (kind, value) 确保不重复 push。
         let _ = looks_like_known_secret(v);
-        try_push(cands, seen, Kind::SecretLike, v, Some([val.start(), val.end()]));
+        try_push(
+            cands,
+            seen,
+            Kind::SecretLike,
+            v,
+            Some([val.start(), val.end()]),
+        );
     }
 
     // Bearer 特殊形态：`Bearer <value>`（空格分隔，不是 `[:=]`）
     let re_bearer = Regex::new(r"(?i)\bBearer\s+([A-Za-z0-9+/_\-\.=]{10,})\b").unwrap();
     for cap in re_bearer.captures_iter(text) {
         let Some(val) = cap.get(1) else { continue };
-        if is_comment_at_offset(text, val.start()) { continue; }
+        if is_comment_at_offset(text, val.start()) {
+            continue;
+        }
         let v = val.as_str();
-        if is_placeholder_token(v) { continue; }
-        if v.len() < 10 { continue; }
-        try_push(cands, seen, Kind::SecretLike, v, Some([val.start(), val.end()]));
+        if is_placeholder_token(v) {
+            continue;
+        }
+        if v.len() < 10 {
+            continue;
+        }
+        try_push(
+            cands,
+            seen,
+            Kind::SecretLike,
+            v,
+            Some([val.start(), val.end()]),
+        );
     }
 
     // 单词 `key` / `密钥` / `秘钥` 标签 —— 严格约束避免英文叙述 FP
@@ -66,16 +93,29 @@ authorization|bearer|token)["']?\s*[:=]\s*["']?([A-Za-z0-9+/_\-\.=]{10,})["']?"#
     // - 值 16+ 字符
     // - 值必须含 digit + alpha 混合
     let re_key_label = Regex::new(
-        r#"(?i)\b(key|\u5bc6\u94a5|\u79d8\u94a5)\b\s*[:=]\s*["']?([A-Za-z0-9+/_\-\.=]{16,})["']?"#
-    ).unwrap();
+        r#"(?i)\b(key|\u5bc6\u94a5|\u79d8\u94a5)\b\s*[:=]\s*["']?([A-Za-z0-9+/_\-\.=]{16,})["']?"#,
+    )
+    .unwrap();
     for cap in re_key_label.captures_iter(text) {
         let Some(val) = cap.get(2) else { continue };
-        if is_comment_at_offset(text, val.start()) { continue; }
+        if is_comment_at_offset(text, val.start()) {
+            continue;
+        }
         let v = val.as_str();
-        if is_placeholder_token(v) { continue; }
+        if is_placeholder_token(v) {
+            continue;
+        }
         let has_digit = v.chars().any(|c| c.is_ascii_digit());
         let has_alpha = v.chars().any(|c| c.is_ascii_alphabetic());
-        if !(has_digit && has_alpha) { continue; }
-        try_push(cands, seen, Kind::SecretLike, v, Some([val.start(), val.end()]));
+        if !(has_digit && has_alpha) {
+            continue;
+        }
+        try_push(
+            cands,
+            seen,
+            Kind::SecretLike,
+            v,
+            Some([val.start(), val.end()]),
+        );
     }
 }

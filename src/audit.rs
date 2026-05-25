@@ -211,13 +211,26 @@ pub fn verify_audit_log(password: &SecretString) -> Result<(usize, Vec<i64>), St
     let mut verified_count = 0;
     let mut tampered_ids = Vec::new();
 
-    while let Some(row) = rows.next().map_err(|e| format!("Failed to read row: {}", e))? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("Failed to read row: {}", e))?
+    {
         let id: i64 = row.get(0).map_err(|e| format!("Failed to get id: {}", e))?;
-        let timestamp: i64 = row.get(1).map_err(|e| format!("Failed to get timestamp: {}", e))?;
-        let operation: String = row.get(2).map_err(|e| format!("Failed to get operation: {}", e))?;
-        let alias: Option<String> = row.get(3).map_err(|e| format!("Failed to get alias: {}", e))?;
-        let success: i32 = row.get(4).map_err(|e| format!("Failed to get success: {}", e))?;
-        let stored_hmac: String = row.get(5).map_err(|e| format!("Failed to get hmac: {}", e))?;
+        let timestamp: i64 = row
+            .get(1)
+            .map_err(|e| format!("Failed to get timestamp: {}", e))?;
+        let operation: String = row
+            .get(2)
+            .map_err(|e| format!("Failed to get operation: {}", e))?;
+        let alias: Option<String> = row
+            .get(3)
+            .map_err(|e| format!("Failed to get alias: {}", e))?;
+        let success: i32 = row
+            .get(4)
+            .map_err(|e| format!("Failed to get success: {}", e))?;
+        let stored_hmac: String = row
+            .get(5)
+            .map_err(|e| format!("Failed to get hmac: {}", e))?;
 
         // Recompute HMAC
         let computed_hmac = compute_audit_hmac(
@@ -237,4 +250,3 @@ pub fn verify_audit_log(password: &SecretString) -> Result<(usize, Vec<i64>), St
 
     Ok((verified_count, tampered_ids))
 }
-

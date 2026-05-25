@@ -29,12 +29,20 @@ fn main() {
     let start = std::time::Instant::now();
     let bytes = crf::train_from_embedded();
     let elapsed_ms = start.elapsed().as_millis();
-    eprintln!("[train-crf] done: {} bytes in {} ms", bytes.len(), elapsed_ms);
+    eprintln!(
+        "[train-crf] done: {} bytes in {} ms",
+        bytes.len(),
+        elapsed_ms
+    );
 
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("[train-crf] ERROR: create_dir_all({}): {}", parent.display(), e);
+                eprintln!(
+                    "[train-crf] ERROR: create_dir_all({}): {}",
+                    parent.display(),
+                    e
+                );
                 process::exit(2);
             }
         }

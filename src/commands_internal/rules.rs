@@ -40,12 +40,29 @@ const LAYER_VERSION_FINGERPRINT: &str = "1.0";
 /// 改之前先确认 Go 端 fallback ([handlers.go RulesHandler]) 也同步——
 /// 这里和 fallback 是一份语义，但后者是 spawn-fail 兜底所以仍要内嵌一次。
 const SAMPLE_PROVIDERS: &[&str] = &[
-    "anthropic_api", "openai_project", "openai_admin", "google_gemini",
-    "groq", "xai_grok", "github_classic", "github_fine_grained",
-    "aws_access_key", "stripe_live", "stripe_restricted", "sendgrid",
-    "slack_bot", "slack_user", "huggingface", "perplexity",
-    "openrouter", "anthropic_oauth", "generic_jwt", "pem_block",
-    "generic_sk", "short_hex_raw", "uuid",
+    "anthropic_api",
+    "openai_project",
+    "openai_admin",
+    "google_gemini",
+    "groq",
+    "xai_grok",
+    "github_classic",
+    "github_fine_grained",
+    "aws_access_key",
+    "stripe_live",
+    "stripe_restricted",
+    "sendgrid",
+    "slack_bot",
+    "slack_user",
+    "huggingface",
+    "perplexity",
+    "openrouter",
+    "anthropic_oauth",
+    "generic_jwt",
+    "pem_block",
+    "generic_sk",
+    "short_hex_raw",
+    "uuid",
 ];
 
 pub fn handle(env: StdinEnvelope) {
@@ -75,8 +92,8 @@ fn build_rules_payload() -> Value {
     // v4.3 (2026-05-01): 把 provider_routes 整张表透传给 Web UI / proxy。
     // 顺序保留 yaml 声明序 (host 不去重排,因为多 host 行的相对顺序在 yaml
     // 里是设计意图,前端按 host map 查表与顺序无关;但稳定输出对调试更友好)。
-    let routes_json = serde_json::to_value(fp.provider_routes())
-        .expect("provider_routes serialise");
+    let routes_json =
+        serde_json::to_value(fp.provider_routes()).expect("provider_routes serialise");
 
     json!({
         "layer_versions": {
@@ -105,25 +122,32 @@ mod tests {
         assert!(v["sample_providers"].is_array());
 
         let login = &v["family_login_urls"];
-        assert_eq!(login["google_gemini"], "https://aistudio.google.com/app/apikey");
+        assert_eq!(
+            login["google_gemini"],
+            "https://aistudio.google.com/app/apikey"
+        );
         assert_eq!(login["qwen"], "https://dashscope.console.aliyun.com/apiKey");
 
         // v4.3: provider_routes 表是单一权威源。前端 + proxy 都从这取。
-        let routes = v["provider_routes"].as_array().expect("provider_routes array");
+        let routes = v["provider_routes"]
+            .as_array()
+            .expect("provider_routes array");
         assert!(!routes.is_empty(), "provider_routes must have entries");
 
         // pin: 2026-05-08 Kimi 双平台拆分,api.kimi.com 与 api.moonshot.cn 现在是
         // 两个独立的 provider_code (kimi_code / moonshot),不再是同一 provider 下
         // 两个 host。family 仍归一到 'kimi' (UI 分组),但 provider_code 拆分修掉了
         // first-match-wins 默认偏 Kimi Code 的隐性 bug。
-        let kimi_coding = routes.iter()
+        let kimi_coding = routes
+            .iter()
             .find(|r| r["host"] == "api.kimi.com")
             .expect("api.kimi.com route present");
         assert_eq!(kimi_coding["provider"], "kimi_code");
         assert_eq!(kimi_coding["base_url"], "https://api.kimi.com/coding");
         assert_eq!(kimi_coding["version"], "/v1");
 
-        let moonshot = routes.iter()
+        let moonshot = routes
+            .iter()
             .find(|r| r["host"] == "api.moonshot.cn")
             .expect("api.moonshot.cn route present");
         assert_eq!(moonshot["provider"], "moonshot");
@@ -131,7 +155,8 @@ mod tests {
         assert_eq!(moonshot["version"], "/v1");
 
         // perplexity: empty version (no /v1 path segment in upstream)
-        let perplexity = routes.iter()
+        let perplexity = routes
+            .iter()
             .find(|r| r["host"] == "api.perplexity.ai")
             .expect("api.perplexity.ai route present");
         assert_eq!(perplexity["version"], "");

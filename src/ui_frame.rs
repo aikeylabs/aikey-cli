@@ -31,27 +31,53 @@ pub fn visible_len(s: &str) -> usize {
 fn char_width(c: char) -> usize {
     let cp = c as u32;
     // Variation selectors and ZWJ — zero width.
-    if cp == 0xFE0F || cp == 0x200D { return 0; }
+    if cp == 0xFE0F || cp == 0x200D {
+        return 0;
+    }
 
     // Emoji that render as wide (2-column) glyphs in modern terminals.
     // Only include ranges where the glyph is *always* wide (color emoji).
     // Ranges like U+2600–U+27BF contain text-presentation symbols (✓✗→←)
     // that are 1 column wide — do NOT include them here.
-    if cp >= 0x1F300 && cp <= 0x1FBFF { return 2; } // Misc Symbols & Pictographs, Emoticons, etc.
-    if cp >= 0x2705 && cp == 0x2705 { return 2; }    // ✅ (white heavy check mark — emoji presentation)
-    if cp == 0x2753 || cp == 0x2754 || cp == 0x2755 { return 2; } // ❓❔❕
-    if cp == 0x2614 || cp == 0x2615 { return 2; }    // ☔☕ (always wide)
-    if cp == 0x267F { return 2; }                     // ♿
-    if cp == 0x2693 { return 2; }                     // ⚓
-    if cp == 0x26A1 { return 2; }                     // ⚡
-    if cp == 0x26D4 { return 2; }                     // ⛔
-    if cp == 0x2934 || cp == 0x2935 { return 2; }     // ⤴⤵
+    if cp >= 0x1F300 && cp <= 0x1FBFF {
+        return 2;
+    } // Misc Symbols & Pictographs, Emoticons, etc.
+    if cp >= 0x2705 && cp == 0x2705 {
+        return 2;
+    } // ✅ (white heavy check mark — emoji presentation)
+    if cp == 0x2753 || cp == 0x2754 || cp == 0x2755 {
+        return 2;
+    } // ❓❔❕
+    if cp == 0x2614 || cp == 0x2615 {
+        return 2;
+    } // ☔☕ (always wide)
+    if cp == 0x267F {
+        return 2;
+    } // ♿
+    if cp == 0x2693 {
+        return 2;
+    } // ⚓
+    if cp == 0x26A1 {
+        return 2;
+    } // ⚡
+    if cp == 0x26D4 {
+        return 2;
+    } // ⛔
+    if cp == 0x2934 || cp == 0x2935 {
+        return 2;
+    } // ⤴⤵
 
     // CJK Unified Ideographs.
-    if cp >= 0x4E00 && cp <= 0x9FFF { return 2; }
-    if cp >= 0x3400 && cp <= 0x4DBF { return 2; }
+    if cp >= 0x4E00 && cp <= 0x9FFF {
+        return 2;
+    }
+    if cp >= 0x3400 && cp <= 0x4DBF {
+        return 2;
+    }
     // Fullwidth Forms.
-    if cp >= 0xFF01 && cp <= 0xFF60 { return 2; }
+    if cp >= 0xFF01 && cp <= 0xFF60 {
+        return 2;
+    }
 
     // Everything else: ASCII, arrows, check marks, box-drawing, etc. → 1 column.
     1
@@ -82,14 +108,21 @@ pub fn term_width() -> usize {
     // subprocesses; still worth trying first when it is propagated.
     if let Ok(val) = std::env::var("COLUMNS") {
         if let Ok(w) = val.parse::<usize>() {
-            if w > 0 { return w; }
+            if w > 0 {
+                return w;
+            }
         }
     }
     #[cfg(unix)]
     {
         use std::mem::MaybeUninit;
         #[repr(C)]
-        struct Winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }
+        struct Winsize {
+            ws_row: u16,
+            ws_col: u16,
+            ws_xpixel: u16,
+            ws_ypixel: u16,
+        }
         #[cfg(target_os = "macos")]
         const TIOCGWINSZ: libc::c_ulong = 0x40087468;
         #[cfg(not(target_os = "macos"))]
@@ -102,7 +135,9 @@ pub fn term_width() -> usize {
                 // compiler infer per target instead of forcing one type.
                 if libc::ioctl(fd, TIOCGWINSZ as _, ws.as_mut_ptr()) == 0 {
                     let ws = ws.assume_init();
-                    if ws.ws_col > 0 { return ws.ws_col as usize; }
+                    if ws.ws_col > 0 {
+                        return ws.ws_col as usize;
+                    }
                 }
             }
         }
@@ -146,10 +181,7 @@ pub fn render_box(icon: &str, title: &str, rows: &[String]) -> String {
     };
 
     // Compute inner width from content + margin.
-    let content_max = rows.iter()
-        .map(|r| visible_len(r))
-        .max()
-        .unwrap_or(20);
+    let content_max = rows.iter().map(|r| visible_len(r)).max().unwrap_or(20);
     let title_vis = visible_len(&icon_title);
     // inner_w = widest content + 2 side padding + right margin
     // Cap at terminal width minus box borders and outer margins (│ + 2 spaces each side + │ = 6).
@@ -190,27 +222,41 @@ pub fn render_box(icon: &str, title: &str, rows: &[String]) -> String {
     // Wide layout: full boxed rendering.
     // Top border with title. Only the frame glyphs are colored — the title
     // text keeps whatever color the caller passed in.
-    out.push_str(&format!("  {f}\u{250C}\u{2500}{r} {} {f}{}\u{2510}{r}\n",
-        icon_title, "\u{2500}".repeat(title_fill),
-        f = FRAME, r = RESET));
+    out.push_str(&format!(
+        "  {f}\u{250C}\u{2500}{r} {} {f}{}\u{2510}{r}\n",
+        icon_title,
+        "\u{2500}".repeat(title_fill),
+        f = FRAME,
+        r = RESET
+    ));
     // Content rows: format is `│  {content}  │`
     // Left margin = 2 spaces, right margin = 2 spaces → content width = inner_w - 4
     for row in rows {
         // Auto-stretch separator lines (pure ─ characters) to fill the content area.
         let is_separator = !row.is_empty() && row.chars().all(|c| c == '\u{2500}');
         if is_separator {
-            out.push_str(&format!("  {f}\u{2502}{r}  \x1b[90m{}\x1b[0m  {f}\u{2502}{r}\n",
+            out.push_str(&format!(
+                "  {f}\u{2502}{r}  \x1b[90m{}\x1b[0m  {f}\u{2502}{r}\n",
                 "\u{2500}".repeat(pad_target),
-                f = FRAME, r = RESET));
+                f = FRAME,
+                r = RESET
+            ));
         } else {
-            out.push_str(&format!("  {f}\u{2502}{r}  {}  {f}\u{2502}{r}\n",
+            out.push_str(&format!(
+                "  {f}\u{2502}{r}  {}  {f}\u{2502}{r}\n",
                 pad_visible(row, pad_target),
-                f = FRAME, r = RESET));
+                f = FRAME,
+                r = RESET
+            ));
         }
     }
     // Bottom border.
-    out.push_str(&format!("  {f}\u{2514}{}\u{2518}{r}",
-        border, f = FRAME, r = RESET));
+    out.push_str(&format!(
+        "  {f}\u{2514}{}\u{2518}{r}",
+        border,
+        f = FRAME,
+        r = RESET
+    ));
     out
 }
 
@@ -236,7 +282,10 @@ mod tests {
     #[test]
     fn term_width_is_always_positive() {
         let w = term_width();
-        assert!(w > 0, "term_width returned 0; box renderer would divide by zero");
+        assert!(
+            w > 0,
+            "term_width returned 0; box renderer would divide by zero"
+        );
     }
 
     /// Bounded sanity: term_width should never exceed some absurd value.

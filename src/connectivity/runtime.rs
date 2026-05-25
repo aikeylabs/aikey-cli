@@ -15,9 +15,7 @@
 
 use std::io::{self, Write};
 
-use super::{
-    BuildTargetError, CredentialKind, SuiteOptions, SuiteOutcome, TestTarget,
-};
+use super::{BuildTargetError, CredentialKind, SuiteOptions, SuiteOutcome, TestTarget};
 
 pub fn tcp_ping(host: &str, port: u16, timeout_secs: u64) -> (bool, u128) {
     use std::net::{TcpStream, ToSocketAddrs};
@@ -108,7 +106,6 @@ pub fn provider_defaults() -> &'static [(&'static str, &'static str)] {
 pub fn default_base_url(provider_code: &str) -> Option<&'static str> {
     crate::provider_registry::lookup(provider_code).map(|e| e.default_base_url)
 }
-
 
 /// Test connectivity to a provider: first TCP ping, then API probe.
 ///
@@ -247,11 +244,7 @@ enum AnimEvent<S> {
 ///     `S = ProxyProbeResult`.
 ///   * Future probes only declare column widths + a per-column formatter;
 ///     the helper owns terminal manipulation, threading, frame timing.
-fn animate_blinking_while<S, F, FFmt, R>(
-    col_widths: &[usize],
-    cell_formatter: FFmt,
-    work: F,
-) -> R
+fn animate_blinking_while<S, F, FFmt, R>(col_widths: &[usize], cell_formatter: FFmt, work: F) -> R
 where
     S: Send + 'static,
     F: FnOnce(std::sync::mpsc::Sender<(usize, AnimEvent<S>)>) -> R + Send + 'static,
@@ -288,9 +281,7 @@ where
     let mut frame_start = Instant::now();
     let mut all_done = false;
 
-    let paint = |rendered: &Vec<Option<String>>,
-                 current_col: Option<usize>,
-                 frame_idx: usize| {
+    let paint = |rendered: &Vec<Option<String>>, current_col: Option<usize>, frame_idx: usize| {
         let (frame_text, _) = BLINK_FRAMES[frame_idx % BLINK_FRAMES.len()];
         eprint!("\x1b8\x1b[K");
         for (i, &w) in widths.iter().enumerate() {
@@ -443,13 +434,14 @@ where
     // localhost URL (team/OAuth TestTargets routed via aikey-proxy), fall
     // back to the provider's canonical upstream so we still measure what
     // the user intuitively expects ("can my laptop reach anthropic?").
-    let ping_target_url: String = if base_url.contains("127.0.0.1") || base_url.contains("localhost") {
-        default_base_url(provider_code)
-            .unwrap_or("https://unknown")
-            .to_string()
-    } else {
-        base_url.to_string()
-    };
+    let ping_target_url: String =
+        if base_url.contains("127.0.0.1") || base_url.contains("localhost") {
+            default_base_url(provider_code)
+                .unwrap_or("https://unknown")
+                .to_string()
+        } else {
+            base_url.to_string()
+        };
     let (upstream_host, upstream_port) = parse_host_port(&ping_target_url);
 
     // Cumulative result that grows as each phase completes. We pass `&result`
@@ -519,9 +511,18 @@ where
     // (incl. 401/403) as "reachable" since the question here is auth
     // transport, not auth success.
     let test_url = if provider_code == "google" {
-        format!("{}{}?key={}", base_url.trim_end_matches('/'), probe_suffix(provider_code, base_url), api_key)
+        format!(
+            "{}{}?key={}",
+            base_url.trim_end_matches('/'),
+            probe_suffix(provider_code, base_url),
+            api_key
+        )
     } else {
-        format!("{}{}", base_url.trim_end_matches('/'), probe_suffix(provider_code, base_url))
+        format!(
+            "{}{}",
+            base_url.trim_end_matches('/'),
+            probe_suffix(provider_code, base_url)
+        )
     };
     let (auth_key, auth_val) = probe_auth(provider_code, api_key);
 
@@ -556,7 +557,10 @@ where
             // local proxy. Demote api_ok to false so the table cell renders
             // red and points the operator at the actual fix.
             let is_local_registry_miss = code == 401
-                && body.as_deref().map(body_indicates_registry_miss).unwrap_or(false);
+                && body
+                    .as_deref()
+                    .map(body_indicates_registry_miss)
+                    .unwrap_or(false);
             // 404 handling — TWO subclasses, treated differently:
             //
             //   (a) Upstream-business 404: JSON envelope like
@@ -581,9 +585,13 @@ where
             // (see `is_known_benign_gateway_404` above). This is a
             // **special case**, not a generalization — DO NOT inline,
             // DO NOT broaden the match.
-            let is_path_missing = code == 404
-                && !is_known_benign_gateway_404(code, body.as_deref());
-            (!(is_local_registry_miss || is_path_missing), Some(code), body)
+            let is_path_missing =
+                code == 404 && !is_known_benign_gateway_404(code, body.as_deref());
+            (
+                !(is_local_registry_miss || is_path_missing),
+                Some(code),
+                body,
+            )
         }
         Err(_) => (false, None, None),
     };
@@ -621,7 +629,8 @@ where
 
     let chat_agent = build_proxy_aware_agent(Duration::from_secs(15));
     let chat_start = Instant::now();
-    let mut req = chat_agent.post(&chat_url)
+    let mut req = chat_agent
+        .post(&chat_url)
         .set("Content-Type", "application/json");
     // Google uses ?key= in URL; skip header auth. Others use header.
     if provider_code != "google" {
@@ -705,7 +714,7 @@ fn parse_host_port(url_or_authority: &str) -> (String, u16) {
     let host_port = stripped.split('/').next().unwrap_or(stripped);
     if let Some(idx) = host_port.rfind(':') {
         let host = host_port[..idx].to_string();
-        let port = host_port[idx+1..]
+        let port = host_port[idx + 1..]
             .parse::<u16>()
             .unwrap_or(if is_http { 80 } else { 443 });
         (host, port)
@@ -764,7 +773,8 @@ fn probe_via_aikey_proxy_ping(provider_code: &str, upstream_url: &str) -> (bool,
         .timeout(std::time::Duration::from_secs(4))
         .build();
     let start = Instant::now();
-    let resp = match agent.post(&endpoint)
+    let resp = match agent
+        .post(&endpoint)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
     {
@@ -778,7 +788,10 @@ fn probe_via_aikey_proxy_ping(provider_code: &str, upstream_url: &str) -> (bool,
         Err(_) => return (false, start.elapsed().as_millis()),
     };
     let proxy_ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-    let proxy_ms = parsed.get("latency_ms").and_then(|v| v.as_u64()).unwrap_or(0) as u128;
+    let proxy_ms = parsed
+        .get("latency_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u128;
     // Report proxy's own measured latency (host → upstream), not our RTT
     // to localhost (which is ~0ms and meaningless).
     (proxy_ok, proxy_ms)
@@ -835,7 +848,8 @@ pub fn test_proxy_connectivity(proxy_addr: &str, provider_code: &str) -> ProxyPr
         .timeout(Duration::from_secs(10))
         .build();
     let start = Instant::now();
-    let result = agent.get(&proxy_url)
+    let result = agent
+        .get(&proxy_url)
         .set(auth_key, &auth_val)
         .set("X-Aikey-Probe", "1")
         .call();
@@ -959,8 +973,8 @@ fn probe_model(provider_code: &str) -> &'static str {
         // Why haiku: sonnet/opus hit rate limits on OAuth accounts (429 business rejection).
         // Haiku is lighter and skips stricter quota checks. Verified in research.
         "anthropic" => "claude-haiku-4-5-20251001",
-        "openai"    => "gpt-4o-mini",
-        "deepseek"  => "deepseek-chat",
+        "openai" => "gpt-4o-mini",
+        "deepseek" => "deepseek-chat",
         // 2026-05-08 Kimi 双平台拆分: 三个 code 都属 Kimi family,但默认探针 model
         // 各自独立 (kimi-cli upstream 不同模型集):
         //   - kimi_code (api.kimi.com/coding) → kimi-k2.5 (Kimi Coding 默认)
@@ -969,13 +983,13 @@ fn probe_model(provider_code: &str) -> &'static str {
         // pre-fix 只有 "kimi" case,kimi_code/moonshot 跑到 fallback gpt-4o-mini,
         // api.kimi.com 探针被 reject (model not found),结果 doctor 报错误诊断。
         "kimi_code" | "kimi" => "kimi-k2.5",
-        "moonshot"  => "moonshot-v1-8k",
-        "google"    => "gemini-2.0-flash",
+        "moonshot" => "moonshot-v1-8k",
+        "google" => "gemini-2.0-flash",
         "glm" | "zhipu" => "glm-4-flash",
-        "yi"        => "yi-lightning",
+        "yi" => "yi-lightning",
         "qwen" | "dashscope" => "qwen-turbo",
-        "mistral"   => "mistral-small-latest",
-        _           => "gpt-4o-mini", // fallback: most gateways understand this
+        "mistral" => "mistral-small-latest",
+        _ => "gpt-4o-mini", // fallback: most gateways understand this
     }
 }
 
@@ -1006,8 +1020,8 @@ fn probe_auth(provider_code: &str, api_key: &str) -> (&'static str, String) {
         "anthropic" => ("x-api-key", api_key.to_string()),
         // Google uses ?key= query param, but we pass it as header too for proxy compatibility.
         // The actual URL builder appends ?key= for direct calls.
-        "google"    => ("x-goog-api-key", api_key.to_string()),
-        _           => ("Authorization", format!("Bearer {}", api_key)),
+        "google" => ("x-goog-api-key", api_key.to_string()),
+        _ => ("Authorization", format!("Bearer {}", api_key)),
     }
 }
 
@@ -1015,7 +1029,11 @@ fn probe_auth(provider_code: &str, api_key: &str) -> (&'static str, String) {
 /// Cap a response body to ~512 chars; safe to embed in display + JSON.
 /// Uses `chars().take` so multi-byte UTF-8 isn't sliced mid-codepoint.
 pub fn truncate_body_snippet(s: String) -> String {
-    if s.chars().count() <= 512 { s } else { s.chars().take(512).collect() }
+    if s.chars().count() <= 512 {
+        s
+    } else {
+        s.chars().take(512).collect()
+    }
 }
 
 /// Returns true when a proxy 401 body indicates the local Tier1 registry
@@ -1169,7 +1187,8 @@ pub fn api_status_hint(status: u16, body: Option<&str>) -> String {
             if is_known_benign_gateway_404(status, body) {
                 "reachable (gateway alive, /v1/models not implemented)".to_string()
             } else {
-                "HTTP 404 — upstream resource missing (check base_url / model availability)".to_string()
+                "HTTP 404 — upstream resource missing (check base_url / model availability)"
+                    .to_string()
             }
         }
         _ => format!("HTTP {}", status),
@@ -1201,14 +1220,18 @@ pub fn run_connectivity_suite(
     let mut rows: Vec<(TestTarget, ConnectivityResult)> = Vec::with_capacity(targets.len());
     let mut json_results: Vec<serde_json::Value> = Vec::new();
     let mut any_reachable = false;
-    let mut any_chat_ok   = false;
+    let mut any_chat_ok = false;
 
     // ── JSON mode: probe all, collect, return; no stderr output. ─────────
     if json_mode {
         for t in &targets {
             let r = test_provider_connectivity(&t.provider_code, &t.base_url, &t.bearer, t.kind);
-            if r.chat_ok { any_chat_ok = true; }
-            if r.ping_ok { any_reachable = true; }
+            if r.chat_ok {
+                any_chat_ok = true;
+            }
+            if r.ping_ok {
+                any_reachable = true;
+            }
             // Truncate body snippets to 400 chars per row before serialising.
             // The probe layer already caps at ~512, but the Web popup
             // only needs enough to read upstream error JSON ({"error":
@@ -1218,7 +1241,8 @@ pub fn run_connectivity_suite(
             // chat_body_snippet so a 200/401 mix (API auth OK, Chat
             // rejected) shows the exact reason at each stage.
             let trunc = |opt: &Option<String>| -> Option<String> {
-                opt.as_ref().map(|s| s.chars().take(400).collect::<String>())
+                opt.as_ref()
+                    .map(|s| s.chars().take(400).collect::<String>())
             };
             json_results.push(serde_json::json!({
                 "provider":           t.provider_code,
@@ -1248,11 +1272,13 @@ pub fn run_connectivity_suite(
         // proxy_is_running_managed (Layer 1 identity + ownership +
         // /health) so the proxy row only appears when we actually own
         // the running instance.
-        let proxy_result = if opts.show_proxy_row && any_reachable
+        let proxy_result = if opts.show_proxy_row
+            && any_reachable
             && crate::commands_proxy::proxy_is_running_managed()
         {
             let proxy_addr = crate::commands_proxy::doctor_proxy_addr();
-            let prov = targets.iter()
+            let prov = targets
+                .iter()
                 .find(|t| t.provider_code != "custom")
                 .map(|t| t.provider_code.as_str());
             prov.map(|p| {
@@ -1282,11 +1308,13 @@ pub fn run_connectivity_suite(
     // ── Interactive mode: streaming table to stderr. ─────────────────────
     // Dynamic width: account for the longest display_label + kind suffix so
     // "anthropic (oauth)" never truncates. Pad +2 for breathing room.
-    let label_w = targets.iter()
+    let label_w = targets
+        .iter()
         .map(|t| t.display_label().len())
         .max()
         .unwrap_or(12)
-        .max("Protocol".len()) + 2;
+        .max("Protocol".len())
+        + 2;
     // 2026-05-09: optional Key column for `aikey test --all`. Uses
     // `key_display()` rather than the raw `source_ref` so team rows surface
     // their human alias (`key-335923591-0011-1`) and OAuth rows surface the
@@ -1311,11 +1339,13 @@ pub fn run_connectivity_suite(
     // `head…tail` shortening below.
     const KEY_W_CAP: usize = 22;
     let key_w = if opts.show_key_column {
-        let raw = targets.iter()
+        let raw = targets
+            .iter()
             .map(|t| t.key_display().chars().count())
             .max()
             .unwrap_or(8)
-            .max("Key".len()) + 2;
+            .max("Key".len())
+            + 2;
         raw.min(KEY_W_CAP)
     } else {
         0
@@ -1323,26 +1353,54 @@ pub fn run_connectivity_suite(
     // 5/6 columns: [Key] | Protocol | Ping(D) | Ping | API | Chat
     //   Ping(D) = CLI → upstream (independent baseline).
     //   Ping    = CLI → aikey-proxy → upstream (gates API+Chat).
-    const W_PD:   usize = 14;   // "Ping(D)" column, short latency (+" (Xms)")
-    const W_PING: usize = 14;   // Ping(PROXY)
-    const W_API:  usize = 34;
+    const W_PD: usize = 14; // "Ping(D)" column, short latency (+" (Xms)")
+    const W_PING: usize = 14; // Ping(PROXY)
+    const W_API: usize = 34;
 
     if let Some(header) = opts.header_label {
         eprintln!();
         eprintln!("  \u{1F50C} {}", header.bold());
     }
     if opts.show_key_column {
-        eprintln!("  {:<wk$} {:<wp$} {:<wpd$} {:<wpi$} {:<wap$} {}",
-            "Key".dimmed(), "Protocol".dimmed(), "Ping(D)".dimmed(),
-            "Ping".dimmed(), "API".dimmed(), "Chat".dimmed(),
-            wk = key_w, wp = label_w, wpd = W_PD, wpi = W_PING, wap = W_API);
-        eprintln!("  {}", "\u{2500}".repeat(key_w + label_w + W_PD + W_PING + W_API + 22).dimmed());
+        eprintln!(
+            "  {:<wk$} {:<wp$} {:<wpd$} {:<wpi$} {:<wap$} {}",
+            "Key".dimmed(),
+            "Protocol".dimmed(),
+            "Ping(D)".dimmed(),
+            "Ping".dimmed(),
+            "API".dimmed(),
+            "Chat".dimmed(),
+            wk = key_w,
+            wp = label_w,
+            wpd = W_PD,
+            wpi = W_PING,
+            wap = W_API
+        );
+        eprintln!(
+            "  {}",
+            "\u{2500}"
+                .repeat(key_w + label_w + W_PD + W_PING + W_API + 22)
+                .dimmed()
+        );
     } else {
-        eprintln!("  {:<wp$} {:<wpd$} {:<wpi$} {:<wap$} {}",
-            "Protocol".dimmed(), "Ping(D)".dimmed(), "Ping".dimmed(),
-            "API".dimmed(), "Chat".dimmed(),
-            wp = label_w, wpd = W_PD, wpi = W_PING, wap = W_API);
-        eprintln!("  {}", "\u{2500}".repeat(label_w + W_PD + W_PING + W_API + 22).dimmed());
+        eprintln!(
+            "  {:<wp$} {:<wpd$} {:<wpi$} {:<wap$} {}",
+            "Protocol".dimmed(),
+            "Ping(D)".dimmed(),
+            "Ping".dimmed(),
+            "API".dimmed(),
+            "Chat".dimmed(),
+            wp = label_w,
+            wpd = W_PD,
+            wpi = W_PING,
+            wap = W_API
+        );
+        eprintln!(
+            "  {}",
+            "\u{2500}"
+                .repeat(label_w + W_PD + W_PING + W_API + 22)
+                .dimmed()
+        );
     }
 
     let mut failed_hints: Vec<String> = Vec::new();
@@ -1371,8 +1429,13 @@ pub fn run_connectivity_suite(
             } else {
                 key_src.to_string()
             };
-            eprint!("  {:<wk$} {:<wp$} ", key_disp.dimmed(), display.bold(),
-                wk = key_w, wp = label_w);
+            eprint!(
+                "  {:<wk$} {:<wp$} ",
+                key_disp.dimmed(),
+                display.bold(),
+                wk = key_w,
+                wp = label_w
+            );
         } else {
             eprint!("  {:<wp$} ", display.bold(), wp = label_w);
         }
@@ -1388,8 +1451,11 @@ pub fn run_connectivity_suite(
                 0 => {
                     // Ping(DIRECT) — dimmed on fail (not a hard error: the
                     // proxy may still reach upstream when the laptop can't).
-                    let raw = if r.ping_direct_ok { format!("ok ({}ms)", r.ping_direct_ms) }
-                              else { format!("fail ({}ms)", r.ping_direct_ms) };
+                    let raw = if r.ping_direct_ok {
+                        format!("ok ({}ms)", r.ping_direct_ms)
+                    } else {
+                        format!("fail ({}ms)", r.ping_direct_ms)
+                    };
                     if r.ping_direct_ok {
                         format!("{:<w$}", raw, w = W_PD).green().to_string()
                     } else {
@@ -1398,8 +1464,11 @@ pub fn run_connectivity_suite(
                 }
                 1 => {
                     // Ping(PROXY) — red on fail (gates API + Chat).
-                    let raw = if r.ping_ok { format!("ok ({}ms)", r.ping_ms) }
-                              else { format!("fail ({}ms)", r.ping_ms) };
+                    let raw = if r.ping_ok {
+                        format!("ok ({}ms)", r.ping_ms)
+                    } else {
+                        format!("fail ({}ms)", r.ping_ms)
+                    };
                     if r.ping_ok {
                         format!("{:<w$}", raw, w = W_PING).green().to_string()
                     } else {
@@ -1410,10 +1479,13 @@ pub fn run_connectivity_suite(
                     // API — em-dash placeholder when ping short-circuited;
                     // otherwise normal ok/fail with status hint.
                     if !r.ping_ok {
-                        format!("{:<w$}", "\u{2014}", w = W_API).dimmed().to_string()
+                        format!("{:<w$}", "\u{2014}", w = W_API)
+                            .dimmed()
+                            .to_string()
                     } else {
                         let raw = if r.api_ok {
-                            let h = r.api_status
+                            let h = r
+                                .api_status
                                 .map(|s| api_status_hint(s, r.api_body_snippet.as_deref()))
                                 .unwrap_or_default();
                             format!("ok ({}ms, {})", r.api_ms, h)
@@ -1422,8 +1494,15 @@ pub fn run_connectivity_suite(
                             // — without it, the operator sees a bare "fail (1ms)"
                             // and has no clue why. Same disambiguation as Chat
                             // column below.
-                            let hint = r.api_status
-                                .map(|s| format!(", HTTP {}: {}", s, api_status_hint(s, r.api_body_snippet.as_deref())))
+                            let hint = r
+                                .api_status
+                                .map(|s| {
+                                    format!(
+                                        ", HTTP {}: {}",
+                                        s,
+                                        api_status_hint(s, r.api_body_snippet.as_deref())
+                                    )
+                                })
                                 .unwrap_or_default();
                             format!("fail ({}ms{})", r.api_ms, hint)
                         };
@@ -1440,13 +1519,21 @@ pub fn run_connectivity_suite(
                     if !r.ping_ok || !r.api_ok {
                         "\u{2014}".dimmed().to_string()
                     } else if r.chat_ok {
-                        let h = r.chat_status
+                        let h = r
+                            .chat_status
                             .map(|s| chat_status_hint(s, r.chat_body_snippet.as_deref()))
                             .unwrap_or_default();
                         format!("ok ({}ms, {})", r.chat_ms, h).green().to_string()
                     } else {
-                        let hint = r.chat_status
-                            .map(|s| format!(", HTTP {}: {}", s, chat_status_hint(s, r.chat_body_snippet.as_deref())))
+                        let hint = r
+                            .chat_status
+                            .map(|s| {
+                                format!(
+                                    ", HTTP {}: {}",
+                                    s,
+                                    chat_status_hint(s, r.chat_body_snippet.as_deref())
+                                )
+                            })
                             .unwrap_or_default();
                         format!("fail ({}ms{})", r.chat_ms, hint).red().to_string()
                     }
@@ -1496,23 +1583,35 @@ pub fn run_connectivity_suite(
         // These can't live in `format_cell` (which is called per-column on
         // the rendering thread); they need the full result and the target's
         // metadata (`display`, `t.kind`, etc.).
-        if r.ping_ok { any_reachable = true; }
-        if r.chat_ok { any_chat_ok = true; }
+        if r.ping_ok {
+            any_reachable = true;
+        }
+        if r.chat_ok {
+            any_chat_ok = true;
+        }
 
         if !r.ping_ok {
             // If Ping(DIRECT) passed while Ping(PROXY) failed, the proxy
             // itself (not the network) is the problem — actionable hint.
             let hint = if r.ping_direct_ok {
-                format!("{}: proxy can't reach upstream (but your laptop can). \
+                format!(
+                    "{}: proxy can't reach upstream (but your laptop can). \
                          Is `aikey proxy` configured with HTTPS_PROXY / \
-                         config.upstream_proxy if your network requires it?", display)
+                         config.upstream_proxy if your network requires it?",
+                    display
+                )
             } else {
-                format!("{}: both paths failed — check network / VPN / firewall", display)
+                format!(
+                    "{}: both paths failed — check network / VPN / firewall",
+                    display
+                )
             };
             failed_hints.push(hint);
         } else if !r.api_ok {
             failed_hints.push(format!(
-                "{}: API unreachable — check base URL or provider status", display));
+                "{}: API unreachable — check base URL or provider status",
+                display
+            ));
         } else if !r.chat_ok {
             // Actionable hint tailored to credential kind + status.
             let suggestion = match (r.chat_status, t.kind, t.provider_code.as_str()) {
@@ -1539,7 +1638,12 @@ pub fn run_connectivity_suite(
     // more table data. Uses the same width + character as the header
     // underline; keep them in lockstep.
     if !rows.is_empty() {
-        eprintln!("  {}", "\u{2500}".repeat(label_w + W_PD + W_PING + W_API + 22).dimmed());
+        eprintln!(
+            "  {}",
+            "\u{2500}"
+                .repeat(label_w + W_PD + W_PING + W_API + 22)
+                .dimmed()
+        );
     }
 
     if !failed_hints.is_empty() {
@@ -1553,12 +1657,17 @@ pub fn run_connectivity_suite(
     let proxy_result = if opts.show_proxy_row {
         eprintln!();
         if !any_reachable {
-            eprintln!("  {:<12} {}", "proxy".bold(), "skipped (all providers unreachable)".dimmed());
+            eprintln!(
+                "  {:<12} {}",
+                "proxy".bold(),
+                "skipped (all providers unreachable)".dimmed()
+            );
             None
         } else if crate::commands_proxy::proxy_is_running_managed() {
             // Round 9 fix #1: was is_proxy_running (PID-only); see top of fn.
             let proxy_addr = crate::commands_proxy::doctor_proxy_addr();
-            let prov = targets.iter()
+            let prov = targets
+                .iter()
                 .find(|t| t.provider_code != "custom")
                 .map(|t| t.provider_code.as_str());
             if let Some(p) = prov {
@@ -1580,21 +1689,21 @@ pub fn run_connectivity_suite(
                         format!("{} ({} ms)", "failed".red(), r.ms)
                     }
                 };
-                let r = animate_blinking_while(
-                    &[12],
-                    format_proxy_cell,
-                    move |tx| {
-                        let _ = tx.send((0, AnimEvent::Started));
-                        let r = test_proxy_connectivity(&proxy_addr_owned, &prov_owned);
-                        let _ = tx.send((0, AnimEvent::Finished(r.clone())));
-                        r
-                    },
-                );
+                let r = animate_blinking_while(&[12], format_proxy_cell, move |tx| {
+                    let _ = tx.send((0, AnimEvent::Started));
+                    let r = test_proxy_connectivity(&proxy_addr_owned, &prov_owned);
+                    let _ = tx.send((0, AnimEvent::Finished(r.clone())));
+                    r
+                });
                 // Helper has painted the cell. Just close the line.
                 eprintln!();
                 Some(r)
             } else {
-                eprintln!("  {:<12} {}", "proxy".bold(), "skipped — no testable provider".dimmed());
+                eprintln!(
+                    "  {:<12} {}",
+                    "proxy".bold(),
+                    "skipped — no testable provider".dimmed()
+                );
                 None
             }
         } else {
@@ -1621,12 +1730,17 @@ pub fn run_connectivity_suite(
 /// actionable next step.  No-op when `errors` is empty.
 pub fn render_cannot_test_block(errors: &[BuildTargetError], json_mode: bool) {
     use colored::Colorize;
-    if errors.is_empty() { return; }
-    if json_mode { return; } // JSON already captures this via callsite metadata.
+    if errors.is_empty() {
+        return;
+    }
+    if json_mode {
+        return;
+    } // JSON already captures this via callsite metadata.
 
     eprintln!();
     eprintln!("  {}", "Cannot test:".yellow());
-    let w = errors.iter()
+    let w = errors
+        .iter()
         .map(|e| e.label().len())
         .max()
         .unwrap_or(0)
@@ -1660,9 +1774,14 @@ mod build_chat_probe_tests {
             "aikey_probe_some-account-id",
             CredentialKind::OAuth,
         );
-        assert!(url.contains("?beta=true"),
-            "anthropic OAuth must add ?beta=true; got: {}", url);
-        let meta = body.get("metadata").expect("OAuth body must inject metadata.user_id");
+        assert!(
+            url.contains("?beta=true"),
+            "anthropic OAuth must add ?beta=true; got: {}",
+            url
+        );
+        let meta = body
+            .get("metadata")
+            .expect("OAuth body must inject metadata.user_id");
         assert_eq!(meta["user_id"], "aikey_doctor_probe");
     }
 
@@ -1679,10 +1798,16 @@ mod build_chat_probe_tests {
             "aikey_probe_my-claude",
             CredentialKind::PersonalApi,
         );
-        assert!(!url.contains("beta=true"),
-            "personal API key MUST NOT add OAuth-only ?beta=true; got: {}", url);
-        assert!(body.get("metadata").is_none(),
-            "personal API key MUST NOT inject metadata.user_id; got body: {}", body);
+        assert!(
+            !url.contains("beta=true"),
+            "personal API key MUST NOT add OAuth-only ?beta=true; got: {}",
+            url
+        );
+        assert!(
+            body.get("metadata").is_none(),
+            "personal API key MUST NOT inject metadata.user_id; got body: {}",
+            body
+        );
         // body still carries the normal anthropic chat shape
         assert!(body.get("messages").is_some());
         assert_eq!(body.get("max_tokens").and_then(|v| v.as_i64()), Some(1));
@@ -1698,8 +1823,11 @@ mod build_chat_probe_tests {
             "sk-ant-api03-real-key",
             CredentialKind::PersonalApi,
         );
-        assert!(!url.contains("beta=true"),
-            "personal-direct anthropic MUST NOT add ?beta=true; got: {}", url);
+        assert!(
+            !url.contains("beta=true"),
+            "personal-direct anthropic MUST NOT add ?beta=true; got: {}",
+            url
+        );
         assert!(body.get("metadata").is_none());
     }
 
@@ -1711,8 +1839,11 @@ mod build_chat_probe_tests {
             "aikey_probe_chatgpt-account",
             CredentialKind::OAuth,
         );
-        assert!(url.ends_with("/responses"),
-            "Codex OAuth must use /responses; got: {}", url);
+        assert!(
+            url.ends_with("/responses"),
+            "Codex OAuth must use /responses; got: {}",
+            url
+        );
         assert_eq!(body["model"], "gpt-5.4");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
@@ -1728,10 +1859,16 @@ mod build_chat_probe_tests {
             "aikey_probe_my-openai",
             CredentialKind::PersonalApi,
         );
-        assert!(!url.contains("/responses"),
-            "personal openai MUST NOT use Codex /responses path; got: {}", url);
-        assert!(url.ends_with("/chat/completions") || url.ends_with("/v1/chat/completions"),
-            "personal openai must hit chat/completions; got: {}", url);
+        assert!(
+            !url.contains("/responses"),
+            "personal openai MUST NOT use Codex /responses path; got: {}",
+            url
+        );
+        assert!(
+            url.ends_with("/chat/completions") || url.ends_with("/v1/chat/completions"),
+            "personal openai must hit chat/completions; got: {}",
+            url
+        );
         // standard chat body — not Responses API
         assert!(body.get("messages").is_some());
         assert!(body.get("input").is_none());
@@ -1745,8 +1882,11 @@ mod build_chat_probe_tests {
             "AIzaSy-fake-key",
             CredentialKind::PersonalApi,
         );
-        assert!(url.contains("?key=AIzaSy-fake-key"),
-            "google personal must use ?key= auth query; got: {}", url);
+        assert!(
+            url.contains("?key=AIzaSy-fake-key"),
+            "google personal must use ?key= auth query; got: {}",
+            url
+        );
     }
 
     // ── 404 special-case allowlist (bugfix 20260523 round-2, revised) ──
@@ -1761,7 +1901,10 @@ mod build_chat_probe_tests {
         // Both forms (with and without trailing newline) — Go ServeMux's
         // serveError writes "...\n", the body reader may or may not strip it.
         assert!(is_known_benign_gateway_404(404, Some("404 page not found")));
-        assert!(is_known_benign_gateway_404(404, Some("404 page not found\n")));
+        assert!(is_known_benign_gateway_404(
+            404,
+            Some("404 page not found\n")
+        ));
     }
 
     #[test]
@@ -1785,9 +1928,11 @@ mod build_chat_probe_tests {
             "   ",
         ];
         for body in cases {
-            assert!(!is_known_benign_gateway_404(404, Some(body)),
+            assert!(
+                !is_known_benign_gateway_404(404, Some(body)),
                 "unallowlisted body must NOT be exempted (kept on main fail path): {:?}",
-                body);
+                body
+            );
         }
     }
 
@@ -1796,8 +1941,11 @@ mod build_chat_probe_tests {
         // The allowlist is gated on 404. Same body text on other status
         // codes is irrelevant to the gateway-404 exception.
         for status in [200, 401, 403, 405, 500] {
-            assert!(!is_known_benign_gateway_404(status, Some("404 page not found")),
-                "allowlist must not bypass non-404 statuses (got status={})", status);
+            assert!(
+                !is_known_benign_gateway_404(status, Some("404 page not found")),
+                "allowlist must not bypass non-404 statuses (got status={})",
+                status
+            );
         }
     }
 
@@ -1805,17 +1953,29 @@ mod build_chat_probe_tests {
     fn api_status_hint_404_differentiates_allowlisted_vs_other() {
         // Allowlisted gateway-default body — hint reads as reachable.
         let gateway = api_status_hint(404, Some("404 page not found"));
-        assert!(gateway.contains("reachable"),
-            "allowlisted gateway 404 must read as reachable, got: {}", gateway);
-        assert!(gateway.contains("not implemented") || gateway.contains("gateway alive"),
-            "allowlisted gateway 404 hint must explain why, got: {}", gateway);
+        assert!(
+            gateway.contains("reachable"),
+            "allowlisted gateway 404 must read as reachable, got: {}",
+            gateway
+        );
+        assert!(
+            gateway.contains("not implemented") || gateway.contains("gateway alive"),
+            "allowlisted gateway 404 hint must explain why, got: {}",
+            gateway
+        );
 
         // Non-allowlisted body — falls through to the upstream-business hint.
         let upstream = api_status_hint(404, Some(r#"{"error":{"type":"not_found_error"}}"#));
-        assert!(upstream.starts_with("HTTP 404"),
-            "non-allowlisted 404 must surface as visible HTTP 404, got: {}", upstream);
-        assert!(upstream.contains("base_url") || upstream.contains("model"),
-            "non-allowlisted 404 hint must guide operator to check config, got: {}", upstream);
+        assert!(
+            upstream.starts_with("HTTP 404"),
+            "non-allowlisted 404 must surface as visible HTTP 404, got: {}",
+            upstream
+        );
+        assert!(
+            upstream.contains("base_url") || upstream.contains("model"),
+            "non-allowlisted 404 hint must guide operator to check config, got: {}",
+            upstream
+        );
     }
 
     #[test]
@@ -1828,8 +1988,11 @@ mod build_chat_probe_tests {
             "aikey_team_vk_xxx",
             CredentialKind::ManagedTeam,
         );
-        assert!(!url.contains("beta=true"),
-            "ManagedTeam MUST NOT add OAuth-only ?beta=true; got: {}", url);
+        assert!(
+            !url.contains("beta=true"),
+            "ManagedTeam MUST NOT add OAuth-only ?beta=true; got: {}",
+            url
+        );
         assert!(body.get("metadata").is_none());
     }
 }
@@ -1893,9 +2056,12 @@ mod proxy_probe_regression_tests {
 
         let req = captured.lock().unwrap();
         let text = String::from_utf8_lossy(&req);
-        assert!(text.to_lowercase().contains("x-aikey-probe: 1"),
+        assert!(
+            text.to_lowercase().contains("x-aikey-probe: 1"),
             "probe must set X-Aikey-Probe: 1 to suppress collector usage events; \
-             got request: {}", text);
+             got request: {}",
+            text
+        );
     }
 
     #[test]
@@ -1915,8 +2081,12 @@ mod proxy_probe_regression_tests {
         // SAFETY: set_var is unsafe in Rust edition 2024 because non-test
         // threads may read env concurrently. In this cfg(test) context only
         // the test thread exists meaningfully.
-        unsafe { std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:1"); }
-        unsafe { std::env::set_var("https_proxy", "http://127.0.0.1:1"); }
+        unsafe {
+            std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:1");
+        }
+        unsafe {
+            std::env::set_var("https_proxy", "http://127.0.0.1:1");
+        }
 
         let (port, _captured, handle) = spawn_capture_server();
         let agent = ureq::AgentBuilder::new()
@@ -1926,16 +2096,22 @@ mod proxy_probe_regression_tests {
         let result = agent.get(&url).call();
         handle.join().ok();
 
-        unsafe { std::env::remove_var("HTTPS_PROXY"); }
-        unsafe { std::env::remove_var("https_proxy"); }
+        unsafe {
+            std::env::remove_var("HTTPS_PROXY");
+        }
+        unsafe {
+            std::env::remove_var("https_proxy");
+        }
 
         // If env-proxy was inherited, the call goes to 127.0.0.1:1 (dead)
         // and errors out. Explicit no-proxy agent must reach our capture
         // server and get the 200.
-        assert!(result.is_ok(),
+        assert!(
+            result.is_ok(),
             "probe agent must NOT inherit HTTPS_PROXY env var — the runtime \
              proxy is on 127.0.0.1 and routing that through Clash/corporate \
-             proxies produces bogus 'failed (10 ms)' bottom row");
+             proxies produces bogus 'failed (10 ms)' bottom row"
+        );
     }
 }
 
