@@ -50,7 +50,7 @@ fn append_unset_lines_for_inactive_providers(
     // protocol family). HashSet::insert returns true the first time only,
     // doubling as the "should we emit?" gate.
     let mut already_unset: HashSet<&'static str> = HashSet::new();
-    let mut emit =
+    let emit =
         |env_lines: &mut Vec<String>, var: &'static str, already: &mut HashSet<&'static str>| {
             if !emitted_export_vars.contains(var) && already.insert(var) {
                 env_lines.push(format!("unset {} 2>/dev/null", var));

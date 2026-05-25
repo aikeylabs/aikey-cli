@@ -477,7 +477,7 @@ pub fn post_admin_reload() -> Result<(), Box<dyn std::error::Error>> {
         // Drain the rest of the body for the error message.
         let mut body = String::new();
         let mut in_body = false;
-        for line in lines.flatten() {
+        for line in lines.by_ref().map_while(Result::ok) {
             if in_body {
                 body.push_str(&line);
                 body.push('\n');
@@ -534,7 +534,7 @@ pub fn post_admin_replay_dead_letter() -> Result<String, Box<dyn std::error::Err
     // Read the rest of the headers + body. Body starts after the blank line.
     let mut body = String::new();
     let mut in_body = false;
-    for line in lines.flatten() {
+    for line in lines.by_ref().map_while(Result::ok) {
         if in_body {
             body.push_str(&line);
             body.push('\n');

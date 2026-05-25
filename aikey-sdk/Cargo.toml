@@ -9,6 +9,9 @@ repository = "https://github.com/aikeylabs/aikey-cli"
 keywords = ["aikey", "secrets", "api-keys", "llm", "sdk"]
 categories = ["authentication", "api-bindings"]
 
+[lints]
+workspace = true
+
 [dependencies]
 aikeylabs-aikey-cli = { path = ".." }
 secrecy = "0.8"

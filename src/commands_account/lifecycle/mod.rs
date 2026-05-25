@@ -23,7 +23,7 @@
 pub mod audit;
 pub mod event;
 
-pub use audit::{audit_credential_lifecycle, AuditReport, DiffEntry, DiffSeverity, DiffSource};
+pub use audit::audit_credential_lifecycle;
 pub use event::{
     apply_credential_lifecycle, apply_credential_lifecycle_batch, CredentialLifecycleEvent,
     LifecycleOutcome,
