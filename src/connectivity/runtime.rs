@@ -877,9 +877,8 @@ pub fn test_proxy_connectivity(
             // Mode 2 — probe_raw. Token suffix is canonical provider code.
             // Plaintext key rides in X-Aikey-Probe-Bearer (NOT Authorization);
             // proxy reads the header to use as upstream credential.
-            let mut headers: Vec<(&'static str, String)> = vec![
-                ("X-Aikey-Probe-Bearer", raw.to_string()),
-            ];
+            let mut headers: Vec<(&'static str, String)> =
+                vec![("X-Aikey-Probe-Bearer", raw.to_string())];
             if let Some(base) = base_url_override {
                 if !base.is_empty() {
                     headers.push(("X-Aikey-Probe-BaseURL", base.to_string()));
@@ -1042,7 +1041,8 @@ pub fn proxy_probe_full_hint(r: &ProxyProbeResult) -> String {
     if let Some(code) = &r.error_code {
         return match code.as_str() {
             "PROXY_TOO_OLD_NO_PROBE_RAW" => {
-                "aikey-proxy too old for pre-save probe — run `aikey service restart proxy`".to_string()
+                "aikey-proxy too old for pre-save probe — run `aikey service restart proxy`"
+                    .to_string()
             }
             "PROBE_RAW_DISABLED" => {
                 "pre-save probe disabled by operator (AIKEY_PROBE_RAW_DISABLED=1)".to_string()
@@ -2416,7 +2416,9 @@ mod probe_raw_request_shape_tests {
                 // Drain any body so the client's write completes (we don't care
                 // about body content for these tests).
                 let mut buf = [0u8; 1024];
-                let _ = reader.get_mut().set_read_timeout(Some(std::time::Duration::from_millis(50)));
+                let _ = reader
+                    .get_mut()
+                    .set_read_timeout(Some(std::time::Duration::from_millis(50)));
                 let _ = reader.get_mut().read(&mut buf);
 
                 let captured_req = CapturedRequest {
@@ -2449,7 +2451,11 @@ mod probe_raw_request_shape_tests {
                 let mut parts = h.splitn(2, ':');
                 let k = parts.next()?.trim().to_ascii_lowercase();
                 let v = parts.next()?.trim().to_string();
-                if k == target { Some(v) } else { None }
+                if k == target {
+                    Some(v)
+                } else {
+                    None
+                }
             })
         }
 
@@ -2460,9 +2466,7 @@ mod probe_raw_request_shape_tests {
 
     // Helper: poll captured until set, with timeout (probe call is sync from
     // the test thread's perspective so this typically returns immediately).
-    fn wait_for_capture(
-        captured: &Arc<Mutex<Option<CapturedRequest>>>,
-    ) -> CapturedRequest {
+    fn wait_for_capture(captured: &Arc<Mutex<Option<CapturedRequest>>>) -> CapturedRequest {
         for _ in 0..50 {
             if let Some(c) = captured.lock().unwrap().take() {
                 return c;
@@ -2584,12 +2588,7 @@ mod probe_raw_request_shape_tests {
         let plaintext_key = "sk-test";
         let custom_base = "https://my-enterprise-gateway.example.com/v1";
 
-        let _ = test_proxy_connectivity(
-            &addr,
-            "anthropic",
-            Some(plaintext_key),
-            Some(custom_base),
-        );
+        let _ = test_proxy_connectivity(&addr, "anthropic", Some(plaintext_key), Some(custom_base));
 
         let req = wait_for_capture(&captured);
 
@@ -2693,7 +2692,7 @@ mod probe_raw_error_classification_tests {
     //! `aikey_active_*` per user decision 2026-05-26 (silent fallback would
     //! mask "test the wrong key" with another wrong-key test).
 
-    use super::{test_proxy_connectivity, proxy_probe_full_hint, ProxyProbeResult};
+    use super::{proxy_probe_full_hint, test_proxy_connectivity, ProxyProbeResult};
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -2819,10 +2818,7 @@ mod probe_raw_error_classification_tests {
 
         let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
 
-        assert_eq!(
-            r.error_code.as_deref(),
-            Some("PROBE_HEADER_REQUIRED"),
-        );
+        assert_eq!(r.error_code.as_deref(), Some("PROBE_HEADER_REQUIRED"),);
         let hint = proxy_probe_full_hint(&r);
         assert!(
             hint.contains("BUG"),
@@ -2883,7 +2879,10 @@ mod probe_raw_error_classification_tests {
 
         let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
 
-        assert_eq!(r.error_code, None, "VAULT_ERROR must not be captured as probe_raw error");
+        assert_eq!(
+            r.error_code, None,
+            "VAULT_ERROR must not be captured as probe_raw error"
+        );
         assert_eq!(r.status, Some(500), "but raw status should still surface");
     }
 
@@ -2896,8 +2895,14 @@ mod probe_raw_error_classification_tests {
         // Pin existing return strings.
         use super::proxy_status_hint;
         assert_eq!(proxy_status_hint(200), "routing ok, key valid");
-        assert_eq!(proxy_status_hint(401), "routing ok, key rejected by provider");
-        assert_eq!(proxy_status_hint(503), "proxy has no active key for this provider");
+        assert_eq!(
+            proxy_status_hint(401),
+            "routing ok, key rejected by provider"
+        );
+        assert_eq!(
+            proxy_status_hint(503),
+            "proxy has no active key for this provider"
+        );
     }
 
     // ───── probe_raw upstream_status extraction (E2E-2 finding fix) ─────
@@ -2924,7 +2929,10 @@ mod probe_raw_error_classification_tests {
             Some(401),
             "probe_raw mode must surface upstream_status (401), not proxy outer status (200). Bug from E2E-2: real upstream rejection was being hidden as 'key valid'."
         );
-        assert!(r.error_code.is_none(), "401 from upstream is NOT an error_code situation");
+        assert!(
+            r.error_code.is_none(),
+            "401 from upstream is NOT an error_code situation"
+        );
     }
 
     #[test]
@@ -2936,7 +2944,11 @@ mod probe_raw_error_classification_tests {
 
         let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-ant-valid"), None);
 
-        assert_eq!(r.status, Some(200), "happy path: upstream_status=200 surfaces");
+        assert_eq!(
+            r.status,
+            Some(200),
+            "happy path: upstream_status=200 surfaces"
+        );
         assert!(r.error_code.is_none());
     }
 
@@ -2961,7 +2973,7 @@ mod probe_raw_error_classification_tests {
         // must NOT parse it.
         let addr = mock_proxy_returning(
             200,
-            r#"{"probe_ok":true,"upstream_status":401}"#,  // would mislead a confused parser
+            r#"{"probe_ok":true,"upstream_status":401}"#, // would mislead a confused parser
         );
 
         // Notice: bearer_override is None here.

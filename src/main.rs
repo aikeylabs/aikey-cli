@@ -1528,9 +1528,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         proxy_port: commands_proxy::proxy_port(),
                         show_key_column: false,
                         probe_raw_bearer: Some(secret.trim().to_string()),
-                        probe_raw_base_url: resolved_base_url
-                            .as_ref()
-                            .map(|s| s.to_string()),
+                        probe_raw_base_url: resolved_base_url.as_ref().map(|s| s.to_string()),
                     };
                     let outcome = commands_project::run_connectivity_suite(targets, opts, false);
                     if !outcome.any_chat_ok {

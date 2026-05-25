@@ -504,10 +504,7 @@ fn issue_or_reuse_bearer(
 /// without adding security. The reveal is gated by vault-unlock
 /// indirectly: `storage::open_connection` (under `get_active_route_token`)
 /// requires an unlocked vault.
-pub fn handle_reveal_token(
-    slug: &str,
-    json_mode: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn handle_reveal_token(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     validate_slug(slug).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let info = super::get_active_route_token(slug)?;
 

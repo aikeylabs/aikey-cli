@@ -483,7 +483,10 @@ fn handle_uninstall_third_party(
             counts.app_keys_revoked, counts.bindings_deleted, counts.app_records_deleted,
         );
         println!("✓ {} uninstall complete", slug);
-        println!("  Re-register any time with: aikey app register --slug {} ...", slug);
+        println!(
+            "  Re-register any time with: aikey app register --slug {} ...",
+            slug
+        );
     }
     Ok(())
 }

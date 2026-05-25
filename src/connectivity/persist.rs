@@ -678,7 +678,10 @@ mod tests {
 
     use crate::connectivity::runtime::ProxyProbeResult;
 
-    fn outcome_with_proxy(rows: Vec<(TestTarget, ConnectivityResult)>, p: ProxyProbeResult) -> SuiteOutcome {
+    fn outcome_with_proxy(
+        rows: Vec<(TestTarget, ConnectivityResult)>,
+        p: ProxyProbeResult,
+    ) -> SuiteOutcome {
         SuiteOutcome {
             rows,
             proxy: Some(p),
@@ -690,19 +693,39 @@ mod tests {
 
     #[test]
     fn proxy_fields_surface_when_proxy_probe_succeeded() {
-        let r = ConnectivityResult { ping_ok: true, api_ok: true, chat_ok: true, ..Default::default() };
+        let r = ConnectivityResult {
+            ping_ok: true,
+            api_ok: true,
+            chat_ok: true,
+            ..Default::default()
+        };
         let so = outcome_with_proxy(
             vec![(target("k1", CredentialKind::PersonalApi), r)],
-            ProxyProbeResult { ok: true, ms: 187, status: Some(200), error_code: None },
+            ProxyProbeResult {
+                ok: true,
+                ms: 187,
+                status: Some(200),
+                error_code: None,
+            },
         );
         let agg = aggregate_test_outcome(&so);
         let lt = &agg[0].last_test;
-        assert_eq!(lt["proxy_ok"], true, "proxy_ok must surface when probe succeeded");
+        assert_eq!(
+            lt["proxy_ok"], true,
+            "proxy_ok must surface when probe succeeded"
+        );
         assert_eq!(lt["proxy_ms"], 187);
         assert_eq!(lt["proxy_status"], 200);
-        assert!(lt.get("proxy_error_code").is_none(), "no error_code → field absent");
+        assert!(
+            lt.get("proxy_error_code").is_none(),
+            "no error_code → field absent"
+        );
         let hint = lt["proxy_status_hint"].as_str().expect("hint missing");
-        assert!(hint.contains("routing ok"), "200 hint should mention routing ok, got: {}", hint);
+        assert!(
+            hint.contains("routing ok"),
+            "200 hint should mention routing ok, got: {}",
+            hint
+        );
     }
 
     #[test]
@@ -710,7 +733,12 @@ mod tests {
         // Critical fence: even when ProxyProbeResult.ok=true (proxy responded),
         // the presence of error_code (PROXY_TOO_OLD_NO_PROBE_RAW etc) must
         // render as proxy_ok=FALSE so the Web Proxy row shows red/warning.
-        let r = ConnectivityResult { ping_ok: true, api_ok: true, chat_ok: true, ..Default::default() };
+        let r = ConnectivityResult {
+            ping_ok: true,
+            api_ok: true,
+            chat_ok: true,
+            ..Default::default()
+        };
         let so = outcome_with_proxy(
             vec![(target("k1", CredentialKind::PersonalApi), r)],
             ProxyProbeResult {
@@ -742,7 +770,12 @@ mod tests {
         // Aggregator must NOT inject proxy_* fields with default 0/false
         // — leave them entirely absent so Web can distinguish "no proxy
         // probe ran" from "proxy probe ran with ok=false".
-        let r = ConnectivityResult { ping_ok: true, api_ok: true, chat_ok: true, ..Default::default() };
+        let r = ConnectivityResult {
+            ping_ok: true,
+            api_ok: true,
+            chat_ok: true,
+            ..Default::default()
+        };
         let so = outcome(vec![(target("k1", CredentialKind::PersonalApi), r)]);
         let agg = aggregate_test_outcome(&so);
         let lt = &agg[0].last_test;
@@ -756,7 +789,12 @@ mod tests {
     #[test]
     fn proxy_fields_surface_with_disabled_flag_error() {
         // Operator-disabled flag returns 503 + PROBE_RAW_DISABLED.
-        let r = ConnectivityResult { ping_ok: true, api_ok: true, chat_ok: true, ..Default::default() };
+        let r = ConnectivityResult {
+            ping_ok: true,
+            api_ok: true,
+            chat_ok: true,
+            ..Default::default()
+        };
         let so = outcome_with_proxy(
             vec![(target("k1", CredentialKind::PersonalApi), r)],
             ProxyProbeResult {
@@ -770,6 +808,10 @@ mod tests {
         let lt = &agg[0].last_test;
         assert_eq!(lt["proxy_error_code"], "PROBE_RAW_DISABLED");
         let hint = lt["proxy_status_hint"].as_str().unwrap();
-        assert!(hint.contains("disabled"), "hint must mention disabled, got: {}", hint);
+        assert!(
+            hint.contains("disabled"),
+            "hint must mention disabled, got: {}",
+            hint
+        );
     }
 }

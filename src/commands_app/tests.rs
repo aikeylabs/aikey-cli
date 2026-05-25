@@ -1182,8 +1182,8 @@ fn third_party_uninstall_revokes_keys_and_deletes_identity() {
     }
 
     // Act
-    let counts =
-        super::delete_third_party_app_identity_with_conn(&mut conn, "target-app").expect("uninstall");
+    let counts = super::delete_third_party_app_identity_with_conn(&mut conn, "target-app")
+        .expect("uninstall");
 
     // 1 key revoked, 1 binding + 1 app_record deleted, 0 keys deleted
     assert_eq!(counts.app_keys_revoked, 1, "should revoke 1 active key");
