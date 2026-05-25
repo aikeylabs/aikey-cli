@@ -37,6 +37,7 @@ pub use targets::{
 #[allow(unused_imports)]
 pub use runtime::{
     ConnectivityResult, ProxyProbeResult,
+    build_proxy_aware_agent,
     provider_defaults, default_base_url,
     tcp_ping,
     test_provider_connectivity, test_proxy_connectivity,

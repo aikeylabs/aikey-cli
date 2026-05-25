@@ -122,9 +122,12 @@ pub fn default_base_url(provider_code: &str) -> Option<&'static str> {
 /// outbound proxy (e.g., socks5://127.0.0.1:7890) that the connectivity
 /// test must use — otherwise TCP ping and HTTP probes time out.
 /// Build a ureq agent that respects proxy.env (https_proxy / http_proxy).
-/// `pub(crate)` so `check_usage_pipeline` in `commands_project.rs` can reuse
-/// the same proxy discovery logic for its "internet reachable" check.
-pub(crate) fn build_proxy_aware_agent(timeout: std::time::Duration) -> ureq::Agent {
+/// Reads from `~/.aikey/proxy.env` first, then falls back to the process
+/// env (lowercase `https_proxy` / `http_proxy` / `all_proxy`). Critical
+/// for Mac users running Clash / V2Ray etc. that export lowercase env
+/// only — ureq's default `ureq::get()` does NOT consult any env on its
+/// own. Bugfix: 20260525-aikey-cli-install-bypasses-proxy-aware-agent.md.
+pub fn build_proxy_aware_agent(timeout: std::time::Duration) -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new().timeout(timeout);
 
     // Try https_proxy, then http_proxy, then all_proxy from proxy.env or env.

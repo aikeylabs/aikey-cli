@@ -560,10 +560,35 @@ fn fetch_and_verify_manifest(
         println!("→ Fetching manifest: {}", trusted.manifest_url);
     }
 
-    let resp = ureq::get(trusted.manifest_url)
-        .timeout(std::time::Duration::from_secs(15))
+    // Route through the proxy-aware agent — `ureq::get()` ignores both
+    // `~/.aikey/proxy.env` AND the process env, which broke first-install
+    // on Mac users running Clash / V2Ray with lowercase `https_proxy`
+    // exported only. The builder consults proxy.env first, then env
+    // (lowercase + uppercase variants).
+    // Bugfix: 20260525-aikey-cli-install-bypasses-proxy-aware-agent.md
+    let agent = crate::connectivity::build_proxy_aware_agent(
+        std::time::Duration::from_secs(15),
+    );
+    let resp = agent
+        .get(trusted.manifest_url)
         .call()
-        .map_err(|e| format!("manifest fetch failed: {}", e))?;
+        .map_err(|e| {
+            // Surface the most common cause for Mac users so they can
+            // self-diagnose without reading source. The hint only adds
+            // value when a TCP connect actually timed out (proxy unset
+            // or pointing at a dead listener); for HTTP-level errors
+            // we keep the raw ureq message intact.
+            let msg = e.to_string();
+            let proxy_hint = if msg.contains("timed out")
+                || msg.contains("Connect error")
+                || msg.contains("dns error")
+            {
+                proxy_misconfiguration_hint()
+            } else {
+                String::new()
+            };
+            format!("manifest fetch failed: {}{}", e, proxy_hint)
+        })?;
 
     let mut bytes = Vec::with_capacity(8 * 1024);
     resp.into_reader()
@@ -589,6 +614,66 @@ fn fetch_and_verify_manifest(
         .map_err(|e| format!("manifest JSON parse failed: {}", e))?;
     validate_manifest_schema_version(&manifest.schema_version)?;
     Ok(manifest)
+}
+
+/// Diagnose the most common manifest-fetch failure mode on Mac:
+/// the user has a local proxy (Clash / V2Ray / Surge) configured via
+/// lowercase env, but the CLI couldn't reach the network anyway.
+/// Returns a multi-line "\n\n│ hint:" suffix or an empty string if no
+/// actionable hint applies. Kept tight on purpose — surface only when
+/// it materially helps, otherwise leave the raw ureq error alone.
+fn proxy_misconfiguration_hint() -> String {
+    let lower_https = std::env::var("https_proxy").ok();
+    let lower_http = std::env::var("http_proxy").ok();
+    let lower_all = std::env::var("all_proxy").ok();
+    let upper_https = std::env::var("HTTPS_PROXY").ok();
+    let upper_http = std::env::var("HTTP_PROXY").ok();
+    let proxy_env_path = std::env::var("HOME")
+        .ok()
+        .map(|h| format!("{}/.aikey/proxy.env", h));
+    let has_proxy_env_file = proxy_env_path
+        .as_ref()
+        .map(|p| std::path::Path::new(p).exists())
+        .unwrap_or(false);
+
+    let lowercase_set = lower_https.is_some() || lower_http.is_some() || lower_all.is_some();
+    let uppercase_set = upper_https.is_some() || upper_http.is_some();
+
+    if lowercase_set && !uppercase_set && !has_proxy_env_file {
+        // Most common Mac case: GUI proxy app exported only lowercase
+        // env. Pre-fix this would silently bypass the proxy and time
+        // out on direct connect. Post-fix the agent already honors
+        // lowercase, so this branch only fires when our agent did try
+        // the lowercase proxy and IT couldn't reach the upstream —
+        // tell the user to verify the proxy app is actually running.
+        return format!(
+            "\n\n│ hint: detected lowercase proxy env ({}) — the CLI did try \
+             routing through it. Verify the proxy app is running:\n\
+             │   curl -sI {} | head -1   # should print HTTP/2 200 or 302\n\
+             │ If curl works but this fetch failed, the proxy is dropping \
+             non-curl clients; try restarting the proxy app.",
+            lower_https
+                .as_ref()
+                .or(lower_http.as_ref())
+                .or(lower_all.as_ref())
+                .map(|s| s.as_str())
+                .unwrap_or(""),
+            "https://github.com/aikeylabs/launch/releases/latest"
+        );
+    }
+    if !lowercase_set && !uppercase_set && !has_proxy_env_file {
+        // No proxy configured anywhere. Likely direct-internet failure
+        // (China mainland blocks GitHub Releases CDN intermittently).
+        return "\n\n│ hint: no proxy env or ~/.aikey/proxy.env detected. \
+             If you're behind a restricted network (e.g. China mainland), \
+             export HTTPS_PROXY=http://<host>:<port> (or write it to \
+             ~/.aikey/proxy.env) and retry."
+            .to_string();
+    }
+    // Everything else (proxy.env set, or both casings set): hand back
+    // the raw error with no hint. Adding noise here would dilute the
+    // signal value of the hint when it does fire.
+    String::new()
 }
 
 /// Manifest schema versions this CLI knows how to deserialize +
