@@ -1,0 +1,10 @@
+# SHAs listed here are skipped by `git blame` so authorship of mechanical
+# reformatting / mass renames doesn't shadow the real authors of the code.
+#
+# Enable locally: `git config blame.ignoreRevsFile .git-blame-ignore-revs`
+# GitHub honors this file by default.
+
+# 2026-05-25 rustfmt 1.9.0 sweep — long-standing drift exposed by
+# release.sh routing through `make fmt-check` in BR-rc.5-61 hotfix bundle.
+# 117 files purely mechanical reformatting; no semantic change.
+7e831c4756bd540cee12f9312d849ca2c6bd5770
