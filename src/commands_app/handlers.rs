@@ -148,7 +148,8 @@ pub fn handle_register(
             if !r.snapshotted_bindings.is_empty() {
                 println!("Snapshotted from your `aikey use` selection (this register):");
                 for (u, t, kr) in &r.snapshotted_bindings {
-                    println!("    {} → {}={}", u, t.as_str(), kr);
+                    let label = super::resolve_binding_label(t.as_str(), kr);
+                    println!("    {} → {}={}", u, t.as_str(), label);
                 }
             }
             if !r.preserved_bindings.is_empty() {
@@ -157,7 +158,8 @@ pub fn handle_register(
                 }
                 println!("Preserved your previous per-app override (Bug 1 fix 2026-05-21):");
                 for (u, t, kr) in &r.preserved_bindings {
-                    println!("    {} → {}={}  (kept — re-register did NOT touch your `aikey app route` choice)", u, t.as_str(), kr);
+                    let label = super::resolve_binding_label(t.as_str(), kr);
+                    println!("    {} → {}={}  (kept — re-register did NOT touch your `aikey app route` choice)", u, t.as_str(), label);
                 }
             }
             if !r.missing_upstreams.is_empty() {
@@ -936,10 +938,16 @@ fn render_bindings_json(bindings: &[(String, CredentialType, String)]) -> Vec<se
     bindings
         .iter()
         .map(|(p, t, r)| {
+            let kt = t.as_str();
             serde_json::json!({
                 "upstream": p,
-                "key_source_type": t.as_str(),
+                "key_source_type": kt,
                 "key_source_ref": r,
+                // Friendly display string the UI should render — see
+                // commands_app::resolve_binding_label. Web UI prefers
+                // this over key_source_ref so OAuth `session_<hex>` and
+                // team `vk_<hex>` rows show a human-readable label.
+                "key_source_label": super::resolve_binding_label(kt, r),
             })
         })
         .collect()

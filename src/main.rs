@@ -3255,7 +3255,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             changes.iter().map(|(p, _, _)| p.as_str()).collect();
                         let mut box_rows: Vec<String> = Vec::new();
                         for b in &bindings {
-                            let display_name = resolve_binding_display_name(
+                            let display_name = commands_app::resolve_binding_label(
                                 b.key_source_type.as_str(),
                                 &b.key_source_ref,
                             );
@@ -4607,29 +4607,6 @@ fn handle_shell_command(json_mode: bool) -> Result<(), Box<dyn std::error::Error
     }
 
     Ok(())
-}
-
-/// Resolve a binding's key_source_ref to a human-readable display name.
-fn resolve_binding_display_name(source_type: &str, source_ref: &str) -> String {
-    if source_type == "team" {
-        if let Ok(Some(entry)) = storage::get_virtual_key_cache(source_ref) {
-            return entry.local_alias.unwrap_or(entry.alias);
-        }
-    }
-    // OAuth accounts: show the user-facing label (local_alias if renamed,
-    // else email identity) instead of opaque provider_account_id.
-    if source_type == "personal_oauth_account" {
-        if let Ok(Some(acct)) = storage::get_provider_account(source_ref) {
-            let label = acct.effective_label();
-            if !label.is_empty() && label != acct.provider_account_id {
-                return label.to_string();
-            }
-            if let Some(id) = acct.external_id.as_deref().filter(|s: &&str| !s.is_empty()) {
-                return id.to_string();
-            }
-        }
-    }
-    source_ref.to_string()
 }
 
 /// Truncate email username part if it exceeds `max_user_len`, keeping domain intact.

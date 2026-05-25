@@ -310,15 +310,22 @@ fn handle_register(env: StdinEnvelope) {
     // Project the typed binding tuples into JSON arrays. Re-uses the
     // same shape as handle_register's CLI JSON output (see
     // commands_app::handlers::handle_register json_mode branch), so the
-    // Web UI and the CLI consumers parse identical wire format.
+    // Web UI and the CLI consumers parse identical wire format. Each row
+    // carries `key_source_label` — the friendly display string the UI
+    // should show — alongside the raw `key_source_ref` (which the UI
+    // still needs as the stable identifier for follow-up calls like
+    // `aikey app route`). See commands_app::resolve_binding_label for
+    // the resolution rules.
     let snapshotted: Vec<Value> = result
         .snapshotted_bindings
         .iter()
         .map(|(u, t, r)| {
+            let kt = t.as_str();
             json!({
                 "upstream": u,
-                "key_source_type": t.as_str(),
+                "key_source_type": kt,
                 "key_source_ref": r,
+                "key_source_label": commands_app::resolve_binding_label(kt, r),
             })
         })
         .collect();
@@ -326,10 +333,12 @@ fn handle_register(env: StdinEnvelope) {
         .preserved_bindings
         .iter()
         .map(|(u, t, r)| {
+            let kt = t.as_str();
             json!({
                 "upstream": u,
-                "key_source_type": t.as_str(),
+                "key_source_type": kt,
                 "key_source_ref": r,
+                "key_source_label": commands_app::resolve_binding_label(kt, r),
             })
         })
         .collect();
@@ -629,41 +638,11 @@ fn render_bindings(bindings: &[(String, &str, String)]) -> Value {
                     "upstream": upstream,
                     "key_source_type": kt_str,
                     "key_source_ref": kr,
-                    "key_source_label": resolve_binding_label(kt_str, kr),
+                    "key_source_label": commands_app::resolve_binding_label(kt_str, kr),
                 })
             })
             .collect(),
     )
-}
-
-/// Turn a raw (key_source_type, key_source_ref) pair into the label the
-/// UI should display.
-///
-/// Why this layer exists:
-///   - `key_source_ref` is the storage-layer identifier. For
-///     `personal` / `team` bindings the ref IS the alias / vk_id —
-///     already user-facing. For `personal_oauth_account` it's an
-///     opaque `session_<hex>` provider_account_id — totally unreadable
-///     in a dashboard.
-///   - The CLI side has the only convenient access to the
-///     `provider_accounts` table, so resolution belongs here, not in
-///     the Web layer (which would need a separate round-trip lookup).
-///
-/// Falls back to `key_source_ref` if the OAuth account row is missing
-/// (e.g., revoked / deleted between binding write and our lookup) —
-/// surfacing the raw ID at least lets the user copy it for forensics.
-fn resolve_binding_label(key_source_type: &str, key_source_ref: &str) -> String {
-    match key_source_type {
-        "personal_oauth_account" => {
-            // storage_platform is re-exported through `crate::storage::*`
-            // — see storage.rs tail block.
-            match crate::storage::get_provider_account(key_source_ref) {
-                Ok(Some(acct)) => acct.effective_label().to_string(),
-                _ => key_source_ref.to_string(),
-            }
-        }
-        _ => key_source_ref.to_string(),
-    }
 }
 
 // ---------------------------------------------------------------------------

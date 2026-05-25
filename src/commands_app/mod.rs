@@ -1246,6 +1246,60 @@ pub fn list_team_keys_for_provider(provider: &str) -> Result<Vec<TeamKeyCandidat
 }
 
 // ---------------------------------------------------------------------------
+// Binding label resolution — single source of truth.
+//
+// Why this lives here:
+//   `key_source_ref` is the storage-layer identifier (`alias`,
+//   `virtual_key_id`, or `provider_account_id`). Only `personal` refs are
+//   already user-facing; team and OAuth refs are opaque IDs (`vk_xxx`,
+//   `session_<hex>`) that must be resolved against the local cache before
+//   showing them to a user. Before this consolidation the resolver lived
+//   in TWO places (main.rs `resolve_binding_display_name` and
+//   commands_internal/app.rs `resolve_binding_label`) which had drifted —
+//   the internal copy only handled OAuth and left team bindings showing
+//   raw `vk_xxx` IDs in the Web UI's register modal / detail page. This
+//   single function is the only resolver from here forward; every binding
+//   row emitted to a user (CLI text, IPC JSON, register response) MUST
+//   route through it.
+//
+// Falls back to `key_source_ref` for any storage error or missing row —
+// surfacing the raw ID at least lets users copy it for forensics.
+// ---------------------------------------------------------------------------
+
+pub fn resolve_binding_label(key_source_type: &str, key_source_ref: &str) -> String {
+    match key_source_type {
+        "personal_oauth_account" => {
+            match crate::storage::get_provider_account(key_source_ref) {
+                Ok(Some(acct)) => {
+                    // effective_label() already chains
+                    // local_alias → display_identity → provider_account_id.
+                    // If it returns the raw provider_account_id, both
+                    // local_alias and display_identity were empty — try
+                    // external_id as one more rung before giving up
+                    // (some pre-v1.0.1 OAuth rows populate external_id
+                    // but not display_identity).
+                    let label = acct.effective_label();
+                    if !label.is_empty() && label != acct.provider_account_id {
+                        return label.to_string();
+                    }
+                    if let Some(id) = acct.external_id.as_deref().filter(|s: &&str| !s.is_empty()) {
+                        return id.to_string();
+                    }
+                    key_source_ref.to_string()
+                }
+                _ => key_source_ref.to_string(),
+            }
+        }
+        "team" => match crate::storage::get_virtual_key_cache(key_source_ref) {
+            Ok(Some(entry)) => entry.local_alias.unwrap_or(entry.alias),
+            _ => key_source_ref.to_string(),
+        },
+        // "personal" and any unknown type — ref is already the alias.
+        _ => key_source_ref.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Small helper: UUID v4 string without pulling the `uuid` crate dep.
 // 36-char canonical form, version=4 + variant=10. Random source: OsRng.
 // ---------------------------------------------------------------------------
