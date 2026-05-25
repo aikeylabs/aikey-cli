@@ -4113,11 +4113,12 @@ fn handle_route(
         // (existing behavior preserved as last-resort safety net).
         // See bugfix 20260525-vault-oauth-route-token-not-generated-by-
         // web-broker.md.
-        let token_result = match storage::get_provider_account_route_token_readonly(&acct.provider_account_id) {
-            Ok(Some(t)) => Ok(t),
-            Ok(None) => storage::ensure_provider_account_route_token(&acct.provider_account_id),
-            Err(e) => Err(e),
-        };
+        let token_result =
+            match storage::get_provider_account_route_token_readonly(&acct.provider_account_id) {
+                Ok(Some(t)) => Ok(t),
+                Ok(None) => storage::ensure_provider_account_route_token(&acct.provider_account_id),
+                Err(e) => Err(e),
+            };
         match token_result {
             Ok(token) => {
                 entries.push(RouteEntry {
@@ -6232,11 +6233,13 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 "zsh" => commands_account::HookKind::Zsh,
                 "bash" => commands_account::HookKind::Bash,
                 "powershell" | "pwsh" => commands_account::HookKind::PowerShell,
-                other => return Err(format!(
+                other => {
+                    return Err(format!(
                     "unsupported shell '{}' for hook status — expected zsh, bash, or powershell",
                     other
                 )
-                .into()),
+                    .into())
+                }
             };
             let hook_filename = match kind {
                 commands_account::HookKind::Zsh => "hook.zsh",
