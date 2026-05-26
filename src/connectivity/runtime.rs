@@ -2698,9 +2698,7 @@ mod probe_raw_request_shape_tests {
         let (addr, captured) = capture_one_request();
         let account_id = "session_abc123def456";
 
-        let _ = test_proxy_connectivity(
-            &addr, "anthropic", None, None, Some(account_id),
-        );
+        let _ = test_proxy_connectivity(&addr, "anthropic", None, None, Some(account_id));
         let req = wait_for_capture(&captured);
 
         // Anthropic uses x-api-key.
@@ -2732,9 +2730,7 @@ mod probe_raw_request_shape_tests {
         let (addr, captured) = capture_one_request();
         let account_id = "session_openai_xyz";
 
-        let _ = test_proxy_connectivity(
-            &addr, "openai", None, None, Some(account_id),
-        );
+        let _ = test_proxy_connectivity(&addr, "openai", None, None, Some(account_id));
         let req = wait_for_capture(&captured);
 
         let auth = req
@@ -2775,9 +2771,7 @@ mod probe_raw_request_shape_tests {
         // OAuth probe (Web Add Key OAuth) emit DIFFERENT token forms despite
         // both being Tier2 family. probe_raw_<provider> vs probe_<account_id>.
         let (addr, captured) = capture_one_request();
-        let _ = test_proxy_connectivity(
-            &addr, "anthropic", Some("sk-ant-test"), None, None,
-        );
+        let _ = test_proxy_connectivity(&addr, "anthropic", Some("sk-ant-test"), None, None);
         let req = wait_for_capture(&captured);
 
         let key = req.header_value("x-api-key").unwrap_or_default();
@@ -2802,7 +2796,11 @@ mod probe_raw_request_shape_tests {
     fn mutual_exclusion_release_falls_back_to_probe_raw() {
         let (addr, captured) = capture_one_request();
         let _ = test_proxy_connectivity(
-            &addr, "anthropic", Some("sk-ant-bug"), None, Some("session_should_be_ignored"),
+            &addr,
+            "anthropic",
+            Some("sk-ant-bug"),
+            None,
+            Some("session_should_be_ignored"),
         );
         let req = wait_for_capture(&captured);
         let key = req.header_value("x-api-key").unwrap_or_default();
