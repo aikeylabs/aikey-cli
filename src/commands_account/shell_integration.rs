@@ -3915,30 +3915,29 @@ mod wire_rc_with_consent_tests {
         );
     }
 
+    // BR-rc.5-77 (2026-05-26): obsoleted by the resolve_user_home fix in
+    // wire_rc_with_consent. Pre-fix, removing HOME forced an immediate
+    // HomeUnset; post-fix, resolve_user_home falls through HOME →
+    // USERPROFILE → dirs::home_dir (passwd db on macOS), so HomeUnset
+    // only fires in pathological no-home environments (containers without
+    // /etc/passwd or USERPROFILE). The old test additionally had a real-
+    // side-effect bug — when fallback succeeded, it actually wrote to
+    // the developer's real ~/.zshrc + ~/.aikey/hook.zsh; the assertion
+    // failure then panicked while holding ENV_MUTATION_LOCK, poisoning
+    // every other env-mutating test that ran after it.
     #[test]
+    #[ignore = "obsolete: BR-rc.5-77 changed HOME resolution to fall through USERPROFILE → dirs::home_dir; HomeUnset is no longer reachable on normal systems and triggering it would mutate the dev's real ~/.zshrc"]
     fn wire_rc_returns_home_unset_when_home_missing() {
         let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_home = std::env::var("HOME").ok();
-        let prev_shell = std::env::var("SHELL").ok();
-        let prev_no_hook = std::env::var("AIKEY_NO_HOOK").ok();
         unsafe {
             std::env::remove_var("HOME");
-            std::env::set_var("SHELL", "/bin/zsh");
-            std::env::remove_var("AIKEY_NO_HOOK");
         }
         let result = wire_rc_with_consent();
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("HOME", v),
                 None => std::env::remove_var("HOME"),
-            }
-            match prev_shell {
-                Some(v) => std::env::set_var("SHELL", v),
-                None => std::env::remove_var("SHELL"),
-            }
-            match prev_no_hook {
-                Some(v) => std::env::set_var("AIKEY_NO_HOOK", v),
-                None => std::env::remove_var("AIKEY_NO_HOOK"),
             }
         }
         assert_eq!(result, Err(HookFailureReason::HomeUnset));
