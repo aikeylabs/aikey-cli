@@ -2176,8 +2176,7 @@ fn wire_powershell_rc_no_tty(home: &str) -> Result<(), HookFailureReason> {
                     replace_between_markers(&contents, V3_BEGIN, V3_END, &v3_block)
                 {
                     if updated != contents {
-                        std::fs::write(profile, updated)
-                            .map_err(|_| HookFailureReason::IoError)?;
+                        std::fs::write(profile, updated).map_err(|_| HookFailureReason::IoError)?;
                     }
                 }
                 return Ok(());
