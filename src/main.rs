@@ -1529,6 +1529,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         show_key_column: false,
                         probe_raw_bearer: Some(secret.trim().to_string()),
                         probe_raw_base_url: resolved_base_url.as_ref().map(|s| s.to_string()),
+                        // aikey add is pre-save API key flow; OAuth doesn't
+                        // go through this branch.
+                        probe_oauth_account_id: None,
                     };
                     let outcome = commands_project::run_connectivity_suite(targets, opts, false);
                     if !outcome.any_chat_ok {
@@ -2104,6 +2107,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     // None — `aikey test --all` is post-save (testing active bindings).
                     probe_raw_bearer: None,
                     probe_raw_base_url: None,
+                    probe_oauth_account_id: None,
                 };
                 let outcome = if cli.json {
                     commands_project::run_connectivity_suite(targets, opts, true)
@@ -2169,6 +2173,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     // None — `aikey test <alias>` is post-save by alias.
                     probe_raw_bearer: None,
                     probe_raw_base_url: None,
+                    probe_oauth_account_id: None,
                 };
                 let outcome = if cli.json {
                     commands_project::run_connectivity_suite(targets, opts, true)
@@ -2239,6 +2244,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     // None — `aikey test` (no alias) is post-save active-bindings test.
                     probe_raw_bearer: None,
                     probe_raw_base_url: None,
+                    probe_oauth_account_id: None,
                 };
                 let outcome = if cli.json {
                     commands_project::run_connectivity_suite(targets, opts, true)

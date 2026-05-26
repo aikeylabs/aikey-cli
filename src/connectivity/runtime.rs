@@ -851,7 +851,22 @@ pub struct ProxyProbeResult {
 ///   through this machine's proxy?". Spec:
 ///   roadmap20260320/技术实现/update/20260526-pre-save-proxy-probe-raw.md
 ///
-/// Common: `X-Aikey-Probe: 1` suppresses usage-event emission either way
+/// **Mode 3 — OAuth account probe (`oauth_account_id = Some(account_id)`)**:
+///   Sends `aikey_probe_<account_id>` Tier2Probe token. Proxy's existing
+///   OAuth Tier2Probe path (proxy.go::handlePathPrefixRoute Tier2Probe
+///   branch) recognizes the account_id via `broker.GetAccountStatus`,
+///   refreshes the token via `broker.EnsureFresh`, resolves the credential
+///   via `broker.ResolveCredential`, and forwards. Used by web Add Key
+///   OAuth Test connectivity (post-save by id) so the proxy row tests
+///   THIS SPECIFIC OAuth account instead of falling back to active
+///   sentinel which may resolve to a different (older) binding because
+///   Web OAuth add doesn't propagate lifecycle (Phase A.1 deferred).
+///
+/// `bearer_override` and `oauth_account_id` are MUTUALLY EXCLUSIVE.
+/// Caller violation (both `Some`) panics in debug; in release the
+/// probe_raw mode (bearer_override) wins for safety.
+///
+/// Common: `X-Aikey-Probe: 1` suppresses usage-event emission in all modes
 /// (see aikey-proxy middleware.go::isAikeyProbe).
 ///
 /// 2026-04-22 regression history (do not silently drop `.set_proxy(None)` —
@@ -863,17 +878,25 @@ pub fn test_proxy_connectivity(
     provider_code: &str,
     bearer_override: Option<&str>,
     base_url_override: Option<&str>,
+    oauth_account_id: Option<&str>,
 ) -> ProxyProbeResult {
     use std::time::{Duration, Instant};
+
+    debug_assert!(
+        !(bearer_override.is_some() && oauth_account_id.is_some()),
+        "test_proxy_connectivity: bearer_override and oauth_account_id are mutually exclusive — caller bug"
+    );
 
     // Proxy strips the provider prefix and forwards to the real provider.
     // The proxy's upstream base_url never ends with /v1, so use full /v1/... paths.
     let proxy_base = format!("http://{}/{}", proxy_addr, provider_code);
     let proxy_url = format!("{}{}", proxy_base, probe_suffix(provider_code, &proxy_base));
 
-    // Token form differs by mode (see fn docstring).
-    let (bearer, extra_headers) = match bearer_override {
-        Some(raw) => {
+    // Token form differs by mode (see fn docstring). Mode precedence in case
+    // a caller bug passes both: probe_raw wins (release-mode defense — the
+    // header bearer is safer than implicitly trusting vault state).
+    let (bearer, extra_headers) = match (bearer_override, oauth_account_id) {
+        (Some(raw), _) => {
             // Mode 2 — probe_raw. Token suffix is canonical provider code.
             // Plaintext key rides in X-Aikey-Probe-Bearer (NOT Authorization);
             // proxy reads the header to use as upstream credential.
@@ -886,7 +909,13 @@ pub fn test_proxy_connectivity(
             }
             (format!("aikey_probe_raw_{}", provider_code), headers)
         }
-        None => {
+        (None, Some(account_id)) => {
+            // Mode 3 — OAuth account probe (Tier2Probe). Proxy resolves the
+            // account_id via broker; no plaintext bearer needed (broker holds
+            // the refreshed OAuth token). No extra headers.
+            (format!("aikey_probe_{}", account_id), Vec::new())
+        }
+        (None, None) => {
             // Mode 1 — active sentinel (legacy / post-save). No extra headers.
             // _active_cfg read kept for compatibility — call site relied on it
             // historically as a vault-presence probe; preserved for byte-equivalent
@@ -1472,6 +1501,7 @@ pub fn run_connectivity_suite(
                     p,
                     opts.probe_raw_bearer.as_deref(),
                     opts.probe_raw_base_url.as_deref(),
+                    opts.probe_oauth_account_id.as_deref(),
                 );
                 json_results.push(serde_json::json!({
                     "provider":   "proxy",
@@ -1875,6 +1905,7 @@ pub fn run_connectivity_suite(
                 // (animate_blinking_while runs the worker fn on a worker thread).
                 let probe_bearer_owned = opts.probe_raw_bearer.clone();
                 let probe_base_url_owned = opts.probe_raw_base_url.clone();
+                let probe_oauth_owned = opts.probe_oauth_account_id.clone();
                 let format_proxy_cell = |_col: usize, r: &ProxyProbeResult| -> String {
                     // 2026-05-26 — use proxy_probe_full_hint so probe_raw
                     // error_codes (PROXY_TOO_OLD_NO_PROBE_RAW etc) surface
@@ -1901,6 +1932,7 @@ pub fn run_connectivity_suite(
                         &prov_owned,
                         probe_bearer_owned.as_deref(),
                         probe_base_url_owned.as_deref(),
+                        probe_oauth_owned.as_deref(),
                     );
                     let _ = tx.send((0, AnimEvent::Finished(r.clone())));
                     r
@@ -2483,7 +2515,7 @@ mod probe_raw_request_shape_tests {
         let (addr, captured) = capture_one_request();
 
         // Run probe in None mode (mirrors all 5 post-save call sites).
-        let _ = test_proxy_connectivity(&addr, "anthropic", None, None);
+        let _ = test_proxy_connectivity(&addr, "anthropic", None, None, None);
 
         let req = wait_for_capture(&captured);
 
@@ -2526,7 +2558,7 @@ mod probe_raw_request_shape_tests {
     fn none_mode_openai_emits_authorization_bearer_active() {
         let (addr, captured) = capture_one_request();
 
-        let _ = test_proxy_connectivity(&addr, "openai", None, None);
+        let _ = test_proxy_connectivity(&addr, "openai", None, None, None);
 
         let req = wait_for_capture(&captured);
 
@@ -2552,7 +2584,7 @@ mod probe_raw_request_shape_tests {
         let plaintext_key = "sk-ant-PRE-SAVE-PROBE-KEY";
 
         // Mirrors `aikey add` / `vault-op test_raw` call site after Phase 2.B/C.
-        let _ = test_proxy_connectivity(&addr, "anthropic", Some(plaintext_key), None);
+        let _ = test_proxy_connectivity(&addr, "anthropic", Some(plaintext_key), None, None);
 
         let req = wait_for_capture(&captured);
 
@@ -2588,7 +2620,13 @@ mod probe_raw_request_shape_tests {
         let plaintext_key = "sk-test";
         let custom_base = "https://my-enterprise-gateway.example.com/v1";
 
-        let _ = test_proxy_connectivity(&addr, "anthropic", Some(plaintext_key), Some(custom_base));
+        let _ = test_proxy_connectivity(
+            &addr,
+            "anthropic",
+            Some(plaintext_key),
+            Some(custom_base),
+            None,
+        );
 
         let req = wait_for_capture(&captured);
 
@@ -2605,7 +2643,7 @@ mod probe_raw_request_shape_tests {
         // (would confuse proxy's empty-vs-missing check). vault_op.rs::handle_test_raw
         // pre-filters this with `if .is_empty() { None }` but defense-in-depth.
         let (addr, captured) = capture_one_request();
-        let _ = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), Some(""));
+        let _ = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), Some(""), None);
 
         let req = wait_for_capture(&captured);
         assert!(
@@ -2622,7 +2660,7 @@ mod probe_raw_request_shape_tests {
         // distinguish "valid key + endpoint happy (200)" from "key rejected
         // (401)". Allowlisted on proxy side (probe_raw.go::outboundHeaderAllowlist).
         let (addr, captured) = capture_one_request();
-        let _ = test_proxy_connectivity(&addr, "anthropic", Some("sk-ant-test"), None);
+        let _ = test_proxy_connectivity(&addr, "anthropic", Some("sk-ant-test"), None, None);
         let req = wait_for_capture(&captured);
         assert_eq!(
             req.header_value("anthropic-version").as_deref(),
@@ -2637,7 +2675,7 @@ mod probe_raw_request_shape_tests {
         // existing chat probe path runtime.rs:640). post-save active sentinel
         // mode also benefits — but we mainly care that no regression here.
         let (addr, captured) = capture_one_request();
-        let _ = test_proxy_connectivity(&addr, "anthropic", None, None);
+        let _ = test_proxy_connectivity(&addr, "anthropic", None, None, None);
         let req = wait_for_capture(&captured);
         assert_eq!(
             req.header_value("anthropic-version").as_deref(),
@@ -2650,7 +2688,7 @@ mod probe_raw_request_shape_tests {
         // openai etc shouldn't receive an Anthropic-specific header — would
         // be ignored but pollutes the wire. Pin per-provider exclusivity.
         let (addr, captured) = capture_one_request();
-        let _ = test_proxy_connectivity(&addr, "openai", Some("sk-test"), None);
+        let _ = test_proxy_connectivity(&addr, "openai", Some("sk-test"), None, None);
         let req = wait_for_capture(&captured);
         assert!(
             !req.has_header("anthropic-version"),
@@ -2661,7 +2699,7 @@ mod probe_raw_request_shape_tests {
     #[test]
     fn some_mode_openai_provider_emits_authorization_bearer_probe_raw() {
         let (addr, captured) = capture_one_request();
-        let _ = test_proxy_connectivity(&addr, "openai", Some("sk-openai-test"), None);
+        let _ = test_proxy_connectivity(&addr, "openai", Some("sk-openai-test"), None, None);
 
         let req = wait_for_capture(&captured);
 
@@ -2753,7 +2791,7 @@ mod probe_raw_error_classification_tests {
             r#"{"error":{"code":"TOKEN_INVALID","message":"unknown token form","type":"authentication_error"}}"#,
         );
 
-        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-pre-save"), None);
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-pre-save"), None, None);
 
         assert_eq!(
             r.error_code.as_deref(),
@@ -2795,7 +2833,7 @@ mod probe_raw_error_classification_tests {
             r#"{"error":{"code":"PROBE_RAW_DISABLED","message":"flag off","type":"server_error"}}"#,
         );
 
-        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None, None);
 
         assert_eq!(
             r.error_code.as_deref(),
@@ -2816,7 +2854,7 @@ mod probe_raw_error_classification_tests {
             r#"{"error":{"code":"PROBE_HEADER_REQUIRED","message":"missing X-Aikey-Probe","type":"authentication_error"}}"#,
         );
 
-        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None, None);
 
         assert_eq!(r.error_code.as_deref(), Some("PROBE_HEADER_REQUIRED"),);
         let hint = proxy_probe_full_hint(&r);
@@ -2841,7 +2879,7 @@ mod probe_raw_error_classification_tests {
             r#"{"error":{"code":"TOKEN_INVALID","message":"x","type":"y"}}"#,
         );
 
-        let r = test_proxy_connectivity(&addr, "anthropic", None, None);
+        let r = test_proxy_connectivity(&addr, "anthropic", None, None, None);
 
         assert_eq!(
             r.error_code, None,
@@ -2861,7 +2899,7 @@ mod probe_raw_error_classification_tests {
             r#"{"error":{"code":"PROBE_FUTURE_ERROR","message":"x","type":"y"}}"#,
         );
 
-        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None, None);
 
         assert_eq!(r.error_code.as_deref(), Some("PROBE_FUTURE_ERROR"));
     }
@@ -2877,7 +2915,7 @@ mod probe_raw_error_classification_tests {
             r#"{"error":{"code":"VAULT_ERROR","message":"x","type":"server_error"}}"#,
         );
 
-        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None, None);
 
         assert_eq!(
             r.error_code, None,
@@ -2921,7 +2959,7 @@ mod probe_raw_error_classification_tests {
             r#"{"probe_ok":true,"upstream_status":401,"latency_ms":150,"provider":"anthropic","status_hint":"routing ok, key rejected by upstream"}"#,
         );
 
-        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-ant-fake"), None);
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-ant-fake"), None, None);
 
         // Outer was 200 but client surfaces upstream (401) so caller sees real verdict.
         assert_eq!(
@@ -2942,7 +2980,7 @@ mod probe_raw_error_classification_tests {
             r#"{"probe_ok":true,"upstream_status":200,"latency_ms":420,"provider":"anthropic","status_hint":"routing ok, key valid"}"#,
         );
 
-        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-ant-valid"), None);
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-ant-valid"), None, None);
 
         assert_eq!(
             r.status,
@@ -2957,7 +2995,7 @@ mod probe_raw_error_classification_tests {
         // Defense: proxy returns 200 but body parse fails / field missing.
         // Client must not panic; fall back to outer status so caller sees ok signal.
         let addr = mock_proxy_returning(200, r#"{}"#);
-        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None);
+        let r = test_proxy_connectivity(&addr, "anthropic", Some("sk-test"), None, None);
         assert_eq!(
             r.status,
             Some(200),
@@ -2977,7 +3015,7 @@ mod probe_raw_error_classification_tests {
         );
 
         // Notice: bearer_override is None here.
-        let r = test_proxy_connectivity(&addr, "anthropic", None, None);
+        let r = test_proxy_connectivity(&addr, "anthropic", None, None, None);
 
         assert_eq!(
             r.status,

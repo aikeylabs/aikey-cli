@@ -1237,6 +1237,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 show_key_column: false,
                 probe_raw_bearer: None,
                 probe_raw_base_url: None,
+                probe_oauth_account_id: None,
             },
             json_mode,
         );

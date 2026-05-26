@@ -365,6 +365,21 @@ pub struct SuiteOptions {
     /// Forwarded only when `probe_raw_bearer` is `Some` (no effect on the
     /// legacy active-sentinel path).
     pub probe_raw_base_url: Option<String>,
+    /// 2026-05-26 (Option β follow-up for OAuth pre-save in web Add Key modal):
+    /// when `Some(account_id)`, the proxy row probe sends
+    /// `Authorization: Bearer aikey_probe_<account_id>` (Tier2Probe). Proxy
+    /// resolves the OAuth account via broker (EnsureFresh + ResolveCredential)
+    /// and forwards using the refreshed access_token. Tests the SPECIFIC OAuth
+    /// account rather than whichever binding happens to be active.
+    ///
+    /// Mutually exclusive with `probe_raw_bearer` — set ONE or NEITHER.
+    /// `None` falls back to legacy `aikey_active_<provider>` sentinel.
+    ///
+    /// Used by `_internal vault-op test` when target=="oauth" (web OAuth Add
+    /// Key Test connectivity button). Other post-save callers keep `None`
+    /// because they're either testing a non-OAuth credential or want the
+    /// active-binding semantic (e.g. `aikey test <alias>`).
+    pub probe_oauth_account_id: Option<String>,
 }
 
 /// Aggregate outcome of one suite run.
