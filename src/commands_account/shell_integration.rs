@@ -2116,17 +2116,33 @@ pub fn wire_rc_with_consent() -> Result<(), HookFailureReason> {
     {
         return Err(HookFailureReason::AikeyNoHook);
     }
-    let home = std::env::var("HOME").map_err(|_| HookFailureReason::HomeUnset)?;
+    // BR-rc.5-77 fix (2026-05-26): use resolve_user_home() rather than HOME
+    // env var. On Windows PowerShell, HOME is typically unset (only
+    // USERPROFILE) so the bare env::var would always fail with HomeUnset.
+    // resolve_user_home handles HOME → USERPROFILE → dirs::home_dir fallback.
+    let home_path = resolve_user_home();
+    let home = home_path
+        .to_str()
+        .ok_or(HookFailureReason::HomeUnset)?
+        .to_string();
     if home.is_empty() {
         return Err(HookFailureReason::HomeUnset);
     }
 
-    // Detect shell. PowerShell / fish / sh / unknown → ShellUndetectable.
-    // The front-end shows a `shell_undetectable` banner pointing at
-    // `aikey hook install --shell zsh` so the user can pick explicitly.
     let kind = match shell_kind() {
         ShellKind::Zsh => HookKind::Zsh,
         ShellKind::Bash => HookKind::Bash,
+        // BR-rc.5-77 fix (2026-05-26): PowerShell now routes to the sibling
+        // shell_integration_windows module instead of returning
+        // ShellUndetectable. The Web modal "Allow" click is the consent gate
+        // (matches the TTY consent for bash/zsh), so we bypass
+        // ensure_powershell_hook's interactive-TTY guard and inline the L1+L2
+        // writes directly. Pre-fix every Windows Web hook install returned
+        // shell_undetectable even though hook.ps1 / $PROFILE wiring was
+        // already implemented in the sibling module.
+        ShellKind::PowerShell => {
+            return wire_powershell_rc_no_tty(&home);
+        }
         _ => return Err(HookFailureReason::ShellUndetectable),
     };
 
@@ -2137,6 +2153,66 @@ pub fn wire_rc_with_consent() -> Result<(), HookFailureReason> {
     // because the JSON envelope's fields (file_installed / rc_wired /
     // failure_reason) are recomputed by callers from FS state.
     write_v3_layers_with_consent(&home, kind).map(|_| ())
+}
+
+/// BR-rc.5-77: PowerShell-side equivalent of `write_v3_layers_with_consent`
+/// for Web-modal callers. Writes hook.ps1 (Layer 1) + injects v3 marker
+/// block into the first existing PowerShell $PROFILE candidate (Layer 2).
+/// Skips the TTY check that `ensure_powershell_hook` has — Web modal
+/// "Allow" IS the consent gate.
+fn wire_powershell_rc_no_tty(home: &str) -> Result<(), HookFailureReason> {
+    // L1: hook.ps1 — write or refresh
+    write_hook_file(home, HookKind::PowerShell).map_err(|_| HookFailureReason::IoError)?;
+    cleanup_legacy_hook_files(home);
+
+    let v3_block = super::shell_integration_windows::v3_rc_block_powershell();
+    let candidates = super::shell_integration_windows::powershell_profile_candidates();
+
+    // L2: look for existing marker in any candidate, idempotent rewrite.
+    for profile in &candidates {
+        if let Ok(contents) = std::fs::read_to_string(profile) {
+            if contents.contains(V3_BEGIN) {
+                if let Some(updated) =
+                    replace_between_markers(&contents, V3_BEGIN, V3_END, &v3_block)
+                {
+                    if updated != contents {
+                        std::fs::write(profile, updated)
+                            .map_err(|_| HookFailureReason::IoError)?;
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    // L2 fresh install: pick the candidate whose parent dir exists so we
+    // write to the PowerShell version the user actually has installed
+    // (mirrors ensure_powershell_hook line 217+ logic — PS 5.1-only users
+    // would otherwise get a hook in pwsh 7+'s profile path their sessions
+    // never source).
+    let target = candidates
+        .iter()
+        .find(|p| p.parent().map(|d| d.exists()).unwrap_or(false))
+        .or_else(|| candidates.first())
+        .ok_or(HookFailureReason::IoError)?;
+
+    // mkdir -p the parent in case it doesn't exist
+    if let Some(parent) = target.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent).map_err(|_| HookFailureReason::IoError)?;
+        }
+    }
+
+    let existing = std::fs::read_to_string(target).unwrap_or_default();
+    let new_contents = if existing.is_empty() {
+        format!("{}\n", v3_block)
+    } else if existing.ends_with('\n') {
+        format!("{}{}\n", existing, v3_block)
+    } else {
+        format!("{}\n{}\n", existing, v3_block)
+    };
+    std::fs::write(target, new_contents).map_err(|_| HookFailureReason::IoError)?;
+    Ok(())
 }
 
 /// Whether the user's shell rc file (for their current `$SHELL`) contains
