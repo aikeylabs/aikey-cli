@@ -2683,6 +2683,136 @@ mod probe_raw_request_shape_tests {
         );
     }
 
+    // ───── 2026-05-26 Option β follow-up — OAuth Tier2Probe mode ─────
+    //
+    // Pin spec: when oauth_account_id is Some(id), token must be
+    // `aikey_probe_<id>` (NOT aikey_probe_raw_<provider>, NOT
+    // aikey_active_<provider>). Proxy's existing OAuth Tier2Probe path
+    // (proxy.go::handlePathPrefixRoute Tier2Probe branch) handles broker
+    // resolve. No probe_raw headers (X-Aikey-Probe-Bearer / -BaseURL).
+    // Fixes user complaint: OAuth Add Key modal Test connectivity still
+    // showed "skipped" + UI hard-coded fallback after Phase 2.E.
+
+    #[test]
+    fn oauth_mode_emits_aikey_probe_account_id_token() {
+        let (addr, captured) = capture_one_request();
+        let account_id = "session_abc123def456";
+
+        let _ = test_proxy_connectivity(
+            &addr, "anthropic", None, None, Some(account_id),
+        );
+        let req = wait_for_capture(&captured);
+
+        // Anthropic uses x-api-key.
+        let key = req.header_value("x-api-key").expect("x-api-key missing");
+        assert_eq!(
+            key,
+            format!("aikey_probe_{}", account_id),
+            "OAuth mode must emit aikey_probe_<account_id>, got: {}",
+            key
+        );
+
+        // X-Aikey-Probe: 1 still present (suppresses reporter on proxy side).
+        assert_eq!(req.header_value("X-Aikey-Probe").as_deref(), Some("1"));
+
+        // CRITICAL: probe_raw headers MUST NOT leak in OAuth mode (no plaintext
+        // key in this flow; broker holds the OAuth token).
+        assert!(
+            !req.has_header("X-Aikey-Probe-Bearer"),
+            "X-Aikey-Probe-Bearer leaked into OAuth-mode request — security regression"
+        );
+        assert!(
+            !req.has_header("X-Aikey-Probe-BaseURL"),
+            "X-Aikey-Probe-BaseURL leaked into OAuth-mode request"
+        );
+    }
+
+    #[test]
+    fn oauth_mode_openai_emits_authorization_bearer_probe_account_id() {
+        let (addr, captured) = capture_one_request();
+        let account_id = "session_openai_xyz";
+
+        let _ = test_proxy_connectivity(
+            &addr, "openai", None, None, Some(account_id),
+        );
+        let req = wait_for_capture(&captured);
+
+        let auth = req
+            .header_value("Authorization")
+            .expect("Authorization missing");
+        assert_eq!(
+            auth,
+            format!("Bearer aikey_probe_{}", account_id),
+            "OAuth mode openai: must emit Bearer aikey_probe_<account_id>, got: {}",
+            auth
+        );
+    }
+
+    // Critical 3-mode regression locks: each mode emits exactly its token
+    // form and no leaks from sibling modes.
+
+    #[test]
+    fn none_mode_does_not_leak_probe_account_id_header() {
+        // Regression lock: None / None / None mode (the 5 post-save callers
+        // including `aikey test <alias>` / `aikey test --all`) must NOT
+        // emit aikey_probe_* anywhere.
+        let (addr, captured) = capture_one_request();
+        let _ = test_proxy_connectivity(&addr, "anthropic", None, None, None);
+        let req = wait_for_capture(&captured);
+
+        let key = req.header_value("x-api-key").unwrap_or_default();
+        assert!(
+            key.starts_with("aikey_active_"),
+            "None mode must emit aikey_active_*, got: {}",
+            key
+        );
+        assert!(!key.starts_with("aikey_probe_"));
+    }
+
+    #[test]
+    fn probe_raw_mode_token_distinct_from_oauth_probe_form() {
+        // Regression lock: probe_raw (aikey add / Web Add Key API key) and
+        // OAuth probe (Web Add Key OAuth) emit DIFFERENT token forms despite
+        // both being Tier2 family. probe_raw_<provider> vs probe_<account_id>.
+        let (addr, captured) = capture_one_request();
+        let _ = test_proxy_connectivity(
+            &addr, "anthropic", Some("sk-ant-test"), None, None,
+        );
+        let req = wait_for_capture(&captured);
+
+        let key = req.header_value("x-api-key").unwrap_or_default();
+        assert!(
+            key.starts_with("aikey_probe_raw_"),
+            "probe_raw mode must emit aikey_probe_raw_*, got: {}",
+            key
+        );
+        assert!(
+            key.contains("_raw_"),
+            "probe_raw mode token MUST contain _raw_ infix to distinguish from Tier2Probe OAuth form, got: {}",
+            key
+        );
+    }
+
+    // Mode priority: when caller buggy-passes BOTH probe_raw_bearer AND
+    // oauth_account_id, probe_raw wins (release-mode defense documented
+    // in fn docstring). debug_assert catches the bug in dev builds; this
+    // test exercises release semantics (release builds skip debug_assert).
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn mutual_exclusion_release_falls_back_to_probe_raw() {
+        let (addr, captured) = capture_one_request();
+        let _ = test_proxy_connectivity(
+            &addr, "anthropic", Some("sk-ant-bug"), None, Some("session_should_be_ignored"),
+        );
+        let req = wait_for_capture(&captured);
+        let key = req.header_value("x-api-key").unwrap_or_default();
+        assert!(
+            key.starts_with("aikey_probe_raw_"),
+            "when caller passes both bearer_override AND oauth_account_id, probe_raw mode wins (header bearer is safer than implicit vault state). Got: {}",
+            key
+        );
+    }
+
     #[test]
     fn probe_raw_non_anthropic_provider_does_not_send_anthropic_version() {
         // openai etc shouldn't receive an Anthropic-specific header — would

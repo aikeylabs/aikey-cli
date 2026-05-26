@@ -1362,19 +1362,34 @@ fn handle_test(env: StdinEnvelope) {
         return;
     }
 
-    // Run the suite in JSON mode so json_results is populated for the
-    // popup's per-provider breakdown. No interactive output — the second
-    // arg to run_connectivity_suite controls that.
+    // 2026-05-26 Option β follow-up (user-reported "OAuth Add Key Test
+    // still shows skipped"): only the OAuth Web-modal Test path needs the
+    // proxy row. Other targets (personal / team) keep show_proxy_row=false
+    // — that's the long-standing single-cred post-save convention shared
+    // with `aikey test <alias>` (CLI single-alias mode, main.rs:2167).
+    //
+    // For OAuth specifically:
+    //   - show_proxy_row=true (so the row appears)
+    //   - probe_oauth_account_id=Some(payload.id) (sends `aikey_probe_<id>`
+    //     Tier2Probe so proxy resolves the SPECIFIC account via broker
+    //     EnsureFresh + ResolveCredential, NOT aikey_active_<provider>
+    //     which would resolve to whichever binding is currently active —
+    //     web OAuth add doesn't propagate lifecycle, so the just-added
+    //     account is unlikely to be active yet, Phase A.1 deferred)
+    let is_oauth = payload.target == "oauth";
     let opts = crate::commands_project::SuiteOptions {
-        show_proxy_row: false,
+        show_proxy_row: is_oauth,
         header_label: None,
         password: None,
         proxy_port,
         show_key_column: false,
-        // None — `_internal vault-op test` (post-save by alias) is single-cred
-        // post-save semantics, mirrors `aikey test <alias>` (proxy row off).
         probe_raw_bearer: None,
         probe_raw_base_url: None,
+        probe_oauth_account_id: if is_oauth {
+            Some(payload.id.clone())
+        } else {
+            None
+        },
     };
     let outcome =
         crate::commands_project::run_connectivity_suite(targets, opts, /*json_mode*/ true);
@@ -1565,6 +1580,10 @@ fn handle_test_raw(env: StdinEnvelope) {
         } else {
             Some(payload.base_url.trim().to_string())
         },
+        // test_raw is pre-save API key flow. OAuth never goes through here
+        // (its broker.Save already wrote the row → goes through handle_test
+        // by id, which uses probe_oauth_account_id). Always None here.
+        probe_oauth_account_id: None,
     };
     let outcome =
         crate::commands_project::run_connectivity_suite(targets, opts, /*json_mode*/ true);
