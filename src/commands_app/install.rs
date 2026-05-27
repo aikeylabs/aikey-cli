@@ -95,12 +95,19 @@ struct TrustedApp {
 /// (BR-rc.5-56 follow-up). When the v2 manifest is republished, this pin
 /// must change in lockstep — see workflow/CI/bugfix/<TODO>.md if this
 /// regression repeats.
+// BR-rc.5-93 (hotfix): URL + SHA updated for v1.0.0-rc.5.1 release. The
+// underlying architectural issue — hardcoded version in TRUSTED_APPS forces
+// rebuild-on-every-patch-release — is tracked for rc.6 (build.rs substitution
+// of env!("AIKEY_RELEASE_TAG") + auto-computed SHA from manifest source).
+// For now, manually bump both fields whenever launch/manifests/*.json or
+// the release tag changes. The pair below must be byte-coherent with
+// what gets uploaded to https://github.com/aikeylabs/launch/releases/<tag>/.
 const TRUSTED_APPS: &[TrustedApp] = &[
     TrustedApp {
         slug: "degrade-detector",
         manifest_url:
-            "https://github.com/aikeylabs/launch/releases/download/v1.0.0-rc.5/degrade-detector.manifest.json",
-        manifest_sha256: "7b96e1b16ba849a1f705d2206f100cd29291924f137dcd01c11214efd31eea09",
+            "https://github.com/aikeylabs/launch/releases/download/v1.0.0-rc.5.1/degrade-detector.manifest.json",
+        manifest_sha256: "ef7e307ae84c2ab6eb128fba425ccc2814cb184840ce6fbf42590f670275d7fa",
     },
 ];
 
