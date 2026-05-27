@@ -99,10 +99,18 @@ pub(super) fn v3_rc_block_powershell() -> String {
     // broadcast (BR-rc.5-89) — the broadcast handles all OTHER shells
     // that aren't PowerShell (cmd.exe, third-party terminals), and the
     // V3 block handles PowerShell specifically. Both layers needed.
+    // BR-rc.5-90 v2: use literal ';' as PATH separator (Windows-specific).
+    // The earlier `[System.IO.Path]::PathSeparator` form trips PS 5.1's
+    // parser inside the `-split` context — it tries to parse the `[type]::`
+    // expression as a type-literal subscript and reports
+    // "Missing closing ')' in expression". $PROFILE.ps1 is Windows-only
+    // (CurrentUserAllHosts resolves to Documents\WindowsPowerShell\... on
+    // Windows; cross-platform PS 7 users use a different config path that
+    // we don't write to from this template). Hardcoding ';' is correct.
     format!(
         "{begin}\n\
          $_aikeyBin = if ($env:USERPROFILE) {{ Join-Path $env:USERPROFILE '.aikey\\bin' }} else {{ Join-Path $env:HOME '.aikey/bin' }}\n\
-         if ((Test-Path $_aikeyBin) -and (($env:Path -split [System.IO.Path]::PathSeparator) -notcontains $_aikeyBin)) {{ $env:Path = \"$_aikeyBin$([System.IO.Path]::PathSeparator)$env:Path\" }}\n\
+         if ((Test-Path $_aikeyBin) -and (($env:Path -split ';') -notcontains $_aikeyBin)) {{ $env:Path = \"$_aikeyBin;$env:Path\" }}\n\
          $_aikeyHookFile = if ($env:USERPROFILE) {{ Join-Path $env:USERPROFILE '.aikey/hook.ps1' }} else {{ Join-Path $env:HOME '.aikey/hook.ps1' }}\n\
          if (Test-Path $_aikeyHookFile) {{ . $_aikeyHookFile }}\n\
          Remove-Variable -Name _aikeyBin,_aikeyHookFile -Scope Local -ErrorAction SilentlyContinue\n\
