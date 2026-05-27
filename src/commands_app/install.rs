@@ -109,13 +109,11 @@ struct TrustedApp {
 //
 // Adding a new first-party app: extend both `SLUGS` in build.rs AND the list
 // below in lockstep.
-const TRUSTED_APPS: &[TrustedApp] = &[
-    TrustedApp {
-        slug: "degrade-detector",
-        manifest_url: env!("AIKEY_MANIFEST_URL_DEGRADE_DETECTOR"),
-        manifest_sha256: env!("AIKEY_MANIFEST_SHA_DEGRADE_DETECTOR"),
-    },
-];
+const TRUSTED_APPS: &[TrustedApp] = &[TrustedApp {
+    slug: "degrade-detector",
+    manifest_url: env!("AIKEY_MANIFEST_URL_DEGRADE_DETECTOR"),
+    manifest_sha256: env!("AIKEY_MANIFEST_SHA_DEGRADE_DETECTOR"),
+}];
 
 // ---------------------------------------------------------------------------
 // Manifest schema.
