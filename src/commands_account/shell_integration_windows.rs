@@ -81,8 +81,32 @@ pub(super) fn v3_rc_block_powershell() -> String {
     // The Test-Path probe is the equivalent of bash's `[[ -f ... ]]` —
     // dot-source only when the hook file actually exists, so a stale
     // marker block never errors on shell start.
+    //
+    // BR-rc.5-90: also ensure .aikey/bin is on $env:Path. We can't rely on
+    // Windows env inheritance because explorer.exe caches the env block at
+    // login time, and WM_SETTINGCHANGE broadcasts don't reliably trigger an
+    // explorer.exe reload on all Windows builds (Server 2019/2022 in
+    // particular). Result: user installs aikey, opens a new PowerShell from
+    // the Start menu, types `aikey` → "term not recognized" even though the
+    // registry HKCU\Environment.Path has been updated correctly. The
+    // user-facing workaround was "log out + log in" or "restart explorer.exe
+    // AND open a brand new PS window" — neither acceptable for a
+    // first-run experience. This block self-heals: every new PowerShell
+    // that loads $PROFILE will check whether .aikey/bin is in $env:Path
+    // and prepend it if missing. No-op if explorer already had it.
+    //
+    // This is in addition to (not replacing) the installer's PATH-update
+    // broadcast (BR-rc.5-89) — the broadcast handles all OTHER shells
+    // that aren't PowerShell (cmd.exe, third-party terminals), and the
+    // V3 block handles PowerShell specifically. Both layers needed.
     format!(
-        "{begin}\n$_aikeyHookFile = if ($env:USERPROFILE) {{ Join-Path $env:USERPROFILE '.aikey/hook.ps1' }} else {{ Join-Path $env:HOME '.aikey/hook.ps1' }}\nif (Test-Path $_aikeyHookFile) {{ . $_aikeyHookFile }}\nRemove-Variable -Name _aikeyHookFile -Scope Local -ErrorAction SilentlyContinue\n{end}\n",
+        "{begin}\n\
+         $_aikeyBin = if ($env:USERPROFILE) {{ Join-Path $env:USERPROFILE '.aikey\\bin' }} else {{ Join-Path $env:HOME '.aikey/bin' }}\n\
+         if ((Test-Path $_aikeyBin) -and (($env:Path -split [System.IO.Path]::PathSeparator) -notcontains $_aikeyBin)) {{ $env:Path = \"$_aikeyBin$([System.IO.Path]::PathSeparator)$env:Path\" }}\n\
+         $_aikeyHookFile = if ($env:USERPROFILE) {{ Join-Path $env:USERPROFILE '.aikey/hook.ps1' }} else {{ Join-Path $env:HOME '.aikey/hook.ps1' }}\n\
+         if (Test-Path $_aikeyHookFile) {{ . $_aikeyHookFile }}\n\
+         Remove-Variable -Name _aikeyBin,_aikeyHookFile -Scope Local -ErrorAction SilentlyContinue\n\
+         {end}\n",
         begin = V3_BEGIN,
         end = V3_END,
     )
