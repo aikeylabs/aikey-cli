@@ -19,9 +19,25 @@
 # Resolve the real aikey.exe binary, bypassing this very wrapper function.
 # Why Get-Command + Application: avoids infinite recursion when a user types
 # `aikey ...` (which would call our function again instead of the binary).
+#
+# BR-rc.5-84: Windows PowerShell 5.1 short-name resolution gap.
+# When a function `aikey` is defined in the current session (which is
+# exactly what THIS hook does), `Get-Command aikey -CommandType
+# Application` returns $null on PS 5.1 even though aikey.exe is on PATH.
+# PS 5.1 resolves the short name against the function table first and
+# the CommandType filter doesn't re-search Application sources. PS 7+
+# doesn't have this gap. Portable workaround: try the platform-specific
+# full name (`aikey.exe`) first to sidestep PS 5.1 shadow, then fall
+# back to bare `aikey` for non-Windows PowerShell 7.
 function global:aikey_resolve_bin {
-    $cmd = Get-Command aikey -CommandType Application -ErrorAction SilentlyContinue |
+    # Try .exe first (Windows; sidesteps PS 5.1 short-name shadow gap)
+    $cmd = Get-Command aikey.exe -CommandType Application -ErrorAction SilentlyContinue |
            Select-Object -First 1
+    # Fallback for macOS / Linux PowerShell 7 (binary has no .exe suffix)
+    if ($null -eq $cmd) {
+        $cmd = Get-Command aikey -CommandType Application -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+    }
     if ($null -eq $cmd) { return $null }
     return $cmd.Source
 }
@@ -379,8 +395,13 @@ if (-not (Get-Command claude -CommandType Function, Alias -ErrorAction SilentlyC
         # Set $env:AIKEY_DISABLE_STATUSLINE_ENSURE=1 to opt out.
         try { & aikey statusline ensure *> $null } catch {}
         aikey_clear_before_tui_handoff
-        $real = (Get-Command claude -CommandType Application -ErrorAction SilentlyContinue |
+        # BR-rc.5-84: try claude.exe first (PS 5.1 short-name shadow gap), fallback to bare claude (PS 7 non-Windows)
+        $real = (Get-Command claude.exe -CommandType Application -ErrorAction SilentlyContinue |
                  Select-Object -First 1).Source
+        if (-not $real) {
+            $real = (Get-Command claude -CommandType Application -ErrorAction SilentlyContinue |
+                     Select-Object -First 1).Source
+        }
         if ($null -eq $real) {
             Write-Error "claude binary not found on PATH"
             return
@@ -397,8 +418,13 @@ if (-not (Get-Command codex -CommandType Function, Alias -ErrorAction SilentlyCo
         $rc = aikey_preflight -Provider 'openai'
         if ($rc -ne 0) { return }
         aikey_clear_before_tui_handoff
-        $real = (Get-Command codex -CommandType Application -ErrorAction SilentlyContinue |
+        # BR-rc.5-84: try codex.exe first (PS 5.1 short-name shadow gap), fallback to bare codex (PS 7 non-Windows)
+        $real = (Get-Command codex.exe -CommandType Application -ErrorAction SilentlyContinue |
                  Select-Object -First 1).Source
+        if (-not $real) {
+            $real = (Get-Command codex -CommandType Application -ErrorAction SilentlyContinue |
+                     Select-Object -First 1).Source
+        }
         if ($null -eq $real) {
             Write-Error "codex binary not found on PATH"
             return
@@ -433,8 +459,13 @@ if (-not (Get-Command kimi -CommandType Function, Alias -ErrorAction SilentlyCon
             & cmd.exe /c "`"$bin`" proxy ensure-running < NUL > NUL 2>&1"
         }
         aikey_clear_before_tui_handoff
-        $real = (Get-Command kimi -CommandType Application -ErrorAction SilentlyContinue |
+        # BR-rc.5-84: try kimi.exe first (PS 5.1 short-name shadow gap), fallback to bare kimi (PS 7 non-Windows)
+        $real = (Get-Command kimi.exe -CommandType Application -ErrorAction SilentlyContinue |
                  Select-Object -First 1).Source
+        if (-not $real) {
+            $real = (Get-Command kimi -CommandType Application -ErrorAction SilentlyContinue |
+                     Select-Object -First 1).Source
+        }
         if ($null -eq $real) {
             Write-Error "kimi binary not found on PATH"
             return

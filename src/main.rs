@@ -4640,6 +4640,36 @@ pub(crate) fn prompt_vault_password(
     password_stdin: bool,
     json_mode: bool,
 ) -> io::Result<SecretString> {
+    // BR-rc.5-87: honor AIKEY_MASTER_PASSWORD env var for non-interactive
+    // automation paths (installer post-install proxy bootstrap, CI, fleet
+    // scripts). The contract is already documented in
+    // commands_proxy.rs:281 ("AIKEY_MASTER_PASSWORD / AK_TEST_PASSWORD env
+    // var → silent start"), but was only honored in the auto-start helper
+    // (`try_auto_start_from_env`), not in the user-facing
+    // `aikey proxy start` command path. Result: workflow installer's
+    // BR-rc.5-85 bootstrap set the env var but the spawned `aikey proxy
+    // start` still prompted for stdin, hung, and the install timed out
+    // with a misleading NativeCommandError.
+    //
+    // Both env vars get the same treatment here: skip cache, skip prompt,
+    // return the env value directly. Caller still verifies the password
+    // against the vault before using it (e.g., main.rs:3611 calls
+    // `executor::list_secrets(&password)`), so a wrong env value fails
+    // loudly with "vault authentication failed", not silently.
+    //
+    // High-sensitivity commands (add, delete, change-password, ...) use
+    // `prompt_vault_password_fresh` directly, NOT this function — they
+    // still always prompt, even if env is set.
+    if !password_stdin {
+        for envvar in &["AIKEY_MASTER_PASSWORD", "AK_TEST_PASSWORD"] {
+            if let Ok(pw) = std::env::var(envvar) {
+                if !pw.is_empty() {
+                    return Ok(SecretString::new(pw));
+                }
+            }
+        }
+    }
+
     // Skip cache when reading from stdin or in automated test mode.
     if !password_stdin && std::env::var("AK_TEST_PASSWORD").is_err() {
         if let Some(cached) = session::try_get() {
