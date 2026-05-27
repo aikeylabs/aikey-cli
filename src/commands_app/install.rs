@@ -95,19 +95,25 @@ struct TrustedApp {
 /// (BR-rc.5-56 follow-up). When the v2 manifest is republished, this pin
 /// must change in lockstep — see workflow/CI/bugfix/<TODO>.md if this
 /// regression repeats.
-// BR-rc.5-93 (hotfix): URL + SHA updated for v1.0.0-rc.5.1 release. The
-// underlying architectural issue — hardcoded version in TRUSTED_APPS forces
-// rebuild-on-every-patch-release — is tracked for rc.6 (build.rs substitution
-// of env!("AIKEY_RELEASE_TAG") + auto-computed SHA from manifest source).
-// For now, manually bump both fields whenever launch/manifests/*.json or
-// the release tag changes. The pair below must be byte-coherent with
-// what gets uploaded to https://github.com/aikeylabs/launch/releases/<tag>/.
+// BR-rc.5-93 方案 A: TRUSTED_APPS manifest URL + SHA are auto-injected at
+// build time by build.rs from launch/manifests/<slug>.manifest.json.
+// build.rs:
+//   1. Reads source manifest (with __RELEASE_TAG__ placeholder)
+//   2. Substitutes placeholder → current release tag (AIKEY_BUILD_VERSION or
+//      Cargo.toml CARGO_PKG_VERSION fallback, "v"-prefixed)
+//   3. Computes SHA-256 of substituted bytes
+//   4. Emits AIKEY_MANIFEST_URL_<SLUG> and AIKEY_MANIFEST_SHA_<SLUG> as
+//      compile-time env vars (consumed here via env!())
+// release.sh performs the SAME substitution at staging time so the manifest
+// uploaded to GitHub matches the SHA pinned in this binary byte-for-byte.
+//
+// Adding a new first-party app: extend both `SLUGS` in build.rs AND the list
+// below in lockstep.
 const TRUSTED_APPS: &[TrustedApp] = &[
     TrustedApp {
         slug: "degrade-detector",
-        manifest_url:
-            "https://github.com/aikeylabs/launch/releases/download/v1.0.0-rc.5.1/degrade-detector.manifest.json",
-        manifest_sha256: "ef7e307ae84c2ab6eb128fba425ccc2814cb184840ce6fbf42590f670275d7fa",
+        manifest_url: env!("AIKEY_MANIFEST_URL_DEGRADE_DETECTOR"),
+        manifest_sha256: env!("AIKEY_MANIFEST_SHA_DEGRADE_DETECTOR"),
     },
 ];
 

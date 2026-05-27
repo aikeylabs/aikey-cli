@@ -92,6 +92,81 @@ fn main() {
     println!("cargo:rustc-env=AIKEY_BUILD_REVISION={}", revision);
     println!("cargo:rustc-env=AIKEY_BUILD_ID={}", build_id);
     println!("cargo:rustc-env=AIKEY_BUILD_TIME={}", build_time);
+
+    // === BR-rc.5-93 方案 A: per-release TRUSTED_APPS manifest URL+SHA injection ===
+    //
+    // Avoid the chicken-and-egg of having to manually update install.rs's
+    // TRUSTED_APPS (manifest_url + manifest_sha256) on every patch release.
+    // Source manifest at launch/manifests/<slug>.manifest.json contains the
+    // __RELEASE_TAG__ placeholder; this build step:
+    //   1. Reads the source manifest
+    //   2. Substitutes __RELEASE_TAG__ → "v" + (AIKEY_BUILD_VERSION or CARGO_PKG_VERSION fallback)
+    //   3. Computes SHA-256 of the substituted bytes
+    //   4. Emits AIKEY_MANIFEST_URL_<SLUG> and AIKEY_MANIFEST_SHA_<SLUG> as
+    //      compile-time env vars consumed by install.rs::TRUSTED_APPS via env!()
+    //
+    // release.sh performs the SAME substitution at staging time to produce
+    // the byte-identical manifest that gets uploaded to GitHub releases.
+    // Both substitutions must agree; the placeholder is the contract.
+    //
+    // If launch/manifests/<slug>.manifest.json is missing (e.g., aikey-cli
+    // cloned without sibling launch repo), the build emits a sentinel value
+    // ("MISSING") which will cause install to refuse the app at runtime
+    // with a clear error — better than silently shipping a broken binary.
+    inject_manifest_env_vars(&version_for_url());
+}
+
+/// Returns the version string to use in TRUSTED_APPS manifest URL — always
+/// prefixed with "v" to match GitHub release tag convention.
+fn version_for_url() -> String {
+    let bare = std::env::var("AIKEY_BUILD_VERSION")
+        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
+    format!("v{}", bare)
+}
+
+/// BR-rc.5-93 方案 A helper. Hardcoded slug list parallel to install.rs::TRUSTED_APPS;
+/// extend together when adding a new first-party app.
+fn inject_manifest_env_vars(release_tag: &str) {
+    use sha2::{Digest, Sha256};
+
+    const SLUGS: &[&str] = &["degrade-detector"];
+    // Sibling repo layout: aikeylabs/aikey-cli + aikeylabs/launch
+    const MANIFESTS_DIR: &str = "../launch/manifests";
+
+    for slug in SLUGS {
+        let env_suffix = slug.to_uppercase().replace('-', "_");
+        let manifest_path = format!("{}/{}.manifest.json", MANIFESTS_DIR, slug);
+        println!("cargo:rerun-if-changed={}", manifest_path);
+
+        match std::fs::read_to_string(&manifest_path) {
+            Ok(src) => {
+                let substituted = src.replace("__RELEASE_TAG__", release_tag);
+                let sha = format!("{:x}", Sha256::digest(substituted.as_bytes()));
+                let url = format!(
+                    "https://github.com/aikeylabs/launch/releases/download/{}/{}.manifest.json",
+                    release_tag, slug
+                );
+                println!("cargo:rustc-env=AIKEY_MANIFEST_URL_{}={}", env_suffix, url);
+                println!("cargo:rustc-env=AIKEY_MANIFEST_SHA_{}={}", env_suffix, sha);
+            }
+            Err(e) => {
+                // Sibling launch repo missing — emit sentinels that will refuse install at runtime.
+                let url = format!(
+                    "https://github.com/aikeylabs/launch/releases/download/{}/{}.manifest.json",
+                    release_tag, slug
+                );
+                println!("cargo:rustc-env=AIKEY_MANIFEST_URL_{}={}", env_suffix, url);
+                println!(
+                    "cargo:rustc-env=AIKEY_MANIFEST_SHA_{}=MISSING_MANIFEST_AT_BUILD_TIME",
+                    env_suffix
+                );
+                println!(
+                    "cargo:warning=BR-rc.5-93: {} not found ({}); '{}' app install will refuse at runtime. Clone sibling 'launch' repo to build a working binary.",
+                    manifest_path, e, slug
+                );
+            }
+        }
+    }
 }
 
 fn git(args: &[&str]) -> Option<String> {

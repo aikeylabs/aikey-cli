@@ -180,6 +180,15 @@ windows-sys = { version = "0.52", features = [
                                # (lib.rs prompt_hidden / ui_select.rs raw input / ui_frame.rs term_width — Stage 1 windows-compat)
 ] }
 
+[build-dependencies]
+# BR-rc.5-93 方案 A: build.rs reads launch/manifests/*.json, substitutes
+# the __RELEASE_TAG__ placeholder with the actual release tag, computes
+# SHA-256 of the substituted content, and injects URL + SHA as compile-time
+# env vars consumed by install.rs's TRUSTED_APPS. This means every patch
+# release auto-syncs trust-anchor without manual install.rs bumps.
+sha2 = "0.10"
+hex = "0.4"
+
 [dev-dependencies]
 assert_cmd = "2.0"      # Test CLI applications
 predicates = "3.0"      # Assertions for command output
