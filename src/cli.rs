@@ -2341,9 +2341,9 @@ pub(crate) fn print_banner() {
     //     exactly (workflow commit chain b4b3a2a → 6b8b9f6 → follow-up)
     //     so brand looks identical at install time and every `ak` run.
     let _ = aikey_home; // kept reachable for future re-introduction
-    // 2026-05-29 user-requested: drop "Source:" prefix on banner feet
-    // row — URL alone is self-explanatory next to the brand logo,
-    // cleaner visual. Mirrors workflow installer banner commit chain.
+                        // 2026-05-29 user-requested: drop "Source:" prefix on banner feet
+                        // row — URL alone is self-explanatory next to the brand logo,
+                        // cleaner visual. Mirrors workflow installer banner commit chain.
     eprintln!("   {}       {}",
         banner_gold("\u{2570}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2588}\u{2588}\u{256F}"),
         "https://github.com/aikeylabs".bright_black().underline());
