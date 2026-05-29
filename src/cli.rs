@@ -2331,9 +2331,19 @@ pub(crate) fn print_banner() {
         banner_gold("\u{254D}\u{2588}     \u{25BC}     \u{2588}\u{254D}"),
         "FinOps & AI Governance Center".cyan().bold()
     );
-    eprintln!("   {}       {}",
+    // 2026-05-29 — banner restructured per UX:
+    //   - Path row removed (aikey_home was here; redundant with `aikey
+    //     config show` and rarely the info users want at every CLI run)
+    //   - Open-source URL moved into row 5 (logo bottom) right-side as
+    //     the top-of-banner trust signal; URL is underlined +
+    //     bright_black so it visually reads as a clickable link while
+    //     staying visually quiet. Mirrors local-install.sh feet row
+    //     exactly (workflow commit chain b4b3a2a → 6b8b9f6 → follow-up)
+    //     so brand looks identical at install time and every `ak` run.
+    let _ = aikey_home; // kept reachable for future re-introduction
+    eprintln!("   {}       Source: {}",
         banner_gold("\u{2570}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2588}\u{2588}\u{256F}"),
-        aikey_home.bright_black());
+        "https://github.com/aikeylabs".bright_black().underline());
     eprintln!("       {}", banner_gold("\u{2579}   \u{2579}"));
     eprintln!();
 }
