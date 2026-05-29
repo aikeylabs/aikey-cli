@@ -2319,13 +2319,21 @@ pub(crate) fn print_banner() {
         banner_gold(BANNER_EYE_OPEN),
         BANNER_EYE_RIGHT.dimmed()
     );
+    // 2026-05-29 — mirror local-install.sh banner colors so brand looks
+    // identical from install time through every `ak` / `aikey` run:
+    //   tagline → cyan + bold (matches installer's `C_CYAN="\033[1;36m"`)
+    //   path    → bright_black (matches installer's `C_DIM="\033[90m"`,
+    //              renders as solid medium-grey vs `.dimmed()` which is
+    //              a faint-intensity attribute that some terminals
+    //              under-render)
     eprintln!(
-        "  {}        FinOps & AI Governance Center",
-        banner_gold("\u{254D}\u{2588}     \u{25BC}     \u{2588}\u{254D}")
+        "  {}        {}",
+        banner_gold("\u{254D}\u{2588}     \u{25BC}     \u{2588}\u{254D}"),
+        "FinOps & AI Governance Center".cyan().bold()
     );
     eprintln!("   {}       {}",
         banner_gold("\u{2570}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2588}\u{2588}\u{256F}"),
-        aikey_home);
+        aikey_home.bright_black());
     eprintln!("       {}", banner_gold("\u{2579}   \u{2579}"));
     eprintln!();
 }
