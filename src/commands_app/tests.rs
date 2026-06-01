@@ -289,10 +289,8 @@ fn set_app_filter_stages_writes_columns_proxy_reads() {
 #[test]
 fn set_app_filter_stages_applies_defaults() {
     let conn = fresh_test_vault();
-    upsert_app_record_with_conn(
-        &conn, "f-app", "F", "v", &[], "third-party", false, &[],
-    )
-    .expect("upsert");
+    upsert_app_record_with_conn(&conn, "f-app", "F", "v", &[], "third-party", false, &[])
+        .expect("upsert");
     set_app_filter_stages_with_conn(&conn, "f-app", &["pre_forward".into()], None, None)
         .expect("set defaults");
     let (priority, policy): (i64, String) = conn
@@ -310,10 +308,8 @@ fn set_app_filter_stages_applies_defaults() {
 #[test]
 fn set_app_filter_stages_rejects_bad_policy() {
     let conn = fresh_test_vault();
-    upsert_app_record_with_conn(
-        &conn, "f-app", "F", "v", &[], "third-party", false, &[],
-    )
-    .expect("upsert");
+    upsert_app_record_with_conn(&conn, "f-app", "F", "v", &[], "third-party", false, &[])
+        .expect("upsert");
     let err = set_app_filter_stages_with_conn(
         &conn,
         "f-app",
@@ -322,7 +318,11 @@ fn set_app_filter_stages_rejects_bad_policy() {
         Some("fail_sideways"),
     )
     .expect_err("bad policy must reject");
-    assert!(err.contains("fail_open"), "msg should list valid policies: {}", err);
+    assert!(
+        err.contains("fail_open"),
+        "msg should list valid policies: {}",
+        err
+    );
 }
 
 /// Setting filter_stages on a non-existent app is an error, not a silent no-op.

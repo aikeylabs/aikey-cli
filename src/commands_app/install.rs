@@ -1173,7 +1173,11 @@ mod tests {
         let slugs: Vec<&str> = TRUSTED_APPS.iter().map(|t| t.slug).collect();
         assert_eq!(
             slugs,
-            vec!["degrade-detector", "ai-compliance-detector", "ai-compliance-deep-scan"]
+            vec![
+                "degrade-detector",
+                "ai-compliance-detector",
+                "ai-compliance-deep-scan"
+            ]
         );
     }
 
@@ -1184,7 +1188,10 @@ mod tests {
         let si = m.service_installers.expect("v2 service_installers");
         // Slug-prefixed asset names so the two apps' install scripts don't
         // overwrite each other in the shared launch release.
-        assert!(si.unix.url.ends_with("ai-compliance-detector_install_service.sh"));
+        assert!(si
+            .unix
+            .url
+            .ends_with("ai-compliance-detector_install_service.sh"));
         assert!(si
             .windows
             .expect("windows entry")
