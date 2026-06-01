@@ -129,7 +129,7 @@ fn version_for_url() -> String {
 fn inject_manifest_env_vars(release_tag: &str) {
     use sha2::{Digest, Sha256};
 
-    const SLUGS: &[&str] = &["degrade-detector", "ai-compliance-detector"];
+    const SLUGS: &[&str] = &["degrade-detector", "ai-compliance-detector", "ai-compliance-deep-scan"];
     // Sibling repo layout: aikeylabs/aikey-cli + aikeylabs/launch
     const MANIFESTS_DIR: &str = "../launch/manifests";
 

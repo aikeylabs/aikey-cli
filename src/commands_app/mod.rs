@@ -54,7 +54,8 @@ mod tests;
 /// Phase 4 launch list contains only `degrade-detector` (the official
 /// degradation-probe plugin). Adding entries here is a deliberate trust
 /// decision; do NOT widen the list without product sign-off.
-pub const FIRST_PARTY_SLUGS: &[&str] = &["degrade-detector", "ai-compliance-detector"];
+pub const FIRST_PARTY_SLUGS: &[&str] =
+    &["degrade-detector", "ai-compliance-detector", "ai-compliance-deep-scan"];
 
 pub fn is_first_party(slug: &str) -> bool {
     FIRST_PARTY_SLUGS.contains(&slug)

@@ -123,6 +123,14 @@ const TRUSTED_APPS: &[TrustedApp] = &[
         manifest_url: env!("AIKEY_MANIFEST_URL_AI_COMPLIANCE_DETECTOR"),
         manifest_sha256: env!("AIKEY_MANIFEST_SHA_AI_COMPLIANCE_DETECTOR"),
     },
+    // Stage-6 compliance deep-scan (Python/PyInstaller daemon, 补漏 via bge
+    // semantic recall). A background service (not a proxy filter); the fast
+    // layer connects to it over AIKEY_DEEPSCAN_SOCKET.
+    TrustedApp {
+        slug: "ai-compliance-deep-scan",
+        manifest_url: env!("AIKEY_MANIFEST_URL_AI_COMPLIANCE_DEEP_SCAN"),
+        manifest_sha256: env!("AIKEY_MANIFEST_SHA_AI_COMPLIANCE_DEEP_SCAN"),
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -849,6 +857,25 @@ fn dev_manifest_for_slug(slug: &str) -> Option<Manifest> {
             service_installer: None,
             doc_url: Some("https://github.com/aikeylabs/ai-compliance-detector".into()),
         }),
+        "ai-compliance-deep-scan" => Some(Manifest {
+            schema_version: "2".into(),
+            slug: "ai-compliance-deep-scan".into(),
+            version: "v1.0.0-rc.5".into(),
+            service_installers: Some(ServiceInstallers {
+                unix: ServiceInstaller {
+                    kind: "curl-pipe-shell".into(),
+                    url: "https://github.com/aikeylabs/launch/releases/download/v1.0.0-rc.5/ai-compliance-deep-scan_install_service.sh"
+                        .into(),
+                },
+                windows: Some(ServiceInstaller {
+                    kind: "powershell-iwr-iex".into(),
+                    url: "https://github.com/aikeylabs/launch/releases/download/v1.0.0-rc.5/ai-compliance-deep-scan_install_service.ps1"
+                        .into(),
+                }),
+            }),
+            service_installer: None,
+            doc_url: Some("https://github.com/aikeylabs/aikey-compliance-workers".into()),
+        }),
         _ => None,
     }
 }
@@ -1141,9 +1168,13 @@ mod tests {
     fn trusted_apps_pinned_list() {
         // Pin so anyone adding a new entry has to update tests/docs.
         // Current trusted apps: degrade-detector (Stage-4 degradation probe)
-        // + ai-compliance-detector (Stage-6 compliance fast-layer filter).
+        // + ai-compliance-detector (Stage-6 fast-layer filter) + ai-compliance-
+        // deep-scan (Stage-6 补漏 daemon).
         let slugs: Vec<&str> = TRUSTED_APPS.iter().map(|t| t.slug).collect();
-        assert_eq!(slugs, vec!["degrade-detector", "ai-compliance-detector"]);
+        assert_eq!(
+            slugs,
+            vec!["degrade-detector", "ai-compliance-detector", "ai-compliance-deep-scan"]
+        );
     }
 
     #[test]
