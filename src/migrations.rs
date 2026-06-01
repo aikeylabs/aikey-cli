@@ -765,6 +765,23 @@ pub mod v1_0_0_baseline {
         // `degrade-detector/server_local/services/check_orchestrator.py
         // ::FIRST_PARTY_APP_KEY`. Renaming requires updating both.
         ensure_first_party_app_keys(conn)?;
+
+        // Delivery-integrity source identity (2026-05-30). One vault = one
+        // upload "source"; the proxy stamps this on every reported event so the
+        // collector can detect per-source sequence gaps. Seeded HERE (in the
+        // idempotent baseline that upgrade_all runs on every command) rather
+        // than only at vault init, so EXISTING vaults get backfilled too — the
+        // CLI vault uses a single-baseline pure-idempotency model (no numbered
+        // migration dispatch), so a new value belongs in this upgrade path, the
+        // same as ensure_first_party_app_keys above. INSERT OR IGNORE keeps an
+        // already-present identity stable. Must match the proxy reader
+        // (supervisor.go SourceIdentityKey) and storage.rs SOURCE_IDENTITY_KEY.
+        conn.execute(
+            "INSERT OR IGNORE INTO config (key, value) VALUES ('runtime.source_identity', ?)",
+            rusqlite::params![crate::storage::new_source_identity().as_bytes().to_vec()],
+        )
+        .map_err(|e| format!("Failed to seed source_identity: {}", e))?;
+
         Ok(())
     }
 
@@ -1219,6 +1236,55 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open");
         upgrade_all(&conn).expect("first upgrade_all");
         upgrade_all(&conn).expect("second upgrade_all (must be idempotent)");
+    }
+
+    /// Delivery-integrity regression (2026-06-01, caught by live E2E): an
+    /// EXISTING vault (config table already present, no source_identity) must
+    /// get `runtime.source_identity` backfilled by upgrade_all — otherwise the
+    /// proxy logs "source_identity missing" and emits v1 events without a
+    /// source_seq, silently disabling gap detection. The original migrate_v8
+    /// approach was dead code (CLI vault has no numbered-migration dispatch);
+    /// the fix seeds in baseline::upgrade, which upgrade_all runs every time.
+    #[test]
+    fn upgrade_all_backfills_source_identity_on_existing_vault() {
+        let conn = Connection::open_in_memory().expect("open");
+        // Simulate a pre-feature vault: config table exists, no source_identity.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value BLOB NOT NULL)",
+            [],
+        )
+        .unwrap();
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM config WHERE key='runtime.source_identity'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0, "precondition: no source_identity yet");
+
+        upgrade_all(&conn).expect("upgrade_all");
+
+        let id: String = conn
+            .query_row(
+                "SELECT CAST(value AS TEXT) FROM config WHERE key='runtime.source_identity'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("source_identity must be backfilled by upgrade_all");
+        assert_eq!(id.len(), 36, "must be a UUID (8-4-4-4-12), got {:?}", id);
+        assert_eq!(id.matches('-').count(), 4, "UUID dash layout");
+
+        // Stable across re-runs (INSERT OR IGNORE never overwrites).
+        upgrade_all(&conn).expect("second upgrade_all");
+        let id2: String = conn
+            .query_row(
+                "SELECT CAST(value AS TEXT) FROM config WHERE key='runtime.source_identity'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(id, id2, "source_identity must be stable across upgrades");
     }
 
     /// 2026-05-08 fold-bugfix regression test:

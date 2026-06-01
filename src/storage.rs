@@ -382,6 +382,17 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
     )
     .map_err(|e| format!("Failed to store password hash: {}", e))?;
 
+    // Seed the delivery-integrity source identity once, at vault creation, so
+    // the proxy reads a stable per-source id from its very first start. Inserted
+    // directly here (not via ensure_source_identity()) because this runs inside
+    // vault init where the connection is already open; OR IGNORE keeps it
+    // idempotent if init is ever re-entered. See SOURCE_IDENTITY_KEY docs.
+    conn.execute(
+        "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+        params![SOURCE_IDENTITY_KEY, generate_uuid_v4().as_bytes().to_vec()],
+    )
+    .map_err(|e| format!("Failed to store source identity: {}", e))?;
+
     Ok(())
 }
 
@@ -1483,6 +1494,45 @@ fn write_u64_config(key: &str, value: u64) -> Result<(), String> {
     )
     .map_err(|e| format!("failed to write '{}': {}", key, e))?;
     Ok(())
+}
+
+/// Config key holding this vault's delivery-integrity source identity (a UUID).
+/// One vault = one upload "source"; the proxy reads this and stamps it on every
+/// reported event so the collector can detect per-source sequence gaps. It is a
+/// VAULT-SCOPED install identity (changes when the vault is recreated), NOT a
+/// hardware fingerprint. See design doc
+/// roadmap20260320/技术实现/阶段6-企业定制/20260530-财务对账级用量审计-完整技术方案.md.
+const SOURCE_IDENTITY_KEY: &str = "runtime.source_identity";
+
+/// Public constructor of a fresh source identity UUID, for the migration module
+/// to seed `runtime.source_identity` on its own open connection (migrate_v8 for
+/// existing vaults). Fresh vaults seed inline in `initialize_vault`; no lazy
+/// "ensure on read" path is needed because those two cover every vault. Kept
+/// thin so the UUID format lives in exactly one place (`generate_uuid_v4`).
+///
+/// UUID format: lowercase 8-4-4-4-12 hex (RFC-4122 v4 layout) from 16 CSPRNG
+/// bytes via the same OsRng path as `generate_route_token` — avoids adding a
+/// `uuid` crate dependency for a single value.
+pub fn new_source_identity() -> String {
+    generate_uuid_v4()
+}
+
+/// Generates a lowercase RFC-4122 v4 UUID string from 16 CSPRNG bytes.
+fn generate_uuid_v4() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    // Set version (4) and variant (10xx) bits per RFC 4122 §4.4.
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex::encode(&b[0..4]),
+        hex::encode(&b[4..6]),
+        hex::encode(&b[6..8]),
+        hex::encode(&b[8..10]),
+        hex::encode(&b[10..16]),
+    )
 }
 
 /// Returns the current vault change sequence number (0 if vault not yet created).

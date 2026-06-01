@@ -6,6 +6,7 @@ pub mod active_env_migration;
 pub mod audit;
 pub mod commands_account;
 pub mod commands_app;
+pub mod commands_audit;
 pub mod commands_import;
 pub mod commands_init;
 pub mod commands_internal;

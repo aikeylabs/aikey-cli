@@ -1111,4 +1111,66 @@ mod tests {
         let y = y + if m <= 2 { 1 } else { 0 };
         (y, m, d)
     }
+
+    // Delivery-integrity WAL v2 (2026-05-30): the proxy now writes envelopes
+    // carrying source_id / source_seq / content_hash + schema_version:2. The
+    // CLI reader (statusline / watch) must keep parsing them — it ignores the
+    // new fields rather than failing. This fence test pins that: a future
+    // #[serde(deny_unknown_fields)] or struct rename that breaks v2 parsing
+    // would dark out statusline/watch on every proxy after the upgrade.
+    #[test]
+    fn wal_v2_envelope_parses_for_ui() {
+        // Full v2 envelope with the new integrity fields at both levels.
+        let raw = br#"{
+            "wal_seq": 7,
+            "written_at": 1748600000000,
+            "schema_version": 2,
+            "source_id": "a626877d-ab50-47ee-9d8c-3150b3e00c18",
+            "source_seq": 1024,
+            "content_hash": "",
+            "event_json": {
+                "event_id": "evt_abc",
+                "source_id": "a626877d-ab50-47ee-9d8c-3150b3e00c18",
+                "source_seq": 1024,
+                "event_time": "2026-04-17T15:23:45Z",
+                "virtual_key_id": "personal:kimi-local",
+                "provider_code": "kimi",
+                "route_source": "personal",
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "total_tokens": 30,
+                "request_status": "success",
+                "http_status_code": 200
+            }
+        }"#;
+        let entry: WalEntry = serde_json::from_slice(raw).expect("v2 envelope must parse");
+        assert_eq!(entry.wal_seq, 7);
+        // The inner UsageEvent the UI consumes is intact; new fields are simply
+        // ignored by the reader (not present on UsageEvent), proving forward-compat.
+        assert_eq!(entry.event_json.input_tokens, Some(10));
+        assert_eq!(entry.event_json.total_tokens, Some(30));
+        assert_eq!(entry.event_json.provider_code, "kimi");
+    }
+
+    // A legacy v1 envelope (no schema_version / source_* fields) must still
+    // parse identically — the reader supports both versions on disk during and
+    // after the upgrade window.
+    #[test]
+    fn wal_v1_envelope_still_parses() {
+        let raw = br#"{
+            "wal_seq": 3,
+            "written_at": 1748600000000,
+            "event_json": {
+                "event_id": "evt_old",
+                "event_time": "2026-04-17T15:23:45Z",
+                "provider_code": "anthropic",
+                "route_source": "oauth",
+                "input_tokens": 5,
+                "output_tokens": 7
+            }
+        }"#;
+        let entry: WalEntry = serde_json::from_slice(raw).expect("v1 envelope must parse");
+        assert_eq!(entry.wal_seq, 3);
+        assert_eq!(entry.event_json.input_tokens, Some(5));
+    }
 }

@@ -44,6 +44,7 @@ mod proxy_proc;
 mod proxy_state;
 // migrations module is in lib.rs (used by both main.rs and executor.rs)
 use aikeylabs_aikey_cli::commands_app;
+use aikeylabs_aikey_cli::commands_audit;
 use aikeylabs_aikey_cli::migrations;
 #[allow(dead_code)]
 mod platform_client;
@@ -1009,7 +1010,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::Statusline {
             action: Some(cli::StatuslineAction::Ensure),
         }
-        | Commands::Watch => {}
+        | Commands::Watch
+        | Commands::Audit { .. } => {}
         _ => {
             commands_proxy::try_auto_start_from_env();
         }
@@ -1031,7 +1033,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::Statusline {
             action: Some(cli::StatuslineAction::Ensure),
         }
-        | Commands::Watch => {}
+        | Commands::Watch
+        | Commands::Audit { .. } => {}
         _ => {
             commands_account::try_background_snapshot_sync();
         }
@@ -1053,7 +1056,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::Statusline {
             action: Some(cli::StatuslineAction::Ensure),
         }
-        | Commands::Watch => {}
+        | Commands::Watch
+        | Commands::Audit { .. } => {}
         _ => {
             if let Ok(vault_path) = storage::get_vault_path() {
                 if vault_path.exists() {
@@ -3784,6 +3788,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Watch => {
             commands_watch::run()?;
         }
+        Commands::Audit { action } => match action {
+            AuditAction::Status => {
+                commands_audit::handle_status(cli.json)?;
+            }
+            AuditAction::Reconcile => {
+                commands_audit::handle_reconcile(cli.json)?;
+            }
+        },
         Commands::Trust { action } => match action {
             cli::TrustAction::Verify {
                 alias,

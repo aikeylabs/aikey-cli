@@ -97,6 +97,8 @@ Vault 每个 shell session 只解锁一次 — 后续的 `aikey run` 用缓存�
 | `aikey test [<alias>]` | vault.db | 无(probe-only,带 `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
 | `aikey web [page]` | 无 | 无 | spawn 浏览器 → `aikey-local-server` |
 | `aikey doctor` | proxy 端口 / vault 路径 / hooks | 无 | stdout 诊断报告 |
+| `aikey audit status` | collector completeness 端点（+ proxy 本地状态）| 无 | stdout per-source 投递报告 |
+| `aikey audit reconcile` | collector 缺口 + proxy WAL | 已知丢失台账（服务端）| stdout 对账结论；补传可恢复缺口、确认丢失 |
 
 真凭据除了在 proxy → provider 调用里被替换成上游 auth header 之外,**从不离开** vault.db。Probe 流量带 `X-Aikey-Probe: 1`,不会污染用量小票。
 
@@ -217,6 +219,10 @@ aikey web vault                             # 直接跳到 Vault 页
 aikey doctor                                # 诊断 PATH / hook / proxy / vault
 aikey test --all                            # 连通性测试所有凭据
 aikey proxy restart                         # 重启 local proxy
+
+# 投递审计（财务对账级用量完整性）
+aikey audit status                          # 按源看：已分配 / 已确认 / 缺口 / 已知丢失 / 隔离
+aikey audit reconcile                       # 立即主动对账：补传可恢复缺口、确认真实丢失
 ```
 
 `aikey --help` 看全部子命令(显示顺序 = 使用频率,高频在前)。

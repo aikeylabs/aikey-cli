@@ -97,6 +97,8 @@ Vault is unlocked once per shell session — subsequent `aikey run` calls reuse 
 | `aikey test [<alias>]` | vault.db | nothing (probe-only via `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
 | `aikey web [page]` | nothing | nothing | spawns browser → `aikey-local-server` |
 | `aikey doctor` | proxy port, vault path, hooks | nothing | stdout report |
+| `aikey audit status` | collector completeness endpoint (+ proxy local state) | nothing | stdout per-source delivery report |
+| `aikey audit reconcile` | collector gaps + proxy WAL | known-loss ledger (server) | stdout verdict; re-sends recoverable gaps, confirms losses |
 
 Real credentials never leave `vault.db` except as the substituted upstream auth header inside the proxy → provider call. Probe traffic carries `X-Aikey-Probe: 1` so it does not pollute usage receipts.
 
@@ -217,6 +219,10 @@ aikey web vault                             # jump straight to Vault page
 aikey doctor                                # diagnose PATH / hook / proxy / vault
 aikey test --all                            # connectivity test all credentials
 aikey proxy restart                         # restart the local proxy
+
+# Delivery audit (financial-grade usage completeness)
+aikey audit status                          # per-source: allocated / confirmed / gaps / known-loss / quarantine
+aikey audit reconcile                       # actively reconcile now: re-send recoverable gaps, confirm true losses
 ```
 
 Run `aikey --help` for the full subcommand list (display order = frequency, frequent first).

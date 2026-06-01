@@ -580,7 +580,7 @@ pub fn post_admin_replay_dead_letter() -> Result<String, Box<dyn std::error::Err
 /// runtime.json tells you *where it is*. When a live proxy has drifted,
 /// preferring intent over runtime would make `aikey proxy status` /
 /// auto-restart logic talk to the wrong port.
-fn proxy_listen_addr(config_path: Option<&std::path::Path>) -> String {
+pub(crate) fn proxy_listen_addr(config_path: Option<&std::path::Path>) -> String {
     // Priority 1: live runtime.json — actual bound port of the running proxy.
     if let Some(actual) = read_runtime_actual_addr() {
         return actual;

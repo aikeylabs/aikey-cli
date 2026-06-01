@@ -450,6 +450,12 @@ pub(crate) enum Commands {
     /// Show a top-style dashboard of recent key usage from the local WAL.
     #[command(display_order = 21)]
     Watch,
+    /// Audit usage-delivery completeness (allocated / confirmed / gaps / known-loss).
+    #[command(display_order = 21)]
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
     /// Manage your aikey account session
     #[command(display_order = 20)]
     Account {
@@ -948,6 +954,14 @@ pub(crate) enum EnvAction {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum AuditAction {
+    /// Show per-source delivery completeness (allocated / confirmed / gaps / known-loss / quarantine).
+    Status,
+    /// Force an immediate reconciliation (scan + known-loss promotion), then show the verdict.
+    Reconcile,
+}
+
+#[derive(Subcommand)]
 pub(crate) enum ProxyAction {
     /// Start the local aikey-proxy (authenticates once, no separate password needed)
     Start {
@@ -1304,6 +1318,13 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 Some(StatuslineAction::Ensure) => "statusline.ensure".to_string(),
             },
             Commands::Watch => "watch".to_string(),
+            Commands::Audit { action } => format!(
+                "audit.{}",
+                match action {
+                    AuditAction::Status => "status",
+                    AuditAction::Reconcile => "reconcile",
+                }
+            ),
             Commands::HookHash { .. } => "_hook-hash".to_string(),
             Commands::RefreshActiveEnv { .. } => "_refresh-active-env".to_string(),
             Commands::Hook { action } => match action {
