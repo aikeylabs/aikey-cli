@@ -652,8 +652,9 @@ pub(crate) enum AppAction {
         #[arg(long, default_value = "")]
         vendor: String,
         /// Comma-separated upstream provider list (e.g. `openai` or
-        /// `openai,anthropic`). At least one required.
-        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        /// `openai,anthropic`). At least one required — UNLESS this is a
+        /// filter-only app (`--filter-stages` set), which has no LLM upstream.
+        #[arg(long, value_delimiter = ',', num_args = 0..)]
         upstreams: Vec<String>,
         /// Mark this app as first-party (AiKey-owned). Unlocks
         /// `--follow-user-active` and other privileged modes. Default:
@@ -668,6 +669,22 @@ pub(crate) enum AppAction {
         /// request time. Stored as a JSON array on the app_records row.
         #[arg(long, value_delimiter = ',', num_args = 0..)]
         requested_permissions: Vec<String>,
+        /// Comma-separated filter stage names (e.g. `pre_forward`). When set,
+        /// this app is registered as a proxy filter: the proxy supervisor
+        /// discovers it via `app_records.filter_stages IS NOT NULL` and spawns
+        /// it on the data plane (e.g. ai-compliance-detector). Filter-only
+        /// apps may register with no `--upstreams`.
+        #[arg(long, value_delimiter = ',', num_args = 0..)]
+        filter_stages: Vec<String>,
+        /// Filter chain priority (lower = earlier). Only meaningful with
+        /// `--filter-stages`. Default 100.
+        #[arg(long)]
+        filter_priority: Option<i64>,
+        /// Filter timeout behavior: `fail_open` (forward unfiltered on filter
+        /// failure) or `fail_closed`. Only meaningful with `--filter-stages`.
+        /// Default `fail_open`.
+        #[arg(long)]
+        filter_timeout_policy: Option<String>,
         /// Force a new bearer to be issued even if the app already has
         /// an active one. Default: reuse existing bearer on
         /// re-register (vendor installer can re-run register safely).

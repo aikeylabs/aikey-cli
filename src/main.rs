@@ -3820,6 +3820,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 first_party,
                 follow_user_active,
                 requested_permissions,
+                filter_stages,
+                filter_priority,
+                filter_timeout_policy,
                 rotate_bearer,
             } => {
                 commands_app::handle_register(
@@ -3830,6 +3833,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     *first_party,
                     *follow_user_active,
                     requested_permissions,
+                    filter_stages,
+                    *filter_priority,
+                    filter_timeout_policy.as_deref(),
                     *rotate_bearer,
                     cli.json,
                 )?;

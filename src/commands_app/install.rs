@@ -109,11 +109,21 @@ struct TrustedApp {
 //
 // Adding a new first-party app: extend both `SLUGS` in build.rs AND the list
 // below in lockstep.
-const TRUSTED_APPS: &[TrustedApp] = &[TrustedApp {
-    slug: "degrade-detector",
-    manifest_url: env!("AIKEY_MANIFEST_URL_DEGRADE_DETECTOR"),
-    manifest_sha256: env!("AIKEY_MANIFEST_SHA_DEGRADE_DETECTOR"),
-}];
+const TRUSTED_APPS: &[TrustedApp] = &[
+    TrustedApp {
+        slug: "degrade-detector",
+        manifest_url: env!("AIKEY_MANIFEST_URL_DEGRADE_DETECTOR"),
+        manifest_sha256: env!("AIKEY_MANIFEST_SHA_DEGRADE_DETECTOR"),
+    },
+    // Stage-6 compliance fast-layer detector (proxy filter child). Manifest
+    // URL+SHA auto-injected by build.rs from
+    // launch/manifests/ai-compliance-detector.manifest.json.
+    TrustedApp {
+        slug: "ai-compliance-detector",
+        manifest_url: env!("AIKEY_MANIFEST_URL_AI_COMPLIANCE_DETECTOR"),
+        manifest_sha256: env!("AIKEY_MANIFEST_SHA_AI_COMPLIANCE_DETECTOR"),
+    },
+];
 
 // ---------------------------------------------------------------------------
 // Manifest schema.
@@ -818,6 +828,27 @@ fn dev_manifest_for_slug(slug: &str) -> Option<Manifest> {
             service_installer: None,
             doc_url: Some("https://github.com/aikeylabs/launch".into()),
         }),
+        "ai-compliance-detector" => Some(Manifest {
+            schema_version: "2".into(),
+            slug: "ai-compliance-detector".into(),
+            version: "v1.0.0-rc.5".into(),
+            service_installers: Some(ServiceInstallers {
+                unix: ServiceInstaller {
+                    kind: "curl-pipe-shell".into(),
+                    // Slug-prefixed asset name so it doesn't collide with
+                    // degrade-detector's install_service.sh in the same release.
+                    url: "https://github.com/aikeylabs/launch/releases/download/v1.0.0-rc.5/ai-compliance-detector_install_service.sh"
+                        .into(),
+                },
+                windows: Some(ServiceInstaller {
+                    kind: "powershell-iwr-iex".into(),
+                    url: "https://github.com/aikeylabs/launch/releases/download/v1.0.0-rc.5/ai-compliance-detector_install_service.ps1"
+                        .into(),
+                }),
+            }),
+            service_installer: None,
+            doc_url: Some("https://github.com/aikeylabs/ai-compliance-detector".into()),
+        }),
         _ => None,
     }
 }
@@ -1107,12 +1138,27 @@ mod tests {
     }
 
     #[test]
-    fn trusted_apps_only_contains_degrade_detector_for_now() {
+    fn trusted_apps_pinned_list() {
         // Pin so anyone adding a new entry has to update tests/docs.
-        // When this fires, also update `roadmap20260320/技术实现/阶段4-增值版/
-        // 第三方Agent自助接入与应用级Key方案.md` §11.B trusted list.
-        assert_eq!(TRUSTED_APPS.len(), 1);
-        assert_eq!(TRUSTED_APPS[0].slug, "degrade-detector");
+        // Current trusted apps: degrade-detector (Stage-4 degradation probe)
+        // + ai-compliance-detector (Stage-6 compliance fast-layer filter).
+        let slugs: Vec<&str> = TRUSTED_APPS.iter().map(|t| t.slug).collect();
+        assert_eq!(slugs, vec!["degrade-detector", "ai-compliance-detector"]);
+    }
+
+    #[test]
+    fn dev_manifest_ai_compliance_detector_present() {
+        let m = dev_manifest_for_slug("ai-compliance-detector").expect("present");
+        assert_eq!(m.slug, "ai-compliance-detector");
+        let si = m.service_installers.expect("v2 service_installers");
+        // Slug-prefixed asset names so the two apps' install scripts don't
+        // overwrite each other in the shared launch release.
+        assert!(si.unix.url.ends_with("ai-compliance-detector_install_service.sh"));
+        assert!(si
+            .windows
+            .expect("windows entry")
+            .url
+            .ends_with("ai-compliance-detector_install_service.ps1"));
     }
 
     // ─── BR-rc.5-59 fence tests ────────────────────────────────────────

@@ -231,6 +231,109 @@ fn upsert_app_record_inserts_then_updates() {
     );
 }
 
+/// G2a: a filter app (e.g. ai-compliance-detector) gets filter_stages written
+/// onto its app_records row so the proxy supervisor discovers it via
+/// `WHERE filter_stages IS NOT NULL`. We assert the exact columns the Go
+/// reader (GetFilterAppSlugs) selects on.
+#[test]
+fn set_app_filter_stages_writes_columns_proxy_reads() {
+    let conn = fresh_test_vault();
+
+    // Register the row first (filter app: no upstreams).
+    upsert_app_record_with_conn(
+        &conn,
+        "ai-compliance-detector",
+        "AI Compliance Detector",
+        "aikey-labs",
+        &[],
+        "first-party",
+        false,
+        &[],
+    )
+    .expect("upsert filter app");
+
+    set_app_filter_stages_with_conn(
+        &conn,
+        "ai-compliance-detector",
+        &["pre_forward".into()],
+        Some(10),
+        Some("fail_open"),
+    )
+    .expect("set filter_stages");
+
+    let (stages, priority, policy): (String, i64, String) = conn
+        .query_row(
+            "SELECT filter_stages, filter_priority, filter_timeout_policy
+               FROM app_records WHERE slug = ?1",
+            rusqlite::params!["ai-compliance-detector"],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("read filter columns");
+    assert_eq!(stages, r#"["pre_forward"]"#);
+    assert_eq!(priority, 10);
+    assert_eq!(policy, "fail_open");
+
+    // The discovery query the proxy runs must now return this slug.
+    let found: String = conn
+        .query_row(
+            "SELECT slug FROM app_records WHERE filter_stages IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("proxy discovery query");
+    assert_eq!(found, "ai-compliance-detector");
+}
+
+/// Defaults: omitting priority/policy yields priority=100, policy=fail_open so
+/// the row is always well-formed for the proxy.
+#[test]
+fn set_app_filter_stages_applies_defaults() {
+    let conn = fresh_test_vault();
+    upsert_app_record_with_conn(
+        &conn, "f-app", "F", "v", &[], "third-party", false, &[],
+    )
+    .expect("upsert");
+    set_app_filter_stages_with_conn(&conn, "f-app", &["pre_forward".into()], None, None)
+        .expect("set defaults");
+    let (priority, policy): (i64, String) = conn
+        .query_row(
+            "SELECT filter_priority, filter_timeout_policy FROM app_records WHERE slug = ?1",
+            rusqlite::params!["f-app"],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("read");
+    assert_eq!(priority, 100);
+    assert_eq!(policy, "fail_open");
+}
+
+/// An invalid timeout policy is rejected (guards against typos reaching the DB).
+#[test]
+fn set_app_filter_stages_rejects_bad_policy() {
+    let conn = fresh_test_vault();
+    upsert_app_record_with_conn(
+        &conn, "f-app", "F", "v", &[], "third-party", false, &[],
+    )
+    .expect("upsert");
+    let err = set_app_filter_stages_with_conn(
+        &conn,
+        "f-app",
+        &["pre_forward".into()],
+        None,
+        Some("fail_sideways"),
+    )
+    .expect_err("bad policy must reject");
+    assert!(err.contains("fail_open"), "msg should list valid policies: {}", err);
+}
+
+/// Setting filter_stages on a non-existent app is an error, not a silent no-op.
+#[test]
+fn set_app_filter_stages_missing_app_errors() {
+    let conn = fresh_test_vault();
+    let err = set_app_filter_stages_with_conn(&conn, "ghost", &["pre_forward".into()], None, None)
+        .expect_err("missing app must error");
+    assert!(err.contains("not registered"), "msg: {}", err);
+}
+
 #[test]
 fn get_app_record_missing_returns_none() {
     let conn = fresh_test_vault();

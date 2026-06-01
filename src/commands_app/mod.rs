@@ -54,7 +54,7 @@ mod tests;
 /// Phase 4 launch list contains only `degrade-detector` (the official
 /// degradation-probe plugin). Adding entries here is a deliberate trust
 /// decision; do NOT widen the list without product sign-off.
-pub const FIRST_PARTY_SLUGS: &[&str] = &["degrade-detector"];
+pub const FIRST_PARTY_SLUGS: &[&str] = &["degrade-detector", "ai-compliance-detector"];
 
 pub fn is_first_party(slug: &str) -> bool {
     FIRST_PARTY_SLUGS.contains(&slug)
@@ -299,6 +299,72 @@ pub fn upsert_app_record_with_conn(
     )
     .map_err(|e| format!("UPSERT app_records: {}", e))?;
     Ok(!pre_existed)
+}
+
+/// Marks an already-registered app as a proxy filter by writing its
+/// filter_stages (+ priority + timeout policy) onto the existing app_records
+/// row. The proxy supervisor discovers filter apps via
+/// `SELECT DISTINCT slug FROM app_records WHERE filter_stages IS NOT NULL`
+/// (aikey-proxy GetFilterAppSlugs) and spawns them on the data plane.
+///
+/// This is a separate UPDATE (not folded into upsert_app_record) on purpose:
+/// upsert has 20+ existing call sites/tests and only filter apps need these
+/// columns, so keeping it additive avoids a shotgun signature change.
+pub fn set_app_filter_stages(
+    slug: &str,
+    filter_stages: &[String],
+    filter_priority: Option<i64>,
+    filter_timeout_policy: Option<&str>,
+) -> Result<(), String> {
+    let conn = storage::open_connection()?;
+    set_app_filter_stages_with_conn(
+        &conn,
+        slug,
+        filter_stages,
+        filter_priority,
+        filter_timeout_policy,
+    )?;
+    let _ = storage::bump_vault_change_seq();
+    Ok(())
+}
+
+/// Test-friendly inner: see `set_app_filter_stages`. Defaults priority=100 and
+/// policy=fail_open when omitted so the row is always well-formed for the proxy.
+pub fn set_app_filter_stages_with_conn(
+    conn: &Connection,
+    slug: &str,
+    filter_stages: &[String],
+    filter_priority: Option<i64>,
+    filter_timeout_policy: Option<&str>,
+) -> Result<(), String> {
+    let stages_json = serde_json::to_string(filter_stages)
+        .map_err(|e| format!("encode filter_stages JSON: {}", e))?;
+    let priority = filter_priority.unwrap_or(100);
+    let policy = filter_timeout_policy.unwrap_or("fail_open");
+    if policy != "fail_open" && policy != "fail_closed" {
+        return Err(format!(
+            "invalid --filter-timeout-policy {:?}; allowed: fail_open, fail_closed",
+            policy
+        ));
+    }
+    let affected = conn
+        .execute(
+            "UPDATE app_records
+                SET filter_stages = ?2,
+                    filter_priority = ?3,
+                    filter_timeout_policy = ?4,
+                    updated_at = strftime('%s', 'now')
+              WHERE slug = ?1",
+            params![slug, stages_json, priority, policy],
+        )
+        .map_err(|e| format!("UPDATE app_records filter_stages: {}", e))?;
+    if affected == 0 {
+        return Err(format!(
+            "cannot set filter_stages: app '{}' is not registered",
+            slug
+        ));
+    }
+    Ok(())
 }
 
 /// SELECT a single `app_records` row by slug. Used by `authorize` to load

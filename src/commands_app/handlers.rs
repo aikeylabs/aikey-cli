@@ -28,8 +28,8 @@ use crate::storage;
 use super::{
     authorize_atomic, get_active_bindings, get_app_record, is_first_party, list_app_active_keys,
     list_apps, pause_active_keys, resume_paused_keys, revoke_active_keys, rotate_app_key,
-    set_app_binding, upsert_app_record, validate_first_party_invariants, validate_slug,
-    validate_upstreams, AppRecord,
+    set_app_binding, set_app_filter_stages, upsert_app_record, validate_first_party_invariants,
+    validate_slug, validate_upstreams, AppRecord,
 };
 
 // ---------------------------------------------------------------------------
@@ -58,6 +58,7 @@ use super::{
 /// Validation runs BEFORE any vault write so a rejected register can't
 /// leave a partial app_records row + change_seq bump that would trigger
 /// a useless proxy restart.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_register(
     slug: &str,
     name: &str,
@@ -66,6 +67,9 @@ pub fn handle_register(
     first_party: bool,
     follow_user_active: bool,
     requested_permissions: &[String],
+    filter_stages: &[String],
+    filter_priority: Option<i64>,
+    filter_timeout_policy: Option<&str>,
     rotate_bearer: bool,
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -77,6 +81,9 @@ pub fn handle_register(
         first_party,
         follow_user_active,
         requested_permissions,
+        filter_stages,
+        filter_priority,
+        filter_timeout_policy,
         rotate_bearer,
     )?;
 
@@ -219,6 +226,7 @@ pub struct RegisterResult {
 /// (`commands_internal::app::handle_register`) call this. Per CLAUDE.md
 /// "_internal 隐藏命令必须复用公开命令逻辑" — single implementation,
 /// two presentation shells.
+#[allow(clippy::too_many_arguments)]
 pub fn register_core(
     slug: &str,
     name: &str,
@@ -227,10 +235,22 @@ pub fn register_core(
     first_party: bool,
     follow_user_active: bool,
     requested_permissions: &[String],
+    filter_stages: &[String],
+    filter_priority: Option<i64>,
+    filter_timeout_policy: Option<&str>,
     rotate_bearer: bool,
 ) -> Result<RegisterResult, Box<dyn std::error::Error>> {
     validate_slug(slug).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    validate_upstreams(upstreams).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    // A filter-only app (e.g. ai-compliance-detector) consumes no LLM upstream,
+    // so empty --upstreams is allowed iff --filter-stages is set. Non-filter
+    // apps still require at least one valid upstream.
+    if upstreams.is_empty() {
+        if filter_stages.is_empty() {
+            return Err("at least one --upstreams value is required (e.g. anthropic), unless registering a filter-only app with --filter-stages".into());
+        }
+    } else {
+        validate_upstreams(upstreams).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    }
     validate_first_party_invariants(slug, first_party, follow_user_active)
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
@@ -249,6 +269,15 @@ pub fn register_core(
         follow_user_active,
         requested_permissions,
     )?;
+
+    // Filter registration is an additive UPDATE on the row just upserted, so
+    // the existing upsert path (and its 20+ tests) stay untouched. Only runs
+    // when this is a filter app; a plain re-register without --filter-stages
+    // preserves any previously-set filter_stages.
+    if !filter_stages.is_empty() {
+        set_app_filter_stages(slug, filter_stages, filter_priority, filter_timeout_policy)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    }
 
     // Resolve bindings for each declared upstream (Q1=A1 + Bug 1 修复).
     // For follow_user_active=true the snapshot is intentionally skipped —

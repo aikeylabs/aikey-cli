@@ -298,6 +298,9 @@ fn handle_register(env: StdinEnvelope) {
         /* first_party */ false,
         /* follow_user_active */ false,
         &p.requested_permissions,
+        /* filter_stages */ &[],
+        /* filter_priority */ None,
+        /* filter_timeout_policy */ None,
         /* rotate_bearer */ false,
     ) {
         Ok(r) => r,
