@@ -29,7 +29,7 @@
 
 use crate::credential_type::CredentialType;
 use crate::storage;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 mod handlers;
 mod install;
@@ -369,6 +369,73 @@ pub fn set_app_filter_stages_with_conn(
         ));
     }
     Ok(())
+}
+
+/// Clears an app's filter columns (filter_stages = NULL) so the proxy stops
+/// spawning it as a filter — the DISABLE half of the compliance on/off toggle.
+/// NULL (not `[]`) is required: the proxy's GetFilterAppSlugs selects rows
+/// WHERE filter_stages IS NOT NULL, and `[]` would still count as "declared".
+/// Bumps change_seq so the proxy reload picks it up (same as the enable path).
+pub fn clear_app_filter_stages(slug: &str) -> Result<(), String> {
+    let conn = storage::open_connection()?;
+    clear_app_filter_stages_with_conn(&conn, slug)?;
+    let _ = storage::bump_vault_change_seq();
+    Ok(())
+}
+
+/// Test-friendly inner: see `clear_app_filter_stages`.
+pub fn clear_app_filter_stages_with_conn(conn: &Connection, slug: &str) -> Result<(), String> {
+    let affected = conn
+        .execute(
+            "UPDATE app_records
+                SET filter_stages = NULL,
+                    filter_priority = NULL,
+                    filter_timeout_policy = NULL,
+                    updated_at = strftime('%s', 'now')
+              WHERE slug = ?1",
+            params![slug],
+        )
+        .map_err(|e| format!("UPDATE app_records clear filter_stages: {}", e))?;
+    if affected == 0 {
+        return Err(format!(
+            "cannot clear filter_stages: app '{}' is not registered",
+            slug
+        ));
+    }
+    Ok(())
+}
+
+/// Reads an app's filter state — the STATUS half of the compliance toggle.
+/// Returns Ok(None) when the app isn't registered OR filter_stages IS NULL
+/// (disabled); Ok(Some(stages)) when enabled. The proxy treats NULL as "off",
+/// so None == disabled is the correct collapse for the web toggle.
+pub fn get_app_filter_stages(slug: &str) -> Result<Option<Vec<String>>, String> {
+    let conn = storage::open_connection()?;
+    get_app_filter_stages_with_conn(&conn, slug)
+}
+
+/// Test-friendly inner: see `get_app_filter_stages`.
+pub fn get_app_filter_stages_with_conn(
+    conn: &Connection,
+    slug: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let stages_json: Option<String> = conn
+        .query_row(
+            "SELECT filter_stages FROM app_records WHERE slug = ?1",
+            params![slug],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|e| format!("read filter_stages: {}", e))?
+        .flatten();
+    match stages_json {
+        None => Ok(None),
+        Some(j) => {
+            let stages: Vec<String> = serde_json::from_str(&j)
+                .map_err(|e| format!("decode filter_stages JSON: {}", e))?;
+            Ok(Some(stages))
+        }
+    }
 }
 
 /// SELECT a single `app_records` row by slug. Used by `authorize` to load

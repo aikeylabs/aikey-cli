@@ -284,6 +284,75 @@ fn set_app_filter_stages_writes_columns_proxy_reads() {
     assert_eq!(found, "ai-compliance-detector");
 }
 
+/// Phase 2 compliance toggle: get_app_filter_stages reads enabled/disabled,
+/// and clear_app_filter_stages sets NULL so the proxy discovery query
+/// (WHERE filter_stages IS NOT NULL) stops returning the slug — the on/off
+/// round-trip the local web toggle drives.
+#[test]
+fn filter_toggle_enable_disable_round_trip() {
+    let conn = fresh_test_vault();
+    upsert_app_record_with_conn(
+        &conn,
+        "ai-compliance-detector",
+        "AI Compliance Detector",
+        "aikey-labs",
+        &[],
+        "first-party",
+        false,
+        &[],
+    )
+    .expect("upsert filter app");
+
+    // Freshly registered, no filter_stages yet → disabled.
+    assert_eq!(
+        get_app_filter_stages_with_conn(&conn, "ai-compliance-detector").unwrap(),
+        None,
+        "unset filter_stages must read as disabled (None)"
+    );
+
+    // Enable → status reads the stages.
+    set_app_filter_stages_with_conn(
+        &conn,
+        "ai-compliance-detector",
+        &["pre_forward".into()],
+        None,
+        None,
+    )
+    .expect("enable");
+    assert_eq!(
+        get_app_filter_stages_with_conn(&conn, "ai-compliance-detector").unwrap(),
+        Some(vec!["pre_forward".to_string()]),
+        "after enable, status must report the stages"
+    );
+    let discovered: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM app_records WHERE filter_stages IS NOT NULL AND slug = ?1",
+            rusqlite::params!["ai-compliance-detector"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(discovered, 1, "enabled app must appear in proxy discovery");
+
+    // Disable → NULL, status disabled, proxy discovery excludes it.
+    clear_app_filter_stages_with_conn(&conn, "ai-compliance-detector").expect("disable");
+    assert_eq!(
+        get_app_filter_stages_with_conn(&conn, "ai-compliance-detector").unwrap(),
+        None,
+        "after disable, status must read disabled (None)"
+    );
+    let discovered_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM app_records WHERE filter_stages IS NOT NULL AND slug = ?1",
+            rusqlite::params!["ai-compliance-detector"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        discovered_after, 0,
+        "disabled app must NOT appear in proxy discovery (NULL, not [])"
+    );
+}
+
 /// Defaults: omitting priority/policy yields priority=100, policy=fail_open so
 /// the row is always well-formed for the proxy.
 #[test]
