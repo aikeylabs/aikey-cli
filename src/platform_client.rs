@@ -114,6 +114,39 @@ pub struct ManagedKeySnapshotItem {
 pub struct ManagedKeysSnapshotResponse {
     pub sync_version: i64,
     pub keys: Vec<ManagedKeySnapshotItem>,
+    /// Enterprise quota rules applicable to this account's seats (design
+    /// §0.5/§5.2). `None` when the server is an older/quota-less edition (field
+    /// absent) — the CLI then leaves its quota cache untouched. `Some` (even
+    /// with an empty `subjects`) is the authoritative full set and triggers a
+    /// full-replace of the local quota cache, so deleting the last quota for a
+    /// seat propagates as an empty list that clears stale rules.
+    #[serde(default)]
+    pub quota: Option<QuotaSnapshot>,
+}
+
+/// The quota payload inlined in the delivery snapshot. Mirrors the server's
+/// `quota.RulesSnapshot`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct QuotaSnapshot {
+    #[serde(default)]
+    pub subjects: Vec<QuotaSubjectSnapshot>,
+}
+
+/// One quota subject (a seat or a group of seats). `rules` is kept as raw JSON:
+/// the CLI only persists it for the proxy to parse, so it doesn't need the Rule
+/// shape and stays forward-compatible with rule-schema evolution.
+#[derive(Debug, Deserialize, Clone)]
+pub struct QuotaSubjectSnapshot {
+    pub subject_id: String,
+    pub subject_kind: String,
+    #[serde(default)]
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub rules: serde_json::Value,
+    /// Stage 4 回填: per-(metric,period) current-period used baseline. Kept as
+    /// raw JSON — the CLI only persists it for the proxy to seed its counter.
+    #[serde(default)]
+    pub baselines: serde_json::Value,
 }
 
 /// One item from GET /accounts/me/all-keys

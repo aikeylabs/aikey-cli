@@ -260,6 +260,42 @@ pub fn clear_virtual_key_cache() -> Result<(), String> {
     Ok(())
 }
 
+/// One row to persist into the client-side `quota_rules_cache` (Phase 2 — design
+/// §0.5/§5.2). A lean mirror of the server's `SubjectSnapshot`; `rules_json` is
+/// the raw rules JSON array (the proxy parses it, the CLI just stores it).
+pub struct QuotaRuleCacheEntry {
+    pub subject_id: String,
+    pub subject_kind: String,
+    pub members_json: Option<String>,  // JSON [seat_id...] for group; None for seat
+    pub rules_json: String,            // JSON array of rules
+    pub baseline_json: Option<String>, // Stage 4: JSON [{metric,period,used}]; None when absent
+}
+
+/// Full-replaces the `quota_rules_cache` with the snapshot's applicable subjects
+/// (design §0.5/§5.2). The delivery snapshot is the authoritative full set for
+/// this account's seats, so a transactional DELETE-then-INSERT keeps the proxy's
+/// 5s read seeing a consistent set (and an empty `entries` clears stale rules
+/// after the last quota is deleted). Caller treats failures as best-effort.
+pub fn replace_quota_rules_cache(entries: &[QuotaRuleCacheEntry]) -> Result<(), String> {
+    let mut conn = open_connection()?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("quota cache tx: {}", e))?;
+    tx.execute("DELETE FROM quota_rules_cache", [])
+        .map_err(|e| format!("clear quota_rules_cache: {}", e))?;
+    for e in entries {
+        tx.execute(
+            "INSERT INTO quota_rules_cache (subject_id, subject_kind, members, rules, baseline, synced_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'))",
+            rusqlite::params![e.subject_id, e.subject_kind, e.members_json, e.rules_json, e.baseline_json],
+        )
+        .map_err(|err| format!("insert quota rule {}: {}", e.subject_id, err))?;
+    }
+    tx.commit()
+        .map_err(|e| format!("commit quota_rules_cache: {}", e))?;
+    Ok(())
+}
+
 /// Clears `provider_key_nonce` / `provider_key_ciphertext` on all active
 /// (non-disabled) managed virtual keys, so a subsequent
 /// `run_full_snapshot_sync` will treat them as `needs_download` and pull

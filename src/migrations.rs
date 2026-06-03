@@ -438,11 +438,22 @@ pub mod v1_0_0_baseline {
                 subject_kind  TEXT NOT NULL,
                 members       TEXT,
                 rules         TEXT NOT NULL DEFAULT '[]',
+                baseline      TEXT,
                 synced_at     INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             )",
             [],
         )
         .map_err(|e| format!("Failed to ensure quota_rules_cache table: {}", e))?;
+
+        // Stage 4 回填: per-(metric,period) current-period used baseline, JSON
+        // array. Retrofit for vaults that created quota_rules_cache before this
+        // column existed (the CREATE TABLE IF NOT EXISTS above is a no-op there).
+        ensure_column(
+            conn,
+            "quota_rules_cache",
+            "baseline",
+            "ALTER TABLE quota_rules_cache ADD COLUMN baseline TEXT",
+        )?;
 
         // entries routing column retrofits.
         for (col, ddl) in &[

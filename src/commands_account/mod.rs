@@ -465,6 +465,55 @@ fn save_control_url_to_config(url: &str) {
     );
 }
 
+/// Updates `~/.aikey/install-state.json`'s `control_panel_url` field so
+/// downstream consumers (notably `aikey web` / `aikey browse`, which
+/// resolve the team URL through `derive_local_control_url`) see the
+/// freshly-logged-in URL instead of the installer-time value.
+///
+/// 2026-06-01 bugfix: prior to this, `aikey login --control-url X` and
+/// `aikey account set-url X` only touched (a) vault platform_account
+/// (b) config.json (c) aikey-proxy.yaml. `install-state.json` stayed
+/// stuck on whatever the LAST installer run wrote — so after a network
+/// change + re-login, `aikey web` opened the previous network's IP.
+///
+/// Best-effort: silently no-ops if install-state.json doesn't exist
+/// (fresh CLI-only state, no installer-tracked metadata yet) or can't
+/// be parsed. Writes through a tmp file + atomic rename to avoid
+/// corrupting the file on a partial-write crash. `last_updated_at`
+/// is also bumped so operators eyeballing the file can see WHEN it
+/// last changed via a login event (vs. installer event).
+fn update_install_state_control_url(url: &str) {
+    let path = shell_integration::resolve_aikey_dir().join("install-state.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return, // No install-state.json → no installer-tracked state to update.
+    };
+    let mut obj: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return, // Corrupt JSON — don't overwrite, let `aikey doctor` flag it.
+    };
+    if !obj.is_object() {
+        return;
+    }
+    obj["control_panel_url"] = serde_json::Value::String(url.to_string());
+    // Note: we intentionally don't touch `last_updated_at` here. The
+    // existing pattern in this crate uses std::time (SystemTime / UNIX_EPOCH),
+    // which can't format ISO 8601 without an extra crate, and bringing in
+    // chrono just for one timestamp string is more weight than the
+    // observability benefit. Operators tracking when the URL last changed
+    // can still see the file mtime via `stat`.
+
+    let tmp = path.with_extension("json.tmp");
+    let body = match serde_json::to_string_pretty(&obj) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    if std::fs::write(&tmp, body).is_err() {
+        return;
+    }
+    let _ = std::fs::rename(&tmp, &path);
+}
+
 // ---------------------------------------------------------------------------
 // account set-url
 // ---------------------------------------------------------------------------
@@ -483,6 +532,13 @@ pub fn handle_set_control_url(
 
     // Update config.json (used by login flow for default URL).
     save_control_url_to_config(url);
+
+    // 2026-06-01: also push to install-state.json so `aikey web` /
+    // `aikey browse` (which resolve through derive_local_control_url and
+    // ultimately read install-state.json's `control_panel_url`) see the
+    // new URL. Without this, `aikey web` would keep opening the previous
+    // network's IP until the next installer run.
+    update_install_state_control_url(url);
 
     // Update the platform_account row if logged in (used by all API calls).
     if let Ok(Some(acc)) = storage::get_platform_account() {
@@ -907,6 +963,12 @@ fn finish_login(
     // Persist control URL to config.json so future logins skip the prompt.
     save_control_url_to_config(&control_url);
 
+    // 2026-06-01: also push to install-state.json so `aikey web` / `aikey
+    // browse` see the freshly-logged-in URL on subsequent invocations.
+    // Without this, install-state stays stuck on whatever the installer
+    // wrote and post-login `aikey web` opens the previous network's IP.
+    update_install_state_control_url(&control_url);
+
     // Auto-configure proxy collector_url so usage reporting works out of the box.
     // Collector runs on the same host as the control panel, fixed port 27300.
     configure_proxy_collector(&control_url, json_mode);
@@ -930,6 +992,64 @@ fn open_url_silently(url: &str) {
         .spawn();
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let _ = url; // unsupported platform — silently skip
+}
+
+/// Delivers the browse URL either by opening the browser (default) or by
+/// copying to the system clipboard (`copy_url=true`).
+///
+/// Why both behaviours live in one helper: every `aikey web` exit point
+/// must consistently honour the `--copy-url` flag, even if a later refactor
+/// changes how the URL is built. Centralising the branch keeps the rule
+/// "what the URL points at goes through this gate" enforceable.
+///
+/// No auto-clear (2026-06-03 decision): the cross-platform
+/// `schedule_clipboard_clear` helper spawns a detached thread that dies
+/// when this `aikey` process exits, so the timer never fires in
+/// practice (same as `aikey get` — pre-existing bug, see future bugfix
+/// "20260603-clipboard-auto-clear-detached-thread-killed"). Rather than
+/// ship a false "auto-clear in 30s" promise, we deliberately don't
+/// schedule a clear here. The user gets the URL on clipboard, sees the
+/// confirmation message, and the next clipboard write overwrites it
+/// naturally. JWT TTL is 24h — by then the token's already expired.
+///
+/// Failure fallback: if `arboard` reports the clipboard is unreachable
+/// (no DISPLAY/WAYLAND_DISPLAY on Linux, sandbox restrictions, etc.) we
+/// print the full URL to stdout with a WARN to stderr instead of failing
+/// silently. The user explicitly asked for the URL, so we always give it
+/// to them — through clipboard if possible, through stdout if not.
+///
+/// `display_url`: what to echo in the success line. Callers that don't
+/// want the auth token in terminal scrollback (the JWT path) pass the
+/// base+path form instead. The clipboard payload is ALWAYS the full URL
+/// — that's what the user pastes.
+fn deliver_browse_url(url: &str, copy_url: bool, json_mode: bool, display_url: &str) {
+    if !copy_url {
+        open_url_silently(url);
+        return;
+    }
+    match crate::executor::copy_to_clipboard(url) {
+        Ok(()) => {
+            if !json_mode {
+                println!("URL copied to clipboard.");
+                println!("  {}", display_url);
+            }
+        }
+        Err(e) => {
+            // Surface the failure on stderr so it's visible even when
+            // the caller pipes stdout. Then print the FULL URL (including
+            // token) on stdout so the user can copy it manually — the
+            // whole point of --copy-url is "give me the URL", and the
+            // fallback path must still deliver on that promise.
+            if json_mode {
+                eprintln!("[warn] copy to clipboard failed: {}", e);
+                eprintln!("[info] URL (auth token included): {}", url);
+            } else {
+                eprintln!("[warn] Clipboard unavailable: {}", e);
+                println!("Copy the URL manually (auth token included):");
+                println!("  {}", url);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,6 +1204,7 @@ pub fn handle_browse(
     page: Option<&str>,
     port: Option<u16>,
     json_mode: bool,
+    copy_url: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate the page name at the CLI boundary. Doing it here (before
     // the local/JWT branch) means typos fail fast with a clear error
@@ -1091,20 +1212,29 @@ pub fn handle_browse(
     // opening the overview page.
     let alias = web_page_alias(page)?;
 
-    // Local-user mode: open console directly without JWT.
-    // Why: personal edition has no login flow — LocalIdentityMiddleware handles
-    // auth server-side, and the SPA is served with authMode:"local_bypass".
+    // 2026-06-01 design change (user spec):
+    //   logged in     → team Control Panel (was: local-first, now flipped)
+    //   not logged in → 127.0.0.1:8090 local console
     //
-    // Phase 3B (2026-05-11) note: unlike `aikey master`, `aikey web` keeps
-    // the local-mode shortcut active even when the user is logged into a
-    // remote team. Reasoning: `web` opens the user's own dashboard / vault /
-    // overview, which are served by the LOCAL local-server — that's where
-    // the Phase 3A merged Personal + Team key display lives. The remote
-    // team server has its own separate user-facing pages, but they're a
-    // different context (master-managed view, no local Personal keys).
-    // `aikey master` is the command that should follow the login URL
-    // (team-admin console); `aikey web` stays local.
-    if port.is_none() {
+    // Previous Phase 3B (2026-05-11) design preferred LOCAL even when logged
+    // in, on the reasoning that `aikey web` opens the user's own dashboard
+    // which surfaces the Phase 3A merged Personal + Team key view. Users
+    // pushed back: when they're logged into a team, `aikey web` should land
+    // them in the team's Control Panel (where seats / providers / org admin
+    // live), not their loopback. Users who specifically want the merged
+    // local view can still pass `--port 8090` to force local.
+    //
+    // The team path runs first now. If get_platform_account returns Some,
+    // we route through the JWT branch below (which fall-throughs here) and
+    // skip the local-server preflight entirely. If None, we fall to the
+    // local path next.
+    let logged_in = matches!(storage::get_platform_account(), Ok(Some(_)));
+
+    // Local-user mode: only used when NOT logged in. Personal edition has
+    // no login flow — LocalIdentityMiddleware handles auth server-side,
+    // and the SPA is served with authMode:"local_bypass". Also used when
+    // an explicit --port is passed (force-local intent).
+    if !logged_in && port.is_none() {
         if let Some(url) = try_local_browse_url(alias) {
             // Pre-flight: probe local-server before opening the browser.
             // Without this, an unstarted service produced ERR_CONNECTION_
@@ -1121,11 +1251,15 @@ pub fn handle_browse(
                             "url": &url,
                             "mode": "local",
                         }));
-                    } else {
+                    } else if !copy_url {
+                        // The clipboard branch prints its own confirmation
+                        // inside deliver_browse_url; skip the duplicate
+                        // "Opening..." message when --copy-url is set.
                         println!("Opening Local Console...");
                         println!("  {}", url);
                     }
-                    open_url_silently(&url);
+                    // Local URL has no auth token, so display_url == url.
+                    deliver_browse_url(&url, copy_url, json_mode, &url);
                     return Ok(());
                 }
                 BrowseLocalPreflight::DeclineNoOpen => {
@@ -1182,12 +1316,19 @@ pub fn handle_browse(
             "ok": true,
             "url": format!("{}{}", base_url, path),
         }));
-    } else {
+    } else if !copy_url {
+        // The clipboard branch prints its own confirmation inside
+        // deliver_browse_url; skip the duplicate "Opening..." message
+        // when --copy-url is set.
         println!("Opening User Console...");
         println!("  {}{}", base_url, path);
     }
 
-    open_url_silently(&url);
+    // Token-bearing URL goes into the clipboard / browser; the display
+    // form (base+path) is what we ever echo to the terminal — keeps the
+    // 24h JWT out of shell scrollback even in --copy-url mode.
+    let display_url = format!("{}{}", base_url, path);
+    deliver_browse_url(&url, copy_url, json_mode, &display_url);
     Ok(())
 }
 
@@ -1462,9 +1603,19 @@ fn derive_local_control_url(state: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     match profile {
-        // trial / local-with-console: ports.trial is canonical (both profiles
-        // populate it; they only differ in `install_profile` value).
-        "trial" | "local" => {
+        // trial / local-with-console / personal: ports.trial is canonical for
+        // all "user-side" installs that run a local-server. Both
+        // `local-install.sh --with-console` and `make restart-personal`
+        // write `ports.trial = console_port`. install_profile differs
+        // ("local" vs "personal") for historical reasons — we accept
+        // both. 2026-06-01: added "personal" so `aikey web` after
+        // logout (which is supposed to land on 127.0.0.1:8090 per user
+        // spec) doesn't fall to the `_ =>` arm and read the now-stale
+        // `control_panel_url` (set by the previous login). The handle_
+        // browse function decides team-vs-local on login state; this
+        // helper is the LOCAL-side of that decision, so reading the
+        // team URL from install-state here would be a layering bug.
+        "trial" | "local" | "personal" => {
             let port = state.get("ports")?.get("trial")?.as_u64()?;
             Some(format!("http://127.0.0.1:{}", port))
         }
@@ -2279,6 +2430,51 @@ fn apply_snapshot_to_cache(
     }
 }
 
+/// Persists the quota rules carried by a delivery snapshot into the local
+/// `quota_rules_cache` for the proxy to read (design §0.5/§5.2). Best-effort:
+/// a failure is logged and never blocks the managed-key sync — quota is the
+/// rule-distribution rail, not the critical key-delivery path. `None` (older /
+/// quota-less server, field absent) leaves the cache untouched; `Some` is the
+/// authoritative full set and full-replaces the cache (an empty list clears
+/// rules after the last quota for a seat is deleted).
+fn apply_quota_snapshot_to_cache(quota: &Option<crate::platform_client::QuotaSnapshot>) {
+    let snap = match quota {
+        Some(s) => s,
+        None => return,
+    };
+    let entries: Vec<storage::QuotaRuleCacheEntry> = snap
+        .subjects
+        .iter()
+        .map(|s| {
+            let members_json = if s.subject_kind == "group" && !s.members.is_empty() {
+                serde_json::to_string(&s.members).ok()
+            } else {
+                None
+            };
+            let rules_json = serde_json::to_string(&s.rules).unwrap_or_else(|_| "[]".to_string());
+            // Stage 4 回填: persist baselines JSON when present (skip null/empty).
+            let baseline_json = if s.baselines.is_null() {
+                None
+            } else {
+                match serde_json::to_string(&s.baselines) {
+                    Ok(j) if j != "null" && j != "[]" => Some(j),
+                    _ => None,
+                }
+            };
+            storage::QuotaRuleCacheEntry {
+                subject_id: s.subject_id.clone(),
+                subject_kind: s.subject_kind.clone(),
+                members_json,
+                rules_json,
+                baseline_json,
+            }
+        })
+        .collect();
+    if let Err(e) = storage::replace_quota_rules_cache(&entries) {
+        eprintln!("[aikey] warning: failed to cache quota rules: {}", e);
+    }
+}
+
 /// Runs one snapshot sync cycle (blocking):
 /// 1. Calls GET /accounts/me/sync-version — fast server round-trip.
 /// 2. Compares remote version with `local_seen_sync_version` in the config table.
@@ -2315,6 +2511,7 @@ pub fn run_snapshot_sync() -> Result<bool, String> {
     };
 
     apply_snapshot_to_cache(&snapshot.keys, &acc.account_id);
+    apply_quota_snapshot_to_cache(&snapshot.quota);
 
     // Record the new version so the next command skips the snapshot pull.
     storage::set_local_seen_sync_version(snapshot.sync_version);
@@ -2373,6 +2570,7 @@ pub fn run_full_snapshot_sync_with_vault_key(
     };
 
     apply_snapshot_to_cache(&snapshot.keys, &acc.account_id);
+    apply_quota_snapshot_to_cache(&snapshot.quota);
     storage::set_local_seen_sync_version(snapshot.sync_version);
     let _ = storage::bump_vault_change_seq();
 
@@ -4570,6 +4768,97 @@ mod core_tests {
         // Any 32-byte key works for apply_add_core tests — it's used purely
         // for AES-GCM encryption. Decryption round-trips aren't tested here.
         [0x42u8; 32]
+    }
+
+    // ── apply_quota_snapshot_to_cache (Phase 2 Stage 2b) ──────────────────────
+
+    #[test]
+    fn quota_snapshot_cache_replace_clear_and_none() {
+        use crate::platform_client::{QuotaSnapshot, QuotaSubjectSnapshot};
+        use rusqlite::OptionalExtension;
+        let (_dir, _guard) = setup_vault();
+
+        // Use the production open_connection() (it runs migrations::upgrade_all,
+        // creating quota_rules_cache) — a raw Connection::open would skip the
+        // lazy schema upgrade and not see the table.
+        let count_rows = || -> i64 {
+            let conn = crate::storage::open_connection().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM quota_rules_cache", [], |r| r.get(0))
+                .unwrap()
+        };
+        let read_row = |id: &str| -> Option<(String, Option<String>, String, Option<String>)> {
+            let conn = crate::storage::open_connection().unwrap();
+            conn.query_row(
+                "SELECT subject_kind, members, rules, baseline FROM quota_rules_cache WHERE subject_id = ?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .unwrap()
+        };
+
+        // None (older/quota-less server) must not touch the cache.
+        apply_quota_snapshot_to_cache(&None);
+        assert_eq!(count_rows(), 0, "None must not write");
+
+        // Some with seat + group → full set; seat members NULL, group members JSON.
+        let snap = QuotaSnapshot {
+            subjects: vec![
+                QuotaSubjectSnapshot {
+                    subject_id: "seat-a".into(),
+                    subject_kind: "seat".into(),
+                    members: vec![],
+                    rules: serde_json::json!([{"metric":"usd","period":"monthly","limit_amount":50.0}]),
+                    baselines: serde_json::json!([{"metric":"tokens","period":"monthly","used":42.0}]),
+                },
+                QuotaSubjectSnapshot {
+                    subject_id: "grp-1".into(),
+                    subject_kind: "group".into(),
+                    members: vec!["seat-a".into(), "seat-b".into()],
+                    rules: serde_json::json!([{"metric":"tokens","period":"daily","limit_amount":1000000.0}]),
+                    baselines: serde_json::Value::Null,
+                },
+            ],
+        };
+        apply_quota_snapshot_to_cache(&Some(snap));
+        assert_eq!(count_rows(), 2);
+        let (kind, members, rules, baseline) = read_row("seat-a").expect("seat-a row");
+        assert_eq!(kind, "seat");
+        assert!(
+            members.is_none(),
+            "seat members must be NULL, got {:?}",
+            members
+        );
+        assert!(
+            rules.contains("\"usd\""),
+            "seat rules round-trip: {}",
+            rules
+        );
+        // Stage 4 baseline persists for seat-a; NULL for grp-1 (no baseline).
+        assert!(
+            baseline.as_deref().unwrap_or("").contains("\"used\":42"),
+            "seat baseline round-trip: {:?}",
+            baseline
+        );
+        let (gkind, gmembers, _, gbaseline) = read_row("grp-1").expect("grp-1 row");
+        assert_eq!(gkind, "group");
+        assert_eq!(gmembers.unwrap(), "[\"seat-a\",\"seat-b\"]");
+        assert!(
+            gbaseline.is_none(),
+            "grp baseline must be NULL, got {:?}",
+            gbaseline
+        );
+
+        // Some with empty subjects → full-replace clears (last-quota-deleted).
+        apply_quota_snapshot_to_cache(&Some(QuotaSnapshot { subjects: vec![] }));
+        assert_eq!(count_rows(), 0, "empty Some must clear stale rules");
     }
 
     // ── validate_alias ────────────────────────────────────────────────────
