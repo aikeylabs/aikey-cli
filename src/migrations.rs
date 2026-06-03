@@ -422,6 +422,28 @@ pub mod v1_0_0_baseline {
             ensure_column(conn, "managed_virtual_keys_cache", col, ddl)?;
         }
 
+        // Enterprise quota rules cache (Phase 2 — design §0.5/§5.2). The proxy
+        // is a client-side component with no access to the control DB, so quota
+        // rules ride the delivery snapshot the same way managed keys do: the CLI
+        // pulls the seat's applicable subjects from the snapshot and writes them
+        // here; the proxy reads this table on its 5s vault sync to build its
+        // in-memory rule snapshot + seat→group reverse index. This is a derived
+        // client mirror of control's quota_subject — NOT a source of truth.
+        // Shape mirrors the snapshot's SubjectSnapshot (lean: id/kind/members/
+        // rules only). Full-replaced on each sync (the snapshot is the complete
+        // applicable set for this account's seats).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS quota_rules_cache (
+                subject_id    TEXT PRIMARY KEY,
+                subject_kind  TEXT NOT NULL,
+                members       TEXT,
+                rules         TEXT NOT NULL DEFAULT '[]',
+                synced_at     INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )
+        .map_err(|e| format!("Failed to ensure quota_rules_cache table: {}", e))?;
+
         // entries routing column retrofits.
         for (col, ddl) in &[
             (
@@ -684,9 +706,16 @@ pub mod v1_0_0_baseline {
                 --                           for P4.
                 --   filter_priority       — chain ordering; smaller = earlier.
                 --   filter_timeout_policy — fail_open | fail_closed.
+                --   filter_record_allow   — 0/1; whether the local self-view
+                --                           records allow (clean-scan) events.
+                --                           Default 0 (off, save space). The
+                --                           proxy reads it and passes it to the
+                --                           detector as env so the detector can
+                --                           skip emitting allow events at source.
                 filter_stages TEXT,
                 filter_priority INTEGER,
                 filter_timeout_policy TEXT,
+                filter_record_allow INTEGER NOT NULL DEFAULT 0,
                 requested_permissions TEXT,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
@@ -697,10 +726,25 @@ pub mod v1_0_0_baseline {
         )
         .map_err(|e| format!("Failed to ensure app_records: {}", e))?;
 
-        // No ALTER TABLE retrofit for `app_records` columns: this table was
-        // added 2026-05-20 and is still pre-GA, so the project convention
-        // (see `entries` ALTER history vs the Kimi-split fold note at the
-        // top of this file) is "modify CREATE TABLE in-place, dev users
+        // filter_record_allow retrofit (2026-06-03): unlike the other
+        // app_records columns (CREATE-TABLE-only per the note below), this one
+        // is added to an ALREADY-DEPLOYED table — dev/real vaults that already
+        // ran the prior baseline have app_records WITHOUT it, and forcing an
+        // uninstall+reinstall to gain one boolean flag is unacceptable. So we
+        // ALTER-retrofit idempotently (same has_column-guarded pattern the
+        // `entries` table uses). The CREATE TABLE above carries it for fresh
+        // installs; this keeps the two in lockstep.
+        ensure_column(
+            conn,
+            "app_records",
+            "filter_record_allow",
+            "ALTER TABLE app_records ADD COLUMN filter_record_allow INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        // No ALTER TABLE retrofit for the OTHER `app_records` columns: this
+        // table was added 2026-05-20 and is still pre-GA, so the project
+        // convention (see `entries` ALTER history vs the Kimi-split fold note at
+        // the top of this file) is "modify CREATE TABLE in-place, dev users
         // uninstall+reinstall". The B/D/E columns sit in the CREATE TABLE
         // statement above as the single source of truth.
         //

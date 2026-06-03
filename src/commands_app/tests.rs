@@ -353,6 +353,50 @@ fn filter_toggle_enable_disable_round_trip() {
     );
 }
 
+/// record_allow sub-toggle: default off (column default 0), set/clear
+/// round-trips, and the column the proxy reads flips 0↔1. This is what the
+/// settings-page "record allow events" switch drives.
+#[test]
+fn filter_record_allow_round_trip() {
+    let conn = fresh_test_vault();
+    upsert_app_record_with_conn(
+        &conn,
+        "ai-compliance-detector",
+        "AI Compliance Detector",
+        "aikey-labs",
+        &[],
+        "first-party",
+        false,
+        &[],
+    )
+    .expect("upsert filter app");
+
+    // Default: off.
+    assert!(
+        !get_app_filter_record_allow_with_conn(&conn, "ai-compliance-detector").unwrap(),
+        "filter_record_allow must default to false (off)"
+    );
+
+    // Turn on → getter true + column = 1 (what the proxy reads).
+    set_app_filter_record_allow_with_conn(&conn, "ai-compliance-detector", true).expect("set on");
+    assert!(get_app_filter_record_allow_with_conn(&conn, "ai-compliance-detector").unwrap());
+    let col: i64 = conn
+        .query_row(
+            "SELECT filter_record_allow FROM app_records WHERE slug = ?1",
+            rusqlite::params!["ai-compliance-detector"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(col, 1);
+
+    // Turn off → false + column = 0.
+    set_app_filter_record_allow_with_conn(&conn, "ai-compliance-detector", false).expect("set off");
+    assert!(!get_app_filter_record_allow_with_conn(&conn, "ai-compliance-detector").unwrap());
+
+    // Unregistered slug → error (mirrors set_app_filter_stages).
+    assert!(set_app_filter_record_allow_with_conn(&conn, "nope", true).is_err());
+}
+
 /// Defaults: omitting priority/policy yields priority=100, policy=fail_open so
 /// the row is always well-formed for the proxy.
 #[test]

@@ -57,6 +57,7 @@ pub fn handle(env: StdinEnvelope) {
         "reveal-token" => handle_reveal_token(env),
         "filter-status" => handle_filter_status(env),
         "filter-set" => handle_filter_set(env),
+        "filter-record-allow" => handle_filter_record_allow(env),
         other => emit_error(
             req_id,
             "I_UNKNOWN_ACTION",
@@ -602,6 +603,10 @@ fn handle_filter_status(env: StdinEnvelope) {
         Some(s) => s,
         None => return,
     };
+    // record_allow is a sub-setting; surface it alongside on/off so the web
+    // reads both compliance toggle + record-allow toggle in one call. Best-
+    // effort (default false) so a read error here never masks the on/off state.
+    let record_allow = commands_app::get_app_filter_record_allow(&slug).unwrap_or(false);
     match commands_app::get_app_filter_stages(&slug) {
         Ok(stages) => emit(&ResultEnvelope::ok(
             req_id,
@@ -609,9 +614,45 @@ fn handle_filter_status(env: StdinEnvelope) {
                 "slug": slug,
                 "enabled": stages.is_some(),
                 "stages": stages.unwrap_or_default(),
+                "record_allow": record_allow,
             }),
         )),
         Err(e) => emit_error(req_id, "I_APP_FILTER_STATUS_FAILED", e),
+    }
+}
+
+/// `filter-record-allow` — set whether the local self-view records "allow"
+/// (clean-scan) events for a filter app. payload {slug, enable}. enable=false
+/// (default) → don't record allow (save space). Bumps change_seq so the proxy
+/// reload re-spawns the detector with the new AIKEY_COMPLIANCE_RECORD_ALLOW env.
+fn handle_filter_record_allow(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+    #[derive(Deserialize)]
+    struct Payload {
+        slug: String,
+        enable: bool,
+    }
+    let p: Payload = match serde_json::from_value(env.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_error(
+                req_id,
+                "I_BAD_PAYLOAD",
+                format!("filter-record-allow payload: {}", e),
+            );
+            return;
+        }
+    };
+    if let Err(e) = commands_app::validate_slug(&p.slug) {
+        emit_error(req_id, "I_INVALID_SLUG", e);
+        return;
+    }
+    match commands_app::set_app_filter_record_allow(&p.slug, p.enable) {
+        Ok(()) => emit(&ResultEnvelope::ok(
+            req_id,
+            json!({ "slug": p.slug, "record_allow": p.enable }),
+        )),
+        Err(e) => emit_error(req_id, "I_APP_FILTER_RECORD_ALLOW_FAILED", e),
     }
 }
 

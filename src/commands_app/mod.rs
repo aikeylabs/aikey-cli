@@ -438,6 +438,65 @@ pub fn get_app_filter_stages_with_conn(
     }
 }
 
+/// Sets whether the local self-view records "allow" (clean-scan) events for a
+/// filter app. Default is off (0) to save space. The proxy reads this column
+/// and passes it to the detector child as env (AIKEY_COMPLIANCE_RECORD_ALLOW)
+/// so the detector can skip emitting allow events at source. Bumps change_seq
+/// so the proxy reload re-spawns the detector with the new env. Decoupled from
+/// the compliance on/off toggle (filter_stages) — this is a sub-setting.
+pub fn set_app_filter_record_allow(slug: &str, record_allow: bool) -> Result<(), String> {
+    let conn = storage::open_connection()?;
+    set_app_filter_record_allow_with_conn(&conn, slug, record_allow)?;
+    let _ = storage::bump_vault_change_seq();
+    Ok(())
+}
+
+/// Test-friendly inner: see `set_app_filter_record_allow`.
+pub fn set_app_filter_record_allow_with_conn(
+    conn: &Connection,
+    slug: &str,
+    record_allow: bool,
+) -> Result<(), String> {
+    let affected = conn
+        .execute(
+            "UPDATE app_records
+                SET filter_record_allow = ?2,
+                    updated_at = strftime('%s', 'now')
+              WHERE slug = ?1",
+            params![slug, if record_allow { 1 } else { 0 }],
+        )
+        .map_err(|e| format!("UPDATE app_records filter_record_allow: {}", e))?;
+    if affected == 0 {
+        return Err(format!(
+            "cannot set filter_record_allow: app '{}' is not registered",
+            slug
+        ));
+    }
+    Ok(())
+}
+
+/// Reads whether the local self-view records "allow" events for an app.
+/// Returns false (the default) when the app isn't registered OR the column is
+/// 0/NULL. The proxy uses this to decide the detector's env.
+pub fn get_app_filter_record_allow(slug: &str) -> Result<bool, String> {
+    let conn = storage::open_connection()?;
+    get_app_filter_record_allow_with_conn(&conn, slug)
+}
+
+/// Test-friendly inner: see `get_app_filter_record_allow`.
+pub fn get_app_filter_record_allow_with_conn(conn: &Connection, slug: &str) -> Result<bool, String> {
+    let v: Option<i64> = conn
+        .query_row(
+            "SELECT filter_record_allow FROM app_records WHERE slug = ?1",
+            params![slug],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map_err(|e| format!("read filter_record_allow: {}", e))?
+        .flatten();
+    Ok(v.unwrap_or(0) != 0)
+}
+
 /// SELECT a single `app_records` row by slug. Used by `authorize` to load
 /// the metadata for the consent prompt and by `list`.
 pub fn get_app_record(slug: &str) -> Result<Option<AppRecord>, String> {
