@@ -143,7 +143,13 @@ fn configure_proxy_collector(control_url: &str, json_mode: bool) {
     // Collector API is proxied through nginx on the same origin as the control panel.
     // Proxy uploads to {collector_url}/v1/usage-events:batch
     let collector_url = control_url.trim_end_matches('/').to_string();
-    let refresh_url = format!("{}/auth/refresh", collector_url);
+    // Refresh path MUST match the server's real CLI-token refresh route
+    // (router.go `POST /v1/auth/cli/token/refresh`) — the same endpoint the
+    // CLI session refresh uses (platform_client.rs). An earlier `/auth/refresh`
+    // here 404'd, so team usage events were silently dead-lettered once the
+    // access token expired. See
+    // workflow/CI/bugfix/2026-06-03-team-usage-refresh-contract-mismatch.md.
+    let refresh_url = format!("{}/v1/auth/cli/token/refresh", collector_url);
 
     // Pull the user's current access_token + expires_at from vault. This is
     // the same blob `aikey login` just wrote a few lines up; reading it
