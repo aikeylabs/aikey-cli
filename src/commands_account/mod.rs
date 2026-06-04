@@ -2479,6 +2479,16 @@ fn apply_quota_snapshot_to_cache(quota: &Option<crate::platform_client::QuotaSna
     if let Err(e) = storage::replace_quota_rules_cache(&entries) {
         eprintln!("[aikey] warning: failed to cache quota rules: {}", e);
     }
+    // D-U8/P6: persist the deployment-global edge price summary for the proxy's
+    // local usd pricing. Only when present — an absent field leaves the last-good
+    // summary untouched (resilient to an old / summary-less server response).
+    if let Some(pt) = &snap.price_tiers {
+        if let Ok(j) = serde_json::to_string(pt) {
+            if let Err(e) = storage::set_quota_price_summary(&j) {
+                eprintln!("[aikey] warning: failed to cache quota price summary: {}", e);
+            }
+        }
+    }
 }
 
 /// Runs one snapshot sync cycle (blocking):
@@ -4832,6 +4842,7 @@ mod core_tests {
                     baselines: serde_json::Value::Null,
                 },
             ],
+            price_tiers: None,
         };
         apply_quota_snapshot_to_cache(&Some(snap));
         assert_eq!(count_rows(), 2);
@@ -4863,7 +4874,10 @@ mod core_tests {
         );
 
         // Some with empty subjects → full-replace clears (last-quota-deleted).
-        apply_quota_snapshot_to_cache(&Some(QuotaSnapshot { subjects: vec![] }));
+        apply_quota_snapshot_to_cache(&Some(QuotaSnapshot {
+            subjects: vec![],
+            price_tiers: None,
+        }));
         assert_eq!(count_rows(), 0, "empty Some must clear stale rules");
     }
 

@@ -296,6 +296,25 @@ pub fn replace_quota_rules_cache(entries: &[QuotaRuleCacheEntry]) -> Result<(), 
     Ok(())
 }
 
+/// Config key for the deployment-global edge price summary (design D-U8/P6).
+pub const QUOTA_PRICE_SUMMARY_KEY: &str = "quota.price_summary";
+
+/// Upserts the deployment-global edge price summary JSON (D-U8/P6) as a singleton
+/// `config` row for the proxy to read for local usd pricing. Reuses the existing
+/// config kv table — no new table; the summary is global (not per-subject), so it
+/// doesn't belong in `quota_rules_cache`. Best-effort like the rules cache.
+/// Only called when the snapshot carries `price_tiers`; an absent field leaves the
+/// last-good summary untouched (resilient to an old / summary-less server).
+pub fn set_quota_price_summary(summary_json: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+        rusqlite::params![QUOTA_PRICE_SUMMARY_KEY, summary_json.as_bytes().to_vec()],
+    )
+    .map_err(|e| format!("write quota price summary: {}", e))?;
+    Ok(())
+}
+
 /// Clears `provider_key_nonce` / `provider_key_ciphertext` on all active
 /// (non-disabled) managed virtual keys, so a subsequent
 /// `run_full_snapshot_sync` will treat them as `needs_download` and pull

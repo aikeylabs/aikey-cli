@@ -130,6 +130,12 @@ pub struct ManagedKeysSnapshotResponse {
 pub struct QuotaSnapshot {
     #[serde(default)]
     pub subjects: Vec<QuotaSubjectSnapshot>,
+    /// D-U8/P6: deployment-global edge price summary `{version, models}` for the
+    /// proxy's local usd pricing. Kept as raw JSON — the CLI only persists it for
+    /// the proxy to parse. Absent (old/summary-less server) leaves the cached
+    /// summary untouched.
+    #[serde(default)]
+    pub price_tiers: Option<serde_json::Value>,
 }
 
 /// One quota subject (a seat or a group of seats). `rules` is kept as raw JSON:
