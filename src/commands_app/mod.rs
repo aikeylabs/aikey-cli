@@ -484,7 +484,10 @@ pub fn get_app_filter_record_allow(slug: &str) -> Result<bool, String> {
 }
 
 /// Test-friendly inner: see `get_app_filter_record_allow`.
-pub fn get_app_filter_record_allow_with_conn(conn: &Connection, slug: &str) -> Result<bool, String> {
+pub fn get_app_filter_record_allow_with_conn(
+    conn: &Connection,
+    slug: &str,
+) -> Result<bool, String> {
     let v: Option<i64> = conn
         .query_row(
             "SELECT filter_record_allow FROM app_records WHERE slug = ?1",

@@ -3,7 +3,7 @@
 //! triggers manual sync from trust-central.
 //!
 //! Boundary: this module is a thin HTTP client. All trust algorithms /
-//! storage live in `aikeylabs/degrade-detector/server_local/` (Python).
+//! storage live in `aikeylabs/ai-degrade-detector/server_local/` (Python).
 //! aikey-cli never owns trust data — vault.app_keys is the only AiKey-side
 //! source of truth for keys; trust state belongs to trust-local's SQLite.
 //!

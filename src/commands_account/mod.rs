@@ -2485,7 +2485,10 @@ fn apply_quota_snapshot_to_cache(quota: &Option<crate::platform_client::QuotaSna
     if let Some(pt) = &snap.price_tiers {
         if let Ok(j) = serde_json::to_string(pt) {
             if let Err(e) = storage::set_quota_price_summary(&j) {
-                eprintln!("[aikey] warning: failed to cache quota price summary: {}", e);
+                eprintln!(
+                    "[aikey] warning: failed to cache quota price summary: {}",
+                    e
+                );
             }
         }
     }
@@ -2555,6 +2558,81 @@ pub fn run_full_snapshot_sync(password: &SecretString) -> Result<usize, String> 
 /// vault_key Argon2id step. Caller must guarantee `vault_key` matches
 /// the vault's stored password_hash (the bridge's `prepare_vault`
 /// already enforces this before invoking us).
+/// A virtual key plus the metadata for one `managed_virtual_keys_cache` row,
+/// EXCEPT the encrypted provider-key material (which `upsert_delivered_key`
+/// derives from the plaintext).
+///
+/// Shared shape for the two delivery writers: the account-scoped CLI sync
+/// (`run_full_snapshot_sync_with_vault_key`) and the org-scoped cluster daemon
+/// path (`_internal vault-op cluster_apply_snapshot`). Both build a
+/// `DeliveredKey` from their own payload, then hand it to the single
+/// encrypt+upsert core below — so the cache row format and the critical vault
+/// encryption live in exactly one place (internal-command-reuses-public-core).
+pub(crate) struct DeliveredKey {
+    pub virtual_key_id: String,
+    pub org_id: String,
+    pub seat_id: String,
+    pub alias: String,
+    pub provider_code: String,
+    pub protocol_type: String,
+    pub base_url: String,
+    pub credential_id: String,
+    pub credential_revision: String,
+    pub virtual_key_revision: String,
+    pub key_status: String,
+    pub share_status: String,
+    pub local_state: String,
+    pub expires_at: Option<i64>,
+    pub local_alias: Option<String>,
+    pub supported_providers: Vec<String>,
+    pub provider_base_urls: std::collections::HashMap<String, String>,
+    pub owner_account_id: Option<String>,
+}
+
+/// Encrypts `plaintext_provider_key` with the (already-verified) vault key and
+/// upserts the resulting `managed_virtual_keys_cache` row. The single chokepoint
+/// for writing real provider-key ciphertext into the cache.
+///
+/// Callers MUST have already passed `vault_key` through
+/// `storage::verify_vault_key` (the CLI sync does so at its entry; the
+/// `_internal` handler does so via `prepare_vault`). Writing ciphertext under an
+/// unverified key is the 2026-05-11 registry-miss incident.
+pub(crate) fn upsert_delivered_key(
+    vault_key: &[u8; crypto::KEY_SIZE],
+    dk: &DeliveredKey,
+    plaintext_provider_key: &str,
+) -> Result<(), String> {
+    let (nonce, ciphertext) = crypto::encrypt(vault_key, plaintext_provider_key.as_bytes())
+        .map_err(|e| format!("encrypt: {}", e))?;
+    let entry = VirtualKeyCacheEntry {
+        virtual_key_id: dk.virtual_key_id.clone(),
+        org_id: dk.org_id.clone(),
+        seat_id: dk.seat_id.clone(),
+        alias: dk.alias.clone(),
+        provider_code: dk.provider_code.clone(),
+        protocol_type: dk.protocol_type.clone(),
+        base_url: dk.base_url.clone(),
+        credential_id: dk.credential_id.clone(),
+        credential_revision: dk.credential_revision.clone(),
+        virtual_key_revision: dk.virtual_key_revision.clone(),
+        key_status: dk.key_status.clone(),
+        share_status: dk.share_status.clone(),
+        local_state: dk.local_state.clone(),
+        expires_at: dk.expires_at,
+        provider_key_nonce: Some(nonce),
+        provider_key_ciphertext: Some(ciphertext),
+        synced_at: 0,
+        local_alias: dk.local_alias.clone(),
+        supported_providers: dk.supported_providers.clone(),
+        provider_base_urls: dk.provider_base_urls.clone(),
+        owner_account_id: dk.owner_account_id.clone(),
+        // Sync writers MUST always pass extra: None; upsert ignores this
+        // field. See doc on VirtualKeyCacheEntry::extra.
+        extra: None,
+    };
+    storage::upsert_virtual_key_cache(&entry)
+}
+
 pub fn run_full_snapshot_sync_with_vault_key(
     vault_key: &[u8; crypto::KEY_SIZE],
 ) -> Result<usize, String> {
@@ -2629,10 +2707,6 @@ pub fn run_full_snapshot_sync_with_vault_key(
                     }
                     Some(binding) => {
                         let protocol_type = payload.primary_protocol_type().to_string();
-                        let (nonce, ciphertext) =
-                            crypto::encrypt(vault_key, binding.provider_key.as_bytes())
-                                .map_err(|e| format!("encrypt: {}", e))?;
-
                         let sync_supported_providers = if !payload.supported_providers.is_empty() {
                             payload.supported_providers.clone()
                         } else if !binding.provider_code.is_empty() {
@@ -2648,7 +2722,9 @@ pub fn run_full_snapshot_sync_with_vault_key(
                                 .map(|b| (b.provider_code.clone(), b.base_url.clone()))
                                 .collect();
 
-                        let updated = VirtualKeyCacheEntry {
+                        // Encrypt + upsert via the shared delivered-key core
+                        // (also used by the cluster daemon's `_internal` path).
+                        let dk = DeliveredKey {
                             virtual_key_id: payload.virtual_key_id.clone(),
                             org_id: payload.org_id.clone(),
                             seat_id: payload.seat_id.clone(),
@@ -2663,19 +2739,13 @@ pub fn run_full_snapshot_sync_with_vault_key(
                             share_status: payload.share_status.clone(),
                             local_state: "synced_inactive".to_string(),
                             expires_at: entry.expires_at,
-                            provider_key_nonce: Some(nonce),
-                            provider_key_ciphertext: Some(ciphertext),
-                            synced_at: 0,
                             local_alias: entry.local_alias.clone(),
                             supported_providers: sync_supported_providers,
                             provider_base_urls: sync_provider_base_urls,
                             owner_account_id: account_id.clone(),
-                            // Sync writers MUST always pass extra: None;
-                            // upsert ignores this field. See doc on
-                            // VirtualKeyCacheEntry::extra.
-                            extra: None,
                         };
-                        let _ = storage::upsert_virtual_key_cache(&updated);
+                        upsert_delivered_key(vault_key, &dk, &binding.provider_key)
+                            .map_err(|e| format!("encrypt/store key: {}", e))?;
 
                         eprintln!(
                             "  {} New key: {} {}",

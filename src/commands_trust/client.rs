@@ -119,7 +119,7 @@ impl TrustClient {
     pub(crate) fn unreachable_hint(&self) -> String {
         format!(
             "trust-local not reachable at {} — install it with:\n  \
-             curl -fsSL https://raw.githubusercontent.com/aikeylabs/degrade-detector/main/scripts/install_service.sh | bash\n\
+             curl -fsSL https://raw.githubusercontent.com/aikeylabs/ai-degrade-detector/main/scripts/install_service.sh | bash\n\
              Or override URL via: export DEGRADE_DETECTOR_LOCAL_URL=...",
             self.base_url
         )

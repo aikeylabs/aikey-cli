@@ -266,8 +266,8 @@ pub fn clear_virtual_key_cache() -> Result<(), String> {
 pub struct QuotaRuleCacheEntry {
     pub subject_id: String,
     pub subject_kind: String,
-    pub members_json: Option<String>,  // JSON [seat_id...] for group; None for seat
-    pub rules_json: String,            // JSON array of rules
+    pub members_json: Option<String>, // JSON [seat_id...] for group; None for seat
+    pub rules_json: String,           // JSON array of rules
     pub baseline_json: Option<String>, // Stage 4: JSON [{metric,period,used}]; None when absent
 }
 

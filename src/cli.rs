@@ -1652,6 +1652,7 @@ Commands:
   {b}list{r}                     Show all personal, team, and OAuth keys (alias for `key list`)
   {b}test{r} <alias>             Test whether a stored API key alias is working
   {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
+  {b}unuse{r} <provider...>      Remove the active binding for one or more providers
   {b}activate{r} <alias>          Temporarily activate a key in the current terminal
   {b}deactivate{r}               Restore global settings in the current terminal
   {b}route{r} [label]            Show proxy route tokens for third-party AI clients
@@ -1765,6 +1766,22 @@ Detailed Commands
       types; the previous 'team is locked' asymmetry has been removed.
     - Sessions launched via `aikey activate` are pinned and DO NOT follow.
     - See: workflow/Docs/Production/aikey-use-runtime-switching.md
+
+[1munuse[0m
+  Remove the active binding for one or more providers.
+
+  Usage:
+    aikey unuse <PROVIDER>...
+
+  Notes:
+    - Inverse of `aikey use`. Clears the active-key binding for the
+      named provider(s) so subsequent CLI launches start without a
+      pre-selected key. Accepts one or more provider codes
+      (e.g. `aikey unuse openai anthropic`).
+    - Takes effect immediately in already-running CLI sessions for the
+      same runtime-switching reasons `aikey use` does (no restart needed).
+    - To remove the credential entry itself (not just the binding),
+      use `aikey delete <ALIAS>`.
 
 [1mactivate[0m
   Temporarily activate a key in the current terminal.

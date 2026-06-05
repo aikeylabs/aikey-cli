@@ -2066,9 +2066,10 @@ pub struct HookUninstallTouch {
 fn strip_marker_blocks(contents: &str, begin: &str, end: &str) -> (String, usize) {
     let mut out = contents.to_string();
     let mut removed = 0usize;
-    loop {
-        let Some(b) = out.find(begin) else { break };
-        let Some(end_rel) = out[b..].find(end) else { break };
+    while let Some(b) = out.find(begin) {
+        let Some(end_rel) = out[b..].find(end) else {
+            break;
+        };
         let mut e = b + end_rel + end.len();
         if out.as_bytes().get(e) == Some(&b'\n') {
             e += 1;
@@ -5328,9 +5329,18 @@ mod hook_uninstall_tests {
         let content = rc_with_v3();
         let (out, n) = strip_marker_blocks(&content, V3_BEGIN, V3_END);
         assert_eq!(n, 1, "exactly one v3 block should be removed");
-        assert!(!out.contains(V3_BEGIN) && !out.contains(V3_END), "block gone");
-        assert!(!out.contains("source ~/.aikey/hook.zsh"), "source line gone");
-        assert!(out.contains("export PATH=$PATH:/usr/local/bin"), "user prelude kept");
+        assert!(
+            !out.contains(V3_BEGIN) && !out.contains(V3_END),
+            "block gone"
+        );
+        assert!(
+            !out.contains("source ~/.aikey/hook.zsh"),
+            "source line gone"
+        );
+        assert!(
+            out.contains("export PATH=$PATH:/usr/local/bin"),
+            "user prelude kept"
+        );
         assert!(out.contains("alias ll='ls -la'"), "trailing user line kept");
     }
 
@@ -5358,10 +5368,21 @@ mod hook_uninstall_tests {
         // Both rc files with a block are touched; the marker-free one is not.
         assert_eq!(touched.len(), 2, "two files had the block");
         for t in &touched {
-            assert!(t.backup.exists(), "backup must exist: {}", t.backup.display());
+            assert!(
+                t.backup.exists(),
+                "backup must exist: {}",
+                t.backup.display()
+            );
             let cleaned = std::fs::read_to_string(&t.rc_file).unwrap();
-            assert!(!cleaned.contains(V3_BEGIN), "block stripped from {}", t.rc_file.display());
-            assert!(cleaned.contains("alias ll='ls -la'"), "user content preserved");
+            assert!(
+                !cleaned.contains(V3_BEGIN),
+                "block stripped from {}",
+                t.rc_file.display()
+            );
+            assert!(
+                cleaned.contains("alias ll='ls -la'"),
+                "user content preserved"
+            );
         }
         // The marker-free file is left byte-identical (not even backed up).
         assert_eq!(
@@ -5388,7 +5409,13 @@ mod hook_uninstall_tests {
         let touched = uninstall_hook_from_candidates(&[zshrc.clone()]);
         assert_eq!(touched.len(), 1);
         let cleaned = std::fs::read_to_string(&zshrc).unwrap();
-        assert!(!cleaned.contains(V2_BEGIN) && !cleaned.contains(V2_END), "v2 block gone");
-        assert!(cleaned.contains("# user") && cleaned.contains("# tail"), "user content kept");
+        assert!(
+            !cleaned.contains(V2_BEGIN) && !cleaned.contains(V2_END),
+            "v2 block gone"
+        );
+        assert!(
+            cleaned.contains("# user") && cleaned.contains("# tail"),
+            "user content kept"
+        );
     }
 }

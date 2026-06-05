@@ -43,7 +43,7 @@ pub struct ProtocolAddons {
     path_override: Option<&'static str>,
 
     /// Body 完全覆盖。Codex OAuth 的 Responses API body shape 跟通用
-    /// chat body 不兼容 (model=gpt-5.4 / instructions / input array /
+    /// chat body 不兼容 (model=gpt-5.5 / instructions / input array /
     /// store / stream),必须完全替换而不是 merge。None = 用 `chat_body()` 默认值。
     body_override: Option<fn() -> Value>,
 }
@@ -106,16 +106,20 @@ pub fn oauth_addons_for(provider_code: &str) -> Option<ProtocolAddons> {
         }),
 
         // Codex OAuth (ChatGPT Plus/Pro): 走 Responses API 不是 chat
-        // completions,且必须用 store=false + stream=true + gpt-5.4 模型
-        // (ChatGPT 账户只支持 Codex-specific 模型)。
-        // Ref: verified 2026-04-16 against chatgpt.com/backend-api/codex/responses
+        // completions,且必须用 store=false + stream=true + Codex-specific
+        // 模型 (ChatGPT 账户只支持 Codex-specific 模型)。
+        //
+        // Model resolution = codex_probe_model() — see that function for
+        // the single-truth chain. Short version: read the user's own
+        // ~/.codex/config.toml so codex-cli updates are auto-tracked,
+        // fall back to a hardcoded recent model only if config is missing.
         "openai" => Some(ProtocolAddons {
             query: &[],
             body_inject: || vec![],
             path_override: Some("/responses"),
             body_override: Some(|| {
                 serde_json::json!({
-                    "model": "gpt-5.4",
+                    "model": codex_probe_model(),
                     "instructions": "Say hi.",
                     "input": [{"role": "user", "content": "hi"}],
                     "store": false,
@@ -127,6 +131,49 @@ pub fn oauth_addons_for(provider_code: &str) -> Option<ProtocolAddons> {
         // 未来加 Kimi OAuth / Gemini OAuth / ... → 加一行
         _ => None,
     }
+}
+
+/// Fallback model used only on the very first probe before the proxy
+/// has observed any real Codex OAuth request. Bump alongside codex-cli
+/// major releases.
+///
+/// History: 2026-04-16 gpt-5.4 → 2026-06-05 gpt-5.5 (gpt-5.4 retired on
+/// chatgpt.com/backend-api/codex/responses, returns HTTP 404 even for
+/// valid OAuth tokens).
+const CODEX_PROBE_FALLBACK_MODEL: &str = "gpt-5.5";
+
+/// Resolve the model to use for the Codex OAuth connectivity probe.
+///
+/// Two layers:
+///   1. **Proxy-observed model** (`~/.aikey/state/codex_last_model`) —
+///      aikey-proxy writes the `model` field from every successful Codex
+///      OAuth request here. Reading this means our probe sends EXACTLY
+///      what the user's running codex CLI just used; self-healing across
+///      codex CLI upgrades with no aikey release needed.
+///   2. **`CODEX_PROBE_FALLBACK_MODEL` constant** — only hit on first
+///      probe before the user has ever run codex through the proxy.
+pub fn codex_probe_model() -> String {
+    proxy_observed_codex_model().unwrap_or_else(|| CODEX_PROBE_FALLBACK_MODEL.to_string())
+}
+
+/// Read the model from the state file aikey-proxy writes after every
+/// successful Codex OAuth request (see aikey-proxy's
+/// codex_model_capture.go). Returns None when the file is missing or
+/// blank — those are "no observation yet" cases, caller falls back to
+/// the constant.
+///
+/// File format: a single text line containing the model name (e.g.
+/// `gpt-5.5\n`). Plain text instead of JSON because there's only one
+/// value, and `cat`/`tail` debugging stays trivial.
+fn proxy_observed_codex_model() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = std::path::PathBuf::from(home).join(".aikey/state/codex_last_model");
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -170,9 +217,24 @@ mod tests {
             url
         );
 
+        // Hermetic: redirect HOME to a temp dir + drop a fake proxy-
+        // observed state file there so codex_probe_model() resolves
+        // through the highest-priority path. We don't touch the user's
+        // real ~/.aikey/state directory.
+        let tmp = std::env::temp_dir().join(format!("aikey_probe_test_{}", std::process::id()));
+        let state_dir = tmp.join(".aikey/state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("codex_last_model"), "gpt-probe-fixture\n").unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &tmp);
         let body = a.body(serde_json::json!({"unused": "default body should be replaced"}));
-        // body_override 完全替换
-        assert_eq!(body["model"], "gpt-5.4");
+        assert_eq!(body["model"], "gpt-probe-fixture");
+        // Restore HOME + clean up the temp dir.
+        match original_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert!(

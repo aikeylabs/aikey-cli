@@ -817,7 +817,7 @@ pub mod v1_0_0_baseline {
         // 2026-05-22-l3-rhythm-signal-design-rules.md §1.3.
         //
         // Coupling: the constant below MUST match
-        // `degrade-detector/server_local/services/check_orchestrator.py
+        // `ai-degrade-detector/server_local/services/check_orchestrator.py
         // ::FIRST_PARTY_APP_KEY`. Renaming requires updating both.
         ensure_first_party_app_keys(conn)?;
 
@@ -852,7 +852,7 @@ pub mod v1_0_0_baseline {
     /// whitelist. See SPEC §1.3 for the security model.
     ///
     /// Twin constant lives at
-    /// `degrade-detector/server_local/services/check_orchestrator.py::FIRST_PARTY_APP_KEY`;
+    /// `ai-degrade-detector/server_local/services/check_orchestrator.py::FIRST_PARTY_APP_KEY`;
     /// both must change together (plus all 3 Go whitelist entries).
     pub(super) const DEGRADE_DETECTOR_FIRST_PARTY_BEARER: &str =
         "aikey_app_internal_degrade_detector_v1";
@@ -958,7 +958,7 @@ pub mod v1_0_0_baseline {
         // label deception" guard is partially re-introduced for App pipeline
         // traffic (the manual Check button is unaffected because it uses
         // Mode C `/probe/<alias>/v1/messages` which carries the alias
-        // explicitly — see degrade-detector/server_local/services/
+        // explicitly — see ai-degrade-detector/server_local/services/
         // check_orchestrator.py:312-318). When M2 lands real L3 cascade
         // verify that calls `/apps/degrade-detector/v1/messages`, the L3
         // baseline-stability question must be revisited — either pin Mode
@@ -1514,6 +1514,11 @@ mod tests {
                 "filter_stages",
                 "filter_priority",
                 "filter_timeout_policy",
+                // 2026-06-03: filter_record_allow boolean — proxy reads
+                // it to decide whether the detector emits allow events.
+                // Retrofitted via ensure_column for existing vaults; the
+                // baseline CREATE TABLE carries it for fresh installs.
+                "filter_record_allow",
                 "requested_permissions",
                 "created_at",
                 "updated_at",
@@ -1581,7 +1586,7 @@ mod tests {
         // app_keys row present, status=active, with the compiled-in
         // Bearer constant. The route_token MUST equal the Python
         // FIRST_PARTY_APP_KEY in
-        // degrade-detector/server_local/services/check_orchestrator.py
+        // ai-degrade-detector/server_local/services/check_orchestrator.py
         // — drift here breaks zero-config trust-local.
         let (route_token, status): (String, String) = conn
             .query_row(

@@ -528,73 +528,97 @@ where
 
     on_phase(ProbePhase::Api, ProbeStage::Started);
     let api_start = Instant::now();
-    let mut api_req = agent.get(&test_url);
-    if provider_code != "google" {
-        api_req = api_req.set(auth_key, &auth_val);
-    }
-    if via_aikey_proxy {
-        api_req = api_req.set("X-Aikey-Probe", "1");
-    }
-    let api_result = api_req.call();
-    let api_ms = api_start.elapsed().as_millis();
+
+    // Codex (OpenAI OAuth) has NO lightweight GET probe endpoint: its backend
+    // is chatgpt.com/backend-api/codex, a Responses-API-only surface (POST
+    // /responses). The generic GET {base}/v1/models 404s there even though the
+    // credential is perfectly usable (deep-searched 2026-06-05: no GET exists;
+    // account / rate-limit data is local app-server JSON-RPC or rides the
+    // /responses SSE stream). Probing /models would falsely paint the API cell
+    // red ("API rejected the key"); let the Chat probe's real POST /responses
+    // be the auth + reachability gate instead. We still emit the phase events
+    // (Started above / Finished below) and DON'T early-return with a fake
+    // status — that hid the real probe in bugfix 2026-04-29-oauth-probe-tier2-503.
+    let codex_skip_api = is_responses_only_backend(provider_code, kind);
 
     // Capture body snippet so api_status_hint can distinguish proxy-side
     // registry miss ("Route token not found in registry") from upstream-side
     // key rejection. Both surface as 401 but mean different things and
     // require different operator actions. Cap at ~512 chars to keep the
     // ConnectivityResult cheap to clone / serialize.
-    let (api_ok, api_status, api_body_snippet) = match api_result {
-        Ok(r) => {
-            let s = r.status();
-            let body = r.into_string().ok().map(truncate_body_snippet);
-            (true, Some(s), body)
+    let (api_ok, api_status, api_body_snippet) = if codex_skip_api {
+        (
+            true, // reachability deferred to the Chat (/responses) probe
+            None,
+            Some(
+                "skipped — Codex backend (Responses API) exposes no GET probe \
+                 endpoint; reachability verified by the Chat probe"
+                    .to_string(),
+            ),
+        )
+    } else {
+        let mut api_req = agent.get(&test_url);
+        if provider_code != "google" {
+            api_req = api_req.set(auth_key, &auth_val);
         }
-        Err(ureq::Error::Status(code, response)) => {
-            let body = response.into_string().ok().map(truncate_body_snippet);
-            // Local proxy registry miss is reported via 401 + a specific
-            // body shape (proxy.go writeJSONError TOKEN_INVALID). It is NOT
-            // "reachable from upstream's perspective" — it never left the
-            // local proxy. Demote api_ok to false so the table cell renders
-            // red and points the operator at the actual fix.
-            let is_local_registry_miss = code == 401
-                && body
-                    .as_deref()
-                    .map(body_indicates_registry_miss)
-                    .unwrap_or(false);
-            // 404 handling — TWO subclasses, treated differently:
-            //
-            //   (a) Upstream-business 404: JSON envelope like
-            //       `{"error":{"type":"not_found_error",...}}` — the upstream
-            //       reached us but the resource (model/route/etc.) is gone.
-            //       Surfaces as a genuine misconfiguration (e.g. wrong
-            //       base_url, deleted upstream route). Vault page used to
-            //       paint "API OK ✓" here behind a green chip; the 5/22
-            //       guard correctly turns this into red fail.
-            //
-            //   (b) Gateway-layer 404: plain "404 page not found" body from
-            //       Go's net/http when the gateway doesn't register that
-            //       specific path. The gateway IS alive — it just only
-            //       proxies POST /v1/messages, not GET /v1/models. Aicoding
-            //       and other anthropic-compatible byok proxies fall here.
-            //       This is transport-OK; keep it green so user isn't
-            //       misled into thinking the credential is broken.
-            //
-            // Bugfix 20260523 round-2 (strict-allowlist version):
-            // keep the 5/22 main-path guard intact, but exempt a small
-            // explicit allowlist of literal gateway-layer 404 bodies
-            // (see `is_known_benign_gateway_404` above). This is a
-            // **special case**, not a generalization — DO NOT inline,
-            // DO NOT broaden the match.
-            let is_path_missing =
-                code == 404 && !is_known_benign_gateway_404(code, body.as_deref());
-            (
-                !(is_local_registry_miss || is_path_missing),
-                Some(code),
-                body,
-            )
+        if via_aikey_proxy {
+            api_req = api_req.set("X-Aikey-Probe", "1");
         }
-        Err(_) => (false, None, None),
+        let api_result = api_req.call();
+        match api_result {
+            Ok(r) => {
+                let s = r.status();
+                let body = r.into_string().ok().map(truncate_body_snippet);
+                (true, Some(s), body)
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                let body = response.into_string().ok().map(truncate_body_snippet);
+                // Local proxy registry miss is reported via 401 + a specific
+                // body shape (proxy.go writeJSONError TOKEN_INVALID). It is NOT
+                // "reachable from upstream's perspective" — it never left the
+                // local proxy. Demote api_ok to false so the table cell renders
+                // red and points the operator at the actual fix.
+                let is_local_registry_miss = code == 401
+                    && body
+                        .as_deref()
+                        .map(body_indicates_registry_miss)
+                        .unwrap_or(false);
+                // 404 handling — TWO subclasses, treated differently:
+                //
+                //   (a) Upstream-business 404: JSON envelope like
+                //       `{"error":{"type":"not_found_error",...}}` — the upstream
+                //       reached us but the resource (model/route/etc.) is gone.
+                //       Surfaces as a genuine misconfiguration (e.g. wrong
+                //       base_url, deleted upstream route). Vault page used to
+                //       paint "API OK ✓" here behind a green chip; the 5/22
+                //       guard correctly turns this into red fail.
+                //
+                //   (b) Gateway-layer 404: plain "404 page not found" body from
+                //       Go's net/http when the gateway doesn't register that
+                //       specific path. The gateway IS alive — it just only
+                //       proxies POST /v1/messages, not GET /v1/models. Aicoding
+                //       and other anthropic-compatible byok proxies fall here.
+                //       This is transport-OK; keep it green so user isn't
+                //       misled into thinking the credential is broken.
+                //
+                // Bugfix 20260523 round-2 (strict-allowlist version):
+                // keep the 5/22 main-path guard intact, but exempt a small
+                // explicit allowlist of literal gateway-layer 404 bodies
+                // (see `is_known_benign_gateway_404` above). This is a
+                // **special case**, not a generalization — DO NOT inline,
+                // DO NOT broaden the match.
+                let is_path_missing =
+                    code == 404 && !is_known_benign_gateway_404(code, body.as_deref());
+                (
+                    !(is_local_registry_miss || is_path_missing),
+                    Some(code),
+                    body,
+                )
+            }
+            Err(_) => (false, None, None),
+        }
     };
+    let api_ms = api_start.elapsed().as_millis();
     result.api_ok = api_ok;
     result.api_ms = api_ms;
     result.api_status = api_status;
@@ -1102,6 +1126,19 @@ pub fn proxy_probe_full_hint(r: &ProxyProbeResult) -> String {
 /// below is only load-bearing for direct-to-api.anthropic.com probes.
 /// Third-party gateways that don't implement `/v1/models` still land in
 /// the 404/405 → "reachable" safety net, so no regression.
+/// Whether `(provider_code, kind)` routes to a backend that exposes NO
+/// lightweight GET probe endpoint, so the API (`GET /models`) probe must be
+/// skipped and reachability deferred to the Chat probe.
+///
+/// Today the only such backend is Codex (OpenAI OAuth → chatgpt.com/backend-api/
+/// codex, a Responses-API-only surface: `POST /responses`, with no `GET /models`,
+/// `/me`, or health endpoint). Deep-searched 2026-06-05 — see the call site in
+/// `test_provider_connectivity_with_progress` for the full why. Other OAuth
+/// providers (e.g. Anthropic) keep the normal GET probe.
+fn is_responses_only_backend(provider_code: &str, kind: CredentialKind) -> bool {
+    provider_code == "openai" && matches!(kind, CredentialKind::OAuth)
+}
+
 fn probe_suffix(provider_code: &str, base_url: &str) -> String {
     let base_has_v1 = base_url.trim_end_matches('/').ends_with("/v1");
     match provider_code {
@@ -1702,6 +1739,21 @@ pub fn run_connectivity_suite(
                         format!("{:<w$}", "\u{2014}", w = W_API)
                             .dimmed()
                             .to_string()
+                    } else if r.api_ok
+                        && r.api_status.is_none()
+                        && r.api_body_snippet
+                            .as_deref()
+                            .is_some_and(|s| s.starts_with("skipped"))
+                    {
+                        // API GET probe deliberately skipped — this backend has no
+                        // GET probe endpoint (Codex = Responses-API only). Render an
+                        // honest dimmed dash, NOT a green "ok": we never probed it.
+                        // Reachability for the credential is shown by the Chat column
+                        // (its real POST /responses). api_ok stays true only so the
+                        // Chat column isn't short-circuited to "—".
+                        format!("{:<w$}", "\u{2014} skipped", w = W_API)
+                            .dimmed()
+                            .to_string()
                     } else {
                         let raw = if r.api_ok {
                             let h = r
@@ -2008,6 +2060,34 @@ mod build_chat_probe_tests {
     //! cases.
     use super::*;
 
+    // Codex (OpenAI OAuth) backend is Responses-API only — chatgpt.com/backend-api/
+    // codex serves POST /responses and has no GET /models, so the API probe must
+    // skip (reachability deferred to the Chat /responses probe) instead of 404→red
+    // "API rejected the key". Pins the gate NARROW: only openai+OAuth skips; every
+    // personal/team key and every other OAuth provider keeps the normal GET probe,
+    // so a real 404 there still surfaces. See bugfix
+    // 2026-06-05-codex-api-probe-skip.md.
+    #[test]
+    fn codex_oauth_skips_api_get_probe_but_others_dont() {
+        assert!(is_responses_only_backend("openai", CredentialKind::OAuth));
+        assert!(!is_responses_only_backend(
+            "openai",
+            CredentialKind::PersonalApi
+        ));
+        assert!(!is_responses_only_backend(
+            "openai",
+            CredentialKind::ManagedTeam
+        ));
+        assert!(!is_responses_only_backend(
+            "anthropic",
+            CredentialKind::OAuth
+        ));
+        assert!(!is_responses_only_backend(
+            "kimi_code",
+            CredentialKind::OAuth
+        ));
+    }
+
     #[test]
     fn anthropic_oauth_via_proxy_gets_beta_query_and_metadata() {
         let (url, body) = build_chat_probe(
@@ -2086,7 +2166,13 @@ mod build_chat_probe_tests {
             "Codex OAuth must use /responses; got: {}",
             url
         );
-        assert_eq!(body["model"], "gpt-5.4");
+        // Probe model is now resolved at call time from ~/.codex/config.toml
+        // (or env override / fallback) — see codex_probe_model in
+        // protocol_addons.rs. This test just asserts the body has a non-empty
+        // string model; the exact value test lives in protocol_addons unit
+        // tests where it's pinned via env override.
+        assert!(body["model"].is_string());
+        assert!(!body["model"].as_str().unwrap_or("").is_empty());
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
     }

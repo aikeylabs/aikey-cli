@@ -1085,7 +1085,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                         })
                         .unwrap_or_else(|| "build_failed (see proxy log)".to_string());
                     emit("rhythm observer", false, "inactive",
-                        Some(&format!("reason: {}; reinstall via: curl -fsSL https://raw.githubusercontent.com/aikeylabs/degrade-detector/main/scripts/install_service.sh | bash", reason)));
+                        Some(&format!("reason: {}; reinstall via: curl -fsSL https://raw.githubusercontent.com/aikeylabs/ai-degrade-detector/main/scripts/install_service.sh | bash", reason)));
                 }
                 _ => {
                     // No observer line in log = proxy started before
