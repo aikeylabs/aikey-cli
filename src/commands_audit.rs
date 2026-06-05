@@ -57,7 +57,10 @@ fn fetch_proxy_status() -> Option<serde_json::Value> {
 /// (proxy) state.
 pub fn handle_status(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let base = audit_base()?;
-    let data = fetch(ureq::get(&format!("{}/v1/diagnostics/completeness", base)), &base)?;
+    let data = fetch(
+        ureq::get(&format!("{}/v1/diagnostics/completeness", base)),
+        &base,
+    )?;
     let local = fetch_proxy_status();
     if json {
         println!(
@@ -80,7 +83,11 @@ pub fn handle_reconcile(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let (mode, client_result) = trigger_reconcile(&base);
     // Settled view — best-effort so a momentarily-down collector degrades to the
     // mode message instead of erroring out before it can print.
-    let data = fetch(ureq::get(&format!("{}/v1/diagnostics/completeness", base)), &base).ok();
+    let data = fetch(
+        ureq::get(&format!("{}/v1/diagnostics/completeness", base)),
+        &base,
+    )
+    .ok();
     if json {
         println!(
             "{}",
@@ -92,9 +99,10 @@ pub fn handle_reconcile(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     match (mode.as_str(), client_result.as_ref()) {
         ("client", Some(c)) => {
+            let resent = c["resent"].as_i64().unwrap_or(0);
             println!(
-                "Reconcile (client-confirmed) — re-sent {} recoverable, confirmed {} lost{}.\n",
-                c["resent"].as_i64().unwrap_or(0),
+                "Reconcile (client-confirmed) — re-sent {} recoverable, confirmed {} lost{}.",
+                resent,
                 c["confirmed_lost"].as_i64().unwrap_or(0),
                 if c["still_missing"].as_i64().unwrap_or(0) > 0 {
                     " (more remain — re-run reconcile)"
@@ -102,15 +110,30 @@ pub fn handle_reconcile(json: bool) -> Result<(), Box<dyn std::error::Error>> {
                     ""
                 },
             );
+            // Honesty: "re-sent" counts gaps re-uploaded from the WAL this pass,
+            // NOT server-acked deliveries — a re-send that fails dead-letters and
+            // is still counted here. So don't let the user read it as "confirmed
+            // landed"; point them at the authoritative completeness view, which
+            // only advances `confirmed` once the server actually ingested.
+            if resent > 0 {
+                println!(
+                    "  (re-sent = re-uploaded best-effort; confirm landing with `aikey audit status`.)"
+                );
+            }
+            println!();
         }
         ("client", None) => {
-            println!("Reconcile (client-confirmed) — triggered on the proxy (no detail returned).\n");
+            println!(
+                "Reconcile (client-confirmed) — triggered on the proxy (no detail returned).\n"
+            );
         }
         ("server", _) => {
             println!("Reconcile (server-only — proxy not reachable) — promoted stale gaps to known-loss.\n");
         }
         _ => {
-            println!("Reconcile — could not reach the proxy or collector to trigger reconciliation.\n");
+            println!(
+                "Reconcile — could not reach the proxy or collector to trigger reconciliation.\n"
+            );
         }
     }
     match data {
@@ -118,7 +141,9 @@ pub fn handle_reconcile(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             print_table(&base, &d, "Reconcile");
             print_verdict(&d);
         }
-        None => println!("  (server completeness unavailable — could not display the settled state)"),
+        None => {
+            println!("  (server completeness unavailable — could not display the settled state)")
+        }
     }
     Ok(())
 }
@@ -214,7 +239,10 @@ fn print_verdict(data: &serde_json::Value) {
         if open == 0 {
             println!("    {}: reconciled — {} documented loss(es)", src, kl);
         } else {
-            println!("    {}: {} still missing, {} documented loss(es)", src, open, kl);
+            println!(
+                "    {}: {} still missing, {} documented loss(es)",
+                src, open, kl
+            );
         }
     }
 }

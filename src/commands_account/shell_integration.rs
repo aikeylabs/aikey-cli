@@ -2044,6 +2044,106 @@ pub(super) fn write_v3_layers_with_consent(
     })
 }
 
+// ============================================================================
+// Hook uninstall (Layer 2 only — rc reference removal)
+// ============================================================================
+
+/// One rc file whose aikey hook block was removed by `uninstall_shell_hook`,
+/// paired with the backup taken just before the edit.
+pub struct HookUninstallTouch {
+    pub rc_file: std::path::PathBuf,
+    pub backup: std::path::PathBuf,
+}
+
+/// Remove every `begin..end` marker block (inclusive, plus one trailing
+/// newline) from `contents`. Loops so multiple stray copies are all cleared.
+/// Returns the cleaned content and how many blocks were removed.
+///
+/// Mirrors `strip_managed_region` (which is hardcoded to the kimi/codex
+/// `# BEGIN aikey` markers) but is generic over the marker pair so it can
+/// strip the shell-hook v3 / v2 blocks. Searches `end` only AFTER `begin`,
+/// so a stray `end` line above `begin` is ignored rather than mis-cutting.
+fn strip_marker_blocks(contents: &str, begin: &str, end: &str) -> (String, usize) {
+    let mut out = contents.to_string();
+    let mut removed = 0usize;
+    loop {
+        let Some(b) = out.find(begin) else { break };
+        let Some(end_rel) = out[b..].find(end) else { break };
+        let mut e = b + end_rel + end.len();
+        if out.as_bytes().get(e) == Some(&b'\n') {
+            e += 1;
+        }
+        out.replace_range(b..e, "");
+        removed += 1;
+    }
+    (out, removed)
+}
+
+/// Strip the aikey shell-hook rc block (v3, plus any legacy v2) from a fixed
+/// list of rc candidate files. Each modified file is backed up first.
+///
+/// Pure over the candidate list so it is unit-testable without touching the
+/// real HOME. `uninstall_shell_hook` is the production entry point that
+/// builds the candidate list.
+pub(super) fn uninstall_hook_from_candidates(
+    candidates: &[std::path::PathBuf],
+) -> Vec<HookUninstallTouch> {
+    let mut touched = Vec::new();
+    for rc in candidates {
+        let Ok(contents) = std::fs::read_to_string(rc) else {
+            continue;
+        };
+        if !contents.contains(V3_BEGIN) && !contents.contains(V2_BEGIN) {
+            continue;
+        }
+        let (s1, n3) = strip_marker_blocks(&contents, V3_BEGIN, V3_END);
+        let (s2, n2) = strip_marker_blocks(&s1, V2_BEGIN, V2_END);
+        if n3 + n2 == 0 || s2 == contents {
+            continue;
+        }
+        // Back up before mutating — same safety contract as the install path.
+        let Ok(backup) = backup_rc_file(rc) else {
+            continue;
+        };
+        if std::fs::write(rc, &s2).is_ok() {
+            touched.push(HookUninstallTouch {
+                rc_file: rc.clone(),
+                backup,
+            });
+        }
+    }
+    touched
+}
+
+/// Remove the aikey shell precmd hook from the user's shell startup files.
+///
+/// "全清": strips the v3 (and legacy v2) marker block from EVERY shell rc
+/// across all shells — `~/.zshrc`, `~/.bashrc`, `~/.bash_profile`, and all
+/// PowerShell profile candidates — backing up each file it edits.
+///
+/// Deliberately scoped to Layer 2 (the `source ~/.aikey/hook.*` reference):
+///   - Layer 1 hook files under `~/.aikey/` are KEPT (decision 2026-06-04),
+///     so `aikey hook install` can re-wire without regenerating them.
+///   - The `~/.bash_profile` → `.bashrc` login-shell shim is NOT removed: it
+///     only sources the user's own `.bashrc` (a benign, generic setup), not
+///     anything aikey-specific, so stripping it could break the user's bash
+///     login flow. Only the aikey hook reference itself is removed.
+///   - kimi/codex provider regions and the statusline are owned by their own
+///     commands (`aikey statusline reset` etc.), not by the shell hook.
+///
+/// Idempotent: rc files without a marker are skipped; an empty return means
+/// nothing needed removing (caller still treats it as success).
+pub fn uninstall_shell_hook() -> Vec<HookUninstallTouch> {
+    let home = resolve_user_home();
+    let mut candidates: Vec<std::path::PathBuf> = vec![
+        home.join(".zshrc"),
+        home.join(".bashrc"),
+        home.join(".bash_profile"),
+    ];
+    candidates.extend(super::shell_integration_windows::powershell_profile_candidates());
+    uninstall_hook_from_candidates(&candidates)
+}
+
 /// Bash-on-macOS supplement: ensure ~/.bash_profile sources ~/.bashrc so
 /// login shells (Terminal.app's default) actually load the hook.
 ///
@@ -5205,5 +5305,90 @@ mod stage3_review_fix_tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod hook_uninstall_tests {
+    use super::{
+        strip_marker_blocks, uninstall_hook_from_candidates, v3_rc_block, V2_BEGIN, V2_END,
+        V3_BEGIN, V3_END,
+    };
+
+    fn rc_with_v3() -> String {
+        // Realistic rc: user content, a blank line, the v3 block, more content.
+        format!(
+            "# user prelude\nexport PATH=$PATH:/usr/local/bin\n\n{}alias ll='ls -la'\n",
+            v3_rc_block("hook.zsh")
+        )
+    }
+
+    #[test]
+    fn strip_marker_blocks_removes_v3_and_preserves_surroundings() {
+        let content = rc_with_v3();
+        let (out, n) = strip_marker_blocks(&content, V3_BEGIN, V3_END);
+        assert_eq!(n, 1, "exactly one v3 block should be removed");
+        assert!(!out.contains(V3_BEGIN) && !out.contains(V3_END), "block gone");
+        assert!(!out.contains("source ~/.aikey/hook.zsh"), "source line gone");
+        assert!(out.contains("export PATH=$PATH:/usr/local/bin"), "user prelude kept");
+        assert!(out.contains("alias ll='ls -la'"), "trailing user line kept");
+    }
+
+    #[test]
+    fn strip_marker_blocks_noop_when_absent() {
+        let content = "# just user content\nexport FOO=bar\n";
+        let (out, n) = strip_marker_blocks(content, V3_BEGIN, V3_END);
+        assert_eq!(n, 0);
+        assert_eq!(out, content, "no marker → byte-identical");
+    }
+
+    #[test]
+    fn uninstall_strips_all_rc_files_backs_up_and_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zshrc = tmp.path().join(".zshrc");
+        let bashrc = tmp.path().join(".bashrc");
+        let untouched = tmp.path().join(".bash_profile"); // no aikey block
+        std::fs::write(&zshrc, rc_with_v3()).unwrap();
+        std::fs::write(&bashrc, rc_with_v3()).unwrap();
+        std::fs::write(&untouched, "if [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n").unwrap();
+
+        let candidates = vec![zshrc.clone(), bashrc.clone(), untouched.clone()];
+        let touched = uninstall_hook_from_candidates(&candidates);
+
+        // Both rc files with a block are touched; the marker-free one is not.
+        assert_eq!(touched.len(), 2, "two files had the block");
+        for t in &touched {
+            assert!(t.backup.exists(), "backup must exist: {}", t.backup.display());
+            let cleaned = std::fs::read_to_string(&t.rc_file).unwrap();
+            assert!(!cleaned.contains(V3_BEGIN), "block stripped from {}", t.rc_file.display());
+            assert!(cleaned.contains("alias ll='ls -la'"), "user content preserved");
+        }
+        // The marker-free file is left byte-identical (not even backed up).
+        assert_eq!(
+            std::fs::read_to_string(&untouched).unwrap(),
+            "if [ -f ~/.bashrc ]; then . ~/.bashrc; fi\n",
+            "non-aikey rc must be untouched",
+        );
+
+        // Idempotent: a second pass finds nothing to do.
+        let again = uninstall_hook_from_candidates(&candidates);
+        assert!(again.is_empty(), "second uninstall is a no-op");
+    }
+
+    #[test]
+    fn uninstall_strips_legacy_v2_block_too() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zshrc = tmp.path().join(".zshrc");
+        let legacy = format!(
+            "# user\n{}\n[[ -f ~/.aikey/hook.zsh ]] && source ~/.aikey/hook.zsh\n{}\n# tail\n",
+            V2_BEGIN, V2_END
+        );
+        std::fs::write(&zshrc, &legacy).unwrap();
+
+        let touched = uninstall_hook_from_candidates(&[zshrc.clone()]);
+        assert_eq!(touched.len(), 1);
+        let cleaned = std::fs::read_to_string(&zshrc).unwrap();
+        assert!(!cleaned.contains(V2_BEGIN) && !cleaned.contains(V2_END), "v2 block gone");
+        assert!(cleaned.contains("# user") && cleaned.contains("# tail"), "user content kept");
     }
 }

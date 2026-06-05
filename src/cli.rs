@@ -129,15 +129,19 @@ pub(crate) enum Commands {
     },
     /// Manage the shell precmd hook installed under ~/.aikey/hook.{zsh,bash}
     ///
-    /// `aikey hook update` regenerates the hook file from the binary's
-    /// embedded template and ensures the rc-file `source` line is present.
-    /// `aikey hook status` reports the file / binary / loaded hashes and
-    /// flags any drift.
+    /// Subcommands:
+    ///   update     regenerate the hook file from the binary (Layer 1 only)
+    ///   install    render the hook file AND wire it into your shell rc
+    ///   reinstall  force-rewrite both layers (use after a template change)
+    ///   uninstall  remove the hook from every shell rc (keeps the hook file)
+    ///   status     report file / binary / loaded hashes and flag drift
     ///
-    /// Both subcommands are idempotent. Update is the manual escape hatch
-    /// for users who want to refresh the hook without running `aikey use`;
-    /// status is for diagnostics when the precmd auto-reload prints a
-    /// drift warning and the user wants to confirm what's misaligned.
+    /// All subcommands are idempotent. Update is the manual escape hatch for
+    /// users who want to refresh the hook without running `aikey use`; status
+    /// is for diagnostics when the precmd auto-reload prints a drift warning
+    /// and the user wants to confirm what's misaligned; uninstall is the
+    /// counterpart to install for users who want to stop routing through
+    /// aikey without uninstalling the binary.
     #[command(display_order = 10)]
     Hook {
         #[command(subcommand)]
@@ -285,6 +289,15 @@ pub(crate) enum Commands {
         /// Override port for dev mode (e.g. --port 3000 for Vite dev server)
         #[arg(long)]
         port: Option<u16>,
+        /// Copy the URL (with auth token attached) to the system clipboard
+        /// instead of opening the browser. Useful for pasting into a
+        /// non-default browser, an incognito window, or a remote machine.
+        /// No auto-clear: the URL stays on the clipboard until the next
+        /// copy overwrites it (the embedded JWT itself expires in 24h).
+        /// If clipboard access fails (no display server, sandbox, etc.)
+        /// the URL is printed to stdout for manual copy.
+        #[arg(long = "copy-url")]
+        copy_url: bool,
     },
     /// Bulk-import credentials from unstructured text via the Web UI
     ///
@@ -1047,6 +1060,21 @@ pub(crate) enum HookAction {
         #[arg(long, value_name = "SHELL")]
         shell: Option<String>,
     },
+    /// Remove the aikey shell hook from your shell startup files.
+    ///
+    /// Strips the `# aikey shell hook v3 begin … end` block from EVERY shell
+    /// rc across all shells (~/.zshrc, ~/.bashrc, ~/.bash_profile, and the
+    /// PowerShell profile), backing up each file it edits. Legacy v2 blocks
+    /// are stripped too. Takes no flags — uninstall is always all-shells.
+    ///
+    /// Layer 1 hook files (~/.aikey/hook.{zsh,bash,ps1}) are KEPT — only the
+    /// rc `source` reference is removed, so `aikey hook install` can re-wire
+    /// without regenerating them. New shells will no longer load the hook;
+    /// already-running shells keep any variables they already exported until
+    /// you open a new terminal.
+    ///
+    /// Idempotent: a no-op (still exits 0) when no hook block is present.
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -1332,6 +1360,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 HookAction::Status { .. } => "hook.status".to_string(),
                 HookAction::Install { .. } => "hook.install".to_string(),
                 HookAction::Reinstall { .. } => "hook.reinstall".to_string(),
+                HookAction::Uninstall => "hook.uninstall".to_string(),
             },
             Commands::Trust { action } => match action {
                 TrustAction::Verify { .. } => "trust.verify".to_string(),

@@ -874,7 +874,7 @@ fn dev_manifest_for_slug(slug: &str) -> Option<Manifest> {
                 }),
             }),
             service_installer: None,
-            doc_url: Some("https://github.com/aikeylabs/aikey-compliance-workers".into()),
+            doc_url: Some("https://github.com/aikeylabs/ai-compliance-workers".into()),
         }),
         _ => None,
     }

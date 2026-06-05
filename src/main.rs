@@ -3538,6 +3538,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             import,
             vault,
             port,
+            copy_url,
         } => {
             // Intercept service-control verbs first. `start` / `stop` /
             // `restart` as the positional argument route to service
@@ -3564,7 +3565,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 page.as_deref()
             };
-            commands_account::handle_browse(effective_page, *port, cli.json)?;
+            commands_account::handle_browse(effective_page, *port, cli.json, *copy_url)?;
         }
         Commands::Master { page, url, port } => {
             commands_account::handle_master_browse(
@@ -6399,6 +6400,7 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             }
         }
         HookAction::Reinstall { shell } => handle_hook_reinstall(shell.as_deref()),
+        HookAction::Uninstall => handle_hook_uninstall(),
     }
 }
 
@@ -6451,6 +6453,38 @@ fn handle_hook_reinstall(shell: Option<&str>) -> Result<(), Box<dyn std::error::
         "\x1b[90m    Activate now: \x1b[1;36m{}\x1b[0m\x1b[90m  or  \x1b[1;36mopen a new terminal\x1b[0m",
         reload,
     );
+    Ok(())
+}
+
+/// `aikey hook uninstall` — strip the aikey hook block from every shell rc
+/// (all shells), keeping the Layer 1 hook files. Counterpart to `install`.
+///
+/// The core lives in `commands_account::uninstall_shell_hook` (testable,
+/// side-effect-scoped); this handler only renders the result. Idempotent:
+/// when nothing was wired, it reports that and exits 0 so the released
+/// `uninstall.sh` can treat it as a clean no-op.
+fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
+    let touched = commands_account::uninstall_shell_hook();
+    if touched.is_empty() {
+        eprintln!(
+            "\x1b[90m  No aikey shell hook block found in any rc file — nothing to remove.\x1b[0m"
+        );
+        return Ok(());
+    }
+    for t in &touched {
+        eprintln!(
+            "\x1b[90m  ✓ Removed hook block from {} \x1b[0m\x1b[90m(backup: {}).\x1b[0m",
+            t.rc_file.display(),
+            t.backup.display()
+        );
+    }
+    eprintln!(
+        "\x1b[90m  Layer 1 hook files under ~/.aikey/ were kept — run \x1b[36maikey hook install\x1b[0m\x1b[90m to re-wire.\x1b[0m"
+    );
+    eprintln!(
+        "\x1b[90m  New shells won't load the hook. Already-open shells keep their current env\x1b[0m"
+    );
+    eprintln!("\x1b[90m  until you open a new terminal.\x1b[0m");
     Ok(())
 }
 
