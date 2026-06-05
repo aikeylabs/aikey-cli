@@ -305,6 +305,21 @@ struct ClusterVk {
     expires_at: Option<i64>,
     #[serde(default)]
     slots: Vec<ClusterSlot>,
+    /// Per-seat quota rows (metric, period, used, limit) from the org delivery.
+    /// Written to quota_rules_cache so the proxy enforces (2c). Same seat repeats
+    /// across the seat's VKs — deduped by seat_id when building cache entries.
+    #[serde(default)]
+    seat_quota: Vec<ClusterSeatQuota>,
+}
+
+#[derive(Debug, serde::Deserialize, Clone)]
+struct ClusterSeatQuota {
+    metric: String,
+    period: String,
+    #[serde(default)]
+    used: f64,
+    #[serde(default)]
+    limit: f64,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -595,6 +610,54 @@ pub(crate) fn apply_cluster_snapshot(
             Some(cfg.enabled)
         }
     };
+
+    // Quota (2c): write the delivered per-seat quota into quota_rules_cache so the
+    // proxy enforces `used >= limit` (enforce.go hard block). seat_quota is the
+    // simplified (metric,period,used,limit) view; warn-tier thresholds aren't
+    // delivered, so rules carry an empty thresholds[] — the hard block on
+    // limit_amount still fires (verified: enforce.go blocks on used>=LimitAmount).
+    // Full-replace (single-org node), mirroring the account-sync path; deduped by
+    // seat (the same seat repeats across its VKs). Empty delivery clears the cache
+    // (quota removed -> no enforcement).
+    {
+        use std::collections::HashMap;
+        let mut by_seat: HashMap<&str, &Vec<ClusterSeatQuota>> = HashMap::new();
+        for vk in &payload.virtual_keys {
+            if !vk.seat_quota.is_empty() {
+                by_seat.entry(vk.seat_id.as_str()).or_insert(&vk.seat_quota);
+            }
+        }
+        let entries: Vec<storage::QuotaRuleCacheEntry> = by_seat
+            .iter()
+            .map(|(seat_id, items)| {
+                let rules: Vec<serde_json::Value> = items
+                    .iter()
+                    .map(|q| {
+                        json!({"metric": q.metric, "period": q.period, "limit_amount": q.limit, "thresholds": []})
+                    })
+                    .collect();
+                let baselines: Vec<serde_json::Value> = items
+                    .iter()
+                    .map(|q| json!({"metric": q.metric, "period": q.period, "used": q.used}))
+                    .collect();
+                storage::QuotaRuleCacheEntry {
+                    subject_id: seat_id.to_string(),
+                    subject_kind: "seat".to_string(),
+                    members_json: None,
+                    rules_json: serde_json::to_string(&rules).unwrap_or_else(|_| "[]".to_string()),
+                    baseline_json: Some(
+                        serde_json::to_string(&baselines).unwrap_or_else(|_| "[]".to_string()),
+                    ),
+                }
+            })
+            .collect();
+        let n = entries.len();
+        if let Err(e) = storage::replace_quota_rules_cache(&entries) {
+            eprintln!("[_internal cluster_apply WARN] quota cache write: {}", e);
+        } else if n > 0 {
+            eprintln!("[_internal cluster_apply] quota: {} seat(s) cached", n);
+        }
+    }
 
     let _ = storage::bump_vault_change_seq();
 

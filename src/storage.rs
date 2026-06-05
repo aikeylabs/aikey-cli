@@ -2407,6 +2407,42 @@ mod tests {
         );
     }
 
+    // 2c: a cluster snapshot's per-seat seat_quota is written to quota_rules_cache
+    // (subject_kind=seat) so the proxy enforces `used >= limit`. Pins the shape:
+    // limit -> rules.limit_amount, used -> baseline.used, thresholds empty.
+    #[test]
+    fn apply_cluster_snapshot_writes_seat_quota_to_cache() {
+        let (_dir, _db, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache();
+        let key = derive_current("test_password");
+        let json = r#"{
+            "org_id":"o","virtual_keys":[
+                {"virtual_key_id":"vk1","owner_account_id":"a","seat_id":"seat-1",
+                 "key_status":"active","virtual_key_revision":"r",
+                 "slots":[{"protocol_type":"openai_compatible","targets":[
+                    {"provider_code":"openai","base_url":"http://x","real_key":"sk",
+                     "credential_id":"c","credential_revision":"cr"}]}],
+                 "seat_quota":[{"metric":"usd","period":"monthly","used":1.5,"limit":10.0}]}
+            ]}"#;
+        let payload: crate::commands_internal::vault_op::ClusterSnapshotPayload =
+            serde_json::from_str(json).expect("parse");
+        let _ = crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &payload);
+
+        let conn = crate::storage::open_connection().expect("conn");
+        let (kind, rules, baseline): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT subject_kind, rules, baseline FROM quota_rules_cache WHERE subject_id = ?1",
+                ["seat-1"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("quota row for seat-1 must exist");
+        assert_eq!(kind, "seat");
+        assert!(rules.contains("limit_amount"), "rules carry limit_amount: {}", rules);
+        assert!(rules.contains("\"metric\":\"usd\""), "rules carry the metric: {}", rules);
+        let bl = baseline.expect("baseline present");
+        assert!(bl.contains("\"used\":1.5"), "baseline carries used: {}", bl);
+    }
+
     // Phase 3d decision B: aikey (not the daemon) derives the vault key from the
     // node master password, so the Argon2id derivation has a single source of
     // truth. This pins that the password-derived key equals aikey's own
