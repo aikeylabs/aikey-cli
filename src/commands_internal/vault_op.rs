@@ -222,6 +222,7 @@ pub fn handle(env: StdinEnvelope) {
         "test" => handle_test(env),
         "test_raw" => handle_test_raw(env),
         "use" => handle_use(env),
+        "cluster_apply_snapshot" => handle_cluster_apply_snapshot(env),
         other => {
             emit_error(
                 req_id,
@@ -229,6 +230,380 @@ pub fn handle(env: StdinEnvelope) {
                 format!("unknown vault-op action: '{}'", other),
             );
         }
+    }
+}
+
+// ========== cluster_apply_snapshot ==========
+//
+// Applies an org-wide credential snapshot (the control plane's
+// POST /internal/org/{orgID}/key-delivery response) into this node's
+// managed_virtual_keys_cache. Invoked by the cluster daemon (aikey-hub) as a
+// subprocess: `AK_VAULT_PATH=<node vault.db> aikey _internal vault-op` with
+// action=cluster_apply_snapshot and the delivery JSON on stdin.
+//
+// Reuses the public delivered-key core `commands_account::upsert_delivered_key`
+// (internal-command-reuses-public-core), so cluster cache rows go through the
+// exact same encrypt+upsert path as the account-scoped `aikey key sync`.
+// owner_account_id is taken per-VK from the payload (the seat's claimer) — the
+// P0-2 multi-user attribution fix; a single fallback account would mis-bill.
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct ClusterSnapshotPayload {
+    org_id: String,
+    #[serde(default)]
+    virtual_keys: Vec<ClusterVk>,
+    /// Optional node master password. When present, aikey derives the vault key
+    /// itself (single source of truth for the Argon2id derivation) instead of
+    /// the caller passing a pre-derived `vault_key_hex`. Used by the cluster
+    /// daemon (a same-host subprocess), so the daemon never re-implements crypto.
+    #[serde(default)]
+    master_password: Option<String>,
+    /// Org compliance config. When present + enabled, this node activates the
+    /// global compliance filter by declaring a "cluster-compliance" pseudo
+    /// app_record with filter_stages (the detector binary must be deployed at
+    /// the conventional apps path, else the proxy 501-fails loud). The filter
+    /// applies to ALL traffic, incl. team VKs (confirmed 2026-06-05).
+    #[serde(default)]
+    compliance: Option<ComplianceConfig>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ComplianceConfig {
+    enabled: bool,
+    #[serde(default)]
+    packs: Vec<String>,
+}
+
+/// The pseudo app_record slug whose filter_stages toggles cluster-wide compliance.
+const COMPLIANCE_SLUG: &str = "cluster-compliance";
+
+/// Counts from one cluster snapshot apply.
+pub(crate) struct ClusterApplyResult {
+    pub applied: usize,
+    pub skipped: usize,
+    pub staled: usize,
+    /// None when the payload carried no compliance block; Some(enabled) after the
+    /// cluster-compliance filter was set (true) / cleared (false).
+    pub compliance_enabled: Option<bool>,
+    /// R6: false when a compliance block was present but its DB writes failed.
+    /// true when no compliance block OR the writes succeeded. The handler turns
+    /// false into an error envelope so the daemon retries (never reports a filter
+    /// active when the toggle write actually failed).
+    pub compliance_ok: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClusterVk {
+    virtual_key_id: String,
+    owner_account_id: String,
+    seat_id: String,
+    #[serde(default)]
+    alias: String,
+    key_status: String,
+    virtual_key_revision: String,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default)]
+    slots: Vec<ClusterSlot>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClusterSlot {
+    protocol_type: String,
+    #[serde(default)]
+    targets: Vec<ClusterTarget>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClusterTarget {
+    provider_code: String,
+    base_url: String,
+    real_key: String,
+    #[serde(default)]
+    credential_id: String,
+    #[serde(default)]
+    credential_revision: String,
+}
+
+fn handle_cluster_apply_snapshot(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+    let payload: ClusterSnapshotPayload = match serde_json::from_value(env.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_error(
+                req_id,
+                "I_STDIN_INVALID_JSON",
+                format!("cluster_apply_snapshot payload invalid: {}", e),
+            );
+            return;
+        }
+    };
+
+    // Resolve the vault key (master_password → aikey derives, else vault_key_hex),
+    // strict-verified against password_hash before any encrypt write (2026-05-11
+    // incident guard). Operates on the AK_VAULT_PATH node vault.db.
+    let key = match resolve_cluster_vault_key(&env, &payload) {
+        Ok(k) => k,
+        Err((code, msg)) => {
+            emit_error(req_id, code, msg);
+            return;
+        }
+    };
+
+    let r = apply_cluster_snapshot(&key, &payload);
+
+    // R6: compliance toggle write failed → error (not a faked success) so the
+    // daemon retries instead of believing the filter is active.
+    if !r.compliance_ok {
+        emit_error(
+            req_id,
+            "CLUSTER_COMPLIANCE_WRITE_FAILED",
+            "compliance filter toggle write failed (see node stderr)",
+        );
+        return;
+    }
+    // R7: a non-empty snapshot that applied ZERO keys is a real failure, not a
+    // success with applied:0 (HTTP-200-≠-wrote anti-pattern). Surface it so the
+    // daemon retries/alarms rather than treating the empty cache as healthy.
+    if !payload.virtual_keys.is_empty() && r.applied == 0 {
+        emit_error(
+            req_id,
+            "CLUSTER_APPLY_ALL_FAILED",
+            format!(
+                "all {} virtual keys failed to apply (skipped={})",
+                payload.virtual_keys.len(),
+                r.skipped
+            ),
+        );
+        return;
+    }
+
+    emit(&ResultEnvelope::ok(
+        req_id,
+        json!({
+            "org_id": payload.org_id,
+            "applied": r.applied,
+            "skipped": r.skipped,
+            "staled": r.staled,
+            "compliance_enabled": r.compliance_enabled,
+        }),
+    ));
+}
+
+/// Resolves the 32-byte vault key for a cluster apply. Prefers
+/// payload.master_password — aikey derives via its own crypto::derive_key_with_params
+/// so the Argon2id derivation has a single source of truth and the daemon needs no
+/// crypto. Falls back to the envelope's pre-derived vault_key_hex (Go-bridge style).
+/// Strict-verified against password_hash before return (2026-05-11 incident guard).
+pub(crate) fn resolve_cluster_vault_key(
+    env: &StdinEnvelope,
+    payload: &ClusterSnapshotPayload,
+) -> Result<[u8; 32], (&'static str, String)> {
+    storage::ensure_vault_exists().map_err(|e| ("I_VAULT_NOT_INITIALIZED", format!("{}", e)))?;
+
+    let key: [u8; 32] = match payload.master_password.as_deref().filter(|s| !s.is_empty()) {
+        Some(pw) => {
+            let salt = storage::get_salt().map_err(|e| ("I_VAULT_NOT_INITIALIZED", e))?;
+            let (m, t, p) = storage::get_kdf_params().map_err(|e| ("I_INTERNAL", e))?;
+            let derived = crate::crypto::derive_key_with_params(
+                &secrecy::SecretString::new(pw.to_string()),
+                &salt,
+                m,
+                t,
+                p,
+            )
+            .map_err(|e| ("I_INTERNAL", e))?;
+            let mut k = [0u8; 32];
+            k.copy_from_slice(derived.as_slice());
+            k
+        }
+        None => decode_vault_key(&env.vault_key_hex)?,
+    };
+
+    storage::verify_vault_key(&key).map_err(|e| ("I_VAULT_KEY_INVALID", e))?;
+    Ok(key)
+}
+
+/// Core of cluster_apply_snapshot: encrypt + upsert each VK (owner taken per-VK
+/// from the payload) into managed_virtual_keys_cache, then mark any cached VK not
+/// in the snapshot stale. Pure of stdin/stdout so it's unit-testable. The caller
+/// MUST have already verified `key` (handle does so via resolve_cluster_vault_key).
+pub(crate) fn apply_cluster_snapshot(
+    key: &[u8; 32],
+    payload: &ClusterSnapshotPayload,
+) -> ClusterApplyResult {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut applied = 0usize;
+    let mut skipped = 0usize;
+
+    for vk in &payload.virtual_keys {
+        // Primary binding = first target of the first slot.
+        let (slot, target) = match vk
+            .slots
+            .first()
+            .and_then(|s| s.targets.first().map(|t| (s, t)))
+        {
+            Some(pair) => pair,
+            None => {
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // supported_providers + provider_base_urls across all slot targets
+        // (order-preserving dedup), mirroring the account sync's derivation.
+        let mut supported_providers: Vec<String> = Vec::new();
+        let mut provider_base_urls: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for s in &vk.slots {
+            for t in &s.targets {
+                if t.provider_code.is_empty() {
+                    continue;
+                }
+                if !supported_providers.contains(&t.provider_code) {
+                    supported_providers.push(t.provider_code.clone());
+                }
+                provider_base_urls.insert(t.provider_code.clone(), t.base_url.clone());
+            }
+        }
+
+        let dk = crate::commands_account::DeliveredKey {
+            virtual_key_id: vk.virtual_key_id.clone(),
+            org_id: payload.org_id.clone(),
+            seat_id: vk.seat_id.clone(),
+            alias: vk.alias.clone(),
+            provider_code: target.provider_code.clone(),
+            protocol_type: slot.protocol_type.clone(),
+            base_url: target.base_url.clone(),
+            credential_id: target.credential_id.clone(),
+            credential_revision: target.credential_revision.clone(),
+            virtual_key_revision: vk.virtual_key_revision.clone(),
+            key_status: vk.key_status.clone(),
+            // Org-delivered keys are inherently claimed (they belong to a seat).
+            share_status: "claimed".to_string(),
+            // synced_inactive: valid + synced, not a local "active" selection
+            // (cluster has no `aikey use`). The cluster proxy serves managed keys
+            // by VK token, not by local_state (Phase 4).
+            local_state: "synced_inactive".to_string(),
+            expires_at: vk.expires_at,
+            local_alias: None,
+            supported_providers,
+            provider_base_urls,
+            owner_account_id: Some(vk.owner_account_id.clone()),
+        };
+
+        match crate::commands_account::upsert_delivered_key(key, &dk, &target.real_key) {
+            Ok(_) => {
+                applied += 1;
+                seen.insert(vk.virtual_key_id.clone());
+            }
+            Err(e) => {
+                eprintln!(
+                    "[_internal cluster_apply WARN] vk {}: {}",
+                    vk.virtual_key_id, e
+                );
+                skipped += 1;
+            }
+        }
+    }
+
+    // Any cached VK belonging to THIS org but absent from this snapshot is
+    // revoked/removed upstream → mark stale so the proxy stops it. R2 fix: scope
+    // the sweep to payload.org_id (mirrors the account path's owner guard at
+    // commands_account/mod.rs). Even though a node vault is meant to be
+    // single-org, an unscoped sweep would clobber another org's / a co-resident
+    // personal-sync's routes if that invariant is ever violated — defensive +
+    // matches the established pattern. R4-style: a cache read error is now a WARN
+    // (was a silent skip that could leave revoked keys serving).
+    let mut staled = 0usize;
+    match storage::list_virtual_key_cache() {
+        Ok(cached) => {
+            for entry in cached {
+                if entry.org_id != payload.org_id {
+                    continue; // not this org — never touch it
+                }
+                if !seen.contains(&entry.virtual_key_id) && entry.local_state != "stale" {
+                    let _ = storage::set_virtual_key_local_state(&entry.virtual_key_id, "stale");
+                    staled += 1;
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[_internal cluster_apply WARN] list cache for stale-sweep failed (revoked keys may keep serving): {}",
+                e
+            );
+        }
+    }
+
+    // Compliance enablement (P6): toggle the cluster-wide compliance filter to
+    // match the org config. We declare a "cluster-compliance" pseudo app_record
+    // and set/clear its filter_stages — the proxy's filter hook activates on ANY
+    // app_record with non-null filter_stages and applies to ALL traffic (incl.
+    // team VKs, confirmed 2026-06-05). The detector binary must be deployed at
+    // <apps_dir>/cluster-compliance/bin/cluster-compliance (Phase 8 / hub-install),
+    // else the proxy 501-fails loud — so enabling here without the binary is a
+    // deploy error, surfaced loudly rather than silently serving unfiltered.
+    // Reuses the public app cores (internal-command-reuses-public-core).
+    // R6 fix: track whether the compliance writes actually succeeded. Previously
+    // upsert/set/clear errors were eprintln-and-continue, yet we still reported
+    // compliance_enabled=Some(true) — claiming success on a failed write
+    // ("失败要显眼" violation). Now compliance_ok=false propagates to the result;
+    // the handler turns it into an error envelope so the daemon retries instead
+    // of believing the filter is active.
+    let mut compliance_ok = true;
+    let compliance_enabled = match &payload.compliance {
+        None => None,
+        Some(cfg) => {
+            // Ensure the pseudo-app row exists (set_/clear_ filter_stages are UPDATEs).
+            if let Err(e) = crate::commands_app::upsert_app_record(
+                COMPLIANCE_SLUG,
+                "Cluster Compliance",
+                "aikey",
+                &[],
+                "third-party", // app_kind CHECK allows only 'third-party'|'first-party'
+                false,
+                &[],
+            ) {
+                eprintln!("[_internal cluster_apply WARN] compliance app_record upsert: {}", e);
+                compliance_ok = false;
+            }
+            let res = if cfg.enabled {
+                crate::commands_app::set_app_filter_stages(
+                    COMPLIANCE_SLUG,
+                    &["pre_forward".to_string()],
+                    None,
+                    None,
+                )
+            } else {
+                crate::commands_app::clear_app_filter_stages(COMPLIANCE_SLUG)
+            };
+            if let Err(e) = res {
+                eprintln!("[_internal cluster_apply WARN] compliance filter set/clear: {}", e);
+                compliance_ok = false;
+            }
+            // packs are the detector's rule config; their distribution to the
+            // detector is handled separately (compliance pack distribution) — we
+            // only log how many the org has so the activation is auditable here.
+            eprintln!(
+                "[_internal cluster_apply] compliance enabled={} packs={} write_ok={}",
+                cfg.enabled,
+                cfg.packs.len(),
+                compliance_ok
+            );
+            Some(cfg.enabled)
+        }
+    };
+
+    let _ = storage::bump_vault_change_seq();
+
+    ClusterApplyResult {
+        applied,
+        skipped,
+        staled,
+        compliance_enabled,
+        compliance_ok,
     }
 }
 

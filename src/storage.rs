@@ -2218,6 +2218,283 @@ mod tests {
         );
     }
 
+    // Fence test for the Phase 2 extraction (B): the shared delivered-key core
+    // `commands_account::upsert_delivered_key` must write a managed_virtual_keys_cache
+    // row whose ciphertext decrypts back to the plaintext under the vault_key, with
+    // metadata (incl. owner_account_id — the P0-2 attribution field) preserved.
+    // Both the account-scoped CLI sync and the org-scoped cluster daemon path rely
+    // on this exact behavior; the test pins it so the extraction can't drift.
+    #[test]
+    fn upsert_delivered_key_roundtrips_under_vault_key() {
+        let (_dir, _db_path, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache(); // run platform migrations
+
+        let vault_key = derive_current("test_password");
+        let plaintext = "sk-real-provider-key-xyz";
+
+        let dk = crate::commands_account::DeliveredKey {
+            virtual_key_id: "vk-deliver-1".to_string(),
+            org_id: "org-9".to_string(),
+            seat_id: "seat-9".to_string(),
+            alias: "team-alpha".to_string(),
+            provider_code: "anthropic".to_string(),
+            protocol_type: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            credential_id: "cred-9".to_string(),
+            credential_revision: "crev-9".to_string(),
+            virtual_key_revision: "vrev-9".to_string(),
+            key_status: "active".to_string(),
+            share_status: "claimed".to_string(),
+            local_state: "synced_inactive".to_string(),
+            expires_at: None,
+            local_alias: None,
+            supported_providers: vec!["anthropic".to_string()],
+            provider_base_urls: std::collections::HashMap::new(),
+            owner_account_id: Some("acct-9".to_string()),
+        };
+
+        crate::commands_account::upsert_delivered_key(&vault_key, &dk, plaintext)
+            .expect("upsert_delivered_key must succeed");
+
+        let cached = crate::storage::get_virtual_key_cache("vk-deliver-1")
+            .expect("get_virtual_key_cache")
+            .expect("row must exist");
+        assert_eq!(cached.org_id, "org-9");
+        assert_eq!(cached.owner_account_id.as_deref(), Some("acct-9"));
+        assert_eq!(cached.supported_providers, vec!["anthropic".to_string()]);
+
+        let nonce = cached.provider_key_nonce.expect("nonce present");
+        let ct = cached.provider_key_ciphertext.expect("ciphertext present");
+        let recovered =
+            crate::crypto::decrypt(&vault_key, &nonce, &ct).expect("decrypt under vault_key");
+        assert_eq!(
+            recovered.as_slice(),
+            plaintext.as_bytes(),
+            "provider key plaintext must round-trip through upsert_delivered_key"
+        );
+    }
+
+    // Phase 2 half-2: the cluster daemon path. apply_cluster_snapshot must
+    // (1) write each org VK with owner_account_id taken per-VK from the payload
+    // (P0-2 multi-user attribution) and a decryptable real key, and (2) mark any
+    // cached VK absent from the snapshot stale (revoked/removed upstream).
+    #[test]
+    fn apply_cluster_snapshot_attributes_owner_and_marks_stale() {
+        let (_dir, _db_path, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache(); // run platform migrations
+
+        let key = derive_current("test_password");
+
+        // Pre-seed a cache VK that the upcoming snapshot will NOT contain.
+        let old = crate::commands_account::DeliveredKey {
+            virtual_key_id: "vk-old".to_string(),
+            org_id: "org-1".to_string(),
+            seat_id: "seat-old".to_string(),
+            alias: "old".to_string(),
+            provider_code: "anthropic".to_string(),
+            protocol_type: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            credential_id: "c-old".to_string(),
+            credential_revision: "r".to_string(),
+            virtual_key_revision: "r".to_string(),
+            key_status: "active".to_string(),
+            share_status: "claimed".to_string(),
+            local_state: "synced_inactive".to_string(),
+            expires_at: None,
+            local_alias: None,
+            supported_providers: vec!["anthropic".to_string()],
+            provider_base_urls: std::collections::HashMap::new(),
+            owner_account_id: Some("acct-old".to_string()),
+        };
+        crate::commands_account::upsert_delivered_key(&key, &old, "old-secret").expect("seed old");
+
+        // Org snapshot: one new VK (owner acct-A), vk-old absent.
+        let json = r#"{
+            "org_id": "org-1",
+            "virtual_keys": [
+                {
+                    "virtual_key_id": "vk-new",
+                    "owner_account_id": "acct-A",
+                    "seat_id": "seat-A",
+                    "alias": "alpha",
+                    "key_status": "active",
+                    "virtual_key_revision": "vr1",
+                    "slots": [
+                        {"protocol_type": "anthropic", "targets": [
+                            {"provider_code": "anthropic", "base_url": "https://api.anthropic.com",
+                             "real_key": "sk-new-secret", "credential_id": "c1", "credential_revision": "cr1"}
+                        ]}
+                    ]
+                }
+            ]
+        }"#;
+        let payload: crate::commands_internal::vault_op::ClusterSnapshotPayload =
+            serde_json::from_str(json).expect("parse cluster snapshot payload");
+
+        let r = crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &payload);
+        assert_eq!(r.applied, 1, "one VK applied");
+        assert_eq!(r.staled, 1, "vk-old must be marked stale");
+
+        // vk-new: owner attributed per-VK + real key decrypts under vault_key.
+        let nw = crate::storage::get_virtual_key_cache("vk-new")
+            .expect("get")
+            .expect("vk-new exists");
+        assert_eq!(nw.owner_account_id.as_deref(), Some("acct-A"));
+        assert_eq!(nw.provider_code, "anthropic");
+        assert_eq!(nw.supported_providers, vec!["anthropic".to_string()]);
+        let recovered = crate::crypto::decrypt(
+            &key,
+            &nw.provider_key_nonce.expect("nonce"),
+            &nw.provider_key_ciphertext.expect("ct"),
+        )
+        .expect("decrypt vk-new");
+        assert_eq!(recovered.as_slice(), b"sk-new-secret");
+
+        // vk-old: stale.
+        let old_row = crate::storage::get_virtual_key_cache("vk-old")
+            .expect("get")
+            .expect("vk-old exists");
+        assert_eq!(old_row.local_state, "stale", "absent VK must be staled");
+    }
+
+    // R2 regression: the stale-sweep MUST be scoped to the snapshot's org. A VK
+    // belonging to another org (e.g. a co-resident personal sync, or a future
+    // shared vault) must NEVER be marked stale by an org-1 snapshot that simply
+    // doesn't contain it. Before the fix the sweep was unscoped and would have
+    // staled it → that org's proxy routing would silently stop.
+    #[test]
+    fn apply_cluster_snapshot_does_not_stale_other_orgs() {
+        let (_dir, _db_path, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache();
+        let key = derive_current("test_password");
+
+        // Seed a VK owned by org-2.
+        let foreign = crate::commands_account::DeliveredKey {
+            virtual_key_id: "vk-org2".to_string(),
+            org_id: "org-2".to_string(),
+            seat_id: "seat-2".to_string(),
+            alias: "foreign".to_string(),
+            provider_code: "anthropic".to_string(),
+            protocol_type: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            credential_id: "c-2".to_string(),
+            credential_revision: "r".to_string(),
+            virtual_key_revision: "r".to_string(),
+            key_status: "active".to_string(),
+            share_status: "claimed".to_string(),
+            local_state: "synced_inactive".to_string(),
+            expires_at: None,
+            local_alias: None,
+            supported_providers: vec!["anthropic".to_string()],
+            provider_base_urls: std::collections::HashMap::new(),
+            owner_account_id: Some("acct-2".to_string()),
+        };
+        crate::commands_account::upsert_delivered_key(&key, &foreign, "foreign-secret")
+            .expect("seed org-2 vk");
+
+        // An org-1 snapshot with zero VKs (does not contain vk-org2).
+        let payload: crate::commands_internal::vault_op::ClusterSnapshotPayload =
+            serde_json::from_str(r#"{"org_id":"org-1","virtual_keys":[]}"#).expect("parse");
+        let r = crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &payload);
+        assert_eq!(r.staled, 0, "org-1 snapshot must not stale any org-2 VK");
+
+        let foreign_row = crate::storage::get_virtual_key_cache("vk-org2")
+            .expect("get")
+            .expect("vk-org2 exists");
+        assert_ne!(
+            foreign_row.local_state, "stale",
+            "another org's VK must remain untouched by an org-1 snapshot"
+        );
+    }
+
+    // Phase 3d decision B: aikey (not the daemon) derives the vault key from the
+    // node master password, so the Argon2id derivation has a single source of
+    // truth. This pins that the password-derived key equals aikey's own
+    // derivation (no daemon-side re-implementation drift), and that the
+    // pre-derived vault_key_hex fallback still works.
+    #[test]
+    fn resolve_cluster_vault_key_password_and_hex_paths() {
+        let (_dir, _db_path, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache(); // run platform migrations
+
+        let expected = derive_current("test_password");
+
+        // Password path: aikey derives.
+        let payload: crate::commands_internal::vault_op::ClusterSnapshotPayload =
+            serde_json::from_str(
+                r#"{"org_id":"o","virtual_keys":[],"master_password":"test_password"}"#,
+            )
+            .expect("parse payload");
+        let env = crate::commands_internal::protocol::StdinEnvelope {
+            vault_key_hex: "00".repeat(32), // ignored when master_password is present
+            action: "cluster_apply_snapshot".to_string(),
+            request_id: None,
+            payload: serde_json::Value::Null,
+        };
+        let key = crate::commands_internal::vault_op::resolve_cluster_vault_key(&env, &payload)
+            .expect("derive from password");
+        assert_eq!(
+            key, expected,
+            "password-derived key must match aikey's own Argon2id derivation"
+        );
+
+        // Hex fallback path: caller pre-derived the key.
+        let payload2: crate::commands_internal::vault_op::ClusterSnapshotPayload =
+            serde_json::from_str(r#"{"org_id":"o","virtual_keys":[]}"#).expect("parse");
+        let env2 = crate::commands_internal::protocol::StdinEnvelope {
+            vault_key_hex: hex::encode(expected),
+            action: "cluster_apply_snapshot".to_string(),
+            request_id: None,
+            payload: serde_json::Value::Null,
+        };
+        let key2 = crate::commands_internal::vault_op::resolve_cluster_vault_key(&env2, &payload2)
+            .expect("hex path");
+        assert_eq!(key2, expected);
+    }
+
+    // Phase 6: cluster compliance enablement. A compliance block in the snapshot
+    // toggles the "cluster-compliance" pseudo app_record's filter_stages, which is
+    // what activates the proxy's global compliance filter (applies to ALL traffic).
+    #[test]
+    fn apply_cluster_snapshot_toggles_compliance_filter() {
+        let (_dir, _db_path, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache(); // runs platform migrations (incl app_records)
+        let key = derive_current("test_password");
+
+        // enabled=true → filter_stages = ["pre_forward"] (filter active)
+        let on: crate::commands_internal::vault_op::ClusterSnapshotPayload = serde_json::from_str(
+            r#"{"org_id":"o","virtual_keys":[],"compliance":{"enabled":true,"packs":["p1","p2"]}}"#,
+        )
+        .expect("parse on");
+        let r = crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &on);
+        assert_eq!(r.compliance_enabled, Some(true));
+        assert_eq!(
+            crate::commands_app::get_app_filter_stages("cluster-compliance").expect("get stages"),
+            Some(vec!["pre_forward".to_string()]),
+            "enabled → filter_stages must be set so the proxy activates the global filter"
+        );
+
+        // enabled=false → filter_stages cleared (NULL) → filter off
+        let off: crate::commands_internal::vault_op::ClusterSnapshotPayload =
+            serde_json::from_str(r#"{"org_id":"o","virtual_keys":[],"compliance":{"enabled":false}}"#)
+                .expect("parse off");
+        let r2 = crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &off);
+        assert_eq!(r2.compliance_enabled, Some(false));
+        assert_eq!(
+            crate::commands_app::get_app_filter_stages("cluster-compliance").expect("get stages"),
+            None,
+            "disabled → filter_stages cleared so the proxy stops filtering"
+        );
+
+        // no compliance block → untouched (None)
+        let neutral: crate::commands_internal::vault_op::ClusterSnapshotPayload =
+            serde_json::from_str(r#"{"org_id":"o","virtual_keys":[]}"#).expect("parse neutral");
+        assert_eq!(
+            crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &neutral).compliance_enabled,
+            None
+        );
+    }
+
     #[test]
     fn change_password_reencrypts_provider_account_tokens() {
         let (_dir, _db_path, _lock) = setup_vault();
