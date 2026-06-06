@@ -455,6 +455,28 @@ pub mod v1_0_0_baseline {
             "ALTER TABLE quota_rules_cache ADD COLUMN baseline TEXT",
         )?;
 
+        // quota_local_usage — proxy-OWNED local usage increment, persisted as a
+        // write-behind crash-recovery checkpoint so an OFFLINE proxy restart does
+        // not forget usage accrued since the last server baseline (design
+        // update/20260605-企业版配额限流-本地用量状态持久化与重启恢复.md, P0).
+        // Distinct from quota_rules_cache (CLI-written, server config mirror): the
+        // PROXY is the sole writer here and the CLI never touches it — so a sync's
+        // DELETE+rebuild of quota_rules_cache cannot wipe it. `increment` = used
+        // beyond the server baseline; reconciled to 0 by the proxy's monotonic-max
+        // (P8) once the server baseline catches up.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS quota_local_usage (
+                subject_id  TEXT NOT NULL,
+                metric      TEXT NOT NULL,
+                period_key  TEXT NOT NULL,
+                increment   REAL NOT NULL DEFAULT 0,
+                updated_at  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                PRIMARY KEY (subject_id, metric, period_key)
+            )",
+            [],
+        )
+        .map_err(|e| format!("Failed to ensure quota_local_usage table: {}", e))?;
+
         // entries routing column retrofits.
         for (col, ddl) in &[
             (
