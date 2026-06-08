@@ -1496,6 +1496,44 @@ fn write_u64_config(key: &str, value: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Read a string value (UTF-8 BLOB) from the config table. None if absent / vault
+/// not initialised. Used for non-numeric config such as the compliance policy.
+fn read_string_config(key: &str) -> Result<Option<String>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_connection()?;
+    let result: rusqlite::Result<Vec<u8>> = conn.query_row(
+        "SELECT value FROM config WHERE key = ?",
+        params![key],
+        |row| row.get(0),
+    );
+    match result {
+        Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).to_string())),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("failed to read '{}': {}", key, e)),
+    }
+}
+
+/// Config key the proxy writes with the org compliance mandate (G3): JSON
+/// `{"enabled":bool,"locked":bool}`. Must match aikey-proxy's
+/// `complianceMasterPolicyKey`.
+const COMPLIANCE_MASTER_POLICY_KEY: &str = "compliance.master_policy";
+
+/// Whether the org policy currently LOCKS the local compliance toggle (master
+/// mandate ON ⇒ the user can't disable it). Defaults to false (unlocked) when the
+/// key is absent / unparseable — never blocks the user spuriously.
+pub fn compliance_master_locked() -> bool {
+    let Ok(Some(s)) = read_string_config(COMPLIANCE_MASTER_POLICY_KEY) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&s)
+        .ok()
+        .and_then(|v| v.get("locked").and_then(|l| l.as_bool()))
+        .unwrap_or(false)
+}
+
 /// Config key holding this vault's delivery-integrity source identity (a UUID).
 /// One vault = one upload "source"; the proxy reads this and stamps it on every
 /// reported event so the collector can detect per-source sequence gaps. It is a

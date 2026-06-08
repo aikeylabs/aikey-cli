@@ -615,6 +615,8 @@ fn handle_filter_status(env: StdinEnvelope) {
                 "enabled": stages.is_some(),
                 "stages": stages.unwrap_or_default(),
                 "record_allow": record_allow,
+                // G3: master mandate locks the local toggle (org enforces ON).
+                "locked": crate::storage::compliance_master_locked(),
             }),
         )),
         Err(e) => emit_error(req_id, "I_APP_FILTER_STATUS_FAILED", e),
@@ -680,6 +682,17 @@ fn handle_filter_set(env: StdinEnvelope) {
     };
     if let Err(e) = commands_app::validate_slug(&p.slug) {
         emit_error(req_id, "I_INVALID_SLUG", e);
+        return;
+    }
+    // G3: when the org mandates compliance (master policy locked), the user can't
+    // disable it locally. The proxy force-spawns the detector regardless (G3a), so
+    // this guard is the friendly refusal — don't let a futile toggle through.
+    if !p.enable && p.slug == "ai-compliance-detector" && crate::storage::compliance_master_locked() {
+        emit_error(
+            req_id,
+            "I_APP_COMPLIANCE_LOCKED",
+            "compliance detection is enforced by your organization policy and cannot be disabled".to_string(),
+        );
         return;
     }
     let res = if p.enable {
