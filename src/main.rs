@@ -38,6 +38,7 @@ mod commands_proxy;
 // the process of being migrated to thin shells over these.
 #[allow(dead_code)]
 mod commands_account;
+mod commands_agent;
 mod proxy_events;
 mod proxy_lifecycle;
 mod proxy_proc;
@@ -1198,6 +1199,21 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Hook { action } => {
             handle_hook_command(action)?;
         }
+        Commands::Agent { action } => match action {
+            cli::AgentAction::Register {
+                join_token,
+                url,
+                name,
+            } => {
+                commands_agent::register(join_token, url.as_deref(), name.as_deref())?;
+            }
+            cli::AgentAction::Start { interval } => {
+                commands_agent::start(*interval)?;
+            }
+            cli::AgentAction::Status => {
+                commands_agent::status()?;
+            }
+        },
         Commands::Add {
             alias,
             provider,
@@ -6272,7 +6288,16 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 Err(e) => Err(augment_hook_update_error(&e).into()),
             }
         }
-        HookAction::Status { shell } => {
+        HookAction::Status { target, shell } => {
+            match target.as_deref() {
+                Some("openclaw") => {
+                    return commands_account::openclaw_hook::status().map_err(|e| e.into());
+                }
+                Some(t) => {
+                    return Err(format!("unknown hook target '{t}' (supported: openclaw)").into());
+                }
+                None => {}
+            }
             let detected;
             let shell_str: &str = match shell.as_deref() {
                 Some(s) => s,
@@ -6333,7 +6358,16 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             println!("state:       {}", state);
             Ok(())
         }
-        HookAction::Install { shell, no_hook } => {
+        HookAction::Install { target, shell, no_hook } => {
+            match target.as_deref() {
+                Some("openclaw") => {
+                    return commands_account::openclaw_hook::install(None).map_err(|e| e.into());
+                }
+                Some(t) => {
+                    return Err(format!("unknown hook target '{t}' (supported: openclaw)").into());
+                }
+                None => {}
+            }
             // Hook coverage v1 §H3: explicit Layer 1 + Layer 2 onboarding
             // for users who set up everything via Web and never touched
             // CLI — running this once wires their rc and unlocks the
@@ -6400,7 +6434,11 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             }
         }
         HookAction::Reinstall { shell } => handle_hook_reinstall(shell.as_deref()),
-        HookAction::Uninstall => handle_hook_uninstall(),
+        HookAction::Uninstall { target } => match target.as_deref() {
+            Some("openclaw") => commands_account::openclaw_hook::uninstall().map_err(|e| e.into()),
+            Some(t) => Err(format!("unknown hook target '{t}' (supported: openclaw)").into()),
+            None => handle_hook_uninstall(),
+        },
     }
 }
 

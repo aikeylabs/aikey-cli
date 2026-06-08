@@ -72,6 +72,16 @@ pub struct RefreshResponse {
     pub expires_in: i64,
 }
 
+/// Returned by POST /v1/digital-employees/register (host self-registration).
+#[derive(Debug, Deserialize)]
+pub struct RegisterDigitalEmployeeResponse {
+    pub refresh_token: String,
+    pub seat_id: String,
+    pub org_id: String,
+    pub account_id: String,
+    pub display_name: String,
+}
+
 /// Returned by GET /accounts/me/sync-version.
 #[derive(Debug, Deserialize)]
 pub struct SyncVersionResponse {
@@ -386,6 +396,40 @@ impl PlatformClient {
             })?;
         resp.into_json::<RefreshResponse>()
             .map_err(|e| format!("failed to parse refresh response: {}", e))
+    }
+
+    /// POST /v1/digital-employees/register — self-register this host as a
+    /// digital employee using an org join token. No JWT required (the join
+    /// token in the body is the credential). Returns the daemon refresh_token.
+    pub fn register_digital_employee(
+        base_url: &str,
+        join_token: &str,
+        host_info: &str,
+        display_name: &str,
+    ) -> Result<RegisterDigitalEmployeeResponse, String> {
+        let url = format!(
+            "{}/v1/digital-employees/register",
+            base_url.trim_end_matches('/')
+        );
+        let body = serde_json::json!({
+            "join_token": join_token,
+            "host_info": host_info,
+            "display_name": display_name,
+        });
+        let resp = ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_json(&body)
+            .map_err(|e| match e {
+                ureq::Error::Status(status, _) if status == 401 => {
+                    "join token is invalid, revoked, or expired".to_string()
+                }
+                ureq::Error::Status(status, ref r) => {
+                    format!("register failed (HTTP {}): {}", status, r.status_text())
+                }
+                _ => format!("register request failed: {}", e),
+            })?;
+        resp.into_json::<RegisterDigitalEmployeeResponse>()
+            .map_err(|e| format!("failed to parse register response: {}", e))
     }
 
     // ---- Key discovery ------------------------------------------------------

@@ -1886,17 +1886,30 @@ fn read_install_state() -> Option<serde_json::Value> {
 /// Determine the base URL for `aikey web`.
 ///
 /// Priority:
-///   1. Explicit `--port` flag  →  `http://localhost:<port>`
+///   1. Explicit `--port` flag  →  `<scheme>://<host>:<port>` (host borrowed
+///                                   from `control_url` so cookie domain /
+///                                   CORS / CSP stay aligned with the host
+///                                   the login flow wrote — see `host_loopback_parts`).
 ///   2. Env var `AIKEY_WEB_URL` →  use as-is
-///   3. Auto-detect: if control_url is localhost, probe dev-server ports
+///   3. Auto-detect: if control_url is loopback, probe dev-server ports
 ///   4. Fall back to the stored `control_url`
 fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> String {
     use std::net::TcpStream;
     use std::time::Duration;
 
-    // 1. Explicit --port
+    // Cache the parsed scheme + host once: every branch below that returns a
+    // synthesized URL (1 and 3) needs them, and re-parsing per branch would
+    // both repeat work and risk drift if the parse rules ever change.
+    let (scheme, host) = host_loopback_parts(control_url);
+
+    // 1. Explicit --port — keep host from control_url so cookies/CORS line up
+    //    with whatever the user logged in against (was hardcoded "localhost"
+    //    pre-2026-06-08 and quietly broke 127.0.0.1-configured installs:
+    //    the SPA at `localhost:3000` couldn't read the auth cookie that
+    //    `aikey login` wrote against `127.0.0.1`, kicking the user back to
+    //    the login page on every `aikey web`).
     if let Some(p) = explicit_port {
-        return format!("http://localhost:{}", p);
+        return format!("{}://{}:{}", scheme, host, p);
     }
 
     // 2. Env var override
@@ -1906,8 +1919,11 @@ fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> Str
         }
     }
 
-    // 3. Auto-detect dev server (only when control_url is localhost).
+    // 3. Auto-detect dev server (only when control_url is loopback).
     //    Vite may listen on IPv6 (::1) or IPv4 (127.0.0.1) — probe both.
+    //    The returned URL keeps control_url's host (not the IP probe order)
+    //    so `127.0.0.1` configs stay on `127.0.0.1` and `localhost` configs
+    //    stay on `localhost` — see the 2026-06-08 fix rationale above.
     let is_local = control_url.contains("localhost") || control_url.contains("127.0.0.1");
     if is_local {
         let dev_ports: &[u16] = &[3000, 5173];
@@ -1923,7 +1939,7 @@ fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> Str
                 )
                 .is_ok()
                 {
-                    return format!("http://localhost:{}", p);
+                    return format!("{}://{}:{}", scheme, host, p);
                 }
             }
         }
@@ -1931,6 +1947,40 @@ fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> Str
 
     // 4. Fall back to control_url
     control_url.to_string()
+}
+
+/// Extracts `(scheme, host)` from a URL like `http://127.0.0.1:3000/foo` or
+/// `https://localhost`. Inline parser (no `url` crate) because:
+///   - this function only ever sees the user's stored `control_url`, which is
+///     already validated at `aikey login` time, so we don't need RFC-3986 strict
+///     parsing — just split on `://` then on the first `:` or `/`.
+///   - keeps `aikey-cli` dependency-footprint small.
+///
+/// Falls back to `("http", "localhost")` if the parse can't find a scheme or
+/// host — same default the pre-2026-06-08 code used unconditionally, so the
+/// fallback path of an unparseable `control_url` keeps the OLD behavior rather
+/// than panicking.
+fn host_loopback_parts(control_url: &str) -> (&str, String) {
+    let (scheme, rest) = if let Some(r) = control_url.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = control_url.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return ("http", "localhost".to_string());
+    };
+    // Trim any path segment.
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // Strip optional `:<port>` to get the bare host. IPv6 in URLs is wrapped
+    // in `[...]` but loopback configs are always `127.0.0.1` / `localhost`
+    // (or hostnames without colons), so a plain split on `:` is safe here —
+    // and IPv6 would still trip our `is_local` check below which only matches
+    // the literal substrings "localhost" or "127.0.0.1".
+    let host = authority.split(':').next().unwrap_or(authority);
+    if host.is_empty() {
+        ("http", "localhost".to_string())
+    } else {
+        (scheme, host.to_string())
+    }
 }
 
 /// Base64URL-encode a string (URL-safe, no padding).
@@ -3759,6 +3809,12 @@ pub fn handle_run_direct(
 
 mod shell_integration;
 pub use shell_integration::*;
+
+// OpenClaw (龙虾 digital-employee) integration: `aikey hook {install,uninstall,
+// status} openclaw`. Separate from shell_integration because OpenClaw is an
+// unattended agent (no precmd hook); we write a static provider into its own
+// config via `openclaw config patch`. Reuses `aikey route` primitives.
+pub(crate) mod openclaw_hook;
 
 // Credential lifecycle: single funnel for all binding writes + read-only
 // state audit. See `lifecycle/mod.rs` for the design rationale (Phase 5
@@ -6042,5 +6098,100 @@ mod user_yaml_team_route_tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nope.yaml");
         assert!(super::read_user_yaml_team(&path).is_none());
+    }
+}
+
+// ============================================================================
+// Tests for `host_loopback_parts` / `resolve_browse_base_url` host preservation
+// (2026-06-08 fix). These pin the contract that `aikey web --copy-url` returns
+// a URL whose host matches the host the user logged in against — so cookies /
+// CORS / CSP all agree across `aikey login` and `aikey web`. Pre-fix, the host
+// was hardcoded to `localhost` and a `127.0.0.1`-configured install would have
+// its login cookie ignored on the auto-detected dev port.
+// ============================================================================
+#[cfg(test)]
+mod browse_url_tests {
+    use super::*;
+
+    #[test]
+    fn host_loopback_parts_preserves_ipv4_loopback() {
+        let (scheme, host) = host_loopback_parts("http://127.0.0.1:3000");
+        assert_eq!(scheme, "http");
+        assert_eq!(host, "127.0.0.1");
+    }
+
+    #[test]
+    fn host_loopback_parts_preserves_localhost_hostname() {
+        let (scheme, host) = host_loopback_parts("http://localhost:3000");
+        assert_eq!(scheme, "http");
+        assert_eq!(host, "localhost");
+    }
+
+    #[test]
+    fn host_loopback_parts_preserves_https_and_named_host() {
+        // Production team Control Panel: scheme + non-loopback host should
+        // also survive parsing — `resolve_browse_base_url` won't synthesize
+        // a URL for non-loopback hosts, but we still build (scheme, host)
+        // for the explicit-port branch.
+        let (scheme, host) = host_loopback_parts("https://team.example.com");
+        assert_eq!(scheme, "https");
+        assert_eq!(host, "team.example.com");
+    }
+
+    #[test]
+    fn host_loopback_parts_strips_trailing_path() {
+        let (_, host) = host_loopback_parts("http://127.0.0.1:3000/user/overview");
+        assert_eq!(host, "127.0.0.1");
+    }
+
+    #[test]
+    fn host_loopback_parts_handles_url_without_port() {
+        let (_, host) = host_loopback_parts("https://team.example.com/some/path");
+        assert_eq!(host, "team.example.com");
+    }
+
+    #[test]
+    fn host_loopback_parts_falls_back_when_unparseable() {
+        // Garbage / scheme-less input → same default the pre-fix code used
+        // unconditionally, so unparseable URLs land on the OLD behavior
+        // rather than crashing.
+        let (scheme, host) = host_loopback_parts("not-a-url");
+        assert_eq!(scheme, "http");
+        assert_eq!(host, "localhost");
+
+        let (scheme, host) = host_loopback_parts("");
+        assert_eq!(scheme, "http");
+        assert_eq!(host, "localhost");
+    }
+
+    #[test]
+    fn resolve_browse_base_url_explicit_port_keeps_ipv4_host() {
+        // The reported bug: `aikey web --copy-url` after logging in with
+        // `127.0.0.1` was returning `localhost`. With this fix, the
+        // explicit-port branch (which `aikey web --port 3000` hits, and
+        // which all auto-detect callers in is_local also pass through
+        // via the rebuilt format string) preserves the host.
+        let got = resolve_browse_base_url("http://127.0.0.1:8080", Some(3000));
+        assert_eq!(got, "http://127.0.0.1:3000");
+    }
+
+    #[test]
+    fn resolve_browse_base_url_explicit_port_keeps_localhost_host() {
+        let got = resolve_browse_base_url("http://localhost:8080", Some(3000));
+        assert_eq!(got, "http://localhost:3000");
+    }
+
+    #[test]
+    fn resolve_browse_base_url_explicit_port_keeps_https() {
+        let got = resolve_browse_base_url("https://team.example.com", Some(5173));
+        assert_eq!(got, "https://team.example.com:5173");
+    }
+
+    #[test]
+    fn resolve_browse_base_url_non_local_falls_back_to_control_url() {
+        // Production team URL with no --port: no probing happens, the
+        // stored control_url is returned verbatim.
+        let got = resolve_browse_base_url("https://team.example.com", None);
+        assert_eq!(got, "https://team.example.com");
     }
 }

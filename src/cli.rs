@@ -147,6 +147,16 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: HookAction,
     },
+    /// Manage this host as a龙虾/OpenClaw digital employee (unattended daemon).
+    ///
+    /// `register` self-enrolls the host into an org using a join token from the
+    /// admin console and stores the daemon credential in the vault. (The
+    /// long-running `start` daemon that syncs the assigned VK + writes OpenClaw
+    /// config arrives in a follow-up phase.)
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
     /// Save a new secret to the vault
     #[command(display_order = 1)]
     Add {
@@ -1024,6 +1034,43 @@ pub(crate) enum ProxyAction {
 /// point so a user who only wants to refresh the hook (without changing any
 /// vault binding) doesn't have to run `aikey use` and worry about side
 /// effects on third-party CLI configs.
+/// Subcommands for `aikey agent` (龙虾/OpenClaw digital-employee daemon).
+#[derive(Subcommand)]
+pub(crate) enum AgentAction {
+    /// Self-register this host as a digital employee using an org join token.
+    ///
+    /// Validates the join token against the Control plane, which creates the
+    /// service account + seat (no VK yet — the admin assigns one later), and
+    /// returns a long-lived daemon credential that is stored in the local vault.
+    /// Run once, typically from the install script. The vault master password is
+    /// taken from the `AIKEY_MASTER_PASSWORD` env (same as the cluster daemon);
+    /// if unset and a TTY is present, you are prompted.
+    Register {
+        /// Org join token from the admin console.
+        #[arg(long = "join-token")]
+        join_token: String,
+        /// Control Panel URL (e.g. http://192.168.1.100:3000). Defaults to the
+        /// value already saved in this host's config, if any.
+        #[arg(long = "control-url", alias = "url")]
+        url: Option<String>,
+        /// Display name shown in the console (default: this host's hostname).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Run the unattended sync daemon (foreground; managed by systemd/launchd).
+    ///
+    /// Each cycle refreshes the assigned virtual key into the local vault (what
+    /// the proxy serves) and keeps OpenClaw pointed at the proxy. Waits quietly
+    /// until an admin assigns a VK. Retries on transient errors; never exits.
+    Start {
+        /// Seconds between sync cycles (default 30, minimum 5).
+        #[arg(long, default_value_t = crate::commands_agent::DEFAULT_INTERVAL_SECS)]
+        interval: u64,
+    },
+    /// Show this host's digital-employee enrollment + sync status.
+    Status,
+}
+
 #[derive(Subcommand)]
 pub(crate) enum HookAction {
     /// Regenerate ~/.aikey/hook.{zsh,bash} from the binary's embedded
@@ -1031,6 +1078,10 @@ pub(crate) enum HookAction {
     Update,
     /// Report file / binary / loaded hashes and flag drift.
     Status {
+        /// Integration target. Omit = shell hook status (default).
+        /// `openclaw` = show whether OpenClaw is wired to the aikey proxy.
+        #[arg(value_name = "TARGET")]
+        target: Option<String>,
         /// Override shell detection (zsh | bash). Default: detect from $SHELL.
         #[arg(long, value_name = "SHELL")]
         shell: Option<String>,
@@ -1043,6 +1094,11 @@ pub(crate) enum HookAction {
     /// in the Web UI without ever running CLI commands). Web operations
     /// only render the hook file; rc wiring still requires a CLI prompt.
     Install {
+        /// Integration target. Omit = install the shell precmd hook (default).
+        /// `openclaw` = wire OpenClaw (龙虾 digital employee) to route its LLM
+        /// calls through the local aikey proxy using the active team key.
+        #[arg(value_name = "TARGET")]
+        target: Option<String>,
         /// Override shell detection (zsh | bash). Default: detect from $SHELL.
         #[arg(long, value_name = "SHELL")]
         shell: Option<String>,
@@ -1074,7 +1130,12 @@ pub(crate) enum HookAction {
     /// you open a new terminal.
     ///
     /// Idempotent: a no-op (still exits 0) when no hook block is present.
-    Uninstall,
+    Uninstall {
+        /// Integration target. Omit = remove the shell hook (default).
+        /// `openclaw` = remove the aikey provider from OpenClaw config.
+        #[arg(value_name = "TARGET")]
+        target: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1360,7 +1421,12 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 HookAction::Status { .. } => "hook.status".to_string(),
                 HookAction::Install { .. } => "hook.install".to_string(),
                 HookAction::Reinstall { .. } => "hook.reinstall".to_string(),
-                HookAction::Uninstall => "hook.uninstall".to_string(),
+                HookAction::Uninstall { .. } => "hook.uninstall".to_string(),
+            },
+            Commands::Agent { action } => match action {
+                AgentAction::Register { .. } => "agent.register".to_string(),
+                AgentAction::Start { .. } => "agent.start".to_string(),
+                AgentAction::Status => "agent.status".to_string(),
             },
             Commands::Trust { action } => match action {
                 TrustAction::Verify { .. } => "trust.verify".to_string(),
