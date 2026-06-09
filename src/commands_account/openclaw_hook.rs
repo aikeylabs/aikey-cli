@@ -89,19 +89,15 @@ pub(crate) fn resolve_anthropic_team_route() -> Result<(String, String), String>
          `aikey use <key>` to activate a team key first"
             .to_string()
     })?;
-    let token =
-        team_token_normalize::team_token_from_vk_id(&vk_id).map_err(|e| format!("team token: {e}"))?;
+    let token = team_token_normalize::team_token_from_vk_id(&vk_id)
+        .map_err(|e| format!("team token: {e}"))?;
     Ok((token, base_url))
 }
 
 // ── openclaw config patch payloads (pure, unit-tested) ──────────────────────
 
 /// Build the JSON patch that registers the `aikey` provider in openclaw.json.
-pub(crate) fn build_install_patch(
-    token: &str,
-    base_url: &str,
-    model: &str,
-) -> serde_json::Value {
+pub(crate) fn build_install_patch(token: &str, base_url: &str, model: &str) -> serde_json::Value {
     serde_json::json!({
         "models": {
             "providers": {
@@ -135,6 +131,36 @@ fn openclaw_bin() -> Result<String, String> {
     // Honor AIKEY_OPENCLAW_BIN override (tests / non-standard installs), else
     // rely on PATH resolution by Command.
     Ok(std::env::var("AIKEY_OPENCLAW_BIN").unwrap_or_else(|_| "openclaw".to_string()))
+}
+
+/// Restart the OpenClaw Gateway IFF one is currently running, so a newly
+/// assigned/rotated team VK takes effect. The Gateway loads config at start and
+/// does NOT hot-reload the file (it prints "Restart the gateway to apply"), so
+/// without this a Gateway-mode digital employee never picks up its key. Returns
+/// Ok(true) when a Gateway was up and a restart was issued, Ok(false) when none
+/// is running — the headless `openclaw agent --local` path reads config fresh,
+/// so there is nothing to restart. Liveness probe: `openclaw health` only
+/// succeeds against a running Gateway.
+pub(crate) fn restart_gateway_if_running() -> Result<bool, String> {
+    let bin = openclaw_bin()?;
+    let up = Command::new(&bin)
+        .args(["health"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !up {
+        return Ok(false);
+    }
+    let out = Command::new(&bin)
+        .args(["gateway", "restart"])
+        .output()
+        .map_err(|e| format!("openclaw gateway restart: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    Ok(true)
 }
 
 /// Pipe a JSON patch into `openclaw config patch --stdin`.
@@ -235,6 +261,58 @@ pub(crate) fn uninstall() -> Result<(), String> {
     Err(format!("openclaw config unset failed: {}", stderr.trim()))
 }
 
+/// Is the `aikey` provider currently present in OpenClaw config? Best-effort via
+/// `openclaw config get`. Used by the agent daemon to seed its in-memory
+/// "configured" flag at startup so revoke-cleanup is restart-safe (survives a
+/// daemon restart) without re-running cleanup every cycle.
+pub(crate) fn is_provider_present() -> Result<bool, String> {
+    let bin = openclaw_bin()?;
+    let out = Command::new(&bin)
+        .args(["config", "get", PROVIDER_DOT_PATH])
+        .output()
+        .map_err(|e| format!("openclaw config get: {e}"))?;
+    if !out.status.success() {
+        return Ok(false);
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let s = s.trim();
+    Ok(!s.is_empty() && s != "null" && s != "undefined" && s != "{}")
+}
+
+/// Remove the `aikey` provider (or, if OpenClaw's config-shrink guard rejects
+/// removing the only provider, blank its apiKey) when the digital employee has
+/// NO active VK — e.g. the admin revoked it. This stops 龙虾 from spinning on a
+/// dead/revoked bearer (it fails fast on "no/empty model key" instead of a
+/// confusing "token not found" every call).
+///
+/// Why no placeholder/sentinel key: the REASON there's no key (pending vs
+/// revoked) is owned by the server/console (seat + VK status). The local
+/// OpenClaw config only mirrors the usable route — encoding state here would
+/// split the source of truth. So we just clear the dead key, nothing more.
+///
+/// Caller gates this behind an in-memory "was configured" flag, so it runs once
+/// on the configured→revoked transition (no restart loop).
+pub(crate) fn deconfigure_quiet() -> Result<(), String> {
+    let bin = openclaw_bin()?;
+    let out = Command::new(&bin)
+        .args(["config", "unset", PROVIDER_DOT_PATH])
+        .output()
+        .map_err(|e| format!("openclaw config unset: {e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // OpenClaw won't remove the only provider (size-drop guard). Fall back to
+    // blanking the dead key so 龙虾 stops sending the revoked bearer.
+    if stderr.contains("size-drop") || stderr.contains("rejected") {
+        let _ = Command::new(&bin)
+            .args(["config", "set", &format!("{PROVIDER_DOT_PATH}.apiKey"), ""])
+            .output();
+        return Ok(());
+    }
+    Err(format!("openclaw config unset failed: {}", stderr.trim()))
+}
+
 /// `aikey hook status openclaw` — show whether OpenClaw is wired to AiKey.
 pub(crate) fn status() -> Result<(), String> {
     let bin = openclaw_bin()?;
@@ -265,7 +343,11 @@ mod tests {
 
     #[test]
     fn install_patch_shape_is_anthropic_messages_provider() {
-        let p = build_install_patch("aikey_team_abc", "http://127.0.0.1:27200/anthropic", "claude-sonnet-4-5");
+        let p = build_install_patch(
+            "aikey_team_abc",
+            "http://127.0.0.1:27200/anthropic",
+            "claude-sonnet-4-5",
+        );
         let prov = &p["models"]["providers"]["aikey"];
         assert_eq!(prov["api"], "anthropic-messages");
         assert_eq!(prov["apiKey"], "aikey_team_abc");

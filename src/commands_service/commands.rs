@@ -278,8 +278,33 @@ mod trust_local {
         Ok(())
     }
 
+    /// Reachability deadline for the post-start healthz probe.
+    ///
+    /// Why 30s: `launchctl kickstart` returns immediately while launchd
+    /// brings trust-local up asynchronously, and the trust-local binary's
+    /// cold start is dominated by PyInstaller **onefile self-extraction**
+    /// (the 23MB single file re-unpacks its bundled Python runtime + numpy
+    /// + deps to a temp dir on every launch) plus the cold-interpreter
+    /// import tax (fastapi/starlette/sqlalchemy/pydantic/numpy). That cost
+    /// is IO-bound and balloons under machine load: measured 2026-06-08 it
+    /// ranged ~5.6s idle to ~20.3s under load (load avg ~4). The original
+    /// 5s window lost that race on nearly every restart and reported a
+    /// false "did not become reachable" failure even though launchd had
+    /// successfully started the service (user saw "无法启动" then a refresh
+    /// showed it online). 30s gives ~1.5x headroom over the worst observed
+    /// 20.3s. The probe returns early on first healthz 200, so the typical
+    /// success path is far shorter than this ceiling — only a genuine
+    /// failure blocks the full 30s. The web caller's context timeout
+    /// (service_handler.go) MUST stay above this.
+    ///
+    /// Root-cause lever (deferred, separate decision): switching the
+    /// PyInstaller build to `onedir` extracts once at install time and
+    /// would cut cold start to ~3s and remove the load-driven variance,
+    /// making this timeout far less load-bearing.
+    const PROBE_DEADLINE_SECS: u64 = 30;
+
     fn probe_healthz() -> Result<(), String> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(PROBE_DEADLINE_SECS);
         while Instant::now() < deadline {
             if ureq::get("http://127.0.0.1:8801/healthz")
                 .timeout(Duration::from_millis(500))
@@ -291,7 +316,10 @@ mod trust_local {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        Err("service did not become reachable on :8801 within 5s".to_string())
+        Err(format!(
+            "service did not become reachable on :8801 within {}s",
+            PROBE_DEADLINE_SECS
+        ))
     }
 
     fn emit(verb: &str, result: &Result<(), String>, json: bool) {

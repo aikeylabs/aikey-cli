@@ -6358,7 +6358,11 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             println!("state:       {}", state);
             Ok(())
         }
-        HookAction::Install { target, shell, no_hook } => {
+        HookAction::Install {
+            target,
+            shell,
+            no_hook,
+        } => {
             match target.as_deref() {
                 Some("openclaw") => {
                     return commands_account::openclaw_hook::install(None).map_err(|e| e.into());

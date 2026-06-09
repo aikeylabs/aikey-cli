@@ -687,11 +687,13 @@ fn handle_filter_set(env: StdinEnvelope) {
     // G3: when the org mandates compliance (master policy locked), the user can't
     // disable it locally. The proxy force-spawns the detector regardless (G3a), so
     // this guard is the friendly refusal — don't let a futile toggle through.
-    if !p.enable && p.slug == "ai-compliance-detector" && crate::storage::compliance_master_locked() {
+    if !p.enable && p.slug == "ai-compliance-detector" && crate::storage::compliance_master_locked()
+    {
         emit_error(
             req_id,
             "I_APP_COMPLIANCE_LOCKED",
-            "compliance detection is enforced by your organization policy and cannot be disabled".to_string(),
+            "compliance detection is enforced by your organization policy and cannot be disabled"
+                .to_string(),
         );
         return;
     }

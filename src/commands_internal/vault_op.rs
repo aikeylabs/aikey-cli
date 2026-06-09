@@ -581,7 +581,10 @@ pub(crate) fn apply_cluster_snapshot(
                 false,
                 &[],
             ) {
-                eprintln!("[_internal cluster_apply WARN] compliance app_record upsert: {}", e);
+                eprintln!(
+                    "[_internal cluster_apply WARN] compliance app_record upsert: {}",
+                    e
+                );
                 compliance_ok = false;
             }
             let res = if cfg.enabled {
@@ -595,7 +598,10 @@ pub(crate) fn apply_cluster_snapshot(
                 crate::commands_app::clear_app_filter_stages(COMPLIANCE_SLUG)
             };
             if let Err(e) = res {
-                eprintln!("[_internal cluster_apply WARN] compliance filter set/clear: {}", e);
+                eprintln!(
+                    "[_internal cluster_apply WARN] compliance filter set/clear: {}",
+                    e
+                );
                 compliance_ok = false;
             }
             // packs are the detector's rule config; their distribution to the

@@ -12,7 +12,9 @@
 //! 20260608-龙虾数字员工接入-daemon实施方案与R1R2拍板.md): self-register first,
 //! admin assigns VK after. The join token is org-level and reusable.
 
-use crate::commands_account::{openclaw_hook, run_full_snapshot_sync};
+use crate::commands_account::{
+    openclaw_hook, persist_control_url_sidecar, run_full_snapshot_sync, set_de_collector_base,
+};
 use crate::platform_client::PlatformClient;
 use crate::storage;
 use secrecy::SecretString;
@@ -96,7 +98,22 @@ pub(crate) fn register(
         &control_url,
     )?;
 
-    println!("\u{2713} Registered as digital employee: {}", res.display_name);
+    // Wire the local proxy to the master the SAME way `aikey login` does — write
+    // the control URL to config.json (proxy compliance-policy poll), install-
+    // state.json, and user-yaml collector_url (usage reporting). save_oauth_session
+    // above only wrote the vault; without this the unattended daemon's proxy never
+    // learns the master URL → compliance detector never spawns + usage reporting
+    // falls back to the Personal localhost default (regression 2026-06-08 form②).
+    persist_control_url_sidecar(&control_url, true);
+    // A DE has no Personal local-server, so its proxy's BASE collector_url
+    // (default 127.0.0.1:8090) is a dead address — point it at the master so
+    // team-key usage events upload instead of bouncing (regression finding #2).
+    set_de_collector_base(&control_url);
+
+    println!(
+        "\u{2713} Registered as digital employee: {}",
+        res.display_name
+    );
     println!("  org_id  : {}", res.org_id);
     println!("  seat_id : {}", res.seat_id);
     println!("  control : {}", control_url);
@@ -177,9 +194,10 @@ fn now_epoch() -> i64 {
 /// Never exits on transient errors — it logs and retries so a flaky network or a
 /// not-yet-assigned VK doesn't take the daemon down.
 pub(crate) fn start(interval_secs: u64) -> Result<(), String> {
-    let acc = storage::get_platform_account().ok().flatten().ok_or(
-        "not registered — run `aikey agent register --join-token <token>` first",
-    )?;
+    let acc = storage::get_platform_account()
+        .ok()
+        .flatten()
+        .ok_or("not registered — run `aikey agent register --join-token <token>` first")?;
     let interval = Duration::from_secs(interval_secs.max(MIN_INTERVAL_SECS));
     println!(
         "aikey agent daemon started (account {}, control {}, sync every {}s)",
@@ -195,6 +213,10 @@ pub(crate) fn start(interval_secs: u64) -> Result<(), String> {
 
     let mut last_token: Option<String> = None;
     let mut announced_waiting = false;
+    // Whether OpenClaw currently carries our `aikey` provider. Seeded from the
+    // actual OpenClaw config so revoke-cleanup is restart-safe (a daemon restart
+    // after a revoke still cleans the stale key) without re-cleaning every cycle.
+    let mut configured = openclaw_hook::is_provider_present().unwrap_or(false);
     loop {
         // 1) FULL snapshot sync: refreshes JWT, claims any newly-assigned VK, and
         //    downloads + encrypts its provider key material into the vault cache —
@@ -211,10 +233,46 @@ pub(crate) fn start(interval_secs: u64) -> Result<(), String> {
                 if last_token.as_deref() != Some(token.as_str()) {
                     println!("[agent] OpenClaw configured with assigned virtual key");
                     last_token = Some(token);
+                    // The OpenClaw Gateway loads config at start and does NOT
+                    // hot-reload the file ("Restart the gateway to apply"), so a
+                    // running Gateway won't pick up the new/rotated VK until
+                    // restarted. Do it here, but only when the VK actually changed
+                    // (not every cycle) and only if a Gateway is up — the headless
+                    // `openclaw agent --local` path reads config fresh and needs no
+                    // restart. Best-effort: never fail the daemon over this.
+                    match openclaw_hook::restart_gateway_if_running() {
+                        Ok(true) => {
+                            println!("[agent] restarted OpenClaw Gateway to apply the new key")
+                        }
+                        Ok(false) => {} // no Gateway running → --local reads fresh
+                        Err(e) => eprintln!(
+                            "[agent] OpenClaw Gateway restart failed (apply manually): {e}"
+                        ),
+                    }
                 }
                 announced_waiting = false;
+                configured = true;
             }
             Ok(None) => {
+                // No active VK (never assigned, or admin revoked it). If OpenClaw
+                // was previously wired, clear the now-dead key so 龙虾 fails fast
+                // instead of spinning on a revoked bearer. Runs once on the
+                // configured→revoked transition (no restart loop). WHY no
+                // placeholder: pending-vs-revoked lives on the server/console,
+                // not in OpenClaw config (no source-of-truth split).
+                if configured {
+                    match openclaw_hook::deconfigure_quiet() {
+                        Ok(()) => {
+                            println!(
+                                "[agent] no active virtual key — cleared OpenClaw config (revoked?)"
+                            );
+                            let _ = openclaw_hook::restart_gateway_if_running();
+                        }
+                        Err(e) => eprintln!("[agent] OpenClaw cleanup failed (retrying): {e}"),
+                    }
+                    configured = false;
+                    last_token = None;
+                }
                 if !announced_waiting {
                     println!("[agent] waiting for an admin to assign a virtual key…");
                     announced_waiting = true;

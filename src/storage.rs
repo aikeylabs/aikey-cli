@@ -2475,8 +2475,16 @@ mod tests {
             )
             .expect("quota row for seat-1 must exist");
         assert_eq!(kind, "seat");
-        assert!(rules.contains("limit_amount"), "rules carry limit_amount: {}", rules);
-        assert!(rules.contains("\"metric\":\"usd\""), "rules carry the metric: {}", rules);
+        assert!(
+            rules.contains("limit_amount"),
+            "rules carry limit_amount: {}",
+            rules
+        );
+        assert!(
+            rules.contains("\"metric\":\"usd\""),
+            "rules carry the metric: {}",
+            rules
+        );
         let bl = baseline.expect("baseline present");
         assert!(bl.contains("\"used\":1.5"), "baseline carries used: {}", bl);
     }
@@ -2549,9 +2557,10 @@ mod tests {
         );
 
         // enabled=false → filter_stages cleared (NULL) → filter off
-        let off: crate::commands_internal::vault_op::ClusterSnapshotPayload =
-            serde_json::from_str(r#"{"org_id":"o","virtual_keys":[],"compliance":{"enabled":false}}"#)
-                .expect("parse off");
+        let off: crate::commands_internal::vault_op::ClusterSnapshotPayload = serde_json::from_str(
+            r#"{"org_id":"o","virtual_keys":[],"compliance":{"enabled":false}}"#,
+        )
+        .expect("parse off");
         let r2 = crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &off);
         assert_eq!(r2.compliance_enabled, Some(false));
         assert_eq!(
@@ -2564,7 +2573,8 @@ mod tests {
         let neutral: crate::commands_internal::vault_op::ClusterSnapshotPayload =
             serde_json::from_str(r#"{"org_id":"o","virtual_keys":[]}"#).expect("parse neutral");
         assert_eq!(
-            crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &neutral).compliance_enabled,
+            crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &neutral)
+                .compliance_enabled,
             None
         );
     }

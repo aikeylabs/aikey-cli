@@ -253,6 +253,42 @@ pub struct PlatformClient {
     jwt: String,
 }
 
+/// Outcome of `PlatformClient::probe_token`. Discriminates the three
+/// cases callers actually act on differently, instead of forcing every
+/// caller to re-parse error strings.
+///
+/// - `Invalid` — server replied 401 with `BIZ_AUTH_TOKEN_INVALID`. This
+///   happens after a backend reset rotates `JWT_SECRET`: the local
+///   token's `exp` claim still says it's valid, but the new server can't
+///   verify the signature. The cached token is permanently dead;
+///   refresh-then-retry MAY help (server may still know our
+///   refresh_token if only access tokens rotated) but typically requires
+///   `aikey login`. Callers should treat this as "stop using this token".
+/// - `Expired` — vanilla 401/403 without the invalidated marker. Same
+///   refresh-then-retry path as the normal expiry case.
+/// - `Offline` — couldn't talk to the server (transport error, timeout,
+///   server 5xx, etc.). The token is presumed-valid; the caller should
+///   carry on with the cached token and let the next operation surface
+///   the real failure.
+#[derive(Debug)]
+pub enum TokenProbeError {
+    Invalid,
+    Expired,
+    Offline,
+}
+
+impl std::fmt::Display for TokenProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid => write!(f, "server does not recognise this token (likely server reset)"),
+            Self::Expired => write!(f, "token expired"),
+            Self::Offline => write!(f, "server unreachable"),
+        }
+    }
+}
+
+impl std::error::Error for TokenProbeError {}
+
 impl PlatformClient {
     /// Creates a new client using a JWT already stored in `platform_account`.
     pub fn new(base_url: &str, jwt: &str) -> Self {
@@ -396,6 +432,58 @@ impl PlatformClient {
             })?;
         resp.into_json::<RefreshResponse>()
             .map_err(|e| format!("failed to parse refresh response: {}", e))
+    }
+
+    /// GET /accounts/me — minimal authenticated probe.
+    ///
+    /// Returns `Ok(())` when the server accepts the supplied access token,
+    /// `Err(TokenProbeError::Invalid)` when the server explicitly rejects
+    /// it as cryptographically unrecognised (BIZ_AUTH_TOKEN_INVALID,
+    /// produced after a backend reset that rotates JWT_SECRET — the
+    /// rejection is permanent until re-login), `Err(TokenProbeError::Expired)`
+    /// for ordinary HTTP-401 expiry, and `Err(TokenProbeError::Offline)`
+    /// when the request can't reach the server (transport / DNS / timeout).
+    ///
+    /// We use `/accounts/me` because it's the cheapest authenticated GET
+    /// the master server exposes — no DB join, no per-org work — and is
+    /// guaranteed available on every control plane (Personal / Trial /
+    /// Production). The 2-second timeout is set so a `aikey web` call
+    /// can't be wedged offline by a slow probe; on offline, the caller
+    /// falls back to the cached token (the URL still gets to the browser,
+    /// where the SPA's existing 401 handling takes over).
+    pub fn probe_token(
+        base_url: &str,
+        jwt: &str,
+    ) -> Result<(), TokenProbeError> {
+        let url = format!("{}/accounts/me", base_url.trim_end_matches('/'));
+        let resp = ureq::get(&url)
+            .set("Authorization", &format!("Bearer {}", jwt))
+            .timeout(std::time::Duration::from_secs(2))
+            .call();
+        match resp {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(401, response)) | Err(ureq::Error::Status(403, response)) => {
+                // The backend distinguishes "invalidated signature" from
+                // "ordinary expiry" via the `error` field. Read the body
+                // best-effort; if we can't parse it we conservatively call
+                // it `Expired` so the caller does a normal refresh first
+                // (cheap) before nuking the session.
+                let body = response.into_string().unwrap_or_default();
+                if body.contains("BIZ_AUTH_TOKEN_INVALID")
+                    || body.contains("token is invalid")
+                    || body.contains("令牌无效")
+                {
+                    Err(TokenProbeError::Invalid)
+                } else {
+                    Err(TokenProbeError::Expired)
+                }
+            }
+            // Any other status (5xx, 404 on weird deployments, etc.) — treat
+            // as transient. Don't claim the token is bad on the basis of a
+            // server error.
+            Err(ureq::Error::Status(_, _)) => Err(TokenProbeError::Offline),
+            Err(ureq::Error::Transport(_)) => Err(TokenProbeError::Offline),
+        }
     }
 
     /// POST /v1/digital-employees/register — self-register this host as a
