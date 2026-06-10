@@ -1120,6 +1120,52 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
+    // ── 8b. Disk space (vault / usage-WAL filesystem) ───────
+    // Why: a full disk makes SQLite WAL appends fail, which silently stops
+    // usage-event capture and billing upload (the proxy degrades its
+    // /health usage_pipeline to `wal_append_failed`, but that fires only
+    // AFTER the disk is already full). This proactive check warns before the
+    // disk fills so the operator can act first — closes the "doctor only
+    // checks WAL size, not free space" operability gap (2026-06-10 review #5).
+    {
+        // Probe the filesystem hosting the vault/WAL (events accumulate there).
+        // Pre-init the vault may not exist yet → walk up to the nearest
+        // existing ancestor so the check still reports the target disk.
+        let target = storage::get_vault_path()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        if let Some(dir) = target {
+            let mut probe = dir.clone();
+            while !probe.exists() {
+                match probe.parent() {
+                    Some(parent) => probe = parent.to_path_buf(),
+                    None => break,
+                }
+            }
+            // fs2::available_space is cross-platform (statvfs / GetDiskFreeSpaceExW),
+            // already a dependency for proxy file locking — no new crate.
+            if let Ok(free) = fs2::available_space(&probe) {
+                const LOW_DISK_MB: u64 = 500; // headroom below which WAL writes are at risk
+                let free_mb = free / (1024 * 1024);
+                if free_mb < LOW_DISK_MB {
+                    emit(
+                        "disk space",
+                        false,
+                        &format!("{} MB free — low, WAL writes at risk", free_mb),
+                        Some("free disk space; a full disk silently stops usage capture + billing upload"),
+                    );
+                } else {
+                    let detail = if free_mb >= 1024 {
+                        format!("{:.1} GB free", free_mb as f64 / 1024.0)
+                    } else {
+                        format!("{} MB free", free_mb)
+                    };
+                    emit("disk space", true, &detail, None);
+                }
+            }
+        }
+    }
+
     // ── 9. Control service ───────────────────────────────────
     if let Ok(Some(account)) = storage::get_platform_account() {
         let url = format!("{}/health", account.control_url.trim_end_matches('/'));

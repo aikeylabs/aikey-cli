@@ -1,0 +1,33 @@
+# CI gate — runs unit + integration tests on every push and PR.
+# Project rule: 持续交付 = CI/CD 失败即失败. A non-zero exit blocks the PR.
+#
+# The lifecycle E2E tests resolve the binary under test via the
+# cargo-provided CARGO_BIN_EXE_aikey, and a controlled-behavior `mock_proxy`
+# Go binary at target/test-bin/mock_proxy. We build mock_proxy here so those
+# E2E scenarios actually run; tests that additionally need a real
+# aikey-proxy binary (a separate repo) self-skip — they are designed not to
+# fail CI when the proxy isn't present.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - uses: Swatinem/rust-cache@v2
+      - name: Build mock_proxy (enables lifecycle E2E)
+        run: make build-mock-proxy
+      - name: cargo test
+        run: cargo test --workspace

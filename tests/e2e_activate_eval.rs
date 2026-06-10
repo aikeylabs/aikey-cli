@@ -179,6 +179,12 @@ fn nested_activate_preserves_original_prompt_across_switches() {
     let (stdout, stderr, code) = run_bash(
         &home,
         r#"
+            # prepend mode keeps the user's original PS1 visible after the
+            # cyan label, so we can observe that the idempotent _AIKEY_ORIG_PS1
+            # save survives a second activate. The default minimal-template
+            # prompt (label + \W) intentionally drops the original (April 2026
+            # CLI UX change, src/main.rs), which would hide what this test checks.
+            export AIKEY_PROMPT_MODE=prepend
             PS1="my-original-prompt> "
             ORIG_PS1="$PS1"
 
@@ -198,14 +204,16 @@ fn nested_activate_preserves_original_prompt_across_switches() {
         "#,
     );
     assert_eq!(code, 0, "bash failed: {}", stderr);
-    // Both activates should embed their label + the ORIGINAL prompt (not nest).
+    // Both activates should embed their cyan label + the ORIGINAL prompt
+    // (not nest). The label is wrapped in bash non-printing escapes
+    // `\[\e[36m\]...\[\e[0m\]` (see src/main.rs activate prompt builder).
     assert!(
-        stdout.contains("FIRST=(claude-a) my-original-prompt> "),
-        "first activate should show label+original:\n{}",
+        stdout.contains("FIRST=\\[\\e[36m\\](claude-a)\\[\\e[0m\\] my-original-prompt> "),
+        "first activate (prepend) should show cyan label + original:\n{}",
         stdout
     );
     assert!(
-        stdout.contains("SECOND=(claude-b) my-original-prompt> "),
+        stdout.contains("SECOND=\\[\\e[36m\\](claude-b)\\[\\e[0m\\] my-original-prompt> "),
         "second activate should replace label but keep SAME original (not nest):\n{}",
         stdout
     );

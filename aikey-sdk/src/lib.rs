@@ -308,7 +308,7 @@ impl AikeyClient {
     ///
     /// Useful for building env maps before you have the password.
     pub fn env_var_for(provider: &str) -> String {
-        Provider::from_str(provider).env_var()
+        Provider::parse(provider).env_var()
     }
 }
 
