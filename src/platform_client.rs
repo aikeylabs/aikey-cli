@@ -540,6 +540,31 @@ impl PlatformClient {
             .map_err(|e| format!("failed to deserialise keys: {}", e))
     }
 
+    /// GET /accounts/me/cluster-node — form-① employee node resolve (P5).
+    ///
+    /// Returns the live cluster node's `host:port` for this employee, or `None`
+    /// when the control plane is not a cluster (404 `not_a_cluster`), has no live
+    /// node, or any request/parse error — the caller then falls back to the local
+    /// proxy. The employee holds ONLY its user JWT here; control brokers the hub
+    /// resolve with the infra token server-side (never sent to the cli).
+    pub fn resolve_cluster_node(&self) -> Option<String> {
+        let url = format!("{}/accounts/me/cluster-node", self.base_url);
+        // ureq returns Err on non-2xx (incl. the 404 not_a_cluster), so any
+        // non-cluster control cleanly maps to None → local-proxy fallback.
+        let resp = ureq::get(&url)
+            .set("Authorization", &format!("Bearer {}", self.jwt))
+            .call()
+            .ok()?;
+        let data: serde_json::Value = resp.into_json().ok()?;
+        if data["ok"].as_bool() != Some(true) {
+            return None;
+        }
+        data["addr"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
     // ---- Snapshot sync (Phase B) --------------------------------------------
 
     /// GET /accounts/me/sync-version

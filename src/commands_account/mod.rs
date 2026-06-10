@@ -4037,6 +4037,28 @@ fn resolve_oauth_account(alias_or_id: &str) -> Option<storage::ProviderAccountIn
 /// Writes `~/.aikey/active.env` with provider env vars; installs shell hook on first use.
 /// Accepts virtual_key_id, alias (local_alias preferred, then server alias),
 /// or OAuth account (by provider_account_id or display_identity / email).
+///
+/// P5 form-① (§5.5): resolve the user's cluster node (one resolve per `aikey use`,
+/// hashed by user → one node for all the user's VKs) and persist its AUTHORITY for
+/// the per-provider router. The token is NOT stored here — each provider's token
+/// comes from its own binding (that's what makes routing per-provider). Control
+/// returns 404 (→ None) for non-cluster / not-logged-in, in which case we clear
+/// the node so every binding routes to the local proxy. The employee never holds
+/// the infra hub token — control brokers the resolve server-side.
+fn update_cluster_node_sidecar() {
+    use crate::commands_account::shell_integration::{clear_cluster_node, write_cluster_node};
+    let client = match get_authenticated_client() {
+        Ok(c) => c,
+        Err(_) => return clear_cluster_node(), // not logged in → all local
+    };
+    match client.resolve_cluster_node() {
+        Some(addr) => {
+            let _ = write_cluster_node(&addr);
+        }
+        None => clear_cluster_node(), // not a cluster / no live node → all local
+    }
+}
+
 pub fn handle_key_use(
     alias_or_id: &str,
     no_hook: bool,
@@ -4044,6 +4066,12 @@ pub fn handle_key_use(
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let proxy_port: u16 = crate::commands_proxy::proxy_port();
+
+    // P5 form-① (§5.5): resolve the user's cluster node up front (one resolve per
+    // `aikey use`). Done BEFORE the team-key delivery check below — a cluster VK's
+    // key lives on the central node, not here, so it must SKIP local delivery — and
+    // before the refresh funnel, whose per-binding cluster_route reads this node.
+    update_cluster_node_sidecar();
 
     // ── 1. Resolve key — try team keys, then personal, then OAuth ────────────
     let team_entry = storage::get_virtual_key_cache(alias_or_id)?.or_else(|| {
@@ -4087,7 +4115,15 @@ pub fn handle_key_use(
             };
             return Err(reason.into());
         }
-        if entry.provider_key_ciphertext.is_none() {
+        // §5.5: a cluster VK's key material lives on the central node, not on this
+        // machine — skip the local delivery below; the up-front resolve set the node
+        // and the refresh routes the tool straight to it. Only non-cluster managed
+        // VKs (key served by the local proxy) still deliver locally.
+        let on_cluster = shell_integration::read_cluster_node().is_some();
+        if on_cluster && entry.provider_key_ciphertext.is_none() {
+            eprintln!("  Key '{}' → cluster node (key stays central)", entry.alias);
+        }
+        if entry.provider_key_ciphertext.is_none() && !on_cluster {
             // Why: key material is NULL when the VK was synced but not yet delivered
             // (share_status=pending_claim). Auto-trigger a full snapshot sync (which
             // includes key material download) instead of forcing a separate command.
@@ -4353,6 +4389,9 @@ pub fn handle_key_use(
         }
         selected
     };
+
+    // (The cluster node was resolved up front, before the delivery check — see the
+    // top of handle_key_use. The funnel's refresh reads it per-binding via cluster_route.)
 
     // Single funnel: Switched event runs write_bindings_canonical →
     // refresh → apply_third_party_cli_configs. Drive off the refreshed

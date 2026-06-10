@@ -146,12 +146,29 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             let canonical_provider = crate::commands_account::oauth_provider_to_canonical(
                 &b.provider_code.to_lowercase(),
             );
-            let token = sentinel_token(canonical_provider);
-            let base_url = format!(
-                "http://127.0.0.1:{}/{}",
-                proxy_port,
-                provider_proxy_prefix_pub(&b.provider_code)
-            );
+            // §5.5 PER-PROVIDER routing (this IS the single write-path for
+            // `aikey use`): a managed VK whose user is on a cluster → the central
+            // node + that VK's real token; every other binding (personal/native/
+            // OAuth, or a managed VK in a non-cluster deployment) → local proxy +
+            // sentinel. Mixed local-key + cluster-VK bindings coexist, each
+            // provider routed to its own proxy.
+            let (token, base_url) = match crate::commands_account::cluster_route(
+                &b.key_source_type,
+                &b.key_source_ref,
+            ) {
+                Some((node, vk_token)) => (
+                    vk_token,
+                    format!("http://{}/{}", node, provider_proxy_prefix_pub(&b.provider_code)),
+                ),
+                None => (
+                    sentinel_token(canonical_provider),
+                    format!(
+                        "http://127.0.0.1:{}/{}",
+                        proxy_port,
+                        provider_proxy_prefix_pub(&b.provider_code)
+                    ),
+                ),
+            };
             // 2026-05-08 Kimi 双平台拆分 review self-review fix: 如果同一个 env
             // var 名已经被前一个 binding 写过 (典型场景:vault 同时有 'kimi'
             // (deprecated alias) + 'kimi_code',两者 env_vars 都是 KIMI_API_KEY

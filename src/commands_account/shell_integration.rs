@@ -566,8 +566,25 @@ pub fn unconfigure_kimi_cli() {
 
 const CODEX_LINE_MARKER: &str = "# managed by aikey";
 
+/// Codex config.toml base_url (§5.5 per-provider). If the openai-family active
+/// binding (openai/gpt/chatgpt) is a managed VK on a cluster, point codex at the
+/// central node; else the local proxy. Codex's token rides OPENAI_API_KEY in
+/// active.env (per-provider there), so only the base_url is routed here.
+fn codex_base_url(proxy_port: u16) -> String {
+    for p in ["openai", "gpt", "chatgpt"] {
+        if let Ok(Some(b)) =
+            crate::storage::get_provider_binding(crate::profile_activation::DEFAULT_PROFILE, p)
+        {
+            if let Some((node, _token)) = cluster_route(&b.key_source_type, &b.key_source_ref) {
+                return format!("http://{}/openai", node);
+            }
+        }
+    }
+    format!("http://127.0.0.1:{}/openai", proxy_port)
+}
+
 fn build_codex_managed_region(proxy_port: u16) -> String {
-    let base_url = format!("http://127.0.0.1:{}/openai", proxy_port);
+    let base_url = codex_base_url(proxy_port);
     format!(
         "{begin}\n\
 [model_providers.aikey]\n\
@@ -715,7 +732,9 @@ pub fn configure_codex_cli(proxy_port: u16) {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| resolve_user_home().join(".codex"));
 
-    let base_url = format!("http://127.0.0.1:{}/openai", proxy_port);
+    // Cluster form-① (P5, §5.5 per-provider): node if the openai binding is a
+    // managed VK on a cluster, else local proxy. See codex_base_url.
+    let base_url = codex_base_url(proxy_port);
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
     let region = build_codex_managed_region(proxy_port);
 
@@ -1089,6 +1108,79 @@ pub fn display_aikey_path(relative: &str) -> String {
     }
 }
 
+/// Cluster form-① PER-PROVIDER routing (P5, design §5.5 "本地/中央共存 · VK 路由").
+///
+/// `aikey use` routes PER KEY TYPE, and local keys + cluster VKs COEXIST on the
+/// same machine: a managed VK whose user is on a cluster goes to the central node
+/// with that VK's real token; every other binding (personal API key / native /
+/// OAuth) stays on the LOCAL proxy with the `aikey_active_*` sentinel. So
+/// anthropic-on-personal-OAuth and openai-on-cluster-VK each hit their own proxy —
+/// the tool sees two BASE_URLs, the user doesn't notice (§5.5 line 588).
+///
+/// The sidecar stores ONLY the user's resolved node authority (one resolve per
+/// `aikey use`, hashed by user → one node for all the user's VKs). The PER-PROVIDER
+/// token comes from each binding's VK id, NOT from the sidecar — that's what makes
+/// routing per-provider instead of a global override (the bug this replaced).
+/// Absent node ⇒ everything local (every personal user + any non-cluster
+/// deployment), byte-identical to the pre-cluster path.
+fn cluster_node_path_in(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("active-cluster.json")
+}
+
+/// The user's resolved cluster node authority (host:port), or None for local.
+/// `_in` core takes an explicit dir so it's testable without mutating HOME.
+pub(crate) fn read_cluster_node() -> Option<String> {
+    read_cluster_node_in(&resolve_aikey_dir())
+}
+fn read_cluster_node_in(dir: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(cluster_node_path_in(dir)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let authority = v["authority"].as_str()?.to_string();
+    if authority.is_empty() {
+        return None;
+    }
+    Some(authority)
+}
+
+/// Persists the user's resolved cluster node (set by `aikey use` when a hub exists).
+pub(crate) fn write_cluster_node(authority: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(resolve_aikey_dir())?;
+    let body = serde_json::json!({ "authority": authority });
+    std::fs::write(
+        cluster_node_path_in(&resolve_aikey_dir()),
+        serde_json::to_vec_pretty(&body).unwrap_or_default(),
+    )
+}
+
+/// Clears the node sidecar — no hub / not a cluster ⇒ all providers local.
+pub(crate) fn clear_cluster_node() {
+    let _ = std::fs::remove_file(cluster_node_path_in(&resolve_aikey_dir()));
+}
+
+/// Per-provider route (§5.5). Returns Some((node_authority, vk_token)) ONLY when
+/// this binding is a managed VK AND the user is on a cluster (node resolved) — the
+/// caller then targets the central node with the VK's real token. None ⇒ caller
+/// uses the local proxy (localhost + sentinel): personal/native/OAuth always, and
+/// managed VKs in a non-cluster deployment (key served by the local proxy).
+pub(crate) fn cluster_route(
+    key_source_type: &crate::credential_type::CredentialType,
+    key_source_ref: &str,
+) -> Option<(String, String)> {
+    cluster_route_with(key_source_type, key_source_ref, read_cluster_node())
+}
+fn cluster_route_with(
+    key_source_type: &crate::credential_type::CredentialType,
+    key_source_ref: &str,
+    node: Option<String>,
+) -> Option<(String, String)> {
+    if *key_source_type != crate::credential_type::CredentialType::ManagedVirtualKey {
+        return None; // personal / native / oauth → always local proxy
+    }
+    let node = node?; // managed VK but no cluster node → local proxy (non-cluster team)
+    let token = crate::team_token_normalize::team_token_from_vk_id(key_source_ref).ok()?;
+    Some((node, token))
+}
+
 pub(super) fn write_active_env(
     _key_type: &str, // legacy parameter — token is now per-provider sentinel (see body)
     _key_ref: &str,  // legacy parameter — see _key_type
@@ -1122,18 +1214,29 @@ pub(super) fn write_active_env(
 
     for provider in providers {
         if let Some((api_key_var, base_url_var)) = super::provider_env_vars(provider) {
-            // Per-provider active sentinel (post-2026-04-29 prefix rename).
-            // Was: per-credential-type sentinel (vk_id for team, alias/account for others).
-            // Now: aikey_active_<provider> for ALL credential types — proxy's
-            // tier-3 fallthrough resolves the active binding via URL path.
-            // key_type / key_ref unused here but kept in signature for caller
-            // ergonomics. Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md
-            let token_value = format!("aikey_active_{}", provider);
-            let base_url = format!(
-                "http://127.0.0.1:{}/{}",
-                proxy_port,
-                super::provider_proxy_prefix(provider)
-            );
+            // §5.5 PER-PROVIDER routing: look up THIS provider's active binding
+            // (write_active_env only has provider names) — a managed VK on a
+            // cluster → node + the VK's real token; everything else → local proxy
+            // + the `aikey_active_<provider>` sentinel (proxy tier-3 resolves it).
+            // Mixed local-key + cluster-VK coexist, each to its own proxy.
+            // Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md
+            let route = crate::storage::get_provider_binding(
+                crate::profile_activation::DEFAULT_PROFILE,
+                provider,
+            )
+            .ok()
+            .flatten()
+            .and_then(|b| cluster_route(&b.key_source_type, &b.key_source_ref));
+            let (token_value, base_url) = match route {
+                Some((node, tok)) => (
+                    tok,
+                    format!("http://{}/{}", node, super::provider_proxy_prefix(provider)),
+                ),
+                None => (
+                    format!("aikey_active_{}", provider),
+                    format!("http://127.0.0.1:{}/{}", proxy_port, super::provider_proxy_prefix(provider)),
+                ),
+            };
             kv_pairs.push((api_key_var.to_string(), token_value));
             kv_pairs.push((base_url_var.to_string(), base_url));
             // Provider-specific extras (e.g. KIMI_MODEL_NAME for the
@@ -5214,6 +5317,56 @@ mod stage3_review_fix_tests {
             "write_active_env's kv_pairs must push AIKEY_ACTIVE_SEQ \
              so active.env.flat carries the seq for cheap PS-hook diff",
         );
+    }
+
+    // ── P5 form-① §5.5: per-provider routing fences ───────────────────────────
+
+    /// The §5.5 coexistence fence: local keys + cluster VKs route INDEPENDENTLY.
+    /// A personal/native/OAuth binding ALWAYS routes local (None) even when a
+    /// cluster node is present (it must not get hijacked to the node); a managed
+    /// VK routes to the node ONLY when the user is on a cluster, with the VK's own
+    /// token. This is the property the old global sidecar violated.
+    #[test]
+    fn cluster_route_is_per_provider_local_and_cluster_coexist() {
+        use crate::credential_type::CredentialType;
+        let node = Some("10.0.0.5:27200".to_string());
+
+        // Personal key + cluster node present ⇒ still LOCAL (coexistence: a
+        // personal-OAuth provider keeps using the local proxy, not the node).
+        assert!(
+            cluster_route_with(&CredentialType::PersonalApiKey, "my-alias", node.clone()).is_none(),
+            "personal API key must route local even when a cluster node exists",
+        );
+        assert!(
+            cluster_route_with(&CredentialType::PersonalOAuthAccount, "acct-1", node.clone())
+                .is_none(),
+            "personal OAuth must route local even when a cluster node exists",
+        );
+
+        // Managed VK + cluster node ⇒ node + THIS VK's real token.
+        let (auth, token) =
+            cluster_route_with(&CredentialType::ManagedVirtualKey, "vk-abc", node.clone())
+                .expect("managed VK on a cluster ⇒ node");
+        assert_eq!(auth, "10.0.0.5:27200");
+        assert_eq!(token, "aikey_team_vk-abc", "uses the VK's own normalized token");
+
+        // Managed VK + NO node (non-cluster team) ⇒ LOCAL (local proxy serves it).
+        assert!(
+            cluster_route_with(&CredentialType::ManagedVirtualKey, "vk-abc", None).is_none(),
+            "a managed VK with no cluster node falls back to the local proxy",
+        );
+    }
+
+    /// Node sidecar parse/round-trip (no global HOME — uses the `_in` core).
+    #[test]
+    fn cluster_node_sidecar_roundtrip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        assert!(read_cluster_node_in(dir).is_none(), "absent ⇒ None (all local)");
+        std::fs::write(cluster_node_path_in(dir), r#"{"authority":"node2:27200"}"#).unwrap();
+        assert_eq!(read_cluster_node_in(dir).as_deref(), Some("node2:27200"));
+        std::fs::write(cluster_node_path_in(dir), r#"{"authority":""}"#).unwrap();
+        assert!(read_cluster_node_in(dir).is_none(), "blank authority ⇒ None");
     }
 
     // ── 2026-04-29 hook.ps1 must not leak file handles via ReadLines + break
