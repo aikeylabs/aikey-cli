@@ -237,6 +237,37 @@ pub fn team_target(virtual_key_id: &str, provider_code: &str, proxy_port: u16) -
     }
 }
 
+/// Build a team target that routes DIRECTLY to a hub-resolved cluster node
+/// (form-①), mirroring `cluster_route()` / `write_active_env`: the node's
+/// central vault decrypts the provider key material, so the LOCAL vault needs
+/// no `provider_key_ciphertext`. `node_authority` is the host:port the hub
+/// resolved (e.g. `10.0.0.88:27200`); `token` is the real VK token
+/// (`team_token_from_vk_id`), not the local-proxy sentinel.
+///
+/// Why this exists: cluster team keys keep key material central, so their local
+/// cache entry has `provider_key_ciphertext = None` by design. Without a
+/// node-routed target the probe builder fell through to "no team credential" →
+/// `I_CREDENTIAL_NOT_FOUND` → HTTP 404 in the Web "Test Connection" (the error
+/// was misleading: the VK exists, only the LOCAL material is absent). This
+/// makes the probe take the SAME path a real call takes. Bug:
+/// workflow/CI/bugfix/20260611-cluster-form1-connectivity-test-404.md
+pub fn team_target_cluster(
+    node_authority: &str,
+    token: &str,
+    virtual_key_id: &str,
+    provider_code: &str,
+) -> TestTarget {
+    let prefix = crate::commands_account::provider_proxy_prefix_pub(provider_code);
+    TestTarget {
+        provider_code: provider_code.to_string(),
+        base_url: format!("http://{}/{}", node_authority, prefix),
+        bearer: token.to_string(),
+        kind: CredentialKind::ManagedTeam,
+        source_ref: virtual_key_id.to_string(),
+        display_alias: String::new(), // populated by callers that have the alias row
+    }
+}
+
 /// Build an OAuth target: `aikey_probe_<account_id>` sentinel bearer (tier 2),
 /// local-proxy URL. The probe path lets the proxy decrypt the OAuth credential
 /// + refresh tokens server-side — same path as a real `aikey test <oauth>`.
@@ -751,6 +782,27 @@ mod connectivity_suite_tests {
         assert!(t.base_url.starts_with("http://127.0.0.1:27200/anthropic"));
         assert_eq!(t.display_label(), "anthropic (team)");
         assert_eq!(t.source_ref, "vk_abc");
+    }
+
+    #[test]
+    fn team_target_cluster_routes_to_node_with_real_token() {
+        // Cluster form-①: target points at the hub-resolved NODE authority
+        // (not the local proxy) and carries the REAL VK token, mirroring a
+        // live call. Bug 20260611-cluster-form1-connectivity-test-404.
+        let t = team_target_cluster(
+            "10.0.0.88:27200",
+            "aikey_team_vk_xyz",
+            "vk_xyz",
+            "anthropic",
+        );
+        assert_eq!(t.kind, CredentialKind::ManagedTeam);
+        assert_eq!(t.bearer, "aikey_team_vk_xyz");
+        assert_eq!(
+            t.base_url, "http://10.0.0.88:27200/anthropic",
+            "cluster team probe must hit the node authority directly, not 127.0.0.1"
+        );
+        assert_eq!(t.source_ref, "vk_xyz");
+        assert_eq!(t.display_label(), "anthropic (team)");
     }
 
     #[test]

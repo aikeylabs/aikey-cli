@@ -18,7 +18,7 @@ use crate::storage;
 
 use super::{
     oauth_target, personal_target, personal_target_direct, provider_defaults, team_target,
-    BuildTargetError, TestTarget,
+    team_target_cluster, BuildTargetError, TestTarget,
 };
 
 /// Build a TestTarget for a single provider binding.
@@ -233,14 +233,39 @@ pub fn targets_from_alias(
         if !crate::commands_proxy::proxy_is_running_managed() {
             return Vec::new();
         }
-        if vk.provider_key_ciphertext.is_none() {
-            return Vec::new();
-        }
         // Team keys have a single authoritative provider; honour the override
         // only when the user supplied one (keeps probe URL consistent).
         let provider = provider_override
             .map(|p| p.to_lowercase())
             .unwrap_or_else(|| vk.provider_code.clone());
+        // Cluster form-①: the provider key material stays central on the hub-
+        // resolved node, so this VK's local cache entry has
+        // provider_key_ciphertext = None BY DESIGN. Probe the SAME way a real
+        // call routes (cluster_route → node authority + real VK token) instead
+        // of demanding local ciphertext. Without this the cluster VK fell
+        // through to the is_none() guard below → empty targets →
+        // I_CREDENTIAL_NOT_FOUND → HTTP 404 in the Web "Test Connection",
+        // which was misleading (the VK exists; only LOCAL material is absent).
+        // Precondition: a prior `aikey use` persisted the resolved node
+        // (read_cluster_node); without it cluster_route is None and we keep the
+        // original local-material path. Bug:
+        // workflow/CI/bugfix/20260611-cluster-form1-connectivity-test-404.md
+        if let Some((node, token)) = crate::commands_account::cluster_route(
+            &crate::credential_type::CredentialType::ManagedVirtualKey,
+            &vk.virtual_key_id,
+        ) {
+            return vec![team_target_cluster(
+                &node,
+                &token,
+                &vk.virtual_key_id,
+                &provider,
+            )];
+        }
+        if vk.provider_key_ciphertext.is_none() {
+            // Non-cluster team VK with no local material (never delivered) —
+            // genuinely unprobeable. Caller surfaces I_CREDENTIAL_NOT_FOUND.
+            return Vec::new();
+        }
         return vec![team_target(&vk.virtual_key_id, &provider, proxy_port)];
     }
 

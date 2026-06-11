@@ -1782,6 +1782,18 @@ fn handle_test(env: StdinEnvelope) {
     // personal → team → oauth; we filter to the caller's declared target
     // kind so a Web-side "test this OAuth key" doesn't accidentally hit a
     // personal alias that happens to share the same name.
+    // A1 (2026-06-11): for team targets, resolve + persist THIS user's cluster
+    // node first (best-effort), mirroring `aikey use`. On a cluster the VK's key
+    // material is central, so the probe must route to the node — without a
+    // persisted node `targets_from_alias`'s cluster branch can't fire and a Web
+    // "Test Connection" run BEFORE any `aikey use` surfaced a misleading
+    // I_CREDENTIAL_NOT_FOUND / 404. on_cluster drives the A2 error below.
+    // Bug: workflow/CI/bugfix/20260611-cluster-form1-connectivity-test-404.md
+    let mut on_cluster = false;
+    if payload.target == "team" {
+        on_cluster = crate::commands_account::try_resolve_and_persist_cluster_node();
+    }
+
     let mut targets =
         crate::commands_project::targets_from_alias(&payload.id, None, None, proxy_port);
     use crate::commands_project::CredentialKind;
@@ -1795,6 +1807,23 @@ fn handle_test(env: StdinEnvelope) {
         targets.retain(|t| t.kind == want);
     }
     if targets.is_empty() {
+        // A2 (2026-06-11): give a cluster-aware, actionable error instead of the
+        // misleading "credential not found" when the VK actually exists but
+        // couldn't be turned into a probe target.
+        if payload.target == "team" && on_cluster {
+            // We ARE on a cluster (node resolved) yet still couldn't build a
+            // target — transient resolve/persist or token-derivation issue, not
+            // a missing credential.
+            emit_error(
+                req_id,
+                "I_CLUSTER_NODE_UNRESOLVED",
+                format!(
+                    "team key '{}' is a cluster key (material stays central); its node was resolved but a probe target could not be built — retry, or check control/hub connectivity",
+                    payload.id
+                ),
+            );
+            return;
+        }
         emit_error(
             req_id,
             "I_CREDENTIAL_NOT_FOUND",

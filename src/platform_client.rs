@@ -280,7 +280,10 @@ pub enum TokenProbeError {
 impl std::fmt::Display for TokenProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Invalid => write!(f, "server does not recognise this token (likely server reset)"),
+            Self::Invalid => write!(
+                f,
+                "server does not recognise this token (likely server reset)"
+            ),
             Self::Expired => write!(f, "token expired"),
             Self::Offline => write!(f, "server unreachable"),
         }
@@ -451,10 +454,7 @@ impl PlatformClient {
     /// can't be wedged offline by a slow probe; on offline, the caller
     /// falls back to the cached token (the URL still gets to the browser,
     /// where the SPA's existing 401 handling takes over).
-    pub fn probe_token(
-        base_url: &str,
-        jwt: &str,
-    ) -> Result<(), TokenProbeError> {
+    pub fn probe_token(base_url: &str, jwt: &str) -> Result<(), TokenProbeError> {
         let url = format!("{}/accounts/me", base_url.trim_end_matches('/'));
         let resp = ureq::get(&url)
             .set("Authorization", &format!("Bearer {}", jwt))

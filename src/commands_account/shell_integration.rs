@@ -1234,7 +1234,11 @@ pub(super) fn write_active_env(
                 ),
                 None => (
                     format!("aikey_active_{}", provider),
-                    format!("http://127.0.0.1:{}/{}", proxy_port, super::provider_proxy_prefix(provider)),
+                    format!(
+                        "http://127.0.0.1:{}/{}",
+                        proxy_port,
+                        super::provider_proxy_prefix(provider)
+                    ),
                 ),
             };
             kv_pairs.push((api_key_var.to_string(), token_value));
@@ -1321,6 +1325,26 @@ const V2_END: &str = "# aikey shell hook v2 end";
 // marker block into PowerShell's $PROFILE. Stage 1.2-extract 2026-04-29.
 pub(super) const V3_BEGIN: &str = "# aikey shell hook v3 begin";
 pub(super) const V3_END: &str = "# aikey shell hook v3 end";
+
+// PATH-injection marker — MUST stay byte-identical to local-install.sh's
+// `_PATH_MARKER` (`# Added by aikey deploy`, see
+// workflow/CD/installer/local-install.sh ~line 2033). The installer is the
+// PRIMARY owner of the PATH line; `aikey hook install` only writes it as a
+// SAFETY NET (idempotent, dedup-on-marker) for fresh machines where the
+// installer's PATH write didn't land — e.g. `--with` opt-out flags
+// (AIKEY_NO_SHELL_RC / AIKEY_CREATE_RC=0), a non-standard install, or an
+// interrupted install. Sharing the marker is what makes the two writers
+// converge on a single PATH line instead of producing a duplicate.
+//
+// Why hook install also manages PATH (Why, 2026-06-11): the hook's `aikey()`
+// wrapper body is `command aikey`, which searches PATH and bypasses the
+// shell function — if `~/.aikey/bin` is not on PATH, sourcing the hook then
+// calling `aikey` fails with `command not found: aikey`. The hook templates
+// self-heal PATH at runtime (hook.zsh v6 / hook.bash v5 top line), and the
+// installer writes the rc PATH line on a fresh-rc create; this rc-level line
+// is the third, install-time net for the gap where neither of those ran.
+// Bug ref: workflow/CI/bugfix/20260611-hook-install-missing-path.md.
+const DEPLOY_PATH_MARKER: &str = "# Added by aikey deploy";
 
 /// Content of `~/.aikey/hook.zsh`. Sourced from `src/templates/hook.zsh` via
 /// `include_str!()` so the template authoring experience is plain .zsh with
@@ -2068,6 +2092,83 @@ pub(super) fn classify_rc_state_for_kind(home: &str, kind: HookKind) -> RcStateF
 ///   - $SHELL detection (kind must already be Zsh or Bash)
 ///   - TTY guard / interactive prompt (where applicable)
 ///   - PowerShell handling (separate function in shell_integration_windows)
+/// Resolve the aikey binary directory for the rc PATH line.
+///
+/// Priority:
+///   1. `current_exe()`'s parent IF its leaf is `bin` (= a real install layout
+///      like `~/.aikey/bin/aikey`). This honors non-standard install prefixes
+///      so the PATH line points at where `aikey` actually lives.
+///   2. Fallback `$HOME/.aikey/bin` — the canonical install dir, matching the
+///      hook templates' own self-heal line and local-install's default.
+///
+/// We emit the path as a `$HOME`-relative literal when it's under `home`, so
+/// the rc line stays portable (matches hook.zsh's `export
+/// PATH="$HOME/.aikey/bin:$PATH"`). Dedup is on the marker, not this value, so
+/// an absolute fallback for out-of-home installs is harmless.
+fn aikey_bin_dir_for_path(home: &str) -> String {
+    let default = format!("{}/.aikey/bin", home);
+    let resolved = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+        .filter(|dir| dir.file_name().map(|n| n == "bin").unwrap_or(false))
+        .map(|dir| dir.to_string_lossy().into_owned());
+    match resolved {
+        Some(abs) => {
+            // Re-express under $HOME when possible for a portable rc line.
+            if let Some(rel) = abs.strip_prefix(&format!("{}/", home)) {
+                format!("$HOME/{}", rel)
+            } else if abs == home {
+                "$HOME".to_string()
+            } else {
+                abs
+            }
+        }
+        None => {
+            // default is "<home>/.aikey/bin" — express as $HOME-relative.
+            let _ = default;
+            "$HOME/.aikey/bin".to_string()
+        }
+    }
+}
+
+/// Idempotently ensure the aikey PATH line exists in `rc_path`.
+///
+/// Dedup contract: keyed on `DEPLOY_PATH_MARKER` (shared with local-install.sh).
+/// If the marker is already present (installer wrote it, or a previous
+/// `aikey hook install` did), this is a no-op — we never append a second PATH
+/// line. Only when the marker is absent do we append `marker\nexport PATH=...`.
+///
+/// This is a SAFETY NET for the install path only (see DEPLOY_PATH_MARKER doc).
+/// `aikey hook update` / pure hook-file refresh deliberately do NOT call this —
+/// they must not mutate the user's rc beyond the source line they own.
+///
+/// Best-effort: a write failure is swallowed (returns false). The hook source
+/// line is the primary outcome of `hook install`; PATH is a redundant net and
+/// the hook templates also self-heal PATH at runtime, so a failure here should
+/// not fail the whole install.
+fn ensure_path_line_in_rc(home: &str, rc_path: &std::path::Path) -> bool {
+    let existing = std::fs::read_to_string(rc_path).unwrap_or_default();
+    if existing.contains(DEPLOY_PATH_MARKER) {
+        return false; // already wired (installer or prior hook install) — dedup
+    }
+    let bin_dir = aikey_bin_dir_for_path(home);
+    // Leading newline mirrors local-install.sh's append format
+    // (`printf '\n%s\nexport PATH=...'`) so the line is visually separated
+    // from whatever preceded it in the rc.
+    let block = format!(
+        "\n{marker}\nexport PATH=\"{bin}:$PATH\"\n",
+        marker = DEPLOY_PATH_MARKER,
+        bin = bin_dir,
+    );
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(rc_path)
+        .and_then(|mut f| f.write_all(block.as_bytes()))
+        .is_ok()
+}
+
 pub(super) fn write_v3_layers_with_consent(
     home: &str,
     kind: HookKind,
@@ -2098,6 +2199,10 @@ pub(super) fn write_v3_layers_with_consent(
                     std::fs::write(rc_path, updated).map_err(|_| HookFailureReason::IoError)?;
                 }
             }
+            // Safety net: ensure PATH even when the rc already had our hook
+            // source line but the installer's PATH line never landed (opt-out /
+            // non-standard install). Idempotent via DEPLOY_PATH_MARKER.
+            ensure_path_line_in_rc(home, rc_path);
             return Ok(HookInstallSummary::RewrittenV3 {
                 rc_file: rc_path.to_path_buf(),
             });
@@ -2107,6 +2212,7 @@ pub(super) fn write_v3_layers_with_consent(
             let migrated = replace_between_markers(&contents, V2_BEGIN, V2_END, &v3_block)
                 .unwrap_or_else(|| contents.clone());
             std::fs::write(rc_path, migrated).map_err(|_| HookFailureReason::IoError)?;
+            ensure_path_line_in_rc(home, rc_path);
             return Ok(HookInstallSummary::MigratedV2 {
                 rc_file: rc_path.to_path_buf(),
                 backup,
@@ -2116,6 +2222,7 @@ pub(super) fn write_v3_layers_with_consent(
             let backup = backup_rc_file(rc_path).map_err(|_| HookFailureReason::IoError)?;
             let migrated = strip_v1_block(&contents, &v3_block);
             std::fs::write(rc_path, migrated).map_err(|_| HookFailureReason::IoError)?;
+            ensure_path_line_in_rc(home, rc_path);
             return Ok(HookInstallSummary::MigratedV1 {
                 rc_file: rc_path.to_path_buf(),
                 backup,
@@ -2140,6 +2247,11 @@ pub(super) fn write_v3_layers_with_consent(
             .and_then(|mut f| f.write_all(block.as_bytes()))
             .map_err(|_| HookFailureReason::IoError)?;
     }
+    // Safety net: same rc gets the PATH line too, idempotent via marker. On a
+    // fresh machine where the installer never wrote PATH (or this rc didn't
+    // exist at install time), this is what makes `command aikey` (inside the
+    // hook's aikey() wrapper) resolvable from a new shell.
+    ensure_path_line_in_rc(home, &canonical_path);
     let bash_profile_shim_added = apply_bash_profile_shim_if_needed(home, kind);
     Ok(HookInstallSummary::FreshAppend {
         rc_file: canonical_path,
@@ -4149,6 +4261,141 @@ mod wire_rc_with_consent_tests {
 }
 
 // ============================================================================
+// PATH safety-net regression tests (2026-06-11)
+// ============================================================================
+//
+// Bug: workflow/CI/bugfix/20260611-hook-install-missing-path.md.
+// `aikey hook install` must idempotently ensure the `# Added by aikey deploy`
+// PATH line so the hook's `aikey()` wrapper (`command aikey` → PATH lookup)
+// resolves on a fresh machine where the installer's PATH write didn't land.
+// Dedup is keyed on the marker, shared byte-for-byte with local-install.sh.
+//
+// These call `write_v3_layers_with_consent` directly (the single Layer 2
+// writer behind both `aikey hook install`/`aikey use` TTY path and the Web
+// modal). No env mutation needed — the fn takes home + kind explicitly.
+#[cfg(test)]
+mod path_safety_net_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_rc_gets_exactly_one_path_line_on_install() {
+        // Pre: no rc at all (fresh machine). Expect: install appends the v3
+        // hook block AND exactly one aikey PATH line with the shared marker.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_str().unwrap();
+        let summary = write_v3_layers_with_consent(home, HookKind::Zsh).expect("install ok");
+        assert!(
+            matches!(summary, HookInstallSummary::FreshAppend { .. }),
+            "fresh rc should be a FreshAppend"
+        );
+        let zshrc = std::fs::read_to_string(tmp.path().join(".zshrc")).expect("read zshrc");
+        assert!(zshrc.contains(V3_BEGIN), "hook source block present");
+        assert_eq!(
+            zshrc.matches(DEPLOY_PATH_MARKER).count(),
+            1,
+            "exactly one PATH marker line"
+        );
+        assert!(
+            zshrc.contains("export PATH=\"$HOME/.aikey/bin:$PATH\""),
+            "PATH line points at the aikey bin dir; got:\n{zshrc}"
+        );
+    }
+
+    #[test]
+    fn existing_local_install_marker_is_not_duplicated() {
+        // Pre: rc already has the installer's PATH marker (local-install wrote
+        // it) but no aikey hook block yet. Expect: install adds the hook block
+        // but does NOT add a second PATH line — dedup on the shared marker.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_str().unwrap();
+        let pre = format!(
+            "# user content\n{}\nexport PATH=\"$HOME/.aikey/bin:$PATH\"\n",
+            DEPLOY_PATH_MARKER
+        );
+        std::fs::write(tmp.path().join(".zshrc"), &pre).expect("seed zshrc");
+        let _ = write_v3_layers_with_consent(home, HookKind::Zsh).expect("install ok");
+        let zshrc = std::fs::read_to_string(tmp.path().join(".zshrc")).expect("read zshrc");
+        assert_eq!(
+            zshrc.matches(DEPLOY_PATH_MARKER).count(),
+            1,
+            "PATH marker must stay single (installer already wrote it)"
+        );
+        assert!(zshrc.contains(V3_BEGIN), "hook block still added");
+        assert!(zshrc.contains("# user content"), "user content preserved");
+    }
+
+    #[test]
+    fn second_install_run_is_idempotent_on_path() {
+        // Running install twice (our own marker present from run 1) must not
+        // add a second PATH line — covers the "this command ran before" dedup.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_str().unwrap();
+        let _ = write_v3_layers_with_consent(home, HookKind::Zsh).expect("install 1");
+        let _ = write_v3_layers_with_consent(home, HookKind::Zsh).expect("install 2");
+        let zshrc = std::fs::read_to_string(tmp.path().join(".zshrc")).expect("read zshrc");
+        assert_eq!(
+            zshrc.matches(DEPLOY_PATH_MARKER).count(),
+            1,
+            "second install must not duplicate the PATH line"
+        );
+        assert_eq!(
+            zshrc.matches(V3_BEGIN).count(),
+            1,
+            "second install must not duplicate the hook block"
+        );
+    }
+
+    #[test]
+    fn bash_install_writes_path_line_to_bashrc() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().to_str().unwrap();
+        let _ = write_v3_layers_with_consent(home, HookKind::Bash).expect("install ok");
+        let bashrc = std::fs::read_to_string(tmp.path().join(".bashrc")).expect("read bashrc");
+        assert_eq!(bashrc.matches(DEPLOY_PATH_MARKER).count(), 1);
+        assert!(bashrc.contains("source ~/.aikey/hook.bash"));
+    }
+
+    #[test]
+    fn hook_update_path_does_not_touch_rc_or_path() {
+        // `aikey hook update` uses refresh_hook_file_only, which must NOT
+        // write any rc file (and therefore never adds a PATH line). This
+        // pins the boundary: PATH safety net is install-only.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_home = std::env::var("HOME").ok();
+        let prev_shell = std::env::var("SHELL").ok();
+        // refresh_hook_file_only reads HOME + (optionally) the shell arg.
+        let _guard = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("SHELL", "/bin/zsh");
+        }
+        let res = refresh_hook_file_only(Some("zsh"));
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_shell {
+                Some(v) => std::env::set_var("SHELL", v),
+                None => std::env::remove_var("SHELL"),
+            }
+        }
+        assert!(res.is_ok(), "hook update should render the hook file");
+        // hook.zsh rendered, but rc untouched → no PATH marker anywhere.
+        assert!(
+            tmp.path().join(".aikey/hook.zsh").exists(),
+            "hook file rendered"
+        );
+        assert!(
+            !tmp.path().join(".zshrc").exists(),
+            "hook update must not create/modify .zshrc (no PATH line)"
+        );
+    }
+}
+
+// ============================================================================
 // Stage 2 windows-compat helpers — tests
 // ============================================================================
 //
@@ -5338,8 +5585,12 @@ mod stage3_review_fix_tests {
             "personal API key must route local even when a cluster node exists",
         );
         assert!(
-            cluster_route_with(&CredentialType::PersonalOAuthAccount, "acct-1", node.clone())
-                .is_none(),
+            cluster_route_with(
+                &CredentialType::PersonalOAuthAccount,
+                "acct-1",
+                node.clone()
+            )
+            .is_none(),
             "personal OAuth must route local even when a cluster node exists",
         );
 
@@ -5348,7 +5599,10 @@ mod stage3_review_fix_tests {
             cluster_route_with(&CredentialType::ManagedVirtualKey, "vk-abc", node.clone())
                 .expect("managed VK on a cluster ⇒ node");
         assert_eq!(auth, "10.0.0.5:27200");
-        assert_eq!(token, "aikey_team_vk-abc", "uses the VK's own normalized token");
+        assert_eq!(
+            token, "aikey_team_vk-abc",
+            "uses the VK's own normalized token"
+        );
 
         // Managed VK + NO node (non-cluster team) ⇒ LOCAL (local proxy serves it).
         assert!(
@@ -5362,11 +5616,17 @@ mod stage3_review_fix_tests {
     fn cluster_node_sidecar_roundtrip() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path();
-        assert!(read_cluster_node_in(dir).is_none(), "absent ⇒ None (all local)");
+        assert!(
+            read_cluster_node_in(dir).is_none(),
+            "absent ⇒ None (all local)"
+        );
         std::fs::write(cluster_node_path_in(dir), r#"{"authority":"node2:27200"}"#).unwrap();
         assert_eq!(read_cluster_node_in(dir).as_deref(), Some("node2:27200"));
         std::fs::write(cluster_node_path_in(dir), r#"{"authority":""}"#).unwrap();
-        assert!(read_cluster_node_in(dir).is_none(), "blank authority ⇒ None");
+        assert!(
+            read_cluster_node_in(dir).is_none(),
+            "blank authority ⇒ None"
+        );
     }
 
     // ── 2026-04-29 hook.ps1 must not leak file handles via ReadLines + break

@@ -1186,6 +1186,37 @@ fn get_authenticated_client() -> Result<PlatformClient, Box<dyn std::error::Erro
     Ok(PlatformClient::new(&acc.control_url, &token))
 }
 
+/// Best-effort: resolve THIS user's cluster node (P5 channel) and persist it,
+/// mirroring what `aikey use` does on its resolve step. Returns `true` if the
+/// user is on a cluster (a node was resolved + persisted), `false` otherwise
+/// (not logged in / control unreachable / non-cluster org → node cleared).
+///
+/// Why callable outside `aikey use`: the Web "Test Connection" on a cluster
+/// team VK needs the resolved node to build a probe target (form-① key material
+/// is central). Before this, a test without a prior `aikey use` had no persisted
+/// node → `cluster_route` returned None → the probe surfaced a misleading
+/// `I_CREDENTIAL_NOT_FOUND` / HTTP 404. Best-effort + silent: any failure leaves
+/// the prior node state and the caller falls back to the local-material path.
+/// Bug: workflow/CI/bugfix/20260611-cluster-form1-connectivity-test-404.md
+pub(crate) fn try_resolve_and_persist_cluster_node() -> bool {
+    let client = match get_authenticated_client() {
+        Ok(c) => c,
+        Err(_) => return false, // not logged in → can't be on a cluster
+    };
+    match client.resolve_cluster_node() {
+        Some(addr) => {
+            let _ = shell_integration::write_cluster_node(&addr);
+            true
+        }
+        None => {
+            // Non-cluster (or transient): clear any stale node so a later
+            // non-cluster test doesn't wrongly route to a dead node.
+            shell_integration::clear_cluster_node();
+            false
+        }
+    }
+}
+
 /// Probes the server to confirm `token` is still cryptographically valid,
 /// and recovers when it isn't.
 ///
@@ -1236,17 +1267,18 @@ fn ensure_token_accepted_by_server(
             // be `--copy-url`-ing for paste-into-other-machine workflows.
             Ok(token)
         }
-        Err(probe_err @ TokenProbeError::Invalid)
-        | Err(probe_err @ TokenProbeError::Expired) => {
+        Err(probe_err @ TokenProbeError::Invalid) | Err(probe_err @ TokenProbeError::Expired) => {
             // Server explicitly rejected the cached token. Force a
             // refresh attempt that ignores the local `exp` gate (the
             // 60-second-window check in `try_refresh_if_needed` would
             // skip the refresh and hand back the same dead token).
-            let refresh_token = acc.refresh_token.as_deref().ok_or_else(|| format!(
+            let refresh_token = acc.refresh_token.as_deref().ok_or_else(|| {
+                format!(
                 "{}.\nThe cached login is unusable and there is no refresh token to retry with.\n\
                  Run: aikey login --email {} --control-url {}",
                 probe_err, acc.email, acc.control_url,
-            ))?;
+            )
+            })?;
             let resp = match PlatformClient::do_refresh_token(&acc.control_url, refresh_token) {
                 Ok(r) => r,
                 Err(e) => {
@@ -2879,6 +2911,25 @@ pub fn run_full_snapshot_sync_with_vault_key(
     };
     let client = PlatformClient::new(&acc.control_url, &token);
 
+    // P5 §5.5: is this user on a cluster? Authoritative resolve (works even before
+    // any `aikey use`). On a cluster, managed-VK key material stays on the CENTRAL
+    // node — never on this machine; the cli points the tool at the node via the
+    // resolve channel. So persist the node for the per-provider router and SKIP the
+    // local key-material download below. The server ALSO refuses per-VK delivery for
+    // cluster orgs (defense-in-depth); skipping here avoids the 403 churn + keeps the
+    // sidecar fresh on sync (not just on `aikey use`). Resolve failure ⇒ None ⇒
+    // treated as non-cluster (form-⓪/② download locally, as before).
+    let on_cluster = match client.resolve_cluster_node() {
+        Some(addr) => {
+            let _ = shell_integration::write_cluster_node(&addr);
+            true
+        }
+        None => {
+            shell_integration::clear_cluster_node();
+            false
+        }
+    };
+
     // Pull the full snapshot (metadata).
     let snapshot = match client.get_managed_keys_snapshot() {
         Ok(s) => s,
@@ -2900,7 +2951,10 @@ pub fn run_full_snapshot_sync_with_vault_key(
         // Needs claim: pending_claim but not yet claimed on server.
         let needs_claim = entry.share_status == "pending_claim" && entry.key_status == "active";
         // Needs download: claimed (or about to be) but missing local ciphertext.
-        let needs_download = entry.provider_key_ciphertext.is_none()
+        // §5.5: NEVER on a cluster — the key material stays on the central node, not
+        // here; the tool reaches it via the resolve channel (not the local proxy).
+        let needs_download = !on_cluster
+            && entry.provider_key_ciphertext.is_none()
             && entry.key_status == "active"
             && !entry.local_state.starts_with("disabled_by_");
 
