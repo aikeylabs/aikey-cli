@@ -318,58 +318,80 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
         // password-stdin mode) to ask for a fresh password.
         use std::io::IsTerminal;
         if !(io::stderr().is_terminal() || password_stdin) {
-            eprintln!("[aikey] proxy not running — run `aikey proxy start` to enable routing");
-            return;
-        }
-        eprintln!();
-        eprintln!("Proxy not running — starting it now.");
-
-        // Cache hit: silent.
-        let mut from_cache = false;
-        let mut prompted = false;
-        let pw: SecretString = if let Some(cached) = (!password_stdin)
-            .then(|| crate::session::try_get())
-            .flatten()
-        {
-            crate::session::refresh();
-            from_cache = true;
-            cached
-        } else if password_stdin {
-            eprint!("\u{1F512} Enter Master Password: ");
-            let _ = io::stderr().flush();
-            let mut line = String::new();
-            let _ = io::stdin().read_line(&mut line);
-            eprintln!("***");
-            prompted = true;
-            SecretString::new(line.trim().to_string())
-        } else {
-            prompted = true;
-            match crate::prompt_hidden("\u{1F512} Enter Master Password: ") {
-                Ok(p) => SecretString::new(p),
-                Err(_) => {
-                    eprintln!(
-                        "  [aikey] Could not read password — run `aikey proxy start` manually."
-                    );
+            // L9 fix A (2026-06-11): UNATTENDED start — launchd/systemd runs
+            // this exact path on login / crash-restart with no TTY. Reading
+            // the session store needs no terminal (only the interactive
+            // PROMPT does), so try it before bailing; otherwise the service
+            // looped on "Enter Master Password: requires an interactive
+            // terminal" forever and the web showed "本地服务不可用". TTL is
+            // deliberately not consulted (see try_get_unattended docs). Bug:
+            // 20260611-proxy-service-no-unattended-password.md
+            if let Some(cached) = crate::session::try_get_unattended() {
+                // Same verify-before-spawn discipline as the interactive
+                // cache path: a stale store (master password changed) must
+                // invalidate + bail here, not crashloop the spawned child.
+                if let Err(e) = crate::executor::list_secrets(&cached) {
+                    crate::session::invalidate();
+                    eprintln!("[aikey] cached vault password rejected: {}", e);
+                    eprintln!("[aikey] run `aikey proxy start` interactively to refresh it");
                     return;
                 }
+                (cached, true, false, false)
+            } else {
+                eprintln!("[aikey] proxy not running — run `aikey proxy start` to enable routing");
+                return;
             }
-        };
+        } else {
+            eprintln!();
+            eprintln!("Proxy not running — starting it now.");
 
-        // Verify password against the vault BEFORE spawning. Catches
-        // wrong-password early instead of letting it manifest as a
-        // silent vault-decrypt failure inside the child.
-        if let Err(e) = crate::executor::list_secrets(&pw) {
-            if from_cache {
-                crate::session::invalidate();
+            // Cache hit: silent.
+            let mut from_cache = false;
+            let mut prompted = false;
+            let pw: SecretString = if let Some(cached) = (!password_stdin)
+                .then(|| crate::session::try_get())
+                .flatten()
+            {
+                crate::session::refresh();
+                from_cache = true;
+                cached
+            } else if password_stdin {
+                eprint!("\u{1F512} Enter Master Password: ");
+                let _ = io::stderr().flush();
+                let mut line = String::new();
+                let _ = io::stdin().read_line(&mut line);
+                eprintln!("***");
+                prompted = true;
+                SecretString::new(line.trim().to_string())
+            } else {
+                prompted = true;
+                match crate::prompt_hidden("\u{1F512} Enter Master Password: ") {
+                    Ok(p) => SecretString::new(p),
+                    Err(_) => {
+                        eprintln!(
+                            "  [aikey] Could not read password — run `aikey proxy start` manually."
+                        );
+                        return;
+                    }
+                }
+            };
+
+            // Verify password against the vault BEFORE spawning. Catches
+            // wrong-password early instead of letting it manifest as a
+            // silent vault-decrypt failure inside the child.
+            if let Err(e) = crate::executor::list_secrets(&pw) {
+                if from_cache {
+                    crate::session::invalidate();
+                }
+                eprintln!("  [aikey] vault password rejected: {}", e);
+                eprintln!("  [aikey] retry with: aikey proxy start");
+                return;
             }
-            eprintln!("  [aikey] vault password rejected: {}", e);
-            eprintln!("  [aikey] retry with: aikey proxy start");
-            return;
+            if prompted {
+                crate::session::store(&pw);
+            }
+            (pw, from_cache, prompted, false)
         }
-        if prompted {
-            crate::session::store(&pw);
-        }
-        (pw, from_cache, prompted, false)
     };
     let _ = (from_cache, prompted, env_path); // suppress unused warnings on cfg paths
 

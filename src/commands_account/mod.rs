@@ -1268,54 +1268,79 @@ fn ensure_token_accepted_by_server(
             Ok(token)
         }
         Err(probe_err @ TokenProbeError::Invalid) | Err(probe_err @ TokenProbeError::Expired) => {
-            // Server explicitly rejected the cached token. Force a
-            // refresh attempt that ignores the local `exp` gate (the
-            // 60-second-window check in `try_refresh_if_needed` would
-            // skip the refresh and hand back the same dead token).
-            let refresh_token = acc.refresh_token.as_deref().ok_or_else(|| {
-                format!(
-                "{}.\nThe cached login is unusable and there is no refresh token to retry with.\n\
-                 Run: aikey login --email {} --control-url {}",
-                probe_err, acc.email, acc.control_url,
-            )
-            })?;
-            let resp = match PlatformClient::do_refresh_token(&acc.control_url, refresh_token) {
-                Ok(r) => r,
-                Err(e) => {
-                    // Refresh also failed — almost certainly because the
-                    // refresh token was signed by the same rotated secret.
-                    // Surface the actionable next step rather than the
-                    // raw HTTP error: the user can't fix HTTP, they CAN
-                    // run `aikey login`.
-                    return Err(format!(
-                        "{} ({}).\nThe cached login is unusable. Re-authenticate with:\n  \
-                        aikey login --email {} --control-url {}",
-                        probe_err, e, acc.email, acc.control_url,
-                    ));
-                }
-            };
-            // Persist the refreshed pair, then re-probe to confirm the
-            // new token isn't ALSO stale (defense in depth — if the
-            // server is misconfigured the new token may be invalid too,
-            // and we'd rather error here than mislead the user).
-            let new_expires_at = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64
-                + resp.expires_in;
-            storage::update_tokens(&resp.access_token, &resp.refresh_token, new_expires_at)
-                .map_err(|e| format!("Failed to save refreshed tokens: {}", e))?;
-            match PlatformClient::probe_token(&acc.control_url, &resp.access_token) {
-                Ok(()) => Ok(resp.access_token),
-                Err(TokenProbeError::Offline) => Ok(resp.access_token),
-                Err(_) => Err(format!(
-                    "Refreshed the token but the server still rejects it. The login is likely \
-                     bound to a previous server install. Re-authenticate with:\n  \
-                     aikey login --email {} --control-url {}",
-                    acc.email, acc.control_url,
-                )),
-            }
+            force_refresh_after_server_reject(acc, &probe_err.to_string())
         }
+    }
+}
+
+/// SHARED recovery core for "the server rejected a token the local clock
+/// still considers valid" — secret rotation, control reinstall, revocation,
+/// or a restored vault backup holding pre-rotation tokens.
+///
+/// Extracted 2026-06-11 from `ensure_token_accepted_by_server` (its sole
+/// logic until then) so BOTH trigger styles share one truth source:
+///   - `aikey web` / `browse`: PRE-flight probe (one extra RTT before
+///     opening a browser is acceptable) → on reject, calls this.
+///   - sync/snapshot (`aikey use` chain): POST-hoc on 401 (high-frequency
+///     path — probing before every call is not) → on 401, calls this and
+///     replays once. Bug: 20260611-jwt-renewal-l8-test.md (L8 T2: bare 401
+///     with no re-login guidance).
+///
+/// Behaviour (pinned by `probe_token_tests` + docstring contract):
+///   1. Force a `do_refresh_token` round trip, IGNORING the local `exp`
+///      gate (`try_refresh_if_needed`'s 60s-window check would skip the
+///      refresh and hand back the same dead token).
+///   2. No refresh token / refresh fails → user-actionable error naming
+///      the exact `aikey login` command (the user can't fix HTTP; they
+///      CAN re-login).
+///   3. Refresh succeeds → persist the rotated pair, then re-probe as
+///      defense in depth (a misconfigured server may reject the new token
+///      too — error out rather than mislead). Offline re-probe → accept.
+///
+/// `reject_context` prefixes the error strings (e.g. the probe error or
+/// "snapshot request returned 401") so the caller's failure mode stays
+/// visible in the final message.
+fn force_refresh_after_server_reject(
+    acc: &storage::PlatformAccount,
+    reject_context: &str,
+) -> Result<String, String> {
+    use crate::platform_client::TokenProbeError;
+
+    let refresh_token = acc.refresh_token.as_deref().ok_or_else(|| {
+        format!(
+            "{}.\nThe cached login is unusable and there is no refresh token to retry with.\n\
+             Run: aikey login --email {} --control-url {}",
+            reject_context, acc.email, acc.control_url,
+        )
+    })?;
+    let resp = match PlatformClient::do_refresh_token(&acc.control_url, refresh_token) {
+        Ok(r) => r,
+        Err(e) => {
+            // Refresh also failed — almost certainly because the
+            // refresh token was signed by the same rotated secret.
+            return Err(format!(
+                "{} ({}).\nThe cached login is unusable. Re-authenticate with:\n  \
+                aikey login --email {} --control-url {}",
+                reject_context, e, acc.email, acc.control_url,
+            ));
+        }
+    };
+    let new_expires_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+        + resp.expires_in;
+    storage::update_tokens(&resp.access_token, &resp.refresh_token, new_expires_at)
+        .map_err(|e| format!("Failed to save refreshed tokens: {}", e))?;
+    match PlatformClient::probe_token(&acc.control_url, &resp.access_token) {
+        Ok(()) => Ok(resp.access_token),
+        Err(TokenProbeError::Offline) => Ok(resp.access_token),
+        Err(_) => Err(format!(
+            "Refreshed the token but the server still rejects it. The login is likely \
+             bound to a previous server install. Re-authenticate with:\n  \
+             aikey login --email {} --control-url {}",
+            acc.email, acc.control_url,
+        )),
     }
 }
 
@@ -2804,6 +2829,26 @@ pub fn run_full_snapshot_sync(password: &SecretString) -> Result<usize, String> 
     run_full_snapshot_sync_with_vault_key(&vault_key)
 }
 
+/// Form-② digital-employee variant: same full snapshot sync, but the
+/// cluster gate on key-material download is OPEN.
+///
+/// Why a separate entry instead of a flag at every call site: the `aikey
+/// agent start` daemon IS the form-② local digital employee — its design
+/// contract (20260603 ER §5.3) is to pull ITS OWN seat's key material into
+/// the local DE vault so the local DE proxy can serve it, even when the org
+/// is a cluster org. Every other caller (human `aikey key sync` / `use`
+/// bridge / login) keeps the keys-stay-central cluster behavior. The control
+/// plane is the enforcement authority either way: it only honors cluster-org
+/// per-VK delivery for the caller's own digital_employee seat (delivery.go
+/// seat-scoped check), so this flag merely lets the daemon ATTEMPT the
+/// download instead of silently skipping (which left ciphertext NULL and the
+/// DE proxy with an empty registry — bug
+/// 20260611-form2-de-proxy-token-registry-mismatch).
+pub fn run_full_snapshot_sync_for_agent(password: &SecretString) -> Result<usize, String> {
+    let vault_key = derive_vault_key(password)?;
+    run_full_snapshot_sync_opts(&vault_key, true)
+}
+
 /// Phase 3B (2026-05-11): vault_key-only snapshot sync. Used by the web
 /// bridge path where the master password isn't available — only the
 /// already-derived 32-byte vault_key flows through the session cookie.
@@ -2890,6 +2935,16 @@ pub(crate) fn upsert_delivered_key(
 pub fn run_full_snapshot_sync_with_vault_key(
     vault_key: &[u8; crypto::KEY_SIZE],
 ) -> Result<usize, String> {
+    run_full_snapshot_sync_opts(vault_key, false)
+}
+
+/// Inner sync core. `allow_cluster_key_download` is true ONLY for the form-②
+/// agent daemon (see run_full_snapshot_sync_for_agent) — it opens the cluster
+/// gate on the key-material download loop below.
+fn run_full_snapshot_sync_opts(
+    vault_key: &[u8; crypto::KEY_SIZE],
+    allow_cluster_key_download: bool,
+) -> Result<usize, String> {
     use colored::Colorize;
 
     // Strict-verify before any encrypt write: a vault_key that does not
@@ -2933,6 +2988,27 @@ pub fn run_full_snapshot_sync_with_vault_key(
     // Pull the full snapshot (metadata).
     let snapshot = match client.get_managed_keys_snapshot() {
         Ok(s) => s,
+        // L8 fix (2026-06-11): 401 here means the server rejected a token the
+        // local clock still considers valid (secret rotation / control
+        // reinstall / restored vault backup) — `try_refresh_if_needed` above
+        // can't catch that (it only checks local exp). Recover through the
+        // SAME shared core `aikey web` uses (force refresh ignoring the exp
+        // gate) and replay once; if recovery fails the core's error already
+        // names the exact `aikey login` command. Previously this surfaced as
+        // a bare "status code 401" with no guidance (L8 T2). Bug:
+        // 20260611-jwt-renewal-l8-test.md
+        Err(e) if e.contains("status code 401") => {
+            let new_token = force_refresh_after_server_reject(
+                &acc,
+                &format!("snapshot request rejected ({})", e),
+            )
+            .map_err(|msg| format!("snapshot: {}", msg))?;
+            let retry_client = PlatformClient::new(&acc.control_url, &new_token);
+            match retry_client.get_managed_keys_snapshot() {
+                Ok(s) => s,
+                Err(e2) => return Err(format!("snapshot (after token refresh): {}", e2)),
+            }
+        }
         Err(e) => return Err(format!("snapshot: {}", e)),
     };
 
@@ -2951,9 +3027,13 @@ pub fn run_full_snapshot_sync_with_vault_key(
         // Needs claim: pending_claim but not yet claimed on server.
         let needs_claim = entry.share_status == "pending_claim" && entry.key_status == "active";
         // Needs download: claimed (or about to be) but missing local ciphertext.
-        // §5.5: NEVER on a cluster — the key material stays on the central node, not
-        // here; the tool reaches it via the resolve channel (not the local proxy).
-        let needs_download = !on_cluster
+        // §5.5: not on a cluster for HUMAN flows — key material stays on the
+        // central node; the tool reaches it via the resolve channel. Exception
+        // (2026-06-11): the form-② agent daemon (allow_cluster_key_download)
+        // pulls its OWN seat's material even on a cluster — the control plane's
+        // seat-scoped delivery check is the enforcement authority (only the
+        // caller's own digital_employee seat is honored there).
+        let needs_download = (!on_cluster || allow_cluster_key_download)
             && entry.provider_key_ciphertext.is_none()
             && entry.key_status == "active"
             && !entry.local_state.starts_with("disabled_by_");
@@ -6497,6 +6577,42 @@ mod probe_token_tests {
         let acc = make_acc(Some("rf"));
         let got = ensure_token_accepted_by_server(&acc, "cached-jwt".into()).unwrap();
         assert_eq!(got, "cached-jwt");
+    }
+
+    #[test]
+    fn force_refresh_core_no_refresh_token_gives_actionable_error() {
+        // 2026-06-11 extraction fence: the shared recovery core (now also
+        // wired into the sync/snapshot 401 path — L8 fix) must return the
+        // user-actionable `aikey login` command when there is no refresh
+        // token, with the caller's reject context preserved as the prefix.
+        let acc = make_acc(None);
+        let err =
+            force_refresh_after_server_reject(&acc, "snapshot request rejected (401)").unwrap_err();
+        assert!(
+            err.contains("aikey login --email user@example.com"),
+            "must name the exact re-login command, got: {err}"
+        );
+        assert!(
+            err.contains("--control-url http://127.0.0.1:0"),
+            "must include the control url, got: {err}"
+        );
+        assert!(
+            err.starts_with("snapshot request rejected (401)"),
+            "caller context must stay visible as prefix, got: {err}"
+        );
+    }
+
+    #[test]
+    fn force_refresh_core_refresh_failure_gives_actionable_error() {
+        // refresh_token present but control_url is port 0 (closed) →
+        // do_refresh_token fails → error must still carry the re-login
+        // command rather than a bare HTTP error.
+        let acc = make_acc(Some("rf"));
+        let err = force_refresh_after_server_reject(&acc, "ctx").unwrap_err();
+        assert!(
+            err.contains("aikey login --email user@example.com"),
+            "must name the exact re-login command, got: {err}"
+        );
     }
 
     #[test]

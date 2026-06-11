@@ -13,7 +13,8 @@
 //! admin assigns VK after. The join token is org-level and reusable.
 
 use crate::commands_account::{
-    openclaw_hook, persist_control_url_sidecar, run_full_snapshot_sync, set_de_collector_base,
+    openclaw_hook, persist_control_url_sidecar, run_full_snapshot_sync_for_agent,
+    set_de_collector_base,
 };
 use crate::platform_client::PlatformClient;
 use crate::storage;
@@ -221,7 +222,12 @@ pub(crate) fn start(interval_secs: u64) -> Result<(), String> {
         // 1) FULL snapshot sync: refreshes JWT, claims any newly-assigned VK, and
         //    downloads + encrypts its provider key material into the vault cache —
         //    metadata-only sync is NOT enough for the proxy to forward a team VK.
-        match run_full_snapshot_sync(&password) {
+        //    Agent variant: opens the cluster gate so a form-② DE on a CLUSTER
+        //    org still pulls its own seat's key material (control plane enforces
+        //    seat-scoped delivery). Plain sync would skip the download on
+        //    clusters → ciphertext NULL → empty DE-proxy registry → 401s. Bug:
+        //    20260611-form2-de-proxy-token-registry-mismatch.
+        match run_full_snapshot_sync_for_agent(&password) {
             Ok(0) => {} // nothing new
             Ok(n) => println!("[agent] synced {n} key(s) into vault"),
             Err(e) => eprintln!("[agent] snapshot sync failed (retrying): {e}"),

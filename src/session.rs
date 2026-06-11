@@ -295,6 +295,38 @@ pub fn try_get() -> Option<SecretString> {
     pw
 }
 
+/// Unattended read for SERVICE START paths (launchd/systemd-managed
+/// `aikey proxy start` with no TTY) — reads the configured backend store
+/// directly, WITHOUT the 30-minute sliding-TTL gate that `try_get` applies.
+///
+/// Why the TTL is deliberately skipped here (2026-06-11, L9 fix option A):
+/// the TTL exists to bound how long an *interactive* user goes without
+/// re-typing the password. A login-time / crash-restart service start has no
+/// human present — gating it on the TTL meant the proxy could only auto-start
+/// within 30 minutes of the user's last command, so boot-after-idle always
+/// failed ("本地服务不可用"). The security posture is unchanged: the secret
+/// still lives only in the OS keychain (unlocked with the user's login
+/// session) or the 0600 encrypted file; this function adds no new storage.
+///
+/// Why no vault_seq / expiry check: a stale cached password (e.g. after a
+/// master-password change) fails vault-open downstream and the caller already
+/// invalidates the cache on that failure — self-correcting, same as today.
+/// Deliberately does NOT refresh the TTL: unattended reads must not extend
+/// the interactive session window.
+///
+/// Backend comes from the vault config pref (not the TTL meta file, which may
+/// be expired/absent). "disabled" → None: the user explicitly opted out of
+/// caching, so unattended start is unavailable by their choice.
+/// Bug: workflow/CI/bugfix/20260611-proxy-service-no-unattended-password.md
+pub fn try_get_unattended() -> Option<SecretString> {
+    let pref = crate::storage::get_session_backend_pref()?;
+    match pref.as_str() {
+        "keychain" => keychain_get().or_else(file_get),
+        "file" => file_get(),
+        _ => None, // "disabled" or unknown → user opted out
+    }
+}
+
 /// Ask the user once whether to enable the OS keychain for session caching.
 ///
 /// Called after the very first successful master-password entry.  The answer
@@ -535,6 +567,38 @@ mod tests {
                 pw.expose_secret(),
                 "round-tripped password must match"
             );
+        });
+    }
+
+    #[test]
+    fn unattended_raw_store_read_ignores_expired_ttl_meta() {
+        // L9 fix A (2026-06-11): pins the property `try_get_unattended` relies
+        // on — the RAW backend store stays readable after the 30-min TTL meta
+        // expires. `try_get` (interactive) must refuse via the TTL gate while
+        // the raw store still yields the password for unattended service
+        // starts. If a refactor ever couples file_get/keychain_get to the
+        // meta TTL, launchd/systemd boot-after-idle breaks again ("本地服务
+        // 不可用" crashloop). Bug:
+        // 20260611-proxy-service-no-unattended-password.md
+        with_temp_home(|| {
+            let pw = SecretString::new("unattended-pw".to_string());
+            assert!(file_store(&pw), "file_store should succeed");
+            save_meta(&SessionMeta {
+                backend: "file".to_string(),
+                expires_at: now_secs() - 1, // TTL already expired
+                vault_seq: 0,
+            });
+
+            assert!(
+                try_get().is_none(),
+                "interactive try_get must refuse on expired TTL"
+            );
+            let raw = file_get();
+            assert!(
+                raw.is_some(),
+                "raw store must remain readable past TTL for unattended start"
+            );
+            assert_eq!(raw.unwrap().expose_secret(), pw.expose_secret());
         });
     }
 
