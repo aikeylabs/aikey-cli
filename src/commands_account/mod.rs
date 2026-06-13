@@ -1204,15 +1204,22 @@ pub(crate) fn try_resolve_and_persist_cluster_node() -> bool {
         Err(_) => return false, // not logged in → can't be on a cluster
     };
     match client.resolve_cluster_node() {
-        Some(addr) => {
+        crate::platform_client::ClusterNodeResolution::Node(addr) => {
             let _ = shell_integration::write_cluster_node(&addr);
             true
         }
-        None => {
-            // Non-cluster (or transient): clear any stale node so a later
-            // non-cluster test doesn't wrongly route to a dead node.
+        crate::platform_client::ClusterNodeResolution::NotACluster => {
+            // Authoritative 404: org has no cluster — clear any stale node so
+            // a later test doesn't wrongly route to a dead node.
             shell_integration::clear_cluster_node();
             false
+        }
+        crate::platform_client::ClusterNodeResolution::Unknown(_) => {
+            // Auth/transport failure: topology UNKNOWN — keep last-known-good
+            // routing untouched (2026-06-12 L8 次生缺口: a dead token here
+            // used to clear the node and downgrade routing to the
+            // material-less local proxy → 503 until a manual `aikey use`).
+            shell_integration::read_cluster_node().is_some()
         }
     }
 }
@@ -2972,16 +2979,26 @@ fn run_full_snapshot_sync_opts(
     // resolve channel. So persist the node for the per-provider router and SKIP the
     // local key-material download below. The server ALSO refuses per-VK delivery for
     // cluster orgs (defense-in-depth); skipping here avoids the 403 churn + keeps the
-    // sidecar fresh on sync (not just on `aikey use`). Resolve failure ⇒ None ⇒
-    // treated as non-cluster (form-⓪/② download locally, as before).
+    // sidecar fresh on sync (not just on `aikey use`).
+    //
+    // 2026-06-12: only an authoritative 404 (NotACluster) may clear the
+    // persisted node. This resolve runs BEFORE the snapshot step's 401-triggered
+    // token self-heal, so with a server-rejected token it fails 401 — the old
+    // code read that as "not a cluster", cleared the node, and rewrote
+    // active.env to the material-less local route → 503 NO_ACTIVE_KEY after an
+    // otherwise-successful self-heal (E2E case 2026-06-11 §L8 次生缺口).
+    // Unknown keeps last-known-good routing.
     let on_cluster = match client.resolve_cluster_node() {
-        Some(addr) => {
+        crate::platform_client::ClusterNodeResolution::Node(addr) => {
             let _ = shell_integration::write_cluster_node(&addr);
             true
         }
-        None => {
+        crate::platform_client::ClusterNodeResolution::NotACluster => {
             shell_integration::clear_cluster_node();
             false
+        }
+        crate::platform_client::ClusterNodeResolution::Unknown(_) => {
+            shell_integration::read_cluster_node().is_some()
         }
     };
 
@@ -4176,20 +4193,25 @@ fn resolve_oauth_account(alias_or_id: &str) -> Option<storage::ProviderAccountIn
 /// hashed by user → one node for all the user's VKs) and persist its AUTHORITY for
 /// the per-provider router. The token is NOT stored here — each provider's token
 /// comes from its own binding (that's what makes routing per-provider). Control
-/// returns 404 (→ None) for non-cluster / not-logged-in, in which case we clear
-/// the node so every binding routes to the local proxy. The employee never holds
+/// returns an authoritative 404 for non-cluster, in which case we clear the
+/// node so every binding routes to the local proxy. The employee never holds
 /// the infra hub token — control brokers the resolve server-side.
+///
+/// 2026-06-12: auth/transport failures (Unknown) keep the persisted node —
+/// only the authoritative 404 clears it (see resolve_cluster_node docs).
 fn update_cluster_node_sidecar() {
     use crate::commands_account::shell_integration::{clear_cluster_node, write_cluster_node};
+    use crate::platform_client::ClusterNodeResolution;
     let client = match get_authenticated_client() {
         Ok(c) => c,
-        Err(_) => return clear_cluster_node(), // not logged in → all local
+        Err(_) => return, // not logged in / token unrenewable → keep state; next login fixes it
     };
     match client.resolve_cluster_node() {
-        Some(addr) => {
+        ClusterNodeResolution::Node(addr) => {
             let _ = write_cluster_node(&addr);
         }
-        None => clear_cluster_node(), // not a cluster / no live node → all local
+        ClusterNodeResolution::NotACluster => clear_cluster_node(), // authoritative → all local
+        ClusterNodeResolution::Unknown(_) => {} // topology unknown → keep last-known-good
     }
 }
 

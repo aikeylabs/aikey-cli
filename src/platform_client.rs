@@ -247,6 +247,24 @@ impl DeliveryPayload {
 // Client
 // ---------------------------------------------------------------------------
 
+/// Three-way answer from `resolve_cluster_node` (2026-06-12).
+///
+/// Why not `Option<String>`: persisted cluster routing may only be CLEARED on
+/// an authoritative "this org has no cluster" (404). Auth failures / network
+/// blips must be distinguishable so callers keep last-known-good routing
+/// instead of silently downgrading a cluster employee to the (material-less)
+/// local route. See `resolve_cluster_node` docs for the incident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClusterNodeResolution {
+    /// On a cluster; routes to this `host:port` (advertise address).
+    Node(String),
+    /// Authoritative 404 `not_a_cluster` — safe to clear persisted routing.
+    NotACluster,
+    /// Auth failure / transport error / unexpected shape — topology UNKNOWN;
+    /// callers must leave persisted routing untouched.
+    Unknown(String),
+}
+
 /// Authenticated client for aikey-control-service.
 pub struct PlatformClient {
     base_url: String,
@@ -541,28 +559,52 @@ impl PlatformClient {
     }
 
     /// GET /accounts/me/cluster-node — form-① employee node resolve (P5).
-    ///
-    /// Returns the live cluster node's `host:port` for this employee, or `None`
-    /// when the control plane is not a cluster (404 `not_a_cluster`), has no live
-    /// node, or any request/parse error — the caller then falls back to the local
-    /// proxy. The employee holds ONLY its user JWT here; control brokers the hub
+    /// The employee holds ONLY its user JWT here; control brokers the hub
     /// resolve with the infra token server-side (never sent to the cli).
-    pub fn resolve_cluster_node(&self) -> Option<String> {
+    ///
+    /// 2026-06-12 three-way result (was `Option<String>`): the old shape
+    /// collapsed EVERY failure — including 401 "your token is dead" and
+    /// network blips — into `None`, and callers treated `None` as the
+    /// authoritative "this org is not a cluster" answer and CLEARED the
+    /// persisted node (`clear_cluster_node`). A server-side token rejection
+    /// during sync therefore silently downgraded a cluster employee to the
+    /// local-proxy route, which has NO key material on a cluster → every
+    /// later call failed 503 NO_ACTIVE_KEY until a manual `aikey use`.
+    /// The two mis-judgement costs are asymmetric: keeping a stale node is
+    /// visible and self-corrects on the next resolve; wrongly clearing it is
+    /// silent and dead-ends. So callers may only clear persisted routing on
+    /// `NotACluster` (authoritative 404); `Unknown` keeps last-known-good.
+    /// Bug: E2E case 2026-06-11 §L8 次生缺口.
+    pub fn resolve_cluster_node(&self) -> ClusterNodeResolution {
         let url = format!("{}/accounts/me/cluster-node", self.base_url);
-        // ureq returns Err on non-2xx (incl. the 404 not_a_cluster), so any
-        // non-cluster control cleanly maps to None → local-proxy fallback.
-        let resp = ureq::get(&url)
+        let resp = match ureq::get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
-            .ok()?;
-        let data: serde_json::Value = resp.into_json().ok()?;
+        {
+            Ok(r) => r,
+            // 404 is the endpoint's designed "not_a_cluster" answer — the one
+            // authoritative signal that this org has no cluster routing.
+            Err(ureq::Error::Status(404, _)) => return ClusterNodeResolution::NotACluster,
+            // 401/403/5xx/transport: says nothing about cluster topology —
+            // auth problem or transient failure. Callers must not touch
+            // persisted routing state.
+            Err(e) => return ClusterNodeResolution::Unknown(e.to_string()),
+        };
+        let data: serde_json::Value = match resp.into_json() {
+            Ok(d) => d,
+            Err(e) => return ClusterNodeResolution::Unknown(format!("parse: {}", e)),
+        };
         if data["ok"].as_bool() != Some(true) {
-            return None;
+            // 2xx but ok!=true is an unexpected shape, not an authoritative
+            // "no cluster" — treat as Unknown rather than clearing routes.
+            return ClusterNodeResolution::Unknown("response ok!=true".to_string());
         }
-        data["addr"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
+        match data["addr"].as_str().filter(|s| !s.is_empty()) {
+            Some(addr) => ClusterNodeResolution::Node(addr.to_string()),
+            // ok:true with no addr = control says cluster exists but no live
+            // node right now — transient (nodes down), not "no cluster".
+            None => ClusterNodeResolution::Unknown("no live node".to_string()),
+        }
     }
 
     // ---- Snapshot sync (Phase B) --------------------------------------------
@@ -631,5 +673,82 @@ impl PlatformClient {
             .map_err(|e| format!("claim request failed: {}", e))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cluster_resolve_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// One-shot mock control: answers a single HTTP request with `status` +
+    /// `body`, then exits. Returns the bound base_url.
+    fn mock_control(status: u16, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    404 => "Not Found",
+                    _ => "X",
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status, reason, body.len(), body
+                );
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    // 2026-06-12 fence (L8 次生缺口): the three-way resolution semantics.
+    // If a refactor ever collapses 401 back into "not a cluster", a dead
+    // token during sync will again clear persisted cluster routing and
+    // strand the employee on the material-less local route (503).
+
+    #[test]
+    fn resolve_404_is_authoritative_not_a_cluster() {
+        let c = PlatformClient::new(&mock_control(404, r#"{"error":"not_a_cluster"}"#), "jwt");
+        assert_eq!(c.resolve_cluster_node(), ClusterNodeResolution::NotACluster);
+    }
+
+    #[test]
+    fn resolve_401_is_unknown_never_not_a_cluster() {
+        let c = PlatformClient::new(&mock_control(401, r#"{"error":"unauthorized"}"#), "dead");
+        match c.resolve_cluster_node() {
+            ClusterNodeResolution::Unknown(_) => {}
+            other => panic!("401 must be Unknown (keep routing), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resolve_200_returns_node_addr() {
+        let c = PlatformClient::new(
+            &mock_control(
+                200,
+                r#"{"ok":true,"addr":"120.77.34.110:27200","node_id":"node-1"}"#,
+            ),
+            "jwt",
+        );
+        assert_eq!(
+            c.resolve_cluster_node(),
+            ClusterNodeResolution::Node("120.77.34.110:27200".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_transport_error_is_unknown() {
+        // Port 0 → connection refused: transport failure, NOT "no cluster".
+        let c = PlatformClient::new("http://127.0.0.1:0", "jwt");
+        match c.resolve_cluster_node() {
+            ClusterNodeResolution::Unknown(_) => {}
+            other => panic!("transport error must be Unknown, got {:?}", other),
+        }
     }
 }

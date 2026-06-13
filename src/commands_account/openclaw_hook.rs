@@ -29,12 +29,45 @@ use crate::{commands_proxy, credential_type, storage, team_token_normalize};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// Provider id written under `models.providers.<id>` in openclaw.json.
-const PROVIDER_ID: &str = "aikey";
+/// Default provider id written under `models.providers.<id>` in openclaw.json
+/// when AiKey OWNS the provider entry (greenfield: we created the OpenClaw
+/// install, so a dedicated `aikey` provider is ours to add/remove).
+const DEFAULT_PROVIDER_ID: &str = "aikey";
 /// api enum OpenClaw expects for Anthropic-native `/v1/messages` upstreams.
 const OPENCLAW_API: &str = "anthropic-messages";
 /// Default model id surfaced to OpenClaw (verified via aicoding/Anthropic).
 const DEFAULT_MODEL: &str = "claude-sonnet-4-5";
+
+/// Which provider id the daemon writes under. Brownfield (the customer already
+/// runs OpenClaw) sets `AIKEY_OPENCLAW_PROVIDER_ID` to THEIR existing provider's
+/// id so we *repoint* it instead of adding a parallel `aikey` provider the
+/// customer would have to switch to. Greenfield leaves it unset → `aikey`.
+/// Why env (not a const): the installer knows the deployment shape (brownfield
+/// vs greenfield) and the de-agent unit carries it; the pure patch builders stay
+/// env-free and unit-testable by taking provider_id as an argument.
+fn provider_id() -> String {
+    std::env::var("AIKEY_OPENCLAW_PROVIDER_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_PROVIDER_ID.to_string())
+}
+
+/// Repoint mode (brownfield): the target provider is the CUSTOMER's, pre-existing
+/// one. We must (a) patch ONLY baseUrl/apiKey/api so their models[] list survives,
+/// and (b) never DELETE the provider on revoke (that would wipe the customer's
+/// config) — we blank the key instead, and the original is restored from the
+/// installer's whole-file backup on uninstall. Gated explicitly (not derived from
+/// provider_id != "aikey") so the two concerns stay independent.
+fn is_repoint_mode() -> bool {
+    std::env::var("AIKEY_OPENCLAW_REPOINT").map(|v| v == "1").unwrap_or(false)
+}
+
+/// Dot-path of the active provider entry (`models.providers.<id>`), for
+/// `openclaw config get/unset/set`. Tracks `provider_id()`.
+fn provider_dot_path() -> String {
+    format!("models.providers.{}", provider_id())
+}
 
 // ── route resolution (reuses `aikey route` primitives) ──────────────────────
 
@@ -96,12 +129,19 @@ pub(crate) fn resolve_anthropic_team_route() -> Result<(String, String), String>
 
 // ── openclaw config patch payloads (pure, unit-tested) ──────────────────────
 
-/// Build the JSON patch that registers the `aikey` provider in openclaw.json.
-pub(crate) fn build_install_patch(token: &str, base_url: &str, model: &str) -> serde_json::Value {
+/// Build the JSON patch that registers a FULL `<provider_id>` provider in
+/// openclaw.json (greenfield: AiKey owns the entry, so it carries our model
+/// list too). The recursive `config patch` merge creates the provider if absent.
+pub(crate) fn build_install_patch(
+    provider_id: &str,
+    token: &str,
+    base_url: &str,
+    model: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "models": {
             "providers": {
-                PROVIDER_ID: {
+                provider_id: {
                     "baseUrl": base_url,
                     "api": OPENCLAW_API,
                     "apiKey": token,
@@ -119,11 +159,31 @@ pub(crate) fn build_install_patch(token: &str, base_url: &str, model: &str) -> s
     })
 }
 
-/// Dot-path of the provider entry, used by `openclaw config unset`.
-/// (We remove via `config unset` rather than a `null` patch because OpenClaw's
-/// patch path has a size-drop safety guard that rejects large shrinks — e.g.
-/// removing the only provider — whereas `unset` is the sanctioned delete.)
-const PROVIDER_DOT_PATH: &str = "models.providers.aikey";
+/// Build the NARROW repoint patch for brownfield: overwrite ONLY the customer's
+/// existing provider baseUrl/apiKey/api so their request flow goes through the
+/// local aikey proxy. Deliberately omits `models[]` — `config patch` merges
+/// recursively, so leaving models out preserves whatever model list the customer
+/// already configured (sending an array would replace theirs). `api` is set to
+/// anthropic-messages because the proxy speaks that on `/anthropic`; a non-
+/// Anthropic target provider must be chosen correctly by the operator
+/// (`--openclaw-provider`).
+pub(crate) fn build_repoint_patch(
+    provider_id: &str,
+    token: &str,
+    base_url: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "models": {
+            "providers": {
+                provider_id: {
+                    "baseUrl": base_url,
+                    "api": OPENCLAW_API,
+                    "apiKey": token
+                }
+            }
+        }
+    })
+}
 
 // ── openclaw CLI plumbing ───────────────────────────────────────────────────
 
@@ -142,6 +202,14 @@ fn openclaw_bin() -> Result<String, String> {
 /// so there is nothing to restart. Liveness probe: `openclaw health` only
 /// succeeds against a running Gateway.
 pub(crate) fn restart_gateway_if_running() -> Result<bool, String> {
+    // Brownfield fail-safe: the customer OWNS their gateway (their unit, their
+    // launch args). `AIKEY_DE_MANAGE_GATEWAY=0` (set by the brownfield installer)
+    // means "never touch their gateway" — the customer restarts it once after the
+    // first VK lands (a documented one-time step). Default unset/"1" preserves the
+    // greenfield behavior where AiKey owns the gateway and applies key changes.
+    if std::env::var("AIKEY_DE_MANAGE_GATEWAY").map(|v| v == "0").unwrap_or(false) {
+        return Ok(false);
+    }
     let bin = openclaw_bin()?;
     let up = Command::new(&bin)
         .args(["health"])
@@ -199,17 +267,25 @@ fn openclaw_config_patch(patch: &serde_json::Value) -> Result<(), String> {
 pub(crate) fn install(model: Option<&str>) -> Result<(), String> {
     let (token, base_url) = resolve_anthropic_team_route()?;
     let model = model.unwrap_or(DEFAULT_MODEL);
-    openclaw_config_patch(&build_install_patch(&token, &base_url, model))?;
-    println!("\u{2713} OpenClaw configured to route through AiKey.");
-    println!("  provider : {PROVIDER_ID}");
-    println!("  baseUrl  : {base_url}");
-    println!("  model    : {PROVIDER_ID}/{model}");
-    println!("  (real provider key stays in the vault; OpenClaw only holds the team VK)");
-    println!();
-    println!("  Try it:");
-    println!(
-        "    openclaw agent --local --session-key s1 --model {PROVIDER_ID}/{model} --message \"hi\""
-    );
+    let pid = provider_id();
+    if is_repoint_mode() {
+        openclaw_config_patch(&build_repoint_patch(&pid, &token, &base_url))?;
+        println!("\u{2713} OpenClaw provider '{pid}' repointed through AiKey.");
+        println!("  baseUrl  : {base_url}");
+        println!("  (real provider key stays in the vault; OpenClaw only holds the team VK)");
+    } else {
+        openclaw_config_patch(&build_install_patch(&pid, &token, &base_url, model))?;
+        println!("\u{2713} OpenClaw configured to route through AiKey.");
+        println!("  provider : {pid}");
+        println!("  baseUrl  : {base_url}");
+        println!("  model    : {pid}/{model}");
+        println!("  (real provider key stays in the vault; OpenClaw only holds the team VK)");
+        println!();
+        println!("  Try it:");
+        println!(
+            "    openclaw agent --local --session-key s1 --model {pid}/{model} --message \"hi\""
+        );
+    }
     println!("  If the OpenClaw gateway is already running, reload it to apply.");
     Ok(())
 }
@@ -228,20 +304,45 @@ pub(crate) fn configure_quiet(model: Option<&str>) -> Result<Option<String>, Str
         Err(e) if e.contains("no active team virtual key") => return Ok(None),
         Err(e) => return Err(e),
     };
-    let model = model.unwrap_or(DEFAULT_MODEL);
-    openclaw_config_patch(&build_install_patch(&token, &base_url, model))?;
+    let pid = provider_id();
+    if is_repoint_mode() {
+        // Brownfield: narrow patch (no models[]) so the customer's model list
+        // survives — we only swap their provider's baseUrl/apiKey to our proxy.
+        openclaw_config_patch(&build_repoint_patch(&pid, &token, &base_url))?;
+    } else {
+        let model = model.unwrap_or(DEFAULT_MODEL);
+        openclaw_config_patch(&build_install_patch(&pid, &token, &base_url, model))?;
+    }
     Ok(Some(token))
 }
 
 /// `aikey hook uninstall openclaw` — remove the aikey provider from OpenClaw.
 pub(crate) fn uninstall() -> Result<(), String> {
     let bin = openclaw_bin()?;
+    let pid = provider_id();
+    let dot_path = provider_dot_path();
+    // Repoint mode: the provider is the customer's — don't delete it, just blank
+    // the apiKey (the original is restored from the installer's whole-file backup).
+    if is_repoint_mode() {
+        let out = Command::new(&bin)
+            .args(["config", "set", &format!("{dot_path}.apiKey"), ""])
+            .output()
+            .map_err(|e| format!("OpenClaw CLI not runnable ('{bin}'): {e}"))?;
+        if out.status.success() {
+            println!("\u{2713} Cleared the AiKey key from OpenClaw provider '{pid}' (provider kept; restore the original baseUrl from the installer backup).");
+            return Ok(());
+        }
+        return Err(format!(
+            "openclaw config set apiKey='' failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
     let out = Command::new(&bin)
-        .args(["config", "unset", PROVIDER_DOT_PATH])
+        .args(["config", "unset", &dot_path])
         .output()
         .map_err(|e| format!("OpenClaw CLI not runnable ('{bin}'): {e}"))?;
     if out.status.success() {
-        println!("\u{2713} Removed the '{PROVIDER_ID}' provider from OpenClaw config.");
+        println!("\u{2713} Removed the '{pid}' provider from OpenClaw config.");
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -254,7 +355,7 @@ pub(crate) fn uninstall() -> Result<(), String> {
             "\u{26a0} OpenClaw declined to auto-remove the provider (its config-shrink safety guard)."
         );
         println!(
-            "  Remove it manually: edit ~/.openclaw/openclaw.json and delete the \"{PROVIDER_ID}\" entry under models.providers."
+            "  Remove it manually: edit ~/.openclaw/openclaw.json and delete the \"{pid}\" entry under models.providers."
         );
         return Ok(());
     }
@@ -268,7 +369,7 @@ pub(crate) fn uninstall() -> Result<(), String> {
 pub(crate) fn is_provider_present() -> Result<bool, String> {
     let bin = openclaw_bin()?;
     let out = Command::new(&bin)
-        .args(["config", "get", PROVIDER_DOT_PATH])
+        .args(["config", "get", &provider_dot_path()])
         .output()
         .map_err(|e| format!("openclaw config get: {e}"))?;
     if !out.status.success() {
@@ -294,8 +395,27 @@ pub(crate) fn is_provider_present() -> Result<bool, String> {
 /// on the configured→revoked transition (no restart loop).
 pub(crate) fn deconfigure_quiet() -> Result<(), String> {
     let bin = openclaw_bin()?;
+    let dot_path = provider_dot_path();
+    // Brownfield repoint mode: the provider is the CUSTOMER's — deleting it would
+    // wipe their config. Only blank the (now revoked) apiKey so 龙虾 fails closed;
+    // the original baseUrl/key is restored from the installer's whole-file backup
+    // on uninstall. Never unset.
+    if is_repoint_mode() {
+        let out = Command::new(&bin)
+            .args(["config", "set", &format!("{dot_path}.apiKey"), ""])
+            .output()
+            .map_err(|e| format!("openclaw config set: {e}"))?;
+        return if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "openclaw config set apiKey='' failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        };
+    }
     let out = Command::new(&bin)
-        .args(["config", "unset", PROVIDER_DOT_PATH])
+        .args(["config", "unset", &dot_path])
         .output()
         .map_err(|e| format!("openclaw config unset: {e}"))?;
     if out.status.success() {
@@ -306,7 +426,7 @@ pub(crate) fn deconfigure_quiet() -> Result<(), String> {
     // blanking the dead key so 龙虾 stops sending the revoked bearer.
     if stderr.contains("size-drop") || stderr.contains("rejected") {
         let _ = Command::new(&bin)
-            .args(["config", "set", &format!("{PROVIDER_DOT_PATH}.apiKey"), ""])
+            .args(["config", "set", &format!("{dot_path}.apiKey"), ""])
             .output();
         return Ok(());
     }
@@ -316,13 +436,14 @@ pub(crate) fn deconfigure_quiet() -> Result<(), String> {
 /// `aikey hook status openclaw` — show whether OpenClaw is wired to AiKey.
 pub(crate) fn status() -> Result<(), String> {
     let bin = openclaw_bin()?;
+    let pid = provider_id();
     let out = Command::new(&bin)
-        .args(["config", "get", "models.providers.aikey"])
+        .args(["config", "get", &provider_dot_path()])
         .output()
         .map_err(|e| format!("OpenClaw CLI not runnable ('{bin}'): {e}"))?;
     let body = String::from_utf8_lossy(&out.stdout);
     if out.status.success() && body.contains("baseUrl") {
-        println!("\u{2713} OpenClaw is wired to AiKey (provider '{PROVIDER_ID}').");
+        println!("\u{2713} OpenClaw is wired to AiKey (provider '{pid}').");
         // Show the base_url line if present (apiKey is redacted by OpenClaw).
         for line in body.lines() {
             if line.contains("baseUrl") {
@@ -344,6 +465,7 @@ mod tests {
     #[test]
     fn install_patch_shape_is_anthropic_messages_provider() {
         let p = build_install_patch(
+            "aikey",
             "aikey_team_abc",
             "http://127.0.0.1:27200/anthropic",
             "claude-sonnet-4-5",
@@ -359,17 +481,40 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_targets_provider_dot_path() {
-        // uninstall removes via `openclaw config unset <dot-path>` (not a null
-        // patch — that trips OpenClaw's size-drop guard). Lock the path.
-        assert_eq!(PROVIDER_DOT_PATH, "models.providers.aikey");
+    fn install_patch_honors_custom_provider_id() {
+        // Greenfield can still be told a non-default id; the patch nests under it.
+        let p = build_install_patch("myprov", "tok", "http://x/anthropic", "m");
+        assert!(p["models"]["providers"]["myprov"].is_object());
+        assert!(p["models"]["providers"]["aikey"].is_null());
     }
 
     #[test]
-    fn install_patch_is_deterministic() {
-        // Same inputs → byte-identical patch (idempotent re-runs).
-        let a = build_install_patch("t", "u", "m").to_string();
-        let b = build_install_patch("t", "u", "m").to_string();
+    fn repoint_patch_omits_models_to_preserve_customer_list() {
+        // Brownfield repoint: ONLY baseUrl/apiKey/api under the CUSTOMER's
+        // provider id, NO models[] (sending one would replace their list).
+        let p = build_repoint_patch("anthropic", "aikey_team_xyz", "http://127.0.0.1:27200/anthropic");
+        let prov = &p["models"]["providers"]["anthropic"];
+        assert_eq!(prov["api"], "anthropic-messages");
+        assert_eq!(prov["apiKey"], "aikey_team_xyz");
+        assert_eq!(prov["baseUrl"], "http://127.0.0.1:27200/anthropic");
+        // The crux: no models key → customer's existing model list is untouched.
+        assert!(prov["models"].is_null());
+    }
+
+    #[test]
+    fn repoint_patch_is_deterministic() {
+        let a = build_repoint_patch("p", "t", "u").to_string();
+        let b = build_repoint_patch("p", "t", "u").to_string();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn provider_resolution_defaults_when_env_absent() {
+        // No env set in the test process → greenfield defaults. (The env-set
+        // brownfield branch is exercised by the installer dry-run + staging E2E,
+        // not by mutating process-global env in a parallel unit test.)
+        assert_eq!(provider_id(), "aikey");
+        assert_eq!(provider_dot_path(), "models.providers.aikey");
+        assert!(!is_repoint_mode());
     }
 }

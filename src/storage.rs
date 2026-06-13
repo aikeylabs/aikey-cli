@@ -2489,6 +2489,82 @@ mod tests {
         assert!(bl.contains("\"used\":1.5"), "baseline carries used: {}", bl);
     }
 
+    // 2026-06-12 通道结构统一 (设计: update/20260612-集群worker组级配额下发):
+    // a cluster snapshot carrying the FULL `quota_snapshot` (preferred path)
+    // persists subjects VERBATIM — including GROUP subjects with members —
+    // so worker proxies enforce department quotas. Pins: (a) group row lands
+    // with kind=group + members JSON; (b) the legacy flattened seat_quota is
+    // IGNORED when quota_snapshot is present (no double-write divergence).
+    // Regression guard for E2E L10c (worker subjects=0 under a group rule).
+    #[test]
+    fn apply_cluster_snapshot_prefers_full_quota_snapshot_with_groups() {
+        let (_dir, _db, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache();
+        let key = derive_current("test_password");
+        let json = r#"{
+            "org_id":"o","virtual_keys":[
+                {"virtual_key_id":"vk1","owner_account_id":"a","seat_id":"seat-1",
+                 "key_status":"active","virtual_key_revision":"r",
+                 "slots":[{"protocol_type":"openai_compatible","targets":[
+                    {"provider_code":"openai","base_url":"http://x","real_key":"sk",
+                     "credential_id":"c","credential_revision":"cr"}]}],
+                 "seat_quota":[{"metric":"usd","period":"monthly","used":99.0,"limit":1.0}]}
+            ],
+            "quota_snapshot":{"subjects":[
+                {"subject_id":"seat-1","subject_kind":"seat",
+                 "rules":[{"metric":"tokens","period":"daily","limit_amount":100,"thresholds":[]}],
+                 "baselines":[{"metric":"tokens","period":"daily","used":40}]},
+                {"subject_id":"grp-fin","subject_kind":"group","members":["seat-1"],
+                 "rules":[{"metric":"tokens","period":"monthly","limit_amount":1000,"thresholds":[{"pct":100,"action":"hard_block"}]}],
+                 "baselines":[{"metric":"tokens","period":"monthly","used":700}]}
+            ]}}"#;
+        let payload: crate::commands_internal::vault_op::ClusterSnapshotPayload =
+            serde_json::from_str(json).expect("parse");
+        let _ = crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &payload);
+
+        let conn = crate::storage::open_connection().expect("conn");
+        // (a) group subject persisted verbatim
+        let (kind, members, rules, baseline): (String, Option<String>, String, Option<String>) = conn
+            .query_row(
+                "SELECT subject_kind, members, rules, baseline FROM quota_rules_cache WHERE subject_id = ?1",
+                ["grp-fin"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("group quota row must exist (the L10c gap)");
+        assert_eq!(kind, "group");
+        assert!(members.expect("members present").contains("seat-1"));
+        assert!(
+            rules.contains("hard_block"),
+            "thresholds survive verbatim: {}",
+            rules
+        );
+        assert!(baseline.expect("baseline").contains("\"used\":700"));
+        // (b) snapshot path wins: seat row comes from the snapshot (tokens/daily),
+        // NOT from the legacy flattened seat_quota (usd/monthly used=99)
+        let seat_rules: String = conn
+            .query_row(
+                "SELECT rules FROM quota_rules_cache WHERE subject_id = ?1",
+                ["seat-1"],
+                |r| r.get(0),
+            )
+            .expect("seat row");
+        assert!(
+            seat_rules.contains("\"metric\":\"tokens\""),
+            "snapshot wins: {}",
+            seat_rules
+        );
+        assert!(
+            !seat_rules.contains("usd"),
+            "legacy seat_quota must be ignored: {}",
+            seat_rules
+        );
+        // total rows = exactly the snapshot's subjects
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM quota_rules_cache", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(n, 2, "full-replace with exactly the snapshot subjects");
+    }
+
     // Phase 3d decision B: aikey (not the daemon) derives the vault key from the
     // node master password, so the Argon2id derivation has a single source of
     // truth. This pins that the password-derived key equals aikey's own

@@ -252,6 +252,16 @@ pub(crate) struct ClusterSnapshotPayload {
     org_id: String,
     #[serde(default)]
     virtual_keys: Vec<ClusterVk>,
+    /// FULL quota snapshot (seat + GROUP subjects, members, rules, baselines) —
+    /// the same structure the cli channel ships. Preferred over the flattened
+    /// per-VK `seat_quota` when present, so worker enforcers receive group
+    /// quotas too (设计: update/20260612-集群worker组级配额下发-通道结构统一;
+    /// gap live-confirmed in E2E case L10c: worker subjects=0 under a group
+    /// rule). Kept as raw JSON values where the proxy owns the schema —
+    /// the daemon only persists, mirroring QuotaSubjectSnapshot in
+    /// platform_client.rs (the cli-channel twin).
+    #[serde(default)]
+    quota_snapshot: Option<ClusterQuotaSnapshot>,
     /// Optional node master password. When present, aikey derives the vault key
     /// itself (single source of truth for the Argon2id derivation) instead of
     /// the caller passing a pre-derived `vault_key_hex`. Used by the cluster
@@ -320,6 +330,27 @@ struct ClusterSeatQuota {
     used: f64,
     #[serde(default)]
     limit: f64,
+}
+
+/// org delivery's `quota_snapshot` — mirrors control's quota.RulesSnapshot /
+/// the cli channel's QuotaSnapshot. rules/baselines stay raw JSON (proxy owns
+/// that schema; the daemon only persists).
+#[derive(Debug, serde::Deserialize)]
+struct ClusterQuotaSnapshot {
+    #[serde(default)]
+    subjects: Vec<ClusterQuotaSubject>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClusterQuotaSubject {
+    subject_id: String,
+    subject_kind: String,
+    #[serde(default)]
+    members: Vec<String>,
+    #[serde(default)]
+    rules: serde_json::Value,
+    #[serde(default)]
+    baselines: serde_json::Value,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -617,14 +648,50 @@ pub(crate) fn apply_cluster_snapshot(
         }
     };
 
-    // Quota (2c): write the delivered per-seat quota into quota_rules_cache so the
-    // proxy enforces `used >= limit` (enforce.go hard block). seat_quota is the
-    // simplified (metric,period,used,limit) view; warn-tier thresholds aren't
-    // delivered, so rules carry an empty thresholds[] — the hard block on
-    // limit_amount still fires (verified: enforce.go blocks on used>=LimitAmount).
-    // Full-replace (single-org node), mirroring the account-sync path; deduped by
-    // seat (the same seat repeats across its VKs). Empty delivery clears the cache
-    // (quota removed -> no enforcement).
+    // Quota (2c): write the delivered quota into quota_rules_cache so the
+    // proxy enforces `used >= limit` (enforce.go hard block).
+    //
+    // PREFERRED path (2026-06-12, 通道结构统一): `quota_snapshot` carries the
+    // FULL subject set (seat + GROUP, members, rules, baselines) — persist it
+    // VERBATIM via full-replace; the proxy's group enforcement (seat→group
+    // reverse index) needs exactly this. The authoritative-full-set semantics
+    // match the cli channel: an empty subjects list still full-replaces, so
+    // deleting the last rule propagates as a cleared cache.
+    if let Some(snap) = &payload.quota_snapshot {
+        let entries: Vec<storage::QuotaRuleCacheEntry> = snap
+            .subjects
+            .iter()
+            .map(|sub| storage::QuotaRuleCacheEntry {
+                subject_id: sub.subject_id.clone(),
+                subject_kind: sub.subject_kind.clone(),
+                members_json: if sub.members.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&sub.members).unwrap_or_else(|_| "[]".to_string()))
+                },
+                rules_json: sub.rules.to_string(),
+                baseline_json: if sub.baselines.is_null() {
+                    None
+                } else {
+                    Some(sub.baselines.to_string())
+                },
+            })
+            .collect();
+        let n = entries.len();
+        if let Err(e) = storage::replace_quota_rules_cache(&entries) {
+            eprintln!("[_internal cluster_apply WARN] quota cache write: {}", e);
+        } else {
+            eprintln!(
+                "[_internal cluster_apply] quota: {} subject(s) cached (full snapshot)",
+                n
+            );
+        }
+    } else
+    // FALLBACK (old control without quota_snapshot): the flattened per-seat
+    // view. seat-only — group quotas are NOT carried on this leg (the very
+    // gap the snapshot path closes); thresholds aren't delivered so rules get
+    // empty thresholds[] — the hard block on limit_amount still fires.
+    // Full-replace, deduped by seat; empty delivery clears the cache.
     {
         use std::collections::HashMap;
         let mut by_seat: HashMap<&str, &Vec<ClusterSeatQuota>> = HashMap::new();
