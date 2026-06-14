@@ -60,7 +60,9 @@ fn provider_id() -> String {
 /// installer's whole-file backup on uninstall. Gated explicitly (not derived from
 /// provider_id != "aikey") so the two concerns stay independent.
 fn is_repoint_mode() -> bool {
-    std::env::var("AIKEY_OPENCLAW_REPOINT").map(|v| v == "1").unwrap_or(false)
+    std::env::var("AIKEY_OPENCLAW_REPOINT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// Dot-path of the active provider entry (`models.providers.<id>`), for
@@ -185,6 +187,28 @@ pub(crate) fn build_repoint_patch(
     })
 }
 
+/// Build the patch that makes `<provider_id>/<model>` openclaw's DEFAULT chat
+/// model (`agents.defaults.model.primary` — the field openclaw onboarding sets).
+/// WHY (2026-06-15 root cause): writing only `models.providers` left the default
+/// model UNSET, so openclaw fell back to a session/built-in default pointing at a
+/// DIFFERENT, un-maintained provider → the digital employee's chat hit a dead
+/// route ("Route token not found in registry"). The caller applies this ONLY when
+/// no default is set yet (see `openclaw_default_model_set`), so a user/operator
+/// who pinned their own default in production is never overridden.
+pub(crate) fn build_default_model_patch(provider_id: &str, model: &str) -> serde_json::Value {
+    let model_ref = format!("{provider_id}/{model}");
+    let mut models = serde_json::Map::new();
+    models.insert(model_ref.clone(), serde_json::json!({}));
+    serde_json::json!({
+        "agents": {
+            "defaults": {
+                "model": { "primary": model_ref },
+                "models": models
+            }
+        }
+    })
+}
+
 // ── openclaw CLI plumbing ───────────────────────────────────────────────────
 
 fn openclaw_bin() -> Result<String, String> {
@@ -193,22 +217,69 @@ fn openclaw_bin() -> Result<String, String> {
     Ok(std::env::var("AIKEY_OPENCLAW_BIN").unwrap_or_else(|_| "openclaw".to_string()))
 }
 
+/// True when openclaw already has a default chat model pinned
+/// (`agents.defaults.model.primary`). The daemon checks this to AVOID overriding a
+/// default the user/operator set in their own (production) OpenClaw — we only make
+/// our provider the default when none exists. Missing key / empty / non-zero exit
+/// all mean "unset" (so we proceed to set ours).
+fn openclaw_default_model_set() -> bool {
+    let bin = match openclaw_bin() {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    match Command::new(&bin)
+        .args(["config", "get", "agents.defaults.model.primary"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let t = s.trim().trim_matches('"');
+            !t.is_empty() && t != "null" && t != "undefined"
+        }
+        _ => false,
+    }
+}
+
 /// Restart the OpenClaw Gateway IFF one is currently running, so a newly
 /// assigned/rotated team VK takes effect. The Gateway loads config at start and
 /// does NOT hot-reload the file (it prints "Restart the gateway to apply"), so
 /// without this a Gateway-mode digital employee never picks up its key. Returns
 /// Ok(true) when a Gateway was up and a restart was issued, Ok(false) when none
 /// is running — the headless `openclaw agent --local` path reads config fresh,
-/// so there is nothing to restart. Liveness probe: `openclaw health` only
-/// succeeds against a running Gateway.
+/// so there is nothing to restart. Greenfield (AiKey owns the gateway unit) goes
+/// through systemd via AIKEY_DE_GATEWAY_UNIT; brownfield `--manage-gateway` uses
+/// the `openclaw health` liveness probe + `openclaw gateway restart`.
 pub(crate) fn restart_gateway_if_running() -> Result<bool, String> {
     // Brownfield fail-safe: the customer OWNS their gateway (their unit, their
     // launch args). `AIKEY_DE_MANAGE_GATEWAY=0` (set by the brownfield installer)
     // means "never touch their gateway" — the customer restarts it once after the
     // first VK lands (a documented one-time step). Default unset/"1" preserves the
     // greenfield behavior where AiKey owns the gateway and applies key changes.
-    if std::env::var("AIKEY_DE_MANAGE_GATEWAY").map(|v| v == "0").unwrap_or(false) {
+    if std::env::var("AIKEY_DE_MANAGE_GATEWAY")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
         return Ok(false);
+    }
+    // Greenfield: AiKey owns the gateway as a systemd unit (AIKEY_DE_GATEWAY_UNIT,
+    // set by the greenfield installer). Restart via systemd — it needs no gateway
+    // auth and reliably reloads the patched config. WHY not the `openclaw health` +
+    // `openclaw gateway restart` path below: the greenfield gateway runs with
+    // `--auth password`, so a tokenless `openclaw health` exits non-zero here
+    // ("reachable, but no token for health RPCs"), making the probe below falsely
+    // report "no gateway" and skip the restart — the live gateway then keeps its
+    // pre-VK config and a newly assigned/rotated key never reaches the chat UI.
+    if let Ok(unit) = std::env::var("AIKEY_DE_GATEWAY_UNIT") {
+        if !unit.is_empty() {
+            let out = Command::new("systemctl")
+                .args(["restart", &unit])
+                .output()
+                .map_err(|e| format!("systemctl restart {unit}: {e}"))?;
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+            }
+            return Ok(true);
+        }
     }
     let bin = openclaw_bin()?;
     let up = Command::new(&bin)
@@ -286,6 +357,14 @@ pub(crate) fn install(model: Option<&str>) -> Result<(), String> {
             "    openclaw agent --local --session-key s1 --model {pid}/{model} --message \"hi\""
         );
     }
+    // Set our provider as OpenClaw's default chat model — but only if none is
+    // pinned, so a production default is never overridden (2026-06-15).
+    if !openclaw_default_model_set() {
+        openclaw_config_patch(&build_default_model_patch(&pid, model))?;
+        println!("  default model : {pid}/{model} (none was pinned)");
+    } else {
+        println!("  default model : left as-is (you have one pinned)");
+    }
     println!("  If the OpenClaw gateway is already running, reload it to apply.");
     Ok(())
 }
@@ -293,11 +372,13 @@ pub(crate) fn install(model: Option<&str>) -> Result<(), String> {
 /// Daemon-friendly variant of `install`: configure OpenClaw for the currently
 /// assigned team VK WITHOUT the interactive banner, used by `aikey agent start`.
 ///
-/// Returns `Ok(Some(bearer))` with the configured team VK bearer (so the daemon
-/// can detect changes and avoid rewriting/reloading every cycle), or `Ok(None)`
-/// when no VK is assigned yet (the admin hasn't assigned one — the daemon waits
+/// Returns `Ok(Some((bearer, default_model_set)))`: the configured team VK bearer
+/// (so the daemon can detect VK changes and avoid reloading every cycle), plus a
+/// flag that is `true` only on the cycle where we FIRST set OpenClaw's default
+/// chat model (so the daemon knows to restart the gateway even when the VK didn't
+/// change — e.g. a redeploy). `Ok(None)` when no VK is assigned yet (daemon waits
 /// and retries). Real failures (vault read, openclaw patch) propagate as `Err`.
-pub(crate) fn configure_quiet(model: Option<&str>) -> Result<Option<String>, String> {
+pub(crate) fn configure_quiet(model: Option<&str>) -> Result<Option<(String, bool)>, String> {
     let (token, base_url) = match resolve_anthropic_team_route() {
         Ok(v) => v,
         // The only "not an error, just not ready" case: no assigned team VK yet.
@@ -305,15 +386,25 @@ pub(crate) fn configure_quiet(model: Option<&str>) -> Result<Option<String>, Str
         Err(e) => return Err(e),
     };
     let pid = provider_id();
+    let model = model.unwrap_or(DEFAULT_MODEL);
     if is_repoint_mode() {
         // Brownfield: narrow patch (no models[]) so the customer's model list
         // survives — we only swap their provider's baseUrl/apiKey to our proxy.
         openclaw_config_patch(&build_repoint_patch(&pid, &token, &base_url))?;
     } else {
-        let model = model.unwrap_or(DEFAULT_MODEL);
         openclaw_config_patch(&build_install_patch(&pid, &token, &base_url, model))?;
     }
-    Ok(Some(token))
+    // Make our provider OpenClaw's DEFAULT chat model so the digital employee's
+    // chat actually routes through AiKey — but ONLY when no default is pinned, so a
+    // user/operator's production default is never overridden. WHY (2026-06-15 root
+    // cause): without a default set, OpenClaw fell back to a stale/other provider
+    // (dead VK) → "Route token not found in registry".
+    let mut default_model_set = false;
+    if !openclaw_default_model_set() {
+        openclaw_config_patch(&build_default_model_patch(&pid, model))?;
+        default_model_set = true;
+    }
+    Ok(Some((token, default_model_set)))
 }
 
 /// `aikey hook uninstall openclaw` — remove the aikey provider from OpenClaw.
@@ -481,6 +572,21 @@ mod tests {
     }
 
     #[test]
+    fn default_model_patch_sets_agents_defaults_primary() {
+        // The default-model patch must write agents.defaults.model.primary (the
+        // field OpenClaw resolves its default chat model from) + register it in
+        // agents.defaults.models, so the digital employee's chat routes through us.
+        let p = build_default_model_patch("aikey", "claude-sonnet-4-5");
+        assert_eq!(
+            p["agents"]["defaults"]["model"]["primary"],
+            "aikey/claude-sonnet-4-5"
+        );
+        assert!(p["agents"]["defaults"]["models"]["aikey/claude-sonnet-4-5"].is_object());
+        // It must NOT touch models.providers (that's the separate provider patch).
+        assert!(p["models"].is_null());
+    }
+
+    #[test]
     fn install_patch_honors_custom_provider_id() {
         // Greenfield can still be told a non-default id; the patch nests under it.
         let p = build_install_patch("myprov", "tok", "http://x/anthropic", "m");
@@ -492,7 +598,11 @@ mod tests {
     fn repoint_patch_omits_models_to_preserve_customer_list() {
         // Brownfield repoint: ONLY baseUrl/apiKey/api under the CUSTOMER's
         // provider id, NO models[] (sending one would replace their list).
-        let p = build_repoint_patch("anthropic", "aikey_team_xyz", "http://127.0.0.1:27200/anthropic");
+        let p = build_repoint_patch(
+            "anthropic",
+            "aikey_team_xyz",
+            "http://127.0.0.1:27200/anthropic",
+        );
         let prov = &p["models"]["providers"]["anthropic"];
         assert_eq!(prov["api"], "anthropic-messages");
         assert_eq!(prov["apiKey"], "aikey_team_xyz");

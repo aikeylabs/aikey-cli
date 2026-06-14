@@ -1467,42 +1467,66 @@ pub fn handle_browse(
     // and the SPA is served with authMode:"local_bypass". Also used when
     // an explicit --port is passed (force-local intent).
     if !logged_in && port.is_none() {
-        if let Some(url) = try_local_browse_url(alias) {
-            // Pre-flight: probe local-server before opening the browser.
-            // Without this, an unstarted service produced ERR_CONNECTION_
-            // REFUSED in the browser with no useful actionable hint —
-            // user couldn't tell whether the install was broken or the
-            // service just needed starting. See decisions (1c, A-a, B-b,
-            // C-b) recorded in the 2026-05-18 session.
-            let preflight = local_server_preflight_for_browse(json_mode);
-            match preflight {
-                BrowseLocalPreflight::OpenNow => {
-                    if json_mode {
-                        crate::json_output::print_json(serde_json::json!({
-                            "ok": true,
-                            "url": &url,
-                            "mode": "local",
-                        }));
-                    } else if !copy_url {
-                        // The clipboard branch prints its own confirmation
-                        // inside deliver_browse_url; skip the duplicate
-                        // "Opening..." message when --copy-url is set.
-                        println!("Opening Local Console...");
-                        println!("  {}", url);
-                    }
-                    // Local URL has no auth token, so display_url == url.
-                    deliver_browse_url(&url, copy_url, json_mode, &url);
-                    return Ok(());
+        // Resolve the local console URL. try_local_browse_url returns None when
+        // install-state.json is missing OR records no local web component.
+        //
+        // Fault isolation (2026-06-14): a Personal user is local-first and must
+        // NEVER be told to `aikey login` for `aikey web`. A MISSING install-state
+        // (a partial / aborted install, corruption, or a SIDE step that failed —
+        // e.g. service registration) must NOT let us fall through to the team
+        // login path; degrade to the default local console (127.0.0.1:8090) and
+        // let the preflight below probe / auto-start it. Only when install-state
+        // EXPLICITLY records a Personal install with no console do we send the
+        // precise "reinstall --with-console" hint instead of a dead URL.
+        let url = match try_local_browse_url(alias) {
+            Some(u) => u,
+            None => {
+                if read_install_state().is_some() {
+                    return Err(
+                        "No web console on this Personal install (CLI + Proxy only).\n  \
+                         To enable a local console, reinstall with --with-console:\n  \
+                         curl -fsSL https://github.com/aikeylabs/launch/releases/latest/download/latest-install.sh \\\n    \
+                           | sh -s -- --yes --with-console"
+                            .into(),
+                    );
                 }
-                BrowseLocalPreflight::DeclineNoOpen => {
-                    // User said "no, don't auto-start". Don't open a URL
-                    // that will refuse the connection; exit non-zero so
-                    // wrapper scripts can detect the abort.
-                    return Err("local-server is not running; declined to start".into());
+                default_local_browse_url(alias)
+            }
+        };
+        // Pre-flight: probe local-server before opening the browser.
+        // Without this, an unstarted service produced ERR_CONNECTION_
+        // REFUSED in the browser with no useful actionable hint —
+        // user couldn't tell whether the install was broken or the
+        // service just needed starting. See decisions (1c, A-a, B-b,
+        // C-b) recorded in the 2026-05-18 session.
+        let preflight = local_server_preflight_for_browse(json_mode);
+        match preflight {
+            BrowseLocalPreflight::OpenNow => {
+                if json_mode {
+                    crate::json_output::print_json(serde_json::json!({
+                        "ok": true,
+                        "url": &url,
+                        "mode": "local",
+                    }));
+                } else if !copy_url {
+                    // The clipboard branch prints its own confirmation
+                    // inside deliver_browse_url; skip the duplicate
+                    // "Opening..." message when --copy-url is set.
+                    println!("Opening Local Console...");
+                    println!("  {}", url);
                 }
-                BrowseLocalPreflight::JsonModeError(msg) => {
-                    return Err(msg.into());
-                }
+                // Local URL has no auth token, so display_url == url.
+                deliver_browse_url(&url, copy_url, json_mode, &url);
+                return Ok(());
+            }
+            BrowseLocalPreflight::DeclineNoOpen => {
+                // User said "no, don't auto-start". Don't open a URL
+                // that will refuse the connection; exit non-zero so
+                // wrapper scripts can detect the abort.
+                return Err("local-server is not running; declined to start".into());
+            }
+            BrowseLocalPreflight::JsonModeError(msg) => {
+                return Err(msg.into());
             }
         }
     }
@@ -1908,6 +1932,19 @@ fn derive_local_control_url(state: &serde_json::Value) -> Option<String> {
 fn try_local_browse_url(alias: &str) -> Option<String> {
     let state = read_install_state()?;
     derive_local_browse_url(&state, alias)
+}
+
+/// Default local console URL, used by `aikey web` when install-state.json is
+/// absent. A Personal install is local-first, so `aikey web` degrades HERE
+/// rather than to the team login path. Uses the console's well-known default
+/// port (read from the live proxy/console config, else 8090) and the same
+/// `/go/<alias>` web-router path `derive_local_browse_url` builds. Fault
+/// isolation (2026-06-14): a missing side-artifact (install-state, e.g. after a
+/// service-registration step aborted the installer) must not break the main
+/// local-console feature.
+fn default_local_browse_url(alias: &str) -> String {
+    let port = crate::local_server_probe::read_local_server_port_or_default().unwrap_or(8090);
+    format!("http://127.0.0.1:{}/go/{}", port, alias)
 }
 
 /// Outcome of the local-server pre-flight that `aikey web` runs before

@@ -235,20 +235,27 @@ pub(crate) fn start(interval_secs: u64) -> Result<(), String> {
 
         // 2) Configure OpenClaw once a VK is assigned + whenever it changes.
         match openclaw_hook::configure_quiet(None) {
-            Ok(Some(token)) => {
-                if last_token.as_deref() != Some(token.as_str()) {
+            Ok(Some((token, default_model_set))) => {
+                let token_changed = last_token.as_deref() != Some(token.as_str());
+                if token_changed {
                     println!("[agent] OpenClaw configured with assigned virtual key");
                     last_token = Some(token);
-                    // The OpenClaw Gateway loads config at start and does NOT
-                    // hot-reload the file ("Restart the gateway to apply"), so a
-                    // running Gateway won't pick up the new/rotated VK until
-                    // restarted. Do it here, but only when the VK actually changed
-                    // (not every cycle) and only if a Gateway is up — the headless
-                    // `openclaw agent --local` path reads config fresh and needs no
-                    // restart. Best-effort: never fail the daemon over this.
+                }
+                if default_model_set {
+                    println!("[agent] set OpenClaw default model → routes chat through AiKey");
+                }
+                // The OpenClaw Gateway loads config at start and does NOT hot-reload
+                // the file ("Restart the gateway to apply"), so a running Gateway
+                // won't pick up changes until restarted. Restart when the VK changed
+                // OR we just set the default model (2026-06-15: a redeploy keeps the
+                // same VK, so without the default-model trigger the gateway would
+                // keep stale config and chat would still hit a dead route). Only when
+                // a Gateway is up — the headless `openclaw agent --local` path reads
+                // config fresh. Best-effort: never fail the daemon over this.
+                if token_changed || default_model_set {
                     match openclaw_hook::restart_gateway_if_running() {
                         Ok(true) => {
-                            println!("[agent] restarted OpenClaw Gateway to apply the new key")
+                            println!("[agent] restarted OpenClaw Gateway to apply config")
                         }
                         Ok(false) => {} // no Gateway running → --local reads fresh
                         Err(e) => eprintln!(
