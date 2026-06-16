@@ -198,6 +198,15 @@ pub(crate) fn build_repoint_patch(
 pub(crate) fn build_default_model_patch(provider_id: &str, model: &str) -> serde_json::Value {
     let model_ref = format!("{provider_id}/{model}");
     let mut models = serde_json::Map::new();
+    // The entry stays EMPTY on purpose. Do NOT put `maxTokens` here — OpenClaw's
+    // config schema REJECTS it ("Unrecognized key: maxTokens" on `config patch`),
+    // so an earlier attempt to fix the browser-chat maxTokens bug that way broke
+    // the de-agent's configure step. maxTokens for the default model is supposed to
+    // come from the provider's models[] (build_install_patch sets 8192).
+    // OPEN ISSUE (2026-06-15): brownfield gateway chat still fails "Anthropic Messages
+    // transport requires a positive maxTokens value" — the provider model has 8192 but
+    // the gateway resolver yields undefined. Root cause unconfirmed (suspect this empty
+    // entry shadows the provider model). Tracked separately; do NOT re-add maxTokens here.
     models.insert(model_ref.clone(), serde_json::json!({}));
     serde_json::json!({
         "agents": {
@@ -217,26 +226,54 @@ fn openclaw_bin() -> Result<String, String> {
     Ok(std::env::var("AIKEY_OPENCLAW_BIN").unwrap_or_else(|_| "openclaw".to_string()))
 }
 
-/// True when openclaw already has a default chat model pinned
-/// (`agents.defaults.model.primary`). The daemon checks this to AVOID overriding a
-/// default the user/operator set in their own (production) OpenClaw — we only make
-/// our provider the default when none exists. Missing key / empty / non-zero exit
-/// all mean "unset" (so we proceed to set ours).
+/// True when openclaw has a default chat model pinned (`agents.defaults.model.primary`)
+/// to a provider that STILL EXISTS. The daemon checks this to AVOID overriding a default
+/// the user/operator set in their own (production) OpenClaw — we only set ours when none
+/// is pinned.
+///
+/// WHY also require the provider to exist (2026-06-15): a green→brownfield transition
+/// leaves a DANGLING default. Greenfield onboarding pins `aikey/<model>` and creates the
+/// `aikey` provider; teardown then `unset`s the `aikey` PROVIDER but NOT
+/// `agents.defaults.model.primary`; the brownfield re-attach repoints a DIFFERENT
+/// provider (e.g. `anthropic`). The stale `aikey/...` default now points at a provider
+/// that is gone, so the chat fails with `No API key found for provider "aikey"`. Treating
+/// a pin-to-a-removed-provider as UNSET lets us re-point the chat at the active provider.
+/// A pin to a provider that IS present (a genuine user default) is still respected.
 fn openclaw_default_model_set() -> bool {
     let bin = match openclaw_bin() {
         Ok(b) => b,
         Err(_) => return false,
     };
-    match Command::new(&bin)
+    let primary = match Command::new(&bin)
         .args(["config", "get", "agents.defaults.model.primary"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .trim_matches('"')
+            .to_string(),
+        _ => return false,
+    };
+    if primary.is_empty() || primary == "null" || primary == "undefined" {
+        return false; // nothing pinned → we set ours
+    }
+    // The model ref is "<provider>/<model>"; honor the pin only when <provider> is still
+    // a configured provider — otherwise it is a stale/dangling default (treat as unset).
+    let provider = match primary.split('/').next() {
+        Some(p) if !p.is_empty() => p,
+        _ => return false,
+    };
+    match Command::new(&bin)
+        .args(["config", "get", &format!("models.providers.{provider}")])
         .output()
     {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
-            let t = s.trim().trim_matches('"');
-            !t.is_empty() && t != "null" && t != "undefined"
+            let t = s.trim();
+            // present = non-empty object/value; absent prints "null"/empty.
+            !t.is_empty() && t != "null" && t != "undefined" && t != "{}"
         }
-        _ => false,
+        _ => false, // provider not found → stale pin → treat as unset
     }
 }
 
@@ -278,6 +315,22 @@ pub(crate) fn restart_gateway_if_running() -> Result<bool, String> {
             if !out.status.success() {
                 return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
             }
+            // VERIFY the gateway actually came back up — don't fire-and-forget.
+            // `systemctl restart` reports success once the unit is *started*, but the
+            // process can still crash-loop or fail to bind. Probe the listen port (set
+            // by the installer as AIKEY_DE_GATEWAY_PORT) so a dead gateway surfaces
+            // loudly (the daemon loop prints this Err as a WARN) instead of the silent
+            // "restarted OK" that hid the original chat-delivery gap.
+            if let Ok(port) = std::env::var("AIKEY_DE_GATEWAY_PORT") {
+                if let Ok(p) = port.parse::<u16>() {
+                    if !gateway_port_listening(p) {
+                        return Err(format!(
+                            "gateway unit '{unit}' restarted but :{p} is not listening \
+                             after retries — check `journalctl -u {unit}`"
+                        ));
+                    }
+                }
+            }
             return Ok(true);
         }
     }
@@ -300,6 +353,30 @@ pub(crate) fn restart_gateway_if_running() -> Result<bool, String> {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     Ok(true)
+}
+
+/// Probe whether the chat gateway accepts TCP on `127.0.0.1:port`, retrying so a
+/// just-restarted gateway has time to bind. Used to VERIFY (not fire-and-forget) that a
+/// gateway restart actually brought the listen port back up.
+///
+/// Window = ~20s: the OpenClaw gateway is NOT instant — it loads config, starts channels
+/// + sidecars, and pre-warms provider auth before binding (observed ~10-13s to "ready"
+/// on a staging lobster, 2026-06-15). An earlier 5s window false-negatived a healthy but
+/// slow start, logging a bogus "restart failed" WARN. Each refused connect returns
+/// immediately, so the loop is paced by the 1s sleep (~20 tries ≈ 20s wall).
+fn gateway_port_listening(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    for attempt in 0..20 {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(800)).is_ok() {
+            return true;
+        }
+        if attempt < 19 {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    false
 }
 
 /// Pipe a JSON patch into `openclaw config patch --stdin`.

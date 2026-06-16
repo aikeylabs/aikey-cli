@@ -2398,7 +2398,13 @@ fn handle_use(env: StdinEnvelope) {
             // (e.g. "run `aikey key sync` from a terminal" — the CLI
             // session might have additional sync paths).
             let mut entry = entry;
-            if entry.provider_key_ciphertext.is_none() {
+            // On a cluster, a central key's material stays on the central node and
+            // the proxy routes via the node — no local ciphertext is needed (by
+            // design). Only require local delivery off-cluster. This mirrors
+            // `activate`'s cluster branch and the picker's `key_material_reachable`,
+            // so the web set-route stops 422'ing central keys (2026-06-15).
+            let on_cluster = crate::commands_account::read_cluster_node().is_some();
+            if !entry.key_material_reachable(on_cluster) {
                 match crate::commands_account::run_full_snapshot_sync_with_vault_key(&key) {
                     Ok(_) => {
                         // Re-read the entry — the sync may have populated
@@ -2411,7 +2417,7 @@ fn handle_use(env: StdinEnvelope) {
                     }
                     Err(e) => {
                         // Sync attempt itself failed (network / token expired).
-                        // Fall through to the ciphertext check below — we'll
+                        // Fall through to the reachability check below — we'll
                         // emit a clearer error there if still missing.
                         eprintln!(
                             "[vault_op handle_use WARN] auto-sync for team key '{}' failed: {}",
@@ -2419,7 +2425,7 @@ fn handle_use(env: StdinEnvelope) {
                         );
                     }
                 }
-                if entry.provider_key_ciphertext.is_none() {
+                if !entry.key_material_reachable(on_cluster) {
                     emit_error(
                         req_id,
                         "I_KEY_NOT_DELIVERED",

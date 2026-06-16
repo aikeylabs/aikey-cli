@@ -544,6 +544,25 @@ pub struct VirtualKeyCacheEntry {
     pub extra: Option<serde_json::Value>,
 }
 
+impl VirtualKeyCacheEntry {
+    /// Whether this team key's provider key material is REACHABLE for routing —
+    /// the single rule `aikey use` (picker + alias), the web set-route bridge, and
+    /// `activate` must agree on. Material is reachable when it was delivered to the
+    /// local vault (`provider_key_ciphertext`), OR — in central key mode — when the
+    /// client is on a cluster AND the seat is claimed: the key stays on the central
+    /// node and the proxy routes via the node (no local ciphertext, by design).
+    ///
+    /// WHY this helper (2026-06-15): only the `use <alias>` path was cluster-aware,
+    /// so a central key showed in `aikey ls` but was hidden by the interactive
+    /// picker (it required a local ciphertext) and rejected by the web set-route
+    /// (`I_KEY_NOT_DELIVERED` → 422). One predicate keeps the three paths from
+    /// diverging again. `claimed` is required so an unclaimed (pending_claim) seat
+    /// is never treated as usable just because the client is on a cluster.
+    pub fn key_material_reachable(&self, on_cluster: bool) -> bool {
+        self.provider_key_ciphertext.is_some() || (on_cluster && self.share_status == "claimed")
+    }
+}
+
 /// Inserts a new row or updates the sync-authoritative fields of an
 /// existing row, keyed by `virtual_key_id`.
 ///
@@ -1668,4 +1687,65 @@ pub fn update_provider_account_status(id: &str, status: &str) -> Result<(), Stri
     )
     .map_err(|e| format!("Failed to update provider account status: {}", e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod key_material_reachable_tests {
+    use super::*;
+
+    /// Build a minimal cache entry with only the two fields the predicate reads
+    /// (ciphertext + share_status) varied; everything else is a benign default.
+    fn entry(ciphertext: Option<Vec<u8>>, share_status: &str) -> VirtualKeyCacheEntry {
+        VirtualKeyCacheEntry {
+            virtual_key_id: "vk-1".into(),
+            org_id: "org".into(),
+            seat_id: "seat".into(),
+            alias: "k".into(),
+            provider_code: "anthropic".into(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: "c".into(),
+            credential_revision: String::new(),
+            virtual_key_revision: String::new(),
+            key_status: "active".into(),
+            share_status: share_status.into(),
+            local_state: "synced_inactive".into(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: ciphertext,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec![],
+            provider_base_urls: std::collections::HashMap::new(),
+            owner_account_id: None,
+            extra: None,
+        }
+    }
+
+    #[test]
+    fn central_claimed_key_reachable_on_cluster_without_ciphertext() {
+        // The central-key fix: no local ciphertext + on a cluster + claimed → the
+        // proxy routes via the central node, so the key IS usable. Previously this
+        // returned false → picker hid it, web set-route 422'd it.
+        assert!(entry(None, "claimed").key_material_reachable(true));
+    }
+
+    #[test]
+    fn no_ciphertext_off_cluster_not_reachable() {
+        // Off-cluster with no delivered ciphertext = genuinely not delivered.
+        assert!(!entry(None, "claimed").key_material_reachable(false));
+    }
+
+    #[test]
+    fn pending_claim_not_reachable_even_on_cluster() {
+        // An unclaimed seat must never be treated as usable just because the
+        // client is on a cluster.
+        assert!(!entry(None, "pending_claim").key_material_reachable(true));
+    }
+
+    #[test]
+    fn delivered_ciphertext_reachable_regardless_of_cluster() {
+        assert!(entry(Some(vec![1, 2, 3]), "claimed").key_material_reachable(false));
+        assert!(entry(Some(vec![1, 2, 3]), "claimed").key_material_reachable(true));
+    }
 }

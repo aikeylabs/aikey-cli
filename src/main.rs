@@ -1218,6 +1218,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             alias,
             provider,
             providers,
+            base_url: base_url_flag,
             no_hook,
         } => {
             // Reject empty / whitespace-only alias before any interactive prompt.
@@ -1474,6 +1475,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     return Err("--provider <CODE> or --providers <c1,c2,...> is required in non-interactive mode.".into());
                 };
+
+            // --base-url flag (if given) overrides the resolved/default base URL,
+            // so self-hosted / aggregator gateways work non-interactively, e.g.
+            // `aikey add k --provider anthropic --base-url https://gw.example/anthropic`.
+            // It's persisted on the vault entry (entries.base_url) and the local
+            // proxy routes this key there instead of the provider default.
+            let resolved_base_url = match &base_url_flag {
+                Some(u) if !u.trim().is_empty() => Some(u.trim().to_string()),
+                _ => resolved_base_url,
+            };
 
             // Warn (not reject) when the user passed a provider code via
             // --provider / --providers that is not one of the built-in ones.
@@ -5139,13 +5150,17 @@ fn pick_providers_interactively(
             add_prov(code);
         }
     }
+    // On a cluster, a central key's material stays on the central node (no local
+    // ciphertext by design); `key_material_reachable` treats it as usable so the
+    // picker surfaces it, matching `aikey use <alias>` (2026-06-15 central-key fix).
+    let on_cluster = crate::commands_account::read_cluster_node().is_some();
     let usable_team: Vec<_> = team
         .iter()
         .filter(|e| {
             e.key_status == "active"
                 && !e.local_state.starts_with("disabled_by_")
                 && e.local_state != "stale"
-                && e.provider_key_ciphertext.is_some()
+                && e.key_material_reachable(on_cluster)
         })
         .collect();
     for e in &usable_team {
@@ -5194,7 +5209,10 @@ fn pick_providers_interactively(
             e.key_status == "active"
                 && !e.local_state.starts_with("disabled_by_")
                 && e.local_state != "stale"
-                && (e.provider_key_ciphertext.is_none() || e.share_status == "pending_claim")
+                // Genuinely pending = material not reachable (and not a central
+                // key routed via the node) OR still unclaimed. A claimed central
+                // key on a cluster IS reachable, so it is no longer flagged here.
+                && (!e.key_material_reachable(on_cluster) || e.share_status == "pending_claim")
         })
         .map(|e| e.local_alias.as_deref().unwrap_or(e.alias.as_str()))
         .collect();

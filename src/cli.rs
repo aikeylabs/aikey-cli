@@ -181,6 +181,12 @@ pub(crate) enum Commands {
         /// has no provider binding (legacy behavior).
         #[arg(long, value_name = "PROVIDERS", value_delimiter = ',', num_args = 1..)]
         providers: Vec<String>,
+        /// Custom upstream base URL for this key, overriding the provider's
+        /// default endpoint. Use for self-hosted or aggregator gateways (e.g. an
+        /// Anthropic-compatible endpoint like https://my-gateway.example/anthropic).
+        /// Stored on the vault entry; the local proxy routes this key there.
+        #[arg(long, value_name = "URL")]
+        base_url: Option<String>,
         /// Skip installing the shell precmd hook into ~/.zshrc / ~/.bashrc.
         /// Hook coverage v1: `aikey add` now installs the hook on first use
         /// (parity with `aikey use`); pass this to opt out, or set
