@@ -994,6 +994,16 @@ fn finish_login(
     // backend selection) but has no master_salt — meaning vault encryption is not
     // initialized. Without it, proxy start, key sync, and aikey use all fail.
     // Auto-initialize here so the user can immediately proceed with `aikey use`.
+    // When this login initializes the vault we capture the master password so the
+    // snapshot sync below can also download key MATERIAL (encrypted at rest needs
+    // the vault key), not just metadata. Why this matters: "Test connection" (and
+    // any real use) needs a team key's material locally; when login synced only
+    // metadata the user hit a 404 ("no team credential matches … run `aikey key
+    // sync`/`aikey use` first") and had to manually `aikey use` before a freshly
+    // issued key was testable. The test path itself CANNOT pull material — it runs
+    // unlocked (no vault key) by design — so login (which DOES hold the password)
+    // is the correct place to pull. 2026-06-17, user-reported.
+    let mut vault_pw: Option<secrecy::SecretString> = None;
     if crate::storage::get_salt().is_err() {
         if !json_mode {
             eprintln!();
@@ -1010,13 +1020,24 @@ fn finish_login(
         if !json_mode {
             eprintln!("  Vault initialized.");
         }
+        vault_pw = Some(pw);
     }
 
-    // Pull the account's current key snapshot immediately after login.
-    // This ensures keys are visible right after `aikey login` without needing
-    // a separate `aikey key list` or `aikey key sync` call.
+    // Pull the account's current key snapshot immediately after login so keys are
+    // visible (and usable) right away without a separate `aikey key list` / `key
+    // sync` / `aikey use`. When this login set up the vault (vault_pw present) do a
+    // FULL snapshot sync that ALSO downloads key material; when the vault already
+    // existed (no password entered this run) fall back to the metadata-only
+    // snapshot — without the vault key we can't encrypt material at rest.
     // Non-fatal: if the server is unreachable the local cache is still usable.
-    let _ = run_snapshot_sync();
+    match &vault_pw {
+        Some(pw) => {
+            let _ = run_full_snapshot_sync(pw);
+        }
+        None => {
+            let _ = run_snapshot_sync();
+        }
+    }
 
     if json_mode {
         crate::json_output::print_json(serde_json::json!({

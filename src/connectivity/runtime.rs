@@ -1387,7 +1387,7 @@ pub fn chat_status_hint(status: u16, body: Option<&str>) -> String {
         // now derives — see workflow/CI/bugfix/2026-05-11-team-key-decrypt-inconsistent.md.
         // The proxy doesn't surface the reason in the 401 body, so we
         // print both recovery paths and let the user pick.
-        return "proxy has no route for this key. Causes: (a) just ran `aikey use`? proxy reloads within 5s — retry or `aikey proxy reload`; (b) vault decrypt mismatch — `aikey key sync --force-reencrypt`".to_string();
+        return "proxy has no route for this key. Causes: (a) just ran `aikey use`? proxy reloads within 5s — retry or `aikey proxy reload`; (b) team key material not downloaded to this machine yet — run `aikey key sync`; (c) vault decrypt mismatch — `aikey key sync --force-reencrypt`".to_string();
     }
     match status {
         200 => "valid".to_string(),
@@ -1421,7 +1421,7 @@ pub fn api_status_hint(status: u16, body: Option<&str>) -> String {
         // now derives — see workflow/CI/bugfix/2026-05-11-team-key-decrypt-inconsistent.md.
         // The proxy doesn't surface the reason in the 401 body, so we
         // print both recovery paths and let the user pick.
-        return "proxy has no route for this key. Causes: (a) just ran `aikey use`? proxy reloads within 5s — retry or `aikey proxy reload`; (b) vault decrypt mismatch — `aikey key sync --force-reencrypt`".to_string();
+        return "proxy has no route for this key. Causes: (a) just ran `aikey use`? proxy reloads within 5s — retry or `aikey proxy reload`; (b) team key material not downloaded to this machine yet — run `aikey key sync`; (c) vault decrypt mismatch — `aikey key sync --force-reencrypt`".to_string();
     }
     match status {
         200 => "valid key".to_string(),

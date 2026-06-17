@@ -1895,8 +1895,18 @@ fn handle_test(env: StdinEnvelope) {
             req_id,
             "I_CREDENTIAL_NOT_FOUND",
             format!(
-                "no {} credential matches id '{}'",
-                payload.target, payload.id
+                "no {target} credential matches id '{id}'{hint}",
+                target = payload.target,
+                id = payload.id,
+                // A team key shows in the list (metadata synced) but can't be
+                // probed until its key material is downloaded locally — guide
+                // the user to the recovery command instead of a bare
+                // "credential not found". 2026-06-17 user-reported.
+                hint = if payload.target == "team" {
+                    " — if this team key was just issued/claimed, run `aikey key sync` (or `aikey use <alias>`) to download its key material first, then retry"
+                } else {
+                    ""
+                }
             ),
         );
         return;

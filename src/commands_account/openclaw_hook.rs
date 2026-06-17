@@ -393,20 +393,24 @@ pub(crate) fn restart_gateway_if_running() -> Result<bool, String> {
 /// just-restarted gateway has time to bind. Used to VERIFY (not fire-and-forget) that a
 /// gateway restart actually brought the listen port back up.
 ///
-/// Window = ~20s: the OpenClaw gateway is NOT instant — it loads config, starts channels
-/// + sidecars, and pre-warms provider auth before binding (observed ~10-13s to "ready"
-/// on a staging lobster, 2026-06-15). An earlier 5s window false-negatived a healthy but
-/// slow start, logging a bogus "restart failed" WARN. Each refused connect returns
-/// immediately, so the loop is paced by the 1s sleep (~20 tries ≈ 20s wall).
+/// Window = ~60s: the OpenClaw gateway is NOT instant — it loads config, starts channels
+/// + sidecars, and pre-warms provider auth before binding. Warmup is NOT bounded by the
+/// earlier ~10-13s observation: under event-loop pressure the provider-auth pre-warm alone
+/// took ~14s and "ready" landed at ~18s from start, and the restart→bind gap exceeded the
+/// old 20s window → a bogus "restart failed (apply manually)" WARN on a gateway that was
+/// in fact coming up fine (staging lobster, 2026-06-17). 60s comfortably covers a cold +
+/// blocked-event-loop warmup. Each refused connect returns immediately, so the loop is
+/// paced by the 1s sleep (~60 tries ≈ 60s wall). Over-waiting is cheap (only runs on a
+/// restart, best-effort); under-waiting cries wolf — bias to the longer window.
 fn gateway_port_listening(port: u16) -> bool {
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    for attempt in 0..20 {
+    for attempt in 0..60 {
         if TcpStream::connect_timeout(&addr, Duration::from_millis(800)).is_ok() {
             return true;
         }
-        if attempt < 19 {
+        if attempt < 59 {
             std::thread::sleep(Duration::from_secs(1));
         }
     }
