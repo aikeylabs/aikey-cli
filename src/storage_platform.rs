@@ -483,6 +483,40 @@ pub fn set_local_seen_sync_version(v: i64) {
     set_text_config(LOCAL_SEEN_SYNC_VERSION_KEY, &v.to_string());
 }
 
+const LAST_MATERIAL_SYNC_VERSION_KEY: &str = "account.last_material_sync_version";
+
+/// Read the sync_version at which managed-key MATERIAL (the encrypted
+/// `provider_key_ciphertext`) was last fully downloaded.
+///
+/// Why this exists, separate from `local_seen_sync_version` (bugfix
+/// 2026-06-16, form-⓪ credential rotation not refreshing the local key):
+/// the snapshot carries only metadata — the real provider key is fetched on a
+/// separate delivery channel and `apply_snapshot_to_cache` deliberately
+/// PRESERVES the existing ciphertext (it is a local field, see
+/// 20260324-provider-key-本地 CLI 表ER图.md). The lightweight background sync
+/// advances `local_seen_sync_version` without re-downloading material, so a
+/// credential/VK rotation (which bumps `sync_version`, see 数据同步方案.md
+/// §4.1.2) would otherwise leave the local ciphertext stale forever. This
+/// account-level marker lets the full sync detect "material is older than the
+/// current server state" and re-pull. Account-level (not per-VK) by design:
+/// coarse re-download of all the account's material on any bump is cheap at
+/// employee scale and keeps sync-tracking state in `config.account.*` where the
+/// design (本地 CLI 表ER图 §3.3) and existing keys
+/// (`account.local_seen_sync_version`, `account.last_status_sync`) already put
+/// it. Returns 0 if never stamped (first full sync downloads everything).
+pub fn get_last_material_sync_version() -> i64 {
+    get_text_config(LAST_MATERIAL_SYNC_VERSION_KEY)
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Persist the sync_version after a full key-material download pass completes
+/// cleanly. A pass with any delivery-fetch failure must leave this un-advanced
+/// so the next full sync retries the stale material.
+pub fn set_last_material_sync_version(v: i64) {
+    set_text_config(LAST_MATERIAL_SYNC_VERSION_KEY, &v.to_string());
+}
+
 // ---------------------------------------------------------------------------
 // Team-managed virtual key cache
 // ---------------------------------------------------------------------------

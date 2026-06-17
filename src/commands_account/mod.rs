@@ -3077,10 +3077,26 @@ fn run_full_snapshot_sync_opts(
     let cached = storage::list_virtual_key_cache().unwrap_or_default();
     let mut downloaded = 0usize;
 
+    // Key-material freshness (bugfix 2026-06-16: form-⓪ credential rotation left
+    // the local provider key stale). `apply_snapshot_to_cache` above refreshed
+    // metadata (incl. credential_revision) but, by design, PRESERVED the local
+    // ciphertext. A rotation bumps the account sync_version, so "the server is
+    // ahead of the last material download" is our re-download trigger — without
+    // it, the old `needs_download = ciphertext.is_none()` gate never re-fired on
+    // rotation (ciphertext stays non-NULL). Account-level/coarse on purpose: all
+    // of this account's active material is re-pulled on any bump (cheap at
+    // employee scale; see 数据同步方案.md). The marker only advances after a
+    // clean pass below, and a *separate* marker from `local_seen_sync_version`
+    // so the no-password lightweight sync can't consume the signal.
+    let material_stale = snapshot.sync_version > storage::get_last_material_sync_version();
+    let mut had_download_error = false;
+
     for entry in &cached {
         // Needs claim: pending_claim but not yet claimed on server.
         let needs_claim = entry.share_status == "pending_claim" && entry.key_status == "active";
-        // Needs download: claimed (or about to be) but missing local ciphertext.
+        // Needs download: claimed (or about to be) AND either we have no local
+        // ciphertext yet, OR the server advanced past our last material pull
+        // (rotation → `material_stale`).
         // §5.5: not on a cluster for HUMAN flows — key material stays on the
         // central node; the tool reaches it via the resolve channel. Exception
         // (2026-06-11): the form-② agent daemon (allow_cluster_key_download)
@@ -3088,7 +3104,7 @@ fn run_full_snapshot_sync_opts(
         // seat-scoped delivery check is the enforcement authority (only the
         // caller's own digital_employee seat is honored there).
         let needs_download = (!on_cluster || allow_cluster_key_download)
-            && entry.provider_key_ciphertext.is_none()
+            && (entry.provider_key_ciphertext.is_none() || material_stale)
             && entry.key_status == "active"
             && !entry.local_state.starts_with("disabled_by_");
 
@@ -3175,8 +3191,20 @@ fn run_full_snapshot_sync_opts(
                     entry.alias,
                     e
                 );
+                // Leave the material marker un-advanced so the next full sync
+                // retries this stale/missing key.
+                had_download_error = true;
             }
         }
+    }
+
+    // Stamp the material marker only on a clean pass: now every eligible VK's
+    // local ciphertext reflects this snapshot's sync_version, so subsequent
+    // syncs skip re-download until the next server-side change bumps it again
+    // (credential/VK rotation → material_stale again). A failed delivery fetch
+    // above keeps the marker behind so the stale key is retried next time.
+    if !had_download_error {
+        storage::set_last_material_sync_version(snapshot.sync_version);
     }
 
     Ok(downloaded)
@@ -3199,7 +3227,16 @@ pub fn check_sync_version_changed() -> Result<bool, String> {
         Err(e) => return Err(format!("sync-version: {}", e)),
     };
     let local_seen = storage::get_local_seen_sync_version();
-    Ok(remote_version > local_seen)
+    let last_material = storage::get_last_material_sync_version();
+    // Trigger a full sync when the server is ahead of EITHER the metadata we've
+    // seen OR the key material we've downloaded. The material arm catches
+    // credential rotation (bugfix 2026-06-16): the lightweight background sync
+    // advances `local_seen` (metadata only, no key download), so gating on
+    // `local_seen` alone made `aikey list`/auto-sync skip the re-download once
+    // metadata had caught up — leaving the local provider key stale forever.
+    // `last_material <= local_seen` always holds, so the material arm only ever
+    // ADDS triggers (when material lags), never removes the metadata trigger.
+    Ok(remote_version > local_seen || remote_version > last_material)
 }
 
 /// Spawns a background thread to check and apply a server snapshot update.
@@ -3939,7 +3976,15 @@ pub fn apply_rename_core(
         }
 
         RenameTarget::Team => {
-            let new_trimmed = new_value.trim().to_string();
+            // Validate, don't just trim: a team key's local_alias is written
+            // verbatim into `~/.aikey/active.env` (AIKEY_ACTIVE_KEYS, sourced
+            // every prompt) and `active.env.flat` (parsed line-by-line). A
+            // control char (esp. newline) would let a renamed alias forge a
+            // KEY=VALUE line in the flat file. Shell metachars are additionally
+            // neutralized at the write boundary by sh single-quoting, but
+            // rejecting control chars here is the cheap input-side guard and
+            // brings team rename to parity with personal rename.
+            let new_trimmed = validate_alias(new_value)?;
             let entry = storage::get_virtual_key_cache(id)
                 .map_err(|e| format!("get team key '{}': {}", id, e))?
                 .or_else(|| storage::get_virtual_key_cache_by_alias(id).ok().flatten())
@@ -3955,7 +4000,10 @@ pub fn apply_rename_core(
         }
 
         RenameTarget::Oauth => {
-            let new_trimmed = new_value.trim().to_string();
+            // Same rationale as the Team branch: the OAuth account's
+            // local_alias reaches active.env / active.env.flat as a display
+            // value. Validate (reject control chars) for parity, not bare trim.
+            let new_trimmed = validate_alias(new_value)?;
             // Existence check for precise 404
             let acct = match storage::get_provider_account(id)
                 .map_err(|e| format!("get_provider_account '{}': {}", id, e))?

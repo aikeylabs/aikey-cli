@@ -23,6 +23,7 @@ mod json_output;
 mod provider_registry;
 mod ratelimit;
 mod session;
+mod shell_quote;
 #[allow(dead_code)]
 mod storage;
 #[allow(dead_code)]
@@ -5411,15 +5412,15 @@ fn collect_picker_changes(
 // ============================================================================
 
 /// Escape a string for safe use inside single quotes in sh/bash/zsh.
-/// Internal single quotes become '\'' (end-quote, escaped-quote, re-open-quote).
+/// Thin alias over the crate-wide single source of truth (`shell_quote`).
 fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
+    crate::shell_quote::sh_single_quote(s)
 }
 
 /// Escape a string for safe use inside single quotes in PowerShell.
-/// Internal single quotes are doubled: ' → ''.
+/// Thin alias over the crate-wide single source of truth (`shell_quote`).
 fn powershell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    crate::shell_quote::powershell_single_quote(s)
 }
 
 /// Escape a string for safe use in cmd.exe `set` statements.

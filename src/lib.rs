@@ -36,6 +36,7 @@ pub mod proxy_state;
 pub mod ratelimit;
 pub mod resolver;
 pub mod session;
+pub mod shell_quote;
 pub mod storage;
 pub mod storage_acl;
 pub mod synapse;

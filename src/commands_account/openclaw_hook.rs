@@ -37,6 +37,18 @@ const DEFAULT_PROVIDER_ID: &str = "aikey";
 const OPENCLAW_API: &str = "anthropic-messages";
 /// Default model id surfaced to OpenClaw (verified via aicoding/Anthropic).
 const DEFAULT_MODEL: &str = "claude-sonnet-4-5";
+/// Max OUTPUT tokens written into a model entry. WHY this MUST be set (2026-06-16,
+/// browser-chat bug): the gateway-served chat path (the OpenClaw web UI / `openclaw
+/// agent`) requires a POSITIVE maxTokens on the resolved model — unlike `infer` /
+/// `openclaw agent --local`, which inject a per-request default and so silently mask a
+/// missing value. A model entry WITHOUT maxTokens makes the digital employee's chat
+/// throw `requires a positive maxTokens value for <provider>/<model>` BEFORE producing
+/// any content. Reproduced + verified in a clean-room VM (openclaw 2026.6.5): the SAME
+/// model with vs without maxTokens flips the gateway agent between a real LLM request
+/// and that error. 8192 is the Anthropic Messages default output cap.
+const MODEL_MAX_OUTPUT_TOKENS: u32 = 8192;
+/// Context window written alongside maxTokens in a model entry.
+const MODEL_CONTEXT_WINDOW: u32 = 200_000;
 
 /// Which provider id the daemon writes under. Brownfield (the customer already
 /// runs OpenClaw) sets `AIKEY_OPENCLAW_PROVIDER_ID` to THEIR existing provider's
@@ -63,6 +75,19 @@ fn is_repoint_mode() -> bool {
     std::env::var("AIKEY_OPENCLAW_REPOINT")
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+/// True when AiKey OWNS this node's OpenClaw gateway — greenfield, or brownfield with
+/// `gateway_port` (the AiKey-managed digital-employee lobster). Mirrors the gate in
+/// `restart_gateway_if_running`: only `AIKEY_DE_MANAGE_GATEWAY=0` (a real customer
+/// running their OWN OpenClaw) opts out. WHY it also governs the model definition: when
+/// AiKey manages the gateway it owns the chat model end-to-end, so the brownfield
+/// repoint must write that model WITH maxTokens (see `build_repoint_patch`). A real
+/// customer keeps their own model list untouched.
+fn de_manages_gateway() -> bool {
+    std::env::var("AIKEY_DE_MANAGE_GATEWAY")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 /// Dot-path of the active provider entry (`models.providers.<id>`), for
@@ -131,6 +156,18 @@ pub(crate) fn resolve_anthropic_team_route() -> Result<(String, String), String>
 
 // ── openclaw config patch payloads (pure, unit-tested) ──────────────────────
 
+/// One `models.providers.<id>.models[]` entry. Centralized so greenfield install and
+/// AiKey-managed brownfield repoint write an IDENTICAL spec — crucially both carry
+/// `maxTokens` (see `MODEL_MAX_OUTPUT_TOKENS`), without which the gateway chat fails.
+fn model_entry(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": model,
+        "name": format!("{model} (via AiKey)"),
+        "contextWindow": MODEL_CONTEXT_WINDOW,
+        "maxTokens": MODEL_MAX_OUTPUT_TOKENS
+    })
+}
+
 /// Build the JSON patch that registers a FULL `<provider_id>` provider in
 /// openclaw.json (greenfield: AiKey owns the entry, so it carries our model
 /// list too). The recursive `config patch` merge creates the provider if absent.
@@ -147,44 +184,44 @@ pub(crate) fn build_install_patch(
                     "baseUrl": base_url,
                     "api": OPENCLAW_API,
                     "apiKey": token,
-                    "models": [
-                        {
-                            "id": model,
-                            "name": format!("{model} (via AiKey)"),
-                            "contextWindow": 200000,
-                            "maxTokens": 8192
-                        }
-                    ]
+                    "models": [model_entry(model)]
                 }
             }
         }
     })
 }
 
-/// Build the NARROW repoint patch for brownfield: overwrite ONLY the customer's
-/// existing provider baseUrl/apiKey/api so their request flow goes through the
-/// local aikey proxy. Deliberately omits `models[]` — `config patch` merges
-/// recursively, so leaving models out preserves whatever model list the customer
-/// already configured (sending an array would replace theirs). `api` is set to
-/// anthropic-messages because the proxy speaks that on `/anthropic`; a non-
+/// Build the repoint patch for brownfield: overwrite the customer's existing provider
+/// baseUrl/apiKey/api so their request flow goes through the local aikey proxy. `api`
+/// is set to anthropic-messages because the proxy speaks that on `/anthropic`; a non-
 /// Anthropic target provider must be chosen correctly by the operator
 /// (`--openclaw-provider`).
+///
+/// `managed_model` decides whether we also write `models[]`:
+/// - `Some(model)` (AiKey OWNS the gateway — the digital-employee lobster): write the
+///   chat model WITH maxTokens. WHY (2026-06-16 root cause): the gateway chat path
+///   requires a positive maxTokens on the resolved model; this patch historically
+///   omitted `models[]`, leaving the spec to the box's pre-existing OpenClaw config,
+///   which need not carry maxTokens → the chat threw `requires a positive maxTokens
+///   value`. Since we own this OpenClaw, defining the one model we route is correct.
+/// - `None` (real customer running their OWN OpenClaw, `AIKEY_DE_MANAGE_GATEWAY=0`):
+///   omit `models[]` — `config patch` merges recursively, so leaving models out
+///   preserves whatever model list the customer already configured.
 pub(crate) fn build_repoint_patch(
     provider_id: &str,
     token: &str,
     base_url: &str,
+    managed_model: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "models": {
-            "providers": {
-                provider_id: {
-                    "baseUrl": base_url,
-                    "api": OPENCLAW_API,
-                    "apiKey": token
-                }
-            }
-        }
-    })
+    let mut provider = serde_json::json!({
+        "baseUrl": base_url,
+        "api": OPENCLAW_API,
+        "apiKey": token
+    });
+    if let Some(model) = managed_model {
+        provider["models"] = serde_json::json!([model_entry(model)]);
+    }
+    serde_json::json!({ "models": { "providers": { provider_id: provider } } })
 }
 
 /// Build the patch that makes `<provider_id>/<model>` openclaw's DEFAULT chat
@@ -198,15 +235,12 @@ pub(crate) fn build_repoint_patch(
 pub(crate) fn build_default_model_patch(provider_id: &str, model: &str) -> serde_json::Value {
     let model_ref = format!("{provider_id}/{model}");
     let mut models = serde_json::Map::new();
-    // The entry stays EMPTY on purpose. Do NOT put `maxTokens` here — OpenClaw's
-    // config schema REJECTS it ("Unrecognized key: maxTokens" on `config patch`),
-    // so an earlier attempt to fix the browser-chat maxTokens bug that way broke
-    // the de-agent's configure step. maxTokens for the default model is supposed to
-    // come from the provider's models[] (build_install_patch sets 8192).
-    // OPEN ISSUE (2026-06-15): brownfield gateway chat still fails "Anthropic Messages
-    // transport requires a positive maxTokens value" — the provider model has 8192 but
-    // the gateway resolver yields undefined. Root cause unconfirmed (suspect this empty
-    // entry shadows the provider model). Tracked separately; do NOT re-add maxTokens here.
+    // The entry stays EMPTY on purpose — it only REGISTERS the model as an allowed
+    // agent default. Do NOT put `maxTokens` here: OpenClaw's config schema REJECTS it
+    // ("Unrecognized key: maxTokens" on `config patch`). maxTokens lives on the
+    // PROVIDER model entry (`model_entry`), which greenfield install and AiKey-managed
+    // brownfield repoint both now write. Clean-room verified (openclaw 2026.6.5): an
+    // empty agent entry + a provider model carrying maxTokens → the gateway chat works.
     models.insert(model_ref.clone(), serde_json::json!({}));
     serde_json::json!({
         "agents": {
@@ -417,7 +451,8 @@ pub(crate) fn install(model: Option<&str>) -> Result<(), String> {
     let model = model.unwrap_or(DEFAULT_MODEL);
     let pid = provider_id();
     if is_repoint_mode() {
-        openclaw_config_patch(&build_repoint_patch(&pid, &token, &base_url))?;
+        let managed_model = de_manages_gateway().then_some(model);
+        openclaw_config_patch(&build_repoint_patch(&pid, &token, &base_url, managed_model))?;
         println!("\u{2713} OpenClaw provider '{pid}' repointed through AiKey.");
         println!("  baseUrl  : {base_url}");
         println!("  (real provider key stays in the vault; OpenClaw only holds the team VK)");
@@ -465,9 +500,12 @@ pub(crate) fn configure_quiet(model: Option<&str>) -> Result<Option<(String, boo
     let pid = provider_id();
     let model = model.unwrap_or(DEFAULT_MODEL);
     if is_repoint_mode() {
-        // Brownfield: narrow patch (no models[]) so the customer's model list
-        // survives — we only swap their provider's baseUrl/apiKey to our proxy.
-        openclaw_config_patch(&build_repoint_patch(&pid, &token, &base_url))?;
+        // Brownfield: when AiKey owns the gateway (digital-employee lobster) write the
+        // chat model WITH maxTokens — else the gateway chat throws "requires a positive
+        // maxTokens value". For a real customer (hands-off, AIKEY_DE_MANAGE_GATEWAY=0)
+        // keep models[] out so their existing model list survives.
+        let managed_model = de_manages_gateway().then_some(model);
+        openclaw_config_patch(&build_repoint_patch(&pid, &token, &base_url, managed_model))?;
     } else {
         openclaw_config_patch(&build_install_patch(&pid, &token, &base_url, model))?;
     }
@@ -672,13 +710,14 @@ mod tests {
     }
 
     #[test]
-    fn repoint_patch_omits_models_to_preserve_customer_list() {
-        // Brownfield repoint: ONLY baseUrl/apiKey/api under the CUSTOMER's
-        // provider id, NO models[] (sending one would replace their list).
+    fn repoint_patch_handsoff_omits_models_to_preserve_customer_list() {
+        // Real customer (managed_model = None): ONLY baseUrl/apiKey/api under the
+        // CUSTOMER's provider id, NO models[] (sending one would replace their list).
         let p = build_repoint_patch(
             "anthropic",
             "aikey_team_xyz",
             "http://127.0.0.1:27200/anthropic",
+            None,
         );
         let prov = &p["models"]["providers"]["anthropic"];
         assert_eq!(prov["api"], "anthropic-messages");
@@ -689,9 +728,26 @@ mod tests {
     }
 
     #[test]
+    fn repoint_patch_managed_writes_model_with_max_tokens() {
+        // AiKey-managed lobster (managed_model = Some): the repoint MUST define the
+        // chat model WITH maxTokens, else the gateway chat throws
+        // "requires a positive maxTokens value". Regression guard for 2026-06-16.
+        let p = build_repoint_patch(
+            "anthropic",
+            "aikey_team_xyz",
+            "http://127.0.0.1:27200/anthropic",
+            Some("claude-sonnet-4-5"),
+        );
+        let prov = &p["models"]["providers"]["anthropic"];
+        assert_eq!(prov["models"][0]["id"], "claude-sonnet-4-5");
+        assert_eq!(prov["models"][0]["maxTokens"], 8192);
+        assert!(prov["models"][0]["contextWindow"].is_number());
+    }
+
+    #[test]
     fn repoint_patch_is_deterministic() {
-        let a = build_repoint_patch("p", "t", "u").to_string();
-        let b = build_repoint_patch("p", "t", "u").to_string();
+        let a = build_repoint_patch("p", "t", "u", None).to_string();
+        let b = build_repoint_patch("p", "t", "u", None).to_string();
         assert_eq!(a, b);
     }
 

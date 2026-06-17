@@ -91,10 +91,24 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
 
     // Build env lines. AIKEY_ACTIVE_SEQ goes near the top so the precmd
     // hook's `grep -m1` can short-circuit cheaply.
+    //
+    // SEQ stays DOUBLE-quoted on purpose: hook.zsh / hook.bash detect it with
+    // `grep -oE 'AIKEY_ACTIVE_SEQ="[0-9]+"'` (literal double quotes). The value
+    // is a CLI-generated integer, so it needs no shell-escaping anyway. Every
+    // OTHER export value below is single-quoted via `sh_single_quote` because it
+    // can carry untrusted data (server-synced alias, cluster token / node URL).
     let mut env_lines: Vec<String> = vec![
         "# aikey active key — auto-generated, do not edit manually".to_string(),
-        format!("export AIKEY_ACTIVE_SEQ=\"{}\"", active_seq),
+        crate::shell_quote::active_env_export_line("AIKEY_ACTIVE_SEQ", &active_seq.to_string()),
     ];
+    // Structured (key, raw-value) pairs that mirror the real `export` lines.
+    // active.env.flat is rendered from THIS (plain KEY=VALUE), never by
+    // reverse-parsing the sh lines — see write_active_env_file. Shell-only
+    // lines (no_proxy case/esac, unset) are deliberately absent from flat.
+    let mut flat_pairs: Vec<(String, String)> = vec![(
+        "AIKEY_ACTIVE_SEQ".to_string(),
+        active_seq.to_string(),
+    )];
     let mut activated_providers: Vec<String> = Vec::new();
     // Track every env var name we `export` below so we can decide which
     // registry-known vars need an `unset` line at the end (see comment
@@ -180,7 +194,8 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             // + bug-trace 噪声)。emitted_export_vars HashSet 已经在跟踪此信息,
             // 这里复用它做幂等门控。
             if !emitted_export_vars.contains(api_key_var) {
-                env_lines.push(format!("export {}=\"{}\"", api_key_var, token));
+                env_lines.push(crate::shell_quote::active_env_export_line(api_key_var, &token));
+                flat_pairs.push((api_key_var.to_string(), token.clone()));
                 emitted_export_vars.insert(api_key_var.to_string());
             }
             // Why: Codex v0.118+ warns when OPENAI_BASE_URL env var is set,
@@ -192,7 +207,9 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
                 "openai" | "gpt" | "chatgpt"
             );
             if !skip_base_url && !emitted_export_vars.contains(base_url_var) {
-                env_lines.push(format!("export {}=\"{}\"", base_url_var, base_url));
+                env_lines
+                    .push(crate::shell_quote::active_env_export_line(base_url_var, &base_url));
+                flat_pairs.push((base_url_var.to_string(), base_url.clone()));
                 emitted_export_vars.insert(base_url_var.to_string());
             }
             // Provider-specific extras (e.g. KIMI_MODEL_NAME for the
@@ -201,7 +218,9 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             // 作为 extra,不去重则重复出现)。
             for (extra_var, extra_val) in provider_extra_env_vars_pub(&b.provider_code) {
                 if !emitted_export_vars.contains(extra_var) {
-                    env_lines.push(format!("export {}=\"{}\"", extra_var, extra_val));
+                    env_lines
+                        .push(crate::shell_quote::active_env_export_line(extra_var, extra_val));
+                    flat_pairs.push((extra_var.to_string(), extra_val.to_string()));
                     emitted_export_vars.insert(extra_var.to_string());
                 }
             }
@@ -261,16 +280,22 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
         active_pairs.push(format!("{}={}", b.provider_code, display));
     }
     if !active_pairs.is_empty() {
-        env_lines.push(format!(
-            "export AIKEY_ACTIVE_KEYS=\"{}\"",
-            active_pairs.join(",")
+        // PRIMARY injection surface: active_pairs embed the display alias of
+        // each binding, which for a managed (team/cluster) key is synced down
+        // from the server and NOT under CLI control. Single-quote the whole
+        // value so any `$(...)` / backtick / `${...}` is inert when sourced.
+        let joined = active_pairs.join(",");
+        env_lines.push(crate::shell_quote::active_env_export_line(
+            "AIKEY_ACTIVE_KEYS",
+            &joined,
         ));
+        flat_pairs.push(("AIKEY_ACTIVE_KEYS".to_string(), joined));
     } else {
         env_lines.push("unset AIKEY_ACTIVE_KEYS 2>/dev/null".to_string());
     }
 
     // Write active.env
-    write_active_env_file(&env_lines)?;
+    write_active_env_file(&env_lines, &flat_pairs)?;
 
     // Sync the anthropic sentinel token's last-20 chars into ~/.claude.json's
     // `customApiKeyResponses.approved` array. Without this, claude code v2.1.x
@@ -538,10 +563,27 @@ fn sentinel_token(canonical_provider: &str) -> String {
 /// the same directory then `rename`, which POSIX guarantees atomic on the
 /// same filesystem (and Win32 ReplaceFile semantics on Windows for stable
 /// readers — best-effort there).
-fn write_active_env_file(lines: &[String]) -> Result<(), String> {
+fn write_active_env_file(lines: &[String], flat_pairs: &[(String, String)]) -> Result<(), String> {
     // Use resolve_aikey_dir for consistent HOME → USERPROFILE → "." fallback.
     let aikey_dir = crate::commands_account::resolve_aikey_dir();
-    std::fs::create_dir_all(&aikey_dir).map_err(|e| format!("Failed to create ~/.aikey: {}", e))?;
+    write_active_env_file_at(&aikey_dir, lines, flat_pairs)
+}
+
+/// Testable core: write active.env / active.env.flat into an explicit dir so
+/// tests don't need to override HOME (which would race with parallel cargo
+/// test threads — same pattern as apply_claude_json_approvals_at).
+fn write_active_env_file_at(
+    aikey_dir: &std::path::Path,
+    lines: &[String],
+    flat_pairs: &[(String, String)],
+) -> Result<(), String> {
+    std::fs::create_dir_all(aikey_dir).map_err(|e| format!("Failed to create ~/.aikey: {}", e))?;
+    // Re-assert owner-only on the directory. Vault init already hardens it to
+    // 0700, but this write path can also create ~/.aikey before vault init in
+    // some orderings; don't depend on that implicit invariant. Best-effort
+    // (a hardening failure must not block activation) — see the file-level
+    // hardening below for why these files must not be world-readable.
+    let _ = crate::storage_acl::enforce_owner_only_dir(aikey_dir);
     let env_path = aikey_dir.join("active.env");
 
     let content = lines.join("\n") + "\n";
@@ -551,27 +593,23 @@ fn write_active_env_file(lines: &[String]) -> Result<(), String> {
 
     atomic_write(&env_path, content.as_bytes())
         .map_err(|e| format!("Failed to write active.env: {}", e))?;
+    // active.env may carry a cluster node's real token (cluster routing); harden
+    // to 0600 / owner-only ACL. Mirrors session.rs / synapse.rs / WAL.
+    let _ = crate::storage_acl::enforce_owner_only_file(&env_path);
 
     // Also write active.env.flat (plain KEY=VALUE, no shell syntax) for Windows.
     // PowerShell/cmd deactivate reads this file instead of parsing sh-style active.env.
+    //
+    // Rendered from the structured (key, raw-value) pairs — NOT by reverse-
+    // parsing the sh `export` lines. Reverse-parsing was both fragile and unsafe:
+    // once sh values are single-quoted for injection-safety, stripping `"` would
+    // produce wrong values, and a value with embedded `=` / quotes could not be
+    // recovered. The structured source is authoritative; shell-only lines
+    // (no_proxy case/esac, unset) have no flat representation by construction.
     let flat_path = aikey_dir.join("active.env.flat");
-    let flat_lines: Vec<String> = lines
+    let flat_lines: Vec<String> = flat_pairs
         .iter()
-        .filter_map(|line| {
-            // Extract KEY="VALUE" from `export KEY="VALUE"` lines.
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix("export ") {
-                if let Some(eq) = rest.find('=') {
-                    let key = &rest[..eq];
-                    let val = rest[eq + 1..].trim_matches('"');
-                    // Skip shell-expansion lines (${...}) — not valid for flat file.
-                    if !val.contains("${") {
-                        return Some(format!("{}={}", key, val));
-                    }
-                }
-            }
-            None
-        })
+        .map(|(k, v)| format!("{}={}", k, v))
         .collect();
     if !flat_lines.is_empty() {
         // Reviewer round-3 fix: don't swallow .flat write errors. A failed
@@ -589,6 +627,9 @@ fn write_active_env_file(lines: &[String]) -> Result<(), String> {
                 flat_path.display(),
                 e,
             );
+        } else {
+            // Same owner-only hardening as active.env (carries the same values).
+            let _ = crate::storage_acl::enforce_owner_only_file(&flat_path);
         }
     }
 
@@ -1569,6 +1610,104 @@ mod claude_json_tests {
         result.expect("write_claude_json_approvals must ride past transient hold");
         let v = read_json(&path);
         assert_eq!(approved_array(&v), vec!["xxxxxxxxxxxxxxxxxxx1".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod active_env_render_tests {
+    //! Fence tests for the #1 (active.env shell injection) fix. They pin the
+    //! contract on the testable core `write_active_env_file_at(&dir, ...)` so we
+    //! exercise the REAL writer (sh single-quoting + structured flat rendering +
+    //! owner-only hardening) without overriding $HOME.
+    //!
+    //! Why this matters (Why): active.env is `source`-d by the zsh/bash prompt
+    //! hook on every prompt. A managed-key display alias is synced from the
+    //! server and not CLI-controlled; an unescaped `$(...)` in it would execute.
+    use super::write_active_env_file_at;
+    use crate::shell_quote::active_env_export_line;
+
+    fn fresh_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aikey-active-env-{}-{}-{}",
+            label,
+            std::process::id(),
+            rand::random::<u64>(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn malicious_alias_is_inert_in_sh_and_raw_in_flat() {
+        let dir = fresh_dir("inject");
+        let payload = "anthropic=$(touch /tmp/aikey_pwn)`id`";
+        // Build the env_lines exactly as refresh_implicit_profile_activation does
+        // for the AIKEY_ACTIVE_KEYS display line.
+        let env_lines = vec![
+            active_env_export_line("AIKEY_ACTIVE_SEQ", "7"),
+            active_env_export_line("AIKEY_ACTIVE_KEYS", payload),
+        ];
+        let flat_pairs = vec![
+            ("AIKEY_ACTIVE_SEQ".to_string(), "7".to_string()),
+            ("AIKEY_ACTIVE_KEYS".to_string(), payload.to_string()),
+        ];
+        write_active_env_file_at(&dir, &env_lines, &flat_pairs).expect("write");
+
+        let sh = std::fs::read_to_string(dir.join("active.env")).unwrap();
+        // The payload must be fully wrapped in single quotes → inert when sourced.
+        assert!(
+            sh.contains("export AIKEY_ACTIVE_KEYS='anthropic=$(touch /tmp/aikey_pwn)`id`'"),
+            "AIKEY_ACTIVE_KEYS must be single-quoted (inert). Got:\n{sh}"
+        );
+        // No bare command-substitution outside single quotes.
+        assert!(
+            !sh.contains("=\"anthropic=$("),
+            "value must not be double-quoted (would expand $()):\n{sh}"
+        );
+
+        // flat carries the RAW value (it is parsed as KEY=VALUE, never eval'd).
+        let flat = std::fs::read_to_string(dir.join("active.env.flat")).unwrap();
+        assert!(
+            flat.contains(&format!("AIKEY_ACTIVE_KEYS={payload}")),
+            "flat must carry the raw value with no quote munging. Got:\n{flat}"
+        );
+        // Exactly the two structured pairs → no reverse-parse artifacts / forged lines.
+        let flat_kv: Vec<&str> = flat.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(flat_kv.len(), 2, "flat must have exactly the structured pairs:\n{flat}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seq_line_stays_double_quoted_for_hook_grep() {
+        let dir = fresh_dir("seq");
+        let env_lines = vec![active_env_export_line("AIKEY_ACTIVE_SEQ", "123")];
+        let flat_pairs = vec![("AIKEY_ACTIVE_SEQ".to_string(), "123".to_string())];
+        write_active_env_file_at(&dir, &env_lines, &flat_pairs).expect("write");
+        let sh = std::fs::read_to_string(dir.join("active.env")).unwrap();
+        // hook.zsh/bash grep `AIKEY_ACTIVE_SEQ="[0-9]+"` — must remain double-quoted.
+        assert!(
+            sh.contains("export AIKEY_ACTIVE_SEQ=\"123\""),
+            "SEQ must stay double-quoted for the precmd grep fast-path:\n{sh}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_env_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = fresh_dir("perm");
+        let env_lines = vec![active_env_export_line("ANTHROPIC_API_KEY", "aikey_active_anthropic")];
+        let flat_pairs = vec![(
+            "ANTHROPIC_API_KEY".to_string(),
+            "aikey_active_anthropic".to_string(),
+        )];
+        write_active_env_file_at(&dir, &env_lines, &flat_pairs).expect("write");
+        for name in ["active.env", "active.env.flat"] {
+            let mode = std::fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} must be 0600, got {mode:o}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
