@@ -1053,7 +1053,13 @@ pub(crate) enum AgentAction {
     /// if unset and a TTY is present, you are prompted.
     Register {
         /// Org join token from the admin console.
-        #[arg(long = "join-token")]
+        ///
+        /// allow_hyphen_values: join tokens are base64url (server GenerateOpaqueToken),
+        /// whose alphabet includes '-', so ~1/64 tokens start with '-'. Without this,
+        /// the documented space form `--join-token -Mxxx…` makes clap parse the value
+        /// as an unknown flag → cryptic "unrecognized command '-M'" and ~1.6% of DE
+        /// registrations fail. Bugfix: 2026-06-22-agent-register-join-token-leading-dash.
+        #[arg(long = "join-token", allow_hyphen_values = true)]
         join_token: String,
         /// Control Panel URL (e.g. http://192.168.1.100:3000). Defaults to the
         /// value already saved in this host's config, if any.
@@ -2661,6 +2667,27 @@ pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── agent register: join token with leading '-' ──────────────────────
+    // Regression for 2026-06-22-agent-register-join-token-leading-dash:
+    // base64url join tokens (~1/64) start with '-'; the documented space form
+    // `--join-token -Mxxx` must parse the value, not error "unrecognized command
+    // '-M'". Guards the allow_hyphen_values on the --join-token arg.
+    #[test]
+    fn agent_register_accepts_leading_dash_join_token() {
+        let cli = Cli::try_parse_from([
+            "aikey", "agent", "register",
+            "--join-token", "-Mq8_sample-TOKEN_value",
+            "--control-url", "http://127.0.0.1:3000",
+        ])
+        .expect("a leading-dash join token (space form) must parse, not be read as a flag");
+        match cli.command {
+            Some(Commands::Agent {
+                action: AgentAction::Register { join_token, .. },
+            }) => assert_eq!(join_token, "-Mq8_sample-TOKEN_value"),
+            _ => panic!("expected `agent register` to parse"),
+        }
+    }
 
     // ── validate_secret_name ─────────────────────────────────────────────
 
