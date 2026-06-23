@@ -86,7 +86,10 @@ mod tests {
 
     #[test]
     fn sh_passes_benign_values_unchanged_in_content() {
-        assert_eq!(sh_single_quote("aikey_active_anthropic"), "'aikey_active_anthropic'");
+        assert_eq!(
+            sh_single_quote("aikey_active_anthropic"),
+            "'aikey_active_anthropic'"
+        );
         assert_eq!(sh_single_quote("my-key"), "'my-key'");
     }
 

@@ -78,18 +78,32 @@ fn spawn_one_shot_listener() -> (u16, thread::JoinHandle<Option<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
     let port = listener.local_addr().unwrap().port();
     let handle = thread::spawn(move || {
-        // Block up to the test's overall timeout for accept. ureq has a
-        // 2s connect timeout below, so this races against that.
-        listener.set_nonblocking(false).ok();
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-                let mut buf = [0u8; 256];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let s = String::from_utf8_lossy(&buf[..n]).into_owned();
-                Some(s.lines().next().unwrap_or("").to_string())
+        // Bounded accept: give up after a deadline and return None so a
+        // MISROUTED request (the agent honoring some other proxy than ours)
+        // makes the test FAIL LOUD ("listener never received a connection")
+        // instead of hanging forever. Blocking accept() has no timeout; a
+        // dev machine whose ~/.aikey/proxy.env points the agent at a real
+        // proxy used to wedge this fence for 20+ min (release build hang,
+        // 2026-06-22). 5s >> the agent's 2s connect timeout below.
+        listener.set_nonblocking(true).ok();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                    let mut buf = [0u8; 256];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let s = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    return Some(s.lines().next().unwrap_or("").to_string());
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => return None,
             }
-            Err(_) => None,
         }
     });
     (port, handle)
@@ -98,6 +112,20 @@ fn spawn_one_shot_listener() -> (u16, thread::JoinHandle<Option<String>>) {
 #[test]
 fn build_proxy_aware_agent_reads_lowercase_https_proxy_env() {
     let _lock = ENV_LOCK.lock().unwrap();
+
+    // Isolate from the dev machine's real ~/.aikey/proxy.env. `build_proxy_
+    // aware_agent` reads proxy config via `read_proxy_env_var`, which consults
+    // THAT FILE *before* the process env. On any machine that ran `aikey env
+    // set -- https_proxy=...` the file wins, so the agent dials the real proxy
+    // instead of our mock listener → the listener starves and the fence hangs
+    // (release build wedged 20+ min, 2026-06-22). Point HOME/USERPROFILE at a
+    // fresh empty dir (resolve_user_home() honors HOME first) so no proxy.env
+    // exists and the lookup falls through to the process env we control below.
+    let tmp_home =
+        std::env::temp_dir().join(format!("aikey-proxyfence-home-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_home).ok();
+    let _home_guard = EnvGuard::set("HOME", tmp_home.to_str().unwrap());
+    let _profile_guard = EnvGuard::set("USERPROFILE", tmp_home.to_str().unwrap());
 
     // Ensure uppercase is empty so we're proving lowercase alone works.
     std::env::remove_var("HTTPS_PROXY");

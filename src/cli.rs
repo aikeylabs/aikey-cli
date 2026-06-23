@@ -2676,9 +2676,13 @@ mod tests {
     #[test]
     fn agent_register_accepts_leading_dash_join_token() {
         let cli = Cli::try_parse_from([
-            "aikey", "agent", "register",
-            "--join-token", "-Mq8_sample-TOKEN_value",
-            "--control-url", "http://127.0.0.1:3000",
+            "aikey",
+            "agent",
+            "register",
+            "--join-token",
+            "-Mq8_sample-TOKEN_value",
+            "--control-url",
+            "http://127.0.0.1:3000",
         ])
         .expect("a leading-dash join token (space form) must parse, not be read as a flag");
         match cli.command {

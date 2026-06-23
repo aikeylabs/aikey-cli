@@ -105,10 +105,8 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
     // active.env.flat is rendered from THIS (plain KEY=VALUE), never by
     // reverse-parsing the sh lines — see write_active_env_file. Shell-only
     // lines (no_proxy case/esac, unset) are deliberately absent from flat.
-    let mut flat_pairs: Vec<(String, String)> = vec![(
-        "AIKEY_ACTIVE_SEQ".to_string(),
-        active_seq.to_string(),
-    )];
+    let mut flat_pairs: Vec<(String, String)> =
+        vec![("AIKEY_ACTIVE_SEQ".to_string(), active_seq.to_string())];
     let mut activated_providers: Vec<String> = Vec::new();
     // Track every env var name we `export` below so we can decide which
     // registry-known vars need an `unset` line at the end (see comment
@@ -194,7 +192,10 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             // + bug-trace 噪声)。emitted_export_vars HashSet 已经在跟踪此信息,
             // 这里复用它做幂等门控。
             if !emitted_export_vars.contains(api_key_var) {
-                env_lines.push(crate::shell_quote::active_env_export_line(api_key_var, &token));
+                env_lines.push(crate::shell_quote::active_env_export_line(
+                    api_key_var,
+                    &token,
+                ));
                 flat_pairs.push((api_key_var.to_string(), token.clone()));
                 emitted_export_vars.insert(api_key_var.to_string());
             }
@@ -207,8 +208,10 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
                 "openai" | "gpt" | "chatgpt"
             );
             if !skip_base_url && !emitted_export_vars.contains(base_url_var) {
-                env_lines
-                    .push(crate::shell_quote::active_env_export_line(base_url_var, &base_url));
+                env_lines.push(crate::shell_quote::active_env_export_line(
+                    base_url_var,
+                    &base_url,
+                ));
                 flat_pairs.push((base_url_var.to_string(), base_url.clone()));
                 emitted_export_vars.insert(base_url_var.to_string());
             }
@@ -218,8 +221,9 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             // 作为 extra,不去重则重复出现)。
             for (extra_var, extra_val) in provider_extra_env_vars_pub(&b.provider_code) {
                 if !emitted_export_vars.contains(extra_var) {
-                    env_lines
-                        .push(crate::shell_quote::active_env_export_line(extra_var, extra_val));
+                    env_lines.push(crate::shell_quote::active_env_export_line(
+                        extra_var, extra_val,
+                    ));
                     flat_pairs.push((extra_var.to_string(), extra_val.to_string()));
                     emitted_export_vars.insert(extra_var.to_string());
                 }
@@ -1674,7 +1678,11 @@ mod active_env_render_tests {
         );
         // Exactly the two structured pairs → no reverse-parse artifacts / forged lines.
         let flat_kv: Vec<&str> = flat.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(flat_kv.len(), 2, "flat must have exactly the structured pairs:\n{flat}");
+        assert_eq!(
+            flat_kv.len(),
+            2,
+            "flat must have exactly the structured pairs:\n{flat}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1698,14 +1706,21 @@ mod active_env_render_tests {
     fn active_env_files_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = fresh_dir("perm");
-        let env_lines = vec![active_env_export_line("ANTHROPIC_API_KEY", "aikey_active_anthropic")];
+        let env_lines = vec![active_env_export_line(
+            "ANTHROPIC_API_KEY",
+            "aikey_active_anthropic",
+        )];
         let flat_pairs = vec![(
             "ANTHROPIC_API_KEY".to_string(),
             "aikey_active_anthropic".to_string(),
         )];
         write_active_env_file_at(&dir, &env_lines, &flat_pairs).expect("write");
         for name in ["active.env", "active.env.flat"] {
-            let mode = std::fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(dir.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600, "{name} must be 0600, got {mode:o}");
         }
         let _ = std::fs::remove_dir_all(&dir);
