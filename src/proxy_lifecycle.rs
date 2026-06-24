@@ -1102,12 +1102,64 @@ fn start_proxy_locked_inner(
         cmd.env(k, v);
     }
     cmd.env("AIKEY_MASTER_PASSWORD", password.expose_secret());
+    // stdin null: aikey-proxy reads the master password from the env var
+    // injected above, never from stdin. Inheriting the parent's stdin
+    // (= the controlling terminal) would re-tether the "background"
+    // child to that terminal — defeating the detachment we add below.
+    cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     let stderr_log_path = match &opts.stderr_target {
         StderrTarget::Log(p) => p.clone(),
         StderrTarget::Null | StderrTarget::Inherit => PathBuf::from("/dev/null"),
     };
     cmd.stderr(opts.stderr_target.into_stdio());
+
+    // **2026-06-23 fix**: detach the spawned proxy from the parent CLI's
+    // session and process group BEFORE exec. Without this, the proxy is
+    // a "background" child only in the sense that we don't `wait()` for
+    // it — it still shares the CLI's PGID and controlling terminal, so a
+    // SIGINT delivered to the terminal's foreground process group (the
+    // classic shell Ctrl+C) is forwarded to BOTH the CLI and the proxy.
+    //
+    // Observed symptom (bugfix 2026-06-23-doctor-ctrlc-kills-proxy.md):
+    // `aikey doctor` auto-restarts the proxy in the middle of its run,
+    // then continues running multi-second connectivity probes. If the
+    // user Ctrl+C's the (still-foreground) doctor command, the proxy
+    // child gets the same SIGINT and dies — leaving a stale pidfile
+    // pointing at a half-dead instance, which the NEXT `aikey doctor`
+    // reports as `unresponsive (pid X, port 27200, /health failing)`.
+    //
+    // The fix mirrors the established pattern in local_server_probe's
+    // `spawn_detached` (introduced 2026-04-30 for `aikey-local-server`):
+    //   - Unix: setsid() in pre_exec → new session leader, no controlling
+    //     terminal, immune to terminal-driven SIGINT/SIGHUP.
+    //   - Windows: CREATE_NEW_PROCESS_GROUP → Ctrl+C in the parent
+    //     console no longer broadcasts CTRL_C_EVENT to the child. We
+    //     deliberately do NOT use DETACHED_PROCESS — that would break
+    //     stderr redirection to the startup log on this code path.
+    //
+    // Service-managed deployments (systemd Type=simple, launchd) take a
+    // DIFFERENT code path (`commands_proxy::handle_start --foreground`,
+    // line ~899) which intentionally keeps the proxy in the parent's
+    // session so the service manager's signal forwarding works. That
+    // path is untouched.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
     let child = cmd
         .spawn()
         .map_err(|e| StartError::SpawnFailed(format!("{e}")))?;

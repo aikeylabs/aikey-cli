@@ -1200,6 +1200,24 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     if !json_mode {
         println!("{}", "─".repeat(52).dimmed());
     }
+    // 2026-06-23 UX: print a dim "↻ checking pipeline metrics…" placeholder
+    // BEFORE the silent 3–9s HTTP fan-out below (proxy /metrics + control
+    // /system/status + collector or fallback control /v1/diagnostics/pipeline
+    // — each capped at the agent's 3s ureq timeout, but serial). Without it,
+    // the user sees nothing happening between the "✓ control service" row
+    // and the eventual "✓ usage-pipeline" emit, and the wait looks like a
+    // hang (real user reported it as `卡` 2026-06-23). The hint is overwritten
+    // in place by an ANSI "cursor-up + clear-line" right before the real
+    // emit, so the final output is identical to before. Skipped when stdout
+    // isn't a TTY (CI / piped output stays clean) or in json_mode.
+    use std::io::IsTerminal;
+    let pipeline_hint_on = !json_mode && std::io::stdout().is_terminal();
+    if pipeline_hint_on {
+        use colored::Colorize;
+        use std::io::Write;
+        println!("  {}", "↻ checking pipeline metrics…".dimmed());
+        let _ = std::io::stdout().flush();
+    }
     {
         let agent = ureq::AgentBuilder::new()
             .timeout(std::time::Duration::from_secs(3))
@@ -1266,6 +1284,16 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 }
             });
 
+        // Overwrite the "↻ checking pipeline metrics…" hint with the real
+        // result. ANSI: cursor-up-1 + clear-entire-line + carriage-return →
+        // cursor lands at column 0 of the hint's row. The next emit then
+        // prints the real "✓ usage-pipeline …" header in that exact slot,
+        // followed by its ↳ sub-rows on subsequent lines.
+        if pipeline_hint_on {
+            use std::io::Write;
+            print!("\x1b[1A\x1b[2K\r");
+            let _ = std::io::stdout().flush();
+        }
         check_usage_pipeline(proxy_metrics.as_deref(), diag_json.as_deref(), &mut emit);
     }
 
