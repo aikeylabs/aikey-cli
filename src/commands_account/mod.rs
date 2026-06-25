@@ -2730,6 +2730,15 @@ fn apply_snapshot_to_cache(
             // requirement. Putting any other value here would be
             // misleading, not destructive.
             extra: None,
+            // N6: fold the seat-group candidate set from the snapshot. These ARE
+            // server-owned (in the upsert's DO UPDATE SET). group_accounts is
+            // stored as raw JSON text; None for a direct-bind VK.
+            seat_group_id: item.seat_group_id.clone(),
+            group_accounts: item
+                .group_accounts
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string())),
+            routing_config: item.routing_config.clone(),
         };
 
         let _ = storage::upsert_virtual_key_cache(&entry);
@@ -2968,6 +2977,14 @@ pub(crate) fn upsert_delivered_key(
 ) -> Result<(), String> {
     let (nonce, ciphertext) = crypto::encrypt(vault_key, plaintext_provider_key.as_bytes())
         .map_err(|e| format!("encrypt: {}", e))?;
+    // N6: this is a direct-bind key-delivery path (single credential ciphertext),
+    // NOT the seat-group structural sync — but it shares upsert_virtual_key_cache,
+    // whose DO UPDATE SET now includes the server-owned seat_group columns. Carry
+    // forward the existing row's group fields so accepting a key never wipes the
+    // candidate set a prior snapshot sync folded in.
+    let existing = storage::get_virtual_key_cache(&dk.virtual_key_id)
+        .ok()
+        .flatten();
     let entry = VirtualKeyCacheEntry {
         virtual_key_id: dk.virtual_key_id.clone(),
         org_id: dk.org_id.clone(),
@@ -2993,6 +3010,11 @@ pub(crate) fn upsert_delivered_key(
         // Sync writers MUST always pass extra: None; upsert ignores this
         // field. See doc on VirtualKeyCacheEntry::extra.
         extra: None,
+        // Carry forward server-synced group fields (this path isn't authoritative
+        // over them) so a key-accept doesn't clobber them to NULL.
+        seat_group_id: existing.as_ref().and_then(|e| e.seat_group_id.clone()),
+        group_accounts: existing.as_ref().and_then(|e| e.group_accounts.clone()),
+        routing_config: existing.as_ref().and_then(|e| e.routing_config.clone()),
     };
     storage::upsert_virtual_key_cache(&entry)
 }
@@ -3405,6 +3427,13 @@ pub fn sync_managed_key_metadata() -> bool {
             // Sync writers MUST always pass extra: None; upsert ignores
             // this field. See doc on VirtualKeyCacheEntry::extra.
             extra: None,
+            // N6: this lightweight metadata sync (KeyItem) does NOT carry seat-group
+            // data — carry forward existing values so it doesn't clobber what the
+            // full snapshot sync folded in. The full sync (apply_snapshot_to_cache)
+            // is authoritative over these.
+            seat_group_id: existing.as_ref().and_then(|e| e.seat_group_id.clone()),
+            group_accounts: existing.as_ref().and_then(|e| e.group_accounts.clone()),
+            routing_config: existing.as_ref().and_then(|e| e.routing_config.clone()),
         };
         let _ = storage::upsert_virtual_key_cache(&entry);
 
@@ -5383,6 +5412,94 @@ mod core_tests {
         // Any 32-byte key works for apply_add_core tests — it's used purely
         // for AES-GCM encryption. Decryption round-trips aren't tested here.
         [0x42u8; 32]
+    }
+
+    // ── N6: seat-group fold + extra fence ─────────────────────────────────────
+
+    fn vk_entry(
+        vk: &str,
+        seat_group_id: Option<&str>,
+        group_accounts: Option<&str>,
+        routing_config: Option<&str>,
+    ) -> storage::VirtualKeyCacheEntry {
+        storage::VirtualKeyCacheEntry {
+            virtual_key_id: vk.into(),
+            org_id: "org-1".into(),
+            seat_id: "seat-1".into(),
+            alias: "k".into(),
+            provider_code: "anthropic".into(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: String::new(),
+            credential_revision: String::new(),
+            virtual_key_revision: "r1".into(),
+            key_status: "active".into(),
+            share_status: "claimed".into(),
+            local_state: "synced_inactive".into(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: None,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec![],
+            provider_base_urls: std::collections::HashMap::new(),
+            owner_account_id: Some("acct-1".into()),
+            extra: None,
+            seat_group_id: seat_group_id.map(|s| s.to_string()),
+            group_accounts: group_accounts.map(|s| s.to_string()),
+            routing_config: routing_config.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn n6_group_fields_fold_and_extra_survives_sync() {
+        let (_dir, _guard) = setup_vault();
+
+        // First sync: a group-bound VK with a candidate set + routing config.
+        let ga = r#"[{"account_id":"acc-A","identity":"a@t.com","provider_code":"anthropic","priority":1,"assigned":true}]"#;
+        let rc = r#"{"exhaustion_signals":["unified_rate_limited"]}"#;
+        storage::upsert_virtual_key_cache(&vk_entry("vk-1", Some("grp-1"), Some(ga), Some(rc))).unwrap();
+
+        let got = storage::get_virtual_key_cache("vk-1").unwrap().unwrap();
+        assert_eq!(got.seat_group_id.as_deref(), Some("grp-1"), "seat_group_id folded");
+        assert!(got.group_accounts.as_deref().unwrap().contains("acc-A"), "group_accounts folded");
+        assert_eq!(got.routing_config.as_deref(), Some(rc), "routing_config folded");
+
+        // User records a connectivity-test result into the user-owned `extra` blob.
+        {
+            let conn = crate::storage::open_connection().unwrap();
+            conn.execute(
+                "UPDATE managed_virtual_keys_cache SET extra = ?1 WHERE virtual_key_id = ?2",
+                rusqlite::params![r#"{"last_test":{"ok":true}}"#, "vk-1"],
+            )
+            .unwrap();
+        }
+
+        // Second sync: candidate set changed (server authoritative) — must UPDATE
+        // group fields BUT leave `extra` intact (the 2026-05-22 fence invariant).
+        let ga2 = r#"[{"account_id":"acc-B","identity":"b@t.com","provider_code":"anthropic","priority":1,"assigned":true}]"#;
+        let rc2 = r#"{"reject_ratio":5}"#;
+        storage::upsert_virtual_key_cache(&vk_entry("vk-1", Some("grp-2"), Some(ga2), Some(rc2))).unwrap();
+
+        let got = storage::get_virtual_key_cache("vk-1").unwrap().unwrap();
+        assert_eq!(got.seat_group_id.as_deref(), Some("grp-2"), "seat_group_id updated by sync");
+        assert_eq!(got.routing_config.as_deref(), Some(rc2), "routing_config updated by sync");
+        assert!(got.group_accounts.as_deref().unwrap().contains("acc-B"), "group_accounts updated");
+        assert!(!got.group_accounts.as_deref().unwrap().contains("acc-A"), "old candidate replaced");
+        // The critical fence: sync touching group fields must NOT wipe extra.
+        let extra = got.extra.expect("extra survived sync");
+        assert_eq!(extra["last_test"]["ok"], serde_json::json!(true), "user-owned extra preserved");
+    }
+
+    #[test]
+    fn n6_direct_bind_vk_has_no_group_fields() {
+        let (_dir, _guard) = setup_vault();
+        // A direct-bind VK syncs with no seat group → all group columns NULL.
+        storage::upsert_virtual_key_cache(&vk_entry("vk-2", None, None, None)).unwrap();
+        let got = storage::get_virtual_key_cache("vk-2").unwrap().unwrap();
+        assert_eq!(got.seat_group_id, None);
+        assert_eq!(got.group_accounts, None);
+        assert_eq!(got.routing_config, None);
     }
 
     // ── apply_quota_snapshot_to_cache (Phase 2 Stage 2b) ──────────────────────

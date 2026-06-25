@@ -418,6 +418,40 @@ pub mod v1_0_0_baseline {
                 "extra",
                 "ALTER TABLE managed_virtual_keys_cache ADD COLUMN extra TEXT",
             ),
+            // 2026-06-24 (master v1.0.1-alpha.3): seat_group fold. When a VK's
+            // binding target is a seat_group, the whole group folds into THIS
+            // row — no separate client cache tables (技术方案 §2.3).
+            //   seat_group_id          != NULL marks a group-backed VK
+            //   group_accounts         candidate-list metadata JSON (from the
+            //                          materialized view; structural sync)
+            //   routing_config         group hash/schedule/util_cap knobs JSON
+            //   my_assignment_override seat's current routed account per protocol
+            //                          JSON {protocol:account_id} — written by the
+            //                          routing-override POLL, NOT structural sync;
+            //                          empty = pure pkg/seatassign hash default
+            //   group_runtime          JSON {account_id:{token ciphertext,
+            //                          window_max_util_pct, window_reset_at}} via
+            //                          channel ③ (volatile; NEVER refresh_token)
+            (
+                "seat_group_id",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN seat_group_id TEXT",
+            ),
+            (
+                "group_accounts",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN group_accounts TEXT",
+            ),
+            (
+                "routing_config",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN routing_config TEXT",
+            ),
+            (
+                "my_assignment_override",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN my_assignment_override TEXT",
+            ),
+            (
+                "group_runtime",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN group_runtime TEXT",
+            ),
         ] {
             ensure_column(conn, "managed_virtual_keys_cache", col, ddl)?;
         }
@@ -1471,6 +1505,37 @@ mod tests {
         );
 
         // Idempotent: re-running must succeed.
+        upgrade_all(&conn).expect("second upgrade_all must be idempotent");
+    }
+
+    /// N0 (master v1.0.1-alpha.3 seat_group fold): the 5 seat_group columns are
+    /// retrofitted onto managed_virtual_keys_cache by upgrade_all — group data
+    /// folds into the VK row, no separate client cache tables (技术方案 §2.3).
+    #[test]
+    fn seat_group_fold_columns_retrofit_on_managed_virtual_keys_cache() {
+        let conn = Connection::open_in_memory().expect("open");
+        upgrade_all(&conn).expect("upgrade_all");
+        for col in [
+            "seat_group_id",
+            "group_accounts",
+            "routing_config",
+            "my_assignment_override",
+            "group_runtime",
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('managed_virtual_keys_cache') WHERE name=?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                n, 1,
+                "managed_virtual_keys_cache.{} missing after upgrade_all",
+                col
+            );
+        }
+        // Idempotent: ensure_column absorbs the duplicate-column error on re-run.
         upgrade_all(&conn).expect("second upgrade_all must be idempotent");
     }
 

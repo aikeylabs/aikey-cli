@@ -576,6 +576,21 @@ pub struct VirtualKeyCacheEntry {
     /// `INSERT ... ON CONFLICT(virtual_key_id) DO UPDATE SET <only
     /// sync-authoritative fields>` exactly to enforce this.
     pub extra: Option<serde_json::Value>,
+    /// Seat-group binding target (N6, server-owned). Folded from the snapshot's
+    /// `seat_group_id`. `None` for direct-bind VKs. Unlike `extra`, this IS in
+    /// the upsert's DO UPDATE SET (server is authoritative).
+    pub seat_group_id: Option<String>,
+    /// Seat's ranked candidate set for a group-bound VK (N6, server-owned),
+    /// stored as raw JSON text `[{account_id, identity, provider_code, priority,
+    /// assigned}]`. Folded from the snapshot. `None` for direct-bind VKs. The
+    /// volatile token/window material is NOT here — it rides `group_runtime`
+    /// (channel ③, N7), a separate column this writer does not touch.
+    pub group_accounts: Option<String>,
+    /// The group's routing knobs JSON (N6, server-owned), folded from the
+    /// snapshot. `None`/`"{}"` for direct-bind VKs. The proxy reads it to
+    /// classify exhaustion (exhaustion_signals) + apply switch/cooldown knobs.
+    /// In the upsert's DO UPDATE SET (server authoritative).
+    pub routing_config: Option<String>,
 }
 
 impl VirtualKeyCacheEntry {
@@ -634,7 +649,8 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              provider_key_nonce, provider_key_ciphertext,
              cache_schema_version, synced_at,
              local_alias, supported_providers,
-             provider_base_urls, owner_account_id
+             provider_base_urls, owner_account_id,
+             seat_group_id, group_accounts, routing_config
          ) VALUES (
              ?1,  ?2,  ?3,  ?4,
              ?5,  ?6,  ?7,
@@ -644,7 +660,8 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              ?15, ?16,
              1,   strftime('%s', 'now'),
              ?17, ?18,
-             ?19, ?20
+             ?19, ?20,
+             ?21, ?22, ?23
          )
          ON CONFLICT(virtual_key_id) DO UPDATE SET
              org_id                  = excluded.org_id,
@@ -666,9 +683,15 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              local_alias             = excluded.local_alias,
              supported_providers     = excluded.supported_providers,
              provider_base_urls      = excluded.provider_base_urls,
-             owner_account_id        = excluded.owner_account_id
+             owner_account_id        = excluded.owner_account_id,
+             seat_group_id           = excluded.seat_group_id,
+             group_accounts          = excluded.group_accounts,
+             routing_config          = excluded.routing_config
              /* extra: DELIBERATELY OMITTED — user-owned column. See doc
                 comment above and on VirtualKeyCacheEntry::extra. */
+             /* my_assignment_override / group_runtime / routing_config: OMITTED —
+                written by other channels (routing poll N12 / channel ③ N7), not
+                this structural sync. Same fence rationale as extra. */
              /* cache_schema_version: omitted because it's a constant. */",
         params![
             entry.virtual_key_id,
@@ -691,6 +714,9 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
             supported_providers_json,
             provider_base_urls_json,
             entry.owner_account_id,
+            entry.seat_group_id,
+            entry.group_accounts,
+            entry.routing_config,
         ],
     )
     .map_err(|e| format!("Failed to upsert virtual key cache: {}", e))?;
@@ -729,15 +755,38 @@ pub fn list_virtual_key_cache_readonly() -> Result<Vec<VirtualKeyCacheEntry>, St
 
 // ── managed_virtual_keys_cache column cascade ──────────────────────────
 //
-// FULL  — post 2026-05-22 vaults (has `extra` column)
-// LEGACY — pre-2026-05-22 (no extra column; project literal NULL)
+// Three tiers, tried newest→oldest so each vault generation reads as many
+// real columns as it has, projecting literal NULL for columns it predates:
+//   GROUP  — post seat_group (v1.0.1-alpha.3): + seat_group_id + group_accounts
+//   FULL   — post 2026-05-22 (has `extra`, but no seat_group columns)
+//   LEGACY — pre-2026-05-22 (no extra either)
 //
-// Why a cascade rather than relying purely on ensure_column to backfill:
-// `list_virtual_key_cache_readonly` opens the DB read-only (no migrations
-// applied), and there is no out-of-process write path that materialises
-// the column for read-only callers. The fallback prepare lets the
-// read-only client serve old vaults uniformly while the next write opens
-// a write conn and triggers ensure_column.
+// CRITICAL: the fixed column ORDER is shared by row_to_virtual_key_cache's
+// index-based reads — extra is ALWAYS index 21, seat_group_id 22,
+// group_accounts 23. The middle (FULL) tier projects NULL for 22/23 but a
+// REAL extra at 21, so a vault that has extra but not yet the seat_group
+// columns still reads its `extra` (no regression — the old 2-tier cascade
+// would have dropped to LEGACY and lost extra). Why a cascade at all:
+// `list_virtual_key_cache_readonly` opens read-only (no migrations), so a
+// vault not yet write-migrated must still be served.
+// Columns 0..=20 are identical across tiers; only the trailing 21/22/23/24
+// (extra / seat_group_id / group_accounts / routing_config) differ. Fixed
+// indices are shared by row_to_virtual_key_cache's index reads — the middle
+// (FULL) tier keeps a REAL extra at 21 and NULLs the seat_group columns, so a
+// vault with extra but not yet the seat_group migration still reads its extra
+// (no LEGACY-fallthrough regression). Kept as full literals (no string-concat
+// crate) for a single grep-able source per tier.
+//
+// Newest: real extra + real seat_group columns.
+const VK_CACHE_COLUMNS_GROUP: &str = "virtual_key_id, org_id, seat_id, alias, \
+     provider_code, protocol_type, base_url, \
+     credential_id, credential_revision, virtual_key_revision, \
+     key_status, share_status, local_state, \
+     expires_at, \
+     provider_key_nonce, provider_key_ciphertext, \
+     synced_at, local_alias, supported_providers, \
+     provider_base_urls, owner_account_id, extra, seat_group_id, group_accounts, routing_config";
+// Middle: real extra, no seat_group columns yet (project NULL at 22/23).
 const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
      credential_id, credential_revision, virtual_key_revision, \
@@ -745,7 +794,8 @@ const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, extra";
+     provider_base_urls, owner_account_id, extra, NULL, NULL, NULL";
+// Oldest: no extra, no seat_group columns.
 const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
      credential_id, credential_revision, virtual_key_revision, \
@@ -753,7 +803,7 @@ const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, NULL";
+     provider_base_urls, owner_account_id, NULL, NULL, NULL, NULL";
 
 /// Single mapping from a SELECT row (in the column order declared by
 /// `VK_CACHE_COLUMNS_*` above) to a struct. Centralised here so adding
@@ -791,21 +841,19 @@ fn row_to_virtual_key_cache(row: &rusqlite::Row) -> rusqlite::Result<VirtualKeyC
         provider_base_urls: parse_base_urls_json(row.get(19)?),
         owner_account_id: row.get(20)?,
         extra,
+        // 22/23/24: seat_group columns (NULL in the FULL/LEGACY tiers → None).
+        seat_group_id: row.get::<_, Option<String>>(22).unwrap_or(None),
+        group_accounts: row.get::<_, Option<String>>(23).unwrap_or(None),
+        routing_config: row.get::<_, Option<String>>(24).unwrap_or(None),
     })
 }
 
 fn query_virtual_key_cache(conn: &Connection) -> Result<Vec<VirtualKeyCacheEntry>, String> {
+    let order = " FROM managed_virtual_keys_cache ORDER BY COALESCE(local_alias, alias)";
     let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {} FROM managed_virtual_keys_cache ORDER BY COALESCE(local_alias, alias)",
-            VK_CACHE_COLUMNS_FULL
-        ))
-        .or_else(|_| {
-            conn.prepare(&format!(
-                "SELECT {} FROM managed_virtual_keys_cache ORDER BY COALESCE(local_alias, alias)",
-                VK_CACHE_COLUMNS_LEGACY
-            ))
-        })
+        .prepare(&format!("SELECT {}{}", VK_CACHE_COLUMNS_GROUP, order))
+        .or_else(|_| conn.prepare(&format!("SELECT {}{}", VK_CACHE_COLUMNS_FULL, order)))
+        .or_else(|_| conn.prepare(&format!("SELECT {}{}", VK_CACHE_COLUMNS_LEGACY, order)))
         .map_err(|e| format!("Failed to prepare list query: {}", e))?;
 
     let rows = stmt
@@ -823,25 +871,23 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
         return Ok(None);
     }
     let conn = open_connection()?;
-    let result = conn
-        .query_row(
-            &format!(
-                "SELECT {} FROM managed_virtual_keys_cache WHERE virtual_key_id = ?1",
-                VK_CACHE_COLUMNS_FULL
-            ),
-            params![virtual_key_id],
-            row_to_virtual_key_cache,
+    // Cascade newest→oldest; only a schema error (missing column) falls through,
+    // never QueryReturnedNoRows (that's the real "absent" answer).
+    let sel = |cols: &str| {
+        format!(
+            "SELECT {} FROM managed_virtual_keys_cache WHERE virtual_key_id = ?1",
+            cols
         )
+    };
+    let result = conn
+        .query_row(&sel(VK_CACHE_COLUMNS_GROUP), params![virtual_key_id], row_to_virtual_key_cache)
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Err(e),
-            _ => conn.query_row(
-                &format!(
-                    "SELECT {} FROM managed_virtual_keys_cache WHERE virtual_key_id = ?1",
-                    VK_CACHE_COLUMNS_LEGACY
-                ),
-                params![virtual_key_id],
-                row_to_virtual_key_cache,
-            ),
+            _ => conn.query_row(&sel(VK_CACHE_COLUMNS_FULL), params![virtual_key_id], row_to_virtual_key_cache),
+        })
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(&sel(VK_CACHE_COLUMNS_LEGACY), params![virtual_key_id], row_to_virtual_key_cache),
         });
     match result {
         Ok(entry) => Ok(Some(entry)),
@@ -1753,6 +1799,9 @@ mod key_material_reachable_tests {
             provider_base_urls: std::collections::HashMap::new(),
             owner_account_id: None,
             extra: None,
+            seat_group_id: None,
+            group_accounts: None,
+            routing_config: None,
         }
     }
 
