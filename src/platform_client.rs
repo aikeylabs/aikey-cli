@@ -117,7 +117,7 @@ pub struct ManagedKeySnapshotItem {
     #[serde(default)]
     pub expires_at: Option<i64>,
     pub sync_version: i64,
-    /// Seat-group binding target (N6). Present only when the VK's binding targets
+    /// Oauth-group binding target (N6). Present only when the VK's binding targets
     /// a oauth_group instead of a single credential. `None` for direct-bind VKs.
     #[serde(default)]
     pub oauth_group_id: Option<String>,

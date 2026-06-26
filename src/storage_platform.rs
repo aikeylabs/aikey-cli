@@ -576,7 +576,7 @@ pub struct VirtualKeyCacheEntry {
     /// `INSERT ... ON CONFLICT(virtual_key_id) DO UPDATE SET <only
     /// sync-authoritative fields>` exactly to enforce this.
     pub extra: Option<serde_json::Value>,
-    /// Seat-group binding target (N6, server-owned). Folded from the snapshot's
+    /// Oauth-group binding target (N6, server-owned). Folded from the snapshot's
     /// `oauth_group_id`. `None` for direct-bind VKs. Unlike `extra`, this IS in
     /// the upsert's DO UPDATE SET (server is authoritative).
     pub oauth_group_id: Option<String>,

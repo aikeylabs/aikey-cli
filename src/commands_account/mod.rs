@@ -2730,7 +2730,7 @@ fn apply_snapshot_to_cache(
             // requirement. Putting any other value here would be
             // misleading, not destructive.
             extra: None,
-            // N6: fold the seat-group candidate set from the snapshot. These ARE
+            // N6: fold the oauth-group candidate set from the snapshot. These ARE
             // server-owned (in the upsert's DO UPDATE SET). group_accounts is
             // stored as raw JSON text; None for a direct-bind VK.
             oauth_group_id: item.oauth_group_id.clone(),
@@ -2978,7 +2978,7 @@ pub(crate) fn upsert_delivered_key(
     let (nonce, ciphertext) = crypto::encrypt(vault_key, plaintext_provider_key.as_bytes())
         .map_err(|e| format!("encrypt: {}", e))?;
     // N6: this is a direct-bind key-delivery path (single credential ciphertext),
-    // NOT the seat-group structural sync — but it shares upsert_virtual_key_cache,
+    // NOT the oauth-group structural sync — but it shares upsert_virtual_key_cache,
     // whose DO UPDATE SET now includes the server-owned oauth_group columns. Carry
     // forward the existing row's group fields so accepting a key never wipes the
     // candidate set a prior snapshot sync folded in.
@@ -3437,7 +3437,7 @@ pub fn sync_managed_key_metadata() -> bool {
             // Sync writers MUST always pass extra: None; upsert ignores
             // this field. See doc on VirtualKeyCacheEntry::extra.
             extra: None,
-            // N6: this lightweight metadata sync (KeyItem) does NOT carry seat-group
+            // N6: this lightweight metadata sync (KeyItem) does NOT carry oauth-group
             // data — carry forward existing values so it doesn't clobber what the
             // full snapshot sync folded in. The full sync (apply_snapshot_to_cache)
             // is authoritative over these.
@@ -5434,7 +5434,7 @@ mod core_tests {
         [0x42u8; 32]
     }
 
-    // ── N6: seat-group fold + extra fence ─────────────────────────────────────
+    // ── N6: oauth-group fold + extra fence ─────────────────────────────────────
 
     fn vk_entry(
         vk: &str,
