@@ -3135,6 +3135,16 @@ fn run_full_snapshot_sync_opts(
     let mut had_download_error = false;
 
     for entry in &cached {
+        // Group VKs carry NO static key material — their per-account material is
+        // pulled by the proxy via channel ③ (group-runtime), not CLI claim/delivery.
+        // The master delivery endpoint denies group VKs (403 access_denied), which
+        // otherwise surfaces as a spurious "could not fetch key" + "0 downloaded"
+        // during sync. Skip claim/delivery entirely for them; their metadata
+        // (seat_group_id / group_accounts / routing_config) was already folded into
+        // the cache by apply_snapshot_to_cache above.
+        if entry.seat_group_id.is_some() {
+            continue;
+        }
         // Needs claim: pending_claim but not yet claimed on server.
         let needs_claim = entry.share_status == "pending_claim" && entry.key_status == "active";
         // Needs download: claimed (or about to be) AND either we have no local
