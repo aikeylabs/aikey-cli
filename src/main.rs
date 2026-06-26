@@ -591,7 +591,40 @@ fn run_unified_list(
                 .map(|b| b.provider_code.as_str())
                 .collect();
             // Unified status display: valid (hidden), expired, invalid, pending.
-            let status = if e.provider_key_ciphertext.is_none() {
+            let is_group_vk = e
+                .oauth_group_id
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let status = if is_group_vk {
+                // Group VK: per-account material rides channel ③ (group-runtime), so
+                // it has NO local provider_key_ciphertext BY DESIGN. The "pending"
+                // (awaiting static-key delivery) branch below would mislabel EVERY
+                // group VK as pending forever. Health here = does the seat still have
+                // usable candidates? Non-empty group_accounts → ready (blank, like a
+                // valid key); empty → no usable account (the seat was unbound from the
+                // group, or the group has no enabled accounts) so the key won't route
+                // until that's fixed — show it so the member isn't left guessing.
+                match e.key_status.as_str() {
+                    "active" => {
+                        let has_candidates = e
+                            .group_accounts
+                            .as_deref()
+                            .map(|s| {
+                                let t = s.trim();
+                                !t.is_empty() && t != "[]" && t != "null"
+                            })
+                            .unwrap_or(false);
+                        if has_candidates {
+                            String::new()
+                        } else {
+                            "no access".to_string()
+                        }
+                    }
+                    "expired" => "expired".to_string(),
+                    _ => "invalid".to_string(),
+                }
+            } else if e.provider_key_ciphertext.is_none() {
                 "pending".to_string() // key not yet delivered to local vault
             } else {
                 match e.local_state.as_str() {

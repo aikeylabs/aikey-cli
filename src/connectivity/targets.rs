@@ -235,7 +235,7 @@ pub fn targets_from_alias(
         }
         // Team keys have a single authoritative provider; honour the override
         // only when the user supplied one (keeps probe URL consistent). GROUP
-        // VKs (seat_group_id set) carry an EMPTY VK-level provider_code BY DESIGN
+        // VKs (oauth_group_id set) carry an EMPTY VK-level provider_code BY DESIGN
         // (provider lives per-account in group_accounts) — fall back to the VK's
         // supported_providers (synced from the group's account set) so the probe
         // URL gets the right /<prefix>. Same root cause as the proxy-side
@@ -280,7 +280,7 @@ pub fn targets_from_alias(
         // delivered → unprobeable") must NOT apply to group VKs: probe them
         // through the proxy with the aikey_team_<vk_id> bearer exactly like a
         // real group request (the proxy resolves the account + injects its key).
-        if vk.seat_group_id.is_none() && vk.provider_key_ciphertext.is_none() {
+        if vk.oauth_group_id.is_none() && vk.provider_key_ciphertext.is_none() {
             // Non-cluster, direct-bind team VK with no local material (never
             // delivered) — genuinely unprobeable. Caller surfaces
             // I_CREDENTIAL_NOT_FOUND.
@@ -392,9 +392,9 @@ pub fn targets_from_all_keys(proxy_port: u16) -> (Vec<TestTarget>, Vec<BuildTarg
             for vk in team_entries {
                 // Skip direct-bind keys without ciphertext (server hasn't
                 // delivered the real key yet) — probe can't decrypt nothing.
-                // GROUP VKs (seat_group_id set) have NO local ciphertext BY
+                // GROUP VKs (oauth_group_id set) have NO local ciphertext BY
                 // DESIGN (material via proxy channel ③), so don't skip them.
-                if vk.seat_group_id.is_none() && vk.provider_key_ciphertext.is_none() {
+                if vk.oauth_group_id.is_none() && vk.provider_key_ciphertext.is_none() {
                     continue;
                 }
                 // Skip stale / disabled rows (matches the runtime route

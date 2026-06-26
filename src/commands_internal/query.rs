@@ -275,13 +275,13 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
                 // Cloned (rather than moved) because t is iterated via
                 // .map(|t| ...) and `last_test` lives behind a Ref.
                 "extra": t.extra.clone(),
-                // N6 seat_group projection (Stage A): surface which shared group
+                // N6 oauth_group projection (Stage A): surface which shared group
                 // this VK joined + the candidate accounts behind it, so the /user
                 // web can show "joined group X, routed to account Y (default)".
                 // Only group VKs carry these (direct-bind VKs → null). group_accounts
                 // is stored as a JSON string in the vault cache; parse it so the web
                 // receives a real array (null on absent/corrupt, not a raw string).
-                "seat_group_id": t.seat_group_id,
+                "oauth_group_id": t.oauth_group_id,
                 "group_accounts": t
                     .group_accounts
                     .as_deref()

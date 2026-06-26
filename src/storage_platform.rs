@@ -577,9 +577,9 @@ pub struct VirtualKeyCacheEntry {
     /// sync-authoritative fields>` exactly to enforce this.
     pub extra: Option<serde_json::Value>,
     /// Seat-group binding target (N6, server-owned). Folded from the snapshot's
-    /// `seat_group_id`. `None` for direct-bind VKs. Unlike `extra`, this IS in
+    /// `oauth_group_id`. `None` for direct-bind VKs. Unlike `extra`, this IS in
     /// the upsert's DO UPDATE SET (server is authoritative).
-    pub seat_group_id: Option<String>,
+    pub oauth_group_id: Option<String>,
     /// Seat's ranked candidate set for a group-bound VK (N6, server-owned),
     /// stored as raw JSON text `[{account_id, identity, provider_code, priority,
     /// assigned}]`. Folded from the snapshot. `None` for direct-bind VKs. The
@@ -608,7 +608,7 @@ impl VirtualKeyCacheEntry {
     /// diverging again. `claimed` is required so an unclaimed (pending_claim) seat
     /// is never treated as usable just because the client is on a cluster.
     pub fn key_material_reachable(&self, on_cluster: bool) -> bool {
-        // Group VKs (seat_group_id set) carry NO local key material BY DESIGN —
+        // Group VKs (oauth_group_id set) carry NO local key material BY DESIGN —
         // the per-account credential is pulled by the proxy via channel ③ (group
         // runtime), so routing works without local ciphertext, exactly like a
         // cluster central key. Without this, `use` / web set-route 422'd a group
@@ -617,7 +617,7 @@ impl VirtualKeyCacheEntry {
         // ciphertext guard (targets.rs) and the proxy group-route path. (2026-06-26)
         self.provider_key_ciphertext.is_some()
             || (on_cluster && self.share_status == "claimed")
-            || self.seat_group_id.is_some()
+            || self.oauth_group_id.is_some()
     }
 }
 
@@ -659,7 +659,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              cache_schema_version, synced_at,
              local_alias, supported_providers,
              provider_base_urls, owner_account_id,
-             seat_group_id, group_accounts, routing_config
+             oauth_group_id, group_accounts, routing_config
          ) VALUES (
              ?1,  ?2,  ?3,  ?4,
              ?5,  ?6,  ?7,
@@ -693,7 +693,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              supported_providers     = excluded.supported_providers,
              provider_base_urls      = excluded.provider_base_urls,
              owner_account_id        = excluded.owner_account_id,
-             seat_group_id           = excluded.seat_group_id,
+             oauth_group_id           = excluded.oauth_group_id,
              group_accounts          = excluded.group_accounts,
              routing_config          = excluded.routing_config
              /* extra: DELIBERATELY OMITTED — user-owned column. See doc
@@ -723,7 +723,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
             supported_providers_json,
             provider_base_urls_json,
             entry.owner_account_id,
-            entry.seat_group_id,
+            entry.oauth_group_id,
             entry.group_accounts,
             entry.routing_config,
         ],
@@ -766,27 +766,27 @@ pub fn list_virtual_key_cache_readonly() -> Result<Vec<VirtualKeyCacheEntry>, St
 //
 // Three tiers, tried newest→oldest so each vault generation reads as many
 // real columns as it has, projecting literal NULL for columns it predates:
-//   GROUP  — post seat_group (v1.0.1-alpha.3): + seat_group_id + group_accounts
-//   FULL   — post 2026-05-22 (has `extra`, but no seat_group columns)
+//   GROUP  — post oauth_group (v1.0.1-alpha.3): + oauth_group_id + group_accounts
+//   FULL   — post 2026-05-22 (has `extra`, but no oauth_group columns)
 //   LEGACY — pre-2026-05-22 (no extra either)
 //
 // CRITICAL: the fixed column ORDER is shared by row_to_virtual_key_cache's
-// index-based reads — extra is ALWAYS index 21, seat_group_id 22,
+// index-based reads — extra is ALWAYS index 21, oauth_group_id 22,
 // group_accounts 23. The middle (FULL) tier projects NULL for 22/23 but a
-// REAL extra at 21, so a vault that has extra but not yet the seat_group
+// REAL extra at 21, so a vault that has extra but not yet the oauth_group
 // columns still reads its `extra` (no regression — the old 2-tier cascade
 // would have dropped to LEGACY and lost extra). Why a cascade at all:
 // `list_virtual_key_cache_readonly` opens read-only (no migrations), so a
 // vault not yet write-migrated must still be served.
 // Columns 0..=20 are identical across tiers; only the trailing 21/22/23/24
-// (extra / seat_group_id / group_accounts / routing_config) differ. Fixed
+// (extra / oauth_group_id / group_accounts / routing_config) differ. Fixed
 // indices are shared by row_to_virtual_key_cache's index reads — the middle
-// (FULL) tier keeps a REAL extra at 21 and NULLs the seat_group columns, so a
-// vault with extra but not yet the seat_group migration still reads its extra
+// (FULL) tier keeps a REAL extra at 21 and NULLs the oauth_group columns, so a
+// vault with extra but not yet the oauth_group migration still reads its extra
 // (no LEGACY-fallthrough regression). Kept as full literals (no string-concat
 // crate) for a single grep-able source per tier.
 //
-// Newest: real extra + real seat_group columns.
+// Newest: real extra + real oauth_group columns.
 const VK_CACHE_COLUMNS_GROUP: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
      credential_id, credential_revision, virtual_key_revision, \
@@ -794,8 +794,8 @@ const VK_CACHE_COLUMNS_GROUP: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, extra, seat_group_id, group_accounts, routing_config";
-// Middle: real extra, no seat_group columns yet (project NULL at 22/23).
+     provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config";
+// Middle: real extra, no oauth_group columns yet (project NULL at 22/23).
 const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
      credential_id, credential_revision, virtual_key_revision, \
@@ -804,7 +804,7 @@ const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
      provider_base_urls, owner_account_id, extra, NULL, NULL, NULL";
-// Oldest: no extra, no seat_group columns.
+// Oldest: no extra, no oauth_group columns.
 const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
      credential_id, credential_revision, virtual_key_revision, \
@@ -850,8 +850,8 @@ fn row_to_virtual_key_cache(row: &rusqlite::Row) -> rusqlite::Result<VirtualKeyC
         provider_base_urls: parse_base_urls_json(row.get(19)?),
         owner_account_id: row.get(20)?,
         extra,
-        // 22/23/24: seat_group columns (NULL in the FULL/LEGACY tiers → None).
-        seat_group_id: row.get::<_, Option<String>>(22).unwrap_or(None),
+        // 22/23/24: oauth_group columns (NULL in the FULL/LEGACY tiers → None).
+        oauth_group_id: row.get::<_, Option<String>>(22).unwrap_or(None),
         group_accounts: row.get::<_, Option<String>>(23).unwrap_or(None),
         routing_config: row.get::<_, Option<String>>(24).unwrap_or(None),
     })
@@ -915,13 +915,13 @@ pub fn get_virtual_key_cache_by_alias(alias: &str) -> Result<Option<VirtualKeyCa
     let conn = open_connection()?;
     let where_clause = "WHERE local_alias = ?1 OR alias = ?1 \
          ORDER BY CASE WHEN local_alias = ?1 THEN 0 ELSE 1 END LIMIT 1";
-    // Try GROUP columns first (includes seat_group_id / group_accounts /
+    // Try GROUP columns first (includes oauth_group_id / group_accounts /
     // routing_config), then FULL, then LEGACY — mirrors get_virtual_key_cache
     // (by id). Before this, the by-alias path only tried FULL+LEGACY, so
-    // seat_group_id was ALWAYS None when a VK was resolved by alias → every
+    // oauth_group_id was ALWAYS None when a VK was resolved by alias → every
     // group-VK-by-alias caller (e.g. `aikey use <group-vk-alias>`) saw a VK with
     // no group membership and fell into the "key not delivered" error, because
-    // the group exemptions all key off seat_group_id. The by-id path (web
+    // the group exemptions all key off oauth_group_id. The by-id path (web
     // set-route passes the vk_id) read GROUP and worked, which masked this on the
     // alias path. (2026-06-26)
     let result = conn
@@ -1828,7 +1828,7 @@ mod key_material_reachable_tests {
             provider_base_urls: std::collections::HashMap::new(),
             owner_account_id: None,
             extra: None,
-            seat_group_id: None,
+            oauth_group_id: None,
             group_accounts: None,
             routing_config: None,
         }

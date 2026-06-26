@@ -118,9 +118,9 @@ pub struct ManagedKeySnapshotItem {
     pub expires_at: Option<i64>,
     pub sync_version: i64,
     /// Seat-group binding target (N6). Present only when the VK's binding targets
-    /// a seat_group instead of a single credential. `None` for direct-bind VKs.
+    /// a oauth_group instead of a single credential. `None` for direct-bind VKs.
     #[serde(default)]
-    pub seat_group_id: Option<String>,
+    pub oauth_group_id: Option<String>,
     /// Seat's ranked candidate set for a group-bound VK (N6): array of
     /// `{account_id, identity, provider_code, priority, assigned}`. `None`/absent
     /// for direct-bind VKs. Stored verbatim into the cache as JSON text.

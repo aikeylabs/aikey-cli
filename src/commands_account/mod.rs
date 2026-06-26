@@ -2733,7 +2733,7 @@ fn apply_snapshot_to_cache(
             // N6: fold the seat-group candidate set from the snapshot. These ARE
             // server-owned (in the upsert's DO UPDATE SET). group_accounts is
             // stored as raw JSON text; None for a direct-bind VK.
-            seat_group_id: item.seat_group_id.clone(),
+            oauth_group_id: item.oauth_group_id.clone(),
             group_accounts: item
                 .group_accounts
                 .as_ref()
@@ -2979,7 +2979,7 @@ pub(crate) fn upsert_delivered_key(
         .map_err(|e| format!("encrypt: {}", e))?;
     // N6: this is a direct-bind key-delivery path (single credential ciphertext),
     // NOT the seat-group structural sync — but it shares upsert_virtual_key_cache,
-    // whose DO UPDATE SET now includes the server-owned seat_group columns. Carry
+    // whose DO UPDATE SET now includes the server-owned oauth_group columns. Carry
     // forward the existing row's group fields so accepting a key never wipes the
     // candidate set a prior snapshot sync folded in.
     let existing = storage::get_virtual_key_cache(&dk.virtual_key_id)
@@ -3012,7 +3012,7 @@ pub(crate) fn upsert_delivered_key(
         extra: None,
         // Carry forward server-synced group fields (this path isn't authoritative
         // over them) so a key-accept doesn't clobber them to NULL.
-        seat_group_id: existing.as_ref().and_then(|e| e.seat_group_id.clone()),
+        oauth_group_id: existing.as_ref().and_then(|e| e.oauth_group_id.clone()),
         group_accounts: existing.as_ref().and_then(|e| e.group_accounts.clone()),
         routing_config: existing.as_ref().and_then(|e| e.routing_config.clone()),
     };
@@ -3140,9 +3140,9 @@ fn run_full_snapshot_sync_opts(
         // The master delivery endpoint denies group VKs (403 access_denied), which
         // otherwise surfaces as a spurious "could not fetch key" + "0 downloaded"
         // during sync. Skip claim/delivery entirely for them; their metadata
-        // (seat_group_id / group_accounts / routing_config) was already folded into
+        // (oauth_group_id / group_accounts / routing_config) was already folded into
         // the cache by apply_snapshot_to_cache above.
-        if entry.seat_group_id.is_some() {
+        if entry.oauth_group_id.is_some() {
             continue;
         }
         // Needs claim: pending_claim but not yet claimed on server.
@@ -3441,7 +3441,7 @@ pub fn sync_managed_key_metadata() -> bool {
             // data — carry forward existing values so it doesn't clobber what the
             // full snapshot sync folded in. The full sync (apply_snapshot_to_cache)
             // is authoritative over these.
-            seat_group_id: existing.as_ref().and_then(|e| e.seat_group_id.clone()),
+            oauth_group_id: existing.as_ref().and_then(|e| e.oauth_group_id.clone()),
             group_accounts: existing.as_ref().and_then(|e| e.group_accounts.clone()),
             routing_config: existing.as_ref().and_then(|e| e.routing_config.clone()),
         };
@@ -4424,7 +4424,7 @@ pub fn handle_key_use(
         if on_cluster && entry.provider_key_ciphertext.is_none() {
             eprintln!("  Key '{}' → cluster node (key stays central)", entry.alias);
         }
-        // Group VKs (seat_group_id set) carry NO local key material BY DESIGN — the
+        // Group VKs (oauth_group_id set) carry NO local key material BY DESIGN — the
         // per-account credential is pulled by the proxy via channel ③ (group runtime),
         // so `use` (set active routing) works without local ciphertext, exactly like a
         // cluster central key. Without this exemption a group VK fell into the "not
@@ -4434,7 +4434,7 @@ pub fn handle_key_use(
         // set-route fix (key_material_reachable) + connectivity-probe / proxy
         // group-route fixes (the same "组 VK 无本地物料是设计" systemic root cause; this
         // is the CLI public-command path, separate from vault_op's web path). (2026-06-26)
-        if entry.provider_key_ciphertext.is_none() && !on_cluster && entry.seat_group_id.is_none() {
+        if entry.provider_key_ciphertext.is_none() && !on_cluster && entry.oauth_group_id.is_none() {
             // Why: key material is NULL when the VK was synced but not yet delivered
             // (share_status=pending_claim). Auto-trigger a full snapshot sync (which
             // includes key material download) instead of forcing a separate command.
@@ -5438,7 +5438,7 @@ mod core_tests {
 
     fn vk_entry(
         vk: &str,
-        seat_group_id: Option<&str>,
+        oauth_group_id: Option<&str>,
         group_accounts: Option<&str>,
         routing_config: Option<&str>,
     ) -> storage::VirtualKeyCacheEntry {
@@ -5465,7 +5465,7 @@ mod core_tests {
             provider_base_urls: std::collections::HashMap::new(),
             owner_account_id: Some("acct-1".into()),
             extra: None,
-            seat_group_id: seat_group_id.map(|s| s.to_string()),
+            oauth_group_id: oauth_group_id.map(|s| s.to_string()),
             group_accounts: group_accounts.map(|s| s.to_string()),
             routing_config: routing_config.map(|s| s.to_string()),
         }
@@ -5481,7 +5481,7 @@ mod core_tests {
         storage::upsert_virtual_key_cache(&vk_entry("vk-1", Some("grp-1"), Some(ga), Some(rc))).unwrap();
 
         let got = storage::get_virtual_key_cache("vk-1").unwrap().unwrap();
-        assert_eq!(got.seat_group_id.as_deref(), Some("grp-1"), "seat_group_id folded");
+        assert_eq!(got.oauth_group_id.as_deref(), Some("grp-1"), "oauth_group_id folded");
         assert!(got.group_accounts.as_deref().unwrap().contains("acc-A"), "group_accounts folded");
         assert_eq!(got.routing_config.as_deref(), Some(rc), "routing_config folded");
 
@@ -5502,7 +5502,7 @@ mod core_tests {
         storage::upsert_virtual_key_cache(&vk_entry("vk-1", Some("grp-2"), Some(ga2), Some(rc2))).unwrap();
 
         let got = storage::get_virtual_key_cache("vk-1").unwrap().unwrap();
-        assert_eq!(got.seat_group_id.as_deref(), Some("grp-2"), "seat_group_id updated by sync");
+        assert_eq!(got.oauth_group_id.as_deref(), Some("grp-2"), "oauth_group_id updated by sync");
         assert_eq!(got.routing_config.as_deref(), Some(rc2), "routing_config updated by sync");
         assert!(got.group_accounts.as_deref().unwrap().contains("acc-B"), "group_accounts updated");
         assert!(!got.group_accounts.as_deref().unwrap().contains("acc-A"), "old candidate replaced");
@@ -5517,7 +5517,7 @@ mod core_tests {
         // A direct-bind VK syncs with no seat group → all group columns NULL.
         storage::upsert_virtual_key_cache(&vk_entry("vk-2", None, None, None)).unwrap();
         let got = storage::get_virtual_key_cache("vk-2").unwrap().unwrap();
-        assert_eq!(got.seat_group_id, None);
+        assert_eq!(got.oauth_group_id, None);
         assert_eq!(got.group_accounts, None);
         assert_eq!(got.routing_config, None);
     }

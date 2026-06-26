@@ -418,10 +418,10 @@ pub mod v1_0_0_baseline {
                 "extra",
                 "ALTER TABLE managed_virtual_keys_cache ADD COLUMN extra TEXT",
             ),
-            // 2026-06-24 (master v1.0.1-alpha.3): seat_group fold. When a VK's
-            // binding target is a seat_group, the whole group folds into THIS
+            // 2026-06-24 (master v1.0.1-alpha.3): oauth_group fold. When a VK's
+            // binding target is a oauth_group, the whole group folds into THIS
             // row — no separate client cache tables (技术方案 §2.3).
-            //   seat_group_id          != NULL marks a group-backed VK
+            //   oauth_group_id          != NULL marks a group-backed VK
             //   group_accounts         candidate-list metadata JSON (from the
             //                          materialized view; structural sync)
             //   routing_config         group hash/schedule/util_cap knobs JSON
@@ -433,8 +433,8 @@ pub mod v1_0_0_baseline {
             //                          window_max_util_pct, window_reset_at}} via
             //                          channel ③ (volatile; NEVER refresh_token)
             (
-                "seat_group_id",
-                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN seat_group_id TEXT",
+                "oauth_group_id",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN oauth_group_id TEXT",
             ),
             (
                 "group_accounts",
@@ -1508,15 +1508,15 @@ mod tests {
         upgrade_all(&conn).expect("second upgrade_all must be idempotent");
     }
 
-    /// N0 (master v1.0.1-alpha.3 seat_group fold): the 5 seat_group columns are
+    /// N0 (master v1.0.1-alpha.3 oauth_group fold): the 5 oauth_group columns are
     /// retrofitted onto managed_virtual_keys_cache by upgrade_all — group data
     /// folds into the VK row, no separate client cache tables (技术方案 §2.3).
     #[test]
-    fn seat_group_fold_columns_retrofit_on_managed_virtual_keys_cache() {
+    fn oauth_group_fold_columns_retrofit_on_managed_virtual_keys_cache() {
         let conn = Connection::open_in_memory().expect("open");
         upgrade_all(&conn).expect("upgrade_all");
         for col in [
-            "seat_group_id",
+            "oauth_group_id",
             "group_accounts",
             "routing_config",
             "my_assignment_override",
