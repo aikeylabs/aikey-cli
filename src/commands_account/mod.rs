@@ -4424,7 +4424,17 @@ pub fn handle_key_use(
         if on_cluster && entry.provider_key_ciphertext.is_none() {
             eprintln!("  Key '{}' → cluster node (key stays central)", entry.alias);
         }
-        if entry.provider_key_ciphertext.is_none() && !on_cluster {
+        // Group VKs (seat_group_id set) carry NO local key material BY DESIGN — the
+        // per-account credential is pulled by the proxy via channel ③ (group runtime),
+        // so `use` (set active routing) works without local ciphertext, exactly like a
+        // cluster central key. Without this exemption a group VK fell into the "not
+        // delivered" sync below, the sync produced no ciphertext (it never will), and
+        // `aikey use` errored with "downloaded no key material — admin may need to
+        // attach a credential" — misleading, the VK routes fine. Mirrors the web
+        // set-route fix (key_material_reachable) + connectivity-probe / proxy
+        // group-route fixes (the same "组 VK 无本地物料是设计" systemic root cause; this
+        // is the CLI public-command path, separate from vault_op's web path). (2026-06-26)
+        if entry.provider_key_ciphertext.is_none() && !on_cluster && entry.seat_group_id.is_none() {
             // Why: key material is NULL when the VK was synced but not yet delivered
             // (share_status=pending_claim). Auto-trigger a full snapshot sync (which
             // includes key material download) instead of forcing a separate command.

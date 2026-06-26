@@ -608,7 +608,16 @@ impl VirtualKeyCacheEntry {
     /// diverging again. `claimed` is required so an unclaimed (pending_claim) seat
     /// is never treated as usable just because the client is on a cluster.
     pub fn key_material_reachable(&self, on_cluster: bool) -> bool {
-        self.provider_key_ciphertext.is_some() || (on_cluster && self.share_status == "claimed")
+        // Group VKs (seat_group_id set) carry NO local key material BY DESIGN —
+        // the per-account credential is pulled by the proxy via channel ③ (group
+        // runtime), so routing works without local ciphertext, exactly like a
+        // cluster central key. Without this, `use` / web set-route 422'd a group
+        // VK with I_KEY_NOT_DELIVERED ("该密钥尚未下发") even though it routes
+        // fine. Same empty-local-material root cause as the connectivity-probe
+        // ciphertext guard (targets.rs) and the proxy group-route path. (2026-06-26)
+        self.provider_key_ciphertext.is_some()
+            || (on_cluster && self.share_status == "claimed")
+            || self.seat_group_id.is_some()
     }
 }
 
@@ -906,15 +915,35 @@ pub fn get_virtual_key_cache_by_alias(alias: &str) -> Result<Option<VirtualKeyCa
     let conn = open_connection()?;
     let where_clause = "WHERE local_alias = ?1 OR alias = ?1 \
          ORDER BY CASE WHEN local_alias = ?1 THEN 0 ELSE 1 END LIMIT 1";
+    // Try GROUP columns first (includes seat_group_id / group_accounts /
+    // routing_config), then FULL, then LEGACY — mirrors get_virtual_key_cache
+    // (by id). Before this, the by-alias path only tried FULL+LEGACY, so
+    // seat_group_id was ALWAYS None when a VK was resolved by alias → every
+    // group-VK-by-alias caller (e.g. `aikey use <group-vk-alias>`) saw a VK with
+    // no group membership and fell into the "key not delivered" error, because
+    // the group exemptions all key off seat_group_id. The by-id path (web
+    // set-route passes the vk_id) read GROUP and worked, which masked this on the
+    // alias path. (2026-06-26)
     let result = conn
         .query_row(
             &format!(
                 "SELECT {} FROM managed_virtual_keys_cache {}",
-                VK_CACHE_COLUMNS_FULL, where_clause
+                VK_CACHE_COLUMNS_GROUP, where_clause
             ),
             params![alias],
             row_to_virtual_key_cache,
         )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &format!(
+                    "SELECT {} FROM managed_virtual_keys_cache {}",
+                    VK_CACHE_COLUMNS_FULL, where_clause
+                ),
+                params![alias],
+                row_to_virtual_key_cache,
+            ),
+        })
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Err(e),
             _ => conn.query_row(

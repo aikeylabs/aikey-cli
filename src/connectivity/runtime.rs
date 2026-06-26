@@ -498,13 +498,30 @@ where
     // short-circuit returned api_status=999 before the real probe ran.
     // Removed in same PR. See bugfix/2026-04-29-oauth-probe-tier2-503.md.
 
-    let agent = build_proxy_aware_agent(Duration::from_secs(10));
-
     // Is this probe flowing through our own local aikey-proxy? If so the
     // X-Aikey-Probe header suppresses usage-event logging on the proxy side
     // (see proxy/middleware.go::isAikeyProbe). Tagging the header for
     // upstream-direct probes would be harmless but misleading, so gate it.
     let via_aikey_proxy = base_url.contains("127.0.0.1") || base_url.contains("localhost");
+
+    // Loopback probes (through our local aikey-proxy on 127.0.0.1) MUST bypass any
+    // external HTTP proxy. build_proxy_aware_agent honors http(s)_proxy but NOT
+    // NO_PROXY, so a non-loopback proxy (e.g. a host-level Clash at 192.168.64.1
+    // as a VM sees it) makes ureq send the 127.0.0.1:27200 probe THROUGH that
+    // proxy — which resolves 127.0.0.1 to ITSELF and hijacks the probe to the
+    // WRONG aikey-proxy instance (the host's), whose registry doesn't have this
+    // VK → spurious 401 "Route token not found in registry" even though the real
+    // route works. NO_PROXY=127.0.0.1 is the standard signal; honor it by using a
+    // direct agent for loopback targets. Only upstream-direct probes (non-loopback
+    // base_url) keep the proxy-aware agent.
+    // bugfix: 2026-06-26-connectivity-probe-loopback-proxy-hijack.
+    let agent = if via_aikey_proxy {
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(10))
+            .build()
+    } else {
+        build_proxy_aware_agent(Duration::from_secs(10))
+    };
 
     // ── Phase 3: API probe ───────────────────────────────────────────────
     // GET — lightweight, no side effects. Treats ANY HTTP response
@@ -651,7 +668,16 @@ where
     let (chat_url, body) = build_chat_probe(provider_code, base_url, api_key, kind);
     let (chat_auth_key, chat_auth_val) = probe_auth(provider_code, api_key);
 
-    let chat_agent = build_proxy_aware_agent(Duration::from_secs(15));
+    // Same loopback-bypass as the API probe above: a loopback aikey-proxy target
+    // must NOT traverse an external HTTP proxy (NO_PROXY=127.0.0.1), else a
+    // non-loopback proxy hijacks 127.0.0.1 to the wrong aikey-proxy → false 401.
+    let chat_agent = if via_aikey_proxy {
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(15))
+            .build()
+    } else {
+        build_proxy_aware_agent(Duration::from_secs(15))
+    };
     let chat_start = Instant::now();
     let mut req = chat_agent
         .post(&chat_url)
