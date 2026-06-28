@@ -889,14 +889,26 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
         )
     };
     let result = conn
-        .query_row(&sel(VK_CACHE_COLUMNS_GROUP), params![virtual_key_id], row_to_virtual_key_cache)
+        .query_row(
+            &sel(VK_CACHE_COLUMNS_GROUP),
+            params![virtual_key_id],
+            row_to_virtual_key_cache,
+        )
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Err(e),
-            _ => conn.query_row(&sel(VK_CACHE_COLUMNS_FULL), params![virtual_key_id], row_to_virtual_key_cache),
+            _ => conn.query_row(
+                &sel(VK_CACHE_COLUMNS_FULL),
+                params![virtual_key_id],
+                row_to_virtual_key_cache,
+            ),
         })
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Err(e),
-            _ => conn.query_row(&sel(VK_CACHE_COLUMNS_LEGACY), params![virtual_key_id], row_to_virtual_key_cache),
+            _ => conn.query_row(
+                &sel(VK_CACHE_COLUMNS_LEGACY),
+                params![virtual_key_id],
+                row_to_virtual_key_cache,
+            ),
         });
     match result {
         Ok(entry) => Ok(Some(entry)),

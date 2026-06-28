@@ -4434,7 +4434,8 @@ pub fn handle_key_use(
         // set-route fix (key_material_reachable) + connectivity-probe / proxy
         // group-route fixes (the same "组 VK 无本地物料是设计" systemic root cause; this
         // is the CLI public-command path, separate from vault_op's web path). (2026-06-26)
-        if entry.provider_key_ciphertext.is_none() && !on_cluster && entry.oauth_group_id.is_none() {
+        if entry.provider_key_ciphertext.is_none() && !on_cluster && entry.oauth_group_id.is_none()
+        {
             // Why: key material is NULL when the VK was synced but not yet delivered
             // (share_status=pending_claim). Auto-trigger a full snapshot sync (which
             // includes key material download) instead of forcing a separate command.
@@ -5478,12 +5479,24 @@ mod core_tests {
         // First sync: a group-bound VK with a candidate set + routing config.
         let ga = r#"[{"account_id":"acc-A","identity":"a@t.com","provider_code":"anthropic","priority":1,"assigned":true}]"#;
         let rc = r#"{"exhaustion_signals":["unified_rate_limited"]}"#;
-        storage::upsert_virtual_key_cache(&vk_entry("vk-1", Some("grp-1"), Some(ga), Some(rc))).unwrap();
+        storage::upsert_virtual_key_cache(&vk_entry("vk-1", Some("grp-1"), Some(ga), Some(rc)))
+            .unwrap();
 
         let got = storage::get_virtual_key_cache("vk-1").unwrap().unwrap();
-        assert_eq!(got.oauth_group_id.as_deref(), Some("grp-1"), "oauth_group_id folded");
-        assert!(got.group_accounts.as_deref().unwrap().contains("acc-A"), "group_accounts folded");
-        assert_eq!(got.routing_config.as_deref(), Some(rc), "routing_config folded");
+        assert_eq!(
+            got.oauth_group_id.as_deref(),
+            Some("grp-1"),
+            "oauth_group_id folded"
+        );
+        assert!(
+            got.group_accounts.as_deref().unwrap().contains("acc-A"),
+            "group_accounts folded"
+        );
+        assert_eq!(
+            got.routing_config.as_deref(),
+            Some(rc),
+            "routing_config folded"
+        );
 
         // User records a connectivity-test result into the user-owned `extra` blob.
         {
@@ -5499,16 +5512,35 @@ mod core_tests {
         // group fields BUT leave `extra` intact (the 2026-05-22 fence invariant).
         let ga2 = r#"[{"account_id":"acc-B","identity":"b@t.com","provider_code":"anthropic","priority":1,"assigned":true}]"#;
         let rc2 = r#"{"reject_ratio":5}"#;
-        storage::upsert_virtual_key_cache(&vk_entry("vk-1", Some("grp-2"), Some(ga2), Some(rc2))).unwrap();
+        storage::upsert_virtual_key_cache(&vk_entry("vk-1", Some("grp-2"), Some(ga2), Some(rc2)))
+            .unwrap();
 
         let got = storage::get_virtual_key_cache("vk-1").unwrap().unwrap();
-        assert_eq!(got.oauth_group_id.as_deref(), Some("grp-2"), "oauth_group_id updated by sync");
-        assert_eq!(got.routing_config.as_deref(), Some(rc2), "routing_config updated by sync");
-        assert!(got.group_accounts.as_deref().unwrap().contains("acc-B"), "group_accounts updated");
-        assert!(!got.group_accounts.as_deref().unwrap().contains("acc-A"), "old candidate replaced");
+        assert_eq!(
+            got.oauth_group_id.as_deref(),
+            Some("grp-2"),
+            "oauth_group_id updated by sync"
+        );
+        assert_eq!(
+            got.routing_config.as_deref(),
+            Some(rc2),
+            "routing_config updated by sync"
+        );
+        assert!(
+            got.group_accounts.as_deref().unwrap().contains("acc-B"),
+            "group_accounts updated"
+        );
+        assert!(
+            !got.group_accounts.as_deref().unwrap().contains("acc-A"),
+            "old candidate replaced"
+        );
         // The critical fence: sync touching group fields must NOT wipe extra.
         let extra = got.extra.expect("extra survived sync");
-        assert_eq!(extra["last_test"]["ok"], serde_json::json!(true), "user-owned extra preserved");
+        assert_eq!(
+            extra["last_test"]["ok"],
+            serde_json::json!(true),
+            "user-owned extra preserved"
+        );
     }
 
     #[test]
