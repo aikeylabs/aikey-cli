@@ -2184,9 +2184,13 @@ fn read_install_state() -> Option<serde_json::Value> {
 ///                                   from `control_url` so cookie domain /
 ///                                   CORS / CSP stay aligned with the host
 ///                                   the login flow wrote — see `host_loopback_parts`).
-///   2. Env var `AIKEY_WEB_URL` →  use as-is
+///   2. Env var `AIKEY_WEB_URL` →  use as-is (trailing slash trimmed)
 ///   3. Auto-detect: if control_url is loopback, probe dev-server ports
-///   4. Fall back to the stored `control_url`
+///   4. Fall back to the stored `control_url` (trailing slash trimmed)
+///
+/// CONTRACT: the returned base NEVER has a trailing slash, so callers can join
+/// it with a leading-slash path (`/go/<alias>`) without producing a `//` that
+/// the browser would treat as a protocol-relative (cross-origin) URL.
 fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> String {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -2209,7 +2213,11 @@ fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> Str
     // 2. Env var override
     if let Ok(url) = std::env::var("AIKEY_WEB_URL") {
         if !url.is_empty() {
-            return url;
+            // Strip any trailing slash: the caller joins this base with a
+            // leading-slash path (`/go/<alias>`), so a trailing slash here would
+            // produce `//go/...` — a PROTOCOL-RELATIVE URL the browser resolves to
+            // a foreign origin (`http://go/...`) and rejects in history.replaceState.
+            return url.trim_end_matches('/').to_string();
         }
     }
 
@@ -2239,8 +2247,15 @@ fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> Str
         }
     }
 
-    // 4. Fall back to control_url
-    control_url.to_string()
+    // 4. Fall back to control_url. Strip any trailing slash so the deep link
+    //    joins cleanly with the leading-slash `/go/<alias>` path — a stored
+    //    control_url like `http://host:3000/` would otherwise yield
+    //    `http://host:3000//go/overview`, which the browser treats as a
+    //    protocol-relative URL (`http://go/overview`) and rejects with a
+    //    SecurityError in the SPA's history.replaceState (cross-origin).
+    //    Normalizing at READ time also fixes installs that already stored a
+    //    trailing-slash control_url, with no re-login/migration.
+    control_url.trim_end_matches('/').to_string()
 }
 
 /// Extracts `(scheme, host)` from a URL like `http://127.0.0.1:3000/foo` or
@@ -6836,6 +6851,17 @@ mod browse_url_tests {
         let got = resolve_browse_base_url("https://team.example.com", None);
         assert_eq!(got, "https://team.example.com");
     }
+
+    #[test]
+    fn resolve_browse_base_url_strips_trailing_slash_on_fallback() {
+        // Regression: a LAN control_url stored WITH a trailing slash must not
+        // leak it into the base — otherwise `base + /go/<alias>` becomes
+        // `http://host:3000//go/overview`, a protocol-relative URL the SPA's
+        // history.replaceState rejects with a SecurityError (cross-origin).
+        let got = resolve_browse_base_url("http://192.168.0.240:3000/", None);
+        assert_eq!(got, "http://192.168.0.240:3000");
+    }
+
 }
 
 // ============================================================================
