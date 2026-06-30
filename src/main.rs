@@ -1601,7 +1601,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let outcome = commands_project::run_connectivity_suite(targets, opts, false);
                     if !outcome.any_chat_ok {
                         eprintln!();
-                        eprint!("  \u{25c6} No chat test passed. Add anyway? [y/N] (default N): ");
+                        eprint!("  \u{25c6} No API connectivity test passed. Add anyway? [y/N] (default N): ");
                         io::stdout().flush()?;
                         let mut input = String::new();
                         io::stdin().read_line(&mut input)?;
@@ -2100,8 +2100,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             //   - else → 1 (couldn't reach upstream via proxy)
             //
             // Across multiple rows (e.g. a personal key bound to N providers),
-            // success on ANY counts as overall success — matches the
-            // `any_chat_ok` semantics used by `aikey add`.
+            // success on ANY counts as overall success.
             fn exit_code_from_outcome(outcome: &commands_project::SuiteOutcome) -> i32 {
                 if outcome.rows.iter().any(|(_, r)| r.api_ok) {
                     return EXIT_OK;
