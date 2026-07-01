@@ -459,6 +459,14 @@ pub mod v1_0_0_baseline {
                 "owner_email",
                 "ALTER TABLE managed_virtual_keys_cache ADD COLUMN owner_email TEXT",
             ),
+            (
+                // group_alias: the OAuth group's name (server-synced from the
+                // managed-keys-snapshot, parallel to oauth_group_id/routing_config) so
+                // /user/vault + `aikey use` can label WHICH group a VK belongs to — a
+                // member in multiple groups gets one VK per group (2026-07-01).
+                "group_alias",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN group_alias TEXT",
+            ),
         ] {
             ensure_column(conn, "managed_virtual_keys_cache", col, ddl)?;
         }

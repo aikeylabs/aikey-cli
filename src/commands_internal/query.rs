@@ -392,6 +392,10 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
                 // current_routed) onto each candidate so the web shows LIVE state
                 // (C1+C2, 2026-06-30) without a manual key sync. null on absent/corrupt.
                 "oauth_group_id": t.oauth_group_id,
+                // group_alias: the OAuth group's name (server-synced) so /user/vault +
+                // `aikey use` label WHICH group this VK routes into — a member in
+                // multiple groups gets one VK per group (2026-07-01).
+                "group_alias": t.group_alias,
                 "group_accounts": merged_accounts,
                 // owner_email: the owning account's email (stamped by sync). Lets
                 // /user/vault show "Owner: <email>" in the drawer — persists for a

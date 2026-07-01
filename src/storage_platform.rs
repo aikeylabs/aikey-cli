@@ -597,6 +597,12 @@ pub struct VirtualKeyCacheEntry {
     /// classify exhaustion (exhaustion_signals) + apply switch/cooldown knobs.
     /// In the upsert's DO UPDATE SET (server authoritative).
     pub routing_config: Option<String>,
+    /// The OAuth group's human-facing name (server-synced from the snapshot,
+    /// parallel to oauth_group_id/routing_config — in the upsert's DO UPDATE SET).
+    /// `None`/empty for direct-bind VKs or an unnamed group. Lets /user/vault +
+    /// `aikey use` label WHICH group a VK belongs to, so a member in multiple groups
+    /// can pick by name (2026-07-01, multi-group disambiguation).
+    pub group_alias: Option<String>,
     /// READ-ONLY here (C1/C2 display, 2026-06-30): the channel-③ per-account
     /// material JSON `{account_id:{..., needs_login, is_current_routed}}`, written
     /// SOLELY by the proxy's 60s group-runtime poll (this CLI never writes it — it
@@ -685,7 +691,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              cache_schema_version, synced_at,
              local_alias, supported_providers,
              provider_base_urls, owner_account_id,
-             oauth_group_id, group_accounts, routing_config, owner_email
+             oauth_group_id, group_accounts, routing_config, owner_email, group_alias
          ) VALUES (
              ?1,  ?2,  ?3,  ?4,
              ?5,  ?6,  ?7,
@@ -696,7 +702,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              1,   strftime('%s', 'now'),
              ?17, ?18,
              ?19, ?20,
-             ?21, ?22, ?23, ?24
+             ?21, ?22, ?23, ?24, ?25
          )
          ON CONFLICT(virtual_key_id) DO UPDATE SET
              org_id                  = excluded.org_id,
@@ -722,7 +728,11 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              oauth_group_id           = excluded.oauth_group_id,
              group_accounts          = excluded.group_accounts,
              routing_config          = excluded.routing_config,
-             owner_email             = excluded.owner_email
+             owner_email             = excluded.owner_email,
+             group_alias             = excluded.group_alias
+             /* group_alias: server-synced (parallel to oauth_group_id/routing_config)
+                — the OAuth group name so /user/vault + aikey use can label which
+                group a VK routes into (multi-group disambiguation). */
              /* owner_email: synced column (parallel to owner_account_id) — the
                 key sync stamps the CURRENT account's email so a group VK still
                 shows its owner in /user/vault after that account logs out (the
@@ -758,6 +768,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
             entry.group_accounts,
             entry.routing_config,
             owner_email,
+            entry.group_alias,
         ],
     )
     .map_err(|e| format!("Failed to upsert virtual key cache: {}", e))?;
@@ -826,7 +837,7 @@ const VK_CACHE_COLUMNS_GROUP: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config, owner_email, group_runtime";
+     provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config, owner_email, group_runtime, group_alias";
 // Middle: real extra, no oauth_group columns yet (project NULL at 22/23).
 const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
@@ -835,7 +846,7 @@ const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, extra, NULL, NULL, NULL, NULL, NULL";
+     provider_base_urls, owner_account_id, extra, NULL, NULL, NULL, NULL, NULL, NULL";
 // Oldest: no extra, no oauth_group columns.
 const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
@@ -844,7 +855,7 @@ const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, NULL, NULL, NULL, NULL, NULL, NULL";
+     provider_base_urls, owner_account_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL";
 
 /// Single mapping from a SELECT row (in the column order declared by
 /// `VK_CACHE_COLUMNS_*` above) to a struct. Centralised here so adding
@@ -890,6 +901,8 @@ fn row_to_virtual_key_cache(row: &rusqlite::Row) -> rusqlite::Result<VirtualKeyC
         owner_email: row.get::<_, Option<String>>(25).unwrap_or(None),
         // 26: group_runtime (proxy-owned, read-only here — NULL in FULL/LEGACY → None).
         group_runtime: row.get::<_, Option<String>>(26).unwrap_or(None),
+        // 27: group_alias (server-synced OAuth group name — NULL in FULL/LEGACY → None).
+        group_alias: row.get::<_, Option<String>>(27).unwrap_or(None),
     })
 }
 
@@ -1877,6 +1890,7 @@ mod key_material_reachable_tests {
             owner_account_id: None,
             owner_email: None,
             group_runtime: None,
+            group_alias: None,
             extra: None,
             oauth_group_id: None,
             group_accounts: None,

@@ -131,6 +131,12 @@ pub struct ManagedKeySnapshotItem {
     /// direct-bind VKs. Stored verbatim into the cache.
     #[serde(default)]
     pub routing_config: Option<String>,
+    /// The OAuth group's human-facing name (oauth_group.alias), so /user/vault +
+    /// `aikey use` can label WHICH group a VK belongs to — a member in multiple
+    /// groups gets one VK per group and picks by name (2026-07-01). `None`/empty for
+    /// direct-bind VKs or an unnamed group.
+    #[serde(default)]
+    pub group_alias: Option<String>,
 }
 
 /// Returned by GET /accounts/me/managed-keys-snapshot.

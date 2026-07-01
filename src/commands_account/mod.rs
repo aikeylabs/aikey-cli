@@ -2757,6 +2757,7 @@ fn apply_snapshot_to_cache(
                 .as_ref()
                 .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string())),
             routing_config: item.routing_config.clone(),
+            group_alias: item.group_alias.clone(),
         };
 
         let _ = storage::upsert_virtual_key_cache(&entry);
@@ -3036,6 +3037,7 @@ pub(crate) fn upsert_delivered_key(
         oauth_group_id: existing.as_ref().and_then(|e| e.oauth_group_id.clone()),
         group_accounts: existing.as_ref().and_then(|e| e.group_accounts.clone()),
         routing_config: existing.as_ref().and_then(|e| e.routing_config.clone()),
+        group_alias: existing.as_ref().and_then(|e| e.group_alias.clone()),
     };
     storage::upsert_virtual_key_cache(&entry)
 }
@@ -3468,6 +3470,7 @@ pub fn sync_managed_key_metadata() -> bool {
             oauth_group_id: existing.as_ref().and_then(|e| e.oauth_group_id.clone()),
             group_accounts: existing.as_ref().and_then(|e| e.group_accounts.clone()),
             routing_config: existing.as_ref().and_then(|e| e.routing_config.clone()),
+            group_alias: existing.as_ref().and_then(|e| e.group_alias.clone()),
         };
         let _ = storage::upsert_virtual_key_cache(&entry);
 
@@ -5491,6 +5494,7 @@ mod core_tests {
             owner_account_id: Some("acct-1".into()),
             owner_email: Some("acct-1@test".into()),
             group_runtime: None,
+            group_alias: None,
             extra: None,
             oauth_group_id: oauth_group_id.map(|s| s.to_string()),
             group_accounts: group_accounts.map(|s| s.to_string()),
