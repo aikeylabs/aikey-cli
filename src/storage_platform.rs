@@ -563,6 +563,12 @@ pub struct VirtualKeyCacheEntry {
     /// The `account_id` that last synced/accepted this key. `None` for pre-v0.8 rows.
     /// Used to scope-disable keys when the user switches to a different account.
     pub owner_account_id: Option<String>,
+    /// The owner account's EMAIL, stamped by the sync (parallel to
+    /// `owner_account_id`). Lets /user/vault show "Owner: <email>" — especially
+    /// for a group VK left behind after that account logs out (the leftover row
+    /// keeps its email because another account's sync doesn't touch it). `None`
+    /// for rows synced before this column / pre-login rows.
+    pub owner_email: Option<String>,
     /// Generic per-key extension JSON blob — same shape contract as
     /// `storage::SecretMetadata::extra`. Stores connectivity-test results
     /// at `$.last_test` (written by `_internal vault-op record_test_result`
@@ -591,6 +597,16 @@ pub struct VirtualKeyCacheEntry {
     /// classify exhaustion (exhaustion_signals) + apply switch/cooldown knobs.
     /// In the upsert's DO UPDATE SET (server authoritative).
     pub routing_config: Option<String>,
+    /// READ-ONLY here (C1/C2 display, 2026-06-30): the channel-③ per-account
+    /// material JSON `{account_id:{..., needs_login, is_current_routed}}`, written
+    /// SOLELY by the proxy's 60s group-runtime poll (this CLI never writes it — it
+    /// is NOT in the upsert). The query layer reads the two PLAINTEXT flags
+    /// (`needs_login`, `is_current_routed`; the secret is encrypted and untouched)
+    /// to project a LIVE `login_status` + `current_routed` onto each `group_accounts`
+    /// candidate — fresher than the key-sync snapshot, so /user/vault reflects
+    /// login/routing without a manual `aikey key sync`. `None` for direct-bind VKs
+    /// or when the proxy hasn't polled yet (→ fall back to the snapshot value).
+    pub group_runtime: Option<String>,
 }
 
 impl VirtualKeyCacheEntry {
@@ -644,6 +660,16 @@ impl VirtualKeyCacheEntry {
 /// the key is accepted.
 pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), String> {
     let conn = open_connection()?;
+    // owner_email is stamped as the CURRENT logged-in account's email — every sync
+    // writes the current account's own keys (all-keys is account-scoped), so the
+    // owner is always this account. Explicit entry.owner_email wins (e.g. a caller
+    // that already knows it); otherwise resolve from platform_account. Persisting
+    // it (parallel to owner_account_id) lets /user/vault show "Owner: <email>" even
+    // after the account logs out — another account's sync won't touch this row.
+    let owner_email = entry
+        .owner_email
+        .clone()
+        .or_else(|| get_platform_account().ok().flatten().map(|a| a.email));
     let supported_providers_json =
         serde_json::to_string(&entry.supported_providers).unwrap_or_else(|_| "[]".to_string());
     let provider_base_urls_json =
@@ -659,7 +685,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              cache_schema_version, synced_at,
              local_alias, supported_providers,
              provider_base_urls, owner_account_id,
-             oauth_group_id, group_accounts, routing_config
+             oauth_group_id, group_accounts, routing_config, owner_email
          ) VALUES (
              ?1,  ?2,  ?3,  ?4,
              ?5,  ?6,  ?7,
@@ -670,7 +696,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              1,   strftime('%s', 'now'),
              ?17, ?18,
              ?19, ?20,
-             ?21, ?22, ?23
+             ?21, ?22, ?23, ?24
          )
          ON CONFLICT(virtual_key_id) DO UPDATE SET
              org_id                  = excluded.org_id,
@@ -695,7 +721,12 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              owner_account_id        = excluded.owner_account_id,
              oauth_group_id           = excluded.oauth_group_id,
              group_accounts          = excluded.group_accounts,
-             routing_config          = excluded.routing_config
+             routing_config          = excluded.routing_config,
+             owner_email             = excluded.owner_email
+             /* owner_email: synced column (parallel to owner_account_id) — the
+                key sync stamps the CURRENT account's email so a group VK still
+                shows its owner in /user/vault after that account logs out (the
+                leftover row isn't overwritten by another account's sync). */
              /* extra: DELIBERATELY OMITTED — user-owned column. See doc
                 comment above and on VirtualKeyCacheEntry::extra. */
              /* my_assignment_override / group_runtime / routing_config: OMITTED —
@@ -726,6 +757,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
             entry.oauth_group_id,
             entry.group_accounts,
             entry.routing_config,
+            owner_email,
         ],
     )
     .map_err(|e| format!("Failed to upsert virtual key cache: {}", e))?;
@@ -794,7 +826,7 @@ const VK_CACHE_COLUMNS_GROUP: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config";
+     provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config, owner_email, group_runtime";
 // Middle: real extra, no oauth_group columns yet (project NULL at 22/23).
 const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
@@ -803,7 +835,7 @@ const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, extra, NULL, NULL, NULL";
+     provider_base_urls, owner_account_id, extra, NULL, NULL, NULL, NULL, NULL";
 // Oldest: no extra, no oauth_group columns.
 const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
@@ -812,7 +844,7 @@ const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, NULL, NULL, NULL, NULL";
+     provider_base_urls, owner_account_id, NULL, NULL, NULL, NULL, NULL, NULL";
 
 /// Single mapping from a SELECT row (in the column order declared by
 /// `VK_CACHE_COLUMNS_*` above) to a struct. Centralised here so adding
@@ -854,6 +886,10 @@ fn row_to_virtual_key_cache(row: &rusqlite::Row) -> rusqlite::Result<VirtualKeyC
         oauth_group_id: row.get::<_, Option<String>>(22).unwrap_or(None),
         group_accounts: row.get::<_, Option<String>>(23).unwrap_or(None),
         routing_config: row.get::<_, Option<String>>(24).unwrap_or(None),
+        // 25: owner_email (NULL in FULL/LEGACY tiers → None).
+        owner_email: row.get::<_, Option<String>>(25).unwrap_or(None),
+        // 26: group_runtime (proxy-owned, read-only here — NULL in FULL/LEGACY → None).
+        group_runtime: row.get::<_, Option<String>>(26).unwrap_or(None),
     })
 }
 
@@ -1839,6 +1875,8 @@ mod key_material_reachable_tests {
             supported_providers: vec![],
             provider_base_urls: std::collections::HashMap::new(),
             owner_account_id: None,
+            owner_email: None,
+            group_runtime: None,
             extra: None,
             oauth_group_id: None,
             group_accounts: None,

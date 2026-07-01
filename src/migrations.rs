@@ -452,6 +452,13 @@ pub mod v1_0_0_baseline {
                 "group_runtime",
                 "ALTER TABLE managed_virtual_keys_cache ADD COLUMN group_runtime TEXT",
             ),
+            (
+                // owner_email: the owner account's email, stamped by key sync
+                // (parallel to owner_account_id) so /user/vault can show
+                // "Owner: <email>" — persists after that account logs out.
+                "owner_email",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN owner_email TEXT",
+            ),
         ] {
             ensure_column(conn, "managed_virtual_keys_cache", col, ddl)?;
         }

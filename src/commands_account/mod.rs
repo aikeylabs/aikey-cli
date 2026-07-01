@@ -2738,6 +2738,9 @@ fn apply_snapshot_to_cache(
             supported_providers: item.supported_providers.clone(),
             provider_base_urls: item.provider_base_urls.clone(),
             owner_account_id: Some(current_account_id.to_string()),
+            owner_email: None, // upsert stamps the current account's email
+            group_runtime: None, // proxy-owned (channel ③) — never written from here
+
             // Sync writers MUST always set extra: None. The value is
             // ignored by upsert (extra is omitted from the UPSERT's
             // DO UPDATE SET — see upsert_virtual_key_cache doc); the
@@ -3022,6 +3025,9 @@ pub(crate) fn upsert_delivered_key(
         supported_providers: dk.supported_providers.clone(),
         provider_base_urls: dk.provider_base_urls.clone(),
         owner_account_id: dk.owner_account_id.clone(),
+        owner_email: None, // upsert stamps the current account's email
+        group_runtime: None, // proxy-owned (channel ③) — never written from here
+
         // Sync writers MUST always pass extra: None; upsert ignores this
         // field. See doc on VirtualKeyCacheEntry::extra.
         extra: None,
@@ -3449,6 +3455,9 @@ pub fn sync_managed_key_metadata() -> bool {
             supported_providers,
             provider_base_urls,
             owner_account_id: Some(acc.account_id.clone()),
+            owner_email: Some(acc.email.clone()), // owner email for /user/vault
+            group_runtime: None, // proxy-owned (channel ③) — never written from here
+
             // Sync writers MUST always pass extra: None; upsert ignores
             // this field. See doc on VirtualKeyCacheEntry::extra.
             extra: None,
@@ -5480,6 +5489,8 @@ mod core_tests {
             supported_providers: vec![],
             provider_base_urls: std::collections::HashMap::new(),
             owner_account_id: Some("acct-1".into()),
+            owner_email: Some("acct-1@test".into()),
+            group_runtime: None,
             extra: None,
             oauth_group_id: oauth_group_id.map(|s| s.to_string()),
             group_accounts: group_accounts.map(|s| s.to_string()),

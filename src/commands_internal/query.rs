@@ -211,6 +211,96 @@ pub(crate) fn team_effective_status(
     }
 }
 
+/// Merge the proxy's LIVE per-account status (the `group_runtime` column's PLAINTEXT
+/// `needs_login` + `is_current_routed` flags — the encrypted secret is ignored) onto
+/// the key-sync candidate snapshot (`group_accounts`), so /user/vault reflects login
+/// + routing within the proxy's 60s poll WITHOUT a manual `aikey key sync` (C1+C2,
+/// 2026-06-30). Precedence (owner-approved): the always-on proxy rail is authoritative
+/// for the logged-in-vs-not axis and for `current_routed`; the key-sync snapshot is the
+/// FALLBACK for an account the proxy hasn't polled yet, and it keeps the finer
+/// `auth_failed`/`revoked` reason when the account is unusable. Returns None when there
+/// are no parseable candidates (direct-bind VK → the web renders no group panel).
+fn merge_group_accounts_live(
+    group_accounts: Option<&str>,
+    group_runtime: Option<&str>,
+) -> Option<serde_json::Value> {
+    let mut cands: Vec<serde_json::Value> = serde_json::from_str(group_accounts?).ok()?;
+    // Proxy's live material map: account_id -> {needs_login, is_current_routed, ...}.
+    // Absent/unparseable → empty → every account falls back to its snapshot value.
+    let runtime: serde_json::Map<String, serde_json::Value> = group_runtime
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    for c in cands.iter_mut() {
+        let Some(obj) = c.as_object_mut() else { continue };
+        let account_id = obj
+            .get("account_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let live = runtime.get(&account_id);
+        // current_routed: proxy-only signal (the snapshot has no equivalent) → false
+        // when the proxy hasn't polled this account/VK yet.
+        let is_current_routed = live
+            .and_then(|m| m.get("is_current_routed"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        obj.insert("current_routed".into(), serde_json::Value::Bool(is_current_routed));
+        // login_status: proxy rail is authoritative for logged-in-vs-not; only override
+        // when the proxy HAS material for this account (else keep the snapshot value).
+        if let Some(m) = live {
+            let needs_login = m
+                .get("needs_login")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let snapshot = obj
+                .get("login_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let merged = if !needs_login {
+                "logged_in" // fresh: member has a usable token now
+            } else if snapshot == "auth_failed" || snapshot == "revoked" {
+                snapshot.as_str() // unusable — keep the finer reason from the snapshot
+            } else {
+                "needs_login"
+            };
+            obj.insert(
+                "login_status".into(),
+                serde_json::Value::String(merged.to_string()),
+            );
+        }
+    }
+    Some(serde_json::Value::Array(cands))
+}
+
+/// Whether the group VK's CURRENT ROUTED account — the one the remote scheduling
+/// engine selected — is logged in. Drives the group-VK usability overlay on
+/// effective_status (owner rule 2026-06-30): a claimed+active group VK is only usable
+/// when the account it actually routes to has a token; otherwise a request goes to
+/// that account and fails (GROUP_NO_CANDIDATES for an empty set, LOGIN_REQUIRED when
+/// the routed account is needs_login) — so it must read inactive (hides the web `use`
+/// button + matches aikey use/list).
+///
+/// Routed account = the candidate the proxy flagged `current_routed` (engine override
+/// ?? rank-0). Before the proxy has stamped it (brief post-sync window), fall back to
+/// the static default (`assigned` = master rank-0) — which IS the routed account when
+/// there is no engine override. Empty set / no routed account resolvable → false
+/// (unusable). Being logged into a DIFFERENT, non-routed account does NOT count: the
+/// engine decides where traffic goes, and that account is what needs a token.
+fn routed_candidate_logged_in(merged: Option<&serde_json::Value>) -> bool {
+    let Some(arr) = merged.and_then(|v| v.as_array()) else {
+        return false;
+    };
+    let flagged = |c: &&serde_json::Value, key: &str| {
+        c.get(key).and_then(|b| b.as_bool()) == Some(true)
+    };
+    let routed = arr
+        .iter()
+        .find(|c| flagged(c, "current_routed"))
+        .or_else(|| arr.iter().find(|c| flagged(c, "assigned")));
+    routed.and_then(|c| c.get("login_status").and_then(|s| s.as_str())) == Some("logged_in")
+}
+
 fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Value> {
     let entries = match storage::list_virtual_key_cache_readonly() {
         Ok(v) => v,
@@ -221,8 +311,26 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
         .map(|t| {
             let effective_alias = t.local_alias.clone().unwrap_or_else(|| t.alias.clone());
             let route_token = format!("aikey_team_{}", t.virtual_key_id);
-            let effective_status =
-                team_effective_status(&t.key_status, &t.share_status, &t.local_state);
+            // Merge the proxy's fresh live status onto the candidate snapshot ONCE —
+            // reused both for the usability overlay below and the group_accounts emit,
+            // so login_status/current_routed are computed a single time.
+            let merged_accounts =
+                merge_group_accounts_live(t.group_accounts.as_deref(), t.group_runtime.as_deref());
+            // Base status from key/share/local; group VKs get a usability overlay: a
+            // claimed+active group VK whose CURRENT ROUTED account isn't logged in can't
+            // route (无可用账号 / needs_login → GROUP_NO_CANDIDATES / LOGIN_REQUIRED), so
+            // it reads inactive — hides the web `use` button + matches aikey use/list
+            // (owner rule 2026-06-30). login_status is the FRESH proxy value, so this
+            // flips to active within the proxy's ≤60s poll after the routed account logs in.
+            let effective_status = {
+                let base = team_effective_status(&t.key_status, &t.share_status, &t.local_state);
+                let is_group_vk = t.oauth_group_id.as_deref().is_some_and(|s| !s.is_empty());
+                if base == "active" && is_group_vk && !routed_candidate_logged_in(merged_accounts.as_ref()) {
+                    "inactive"
+                } else {
+                    base
+                }
+            };
             // Wire-shape normalization for TeamVaultRecord:
             //   - share_status "pending_claim" → "pending" (UI union is
             //     'pending' | 'claimed' | 'revoked'). Pass through
@@ -279,13 +387,16 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
                 // this VK joined + the candidate accounts behind it, so the /user
                 // web can show "joined group X, routed to account Y (default)".
                 // Only group VKs carry these (direct-bind VKs → null). group_accounts
-                // is stored as a JSON string in the vault cache; parse it so the web
-                // receives a real array (null on absent/corrupt, not a raw string).
+                // is the key-sync candidate snapshot; merge_group_accounts_live folds
+                // the proxy's fresh group_runtime status (login_status override +
+                // current_routed) onto each candidate so the web shows LIVE state
+                // (C1+C2, 2026-06-30) without a manual key sync. null on absent/corrupt.
                 "oauth_group_id": t.oauth_group_id,
-                "group_accounts": t
-                    .group_accounts
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+                "group_accounts": merged_accounts,
+                // owner_email: the owning account's email (stamped by sync). Lets
+                // /user/vault show "Owner: <email>" in the drawer — persists for a
+                // group VK left behind after that account logs out.
+                "owner_email": t.owner_email,
             })
         })
         .collect()
@@ -1121,6 +1232,140 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
             "team_active_bindings": active_team,
         }),
     ));
+}
+
+#[cfg(test)]
+mod merge_group_accounts_live_tests {
+    use super::*;
+
+    // Two candidates: a1 (assigned, snapshot says needs_login) and a2.
+    const SNAPSHOT: &str = r#"[
+        {"account_id":"a1","identity":"a1@x","assigned":true,"login_status":"needs_login"},
+        {"account_id":"a2","identity":"a2@x","assigned":false,"login_status":"needs_login"}
+    ]"#;
+
+    fn login_status(v: &serde_json::Value, account_id: &str) -> String {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["account_id"] == account_id)
+            .unwrap()["login_status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+    fn current_routed(v: &serde_json::Value, account_id: &str) -> bool {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["account_id"] == account_id)
+            .unwrap()["current_routed"]
+            .as_bool()
+            .unwrap()
+    }
+
+    // C1 core: proxy's fresh needs_login=false OVERRIDES the stale snapshot
+    // "needs_login" → "logged_in". This is the exact reported bug (logged in but
+    // vault shows 待登录). Break the override (keep snapshot) and this fails.
+    #[test]
+    fn proxy_fresh_login_overrides_stale_snapshot() {
+        let runtime = r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":true}}"#;
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
+        assert_eq!(login_status(&merged, "a1"), "logged_in", "fresh token → logged_in");
+        assert_eq!(login_status(&merged, "a2"), "needs_login", "still no token");
+    }
+
+    // C2 core: is_current_routed from the proxy is surfaced as current_routed.
+    #[test]
+    fn current_routed_flag_surfaced() {
+        let runtime = r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":false}}"#;
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
+        assert!(current_routed(&merged, "a1"), "a1 is the routed account");
+        assert!(!current_routed(&merged, "a2"), "a2 is not routed");
+    }
+
+    // Fallback: proxy hasn't polled (no group_runtime) → snapshot login_status kept,
+    // current_routed defaults false (unknown, not wrongly true).
+    #[test]
+    fn no_runtime_falls_back_to_snapshot() {
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), None).unwrap();
+        assert_eq!(login_status(&merged, "a1"), "needs_login", "snapshot fallback");
+        assert!(!current_routed(&merged, "a1"), "unknown routed → false, not true");
+    }
+
+    // Finer failure reason preserved: proxy says needs_login=true but snapshot has the
+    // specific "revoked" → keep "revoked" (unusable either way, but more informative).
+    #[test]
+    fn unusable_keeps_finer_snapshot_reason() {
+        let snap = r#"[{"account_id":"a1","assigned":true,"login_status":"revoked"}]"#;
+        let runtime = r#"{"a1":{"needs_login":true}}"#;
+        let merged = merge_group_accounts_live(Some(snap), Some(runtime)).unwrap();
+        assert_eq!(login_status(&merged, "a1"), "revoked");
+    }
+
+    // Direct-bind VK (no candidates) → None (web renders no group panel).
+    #[test]
+    fn direct_bind_returns_none() {
+        assert!(merge_group_accounts_live(None, None).is_none());
+        assert!(merge_group_accounts_live(Some("not json"), None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod routed_candidate_logged_in_tests {
+    use super::*;
+    use serde_json::json;
+
+    // Owner rule (2026-06-30): usable iff the CURRENT ROUTED account (engine pick) is
+    // logged in. current_routed=a1 logged_in → usable.
+    #[test]
+    fn routed_account_logged_in_is_usable() {
+        let m = json!([
+            {"account_id":"a1","assigned":true,"current_routed":true,"login_status":"logged_in"},
+            {"account_id":"a2","assigned":false,"current_routed":false,"login_status":"needs_login"}
+        ]);
+        assert!(routed_candidate_logged_in(Some(&m)));
+    }
+
+    // STRICT: logged into a NON-routed account does NOT count. routed (a1) needs_login,
+    // a2 logged_in but not routed → NOT usable. 能红: a looser "any logged in" gate
+    // would wrongly pass this.
+    #[test]
+    fn logged_into_non_routed_account_is_not_usable() {
+        let m = json!([
+            {"account_id":"a1","assigned":true,"current_routed":true,"login_status":"needs_login"},
+            {"account_id":"a2","assigned":false,"current_routed":false,"login_status":"logged_in"}
+        ]);
+        assert!(!routed_candidate_logged_in(Some(&m)));
+    }
+
+    // Fallback: proxy hasn't stamped current_routed yet → use the static default
+    // (assigned = rank-0). assigned a1 logged_in → usable.
+    #[test]
+    fn falls_back_to_assigned_when_no_current_routed() {
+        let m = json!([
+            {"account_id":"a1","assigned":true,"login_status":"logged_in"},
+            {"account_id":"a2","assigned":false,"login_status":"needs_login"}
+        ]);
+        assert!(routed_candidate_logged_in(Some(&m)));
+    }
+
+    // 无可用账号: empty candidate set (seat unbound) → not usable.
+    #[test]
+    fn empty_candidate_set_is_not_usable() {
+        assert!(!routed_candidate_logged_in(Some(&json!([]))));
+        assert!(!routed_candidate_logged_in(None));
+    }
+
+    // All needs_login (member signed into nothing) → routed account needs_login → not usable.
+    #[test]
+    fn all_needs_login_is_not_usable() {
+        let m = json!([
+            {"account_id":"a1","assigned":true,"login_status":"needs_login"},
+            {"account_id":"a2","assigned":false,"login_status":"needs_login"}
+        ]);
+        assert!(!routed_candidate_logged_in(Some(&m)));
+    }
 }
 
 #[cfg(test)]
