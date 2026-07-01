@@ -1414,9 +1414,7 @@ pub fn run_connectivity_suite(
     if json_mode {
         for t in &targets {
             let r = test_provider_connectivity(&t.provider_code, &t.base_url, &t.bearer, t.kind);
-            if r.chat_ok {
-                any_chat_ok = true;
-            } else if r.chat_skipped && r.api_ok {
+            if r.chat_ok || (r.chat_skipped && r.api_ok) {
                 any_chat_ok = true;
             }
             if r.ping_ok {
@@ -1803,9 +1801,7 @@ pub fn run_connectivity_suite(
         if r.ping_ok {
             any_reachable = true;
         }
-        if r.chat_ok {
-            any_chat_ok = true;
-        } else if r.chat_skipped && r.api_ok {
+        if r.chat_ok || (r.chat_skipped && r.api_ok) {
             any_chat_ok = true;
         }
 
