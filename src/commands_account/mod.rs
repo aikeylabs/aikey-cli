@@ -2738,7 +2738,7 @@ fn apply_snapshot_to_cache(
             supported_providers: item.supported_providers.clone(),
             provider_base_urls: item.provider_base_urls.clone(),
             owner_account_id: Some(current_account_id.to_string()),
-            owner_email: None, // upsert stamps the current account's email
+            owner_email: None,   // upsert stamps the current account's email
             group_runtime: None, // proxy-owned (channel ③) — never written from here
 
             // Sync writers MUST always set extra: None. The value is
@@ -3026,7 +3026,7 @@ pub(crate) fn upsert_delivered_key(
         supported_providers: dk.supported_providers.clone(),
         provider_base_urls: dk.provider_base_urls.clone(),
         owner_account_id: dk.owner_account_id.clone(),
-        owner_email: None, // upsert stamps the current account's email
+        owner_email: None,   // upsert stamps the current account's email
         group_runtime: None, // proxy-owned (channel ③) — never written from here
 
         // Sync writers MUST always pass extra: None; upsert ignores this
@@ -6876,7 +6876,6 @@ mod browse_url_tests {
         let got = resolve_browse_base_url("http://192.168.0.240:3000/", None);
         assert_eq!(got, "http://192.168.0.240:3000");
     }
-
 }
 
 // ============================================================================

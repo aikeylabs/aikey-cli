@@ -9,11 +9,14 @@
 //!
 //! - **I-7a (identity)**: only PIDs whose process executable basename ==
 //!   `"aikey-proxy"` may produce `Running` / `Unresponsive`. PIDs that fail
-//!   identity check fall to `OrphanedPort` (read-only, never killed).
+//!   identity check fall to `OrphanedPort` when the configured port is
+//!   actually held, or `Crashed` (stale on-disk files, cleanable) when the
+//!   port is free. Neither state is ever signalled.
 //! - **I-7b (ownership)**: only PIDs whose `process_birth_token` matches
 //!   the sidecar `meta.birth_token` may produce `Running` / `Unresponsive`.
 //!   PID recycle to *another* aikey-proxy instance is caught here and
-//!   demoted to `OrphanedPort`.
+//!   demoted the same way (port held → `OrphanedPort`, port free →
+//!   `Crashed`).
 //!
 //! These invariants together guarantee that any state Layer 2 will act on
 //! (`Running` / `Unresponsive` → `kill our PID`) is genuinely **our**
@@ -106,9 +109,22 @@ pub enum ProxyState {
     /// is verified.
     Unresponsive { pid: u32, port: u16 },
 
-    /// pidfile points at a PID that is no longer alive. The pidfile + any
-    /// stale sidecar meta should be cleaned by the next `start_proxy` /
-    /// `stop_proxy`. No process to kill.
+    /// The on-disk lifecycle files are stale and the configured port is
+    /// free: the pidfile PID is either no longer alive, or alive but
+    /// provably NOT our proxy (identity/ownership failed — e.g. the OS
+    /// recycled the PID to an unrelated process after a reboot). Either
+    /// way there is nothing of ours running: the pidfile + sidecar meta
+    /// should be cleaned by the next `start_proxy` / `stop_proxy`, and
+    /// starting is safe (bind cannot conflict, no signal is ever sent to
+    /// `stale_pid`).
+    ///
+    /// Why "alive but not ours + port free" lands here and not in
+    /// `OrphanedPort` (2026-07-01 bugfix): after a machine reboot the
+    /// leftover pidfile's low PID is very likely reused by a boot
+    /// daemon; classifying that as `OrphanedPort` locked out
+    /// start/stop/restart/ensure-running even though port 27200 was
+    /// completely free — the user's only escape was manually deleting
+    /// `~/.aikey/run/proxy.pid`.
     Crashed { stale_pid: u32 },
 
     /// **Read-only diagnostic state** — port is owned by some process the
@@ -129,22 +145,28 @@ pub enum ProxyState {
 /// Why a state was classified as `OrphanedPort`. Drives the actionable
 /// hint we show the user — "stop the other process" vs "your old proxy
 /// from before the upgrade is in the way" call for very different fixes.
+/// All three pidfile-derived reasons are only produced when the
+/// configured port is **actually held** by that PID (2026-07-01 bugfix);
+/// with the port free the same signals classify as `Crashed` (stale
+/// files) instead, so a leftover pidfile can never lock the user out of
+/// start/stop/restart.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrphanReason {
     /// The PID under our pidfile is alive but its executable is not
-    /// `aikey-proxy` — the kernel reused the PID for an unrelated process.
+    /// `aikey-proxy` — the kernel reused the PID for an unrelated
+    /// process, and that process is now listening on our configured port.
     PidRecycledToNonProxy,
 
-    /// The PID under our pidfile is an `aikey-proxy` process, but no
-    /// sidecar meta file exists. Most likely a proxy spawned by a
-    /// pre-Round-5 CLI (legacy upgrade path) — we can't prove ownership,
-    /// so we don't touch it.
+    /// The PID under our pidfile is an `aikey-proxy` process holding the
+    /// port, but no sidecar meta file exists. Most likely a proxy spawned
+    /// by a pre-Round-5 CLI (legacy upgrade path) — we can't prove
+    /// ownership, so we don't touch it.
     LegacyPidfileNoSidecar,
 
-    /// The PID under our pidfile is an `aikey-proxy` process AND a sidecar
-    /// meta exists, but `birth_token` mismatches — the kernel reused the
-    /// PID for a *different* aikey-proxy instance (e.g., user manually
-    /// started another proxy, sandbox install, etc.).
+    /// The PID under our pidfile is an `aikey-proxy` process holding the
+    /// port AND a sidecar meta exists, but `birth_token` mismatches — the
+    /// kernel reused the PID for a *different* aikey-proxy instance
+    /// (e.g., user manually started another proxy, sandbox install, etc.).
     PidRecycledToDifferentInstance,
 
     /// No pidfile, but the configured port is held by some other process.
@@ -161,7 +183,8 @@ impl OrphanReason {
             .unwrap_or_else(|| "unknown owner".to_string());
         match self {
             OrphanReason::PidRecycledToNonProxy => format!(
-                "pidfile points at PID that has been reused for an unrelated process; \
+                "pidfile points at PID that has been reused for an unrelated process, \
+                 and that process ({owner}) is listening on port {port}; \
                  run `{}` to inspect",
                 crate::proxy_proc::port_inspect_command(port),
             ),
@@ -463,8 +486,10 @@ fn read_pidfile(path: &std::path::Path) -> Option<u32> {
 ///   (`process_birth_token(pid) == sidecar meta.birth_token`) succeed.
 ///   Layer 2 may safely kill PIDs in these states.
 /// - All identity / ownership failures fall to `OrphanedPort` with a
-///   specific [`OrphanReason`] for actionable diagnostics. Layer 2 is
-///   forbidden from sending signals to these PIDs.
+///   specific [`OrphanReason`] when the configured port is actually
+///   held, or to `Crashed` (stale files) when it is free — see
+///   [`classify_alive_unowned_pid`]. Layer 2 is forbidden from sending
+///   signals to the PIDs in either state.
 pub fn compute_proxy_state(inputs: &StateInputs) -> ProxyState {
     let (_host, port) = inputs.host_port();
 
@@ -483,11 +508,7 @@ pub fn compute_proxy_state(inputs: &StateInputs) -> ProxyState {
         // 2b. PID is alive. Check identity (I-7a).
         if !crate::proxy_proc::is_aikey_proxy(pid) {
             // PID was reused for a non-aikey-proxy process. Not ours.
-            return ProxyState::OrphanedPort {
-                port,
-                owner_pid: Some(pid),
-                reason: OrphanReason::PidRecycledToNonProxy,
-            };
+            return classify_alive_unowned_pid(pid, port, OrphanReason::PidRecycledToNonProxy);
         }
         // 2c. Check ownership (I-7b) — sidecar meta + birth_token.
         let meta_result = read_meta_at(&inputs.meta_path);
@@ -495,11 +516,7 @@ pub fn compute_proxy_state(inputs: &StateInputs) -> ProxyState {
             Ok(m) => m,
             Err(MetaError::Read { missing: true, .. }) => {
                 // Legacy: pre-Round-5 CLI started this proxy, no sidecar.
-                return ProxyState::OrphanedPort {
-                    port,
-                    owner_pid: Some(pid),
-                    reason: OrphanReason::LegacyPidfileNoSidecar,
-                };
+                return classify_alive_unowned_pid(pid, port, OrphanReason::LegacyPidfileNoSidecar);
             }
             Err(_) => {
                 // Sidecar present but corrupt / wrong schema. Ownership
@@ -507,21 +524,17 @@ pub fn compute_proxy_state(inputs: &StateInputs) -> ProxyState {
                 // legacy upgrade case for the user-facing hint, since
                 // the actionable fix is the same (manual stop + restart
                 // through current CLI).
-                return ProxyState::OrphanedPort {
-                    port,
-                    owner_pid: Some(pid),
-                    reason: OrphanReason::LegacyPidfileNoSidecar,
-                };
+                return classify_alive_unowned_pid(pid, port, OrphanReason::LegacyPidfileNoSidecar);
             }
         };
         // pid in meta must match the pidfile pid (sanity — they should
         // have been written together). If not, the sidecar is stale.
         if meta.pid != pid {
-            return ProxyState::OrphanedPort {
+            return classify_alive_unowned_pid(
+                pid,
                 port,
-                owner_pid: Some(pid),
-                reason: OrphanReason::PidRecycledToDifferentInstance,
-            };
+                OrphanReason::PidRecycledToDifferentInstance,
+            );
         }
         // birth_token must match the LIVE process's token. This is the
         // load-bearing check that catches PID-recycle-to-another-
@@ -531,19 +544,19 @@ pub fn compute_proxy_state(inputs: &StateInputs) -> ProxyState {
             Err(_) => {
                 // Could not read live token (process disappeared in the
                 // race, permission denied, ABI mismatch). Conservative.
-                return ProxyState::OrphanedPort {
+                return classify_alive_unowned_pid(
+                    pid,
                     port,
-                    owner_pid: Some(pid),
-                    reason: OrphanReason::PidRecycledToDifferentInstance,
-                };
+                    OrphanReason::PidRecycledToDifferentInstance,
+                );
             }
         };
         if live_token != meta.birth_token {
-            return ProxyState::OrphanedPort {
+            return classify_alive_unowned_pid(
+                pid,
                 port,
-                owner_pid: Some(pid),
-                reason: OrphanReason::PidRecycledToDifferentInstance,
-            };
+                OrphanReason::PidRecycledToDifferentInstance,
+            );
         }
         // 2d. Identity ✓ + ownership ✓ — we own this PID. Now check
         // whether the proxy is actually serving requests on the port.
@@ -620,6 +633,49 @@ fn classify_dead_pid(stale_pid: u32, port: u16) -> ProxyState {
             reason: OrphanReason::PortHeldByExternal,
         },
         Ok(None) | Err(_) => ProxyState::Crashed { stale_pid },
+    }
+}
+
+/// Helper: for an ALIVE pidfile PID that failed identity/ownership
+/// verification, classify by what actually holds the configured port —
+/// symmetric with [`classify_dead_pid`].
+///
+/// Why (2026-07-01 bugfix): the previous behavior returned
+/// `OrphanedPort { owner_pid: pidfile_pid }` unconditionally, without
+/// probing the port. After a machine reboot the leftover pidfile's low
+/// PID is routinely reused by a boot daemon (observed on dev2: `icdd`
+/// took PID 789), so start/stop/restart/ensure-running were all refused
+/// even though the port was completely free — a main-path lockout whose
+/// only escape was manually deleting `~/.aikey/run/proxy.pid`. It also
+/// reported that recycled PID as the port "owner", sending users to
+/// inspect a port nothing was listening on.
+///
+/// - Port free → `Crashed` (stale files; cleanup + start are safe, no
+///   signal is ever sent — invariant I-1 holds because Layer 2 never
+///   signals `Crashed.stale_pid`).
+/// - Port held by the pidfile PID itself → `OrphanedPort` with the
+///   caller's reason (the unowned process really is serving our port).
+/// - Port held by a third process → `OrphanedPort` with
+///   `PortHeldByExternal` and the REAL owner pid, so diagnostics point
+///   at the actual listener.
+/// - Port probe tooling failed → `Crashed`, same degradation policy as
+///   [`classify_dead_pid`] and the no-pidfile branch: better to attempt
+///   a start (its own bind surfaces real conflicts) than refuse forever.
+fn classify_alive_unowned_pid(pidfile_pid: u32, port: u16, reason: OrphanReason) -> ProxyState {
+    match crate::proxy_proc::port_owner_pid(port) {
+        Ok(Some(owner)) if owner == pidfile_pid => ProxyState::OrphanedPort {
+            port,
+            owner_pid: Some(owner),
+            reason,
+        },
+        Ok(Some(owner)) => ProxyState::OrphanedPort {
+            port,
+            owner_pid: Some(owner),
+            reason: OrphanReason::PortHeldByExternal,
+        },
+        Ok(None) | Err(_) => ProxyState::Crashed {
+            stale_pid: pidfile_pid,
+        },
     }
 }
 
@@ -931,60 +987,115 @@ mod tests {
         );
     }
 
-    /// pidfile points at PID 1 (init/launchd) → identity check fails
-    /// → OrphanedPort with PidRecycledToNonProxy reason. Pinned because
-    /// this is the I-7a check fired in production.
+    /// **2026-07-01 regression pin (reboot lockout)**: pidfile points at
+    /// PID 1 (init/launchd — alive, never aikey-proxy) while the
+    /// configured port is FREE → must classify `Crashed` (stale files,
+    /// recoverable), NOT `OrphanedPort`. This is exactly the state a
+    /// machine reboot leaves behind when a boot daemon reuses the
+    /// leftover pidfile's PID (dev2 incident: `icdd` took PID 789);
+    /// classifying it OrphanedPort locked out start/stop/restart even
+    /// though nothing was listening.
     #[test]
-    fn state_branch_orphaned_when_pid_recycled_to_non_proxy() {
+    fn state_recycled_pid_with_free_port_is_crashed_not_orphaned() {
         let tmp = tempfile::tempdir().unwrap();
         let port = pick_free_port_for_state_tests();
         let inputs = build_inputs(tmp.path(), port);
         // PID 1 = init / launchd / SYSTEM — guaranteed alive, never
         // aikey-proxy.
         std::fs::write(&inputs.pid_path, "1").unwrap();
-        match compute_proxy_state(&inputs) {
-            ProxyState::OrphanedPort {
-                owner_pid: Some(1),
-                reason: OrphanReason::PidRecycledToNonProxy,
-                ..
-            } => {} // expected
-            other => panic!("expected OrphanedPort/PidRecycledToNonProxy, got {other:?}"),
-        }
+        assert_eq!(
+            compute_proxy_state(&inputs),
+            ProxyState::Crashed { stale_pid: 1 },
+            "recycled pidfile PID + free port must be recoverable (Crashed), not a lockout"
+        );
     }
 
-    /// pidfile points at our self-PID (alive) but no sidecar meta →
-    /// OrphanedPort with LegacyPidfileNoSidecar reason. This is the
-    /// upgrade-friction case from Round 5: a pre-Round-5 CLI started
-    /// the proxy and didn't write sidecar.
-    ///
-    /// Note: self-PID *is* the cargo test runner, not aikey-proxy, so
-    /// identity check would fail FIRST → PidRecycledToNonProxy. We
-    /// can't easily fake "alive PID with aikey-proxy basename" in a
-    /// pure unit test. The semantically-correct branch is exercised
-    /// in Stage 2 integration tests using the real aikey-proxy
-    /// binary. Here we just pin that the no-sidecar case eventually
-    /// lands in OrphanedPort regardless of the exact reason.
+    /// pidfile points at an alive non-proxy PID AND that same PID holds
+    /// the configured port → OrphanedPort with PidRecycledToNonProxy and
+    /// owner_pid = the real listener. We fake it with our own PID: the
+    /// cargo test runner is alive, is not aikey-proxy, and holds the
+    /// listener we bind here. Pinned because this is the I-7a check
+    /// fired in production, now gated on the port actually being held.
     #[test]
-    fn state_no_sidecar_lands_in_orphanedport() {
+    fn state_branch_orphaned_when_pid_recycled_to_non_proxy_holds_port() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let inputs = build_inputs(tmp.path(), port);
+        let me = std::process::id();
+        std::fs::write(&inputs.pid_path, me.to_string()).unwrap();
+        match compute_proxy_state(&inputs) {
+            ProxyState::OrphanedPort {
+                owner_pid: Some(pid),
+                reason: OrphanReason::PidRecycledToNonProxy,
+                ..
+            } => {
+                assert_eq!(pid, me, "owner_pid must be the actual port holder");
+            }
+            // lsof missing → port owner lookup degrades → Crashed per
+            // the documented policy. Acceptable but skip.
+            ProxyState::Crashed { .. } => {
+                eprintln!("[skip] lsof not available — port owner lookup degraded");
+            }
+            other => panic!("expected OrphanedPort/PidRecycledToNonProxy, got {other:?}"),
+        }
+        drop(listener);
+    }
+
+    /// pidfile points at an alive non-proxy PID while a THIRD process
+    /// holds the port → OrphanedPort must report the REAL port owner
+    /// with PortHeldByExternal, not the stale pidfile PID. Before the
+    /// 2026-07-01 fix, status printed `owner: pid <pidfile-pid>` and the
+    /// hint sent users to lsof a port that PID never held.
+    ///
+    /// PID 1 plays the recycled pidfile PID (alive, not aikey-proxy,
+    /// definitely not holding our ephemeral test port — we hold it).
+    #[test]
+    fn state_recycled_pid_with_port_held_by_third_reports_real_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let inputs = build_inputs(tmp.path(), port);
+        std::fs::write(&inputs.pid_path, "1").unwrap();
+        match compute_proxy_state(&inputs) {
+            ProxyState::OrphanedPort {
+                owner_pid: Some(pid),
+                reason: OrphanReason::PortHeldByExternal,
+                ..
+            } => {
+                assert_eq!(
+                    pid,
+                    std::process::id(),
+                    "owner_pid must be the actual listener, not the stale pidfile PID"
+                );
+            }
+            ProxyState::Crashed { .. } => {
+                eprintln!("[skip] lsof not available — port owner lookup degraded");
+            }
+            other => panic!("expected OrphanedPort/PortHeldByExternal, got {other:?}"),
+        }
+        drop(listener);
+    }
+
+    /// pidfile points at our self-PID (alive) with no sidecar meta and
+    /// the port free → `Crashed` (stale files). In the field the
+    /// no-sidecar case matters when the legacy proxy still HOLDS the
+    /// port (→ OrphanedPort/LegacyPidfileNoSidecar, exercised in the
+    /// e2e suite with the real aikey-proxy binary); with the port free
+    /// there is nothing serving, so the files are just stale.
+    #[test]
+    fn state_no_sidecar_with_free_port_is_crashed() {
         let tmp = tempfile::tempdir().unwrap();
         let port = pick_free_port_for_state_tests();
         let inputs = build_inputs(tmp.path(), port);
         let me = std::process::id();
         std::fs::write(&inputs.pid_path, me.to_string()).unwrap();
-        // No sidecar written. Even though we WANT this to surface as
-        // LegacyPidfileNoSidecar in the field, here identity will fail
-        // first (we are the cargo test runner, not aikey-proxy). So
-        // assert the OrphanedPort outer branch — both reasons produce
-        // identical Layer 2 behavior (do not touch).
-        match compute_proxy_state(&inputs) {
-            ProxyState::OrphanedPort {
-                owner_pid: Some(pid),
-                ..
-            } => {
-                assert_eq!(pid, me, "OrphanedPort owner_pid should be the pidfile pid");
-            }
-            other => panic!("expected OrphanedPort, got {other:?}"),
-        }
+        // No sidecar written; identity fails first anyway (we are the
+        // cargo test runner, not aikey-proxy). Port free → stale.
+        assert_eq!(
+            compute_proxy_state(&inputs),
+            ProxyState::Crashed { stale_pid: me }
+        );
     }
 
     /// No pidfile + something else holding the port → OrphanedPort

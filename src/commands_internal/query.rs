@@ -256,11 +256,18 @@ fn merge_group_accounts_live(
     // Fast rail authoritative for membership. Index the snapshot for metadata fallback.
     let snap_by_id: std::collections::HashMap<&str, &Value> = snapshot
         .iter()
-        .filter_map(|c| c.get("account_id").and_then(|v| v.as_str()).map(|id| (id, c)))
+        .filter_map(|c| {
+            c.get("account_id")
+                .and_then(|v| v.as_str())
+                .map(|id| (id, c))
+        })
         .collect();
 
     let live_str = |live: &Value, key: &str| -> String {
-        live.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+        live.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
     };
 
     let mut merged: Vec<Value> = Vec::with_capacity(runtime.len());
@@ -274,8 +281,14 @@ fn merge_group_accounts_live(
                 let mut o = serde_json::Map::new();
                 o.insert("account_id".into(), Value::String(account_id.clone()));
                 o.insert("identity".into(), Value::String(live_str(live, "identity")));
-                o.insert("provider_code".into(), Value::String(live_str(live, "provider_code")));
-                o.insert("credential_type".into(), Value::String(live_str(live, "credential_type")));
+                o.insert(
+                    "provider_code".into(),
+                    Value::String(live_str(live, "provider_code")),
+                );
+                o.insert(
+                    "credential_type".into(),
+                    Value::String(live_str(live, "credential_type")),
+                );
                 let prio = live.get("priority").and_then(|v| v.as_i64()).unwrap_or(0);
                 o.insert("priority".into(), Value::Number(prio.into()));
                 o.insert("assigned".into(), Value::Bool(false)); // rail has no static default
@@ -283,10 +296,20 @@ fn merge_group_accounts_live(
             }
         };
         // Overlay the rail-authoritative fields (both regimes of `obj`).
-        let needs_login = live.get("needs_login").and_then(|v| v.as_bool()).unwrap_or(false);
-        let is_current_routed = live.get("is_current_routed").and_then(|v| v.as_bool()).unwrap_or(false);
+        let needs_login = live
+            .get("needs_login")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let is_current_routed = live
+            .get("is_current_routed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         obj.insert("current_routed".into(), Value::Bool(is_current_routed));
-        let snap_login = obj.get("login_status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let snap_login = obj
+            .get("login_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let login_status = if !needs_login {
             "logged_in"
         } else if snap_login == "auth_failed" || snap_login == "revoked" {
@@ -294,7 +317,10 @@ fn merge_group_accounts_live(
         } else {
             "needs_login"
         };
-        obj.insert("login_status".into(), Value::String(login_status.to_string()));
+        obj.insert(
+            "login_status".into(),
+            Value::String(login_status.to_string()),
+        );
         merged.push(Value::Object(obj));
     }
     // Deterministic display order: priority asc, then account_id (serde_json::Map's own
@@ -329,9 +355,8 @@ fn routed_candidate_logged_in(merged: Option<&serde_json::Value>) -> bool {
     let Some(arr) = merged.and_then(|v| v.as_array()) else {
         return false;
     };
-    let flagged = |c: &&serde_json::Value, key: &str| {
-        c.get(key).and_then(|b| b.as_bool()) == Some(true)
-    };
+    let flagged =
+        |c: &&serde_json::Value, key: &str| c.get(key).and_then(|b| b.as_bool()) == Some(true);
     let routed = arr
         .iter()
         .find(|c| flagged(c, "current_routed"))
@@ -363,7 +388,10 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
             let effective_status = {
                 let base = team_effective_status(&t.key_status, &t.share_status, &t.local_state);
                 let is_group_vk = t.oauth_group_id.as_deref().is_some_and(|s| !s.is_empty());
-                if base == "active" && is_group_vk && !routed_candidate_logged_in(merged_accounts.as_ref()) {
+                if base == "active"
+                    && is_group_vk
+                    && !routed_candidate_logged_in(merged_accounts.as_ref())
+                {
                     "inactive"
                 } else {
                     base
@@ -1311,16 +1339,22 @@ mod merge_group_accounts_live_tests {
     // vault shows 待登录). Break the override (keep snapshot) and this fails.
     #[test]
     fn proxy_fresh_login_overrides_stale_snapshot() {
-        let runtime = r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":true}}"#;
+        let runtime =
+            r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":true}}"#;
         let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
-        assert_eq!(login_status(&merged, "a1"), "logged_in", "fresh token → logged_in");
+        assert_eq!(
+            login_status(&merged, "a1"),
+            "logged_in",
+            "fresh token → logged_in"
+        );
         assert_eq!(login_status(&merged, "a2"), "needs_login", "still no token");
     }
 
     // C2 core: is_current_routed from the proxy is surfaced as current_routed.
     #[test]
     fn current_routed_flag_surfaced() {
-        let runtime = r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":false}}"#;
+        let runtime =
+            r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":false}}"#;
         let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
         assert!(current_routed(&merged, "a1"), "a1 is the routed account");
         assert!(!current_routed(&merged, "a2"), "a2 is not routed");
@@ -1331,8 +1365,15 @@ mod merge_group_accounts_live_tests {
     #[test]
     fn no_runtime_falls_back_to_snapshot() {
         let merged = merge_group_accounts_live(Some(SNAPSHOT), None).unwrap();
-        assert_eq!(login_status(&merged, "a1"), "needs_login", "snapshot fallback");
-        assert!(!current_routed(&merged, "a1"), "unknown routed → false, not true");
+        assert_eq!(
+            login_status(&merged, "a1"),
+            "needs_login",
+            "snapshot fallback"
+        );
+        assert!(
+            !current_routed(&merged, "a1"),
+            "unknown routed → false, not true"
+        );
     }
 
     // Finer failure reason preserved: proxy says needs_login=true but snapshot has the
@@ -1360,7 +1401,11 @@ mod merge_group_accounts_live_tests {
             .collect()
     }
     fn find<'a>(v: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
-        v.as_array().unwrap().iter().find(|c| c["account_id"] == id).unwrap()
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["account_id"] == id)
+            .unwrap()
     }
 
     // 2026-07-01 membership: the fast rail is AUTHORITATIVE for the candidate LIST. An
@@ -1375,10 +1420,17 @@ mod merge_group_accounts_live_tests {
             "a3":{"needs_login":true,"identity":"a3@x","provider_code":"anthropic","priority":5}
         }"#;
         let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
-        assert!(ids(&merged).contains(&"a3".to_string()), "fast-rail-only account must appear: {:?}", ids(&merged));
+        assert!(
+            ids(&merged).contains(&"a3".to_string()),
+            "fast-rail-only account must appear: {:?}",
+            ids(&merged)
+        );
         let a3 = find(&merged, "a3");
         assert_eq!(a3["identity"], "a3@x", "identity from the rail");
-        assert_eq!(a3["provider_code"], "anthropic", "provider_code from the rail");
+        assert_eq!(
+            a3["provider_code"], "anthropic",
+            "provider_code from the rail"
+        );
         assert_eq!(a3["priority"], 5, "priority from the rail");
         assert_eq!(a3["login_status"], "needs_login");
     }
@@ -1389,14 +1441,19 @@ mod merge_group_accounts_live_tests {
     fn fast_rail_drops_removed_account() {
         let runtime = r#"{"a1":{"needs_login":false,"is_current_routed":true}}"#;
         let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
-        assert_eq!(ids(&merged), vec!["a1".to_string()], "a2 (gone from rail) must drop");
+        assert_eq!(
+            ids(&merged),
+            vec!["a1".to_string()],
+            "a2 (gone from rail) must drop"
+        );
     }
 
     // For an account in BOTH, the richer snapshot metadata is preserved (identity/assigned
     // from the snapshot), only the rail-authoritative flags overlay.
     #[test]
     fn account_in_both_keeps_snapshot_meta() {
-        let runtime = r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":false}}"#;
+        let runtime =
+            r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":false}}"#;
         let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
         let a1 = find(&merged, "a1");
         assert_eq!(a1["identity"], "a1@x", "snapshot identity preserved");

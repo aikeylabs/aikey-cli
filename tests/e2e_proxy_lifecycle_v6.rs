@@ -15,6 +15,8 @@
 //!   escalation
 //! - **E-series** (events log): E1a lifecycle event content
 //! - **C-series** (cache fast path): C1 ensure-running warm path
+//! - **R-series** (reboot recovery, 2026-07-01 bugfix): R1 restart / R2
+//!   stop recover from a reboot-recycled pidfile with the port free
 //!
 //! ## Test infrastructure
 //!
@@ -1435,6 +1437,130 @@ fn i3_foreground_forwards_sigterm_to_child() {
         !proxy_alive,
         "proxy child (PID {proxy_pid}) MUST be dead after CLI received \
          SIGTERM — install-script fix #1a signal forwarding regression!"
+    );
+}
+
+// ── R series: reboot-recovery regression (2026-07-01 bugfix) ─────────
+//
+// Scenario: a machine reboot leaves ~/.aikey/run/proxy.pid behind, and a
+// boot daemon reuses that PID (alive, NOT aikey-proxy) while the
+// configured port stays FREE (observed on dev2: `icdd` took PID 789).
+// Old behavior classified this OrphanedPort → start/stop/restart/
+// ensure-running ALL refused; the only escape was manually deleting the
+// pidfile. Fixed behavior classifies it Crashed (stale files) and every
+// entry point recovers. PID 1 (init/launchd) stands in for the recycled
+// PID: guaranteed alive forever and never aikey-proxy.
+//
+// Bugfix record: workflow/CI/bugfix/
+// 2026-07-01-proxy-orphaned-lockout-reboot-pid-reuse.md (BR-v1.0.1-17)
+
+/// R1: status on the post-reboot state must say "stale pid file", NOT
+/// "orphaned", and `proxy restart` (the exact command the user was
+/// locked out of) must recover in one shot without signalling PID 1.
+#[test]
+fn r1_recycled_pidfile_free_port_restart_recovers() {
+    let env = match Env::try_new("r1-reboot-restart") {
+        Some(e) => e,
+        None => return skip("AIKEY_PROXY_BIN not found"),
+    };
+
+    // Fabricate the post-reboot state: pidfile → PID 1, no sidecar meta,
+    // port free (Env picked a free port and nothing was started).
+    env.write_pidfile(1);
+    assert!(!env.meta_path().exists(), "precondition: no sidecar meta");
+
+    let out = env
+        .cmd()
+        .args(["proxy", "status"])
+        .output()
+        .expect("status");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let lower = combined.to_lowercase();
+    assert!(
+        !lower.contains("orphan"),
+        "recycled pidfile + FREE port must not be reported orphaned \
+         (that was the lockout bug); got:\n{combined}"
+    );
+    assert!(
+        lower.contains("stale"),
+        "status should surface the stale pidfile diagnostic; got:\n{combined}"
+    );
+
+    // The locked-out user path: restart must clean up + spawn.
+    let out = env
+        .cmd()
+        .args(["proxy", "restart"])
+        .output()
+        .expect("restart");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        out.status.success(),
+        "restart must recover from the post-reboot state; got:\n{combined}"
+    );
+    assert!(env.wait_status(true, 10), "proxy not running after restart");
+
+    // Pidfile must now belong to the freshly spawned proxy, not PID 1.
+    let new_pid: u32 = std::fs::read_to_string(env.pid_path())
+        .expect("read pidfile")
+        .trim()
+        .parse()
+        .expect("parse pid");
+    assert_ne!(new_pid, 1, "pidfile must be rewritten to the new proxy");
+    assert!(env.meta_path().exists(), "sidecar meta must be rewritten");
+
+    // Invariant I-1: PID 1 never received any signal.
+    let pid1_ret = unsafe { libc::kill(1, 0) };
+    let pid1_errno = std::io::Error::last_os_error().raw_os_error();
+    assert!(
+        pid1_ret == 0 || pid1_errno == Some(libc::EPERM),
+        "PID 1 must still be alive (never signalled); ret={pid1_ret}, errno={pid1_errno:?}"
+    );
+}
+
+/// R2: `proxy stop` on the same post-reboot state must exit 0 and clean
+/// the stale files (old behavior: non-zero "port not owned by us" and
+/// the files stayed, blocking everything downstream).
+#[test]
+fn r2_recycled_pidfile_free_port_stop_cleans_and_succeeds() {
+    let env = match Env::try_new("r2-reboot-stop") {
+        Some(e) => e,
+        None => return skip("AIKEY_PROXY_BIN not found"),
+    };
+
+    env.write_pidfile(1);
+
+    let out = env.cmd().args(["proxy", "stop"]).output().expect("stop");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        out.status.success(),
+        "stop on stale (recycled-pid, free-port) state must succeed; got:\n{combined}"
+    );
+    assert!(
+        !env.pid_path().exists(),
+        "stale pidfile must be cleaned by stop"
+    );
+    assert!(
+        !env.meta_path().exists(),
+        "stale sidecar meta must be cleaned by stop"
+    );
+
+    let pid1_ret = unsafe { libc::kill(1, 0) };
+    let pid1_errno = std::io::Error::last_os_error().raw_os_error();
+    assert!(
+        pid1_ret == 0 || pid1_errno == Some(libc::EPERM),
+        "PID 1 must still be alive (never signalled); ret={pid1_ret}, errno={pid1_errno:?}"
     );
 }
 
