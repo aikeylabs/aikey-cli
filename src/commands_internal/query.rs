@@ -211,66 +211,104 @@ pub(crate) fn team_effective_status(
     }
 }
 
-/// Merge the proxy's LIVE per-account status (the `group_runtime` column's PLAINTEXT
-/// `needs_login` + `is_current_routed` flags — the encrypted secret is ignored) onto
-/// the key-sync candidate snapshot (`group_accounts`), so /user/vault reflects login
-/// + routing within the proxy's 60s poll WITHOUT a manual `aikey key sync` (C1+C2,
-/// 2026-06-30). Precedence (owner-approved): the always-on proxy rail is authoritative
-/// for the logged-in-vs-not axis and for `current_routed`; the key-sync snapshot is the
-/// FALLBACK for an account the proxy hasn't polled yet, and it keeps the finer
-/// `auth_failed`/`revoked` reason when the account is unusable. Returns None when there
-/// are no parseable candidates (direct-bind VK → the web renders no group panel).
+/// Merge the proxy's LIVE per-account material (`group_runtime`, PLAINTEXT flags +
+/// display meta — the encrypted secret is ignored) with the key-sync candidate snapshot
+/// (`group_accounts`), so /user/vault reflects login + routing + MEMBERSHIP within the
+/// proxy's 60s poll WITHOUT a manual `aikey key sync`.
+///
+/// Two regimes (owner-approved):
+///   - **Fast rail present** (proxy has polled this VK): the rail is AUTHORITATIVE for
+///     LIST MEMBERSHIP (C1+C2 extended 2026-07-01) — the candidate list tracks the rail
+///     (new accounts appear, removed accounts drop) instead of the possibly-stale
+///     key-sync snapshot. Each account's `current_routed` + `login_status` come from the
+///     rail; identity/provider/priority prefer the richer key-sync snapshot when the
+///     account is in both, and fall back to the rail's own display meta for a fast-rail-
+///     only account (added since the last key sync — renders with its email/provider,
+///     not a bare UUID). The snapshot keeps supplying the finer `auth_failed`/`revoked`
+///     unusable reason.
+///   - **Fast rail empty/absent** (proxy hasn't polled yet / direct-bind): fall back to
+///     the key-sync snapshot list, `current_routed=false` (no live routing signal).
+///
+/// Returns None when there are no parseable snapshot candidates (direct-bind VK → the web
+/// renders no group panel).
 fn merge_group_accounts_live(
     group_accounts: Option<&str>,
     group_runtime: Option<&str>,
 ) -> Option<serde_json::Value> {
-    let mut cands: Vec<serde_json::Value> = serde_json::from_str(group_accounts?).ok()?;
-    // Proxy's live material map: account_id -> {needs_login, is_current_routed, ...}.
-    // Absent/unparseable → empty → every account falls back to its snapshot value.
-    let runtime: serde_json::Map<String, serde_json::Value> = group_runtime
+    use serde_json::Value;
+    let snapshot: Vec<Value> = serde_json::from_str(group_accounts?).ok()?;
+
+    let runtime: serde_json::Map<String, Value> = group_runtime
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
-    for c in cands.iter_mut() {
-        let Some(obj) = c.as_object_mut() else { continue };
-        let account_id = obj
-            .get("account_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let live = runtime.get(&account_id);
-        // current_routed: proxy-only signal (the snapshot has no equivalent) → false
-        // when the proxy hasn't polled this account/VK yet.
-        let is_current_routed = live
-            .and_then(|m| m.get("is_current_routed"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        obj.insert("current_routed".into(), serde_json::Value::Bool(is_current_routed));
-        // login_status: proxy rail is authoritative for logged-in-vs-not; only override
-        // when the proxy HAS material for this account (else keep the snapshot value).
-        if let Some(m) = live {
-            let needs_login = m
-                .get("needs_login")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let snapshot = obj
-                .get("login_status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let merged = if !needs_login {
-                "logged_in" // fresh: member has a usable token now
-            } else if snapshot == "auth_failed" || snapshot == "revoked" {
-                snapshot.as_str() // unusable — keep the finer reason from the snapshot
-            } else {
-                "needs_login"
-            };
-            obj.insert(
-                "login_status".into(),
-                serde_json::Value::String(merged.to_string()),
-            );
+
+    // No live rail yet → snapshot list, current_routed defaulted false (legacy path).
+    if runtime.is_empty() {
+        let mut cands = snapshot;
+        for c in cands.iter_mut() {
+            if let Some(obj) = c.as_object_mut() {
+                obj.entry("current_routed").or_insert(Value::Bool(false));
+            }
         }
+        return Some(Value::Array(cands));
     }
-    Some(serde_json::Value::Array(cands))
+
+    // Fast rail authoritative for membership. Index the snapshot for metadata fallback.
+    let snap_by_id: std::collections::HashMap<&str, &Value> = snapshot
+        .iter()
+        .filter_map(|c| c.get("account_id").and_then(|v| v.as_str()).map(|id| (id, c)))
+        .collect();
+
+    let live_str = |live: &Value, key: &str| -> String {
+        live.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    };
+
+    let mut merged: Vec<Value> = Vec::with_capacity(runtime.len());
+    for (account_id, live) in runtime.iter() {
+        let snap = snap_by_id.get(account_id.as_str()).copied();
+        // Base: the snapshot object (preserves ALL its fields) when the account is in
+        // both; otherwise a fresh object built from the rail's display meta.
+        let mut obj = match snap.and_then(|s| s.as_object()) {
+            Some(o) => o.clone(),
+            None => {
+                let mut o = serde_json::Map::new();
+                o.insert("account_id".into(), Value::String(account_id.clone()));
+                o.insert("identity".into(), Value::String(live_str(live, "identity")));
+                o.insert("provider_code".into(), Value::String(live_str(live, "provider_code")));
+                o.insert("credential_type".into(), Value::String(live_str(live, "credential_type")));
+                let prio = live.get("priority").and_then(|v| v.as_i64()).unwrap_or(0);
+                o.insert("priority".into(), Value::Number(prio.into()));
+                o.insert("assigned".into(), Value::Bool(false)); // rail has no static default
+                o
+            }
+        };
+        // Overlay the rail-authoritative fields (both regimes of `obj`).
+        let needs_login = live.get("needs_login").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_current_routed = live.get("is_current_routed").and_then(|v| v.as_bool()).unwrap_or(false);
+        obj.insert("current_routed".into(), Value::Bool(is_current_routed));
+        let snap_login = obj.get("login_status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let login_status = if !needs_login {
+            "logged_in"
+        } else if snap_login == "auth_failed" || snap_login == "revoked" {
+            snap_login.as_str() // keep the finer unusable reason from the snapshot
+        } else {
+            "needs_login"
+        };
+        obj.insert("login_status".into(), Value::String(login_status.to_string()));
+        merged.push(Value::Object(obj));
+    }
+    // Deterministic display order: priority asc, then account_id (serde_json::Map's own
+    // iteration order is not a meaningful candidate order).
+    merged.sort_by(|a, b| {
+        let pa = a.get("priority").and_then(|v| v.as_i64()).unwrap_or(0);
+        let pb = b.get("priority").and_then(|v| v.as_i64()).unwrap_or(0);
+        pa.cmp(&pb).then_with(|| {
+            let ia = a.get("account_id").and_then(|v| v.as_str()).unwrap_or("");
+            let ib = b.get("account_id").and_then(|v| v.as_str()).unwrap_or("");
+            ia.cmp(ib)
+        })
+    });
+    Some(Value::Array(merged))
 }
 
 /// Whether the group VK's CURRENT ROUTED account — the one the remote scheduling
@@ -1312,6 +1350,58 @@ mod merge_group_accounts_live_tests {
     fn direct_bind_returns_none() {
         assert!(merge_group_accounts_live(None, None).is_none());
         assert!(merge_group_accounts_live(Some("not json"), None).is_none());
+    }
+
+    fn ids(v: &serde_json::Value) -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["account_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+    fn find<'a>(v: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+        v.as_array().unwrap().iter().find(|c| c["account_id"] == id).unwrap()
+    }
+
+    // 2026-07-01 membership: the fast rail is AUTHORITATIVE for the candidate LIST. An
+    // account the key-sync snapshot doesn't know yet (a3, added since last sync) but the
+    // proxy delivers MUST appear — rendered with its rail-supplied identity/provider/
+    // priority (not a bare UUID). 能红: the old "iterate the snapshot" merge never adds a3.
+    #[test]
+    fn fast_rail_adds_new_account_with_meta() {
+        let runtime = r#"{
+            "a1":{"needs_login":false,"is_current_routed":true},
+            "a2":{"needs_login":true},
+            "a3":{"needs_login":true,"identity":"a3@x","provider_code":"anthropic","priority":5}
+        }"#;
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
+        assert!(ids(&merged).contains(&"a3".to_string()), "fast-rail-only account must appear: {:?}", ids(&merged));
+        let a3 = find(&merged, "a3");
+        assert_eq!(a3["identity"], "a3@x", "identity from the rail");
+        assert_eq!(a3["provider_code"], "anthropic", "provider_code from the rail");
+        assert_eq!(a3["priority"], 5, "priority from the rail");
+        assert_eq!(a3["login_status"], "needs_login");
+    }
+
+    // Membership: an account still in the (stale) snapshot but NO LONGER delivered by the
+    // rail (removed from the group) MUST drop from the list. 能红: old merge keeps a2.
+    #[test]
+    fn fast_rail_drops_removed_account() {
+        let runtime = r#"{"a1":{"needs_login":false,"is_current_routed":true}}"#;
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
+        assert_eq!(ids(&merged), vec!["a1".to_string()], "a2 (gone from rail) must drop");
+    }
+
+    // For an account in BOTH, the richer snapshot metadata is preserved (identity/assigned
+    // from the snapshot), only the rail-authoritative flags overlay.
+    #[test]
+    fn account_in_both_keeps_snapshot_meta() {
+        let runtime = r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":false}}"#;
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
+        let a1 = find(&merged, "a1");
+        assert_eq!(a1["identity"], "a1@x", "snapshot identity preserved");
+        assert_eq!(a1["assigned"], true, "snapshot assigned preserved");
+        assert_eq!(a1["login_status"], "logged_in", "rail overlay");
     }
 }
 
