@@ -59,6 +59,19 @@ pub fn run() -> io::Result<()> {
         return last_active();
     }
 
+    // Pool-account login pending? Takes precedence over the usage receipt
+    // (20260703 OAuth组成员登录提示): while the proxy's bypass state file
+    // exists, every request 401s anyway — a receipt would be stale noise,
+    // and this row is where the member actually SEES the sign-in link
+    // (claude's own error line scrolls away; this one persists). The proxy
+    // clears the file on the next successful group resolve, so the receipt
+    // comes back on its own after login. One stat() on the hot path.
+    if let Some(line) = group_login_required_line() {
+        let mut out = io::stdout().lock();
+        write!(out, "{}", line)?;
+        return Ok(());
+    }
+
     let ctx = read_stdin_ctx().unwrap_or_default();
 
     // `scan_wal_backward` walks newest-first with a bounded budget; see
@@ -147,6 +160,50 @@ fn env_flag(name: &str) -> bool {
         std::env::var(name).ok().as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
     )
+}
+
+/// Wire shape of the proxy's bypass login-required state file — a cross-repo
+/// contract with aikey-proxy `internal/proxy/group_login_state.go`
+/// (20260703 OAuth组成员登录提示). Written on OAUTH_GROUP_MEMBER_LOGIN_REQUIRED
+/// 401s, removed on the next successful group resolve.
+#[derive(Debug, Deserialize)]
+struct GroupLoginState {
+    #[serde(default)]
+    login_url: String,
+    /// Unix millis; 0/absent ⇒ malformed writer, ignore the file.
+    #[serde(default)]
+    written_at: i64,
+}
+
+/// Same resolution as the proxy writer: $AIKEY_RUN_DIR override (tests),
+/// else ~/.aikey/run/ — mirrors `runtime_snapshot_path` in commands_proxy.rs.
+fn group_login_state_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("AIKEY_RUN_DIR") {
+        return PathBuf::from(dir).join("group-login-required.json");
+    }
+    crate::commands_account::resolve_aikey_dir()
+        .join("run")
+        .join("group-login-required.json")
+}
+
+/// Returns the rendered "login required" status row while the proxy's state
+/// file exists, or None. Presence-based on purpose: a pending sign-in can
+/// legitimately sit for days, and the proxy deterministically removes the
+/// file once the member's token lands — no staleness heuristic beats that.
+/// Malformed / URL-less content ⇒ None (never render a broken hint).
+fn group_login_required_line() -> Option<String> {
+    let raw = std::fs::read_to_string(group_login_state_path()).ok()?;
+    let st: GroupLoginState = serde_json::from_str(&raw).ok()?;
+    if st.written_at <= 0 || st.login_url.is_empty() {
+        return None;
+    }
+    use colored::Colorize;
+    Some(format!(
+        "{} {} {}",
+        "[aikey]".dimmed(),
+        "⚠ team account sign-in required →".yellow(),
+        st.login_url.underline()
+    ))
 }
 
 fn read_stdin_ctx() -> io::Result<ClaudeCodeCtx> {
@@ -1734,6 +1791,46 @@ fn format_number(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // group_login_required_line contract tests (20260703 OAuth组成员登录提示).
+    // NOTE: env-var mutation → run serially per test binary section; each test
+    // uses its own temp dir and restores nothing (AIKEY_RUN_DIR is test-only).
+    #[test]
+    fn group_login_line_renders_url_and_clears_with_file() {
+        let dir = std::env::temp_dir().join(format!("aikey-sl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIKEY_RUN_DIR", &dir);
+
+        let path = dir.join("group-login-required.json");
+        std::fs::write(
+            &path,
+            r#"{"provider":"anthropic","account_id":"acc-1","login_url":"http://127.0.0.1:8090/user/team-oauth","written_at":1776439425000}"#,
+        )
+        .unwrap();
+        let line = group_login_required_line().expect("state file present → hint rendered");
+        assert!(
+            line.contains("http://127.0.0.1:8090/user/team-oauth"),
+            "hint must carry the clickable login URL: {line}"
+        );
+        assert!(
+            line.contains("sign-in required"),
+            "hint must say WHY the receipt is replaced: {line}"
+        );
+
+        // Proxy removed the file after a successful resolve → receipt path resumes.
+        std::fs::remove_file(&path).unwrap();
+        assert!(group_login_required_line().is_none());
+
+        // Malformed writer (no written_at / empty URL) must never render a
+        // broken hint — silence over garbage.
+        std::fs::write(&path, r#"{"login_url":"","written_at":0}"#).unwrap();
+        assert!(group_login_required_line().is_none());
+        std::fs::write(&path, "not-json").unwrap();
+        assert!(group_login_required_line().is_none());
+
+        std::fs::remove_file(&path).ok();
+        std::env::remove_var("AIKEY_RUN_DIR");
+    }
 
     fn ev(
         session_id: &str,

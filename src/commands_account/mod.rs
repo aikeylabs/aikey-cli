@@ -1068,18 +1068,37 @@ fn finish_login(
 // Browser helper
 // ---------------------------------------------------------------------------
 
+/// Returns the `(program, args)` invocation that opens `url` in the default
+/// browser on the given OS (`std::env::consts::OS` values), or `None` on
+/// unsupported platforms.
+///
+/// Why this is a pure function: so unit tests on any host can pin the
+/// Windows invocation without cross-compiling (see `browser_launch_tests`).
+///
+/// Why Windows uses `rundll32 url.dll,FileProtocolHandler` and MUST NOT go
+/// through `cmd /c start`: cmd.exe treats a bare `&` in its command line as
+/// a command separator, so login URLs (`?s=...&d=...&email=...`) were
+/// truncated at the first `&` — the browser opened with only `s`, the login
+/// page failed with "Missing session parameters", and cmd spawned garbage
+/// `d=...` / `email=...` commands (bugfix
+/// 20260702-windows-login-url-ampersand-truncation). rundll32 receives the
+/// URL as a plain argv entry with no shell parsing — same pattern as
+/// `try_open_browser` (commands_import.rs) and `open_browser`
+/// (commands_auth/mod.rs).
+fn browser_launch_command<'a>(os: &str, url: &'a str) -> Option<(&'static str, Vec<&'a str>)> {
+    match os {
+        "macos" => Some(("open", vec![url])),
+        "linux" => Some(("xdg-open", vec![url])),
+        "windows" => Some(("rundll32", vec!["url.dll,FileProtocolHandler", url])),
+        _ => None, // unsupported platform — silently skip
+    }
+}
+
 /// Opens a URL in the default system browser (best-effort; failures are ignored).
 fn open_url_silently(url: &str) {
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let _ = url; // unsupported platform — silently skip
+    if let Some((program, args)) = browser_launch_command(std::env::consts::OS, url) {
+        let _ = std::process::Command::new(program).args(args).spawn();
+    }
 }
 
 /// Delivers the browse URL either by opening the browser (default) or by
@@ -5006,6 +5025,48 @@ fn resolve_binding_display_name(source_type: &str, source_ref: &str) -> String {
         }
     }
     source_ref.to_string()
+}
+
+#[cfg(test)]
+mod browser_launch_tests {
+    //! Fence for bugfix 20260702-windows-login-url-ampersand-truncation.
+    //!
+    //! On Windows the login URL (`?s=...&d=...&email=...`) was launched via
+    //! `cmd /c start "" <url>`; cmd.exe splits its command line at bare `&`,
+    //! so the browser opened a URL truncated at the first `&` ("Missing
+    //! session parameters" on the login page) and cmd tried to run `d=...` /
+    //! `email=...` as commands. The URL must reach a non-shell launcher as
+    //! one intact argv entry.
+
+    use super::browser_launch_command;
+
+    const LOGIN_URL: &str = "http://127.0.0.1:3000/auth/cli/login?s=abc&d=def&email=ZmFuZw";
+
+    #[test]
+    fn windows_never_routes_through_cmd_start() {
+        let (program, args) =
+            browser_launch_command("windows", LOGIN_URL).expect("windows is supported");
+        assert_ne!(program, "cmd", "cmd.exe shell-parses bare `&` — truncates the URL");
+        assert_eq!(program, "rundll32");
+        assert_eq!(args, vec!["url.dll,FileProtocolHandler", LOGIN_URL]);
+    }
+
+    #[test]
+    fn unix_launchers_take_url_as_single_arg() {
+        assert_eq!(
+            browser_launch_command("macos", LOGIN_URL),
+            Some(("open", vec![LOGIN_URL]))
+        );
+        assert_eq!(
+            browser_launch_command("linux", LOGIN_URL),
+            Some(("xdg-open", vec![LOGIN_URL]))
+        );
+    }
+
+    #[test]
+    fn unsupported_platform_skips() {
+        assert_eq!(browser_launch_command("freebsd", LOGIN_URL), None);
+    }
 }
 
 #[cfg(test)]
