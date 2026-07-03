@@ -72,16 +72,23 @@ pub fn run() -> io::Result<()> {
         return Ok(());
     }
 
+    // Control-plane sync degraded? (SyncRail §5.5) Unlike the login hint this
+    // does NOT replace the receipt — usage keeps flowing off cached material —
+    // so it renders as a prefix segment when a receipt exists, or alone when
+    // none does. Presence-based: the proxy removes the file on recovery.
+    let sync_warn = sync_health_line();
+
     let ctx = read_stdin_ctx().unwrap_or_default();
 
     // `scan_wal_backward` walks newest-first with a bounded budget; see
     // §5.1 of the design doc for why a fixed "tail N" is insufficient.
     let opts = ScanOptions::default();
     let Some(dir) = default_wal_dir() else {
-        return Ok(());
+        return emit_optional_line(sync_warn);
     };
     if !dir.exists() {
-        return Ok(()); // proxy never wrote a WAL on this machine
+        // proxy never wrote a WAL on this machine
+        return emit_optional_line(sync_warn);
     }
 
     let sid = ctx.session_id.as_deref().unwrap_or("");
@@ -129,8 +136,9 @@ pub fn run() -> io::Result<()> {
     };
 
     let Some(ev) = exact.or(fallback) else {
-        // Nothing to show — Claude Code hides the row when stdout is empty.
-        return Ok(());
+        // No receipt — Claude Code hides the row when stdout stays empty, but a
+        // degraded sync rail must still surface.
+        return emit_optional_line(sync_warn);
     };
 
     // Freshness guard: even after a match, if the latest event for this
@@ -139,7 +147,7 @@ pub fn run() -> io::Result<()> {
     // has stopped and the previous value is no longer representative.
     if let Some(age) = ev.age(std::time::SystemTime::now()) {
         if age > Duration::from_secs(3600) {
-            return Ok(());
+            return emit_optional_line(sync_warn);
         }
     }
 
@@ -151,7 +159,20 @@ pub fn run() -> io::Result<()> {
     use colored::Colorize;
     let line = render_line(&ev);
     let mut out = io::stdout().lock();
+    if let Some(warn) = sync_warn {
+        write!(out, "{} {} ", warn, "|".dimmed())?;
+    }
     write!(out, "{} {}", "[receipt]".dimmed(), line)?;
+    Ok(())
+}
+
+/// Writes an optional status row (used by the receipt-less exit points so a
+/// degraded sync rail still surfaces; None keeps stdout empty → row hidden).
+fn emit_optional_line(line: Option<String>) -> io::Result<()> {
+    if let Some(l) = line {
+        let mut out = io::stdout().lock();
+        write!(out, "{}", l)?;
+    }
     Ok(())
 }
 
@@ -203,6 +224,68 @@ fn group_login_required_line() -> Option<String> {
         "[aikey]".dimmed(),
         "⚠ team account sign-in required →".yellow(),
         st.login_url.underline()
+    ))
+}
+
+/// Cross-repo contract with aikey-proxy railset.go `syncHealthBody` — the
+/// SyncRail framework writes this file on rail state TRANSITIONS only
+/// (degraded rails present ⇒ file exists; all healthy ⇒ file removed).
+#[derive(serde::Deserialize)]
+struct SyncHealthState {
+    rails: std::collections::HashMap<String, SyncHealthRail>,
+    written_at: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct SyncHealthRail {
+    state: String,
+    /// Unix seconds of the first failure in the current streak — the reader
+    /// renders a LIVE outage duration without the proxy re-writing the file.
+    failed_since: i64,
+}
+
+fn sync_health_state_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("AIKEY_RUN_DIR") {
+        return PathBuf::from(dir).join("sync-health.json");
+    }
+    crate::commands_account::resolve_aikey_dir()
+        .join("run")
+        .join("sync-health.json")
+}
+
+/// Returns the rendered "control-plane sync degraded" status row while the
+/// proxy's sync-health file exists, or None (SyncRail §5.5, 2026-07-03
+/// incident: two sync rails were silently dead for 7+ hours — this row makes
+/// that state visible BEFORE a request fails). Presence-based like the login
+/// hint: the proxy removes the file when every rail recovers. Renders the
+/// WORST rail (offline > stale) with a live duration; malformed ⇒ None.
+fn sync_health_line() -> Option<String> {
+    let raw = std::fs::read_to_string(sync_health_state_path()).ok()?;
+    let st: SyncHealthState = serde_json::from_str(&raw).ok()?;
+    if st.written_at <= 0 || st.rails.is_empty() {
+        return None;
+    }
+    let worst = st
+        .rails
+        .values()
+        .max_by_key(|r| (r.state == "offline", r.failed_since.saturating_neg()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let secs = (now - worst.failed_since).max(0);
+    let dur = if secs >= 3600 {
+        format!("{} h", secs / 3600)
+    } else if secs >= 60 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{} s", secs)
+    };
+    use colored::Colorize;
+    Some(format!(
+        "{} {}",
+        "[aikey]".dimmed(),
+        format!("⚠ team sync {} {} — serving cached data", worst.state, dur).yellow()
     ))
 }
 
@@ -1793,10 +1876,13 @@ mod tests {
     use super::*;
 
     // group_login_required_line contract tests (20260703 OAuth组成员登录提示).
-    // NOTE: env-var mutation → run serially per test binary section; each test
-    // uses its own temp dir and restores nothing (AIKEY_RUN_DIR is test-only).
+    // NOTE: env-var mutation (AIKEY_RUN_DIR is process-global) — every test that
+    // sets it must hold RUN_DIR_LOCK for its whole body, or parallel test
+    // threads repoint the dir mid-read (observed flake, 2026-07-03).
+    static RUN_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
     fn group_login_line_renders_url_and_clears_with_file() {
+        let _guard = RUN_DIR_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("aikey-sl-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("AIKEY_RUN_DIR", &dir);
@@ -1830,6 +1916,64 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         std::env::remove_var("AIKEY_RUN_DIR");
+    }
+
+    // sync_health_line contract tests (SyncRail §5.5, 2026-07-03): the proxy
+    // writes sync-health.json on rail state transitions; the row renders the
+    // WORST rail with a live duration and disappears with the file.
+    #[test]
+    fn sync_health_line_renders_worst_rail_and_clears_with_file() {
+        let _guard = RUN_DIR_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("aikey-sl-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIKEY_RUN_DIR", &dir);
+
+        let path = dir.join("sync-health.json");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"rails":{{"group_runtime":{{"state":"stale","failed_since":{}}},"routing_override":{{"state":"offline","failed_since":{}}}}},"written_at":1776439425000}}"#,
+                now - 200,
+                now - 23 * 60,
+            ),
+        )
+        .unwrap();
+        let line = sync_health_line().expect("state file present → warning rendered");
+        assert!(
+            line.contains("offline"),
+            "worst rail (offline beats stale) must win: {line}"
+        );
+        assert!(
+            line.contains("23 min"),
+            "live outage duration must render from failed_since: {line}"
+        );
+        assert!(
+            line.contains("serving cached data"),
+            "warning must say the data path still serves (offline-first): {line}"
+        );
+
+        // Proxy removed the file on recovery → warning disappears.
+        std::fs::remove_file(&path).unwrap();
+        assert!(sync_health_line().is_none());
+    }
+
+    #[test]
+    fn sync_health_line_malformed_or_empty_is_silent() {
+        let _guard = RUN_DIR_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("aikey-sl-sync-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIKEY_RUN_DIR", &dir);
+        let path = dir.join("sync-health.json");
+
+        std::fs::write(&path, "{not-json").unwrap();
+        assert!(sync_health_line().is_none(), "malformed file must not render");
+
+        std::fs::write(&path, r#"{"rails":{},"written_at":1}"#).unwrap();
+        assert!(sync_health_line().is_none(), "empty rails must not render");
     }
 
     fn ev(

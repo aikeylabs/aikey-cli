@@ -622,22 +622,43 @@ pub fn handle_set_control_url(
         // Also update proxy collector_url (nginx proxies collector on same origin).
         configure_proxy_collector(url, json_mode);
 
+        // SyncRail §5.2 (2026-07-03): nudge the running proxy so the URL change
+        // converges NOW — the reload re-reads aikey-proxy.yaml (reporter creds)
+        // and kicks the control-plane sync rails (routing/group material re-pull
+        // against the NEW server, team credential rebuilt). Best-effort by
+        // design: when the proxy isn't running (or the POST fails) the rails'
+        // per-cycle URL re-check still self-heals within ≤60s of the next start,
+        // so this replaces the old "Restart proxy to apply" manual step for BOTH
+        // entrances (CLI set-url and the Web Settings page, which subprocesses
+        // this same core — internal-command-reuses-public-core).
+        let proxy_running = crate::commands_proxy::proxy_is_running_managed();
+        if proxy_running {
+            crate::commands_proxy::try_reload_proxy();
+        }
+
         if json_mode {
             crate::json_output::print_json(serde_json::json!({
                 "ok": true,
                 "old_url": old_url,
                 "new_url": url,
+                "proxy_reloaded": proxy_running,
             }));
         } else {
             println!("{} Control URL updated.", "\u{2713}".green());
             println!("  {} → {}", old_url.dimmed(), url.bold());
             println!("  Proxy collector URL also updated.");
             println!();
-            println!(
-                "  {} Restart proxy to apply: {}",
-                "\u{2192}".dimmed(),
-                "aikey proxy restart".bold()
-            );
+            if proxy_running {
+                println!(
+                    "  {} Proxy reloaded — the new URL is live (sync rails re-pull within seconds).",
+                    "\u{2713}".green()
+                );
+            } else {
+                println!(
+                    "  {} Proxy not running — it picks up the new URL on next start.",
+                    "\u{2192}".dimmed()
+                );
+            }
         }
     } else {
         // Not logged in — only save to config.json.
