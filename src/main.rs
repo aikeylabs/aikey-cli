@@ -3609,6 +3609,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // not meaningful for service actions, so we ignore them on
             // that branch.
             if let Some(action) = page.as_deref() {
+                // `status` is read-only (no vault password, no spawn) so it
+                // routes to its own handler, not handle_web_service.
+                if action == "status" {
+                    commands_account::handle_web_status(cli.json)?;
+                    return Ok(());
+                }
                 if matches!(action, "start" | "stop" | "restart") {
                     commands_account::handle_web_service(action, cli.json)?;
                     return Ok(());

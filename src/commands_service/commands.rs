@@ -31,12 +31,18 @@ pub(crate) fn handle_service(
         ServiceAction::Start { name } => ("start", name),
         ServiceAction::Stop { name } => ("stop", name),
         ServiceAction::Restart { name } => ("restart", name),
+        ServiceAction::Status { name } => ("status", name),
     };
 
     let Some(name) = name.as_deref() else {
-        // Bare `aikey service start` (no name) — print the list and
-        // exit non-error. Users typically reach this by tab-completing
-        // and forgetting to pass a name.
+        // No name given. For the read-only `status` verb this means "show
+        // every service at once" (the aggregate dashboard). For the
+        // mutating verbs there's no safe all-services default, so we print
+        // the supported list instead (users usually land here by tab-
+        // completing and forgetting the name).
+        if verb == "status" {
+            return status_all(json);
+        }
         print_supported(json);
         return Ok(());
     };
@@ -87,8 +93,47 @@ fn print_supported(json: bool) {
             println!("  {:<14}  {}", name, label);
         }
         println!();
-        println!("Usage: aikey service <start|stop|restart> <name>");
+        println!("Usage: aikey service <start|stop|restart|status> <name>");
     }
+}
+
+/// `aikey service status` (no name) — one-line status for every registered
+/// service. Each row delegates to that service's own compact probe
+/// (`status_summary`), so this aggregate is a pure view: it never owns a
+/// second copy of any service's health logic and can't drift from the
+/// per-service `status` commands.
+fn status_all(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let rows: Vec<(&str, bool, String)> = vec![
+        {
+            let (r, d) = crate::local_server_probe::status_summary();
+            ("web", r, d)
+        },
+        {
+            let (r, d) = crate::commands_proxy::status_summary();
+            ("proxy", r, d)
+        },
+        {
+            let (r, d) = trust_local::status_summary();
+            ("trust-local", r, d)
+        },
+    ];
+
+    if json {
+        let payload: Vec<_> = rows
+            .iter()
+            .map(|(name, running, detail)| {
+                serde_json::json!({"name": name, "running": running, "detail": detail})
+            })
+            .collect();
+        println!("{}", serde_json::json!({"services": payload}));
+    } else {
+        for (name, running, detail) in &rows {
+            // Aligned two-column table: fixed-width name, state glyph, detail.
+            let glyph = if *running { "●" } else { "○" };
+            println!("{glyph} {name:<12}  {detail}");
+        }
+    }
+    Ok(())
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -105,7 +150,63 @@ mod trust_local {
 
     const SERVICE_NAME: &str = "aikey.trust-local";
 
+    /// Compact one-line status for the aggregate + the `status` verb.
+    /// Read-only: a single-shot healthz probe on :8801 (no 30s wait — that
+    /// belongs to post-start). "not installed" is a status, not an error.
+    pub(super) fn status_summary() -> (bool, String) {
+        if !aikey_home_bin_path().exists() {
+            return (false, "not installed".to_string());
+        }
+        if healthz_once() {
+            (true, "running on http://127.0.0.1:8801".to_string())
+        } else {
+            (false, "not running".to_string())
+        }
+    }
+
+    /// Single-shot healthz check (no retry loop). Distinct from
+    /// `probe_healthz`, which waits up to 30s for a service that was just
+    /// asked to start.
+    fn healthz_once() -> bool {
+        ureq::get("http://127.0.0.1:8801/healthz")
+            .timeout(Duration::from_millis(500))
+            .call()
+            .map(|r| r.status() == 200)
+            .unwrap_or(false)
+    }
+
+    fn status_detail(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let (running, detail) = status_summary();
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "service": SERVICE_NAME,
+                    "running": running,
+                    "detail": detail,
+                })
+            );
+        } else if running {
+            println!("{}: {}", SERVICE_NAME, detail);
+        } else {
+            println!("{}: {}", SERVICE_NAME, detail);
+            if detail == "not installed" {
+                println!("    Install: aikey app install degrade-detector");
+            } else {
+                println!("    Start:   aikey service start trust-local");
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn dispatch(verb: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+        // Read-only status short-circuits before the install check: on a
+        // host without trust-local, "not installed" is the answer we want to
+        // print, not a hard error like the mutating verbs raise.
+        if verb == "status" {
+            return status_detail(json);
+        }
         // Refuse if trust-local binary isn't installed. Since rc.5 it's
         // installed by default — if it's missing the user either ran
         // `--no-degrade-detector` at install time or `aikey app
@@ -353,6 +454,12 @@ mod web {
     //! don't replicate any logic.
 
     pub(super) fn dispatch(verb: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+        // status is read-only and lives in its own handler; the mutating
+        // verbs go through the existing lifecycle controller. Both spellings
+        // (`aikey web status` and `aikey service status web`) land here.
+        if verb == "status" {
+            return crate::commands_account::handle_web_status(json);
+        }
         crate::commands_account::handle_web_service(verb, json)
     }
 }
@@ -370,10 +477,31 @@ mod proxy {
 
     pub(super) fn dispatch(
         verb: &str,
-        _json: bool,
+        json: bool,
         password_stdin: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match verb {
+            "status" => {
+                // Read-only: no vault password. Human path delegates to the
+                // exact same `handle_status()` as `aikey proxy status` (byte-
+                // identical output); JSON path reuses `status_summary()`,
+                // which derives from the same proxy_state() truth source.
+                if json {
+                    let (running, detail) = crate::commands_proxy::status_summary();
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ok": true,
+                            "service": "proxy",
+                            "running": running,
+                            "detail": detail,
+                        })
+                    );
+                } else {
+                    crate::commands_proxy::handle_status()?;
+                }
+                Ok(())
+            }
             "start" => {
                 // prompt_vault_password lives in main.rs as a thin
                 // wrapper around executor::prompt_password; we
@@ -444,5 +572,40 @@ mod tests {
         // Whitespace not stripped — caller's responsibility to trim.
         assert!(!is_supported(" web"));
         assert!(!is_supported("web "));
+    }
+
+    // ── status verb ────────────────────────────────────────────────
+
+    #[test]
+    fn status_summary_shape_per_service() {
+        // Each service's compact probe returns (bool, non-empty detail).
+        // We can't assert the running state (depends on the host), but the
+        // contract that the aggregate relies on is: always a printable
+        // detail line, never an empty string or a panic.
+        for (_, detail) in [
+            crate::local_server_probe::status_summary(),
+            crate::commands_proxy::status_summary(),
+            trust_local::status_summary(),
+        ] {
+            assert!(!detail.is_empty(), "status detail must be non-empty");
+        }
+    }
+
+    #[test]
+    fn trust_local_status_summary_not_installed_is_status_not_error() {
+        // The whole point of status short-circuiting the install check:
+        // on a host without the binary, "not installed" is a legitimate
+        // (running=false) status, never an Err. This test only holds when
+        // trust-local isn't installed on the test host; when it is, the
+        // detail is a running/not-running line — either way non-empty and
+        // no panic. (Kept assertion loose so it passes on both kinds of
+        // host / CI.)
+        let (running, detail) = trust_local::status_summary();
+        if !running {
+            assert!(
+                detail == "not installed" || detail == "not running",
+                "unexpected trust-local down-detail: {detail}"
+            );
+        }
     }
 }

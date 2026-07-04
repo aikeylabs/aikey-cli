@@ -1799,6 +1799,32 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
     }
 }
 
+/// `aikey web status` (and `aikey service status web`) — read-only report of
+/// the local web service (Personal local-server / Trial trial-server).
+///
+/// Distinct from `handle_web_service` (which drives start/stop/restart and
+/// mutates state): status never spawns anything, needs no vault password, and
+/// on a host with no local web service reports that as a non-error status.
+/// Both entry points call this single core so the two CLI spellings agree.
+pub fn handle_web_status(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (running, detail) = crate::local_server_probe::status_summary();
+    if json_mode {
+        let edition = crate::local_server_probe::detect_edition().map(|e| e.label());
+        crate::json_output::print_json(serde_json::json!({
+            "ok": true,
+            "service": "web",
+            "running": running,
+            "edition": edition,
+            "detail": detail,
+        }));
+    } else {
+        // Reuse the richer multi-line line for the dedicated command — it
+        // already includes a Start hint on the NOT RUNNING path.
+        println!("{}", crate::local_server_probe::local_server_status_line());
+    }
+    Ok(())
+}
+
 /// `aikey master [page] [--port PORT]` — open Master Console in the default browser.
 ///
 /// Resolves the control panel URL from install-state.json or the stored
@@ -2822,16 +2848,24 @@ fn apply_snapshot_to_cache(
         }
     }
 
-    // Mark stale: keys the current account owns locally but the server no longer returns.
-    // This includes the currently-active key: if the server has removed it from the
-    // snapshot, it is no longer valid and must be deactivated immediately.
+    // Prune: keys the current account owns locally but the server no longer
+    // returns are DELETED (2026-07-04 self-heal, replaces the old mark-stale).
+    // WHY delete, not stale: the server is the single authority for the
+    // owner's keys — a server-deleted key kept as a local `stale` row rendered
+    // forever as a "revoked / inactive" ghost in /user/vault (the exact user
+    // confusion on 2026-07-03), and for DETERMINISTIC group-VK aliases the
+    // ghost also shadowed the freshly re-issued key. Scope guard: ONLY rows
+    // owned by the CURRENT account are pruned — other accounts' rows keep the
+    // re-login recovery semantics (see clear_virtual_key_cache's doc note).
+    // Idempotent: the second sync finds nothing absent to prune.
+    // This includes the currently-active key: if the server removed it, it is
+    // no longer valid and must be deactivated immediately.
     if let Ok(cached) = storage::list_virtual_key_cache() {
+        let mut pruned = 0usize;
         for entry in cached {
             if entry.owner_account_id.as_deref() == Some(current_account_id)
                 && !seen_ids.contains(&entry.virtual_key_id)
-                && entry.local_state != "stale"
             {
-                let _ = storage::set_virtual_key_local_state(&entry.virtual_key_id, "stale");
                 // If this key was the active proxy key, clear the active key config
                 // so the proxy stops routing it on next reload.
                 if entry.local_state == "active" {
@@ -2843,7 +2877,23 @@ fn apply_snapshot_to_cache(
                         }
                     }
                 }
+                match storage::delete_virtual_key_cache_row(&entry.virtual_key_id) {
+                    Ok(()) => pruned += 1,
+                    Err(e) => {
+                        // Fall back to the legacy stale mark so the row at least
+                        // stops being usable; visible per the mandatory-WARN rule.
+                        eprintln!(
+                            "[aikey] warn: prune of server-removed key {} failed ({}); marked stale instead",
+                            entry.virtual_key_id, e
+                        );
+                        let _ =
+                            storage::set_virtual_key_local_state(&entry.virtual_key_id, "stale");
+                    }
+                }
             }
+        }
+        if pruned > 0 {
+            println!("  pruned {pruned} server-removed key(s) from local cache");
         }
     }
 }
@@ -5067,7 +5117,10 @@ mod browser_launch_tests {
     fn windows_never_routes_through_cmd_start() {
         let (program, args) =
             browser_launch_command("windows", LOGIN_URL).expect("windows is supported");
-        assert_ne!(program, "cmd", "cmd.exe shell-parses bare `&` — truncates the URL");
+        assert_ne!(
+            program, "cmd",
+            "cmd.exe shell-parses bare `&` — truncates the URL"
+        );
         assert_eq!(program, "rundll32");
         assert_eq!(args, vec!["url.dll,FileProtocolHandler", LOGIN_URL]);
     }
@@ -7061,5 +7114,96 @@ mod probe_token_tests {
         assert!(err.contains("aikey login"));
         assert!(err.contains("user@example.com"));
         assert!(err.contains("http://127.0.0.1:0"));
+    }
+}
+
+#[cfg(test)]
+mod sync_prune_tests {
+    // Sync prune self-heal (2026-07-04): keys the server no longer returns for
+    // the OWNING account are DELETED from the local cache (not stale-marked) —
+    // a server-deleted key kept as `stale` rendered a permanent ghost row and,
+    // for deterministic group-VK aliases, shadowed the re-issued key. Other
+    // accounts' rows keep the re-login recovery semantics. 能红: revert the
+    // prune to mark-stale and `owner_absent_row_is_deleted` fails.
+    use super::*;
+    use crate::storage;
+    use secrecy::SecretString;
+
+    fn setup_vault() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).expect("salt");
+        storage::initialize_vault(&salt, &SecretString::new("test_password".to_string()))
+            .expect("init vault");
+        (dir, guard)
+    }
+
+    fn cache_entry(vk_id: &str, owner: &str) -> storage::VirtualKeyCacheEntry {
+        storage::VirtualKeyCacheEntry {
+            virtual_key_id: vk_id.to_string(),
+            org_id: "org-1".to_string(),
+            seat_id: "seat-1".to_string(),
+            alias: format!("alias-{vk_id}"),
+            provider_code: "anthropic".to_string(),
+            protocol_type: "anthropic".to_string(),
+            base_url: String::new(),
+            credential_id: "cred-1".to_string(),
+            credential_revision: "r1".to_string(),
+            virtual_key_revision: "vr1".to_string(),
+            key_status: "active".to_string(),
+            share_status: "claimed".to_string(),
+            local_state: "synced_inactive".to_string(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: None,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec!["anthropic".to_string()],
+            provider_base_urls: Default::default(),
+            owner_account_id: Some(owner.to_string()),
+            owner_email: None,
+            extra: None,
+            oauth_group_id: None,
+            group_accounts: None,
+            routing_config: None,
+            group_alias: None,
+            group_runtime: None,
+        }
+    }
+
+    #[test]
+    fn owner_absent_row_is_deleted_other_account_kept_idempotent() {
+        let (_dir, _lock) = setup_vault();
+        storage::upsert_virtual_key_cache(&cache_entry("vk-mine-gone", "acct-A")).unwrap();
+        storage::upsert_virtual_key_cache(&cache_entry("vk-other-acct", "acct-B")).unwrap();
+
+        // Empty snapshot for acct-A → its row must be DELETED; acct-B's row
+        // (another server session's cache) must be untouched.
+        apply_snapshot_to_cache(&[], "acct-A");
+
+        let left = storage::list_virtual_key_cache().unwrap();
+        assert!(
+            !left.iter().any(|e| e.virtual_key_id == "vk-mine-gone"),
+            "owner's server-removed key must be pruned, not stale-marked: {left:?}"
+        );
+        let other = left
+            .iter()
+            .find(|e| e.virtual_key_id == "vk-other-acct")
+            .expect("other account's row must survive the prune");
+        assert_ne!(
+            other.local_state, "stale",
+            "other account's row must be untouched"
+        );
+
+        // Idempotent: a second pass has nothing to prune and must not error.
+        apply_snapshot_to_cache(&[], "acct-A");
+        assert_eq!(storage::list_virtual_key_cache().unwrap().len(), 1);
     }
 }

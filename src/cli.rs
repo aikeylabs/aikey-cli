@@ -290,11 +290,12 @@ pub(crate) enum Commands {
         /// secrets, profile, usage-ledger, bulk-import, quick-import, trust) —
         /// resolved by the web UI.
         ///
-        /// Service control: pass `start`, `stop`, or `restart` instead of a
-        /// page name to start / stop / restart the local web service
+        /// Service control: pass `start`, `stop`, `restart`, or `status`
+        /// instead of a page name to control / inspect the local web service
         /// (aikey-local-server on Personal, aikey-trial-server on Trial).
-        /// Production servers are not managed here — use the server-install
-        /// runbook on the server host instead.
+        /// `status` reports whether it's running, on which port, and the
+        /// vault lock state. Production servers are not managed here — use the
+        /// server-install runbook on the server host instead.
         page: Option<String>,
         /// Shortcut for `aikey web import` — opens the Import page directly.
         #[arg(long)]
@@ -536,18 +537,25 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: AppAction,
     },
-    /// Manage AiKey background services (`start` / `stop` / `restart`).
+    /// Manage AiKey background services (`start` / `stop` / `restart` / `status`).
     ///
-    /// Generic service-control namespace for any AiKey-owned daemon
-    /// that runs as a user-scope launchd / systemd unit. Today the
-    /// only registered service is `trust-local` (degrade-detector).
-    /// Refuses to operate on names not in the whitelist — this is NOT
-    /// a generic launchd/systemd wrapper.
+    /// Umbrella service-control namespace for the AiKey-owned daemons.
+    /// Registered services (closed whitelist): `web` (local-server /
+    /// trial-server console), `proxy` (aikey-proxy), `trust-local`
+    /// (degrade-detector observer). Refuses names outside the whitelist —
+    /// this is NOT a generic launchd/systemd wrapper.
+    ///
+    /// The per-service namespaces (`aikey proxy ...`, `aikey web ...`) and
+    /// this umbrella share ONE implementation core per service, so
+    /// `aikey service status proxy` and `aikey proxy status` print the same
+    /// thing. Bare `aikey service status` (no name) prints a one-line
+    /// summary of every service at once.
     ///
     /// Examples:
-    ///   aikey service start trust-local
-    ///   aikey service restart trust-local
-    ///   aikey service stop trust-local
+    ///   aikey service status                 # all services, one line each
+    ///   aikey service status trust-local     # one service, full detail
+    ///   aikey service restart web
+    ///   aikey service stop proxy
     #[command(display_order = 27)]
     Service {
         #[command(subcommand)]
@@ -572,6 +580,10 @@ pub(crate) enum ServiceAction {
     Stop { name: Option<String> },
     /// Restart a registered AiKey service.
     Restart { name: Option<String> },
+    /// Show service status. Without a name: one-line summary of every
+    /// service. With a name (`web` / `proxy` / `trust-local`): full detail
+    /// for that one — delegates to the same probe as `aikey <name> status`.
+    Status { name: Option<String> },
 }
 
 /// Subcommands for `aikey trust` (M4).
@@ -1463,6 +1475,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 ServiceAction::Start { .. } => "service.start".to_string(),
                 ServiceAction::Stop { .. } => "service.stop".to_string(),
                 ServiceAction::Restart { .. } => "service.restart".to_string(),
+                ServiceAction::Status { .. } => "service.status".to_string(),
             },
         },
     }
@@ -2984,5 +2997,49 @@ mod tests {
             },
         };
         assert_eq!(command_name(Some(&cmd)), "service.restart");
+
+        let cmd = Commands::Service {
+            action: ServiceAction::Status { name: None },
+        };
+        assert_eq!(command_name(Some(&cmd)), "service.status");
+    }
+
+    /// `aikey service status` (no name) parses with name=None so the
+    /// dispatcher renders the aggregate dashboard.
+    #[test]
+    fn aikey_service_status_no_name() {
+        let cli = Cli::try_parse_from(["aikey", "service", "status"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Service {
+                action: ServiceAction::Status { name: None }
+            })
+        ));
+    }
+
+    /// `aikey service status <name>` parses the name through for per-service
+    /// detail (web / proxy / trust-local).
+    #[test]
+    fn aikey_service_status_named() {
+        for svc in ["web", "proxy", "trust-local"] {
+            let cli = Cli::try_parse_from(["aikey", "service", "status", svc]).expect("parse");
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Service { action: ServiceAction::Status { ref name } })
+                    if name.as_deref() == Some(svc)
+            ));
+        }
+    }
+
+    /// `aikey web status` parses as the Web command with page="status" —
+    /// main.rs intercepts that positional and routes to handle_web_status
+    /// (read-only) instead of opening a browser page named "status".
+    #[test]
+    fn aikey_web_status_parses_as_page_verb() {
+        let cli = Cli::try_parse_from(["aikey", "web", "status"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Web { ref page, .. }) if page.as_deref() == Some("status")
+        ));
     }
 }

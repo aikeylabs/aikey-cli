@@ -253,6 +253,23 @@ pub fn set_active_key_config(cfg: &ActiveKeyConfig) -> Result<(), String> {
 /// NOTE: Prefer `disable_keys_for_account_scope` on account switch —
 /// it keeps the ciphertext rows so the previous account can access them again
 /// after re-login, while still preventing the new account from using those keys.
+/// Deletes ONE row from `managed_virtual_keys_cache` by primary key.
+/// Used by the sync prune (2026-07-04 self-heal): a key the server no longer
+/// returns for the OWNING account is removed outright — keeping it as a
+/// `stale` row rendered a permanent "revoked/inactive" ghost in /user/vault
+/// and, for deterministic group-VK aliases, shadowed the re-issued key.
+/// Callers are responsible for the owner-scope guard (other accounts' rows
+/// keep the re-login recovery semantics documented on clear_virtual_key_cache).
+pub fn delete_virtual_key_cache_row(virtual_key_id: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "DELETE FROM managed_virtual_keys_cache WHERE virtual_key_id = ?1",
+        params![virtual_key_id],
+    )
+    .map_err(|e| format!("Failed to delete virtual key cache row: {}", e))?;
+    Ok(())
+}
+
 pub fn clear_virtual_key_cache() -> Result<(), String> {
     let conn = open_connection()?;
     conn.execute("DELETE FROM managed_virtual_keys_cache", [])

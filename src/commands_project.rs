@@ -565,6 +565,75 @@ pub fn handle_provider_ls(json_mode: bool) -> Result<(), Box<dyn std::error::Err
 ///
 /// No master password required. Checks run sequentially and stream output
 /// as each result arrives so the user sees progress immediately.
+/// Edition banner text for `aikey doctor` (B1). `aikey doctor` is a
+/// client-side tool: it runs on Personal (local-server or CLI-only) and
+/// Trial hosts. Production is a server-install deployment, not diagnosed via
+/// this CLI, so there's no Production variant here.
+fn doctor_edition_label(edition: Option<crate::local_server_probe::Edition>) -> &'static str {
+    match edition {
+        Some(crate::local_server_probe::Edition::Trial) => "Trial (full-trial bundle)",
+        Some(crate::local_server_probe::Edition::Personal) => "Personal (local-server)",
+        None => "Personal (CLI-only, no local web service)",
+    }
+}
+
+/// N/A note for the `--detail` ODS panels on non-Trial editions (B2). Those
+/// panels read the Trial-server ODS pipeline (control-trial.db/.log); on
+/// Personal / CLI-only that pipeline doesn't exist. Returns "" for Trial
+/// (the panel renders real data instead).
+fn doctor_detail_ods_na_note(edition: Option<crate::local_server_probe::Edition>) -> &'static str {
+    match edition {
+        Some(crate::local_server_probe::Edition::Personal) => {
+            "not applicable on Personal edition — the ODS pipeline is a Trial-server feature"
+        }
+        None => "not applicable (CLI-only host — no Trial-server ODS pipeline)",
+        Some(crate::local_server_probe::Edition::Trial) => "",
+    }
+}
+
+/// One optional first-party plugin app that `aikey doctor` reports (A2).
+struct DoctorPlugin {
+    /// Row label shown in the doctor output.
+    label: &'static str,
+    /// Binary path relative to `$HOME`.
+    rel_path: &'static str,
+    /// `aikey app install <slug>` name (for the "enable" hint).
+    install_slug: &'static str,
+    /// Daemon (own port, gets a liveness probe) vs subprocess filter
+    /// (spawned per-request by the proxy, presence check only).
+    is_daemon: bool,
+}
+
+/// The optional first-party plugin apps `aikey doctor` reports (A2).
+///
+/// Kept as one table so the doctor section, this list, and the app registry
+/// (`commands_app::FIRST_PARTY_SLUGS`) stay in lockstep — a slug added there
+/// should surface here too (asserted by a unit test). Path note: trust-local
+/// installs to the legacy `~/.aikey/bin/`, the compliance apps to the
+/// app-manifest convention `~/.aikey/apps/<slug>/bin/`.
+fn doctor_plugin_registry() -> Vec<DoctorPlugin> {
+    vec![
+        DoctorPlugin {
+            label: "trust-local",
+            rel_path: ".aikey/bin/trust-local",
+            install_slug: "degrade-detector",
+            is_daemon: true,
+        },
+        DoctorPlugin {
+            label: "compliance-detector",
+            rel_path: ".aikey/apps/ai-compliance-detector/bin/ai-compliance-detector",
+            install_slug: "ai-compliance-detector",
+            is_daemon: false,
+        },
+        DoctorPlugin {
+            label: "compliance-deep-scan",
+            rel_path: ".aikey/apps/ai-compliance-deep-scan/bin/ai-compliance-deep-scan",
+            install_slug: "ai-compliance-deep-scan",
+            is_daemon: false,
+        },
+    ]
+}
+
 pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
     use std::time::Instant;
@@ -597,7 +666,8 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 }
             } else {
                 let icon = if ok { "✓".green() } else { "✗".red() };
-                println!("{} {:<18} {}", icon, label, detail);
+                // Label column width 20 = longest label (`compliance-deep-scan`).
+                println!("{} {:<20} {}", icon, label, detail);
                 if let Some(h) = hint {
                     println!("  {}", format!("↳ {}", h).dimmed());
                 }
@@ -631,6 +701,16 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             format!("{}+{}.{}", cli_ver, cli_rev, cli_bid)
         };
         emit("cli version", true, &cli_str, None);
+
+        // Edition banner (B1): state up-front which edition doctor is
+        // diagnosing so every row below has context and support can tell a
+        // Personal host from a Trial one at a glance. `aikey doctor` is a
+        // client-side tool — it runs on Personal (local-server or CLI-only)
+        // and Trial (full-trial) hosts; Production is a server-install
+        // deployment managed on the server, not via this CLI. detect_edition
+        // reads install-state.json's installed_components (single source).
+        let doctor_edition = crate::local_server_probe::detect_edition();
+        emit("edition", true, doctor_edition_label(doctor_edition), None);
 
         // Probe proxy /version
         let proxy_port = crate::commands_proxy::proxy_port();
@@ -1015,21 +1095,36 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
-    // ── 7.5. degrade-detector trust-local + rhythm observer ──
+    // ── 7.5. Optional first-party plugins ────────────────────
     //
-    // Optional service. Two independent checks:
-    //   a) trust-local HTTP /healthz on :8801 — service running?
-    //   b) aikey-proxy's rhythm observer — was it built? (silent
-    //      failure mode is the proxy boots fine but the observer
-    //      dies due to missing DEGRADE_DETECTOR_PROXY_TOKEN /
-    //      ALLOW_DIRECT_AUTH env). doctor used to be blind to this.
+    // The `aikey app install <slug>` plugins (registry: FIRST_PARTY_SLUGS).
+    // Two shapes, checked differently:
+    //   • degrade-detector → trust-local: a DAEMON (:8801). Probe /healthz
+    //     for liveness + read the proxy's rhythm-observer build verdict.
+    //   • ai-compliance-detector / -deep-scan: stdin/stdout SUBPROCESSES the
+    //     proxy spawns per request — there is no port to probe, so the only
+    //     honest signal is "binary installed?" (presence = the proxy can
+    //     spawn it). deep-scan is the heavy opt-in semantic layer.
     //
-    // Skip the section entirely when trust-local binary isn't
-    // installed — many users never opt into degrade-detector and
-    // shouldn't see "✗" rows for a feature they didn't choose.
+    // Why show not-installed rows now (previously the whole section was
+    // skipped when trust-local was absent): a health *dashboard* should say
+    // which optional capabilities exist and which are off, not go silent —
+    // otherwise a user can't tell "compliance filtering isn't running" from
+    // "doctor doesn't check it". Not-installed renders dim/informational and
+    // never bubbles to the overall pass/fail (these are opt-in).
     {
-        let trust_local_bin = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
-            .join(".aikey/bin/trust-local");
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let plugins = doctor_plugin_registry();
+        // Paths come from the registry (single source shared with the
+        // consistency test); trust-local keeps its bespoke daemon+observer
+        // logic, the subprocess filters loop through a generic presence check.
+        let trust_local_plugin = plugins
+            .iter()
+            .find(|p| p.is_daemon)
+            .expect("registry has the trust-local daemon entry");
+
+        // ── degrade-detector / trust-local (daemon) ──
+        let trust_local_bin = home.join(trust_local_plugin.rel_path);
         if trust_local_bin.exists() {
             // (a) trust-local service liveness.
             let trust_local_url = "http://127.0.0.1:8801/healthz";
@@ -1098,6 +1193,36 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                         Some("restart proxy: aikey proxy restart"),
                     );
                 }
+            }
+        } else {
+            let hint = format!(
+                "enable: aikey app install {}",
+                trust_local_plugin.install_slug
+            );
+            emit(
+                trust_local_plugin.label,
+                true,
+                "not installed (optional degrade-detector plugin)",
+                Some(&hint),
+            );
+        }
+
+        // ── compliance filters (subprocess, presence-only) ──
+        // The proxy spawns these per request (stdin/stdout frames), so there
+        // is no port to probe — presence of the binary is the honest signal
+        // that the proxy *can* spawn it. Looped from the registry's
+        // non-daemon entries so adding a filter app is a one-line table edit.
+        for p in plugins.iter().filter(|p| !p.is_daemon) {
+            if home.join(p.rel_path).exists() {
+                emit(p.label, true, "installed (proxy-spawned filter)", None);
+            } else {
+                let hint = format!("enable: aikey app install {}", p.install_slug);
+                emit(
+                    p.label,
+                    true,
+                    "not installed (optional compliance filter)",
+                    Some(&hint),
+                );
             }
         }
     }
@@ -1376,7 +1501,8 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             } else {
                 "⚠".yellow()
             };
-            println!("{} {:<18} {}", icon, label, detail);
+            // Label column width 20 = longest label (`compliance-deep-scan`).
+            println!("{} {:<20} {}", icon, label, detail);
             if let Some(ref h) = hint {
                 println!("  {}", format!("↳ Start: {}", h).dimmed());
             }
@@ -1816,17 +1942,40 @@ pub fn handle_doctor_detail() -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
     let dim_rule = "─".repeat(52).dimmed();
 
+    // B2: the first two panels read the Trial-server ODS pipeline
+    // (control-trial.db / .log) and are meaningful ONLY on a Trial host.
+    // On Personal (local-server or CLI-only) that pipeline doesn't exist, so
+    // instead of the misleading "trial DB not present — trial-server hasn't
+    // run" (which implies it *should* have), state clearly that the panel is
+    // N/A for this edition. The 4xx-captures panel reads aikey-proxy's log,
+    // which every edition has, so it always runs.
+    //
+    // Production note: `aikey doctor` is client-side; a Production server's
+    // ODS lives in PostgreSQL on the server host, not reachable from this
+    // CLI — the ODS panels there also render as N/A with a pointer.
+    let edition = crate::local_server_probe::detect_edition();
+    let is_trial = matches!(edition, Some(crate::local_server_probe::Edition::Trial));
+    let edition_na_note = doctor_detail_ods_na_note(edition);
+
     println!();
     println!("{}", dim_rule);
     println!("{}", "🔍 Recent failures (last 5 ODS errors)".bold());
-    println!("{}  {}", dim_rule, "from control-trial.db".dimmed());
-    render_recent_failures();
+    if is_trial {
+        println!("{}  {}", dim_rule, "from control-trial.db".dimmed());
+        render_recent_failures();
+    } else {
+        println!("  {}", edition_na_note.dimmed());
+    }
 
     println!();
     println!("{}", dim_rule);
     println!("{}", "🔍 Ingest health (signal-based)".bold());
-    println!("{}  {}", dim_rule, "from control-trial.log".dimmed());
-    render_ingest_health();
+    if is_trial {
+        println!("{}  {}", dim_rule, "from control-trial.log".dimmed());
+        render_ingest_health();
+    } else {
+        println!("  {}", edition_na_note.dimmed());
+    }
 
     println!();
     println!("{}", dim_rule);
@@ -2396,6 +2545,55 @@ mod doctor_detail_tests {
     fn format_local_time_hms_zero_returns_placeholder() {
         assert_eq!(format_local_time_hms(0), "?");
         assert!(!format_local_time_hms(1_700_000_000_000).contains('?'));
+    }
+
+    // ── B1: edition banner mapping ──────────────────────────────────
+    #[test]
+    fn doctor_edition_label_covers_all_editions() {
+        use crate::local_server_probe::Edition;
+        assert!(doctor_edition_label(Some(Edition::Trial)).starts_with("Trial"));
+        assert!(doctor_edition_label(Some(Edition::Personal)).starts_with("Personal"));
+        // CLI-only host (no local web service installed).
+        assert!(doctor_edition_label(None).contains("CLI-only"));
+    }
+
+    // ── B2: --detail ODS panel N/A note by edition ──────────────────
+    #[test]
+    fn doctor_detail_ods_na_note_empty_only_for_trial() {
+        use crate::local_server_probe::Edition;
+        // Trial renders real ODS data → no N/A note.
+        assert_eq!(doctor_detail_ods_na_note(Some(Edition::Trial)), "");
+        // Non-Trial editions get a clear "not applicable" note (never the
+        // misleading "trial-server hasn't run" wording).
+        assert!(doctor_detail_ods_na_note(Some(Edition::Personal)).contains("not applicable"));
+        assert!(doctor_detail_ods_na_note(None).contains("not applicable"));
+    }
+
+    // ── A2: plugin registry stays in lockstep with the app registry ──
+    #[test]
+    fn doctor_plugin_registry_matches_first_party_slugs() {
+        use crate::commands_app::FIRST_PARTY_SLUGS;
+        let plugins = doctor_plugin_registry();
+        // Every first-party app must have a doctor row — otherwise a newly
+        // launched plugin is silently un-diagnosed. Compared as sorted sets
+        // of install slugs.
+        let mut doctor_slugs: Vec<&str> = plugins.iter().map(|p| p.install_slug).collect();
+        doctor_slugs.sort_unstable();
+        let mut app_slugs: Vec<&str> = FIRST_PARTY_SLUGS.to_vec();
+        app_slugs.sort_unstable();
+        assert_eq!(
+            doctor_slugs, app_slugs,
+            "doctor_plugin_registry() and FIRST_PARTY_SLUGS drifted — add the new plugin to doctor"
+        );
+    }
+
+    #[test]
+    fn doctor_plugin_registry_exactly_one_daemon() {
+        // trust-local is the only daemon plugin (own port); the compliance
+        // filters are subprocesses. The §7.5 code `.find(|p| p.is_daemon)`
+        // relies on this — pin it so a future daemon plugin forces a review.
+        let plugins = doctor_plugin_registry();
+        assert_eq!(plugins.iter().filter(|p| p.is_daemon).count(), 1);
     }
 }
 

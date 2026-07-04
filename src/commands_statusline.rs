@@ -1970,7 +1970,10 @@ mod tests {
         let path = dir.join("sync-health.json");
 
         std::fs::write(&path, "{not-json").unwrap();
-        assert!(sync_health_line().is_none(), "malformed file must not render");
+        assert!(
+            sync_health_line().is_none(),
+            "malformed file must not render"
+        );
 
         std::fs::write(&path, r#"{"rails":{},"written_at":1}"#).unwrap();
         assert!(sync_health_line().is_none(), "empty rails must not render");

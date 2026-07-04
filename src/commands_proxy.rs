@@ -1816,6 +1816,29 @@ pub fn doctor_proxy_status() -> (bool, Option<u32>) {
     }
 }
 
+/// Compact one-line status for the `aikey service status` aggregate.
+/// Returns `(running, "<detail>")`. Reuses the same `proxy_state()` truth
+/// source as `handle_status()` so the aggregate can never disagree with
+/// `aikey proxy status` — only the verbosity differs.
+pub fn status_summary() -> (bool, String) {
+    use crate::proxy_state::{proxy_state, ProxyState};
+    let addr = proxy_listen_addr(None);
+    match proxy_state(&addr) {
+        ProxyState::Running {
+            pid, listen_addr, ..
+        } => (true, format!("running on http://{listen_addr} (pid {pid})")),
+        ProxyState::Stopped => (false, "stopped".to_string()),
+        ProxyState::Crashed { stale_pid } => (false, format!("stopped (stale pid {stale_pid})")),
+        ProxyState::Unresponsive { pid, port } => (
+            false,
+            format!("unresponsive on :{port} (pid {pid}, /health not answering)"),
+        ),
+        ProxyState::OrphanedPort { port, .. } => {
+            (false, format!("port :{port} held by a foreign process"))
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Tests — resolve_config (regression net for the 2026-05-21 cwd-first
 // deprecation: see config-split-system-user.md v9 + bugfix 20260521).
