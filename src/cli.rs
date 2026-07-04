@@ -1738,46 +1738,53 @@ AiKey - Secure local-first secret management
 Usage: aikey [OPTIONS] [COMMAND]
 
 Commands:
+  {b}account{r} <command>        Manage your aikey account session
+  {b}activate{r} <alias>          Temporarily activate a key in the current terminal
   {b}add{r} <alias>              Save a new secret to the vault
   {b}auth{r} <command>           Manage provider OAuth accounts (Claude, Codex, Kimi)
-  {b}list{r}                     Show all personal, team, and OAuth keys (alias for `key list`)
-  {b}test{r} <alias>             Test whether a stored API key alias is working
-  {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
-  {b}unuse{r} <provider...>      Remove the active binding for one or more providers
-  {b}activate{r} <alias>          Temporarily activate a key in the current terminal
+  {b}change-password{r}          Change the vault master password
   {b}deactivate{r}               Restore global settings in the current terminal
-  {b}route{r} [label]            Show proxy route tokens for third-party AI clients
-  {b}login{r}                    Log in to aikey service (shortcut for `account login`)
-  {b}web{r} [page]               Open the User Console in your default browser
-  {b}master{r} [page]            Open the Master Console (admin) in your default browser
+  {b}delete{r} <alias>           Delete a secret from the vault
   {b}doctor{r}                   Check system health, connectivity, and configuration
   {b}env{r} [command]            View or set proxy environment variables
-  {b}proxy{r} <command>          Manage the local proxy process
-  {b}status{r}                   Show a summary of gateway, login, keys, and providers
-  {b}whoami{r}                   Show your current login, active key, and vault status
-  {b}get{r} <alias>              Retrieve a secret and copy it to the clipboard
-  {b}run{r} -- <command>         Run a command with secrets injected as environment variables
-  {b}key{r} <command>            Manage API keys (rotate, list, sync, use)
-  {b}quickstart{r}               Show a state-aware landing page with the next most useful commands
-  {b}project{r} <command>        Manage project configuration
-  {b}logs{r}                     Show recent activity logs
-  {b}update{r} <alias>           Update an existing secret
-  {b}delete{r} <alias>           Delete a secret from the vault
   {b}export{r} <pattern> <file>  Export secrets to an encrypted backup file
-  {b}change-password{r}          Change the vault master password
-  {b}account{r} <command>        Manage your aikey account session
-  {b}logout{r}                   Log out of the current session (shortcut for `account logout`)
-  {b}secret{r} <command>         Manage secrets and platform-backed secret actions
-  {b}statusline{r}               Render a one-line usage receipt for Claude Code's status line
-  {b}watch{r}                    Show a top-style dashboard of recent key usage
+  {b}get{r} <alias>              Retrieve a secret and copy it to the clipboard
   {b}help{r}                     Show this help message or help for a command
+  {b}key{r} <command>            Manage API keys (rotate, list, sync, use)
+  {b}list{r}                     Show all personal, team, and OAuth keys (alias for `key list`)
+  {b}login{r}                    Log in to aikey service (shortcut for `account login`)
+  {b}logout{r}                   Log out of the current session (shortcut for `account logout`)
+  {b}logs{r}                     Show recent activity logs
+  {b}master{r} [page]            Open the Master Console (admin) in your default browser
+  {b}project{r} <command>        Manage project configuration
+  {b}proxy{r} <command>          Manage the local proxy process
+  {b}quickstart{r}               Show a state-aware landing page with the next most useful commands
+  {b}route{r} [label]            Show proxy route tokens for third-party AI clients
+  {b}run{r} -- <command>         Run a command with secrets injected as environment variables
+  {b}secret{r} <command>         Manage secrets and platform-backed secret actions
+  {b}status{r}                   Show a summary of gateway, login, keys, and providers
+  {b}statusline{r}               Render a one-line usage receipt for Claude Code's status line
+  {b}test{r} <alias>             Test whether a stored API key alias is working
+  {b}unuse{r} <provider...>      Remove the active binding for one or more providers
+  {b}update{r} <alias>           Update an existing secret
+  {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
+  {b}watch{r}                    Show a top-style dashboard of recent key usage
+  {b}web{r} [page]               Open the User Console in your default browser
+  {b}whoami{r}                   Show your current login, active key, and vault status
 
 Options:
       --password-stdin  Read password from stdin instead of prompting
       --json            Output in JSON format (where supported)
   -V, --version         Print version information
   -h, --help            Print help
-      --detail          Print detailed help for all commands"
+      --detail          Print detailed help for all commands
+
+Frequently used:
+  {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
+  {b}login{r}                    Log in to aikey service (shortcut for `account login`)
+  {b}doctor{r}                   Check system health, connectivity, and configuration
+  {b}web{r} [page]               Open the User Console in your default browser
+  {b}master{r} [page]            Open the Master Console (admin) in your default browser"
     );
 }
 

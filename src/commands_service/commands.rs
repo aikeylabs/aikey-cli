@@ -176,6 +176,13 @@ mod trust_local {
     }
 
     fn status_detail(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+        // `installed` is an explicit field (not inferred from `detail`) so
+        // consumers — notably the web trust-check banner via the console —
+        // can distinguish "not installed" from "installed but stopped"
+        // without string-matching the human detail. Same binary-path truth
+        // source as status_summary(). Bugfix:
+        // 20260703-trust-check-web-offline-vs-notinstalled-proactive.md.
+        let installed = aikey_home_bin_path().exists();
         let (running, detail) = status_summary();
         if json {
             println!(
@@ -183,6 +190,7 @@ mod trust_local {
                 serde_json::json!({
                     "ok": true,
                     "service": SERVICE_NAME,
+                    "installed": installed,
                     "running": running,
                     "detail": detail,
                 })

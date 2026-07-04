@@ -231,7 +231,7 @@ aikey audit status                          # 按源看：已分配 / 已确认 
 aikey audit reconcile                       # 立即主动对账：补传可恢复缺口、确认真实丢失
 ```
 
-`aikey --help` 看全部子命令(显示顺序 = 使用频率,高频在前)。
+`aikey --help` 看全部子命令(按字母序排列,末尾附「Frequently used」高频命令快捷区)。
 
 ## 10. 错误码
 

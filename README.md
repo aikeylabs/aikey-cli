@@ -231,7 +231,7 @@ aikey audit status                          # per-source: allocated / confirmed 
 aikey audit reconcile                       # actively reconcile now: re-send recoverable gaps, confirm true losses
 ```
 
-Run `aikey --help` for the full subcommand list (display order = frequency, frequent first).
+Run `aikey --help` for the full subcommand list (alphabetical, with a "Frequently used" shortcut section at the end).
 
 ## 10. Error Codes
 

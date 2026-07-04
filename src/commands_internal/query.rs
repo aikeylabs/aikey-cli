@@ -337,23 +337,36 @@ fn merge_group_accounts_live(
     Some(Value::Array(merged))
 }
 
-/// Whether the group VK's CURRENT ROUTED account — the one the remote scheduling
-/// engine selected — is logged in. Drives the group-VK usability overlay on
-/// effective_status (owner rule 2026-06-30): a claimed+active group VK is only usable
-/// when the account it actually routes to has a token; otherwise a request goes to
-/// that account and fails (GROUP_NO_CANDIDATES for an empty set, LOGIN_REQUIRED when
-/// the routed account is needs_login) — so it must read inactive (hides the web `use`
-/// button + matches aikey use/list).
+/// The usability state of a group VK's CURRENT ROUTED account — the one the remote
+/// scheduling engine selected. Drives the group-VK overlay on effective_status
+/// (owner rule 2026-06-30, refined 2026-07-03): a claimed+active group VK is only
+/// usable when the account it actually routes to has a token. The refinement splits
+/// the old single "inactive" verdict into two, so the member sees the actionable
+/// case distinctly (防呆):
+///   - `LoggedIn`   → the routed account has a token → VK is `active`.
+///   - `NeedsLogin` → the routed account exists but the member hasn't logged in →
+///     VK reads `needs_login` (not a scary red `inactive`): a request would return
+///     LOGIN_REQUIRED, but the fix is one login, not an admin action. The web vault
+///     page shows an amber "待登录" chip + a login CTA (→ /user/team-oauth) instead of
+///     a dead red row.
+///   - `NoCandidate` → empty set / no routed account resolvable → VK reads `inactive`
+///     (genuinely unusable — GROUP_NO_CANDIDATES; nothing to log into).
 ///
 /// Routed account = the candidate the proxy flagged `current_routed` (engine override
 /// ?? rank-0). Before the proxy has stamped it (brief post-sync window), fall back to
 /// the static default (`assigned` = master rank-0) — which IS the routed account when
-/// there is no engine override. Empty set / no routed account resolvable → false
-/// (unusable). Being logged into a DIFFERENT, non-routed account does NOT count: the
-/// engine decides where traffic goes, and that account is what needs a token.
-fn routed_candidate_logged_in(merged: Option<&serde_json::Value>) -> bool {
+/// there is no engine override. Being logged into a DIFFERENT, non-routed account does
+/// NOT count: the engine decides where traffic goes, and that account is what needs a token.
+#[derive(PartialEq, Eq, Debug)]
+enum RoutedState {
+    LoggedIn,
+    NeedsLogin,
+    NoCandidate,
+}
+
+fn routed_candidate_state(merged: Option<&serde_json::Value>) -> RoutedState {
     let Some(arr) = merged.and_then(|v| v.as_array()) else {
-        return false;
+        return RoutedState::NoCandidate;
     };
     let flagged =
         |c: &&serde_json::Value, key: &str| c.get(key).and_then(|b| b.as_bool()) == Some(true);
@@ -361,7 +374,37 @@ fn routed_candidate_logged_in(merged: Option<&serde_json::Value>) -> bool {
         .iter()
         .find(|c| flagged(c, "current_routed"))
         .or_else(|| arr.iter().find(|c| flagged(c, "assigned")));
-    routed.and_then(|c| c.get("login_status").and_then(|s| s.as_str())) == Some("logged_in")
+    match routed {
+        None => RoutedState::NoCandidate,
+        Some(c) => {
+            if c.get("login_status").and_then(|s| s.as_str()) == Some("logged_in") {
+                RoutedState::LoggedIn
+            } else {
+                RoutedState::NeedsLogin
+            }
+        }
+    }
+}
+
+/// The protocol source for a team VK's `protocol_family`, priority ordered:
+/// VK-level `provider_code` (direct VKs / present) → `protocol_type` (2026-07-03).
+///
+/// **Why the protocol_type fallback**: a group VK's `provider_code` is ALWAYS empty
+/// (it binds a group, not one provider). Normally the web recovers the protocol from
+/// the routed pool account's provider — but when the seat is unbound from the group
+/// the candidate set (`group_accounts`) AND `supported_providers` both go empty, so
+/// there is nothing account-derived left and the protocol column falls to "unknown"
+/// for the orphaned VK. `protocol_type` comes from the VK's group BINDING (not the
+/// accounts), so it SURVIVES member removal ("anthropic" stays) — the stable source.
+/// `None` only when both are empty (truly no protocol info) → caller renders "unknown".
+fn team_protocol_source<'a>(provider_code: &'a str, protocol_type: &'a str) -> Option<&'a str> {
+    if !provider_code.is_empty() {
+        Some(provider_code)
+    } else if !protocol_type.is_empty() {
+        Some(protocol_type)
+    } else {
+        None
+    }
 }
 
 fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Value> {
@@ -381,18 +424,21 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
                 merge_group_accounts_live(t.group_accounts.as_deref(), t.group_runtime.as_deref());
             // Base status from key/share/local; group VKs get a usability overlay: a
             // claimed+active group VK whose CURRENT ROUTED account isn't logged in can't
-            // route (无可用账号 / needs_login → GROUP_NO_CANDIDATES / LOGIN_REQUIRED), so
-            // it reads inactive — hides the web `use` button + matches aikey use/list
-            // (owner rule 2026-06-30). login_status is the FRESH proxy value, so this
-            // flips to active within the proxy's ≤60s poll after the routed account logs in.
+            // route. The overlay splits that into `needs_login` (routed account exists,
+            // just needs a token — actionable) vs `inactive` (no routable account at all
+            // → GROUP_NO_CANDIDATES) so the member sees the actionable case distinctly
+            // (owner rule 2026-06-30, 防呆 refinement 2026-07-03). login_status is the
+            // FRESH proxy value, so this flips to active within the proxy's ≤60s poll
+            // after the routed account logs in.
             let effective_status = {
                 let base = team_effective_status(&t.key_status, &t.share_status, &t.local_state);
                 let is_group_vk = t.oauth_group_id.as_deref().is_some_and(|s| !s.is_empty());
-                if base == "active"
-                    && is_group_vk
-                    && !routed_candidate_logged_in(merged_accounts.as_ref())
-                {
-                    "inactive"
+                if base == "active" && is_group_vk {
+                    match routed_candidate_state(merged_accounts.as_ref()) {
+                        RoutedState::LoggedIn => "active",
+                        RoutedState::NeedsLogin => "needs_login",
+                        RoutedState::NoCandidate => "inactive",
+                    }
                 } else {
                     base
                 }
@@ -420,7 +466,7 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
                 "virtual_key_id": t.virtual_key_id,
                 "alias": effective_alias,
                 "local_alias": t.local_alias,
-                "protocol_family": protocol_family_of(Some(&t.provider_code)),
+                "protocol_family": protocol_family_of(team_protocol_source(&t.provider_code, &t.protocol_type)),
                 "supported_providers": t.supported_providers,
                 "share_status": share_status_wire,
                 "effective_status": effective_status,
@@ -1463,59 +1509,90 @@ mod merge_group_accounts_live_tests {
 }
 
 #[cfg(test)]
-mod routed_candidate_logged_in_tests {
+mod team_protocol_source_tests {
+    use super::*;
+
+    // Direct VK: provider_code present → use it.
+    #[test]
+    fn provider_code_wins_when_present() {
+        assert_eq!(team_protocol_source("anthropic", "openai_compatible"), Some("anthropic"));
+    }
+
+    // Orphaned group VK (seat unbound): provider_code empty → fall back to the stable,
+    // binding-derived protocol_type. 能红: drop the protocol_type fallback → returns
+    // None → protocol renders "unknown" for the orphaned VK (the reported bug).
+    #[test]
+    fn falls_back_to_protocol_type_when_provider_code_empty() {
+        assert_eq!(team_protocol_source("", "anthropic"), Some("anthropic"));
+    }
+
+    // Both empty → no protocol info at all → None (caller renders "unknown", honest).
+    #[test]
+    fn none_when_both_empty() {
+        assert_eq!(team_protocol_source("", ""), None);
+    }
+}
+
+#[cfg(test)]
+mod routed_candidate_state_tests {
     use super::*;
     use serde_json::json;
 
     // Owner rule (2026-06-30): usable iff the CURRENT ROUTED account (engine pick) is
-    // logged in. current_routed=a1 logged_in → usable.
+    // logged in. current_routed=a1 logged_in → LoggedIn (→ active).
     #[test]
-    fn routed_account_logged_in_is_usable() {
+    fn routed_account_logged_in_is_logged_in() {
         let m = json!([
             {"account_id":"a1","assigned":true,"current_routed":true,"login_status":"logged_in"},
             {"account_id":"a2","assigned":false,"current_routed":false,"login_status":"needs_login"}
         ]);
-        assert!(routed_candidate_logged_in(Some(&m)));
+        assert_eq!(routed_candidate_state(Some(&m)), RoutedState::LoggedIn);
     }
 
     // STRICT: logged into a NON-routed account does NOT count. routed (a1) needs_login,
-    // a2 logged_in but not routed → NOT usable. 能红: a looser "any logged in" gate
-    // would wrongly pass this.
+    // a2 logged_in but not routed → NeedsLogin (→ the actionable state, not active).
+    // 能红: a looser "any logged in" gate would wrongly return LoggedIn.
     #[test]
-    fn logged_into_non_routed_account_is_not_usable() {
+    fn logged_into_non_routed_account_is_needs_login() {
         let m = json!([
             {"account_id":"a1","assigned":true,"current_routed":true,"login_status":"needs_login"},
             {"account_id":"a2","assigned":false,"current_routed":false,"login_status":"logged_in"}
         ]);
-        assert!(!routed_candidate_logged_in(Some(&m)));
+        assert_eq!(routed_candidate_state(Some(&m)), RoutedState::NeedsLogin);
     }
 
     // Fallback: proxy hasn't stamped current_routed yet → use the static default
-    // (assigned = rank-0). assigned a1 logged_in → usable.
+    // (assigned = rank-0). assigned a1 logged_in → LoggedIn.
     #[test]
     fn falls_back_to_assigned_when_no_current_routed() {
         let m = json!([
             {"account_id":"a1","assigned":true,"login_status":"logged_in"},
             {"account_id":"a2","assigned":false,"login_status":"needs_login"}
         ]);
-        assert!(routed_candidate_logged_in(Some(&m)));
+        assert_eq!(routed_candidate_state(Some(&m)), RoutedState::LoggedIn);
     }
 
-    // 无可用账号: empty candidate set (seat unbound) → not usable.
+    // 无可用账号: empty candidate set (seat unbound) → NoCandidate (→ genuine inactive,
+    // NOT needs_login — there is nothing to log into). 能红: collapsing NoCandidate into
+    // NeedsLogin would wrongly offer a login CTA for an unbindable seat.
     #[test]
-    fn empty_candidate_set_is_not_usable() {
-        assert!(!routed_candidate_logged_in(Some(&json!([]))));
-        assert!(!routed_candidate_logged_in(None));
+    fn empty_candidate_set_is_no_candidate() {
+        assert_eq!(
+            routed_candidate_state(Some(&json!([]))),
+            RoutedState::NoCandidate
+        );
+        assert_eq!(routed_candidate_state(None), RoutedState::NoCandidate);
     }
 
-    // All needs_login (member signed into nothing) → routed account needs_login → not usable.
+    // All needs_login (member signed into nothing) → routed account needs_login →
+    // NeedsLogin (the 防呆 case the vault page surfaces as amber "待登录" + login CTA).
     #[test]
-    fn all_needs_login_is_not_usable() {
+    fn all_needs_login_is_needs_login() {
         let m = json!([
             {"account_id":"a1","assigned":true,"login_status":"needs_login"},
             {"account_id":"a2","assigned":false,"login_status":"needs_login"}
         ]);
-        assert!(!routed_candidate_logged_in(Some(&m)));
+        assert_eq!(routed_candidate_state(Some(&m)), RoutedState::NeedsLogin);
     }
 }
 
