@@ -1082,6 +1082,12 @@ fn finish_login(
     // daemon wires the proxy identically — see persist_control_url_sidecar.
     persist_control_url_sidecar(&control_url, json_mode);
 
+    // Unified-origin landing (方案A, 2026-07-03): the ACTIVATION PAGE swaps
+    // itself to the local console once it observes the gateway live (its
+    // polling probe reads /system/team-url). The CLI deliberately does NOT
+    // also open a tab — two openers meant two console tabs. `aikey web`
+    // remains the manual entry (P3 gateway branch).
+
     Ok(())
 }
 
@@ -1611,6 +1617,37 @@ pub fn handle_browse(
                        | sh -s -- --yes --with-console".into()
                 );
             }
+        }
+    }
+
+    // Unified-origin composing gateway (P3, 2026-07-03 design doc
+    // 20260703-web统一origin-本地网关方案): when the co-installed local-server
+    // composes the team side on 127.0.0.1, `aikey web` opens the LOCAL
+    // origin. Team pages/data are reachable there same-origin (which is why
+    // the 2026-06-01 "logged-in must land on the team panel" pushback no
+    // longer applies), and this path performs NO remote token refresh —
+    // refresh hard-blocked `aikey web` whenever the team server's address
+    // changed (2026-07-02 report: Connection refused on token/refresh).
+    // OLD local-servers don't advertise the gateway → fall through to the
+    // pre-existing team-origin flow below, unchanged (progressive
+    // enhancement, no hard cutover). Explicit --port keeps its meaning.
+    if port.is_none() {
+        if let Some(base) = local_gateway_base() {
+            let url = format!("{}/go/{}", base, alias);
+            if json_mode {
+                crate::json_output::print_json(serde_json::json!({
+                    "ok": true,
+                    "url": &url,
+                    "mode": "local-gateway",
+                }));
+            } else if !copy_url {
+                println!("Opening User Console (unified local origin)...");
+                println!("  {}", url);
+            }
+            // Local origin needs no auth token in the URL — the gateway
+            // injects the vault JWT server-side for team requests.
+            deliver_browse_url(&url, copy_url, json_mode, &url);
+            return Ok(());
         }
     }
 
@@ -7205,5 +7242,79 @@ mod sync_prune_tests {
         // Idempotent: a second pass has nothing to prune and must not error.
         apply_snapshot_to_cache(&[], "acct-A");
         assert_eq!(storage::list_virtual_key_cache().unwrap().len(), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified-origin composing gateway probe (P3, 20260703-web统一origin design)
+// ---------------------------------------------------------------------------
+
+/// Decides whether the local console can serve as the unified origin, from
+/// the parsed /system/team-url response. Pure so unit tests can pin the
+/// gating rule without a live server (same pattern as
+/// `browser_launch_command`).
+///
+/// Gate = `gateway:true` AND a non-empty team_url: the gateway capability
+/// exists only on new local-server binaries, and it composes nothing until
+/// the CLI is logged in — both must hold or `aikey web` must keep the
+/// pre-gateway team-origin behavior.
+fn gateway_base_from_team_url_response(v: &serde_json::Value, port: u16) -> Option<String> {
+    let gateway = v.get("gateway").and_then(|g| g.as_bool()).unwrap_or(false);
+    let team = v.get("team_url").and_then(|t| t.as_str()).unwrap_or("");
+    if gateway && !team.is_empty() {
+        Some(format!("http://127.0.0.1:{}", port))
+    } else {
+        None
+    }
+}
+
+/// Probes the co-installed local-server for the composing gateway. Returns
+/// the local console base URL when the RUNNING server advertises it.
+///
+/// Why probe at call time instead of trusting install-state: the gateway is
+/// login-gated per request inside the server and only exists on new
+/// binaries; a 400ms loopback probe is cheap and always current, and a
+/// failed probe simply falls back to the old flow (never blocks).
+fn local_gateway_base() -> Option<String> {
+    let port = crate::local_server_probe::read_local_server_port_or_default().unwrap_or(8090);
+    let url = format!("http://127.0.0.1:{}/system/team-url", port);
+    let resp = ureq::get(&url)
+        .timeout(std::time::Duration::from_millis(400))
+        .call()
+        .ok()?;
+    let v: serde_json::Value = resp.into_json().ok()?;
+    gateway_base_from_team_url_response(&v, port)
+}
+
+#[cfg(test)]
+mod gateway_probe_tests {
+    use super::gateway_base_from_team_url_response;
+    use serde_json::json;
+
+    // Fence for the P3 gating rule: `aikey web` may only route to the local
+    // origin when the server EXPLICITLY advertises the composing gateway AND
+    // a team login exists. Every other shape (old server without the field,
+    // logged-out, malformed) must fall back to the team-origin flow.
+    #[test]
+    fn routes_local_only_when_gateway_and_logged_in() {
+        let yes = json!({"team_url": "http://192.168.0.120:3000", "gateway": true});
+        assert_eq!(
+            gateway_base_from_team_url_response(&yes, 8090).as_deref(),
+            Some("http://127.0.0.1:8090")
+        );
+    }
+
+    #[test]
+    fn old_server_without_gateway_field_falls_back() {
+        let old = json!({"team_url": "http://192.168.0.120:3000"});
+        assert!(gateway_base_from_team_url_response(&old, 8090).is_none());
+    }
+
+    #[test]
+    fn logged_out_or_malformed_falls_back() {
+        let out = json!({"team_url": "", "gateway": true});
+        assert!(gateway_base_from_team_url_response(&out, 8090).is_none());
+        let weird = json!({"gateway": "yes"});
+        assert!(gateway_base_from_team_url_response(&weird, 8090).is_none());
     }
 }

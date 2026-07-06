@@ -136,6 +136,7 @@ regex = "1.11"      # Text pattern matching (commands_internal/parse.rs)
 bitflags = "2"      # LineFlags 属性矩阵 (parse/line_class.rs, v4.1 spike 迁移 Stage 1)
 crfs = "0.4"        # Pure-Rust CRFsuite port (Stage 3 parse Layer 2; ablation-spike verified determinism)
 serde_yaml = "0.9"  # Provider fingerprint registry (Stage 3 parse Layer 3; embedded via include_str!)
+toml_edit = "0.19" # Format-preserving TOML parse-merge for third-party CLI config injection (kimi/codex). Already in Cargo.lock as a transitive dep, so promoting it adds zero new transitive deps. Why not string-append: a foreign writer (e.g. kimi's own `hooks = []`) plus our blind append produced duplicate-key invalid TOML — see workflow/CI/bugfix. Why toml_edit over `toml`: preserves the user's comments/key-ordering when we edit their file.
 md-5 = "0.10"       # MD5 for Kimi session_dir lookup (matches kimi-cli's WorkDirMeta hash)
 hex = "0.4"         # Hex encoding for HMAC display
 bincode = "1.3"     # Binary serialization for .akb format

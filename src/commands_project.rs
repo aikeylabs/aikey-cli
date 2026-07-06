@@ -758,6 +758,46 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             }
         }
 
+        // Usage-receipt pipeline heartbeat. Surfaces "receipts last landed N ago
+        // / never observed" so a third-party CLI upgrade that silently broke the
+        // kimi/claude receipt path (session-layout / payload drift) is visible
+        // here instead of nowhere. Informational (ok=true): a stale/absent
+        // heartbeat can also just mean the tool wasn't used, so we never fail
+        // doctor on it — but we point at the WARN log for the drift signature.
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let fmt_age = |ts: i64| -> String {
+                let s = (now - ts).max(0);
+                if s >= 86400 {
+                    format!("{}d ago", s / 86400)
+                } else if s >= 3600 {
+                    format!("{}h ago", s / 3600)
+                } else if s >= 60 {
+                    format!("{}m ago", s / 60)
+                } else {
+                    format!("{}s ago", s)
+                }
+            };
+            let parts: Vec<String> = ["kimi", "claude"]
+                .iter()
+                .map(|tool| match crate::commands_statusline::receipt_last_ok(tool) {
+                    Some(ts) => format!("{}: {}", tool, fmt_age(ts)),
+                    None => format!("{}: never", tool),
+                })
+                .collect();
+            emit(
+                "usage receipts",
+                true,
+                &parts.join(" · "),
+                Some(
+                    "if a tool you use shows 'never'/very stale, grep ~/.aikey/logs/aikey-cli/current.jsonl for cli.receipt.* WARNs (may signal a kimi/claude upgrade broke the pipeline)",
+                ),
+            );
+        }
+
         // Probe backend services (docker or native).
         // control/collector/query = server-mode docker services. Probed
         // silently — failures here aren't actionable for Personal users.

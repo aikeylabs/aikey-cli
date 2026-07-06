@@ -287,35 +287,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!();
             eprintln!("  {}", "Get started:".bold());
             eprintln!(
-                "    aikey quickstart                       {}",
-                "See what to do next (state-aware)".dimmed()
-            );
-            eprintln!(
-                "    aikey add                              {}",
-                "Add a personal API key to the local vault".dimmed()
-            );
-            eprintln!(
-                "    aikey auth login <claude|codex|kimi>   {}",
-                "Sign in with an OAuth provider account".dimmed()
-            );
-            eprintln!(
-                "    aikey list                             {}",
-                "Show your keys (personal, team, OAuth)".dimmed()
-            );
-            eprintln!(
-                "    aikey route                            {}",
-                "Print proxy config for AI clients".dimmed()
-            );
-            eprintln!(
-                "    aikey web                              {}",
+                "    aikey web        {}",
                 "Open the User Console in the browser".dimmed()
+            );
+            eprintln!(
+                "    aikey login      {}",
+                "Log in to the aikey service".dimmed()
+            );
+            eprintln!(
+                "    aikey use        {}",
+                "Select the active key for routing".dimmed()
+            );
+            eprintln!(
+                "    aikey list       {}",
+                "Show your keys (personal, team, OAuth)".dimmed()
             );
             eprintln!();
             eprintln!("  {}", "Run 'aikey --help' for all commands.".dimmed());
             // Blink runs AFTER the full screen is painted so the user sees
             // banner + hints together instead of being held by the animation.
-            // 10 = blank + "Get started" + 6 commands + blank + hint.
-            cli::animate_banner_blink(10);
+            // 8 = blank + "Get started" + 4 commands + blank + hint.
+            cli::animate_banner_blink(8);
             std::process::exit(1);
         }
     }

@@ -29,6 +29,7 @@ AIKEY_BUILD_VERSION ?= $(VERSION)
 BUILD_ENV   = AIKEY_BUILD_VERSION=$(AIKEY_BUILD_VERSION) AIKEY_BUILD_REVISION=$(GIT_REVISION)$(GIT_DIRTY) AIKEY_BUILD_ID=$(BUILD_ID) AIKEY_BUILD_TIME=$(BUILD_TIME)
 
 .PHONY: all release dev rebuild run test test-integration test-unit test-verbose \
+        test-cli-config-injection \
         test-import-recall test-proxy-lifecycle-e2e build-mock-proxy \
         e2e-import-personal e2e-import-trial e2e-import-production \
         security-check-batch-import \
@@ -77,6 +78,18 @@ test-unit:
 ## Run tests with output visible
 test-verbose:
 	$(CARGO) test -- --nocapture
+
+## Third-party CLI config-injection regression (kimi/codex toml_edit merge).
+## Guards against the 2026-07-04 kimi `hooks = []` duplicate-key corruption
+## (workflow/CI/bugfix/2026-07-04-kimi-config-hooks-duplicate-key.md): a foreign
+## key + our blind append produced invalid TOML. Covers merge/self-heal/idempotency
+## for kimi and structural upsert/conflict for codex.
+test-cli-config-injection:
+	$(CARGO) test --lib 'commands_account::shell_integration::hook_tests::kimi_merge'
+	$(CARGO) test --lib 'commands_account::shell_integration::hook_tests::kimi_remove'
+	$(CARGO) test --lib 'commands_account::shell_integration::hook_tests::codex_merge'
+	$(CARGO) test --lib 'commands_account::shell_integration::hook_tests::codex_remove'
+	$(CARGO) test --lib 'commands_account::shell_integration::hook_tests::codex_conflict'
 
 ## Stage 6 — end-to-end Quick Import smoke (per edition).
 ##
@@ -268,6 +281,7 @@ help:
 	@printf "  %-22s %s\n" "make test-unit"      "Unit tests only"
 	@printf "  %-22s %s\n" "make test-integration" "Integration tests only"
 	@printf "  %-22s %s\n" "make test-verbose"   "Tests with stdout visible"
+	@printf "  %-22s %s\n" "make test-cli-config-injection" "kimi/codex config-injection merge + self-heal regression (2026-07-04)"
 	@printf "  %-22s %s\n" "make test-import-recall" "Stage 3 parse engine recall + fingerprint gates"
 	@printf "  %-22s %s\n" "make e2e-import-personal" "Stage 6 e2e: status + aikey import smoke"
 	@printf "  %-22s %s\n" "make e2e-import-trial" "  (alias — same binary as personal)"

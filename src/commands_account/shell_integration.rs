@@ -50,21 +50,6 @@ const LEGACY_MARKER: &str = "# managed by aikey";
 /// build time depends on the aikey binary absolute path (which is derived
 /// from `current_exe()` independently of proxy_port). The proxy port is no
 /// longer embedded in this region — it's only referenced via env vars.
-fn build_kimi_managed_region(_proxy_port: u16) -> String {
-    let hook_cmd = crate::commands_statusline::aikey_statusline_render_kimi_command();
-    format!(
-        "{begin}\n\
-[[hooks]]\n\
-event = \"Stop\"\n\
-command = \"{cmd}\"\n\
-timeout = 5\n\
-{end}",
-        begin = AIKEY_BEGIN,
-        cmd = hook_cmd,
-        end = AIKEY_END,
-    )
-}
-
 /// Strip `default_model = "..."` lines at the top-level (outside any table)
 /// that were originally written by old aikey versions when the scaffold still
 /// included `[models.kimi-k2-5]`. After shrinking the region to hooks-only,
@@ -101,17 +86,228 @@ fn strip_legacy_kimi_default_model(content: &str) -> String {
     out
 }
 
-/// Replace the aikey-managed region in place. Returns `None` if no region
-/// was found (caller handles that as first-time install).
-fn replace_managed_region(content: &str, new_region: &str) -> Option<String> {
-    let begin = content.find(AIKEY_BEGIN)?;
-    let end_rel = content[begin..].find(AIKEY_END)?;
-    let end = begin + end_rel + AIKEY_END.len();
-    let mut out = String::with_capacity(content.len() + new_region.len());
-    out.push_str(&content[..begin]);
-    out.push_str(new_region);
-    out.push_str(&content[end..]);
-    Some(out)
+// ---------------------------------------------------------------------------
+// Foreign-config TOML merge core (kimi + codex)
+// ---------------------------------------------------------------------------
+//
+// Why this exists (workflow/CI/bugfix/2026-07-04-kimi-config-hooks-duplicate-key.md):
+//   We write into config files owned by third-party CLIs (kimi's
+//   `~/.kimi/config.toml`, codex's `~/.codex/config.toml`). The old approach
+//   string-appended a `[[hooks]]` / `[model_providers.aikey]` block WITHOUT
+//   parsing the existing TOML. When the third-party tool itself wrote a key of
+//   the same name (kimi's `save_config` emits a top-level `hooks = []`), the
+//   append produced TWO `hooks` definitions of incompatible TOML kinds
+//   (inline array vs array-of-tables) → the tool's own parser aborts with
+//   `Key "hooks" already exists` and the tool won't start.
+//
+// Fix: parse the existing file with `toml_edit` (format-preserving), merge our
+//   keys structurally, and re-serialize. A structural merge is immune to a
+//   foreign key of any name because we operate on the parsed document, never on
+//   raw text. `write_verified_toml` adds a belt-and-suspenders re-parse before
+//   committing so we can never leave a corrupt file behind while reporting ✓.
+
+/// Substring that identifies a `[[hooks]]` entry as aikey-authored, used to
+/// dedupe our own hook across re-runs and to strip it on uninstall. We key on
+/// the command's stable tail rather than a text marker comment, because a
+/// structural merge doesn't preserve arbitrary comment placement — semantic
+/// identity is more robust than a `# BEGIN aikey` text marker.
+const KIMI_HOOK_COMMAND_MARKER: &str = "statusline render kimi";
+
+/// Parse `content` as TOML, self-healing a file we previously corrupted.
+///
+/// Returns `None` only when the file is invalid TOML for a reason we did NOT
+/// cause — in that case the caller must NOT touch it (backup + WARN), because
+/// blindly rewriting could destroy user content we can't understand.
+///
+/// Self-heal path: our historical bug left a `# BEGIN aikey … [[hooks]] … # END
+/// aikey` region alongside a foreign `hooks = []`, which is unparseable. We
+/// strip our own marker region first (`strip_managed_region`) and retry — after
+/// removing our block the remaining file is the tool's own valid TOML, which we
+/// then merge into cleanly. This makes existing broken installs self-heal on
+/// the next `aikey use`.
+fn parse_or_heal_toml(content: &str) -> Option<toml_edit::Document> {
+    if let Ok(doc) = content.parse::<toml_edit::Document>() {
+        return Some(doc);
+    }
+    // Attempt 2: strip our own marker region(s) then re-parse.
+    let mut healed = content.to_string();
+    while let Some(stripped) = strip_managed_region(&healed) {
+        healed = stripped;
+    }
+    // Also drop any legacy single-line-marked rows before re-parsing.
+    let healed: String = healed
+        .lines()
+        .filter(|l| !l.contains(LEGACY_MARKER))
+        .collect::<Vec<_>>()
+        .join("\n");
+    healed.parse::<toml_edit::Document>().ok()
+}
+
+/// Layer-0 guardrail: verify the rendered document re-parses before committing.
+/// Returns `Ok(())` if it parses (caller writes), `Err(msg)` otherwise (caller
+/// must abort the write — never leave a corrupt config while reporting success).
+fn verify_toml(rendered: &str) -> Result<(), String> {
+    rendered
+        .parse::<toml_edit::Document>()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// True if a `[[hooks]]` table entry is one aikey wrote (matched by its
+/// command tail), so re-runs replace rather than duplicate it.
+fn hook_table_is_ours(t: &toml_edit::Table) -> bool {
+    t.get("command")
+        .and_then(|i| i.as_str())
+        .map(|c| c.contains(KIMI_HOOK_COMMAND_MARKER))
+        .unwrap_or(false)
+}
+
+/// Outcome of a structural merge into a third-party config.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum TomlMergeOutcome {
+    /// The file changed; carries the new full content to write.
+    Changed(String),
+    /// The desired state already holds; nothing to write (idempotent no-op).
+    Unchanged,
+    /// The existing file is invalid TOML that we did not author; the caller
+    /// must back it up + WARN and NOT overwrite it.
+    SkipUnparseable,
+}
+
+/// Pure core: merge aikey's Stop hook into an existing kimi `config.toml`
+/// (given as text), returning the new text. No IO. This is what the unit tests
+/// exercise directly.
+///
+/// Invariants:
+///   - Exactly one aikey-authored Stop hook after merge (dedupe by command).
+///   - Any non-aikey `hooks` entries the user/kimi wrote are preserved.
+///   - A foreign top-level `hooks = []` (kimi's own default) is folded into the
+///     array-of-tables instead of colliding with it — the reported bug.
+///   - The result always re-parses as valid TOML.
+pub(super) fn kimi_merge_hook(existing: &str, hook_cmd: &str) -> TomlMergeOutcome {
+    use toml_edit::{value, ArrayOfTables, Item, Table, Value};
+
+    // Legacy cleanup preserved from the string era: drop a top-level
+    // `default_model = "<old-aikey-default>"` that older aikey versions wrote
+    // pointing at a `[models.*]` block we no longer create.
+    let pre = strip_legacy_kimi_default_model(existing);
+
+    let mut doc = match parse_or_heal_toml(&pre) {
+        Some(d) => d,
+        None => return TomlMergeOutcome::SkipUnparseable,
+    };
+
+    // Collect existing hook entries (from array-of-tables OR an inline array),
+    // dropping any we previously authored.
+    let mut kept: Vec<Table> = Vec::new();
+    match doc.get("hooks") {
+        Some(Item::ArrayOfTables(aot)) => {
+            for t in aot.iter() {
+                if !hook_table_is_ours(t) {
+                    kept.push(t.clone());
+                }
+            }
+        }
+        Some(Item::Value(Value::Array(arr))) => {
+            // kimi's empty default is `hooks = []`; a populated inline array is
+            // rare but handle it by lifting inline tables into real tables.
+            for v in arr.iter() {
+                if let Value::InlineTable(it) = v {
+                    let t = it.clone().into_table();
+                    if !hook_table_is_ours(&t) {
+                        kept.push(t);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Build our Stop hook table.
+    let mut ours = Table::new();
+    ours["event"] = value("Stop");
+    ours["command"] = value(hook_cmd);
+    ours["timeout"] = value(5i64);
+
+    // Rebuild the array-of-tables: kept entries first, then ours.
+    let mut aot = ArrayOfTables::new();
+    for t in kept {
+        aot.push(t);
+    }
+    aot.push(ours);
+
+    // Remove the old `hooks` key entirely, then insert the fresh AoT. Removing
+    // first is critical: replacing a top-level `hooks = []` value in place would
+    // keep its position AMONG the scalar keys, and a `[[hooks]]` header emitted
+    // mid-scalars would swallow every following scalar into the table. Removing
+    // + re-inserting gives the AoT an end-of-document position (valid TOML).
+    doc.as_table_mut().remove("hooks");
+    doc["hooks"] = Item::ArrayOfTables(aot);
+
+    let rendered = doc.to_string();
+    if rendered == existing {
+        TomlMergeOutcome::Unchanged
+    } else {
+        TomlMergeOutcome::Changed(rendered)
+    }
+}
+
+/// Pure core: remove aikey's Stop hook(s) from an existing kimi config,
+/// preserving every non-aikey hook. `Unchanged` when we authored nothing here.
+pub(super) fn kimi_remove_hook(existing: &str) -> TomlMergeOutcome {
+    use toml_edit::{ArrayOfTables, Item, Table, Value};
+
+    let mut doc = match parse_or_heal_toml(existing) {
+        Some(d) => d,
+        None => return TomlMergeOutcome::SkipUnparseable,
+    };
+
+    let mut kept: Vec<Table> = Vec::new();
+    let mut removed_ours = false;
+    match doc.get("hooks") {
+        Some(Item::ArrayOfTables(aot)) => {
+            for t in aot.iter() {
+                if hook_table_is_ours(t) {
+                    removed_ours = true;
+                } else {
+                    kept.push(t.clone());
+                }
+            }
+        }
+        Some(Item::Value(Value::Array(arr))) => {
+            for v in arr.iter() {
+                if let Value::InlineTable(it) = v {
+                    let t = it.clone().into_table();
+                    if hook_table_is_ours(&t) {
+                        removed_ours = true;
+                    } else {
+                        kept.push(t);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if !removed_ours {
+        return TomlMergeOutcome::Unchanged;
+    }
+
+    doc.as_table_mut().remove("hooks");
+    if !kept.is_empty() {
+        let mut aot = ArrayOfTables::new();
+        for t in kept {
+            aot.push(t);
+        }
+        doc["hooks"] = Item::ArrayOfTables(aot);
+    }
+
+    let rendered = doc.to_string();
+    if rendered == existing {
+        TomlMergeOutcome::Unchanged
+    } else {
+        TomlMergeOutcome::Changed(rendered)
+    }
 }
 
 /// Strip the aikey-managed region (plus one trailing newline, if any) and
@@ -324,13 +520,14 @@ pub fn apply_third_party_cli_configs(providers: &[String], proxy_port: u16) {
     }
 }
 
-/// Ensure the aikey-managed scaffold exists in `~/.kimi/config.toml`.
+/// Ensure aikey's Stop hook exists in `~/.kimi/config.toml`.
 ///
-/// Writes the region only if absent or content-drifted — subsequent `aikey use`
-/// calls are no-ops, because the region is token-agnostic (token overrides
-/// via `KIMI_API_KEY` env var at runtime). See `build_kimi_managed_region`
-/// docstring for why the scaffold is necessary at all.
-pub fn configure_kimi_cli(proxy_port: u16) {
+/// Structurally merges the hook via `kimi_merge_hook` (toml_edit) — subsequent
+/// `aikey use` calls are no-ops when unchanged, because the hook is
+/// token-agnostic (token overrides ride the `KIMI_API_KEY` env var at runtime).
+/// The merge is immune to kimi's own `hooks = []` because it edits the parsed
+/// document, never raw text (see the foreign-config TOML merge core above).
+pub fn configure_kimi_cli(_proxy_port: u16) {
     use colored::Colorize;
     use std::io::{IsTerminal, Write};
 
@@ -341,134 +538,89 @@ pub fn configure_kimi_cli(proxy_port: u16) {
         .unwrap_or_else(|| resolve_user_home().join(".kimi"));
 
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let region = build_kimi_managed_region(proxy_port);
+    let hook_cmd = crate::commands_statusline::aikey_statusline_render_kimi_command();
 
-    let has_region = existing.contains(AIKEY_BEGIN);
-    let has_legacy_only = !has_region && existing.contains(LEGACY_MARKER);
+    // First-time = our hook not yet present (semantic identity, not a text
+    // marker). Governs the TTY prompt + one-time backup.
+    let first_time = !existing.contains(KIMI_HOOK_COMMAND_MARKER);
 
-    // Build the desired file contents for each of the three code paths.
-    let (desired, first_time) = if has_region {
-        // Managed region already present — in-place replace (no prompt).
-        // Also strip any legacy `default_model = "<old-aikey-default>"` at the
-        // top level. Older aikey versions wrote `default_model = "kimi-k2-5"`
-        // outside the region assuming `[models.kimi-k2-5]` existed inside;
-        // with the hook-only region, that reference would fail Kimi validation.
-        match replace_managed_region(&existing, &region) {
-            Some(s) => (strip_legacy_kimi_default_model(&s), false),
-            None => return, // defensive; should be unreachable because has_region is true
-        }
-    } else if has_legacy_only {
-        // Legacy upgrade path: user has the old `# managed by aikey` single-line
-        // marker but not the new AIKEY_BEGIN region. Strategy:
-        //
-        // 1. If a backup exists → restore it wholesale, then append fresh region.
-        //    This is the clean path and leaves no duplicate TOML keys.
-        //
-        // 2. Otherwise → strip any line containing the legacy marker before
-        //    appending. Without this strip, the legacy provider/model blocks
-        //    remain and Kimi's TOML parser rejects the duplicate `[providers.kimi]`
-        //    key. The strip is conservative: we only drop lines that explicitly
-        //    carry the `# managed by aikey` marker (aikey never wrote those
-        //    lines without the marker), preserving any user-added content in
-        //    between.
-        let (base, stripped_legacy) = match std::fs::read_to_string(&backup_path) {
-            Ok(s) => (s, false),
-            Err(_) => {
-                let sanitized: String = existing
-                    .lines()
-                    .filter(|l| !l.contains(LEGACY_MARKER))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                (sanitized, true)
+    if first_time && io::stderr().is_terminal() {
+        // Hook-only footprint: providers/models come from env vars set in
+        // active.env; only the `[[hooks]]` Stop entry needs file-backed storage.
+        let rows: Vec<String> = {
+            let mut r = vec![
+                format!("File:    {}", display_path(".kimi/config.toml")),
+                "Add:     Stop hook → aikey statusline render kimi".to_string(),
+                "         (provider/models come from env vars)".to_string(),
+            ];
+            if !existing.is_empty() {
+                r.push(format!(
+                    "Backup:  {}",
+                    display_path(".kimi/config.aikey_backup.toml")
+                ));
             }
+            r
         };
-        let mut out = base.trim_end().to_string();
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(&region);
-        out.push('\n');
-        if stripped_legacy && io::stderr().is_terminal() {
-            use colored::Colorize;
+        crate::ui_frame::eprint_box("\u{2753}", "Configure Kimi CLI", &rows);
+        eprint!("  Proceed? [Y/n] (default Y): ");
+        io::stderr().flush().ok();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("n") {
             eprintln!(
-                "  {} Legacy `# managed by aikey` lines removed before adding new region.",
-                "!".yellow()
+                "  {}",
+                "Skipped. Run 'aikey use kimi' again to retry.".dimmed()
             );
-            eprintln!(
-                "    {}",
-                "(No backup found; duplicate-key conflict prevented.)".dimmed()
-            );
+            return;
         }
-        (out, false)
-    } else {
-        // First-time install — prompt (TTY only), then backup + append.
-        //
-        // Hook-only region: we no longer write `[providers.kimi]`, `[models.*]`,
-        // or `default_model`. All of those are driven by env vars set in
-        // active.env (see `provider_extra_env_vars` for the KIMI_MODEL_NAME /
-        // KIMI_MODEL_MAX_CONTEXT_SIZE pairs). Only `[[hooks]]` Stop genuinely
-        // requires file-backed storage.
-        if io::stderr().is_terminal() {
-            let rows: Vec<String> = {
-                let mut r = vec![
-                    format!("File:    {}", display_path(".kimi/config.toml")),
-                    format!("Add:     Stop hook → aikey statusline render kimi"),
-                    format!("         (provider/models come from env vars)"),
-                ];
-                if !existing.is_empty() {
-                    r.push(format!(
-                        "Backup:  {}",
-                        display_path(".kimi/config.aikey_backup.toml")
-                    ));
-                }
-                r
-            };
-            crate::ui_frame::eprint_box("\u{2753}", "Configure Kimi CLI", &rows);
-            eprint!("  Proceed? [Y/n] (default Y): ");
-            io::stderr().flush().ok();
+    }
 
-            let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("n") {
+    match kimi_merge_hook(&existing, &hook_cmd) {
+        TomlMergeOutcome::Unchanged => {}
+        TomlMergeOutcome::SkipUnparseable => {
+            // Honest failure (失败要显眼): the file is invalid TOML we did NOT
+            // author, so we refuse to overwrite it and surface a WARN instead of
+            // silently reporting success. Back it up so the user can recover.
+            if !existing.is_empty() && !backup_path.exists() {
+                let _ = std::fs::create_dir_all(&config_dir);
+                let _ = std::fs::copy(&config_path, &backup_path);
+            }
+            eprintln!(
+                "  {} ~/.kimi/config.toml is not valid TOML (not written by aikey); \
+                 left untouched. Backup: {}. Fix it, then run 'aikey use kimi'.",
+                "!".yellow(),
+                backup_path.display().to_string().dimmed()
+            );
+        }
+        TomlMergeOutcome::Changed(desired) => {
+            // Layer-0 guardrail: re-parse before committing. A structural merge
+            // should always produce valid TOML, but verifying means a future
+            // regression can never leave a corrupt config behind a green ✓.
+            if let Err(e) = verify_toml(&desired) {
                 eprintln!(
-                    "  {}",
-                    "Skipped. Run 'aikey use kimi' again to retry.".dimmed()
+                    "  {} Refusing to write invalid Kimi config ({e}); left untouched.",
+                    "!".yellow()
                 );
                 return;
             }
-        }
-
-        if !existing.is_empty() && !backup_path.exists() {
-            let _ = std::fs::create_dir_all(&config_dir);
-            let _ = std::fs::copy(&config_path, &backup_path);
-        }
-
-        let mut out = existing.trim_end().to_string();
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        out.push_str(&region);
-        out.push('\n');
-        (out, true)
-    };
-
-    // Idempotent: nothing to do if the file is already what we want.
-    if desired == existing {
-        return;
-    }
-
-    match write_config_atomic(&config_dir, &config_path, &desired) {
-        Ok(_) => {
-            if first_time && io::stderr().is_terminal() {
-                eprintln!(
-                    "  {} Kimi CLI auto-configured: {}",
-                    "✓".green().bold(),
-                    config_path.display().to_string().dimmed()
-                );
+            if first_time && !existing.is_empty() && !backup_path.exists() {
+                let _ = std::fs::create_dir_all(&config_dir);
+                let _ = std::fs::copy(&config_path, &backup_path);
             }
-        }
-        Err(e) => {
-            if first_time && io::stderr().is_terminal() {
-                eprintln!("  {} Could not configure Kimi CLI: {}", "!".yellow(), e);
+            match write_config_atomic(&config_dir, &config_path, &desired) {
+                Ok(_) => {
+                    if first_time && io::stderr().is_terminal() {
+                        eprintln!(
+                            "  {} Kimi CLI auto-configured: {}",
+                            "✓".green().bold(),
+                            config_path.display().to_string().dimmed()
+                        );
+                    }
+                }
+                Err(e) => {
+                    if first_time && io::stderr().is_terminal() {
+                        eprintln!("  {} Could not configure Kimi CLI: {}", "!".yellow(), e);
+                    }
+                }
             }
         }
     }
@@ -503,24 +655,33 @@ pub fn unconfigure_kimi_cli() {
         return;
     };
 
-    // Path 2: strip the new-style managed region if present.
-    if let Some(stripped) = strip_managed_region(&content) {
-        let cleaned = stripped.trim_end().to_string();
-        if cleaned.is_empty() {
-            let _ = std::fs::remove_file(&config_path);
-        } else {
-            let mut with_nl = cleaned;
-            with_nl.push('\n');
-            let _ = write_config_atomic(&config_dir, &config_path, &with_nl);
+    // Path 2: structural removal — drop only our Stop hook, keep every other
+    // key and any non-aikey hooks the user/kimi added.
+    match kimi_remove_hook(&content) {
+        TomlMergeOutcome::Changed(out) => {
+            if out.trim().is_empty() {
+                let _ = std::fs::remove_file(&config_path);
+            } else {
+                let _ = write_config_atomic(&config_dir, &config_path, &out);
+            }
         }
-        return;
-    }
-
-    // Path 3: legacy fallback — file has old-style marker but no region.
-    // We created the file from scratch when installing the old-style
-    // config, so drop it wholesale to return Kimi to defaults.
-    if content.contains(LEGACY_MARKER) {
-        let _ = std::fs::remove_file(&config_path);
+        TomlMergeOutcome::Unchanged => {}
+        TomlMergeOutcome::SkipUnparseable => {
+            // Foreign-invalid file: fall back to the historical text strip so a
+            // pre-toml_edit broken install can still be cleaned up.
+            if let Some(stripped) = strip_managed_region(&content) {
+                let cleaned = stripped.trim_end().to_string();
+                if cleaned.is_empty() {
+                    let _ = std::fs::remove_file(&config_path);
+                } else {
+                    let mut with_nl = cleaned;
+                    with_nl.push('\n');
+                    let _ = write_config_atomic(&config_dir, &config_path, &with_nl);
+                }
+            } else if content.contains(LEGACY_MARKER) {
+                let _ = std::fs::remove_file(&config_path);
+            }
+        }
     }
 }
 
@@ -583,102 +744,69 @@ fn codex_base_url(proxy_port: u16) -> String {
     format!("http://127.0.0.1:{}/openai", proxy_port)
 }
 
-fn build_codex_managed_region(proxy_port: u16) -> String {
-    let base_url = codex_base_url(proxy_port);
-    format!(
-        "{begin}\n\
-[model_providers.aikey]\n\
-name = \"aikey\"\n\
-base_url = \"{base_url}\"\n\
-env_key = \"OPENAI_API_KEY\"\n\
-wire_api = \"responses\"\n\
-requires_openai_auth = false\n\
-{end}",
-        begin = AIKEY_BEGIN,
-        end = AIKEY_END,
-    )
-}
-
-/// Insert or replace a single-line TOML top-level key with an aikey marker.
+/// Pure core: merge aikey's Codex routing into an existing `~/.codex/config.toml`
+/// (given as text). Returns `(outcome, model_provider_written)`. No IO.
 ///
-/// Safe to call repeatedly — if the line already exists (with or without our
-/// marker) it's replaced in place. Otherwise inserted at the TOML-safe
-/// position: immediately before the first `[table]` header (or at end of file
-/// if there are no tables), which guarantees the key stays in the top-level
-/// scope.
-fn upsert_codex_managed_line(content: &str, key: &str, value: &str) -> String {
-    let new_line = format!("{} = \"{}\"  {}", key, value, CODEX_LINE_MARKER);
-    let key_prefix = format!("{} ", key);
-    let key_eq = format!("{}=", key);
+/// Writes three things structurally (immune to duplicate-key corruption because
+/// it operates on the parsed document, not raw text):
+///   - top-level `openai_base_url`
+///   - top-level `model_provider = "aikey"` — SKIPPED if the user set a
+///     non-default provider (conflict), matching the prior behavior exactly
+///   - `[model_providers.aikey]` table (name/base_url/env_key/wire_api/…)
+///
+/// The `[model_providers.aikey]` upsert fixes the latent sibling of the kimi
+/// bug: the old code blind-appended this table, so a user who independently
+/// defined `[model_providers.aikey]` (no marker) got a duplicate-table → invalid
+/// TOML. A structural set replaces in place instead.
+pub(super) fn codex_merge(existing: &str, base_url: &str) -> (TomlMergeOutcome, bool) {
+    use toml_edit::{value, Item, Table};
 
-    // Pass 1: replace in place if the key already exists at top level.
-    //
-    // Note: we don't attempt to detect whether the existing key is inside a
-    // table scope. If the user put `model_provider = "..."` inside some table
-    // (which would actually be a subkey of that table, not our target), we
-    // may replace the wrong line. Accept this as a known limitation —
-    // legitimate Codex configs use top-level-only for these keys.
-    if content
-        .lines()
-        .any(|l| l.trim_start().starts_with(&key_prefix) || l.trim_start().starts_with(&key_eq))
-    {
-        let mut out = String::new();
-        for line in content.lines() {
-            if line.trim_start().starts_with(&key_prefix) || line.trim_start().starts_with(&key_eq)
-            {
-                out.push_str(&new_line);
-            } else {
-                out.push_str(line);
-            }
-            out.push('\n');
-        }
-        return out;
-    }
+    let mut doc = match parse_or_heal_toml(existing) {
+        Some(d) => d,
+        None => return (TomlMergeOutcome::SkipUnparseable, false),
+    };
 
-    if content.is_empty() {
-        return format!("{}\n", new_line);
+    // Detect a user-set non-default `model_provider` from the ORIGINAL text
+    // before we mutate anything (preserves the pre-existing conflict semantics).
+    let conflict = detect_codex_model_provider_conflict(existing);
+    let model_provider_written = conflict.is_none();
+
+    // Top-level scalars. No positioning needed: toml_edit's Document renderer
+    // structurally emits ALL root-level values before ANY `[table]` section
+    // (encode.rs Display for Document — root node's get_values() render first,
+    // then tables sorted by position), so a scalar can never land after a table
+    // header regardless of insertion order.
+    doc["openai_base_url"] = value(base_url);
+    if model_provider_written {
+        doc["model_provider"] = value("aikey");
     }
 
-    // Pass 2: insert. Find the first `[table]` header line index; insert at
-    // that position (which places our new line in the top-level scope just
-    // before any tables). If no table exists, append at end — still top-level.
-    let lines: Vec<&str> = content.lines().collect();
-    let insert_at = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with('['))
-        .unwrap_or(lines.len());
+    // [model_providers.aikey] table — structural upsert of our fields.
+    let mut aikey_tbl = Table::new();
+    aikey_tbl["name"] = value("aikey");
+    aikey_tbl["base_url"] = value(base_url);
+    aikey_tbl["env_key"] = value("OPENAI_API_KEY");
+    aikey_tbl["wire_api"] = value("responses");
+    aikey_tbl["requires_openai_auth"] = value(false);
 
-    let mut out = String::new();
-    for (idx, line) in lines.iter().enumerate() {
-        if idx == insert_at {
-            out.push_str(&new_line);
-            out.push('\n');
-        }
-        out.push_str(line);
-        out.push('\n');
+    // Ensure `[model_providers]` is a (possibly implicit) table, then set the
+    // `aikey` sub-table, replacing any prior definition of it in place.
+    if !doc.get("model_providers").map(|i| i.is_table()).unwrap_or(false) {
+        let mut parent = Table::new();
+        parent.set_implicit(true); // render as `[model_providers.aikey]`, not `[model_providers]`
+        doc["model_providers"] = Item::Table(parent);
     }
-    if insert_at >= lines.len() {
-        out.push_str(&new_line);
-        out.push('\n');
+    if let Some(parent) = doc["model_providers"].as_table_mut() {
+        parent.insert("aikey", Item::Table(aikey_tbl));
     }
-    out
-}
 
-/// Append (or replace) the aikey-managed `[model_providers.aikey]` region at
-/// the END of the content. Must come after all user tables because TOML table
-/// sections don't terminate — anything we append inside a "user table scope"
-/// would bind to the wrong table.
-fn upsert_codex_region(content: &str, new_region: &str) -> String {
-    if content.contains(AIKEY_BEGIN) {
-        return replace_managed_region(content, new_region).unwrap_or_else(|| content.to_string());
-    }
-    let mut out = content.trim_end().to_string();
-    if !out.is_empty() {
-        out.push_str("\n\n");
-    }
-    out.push_str(new_region);
-    out.push('\n');
-    out
+    let rendered = doc.to_string();
+    let outcome = if rendered == existing {
+        TomlMergeOutcome::Unchanged
+    } else {
+        TomlMergeOutcome::Changed(rendered)
+    };
+    (outcome, model_provider_written)
 }
 
 /// Detect whether the user has set a non-default `model_provider` that we
@@ -736,18 +864,17 @@ pub fn configure_codex_cli(proxy_port: u16) {
     // managed VK on a cluster, else local proxy. See codex_base_url.
     let base_url = codex_base_url(proxy_port);
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let region = build_codex_managed_region(proxy_port);
 
-    let has_region = existing.contains(AIKEY_BEGIN);
-    let has_any_marker = existing.contains(CODEX_LINE_MARKER) || has_region;
-
-    // First-time install → prompt (TTY only) + backup.
-    let first_time = !has_any_marker;
+    // First-time = our provider block not yet present (structural identity, plus
+    // legacy markers for pre-toml_edit installs). Governs the prompt + backup.
+    let first_time = !existing.contains("model_providers.aikey")
+        && !existing.contains(AIKEY_BEGIN)
+        && !existing.contains(CODEX_LINE_MARKER);
     if first_time && io::stderr().is_terminal() {
         let mut rows: Vec<String> = vec![
             format!("File:    {}", display_path(".codex/config.toml")),
-            format!("Add:     openai_base_url + [model_providers.aikey]"),
-            format!("         env_key = \"OPENAI_API_KEY\" (per-shell token)"),
+            "Add:     openai_base_url + [model_providers.aikey]".to_string(),
+            "         env_key = \"OPENAI_API_KEY\" (per-shell token)".to_string(),
         ];
         if !existing.is_empty() {
             rows.push(format!(
@@ -765,54 +892,67 @@ pub fn configure_codex_cli(proxy_port: u16) {
         }
     }
 
-    // Build desired content via the three upsert passes.
-    let mut desired = existing.clone();
-    desired = upsert_codex_managed_line(&desired, "openai_base_url", &base_url);
+    let (outcome, model_provider_written) = codex_merge(&existing, &base_url);
 
-    // model_provider: conditional on conflict detection. `desired` at this
-    // point already has `openai_base_url` added but model_provider detection
-    // looks at existing-like lines by key, so order is fine.
-    let conflict = detect_codex_model_provider_conflict(&desired);
-    let model_provider_written = if let Some(other) = conflict {
-        // Print the conflict warning unconditionally — stderr, non-TTY-gated.
-        // Rationale: this is operational info the user must see regardless of
-        // whether they ran us from a TTY or piped us into a log. Silent
-        // non-overwrite would be worse than a visible warning.
-        eprintln!(
-            "  {} Detected existing `model_provider = \"{}\"` in ~/.codex/config.toml.",
-            "!".yellow(),
-            other
-        );
-        eprintln!(
-            "    {}",
-            "aikey provider block installed but NOT activated. To route through aikey:".dimmed()
-        );
-        eprintln!(
-            "    {}",
-            "  • Remove that line (aikey will set `model_provider = \"aikey\"` next run), or"
-                .dimmed()
-        );
-        eprintln!(
-            "    {}",
-            "  • Invoke as: codex -c model_provider=aikey".dimmed()
-        );
-        eprintln!(
-            "    {}",
-            "Note: the aikey-managed `codex` shell wrapper already injects \
-             `-c model_provider=aikey` automatically; this hint is for when \
-             you call the codex binary directly via `command codex` or a \
-             non-shell launcher."
-                .dimmed()
-        );
-        false
-    } else {
-        desired = upsert_codex_managed_line(&desired, "model_provider", "aikey");
-        true
+    // Preserve the pre-existing conflict messaging: printed unconditionally
+    // (stderr, non-TTY-gated) when the user has a non-default `model_provider`.
+    if !model_provider_written {
+        if let Some(other) = detect_codex_model_provider_conflict(&existing) {
+            eprintln!(
+                "  {} Detected existing `model_provider = \"{}\"` in ~/.codex/config.toml.",
+                "!".yellow(),
+                other
+            );
+            eprintln!(
+                "    {}",
+                "aikey provider block installed but NOT activated. To route through aikey:"
+                    .dimmed()
+            );
+            eprintln!(
+                "    {}",
+                "  • Remove that line (aikey will set `model_provider = \"aikey\"` next run), or"
+                    .dimmed()
+            );
+            eprintln!(
+                "    {}",
+                "  • Invoke as: codex -c model_provider=aikey".dimmed()
+            );
+            eprintln!(
+                "    {}",
+                "Note: the aikey-managed `codex` shell wrapper already injects \
+                 `-c model_provider=aikey` automatically; this hint is for when \
+                 you call the codex binary directly via `command codex` or a \
+                 non-shell launcher."
+                    .dimmed()
+            );
+        }
+    }
+
+    let desired = match outcome {
+        TomlMergeOutcome::Unchanged => return,
+        TomlMergeOutcome::SkipUnparseable => {
+            // Honest failure: never overwrite a foreign-invalid config.
+            if !existing.is_empty() && !backup_path.exists() {
+                let _ = std::fs::create_dir_all(&config_dir);
+                let _ = std::fs::copy(&config_path, &backup_path);
+            }
+            eprintln!(
+                "  {} ~/.codex/config.toml is not valid TOML (not written by aikey); \
+                 left untouched. Backup: {}. Fix it, then run 'aikey use'.",
+                "!".yellow(),
+                backup_path.display().to_string().dimmed()
+            );
+            return;
+        }
+        TomlMergeOutcome::Changed(d) => d,
     };
 
-    desired = upsert_codex_region(&desired, &region);
-
-    if desired == existing {
+    // Layer-0 guardrail: verify before commit.
+    if let Err(e) = verify_toml(&desired) {
+        eprintln!(
+            "  {} Refusing to write invalid Codex config ({e}); left untouched.",
+            "!".yellow()
+        );
         return;
     }
 
@@ -847,6 +987,47 @@ pub fn configure_codex_cli(proxy_port: u16) {
     }
 }
 
+/// Pure core: remove aikey's Codex routing from an existing config, preserving
+/// all user content. Removes `[model_providers.aikey]`, resets `model_provider`
+/// if it is our value, and drops `openai_base_url` when it points at our proxy
+/// (value ending in `/openai` — the shape `codex_base_url` writes).
+pub(super) fn codex_remove(existing: &str) -> TomlMergeOutcome {
+    let mut doc = match parse_or_heal_toml(existing) {
+        Some(d) => d,
+        None => return TomlMergeOutcome::SkipUnparseable,
+    };
+
+    // Drop [model_providers.aikey]; if the parent becomes empty, drop it too.
+    if let Some(parent) = doc.get_mut("model_providers").and_then(|i| i.as_table_mut()) {
+        parent.remove("aikey");
+        if parent.is_empty() {
+            doc.as_table_mut().remove("model_providers");
+        }
+    }
+
+    // Reset model_provider only if it is ours.
+    if doc.get("model_provider").and_then(|i| i.as_str()) == Some("aikey") {
+        doc.as_table_mut().remove("model_provider");
+    }
+
+    // Drop openai_base_url only when it is our proxy route (ends with /openai).
+    let ours = doc
+        .get("openai_base_url")
+        .and_then(|i| i.as_str())
+        .map(|v| v.ends_with("/openai"))
+        .unwrap_or(false);
+    if ours {
+        doc.as_table_mut().remove("openai_base_url");
+    }
+
+    let rendered = doc.to_string();
+    if rendered == existing {
+        TomlMergeOutcome::Unchanged
+    } else {
+        TomlMergeOutcome::Changed(rendered)
+    }
+}
+
 /// Restore `~/.codex/config.toml` from the backup created by `configure_codex_cli`.
 ///
 /// Priority: (1) restore `config.aikey_backup.toml` wholesale; (2) failing
@@ -865,25 +1046,41 @@ pub fn unconfigure_codex_cli() {
     let Ok(content) = std::fs::read_to_string(&config_path) else {
         return;
     };
+    let config_dir = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| resolve_user_home().join(".codex"));
 
-    // Path 2: strip region + any single-line markers (covers both the new v3
-    // codex format and the legacy per-line-marker-only format from before
-    // Option A).
-    let stripped_region = strip_managed_region(&content).unwrap_or(content.clone());
-    let cleaned: String = stripped_region
-        .lines()
-        .filter(|line| !line.contains(CODEX_LINE_MARKER))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    if cleaned.trim().is_empty() {
-        let _ = std::fs::remove_file(&config_path);
-    } else {
-        let mut final_content = cleaned;
-        if !final_content.ends_with('\n') {
-            final_content.push('\n');
+    // Path 2: structural removal of our keys/tables, preserving user content.
+    match codex_remove(&content) {
+        TomlMergeOutcome::Changed(out) => {
+            if out.trim().is_empty() {
+                let _ = std::fs::remove_file(&config_path);
+            } else {
+                let _ = write_config_atomic(&config_dir, &config_path, &out);
+            }
         }
-        let _ = std::fs::write(&config_path, final_content);
+        TomlMergeOutcome::Unchanged => {}
+        TomlMergeOutcome::SkipUnparseable => {
+            // Foreign-invalid file: fall back to the historical text strip
+            // (region + `# managed by aikey` marker lines) for pre-toml_edit
+            // installs that can no longer be parsed.
+            let stripped_region = strip_managed_region(&content).unwrap_or(content.clone());
+            let cleaned: String = stripped_region
+                .lines()
+                .filter(|line| !line.contains(CODEX_LINE_MARKER))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if cleaned.trim().is_empty() {
+                let _ = std::fs::remove_file(&config_path);
+            } else {
+                let mut final_content = cleaned;
+                if !final_content.ends_with('\n') {
+                    final_content.push('\n');
+                }
+                let _ = std::fs::write(&config_path, final_content);
+            }
+        }
     }
 }
 
@@ -3316,55 +3513,145 @@ mod hook_tests {
         assert!(out.contains("# user code"));
     }
 
-    // ── Kimi marker-region helpers ──────────────────────────────────────────
+    // ── Kimi hook merge (toml_edit structural; 2026-07-04 hooks-dup fix) ─────
+    //
+    // Regression bugfix: workflow/CI/bugfix/2026-07-04-kimi-config-hooks-duplicate-key.md
+
+    const KIMI_HOOK_CMD: &str = "/home/u/.aikey/bin/aikey statusline render kimi";
+
+    /// A representative slice of kimi-cli's own `save_config` output. The
+    /// top-level `hooks = []` is the exact key that used to collide with our
+    /// appended `[[hooks]]`. Mirrors real kimi schema (test-fixture-real-schema).
+    fn kimi_real_config_with_empty_hooks() -> &'static str {
+        "default_model = \"\"\n\
+default_thinking = false\n\
+hooks = []\n\
+telemetry = true\n\
+\n\
+[loop_control]\n\
+max_steps_per_turn = 1000\n\
+\n\
+[mcp.client]\n\
+tool_call_timeout_ms = 60000\n"
+    }
 
     #[test]
-    fn kimi_region_contains_only_hook_scaffold() {
-        // Minimal scaffold: only the Stop hook lives in config.toml. Providers,
-        // models, and default_model are all env-var-driven (see
-        // provider_extra_env_vars + active.env writers).
-        let r = build_kimi_managed_region(27200);
-        assert!(r.starts_with(AIKEY_BEGIN));
-        assert!(r.trim_end().ends_with(AIKEY_END));
-        // Hook — the only thing that genuinely needs file storage.
-        assert!(r.contains("[[hooks]]"));
-        assert!(r.contains("event = \"Stop\""));
-        assert!(r.contains("statusline render kimi"));
-        // Must NOT contain provider/model scaffolding anymore.
+    fn kimi_merge_into_empty_hooks_is_valid_and_single_hook() {
+        // THE regression: kimi wrote `hooks = []`; we must fold our Stop hook
+        // into it, not emit a second `hooks` of an incompatible TOML kind.
+        let out = match kimi_merge_hook(kimi_real_config_with_empty_hooks(), KIMI_HOOK_CMD) {
+            TomlMergeOutcome::Changed(s) => s,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        // Re-parses — this is what `kimi` does; before the fix it aborted with
+        // `Key "hooks" already exists`.
+        let doc = out.parse::<toml_edit::Document>().expect("valid TOML");
+        let aot = doc
+            .get("hooks")
+            .and_then(|i| i.as_array_of_tables())
+            .expect("[[hooks]] array-of-tables");
+        assert_eq!(aot.len(), 1, "exactly one hook:\n{out}");
+        let ours = aot.get(0).unwrap();
+        assert_eq!(ours.get("event").unwrap().as_str().unwrap(), "Stop");
+        assert_eq!(ours.get("command").unwrap().as_str().unwrap(), KIMI_HOOK_CMD);
         assert!(
-            !r.contains("[providers.kimi]"),
-            "region should not include provider block:\n{}",
-            r
+            !out.contains("hooks = []"),
+            "empty inline array must be gone:\n{out}"
         );
-        assert!(
-            !r.contains("[models."),
-            "region should not include model blocks:\n{}",
-            r
-        );
-        assert!(
-            !r.contains("api_key"),
-            "region should not include api_key:\n{}",
-            r
-        );
-        assert!(
-            !r.contains("base_url"),
-            "region should not include base_url:\n{}",
-            r
+        assert!(out.contains("telemetry = true"), "unrelated keys preserved");
+        assert!(out.contains("[mcp.client]"), "unrelated tables preserved");
+    }
+
+    #[test]
+    fn kimi_merge_empty_file_creates_hook() {
+        let out = match kimi_merge_hook("", KIMI_HOOK_CMD) {
+            TomlMergeOutcome::Changed(s) => s,
+            other => panic!("{other:?}"),
+        };
+        out.parse::<toml_edit::Document>().expect("valid TOML");
+        assert!(out.contains("[[hooks]]"));
+        assert!(out.contains("statusline render kimi"));
+    }
+
+    #[test]
+    fn kimi_merge_is_idempotent() {
+        let once = match kimi_merge_hook(kimi_real_config_with_empty_hooks(), KIMI_HOOK_CMD) {
+            TomlMergeOutcome::Changed(s) => s,
+            other => panic!("{other:?}"),
+        };
+        // Re-running over our own output must not rewrite (no `aikey use` churn).
+        assert_eq!(
+            kimi_merge_hook(&once, KIMI_HOOK_CMD),
+            TomlMergeOutcome::Unchanged
         );
     }
 
     #[test]
-    fn kimi_region_is_port_agnostic() {
-        // Port no longer appears in the region (base_url is env-var-driven).
-        let a = build_kimi_managed_region(27200);
-        let b = build_kimi_managed_region(19999);
-        assert_eq!(
-            a, b,
-            "region content must not depend on proxy_port:\nA={}\nB={}",
-            a, b
+    fn kimi_merge_preserves_foreign_hook() {
+        let existing =
+            "[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"user-thing\"\ntimeout = 10\n";
+        let out = match kimi_merge_hook(existing, KIMI_HOOK_CMD) {
+            TomlMergeOutcome::Changed(s) => s,
+            other => panic!("{other:?}"),
+        };
+        let doc = out.parse::<toml_edit::Document>().expect("valid");
+        let aot = doc.get("hooks").and_then(|i| i.as_array_of_tables()).unwrap();
+        assert_eq!(aot.len(), 2, "user hook + ours:\n{out}");
+        assert!(out.contains("user-thing"));
+        assert!(out.contains(KIMI_HOOK_CMD));
+    }
+
+    #[test]
+    fn kimi_merge_self_heals_previously_corrupted_file() {
+        // Exact shape of the shipped bug: kimi's `hooks = []` PLUS our old
+        // appended marker region with `[[hooks]]` = invalid TOML. parse_or_heal
+        // strips our region, then the merge folds cleanly into a single hook.
+        let broken = format!(
+            "default_model = \"\"\nhooks = []\n\n{AIKEY_BEGIN}\n[[hooks]]\nevent = \"Stop\"\ncommand = \"{KIMI_HOOK_CMD}\"\ntimeout = 5\n{AIKEY_END}\n"
         );
-        assert!(!a.contains("27200"));
-        assert!(!a.contains("19999"));
+        assert!(
+            broken.parse::<toml_edit::Document>().is_err(),
+            "fixture must reproduce the broken (duplicate-key) state"
+        );
+        let out = match kimi_merge_hook(&broken, KIMI_HOOK_CMD) {
+            TomlMergeOutcome::Changed(s) => s,
+            other => panic!("expected self-heal, got {other:?}"),
+        };
+        let doc = out.parse::<toml_edit::Document>().expect("healed valid TOML");
+        let aot = doc.get("hooks").and_then(|i| i.as_array_of_tables()).unwrap();
+        assert_eq!(aot.len(), 1, "one merged hook after heal:\n{out}");
+    }
+
+    #[test]
+    fn kimi_merge_skips_foreign_unparseable() {
+        // Invalid for a reason we did NOT cause → leave it alone (no overwrite).
+        let foreign_bad = "not valid = = toml [[[\n";
+        assert_eq!(
+            kimi_merge_hook(foreign_bad, KIMI_HOOK_CMD),
+            TomlMergeOutcome::SkipUnparseable
+        );
+    }
+
+    #[test]
+    fn kimi_remove_hook_drops_only_ours() {
+        let existing = format!(
+            "[[hooks]]\nevent = \"Stop\"\ncommand = \"{KIMI_HOOK_CMD}\"\ntimeout = 5\n\n[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"user\"\ntimeout = 3\n"
+        );
+        let out = match kimi_remove_hook(&existing) {
+            TomlMergeOutcome::Changed(s) => s,
+            other => panic!("{other:?}"),
+        };
+        let doc = out.parse::<toml_edit::Document>().unwrap();
+        let aot = doc.get("hooks").and_then(|i| i.as_array_of_tables()).unwrap();
+        assert_eq!(aot.len(), 1);
+        assert!(out.contains("user"));
+        assert!(!out.contains(KIMI_HOOK_CMD));
+    }
+
+    #[test]
+    fn kimi_remove_hook_noop_when_none_ours() {
+        let existing = "[[hooks]]\nevent = \"Stop\"\ncommand = \"user\"\ntimeout = 3\n";
+        assert_eq!(kimi_remove_hook(existing), TomlMergeOutcome::Unchanged);
     }
 
     #[test]
@@ -3396,32 +3683,10 @@ mod hook_tests {
     }
 
     #[test]
-    fn kimi_replace_region_preserves_surrounding_content() {
-        let before = "default_thinking = false\n\n";
-        let old_region = format!("{AIKEY_BEGIN}\n[providers.kimi]\napi_key = \"old\"\n{AIKEY_END}");
-        let after = "\n\n# user-added provider below\n[providers.custom]\nkey = \"keep-me\"\n";
-        let existing = format!("{before}{old_region}{after}");
-
-        let new_region = build_kimi_managed_region(27200);
-        let out = replace_managed_region(&existing, &new_region).unwrap();
-
-        assert!(out.starts_with("default_thinking = false\n\n"));
-        assert!(!out.contains("api_key = \"old\""));
-        assert!(out.contains("[[hooks]]"));
-        assert!(out.contains("[providers.custom]"));
-        assert!(out.contains("keep-me"));
-    }
-
-    #[test]
-    fn kimi_replace_region_returns_none_without_markers() {
-        let plain = "default_thinking = false\n[providers.custom]\nkey = \"k\"\n";
-        let region = build_kimi_managed_region(27200);
-        assert!(replace_managed_region(plain, &region).is_none());
-    }
-
-    #[test]
     fn kimi_strip_region_removes_region_and_one_trailing_newline() {
-        let region = build_kimi_managed_region(27200);
+        // strip_managed_region is retained for self-heal + uninstall fallback.
+        let region =
+            format!("{AIKEY_BEGIN}\n[[hooks]]\nevent = \"Stop\"\ntimeout = 5\n{AIKEY_END}");
         let existing = format!("default_thinking = false\n\n{region}\n\n# user\n");
         let out = strip_managed_region(&existing).unwrap();
         assert!(out.starts_with("default_thinking = false\n\n"));
@@ -3436,107 +3701,103 @@ mod hook_tests {
         assert!(strip_managed_region(plain).is_none());
     }
 
-    #[test]
-    fn kimi_strip_then_replace_round_trip_is_identity() {
-        // Stripping a region and re-inserting the same region should
-        // produce the original file modulo a trailing-newline variation.
-        let region = build_kimi_managed_region(27200);
-        let original = format!("user_key = \"a\"\n\n{region}\n");
-        let stripped = strip_managed_region(&original).unwrap();
-        let mut rebuilt = stripped.trim_end().to_string();
-        rebuilt.push_str("\n\n");
-        rebuilt.push_str(&region);
-        rebuilt.push('\n');
-        assert_eq!(rebuilt, original);
-    }
-
-    // ── Codex managed region (Option A — env-var-driven custom provider) ──
+    // ── Codex merge (toml_edit structural) ───────────────────────────────────
 
     #[test]
-    fn codex_region_contains_custom_provider_with_env_key() {
-        let r = build_codex_managed_region(27200);
-        assert!(r.starts_with(AIKEY_BEGIN));
-        assert!(r.trim_end().ends_with(AIKEY_END));
-        assert!(r.contains("[model_providers.aikey]"));
-        assert!(r.contains("name = \"aikey\""));
-        assert!(r.contains("base_url = \"http://127.0.0.1:27200/openai\""));
-        // THE critical assertion: per-shell token via env_key.
-        assert!(r.contains("env_key = \"OPENAI_API_KEY\""));
-        assert!(r.contains("wire_api = \"responses\""));
-        // Must bypass the auth.json / ChatGPT login path.
-        assert!(r.contains("requires_openai_auth = false"));
-    }
-
-    #[test]
-    fn codex_region_respects_proxy_port() {
-        let r = build_codex_managed_region(19999);
-        assert!(r.contains("127.0.0.1:19999"));
-        assert!(!r.contains(":27200"));
-    }
-
-    #[test]
-    fn codex_upsert_line_on_empty_file_creates_line() {
-        let out = upsert_codex_managed_line("", "openai_base_url", "http://x/y");
-        assert_eq!(
-            out,
-            "openai_base_url = \"http://x/y\"  # managed by aikey\n"
-        );
-    }
-
-    #[test]
-    fn codex_upsert_line_replaces_existing_in_place() {
-        let existing = "model = \"gpt-5\"\nopenai_base_url = \"OLD\"\n[projects.x]\n";
-        let out = upsert_codex_managed_line(existing, "openai_base_url", "NEW");
-        assert!(out.contains("openai_base_url = \"NEW\"  # managed by aikey"));
-        assert!(!out.contains("\"OLD\""));
-        assert!(out.contains("model = \"gpt-5\""));
-        assert!(out.contains("[projects.x]"));
-    }
-
-    #[test]
-    fn codex_upsert_line_no_duplicate_when_other_keys_exist() {
-        // Regression: when `openai_base_url` already exists AND there's a
-        // different top-level key (`model_provider = "ollama"`) before any
-        // table, upsert must not also prepend a new line — it should JUST
-        // replace the existing one.
-        let existing = "model = \"gpt-5\"\nopenai_base_url = \"OLD\"  # managed by aikey\nmodel_provider = \"ollama\"\n[projects.x]\n";
-        let out = upsert_codex_managed_line(existing, "openai_base_url", "NEW");
-        // Exactly one openai_base_url line
-        let count = out
-            .lines()
-            .filter(|l| l.trim_start().starts_with("openai_base_url"))
-            .count();
-        assert_eq!(count, 1, "got duplicate openai_base_url:\n{}", out);
-        // Exactly one model_provider line (user's, untouched here)
-        let mp_count = out
-            .lines()
-            .filter(|l| {
-                l.trim_start().starts_with("model_provider ")
-                    || l.trim_start().starts_with("model_provider=")
-            })
-            .count();
-        assert_eq!(mp_count, 1, "model_provider duplicated:\n{}", out);
-    }
-
-    #[test]
-    fn codex_upsert_line_inserts_before_first_table() {
-        // TOML constraint: top-level keys must precede any [table] header.
+    fn codex_merge_into_config_with_tables_keeps_scalars_above_tables() {
+        // Sibling ordering hazard: adding top-level scalars to a config that
+        // already has [tables] must keep them above any table header (else the
+        // scalar would be parsed into the table).
         let existing = "model = \"gpt-5\"\n[projects.x]\ntrust = \"full\"\n";
-        let out = upsert_codex_managed_line(existing, "model_provider", "aikey");
-        let key_pos = out.find("model_provider").unwrap();
+        let (outcome, mp) = codex_merge(existing, "http://127.0.0.1:27200/openai");
+        let out = match outcome {
+            TomlMergeOutcome::Changed(s) => s,
+            o => panic!("{o:?}"),
+        };
+        out.parse::<toml_edit::Document>().expect("valid TOML");
+        assert!(mp, "no conflict → model_provider written");
+        let base_pos = out.find("openai_base_url").unwrap();
         let table_pos = out.find("[projects.x]").unwrap();
-        assert!(
-            key_pos < table_pos,
-            "model_provider must come before table header:\n{}",
-            out
-        );
+        assert!(base_pos < table_pos, "scalar must precede table:\n{out}");
+        assert!(out.contains("[model_providers.aikey]"));
+        assert!(out.contains("env_key = \"OPENAI_API_KEY\""));
+        assert!(out.contains("http://127.0.0.1:27200/openai"));
+        assert!(out.contains("requires_openai_auth = false"));
     }
 
     #[test]
-    fn codex_upsert_line_prepends_when_file_is_all_tables() {
-        let existing = "[projects.x]\ntrust = \"full\"\n";
-        let out = upsert_codex_managed_line(existing, "model_provider", "aikey");
-        assert!(out.starts_with("model_provider = \"aikey\"  # managed by aikey"));
+    fn codex_merge_respects_port() {
+        let (outcome, _) = codex_merge("", "http://127.0.0.1:19999/openai");
+        let out = match outcome {
+            TomlMergeOutcome::Changed(s) => s,
+            o => panic!("{o:?}"),
+        };
+        assert!(out.contains("127.0.0.1:19999"));
+    }
+
+    #[test]
+    fn codex_merge_upserts_existing_aikey_table_no_duplicate() {
+        // Latent sibling of the kimi bug: a pre-existing [model_providers.aikey]
+        // (user-defined, no marker) must be replaced in place, not duplicated
+        // into invalid TOML.
+        let existing =
+            "[model_providers.aikey]\nname = \"aikey\"\nbase_url = \"http://old\"\nenv_key = \"X\"\n";
+        let (outcome, _) = codex_merge(existing, "http://127.0.0.1:27200/openai");
+        let out = match outcome {
+            TomlMergeOutcome::Changed(s) => s,
+            o => panic!("{o:?}"),
+        };
+        out.parse::<toml_edit::Document>()
+            .expect("valid — must not duplicate the table");
+        assert_eq!(
+            out.matches("[model_providers.aikey]").count(),
+            1,
+            "duplicate provider table:\n{out}"
+        );
+        assert!(out.contains("http://127.0.0.1:27200/openai"));
+        assert!(!out.contains("http://old"));
+    }
+
+    #[test]
+    fn codex_merge_skips_model_provider_on_conflict_but_installs_block() {
+        let existing = "model_provider = \"ollama\"\n";
+        let (outcome, mp) = codex_merge(existing, "http://127.0.0.1:27200/openai");
+        let out = match outcome {
+            TomlMergeOutcome::Changed(s) => s,
+            o => panic!("{o:?}"),
+        };
+        assert!(!mp, "must not overwrite the user's model_provider");
+        assert!(
+            out.contains("model_provider = \"ollama\""),
+            "user provider preserved:\n{out}"
+        );
+        assert!(
+            out.contains("[model_providers.aikey]"),
+            "provider block still installed:\n{out}"
+        );
+        out.parse::<toml_edit::Document>().expect("valid TOML");
+    }
+
+    #[test]
+    fn codex_remove_strips_our_keys_only() {
+        let (installed, _) = codex_merge(
+            "model = \"gpt-5\"\n[projects.x]\ntrust = \"full\"\n",
+            "http://127.0.0.1:27200/openai",
+        );
+        let installed = match installed {
+            TomlMergeOutcome::Changed(s) => s,
+            o => panic!("{o:?}"),
+        };
+        let out = match codex_remove(&installed) {
+            TomlMergeOutcome::Changed(s) => s,
+            o => panic!("{o:?}"),
+        };
+        out.parse::<toml_edit::Document>().expect("valid TOML");
+        assert!(!out.contains("[model_providers.aikey]"));
+        assert!(!out.contains("model_provider = \"aikey\""));
+        assert!(!out.contains("openai_base_url"));
+        assert!(out.contains("model = \"gpt-5\""), "user content preserved");
+        assert!(out.contains("[projects.x]"));
     }
 
     #[test]
@@ -3567,28 +3828,6 @@ mod hook_tests {
         // Our own write even with value == "custom-thing" must not self-report as conflict.
         let content = "model_provider = \"anything\"  # managed by aikey\n";
         assert_eq!(detect_codex_model_provider_conflict(content), None);
-    }
-
-    #[test]
-    fn codex_upsert_region_appends_to_end() {
-        let existing = "model = \"gpt-5\"\n[projects.x]\ntrust = \"full\"\n";
-        let region = build_codex_managed_region(27200);
-        let out = upsert_codex_region(existing, &region);
-        assert!(out.ends_with(&format!("{}\n", AIKEY_END)));
-        assert!(out.contains("model = \"gpt-5\""));
-        assert!(out.contains("[projects.x]"));
-    }
-
-    #[test]
-    fn codex_upsert_region_replaces_existing() {
-        let old_region =
-            format!("{AIKEY_BEGIN}\n[model_providers.aikey]\napi_key = \"old\"\n{AIKEY_END}");
-        let existing = format!("model = \"gpt-5\"\n\n{old_region}\n");
-        let new_region = build_codex_managed_region(27200);
-        let out = upsert_codex_region(&existing, &new_region);
-        assert!(!out.contains("api_key = \"old\""));
-        assert!(out.contains("env_key = \"OPENAI_API_KEY\""));
-        assert!(out.contains("model = \"gpt-5\""));
     }
 
     // ── Stage 4 (active-state cross-shell sync, 2026-04-27) regression ──────

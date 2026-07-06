@@ -163,6 +163,8 @@ pub fn run() -> io::Result<()> {
         write!(out, "{} {} ", warn, "|".dimmed())?;
     }
     write!(out, "{} {}", "[receipt]".dimmed(), line)?;
+    // Receipt delivered → advance the health heartbeat.
+    record_receipt_ok("claude");
     Ok(())
 }
 
@@ -289,6 +291,66 @@ fn sync_health_line() -> Option<String> {
     ))
 }
 
+// ── Usage-receipt pipeline heartbeat (health-signal-surface) ────────────────
+//
+// Why: the receipt render path couples to third-party CLIs' session layout and
+// Stop-hook payload shape. Those break silently on a tool upgrade — the render
+// just `return Ok(())`s and receipts quietly stop. A bare log line is not enough
+// (health-signal-surface.md: pipeline health "必须暴露一个可读取的健康端点").
+// So on every SUCCESSFUL delivery we stamp a per-tool heartbeat file; `aikey
+// doctor` reads it to surface "receipts last landed Nh ago / never observed",
+// which is how an operator notices a tool upgrade silently killed the pipeline.
+//
+// Per-tool files + atomic last-writer-wins write (no read-modify-write) so
+// concurrent hook subprocesses never corrupt or race the state.
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn receipt_health_path(tool: &str) -> PathBuf {
+    let base = if let Ok(dir) = std::env::var("AIKEY_RUN_DIR") {
+        PathBuf::from(dir)
+    } else {
+        crate::commands_account::resolve_aikey_dir().join("run")
+    };
+    base.join(format!("receipt-health-{tool}.json"))
+}
+
+/// Stamp the tool's last-successful-receipt timestamp. Called only after a
+/// receipt actually landed (not on the common "no new events" no-op), so a
+/// stale heartbeat genuinely means "delivery stopped", not "user idle".
+fn record_receipt_ok(tool: &str) {
+    write_receipt_ok_at(&receipt_health_path(tool), tool, unix_now_secs());
+}
+
+/// Path-explicit core (testable without env). Atomic tmp+rename, last-writer-
+/// wins, no read-modify-write → concurrent hook subprocesses can't corrupt it.
+fn write_receipt_ok_at(path: &Path, tool: &str, ts: i64) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body = format!("{{\"last_ok_at\":{ts},\"tool\":\"{tool}\"}}\n");
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Read a tool's last-successful-receipt unix timestamp (None = never observed).
+pub(crate) fn receipt_last_ok(tool: &str) -> Option<i64> {
+    read_receipt_ok_at(&receipt_health_path(tool))
+}
+
+fn read_receipt_ok_at(path: &Path) -> Option<i64> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("last_ok_at").and_then(|x| x.as_i64())
+}
+
 fn read_stdin_ctx() -> io::Result<ClaudeCodeCtx> {
     // Caller (`run`) has already verified stdin is a pipe; we will not block
     // on TTY input. Keep the read bounded: Claude Code's payload is always
@@ -298,7 +360,18 @@ fn read_stdin_ctx() -> io::Result<ClaudeCodeCtx> {
     if buf.trim().is_empty() {
         return Ok(ClaudeCodeCtx::default());
     }
-    serde_json::from_str(&buf).or_else(|_| Ok(ClaudeCodeCtx::default()))
+    serde_json::from_str(&buf).or_else(|_| {
+        // Non-empty stdin that won't parse = Claude Code changed its statusLine
+        // payload shape (or a foreign caller). Degrade to default so the row
+        // just hides, but log it — a silent default here is exactly how a Claude
+        // upgrade would invisibly kill the receipt row.
+        crate::observability::log_warn_event(
+            crate::observability::EVENT_RECEIPT_CLAUDE_PAYLOAD_UNRECOGNIZED,
+            "claude statusLine stdin payload did not parse; rendering empty receipt row",
+            Some(crate::observability::ERRCODE_CLAUDE_STATUSLINE_PAYLOAD_UNRECOGNIZED),
+        );
+        Ok(ClaudeCodeCtx::default())
+    })
 }
 
 /// `aikey statusline last-active` — scan the WAL for the newest event and
@@ -405,9 +478,25 @@ pub fn render_kimi() -> io::Result<()> {
         return Ok(());
     }
     let Ok(ctx) = serde_json::from_str::<KimiStopCtx>(&buf) else {
+        // Non-empty payload that won't parse = kimi changed its Stop-hook JSON.
+        // No-op (must not crash the hook) but log it, else a kimi upgrade would
+        // invisibly kill receipts.
+        if !buf.trim().is_empty() {
+            crate::observability::log_warn_event(
+                crate::observability::EVENT_RECEIPT_KIMI_PAYLOAD_UNRECOGNIZED,
+                "kimi Stop-hook stdin payload did not parse; skipping receipt",
+                Some(crate::observability::ERRCODE_KIMI_STOP_PAYLOAD_UNRECOGNIZED),
+            );
+        }
         return Ok(());
     };
     if ctx.session_id.is_empty() || ctx.cwd.is_empty() {
+        // Parsed, but the fields we key on are absent = kimi renamed/moved them.
+        crate::observability::log_warn_event(
+            crate::observability::EVENT_RECEIPT_KIMI_PAYLOAD_UNRECOGNIZED,
+            "kimi Stop-hook payload missing session_id/cwd; skipping receipt",
+            Some(crate::observability::ERRCODE_KIMI_STOP_PAYLOAD_UNRECOGNIZED),
+        );
         return Ok(());
     }
 
@@ -420,7 +509,18 @@ pub fn render_kimi() -> io::Result<()> {
     }
     let session_dir = kimi_session_dir(&ctx.cwd, &ctx.session_id);
     if !session_dir.exists() {
-        // Kimi session dir gone (user closed Kimi mid-turn?); skip silently.
+        // We derived kimi's session dir via its `WorkDirMeta` md5(cwd) formula
+        // but it isn't there. Usually benign (session closed mid-turn), but it
+        // is ALSO the signature of kimi-cli changing that derivation on upgrade
+        // — the exact silent-drift class as the config `hooks=[]` bug. Log at
+        // WARN (not a health-degrade, to avoid crying wolf on closed sessions);
+        // a persistent stream of these in the log is the drift tell.
+        crate::observability::log_warn_event(
+            crate::observability::EVENT_RECEIPT_KIMI_SESSION_DIR_MISSING,
+            "kimi session dir (md5(cwd)/session_id) not found; skipping receipt \
+             (session closed, or kimi-cli session layout changed on upgrade)",
+            Some(crate::observability::ERRCODE_KIMI_SESSION_DIR_MISSING),
+        );
         return Ok(());
     }
 
@@ -527,6 +627,9 @@ pub fn render_kimi() -> io::Result<()> {
     if write_kimi_notification(&session_dir, &ctx.session_id, &title, hits.len()).is_err() {
         return Ok(());
     }
+
+    // Receipt delivered → advance the health heartbeat (read by `aikey doctor`).
+    record_receipt_ok("kimi");
 
     // 8. Advance watermark. Any error here is non-fatal: next turn will
     // re-aggregate these events (at-least-once display).
@@ -2425,6 +2528,33 @@ mod tests {
             s.contains(&format!("/{expect_hex}/")),
             "md5 hex missing: {s}"
         );
+    }
+
+    #[test]
+    fn receipt_heartbeat_round_trip_and_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "aikey-test-receipt-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path = dir.join("receipt-health-kimi.json");
+
+        // Absent → None (never observed).
+        assert_eq!(read_receipt_ok_at(&path), None);
+
+        // Write then read back the exact timestamp.
+        write_receipt_ok_at(&path, "kimi", 1_720_000_000);
+        assert_eq!(read_receipt_ok_at(&path), Some(1_720_000_000));
+
+        // Last-writer-wins overwrite (idempotent stamp on each success).
+        write_receipt_ok_at(&path, "kimi", 1_720_000_500);
+        assert_eq!(read_receipt_ok_at(&path), Some(1_720_000_500));
+
+        // Malformed content → None (never render a broken signal).
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(read_receipt_ok_at(&path), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

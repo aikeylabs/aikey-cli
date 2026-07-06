@@ -322,31 +322,43 @@ mod trust_local {
         run("systemctl", &["--user", verb, SERVICE_NAME])
     }
 
-    /// Windows: drive the NSSM-wrapped service via Windows SCM.
+    /// Windows: drive the trust-local per-user ScheduledTask via `schtasks`.
     ///
-    /// install_service.ps1 registers the service via `nssm install`, which
-    /// produces a real Windows service that responds to `sc.exe` SCM calls.
-    /// We use `sc.exe` (Windows-bundled) rather than `nssm.exe` directly to
-    /// avoid hard-depending on NSSM being on PATH from this CLI's perspective
-    /// (nssm is installed to System32 by setup-aliyun-win-build.ps1, but if
-    /// an end-user installed trust-local via the published install_service.ps1
-    /// it lands wherever the script placed it).
+    /// 2026-07-06: trust-local migrated from an NSSM-wrapped Windows service to
+    /// a per-user ScheduledTask (install_service.ps1), matching the aikey-proxy
+    /// + console migration in local-install.ps1. Root cause: nssm.exe is NOT
+    /// shipped in the offline package (only on the build box), so the sc.exe
+    /// service never registered on real end-user machines and this command
+    /// errored with "sc.exe start aikey.trust-local: <service not found>".
+    /// The task is registered under the same identifier as SERVICE_NAME.
+    /// `schtasks` is Windows-bundled (no nssm dependency).
+    ///   start -> /Run (launch the task's action now)
+    ///   stop  -> /End (terminate the running task instance)
     fn sc_action(verb: &str) -> Result<(), String> {
-        run("sc.exe", &[verb, SERVICE_NAME])
+        let sw = match verb {
+            "start" => "/Run",
+            "stop" => "/End",
+            other => return Err(format!("unknown service verb '{}'", other)),
+        };
+        run("schtasks", &[sw, "/TN", SERVICE_NAME])
     }
 
-    /// Returns true when `sc.exe query <SERVICE_NAME>` reports `STATE :
-    /// 1  STOPPED`. Used by the restart loop to wait for an async `sc.exe
-    /// stop` to actually finish before re-firing `sc.exe start` (otherwise
-    /// start races stop and returns 1056 / 1062).
+    /// Returns true when trust-local is NOT running. Used by the restart loop
+    /// to wait for an async `/End` to finish before re-firing `/Run`.
+    ///
+    /// We probe the process image name via `tasklist` rather than parsing
+    /// `schtasks /Query` Status, because the Status strings ("Running" /
+    /// "Ready" / …) are LOCALIZED (e.g. "正在运行" / "就绪" on zh-CN Windows) and
+    /// a substring match would break off English hosts. The image name
+    /// `trust-local.exe` is not localized.
     fn sc_is_stopped() -> bool {
-        match std::process::Command::new("sc.exe")
-            .args(["query", SERVICE_NAME])
+        match std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq trust-local.exe", "/FO", "CSV", "/NH"])
             .output()
         {
             Ok(out) => {
-                let s = String::from_utf8_lossy(&out.stdout);
-                s.contains("STOPPED")
+                let s = String::from_utf8_lossy(&out.stdout).to_lowercase();
+                !s.contains("trust-local.exe")
             }
             Err(_) => false,
         }
