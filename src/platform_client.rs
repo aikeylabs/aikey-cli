@@ -50,7 +50,7 @@ pub struct StartSessionResponse {
     pub expires_in_seconds: u64,
 }
 
-/// Returned by POST /v1/auth/cli/login/poll and /v1/auth/cli/login/exchange.
+/// Returned by POST /v1/auth/cli/login/poll.
 ///
 /// `status` is one of: "pending" | "approved" | "denied" | "expired" | "token_claimed"
 /// Token fields are non-None when `status == "approved"`.
@@ -62,6 +62,32 @@ pub struct PollResponse {
     pub token_type: Option<String>,
     pub expires_in: Option<i64>,
     pub account: Option<AccountInfo>,
+}
+
+/// Returned by POST /v1/auth/cli/login/exchange.
+///
+/// The copy-paste fallback exchange is not a polling endpoint: success is
+/// represented by HTTP 200 plus the token payload, with no `status` field.
+#[derive(Debug, Deserialize)]
+struct LoginTokenExchangeResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub token_type: Option<String>,
+    pub expires_in: Option<i64>,
+    pub account: AccountInfo,
+}
+
+impl From<LoginTokenExchangeResponse> for PollResponse {
+    fn from(value: LoginTokenExchangeResponse) -> Self {
+        PollResponse {
+            status: "approved".to_string(),
+            access_token: Some(value.access_token),
+            refresh_token: Some(value.refresh_token),
+            token_type: value.token_type,
+            expires_in: value.expires_in,
+            account: Some(value.account),
+        }
+    }
 }
 
 /// Returned by POST /v1/auth/cli/token/refresh
@@ -442,7 +468,8 @@ impl PlatformClient {
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("exchange request failed: {}", e))?;
-        resp.into_json::<PollResponse>()
+        resp.into_json::<LoginTokenExchangeResponse>()
+            .map(PollResponse::from)
             .map_err(|e| format!("failed to parse exchange response: {}", e))
     }
 
@@ -727,6 +754,60 @@ mod cluster_resolve_tests {
         format!("http://{}", addr)
     }
 
+    fn mock_control_draining_request(status: u16, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 512];
+                let mut header_end = None;
+                while header_end.is_none() {
+                    match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            header_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+                        }
+                    }
+                }
+                if let Some(pos) = header_end {
+                    let headers = String::from_utf8_lossy(&buf[..pos + 4]).to_ascii_lowercase();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let already_read = buf.len().saturating_sub(pos + 4);
+                    let mut remaining = content_length.saturating_sub(already_read);
+                    while remaining > 0 {
+                        match s.read(&mut tmp) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => remaining = remaining.saturating_sub(n),
+                        }
+                    }
+                }
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    404 => "Not Found",
+                    _ => "X",
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    reason,
+                    body.len(),
+                    body
+                );
+            }
+        });
+        format!("http://{}", addr)
+    }
+
     // 2026-06-12 fence (L8 次生缺口): the three-way resolution semantics.
     // If a refactor ever collapses 401 back into "not a cluster", a dead
     // token during sync will again clear persisted cluster routing and
@@ -770,5 +851,25 @@ mod cluster_resolve_tests {
             ClusterNodeResolution::Unknown(_) => {}
             other => panic!("transport error must be Unknown, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn exchange_login_token_accepts_statusless_token_body() {
+        let base = mock_control_draining_request(
+            200,
+            r#"{"access_token":"jwt-123","refresh_token":"rt-456","token_type":"Bearer","expires_in":3600,"account":{"account_id":"acct-1","email":"admin@aikey.local"}}"#,
+        );
+
+        let resp = PlatformClient::exchange_login_token(&base, "session-1", "login-token-1")
+            .expect("statusless exchange token payload should parse");
+
+        assert_eq!(resp.status, "approved");
+        assert_eq!(resp.access_token.as_deref(), Some("jwt-123"));
+        assert_eq!(resp.refresh_token.as_deref(), Some("rt-456"));
+        assert_eq!(resp.token_type.as_deref(), Some("Bearer"));
+        assert_eq!(resp.expires_in, Some(3600));
+        let account = resp.account.expect("account should be preserved");
+        assert_eq!(account.account_id, "acct-1");
+        assert_eq!(account.email, "admin@aikey.local");
     }
 }
