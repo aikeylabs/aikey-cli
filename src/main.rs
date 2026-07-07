@@ -1681,6 +1681,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     source_ref: alias,
                     providers: &resolved_providers,
                 },
+                commands_account::audit_key_from_password(&password).as_ref(),
             )
             .unwrap_or_default();
             let newly_primary = lifecycle.newly_primary;
@@ -1872,8 +1873,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             // Single funnel — runs reconcile per event, refresh + apply once.
             if !events.is_empty() {
-                let outcomes =
-                    commands_account::apply_credential_lifecycle_batch(&events).unwrap_or_default();
+                let outcomes = commands_account::apply_credential_lifecycle_batch(
+                    &events,
+                    commands_account::audit_key_from_password(&password).as_ref(),
+                )
+                .unwrap_or_default();
                 // Walk outcomes in lockstep with successful per_alias rows
                 // and copy reconcile_actions back so the UX renderer below
                 // can show them per-alias.
@@ -2977,6 +2981,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                     source_type: "personal",
                                     source_ref: name,
                                 },
+                                commands_account::audit_key_from_password(&password).as_ref(),
                             )
                             .unwrap_or_default();
                             let actions = outcome.reconcile_actions;
@@ -3299,8 +3304,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             })
                             .collect();
-                        commands_account::apply_credential_lifecycle_batch(&events)
-                            .map_err(|e| format!("Failed to apply use: {}", e))?;
+                        commands_account::apply_credential_lifecycle_batch(
+                            &events,
+                            commands_account::try_audit_key_from_session().as_ref(),
+                        )
+                        .map_err(|e| format!("Failed to apply use: {}", e))?;
                         if !*no_hook {
                             commands_account::ensure_shell_hook(false);
                         }
@@ -3669,10 +3677,55 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Proxy { action } => {
             match action {
                 ProxyAction::Start { config, foreground } => {
-                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
-                    // Verify the password is valid before handing it to the proxy.
-                    executor::list_secrets(&password)
-                        .map_err(|e| format!("vault authentication failed: {}", e))?;
+                    // Unattended service-start path (L9 fix A extended, parity
+                    // audit 2026-07-07 P1-1): launchd / systemd / Windows
+                    // ScheduledTask run exactly `aikey proxy start --foreground`
+                    // with no TTY. `prompt_vault_password` only consults the
+                    // TTL-gated cache (`try_get`), so a boot-after-idle service
+                    // start fell through to the interactive prompt — which
+                    // hangs or errors with no terminal. Mirror
+                    // `ensure_proxy_for_use`'s no-TTY branch: read the raw
+                    // session store (TTL deliberately skipped, see
+                    // try_get_unattended docs) and fail fast with actionable
+                    // guidance instead of prompting. Env vars still win (they
+                    // are checked first inside prompt_vault_password, and the
+                    // env-set case never enters this branch).
+                    use std::io::IsTerminal;
+                    let env_pw_set = ["AIKEY_MASTER_PASSWORD", "AK_TEST_PASSWORD"]
+                        .iter()
+                        .any(|v| std::env::var(v).map(|s| !s.is_empty()).unwrap_or(false));
+                    let unattended =
+                        !io::stderr().is_terminal() && !cli.password_stdin && !env_pw_set;
+                    let password = if unattended {
+                        match session::try_get_unattended() {
+                            Some(pw) => pw,
+                            None => {
+                                return Err("unattended proxy start: no master password available. \
+                                     Set AIKEY_MASTER_PASSWORD in the service environment, or run \
+                                     `aikey proxy start` interactively once to populate the session cache."
+                                    .into());
+                            }
+                        }
+                    } else {
+                        prompt_vault_password(cli.password_stdin, cli.json)?
+                    };
+                    // Verify the password is valid before handing it to the
+                    // proxy. On the unattended path a stale cache (master
+                    // password changed) must invalidate, same discipline as
+                    // ensure_proxy_for_use — otherwise every service start
+                    // re-fails on the same dead cache entry.
+                    if let Err(e) = executor::list_secrets(&password) {
+                        if unattended {
+                            session::invalidate();
+                            return Err(format!(
+                                "unattended proxy start: cached vault password rejected ({}). \
+                                 Run `aikey proxy start` interactively to refresh it.",
+                                e
+                            )
+                            .into());
+                        }
+                        return Err(format!("vault authentication failed: {}", e).into());
+                    }
                     // Why: default is background (detach=true) so the terminal is not blocked.
                     // Use --foreground for debugging or when running under a process manager.
                     commands_proxy::handle_start(
@@ -5185,13 +5238,18 @@ fn pick_providers_interactively(
     // ciphertext by design); `key_material_reachable` treats it as usable so the
     // picker surfaces it, matching `aikey use <alias>` (2026-06-15 central-key fix).
     let on_cluster = crate::commands_account::read_cluster_node().is_some();
+    // 2026-07-06 (update/20260706-绑定材料守卫与Web解锁态全量sync.md): material-
+    // unreachable team keys are no longer HIDDEN — they show as dimmed,
+    // non-selectable "pending" rows. Hiding them made the picker show
+    // "nothing selected" while the same key was the active binding and the
+    // web vault labeled it IN USE. Visibility set = web vault's; only
+    // SELECTABILITY is gated on material.
     let usable_team: Vec<_> = team
         .iter()
         .filter(|e| {
             e.key_status == "active"
                 && !e.local_state.starts_with("disabled_by_")
                 && e.local_state != "stale"
-                && e.key_material_reachable(on_cluster)
         })
         .collect();
     for e in &usable_team {
@@ -5295,6 +5353,7 @@ fn pick_providers_interactively(
                     source_type: "personal".to_string(),
                     source_ref: e.alias.clone(),
                     display_type: None,
+                    pending: false,
                 });
             }
         }
@@ -5306,16 +5365,25 @@ fn pick_providers_interactively(
                 vec![e.provider_code.clone()]
             };
             if providers.iter().any(|p| p.to_lowercase() == *prov) {
+                let pending = !e.key_material_reachable(on_cluster);
                 let label = e
                     .local_alias
                     .as_deref()
                     .unwrap_or(e.alias.as_str())
                     .to_string();
+                let label = if pending {
+                    // Inline tag so the width calc (visible_len on label)
+                    // sizes the box for it; renderer adds dim styling.
+                    format!("{} \x1b[2;33m(pending sync)\x1b[0m", label)
+                } else {
+                    label
+                };
                 candidates.push(ui_select::KeyCandidate {
                     label,
                     source_type: "team".to_string(),
                     source_ref: e.virtual_key_id.clone(),
                     display_type: None,
+                    pending,
                 });
             }
         }
@@ -5361,6 +5429,7 @@ fn pick_providers_interactively(
                     source_type: "personal_oauth_account".to_string(), // DB value
                     source_ref: acct.provider_account_id.clone(),
                     display_type: Some(source_display), // UI: "oauth" or "oauth(f)"
+                    pending: false,
                 });
             }
         }
