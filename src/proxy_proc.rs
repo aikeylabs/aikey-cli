@@ -56,7 +56,9 @@ pub fn process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GetLastError, ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE,
+        };
         use windows_sys::Win32::System::Threading::{
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
@@ -64,10 +66,69 @@ pub fn process_alive(pid: u32) -> bool {
         // failure; we check before CloseHandle.
         let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if h == 0 || h == INVALID_HANDLE_VALUE as isize {
-            return false;
+            // ERROR_ACCESS_DENIED = the PID exists but we may not open it —
+            // the canonical case is an ELEVATED proxy probed from a
+            // non-elevated session (an elevated process's DACL grants only
+            // Administrators+SYSTEM, and the caller's Administrators group
+            // is deny-only in a filtered token). This is the exact analog
+            // of the unix EPERM branch above: alive, just not ours to
+            // introspect. Treating it as dead sent Layer 1 down
+            // classify_dead_pid → OrphanedPort/PortHeldByExternal for a
+            // perfectly healthy proxy (live incident 2026-07-07, Windows
+            // box: admin-SSH-started proxy vs user's normal console).
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
         }
         unsafe { CloseHandle(h) };
         true
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// True when `pid` exists but this session lacks permission to open it for
+/// introspection — the "privileged process probed from an unprivileged
+/// session" shape:
+///
+/// - **Windows**: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` fails
+///   with `ERROR_ACCESS_DENIED` (elevated/admin-session proxy vs the
+///   user's normal console — live incident 2026-07-07).
+/// - **Unix**: `kill(pid, 0)` fails with `EPERM` (e.g. a proxy started
+///   under sudo probed from the user's shell).
+///
+/// Callers use this to tell "identity UNVERIFIABLE (permission)" apart
+/// from "identity verified as NOT ours (pid recycled)": the former gets
+/// an elevation-aware hint and — with pidfile/meta/port/health quorum —
+/// may still classify as Running; the latter stays a hard OrphanedPort.
+pub fn process_open_denied(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if ret == 0 {
+            return false;
+        }
+        matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPERM)
+        )
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GetLastError, ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: same OpenProcess probe pattern as process_alive above.
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h == 0 || h == INVALID_HANDLE_VALUE as isize {
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+        }
+        unsafe { CloseHandle(h) };
+        false
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -579,6 +640,31 @@ mod tests {
         // confirms the call is reading the actual exe path, not a hard-
         // coded sentinel.
         assert!(p.is_absolute(), "expected absolute path, got {p:?}");
+    }
+
+    /// Self-PID is always openable — process_open_denied must be false, or
+    /// the elevated-proxy quorum path would hijack ordinary classification.
+    #[test]
+    fn process_open_denied_false_for_self() {
+        assert!(!process_open_denied(std::process::id()));
+    }
+
+    /// Unix leg of the 2026-07-07 elevated-proxy incident fix: pid 1
+    /// (launchd/systemd) exists but kill(1,0) from an unprivileged test
+    /// runner yields EPERM — that must read as alive + open-denied, the
+    /// same semantics the Windows branch now applies to
+    /// ERROR_ACCESS_DENIED. Skipped when running as root (kill succeeds).
+    #[cfg(unix)]
+    #[test]
+    fn process_open_denied_detects_privileged_pid1() {
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root can signal pid 1 — the EPERM shape doesn't exist
+        }
+        assert!(process_alive(1), "pid 1 must classify as alive");
+        assert!(
+            process_open_denied(1),
+            "unprivileged probe of pid 1 must report open-denied (EPERM)"
+        );
     }
 
     /// Self-PID is definitely not aikey-proxy (we are the test runner).

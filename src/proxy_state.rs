@@ -171,6 +171,17 @@ pub enum OrphanReason {
 
     /// No pidfile, but the configured port is held by some other process.
     PortHeldByExternal,
+
+    /// The PID under our pidfile is alive but this session LACKS
+    /// PERMISSION to introspect it (identity/birth_token unverifiable) —
+    /// canonically a proxy started from an elevated/admin session probed
+    /// from the user's normal console (Windows), or a sudo-started proxy
+    /// probed from the user's shell (Unix). Distinct from
+    /// `PidRecycledToNonProxy` because the process may well be OUR
+    /// healthy proxy; the hint must say "manage it from an elevated
+    /// terminal", not "an unrelated program took the port".
+    /// Live incident 2026-07-07 (Windows box, admin-SSH-started proxy).
+    OwnershipUnverifiablePermission,
 }
 
 impl OrphanReason {
@@ -208,6 +219,21 @@ impl OrphanReason {
             OrphanReason::PortHeldByExternal => format!(
                 "port {port} is held by {owner}, which is not an aikey-proxy we manage. \
                  Stop that listener or change `listen.port` in aikey-proxy.yaml"
+            ),
+            OrphanReason::OwnershipUnverifiablePermission => format!(
+                "{owner} matches our pidfile but this session lacks permission to verify it — \
+                 it was likely started from an elevated/admin session. Manage it from an \
+                 elevated terminal (`aikey proxy status` / `aikey proxy stop` there), or stop \
+                 it there ({kill_cmd}) and re-run `aikey proxy start` from this session",
+                kill_cmd = owner_pid
+                    .map(crate::proxy_proc::kill_command_hint)
+                    .unwrap_or_else(|| {
+                        if cfg!(windows) {
+                            "taskkill /F /PID <pid>".into()
+                        } else {
+                            "sudo kill <pid>".into()
+                        }
+                    }),
             ),
         }
     }
@@ -507,6 +533,14 @@ pub fn compute_proxy_state(inputs: &StateInputs) -> ProxyState {
         }
         // 2b. PID is alive. Check identity (I-7a).
         if !crate::proxy_proc::is_aikey_proxy(pid) {
+            // Distinguish "verified as NOT ours" from "UNVERIFIABLE due to
+            // permissions" (elevated-session proxy probed from a normal
+            // console — live incident 2026-07-07). The latter may still be
+            // our healthy proxy; decide by pidfile/meta/port/health quorum
+            // instead of condemning it to a misleading OrphanedPort.
+            if crate::proxy_proc::process_open_denied(pid) {
+                return classify_permission_denied_pid(pid, port, &inputs.meta_path, inputs);
+            }
             // PID was reused for a non-aikey-proxy process. Not ours.
             return classify_alive_unowned_pid(pid, port, OrphanReason::PidRecycledToNonProxy);
         }
@@ -661,6 +695,54 @@ fn classify_dead_pid(stale_pid: u32, port: u16) -> ProxyState {
 /// - Port probe tooling failed → `Crashed`, same degradation policy as
 ///   [`classify_dead_pid`] and the no-pidfile branch: better to attempt
 ///   a start (its own bind surfaces real conflicts) than refuse forever.
+/// Helper: pidfile PID is alive but this session LACKS PERMISSION to
+/// introspect it (see [`crate::proxy_proc::process_open_denied`]).
+///
+/// Why not a flat OrphanedPort (2026-07-07 live incident): a proxy started
+/// from an elevated/admin session is healthy and correctly recorded in
+/// pidfile + sidecar meta, yet every normal-console `status` /
+/// `ensure-running` / wrapper preflight condemned it as "port held by
+/// something we cannot manage" and refused to route — a main-path lockout
+/// for any customer who installs from an admin PowerShell.
+///
+/// Decision: accept as `Running` on a strict quorum of the evidence this
+/// session CAN still read —
+///   meta parses ∧ meta.pid == pidfile pid ∧ port owner == that pid ∧
+///   /health answers 200.
+/// The birth_token can't be compared (that's exactly the permission that
+/// was denied), so this is weaker than the verified path; the quorum makes
+/// the impostor scenario require a recycled PID that (a) our meta+pidfile
+/// both name, (b) binds our configured port, and (c) speaks our /health —
+/// while Layer 2's kill paths are still physically blocked by the same OS
+/// permission that blocked verification (stop surfaces its own OS error).
+/// Anything short of the quorum → OrphanedPort with the elevation-aware
+/// hint, never the misleading "not an aikey-proxy we manage".
+fn classify_permission_denied_pid(
+    pid: u32,
+    port: u16,
+    meta_path: &std::path::Path,
+    inputs: &StateInputs,
+) -> ProxyState {
+    let meta_pid_matches = matches!(read_meta_at(meta_path), Ok(m) if m.pid == pid);
+    let port_owner = crate::proxy_proc::port_owner_pid(port).ok().flatten();
+    if meta_pid_matches && port_owner == Some(pid) {
+        let healthy =
+            crate::proxy_proc::http_health_ok(port, std::time::Duration::from_millis(500));
+        if healthy {
+            return ProxyState::Running {
+                pid,
+                port,
+                listen_addr: inputs.listen_addr.clone(),
+            };
+        }
+    }
+    ProxyState::OrphanedPort {
+        port,
+        owner_pid: port_owner.or(Some(pid)),
+        reason: OrphanReason::OwnershipUnverifiablePermission,
+    }
+}
+
 fn classify_alive_unowned_pid(pidfile_pid: u32, port: u16, reason: OrphanReason) -> ProxyState {
     match crate::proxy_proc::port_owner_pid(port) {
         Ok(Some(owner)) if owner == pidfile_pid => ProxyState::OrphanedPort {
@@ -752,6 +834,52 @@ mod tests {
             hint.contains("listen.port"),
             "hint must point users at the config knob"
         );
+    }
+
+    #[test]
+    fn orphan_reason_hint_for_permission_denied_names_elevation_not_external() {
+        // 2026-07-07 live incident: an elevated-session proxy probed from a
+        // normal console must NOT be described as "not an aikey-proxy we
+        // manage" — that sent users hunting a nonexistent rogue listener.
+        // Pin that the hint names the elevation situation + both remedies.
+        let r = OrphanReason::OwnershipUnverifiablePermission;
+        let hint = r.hint(27200, Some(21860));
+        assert!(hint.contains("21860"), "hint must name the pid");
+        assert!(
+            hint.contains("elevated"),
+            "hint must attribute the failure to session elevation, got: {hint}"
+        );
+        assert!(
+            hint.contains("aikey proxy start"),
+            "hint must include the recovery command for THIS session"
+        );
+        assert!(
+            !hint.contains("not an aikey-proxy we manage"),
+            "must not reuse the misleading external-holder wording"
+        );
+    }
+
+    #[test]
+    fn permission_denied_pid_without_quorum_is_orphaned_with_permission_reason() {
+        // Quorum fails here (no meta file, no port listener) → must fall to
+        // OrphanedPort carrying the elevation-aware reason, never Running
+        // and never PortHeldByExternal.
+        let dir = std::env::temp_dir().join(format!("aikey_permdenied_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inputs = StateInputs {
+            pid_path: dir.join("proxy.pid"),
+            meta_path: dir.join("proxy-meta.json"), // absent → meta_pid_matches = false
+            listen_addr: "127.0.0.1:1".to_string(), // port 1: nothing listens
+        };
+        let state = classify_permission_denied_pid(999_999, 1, &inputs.meta_path, &inputs);
+        match state {
+            ProxyState::OrphanedPort { reason, owner_pid, .. } => {
+                assert_eq!(reason, OrphanReason::OwnershipUnverifiablePermission);
+                assert_eq!(owner_pid, Some(999_999), "falls back to the pidfile pid as owner");
+            }
+            other => panic!("expected OrphanedPort, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
