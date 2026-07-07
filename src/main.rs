@@ -1088,9 +1088,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         _ => {
             if let Ok(vault_path) = storage::get_vault_path() {
                 if vault_path.exists() {
-                    if let Ok(conn) = rusqlite::Connection::open(&vault_path) {
-                        let _ = migrations::upgrade_all(&conn);
-                    }
+                    // Marker-gated: read-only probe when this build already
+                    // replayed, full idempotent replay otherwise. The old
+                    // unconditional upgrade_all took the vault WRITE lock on
+                    // every command — `_internal` bridge children spawned by
+                    // the web console then queued on that lock and the vault
+                    // page crawled (2026-07-07, see ensure_schema_current
+                    // docs). `aikey db upgrade` still force-replays.
+                    let _ = migrations::ensure_schema_current(&vault_path);
                 }
             }
         }
@@ -1152,6 +1157,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let conn = rusqlite::Connection::open(&vault_path)
                     .map_err(|e| format!("Failed to open vault: {}", e))?;
                 migrations::upgrade_all(&conn)?;
+                // Explicit upgrade counts as this build's replay — stamp the
+                // marker so the next command takes the read-only fast path.
+                migrations::stamp_schema_marker(&conn)?;
                 eprintln!("[db upgrade] Done");
             }
             DbAction::Rollback { to } => {
@@ -1165,6 +1173,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let conn = rusqlite::Connection::open(&vault_path)
                     .map_err(|e| format!("Failed to open vault: {}", e))?;
                 migrations::rollback_to(&conn, &to)?;
+                // Drop the replay marker so the next command re-converges —
+                // preserves the pre-marker behavior for same-binary rollbacks
+                // (the documented flow installs an older binary next anyway).
+                migrations::clear_schema_marker(&conn);
                 eprintln!("[db rollback] Vault schema rolled back to {}", to);
             }
         },

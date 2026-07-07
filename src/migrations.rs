@@ -54,6 +54,112 @@ pub fn upgrade_all(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Per-build replay marker (vault-page lock-convoy fix, 2026-07-07)
+// ---------------------------------------------------------------------------
+
+/// `config` table key recording which binary BUILD last replayed the schema.
+const SCHEMA_REPLAYED_BY_KEY: &str = "schema.replayed_by";
+
+/// Identity of THIS binary for the replay marker. Includes the git revision
+/// (not just the version string) so dev/dirty builds sharing a version
+/// number still re-replay after a rebuild — a stale skip on a schema-
+/// changing dev build would be a debugging nightmare.
+fn current_schema_marker() -> String {
+    format!(
+        "{}:{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("AIKEY_BUILD_REVISION")
+    )
+}
+
+/// Outcome of [`ensure_schema_current`] — exposed so tests can assert the
+/// fast path actually skipped.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SchemaEnsure {
+    /// Marker matched this build — no write connection was opened.
+    SkippedFresh,
+    /// Full idempotent replay ran (first contact of this build, or marker
+    /// unreadable) and the marker was updated.
+    Replayed,
+}
+
+/// Pre-dispatch schema convergence with a read-only fast path.
+///
+/// Why this exists (2026-07-07 vault-page lock convoy, Windows live box):
+/// the vault has NO migration ledger — convergence = replaying the whole
+/// idempotent baseline. Several statements in that replay (`INSERT OR
+/// IGNORE` self-heal rows) are real write attempts that take SQLite's
+/// write lock even when they end up ignoring. Running that on EVERY
+/// command was fine for humans, but `_internal` bridge children are
+/// spawned by the web console many times per page load plus background
+/// polls — N concurrent replays queued on the vault write lock inflated a
+/// 52ms call to 1.2-3.3s (measured), and the vault page crawled.
+///
+/// The schema can only change when the BINARY changes, so the replay is
+/// now gated on a per-build marker in the `config` table:
+/// - marker == this build (read-only probe, no write lock) → skip;
+/// - anything else (missing marker / other build / unreadable / legacy
+///   vault without the row) → full replay, then stamp the marker.
+///
+/// Trade-off (user-approved 2026-07-07): self-heal frequency drops from
+/// "every command" to "once per binary build". Hand-damaged vault content
+/// between upgrades now needs an explicit `aikey db upgrade` (which still
+/// force-replays unconditionally) instead of healing on the next command.
+///
+/// Errors are returned for the caller to ignore-or-log — same "schema
+/// convergence must never block the command itself" stance as before.
+pub fn ensure_schema_current(vault_path: &std::path::Path) -> Result<SchemaEnsure, String> {
+    let marker = current_schema_marker();
+
+    // Fast path: read-only probe. Any failure (no config table yet, BLOB
+    // value, locked file, corrupt db) simply falls through to the replay,
+    // which owns real error handling.
+    let probe = Connection::open_with_flags(vault_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT CAST(value AS TEXT) FROM config WHERE key = ?1",
+                [SCHEMA_REPLAYED_BY_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        });
+    if probe.as_deref() == Some(marker.as_str()) {
+        return Ok(SchemaEnsure::SkippedFresh);
+    }
+
+    let conn =
+        Connection::open(vault_path).map_err(|e| format!("open vault for schema replay: {}", e))?;
+    upgrade_all(&conn)?;
+    stamp_schema_marker(&conn)?;
+    Ok(SchemaEnsure::Replayed)
+}
+
+/// Record that THIS build has replayed the schema. Also called by the
+/// explicit `aikey db upgrade` path so a manual force-replay flips the
+/// next command onto the read-only fast path.
+pub fn stamp_schema_marker(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+        rusqlite::params![SCHEMA_REPLAYED_BY_KEY, current_schema_marker()],
+    )
+    .map_err(|e| format!("stamp schema marker: {}", e))?;
+    Ok(())
+}
+
+/// Remove the replay marker. Called after `aikey db rollback` so the next
+/// command re-converges the schema (preserves the pre-marker behavior
+/// where any command after a same-binary rollback immediately re-upgraded;
+/// the documented rollback flow installs an older binary next, whose own
+/// marker differs anyway).
+pub fn clear_schema_marker(conn: &Connection) {
+    let _ = conn.execute(
+        "DELETE FROM config WHERE key = ?1",
+        [SCHEMA_REPLAYED_BY_KEY],
+    );
+}
+
 /// Rollback vault schema from current state down to target version.
 /// Walks the registry in reverse, calling rollback() for each version
 /// that is AFTER the target. Supports crossing multiple versions.
@@ -2291,6 +2397,76 @@ mod tests {
         assert!(
             dup_token.is_err(),
             "duplicate route_token must be rejected by UNIQUE constraint"
+        );
+    }
+
+    /// 2026-07-07 vault-page lock-convoy fix: the marker lifecycle.
+    /// First contact replays + stamps; second call takes the read-only
+    /// fast path (SkippedFresh — this is the load-bearing assertion: it
+    /// proves no write connection is needed once stamped); clearing the
+    /// marker (db rollback path) re-arms the replay.
+    #[test]
+    fn schema_marker_gates_replay_and_clear_rearms() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault.db");
+        // Create the file with a baseline replay so the fast path has a
+        // config table to probe.
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::Replayed,
+            "first contact must replay"
+        );
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::SkippedFresh,
+            "same build must skip via the read-only probe"
+        );
+        // Tampered marker (≈ different build stamped it) → replay again.
+        {
+            let conn = Connection::open(&vault).unwrap();
+            conn.execute(
+                "UPDATE config SET value='0.0.0:other' WHERE key='schema.replayed_by'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::Replayed,
+            "foreign marker must trigger a fresh replay"
+        );
+        // Rollback path clears the marker → next command re-converges.
+        {
+            let conn = Connection::open(&vault).unwrap();
+            clear_schema_marker(&conn);
+        }
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::Replayed,
+            "cleared marker must re-arm the replay"
+        );
+    }
+
+    /// The replay stays idempotent under the marker scheme: a legacy vault
+    /// (schema present, no marker row — every pre-fix install looks like
+    /// this) must replay once without error and then fast-path.
+    #[test]
+    fn legacy_vault_without_marker_replays_once_then_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault.db");
+        {
+            // Simulate a pre-marker vault: full schema, no marker row.
+            let conn = Connection::open(&vault).unwrap();
+            upgrade_all(&conn).unwrap();
+        }
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::Replayed,
+            "legacy vault (no marker) must converge via replay"
+        );
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::SkippedFresh
         );
     }
 }
