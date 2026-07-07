@@ -3898,9 +3898,8 @@ tool_call_timeout_ms = 60000\n"
         // Exact-command leg: content carrying THIS binary's render command
         // must report hook_present=true.
         let expected = crate::commands_statusline::aikey_statusline_render_kimi_command();
-        let current = format!(
-            "[[hooks]]\nevent = \"Stop\"\ncommand = \"{expected}\"\ntimeout = 5\n"
-        );
+        let current =
+            format!("[[hooks]]\nevent = \"Stop\"\ncommand = \"{expected}\"\ntimeout = 5\n");
         assert_eq!(kimi_content_status(&current), (true, true));
     }
 
