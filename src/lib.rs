@@ -59,6 +59,20 @@ pub mod usage_wal;
 #[cfg(test)]
 pub(crate) mod test_env_lock;
 
+/// Strip a leading UTF-8 BOM before handing text to serde/toml parsers.
+///
+/// Why (encoding sweep 2026-07-07 H1/L1): Windows tooling — PowerShell
+/// 5.1's `Set-Content -Encoding UTF8` in particular — prepends a BOM, and
+/// `serde_json::from_str` rejects it at byte 0. The failure mode is nasty
+/// because most callers `.ok()?` the parse: a BOM'd install-state.json
+/// silently reads as "no install at all" (detect_edition → None → `aikey
+/// web` claims the host has no local server). Writers are fixed to emit
+/// BOM-less files, but shipped installers already produced BOM'd files on
+/// customer machines — readers must tolerate them forever.
+pub fn strip_bom(s: &str) -> &str {
+    s.strip_prefix('\u{feff}').unwrap_or(s)
+}
+
 /// Prompts for a hidden input (password / API key), showing a `*` for each
 /// keystroke in real time. Supports backspace and handles paste gracefully.
 ///

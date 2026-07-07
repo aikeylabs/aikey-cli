@@ -283,6 +283,31 @@ pub(super) fn ensure_powershell_hook() -> Option<String> {
         ));
     }
 
+    // H2 guard (encoding sweep 2026-07-07): NEVER byte-append UTF-8 onto a
+    // profile we can't read as UTF-8. PS 5.1 commonly produces UTF-16LE
+    // $PROFILE files (`'x' > $PROFILE` redirection, old Notepad "Unicode");
+    // appending UTF-8 bytes onto UTF-16 corrupts the file — PowerShell
+    // decodes the WHOLE file as UTF-16, the appended block turns into CJK
+    // garbage, and every new session can throw a parse error. Worse, the
+    // marker check above can't see markers in such files (read_to_string
+    // errors → candidate skipped), so repeated runs would keep appending
+    // and compound the damage. Until a decode-splice-rewrite lands
+    // (installer's Get-Content/Set-Content path already does this
+    // correctly), fail safe with actionable guidance.
+    if let Ok(bytes) = std::fs::read(&target) {
+        let utf16_bom = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+        let undecodable = !bytes.is_empty() && std::str::from_utf8(&bytes).is_err();
+        if utf16_bom || undecodable {
+            return Some(format!(
+                "  {} exists but is not UTF-8 (likely UTF-16 from PowerShell 5.1).\n  \
+                 Appending would corrupt it — hook wiring skipped.\n  \
+                 Convert it once in PowerShell: \x1b[36m(Get-Content $PROFILE -Raw) | Set-Content $PROFILE -Encoding utf8\x1b[0m\n  \
+                 then re-run: \x1b[36maikey hook install\x1b[0m",
+                target_display,
+            ));
+        }
+    }
+
     // Create parent dir (pwsh 7+ profile dir is often missing on a
     // freshly-installed pwsh) and append the v3 block. Use OpenOptions
     // append — never overwrite user content already present.

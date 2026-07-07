@@ -96,6 +96,8 @@ mod usage_wal;
 mod test_env_lock;
 
 use aikeylabs_aikey_cli::prompt_hidden;
+#[allow(unused_imports)] // available as crate::strip_bom to bin-side modules
+use aikeylabs_aikey_cli::strip_bom;
 use clap::Parser;
 use cli::*;
 use secrecy::{ExposeSecret, SecretString};

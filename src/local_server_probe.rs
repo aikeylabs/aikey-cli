@@ -101,7 +101,10 @@ pub fn detect_edition() -> Option<Edition> {
     let home = crate::commands_account::resolve_user_home();
     let path = home.join(".aikey/install-state.json");
     let raw = fs::read_to_string(&path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    // strip_bom: shipped PS 5.1 trial installers wrote this file WITH a BOM
+    // (encoding sweep 2026-07-07 H1) and serde rejects it — without the strip
+    // a whole trial install reads as "not installed" here.
+    let parsed: serde_json::Value = serde_json::from_str(crate::strip_bom(&raw)).ok()?;
     let components = parsed.get("installed_components")?.as_array()?;
     // Why Trial wins over local-server when both appear: trial-server
     // is a superset bundle that includes local-server's user-side
@@ -1349,6 +1352,25 @@ mod tests {
         let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(tmp.path(), r#"{"installed_components":["full-trial"]}"#);
+        with_home(tmp.path(), || {
+            assert_eq!(detect_edition(), Some(Edition::Trial));
+        });
+    }
+
+    #[test]
+    fn detect_edition_tolerates_utf8_bom() {
+        // Encoding sweep 2026-07-07 H1: shipped PS 5.1 trial installers
+        // wrote install-state.json WITH a UTF-8 BOM (`Set-Content -Encoding
+        // UTF8`), serde rejects BOM at byte 0, and the `.ok()?` swallowed
+        // the error — a whole trial install read as "not installed".
+        // Readers must tolerate BOM'd files forever (they're already on
+        // customer machines).
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_install_state(
+            tmp.path(),
+            "\u{feff}{\"installed_components\":[\"full-trial\"]}",
+        );
         with_home(tmp.path(), || {
             assert_eq!(detect_edition(), Some(Edition::Trial));
         });
