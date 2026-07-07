@@ -370,20 +370,28 @@ pub(crate) fn uninstall_kimi_hook() -> KimiUninstallOutcome {
 /// its managed region. Used by `aikey env` so users can see at a glance
 /// which provider CLIs are wired up.
 ///
-/// Detection is by AIKEY_BEGIN marker presence — the same source of truth
-/// used by `*_status()` and `unconfigure_*` so display can never disagree
-/// with the actual injection state.
+/// Detection is SEMANTIC (2026-07-07 fix), not marker-text: the injectors
+/// migrated to structural toml_edit writes that emit NO `# BEGIN aikey`
+/// comments (kimi hook merge keyed on the command tail; codex_merge /
+/// codex_remove keyed on our keys), and third-party CLIs re-serialize
+/// their configs dropping ALL comments anyway (observed live: codex
+/// rewrote config.toml on 2026-07-06 and the legacy marker vanished while
+/// every aikey key survived). Marker-based detection therefore went
+/// permanently blind and `aikey env` silently stopped listing injected
+/// configs. We now key on the same semantic identity the REMOVE paths use
+/// — so display stays in lockstep with what `aikey unuse` would actually
+/// strip. AIKEY_BEGIN is still honored for legacy never-rewritten files.
 ///
-/// Files that don't exist or don't contain the marker are omitted; the
+/// Files that don't exist or carry nothing of ours are omitted; the
 /// caller can render "(none)" when the result is empty.
 pub fn injected_provider_toml_paths() -> Vec<(&'static str, std::path::PathBuf)> {
     let mut out = Vec::new();
     let (kimi, _) = kimi_config_paths();
-    if file_has_aikey_marker(&kimi) {
+    if kimi_config_has_aikey(&kimi) {
         out.push(("kimi", kimi));
     }
     let (codex, _) = codex_config_paths();
-    if file_has_aikey_marker(&codex) {
+    if codex_config_has_aikey(&codex) {
         out.push(("codex", codex));
     }
     // Claude lives in a JSON settings file, not a TOML — but it's still a
@@ -397,10 +405,43 @@ pub fn injected_provider_toml_paths() -> Vec<(&'static str, std::path::PathBuf)>
     out
 }
 
-fn file_has_aikey_marker(p: &std::path::Path) -> bool {
+/// Kimi wiring detection: the structural hook merge is keyed on the
+/// command's stable tail (KIMI_HOOK_COMMAND_MARKER, see its doc), so that
+/// is the semantic identity; AIKEY_BEGIN covers legacy marker-region files.
+fn kimi_config_has_aikey(p: &std::path::Path) -> bool {
     std::fs::read_to_string(p)
-        .map(|s| s.contains(AIKEY_BEGIN))
+        .map(|s| s.contains(KIMI_HOOK_COMMAND_MARKER) || s.contains(AIKEY_BEGIN))
         .unwrap_or(false)
+}
+
+/// Codex wiring detection — file wrapper over `codex_content_has_aikey`.
+fn codex_config_has_aikey(p: &std::path::Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(p) else {
+        return false;
+    };
+    content.contains(AIKEY_BEGIN) || codex_content_has_aikey(&content)
+}
+
+/// True when the config carries anything `codex_remove` would strip. Keep
+/// these three predicates in LOCKSTEP with codex_remove — the test
+/// `codex_detection_lockstep_with_remove` pins the equivalence so display
+/// ("wired") and removal ("what unuse strips") can never disagree.
+pub(super) fn codex_content_has_aikey(content: &str) -> bool {
+    let Some(doc) = parse_or_heal_toml(content) else {
+        return false;
+    };
+    let has_table = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table())
+        .map(|t| t.contains_key("aikey"))
+        .unwrap_or(false);
+    let provider_ours = doc.get("model_provider").and_then(|i| i.as_str()) == Some("aikey");
+    let base_ours = doc
+        .get("openai_base_url")
+        .and_then(|i| i.as_str())
+        .map(|v| v.ends_with("/openai"))
+        .unwrap_or(false);
+    has_table || provider_ours || base_ours
 }
 
 /// Inspect the current Kimi config state for `aikey statusline status`. Does
@@ -1273,7 +1314,14 @@ pub fn reload_hint_for_shell() -> String {
     match shell_kind() {
         ShellKind::Zsh => "source ~/.zshrc".to_string(),
         ShellKind::Bash => "source ~/.bashrc".to_string(),
-        ShellKind::PowerShell => ". $PROFILE".to_string(),
+        // find#11 (2026-07-07): the hook is installed into
+        // `$PROFILE.CurrentUserAllHosts` (profile.ps1) — see
+        // shell_integration_windows.rs — but `$PROFILE` alone resolves to
+        // `$PROFILE.CurrentUserCurrentHost` (Microsoft.PowerShell_profile.ps1),
+        // a DIFFERENT file that (a) usually does not exist → `. $PROFILE`
+        // errors "cannot be found", and (b) even if it did, would not contain
+        // our hook. Dot-source the same AllHosts profile the installer wrote to.
+        ShellKind::PowerShell => ". $PROFILE.CurrentUserAllHosts".to_string(),
         ShellKind::Cmd => "open a new cmd.exe window (cmd has no rc reload)".to_string(),
         // Unknown deliberately avoids suggesting `source ...` (POSIX-only).
         // Returns the same message the bash/zsh/PS branches' callers
@@ -3797,6 +3845,58 @@ tool_call_timeout_ms = 60000\n"
             "provider block still installed:\n{out}"
         );
         out.parse::<toml_edit::Document>().expect("valid TOML");
+    }
+
+    #[test]
+    fn codex_detection_semantic_survives_comment_stripping_rewrite() {
+        // THE 2026-07-07 regression: codex CLI re-serializes config.toml on
+        // its own writes (trust_level / personality / …) and drops ALL
+        // comment lines — the legacy `# BEGIN aikey` marker vanished while
+        // every aikey key survived, and `aikey env` silently stopped
+        // listing the codex config. Shape below mirrors the live file.
+        let marker_less = "model = \"gpt-5.5\"\nopenai_base_url = \"http://127.0.0.1:27200/openai\"\nmodel_provider = \"aikey\"\n\n[projects.\"/x\"]\ntrust_level = \"trusted\"\n\n[model_providers.aikey]\nname = \"aikey\"\nbase_url = \"http://127.0.0.1:27200/openai\"\nenv_key = \"OPENAI_API_KEY\"\n";
+        assert!(
+            codex_content_has_aikey(marker_less),
+            "structural content without markers must be detected as wired"
+        );
+
+        let vanilla = "model = \"gpt-5.5\"\n\n[projects.\"/x\"]\ntrust_level = \"trusted\"\n";
+        assert!(
+            !codex_content_has_aikey(vanilla),
+            "vanilla codex config must not be reported as wired"
+        );
+    }
+
+    #[test]
+    fn codex_detection_lockstep_with_remove() {
+        // Display ("wired") and removal ("what unuse strips") share their
+        // semantic identity. If someone changes codex_remove's predicates
+        // without updating codex_content_has_aikey (or vice versa), the
+        // `aikey env` listing starts lying about injection state again.
+        let fixtures: &[&str] = &[
+            // vanilla — nothing of ours
+            "model = \"gpt-5\"\n[projects.x]\ntrust = \"full\"\n",
+            // full structural install, no markers (the live regression shape)
+            "openai_base_url = \"http://127.0.0.1:27200/openai\"\nmodel_provider = \"aikey\"\n[model_providers.aikey]\nname = \"aikey\"\n",
+            // only the provider table left behind
+            "model = \"gpt-5\"\n[model_providers.aikey]\nname = \"aikey\"\n",
+            // only our proxy base_url left behind
+            "openai_base_url = \"http://127.0.0.1:27200/openai\"\n",
+            // only model_provider pointing at us
+            "model_provider = \"aikey\"\n",
+            // user's own base_url — NOT ours (doesn't end in /openai)
+            "openai_base_url = \"https://api.example.com/v1\"\n",
+            // user's own model_provider — NOT ours
+            "model_provider = \"ollama\"\n",
+        ];
+        for f in fixtures {
+            let remove_changes = matches!(codex_remove(f), TomlMergeOutcome::Changed(_));
+            assert_eq!(
+                codex_content_has_aikey(f),
+                remove_changes,
+                "detection and codex_remove disagree on fixture:\n{f}"
+            );
+        }
     }
 
     #[test]
