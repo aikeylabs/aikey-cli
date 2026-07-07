@@ -727,6 +727,14 @@ pub fn handle_login(
             eprintln!("  Control Panel: {}", default_url);
         }
         default_url
+    } else if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        // No TTY (spawned from a script / service / web bridge): reading
+        // stdin here blocks forever on a silent pipe — observed live as an
+        // `aikey login` process hung >1h on Windows (parity audit 2026-07-07
+        // P2-5). Behave like json_mode: take the default without prompting;
+        // a wrong default fails loudly downstream instead of hanging here.
+        eprintln!("  Control Panel: {} (no TTY — using default; pass --control-url to override)", default_url);
+        default_url
     } else {
         print!("Control Panel URL [{}]: ", default_url);
         io::stdout().flush()?;
@@ -850,7 +858,12 @@ pub fn handle_login(
         std::thread::sleep(poll_interval);
 
         if SystemTime::now() > deadline {
-            if !json_mode {
+            // TTY guard (parity audit 2026-07-07 P2-5): without it, a
+            // scripted/service-spawned login that outlived the poll window
+            // fell into the paste-token read_line below and blocked forever
+            // on a silent stdin (observed live: `aikey login` hung >1h on
+            // Windows after the ~1h poll window expired).
+            if !json_mode && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 eprintln!();
                 eprintln!("  {}", "Session expired.".yellow());
                 eprintln!(
