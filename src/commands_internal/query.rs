@@ -412,6 +412,10 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
+    // Same cluster-awareness as the picker / use / set-route paths — on a
+    // cluster a claimed central key routes via the node and IS usable
+    // without local ciphertext (key_material_reachable's contract).
+    let on_cluster = crate::commands_account::read_cluster_node().is_some();
     entries
         .into_iter()
         .map(|t| {
@@ -439,6 +443,17 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
                         RoutedState::NeedsLogin => "needs_login",
                         RoutedState::NoCandidate => "inactive",
                     }
+                } else if base == "active" && !t.key_material_reachable(on_cluster) {
+                    // 2026-07-06 (update/20260706-绑定材料守卫与Web解锁态全量sync.md):
+                    // direct-bind VK whose provider key material never arrived
+                    // locally (and can't route via a cluster node). Without this
+                    // overlay the web chip said "active" — and the IN USE badge
+                    // (binding-driven, deliberately decoupled from usability)
+                    // could claim a key the proxy 503s on. Same predicate as the
+                    // picker's pending rows, so both surfaces tell one story.
+                    // Actionable like needs_login: unlock+reload or `aikey key
+                    // sync` downloads the material and this flips back to active.
+                    "pending_download"
                 } else {
                     base
                 }
@@ -590,11 +605,83 @@ pub fn handle(env: StdinEnvelope) {
         "list_personal_with_masked" => handle_list_personal_with_masked(env),
         "list_oauth" => handle_list_oauth(env),
         "list_metadata_locked" => handle_list_metadata_locked(env),
+        "snapshot_sync" => handle_snapshot_sync(env),
         other => emit_error(
             req_id,
             "I_UNKNOWN_ACTION",
             format!("unknown query action: '{}'", other),
         ),
+    }
+}
+
+// ========== snapshot_sync ==========
+
+/// `snapshot_sync`: pull the account's managed-keys snapshot from Control and
+/// upsert the local VK metadata cache (`managed_virtual_keys_cache`).
+///
+/// # Why this exists
+/// The Web vault page reads the LOCAL VK cache. That cache is only written by
+/// `run_snapshot_sync` — historically triggered by user CLI commands (`aikey
+/// list`) or the `aikey agent` daemon. The always-on aikey-proxy has rails for
+/// the DYNAMIC columns (group_runtime / quota / routing) but NONE that pull the
+/// structural VK-row snapshot, so a newly-issued team/group VK never lands in
+/// the cache until the CLI happens to run — the Web page then shows a stale list
+/// (missing key / "unknown" protocol). This action lets the local-server refresh
+/// the cache itself, decoupled from the CLI/agent.
+///
+/// # Contract
+/// - Reuses the public sync cores (no parallel impl) — the
+///   `_internal must reuse public core` rule.
+/// - Two tiers keyed by the envelope's `vault_key_hex` (2026-07-06,
+///   update/20260706-绑定材料守卫与Web解锁态全量sync.md):
+///     - absent / placeholder → metadata-only `run_snapshot_sync` (works
+///       locked; no provider secret material to encrypt);
+///     - real verifying vault_key (unlocked web session) → FULL
+///       `run_full_snapshot_sync_with_vault_key` (claim + key-material
+///       download), so a web page load self-heals a missing
+///       `provider_key_ciphertext` instead of leaving the key stuck in
+///       "pending download" until someone runs `aikey key sync` in a
+///       terminal. Material MUST be encrypted with the vault key before it
+///       touches disk — that is WHY the locked tier cannot download it.
+///     - a NON-verifying non-placeholder key is an error envelope, not a
+///       silent downgrade (fail-visible; a stale session cookie should
+///       surface, and the full core strict-verifies anyway).
+/// - Best-effort by design: the caller (local-server) fires this in the
+///   BACKGROUND and ignores the result. It must NEVER be on the vault read's
+///   critical path — offline use must return the local cache instantly. Errors
+///   (offline / Control down) come back as a status envelope, not a panic.
+/// - Version-gated: metadata tier inside `run_snapshot_sync` (fast
+///   sync-version check); the full tier's material step is gated by the
+///   separate `last_material_sync_version` marker + ciphertext-absence check.
+/// Whether the envelope carries a REAL vault_key (unlocked web session) as
+/// opposed to "deliberately none": empty string (Go read-path convention) or
+/// the all-zero PlaceholderHex (Go cli.PlaceholderHex). Only a real key
+/// selects the full sync tier; a real-but-wrong key must ERROR (fail-visible),
+/// never silently downgrade to metadata-only — that split lives in the caller.
+fn envelope_has_real_vault_key(vault_key_hex: &str) -> bool {
+    !vault_key_hex.is_empty() && !vault_key_hex.chars().all(|c| c == '0')
+}
+
+fn handle_snapshot_sync(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+    if envelope_has_real_vault_key(&env.vault_key_hex) {
+        let key = match verify_key(&env) {
+            Ok(k) => k,
+            Err((code, msg)) => return emit_error(req_id, code, msg),
+        };
+        return match crate::commands_account::run_full_snapshot_sync_with_vault_key(&key) {
+            Ok(downloaded) => emit(&ResultEnvelope::ok(
+                req_id,
+                json!({ "synced": true, "downloaded": downloaded, "full": true }),
+            )),
+            Err(e) => emit_error(req_id, "I_SNAPSHOT_SYNC_FAILED", e),
+        };
+    }
+    match crate::commands_account::run_snapshot_sync() {
+        // `applied` = true when a newer snapshot was pulled + written; false when
+        // already up-to-date or not logged in. Both are success for the caller.
+        Ok(applied) => emit(&ResultEnvelope::ok(req_id, json!({ "synced": applied }))),
+        Err(e) => emit_error(req_id, "I_SNAPSHOT_SYNC_FAILED", e),
     }
 }
 
@@ -1515,7 +1602,10 @@ mod team_protocol_source_tests {
     // Direct VK: provider_code present → use it.
     #[test]
     fn provider_code_wins_when_present() {
-        assert_eq!(team_protocol_source("anthropic", "openai_compatible"), Some("anthropic"));
+        assert_eq!(
+            team_protocol_source("anthropic", "openai_compatible"),
+            Some("anthropic")
+        );
     }
 
     // Orphaned group VK (seat unbound): provider_code empty → fall back to the stable,
@@ -1979,5 +2069,121 @@ mod protocol_family_of_tests {
         // 输入大小写无关
         assert_eq!(protocol_family_of(Some("KIMI_CODE")), "kimi");
         assert_eq!(protocol_family_of(Some("Moonshot")), "kimi");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_sync_tier_tests {
+    use super::envelope_has_real_vault_key;
+
+    // Two-tier snapshot_sync dispatch (2026-07-06,
+    // update/20260706-绑定材料守卫与Web解锁态全量sync.md): the web bridge sends
+    // "" or the all-zero PlaceholderHex when locked (→ metadata-only tier) and
+    // the session's real vault_key when unlocked (→ full tier with key-material
+    // download). Misclassifying the placeholder as "real" would make every
+    // locked page load fail with I_VAULT_KEY_INVALID; misclassifying a real
+    // key as "none" would silently never download material.
+
+    #[test]
+    fn empty_hex_is_not_a_real_key() {
+        assert!(!envelope_has_real_vault_key(""));
+    }
+
+    #[test]
+    fn all_zero_placeholder_is_not_a_real_key() {
+        // Byte-identical to Go's cli.PlaceholderHex.
+        let placeholder = "0".repeat(64);
+        assert!(!envelope_has_real_vault_key(&placeholder));
+    }
+
+    #[test]
+    fn real_key_hex_selects_full_tier() {
+        let key = "42".repeat(32);
+        assert!(envelope_has_real_vault_key(&key));
+    }
+}
+
+#[cfg(test)]
+mod team_status_overlay_tests {
+    //! pending_download overlay (2026-07-06,
+    //! update/20260706-绑定材料守卫与Web解锁态全量sync.md): a direct-bind VK whose
+    //! key material never arrived locally must NOT read "active" on the web
+    //! vault — the proxy 503s on it. Regression pin for the display-split
+    //! incident (web IN USE + chip active vs picker hides vs 503).
+    use super::*;
+    use crate::storage;
+
+    fn setup_vault() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).expect("salt");
+        let pw = secrecy::SecretString::new("test_password".to_string());
+        storage::initialize_vault(&salt, &pw).expect("init vault");
+        (dir, guard)
+    }
+
+    fn vk(id: &str, ciphertext: Option<&[u8]>) -> storage::VirtualKeyCacheEntry {
+        storage::VirtualKeyCacheEntry {
+            virtual_key_id: id.into(),
+            org_id: "org-1".into(),
+            seat_id: "seat-1".into(),
+            alias: id.into(),
+            provider_code: "anthropic".into(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: "cred-1".into(),
+            credential_revision: "r1".into(),
+            virtual_key_revision: "vr1".into(),
+            key_status: "active".into(),
+            share_status: "claimed".into(),
+            local_state: "synced_inactive".into(),
+            expires_at: None,
+            provider_key_nonce: ciphertext.map(|_| vec![0u8; 12]),
+            provider_key_ciphertext: ciphertext.map(|c| c.to_vec()),
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec!["anthropic".into()],
+            provider_base_urls: std::collections::HashMap::new(),
+            owner_account_id: Some("acct-1".into()),
+            owner_email: None,
+            group_runtime: None,
+            group_alias: None,
+            extra: None,
+            oauth_group_id: None,
+            group_accounts: None,
+            routing_config: None,
+        }
+    }
+
+    fn emitted_status(vk_id: &str) -> String {
+        let records = team_records_for_emit(&HashMap::new());
+        records
+            .iter()
+            .find(|r| r["virtual_key_id"] == vk_id)
+            .expect("record present")["effective_status"]
+            .as_str()
+            .expect("status string")
+            .to_string()
+    }
+
+    #[test]
+    fn direct_bind_vk_without_material_reads_pending_download() {
+        let (_dir, _guard) = setup_vault();
+        storage::upsert_virtual_key_cache(&vk("vk-nomat", None)).unwrap();
+        assert_eq!(emitted_status("vk-nomat"), "pending_download");
+    }
+
+    #[test]
+    fn direct_bind_vk_with_material_reads_active() {
+        let (_dir, _guard) = setup_vault();
+        storage::upsert_virtual_key_cache(&vk("vk-mat", Some(b"cipher"))).unwrap();
+        assert_eq!(emitted_status("vk-mat"), "active");
     }
 }

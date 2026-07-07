@@ -783,10 +783,12 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             };
             let parts: Vec<String> = ["kimi", "claude"]
                 .iter()
-                .map(|tool| match crate::commands_statusline::receipt_last_ok(tool) {
-                    Some(ts) => format!("{}: {}", tool, fmt_age(ts)),
-                    None => format!("{}: never", tool),
-                })
+                .map(
+                    |tool| match crate::commands_statusline::receipt_last_ok(tool) {
+                        Some(ts) => format!("{}: {}", tool, fmt_age(ts)),
+                        None => format!("{}: never", tool),
+                    },
+                )
                 .collect();
             emit(
                 "usage receipts",

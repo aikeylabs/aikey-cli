@@ -372,6 +372,7 @@ pub fn auto_assign_primaries_for_key(
     key_source_type: &str,
     key_source_ref: &str,
     providers: &[String],
+    audit: Option<&crate::audit::VerifiedVaultKey>,
 ) -> Result<Vec<String>, String> {
     // 2026-05-08 Kimi family fill-empty-only(详见 update/20260508-Kimi-family
     // 互斥-active-env统一KIMI写入.md 决策 #2.1):family 内已有任何 primary
@@ -385,6 +386,40 @@ pub fn auto_assign_primaries_for_key(
             .map(|o| o.is_some())
             .unwrap_or(false)
     });
+
+    // Material guard (2026-07-06): a team VK whose key material is NOT reachable
+    // (no local ciphertext, not a claimed cluster central key, not a group VK)
+    // must never be auto-promoted to Primary. A Primary binding's semantic is
+    // "the proxy can serve requests with it" — binding an unreachable key gives
+    // 503 NO_ACTIVE_KEY at request time while the picker hides the key and the
+    // web vault still shows it as IN USE (the 2026-07-06 display-split incident).
+    // Better to leave the slot EMPTY (fail-visible, next reachable key or an
+    // explicit `aikey use` fills it) than to bind an unusable key. Explicit user
+    // switches are NOT gated here — `use`/web set-route have their own guard
+    // with a hard error (I_KEY_NOT_DELIVERED); automatic fills skip silently
+    // except for the WARN below. Same predicate as the picker / web set-route
+    // (`key_material_reachable`) so the three paths cannot diverge.
+    if key_source_type == "team" {
+        let on_cluster = crate::commands_account::read_cluster_node().is_some();
+        let reachable = storage::get_virtual_key_cache(key_source_ref)
+            .ok()
+            .flatten()
+            .map(|e| e.key_material_reachable(on_cluster))
+            .unwrap_or(false);
+        if !reachable {
+            let msg = format!(
+                "auto-assign skipped: team key {} has no reachable key material (run `aikey key sync`)",
+                key_source_ref
+            );
+            crate::observability::log_warn_event(
+                crate::observability::EVENT_CLI_BINDING_AUTO_ASSIGN_SKIPPED,
+                &msg,
+                Some(crate::observability::ERRCODE_BINDING_MATERIAL_UNREACHABLE),
+            );
+            eprintln!("[aikey] warning: {}", msg);
+            return Ok(Vec::new());
+        }
+    }
 
     let mut newly_assigned: Vec<String> = Vec::new();
 
@@ -406,7 +441,18 @@ pub fn auto_assign_primaries_for_key(
                 &[canonical.clone()],
                 key_source_type,
                 key_source_ref,
+                audit,
             )?;
+            // Traceability (2026-07-06): automatic binding writes bypass the
+            // user-facing audit chain, so they MUST leave a structured event —
+            // this write was previously invisible in every log store.
+            crate::observability::log_event(
+                crate::observability::EVENT_CLI_BINDING_AUTO_ASSIGNED,
+                &format!(
+                    "auto-assigned {} ({}) as primary for {}",
+                    key_source_ref, key_source_type, canonical
+                ),
+            );
             newly_assigned.push(canonical);
         }
     }
@@ -425,11 +471,12 @@ pub fn auto_assign_primaries_for_key(
 /// on a batch of team keys.
 pub fn reconcile_provider_primaries_after_team_key_sync(
     synced_keys: &[(String, Vec<String>)], // (virtual_key_id, supported_providers)
+    audit: Option<&crate::audit::VerifiedVaultKey>,
 ) -> Result<Vec<(String, Vec<String>)>, String> {
     let mut results: Vec<(String, Vec<String>)> = Vec::new();
 
     for (vk_id, providers) in synced_keys {
-        let assigned = auto_assign_primaries_for_key("team", vk_id, providers)?;
+        let assigned = auto_assign_primaries_for_key("team", vk_id, providers, audit)?;
         if !assigned.is_empty() {
             results.push((vk_id.clone(), assigned));
         }
@@ -449,6 +496,7 @@ pub fn reconcile_provider_primaries_after_team_key_sync(
 pub fn reconcile_provider_primary_after_key_removal(
     key_source_type: &str,
     key_source_ref: &str,
+    audit: Option<&crate::audit::VerifiedVaultKey>,
 ) -> Result<Vec<ReconcileAction>, String> {
     // Remove all bindings referencing this key.
     let affected_providers =
@@ -468,7 +516,17 @@ pub fn reconcile_provider_primary_after_key_removal(
                     &[provider.clone()],
                     &src_type,
                     &src_ref,
+                    audit,
                 )?;
+                // Traceability (2026-07-06): automatic binding writes must
+                // leave a structured event (see auto_assign counterpart).
+                crate::observability::log_event(
+                    crate::observability::EVENT_CLI_BINDING_RECONCILED,
+                    &format!(
+                        "reconcile promoted {} ({}) as primary for {} after removal of {} ({})",
+                        src_ref, src_type, provider, key_source_ref, key_source_type
+                    ),
+                );
                 actions.push(ReconcileAction {
                     provider_code: provider.clone(),
                     outcome: ReconcileOutcome::Replaced {
@@ -990,6 +1048,11 @@ fn find_replacement_candidate(
 
     // Search team keys.
     let vk_entries = storage::list_virtual_key_cache().unwrap_or_default();
+    // Material guard (2026-07-06): same predicate as the picker / web set-route /
+    // auto_assign — a replacement Primary must be servable by the proxy NOW.
+    // Promoting a material-unreachable VK here recreates the display-split
+    // incident (web "IN USE" vs picker hides it vs proxy 503).
+    let on_cluster = crate::commands_account::read_cluster_node().is_some();
     for vk in &vk_entries {
         if vk.virtual_key_id == excluded_ref && excluded_type == "team" {
             continue;
@@ -999,6 +1062,9 @@ fn find_replacement_candidate(
             continue;
         }
         if vk.key_status != "active" {
+            continue;
+        }
+        if !vk.key_material_reachable(on_cluster) {
             continue;
         }
         let providers = if !vk.supported_providers.is_empty() {

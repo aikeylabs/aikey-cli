@@ -791,7 +791,11 @@ pub(super) fn codex_merge(existing: &str, base_url: &str) -> (TomlMergeOutcome, 
 
     // Ensure `[model_providers]` is a (possibly implicit) table, then set the
     // `aikey` sub-table, replacing any prior definition of it in place.
-    if !doc.get("model_providers").map(|i| i.is_table()).unwrap_or(false) {
+    if !doc
+        .get("model_providers")
+        .map(|i| i.is_table())
+        .unwrap_or(false)
+    {
         let mut parent = Table::new();
         parent.set_implicit(true); // render as `[model_providers.aikey]`, not `[model_providers]`
         doc["model_providers"] = Item::Table(parent);
@@ -998,7 +1002,10 @@ pub(super) fn codex_remove(existing: &str) -> TomlMergeOutcome {
     };
 
     // Drop [model_providers.aikey]; if the parent becomes empty, drop it too.
-    if let Some(parent) = doc.get_mut("model_providers").and_then(|i| i.as_table_mut()) {
+    if let Some(parent) = doc
+        .get_mut("model_providers")
+        .and_then(|i| i.as_table_mut())
+    {
         parent.remove("aikey");
         if parent.is_empty() {
             doc.as_table_mut().remove("model_providers");
@@ -3553,7 +3560,10 @@ tool_call_timeout_ms = 60000\n"
         assert_eq!(aot.len(), 1, "exactly one hook:\n{out}");
         let ours = aot.get(0).unwrap();
         assert_eq!(ours.get("event").unwrap().as_str().unwrap(), "Stop");
-        assert_eq!(ours.get("command").unwrap().as_str().unwrap(), KIMI_HOOK_CMD);
+        assert_eq!(
+            ours.get("command").unwrap().as_str().unwrap(),
+            KIMI_HOOK_CMD
+        );
         assert!(
             !out.contains("hooks = []"),
             "empty inline array must be gone:\n{out}"
@@ -3595,7 +3605,10 @@ tool_call_timeout_ms = 60000\n"
             other => panic!("{other:?}"),
         };
         let doc = out.parse::<toml_edit::Document>().expect("valid");
-        let aot = doc.get("hooks").and_then(|i| i.as_array_of_tables()).unwrap();
+        let aot = doc
+            .get("hooks")
+            .and_then(|i| i.as_array_of_tables())
+            .unwrap();
         assert_eq!(aot.len(), 2, "user hook + ours:\n{out}");
         assert!(out.contains("user-thing"));
         assert!(out.contains(KIMI_HOOK_CMD));
@@ -3617,8 +3630,13 @@ tool_call_timeout_ms = 60000\n"
             TomlMergeOutcome::Changed(s) => s,
             other => panic!("expected self-heal, got {other:?}"),
         };
-        let doc = out.parse::<toml_edit::Document>().expect("healed valid TOML");
-        let aot = doc.get("hooks").and_then(|i| i.as_array_of_tables()).unwrap();
+        let doc = out
+            .parse::<toml_edit::Document>()
+            .expect("healed valid TOML");
+        let aot = doc
+            .get("hooks")
+            .and_then(|i| i.as_array_of_tables())
+            .unwrap();
         assert_eq!(aot.len(), 1, "one merged hook after heal:\n{out}");
     }
 
@@ -3642,7 +3660,10 @@ tool_call_timeout_ms = 60000\n"
             other => panic!("{other:?}"),
         };
         let doc = out.parse::<toml_edit::Document>().unwrap();
-        let aot = doc.get("hooks").and_then(|i| i.as_array_of_tables()).unwrap();
+        let aot = doc
+            .get("hooks")
+            .and_then(|i| i.as_array_of_tables())
+            .unwrap();
         assert_eq!(aot.len(), 1);
         assert!(out.contains("user"));
         assert!(!out.contains(KIMI_HOOK_CMD));

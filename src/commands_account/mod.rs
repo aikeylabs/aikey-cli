@@ -3658,6 +3658,13 @@ pub fn handle_key_sync(
     // Force a full sync by resetting local_seen_sync_version to 0.
     storage::set_local_seen_sync_version(0);
     let downloaded = run_full_snapshot_sync(password)?;
+    // B-2 (2026-07-06): sign post-sync auto-assign binding writes. The full
+    // sync above already strict-verified this password's derived key, so
+    // VerifiedVaultKey::new cannot fail here except on a concurrent password
+    // change — in which case signing is correctly skipped (best-effort None).
+    let audit_key = derive_vault_key(password)
+        .ok()
+        .and_then(|k| crate::audit::VerifiedVaultKey::new(k).ok());
 
     // v1.0.2: reconcile provider primaries after sync.
     let cached = storage::list_virtual_key_cache().unwrap_or_default();
@@ -3676,9 +3683,11 @@ pub fn handle_key_sync(
         })
         .filter(|(_, p)| !p.is_empty())
         .collect();
-    let reconciled =
-        crate::profile_activation::reconcile_provider_primaries_after_team_key_sync(&synced_keys)
-            .unwrap_or_default();
+    let reconciled = crate::profile_activation::reconcile_provider_primaries_after_team_key_sync(
+        &synced_keys,
+        audit_key.as_ref(),
+    )
+    .unwrap_or_default();
     if !reconciled.is_empty() {
         let _ = crate::profile_activation::refresh_implicit_profile_activation();
     }
@@ -4297,6 +4306,7 @@ pub(crate) fn write_bindings_canonical(
     providers: &[String],
     key_type_str: &str,
     key_ref: &str,
+    audit: Option<&crate::audit::VerifiedVaultKey>,
 ) -> Result<(), String> {
     for raw_provider in providers {
         let raw = raw_provider.to_lowercase();
@@ -4315,6 +4325,23 @@ pub(crate) fn write_bindings_canonical(
             key_ref,
         )
         .map_err(|e| format!("set_provider_binding: {}", e))?;
+        // B-2 (2026-07-06): sign one tamper-evident `bind` audit row per
+        // binding write when the caller holds a verified vault key — the
+        // incident write (post-sync auto-assign) was invisible in audit_log
+        // AND the internal log. BEST-EFFORT by design: the binding write above
+        // already landed; an audit insert failure must never fail activation
+        // (fail-visible via WARN instead). `None` (keyless automatic contexts)
+        // still leaves the observability event emitted by the caller.
+        if let Some(vk) = audit {
+            if let Err(e) = crate::audit::log_audit_event_from_vault_key(
+                vk.as_bytes(),
+                crate::audit::AuditOperation::Bind,
+                Some(&format!("{}:{}:{}", canonical, key_type_str, key_ref)),
+                true,
+            ) {
+                eprintln!("[aikey] warning: bind audit row not written: {}", e);
+            }
+        }
     }
     Ok(())
 }
@@ -4863,11 +4890,14 @@ pub fn handle_key_use(
     // refresh → apply_third_party_cli_configs. Drive off the refreshed
     // binding set so switching one provider away from kimi/codex correctly
     // unconfigures the corresponding toml region.
-    let _lifecycle = apply_credential_lifecycle(CredentialLifecycleEvent::Switched {
-        source_type: key_type.as_str(),
-        source_ref: &key_ref,
-        providers: &target_providers,
-    })
+    let _lifecycle = apply_credential_lifecycle(
+        CredentialLifecycleEvent::Switched {
+            source_type: key_type.as_str(),
+            source_ref: &key_ref,
+            providers: &target_providers,
+        },
+        try_audit_key_from_session().as_ref(),
+    )
     .map_err(|e| format!("Failed to apply use: {}", e))?;
 
     // ── 6. Shell hook (one-time, first use) ───────────────────────────────────
@@ -5119,6 +5149,27 @@ pub fn handle_key_alias(
 
 /// Derives the vault AES key from the master password.
 /// Uses the same salt + KDF parameters stored in the vault DB.
+/// B-2 (2026-07-06): best-effort audit signer for binding writes in commands
+/// that don't already hold the master password. Reads the CACHED session
+/// password (keychain/file) — non-interactive by contract, NEVER prompts
+/// (interaction-simplicity-first: audit must not add a password prompt).
+/// None ⇒ the binding write proceeds unsigned (observability events only).
+pub(crate) fn try_audit_key_from_session() -> Option<crate::audit::VerifiedVaultKey> {
+    let pw = crate::session::try_get()?;
+    let key = derive_vault_key(&pw).ok()?;
+    crate::audit::VerifiedVaultKey::new(key).ok()
+}
+
+/// B-2 sibling for commands that already hold the master password (add /
+/// delete / key sync): derive + verify, best-effort (None on mismatch — the
+/// command's own executor already failed loudly in that case).
+pub(crate) fn audit_key_from_password(
+    password: &SecretString,
+) -> Option<crate::audit::VerifiedVaultKey> {
+    let key = derive_vault_key(password).ok()?;
+    crate::audit::VerifiedVaultKey::new(key).ok()
+}
+
 fn derive_vault_key(password: &SecretString) -> Result<[u8; crypto::KEY_SIZE], String> {
     let salt = storage::get_salt()?;
     let (m, t, p) = storage::get_kdf_params()?;
@@ -6166,6 +6217,7 @@ mod core_tests {
             &["claude".to_string()],
             "personal_oauth_account",
             "acct-xyz",
+            None,
         )
         .expect("write ok");
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
@@ -6194,6 +6246,7 @@ mod core_tests {
             &["codex".to_string()],
             "personal_oauth_account",
             "fresh-uuid",
+            None,
         )
         .unwrap();
 
@@ -6226,10 +6279,11 @@ mod core_tests {
         //   ④ 跨 family 不受影响(anthropic 不被 mutex 触动)
         let (_dir, _lock) = setup_vault();
         // 先写 anthropic 作为 cross-family 不受影响的对照
-        write_bindings_canonical(&["anthropic".to_string()], "personal", "k-claude").unwrap();
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "k-claude", None).unwrap();
         // 然后顺序写入 kimi family 两个成员
-        write_bindings_canonical(&["moonshot".to_string()], "personal", "k-moonshot").unwrap();
-        write_bindings_canonical(&["kimi".to_string()], "personal", "k-kimi").unwrap();
+        write_bindings_canonical(&["moonshot".to_string()], "personal", "k-moonshot", None)
+            .unwrap();
+        write_bindings_canonical(&["kimi".to_string()], "personal", "k-kimi", None).unwrap();
 
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
         // ① + ② 最后写入的 'kimi' 经 alias → kimi_code,独占 family
@@ -6255,8 +6309,8 @@ mod core_tests {
     #[test]
     fn write_bindings_canonical_upserts_same_canonical() {
         let (_dir, _lock) = setup_vault();
-        write_bindings_canonical(&["anthropic".to_string()], "personal", "first").unwrap();
-        write_bindings_canonical(&["anthropic".to_string()], "personal", "second").unwrap();
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "first", None).unwrap();
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "second", None).unwrap();
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
         let anthropic_rows: Vec<_> = bindings
             .iter()
@@ -6268,6 +6322,229 @@ mod core_tests {
             "UPSERT should leave exactly one row per canonical"
         );
         assert_eq!(anthropic_rows[0].key_source_ref, "second");
+    }
+
+    // ── binding material guard (2026-07-06 incident) ─────────────────────────
+    //
+    // A post-`aikey key sync` reconcile auto-bound a team VK with NO local
+    // provider_key_ciphertext as the anthropic Primary. Result: proxy 503s,
+    // the picker hides the key (material filter), the web vault shows it as
+    // "IN USE" — three surfaces disagreeing about the active key. The guard:
+    // automatic binding fills (auto_assign / removal-reconcile replacement)
+    // must skip material-unreachable team VKs and rather leave the slot empty.
+    // See update/20260706-绑定材料守卫与Web解锁态全量sync.md.
+    //
+    // NOTE: these tests assume the non-cluster environment (no
+    // ~/.aikey/active-cluster.json) — `key_material_reachable(false)` requires
+    // local ciphertext unless the VK is a group VK.
+
+    fn guard_vk(vk: &str, group: Option<&str>, ciphertext: Option<&[u8]>) -> () {
+        let mut e = vk_entry(vk, group, None, None);
+        e.provider_key_ciphertext = ciphertext.map(|c| c.to_vec());
+        e.provider_key_nonce = ciphertext.map(|_| vec![0u8; 12]);
+        storage::upsert_virtual_key_cache(&e).unwrap();
+    }
+
+    #[test]
+    fn auto_assign_skips_material_unreachable_team_vk() {
+        let (_dir, _lock) = setup_vault();
+        // Direct-bind VK, no local ciphertext, no group → unreachable.
+        guard_vk("vk-nomat", None, None);
+
+        let assigned = crate::profile_activation::auto_assign_primaries_for_key(
+            "team",
+            "vk-nomat",
+            &["anthropic".to_string()],
+            None,
+        )
+        .expect("auto_assign must not error");
+        assert!(assigned.is_empty(), "unreachable VK must not be promoted");
+        let bindings = storage::list_provider_bindings_readonly("default").unwrap();
+        assert!(
+            bindings.iter().all(|b| b.key_source_ref != "vk-nomat"),
+            "no binding may reference the unreachable VK, got: {:?}",
+            bindings
+        );
+    }
+
+    #[test]
+    fn auto_assign_allows_group_vk_without_ciphertext() {
+        let (_dir, _lock) = setup_vault();
+        // Group VK: no local material BY DESIGN (proxy channel ③) → reachable.
+        guard_vk("vk-grp", Some("grp-1"), None);
+
+        let assigned = crate::profile_activation::auto_assign_primaries_for_key(
+            "team",
+            "vk-grp",
+            &["anthropic".to_string()],
+            None,
+        )
+        .expect("auto_assign ok");
+        assert_eq!(assigned, vec!["anthropic".to_string()]);
+    }
+
+    #[test]
+    fn auto_assign_allows_team_vk_with_local_ciphertext() {
+        let (_dir, _lock) = setup_vault();
+        guard_vk("vk-mat", None, Some(b"cipher"));
+
+        let assigned = crate::profile_activation::auto_assign_primaries_for_key(
+            "team",
+            "vk-mat",
+            &["anthropic".to_string()],
+            None,
+        )
+        .expect("auto_assign ok");
+        assert_eq!(assigned, vec!["anthropic".to_string()]);
+    }
+
+    /// Pins the exact incident path: `aikey key sync`'s post-sync reconcile
+    /// wrapper must not bind a material-unreachable VK even when it is the
+    /// only anthropic candidate — an empty slot is the correct outcome.
+    #[test]
+    fn post_sync_reconcile_does_not_bind_material_unreachable_vk() {
+        let (_dir, _lock) = setup_vault();
+        guard_vk("vk-nomat", None, None);
+
+        let reconciled =
+            crate::profile_activation::reconcile_provider_primaries_after_team_key_sync(
+                &[("vk-nomat".to_string(), vec!["anthropic".to_string()])],
+                None,
+            )
+            .expect("reconcile ok");
+        assert!(reconciled.is_empty(), "nothing may be promoted");
+        let bindings = storage::list_provider_bindings_readonly("default").unwrap();
+        assert!(
+            bindings.iter().all(|b| b.provider_code != "anthropic"),
+            "anthropic slot must stay EMPTY rather than bind an unusable key"
+        );
+    }
+
+    /// Removal-reconcile replacement search must skip the unreachable VK and
+    /// promote the reachable one, regardless of cache iteration order.
+    #[test]
+    fn removal_reconcile_replacement_skips_unreachable_vk() {
+        let (_dir, _lock) = setup_vault();
+        // Current primary that is about to be removed.
+        guard_vk("vk-old", None, Some(b"cipher-old"));
+        write_bindings_canonical(&["anthropic".to_string()], "team", "vk-old", None).unwrap();
+        // Two candidates: unreachable direct-bind VK (inserted first) and a
+        // reachable group VK.
+        guard_vk("vk-nomat", None, None);
+        guard_vk("vk-grp", Some("grp-1"), None);
+
+        let actions = crate::profile_activation::reconcile_provider_primary_after_key_removal(
+            "team", "vk-old", None,
+        )
+        .expect("reconcile ok");
+        let anthropic = actions
+            .iter()
+            .find(|a| a.provider_code == "anthropic")
+            .expect("anthropic action");
+        match &anthropic.outcome {
+            crate::profile_activation::ReconcileOutcome::Replaced { new_source_ref, .. } => {
+                assert_eq!(
+                    new_source_ref, "vk-grp",
+                    "replacement must be the reachable VK, not the material-less one"
+                );
+            }
+            other => panic!("expected Replaced, got {:?}", other),
+        }
+    }
+
+    // ── B-2 bind audit rows (2026-07-06) ─────────────────────────────────────
+    //
+    // Every binding write through write_bindings_canonical must sign a
+    // tamper-evident `bind` audit row when the caller holds a VerifiedVaultKey.
+    // The incident write (post-sync auto-assign) had NO trace in audit_log —
+    // root-causing required timestamp cross-referencing across three stores.
+
+    fn verified_key() -> crate::audit::VerifiedVaultKey {
+        // setup_vault stored password_hash = derived key of "test_password";
+        // derive the same way the CLI does and let the newtype verify it.
+        let pw = SecretString::new("test_password".to_string());
+        let key = derive_vault_key(&pw).expect("derive");
+        crate::audit::VerifiedVaultKey::new(key).expect("verified")
+    }
+
+    fn bind_audit_rows() -> Vec<String> {
+        let conn = storage::open_connection().expect("open");
+        let mut stmt = conn
+            .prepare("SELECT alias FROM audit_log WHERE operation = 'bind' ORDER BY id")
+            .expect("prepare");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    }
+
+    #[test]
+    fn bind_write_with_verified_key_signs_audit_row() {
+        let (_dir, _lock) = setup_vault();
+        crate::audit::initialize_audit_log().expect("audit table");
+        let vk = verified_key();
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "k-1", Some(&vk))
+            .expect("write");
+        let rows = bind_audit_rows();
+        assert_eq!(rows, vec!["anthropic:personal:k-1".to_string()]);
+        // Chain integrity: the signed row must VERIFY (a wrong-key signature
+        // would surface as a tampered entry and poison the whole chain).
+        let pw = SecretString::new("test_password".to_string());
+        let (verified, tampered) = crate::audit::verify_audit_log(&pw).expect("verify");
+        assert!(verified >= 1, "bind row must be part of the verified chain");
+        assert!(
+            tampered.is_empty(),
+            "bind row signed with VerifiedVaultKey must not read as tampered: {:?}",
+            tampered
+        );
+    }
+
+    #[test]
+    fn bind_write_without_key_stays_unsigned_but_succeeds() {
+        let (_dir, _lock) = setup_vault();
+        crate::audit::initialize_audit_log().expect("audit table");
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "k-2", None)
+            .expect("keyless binding write must not fail");
+        assert!(
+            bind_audit_rows().is_empty(),
+            "no VerifiedVaultKey → no audit row (observability event only)"
+        );
+        // The binding itself must still land (audit is an overlay, never a gate).
+        let bindings = storage::list_provider_bindings_readonly("default").unwrap();
+        assert!(bindings.iter().any(|b| b.key_source_ref == "k-2"));
+    }
+
+    #[test]
+    fn verified_vault_key_rejects_wrong_key() {
+        let (_dir, _lock) = setup_vault();
+        let err = crate::audit::VerifiedVaultKey::new([0x41u8; 32]);
+        assert!(
+            err.is_err(),
+            "a non-matching key must NOT be constructible — it would sign rows that read as tampered"
+        );
+    }
+
+    #[test]
+    fn auto_assign_with_verified_key_signs_bind_row() {
+        let (_dir, _lock) = setup_vault();
+        crate::audit::initialize_audit_log().expect("audit table");
+        guard_vk("vk-audit", None, Some(b"cipher"));
+        let vk = verified_key();
+        let assigned = crate::profile_activation::auto_assign_primaries_for_key(
+            "team",
+            "vk-audit",
+            &["anthropic".to_string()],
+            Some(&vk),
+        )
+        .expect("auto_assign");
+        assert_eq!(assigned, vec!["anthropic".to_string()]);
+        assert_eq!(
+            bind_audit_rows(),
+            vec!["anthropic:team:vk-audit".to_string()],
+            "the previously-invisible auto-assign write must now leave a signed audit row"
+        );
     }
 
     // ── snapshot sync verify (2026-05-11 fix) ────────────────────────────────

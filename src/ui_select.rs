@@ -805,6 +805,13 @@ pub struct KeyCandidate {
     pub source_type: String, // DB value: "personal", "team", "personal_oauth_account"
     pub source_ref: String,
     pub display_type: Option<String>, // UI display override (e.g., "oauth(f)"). None → auto from source_type.
+    /// Key material not reachable (team VK pending download / not claimed).
+    /// Rendered dimmed and NOT selectable — but still VISIBLE, and still shows
+    /// the radio/dot when it is the current binding. WHY show instead of hide
+    /// (2026-07-06, update/20260706-绑定材料守卫与Web解锁态全量sync.md): hiding
+    /// made the picker show "nothing selected" while the web vault showed the
+    /// same key as IN USE — two surfaces disagreeing about the active key.
+    pub pending: bool,
 }
 #[derive(Clone)]
 pub struct ProviderGroup {
@@ -855,10 +862,11 @@ fn fallback_provider_tree(
         eprintln!("  {} \u{2192} {}", g.provider_code, cur);
         for (i, c) in g.candidates.iter().enumerate() {
             eprintln!(
-                "    {} {} [{}]",
+                "    {} {} [{}]{}",
                 if g.selected == Some(i) { "(*)" } else { "( )" },
                 c.label,
-                c.source_type
+                c.source_type,
+                if c.pending { " (pending download)" } else { "" }
             );
         }
     }
@@ -877,7 +885,14 @@ fn fallback_provider_tree(
             if let Ok(n) = num.trim().parse::<usize>() {
                 if let Some(g) = groups.iter_mut().find(|g| g.provider_code == prov.trim()) {
                     if n >= 1 && n <= g.candidates.len() {
-                        g.selected = Some(n - 1);
+                        if g.candidates[n - 1].pending {
+                            eprintln!(
+                                "  '{}' is pending download (run `aikey key sync` first).",
+                                g.candidates[n - 1].label
+                            );
+                        } else {
+                            g.selected = Some(n - 1);
+                        }
                     }
                 }
             }
@@ -912,6 +927,18 @@ pub(crate) fn family_aware_toggle_expanded(groups: &mut Vec<ProviderGroup>, gi: 
 /// picker 层 family-mutex 视觉一致 (DB 层互斥仍由 set_provider_binding transaction 兜底)。
 /// Caller 是 Space 键 on Candidate row。
 pub(crate) fn family_aware_select(groups: &mut Vec<ProviderGroup>, gi: usize, ci: usize) {
+    // Pending (material-unreachable) candidates are visible but not selectable —
+    // selecting one would recreate the "IN USE but proxy 503s" state the
+    // 2026-07-06 binding material guard exists to prevent. Space is a no-op;
+    // the row's dim style + "pending" tag tells the user why.
+    if groups[gi]
+        .candidates
+        .get(ci)
+        .map(|c| c.pending)
+        .unwrap_or(false)
+    {
+        return;
+    }
     let target_fam = crate::provider_registry::family_of(&groups[gi].provider_code);
     for (other_gi, og) in groups.iter_mut().enumerate() {
         if other_gi != gi && crate::provider_registry::family_of(&og.provider_code) == target_fam {
@@ -1007,13 +1034,22 @@ pub(crate) fn format_tree_row(
         TreeRow::Candidate(gi, ci) => {
             let g = &groups[*gi];
             let c = &g.candidates[*ci];
+            // Pending selected state renders YELLOW, not green: "this IS your
+            // current binding but it cannot serve requests yet" (material not
+            // downloaded). Green would claim health it doesn't have.
             let radio = if g.selected == Some(*ci) {
-                "\x1b[32m(*)\x1b[0m"
+                if c.pending {
+                    "\x1b[33m(*)\x1b[0m"
+                } else {
+                    "\x1b[32m(*)\x1b[0m"
+                }
             } else {
                 "( )"
             };
             let label_raw = if is_cursor {
                 format!("\x1b[1m{}\x1b[0m", c.label)
+            } else if c.pending {
+                format!("\x1b[2m{}\x1b[0m", c.label)
             } else {
                 c.label.clone()
             };
@@ -1029,7 +1065,11 @@ pub(crate) fn format_tree_row(
             // This ensures the dot column is aligned regardless of type length.
             let type_padded = pad_visible(&format!("\x1b[90m{}\x1b[0m", display_type), type_col_w);
             let dot = if g.selected == Some(*ci) {
-                " \x1b[32m\u{25cf}\x1b[0m"
+                if c.pending {
+                    " \x1b[33m\u{25cf}\x1b[0m"
+                } else {
+                    " \x1b[32m\u{25cf}\x1b[0m"
+                }
             } else {
                 ""
             };
@@ -1260,6 +1300,7 @@ mod family_grouping_tests {
                     source_type: "personal".to_string(),
                     source_ref: format!("k{}", i),
                     display_type: None,
+                    pending: false,
                 })
                 .collect(),
             selected: None,
