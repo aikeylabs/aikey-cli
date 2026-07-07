@@ -83,6 +83,22 @@ fn fallback_select(
     items: &[String],
     selectable: &[bool],
 ) -> Result<SelectResult, Box<dyn std::error::Error>> {
+    // No stdin terminal → don't block on read_line (lateral sweep
+    // 2026-07-07, same class as the P2-5 login hang): this fallback is
+    // reached precisely when stderr is NOT a tty, so an automation-spawned
+    // `aikey use` / `aikey auth login` with no explicit argument landed
+    // here and hung forever on a silent-but-open stdin. Piped-selection is
+    // not a supported contract (all documented automation passes explicit
+    // args; interactive pickers are gated on stdin tty elsewhere, see
+    // main.rs `aikey add`). Cancelled keeps the callers' existing
+    // "nothing chosen" handling.
+    {
+        use std::io::IsTerminal;
+        if !io::stdin().is_terminal() {
+            eprintln!("[aikey] non-interactive session: pass the selection explicitly (e.g. an alias / provider argument) instead of the picker");
+            return Ok(SelectResult::Cancelled);
+        }
+    }
     eprintln!("Select a key (enter number):");
     for (i, item) in items.iter().enumerate() {
         if selectable[i] {
@@ -488,6 +504,15 @@ pub(crate) fn apply_mutex_on_toggle(checked: &mut [bool], idx: usize, mutex_grou
 fn fallback_multi_select(
     items: &[String],
 ) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
+    // Same no-stdin-terminal guard as fallback_select above (2026-07-07
+    // lateral sweep) — never block a non-interactive session on read_line.
+    {
+        use std::io::IsTerminal;
+        if !io::stdin().is_terminal() {
+            eprintln!("[aikey] non-interactive session: pass protocols explicitly instead of the picker");
+            return Ok(MultiSelectResult::Cancelled);
+        }
+    }
     eprintln!("Select protocol types (comma-separated numbers):");
     for (i, item) in items.iter().enumerate() {
         eprintln!("  [{}] {}", i + 1, item);

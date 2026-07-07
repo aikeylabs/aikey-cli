@@ -900,6 +900,20 @@ fn set_display_identity(
 fn prompt_display_identity(base: &str, account_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     const MAX_DISPLAY_LEN: usize = 256;
 
+    // No stdin terminal → skip instead of read_line (lateral sweep
+    // 2026-07-07, same class as the P2-5 login hang). The device_code OAuth
+    // flow reaches this prompt with no earlier tty-gated read, so a
+    // scripted login hung forever here on a silent-but-open stdin. Skipping
+    // matches the documented non-interactive contract (display name is
+    // optional; pass --alias to set it without interaction).
+    {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            eprintln!("  non-interactive session: display name skipped (use --alias to set one)");
+            return Ok(());
+        }
+    }
+
     eprint!("\nEnter a display name for this account (e.g. email or alias, Enter to skip): ");
     io::stderr().flush()?;
 
