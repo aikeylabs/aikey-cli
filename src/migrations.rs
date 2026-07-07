@@ -112,19 +112,30 @@ pub enum SchemaEnsure {
 pub fn ensure_schema_current(vault_path: &std::path::Path) -> Result<SchemaEnsure, String> {
     let marker = current_schema_marker();
 
-    // Fast path: read-only probe. Any failure (no config table yet, BLOB
-    // value, locked file, corrupt db) simply falls through to the replay,
-    // which owns real error handling.
-    let probe = Connection::open_with_flags(vault_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    // Fast path: probe over a NORMAL connection, not SQLITE_OPEN_READ_ONLY.
+    //
+    // Why not read-only (2026-07-07 Windows live regression of this very
+    // fix): opening a WAL database read-only depends on adopting the -shm
+    // mapping — exactly the fragile step behind the Go side's CANTOPEN(14)
+    // class on Windows. The RO open failed routinely there, every probe
+    // fell through to the full replay, and the write-lock convoy this
+    // marker exists to kill came right back (measured: `_internal rules`
+    // median 1.5s with the marker binary deployed, min 53ms ≈ solo-replay
+    // cost — the fast path was never taken). A default-mode connection
+    // avoids -shm adoption; the probe still only SELECTs, and WAL readers
+    // never block on writers, so it stays contention-free. busy_timeout
+    // guards the non-WAL edge. Probe failure of any kind (no config table
+    // yet, BLOB value, corrupt db) falls through to the replay, which owns
+    // real error handling.
+    let probe = Connection::open(vault_path).ok().and_then(|conn| {
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(1000));
+        conn.query_row(
+            "SELECT CAST(value AS TEXT) FROM config WHERE key = ?1",
+            [SCHEMA_REPLAYED_BY_KEY],
+            |row| row.get::<_, String>(0),
+        )
         .ok()
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT CAST(value AS TEXT) FROM config WHERE key = ?1",
-                [SCHEMA_REPLAYED_BY_KEY],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-        });
+    });
     if probe.as_deref() == Some(marker.as_str()) {
         return Ok(SchemaEnsure::SkippedFresh);
     }
