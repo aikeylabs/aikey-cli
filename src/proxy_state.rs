@@ -717,29 +717,46 @@ fn classify_dead_pid(stale_pid: u32, port: u16) -> ProxyState {
 /// permission that blocked verification (stop surfaces its own OS error).
 /// Anything short of the quorum → OrphanedPort with the elevation-aware
 /// hint, never the misleading "not an aikey-proxy we manage".
+/// Port-occupancy first, mirroring [`classify_alive_unowned_pid`] — the
+/// 2026-07-01 reboot-lockout rules MUST survive this branch too (a
+/// rebooted machine routinely leaves the pidfile naming a PRIVILEGED
+/// recycled pid like init/launchd, which is exactly an open-denied pid):
+/// - port free → `Crashed` (stale files, recoverable — anything else
+///   re-introduces the start/stop lockout the 2026-07-01 fix removed);
+/// - port held by a third pid → `PortHeldByExternal` naming the real
+///   listener;
+/// - only when the denied pid ITSELF holds the port does the
+///   elevated-proxy question exist at all → quorum decides.
 fn classify_permission_denied_pid(
     pid: u32,
     port: u16,
     meta_path: &std::path::Path,
     inputs: &StateInputs,
 ) -> ProxyState {
-    let meta_pid_matches = matches!(read_meta_at(meta_path), Ok(m) if m.pid == pid);
-    let port_owner = crate::proxy_proc::port_owner_pid(port).ok().flatten();
-    if meta_pid_matches && port_owner == Some(pid) {
-        let healthy =
-            crate::proxy_proc::http_health_ok(port, std::time::Duration::from_millis(500));
-        if healthy {
-            return ProxyState::Running {
-                pid,
+    match crate::proxy_proc::port_owner_pid(port).ok().flatten() {
+        Some(owner) if owner == pid => {
+            let meta_pid_matches = matches!(read_meta_at(meta_path), Ok(m) if m.pid == pid);
+            if meta_pid_matches
+                && crate::proxy_proc::http_health_ok(port, std::time::Duration::from_millis(500))
+            {
+                return ProxyState::Running {
+                    pid,
+                    port,
+                    listen_addr: inputs.listen_addr.clone(),
+                };
+            }
+            ProxyState::OrphanedPort {
                 port,
-                listen_addr: inputs.listen_addr.clone(),
-            };
+                owner_pid: Some(pid),
+                reason: OrphanReason::OwnershipUnverifiablePermission,
+            }
         }
-    }
-    ProxyState::OrphanedPort {
-        port,
-        owner_pid: port_owner.or(Some(pid)),
-        reason: OrphanReason::OwnershipUnverifiablePermission,
+        Some(owner) => ProxyState::OrphanedPort {
+            port,
+            owner_pid: Some(owner),
+            reason: OrphanReason::PortHeldByExternal,
+        },
+        None => ProxyState::Crashed { stale_pid: pid },
     }
 }
 
@@ -860,25 +877,64 @@ mod tests {
     }
 
     #[test]
-    fn permission_denied_pid_without_quorum_is_orphaned_with_permission_reason() {
-        // Quorum fails here (no meta file, no port listener) → must fall to
-        // OrphanedPort carrying the elevation-aware reason, never Running
-        // and never PortHeldByExternal.
-        let dir = std::env::temp_dir().join(format!("aikey_permdenied_test_{}", std::process::id()));
+    fn permission_denied_pid_with_free_port_stays_crashed_not_lockout() {
+        // The open-denied branch must PRESERVE the 2026-07-01 reboot-lockout
+        // rules: a rebooted machine routinely leaves the pidfile naming a
+        // privileged recycled pid (init/launchd — exactly an open-denied
+        // pid) with the port FREE. That must classify Crashed (recoverable),
+        // never OrphanedPort — otherwise start/stop lock out again.
+        let dir =
+            std::env::temp_dir().join(format!("aikey_permdenied_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let inputs = StateInputs {
             pid_path: dir.join("proxy.pid"),
-            meta_path: dir.join("proxy-meta.json"), // absent → meta_pid_matches = false
+            meta_path: dir.join("proxy-meta.json"), // absent
             listen_addr: "127.0.0.1:1".to_string(), // port 1: nothing listens
         };
         let state = classify_permission_denied_pid(999_999, 1, &inputs.meta_path, &inputs);
+        assert_eq!(
+            state,
+            ProxyState::Crashed { stale_pid: 999_999 },
+            "free port + open-denied pid must stay recoverable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permission_denied_pid_holding_port_without_meta_is_permission_orphan() {
+        // The denied pid ITSELF holds the port but the quorum is incomplete
+        // (no meta) → OrphanedPort with the elevation-aware reason, never
+        // Running and never the misleading PortHeldByExternal. We bind a
+        // listener from this test and claim its OWN pid... we cannot make
+        // our own pid open-denied, so exercise the arm via the classifier
+        // directly with the listener's real owner pid = our pid.
+        let dir =
+            std::env::temp_dir().join(format!("aikey_permdenied_hold_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let inputs = StateInputs {
+            pid_path: dir.join("proxy.pid"),
+            meta_path: dir.join("proxy-meta.json"), // absent → quorum incomplete
+            listen_addr: format!("127.0.0.1:{port}"),
+        };
+        let state =
+            classify_permission_denied_pid(std::process::id(), port, &inputs.meta_path, &inputs);
         match state {
-            ProxyState::OrphanedPort { reason, owner_pid, .. } => {
+            ProxyState::OrphanedPort {
+                reason, owner_pid, ..
+            } => {
                 assert_eq!(reason, OrphanReason::OwnershipUnverifiablePermission);
-                assert_eq!(owner_pid, Some(999_999), "falls back to the pidfile pid as owner");
+                assert_eq!(owner_pid, Some(std::process::id()));
             }
-            other => panic!("expected OrphanedPort, got {other:?}"),
+            ProxyState::Crashed { .. } => {
+                // Port-owner tooling unavailable (no lsof) — degraded env,
+                // same skip policy as the neighboring port-owner tests.
+                eprintln!("[skip] port owner lookup degraded");
+            }
+            other => panic!("expected OrphanedPort/OwnershipUnverifiablePermission, got {other:?}"),
         }
+        drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
