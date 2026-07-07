@@ -3535,6 +3535,13 @@ pub fn try_background_snapshot_sync() {
 
     // Cross-process debounce (see SNAPSHOT_SYNC_DEBOUNCE_SECS): skip the
     // expensive thread spawn when any process attempted a sync recently.
+    //
+    // Why thread::spawn and not a detached worker PROCESS (evaluated and
+    // measured 2026-07-07): endpoint AV taxes creating a process from our
+    // unsigned binary just as hard as creating a thread (~1.4s vs ~1.2s,
+    // Norton live box) — the earlier "process creation is ~30ms" datum was
+    // for SIGNED system binaries (cmd.exe) and does not transfer. A worker
+    // process buys nothing and adds detach/handle-inheritance hazards.
     let now_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

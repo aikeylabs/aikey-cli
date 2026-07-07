@@ -1052,17 +1052,25 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // lifecycle and init commands which either predate the vault or manage the
     // process themselves.
     //
-    // NOT skipped for `_internal` (user decision 2026-07-07): the implicit
-    // async sync exists to catch OAuth-pool material changes promptly, so
-    // bridge children keep it. The per-call cost problem (OS thread creation
-    // costs ~1.2s under endpoint AV like Norton — profiled live) is solved by
-    // the cross-process debounce INSIDE try_background_snapshot_sync instead
-    // of exempting commands.
+    // `_internal` is exempt (2026-07-07, evidence-based revision of an
+    // earlier "keep it for OAuth-pool freshness" decision): a bridge child
+    // exits ~50ms after dispatch, killing the detached sync thread before
+    // its first HTTP round-trip can complete — the implicit sync from
+    // `_internal` NEVER actually delivered a sync; it only paid the thread-
+    // creation cost (~1.2s under endpoint AV like Norton, profiled live —
+    // the whole vault-page latency). OAuth-pool freshness for the web is
+    // genuinely delivered by the server-side explicit trigger
+    // (aikey-control CRUDHandlers.triggerBackgroundSnapshotSync →
+    // `_internal query snapshot_sync`, which runs the sync INSIDE the
+    // handler and completes), plus interactive commands below which keep
+    // the implicit path. A detached worker PROCESS was also evaluated and
+    // rejected: AV taxes spawning our unsigned binary the same ~1.4s.
     match command {
         Commands::Proxy { .. }
         | Commands::Init
         | Commands::Db { .. }
         | Commands::Version
+        | Commands::Internal { .. }
         | Commands::Statusline { action: None }
         | Commands::Statusline {
             action: Some(cli::StatuslineAction::Render { .. }),
