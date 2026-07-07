@@ -733,7 +733,10 @@ pub fn handle_login(
         // `aikey login` process hung >1h on Windows (parity audit 2026-07-07
         // P2-5). Behave like json_mode: take the default without prompting;
         // a wrong default fails loudly downstream instead of hanging here.
-        eprintln!("  Control Panel: {} (no TTY — using default; pass --control-url to override)", default_url);
+        eprintln!(
+            "  Control Panel: {} (no TTY — using default; pass --control-url to override)",
+            default_url
+        );
         default_url
     } else {
         print!("Control Panel URL [{}]: ", default_url);
@@ -1784,7 +1787,16 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
                 match crate::local_server_probe::read_local_server_port_or_default() {
                     Ok(port) => crate::local_server_probe::wait_for_reachable(
                         port,
-                        std::time::Duration::from_secs(8),
+                        // find#10 (2026-07-07): 8s was too short on Windows. The
+                        // local-server cold start (Go binary + embedded web +
+                        // SQLite open, plus an antivirus scan of a freshly-written
+                        // .exe) routinely exceeds 8s, so `aikey service start web`
+                        // reported "did not come up within 8s" as a FALSE NEGATIVE
+                        // even though the console bound :8090 a few seconds later.
+                        // wait_for_reachable polls every 200ms and returns on the
+                        // FIRST success, so a larger ceiling never slows a fast
+                        // start — it only stops the premature failure verdict.
+                        std::time::Duration::from_secs(25),
                     )
                     .map(|()| Some(port)),
                     Err(strict_err) => Err(strict_err),
@@ -2177,8 +2189,11 @@ fn local_server_preflight_for_browse(json_mode: bool) -> BrowseLocalPreflight {
 
     println!("Starting local-server…");
     let start_result = crate::local_server_probe::spawn_start_command();
+    // find#10 (2026-07-07): 5s was too short on Windows — same cold-start
+    // false-negative as `aikey service start web` (mod.rs:1787). Poll returns
+    // on first success, so a larger ceiling only helps slow starts.
     let wait =
-        crate::local_server_probe::wait_for_reachable(port, std::time::Duration::from_secs(5));
+        crate::local_server_probe::wait_for_reachable(port, std::time::Duration::from_secs(25));
 
     match (start_result, &wait) {
         (Ok(()), Ok(())) => {

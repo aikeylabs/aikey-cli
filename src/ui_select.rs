@@ -509,7 +509,9 @@ fn fallback_multi_select(
     {
         use std::io::IsTerminal;
         if !io::stdin().is_terminal() {
-            eprintln!("[aikey] non-interactive session: pass protocols explicitly instead of the picker");
+            eprintln!(
+                "[aikey] non-interactive session: pass protocols explicitly instead of the picker"
+            );
             return Ok(MultiSelectResult::Cancelled);
         }
     }
