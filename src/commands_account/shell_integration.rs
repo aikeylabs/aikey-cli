@@ -353,8 +353,13 @@ pub(crate) fn uninstall_kimi_hook() -> KimiUninstallOutcome {
     // never returns Err — the `"."` fallback means we always proceed.
     let (config_path, backup_path) = kimi_config_paths();
 
+    // Semantic gate (2026-07-07): marker-text-only detection returned
+    // NothingToRemove — skipping removal entirely — once kimi's own config
+    // rewrite washed the comment markers out while the hook stayed wired.
+    // kimi_content_has_aikey also matches the hook-command tail, which is
+    // what the structural removal below actually keys on.
     let had_region = std::fs::read_to_string(&config_path)
-        .map(|c| c.contains(AIKEY_BEGIN) || c.contains(LEGACY_MARKER))
+        .map(|c| kimi_content_has_aikey(&c))
         .unwrap_or(false);
     let had_backup = backup_path.exists();
 
@@ -405,12 +410,25 @@ pub fn injected_provider_toml_paths() -> Vec<(&'static str, std::path::PathBuf)>
     out
 }
 
-/// Kimi wiring detection: the structural hook merge is keyed on the
+/// Kimi wiring detection — single truth source for ALL kimi readers
+/// (`aikey env` listing, `kimi_status` / statusline status, and the
+/// `uninstall_kimi_hook` gate). The structural hook merge is keyed on the
 /// command's stable tail (KIMI_HOOK_COMMAND_MARKER, see its doc), so that
-/// is the semantic identity; AIKEY_BEGIN covers legacy marker-region files.
+/// is the semantic identity; AIKEY_BEGIN / LEGACY_MARKER cover legacy
+/// never-rewritten files. Why one predicate (2026-07-07): the three
+/// readers each had their own marker-text checks, and after kimi/codex
+/// CLIs re-serialize their configs (dropping all comments) the readers
+/// went blind one by one — the uninstall gate even skipped removal while
+/// the hook was still wired.
+pub(super) fn kimi_content_has_aikey(content: &str) -> bool {
+    content.contains(KIMI_HOOK_COMMAND_MARKER)
+        || content.contains(AIKEY_BEGIN)
+        || content.contains(LEGACY_MARKER)
+}
+
 fn kimi_config_has_aikey(p: &std::path::Path) -> bool {
     std::fs::read_to_string(p)
-        .map(|s| s.contains(KIMI_HOOK_COMMAND_MARKER) || s.contains(AIKEY_BEGIN))
+        .map(|s| kimi_content_has_aikey(&s))
         .unwrap_or(false)
 }
 
@@ -451,7 +469,16 @@ pub(crate) fn kimi_status() -> (bool, bool) {
     let Ok(content) = std::fs::read_to_string(&config_path) else {
         return (false, false);
     };
-    if !content.contains(AIKEY_BEGIN) {
+    kimi_content_status(&content)
+}
+
+/// Pure core of `kimi_status` (2026-07-07, same fix class as the `aikey env`
+/// listing): the first gate used to be the AIKEY_BEGIN comment marker, which
+/// goes blind once kimi re-serializes its config — statusline status then
+/// reported "not wired" on a wired install. Now gated on the shared
+/// semantic predicate.
+pub(super) fn kimi_content_status(content: &str) -> (bool, bool) {
+    if !kimi_content_has_aikey(content) {
         return (false, false);
     }
     let expected = crate::commands_statusline::aikey_statusline_render_kimi_command();
@@ -3845,6 +3872,36 @@ tool_call_timeout_ms = 60000\n"
             "provider block still installed:\n{out}"
         );
         out.parse::<toml_edit::Document>().expect("valid TOML");
+    }
+
+    #[test]
+    fn kimi_detection_semantic_survives_comment_stripping_rewrite() {
+        // Same regression shape as codex (2026-07-07): kimi re-serializes
+        // its config dropping comment lines; the hook table survives
+        // without any `# BEGIN aikey` marker. All three readers (env
+        // listing / statusline status / uninstall gate) share
+        // kimi_content_has_aikey, so this one test guards them together.
+        let marker_less = format!(
+            "default_model = \"k2\"\n\n[[hooks]]\nevent = \"Stop\"\ncommand = \"/usr/local/bin/aikey {KIMI_HOOK_COMMAND_MARKER}\"\ntimeout = 5\n"
+        );
+        assert!(
+            kimi_content_has_aikey(&marker_less),
+            "marker-less wired config must be detected"
+        );
+        let (region, _) = kimi_content_status(&marker_less);
+        assert!(region, "statusline status must see the wired hook");
+
+        let vanilla = "default_model = \"k2\"\nhooks = []\n";
+        assert!(!kimi_content_has_aikey(vanilla));
+        assert_eq!(kimi_content_status(vanilla), (false, false));
+
+        // Exact-command leg: content carrying THIS binary's render command
+        // must report hook_present=true.
+        let expected = crate::commands_statusline::aikey_statusline_render_kimi_command();
+        let current = format!(
+            "[[hooks]]\nevent = \"Stop\"\ncommand = \"{expected}\"\ntimeout = 5\n"
+        );
+        assert_eq!(kimi_content_status(&current), (true, true));
     }
 
     #[test]
