@@ -1157,7 +1157,19 @@ fn start_proxy_locked_inner(
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        // CREATE_NO_WINDOW (2026-07-07 lateral sweep, window-flash class):
+        // aikey-proxy is a console-subsystem child. When THIS aikey process
+        // itself runs console-less (spawned by the web bridge / a service
+        // context), a child without this flag materializes a visible
+        // terminal window — and since the proxy is long-lived, it would sit
+        // on the desktop permanently. Unlike DETACHED_PROCESS (rejected
+        // above), CREATE_NO_WINDOW keeps handle inheritance intact, so the
+        // stderr→startup-log redirection still works; when run from a real
+        // terminal the child gets its own windowless console instead of the
+        // user's (no output was ever expected there — stderr goes to the
+        // log). Composes with CREATE_NEW_PROCESS_GROUP.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
     let child = cmd
