@@ -901,8 +901,11 @@ fn cache_manifest(slug: &str, manifest: &Manifest) -> Result<(), Box<dyn std::er
 }
 
 fn apps_cache_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let home = std::env::var("HOME").map_err(|_| "HOME not set")?;
-    Ok(PathBuf::from(home).join(".aikey").join("apps-cache"))
+    // resolve_aikey_dir (HOME → USERPROFILE → dirs), NOT env::var("HOME"):
+    // native Windows has no HOME, so the old direct read hard-errored
+    // ("HOME not set") and `aikey app` was unusable there (parity audit
+    // 2026-07-07 P2-1 point fix).
+    Ok(crate::commands_account::resolve_aikey_dir().join("apps-cache"))
 }
 
 // ---------------------------------------------------------------------------

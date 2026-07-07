@@ -95,6 +95,10 @@ impl Writer {
 
     fn append(&mut self, line: &str) {
         self.rotate_if_needed();
+        // Detect first creation BEFORE the open below creates the file, so
+        // the Windows ACL pass runs exactly once per file (icacls is ~50ms —
+        // fine at creation, unacceptable per append).
+        let newly_created = !self.path.exists();
         let mut opts = OpenOptions::new();
         opts.create(true).append(true);
         #[cfg(unix)]
@@ -105,6 +109,15 @@ impl Writer {
             Ok(f) => f,
             Err(_) => return, // logging failures never propagate to the caller
         };
+        // Windows analog of the 0o600 above (parity audit 2026-07-07 P3):
+        // without it the sensitive payload log inherited the default
+        // profile-dir ACL and was readable by other local users. On Unix the
+        // helper just re-applies the 0600 already set at open (harmless);
+        // errors are ignored by the same "logging never breaks the caller"
+        // rule.
+        if newly_created {
+            let _ = crate::storage_acl::enforce_owner_only_file(&self.path);
+        }
         let bytes = line.as_bytes();
         if file.write_all(bytes).is_err() {
             return;
