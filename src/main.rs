@@ -314,6 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+
     // Determine command name for structured log fields (best-effort, no secrets).
     let cmd_name = command_name(cli.command.as_ref());
 
@@ -1050,6 +1051,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // key state if it has changed since the last local pull. Skipped for proxy
     // lifecycle and init commands which either predate the vault or manage the
     // process themselves.
+    //
+    // NOT skipped for `_internal` (user decision 2026-07-07): the implicit
+    // async sync exists to catch OAuth-pool material changes promptly, so
+    // bridge children keep it. The per-call cost problem (OS thread creation
+    // costs ~1.2s under endpoint AV like Norton — profiled live) is solved by
+    // the cross-process debounce INSIDE try_background_snapshot_sync instead
+    // of exempting commands.
     match command {
         Commands::Proxy { .. }
         | Commands::Init

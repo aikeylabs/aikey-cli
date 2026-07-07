@@ -3478,10 +3478,71 @@ pub fn check_sync_version_changed() -> Result<bool, String> {
 ///
 /// Non-blocking: the calling command is not delayed.
 /// All errors are silently suppressed — the local cache remains usable offline.
+/// Cross-process debounce window for the implicit background snapshot sync.
+///
+/// Why this exists (2026-07-07, profiled live on the Windows box): the sync's
+/// own sync_version fast-check runs INSIDE the spawned thread, but
+/// `std::thread::spawn` ITSELF cost ~1.2s there — endpoint AV (Norton)
+/// intercepts thread creation. Every short-lived `_internal` bridge child
+/// paid that before any version check could run, which is exactly the
+/// vault-page latency. The in-process SYNC_IN_PROGRESS flag can't help:
+/// each bridge call is a NEW process, so every one of them spawned a thread.
+///
+/// The debounce is therefore a FILE (cross-process): if any aikey process
+/// attempted the sync within the window, later processes skip the spawn
+/// entirely (sub-ms stat+read on the hot path). Freshness bound for
+/// OAuth-pool material (the reason the implicit sync exists — user decision
+/// 2026-07-07: keep it, don't exempt `_internal`) becomes the window below,
+/// on top of the server-side page-load trigger which is unaffected.
+const SNAPSHOT_SYNC_DEBOUNCE_SECS: u64 = 30;
+
+fn snapshot_sync_debounce_path() -> std::path::PathBuf {
+    crate::commands_account::resolve_aikey_dir()
+        .join("run")
+        .join("snapshot-sync-last-attempt")
+}
+
+/// True when a sync attempt was recorded within the debounce window.
+/// State-file reads follow the "enhancement, not dependency" rule: any
+/// IO/parse failure reads as "stale" so the sync still runs.
+fn snapshot_sync_recently_attempted(path: &std::path::Path, now_epoch: u64) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(last) = raw.trim().parse::<u64>() else {
+        return false;
+    };
+    // `last > now` (clock jumped backwards) reads as stale — never lets a
+    // future timestamp suppress syncs indefinitely.
+    now_epoch >= last && now_epoch - last < SNAPSHOT_SYNC_DEBOUNCE_SECS
+}
+
+/// Record "an attempt happened now". Written BEFORE the sync runs so
+/// concurrent processes inside the window skip even while the winner is
+/// still working; a failed sync simply retries after the window (bounded
+/// cadence for a best-effort path). Write failures are ignored.
+fn record_snapshot_sync_attempt(path: &std::path::Path, now_epoch: u64) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, now_epoch.to_string());
+}
+
 pub fn try_background_snapshot_sync() {
     use std::sync::atomic::{AtomicBool, Ordering};
     // Static flag: true while a background sync thread is running.
     static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+    // Cross-process debounce (see SNAPSHOT_SYNC_DEBOUNCE_SECS): skip the
+    // expensive thread spawn when any process attempted a sync recently.
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let debounce = snapshot_sync_debounce_path();
+    if snapshot_sync_recently_attempted(&debounce, now_epoch) {
+        return;
+    }
 
     // compare_exchange(expected=false, new=true): only one thread wins.
     if SYNC_IN_PROGRESS
@@ -3491,6 +3552,7 @@ pub fn try_background_snapshot_sync() {
         return; // another sync is already running — skip
     }
 
+    record_snapshot_sync_attempt(&debounce, now_epoch);
     std::thread::spawn(|| {
         let _ = run_snapshot_sync();
         SYNC_IN_PROGRESS.store(false, Ordering::Release);
@@ -5682,6 +5744,49 @@ mod sync_tests {
 // of bug the 2026-04-24 `_internal must reuse public command core` rule
 // is designed to prevent.
 // ============================================================================
+#[cfg(test)]
+mod snapshot_sync_debounce_tests {
+    use super::*;
+
+    // Pins the cross-process debounce contract (2026-07-07 vault-page
+    // latency): within the window → skip (this is what saves the ~1.2s
+    // AV-taxed thread::spawn per bridge child); stale / missing / corrupt /
+    // future-clock states all read as "attempt now" so the sync semantics
+    // the OAuth-pool design relies on are never silently lost.
+    #[test]
+    fn debounce_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run").join("snapshot-sync-last-attempt");
+        let now = 1_000_000u64;
+
+        // Missing file → not recently attempted (sync runs).
+        assert!(!snapshot_sync_recently_attempted(&path, now));
+
+        // Recorded just now → suppressed for the window.
+        record_snapshot_sync_attempt(&path, now);
+        assert!(snapshot_sync_recently_attempted(&path, now));
+        assert!(snapshot_sync_recently_attempted(
+            &path,
+            now + SNAPSHOT_SYNC_DEBOUNCE_SECS - 1
+        ));
+
+        // Window elapsed → stale again.
+        assert!(!snapshot_sync_recently_attempted(
+            &path,
+            now + SNAPSHOT_SYNC_DEBOUNCE_SECS
+        ));
+
+        // Corrupt content → stale (enhancement-not-dependency).
+        std::fs::write(&path, "not-a-number").unwrap();
+        assert!(!snapshot_sync_recently_attempted(&path, now));
+
+        // Future timestamp (clock jumped back) → stale, never a permanent
+        // suppression.
+        std::fs::write(&path, (now + 10_000).to_string()).unwrap();
+        assert!(!snapshot_sync_recently_attempted(&path, now));
+    }
+}
+
 #[cfg(test)]
 mod core_tests {
     use super::*;
