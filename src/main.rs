@@ -314,7 +314,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-
     // Determine command name for structured log fields (best-effort, no secrets).
     let cmd_name = command_name(cli.command.as_ref());
 
