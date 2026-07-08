@@ -3520,10 +3520,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             };
                             eprintln!("  1. User-set (Settings > Upstream proxy)  {}", l1.dimmed());
 
-                            // Layer 2: the daemon process env (frozen at spawn).
+                            // Layer 2: EXPLICIT aikey env config (proxy.env,
+                            // CLI-marked at spawn). 2026-07-08 refinement:
+                            // inherited shell env is layer 4, BELOW the system
+                            // proxy — otherwise Clash users' .zshrc exports
+                            // permanently masked system-proxy auto-follow.
                             if eg.env_vars.is_empty() {
                                 eprintln!(
-                                    "  2. Daemon env (HTTP(S)_PROXY)            {}",
+                                    "  2. proxy.env explicit (HTTP(S)_PROXY)    {}",
                                     "(not set)".dimmed()
                                 );
                             } else {
@@ -3539,7 +3543,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                     ""
                                 };
                                 eprintln!(
-                                    "  2. Daemon env (HTTP(S)_PROXY)            {}{}",
+                                    "  2. proxy.env explicit (HTTP(S)_PROXY)    {}{}",
                                     vars.dimmed(),
                                     note.dimmed()
                                 );
@@ -3549,7 +3553,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             let l3 = if !eg.system_supported {
                                 "(unsupported on this platform)".to_string()
                             } else if eg.env_authoritative {
-                                "(not consulted — daemon env takes precedence)".to_string()
+                                "(not consulted — proxy.env takes precedence)".to_string()
                             } else if eg.system_http.is_empty()
                                 && eg.system_https.is_empty()
                                 && eg.system_socks.is_empty()
@@ -3570,11 +3574,37 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             };
                             eprintln!("  3. OS system proxy (live, auto-refresh)  {}", l3.dimmed());
 
+                            // Layer 4: shell-inherited env — fallback only.
+                            if eg.env_inherited_vars.is_empty() {
+                                eprintln!(
+                                    "  4. Inherited shell env (fallback)        {}",
+                                    "(not set)".dimmed()
+                                );
+                            } else {
+                                let vars = eg
+                                    .env_inherited_vars
+                                    .iter()
+                                    .map(|(k, v)| format!("{}={}", k, v))
+                                    .collect::<Vec<_>>()
+                                    .join("  ");
+                                let note = if eg.effective_source == "env_inherited" {
+                                    ""
+                                } else {
+                                    "  [outranked by a higher layer]"
+                                };
+                                eprintln!(
+                                    "  4. Inherited shell env (fallback)        {}{}",
+                                    vars.dimmed(),
+                                    note.dimmed()
+                                );
+                            }
+
                             // Effective result, as the transport resolves it.
                             let source = match eg.effective_source.as_str() {
                                 "explicit" => "user-set",
-                                "env" => "daemon env",
+                                "env" => "proxy.env",
                                 "system" => "system proxy",
+                                "env_inherited" => "inherited shell env",
                                 _ => "direct",
                             };
                             let value = if eg.effective_url.is_empty() {

@@ -627,6 +627,18 @@ pub struct StartOptions {
     /// proxy.env).  `AIKEY_MASTER_PASSWORD` is always set separately
     /// from the password parameter.
     pub extra_env: Vec<(String, String)>,
+
+    /// Whether the proxy config enables port drift (`listen.port_drift_max`
+    /// absent or >= 0; only an explicit negative value disables — mirrors the
+    /// Go side's `supervisor.Listen` semantics, see 20260430-端口偏移能力修复).
+    ///
+    /// WHY start needs to know (2026-07-08 bugfix, e2e w2b): with drift ON, an
+    /// externally-held configured port is NOT a refusal condition — we spawn
+    /// anyway and the proxy binds port+1..+max itself. The 2026-07-01
+    /// PID-reuse-lockout rework classified that situation as `OrphanedPort`
+    /// and start refused before spawn, silently killing the drift capability.
+    /// Refusal stays for drift-disabled configs (strict legacy).
+    pub port_drift_enabled: bool,
 }
 
 /// Where to direct the spawned child's stderr.
@@ -1065,11 +1077,24 @@ fn start_proxy_locked_inner(
             reason,
         } => {
             *entry_state_label = "OrphanedPort".into();
-            return Err(StartError::OrphanedPort {
-                port,
-                owner_pid,
-                reason,
-            });
+            // 2026-07-08 bugfix (e2e w2b, 20260430 §6 acceptance row 2): with
+            // port drift ENABLED, an externally-held configured port is not a
+            // refusal — spawn anyway, the proxy binds port+1..+max itself and
+            // the healthy loop below discovers the actual port via
+            // proxy-runtime.json. We never signal the holder (o2 invariant
+            // intact). Refusal stays for drift-disabled configs, preserving
+            // the 2026-07-01 PID-reuse-lockout protection there.
+            if !opts.port_drift_enabled {
+                return Err(StartError::OrphanedPort {
+                    port,
+                    owner_pid,
+                    reason,
+                });
+            }
+            eprintln!(
+                "[aikey] port {} is busy — starting with port drift (proxy will bind the next free port)",
+                port
+            );
         }
         ProxyState::Stopped => {
             *entry_state_label = "Stopped".into();
@@ -1212,7 +1237,41 @@ fn start_proxy_locked_inner(
                 stderr_log: stderr_log_path,
             });
         }
-        if proxy_proc::http_health_ok(port, Duration::from_millis(500)) {
+        // Drift discovery (2026-07-08, e2e w2b): with drift enabled the child
+        // may have bound port+k, so probing only the CONFIGURED port would
+        // time out (or hit the foreign holder). The proxy writes its ACTUAL
+        // bound addr to proxy-runtime.json right after bind — trust it IFF
+        // the snapshot's pid is OUR child (a stale file from a previous
+        // incarnation must not fake a healthy signal).
+        let drifted_addr = if opts.port_drift_enabled {
+            runtime_actual_addr_for_pid(child_pid).filter(|a| *a != opts.listen_addr)
+        } else {
+            None
+        };
+        let probe_port = drifted_addr.as_deref().map(parse_port).unwrap_or(port);
+        if proxy_proc::http_health_ok(probe_port, Duration::from_millis(500))
+            && port_owned_by(probe_port, child_pid)
+        {
+            if let Some(actual) = drifted_addr {
+                // Re-anchor the ownership meta at the REAL addr so status /
+                // stop probe the drifted port even if runtime.json vanishes.
+                if let Err(e) = persist_ownership_files(
+                    child_pid,
+                    &opts.binary_path,
+                    &opts.config_path,
+                    &actual,
+                ) {
+                    eprintln!(
+                        "[aikey] warning: proxy drifted to {actual} but updating the ownership meta failed: {e}"
+                    );
+                }
+                guard.commit();
+                return Ok(RunningState {
+                    pid: child_pid,
+                    port: probe_port,
+                    listen_addr: actual,
+                });
+            }
             guard.commit();
             return Ok(RunningState {
                 pid: child_pid,
@@ -1226,6 +1285,42 @@ fn start_proxy_locked_inner(
             });
         }
         std::thread::sleep(HEALTHY_POLL_INTERVAL);
+    }
+}
+
+/// Whether `port` is held by `child_pid` — the healthy loop's identity guard
+/// (2026-07-08). A bare /health 200 proves *a* proxy answers, not OURS: the
+/// spawned child can be a zombie (held un-reaped by StartCleanupGuard, so
+/// `process_alive` stays true) while an unrelated healthy proxy squats the
+/// probed port — start would then report success for a dead child. Only an
+/// affirmative "someone ELSE owns it" vetoes; lookup failure / unknown owner
+/// degrades to the pre-check behavior (don't block success on missing lsof).
+fn port_owned_by(port: u16, child_pid: u32) -> bool {
+    match proxy_proc::port_owner_pid(port) {
+        Ok(Some(owner)) => owner == child_pid,
+        Ok(None) | Err(_) => true,
+    }
+}
+
+/// Read the actual bound addr from `proxy-runtime.json` IFF it was written by
+/// THIS child (pid match) — the drift-discovery seam of the healthy loop
+/// above. Field names mirror aikey-proxy's internal/runtime Snapshot wire
+/// format (`pid`, `listen.actual_addr`).
+fn runtime_actual_addr_for_pid(pid: u32) -> Option<String> {
+    let path = crate::commands_proxy::runtime_snapshot_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if v.get("pid")?.as_u64()? != pid as u64 {
+        return None;
+    }
+    let addr = v
+        .get("listen")
+        .and_then(|l| l.get("actual_addr"))
+        .and_then(|a| a.as_str())?;
+    if addr.is_empty() {
+        None
+    } else {
+        Some(addr.to_string())
     }
 }
 
