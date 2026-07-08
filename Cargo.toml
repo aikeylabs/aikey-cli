@@ -179,6 +179,10 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Time",       # FileTimeToSystemTime / SystemTimeToTzSpecificLocalTime (commands_statusline.rs event_time_hm)
     "Win32_System_Console",    # GetStdHandle / ReadConsoleW / GetConsoleMode / SetConsoleMode / GetConsoleScreenBufferInfo
                                # (lib.rs prompt_hidden / ui_select.rs raw input / ui_frame.rs term_width — Stage 1 windows-compat)
+    "Win32_UI_Shell",          # SHGetKnownFolderPath(FOLDERID_Documents) — PowerShell $PROFILE must follow Documents
+                               # known-folder REDIRECTION (Parallels shared profile / OneDrive / roaming); compat
+                               # layer only, hardcoded <home>\Documents kept as fallback (bugfix 2026-07-08)
+    "Win32_System_Com",        # CoTaskMemFree for the SHGetKnownFolderPath out-buffer
 ] }
 
 [build-dependencies]

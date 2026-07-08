@@ -43,9 +43,11 @@
 //! The functions here (`v3_rc_block_powershell`,
 //! `powershell_profile_candidates`, `ensure_powershell_hook`) are
 //! "PowerShell-specific" in concept but **not** "Windows-only" in
-//! compilation: none of them use windows-sys / winapi imports. They
-//! just produce PowerShell-syntax strings + paths that happen to
-//! describe Windows folder layout. Critically:
+//! compilation: almost none of them use windows-sys / winapi imports
+//! (sole exception: `documents_known_folder`, individually gated with
+//! `#[cfg(windows)]` — see its docstring). The rest just produce
+//! PowerShell-syntax strings + paths that happen to describe Windows
+//! folder layout. Critically:
 //!
 //!   - cross-platform tests in `stage3_powershell_hook_tests` reference
 //!     `v3_rc_block_powershell` to assert PowerShell-syntax invariants;
@@ -128,10 +130,31 @@ pub(super) fn v3_rc_block_powershell() -> String {
 ///   - PowerShell 7+ on macOS / Linux: `~/.config/powershell/profile.ps1`
 ///
 /// We don't spawn a PowerShell subprocess to query the actual value
-/// because that costs ~200 ms per `aikey use`. Instead we replicate the
-/// path resolution from PowerShell's source (SHGetKnownFolderPath
-/// FOLDERID_Documents lookup on Windows; XDG `$HOME/.config/powershell`
-/// on Unix-y pwsh 7+).
+/// because that costs ~200 ms per `aikey use`. Instead we ask the SAME
+/// Win32 API PowerShell's own resolution bottoms out in
+/// (SHGetKnownFolderPath FOLDERID_Documents on Windows; XDG
+/// `$HOME/.config/powershell` on Unix-y pwsh 7+).
+///
+/// COMPAT LAYER (2026-07-08, minimal by user decision): the Documents
+/// known folder can be REDIRECTED away from `<home>\Documents`
+/// (Parallels/VMware shared profiles, OneDrive folder redirection,
+/// roaming profiles) and PowerShell follows the redirect. The previous
+/// hardcoded `<home>\Documents` wrote the hook into a profile PowerShell
+/// never reads on such machines — active.env vars silently never reached
+/// any shell, and the post-`aikey use` hint
+/// (`. $PROFILE.CurrentUserAllHosts`) died with CommandNotFoundException
+/// (Parallels box, 2026-07-08: interactive Documents =
+/// `C:\Mac\Home\Documents`). Known-folder candidates therefore come
+/// FIRST; the hardcoded paths are KEPT UNCHANGED as fallbacks (API
+/// failure + hooks written by older builds must stay findable). On a
+/// non-redirected machine the known folder equals `<home>\Documents`,
+/// dedup collapses the list to exactly the old one — zero behavior
+/// change for machines that already work.
+///
+/// The known-folder value can be SESSION-DEPENDENT (Parallels:
+/// interactive sessions see the Mac-shared path, SSH sessions the local
+/// default). Reading it live per-invocation makes the write location
+/// agree with the shells the user opens next to this `aikey use`.
 ///
 /// Returns the candidates in stable preference order. We don't filter
 /// to existing-parent here because the user might be installing pwsh
@@ -148,16 +171,22 @@ pub(super) fn powershell_profile_candidates() -> Vec<std::path::PathBuf> {
 
     #[cfg(windows)]
     {
-        out.push(
+        if let Some(docs) = documents_known_folder() {
+            out.push(docs.join("PowerShell").join("profile.ps1"));
+            out.push(docs.join("WindowsPowerShell").join("profile.ps1"));
+        }
+        for fb in [
             home.join("Documents")
                 .join("PowerShell")
                 .join("profile.ps1"),
-        );
-        out.push(
             home.join("Documents")
                 .join("WindowsPowerShell")
                 .join("profile.ps1"),
-        );
+        ] {
+            if !out.contains(&fb) {
+                out.push(fb);
+            }
+        }
     }
     #[cfg(not(windows))]
     {
@@ -165,6 +194,44 @@ pub(super) fn powershell_profile_candidates() -> Vec<std::path::PathBuf> {
     }
 
     out
+}
+
+/// Resolve the Documents known folder via `SHGetKnownFolderPath` — the
+/// same resolution PowerShell performs for `$PROFILE`, so redirection
+/// (Parallels / OneDrive / roaming) is honored identically. `None` on
+/// any API failure; callers fall back to `<home>\Documents`.
+///
+/// This is the module's one windows-sys use — kept behind
+/// `#[cfg(windows)]` so the module (and its PowerShell-syntax tests)
+/// still compiles and runs on macOS / Linux.
+#[cfg(windows)]
+fn documents_known_folder() -> Option<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath};
+
+    unsafe {
+        let mut pw: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // dwFlags = 0 (KF_FLAG_DEFAULT), hToken = 0 (current user; HANDLE
+        // is isize in windows-sys 0.52) — mirrors PowerShell's
+        // Environment.GetFolderPath(MyDocuments).
+        let hr = SHGetKnownFolderPath(&FOLDERID_Documents, 0, 0, &mut pw);
+        if hr != 0 || pw.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *pw.add(len) != 0 {
+            len += 1;
+        }
+        let s = OsString::from_wide(std::slice::from_raw_parts(pw, len));
+        CoTaskMemFree(pw as *const core::ffi::c_void);
+        if s.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(s))
+        }
+    }
 }
 
 /// Stage 3.2: PowerShell sibling of `ensure_shell_hook`.
