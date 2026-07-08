@@ -34,6 +34,50 @@ fn setup() -> TempDir {
     dir
 }
 
+/// Registers `vk` in the virtual-key cache WITH local ciphertext, so the
+/// 2026-07-06 binding-material guard sees it as reachable.
+///
+/// WHY: auto_assign / team-sync reconcile now skip team VKs whose key
+/// material is unreachable (no ciphertext / not group / not claimed-on-
+/// cluster) — see update/20260706-绑定材料守卫与Web解锁态全量sync.md. The
+/// team-key tests below assert the POSITIVE assignment path, so their VKs
+/// must be material-reachable; the guard's negative paths are pinned by the
+/// dedicated tests in commands_account (auto_assign_skips_material_
+/// unreachable_team_vk and friends).
+fn reachable_team_vk(vk: &str) {
+    let entry = storage::VirtualKeyCacheEntry {
+        virtual_key_id: vk.into(),
+        org_id: "org-1".into(),
+        seat_id: "seat-1".into(),
+        alias: "k".into(),
+        provider_code: "anthropic".into(),
+        protocol_type: "anthropic".into(),
+        base_url: String::new(),
+        credential_id: String::new(),
+        credential_revision: String::new(),
+        virtual_key_revision: "r1".into(),
+        key_status: "active".into(),
+        share_status: "claimed".into(),
+        local_state: "synced_inactive".into(),
+        expires_at: None,
+        provider_key_nonce: Some(vec![0u8; 12]),
+        provider_key_ciphertext: Some(b"cipher".to_vec()),
+        synced_at: 0,
+        local_alias: None,
+        supported_providers: vec![],
+        provider_base_urls: std::collections::HashMap::new(),
+        owner_account_id: Some("acct-1".into()),
+        owner_email: Some("acct-1@test".into()),
+        group_runtime: None,
+        group_alias: None,
+        extra: None,
+        oauth_group_id: None,
+        group_accounts: None,
+        routing_config: None,
+    };
+    storage::upsert_virtual_key_cache(&entry).expect("upsert vk cache");
+}
+
 // ============================================================================
 // auto_assign_primaries_for_key
 // ============================================================================
@@ -42,11 +86,13 @@ fn setup() -> TempDir {
 fn auto_assign_fills_empty_providers() {
     let _dir = setup();
 
-    // Add a key supporting two providers.
+    // Add a key supporting two providers. audit=None: automatic fills carry
+    // no vault-key context (same convention as production reconcile callers).
     let assigned = profile_activation::auto_assign_primaries_for_key(
         "personal",
         "my-claude",
         &["anthropic".into(), "openai".into()],
+        None,
     )
     .unwrap();
 
@@ -72,6 +118,7 @@ fn auto_assign_does_not_overwrite_existing_primary() {
         "personal",
         "new-key",
         &["anthropic".into(), "openai".into()],
+        None,
     )
     .unwrap();
 
@@ -88,10 +135,16 @@ fn auto_assign_does_not_overwrite_existing_primary() {
 #[test]
 fn auto_assign_team_key() {
     let _dir = setup();
+    // Material guard: the VK must be reachable or auto-assign skips it.
+    reachable_team_vk("vk_abc");
 
-    let assigned =
-        profile_activation::auto_assign_primaries_for_key("team", "vk_abc", &["google".into()])
-            .unwrap();
+    let assigned = profile_activation::auto_assign_primaries_for_key(
+        "team",
+        "vk_abc",
+        &["google".into()],
+        None,
+    )
+    .unwrap();
 
     assert_eq!(assigned, vec!["google"]);
 
@@ -113,13 +166,16 @@ fn team_sync_reconcile_fills_gaps() {
     // anthropic already has a primary.
     storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "my-claude").unwrap();
 
-    // Sync brings in a team key that supports anthropic + openai.
+    // Sync brings in a team key (material-reachable) that supports
+    // anthropic + openai.
+    reachable_team_vk("vk_team_1");
     let synced = vec![(
         "vk_team_1".to_string(),
         vec!["anthropic".to_string(), "openai".to_string()],
     )];
     let results =
-        profile_activation::reconcile_provider_primaries_after_team_key_sync(&synced).unwrap();
+        profile_activation::reconcile_provider_primaries_after_team_key_sync(&synced, None)
+            .unwrap();
 
     // Only openai should be assigned to the team key.
     assert_eq!(results.len(), 1);
@@ -140,12 +196,16 @@ fn team_sync_reconcile_no_op_when_all_taken() {
     storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "a").unwrap();
     storage::set_provider_binding(DEFAULT_PROFILE, "openai", "personal", "b").unwrap();
 
+    // Reachable on purpose: the empty result below must come from "all
+    // provider slots taken", not from the material guard skipping the VK.
+    reachable_team_vk("vk_x");
     let synced = vec![(
         "vk_x".to_string(),
         vec!["anthropic".to_string(), "openai".to_string()],
     )];
     let results =
-        profile_activation::reconcile_provider_primaries_after_team_key_sync(&synced).unwrap();
+        profile_activation::reconcile_provider_primaries_after_team_key_sync(&synced, None)
+            .unwrap();
 
     assert!(results.is_empty());
 }
@@ -162,9 +222,10 @@ fn removal_clears_binding_when_no_replacement() {
 
     // The only personal key — no replacement available.
     // (We don't add any entries to the entries table, so find_replacement will find nothing.)
-    let actions =
-        profile_activation::reconcile_provider_primary_after_key_removal("personal", "only-key")
-            .unwrap();
+    let actions = profile_activation::reconcile_provider_primary_after_key_removal(
+        "personal", "only-key", None,
+    )
+    .unwrap();
 
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].provider_code, "anthropic");
@@ -192,7 +253,7 @@ fn removal_promotes_replacement_personal_key() {
 
     // Remove key-a.
     let actions =
-        profile_activation::reconcile_provider_primary_after_key_removal("personal", "key-a")
+        profile_activation::reconcile_provider_primary_after_key_removal("personal", "key-a", None)
             .unwrap();
 
     assert_eq!(actions.len(), 1);
@@ -227,9 +288,10 @@ fn removal_of_multi_provider_key_reconciles_each_provider() {
     storage::store_entry("backup-openai", &[0u8; 12], &[1u8; 32]).unwrap();
     storage::set_entry_supported_providers("backup-openai", &["openai".into()]).unwrap();
 
-    let actions =
-        profile_activation::reconcile_provider_primary_after_key_removal("personal", "gateway")
-            .unwrap();
+    let actions = profile_activation::reconcile_provider_primary_after_key_removal(
+        "personal", "gateway", None,
+    )
+    .unwrap();
 
     assert_eq!(actions.len(), 2);
 
@@ -277,9 +339,10 @@ fn replacement_search_finds_personal_entry_with_raw_oauth_provider_code() {
 
     storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "primary").unwrap();
 
-    let actions =
-        profile_activation::reconcile_provider_primary_after_key_removal("personal", "primary")
-            .unwrap();
+    let actions = profile_activation::reconcile_provider_primary_after_key_removal(
+        "personal", "primary", None,
+    )
+    .unwrap();
 
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].provider_code, "anthropic");
@@ -328,8 +391,11 @@ fn refresh_writes_active_env_for_all_bindings() {
     // Old: per-credential-type sentinel embedded the alias / vk_id.
     // New: ANTHROPIC_API_KEY=aikey_active_anthropic (same string regardless of bound alias).
     // Alias info still surfaces via the separate AIKEY_ACTIVE_KEYS=anthropic=my-claude,...
-    assert!(contents.contains("ANTHROPIC_API_KEY=\"aikey_active_anthropic\""));
-    assert!(contents.contains("OPENAI_API_KEY=\"aikey_active_openai\""));
+    // Quoting: export values are SINGLE-quoted via sh_single_quote (injection
+    // hardening — see shell_quote::active_env_export_line; only AIKEY_ACTIVE_SEQ
+    // / no_proxy keep double quotes for the precmd grep contract).
+    assert!(contents.contains("ANTHROPIC_API_KEY='aikey_active_anthropic'"));
+    assert!(contents.contains("OPENAI_API_KEY='aikey_active_openai'"));
     assert!(
         contents.contains("anthropic=my-claude"),
         "AIKEY_ACTIVE_KEYS must surface the bound personal alias for anthropic"
@@ -357,9 +423,25 @@ fn refresh_writes_empty_env_when_no_bindings() {
     let env_path = std::path::PathBuf::from(&home).join(".aikey/active.env");
     let contents = std::fs::read_to_string(&env_path).expect("active.env should exist");
 
-    // Should only contain the header comment.
     assert!(contents.contains("auto-generated"));
-    assert!(!contents.contains("API_KEY"));
+    // No provider var may be EXPORTED with no bindings…
+    assert!(
+        !contents
+            .lines()
+            .any(|l| l.starts_with("export ") && l.contains("API_KEY")),
+        "no provider API_KEY may be exported with no bindings, got:\n{}",
+        contents
+    );
+    // …but registry-known vars ARE actively `unset` (stale-var cleanup: a
+    // shell that sourced an older active.env must not keep a dead
+    // KIMI_API_KEY etc. — see append_unset_lines_for_inactive_providers).
+    assert!(
+        contents
+            .lines()
+            .any(|l| l.starts_with("unset ") && l.contains("API_KEY")),
+        "registry-known provider vars must be unset for cross-shell cleanup, got:\n{}",
+        contents
+    );
 }
 
 // ============================================================================

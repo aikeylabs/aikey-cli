@@ -1839,6 +1839,103 @@ pub fn status_summary() -> (bool, String) {
     }
 }
 
+/// Layered egress-proxy decision reported by the RUNNING daemon
+/// (GET /admin/upstream-proxy `egress` block, 2026-07-08). Field names mirror
+/// aikey-proxy's admin.EgressState wire format.
+///
+/// WHY this comes from the daemon and not from this process: the daemon's env
+/// is the launchd/systemd spawn snapshot — usually NOT the user's shell env —
+/// and the daemon's `effective_*` is computed through the very ProxyFunc its
+/// forwarding transport runs, so what we display cannot diverge from what
+/// traffic actually does.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct EgressState {
+    #[serde(default)]
+    pub explicit_url: String,
+    #[serde(default)]
+    pub env_authoritative: bool,
+    #[serde(default)]
+    pub env_vars: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub system_supported: bool,
+    #[serde(default)]
+    pub system_http: String,
+    #[serde(default)]
+    pub system_https: String,
+    #[serde(default)]
+    pub system_socks: String,
+    #[serde(default)]
+    pub effective_source: String,
+    #[serde(default)]
+    pub effective_url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct UpstreamProxyResponse {
+    egress: Option<EgressState>,
+}
+
+/// Fetch the layered egress decision from the running daemon.
+/// `Ok(None)` = daemon answered but predates the `egress` block (older
+/// binary); `Err` = daemon unreachable (not running / wrong port).
+pub fn fetch_egress_state() -> Result<Option<EgressState>, String> {
+    let addr = proxy_listen_addr(None);
+    // Plain agent on purpose: this is a loopback admin call and must never be
+    // routed through any proxy env of THIS shell.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(3))
+        .build();
+    let resp = agent
+        .get(&format!("http://{addr}/admin/upstream-proxy"))
+        .call()
+        .map_err(|e| format!("cannot reach proxy admin at {addr}: {e}"))?;
+    let body: UpstreamProxyResponse = resp
+        .into_json()
+        .map_err(|e| format!("invalid /admin/upstream-proxy response: {e}"))?;
+    Ok(body.egress)
+}
+
+#[cfg(test)]
+mod egress_state_tests {
+    use super::*;
+
+    // Wire-format contract with aikey-proxy's admin.EgressState JSON
+    // marshaling (internal/admin/upstream_proxy.go) — if a field name drifts
+    // on either side, this fixture goes red.
+    #[test]
+    fn parses_layered_egress_wire_format() {
+        let body = r#"{
+            "url": "",
+            "egress": {
+                "explicit_url": "",
+                "env_authoritative": false,
+                "system_supported": true,
+                "system_http": "http://127.0.0.1:7890",
+                "system_https": "http://127.0.0.1:7890",
+                "system_socks": "socks5://127.0.0.1:7891",
+                "effective_source": "system",
+                "effective_url": "http://127.0.0.1:7890"
+            }
+        }"#;
+        let resp: UpstreamProxyResponse = serde_json::from_str(body).unwrap();
+        let eg = resp.egress.expect("egress block present");
+        assert!(eg.system_supported);
+        assert_eq!(eg.effective_source, "system");
+        assert_eq!(eg.effective_url, "http://127.0.0.1:7890");
+        assert_eq!(eg.system_socks, "socks5://127.0.0.1:7891");
+        assert!(eg.env_vars.is_empty());
+    }
+
+    // Older daemons answer the legacy {"url"} shape — must parse as None
+    // (CLI renders an "update aikey-proxy" hint, not an error).
+    #[test]
+    fn legacy_shape_without_egress_is_none() {
+        let resp: UpstreamProxyResponse =
+            serde_json::from_str(r#"{"url":"http://127.0.0.1:7890"}"#).unwrap();
+        assert!(resp.egress.is_none());
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Tests — resolve_config (regression net for the 2026-05-21 cwd-first
 // deprecation: see config-split-system-user.md v9 + bugfix 20260521).

@@ -5593,7 +5593,9 @@ mod provider_mapping_tests {
         // 三个 family 内 provider_code 各自的 KIMI_MODEL_NAME / MAX_CONTEXT_SIZE 不同
         // (避免上游 reject + 客户端预估错):
         //   kimi_code → kimi-k2.5 / 131072(api.kimi.com 自家 model,128K context)
-        //   moonshot  → moonshot-v1-8k / 8192(模型名编码 context 上限,默认配最便宜)
+        //   moonshot  → moonshot-v1-128k / 131072(2026-07-08 从 moonshot-v1-8k/8192
+        //               反转,原 8k 默认使 Kimi CLI 开箱即废;选 v1-128k 而非更新的
+        //               kimi-latest 因后者账号权限门控会 404,基础 v1 家族最广兼容)
         //   kimi(deprecated)→ 与 kimi_code 一致(经 oauth_alias 解析)
         let kimi_code = provider_extra_env_vars("kimi_code");
         assert!(kimi_code
@@ -5604,22 +5606,26 @@ mod provider_mapping_tests {
             .any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "131072"));
 
         let moonshot = provider_extra_env_vars("moonshot");
+        // 2026-07-08 默认模型反转为 moonshot-v1-128k: Kimi CLI 最小提示词 ~12.4K > 8192,
+        // 原 moonshot-v1-8k 从第一句就 400 token-limit-exceeded(开箱即废)。选基础 v1
+        // 家族的 128k 而非更新的 kimi-latest —— 后者在 api.moonshot.cn 账号权限门控,
+        // 实测 404 Permission denied;DEFAULT 要最广兼容而非最新。
         assert!(moonshot
             .iter()
-            .any(|(k, v)| *k == "KIMI_MODEL_NAME" && *v == "moonshot-v1-8k"));
-        // Moonshot 模型族名字直接编码 context 上限: moonshot-v1-8k=8192, -32k=32768,
-        // -128k=131072。default 配 8k 模型必须配 8192 context, 否则 kimi-cli 端会做错截断预估。
+            .any(|(k, v)| *k == "KIMI_MODEL_NAME" && *v == "moonshot-v1-128k"));
+        // MAX_CONTEXT 匹配 128K 上限,否则 kimi-cli 端会按旧 8192 错误截断。
         assert!(moonshot
             .iter()
-            .any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "8192"));
+            .any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "131072"));
 
         // deprecated 'kimi' alias 解析到 kimi_code,继承 kimi-k2.5 / 131072
         let kimi_alias = provider_extra_env_vars("kimi");
         assert_eq!(kimi_alias, kimi_code);
 
-        // 关键不变量:moonshot 的 model 不应该是 kimi-k2.5(pre-fix bug)
+        // 关键不变量:moonshot 的 model 不应该是 kimi-k2.5(pre-fix bug — 会被
+        // api.moonshot.cn reject);现默认 moonshot-v1-128k,仍与 kimi_code 不同。
         assert_ne!(moonshot, kimi_code,
-            "moonshot extras must use moonshot-v1-8k, not kimi-k2.5 (would be rejected by api.moonshot.cn)");
+            "moonshot extras must use moonshot-v1-128k, not kimi-k2.5 (would be rejected by api.moonshot.cn)");
     }
 
     #[test]

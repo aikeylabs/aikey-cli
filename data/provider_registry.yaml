@@ -129,15 +129,30 @@ providers:
     #    / KIMI_BASE_URL,kimi CLI 上游只读这一组。区分 platform 由 proxy_path 决定:
     #    moonshot 走 /moonshot/v1 → 上游 api.moonshot.cn;kimi_code 走 /kimi/v1 →
     #    上游 api.kimi.com/coding。
-    # ② extra_env_vars KIMI_MODEL_NAME 从 kimi-k2.5 改为 moonshot-v1-8k,
+    # ② extra_env_vars KIMI_MODEL_NAME 从 kimi-k2.5 改为 moonshot-v1-128k,
     #    Moonshot 上游不支持 kimi-k2.5(原值是从 kimi_code 复制的 bug)。
     # ③ MOONSHOT_API_KEY / MOONSHOT_BASE_URL 三层证据(kimi-cli runtime grep /
     #    Moonshot 官方 env-vars 文档 / 项目内 grep)实证无消费方,直接停写。
-    # ④ KIMI_MODEL_MAX_CONTEXT_SIZE = 8192(不是 131072): Moonshot 模型族名字直接
-    #    编码 context 上限(moonshot-v1-8k=8192 / -32k=32768 / -128k=131072),
-    #    默认配最便宜的 8k 模型 + 匹配的 8192 context,首单成本最低,长文用户
-    #    自行升 -32k/-128k。原 131072 与 8k 模型互相矛盾,会让 kimi-cli 端做错
-    #    截断预估。
+    # ④ KIMI_MODEL_MAX_CONTEXT_SIZE = 131072(moonshot-v1-128k 上限 128K)。
+    #
+    # 2026-07-08 默认模型 8k→moonshot-v1-128k 反转(详见 update/20260708-moonshot-
+    # 默认模型-8k-改-kimi-latest.md;bugfix/2026-07-08-moonshot-default-model-8k-
+    # breaks-kimi-cli.md):
+    #   决策 #9 原拍板 B(moonshot-v1-8k / 8192,"配最便宜的 8k,长文自行升级")的
+    #   前提是"用户从短请求起步"。但 Kimi CLI 光系统提示词就 ~12.4K token > 8192,
+    #   moonshot 协议下从第一句 "hello" 就必然 400 token-limit-exceeded —— 等于
+    #   开箱即废,且用户无任何 UI 入口改模型(model 写死在本 registry)。前提不成立,
+    #   故抬高默认到 128K 上下文模型。
+    #   ⚠️ 为什么是 moonshot-v1-128k 而不是"更新/更智能"的 kimi-latest / kimi-k2*:
+    #      kimi-latest 等新模型在 api.moonshot.cn 上是**账号权限门控**的 —— 实测某
+    #      账号跑 kimi-latest 直接 404 "Not found the model or Permission denied",
+    #      而基础的 moonshot-v1 家族(8k/32k/128k,同一权限档)所有账号都够得着。
+    #      DEFAULT 的目标是"最大范围账号开箱可用",要的是**最广兼容**而非**最新**。
+    #      => 任何"自动追最新模型"的想法(含构建期拉取)在这里都是反模式:越新的
+    #         模型越可能权限门控,会让默认对更多账号 404。
+    #   ⚠️ 未来若见此处想改回 8k 省钱,请先确认 Kimi CLI 最小提示词是否已 <8K,
+    #      否则会再次退化为开箱即废(regression: provider_extra_env_vars_kimi_
+    #      family_per_platform_model 围栏测试守住此值)。
     family: kimi
     proxy_path: moonshot/v1
     env_api_key: KIMI_API_KEY
@@ -146,8 +161,8 @@ providers:
     picker: true
     display: kimi(moonshot)
     extra_env_vars:
-      - {var: KIMI_MODEL_NAME, value: "moonshot-v1-8k"}
-      - {var: KIMI_MODEL_MAX_CONTEXT_SIZE, value: "8192"}
+      - {var: KIMI_MODEL_NAME, value: "moonshot-v1-128k"}
+      - {var: KIMI_MODEL_MAX_CONTEXT_SIZE, value: "131072"}
 
   # ──────────────────────────────────────────────────────────────────
   # P0 additions (2026-04-24) — widely-adopted OpenAI-compatible Western

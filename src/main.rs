@@ -3502,6 +3502,110 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  {}", "(no proxy env vars detected)".dimmed());
                     }
 
+                    // Upstream proxy egress — the DAEMON's layered decision
+                    // (2026-07-08 需求: 逐级显示 user-set > env > system proxy).
+                    // Fetched live from /admin/upstream-proxy because the
+                    // daemon's env is its spawn snapshot, not this shell, and
+                    // its effective value comes from the same resolver the
+                    // forwarding transport uses (display == behavior).
+                    eprintln!();
+                    eprintln!("{}", "Upstream proxy egress (running daemon):".bold());
+                    match commands_proxy::fetch_egress_state() {
+                        Ok(Some(eg)) => {
+                            // Layer 1: user-set URL (Settings > Upstream proxy).
+                            let l1 = if eg.explicit_url.is_empty() {
+                                "(not set)".to_string()
+                            } else {
+                                eg.explicit_url.clone()
+                            };
+                            eprintln!("  1. User-set (Settings > Upstream proxy)  {}", l1.dimmed());
+
+                            // Layer 2: the daemon process env (frozen at spawn).
+                            if eg.env_vars.is_empty() {
+                                eprintln!(
+                                    "  2. Daemon env (HTTP(S)_PROXY)            {}",
+                                    "(not set)".dimmed()
+                                );
+                            } else {
+                                let vars = eg
+                                    .env_vars
+                                    .iter()
+                                    .map(|(k, v)| format!("{}={}", k, v))
+                                    .collect::<Vec<_>>()
+                                    .join("  ");
+                                let note = if eg.env_authoritative {
+                                    "  [authoritative — lower layers skipped]"
+                                } else {
+                                    ""
+                                };
+                                eprintln!(
+                                    "  2. Daemon env (HTTP(S)_PROXY)            {}{}",
+                                    vars.dimmed(),
+                                    note.dimmed()
+                                );
+                            }
+
+                            // Layer 3: live OS system proxy.
+                            let l3 = if !eg.system_supported {
+                                "(unsupported on this platform)".to_string()
+                            } else if eg.env_authoritative {
+                                "(not consulted — daemon env takes precedence)".to_string()
+                            } else if eg.system_http.is_empty()
+                                && eg.system_https.is_empty()
+                                && eg.system_socks.is_empty()
+                            {
+                                "(none detected)".to_string()
+                            } else {
+                                let mut parts = Vec::new();
+                                if !eg.system_https.is_empty() {
+                                    parts.push(format!("https={}", eg.system_https));
+                                }
+                                if !eg.system_http.is_empty() {
+                                    parts.push(format!("http={}", eg.system_http));
+                                }
+                                if !eg.system_socks.is_empty() {
+                                    parts.push(format!("socks={}", eg.system_socks));
+                                }
+                                parts.join("  ")
+                            };
+                            eprintln!("  3. OS system proxy (live, auto-refresh)  {}", l3.dimmed());
+
+                            // Effective result, as the transport resolves it.
+                            let source = match eg.effective_source.as_str() {
+                                "explicit" => "user-set",
+                                "env" => "daemon env",
+                                "system" => "system proxy",
+                                _ => "direct",
+                            };
+                            let value = if eg.effective_url.is_empty() {
+                                "direct (no proxy)".to_string()
+                            } else {
+                                eg.effective_url.clone()
+                            };
+                            eprintln!(
+                                "  {} {}  {}",
+                                "=> Effective for AI providers".bold(),
+                                value,
+                                format!("[source: {}]", source).dimmed()
+                            );
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "  {}",
+                                "(daemon predates layered egress reporting — update aikey-proxy)"
+                                    .dimmed()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("  {}", format!("(unavailable: {})", e).dimmed());
+                            eprintln!(
+                                "  {}",
+                                "Start the proxy to see the live decision: aikey proxy start"
+                                    .dimmed()
+                            );
+                        }
+                    }
+
                     // Injected provider configs: third-party CLI toml files
                     // (kimi, codex) where aikey has written its managed
                     // region. Hidden when no injection has happened so the
