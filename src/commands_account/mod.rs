@@ -4998,7 +4998,7 @@ pub fn handle_key_use(
     // refresh → apply_third_party_cli_configs. Drive off the refreshed
     // binding set so switching one provider away from kimi/codex correctly
     // unconfigures the corresponding toml region.
-    let _lifecycle = apply_credential_lifecycle(
+    let lifecycle = apply_credential_lifecycle(
         CredentialLifecycleEvent::Switched {
             source_type: key_type.as_str(),
             source_ref: &key_ref,
@@ -5031,6 +5031,10 @@ pub fn handle_key_use(
             "promoted_providers": target_providers,
             "all_active_providers": bindings.iter().map(|b| &b.provider_code).collect::<Vec<_>>(),
             "active_env_written": true,
+            // 阶段7 (2026-07-13): Desktop takeover state from the funnel —
+            // same wire shape as the vault-op envelope, so scripted `aikey
+            // use --json` callers (E2E DS-13) can assert consent semantics.
+            "desktop_switch": lifecycle.desktop_switch,
         }));
     } else {
         // Stage 4 (active-state cross-shell sync, 2026-04-27): the previous
@@ -5085,6 +5089,15 @@ pub fn handle_key_use(
             target_providers.join(", ")
         );
         crate::ui_frame::print_box("\u{1F7E2}", &title, &rows);
+        // 阶段7: Desktop is a cold-switch surface — when THIS use rewrote
+        // its config the user must restart the app, and silence here would
+        // read as "done" (防呆: every takeover needs visible feedback).
+        if lifecycle
+            .desktop_switch
+            .is_some_and(|d| d.restart_required)
+        {
+            println!("  \u{21BB} Claude Desktop config updated — restart Desktop to apply.");
+        }
         println!();
     }
 
