@@ -4562,6 +4562,13 @@ pub use shell_integration::*;
 // config via `openclaw config patch`. Reuses `aikey route` primitives.
 pub(crate) mod openclaw_hook;
 
+// Claude Desktop takeover (阶段7, D1–D10): pure file layer that flips the
+// GUI app between official (1p) and aikey-gateway (3p) modes, following the
+// active anthropic binding. P1 = writer core only; the P2 funnel hook lives
+// inside `apply_third_party_cli_configs` so BOTH production call sites
+// (lifecycle tail + handle_key_unuse's parallel copy) cover it.
+pub(crate) mod claude_desktop;
+
 // Credential lifecycle: single funnel for all binding writes + read-only
 // state audit. See `lifecycle/mod.rs` for the design rationale (Phase 5
 // of bugfix 2026-05-07-handle-add-skips-third-party-cli-config).

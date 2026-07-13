@@ -64,12 +64,37 @@ struct RegistryEntryRaw {
     display_alias: Option<String>,
     #[serde(default)]
     extra_env_vars: Vec<ExtraEnvVarRaw>,
+    /// Per-client-surface config namespace (D4 rev2, 2026-07-12). Keyed by
+    /// client id (e.g. "claude-desktop"). Unknown client keys deserialize
+    /// fine and are simply never looked up — forward compat for older CLIs
+    /// reading a newer YAML.
+    #[serde(default)]
+    clients: std::collections::BTreeMap<String, ClientEntryRaw>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ExtraEnvVarRaw {
     var: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ClientEntryRaw {
+    #[serde(default)]
+    models: Vec<ClientModelEntryRaw>,
+}
+
+/// A client model-menu entry: bare string or structured `{name, supports_1m}`.
+/// Untagged so YAML stays terse for the common case.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ClientModelEntryRaw {
+    Plain(String),
+    Detailed {
+        name: String,
+        #[serde(default)]
+        supports_1m: bool,
+    },
 }
 
 /// Public registry entry (static strings for cheap borrowing).
@@ -103,6 +128,18 @@ pub struct RegistryEntry {
     /// Extra env vars (e.g. `KIMI_MODEL_NAME`) written alongside api_key /
     /// base_url for SDKs that need additional context.
     pub extra_env_vars: &'static [(&'static str, &'static str)],
+    /// Per-client-surface config: `(client_id, models)` pairs in YAML order.
+    /// See `client_models()` for the lookup helper.
+    pub clients: &'static [(&'static str, &'static [ClientModel])],
+}
+
+/// One entry of a client model menu (`clients.<client>.models` in the YAML).
+#[derive(Debug)]
+pub struct ClientModel {
+    pub name: &'static str,
+    /// Whether the client should advertise 1M-context support for this model
+    /// (Claude Desktop renders `supports1m` in its gateway profile).
+    pub supports_1m: bool,
 }
 
 struct RegistryState {
@@ -137,6 +174,31 @@ fn state() -> &'static RegistryState {
                 .collect();
             Box::leak(boxed)
         }
+        fn leak_clients(
+            m: std::collections::BTreeMap<String, ClientEntryRaw>,
+        ) -> &'static [(&'static str, &'static [ClientModel])] {
+            let boxed: Box<[(&'static str, &'static [ClientModel])]> = m
+                .into_iter()
+                .map(|(client, entry)| {
+                    let models: Box<[ClientModel]> = entry
+                        .models
+                        .into_iter()
+                        .map(|me| match me {
+                            ClientModelEntryRaw::Plain(name) => ClientModel {
+                                name: leak(name),
+                                supports_1m: false,
+                            },
+                            ClientModelEntryRaw::Detailed { name, supports_1m } => ClientModel {
+                                name: leak(name),
+                                supports_1m,
+                            },
+                        })
+                        .collect();
+                    (leak(client), &*Box::leak(models))
+                })
+                .collect();
+            Box::leak(boxed)
+        }
 
         let mut entries: Vec<RegistryEntry> = Vec::with_capacity(raw.providers.len());
         for r in raw.providers {
@@ -161,6 +223,7 @@ fn state() -> &'static RegistryState {
                 display,
                 display_alias,
                 extra_env_vars: leak_extras(r.extra_env_vars),
+                clients: leak_clients(r.clients),
             });
         }
 
@@ -287,6 +350,22 @@ pub fn family_display(family: &str) -> (&'static str, Option<&'static str>) {
         }
         _ => (cached_leak(family), None),
     }
+}
+
+/// Model menu for a client surface of a provider (e.g.
+/// `client_models("anthropic", "claude-desktop")` → the Claude Desktop
+/// gateway-profile menu). Empty slice when the provider or client key is
+/// absent — callers treat "no menu" as "skip writing a menu", never an error
+/// (the registry is config, not a gate).
+pub fn client_models(code: &str, client: &str) -> &'static [ClientModel] {
+    lookup(code)
+        .and_then(|e| {
+            e.clients
+                .iter()
+                .find(|(c, _)| *c == client)
+                .map(|(_, models)| *models)
+        })
+        .unwrap_or(&[])
 }
 
 /// Leak-once cache for unknown-code passthrough in `canonical()`. Bounded

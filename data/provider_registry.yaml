@@ -35,6 +35,22 @@
 #   display           (optional)  human label shown in picker (default = code)
 #   extra_env_vars    (optional)  extras written alongside api_key/base_url
 #                                 list of {var, value}
+#   clients           (optional)  per-client-surface config namespace. A
+#                                 "client" is a consuming app surface (e.g.
+#                                 claude-desktop). Third occurrence of
+#                                 per-client config (kimi extra_env_vars /
+#                                 openclaw hardcoded models[] / Desktop menu)
+#                                 promoted "client" to a first-class key:
+#                                 a new client = a new key here, never a new
+#                                 top-level field. Unknown client keys are
+#                                 ignored by older CLIs (forward compat).
+#                                 Existing per-client config (openclaw code,
+#                                 kimi extra_env_vars) stays put this cycle;
+#                                 future evolution may fold them in here.
+#                                 Go middleware.go parallel table does NOT
+#                                 consume `clients` — no cross-language sync.
+#     <client>.models (optional)  model menu for that client. Entries are a
+#                                 bare string or {name, supports_1m}.
 
 providers:
   # ──────────────────────────────────────────────────────────────────
@@ -54,6 +70,20 @@ providers:
     # multi-platform Kimi family keeps its (platform-code) parenthetical in
     # the display field itself instead — see kimi_code / moonshot below.
     display_alias: claude
+    clients:
+      claude-desktop:
+        # Claude Desktop 3p-gateway menu (D4 rev2, 2026-07-12). Every name is
+        # validated claude-safe (claude-{sonnet|opus|haiku|fable}-*, no "[1m]")
+        # before writing — Desktop rejects the WHOLE list on one bad entry
+        # (fail-all, cc-switch is_claude_safe_model_id). STATIC list on
+        # purpose: do NOT auto-fetch /v1/models here — newer models are often
+        # account-permission-gated and would 404 for many users (same lesson
+        # as the moonshot default-model note below, 2026-07-08).
+        models:
+          - claude-sonnet-5
+          - {name: claude-opus-4-8, supports_1m: true}
+          - claude-haiku-4-5
+          - claude-fable-5
 
   - code: openai
     oauth_aliases: [gpt, chatgpt, codex]

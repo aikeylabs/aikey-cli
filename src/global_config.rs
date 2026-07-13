@@ -14,6 +14,15 @@ pub struct GlobalConfig {
     #[serde(rename = "currentOrg")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_org: Option<String>,
+    /// Claude Desktop takeover persistent consent (D3): `"always"` = take
+    /// over silently on future `use`; `"never"` = never ask, never write.
+    /// Absent = ask each time a real 1p→3p takeover is needed. Cleared by
+    /// any aikey-performed restore (D6 supplement: 还原即清同意) — external
+    /// flips do NOT clear it. Lives here (existing config.json truth source)
+    /// instead of a new pref file — careful-api principle.
+    #[serde(rename = "claudeDesktopConsent")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_desktop_consent: Option<String>,
 }
 
 impl Default for GlobalConfig {
@@ -23,6 +32,7 @@ impl Default for GlobalConfig {
             current_profile: None,
             current_env: None,
             current_org: None,
+            claude_desktop_consent: None,
         }
     }
 }
@@ -103,4 +113,45 @@ pub fn set_current_env(env: &str) -> Result<(), String> {
 pub fn get_current_env() -> Result<Option<String>, String> {
     let config = load_config()?;
     Ok(config.current_env)
+}
+
+/// Claude Desktop takeover consent (D3). Value is `"always"` or `"never"`;
+/// anything else stored is treated as absent by readers (defensive).
+#[allow(dead_code)] // consumed by the P2 reconcile/consent wiring
+pub fn get_claude_desktop_consent() -> Result<Option<String>, String> {
+    Ok(load_config()?
+        .claude_desktop_consent
+        .filter(|v| v == "always" || v == "never"))
+}
+
+#[allow(dead_code)] // consumed by the P2 reconcile/consent wiring
+pub fn set_claude_desktop_consent(value: &str) -> Result<(), String> {
+    let mut config = load_config()?;
+    config.claude_desktop_consent = Some(value.to_string());
+    save_config(&config)
+}
+
+/// D6 supplement (还原即清同意): every aikey-performed restore clears an
+/// `always` grant so the next takeover asks again. `never` survives — it
+/// never produced a takeover, so a restore says nothing about it; its only
+/// exits are `aikey desktop uninstall` (clears both) or an explicit
+/// `aikey desktop install` (the command itself is actionable consent).
+#[allow(dead_code)] // consumed by the P2 restore wiring
+pub fn clear_claude_desktop_consent_always() -> Result<(), String> {
+    let mut config = load_config()?;
+    if config.claude_desktop_consent.as_deref() == Some("always") {
+        config.claude_desktop_consent = None;
+        save_config(&config)?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // consumed by `aikey desktop uninstall` (P2)
+pub fn clear_claude_desktop_consent() -> Result<(), String> {
+    let mut config = load_config()?;
+    if config.claude_desktop_consent.is_some() {
+        config.claude_desktop_consent = None;
+        save_config(&config)?;
+    }
+    Ok(())
 }
