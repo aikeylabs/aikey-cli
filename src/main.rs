@@ -2227,7 +2227,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     });
                     eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
-                std::process::exit(exit_code_from_outcome(&outcome));
+                let code = exit_code_from_outcome(&outcome);
+                print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
+                std::process::exit(code);
             } else if let Some(ref alias) = alias {
                 // ── Single-alias mode: resolve across personal/team/OAuth ──
                 let targets = commands_project::targets_from_alias(
@@ -2305,7 +2307,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     });
                     eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
-                std::process::exit(exit_code_from_outcome(&outcome));
+                let code = exit_code_from_outcome(&outcome);
+                print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
+                std::process::exit(code);
             } else {
                 // ── No alias: test all active bindings (personal/team/OAuth) ──
                 let (targets, build_errors) =
@@ -2372,7 +2376,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     });
                     eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
-                std::process::exit(exit_code_from_outcome(&outcome));
+                let code = exit_code_from_outcome(&outcome);
+                print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
+                std::process::exit(code);
             }
         }
         Commands::Export { pattern, output } => {
@@ -6624,6 +6630,12 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 loaded_hash.as_deref(),
             );
 
+            // Layer 2 line (2026-07-10): file-hash state alone told users
+            // "in-sync" while the rc had no `source` line at all — the
+            // exact web-only-onboarding blind spot. Same probe the
+            // `_internal hook-op status` bridge uses (shared core).
+            let (_, rc_wired, _) = commands_account::hook_status_probe();
+
             println!("hook file:   {}", hook_path.display());
             println!(
                 "file hash:   {}",
@@ -6635,6 +6647,14 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 loaded_hash
                     .as_deref()
                     .unwrap_or("<not set in this process env>")
+            );
+            println!(
+                "rc wired:    {}",
+                if rc_wired {
+                    "yes".to_string()
+                } else {
+                    "no (run: aikey hook install)".to_string()
+                }
             );
             println!("state:       {}", state);
             Ok(())
@@ -6792,6 +6812,9 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "\x1b[90m  No aikey shell hook block found in any rc file — nothing to remove.\x1b[0m"
         );
+        // Even when nothing was wired, stale third-party CLI configs are
+        // exactly as broken (no env channel) — reconcile them too.
+        commands_account::reconcile_cli_configs_after_hook_uninstall();
         return Ok(());
     }
     for t in &touched {
@@ -6808,6 +6831,9 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
         "\x1b[90m  New shells won't load the hook. Already-open shells keep their current env\x1b[0m"
     );
     eprintln!("\x1b[90m  until you open a new terminal.\x1b[0m");
+    // X8 (2026-07-12): codex/kimi configs that route through aikey only work
+    // WITH the hook env — offer to strip them (TTY) or warn loudly (non-TTY).
+    commands_account::reconcile_cli_configs_after_hook_uninstall();
     Ok(())
 }
 
@@ -6850,6 +6876,88 @@ fn compute_hook_status_state(
         }
         Some(_) => "in-sync",
         None => "in-sync (loaded hash unknown — old hook or unsourced shell)",
+    }
+}
+
+/// Pure classifier for the `aikey test` tail warning (2026-07-10).
+///
+/// Why: `aikey test` probes through the proxy directly, while interactive
+/// `claude`/`codex` need the shell hook to inject env — so "test passes"
+/// is routinely misread as "claude will route through aikey" even when the
+/// rc was never wired (web-only onboarding) . Historical incident: bugfix
+/// 2026-04-29-active-env-flat-rename-access-denied-on-windows.md — `aikey
+/// test` green while claude.exe launched with no ANTHROPIC_* env.
+///
+/// Contract: NEVER affects the exit code — wrapper scripts branch on the
+/// EXIT_* codes documented in the Test handler.
+fn test_rc_unwired_warning(
+    connectivity_ok: bool,
+    has_active_bindings: bool,
+    rc_wired: bool,
+    hook_opted_out: bool,
+) -> Option<&'static str> {
+    if connectivity_ok && has_active_bindings && !rc_wired && !hook_opted_out {
+        Some(
+            "\u{25b2} Connectivity OK, but the shell rc is not wired \u{2014} interactive \
+             `claude`/`codex` will NOT inherit aikey env.\n  Fix: run `aikey hook install`, \
+             then open a new terminal.",
+        )
+    } else {
+        None
+    }
+}
+
+/// Effectful wrapper around `test_rc_unwired_warning` — gathers shell/rc/
+/// binding state and prints the warning to stderr. Called by all three
+/// `aikey test` branches right before their `process::exit`.
+fn print_test_rc_unwired_warning(json_mode: bool, connectivity_ok: bool) {
+    if json_mode {
+        return;
+    }
+    let shell_supported = !matches!(
+        commands_account::shell_kind(),
+        commands_account::ShellKind::Cmd | commands_account::ShellKind::Unknown
+    );
+    if !shell_supported {
+        return;
+    }
+    let opted_out = std::env::var("AIKEY_NO_HOOK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let has_bindings =
+        !storage::list_provider_bindings_readonly(profile_activation::DEFAULT_PROFILE)
+            .unwrap_or_default()
+            .is_empty();
+    let rc_wired = commands_account::shell_rc_has_aikey_block();
+    if let Some(w) = test_rc_unwired_warning(connectivity_ok, has_bindings, rc_wired, opted_out) {
+        eprintln!("\n  \x1b[33m{}\x1b[0m", w);
+    }
+}
+
+#[cfg(test)]
+mod test_rc_unwired_warning_tests {
+    use super::test_rc_unwired_warning;
+
+    #[test]
+    fn warns_only_when_ok_bindings_active_and_rc_unwired() {
+        assert!(test_rc_unwired_warning(true, true, false, false).is_some());
+    }
+
+    #[test]
+    fn silent_when_rc_wired_or_no_bindings_or_failed_or_opted_out() {
+        assert!(test_rc_unwired_warning(true, true, true, false).is_none());
+        assert!(test_rc_unwired_warning(true, false, false, false).is_none());
+        // Connectivity already failed — the failure output is the signal;
+        // don't stack a hook warning on top of it.
+        assert!(test_rc_unwired_warning(false, true, false, false).is_none());
+        assert!(test_rc_unwired_warning(true, true, false, true).is_none());
+    }
+
+    #[test]
+    fn warning_points_at_hook_install() {
+        let w = test_rc_unwired_warning(true, true, false, false).unwrap();
+        assert!(w.contains("aikey hook install"));
+        assert!(w.contains("NOT inherit aikey env"));
     }
 }
 

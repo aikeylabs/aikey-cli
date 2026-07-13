@@ -4576,6 +4576,10 @@ pub use lifecycle::*;
 // sibling, mainly relevant to Windows users), not a compilation gate.
 // See shell_integration_windows.rs module docstring.
 mod shell_integration_windows;
+// ExecutionPolicy wired-but-dead probe (2026-07-12 X2) — consumed by doctor.
+pub use shell_integration_windows::powershell_profile_load_blocked;
+// pwsh-7 dual-profile wiring gap probe (2026-07-12 3a) — consumed by doctor.
+pub use shell_integration_windows::pwsh_profile_wiring_gap;
 
 /// Resolve an OAuth account by `provider_account_id`, `local_alias`, OR
 /// `display_identity` (email). Returns `None` when no match — caller treats
@@ -5028,11 +5032,22 @@ pub fn handle_key_use(
         // precmd hook picks up the new active.env on the user's next prompt
         // (free, unconditional), but if they want to use the new key in
         // *this* prompt they can `source` the file. State that plainly.
-        let status = if hook_msg.is_some() {
-            "\u{2192} Shell hook just installed. Open a new terminal or: source ~/.aikey/active.env"
-        } else {
-            "\u{2713} Active key updated. Next prompt picks it up automatically.\n     To apply right now: source ~/.aikey/active.env"
-        };
+        //
+        // Use-effectiveness self-check (2026-07-10): "next prompt picks it
+        // up automatically" is only true when the hook is actually loaded
+        // in the invoking shell. Classify via the exported
+        // _AIKEY_HOOK_LOADED_HASH marker + rc wiring state instead of
+        // asserting it unconditionally — a terminal opened before hook
+        // install got a claim that silently never came true.
+        let status = use_status_line(
+            hook_msg.as_deref(),
+            std::env::var("_AIKEY_HOOK_LOADED_HASH").is_ok(),
+            shell_integration::shell_rc_has_aikey_block(),
+            no_hook
+                || std::env::var("AIKEY_NO_HOOK")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
+        );
 
         let mut rows: Vec<String> = Vec::new();
         for b in &bindings {
@@ -5055,7 +5070,7 @@ pub fn handle_key_use(
             }
         }
         rows.push(String::new());
-        rows.push(status.to_string());
+        rows.push(status);
 
         let title = format!(
             "Set '{}' as Primary for {}",
@@ -5072,6 +5087,172 @@ pub fn handle_key_use(
     // unuse.md for why the previous one-sided install call was hiding a
     // matching uninstall gap.
     Ok(())
+}
+
+/// Classify the `aikey use` summary line so it never overpromises
+/// (use-effectiveness self-check, 2026-07-10).
+///
+/// Problem this solves: the old summary claimed "Next prompt picks it up
+/// automatically" unconditionally whenever the rc was already wired
+/// (AlreadyV3 → `hook_msg == None`). In a terminal opened BEFORE the hook
+/// was wired, precmd was never registered there, so the claim silently
+/// never came true — the user ran `claude` bare and nothing routed through
+/// aikey, with zero feedback. Re-running `aikey use` with the SAME key hit
+/// the same silent path.
+///
+/// Detection: the hook file exports `_AIKEY_HOOK_LOADED_HASH` at source
+/// time (see `hook_content_with_hash_header`), so a child process seeing
+/// that env var knows the invoking shell loaded the hook. aikey cannot
+/// source the hook into the parent shell on the user's behalf — the honest
+/// remediation is a precise, actionable hint.
+///
+/// Transitional caveat: shells that loaded a pre-export hook (< 2026-07-10
+/// template) don't expose the marker until the auto-reload picks up the
+/// regenerated file at the next prompt; they may see one warning that a
+/// fresh prompt (or new terminal) resolves. Self-healing, accepted.
+pub(crate) fn use_status_line(
+    hook_msg: Option<&str>,
+    hook_loaded_in_shell: bool,
+    rc_wired: bool,
+    hook_opted_out: bool,
+) -> String {
+    // Platform-aware immediate-apply hint (2026-07-12, Windows X4/X5):
+    // `source ~/.aikey/active.env` is a dead instruction on PowerShell/cmd.
+    let apply_now = shell_integration::apply_now_hint();
+    if hook_opted_out {
+        return format!(
+            "\u{2713} Active key updated. Shell hook disabled (AIKEY_NO_HOOK) \u{2014} apply manually: {apply_now}"
+        );
+    }
+    // ensure_shell_hook spoke (installed / migrated / declined / non-TTY
+    // hint): surface its exact message instead of the old generic "hook
+    // just installed" line, which mislabeled hints and declines. The
+    // message text was previously swallowed (only is_some() was checked).
+    if let Some(msg) = hook_msg {
+        return format!(
+            "\u{2192} {}\n     To apply right now: {apply_now}",
+            msg.trim_start()
+        );
+    }
+    if hook_loaded_in_shell {
+        return format!(
+            "\u{2713} Active key updated. Next prompt picks it up automatically.\n     To apply right now: {apply_now}"
+        );
+    }
+    if rc_wired {
+        // Platform-aware remediation (2026-07-12, found on Windows real-machine
+        // verification): the first draft hardcoded "~/.zshrc / ~/.bashrc",
+        // which is a dead instruction for PowerShell users — their hook lives
+        // in $PROFILE.CurrentUserAllHosts. reload_hint_for_shell() owns the
+        // per-shell dispatch.
+        format!(
+            "\x1b[33m\u{25b2} Active key updated, but aikey env is NOT loaded in this shell (terminal opened before the hook was installed?).\n     Apply: open a new terminal, or run: {}\x1b[0m",
+            shell_integration::reload_hint_for_shell()
+        )
+    } else {
+        "\x1b[33m\u{25b2} Active key updated, but the shell hook is not wired \u{2014} `claude`/`codex` will NOT route through aikey.\n     Fix: run `aikey hook install`, then open a new terminal.\x1b[0m".to_string()
+    }
+}
+
+#[cfg(test)]
+mod use_status_line_tests {
+    use super::use_status_line;
+
+    #[test]
+    fn opted_out_is_neutral_and_never_warns() {
+        let s = use_status_line(None, false, false, true);
+        assert!(s.contains("AIKEY_NO_HOOK"));
+        assert!(!s.contains("\u{25b2}"), "opt-out users chose this — no warning");
+    }
+
+    #[test]
+    fn hook_msg_is_surfaced_verbatim_not_swallowed() {
+        // Regression: the old code only checked is_some() and replaced the
+        // actual hint ("Skipped...", "needs interactive confirmation...")
+        // with a generic "hook just installed" line — wrong for declines.
+        let s = use_status_line(Some("  Skipped. To apply once: source ~/.aikey/hook.zsh"), false, false, false);
+        assert!(s.contains("Skipped. To apply once"));
+    }
+
+    #[test]
+    fn loaded_shell_keeps_autopickup_promise() {
+        let s = use_status_line(None, true, true, false);
+        assert!(s.contains("Next prompt picks it up automatically"));
+        assert!(!s.contains("\u{25b2}"));
+    }
+
+    #[test]
+    fn wired_but_stale_shell_warns_with_reload_hint() {
+        let s = use_status_line(None, false, true, false);
+        assert!(s.contains("NOT loaded in this shell"));
+        assert!(s.contains("new terminal"));
+    }
+
+    #[test]
+    fn unwired_shell_warns_with_hook_install_hint() {
+        let s = use_status_line(None, false, false, false);
+        assert!(s.contains("aikey hook install"));
+        assert!(s.contains("NOT route through aikey"));
+    }
+}
+
+/// Post-`aikey hook uninstall` third-party CLI config reconciliation
+/// (2026-07-12, user report X8: Windows `hook uninstall` → `codex` dies
+/// with "Missing environment variable: OPENAI_API_KEY").
+///
+/// Why: `hook uninstall` removes the env-injection channel but used to
+/// leave `~/.codex/config.toml` (`model_provider=aikey`, env_key) and the
+/// kimi config pointing at aikey — configs that only work WITH the hook.
+/// New terminals then fail with a cryptic upstream error. `aikey unuse`
+/// got symmetric cleanup in 2026-05-18 (B1/B2); this is the same lifecycle
+/// gap on the hook-uninstall edge.
+///
+/// Behavior (user decision 2026-07-12, option b): interactive sessions get
+/// a Y/n prompt to strip aikey routing from the affected CLI configs
+/// (bindings are KEPT — re-wiring the hook or the next `aikey use`
+/// re-configures them). Non-TTY callers get a loud warning + exact
+/// commands instead — never a silent config mutation.
+pub fn reconcile_cli_configs_after_hook_uninstall() {
+    use std::io::{IsTerminal, Write};
+
+    let injected = shell_integration::injected_provider_toml_paths();
+    if injected.is_empty() {
+        return;
+    }
+    eprintln!(
+        "\x1b[33m  \u{25b2} These CLI configs still route through aikey, but the hook (env channel) is now unwired:\x1b[0m"
+    );
+    for (label, path) in &injected {
+        eprintln!("\x1b[33m      {:<6} {}\x1b[0m", label, path.display());
+    }
+    eprintln!(
+        "\x1b[33m    In new terminals those CLIs will fail (e.g. codex: Missing environment variable: OPENAI_API_KEY).\x1b[0m"
+    );
+
+    if !std::io::stderr().is_terminal() || !std::io::stdin().is_terminal() {
+        eprintln!(
+            "    Clean them up with: \x1b[36maikey unuse <provider>\x1b[0m  \u{2014} or re-enable the hook: \x1b[36maikey hook install\x1b[0m"
+        );
+        return;
+    }
+
+    eprint!("  Remove aikey routing from these CLI configs now? [Y/n] (default Y): ");
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_ok()
+        && matches!(input.trim().to_lowercase().as_str(), "n" | "no")
+    {
+        eprintln!(
+            "    Kept. Clean up later with: \x1b[36maikey unuse <provider>\x1b[0m  \u{2014} or re-enable: \x1b[36maikey hook install\x1b[0m"
+        );
+        return;
+    }
+
+    // Empty provider set = unconfigure every aikey-managed third-party CLI
+    // config (same funnel `aikey unuse` drives after removing the last
+    // binding). Bindings themselves are untouched.
+    shell_integration::apply_third_party_cli_configs(&[], crate::commands_proxy::proxy_port());
+    eprintln!("  \u{2713} aikey routing removed from third-party CLI configs (bindings kept; next `aikey use` re-applies them).");
 }
 
 /// `aikey unuse <PROVIDERS...>` — remove the active binding for one or more

@@ -123,9 +123,9 @@ function global:aikey_precmd_powershell {
     # The next `aikey use` then can't atomically replace active.env.flat
     # because Windows MoveFileEx returns ERROR_ACCESS_DENIED (os err 5)
     # when the target is held without FILE_SHARE_DELETE (PS opens with
-    # only FILE_SHARE_READ | FILE_SHARE_WRITE). Cascade: stale .flat →
-    # SEQ matches in-shell → no reload → claude.exe sees no $env:ANTHROPIC_*
-    # → user gets login prompt despite a valid binding.
+    # only FILE_SHARE_READ | FILE_SHARE_WRITE). Cascade: stale .flat ->
+    # SEQ matches in-shell -> no reload -> claude.exe sees no $env:ANTHROPIC_*
+    # -> user gets login prompt despite a valid binding.
     #
     # ReadAllLines reads the whole file into a string[] and closes the
     # StreamReader synchronously -- safe for the small .flat file.
@@ -142,8 +142,8 @@ function global:aikey_precmd_powershell {
     } catch { aikey_hook_check_once; return }
 
     # Decide whether to re-import:
-    #   - on_disk_seq present + differs from in-shell → reload (cheap path)
-    #   - on_disk_seq missing → unconditional reload (mirrors hook.bash's
+    #   - on_disk_seq present + differs from in-shell -> reload (cheap path)
+    #   - on_disk_seq missing -> unconditional reload (mirrors hook.bash's
     #     "Fallback for active.env produced by pre-Stage-1 CLI / by paths
     #     that don't write SEQ"; see commands_account/shell_integration.rs
     #     `write_active_env` which builds a kv_pairs list without SEQ).
@@ -184,7 +184,7 @@ function global:aikey_hook_check_once {
     if (-not $home_dir) { return }
     $hook_path = Join-Path (Join-Path $home_dir '.aikey') 'hook.ps1'
 
-    # ── Layer 1 ───────────────────────────────────────────────────────────
+    # -- Layer 1 -----------------------------------------------------------
     if ($script:_aikey_hook_loaded_hash) {
         $disk_hash = $null
         try {
@@ -212,7 +212,7 @@ function global:aikey_hook_check_once {
         }
     }
 
-    # ── Layer 2 ───────────────────────────────────────────────────────────
+    # -- Layer 2 -----------------------------------------------------------
     if ($script:_aikey_hook_layer2_checked) { return }
     $script:_aikey_hook_layer2_checked = $true
     $bin = aikey_resolve_bin
@@ -266,13 +266,13 @@ function global:prompt {
     }
 }
 
-# ── Wrapper preflight (claude / codex) ────────────────────────────────────
+# -- Wrapper preflight (claude / codex) ------------------------------------
 #
 # Mirror of hook.bash's `aikey_preflight` + `aikey_clear_before_tui_handoff`
 # + claude/codex/kimi function wrappers. Same contract:
 #
 #   - $env:AIKEY_PREFLIGHT = 'off' disables the connectivity probe entirely.
-#   - If no active binding ($env:AIKEY_ACTIVE_KEYS empty) → emit advisory
+#   - If no active binding ($env:AIKEY_ACTIVE_KEYS empty) -> emit advisory
 #     line and pass through to the real binary (the user explicitly opted
 #     out by not running `aikey use <alias>` first).
 #   - Otherwise: `aikey proxy ensure-running` (auto-start proxy if down),

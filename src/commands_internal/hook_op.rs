@@ -21,12 +21,15 @@ use serde::Deserialize;
 
 use super::internal_log;
 use super::protocol::ResultEnvelope;
-use crate::commands_account::{shell_rc_has_aikey_block, wire_rc_with_consent, HookFailureReason};
+use crate::commands_account::{
+    hook_status_probe, shell_rc_has_aikey_block, wire_rc_with_consent, HookFailureReason,
+};
 
 #[derive(Debug, Deserialize)]
 struct HookOpEnvelope {
-    /// "wire-rc" — currently the only action. Future: "uninstall-rc",
-    /// "status", etc. Keep the field so the same handler can grow.
+    /// "wire-rc" (write, modal Allow) or "status" (read-only probe for
+    /// GET /api/user/hook/status). Future: "uninstall-rc". Keep the field
+    /// so the same handler can grow.
     action: String,
     #[serde(default)]
     request_id: Option<String>,
@@ -76,6 +79,7 @@ pub fn handle() {
 
     match env.action.as_str() {
         "wire-rc" => handle_wire_rc(req_id, started),
+        "status" => handle_status(req_id, started),
         other => emit_error(
             req_id,
             "I_UNKNOWN_ACTION",
@@ -83,6 +87,30 @@ pub fn handle() {
             started,
         ),
     }
+}
+
+/// `status` action: read-only readiness probe. Same three-field envelope
+/// shape as wire-rc so the SPA's `pickHookReadiness` consumes both without
+/// branching. MUST stay read-only — it backs `GET /api/user/hook/status`,
+/// which the banner polls on page load; a GET that writes user files would
+/// be a covert write (see `hook_status_probe` docs).
+fn handle_status(req_id: Option<String>, started: std::time::Instant) {
+    let (file_installed, rc_wired, reason) = hook_status_probe();
+    let result_data = serde_json::json!({
+        "hook_file_installed": file_installed,
+        "hook_rc_wired": rc_wired,
+        "hook_failure_reason": reason
+            .map(|r| serde_json::Value::from(r.as_envelope_str()))
+            .unwrap_or(serde_json::Value::Null),
+    });
+    let result = ResultEnvelope::ok(req_id.clone(), result_data);
+    internal_log::log_dispatch_success(
+        ACTION,
+        req_id.as_deref(),
+        result.data.as_ref().unwrap_or(&serde_json::Value::Null),
+        started.elapsed().as_millis(),
+    );
+    emit(&result);
 }
 
 /// `wire-rc` action: render hook file (Layer 1) + write rc marker block

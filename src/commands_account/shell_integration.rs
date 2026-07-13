@@ -1337,6 +1337,23 @@ pub fn shell_kind() -> ShellKind {
 /// which is a dead instruction for PowerShell / cmd users. Centralising
 /// here keeps the dispatch logic in one place; if a future shell needs
 /// special handling we update one fn.
+/// "Apply the new active key in THIS shell right now" hint, per shell.
+///
+/// Why (2026-07-12, Windows real-machine exploratory testing X4/X5): the
+/// `aikey use` summary hardcoded `source ~/.aikey/active.env` — a dead
+/// instruction on Windows twice over: PowerShell has no `source`/`~`, and
+/// the PS hook reads active.env.flat, not active.env. Dot-sourcing the
+/// AllHosts profile reloads the hook, which applies the flat env — that IS
+/// the immediate-apply on PowerShell. cmd/Unknown get "open a new
+/// terminal" (cmd has no reload mechanism at all).
+pub fn apply_now_hint() -> &'static str {
+    match shell_kind() {
+        ShellKind::Zsh | ShellKind::Bash => "source ~/.aikey/active.env",
+        ShellKind::PowerShell => ". $PROFILE.CurrentUserAllHosts",
+        ShellKind::Cmd | ShellKind::Unknown => "open a new terminal",
+    }
+}
+
 pub fn reload_hint_for_shell() -> String {
     match shell_kind() {
         ShellKind::Zsh => "source ~/.zshrc".to_string(),
@@ -1728,13 +1745,23 @@ fn hook_content_with_hash_header(kind: HookKind) -> String {
     // against the on-disk `# Hook-Template-Hash:` — if they diverge,
     // the user has regenerated the hook file AFTER this shell sourced
     // it, so the claude/codex wrapper defs in memory are stale.
+    //
+    // Why `export` (2026-07-10, use-effectiveness self-check): child
+    // processes — `aikey use`, `aikey hook status` — read this env var to
+    // answer "is the hook actually loaded in the invoking shell?". Without
+    // export the var was shell-local, `aikey hook status` always printed
+    // "loaded hash: <not set>", and `aikey use` could claim "next prompt
+    // picks it up automatically" in a shell where precmd was never
+    // registered (terminal opened before hook install). PowerShell keeps
+    // the `$script:` var for the in-shell drift detector and adds `$env:`
+    // for child-process visibility (script scope never reaches children).
     let header = match kind {
         HookKind::Zsh | HookKind::Bash => format!(
-            "# Hook-Template-Hash: {hash}\n_AIKEY_HOOK_LOADED_HASH=\"{hash}\"\n",
+            "# Hook-Template-Hash: {hash}\nexport _AIKEY_HOOK_LOADED_HASH=\"{hash}\"\n",
             hash = hash,
         ),
         HookKind::PowerShell => format!(
-            "# Hook-Template-Hash: {hash}\n$script:_aikey_hook_loaded_hash = '{hash}'\n",
+            "# Hook-Template-Hash: {hash}\n$script:_aikey_hook_loaded_hash = '{hash}'\n$env:_AIKEY_HOOK_LOADED_HASH = '{hash}'\n",
             hash = hash,
         ),
     };
@@ -1793,6 +1820,20 @@ pub(super) fn write_hook_file(home: &str, kind: HookKind) -> io::Result<std::pat
     let aikey_dir = std::path::PathBuf::from(home).join(".aikey");
     std::fs::create_dir_all(&aikey_dir)?;
     let target = aikey_dir.join(filename);
+    // Visible-write contract (2026-07-10 user mandate: no covert writes to
+    // the user's environment): read the on-disk template hash BEFORE the
+    // write so we can tell an idempotent no-op rewrite (same hash — stay
+    // silent, don't drown `aikey use` output) from a real content change
+    // (print one line so the user knows their hook file was upgraded).
+    // Previously `aikey use` and the web vault-op funnel overwrote this
+    // file silently on every invocation.
+    let new_hash = hook_template_hash(kind);
+    let old_hash = std::fs::read_to_string(&target).ok().and_then(|c| {
+        c.lines().take(8).find_map(|line| {
+            line.strip_prefix("# Hook-Template-Hash: ")
+                .map(|s| s.trim().to_string())
+        })
+    });
     // Why atomic_write (not raw temp+rename): on Windows, MoveFileExW can
     // return ERROR_ACCESS_DENIED (5) / ERROR_SHARING_VIOLATION (32) when
     // another PowerShell session has loaded an outdated hook.ps1 whose
@@ -1803,7 +1844,27 @@ pub(super) fn write_hook_file(home: &str, kind: HookKind) -> io::Result<std::pat
     // and-sudo-silent-failure.md was an unrecoverable EACCES on the first
     // rename — propagated up to the user as "拒绝访问 (os error 5)".
     crate::profile_activation::atomic_write(&target, content.as_bytes())?;
+    if let Some(notice) = hook_write_notice(filename, old_hash.as_deref(), &new_hash) {
+        eprintln!("{notice}");
+    }
     Ok(target)
+}
+
+/// Visible-write classifier for `write_hook_file`: `None` = idempotent
+/// rewrite (same template hash — stay silent, don't drown `aikey use`
+/// output), `Some(line)` = the file was created or its content changed and
+/// the user must be told (no-covert-writes mandate, 2026-07-10).
+fn hook_write_notice(filename: &str, old_hash: Option<&str>, new_hash: &str) -> Option<String> {
+    match old_hash {
+        Some(h) if h == new_hash => None,
+        Some(h) => Some(format!(
+            "  \u{2713} Updated ~/.aikey/{filename} (hook template {h} \u{2192} {new_hash}). \
+             Running shells auto-reload at the next prompt."
+        )),
+        None => Some(format!(
+            "  \u{2713} Rendered ~/.aikey/{filename} (hook template {new_hash})."
+        )),
+    }
 }
 
 /// Filename for the hook file under `~/.aikey/`. Stage 3.1 windows-compat
@@ -2258,6 +2319,53 @@ pub fn web_install_hook_file_layer1() -> (bool, Option<HookFailureReason>) {
             (false, Some(reason))
         }
     }
+}
+
+/// Read-only hook readiness probe (2026-07-10, GET /api/user/hook/status).
+///
+/// Returns `(file_installed, rc_wired, failure_reason)` — the exact triple
+/// the Web envelope carries — WITHOUT writing anything. This must NOT be
+/// implemented on top of `web_install_hook_file_layer1`: that helper
+/// renders `~/.aikey/hook.*` as a side effect, and a GET endpoint that
+/// silently writes user files violates the no-covert-writes mandate.
+///
+/// Guard order mirrors `web_install_hook_file_layer1` so both entry points
+/// classify identically:
+///   1. AIKEY_NO_HOOK opt-out → report REAL file/rc state + `aikey_no_hook`
+///      (the front-end maps the reason to the silent `disabled` banner kind;
+///      real state keeps `aikey hook status` output truthful).
+///   2. no resolvable home → `home_unset`.
+///   3. unsupported shell → `shell_undetectable`.
+///   4. otherwise: file presence + `shell_rc_has_aikey_block()` (the single
+///      rc-wired truth source shared with doctor / `aikey use` / wire-rc).
+pub fn hook_status_probe() -> (bool, bool, Option<HookFailureReason>) {
+    if std::env::var("HOME").is_err()
+        && std::env::var("USERPROFILE").is_err()
+        && dirs::home_dir().is_none()
+    {
+        return (false, false, Some(HookFailureReason::HomeUnset));
+    }
+    let kind = match shell_kind() {
+        ShellKind::Zsh => HookKind::Zsh,
+        ShellKind::Bash => HookKind::Bash,
+        ShellKind::PowerShell => HookKind::PowerShell,
+        ShellKind::Cmd | ShellKind::Unknown => {
+            return (false, false, Some(HookFailureReason::ShellUndetectable));
+        }
+    };
+    let file_installed = resolve_aikey_dir()
+        .join(hook_filename_for_kind(kind))
+        .exists();
+    let rc_wired = shell_rc_has_aikey_block();
+    let opted_out = std::env::var("AIKEY_NO_HOOK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let reason = if opted_out {
+        Some(HookFailureReason::AikeyNoHook)
+    } else {
+        None
+    };
+    (file_installed, rc_wired, reason)
 }
 
 /// Result of a successful `write_v3_layers_with_consent` call.
@@ -2769,42 +2877,50 @@ fn wire_powershell_rc_no_tty(home: &str) -> Result<(), HookFailureReason> {
     cleanup_legacy_hook_files(home);
 
     let v3_block = super::shell_integration_windows::v3_rc_block_powershell();
-    let candidates = super::shell_integration_windows::powershell_profile_candidates();
+    // 3a (2026-07-12): wire EVERY present PowerShell flavor, not the first
+    // candidate that happens to exist. pwsh 7 and PS 5.1 read different
+    // profile files; wiring one left the other flavor's sessions hookless
+    // while OR-logic detectors reported wired. Idempotent per file.
+    let targets = super::shell_integration_windows::powershell_wire_targets();
+    if targets.is_empty() {
+        return Err(HookFailureReason::IoError);
+    }
+    for target in &targets {
+        wire_one_powershell_profile(target, &v3_block)?;
+    }
+    Ok(())
+}
 
-    // L2: look for existing marker in any candidate, idempotent rewrite.
-    for profile in &candidates {
-        if let Ok(contents) = std::fs::read_to_string(profile) {
-            if contents.contains(V3_BEGIN) {
-                if let Some(updated) =
-                    replace_between_markers(&contents, V3_BEGIN, V3_END, &v3_block)
-                {
-                    if updated != contents {
-                        std::fs::write(profile, updated).map_err(|_| HookFailureReason::IoError)?;
-                    }
-                }
-                return Ok(());
-            }
+/// Idempotently wire ONE PowerShell profile file: replace the v3 block in
+/// place when markers exist, else append (creating the parent dir). Shared
+/// by the Web wire-rc path and `ensure_powershell_hook`'s consent path.
+/// Refuses UTF-16 / non-UTF-8 profiles — byte-appending UTF-8 onto UTF-16
+/// corrupts the whole file (H2 guard, see ensure_powershell_hook).
+pub(super) fn wire_one_powershell_profile(
+    target: &std::path::Path,
+    v3_block: &str,
+) -> Result<(), HookFailureReason> {
+    if let Ok(bytes) = std::fs::read(target) {
+        let utf16_bom = bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+        if utf16_bom || (!bytes.is_empty() && std::str::from_utf8(&bytes).is_err()) {
+            return Err(HookFailureReason::IoError);
         }
     }
-
-    // L2 fresh install: pick the candidate whose parent dir exists so we
-    // write to the PowerShell version the user actually has installed
-    // (mirrors ensure_powershell_hook line 217+ logic — PS 5.1-only users
-    // would otherwise get a hook in pwsh 7+'s profile path their sessions
-    // never source).
-    let target = candidates
-        .iter()
-        .find(|p| p.parent().map(|d| d.exists()).unwrap_or(false))
-        .or_else(|| candidates.first())
-        .ok_or(HookFailureReason::IoError)?;
-
-    // mkdir -p the parent in case it doesn't exist
+    if let Ok(contents) = std::fs::read_to_string(target) {
+        if contents.contains(V3_BEGIN) {
+            if let Some(updated) = replace_between_markers(&contents, V3_BEGIN, V3_END, v3_block) {
+                if updated != contents {
+                    std::fs::write(target, updated).map_err(|_| HookFailureReason::IoError)?;
+                }
+            }
+            return Ok(());
+        }
+    }
     if let Some(parent) = target.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent).map_err(|_| HookFailureReason::IoError)?;
         }
     }
-
     let existing = std::fs::read_to_string(target).unwrap_or_default();
     let new_contents = if existing.is_empty() {
         format!("{}\n", v3_block)
@@ -4033,8 +4149,9 @@ tool_call_timeout_ms = 60000\n"
             "rendered zsh hook must contain greppable hash header"
         );
         assert!(
-            rendered.contains(&format!("_AIKEY_HOOK_LOADED_HASH=\"{}\"", hash)),
-            "rendered zsh hook must assign _AIKEY_HOOK_LOADED_HASH at source time"
+            rendered.contains(&format!("export _AIKEY_HOOK_LOADED_HASH=\"{}\"", hash)),
+            "rendered zsh hook must EXPORT _AIKEY_HOOK_LOADED_HASH at source time \
+             (child processes like `aikey use` read it to detect hook-loaded shells)"
         );
     }
 
@@ -4047,9 +4164,60 @@ tool_call_timeout_ms = 60000\n"
             "rendered bash hook must contain greppable hash header"
         );
         assert!(
-            rendered.contains(&format!("_AIKEY_HOOK_LOADED_HASH=\"{}\"", hash)),
-            "rendered bash hook must assign _AIKEY_HOOK_LOADED_HASH at source time"
+            rendered.contains(&format!("export _AIKEY_HOOK_LOADED_HASH=\"{}\"", hash)),
+            "rendered bash hook must EXPORT _AIKEY_HOOK_LOADED_HASH at source time \
+             (child processes like `aikey use` read it to detect hook-loaded shells)"
         );
+    }
+
+    #[test]
+    fn hook_ps1_template_is_pure_ascii() {
+        // F3-family guard (2026-07-12, exploratory finding X6): PowerShell
+        // 5.1 reads a BOM-less hook.ps1 via the system ANSI codepage
+        // (cp1252 on EN, cp936/GBK multibyte on zh-CN). Non-ASCII bytes
+        // can mutate into quote-swallowing sequences and break parsing for
+        // EVERY new session (see bugfix 20260526-hook-ps1-em-dash-mojibake).
+        // The 2026-05-26 fix only replaced em/en-dashes and left 981 other
+        // high bytes; this pins the template to pure ASCII so the entire
+        // encoding-fallback hazard class is structurally impossible.
+        //
+        // Deliberately ps1-ONLY: zsh/bash have no codepage-fallback
+        // mechanism, and their unicode lives in user-visible output
+        // strings — ASCII-izing those would degrade UX for zero hazard
+        // reduction.
+        for (i, line) in hook_ps1_content().lines().enumerate() {
+            assert!(
+                line.bytes().all(|b| b < 128),
+                "hook.ps1 line {} contains non-ASCII bytes (PS 5.1 codepage hazard): {}",
+                i + 1,
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn hook_write_notice_silent_only_on_identical_hash() {
+        // Visible-write contract (2026-07-10): silence is reserved for the
+        // idempotent no-op; creation and content change must both produce a
+        // user-visible line. Regression fence for the old always-silent
+        // overwrite in `aikey use` / the web vault-op funnel.
+        assert_eq!(hook_write_notice("hook.bash", Some("abc"), "abc"), None);
+        let updated = hook_write_notice("hook.bash", Some("abc"), "def").expect("must notify");
+        assert!(updated.contains("abc") && updated.contains("def"));
+        let created = hook_write_notice("hook.zsh", None, "def").expect("must notify");
+        assert!(created.contains("hook.zsh") && created.contains("def"));
+    }
+
+    #[test]
+    fn rendered_hook_ps1_sets_both_script_and_env_loaded_hash() {
+        // PowerShell needs BOTH scopes: `$script:` for the in-shell drift
+        // detector (aikey_hook_check_once) and `$env:` so child processes
+        // (`aikey use` effectiveness check, `aikey hook status`) can see
+        // that the hook is loaded — script scope never reaches children.
+        let rendered = hook_content_with_hash_header(HookKind::PowerShell);
+        let hash = hook_template_hash(HookKind::PowerShell);
+        assert!(rendered.contains(&format!("$script:_aikey_hook_loaded_hash = '{}'", hash)));
+        assert!(rendered.contains(&format!("$env:_AIKEY_HOOK_LOADED_HASH = '{}'", hash)));
     }
 
     #[test]
@@ -4067,8 +4235,8 @@ tool_call_timeout_ms = 60000\n"
         );
         assert!(
             head.iter()
-                .any(|l| l.starts_with("_AIKEY_HOOK_LOADED_HASH=")),
-            "_AIKEY_HOOK_LOADED_HASH should appear in the first 5 lines, got:\n{}",
+                .any(|l| l.starts_with("export _AIKEY_HOOK_LOADED_HASH=")),
+            "export _AIKEY_HOOK_LOADED_HASH should appear in the first 5 lines, got:\n{}",
             head.join("\n"),
         );
     }
@@ -4160,6 +4328,72 @@ tool_call_timeout_ms = 60000\n"
             c.contains("AIKEY_ACTIVE_LABEL"),
             "legacy grace var must still be checked alongside _AIKEY_EXPLICIT_ALIAS"
         );
+    }
+
+    #[test]
+    fn hook_bash_precmd_keeps_legacy_label_grace() {
+        // bash counterpart of the zsh grace-period pin above; was missing
+        // when the zsh test landed (2026-05-05 era) — added 2026-07-10.
+        let c = hook_bash_content();
+        assert!(
+            c.contains("AIKEY_ACTIVE_LABEL"),
+            "legacy grace var must still be checked alongside _AIKEY_EXPLICIT_ALIAS"
+        );
+    }
+
+    // ── source-time bootstrap (zsh v5 2026-05-05, bash v6 2026-07-10) ──────
+    //
+    // precmd/PROMPT_COMMAND never fire in shells that don't render a prompt
+    // (`zsh -ilc 'exec claude'`, `bash -lc 'exec claude'`, CI runners), so
+    // both templates must source active.env once at hook-source-time, outside
+    // any function body, mirroring precmd's pin/kill-switch guards. The zsh
+    // block shipped in 2026-05-05 WITHOUT a pinning test and the bash port
+    // was silently missed for two months — these tests are the regression
+    // fence for that exact failure mode.
+    // Bugfix: workflow/CI/bugfix/2026-05-05-hook-active-env-not-loaded-without-precmd.md
+    //         workflow/CI/bugfix/20260710-hook-bash-missing-bootstrap.md
+
+    fn assert_bootstrap_block(content: &str, shell: &str) {
+        let marker = "Bootstrap source of active.env";
+        let idx = content
+            .find(marker)
+            .unwrap_or_else(|| panic!("{shell} template must contain the '{marker}' block"));
+        // The block sits at top level between the marker comment and the
+        // wrapper-preflight section — inspect just that slice so a `source`
+        // inside precmd can't satisfy the assertion by accident.
+        let tail = &content[idx..];
+        let block_end = tail
+            .find("Wrapper preflight")
+            .unwrap_or_else(|| panic!("{shell} bootstrap block must precede the wrapper section"));
+        let block = &tail[..block_end];
+        for guard in [
+            "AIKEY_AUTO_REFRESH",
+            "_AIKEY_EXPLICIT_ALIAS",
+            "AIKEY_ACTIVE_LABEL",
+        ] {
+            assert!(
+                block.contains(guard),
+                "{shell} bootstrap must mirror precmd guard {guard}"
+            );
+        }
+        assert!(
+            block.contains("source ~/.aikey/active.env"),
+            "{shell} bootstrap must source active.env at hook-source-time"
+        );
+        assert!(
+            !block.contains("AIKEY_ACTIVE_SEQ"),
+            "{shell} bootstrap must NOT seq-diff — it sources unconditionally once"
+        );
+    }
+
+    #[test]
+    fn hook_zsh_bootstrap_sources_active_env_at_source_time() {
+        assert_bootstrap_block(&hook_zsh_content(), "zsh");
+    }
+
+    #[test]
+    fn hook_bash_bootstrap_sources_active_env_at_source_time() {
+        assert_bootstrap_block(&hook_bash_content(), "bash");
     }
 
     // ── H1.5 (hook coverage v1, 2026-04-27) regression ─────────────────────

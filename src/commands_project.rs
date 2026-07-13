@@ -1089,34 +1089,23 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
 
     // ── 7. Shell hook installed ───────────────────────────────
     {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let shell = std::env::var("SHELL").unwrap_or_default();
-        let hook_marker = "# aikey shell hook";
+        // Wired-state predicate unified to `shell_rc_has_aikey_block()`
+        // (2026-07-10): the previous inline `# aikey shell hook` grep was
+        // the LEGACY V1 marker — a truth-source split from the v3 block
+        // that `aikey use` / the web modal actually write, so this check
+        // reported "installed" for stale v1 rcs and "not installed" for
+        // healthy v3 ones. The shared predicate is the same one the web
+        // envelope's `hook_rc_wired` field uses (vault_op.rs), so doctor,
+        // `aikey use`, and the web banner can no longer disagree.
+        let shell_supported = !matches!(
+            crate::commands_account::shell_kind(),
+            crate::commands_account::ShellKind::Cmd | crate::commands_account::ShellKind::Unknown
+        );
+        let rc_wired = crate::commands_account::shell_rc_has_aikey_block();
 
-        let rc_file = if shell.contains("zsh") {
-            Some(format!("{}/.zshrc", home))
-        } else if shell.contains("bash") {
-            // Check .bashrc first, then .bash_profile.
-            let bashrc = format!("{}/.bashrc", home);
-            let profile = format!("{}/.bash_profile", home);
-            if std::path::Path::new(&bashrc).exists() {
-                Some(bashrc)
-            } else {
-                Some(profile)
-            }
-        } else {
-            None
-        };
-
-        let installed = rc_file.as_ref().map_or(false, |rc| {
-            std::fs::read_to_string(rc)
-                .map(|c| c.contains(hook_marker))
-                .unwrap_or(false)
-        });
-
-        if installed {
+        if rc_wired {
             emit("shell hook", true, "installed", None);
-        } else if rc_file.is_some() {
+        } else if shell_supported {
             emit(
                 "shell hook",
                 false,
@@ -1134,6 +1123,70 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 "unsupported shell",
                 Some("add 'source ~/.aikey/active.env' to your shell config manually"),
             );
+        }
+
+        // ── 7.1. Hook wiring vs active bindings ──────────────
+        //
+        // Why a separate item: "rc not wired" alone is a setup nit, but
+        // "bindings are ACTIVE and the rc is not wired" means the user
+        // believes keys are routing while `claude`/`codex` run bare —
+        // the exact silent failure of the web-only onboarding path
+        // (install → web use → never wire rc). Health signals must be
+        // externally readable, so this states the consequence explicitly
+        // instead of leaving it implied by two separate green/red items.
+        // Skipped for unsupported shells: the item above already reports
+        // that there is no rc to wire.
+        if shell_supported {
+            let has_active_bindings = !crate::storage::list_provider_bindings_readonly(
+                crate::profile_activation::DEFAULT_PROFILE,
+            )
+            .unwrap_or_default()
+            .is_empty();
+            // Re-check: the auto-install above may have just wired the rc.
+            let rc_wired_now = rc_wired || crate::commands_account::shell_rc_has_aikey_block();
+            let (ok, detail, hint) = hook_wiring_check(has_active_bindings, rc_wired_now);
+            emit("hook wiring", ok, detail, hint);
+        }
+
+        // ── 7.2. PowerShell ExecutionPolicy (wired-but-dead guard) ────
+        //
+        // 2026-07-12 exploratory finding X2: default client Windows keeps
+        // every ExecutionPolicy scope Undefined → effective Restricted →
+        // profile.ps1 refuses to load, so a WIRED hook never runs while
+        // every other check above stays green. The one detector that can
+        // see it is this policy probe. No-op on non-PowerShell shells and
+        // on Unix (stub returns None).
+        if matches!(
+            crate::commands_account::shell_kind(),
+            crate::commands_account::ShellKind::PowerShell
+        ) {
+            if crate::commands_account::powershell_profile_load_blocked().is_some() {
+                emit(
+                    "execution policy",
+                    false,
+                    "ExecutionPolicy blocks profile loading — the wired hook NEVER runs in new sessions",
+                    Some("Set-ExecutionPolicy -Scope CurrentUser RemoteSigned (GPO-managed: ask IT)"),
+                );
+            } else {
+                emit("execution policy", true, "profile loading allowed", None);
+            }
+
+            // ── 7.3. pwsh 7+ profile wiring gap ───────────────────
+            //
+            // 3a (2026-07-12): pwsh 7 reads Documents\PowerShell\profile.ps1
+            // — a different file from PS 5.1's. Machines wired before the
+            // dual-flavor write (or where pwsh was installed later) run
+            // pwsh sessions hookless while the OR-logic wired check above
+            // stays green. Silent when pwsh isn't present.
+            if let Some(gap) = crate::commands_account::pwsh_profile_wiring_gap() {
+                emit(
+                    "pwsh profile",
+                    false,
+                    "pwsh 7+ detected but its profile is not wired — pwsh sessions won't load the hook",
+                    Some("run `aikey hook install` (wires every present PowerShell flavor)"),
+                );
+                let _ = gap;
+            }
         }
     }
 
@@ -1979,6 +2032,49 @@ fn format_time_short(ts: &str) -> String {
 //
 // JSON mode short-circuits in main.rs — --detail extras are tty-only.
 // ===========================================================================
+
+/// Pure classifier for doctor's "hook wiring" item (2026-07-10). Extracted
+/// so the four-quadrant matrix (bindings × rc-wired) is unit-testable
+/// without touching the vault or the filesystem.
+///
+/// Why this item exists: "rc not wired" alone is a setup nit, but "bindings
+/// ACTIVE and rc not wired" means the user believes keys are routing while
+/// `claude`/`codex` run bare — the silent failure of the web-only
+/// onboarding path (install → web use → never wire rc).
+fn hook_wiring_check(
+    has_active_bindings: bool,
+    rc_wired: bool,
+) -> (bool, &'static str, Option<&'static str>) {
+    match (has_active_bindings, rc_wired) {
+        (true, false) => (
+            false,
+            "active bindings but shell rc not wired — claude/codex will NOT route through aikey",
+            Some("run `aikey hook install`, then open a new terminal"),
+        ),
+        (true, true) => (true, "active bindings routed via shell hook", None),
+        (false, _) => (true, "no active bindings to route", None),
+    }
+}
+
+#[cfg(test)]
+mod hook_wiring_check_tests {
+    use super::hook_wiring_check;
+
+    #[test]
+    fn red_only_when_bindings_active_and_rc_unwired() {
+        let (ok, detail, hint) = hook_wiring_check(true, false);
+        assert!(!ok);
+        assert!(detail.contains("NOT route through aikey"));
+        assert_eq!(hint, Some("run `aikey hook install`, then open a new terminal"));
+    }
+
+    #[test]
+    fn green_in_the_other_three_quadrants() {
+        assert!(hook_wiring_check(true, true).0);
+        assert!(hook_wiring_check(false, true).0);
+        assert!(hook_wiring_check(false, false).0);
+    }
+}
 
 pub fn handle_doctor_detail() -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
