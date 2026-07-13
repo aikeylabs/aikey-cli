@@ -90,6 +90,12 @@ pub struct LifecycleOutcome {
     /// `None` on success or when no event in the batch touched bindings
     /// (tail skipped).
     pub hook_failure_reason: Option<crate::commands_account::HookFailureReason>,
+    /// 阶段7 (2026-07-13) — Claude Desktop takeover/consent state after this
+    /// event's tail. `None` when the tail didn't run or anthropic wasn't
+    /// active. Rides the vault-op envelope as `data.desktop_switch` so the
+    /// web can pop the consent modal / restart toast (same channel pattern
+    /// as `hook_file_installed`). Shared across all outcomes in a batch.
+    pub desktop_switch: Option<crate::commands_account::claude_desktop::DesktopSwitch>,
 }
 
 /// Single-event entry: equivalent to `apply_credential_lifecycle_batch(&[event])`
@@ -195,7 +201,8 @@ pub fn apply_credential_lifecycle_batch(
                 .iter()
                 .map(|b| b.provider_code.clone())
                 .collect();
-            crate::commands_account::apply_third_party_cli_configs(&active_providers, proxy_port);
+            let third_party =
+                crate::commands_account::apply_third_party_cli_configs(&active_providers, proxy_port);
             // Layer 1 hook file — write once, share result across batch
             // outcomes. Best-effort: failure here surfaces via
             // `hook_failure_reason` for the Web envelope but doesn't
@@ -207,6 +214,7 @@ pub fn apply_credential_lifecycle_batch(
             for outcome in &mut outcomes {
                 outcome.active_env_refreshed = true;
                 outcome.active_providers = active_providers.clone();
+                outcome.desktop_switch = third_party.desktop;
                 outcome.hook_file_installed = hook_file_installed;
                 outcome.hook_failure_reason = hook_failure_reason;
             }

@@ -477,6 +477,13 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: Option<StatuslineAction>,
     },
+    /// Manage Claude Desktop routing through aikey (takeover status /
+    /// manual install / restore to official mode).
+    #[command(display_order = 20)]
+    Desktop {
+        #[command(subcommand)]
+        action: DesktopAction,
+    },
     /// Show a top-style dashboard of recent key usage from the local WAL.
     #[command(display_order = 21)]
     Watch,
@@ -926,6 +933,25 @@ pub(crate) enum DbAction {
         #[arg(long)]
         to: String,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DesktopAction {
+    /// Diagnose Claude Desktop routing: detection, ownership, consent,
+    /// gateway reachability, port consistency, and claude.ai account-plane
+    /// reachability (Desktop chat needs BOTH planes — the gateway only
+    /// carries inference).
+    Status {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Route Claude Desktop through aikey now (follows the active claude
+    /// credential; requires one). Also lifts a standing "never" refusal.
+    Install,
+    /// Restore Claude Desktop to official mode (1p) and clear the consent
+    /// preference. Only undoes aikey's own takeover.
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -1405,6 +1431,14 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 }
             ),
             Commands::Version => "version".to_string(),
+            Commands::Desktop { action } => format!(
+                "desktop.{}",
+                match action {
+                    DesktopAction::Status { .. } => "status",
+                    DesktopAction::Install => "install",
+                    DesktopAction::Uninstall => "uninstall",
+                }
+            ),
             Commands::Statusline { action } => match action {
                 None => "statusline".to_string(),
                 Some(StatuslineAction::Install { target, all, .. }) => {

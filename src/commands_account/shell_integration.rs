@@ -407,6 +407,17 @@ pub fn injected_provider_toml_paths() -> Vec<(&'static str, std::path::PathBuf)>
     if let Some(claude_settings) = crate::commands_statusline::injected_claude_settings_path() {
         out.push(("claude", claude_settings));
     }
+    // Claude Desktop gateway profile (阶段7): listed only while WE own the
+    // active 3p setup — mirrors the semantic-ownership rule everywhere else
+    // (never listed for foreign/official states). Flows into `aikey env` and
+    // the lifecycle audit like the toml entries above.
+    if let Some(paths) = crate::commands_account::claude_desktop::desktop_paths() {
+        if crate::commands_account::claude_desktop::detect_state(&paths)
+            == crate::commands_account::claude_desktop::DesktopState::OursActive
+        {
+            out.push(("claude-desktop", paths.profile));
+        }
+    }
     out
 }
 
@@ -534,7 +545,20 @@ pub(super) fn providers_need_kimi_scaffold(providers: &[String]) -> bool {
     })
 }
 
-pub fn apply_third_party_cli_configs(providers: &[String], proxy_port: u16) {
+/// What the funnel's side surfaces did this pass, for callers with a wire
+/// obligation (vault-op envelope `desktop_switch`, unuse json output).
+/// kimi/codex/statusline remain fire-and-forget — only Desktop needs a
+/// consent round-trip, hence only it reports (careful-api: no speculative
+/// fields).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ThirdPartyApplyOutcome {
+    pub desktop: Option<crate::commands_account::claude_desktop::DesktopSwitch>,
+}
+
+pub fn apply_third_party_cli_configs(
+    providers: &[String],
+    proxy_port: u16,
+) -> ThirdPartyApplyOutcome {
     let has_kimi = providers_need_kimi_scaffold(providers);
     if has_kimi {
         // Token-agnostic: writes scaffold once; token comes from KIMI_API_KEY env var.
@@ -581,11 +605,28 @@ pub fn apply_third_party_cli_configs(providers: &[String], proxy_port: u16) {
         let c = p.to_lowercase();
         c == "anthropic" || c == "claude"
     });
+    let mut out = ThirdPartyApplyOutcome::default();
     if has_anthropic {
         crate::commands_statusline::ensure_claude_statusline_installed();
+        // Claude Desktop takeover (阶段7 D1): lives INSIDE this function body
+        // on purpose — both production call sites (lifecycle tail +
+        // handle_key_unuse's parallel copy) then cover takeover AND restore
+        // with no per-caller wiring. Consent prompting only when stderr is a
+        // TTY; headless callers (web `_internal` bridge) get needs_consent
+        // back on the envelope instead (P3 replays `use` with
+        // desktop_consent after the modal).
+        {
+            use std::io::IsTerminal;
+            out.desktop = Some(crate::commands_account::claude_desktop::reconcile_active(
+                proxy_port,
+                std::io::stderr().is_terminal(),
+            ));
+        }
     } else {
         let _ = crate::commands_statusline::uninstall_claude(true);
+        crate::commands_account::claude_desktop::restore_quiet();
     }
+    out
 }
 
 /// Ensure aikey's Stop hook exists in `~/.kimi/config.toml`.

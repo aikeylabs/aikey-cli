@@ -4066,6 +4066,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = commands_statusline::ensure();
             }
         },
+        Commands::Desktop { action } => match action {
+            cli::DesktopAction::Status { json } => {
+                commands_account::claude_desktop::handle_desktop_status(*json || cli.json)?;
+            }
+            cli::DesktopAction::Install => {
+                commands_account::claude_desktop::handle_desktop_install()?;
+            }
+            cli::DesktopAction::Uninstall => {
+                commands_account::claude_desktop::handle_desktop_uninstall()?;
+            }
+        },
         Commands::Watch => {
             commands_watch::run()?;
         }
@@ -6815,6 +6826,7 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
         // Even when nothing was wired, stale third-party CLI configs are
         // exactly as broken (no env channel) — reconcile them too.
         commands_account::reconcile_cli_configs_after_hook_uninstall();
+        commands_account::claude_desktop::restore_quiet();
         return Ok(());
     }
     for t in &touched {
@@ -6834,6 +6846,14 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
     // X8 (2026-07-12): codex/kimi configs that route through aikey only work
     // WITH the hook env — offer to strip them (TTY) or warn loudly (non-TTY).
     commands_account::reconcile_cli_configs_after_hook_uninstall();
+    // 阶段7 D8② (2026-07-13): Desktop is a persisted-file surface, not env-
+    // injected — left in 3p after hook uninstall it breaks silently once the
+    // proxy stops, with no diagnosable symptom in the GUI. Deliberate
+    // exception: bare `hook uninstall` also restores Desktop (soft-fail,
+    // proxy-independent; clears an `always` grant per D6 supplement).
+    // `hook uninstall openclaw` and `hook reinstall` never reach this
+    // handler — verified, no reinstall flip-flop.
+    commands_account::claude_desktop::restore_quiet();
     Ok(())
 }
 

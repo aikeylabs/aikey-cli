@@ -2210,6 +2210,15 @@ fn handle_use(env: StdinEnvelope) {
     struct Payload {
         target: String,
         id: String,
+        /// 阶段7 web consent replay (D9/方案B): after the browser modal the
+        /// web re-invokes this same `use` with `"granted"`/`"denied"` instead
+        /// of a dedicated `_internal desktop-op` command. Optional — absent
+        /// on every ordinary use.
+        #[serde(default)]
+        desktop_consent: Option<String>,
+        /// "不再提示" checkbox state accompanying `desktop_consent`.
+        #[serde(default)]
+        desktop_remember: bool,
     }
     let payload: Payload = match serde_json::from_value(env.payload.clone()) {
         Ok(p) => p,
@@ -2509,6 +2518,22 @@ fn handle_use(env: StdinEnvelope) {
         _ => payload.id.clone(),
     };
 
+    // 阶段7 consent replay, step 1 — REMEMBERED answers land in the pref
+    // BEFORE the lifecycle runs, so the funnel's reconcile reads them
+    // naturally (plan §4.2 timing): granted+remember → always;
+    // denied+remember → never.
+    if payload.desktop_remember {
+        match payload.desktop_consent.as_deref() {
+            Some("granted") => {
+                let _ = crate::global_config::set_claude_desktop_consent("always");
+            }
+            Some("denied") => {
+                let _ = crate::global_config::set_claude_desktop_consent("never");
+            }
+            _ => {}
+        }
+    }
+
     // Single funnel: Switched event runs write_bindings_canonical → refresh
     // → apply_third_party_cli_configs.
     let lifecycle = match crate::commands_account::apply_credential_lifecycle(
@@ -2527,21 +2552,43 @@ fn handle_use(env: StdinEnvelope) {
     };
     let refresh_ok = lifecycle.active_env_refreshed;
 
+    // 阶段7 consent replay, step 2 — a ONE-SHOT grant (granted without
+    // remember) leaves no pref for the funnel to read, so the funnel just
+    // reported needs_consent again; honor the grant now with a direct
+    // takeover and overwrite the wire field (plan §4.2).
+    let mut desktop_switch = lifecycle.desktop_switch;
+    if payload.desktop_consent.as_deref() == Some("granted")
+        && !payload.desktop_remember
+        && desktop_switch.is_some_and(|d| d.needs_consent)
+    {
+        if let Some(paths) = crate::commands_account::claude_desktop::desktop_paths() {
+            desktop_switch = Some(crate::commands_account::claude_desktop::perform_takeover(
+                &paths,
+                crate::commands_proxy::proxy_port(),
+            ));
+        }
+    }
+
     let audit_logged = try_log_audit(&key, AuditOperation::Exec, Some(&canonical_key_ref), true);
+
+    let mut data = json!({
+        "target": payload.target,
+        "id": canonical_key_ref,
+        "input_id": payload.id,
+        "activated_providers": providers,
+        "active_env_refreshed": refresh_ok,
+        "audit_logged": audit_logged,
+    });
+    // Optional wire field (careful-api: absent unless the funnel actually
+    // evaluated Desktop). Web reads needs_consent → modal, restart_required
+    // → toast hint (P3).
+    if let Some(d) = desktop_switch {
+        data["desktop_switch"] = serde_json::to_value(d).unwrap_or(serde_json::Value::Null);
+    }
 
     emit(&ResultEnvelope::ok(
         req_id,
-        merge_hook_status_from_outcome(
-            json!({
-                "target": payload.target,
-                "id": canonical_key_ref,
-                "input_id": payload.id,
-                "activated_providers": providers,
-                "active_env_refreshed": refresh_ok,
-                "audit_logged": audit_logged,
-            }),
-            &lifecycle,
-        ),
+        merge_hook_status_from_outcome(data, &lifecycle),
     ));
 }
 

@@ -5298,6 +5298,7 @@ pub fn handle_key_unuse(
     // refresh active.env → apply third-party CLI configs → hook file.
     // This ensures env vars and toml regions for unbound providers are
     // removed immediately.
+    let mut desktop_switch: Option<claude_desktop::DesktopSwitch> = None;
     if !unbound.is_empty() {
         if let Ok(refresh) = crate::profile_activation::refresh_implicit_profile_activation() {
             let proxy_port = crate::commands_proxy::proxy_port();
@@ -5306,7 +5307,12 @@ pub fn handle_key_unuse(
                 .iter()
                 .map(|b| b.provider_code.clone())
                 .collect();
-            apply_third_party_cli_configs(&active_providers, proxy_port);
+            // Second (parallel) funnel call site — Desktop takeover/restore
+            // rides INSIDE apply_third_party_cli_configs, so `unuse
+            // anthropic` restores Desktop and `unuse <other>` leaves it
+            // alone with no extra wiring here (阶段7 §4.1).
+            let third_party = apply_third_party_cli_configs(&active_providers, proxy_port);
+            desktop_switch = third_party.desktop;
             let _ = web_install_hook_file_layer1();
         }
     }
@@ -5316,6 +5322,7 @@ pub fn handle_key_unuse(
             "ok": true,
             "unbound_providers": unbound,
             "already_unbound": already_unbound,
+            "desktop_switch": desktop_switch,
         }));
     } else {
         if unbound.is_empty() && !already_unbound.is_empty() {
@@ -7777,8 +7784,26 @@ mod sync_prune_tests {
     use crate::storage;
     use secrecy::SecretString;
 
-    fn setup_vault() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
-        let guard = crate::test_env_lock::ENV_MUTATION_LOCK
+    fn setup_vault() -> (
+        tempfile::TempDir,
+        (
+            std::sync::MutexGuard<'static, ()>,
+            std::sync::MutexGuard<'static, ()>,
+        ),
+    ) {
+        // AK_VAULT_PATH is guarded by storage::TEST_VAULT_LOCK (the vault
+        // lock domain used by core_tests / query / executor / storage
+        // tests). This module used to take ONLY ENV_MUTATION_LOCK here —
+        // the sole offender in the crate — so it raced every vault-lock
+        // test mutating the same var (surfaced 2026-07-13 as a flaky
+        // 2-rows-vs-1 assert here that poisoned the env lock and cascaded
+        // into 22 local_server_probe PoisonErrors). Hold BOTH, in the
+        // crate-wide order established by claude_desktop::p2_tests::
+        // EnvSandbox: ENV_MUTATION_LOCK first, TEST_VAULT_LOCK second.
+        let env_guard = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vault_guard = crate::storage::TEST_VAULT_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -7790,7 +7815,7 @@ mod sync_prune_tests {
         crate::crypto::generate_salt(&mut salt).expect("salt");
         storage::initialize_vault(&salt, &SecretString::new("test_password".to_string()))
             .expect("init vault");
-        (dir, guard)
+        (dir, (env_guard, vault_guard))
     }
 
     fn cache_entry(vk_id: &str, owner: &str) -> storage::VirtualKeyCacheEntry {
