@@ -1007,6 +1007,7 @@ fn handle_add(env: StdinEnvelope) {
             source_ref: &outcome.alias,
             providers: &outcome.providers,
         },
+        crate::audit::VerifiedVaultKey::new(key).ok().as_ref(),
     )
     .unwrap_or_default();
     let newly_primary = lifecycle.newly_primary.clone();
@@ -1216,9 +1217,11 @@ fn handle_batch_import(env: StdinEnvelope) {
             },
         )
         .collect();
-    let lifecycle_outcomes =
-        crate::commands_account::apply_credential_lifecycle_batch(&lifecycle_events)
-            .unwrap_or_default();
+    let lifecycle_outcomes = crate::commands_account::apply_credential_lifecycle_batch(
+        &lifecycle_events,
+        crate::audit::VerifiedVaultKey::new(key).ok().as_ref(),
+    )
+    .unwrap_or_default();
     let total_newly_primary: Vec<String> = lifecycle_outcomes
         .iter()
         .flat_map(|o| o.newly_primary.clone())
@@ -1368,6 +1371,7 @@ fn handle_delete(env: StdinEnvelope) {
             source_type: "personal",
             source_ref: &payload.alias,
         },
+        crate::audit::VerifiedVaultKey::new(key).ok().as_ref(),
     );
 
     let audit_logged = try_log_audit(&key, AuditOperation::Delete, Some(&payload.alias), true);
@@ -1448,6 +1452,7 @@ fn handle_delete_target(env: StdinEnvelope) {
                     source_type: "personal",
                     source_ref: &payload.id,
                 },
+                crate::audit::VerifiedVaultKey::new(key).ok().as_ref(),
             )
             .unwrap_or_default();
             let audit_logged = try_log_audit(&key, AuditOperation::Delete, Some(&payload.id), true);
@@ -1522,6 +1527,7 @@ fn handle_delete_target(env: StdinEnvelope) {
                     source_type: "personal_oauth_account",
                     source_ref: &payload.id,
                 },
+                crate::audit::VerifiedVaultKey::new(key).ok().as_ref(),
             )
             .unwrap_or_default();
             let audit_logged = try_log_audit(&key, AuditOperation::Delete, Some(&payload.id), true);
@@ -2511,6 +2517,7 @@ fn handle_use(env: StdinEnvelope) {
             source_ref: &canonical_key_ref,
             providers: &providers,
         },
+        crate::audit::VerifiedVaultKey::new(key).ok().as_ref(),
     ) {
         Ok(o) => o,
         Err(e) => {

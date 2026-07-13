@@ -25,6 +25,13 @@ pub enum AuditOperation {
     Export,
     Import,
     Exec,
+    /// A provider-binding write (Primary switch / auto-assign / reconcile
+    /// replacement). Added 2026-07-06: the incident binding write had NO audit
+    /// row, making "who bound this key" unanswerable — every write through
+    /// `write_bindings_canonical` now signs one Bind row when the caller holds
+    /// a `VerifiedVaultKey`. Pure enum addition — operation is a TEXT column,
+    /// no migration; `verify_audit_log` recomputes HMAC over the raw string.
+    Bind,
 }
 
 impl AuditOperation {
@@ -39,7 +46,34 @@ impl AuditOperation {
             AuditOperation::Export => "export",
             AuditOperation::Import => "import",
             AuditOperation::Exec => "exec",
+            AuditOperation::Bind => "bind",
         }
+    }
+}
+
+/// A 32-byte vault key PROVEN to match this vault's stored password_hash.
+///
+/// Why a newtype (2026-07-06, B-2 protocol hardening): audit rows are
+/// HMAC-signed with an audit_key derived from the vault key. A row signed with
+/// a WRONG key doesn't fail at write time — it surfaces later as a bogus
+/// "tampered" verdict from `verify_audit_log`, poisoning the whole chain's
+/// trustworthiness. The ONLY constructor runs `storage::verify_vault_key`, so
+/// the type system guarantees every signer input was checked against the vault
+/// (one cheap SQLite read per command; same chokepoint contract as the
+/// 2026-05-11 snapshot-sync strict-verify fix).
+pub struct VerifiedVaultKey([u8; 32]);
+
+impl VerifiedVaultKey {
+    /// Verifies `key` against the vault's stored password_hash. Err when the
+    /// key doesn't match (stale web session, wrong derivation) — callers must
+    /// surface that, not sign with it.
+    pub fn new(key: [u8; 32]) -> Result<Self, String> {
+        storage::verify_vault_key(&key)?;
+        Ok(Self(key))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -198,6 +232,21 @@ pub fn log_audit_event(
 /// Returns the number of entries verified and any tampered entries.
 pub fn verify_audit_log(password: &SecretString) -> Result<(usize, Vec<i64>), String> {
     let audit_key = derive_audit_key(password)?;
+    // V2 acceptance (bugfix 2026-07-06, exposed by the B-2 bind-audit tests):
+    // rows written through `log_audit_event_from_vault_key` (the `_internal`
+    // web-bridge path since 2026-05, and B-2 bind rows) are signed with
+    // HMAC(vault_key, "AK_AUDIT_V2") — a DIFFERENT key than V1's
+    // Argon2(password, AK_AUDIT_SALT_V1). The verifier only ever tried V1, so
+    // every V2-signed row read as "tampered" (false positive). A row now
+    // verifies if EITHER derivation matches; both keys come from the same
+    // password, so the tamper-evidence property is unchanged. Best-effort on
+    // the V2 key: absent salt/kdf params (pre-vault state) just skips V2.
+    let audit_key_v2: Option<[u8; 32]> = (|| {
+        let salt = storage::get_salt().ok()?;
+        let (m, t, p) = storage::get_kdf_params().ok()?;
+        let vault_key = crypto::derive_key_with_params(password, &salt, m, t, p).ok()?;
+        derive_audit_key_from_vault_key(&vault_key).ok()
+    })();
     let conn = storage::open_connection()?;
 
     let mut stmt = conn
@@ -232,16 +281,24 @@ pub fn verify_audit_log(password: &SecretString) -> Result<(usize, Vec<i64>), St
             .get(5)
             .map_err(|e| format!("Failed to get hmac: {}", e))?;
 
-        // Recompute HMAC
-        let computed_hmac = compute_audit_hmac(
+        // Recompute HMAC — V1 first (bulk of historic rows), then V2
+        // (vault_key-signed rows from the web bridge / B-2 bind rows).
+        let v1_hmac = compute_audit_hmac(
             &*audit_key,
             timestamp,
             &operation,
             alias.as_deref(),
             success != 0,
         )?;
-
-        if computed_hmac != stored_hmac {
+        let mut matches = v1_hmac == stored_hmac;
+        if !matches {
+            if let Some(k2) = &audit_key_v2 {
+                let v2_hmac =
+                    compute_audit_hmac(k2, timestamp, &operation, alias.as_deref(), success != 0)?;
+                matches = v2_hmac == stored_hmac;
+            }
+        }
+        if !matches {
             tampered_ids.push(id);
         }
 

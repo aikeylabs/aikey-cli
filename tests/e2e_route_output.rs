@@ -96,7 +96,10 @@ fn route_table_has_expected_columns() {
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
 
     // Header row is on stderr (table is informational).
-    for col in &["PROVIDER", "LABEL", "API_KEY", "BASE URL"] {
+    // "PROTOCOL" (not "PROVIDER") since a737948 2026-04-27: the column shows
+    // the wire protocol (openai/anthropic/...) — the provider/protocol
+    // terminology split of the protocol_type domain model.
+    for col in &["PROTOCOL", "LABEL", "API_KEY", "BASE URL"] {
         assert!(
             stderr.contains(col),
             "route header missing '{}' column:\n{}",

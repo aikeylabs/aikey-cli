@@ -156,6 +156,8 @@ impl ProjectConfig {
     pub fn load(path: &Path) -> Result<Self, String> {
         let content =
             fs::read_to_string(path).map_err(|e| format!("Failed to read config file: {}", e))?;
+        // Tolerate a UTF-8 BOM from Windows editors/tools (see crate::strip_bom docs).
+        let content = crate::strip_bom(&content).to_string();
 
         let filename = path
             .file_name()

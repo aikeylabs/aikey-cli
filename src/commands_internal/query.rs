@@ -211,18 +211,253 @@ pub(crate) fn team_effective_status(
     }
 }
 
+/// Merge the proxy's LIVE per-account material (`group_runtime`, PLAINTEXT flags +
+/// display meta — the encrypted secret is ignored) with the key-sync candidate snapshot
+/// (`group_accounts`), so /user/vault reflects login + routing + MEMBERSHIP within the
+/// proxy's 60s poll WITHOUT a manual `aikey key sync`.
+///
+/// Two regimes (owner-approved):
+///   - **Fast rail present** (proxy has polled this VK): the rail is AUTHORITATIVE for
+///     LIST MEMBERSHIP (C1+C2 extended 2026-07-01) — the candidate list tracks the rail
+///     (new accounts appear, removed accounts drop) instead of the possibly-stale
+///     key-sync snapshot. Each account's `current_routed` + `login_status` come from the
+///     rail; identity/provider/priority prefer the richer key-sync snapshot when the
+///     account is in both, and fall back to the rail's own display meta for a fast-rail-
+///     only account (added since the last key sync — renders with its email/provider,
+///     not a bare UUID). The snapshot keeps supplying the finer `auth_failed`/`revoked`
+///     unusable reason.
+///   - **Fast rail empty/absent** (proxy hasn't polled yet / direct-bind): fall back to
+///     the key-sync snapshot list, `current_routed=false` (no live routing signal).
+///
+/// Returns None when there are no parseable snapshot candidates (direct-bind VK → the web
+/// renders no group panel).
+fn merge_group_accounts_live(
+    group_accounts: Option<&str>,
+    group_runtime: Option<&str>,
+) -> Option<serde_json::Value> {
+    use serde_json::Value;
+    let snapshot: Vec<Value> = serde_json::from_str(group_accounts?).ok()?;
+
+    let runtime: serde_json::Map<String, Value> = group_runtime
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    // No live rail yet → snapshot list, current_routed defaulted false (legacy path).
+    if runtime.is_empty() {
+        let mut cands = snapshot;
+        for c in cands.iter_mut() {
+            if let Some(obj) = c.as_object_mut() {
+                obj.entry("current_routed").or_insert(Value::Bool(false));
+            }
+        }
+        return Some(Value::Array(cands));
+    }
+
+    // Fast rail authoritative for membership. Index the snapshot for metadata fallback.
+    let snap_by_id: std::collections::HashMap<&str, &Value> = snapshot
+        .iter()
+        .filter_map(|c| {
+            c.get("account_id")
+                .and_then(|v| v.as_str())
+                .map(|id| (id, c))
+        })
+        .collect();
+
+    let live_str = |live: &Value, key: &str| -> String {
+        live.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let mut merged: Vec<Value> = Vec::with_capacity(runtime.len());
+    for (account_id, live) in runtime.iter() {
+        let snap = snap_by_id.get(account_id.as_str()).copied();
+        // Base: the snapshot object (preserves ALL its fields) when the account is in
+        // both; otherwise a fresh object built from the rail's display meta.
+        let mut obj = match snap.and_then(|s| s.as_object()) {
+            Some(o) => o.clone(),
+            None => {
+                let mut o = serde_json::Map::new();
+                o.insert("account_id".into(), Value::String(account_id.clone()));
+                o.insert("identity".into(), Value::String(live_str(live, "identity")));
+                o.insert(
+                    "provider_code".into(),
+                    Value::String(live_str(live, "provider_code")),
+                );
+                o.insert(
+                    "credential_type".into(),
+                    Value::String(live_str(live, "credential_type")),
+                );
+                let prio = live.get("priority").and_then(|v| v.as_i64()).unwrap_or(0);
+                o.insert("priority".into(), Value::Number(prio.into()));
+                o.insert("assigned".into(), Value::Bool(false)); // rail has no static default
+                o
+            }
+        };
+        // Overlay the rail-authoritative fields (both regimes of `obj`).
+        let needs_login = live
+            .get("needs_login")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let is_current_routed = live
+            .get("is_current_routed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        obj.insert("current_routed".into(), Value::Bool(is_current_routed));
+        let snap_login = obj
+            .get("login_status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let login_status = if !needs_login {
+            "logged_in"
+        } else if snap_login == "auth_failed" || snap_login == "revoked" {
+            snap_login.as_str() // keep the finer unusable reason from the snapshot
+        } else {
+            "needs_login"
+        };
+        obj.insert(
+            "login_status".into(),
+            Value::String(login_status.to_string()),
+        );
+        merged.push(Value::Object(obj));
+    }
+    // Deterministic display order: priority asc, then account_id (serde_json::Map's own
+    // iteration order is not a meaningful candidate order).
+    merged.sort_by(|a, b| {
+        let pa = a.get("priority").and_then(|v| v.as_i64()).unwrap_or(0);
+        let pb = b.get("priority").and_then(|v| v.as_i64()).unwrap_or(0);
+        pa.cmp(&pb).then_with(|| {
+            let ia = a.get("account_id").and_then(|v| v.as_str()).unwrap_or("");
+            let ib = b.get("account_id").and_then(|v| v.as_str()).unwrap_or("");
+            ia.cmp(ib)
+        })
+    });
+    Some(Value::Array(merged))
+}
+
+/// The usability state of a group VK's CURRENT ROUTED account — the one the remote
+/// scheduling engine selected. Drives the group-VK overlay on effective_status
+/// (owner rule 2026-06-30, refined 2026-07-03): a claimed+active group VK is only
+/// usable when the account it actually routes to has a token. The refinement splits
+/// the old single "inactive" verdict into two, so the member sees the actionable
+/// case distinctly (防呆):
+///   - `LoggedIn`   → the routed account has a token → VK is `active`.
+///   - `NeedsLogin` → the routed account exists but the member hasn't logged in →
+///     VK reads `needs_login` (not a scary red `inactive`): a request would return
+///     LOGIN_REQUIRED, but the fix is one login, not an admin action. The web vault
+///     page shows an amber "待登录" chip + a login CTA (→ /user/team-oauth) instead of
+///     a dead red row.
+///   - `NoCandidate` → empty set / no routed account resolvable → VK reads `inactive`
+///     (genuinely unusable — GROUP_NO_CANDIDATES; nothing to log into).
+///
+/// Routed account = the candidate the proxy flagged `current_routed` (engine override
+/// ?? rank-0). Before the proxy has stamped it (brief post-sync window), fall back to
+/// the static default (`assigned` = master rank-0) — which IS the routed account when
+/// there is no engine override. Being logged into a DIFFERENT, non-routed account does
+/// NOT count: the engine decides where traffic goes, and that account is what needs a token.
+#[derive(PartialEq, Eq, Debug)]
+enum RoutedState {
+    LoggedIn,
+    NeedsLogin,
+    NoCandidate,
+}
+
+fn routed_candidate_state(merged: Option<&serde_json::Value>) -> RoutedState {
+    let Some(arr) = merged.and_then(|v| v.as_array()) else {
+        return RoutedState::NoCandidate;
+    };
+    let flagged =
+        |c: &&serde_json::Value, key: &str| c.get(key).and_then(|b| b.as_bool()) == Some(true);
+    let routed = arr
+        .iter()
+        .find(|c| flagged(c, "current_routed"))
+        .or_else(|| arr.iter().find(|c| flagged(c, "assigned")));
+    match routed {
+        None => RoutedState::NoCandidate,
+        Some(c) => {
+            if c.get("login_status").and_then(|s| s.as_str()) == Some("logged_in") {
+                RoutedState::LoggedIn
+            } else {
+                RoutedState::NeedsLogin
+            }
+        }
+    }
+}
+
+/// The protocol source for a team VK's `protocol_family`, priority ordered:
+/// VK-level `provider_code` (direct VKs / present) → `protocol_type` (2026-07-03).
+///
+/// **Why the protocol_type fallback**: a group VK's `provider_code` is ALWAYS empty
+/// (it binds a group, not one provider). Normally the web recovers the protocol from
+/// the routed pool account's provider — but when the seat is unbound from the group
+/// the candidate set (`group_accounts`) AND `supported_providers` both go empty, so
+/// there is nothing account-derived left and the protocol column falls to "unknown"
+/// for the orphaned VK. `protocol_type` comes from the VK's group BINDING (not the
+/// accounts), so it SURVIVES member removal ("anthropic" stays) — the stable source.
+/// `None` only when both are empty (truly no protocol info) → caller renders "unknown".
+fn team_protocol_source<'a>(provider_code: &'a str, protocol_type: &'a str) -> Option<&'a str> {
+    if !provider_code.is_empty() {
+        Some(provider_code)
+    } else if !protocol_type.is_empty() {
+        Some(protocol_type)
+    } else {
+        None
+    }
+}
+
 fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Value> {
     let entries = match storage::list_virtual_key_cache_readonly() {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
+    // Same cluster-awareness as the picker / use / set-route paths — on a
+    // cluster a claimed central key routes via the node and IS usable
+    // without local ciphertext (key_material_reachable's contract).
+    let on_cluster = crate::commands_account::read_cluster_node().is_some();
     entries
         .into_iter()
         .map(|t| {
             let effective_alias = t.local_alias.clone().unwrap_or_else(|| t.alias.clone());
             let route_token = format!("aikey_team_{}", t.virtual_key_id);
-            let effective_status =
-                team_effective_status(&t.key_status, &t.share_status, &t.local_state);
+            // Merge the proxy's fresh live status onto the candidate snapshot ONCE —
+            // reused both for the usability overlay below and the group_accounts emit,
+            // so login_status/current_routed are computed a single time.
+            let merged_accounts =
+                merge_group_accounts_live(t.group_accounts.as_deref(), t.group_runtime.as_deref());
+            // Base status from key/share/local; group VKs get a usability overlay: a
+            // claimed+active group VK whose CURRENT ROUTED account isn't logged in can't
+            // route. The overlay splits that into `needs_login` (routed account exists,
+            // just needs a token — actionable) vs `inactive` (no routable account at all
+            // → GROUP_NO_CANDIDATES) so the member sees the actionable case distinctly
+            // (owner rule 2026-06-30, 防呆 refinement 2026-07-03). login_status is the
+            // FRESH proxy value, so this flips to active within the proxy's ≤60s poll
+            // after the routed account logs in.
+            let effective_status = {
+                let base = team_effective_status(&t.key_status, &t.share_status, &t.local_state);
+                let is_group_vk = t.oauth_group_id.as_deref().is_some_and(|s| !s.is_empty());
+                if base == "active" && is_group_vk {
+                    match routed_candidate_state(merged_accounts.as_ref()) {
+                        RoutedState::LoggedIn => "active",
+                        RoutedState::NeedsLogin => "needs_login",
+                        RoutedState::NoCandidate => "inactive",
+                    }
+                } else if base == "active" && !t.key_material_reachable(on_cluster) {
+                    // 2026-07-06 (update/20260706-绑定材料守卫与Web解锁态全量sync.md):
+                    // direct-bind VK whose provider key material never arrived
+                    // locally (and can't route via a cluster node). Without this
+                    // overlay the web chip said "active" — and the IN USE badge
+                    // (binding-driven, deliberately decoupled from usability)
+                    // could claim a key the proxy 503s on. Same predicate as the
+                    // picker's pending rows, so both surfaces tell one story.
+                    // Actionable like needs_login: unlock+reload or `aikey key
+                    // sync` downloads the material and this flips back to active.
+                    "pending_download"
+                } else {
+                    base
+                }
+            };
             // Wire-shape normalization for TeamVaultRecord:
             //   - share_status "pending_claim" → "pending" (UI union is
             //     'pending' | 'claimed' | 'revoked'). Pass through
@@ -246,7 +481,7 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
                 "virtual_key_id": t.virtual_key_id,
                 "alias": effective_alias,
                 "local_alias": t.local_alias,
-                "protocol_family": protocol_family_of(Some(&t.provider_code)),
+                "protocol_family": protocol_family_of(team_protocol_source(&t.provider_code, &t.protocol_type)),
                 "supported_providers": t.supported_providers,
                 "share_status": share_status_wire,
                 "effective_status": effective_status,
@@ -275,6 +510,24 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
                 // Cloned (rather than moved) because t is iterated via
                 // .map(|t| ...) and `last_test` lives behind a Ref.
                 "extra": t.extra.clone(),
+                // N6 oauth_group projection (Stage A): surface which shared group
+                // this VK joined + the candidate accounts behind it, so the /user
+                // web can show "joined group X, routed to account Y (default)".
+                // Only group VKs carry these (direct-bind VKs → null). group_accounts
+                // is the key-sync candidate snapshot; merge_group_accounts_live folds
+                // the proxy's fresh group_runtime status (login_status override +
+                // current_routed) onto each candidate so the web shows LIVE state
+                // (C1+C2, 2026-06-30) without a manual key sync. null on absent/corrupt.
+                "oauth_group_id": t.oauth_group_id,
+                // group_alias: the OAuth group's name (server-synced) so /user/vault +
+                // `aikey use` label WHICH group this VK routes into — a member in
+                // multiple groups gets one VK per group (2026-07-01).
+                "group_alias": t.group_alias,
+                "group_accounts": merged_accounts,
+                // owner_email: the owning account's email (stamped by sync). Lets
+                // /user/vault show "Owner: <email>" in the drawer — persists for a
+                // group VK left behind after that account logs out.
+                "owner_email": t.owner_email,
             })
         })
         .collect()
@@ -352,11 +605,83 @@ pub fn handle(env: StdinEnvelope) {
         "list_personal_with_masked" => handle_list_personal_with_masked(env),
         "list_oauth" => handle_list_oauth(env),
         "list_metadata_locked" => handle_list_metadata_locked(env),
+        "snapshot_sync" => handle_snapshot_sync(env),
         other => emit_error(
             req_id,
             "I_UNKNOWN_ACTION",
             format!("unknown query action: '{}'", other),
         ),
+    }
+}
+
+// ========== snapshot_sync ==========
+
+/// `snapshot_sync`: pull the account's managed-keys snapshot from Control and
+/// upsert the local VK metadata cache (`managed_virtual_keys_cache`).
+///
+/// # Why this exists
+/// The Web vault page reads the LOCAL VK cache. That cache is only written by
+/// `run_snapshot_sync` — historically triggered by user CLI commands (`aikey
+/// list`) or the `aikey agent` daemon. The always-on aikey-proxy has rails for
+/// the DYNAMIC columns (group_runtime / quota / routing) but NONE that pull the
+/// structural VK-row snapshot, so a newly-issued team/group VK never lands in
+/// the cache until the CLI happens to run — the Web page then shows a stale list
+/// (missing key / "unknown" protocol). This action lets the local-server refresh
+/// the cache itself, decoupled from the CLI/agent.
+///
+/// # Contract
+/// - Reuses the public sync cores (no parallel impl) — the
+///   `_internal must reuse public core` rule.
+/// - Two tiers keyed by the envelope's `vault_key_hex` (2026-07-06,
+///   update/20260706-绑定材料守卫与Web解锁态全量sync.md):
+///     - absent / placeholder → metadata-only `run_snapshot_sync` (works
+///       locked; no provider secret material to encrypt);
+///     - real verifying vault_key (unlocked web session) → FULL
+///       `run_full_snapshot_sync_with_vault_key` (claim + key-material
+///       download), so a web page load self-heals a missing
+///       `provider_key_ciphertext` instead of leaving the key stuck in
+///       "pending download" until someone runs `aikey key sync` in a
+///       terminal. Material MUST be encrypted with the vault key before it
+///       touches disk — that is WHY the locked tier cannot download it.
+///     - a NON-verifying non-placeholder key is an error envelope, not a
+///       silent downgrade (fail-visible; a stale session cookie should
+///       surface, and the full core strict-verifies anyway).
+/// - Best-effort by design: the caller (local-server) fires this in the
+///   BACKGROUND and ignores the result. It must NEVER be on the vault read's
+///   critical path — offline use must return the local cache instantly. Errors
+///   (offline / Control down) come back as a status envelope, not a panic.
+/// - Version-gated: metadata tier inside `run_snapshot_sync` (fast
+///   sync-version check); the full tier's material step is gated by the
+///   separate `last_material_sync_version` marker + ciphertext-absence check.
+/// Whether the envelope carries a REAL vault_key (unlocked web session) as
+/// opposed to "deliberately none": empty string (Go read-path convention) or
+/// the all-zero PlaceholderHex (Go cli.PlaceholderHex). Only a real key
+/// selects the full sync tier; a real-but-wrong key must ERROR (fail-visible),
+/// never silently downgrade to metadata-only — that split lives in the caller.
+fn envelope_has_real_vault_key(vault_key_hex: &str) -> bool {
+    !vault_key_hex.is_empty() && !vault_key_hex.chars().all(|c| c == '0')
+}
+
+fn handle_snapshot_sync(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+    if envelope_has_real_vault_key(&env.vault_key_hex) {
+        let key = match verify_key(&env) {
+            Ok(k) => k,
+            Err((code, msg)) => return emit_error(req_id, code, msg),
+        };
+        return match crate::commands_account::run_full_snapshot_sync_with_vault_key(&key) {
+            Ok(downloaded) => emit(&ResultEnvelope::ok(
+                req_id,
+                json!({ "synced": true, "downloaded": downloaded, "full": true }),
+            )),
+            Err(e) => emit_error(req_id, "I_SNAPSHOT_SYNC_FAILED", e),
+        };
+    }
+    match crate::commands_account::run_snapshot_sync() {
+        // `applied` = true when a newer snapshot was pulled + written; false when
+        // already up-to-date or not logged in. Both are success for the caller.
+        Ok(applied) => emit(&ResultEnvelope::ok(req_id, json!({ "synced": applied }))),
+        Err(e) => emit_error(req_id, "I_SNAPSHOT_SYNC_FAILED", e),
     }
 }
 
@@ -1113,6 +1438,255 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
 }
 
 #[cfg(test)]
+mod merge_group_accounts_live_tests {
+    use super::*;
+
+    // Two candidates: a1 (assigned, snapshot says needs_login) and a2.
+    const SNAPSHOT: &str = r#"[
+        {"account_id":"a1","identity":"a1@x","assigned":true,"login_status":"needs_login"},
+        {"account_id":"a2","identity":"a2@x","assigned":false,"login_status":"needs_login"}
+    ]"#;
+
+    fn login_status(v: &serde_json::Value, account_id: &str) -> String {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["account_id"] == account_id)
+            .unwrap()["login_status"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+    fn current_routed(v: &serde_json::Value, account_id: &str) -> bool {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["account_id"] == account_id)
+            .unwrap()["current_routed"]
+            .as_bool()
+            .unwrap()
+    }
+
+    // C1 core: proxy's fresh needs_login=false OVERRIDES the stale snapshot
+    // "needs_login" → "logged_in". This is the exact reported bug (logged in but
+    // vault shows 待登录). Break the override (keep snapshot) and this fails.
+    #[test]
+    fn proxy_fresh_login_overrides_stale_snapshot() {
+        let runtime =
+            r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":true}}"#;
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
+        assert_eq!(
+            login_status(&merged, "a1"),
+            "logged_in",
+            "fresh token → logged_in"
+        );
+        assert_eq!(login_status(&merged, "a2"), "needs_login", "still no token");
+    }
+
+    // C2 core: is_current_routed from the proxy is surfaced as current_routed.
+    #[test]
+    fn current_routed_flag_surfaced() {
+        let runtime =
+            r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":false}}"#;
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
+        assert!(current_routed(&merged, "a1"), "a1 is the routed account");
+        assert!(!current_routed(&merged, "a2"), "a2 is not routed");
+    }
+
+    // Fallback: proxy hasn't polled (no group_runtime) → snapshot login_status kept,
+    // current_routed defaults false (unknown, not wrongly true).
+    #[test]
+    fn no_runtime_falls_back_to_snapshot() {
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), None).unwrap();
+        assert_eq!(
+            login_status(&merged, "a1"),
+            "needs_login",
+            "snapshot fallback"
+        );
+        assert!(
+            !current_routed(&merged, "a1"),
+            "unknown routed → false, not true"
+        );
+    }
+
+    // Finer failure reason preserved: proxy says needs_login=true but snapshot has the
+    // specific "revoked" → keep "revoked" (unusable either way, but more informative).
+    #[test]
+    fn unusable_keeps_finer_snapshot_reason() {
+        let snap = r#"[{"account_id":"a1","assigned":true,"login_status":"revoked"}]"#;
+        let runtime = r#"{"a1":{"needs_login":true}}"#;
+        let merged = merge_group_accounts_live(Some(snap), Some(runtime)).unwrap();
+        assert_eq!(login_status(&merged, "a1"), "revoked");
+    }
+
+    // Direct-bind VK (no candidates) → None (web renders no group panel).
+    #[test]
+    fn direct_bind_returns_none() {
+        assert!(merge_group_accounts_live(None, None).is_none());
+        assert!(merge_group_accounts_live(Some("not json"), None).is_none());
+    }
+
+    fn ids(v: &serde_json::Value) -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["account_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+    fn find<'a>(v: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["account_id"] == id)
+            .unwrap()
+    }
+
+    // 2026-07-01 membership: the fast rail is AUTHORITATIVE for the candidate LIST. An
+    // account the key-sync snapshot doesn't know yet (a3, added since last sync) but the
+    // proxy delivers MUST appear — rendered with its rail-supplied identity/provider/
+    // priority (not a bare UUID). 能红: the old "iterate the snapshot" merge never adds a3.
+    #[test]
+    fn fast_rail_adds_new_account_with_meta() {
+        let runtime = r#"{
+            "a1":{"needs_login":false,"is_current_routed":true},
+            "a2":{"needs_login":true},
+            "a3":{"needs_login":true,"identity":"a3@x","provider_code":"anthropic","priority":5}
+        }"#;
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
+        assert!(
+            ids(&merged).contains(&"a3".to_string()),
+            "fast-rail-only account must appear: {:?}",
+            ids(&merged)
+        );
+        let a3 = find(&merged, "a3");
+        assert_eq!(a3["identity"], "a3@x", "identity from the rail");
+        assert_eq!(
+            a3["provider_code"], "anthropic",
+            "provider_code from the rail"
+        );
+        assert_eq!(a3["priority"], 5, "priority from the rail");
+        assert_eq!(a3["login_status"], "needs_login");
+    }
+
+    // Membership: an account still in the (stale) snapshot but NO LONGER delivered by the
+    // rail (removed from the group) MUST drop from the list. 能红: old merge keeps a2.
+    #[test]
+    fn fast_rail_drops_removed_account() {
+        let runtime = r#"{"a1":{"needs_login":false,"is_current_routed":true}}"#;
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
+        assert_eq!(
+            ids(&merged),
+            vec!["a1".to_string()],
+            "a2 (gone from rail) must drop"
+        );
+    }
+
+    // For an account in BOTH, the richer snapshot metadata is preserved (identity/assigned
+    // from the snapshot), only the rail-authoritative flags overlay.
+    #[test]
+    fn account_in_both_keeps_snapshot_meta() {
+        let runtime =
+            r#"{"a1":{"needs_login":false,"is_current_routed":true},"a2":{"needs_login":false}}"#;
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
+        let a1 = find(&merged, "a1");
+        assert_eq!(a1["identity"], "a1@x", "snapshot identity preserved");
+        assert_eq!(a1["assigned"], true, "snapshot assigned preserved");
+        assert_eq!(a1["login_status"], "logged_in", "rail overlay");
+    }
+}
+
+#[cfg(test)]
+mod team_protocol_source_tests {
+    use super::*;
+
+    // Direct VK: provider_code present → use it.
+    #[test]
+    fn provider_code_wins_when_present() {
+        assert_eq!(
+            team_protocol_source("anthropic", "openai_compatible"),
+            Some("anthropic")
+        );
+    }
+
+    // Orphaned group VK (seat unbound): provider_code empty → fall back to the stable,
+    // binding-derived protocol_type. 能红: drop the protocol_type fallback → returns
+    // None → protocol renders "unknown" for the orphaned VK (the reported bug).
+    #[test]
+    fn falls_back_to_protocol_type_when_provider_code_empty() {
+        assert_eq!(team_protocol_source("", "anthropic"), Some("anthropic"));
+    }
+
+    // Both empty → no protocol info at all → None (caller renders "unknown", honest).
+    #[test]
+    fn none_when_both_empty() {
+        assert_eq!(team_protocol_source("", ""), None);
+    }
+}
+
+#[cfg(test)]
+mod routed_candidate_state_tests {
+    use super::*;
+    use serde_json::json;
+
+    // Owner rule (2026-06-30): usable iff the CURRENT ROUTED account (engine pick) is
+    // logged in. current_routed=a1 logged_in → LoggedIn (→ active).
+    #[test]
+    fn routed_account_logged_in_is_logged_in() {
+        let m = json!([
+            {"account_id":"a1","assigned":true,"current_routed":true,"login_status":"logged_in"},
+            {"account_id":"a2","assigned":false,"current_routed":false,"login_status":"needs_login"}
+        ]);
+        assert_eq!(routed_candidate_state(Some(&m)), RoutedState::LoggedIn);
+    }
+
+    // STRICT: logged into a NON-routed account does NOT count. routed (a1) needs_login,
+    // a2 logged_in but not routed → NeedsLogin (→ the actionable state, not active).
+    // 能红: a looser "any logged in" gate would wrongly return LoggedIn.
+    #[test]
+    fn logged_into_non_routed_account_is_needs_login() {
+        let m = json!([
+            {"account_id":"a1","assigned":true,"current_routed":true,"login_status":"needs_login"},
+            {"account_id":"a2","assigned":false,"current_routed":false,"login_status":"logged_in"}
+        ]);
+        assert_eq!(routed_candidate_state(Some(&m)), RoutedState::NeedsLogin);
+    }
+
+    // Fallback: proxy hasn't stamped current_routed yet → use the static default
+    // (assigned = rank-0). assigned a1 logged_in → LoggedIn.
+    #[test]
+    fn falls_back_to_assigned_when_no_current_routed() {
+        let m = json!([
+            {"account_id":"a1","assigned":true,"login_status":"logged_in"},
+            {"account_id":"a2","assigned":false,"login_status":"needs_login"}
+        ]);
+        assert_eq!(routed_candidate_state(Some(&m)), RoutedState::LoggedIn);
+    }
+
+    // 无可用账号: empty candidate set (seat unbound) → NoCandidate (→ genuine inactive,
+    // NOT needs_login — there is nothing to log into). 能红: collapsing NoCandidate into
+    // NeedsLogin would wrongly offer a login CTA for an unbindable seat.
+    #[test]
+    fn empty_candidate_set_is_no_candidate() {
+        assert_eq!(
+            routed_candidate_state(Some(&json!([]))),
+            RoutedState::NoCandidate
+        );
+        assert_eq!(routed_candidate_state(None), RoutedState::NoCandidate);
+    }
+
+    // All needs_login (member signed into nothing) → routed account needs_login →
+    // NeedsLogin (the 防呆 case the vault page surfaces as amber "待登录" + login CTA).
+    #[test]
+    fn all_needs_login_is_needs_login() {
+        let m = json!([
+            {"account_id":"a1","assigned":true,"login_status":"needs_login"},
+            {"account_id":"a2","assigned":false,"login_status":"needs_login"}
+        ]);
+        assert_eq!(routed_candidate_state(Some(&m)), RoutedState::NeedsLogin);
+    }
+}
+
+#[cfg(test)]
 mod active_binding_refs_tests {
     use super::*;
     use crate::storage;
@@ -1495,5 +2069,121 @@ mod protocol_family_of_tests {
         // 输入大小写无关
         assert_eq!(protocol_family_of(Some("KIMI_CODE")), "kimi");
         assert_eq!(protocol_family_of(Some("Moonshot")), "kimi");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_sync_tier_tests {
+    use super::envelope_has_real_vault_key;
+
+    // Two-tier snapshot_sync dispatch (2026-07-06,
+    // update/20260706-绑定材料守卫与Web解锁态全量sync.md): the web bridge sends
+    // "" or the all-zero PlaceholderHex when locked (→ metadata-only tier) and
+    // the session's real vault_key when unlocked (→ full tier with key-material
+    // download). Misclassifying the placeholder as "real" would make every
+    // locked page load fail with I_VAULT_KEY_INVALID; misclassifying a real
+    // key as "none" would silently never download material.
+
+    #[test]
+    fn empty_hex_is_not_a_real_key() {
+        assert!(!envelope_has_real_vault_key(""));
+    }
+
+    #[test]
+    fn all_zero_placeholder_is_not_a_real_key() {
+        // Byte-identical to Go's cli.PlaceholderHex.
+        let placeholder = "0".repeat(64);
+        assert!(!envelope_has_real_vault_key(&placeholder));
+    }
+
+    #[test]
+    fn real_key_hex_selects_full_tier() {
+        let key = "42".repeat(32);
+        assert!(envelope_has_real_vault_key(&key));
+    }
+}
+
+#[cfg(test)]
+mod team_status_overlay_tests {
+    //! pending_download overlay (2026-07-06,
+    //! update/20260706-绑定材料守卫与Web解锁态全量sync.md): a direct-bind VK whose
+    //! key material never arrived locally must NOT read "active" on the web
+    //! vault — the proxy 503s on it. Regression pin for the display-split
+    //! incident (web IN USE + chip active vs picker hides vs 503).
+    use super::*;
+    use crate::storage;
+
+    fn setup_vault() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).expect("salt");
+        let pw = secrecy::SecretString::new("test_password".to_string());
+        storage::initialize_vault(&salt, &pw).expect("init vault");
+        (dir, guard)
+    }
+
+    fn vk(id: &str, ciphertext: Option<&[u8]>) -> storage::VirtualKeyCacheEntry {
+        storage::VirtualKeyCacheEntry {
+            virtual_key_id: id.into(),
+            org_id: "org-1".into(),
+            seat_id: "seat-1".into(),
+            alias: id.into(),
+            provider_code: "anthropic".into(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: "cred-1".into(),
+            credential_revision: "r1".into(),
+            virtual_key_revision: "vr1".into(),
+            key_status: "active".into(),
+            share_status: "claimed".into(),
+            local_state: "synced_inactive".into(),
+            expires_at: None,
+            provider_key_nonce: ciphertext.map(|_| vec![0u8; 12]),
+            provider_key_ciphertext: ciphertext.map(|c| c.to_vec()),
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec!["anthropic".into()],
+            provider_base_urls: std::collections::HashMap::new(),
+            owner_account_id: Some("acct-1".into()),
+            owner_email: None,
+            group_runtime: None,
+            group_alias: None,
+            extra: None,
+            oauth_group_id: None,
+            group_accounts: None,
+            routing_config: None,
+        }
+    }
+
+    fn emitted_status(vk_id: &str) -> String {
+        let records = team_records_for_emit(&HashMap::new());
+        records
+            .iter()
+            .find(|r| r["virtual_key_id"] == vk_id)
+            .expect("record present")["effective_status"]
+            .as_str()
+            .expect("status string")
+            .to_string()
+    }
+
+    #[test]
+    fn direct_bind_vk_without_material_reads_pending_download() {
+        let (_dir, _guard) = setup_vault();
+        storage::upsert_virtual_key_cache(&vk("vk-nomat", None)).unwrap();
+        assert_eq!(emitted_status("vk-nomat"), "pending_download");
+    }
+
+    #[test]
+    fn direct_bind_vk_with_material_reads_active() {
+        let (_dir, _guard) = setup_vault();
+        storage::upsert_virtual_key_cache(&vk("vk-mat", Some(b"cipher"))).unwrap();
+        assert_eq!(emitted_status("vk-mat"), "active");
     }
 }

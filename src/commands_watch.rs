@@ -1275,11 +1275,11 @@ fn spawn_wal_watcher(
 /// file / dead process both produce alive=false; the TUI renders the
 /// difference visually.
 fn probe_proxy() -> (Option<u32>, bool) {
-    let Some(home) = std::env::var_os("HOME") else {
-        return (None, false);
-    };
-    let pid_path = PathBuf::from(home)
-        .join(".aikey")
+    // resolve_aikey_dir (HOME → USERPROFILE → dirs), NOT env::var("HOME"):
+    // native Windows has no HOME, so the old direct read returned early and
+    // `aikey watch` permanently rendered the proxy as dead there (parity
+    // audit 2026-07-07 P2-1 point fix).
+    let pid_path = crate::commands_account::resolve_aikey_dir()
         .join("run")
         .join("proxy.pid");
     let Ok(content) = std::fs::read_to_string(&pid_path) else {

@@ -422,8 +422,10 @@ pub struct SuiteOutcome {
     pub proxy: Option<ProxyProbeResult>,
     /// Targets we could not construct — printed in the "cannot test" block.
     pub build_errors: Vec<BuildTargetError>,
-    /// True if any row's chat probe returned 2xx. Drives `aikey add`'s
-    /// "Add anyway? [y/N]" prompt.
+    /// True if any row reached the deepest enabled connectivity gate.
+    /// Historically this meant Chat 2xx; with Chat skipped by policy it
+    /// means API success. Kept under the old field name for caller
+    /// compatibility.
     pub any_chat_ok: bool,
     /// JSON payload for `--json` mode; empty in interactive mode.
     pub json_results: Vec<serde_json::Value>,
@@ -868,6 +870,8 @@ mod connectivity_suite_tests {
             chat_ok: false,
             chat_ms: 0,
             chat_status: None,
+            chat_skipped: false,
+            chat_skip_reason: None,
             chat_body_snippet: None,
         };
         // Ping(DIRECT) must not participate in success bookkeeping —
@@ -895,6 +899,8 @@ mod connectivity_suite_tests {
             chat_ok: false,
             chat_ms: 0,
             chat_status: None,
+            chat_skipped: false,
+            chat_skip_reason: None,
             chat_body_snippet: None,
         };
         assert!(

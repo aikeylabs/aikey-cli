@@ -64,7 +64,9 @@ pub fn load_config() -> Result<GlobalConfig, String> {
 
     let content =
         fs::read_to_string(&path).map_err(|e| format!("Failed to read global config: {}", e))?;
-    serde_json::from_str(&content).map_err(|e| format!("Failed to parse global config: {}", e))
+    // Tolerate a UTF-8 BOM from Windows editors/tools (see crate::strip_bom docs).
+    serde_json::from_str(crate::strip_bom(&content))
+        .map_err(|e| format!("Failed to parse global config: {}", e))
 }
 
 pub fn save_config(config: &GlobalConfig) -> Result<(), String> {

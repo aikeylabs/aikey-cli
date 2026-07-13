@@ -290,11 +290,12 @@ pub(crate) enum Commands {
         /// secrets, profile, usage-ledger, bulk-import, quick-import, trust) —
         /// resolved by the web UI.
         ///
-        /// Service control: pass `start`, `stop`, or `restart` instead of a
-        /// page name to start / stop / restart the local web service
+        /// Service control: pass `start`, `stop`, `restart`, or `status`
+        /// instead of a page name to control / inspect the local web service
         /// (aikey-local-server on Personal, aikey-trial-server on Trial).
-        /// Production servers are not managed here — use the server-install
-        /// runbook on the server host instead.
+        /// `status` reports whether it's running, on which port, and the
+        /// vault lock state. Production servers are not managed here — use the
+        /// server-install runbook on the server host instead.
         page: Option<String>,
         /// Shortcut for `aikey web import` — opens the Import page directly.
         #[arg(long)]
@@ -536,18 +537,25 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: AppAction,
     },
-    /// Manage AiKey background services (`start` / `stop` / `restart`).
+    /// Manage AiKey background services (`start` / `stop` / `restart` / `status`).
     ///
-    /// Generic service-control namespace for any AiKey-owned daemon
-    /// that runs as a user-scope launchd / systemd unit. Today the
-    /// only registered service is `trust-local` (degrade-detector).
-    /// Refuses to operate on names not in the whitelist — this is NOT
-    /// a generic launchd/systemd wrapper.
+    /// Umbrella service-control namespace for the AiKey-owned daemons.
+    /// Registered services (closed whitelist): `web` (local-server /
+    /// trial-server console), `proxy` (aikey-proxy), `trust-local`
+    /// (degrade-detector observer). Refuses names outside the whitelist —
+    /// this is NOT a generic launchd/systemd wrapper.
+    ///
+    /// The per-service namespaces (`aikey proxy ...`, `aikey web ...`) and
+    /// this umbrella share ONE implementation core per service, so
+    /// `aikey service status proxy` and `aikey proxy status` print the same
+    /// thing. Bare `aikey service status` (no name) prints a one-line
+    /// summary of every service at once.
     ///
     /// Examples:
-    ///   aikey service start trust-local
-    ///   aikey service restart trust-local
-    ///   aikey service stop trust-local
+    ///   aikey service status                 # all services, one line each
+    ///   aikey service status trust-local     # one service, full detail
+    ///   aikey service restart web
+    ///   aikey service stop proxy
     #[command(display_order = 27)]
     Service {
         #[command(subcommand)]
@@ -572,6 +580,10 @@ pub(crate) enum ServiceAction {
     Stop { name: Option<String> },
     /// Restart a registered AiKey service.
     Restart { name: Option<String> },
+    /// Show service status. Without a name: one-line summary of every
+    /// service. With a name (`web` / `proxy` / `trust-local`): full detail
+    /// for that one — delegates to the same probe as `aikey <name> status`.
+    Status { name: Option<String> },
 }
 
 /// Subcommands for `aikey trust` (M4).
@@ -1463,6 +1475,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 ServiceAction::Start { .. } => "service.start".to_string(),
                 ServiceAction::Stop { .. } => "service.stop".to_string(),
                 ServiceAction::Restart { .. } => "service.restart".to_string(),
+                ServiceAction::Status { .. } => "service.status".to_string(),
             },
         },
     }
@@ -1725,46 +1738,53 @@ AiKey - Secure local-first secret management
 Usage: aikey [OPTIONS] [COMMAND]
 
 Commands:
+  {b}account{r} <command>        Manage your aikey account session
+  {b}activate{r} <alias>          Temporarily activate a key in the current terminal
   {b}add{r} <alias>              Save a new secret to the vault
   {b}auth{r} <command>           Manage provider OAuth accounts (Claude, Codex, Kimi)
-  {b}list{r}                     Show all personal, team, and OAuth keys (alias for `key list`)
-  {b}test{r} <alias>             Test whether a stored API key alias is working
-  {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
-  {b}unuse{r} <provider...>      Remove the active binding for one or more providers
-  {b}activate{r} <alias>          Temporarily activate a key in the current terminal
+  {b}change-password{r}          Change the vault master password
   {b}deactivate{r}               Restore global settings in the current terminal
-  {b}route{r} [label]            Show proxy route tokens for third-party AI clients
-  {b}login{r}                    Log in to aikey service (shortcut for `account login`)
-  {b}web{r} [page]               Open the User Console in your default browser
-  {b}master{r} [page]            Open the Master Console (admin) in your default browser
+  {b}delete{r} <alias>           Delete a secret from the vault
   {b}doctor{r}                   Check system health, connectivity, and configuration
   {b}env{r} [command]            View or set proxy environment variables
-  {b}proxy{r} <command>          Manage the local proxy process
-  {b}status{r}                   Show a summary of gateway, login, keys, and providers
-  {b}whoami{r}                   Show your current login, active key, and vault status
-  {b}get{r} <alias>              Retrieve a secret and copy it to the clipboard
-  {b}run{r} -- <command>         Run a command with secrets injected as environment variables
-  {b}key{r} <command>            Manage API keys (rotate, list, sync, use)
-  {b}quickstart{r}               Show a state-aware landing page with the next most useful commands
-  {b}project{r} <command>        Manage project configuration
-  {b}logs{r}                     Show recent activity logs
-  {b}update{r} <alias>           Update an existing secret
-  {b}delete{r} <alias>           Delete a secret from the vault
   {b}export{r} <pattern> <file>  Export secrets to an encrypted backup file
-  {b}change-password{r}          Change the vault master password
-  {b}account{r} <command>        Manage your aikey account session
-  {b}logout{r}                   Log out of the current session (shortcut for `account logout`)
-  {b}secret{r} <command>         Manage secrets and platform-backed secret actions
-  {b}statusline{r}               Render a one-line usage receipt for Claude Code's status line
-  {b}watch{r}                    Show a top-style dashboard of recent key usage
+  {b}get{r} <alias>              Retrieve a secret and copy it to the clipboard
   {b}help{r}                     Show this help message or help for a command
+  {b}key{r} <command>            Manage API keys (rotate, list, sync, use)
+  {b}list{r}                     Show all personal, team, and OAuth keys (alias for `key list`)
+  {b}login{r}                    Log in to aikey service (shortcut for `account login`)
+  {b}logout{r}                   Log out of the current session (shortcut for `account logout`)
+  {b}logs{r}                     Show recent activity logs
+  {b}master{r} [page]            Open the Master Console (admin) in your default browser
+  {b}project{r} <command>        Manage project configuration
+  {b}proxy{r} <command>          Manage the local proxy process
+  {b}quickstart{r}               Show a state-aware landing page with the next most useful commands
+  {b}route{r} [label]            Show proxy route tokens for third-party AI clients
+  {b}run{r} -- <command>         Run a command with secrets injected as environment variables
+  {b}secret{r} <command>         Manage secrets and platform-backed secret actions
+  {b}status{r}                   Show a summary of gateway, login, keys, and providers
+  {b}statusline{r}               Render a one-line usage receipt for Claude Code's status line
+  {b}test{r} <alias>             Test whether a stored API key alias is working
+  {b}unuse{r} <provider...>      Remove the active binding for one or more providers
+  {b}update{r} <alias>           Update an existing secret
+  {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
+  {b}watch{r}                    Show a top-style dashboard of recent key usage
+  {b}web{r} [page]               Open the User Console in your default browser
+  {b}whoami{r}                   Show your current login, active key, and vault status
 
 Options:
       --password-stdin  Read password from stdin instead of prompting
       --json            Output in JSON format (where supported)
   -V, --version         Print version information
   -h, --help            Print help
-      --detail          Print detailed help for all commands"
+      --detail          Print detailed help for all commands
+
+Frequently used:
+  {b}use{r} [alias]              Select the active key for routing (shortcut for `key use`)
+  {b}login{r}                    Log in to aikey service (shortcut for `account login`)
+  {b}doctor{r}                   Check system health, connectivity, and configuration
+  {b}web{r} [page]               Open the User Console in your default browser
+  {b}master{r} [page]            Open the Master Console (admin) in your default browser"
     );
 }
 
@@ -2984,5 +3004,49 @@ mod tests {
             },
         };
         assert_eq!(command_name(Some(&cmd)), "service.restart");
+
+        let cmd = Commands::Service {
+            action: ServiceAction::Status { name: None },
+        };
+        assert_eq!(command_name(Some(&cmd)), "service.status");
+    }
+
+    /// `aikey service status` (no name) parses with name=None so the
+    /// dispatcher renders the aggregate dashboard.
+    #[test]
+    fn aikey_service_status_no_name() {
+        let cli = Cli::try_parse_from(["aikey", "service", "status"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Service {
+                action: ServiceAction::Status { name: None }
+            })
+        ));
+    }
+
+    /// `aikey service status <name>` parses the name through for per-service
+    /// detail (web / proxy / trust-local).
+    #[test]
+    fn aikey_service_status_named() {
+        for svc in ["web", "proxy", "trust-local"] {
+            let cli = Cli::try_parse_from(["aikey", "service", "status", svc]).expect("parse");
+            assert!(matches!(
+                cli.command,
+                Some(Commands::Service { action: ServiceAction::Status { ref name } })
+                    if name.as_deref() == Some(svc)
+            ));
+        }
+    }
+
+    /// `aikey web status` parses as the Web command with page="status" —
+    /// main.rs intercepts that positional and routes to handle_web_status
+    /// (read-only) instead of opening a browser page named "status".
+    #[test]
+    fn aikey_web_status_parses_as_page_verb() {
+        let cli = Cli::try_parse_from(["aikey", "web", "status"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Web { ref page, .. }) if page.as_deref() == Some("status")
+        ));
     }
 }

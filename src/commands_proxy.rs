@@ -65,7 +65,7 @@ fn build_start_options(
     let config_path = resolve_config(config)?;
     let listen_addr = proxy_listen_addr(Some(&config_path));
 
-    let (extra_env, env_keys) = match crate::proxy_env::read_proxy_env() {
+    let (mut extra_env, env_keys) = match crate::proxy_env::read_proxy_env() {
         Ok(env_map) => {
             let keys: Vec<String> = env_map.keys().cloned().collect();
             let pairs: Vec<(String, String)> = env_map.into_iter().collect();
@@ -80,7 +80,16 @@ fn build_start_options(
             .into());
         }
     };
+    // AIKEY_PROXYENV_KEYS (2026-07-08 egress precedence refinement): tell the
+    // daemon WHICH env vars are the user's EXPLICIT aikey config (proxy.env)
+    // vs accidental shell inheritance (.zshrc exports, stale terminals). Only
+    // marked proxy vars outrank OS system-proxy detection; inherited ones are
+    // demoted to a fallback below it. Without this marker the system-proxy
+    // auto-follow layer never engaged on Clash-style machines (field evidence
+    // 2026-07-08: both the user's Mac and a Windows box).
+    extra_env.push(("AIKEY_PROXYENV_KEYS".to_string(), env_keys.join(",")));
 
+    let port_drift_enabled = read_yaml_port_drift_enabled(Some(&config_path));
     let opts = crate::proxy_lifecycle::StartOptions {
         config_path,
         binary_path,
@@ -88,8 +97,50 @@ fn build_start_options(
         healthy_deadline: crate::proxy_lifecycle::DEFAULT_HEALTHY_DEADLINE,
         stderr_target,
         extra_env,
+        port_drift_enabled,
     };
     Ok((opts, env_keys))
+}
+
+/// Whether `listen.port_drift_max` in the proxy yaml enables port drift.
+/// Mirrors the Go side's semantics (supervisor.Listen + config defaults):
+/// absent → default ON; `0` → coerced to the default (ON); only an explicit
+/// negative value means strict/OFF. Read failure → ON (the daemon's own
+/// default), so the CLI never refuses a start the daemon itself would accept.
+pub(crate) fn read_yaml_port_drift_enabled(config_path: Option<&std::path::Path>) -> bool {
+    let path = match config_path {
+        Some(p) => p.to_path_buf(),
+        None => match resolve_config(None) {
+            Ok(p) => p,
+            Err(_) => return true,
+        },
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return true,
+    };
+    let mut in_listen = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "listen:" {
+            in_listen = true;
+            continue;
+        }
+        if in_listen {
+            if let Some(rest) = trimmed.strip_prefix("port_drift_max:") {
+                if let Ok(n) = rest.trim().parse::<i64>() {
+                    return n >= 0;
+                }
+            } else if !trimmed.is_empty()
+                && !trimmed.starts_with('#')
+                && !trimmed.starts_with(' ')
+                && !line.starts_with(' ')
+            {
+                in_listen = false;
+            }
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -684,7 +735,66 @@ fn read_runtime_actual_addr() -> Option<String> {
     Some(actual)
 }
 
-fn runtime_snapshot_path() -> Option<std::path::PathBuf> {
+/// "started" row for `aikey proxy status` (2026-07-08): when the daemon was
+/// (re)started, plus a humanized uptime — the quick answer to "did the proxy
+/// just restart on me?" (self-heal exit-75 relaunches rewrite the snapshot,
+/// so this reflects the CURRENT incarnation, not the first-ever start).
+///
+/// Guard: the snapshot pid must match the pid `proxy_state` verified, so a
+/// stale proxy-runtime.json from a crashed prior incarnation is never
+/// attributed to the running process.
+fn runtime_started_row(expect_pid: u32) -> Option<String> {
+    let path = runtime_snapshot_path()?;
+    let text = fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    started_row_from_snapshot(&v, expect_pid, now)
+}
+
+/// Pure core of runtime_started_row, split out so tests drive it with a
+/// fixture snapshot + fixed clock (no env-var / filesystem coupling).
+fn started_row_from_snapshot(
+    v: &serde_json::Value,
+    expect_pid: u32,
+    now_secs: i64,
+) -> Option<String> {
+    if v.get("pid")?.as_i64()? != expect_pid as i64 {
+        return None;
+    }
+    let raw = v.get("started_at")?.as_str()?;
+    let started = crate::usage_wal::parse_rfc3339_secs(raw)?;
+    // The daemon writes started_at as UTC RFC3339; render "date time UTC"
+    // (drop fractional seconds) — en-US/UTC locked per code-and-ui-language.
+    if raw.len() < 19 {
+        return None;
+    }
+    let ts = format!("{} {} UTC", &raw[0..10], &raw[11..19]);
+    Some(format!(
+        "started: {} (up {})",
+        ts,
+        humanize_uptime(now_secs - started)
+    ))
+}
+
+/// 3661 → "1h 1m", 90061 → "1d 1h", 42 → "42s". Clock skew (negative) → "0s".
+fn humanize_uptime(secs: i64) -> String {
+    let s = secs.max(0);
+    let (d, h, m) = (s / 86400, (s % 86400) / 3600, (s % 3600) / 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {}s", s % 60)
+    } else {
+        format!("{s}s")
+    }
+}
+
+pub(crate) fn runtime_snapshot_path() -> Option<std::path::PathBuf> {
     if let Ok(dir) = std::env::var("AIKEY_RUN_DIR") {
         return Some(std::path::PathBuf::from(dir).join("proxy-runtime.json"));
     }
@@ -870,12 +980,21 @@ fn handle_start_foreground(
             owner_pid,
             reason,
         } => {
-            return Err(format!(
-                "cannot start in foreground: port {port} is owned by something \
-                 we cannot manage ({})",
-                reason.hint(port, owner_pid)
-            )
-            .into());
+            // 2026-07-08 (same rule as the detached path, e2e w2b): drift ON →
+            // the busy configured port is the proxy's problem to solve (it
+            // binds port+1..+max itself); other shells discover the actual
+            // port via proxy-runtime.json. Refuse only when drift is OFF.
+            if !read_yaml_port_drift_enabled(Some(&config_path)) {
+                return Err(format!(
+                    "cannot start in foreground: port {port} is owned by something \
+                     we cannot manage ({})",
+                    reason.hint(port, owner_pid)
+                )
+                .into());
+            }
+            eprintln!(
+                "[aikey] port {port} is busy — starting with port drift (proxy will bind the next free port)"
+            );
         }
         ProxyState::Crashed { stale_pid: _ } => {
             // Crashed cleanup happens here while we hold the lock so
@@ -930,27 +1049,6 @@ fn handle_start_foreground(
         .map_err(|e| format!("failed to spawn aikey-proxy: {}", e))?;
     let pid = child.id();
 
-    // Persist BOTH ownership anchor files so the proxy is recognized
-    // by Layer 1 as `Running` (not `LegacyPidfileNoSidecar`).
-    if let Err(e) = persist_ownership_files(pid, &proxy_bin, &config_path, &listen_addr) {
-        // Spawn succeeded but we can't anchor ownership — the proxy
-        // would otherwise be unmanageable from other shells. Kill the
-        // child to avoid leaving an unowned instance.
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(format!("failed to persist ownership files: {e}").into());
-    }
-
-    if let Ok(seq) = crate::storage::get_vault_change_seq() {
-        let _ = crate::storage::set_proxy_loaded_seq(seq);
-    }
-
-    // Release the lifecycle lock now that ownership files are written.
-    // The foreground proxy continues running independently; other
-    // shells' `aikey proxy stop / restart / status` see it as a
-    // first-class managed instance via the sidecar meta.
-    drop(_lock);
-
     // **Round-15 install-script fix #1**: forward SIGTERM / SIGINT
     // from this CLI to the spawned proxy child. Critical for
     // service-managed deployments (systemd Type=simple, launchd):
@@ -961,6 +1059,13 @@ fn handle_start_foreground(
     // restart, the new instance would see OrphanedPort, and the
     // service would fail to recover.
     //
+    // ORDERING (2026-07-08, e2e i3): installed IMMEDIATELY after spawn,
+    // BEFORE persist_ownership_files. The ownership meta is the public
+    // "you may manage me now" signal — a stop/SIGTERM arriving right
+    // after it appears must already find the forwarder installed, or
+    // the CLI dies by default disposition (killed-by-signal instead of
+    // forwarding + clean exit).
+    //
     // ctrlc 3.x supports installing a single global handler. We
     // capture child PID into a local closure context. Any
     // subsequent installation (also rare in CLI-shell contexts)
@@ -969,7 +1074,17 @@ fn handle_start_foreground(
     // that needs signal forwarding, so first-installation-wins is
     // fine for our model.
     let child_pid_for_signal = pid;
+    // Records that WE forwarded a shutdown signal, so the wait below can tell
+    // "child killed by the SIGTERM we sent" apart from a real crash. Needed
+    // because a signal landing in the child's first milliseconds (before the
+    // Go runtime installs its handler — see aikey-proxy main.go 2026-07-08
+    // Notify-first comment) still kills it via default disposition
+    // ("signal: 15" instead of graceful exit 0); that is an ORDERED shutdown,
+    // not a failure. e2e i3 pins this.
+    let forwarded_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let forwarded_shutdown_w = forwarded_shutdown.clone();
     let _ = ctrlc::set_handler(move || {
+        forwarded_shutdown_w.store(true, std::sync::atomic::Ordering::SeqCst);
         // Forward SIGTERM to the child. Best-effort: if the child is
         // already gone, libc::kill returns ESRCH which we silently
         // ignore. We do NOT exit the parent ourselves — child.wait()
@@ -994,6 +1109,27 @@ fn handle_start_foreground(
         let _ = child_pid_for_signal;
     });
 
+    // Persist BOTH ownership anchor files so the proxy is recognized
+    // by Layer 1 as `Running` (not `LegacyPidfileNoSidecar`).
+    if let Err(e) = persist_ownership_files(pid, &proxy_bin, &config_path, &listen_addr) {
+        // Spawn succeeded but we can't anchor ownership — the proxy
+        // would otherwise be unmanageable from other shells. Kill the
+        // child to avoid leaving an unowned instance.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("failed to persist ownership files: {e}").into());
+    }
+
+    if let Ok(seq) = crate::storage::get_vault_change_seq() {
+        let _ = crate::storage::set_proxy_loaded_seq(seq);
+    }
+
+    // Release the lifecycle lock now that ownership files are written.
+    // The foreground proxy continues running independently; other
+    // shells' `aikey proxy stop / restart / status` see it as a
+    // first-class managed instance via the sidecar meta.
+    drop(_lock);
+
     let status = child.wait()?;
 
     // Reverse order of write: pidfile first, sidecar second
@@ -1008,6 +1144,19 @@ fn handle_start_foreground(
         best_effort_remove(&p);
     }
     if !status.success() {
+        // Child died BY the shutdown signal we ourselves forwarded → ordered
+        // shutdown, not a failure (see forwarded_shutdown comment above).
+        // Unix-only: on Windows the handler never signals the child (no-op),
+        // so this branch cannot trigger there.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if forwarded_shutdown.load(std::sync::atomic::Ordering::SeqCst)
+                && matches!(status.signal(), Some(libc::SIGTERM) | Some(libc::SIGINT))
+            {
+                return Ok(());
+            }
+        }
         return Err(format!("aikey-proxy exited with status: {}", status).into());
     }
     Ok(())
@@ -1115,6 +1264,9 @@ pub fn status_rows() -> Vec<String> {
         } => {
             rows.push("status:  running (healthy)".to_string());
             rows.push(format!("pid:     {pid}"));
+            if let Some(row) = runtime_started_row(pid) {
+                rows.push(row);
+            }
             rows.push(format!("listen:  http://{listen_addr}"));
             match proxy_vault_state() {
                 ProxyVaultState::Current => rows.push("vault sync: current".to_string()),
@@ -1127,6 +1279,11 @@ pub fn status_rows() -> Vec<String> {
         ProxyState::Unresponsive { pid, port } => {
             rows.push("status:  unresponsive (port bound, /health not responding)".to_string());
             rows.push(format!("pid:     {pid}"));
+            // Uptime disambiguates "hung" from "still initializing": a
+            // seconds-old start says wait, an hours-old one says restart.
+            if let Some(row) = runtime_started_row(pid) {
+                rows.push(row);
+            }
             rows.push(format!("listen:  http://127.0.0.1:{port}"));
             rows.push(
                 "hint:    could be initializing or hung — wait or `aikey proxy restart`"
@@ -1813,6 +1970,175 @@ pub fn doctor_proxy_status() -> (bool, Option<u32>) {
         ProxyState::Crashed { stale_pid } => (false, Some(stale_pid)),
         ProxyState::OrphanedPort { owner_pid, .. } => (false, owner_pid),
         ProxyState::Stopped => (false, None),
+    }
+}
+
+/// Compact one-line status for the `aikey service status` aggregate.
+/// Returns `(running, "<detail>")`. Reuses the same `proxy_state()` truth
+/// source as `handle_status()` so the aggregate can never disagree with
+/// `aikey proxy status` — only the verbosity differs.
+pub fn status_summary() -> (bool, String) {
+    use crate::proxy_state::{proxy_state, ProxyState};
+    let addr = proxy_listen_addr(None);
+    match proxy_state(&addr) {
+        ProxyState::Running {
+            pid, listen_addr, ..
+        } => (true, format!("running on http://{listen_addr} (pid {pid})")),
+        ProxyState::Stopped => (false, "stopped".to_string()),
+        ProxyState::Crashed { stale_pid } => (false, format!("stopped (stale pid {stale_pid})")),
+        ProxyState::Unresponsive { pid, port } => (
+            false,
+            format!("unresponsive on :{port} (pid {pid}, /health not answering)"),
+        ),
+        ProxyState::OrphanedPort { port, .. } => {
+            (false, format!("port :{port} held by a foreign process"))
+        }
+    }
+}
+
+/// Layered egress-proxy decision reported by the RUNNING daemon
+/// (GET /admin/upstream-proxy `egress` block, 2026-07-08). Field names mirror
+/// aikey-proxy's admin.EgressState wire format.
+///
+/// WHY this comes from the daemon and not from this process: the daemon's env
+/// is the launchd/systemd spawn snapshot — usually NOT the user's shell env —
+/// and the daemon's `effective_*` is computed through the very ProxyFunc its
+/// forwarding transport runs, so what we display cannot diverge from what
+/// traffic actually does.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct EgressState {
+    #[serde(default)]
+    pub explicit_url: String,
+    #[serde(default)]
+    pub env_authoritative: bool,
+    #[serde(default)]
+    pub env_vars: std::collections::BTreeMap<String, String>,
+    /// Layer 4 (2026-07-08 refinement): proxy vars inherited from the spawn
+    /// shell — consulted only when user-set URL / proxy.env / system proxy
+    /// are all empty.
+    #[serde(default)]
+    pub env_inherited_vars: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub system_supported: bool,
+    #[serde(default)]
+    pub system_http: String,
+    #[serde(default)]
+    pub system_https: String,
+    #[serde(default)]
+    pub system_socks: String,
+    #[serde(default)]
+    pub effective_source: String,
+    #[serde(default)]
+    pub effective_url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct UpstreamProxyResponse {
+    egress: Option<EgressState>,
+}
+
+/// Fetch the layered egress decision from the running daemon.
+/// `Ok(None)` = daemon answered but predates the `egress` block (older
+/// binary); `Err` = daemon unreachable (not running / wrong port).
+pub fn fetch_egress_state() -> Result<Option<EgressState>, String> {
+    let addr = proxy_listen_addr(None);
+    // Plain agent on purpose: this is a loopback admin call and must never be
+    // routed through any proxy env of THIS shell.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(3))
+        .build();
+    let resp = agent
+        .get(&format!("http://{addr}/admin/upstream-proxy"))
+        .call()
+        .map_err(|e| format!("cannot reach proxy admin at {addr}: {e}"))?;
+    let body: UpstreamProxyResponse = resp
+        .into_json()
+        .map_err(|e| format!("invalid /admin/upstream-proxy response: {e}"))?;
+    Ok(body.egress)
+}
+
+#[cfg(test)]
+mod started_row_tests {
+    use super::*;
+
+    fn snap(pid: i64, started_at: &str) -> serde_json::Value {
+        serde_json::json!({"pid": pid, "started_at": started_at, "listen": {"actual_addr": "127.0.0.1:27200"}})
+    }
+
+    #[test]
+    fn renders_started_time_and_uptime() {
+        // started 2026-07-08T06:00:00Z, now = +2h13m — Go's fractional
+        // seconds must be dropped, uptime humanized.
+        let v = snap(4242, "2026-07-08T06:00:00.123456789Z");
+        let now = crate::usage_wal::parse_rfc3339_secs("2026-07-08T08:13:00Z").unwrap();
+        assert_eq!(
+            started_row_from_snapshot(&v, 4242, now).unwrap(),
+            "started: 2026-07-08 06:00:00 UTC (up 2h 13m)"
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_pid_mismatch_hides_row() {
+        // A leftover runtime.json from a previous incarnation (pid recycled)
+        // must never be attributed to the current process.
+        let v = snap(1111, "2026-07-08T06:00:00Z");
+        assert!(started_row_from_snapshot(&v, 4242, 0).is_none());
+    }
+
+    #[test]
+    fn uptime_humanizes_all_magnitudes() {
+        assert_eq!(humanize_uptime(42), "42s");
+        assert_eq!(humanize_uptime(5 * 60 + 12), "5m 12s");
+        assert_eq!(humanize_uptime(2 * 3600 + 13 * 60), "2h 13m");
+        assert_eq!(humanize_uptime(3 * 86400 + 4 * 3600), "3d 4h");
+        assert_eq!(humanize_uptime(-5), "0s"); // clock skew must not panic
+    }
+}
+
+#[cfg(test)]
+mod egress_state_tests {
+    use super::*;
+
+    // Wire-format contract with aikey-proxy's admin.EgressState JSON
+    // marshaling (internal/admin/upstream_proxy.go) — if a field name drifts
+    // on either side, this fixture goes red.
+    #[test]
+    fn parses_layered_egress_wire_format() {
+        let body = r#"{
+            "url": "",
+            "egress": {
+                "explicit_url": "",
+                "env_authoritative": false,
+                "env_inherited_vars": {"https_proxy": "http://127.0.0.1:7890"},
+                "system_supported": true,
+                "system_http": "http://127.0.0.1:7890",
+                "system_https": "http://127.0.0.1:7890",
+                "system_socks": "socks5://127.0.0.1:7891",
+                "effective_source": "system",
+                "effective_url": "http://127.0.0.1:7890"
+            }
+        }"#;
+        let resp: UpstreamProxyResponse = serde_json::from_str(body).unwrap();
+        let eg = resp.egress.expect("egress block present");
+        assert!(eg.system_supported);
+        assert_eq!(eg.effective_source, "system");
+        assert_eq!(eg.effective_url, "http://127.0.0.1:7890");
+        assert_eq!(eg.system_socks, "socks5://127.0.0.1:7891");
+        assert!(eg.env_vars.is_empty());
+        // Layer 4 (2026-07-08): inherited shell env travels separately.
+        assert_eq!(
+            eg.env_inherited_vars.get("https_proxy").map(String::as_str),
+            Some("http://127.0.0.1:7890")
+        );
+    }
+
+    // Older daemons answer the legacy {"url"} shape — must parse as None
+    // (CLI renders an "update aikey-proxy" hint, not an error).
+    #[test]
+    fn legacy_shape_without_egress_is_none() {
+        let resp: UpstreamProxyResponse =
+            serde_json::from_str(r#"{"url":"http://127.0.0.1:7890"}"#).unwrap();
+        assert!(resp.egress.is_none());
     }
 }
 

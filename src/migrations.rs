@@ -54,6 +54,123 @@ pub fn upgrade_all(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Per-build replay marker (vault-page lock-convoy fix, 2026-07-07)
+// ---------------------------------------------------------------------------
+
+/// `config` table key recording which binary BUILD last replayed the schema.
+const SCHEMA_REPLAYED_BY_KEY: &str = "schema.replayed_by";
+
+/// Identity of THIS binary for the replay marker. Includes the git revision
+/// (not just the version string) so dev/dirty builds sharing a version
+/// number still re-replay after a rebuild — a stale skip on a schema-
+/// changing dev build would be a debugging nightmare.
+fn current_schema_marker() -> String {
+    format!(
+        "{}:{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("AIKEY_BUILD_REVISION")
+    )
+}
+
+/// Outcome of [`ensure_schema_current`] — exposed so tests can assert the
+/// fast path actually skipped.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SchemaEnsure {
+    /// Marker matched this build — no write connection was opened.
+    SkippedFresh,
+    /// Full idempotent replay ran (first contact of this build, or marker
+    /// unreadable) and the marker was updated.
+    Replayed,
+}
+
+/// Pre-dispatch schema convergence with a read-only fast path.
+///
+/// Why this exists (2026-07-07 vault-page lock convoy, Windows live box):
+/// the vault has NO migration ledger — convergence = replaying the whole
+/// idempotent baseline. Several statements in that replay (`INSERT OR
+/// IGNORE` self-heal rows) are real write attempts that take SQLite's
+/// write lock even when they end up ignoring. Running that on EVERY
+/// command was fine for humans, but `_internal` bridge children are
+/// spawned by the web console many times per page load plus background
+/// polls — N concurrent replays queued on the vault write lock inflated a
+/// 52ms call to 1.2-3.3s (measured), and the vault page crawled.
+///
+/// The schema can only change when the BINARY changes, so the replay is
+/// now gated on a per-build marker in the `config` table:
+/// - marker == this build (read-only probe, no write lock) → skip;
+/// - anything else (missing marker / other build / unreadable / legacy
+///   vault without the row) → full replay, then stamp the marker.
+///
+/// Trade-off (user-approved 2026-07-07): self-heal frequency drops from
+/// "every command" to "once per binary build". Hand-damaged vault content
+/// between upgrades now needs an explicit `aikey db upgrade` (which still
+/// force-replays unconditionally) instead of healing on the next command.
+///
+/// Errors are returned for the caller to ignore-or-log — same "schema
+/// convergence must never block the command itself" stance as before.
+pub fn ensure_schema_current(vault_path: &std::path::Path) -> Result<SchemaEnsure, String> {
+    let marker = current_schema_marker();
+
+    // Fast path: probe over a NORMAL connection, not SQLITE_OPEN_READ_ONLY.
+    //
+    // Why not read-only (2026-07-07 Windows live regression of this very
+    // fix): opening a WAL database read-only depends on adopting the -shm
+    // mapping — exactly the fragile step behind the Go side's CANTOPEN(14)
+    // class on Windows. The RO open failed routinely there, every probe
+    // fell through to the full replay, and the write-lock convoy this
+    // marker exists to kill came right back (measured: `_internal rules`
+    // median 1.5s with the marker binary deployed, min 53ms ≈ solo-replay
+    // cost — the fast path was never taken). A default-mode connection
+    // avoids -shm adoption; the probe still only SELECTs, and WAL readers
+    // never block on writers, so it stays contention-free. busy_timeout
+    // guards the non-WAL edge. Probe failure of any kind (no config table
+    // yet, BLOB value, corrupt db) falls through to the replay, which owns
+    // real error handling.
+    let probe = Connection::open(vault_path).ok().and_then(|conn| {
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(1000));
+        conn.query_row(
+            "SELECT CAST(value AS TEXT) FROM config WHERE key = ?1",
+            [SCHEMA_REPLAYED_BY_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    });
+    if probe.as_deref() == Some(marker.as_str()) {
+        return Ok(SchemaEnsure::SkippedFresh);
+    }
+
+    let conn =
+        Connection::open(vault_path).map_err(|e| format!("open vault for schema replay: {}", e))?;
+    upgrade_all(&conn)?;
+    stamp_schema_marker(&conn)?;
+    Ok(SchemaEnsure::Replayed)
+}
+
+/// Record that THIS build has replayed the schema. Also called by the
+/// explicit `aikey db upgrade` path so a manual force-replay flips the
+/// next command onto the read-only fast path.
+pub fn stamp_schema_marker(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+        rusqlite::params![SCHEMA_REPLAYED_BY_KEY, current_schema_marker()],
+    )
+    .map_err(|e| format!("stamp schema marker: {}", e))?;
+    Ok(())
+}
+
+/// Remove the replay marker. Called after `aikey db rollback` so the next
+/// command re-converges the schema (preserves the pre-marker behavior
+/// where any command after a same-binary rollback immediately re-upgraded;
+/// the documented rollback flow installs an older binary next, whose own
+/// marker differs anyway).
+pub fn clear_schema_marker(conn: &Connection) {
+    let _ = conn.execute(
+        "DELETE FROM config WHERE key = ?1",
+        [SCHEMA_REPLAYED_BY_KEY],
+    );
+}
+
 /// Rollback vault schema from current state down to target version.
 /// Walks the registry in reverse, calling rollback() for each version
 /// that is AFTER the target. Supports crossing multiple versions.
@@ -417,6 +534,55 @@ pub mod v1_0_0_baseline {
             (
                 "extra",
                 "ALTER TABLE managed_virtual_keys_cache ADD COLUMN extra TEXT",
+            ),
+            // 2026-06-24 (master v1.0.1-alpha.3): oauth_group fold. When a VK's
+            // binding target is a oauth_group, the whole group folds into THIS
+            // row — no separate client cache tables (技术方案 §2.3).
+            //   oauth_group_id          != NULL marks a group-backed VK
+            //   group_accounts         candidate-list metadata JSON (from the
+            //                          materialized view; structural sync)
+            //   routing_config         group hash/schedule/util_cap knobs JSON
+            //   my_assignment_override seat's current routed account per protocol
+            //                          JSON {protocol:account_id} — written by the
+            //                          routing-override POLL, NOT structural sync;
+            //                          empty = pure pkg/seatassign hash default
+            //   group_runtime          JSON {account_id:{token ciphertext,
+            //                          window_max_util_pct, window_reset_at}} via
+            //                          channel ③ (volatile; NEVER refresh_token)
+            (
+                "oauth_group_id",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN oauth_group_id TEXT",
+            ),
+            (
+                "group_accounts",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN group_accounts TEXT",
+            ),
+            (
+                "routing_config",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN routing_config TEXT",
+            ),
+            (
+                "my_assignment_override",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN my_assignment_override TEXT",
+            ),
+            (
+                "group_runtime",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN group_runtime TEXT",
+            ),
+            (
+                // owner_email: the owner account's email, stamped by key sync
+                // (parallel to owner_account_id) so /user/vault can show
+                // "Owner: <email>" — persists after that account logs out.
+                "owner_email",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN owner_email TEXT",
+            ),
+            (
+                // group_alias: the OAuth group's name (server-synced from the
+                // managed-keys-snapshot, parallel to oauth_group_id/routing_config) so
+                // /user/vault + `aikey use` can label WHICH group a VK belongs to — a
+                // member in multiple groups gets one VK per group (2026-07-01).
+                "group_alias",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN group_alias TEXT",
             ),
         ] {
             ensure_column(conn, "managed_virtual_keys_cache", col, ddl)?;
@@ -1474,6 +1640,37 @@ mod tests {
         upgrade_all(&conn).expect("second upgrade_all must be idempotent");
     }
 
+    /// N0 (master v1.0.1-alpha.3 oauth_group fold): the 5 oauth_group columns are
+    /// retrofitted onto managed_virtual_keys_cache by upgrade_all — group data
+    /// folds into the VK row, no separate client cache tables (技术方案 §2.3).
+    #[test]
+    fn oauth_group_fold_columns_retrofit_on_managed_virtual_keys_cache() {
+        let conn = Connection::open_in_memory().expect("open");
+        upgrade_all(&conn).expect("upgrade_all");
+        for col in [
+            "oauth_group_id",
+            "group_accounts",
+            "routing_config",
+            "my_assignment_override",
+            "group_runtime",
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('managed_virtual_keys_cache') WHERE name=?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                n, 1,
+                "managed_virtual_keys_cache.{} missing after upgrade_all",
+                col
+            );
+        }
+        // Idempotent: ensure_column absorbs the duplicate-column error on re-run.
+        upgrade_all(&conn).expect("second upgrade_all must be idempotent");
+    }
+
     // T26 + cycle test were both deleted 2026-05-06: they exercised the
     // multi-version chain (rollback to v1.0.2-alpha then re-upgrade
     // through v1.0.3, v1.0.4) which no longer exists post-fold. After
@@ -2211,6 +2408,76 @@ mod tests {
         assert!(
             dup_token.is_err(),
             "duplicate route_token must be rejected by UNIQUE constraint"
+        );
+    }
+
+    /// 2026-07-07 vault-page lock-convoy fix: the marker lifecycle.
+    /// First contact replays + stamps; second call takes the read-only
+    /// fast path (SkippedFresh — this is the load-bearing assertion: it
+    /// proves no write connection is needed once stamped); clearing the
+    /// marker (db rollback path) re-arms the replay.
+    #[test]
+    fn schema_marker_gates_replay_and_clear_rearms() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault.db");
+        // Create the file with a baseline replay so the fast path has a
+        // config table to probe.
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::Replayed,
+            "first contact must replay"
+        );
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::SkippedFresh,
+            "same build must skip via the read-only probe"
+        );
+        // Tampered marker (≈ different build stamped it) → replay again.
+        {
+            let conn = Connection::open(&vault).unwrap();
+            conn.execute(
+                "UPDATE config SET value='0.0.0:other' WHERE key='schema.replayed_by'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::Replayed,
+            "foreign marker must trigger a fresh replay"
+        );
+        // Rollback path clears the marker → next command re-converges.
+        {
+            let conn = Connection::open(&vault).unwrap();
+            clear_schema_marker(&conn);
+        }
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::Replayed,
+            "cleared marker must re-arm the replay"
+        );
+    }
+
+    /// The replay stays idempotent under the marker scheme: a legacy vault
+    /// (schema present, no marker row — every pre-fix install looks like
+    /// this) must replay once without error and then fast-path.
+    #[test]
+    fn legacy_vault_without_marker_replays_once_then_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault.db");
+        {
+            // Simulate a pre-marker vault: full schema, no marker row.
+            let conn = Connection::open(&vault).unwrap();
+            upgrade_all(&conn).unwrap();
+        }
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::Replayed,
+            "legacy vault (no marker) must converge via replay"
+        );
+        assert_eq!(
+            ensure_schema_current(&vault).unwrap(),
+            SchemaEnsure::SkippedFresh
         );
     }
 }

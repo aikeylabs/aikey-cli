@@ -96,7 +96,7 @@ Vault is unlocked once per shell session — subsequent `aikey run` calls reuse 
 | `aikey route` | vault.db (read-only) | nothing | stdout (for copying into third-party tool config) |
 | `aikey test [<alias>]` | vault.db | nothing (probe-only via `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
 | `aikey web [page]` | nothing | nothing | spawns browser → `aikey-local-server` |
-| `aikey doctor` | proxy port, vault path, hooks | nothing | stdout report |
+| `aikey doctor` | edition, proxy, vault, hooks, plugins (trust-local / compliance) | nothing | stdout report (`--detail` adds edition-aware ODS panels) |
 | `aikey audit status` | collector completeness endpoint (+ proxy local state) | nothing | stdout per-source delivery report |
 | `aikey audit reconcile` | collector gaps + proxy WAL | known-loss ledger (server) | stdout verdict; re-sends recoverable gaps, confirms losses |
 
@@ -220,12 +220,18 @@ aikey doctor                                # diagnose PATH / hook / proxy / vau
 aikey test --all                            # connectivity test all credentials
 aikey proxy restart                         # restart the local proxy
 
+# Service status (which daemons are up)
+aikey service status                        # one line each: web / proxy / trust-local
+aikey web status                            # local web console: running? port? vault state?
+aikey proxy status                          # proxy: running? pid? listen addr?
+aikey service status trust-local            # a single service in detail
+
 # Delivery audit (financial-grade usage completeness)
 aikey audit status                          # per-source: allocated / confirmed / gaps / known-loss / quarantine
 aikey audit reconcile                       # actively reconcile now: re-send recoverable gaps, confirm true losses
 ```
 
-Run `aikey --help` for the full subcommand list (display order = frequency, frequent first).
+Run `aikey --help` for the full subcommand list (alphabetical, with a "Frequently used" shortcut section at the end).
 
 ## 10. Error Codes
 

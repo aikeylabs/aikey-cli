@@ -97,8 +97,9 @@ pub struct LifecycleOutcome {
 /// that only do one write per command.
 pub fn apply_credential_lifecycle(
     event: CredentialLifecycleEvent,
+    audit: Option<&crate::audit::VerifiedVaultKey>,
 ) -> Result<LifecycleOutcome, String> {
-    let mut outcomes = apply_credential_lifecycle_batch(&[event])?;
+    let mut outcomes = apply_credential_lifecycle_batch(&[event], audit)?;
     Ok(outcomes.pop().unwrap_or_default())
 }
 
@@ -112,8 +113,13 @@ pub fn apply_credential_lifecycle(
 /// On any per-event error: returns immediately without running the tail
 /// (DB writes that already landed stay; tail not run, so caller's UX may
 /// observe stale active.env until next operation).
+/// `audit`: a verified vault key when the calling command holds one — every
+/// binding write in the batch then signs a tamper-evident `bind` audit row
+/// (B-2, 2026-07-06). `None` keeps the pre-B-2 behavior (observability events
+/// only) for contexts without key material.
 pub fn apply_credential_lifecycle_batch(
     events: &[CredentialLifecycleEvent<'_>],
+    audit: Option<&crate::audit::VerifiedVaultKey>,
 ) -> Result<Vec<LifecycleOutcome>, String> {
     let mut outcomes: Vec<LifecycleOutcome> = Vec::with_capacity(events.len());
     let mut any_binding_touched = false;
@@ -128,7 +134,7 @@ pub fn apply_credential_lifecycle_batch(
             } => {
                 if !providers.is_empty() {
                     let primaries =
-                        auto_assign_primaries_for_key(source_type, source_ref, providers)
+                        auto_assign_primaries_for_key(source_type, source_ref, providers, audit)
                             .unwrap_or_default();
                     outcome.newly_primary = primaries;
                     // Treat presence of providers as a binding touch so
@@ -147,6 +153,7 @@ pub fn apply_credential_lifecycle_batch(
                         providers,
                         source_type,
                         source_ref,
+                        audit,
                     )?;
                     outcome.newly_primary = providers.to_vec();
                     any_binding_touched = true;
@@ -156,8 +163,9 @@ pub fn apply_credential_lifecycle_batch(
                 source_type,
                 source_ref,
             } => {
-                let actions = reconcile_provider_primary_after_key_removal(source_type, source_ref)
-                    .unwrap_or_default();
+                let actions =
+                    reconcile_provider_primary_after_key_removal(source_type, source_ref, audit)
+                        .unwrap_or_default();
                 if !actions.is_empty() {
                     any_binding_touched = true;
                 }
