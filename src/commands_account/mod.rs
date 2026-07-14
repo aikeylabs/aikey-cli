@@ -5299,11 +5299,19 @@ mod use_status_line_tests {
 /// got symmetric cleanup in 2026-05-18 (B1/B2); this is the same lifecycle
 /// gap on the hook-uninstall edge.
 ///
-/// Behavior (user decision 2026-07-12, option b): interactive sessions get
-/// a Y/n prompt to strip aikey routing from the affected CLI configs
-/// (bindings are KEPT — re-wiring the hook or the next `aikey use`
-/// re-configures them). Non-TTY callers get a loud warning + exact
-/// commands instead — never a silent config mutation.
+/// Behavior:
+/// - 2026-07-12 (X8, option b): interactive sessions get a Y/n prompt to
+///   strip aikey routing from the affected CLI configs (bindings are KEPT —
+///   re-wiring the hook or the next `aikey use` re-configures them).
+/// - 2026-07-13 (G1 revision, user-approved): non-TTY callers now get the
+///   SAME default applied (strip) instead of a warn-and-leave. Sandbox
+///   repro showed the warn path left `model_provider="aikey"` in codex's
+///   toml, and scripted callers swallow stderr — users hit "Missing
+///   environment variable: OPENAI_API_KEY" with no visible cause. The
+///   strip is harmless + reversible (next `aikey use` / `hook install`
+///   re-applies), same rationale as the unconditional Claude Desktop
+///   restore (D8②). "Never silent": we print the stripped list — the
+///   TTY prompt remains the opt-out chance when a human is present.
 pub fn reconcile_cli_configs_after_hook_uninstall() {
     use std::io::{IsTerminal, Write};
 
@@ -5318,12 +5326,16 @@ pub fn reconcile_cli_configs_after_hook_uninstall() {
         eprintln!("\x1b[33m      {:<6} {}\x1b[0m", label, path.display());
     }
     eprintln!(
-        "\x1b[33m    In new terminals those CLIs will fail (e.g. codex: Missing environment variable: OPENAI_API_KEY).\x1b[0m"
+        "\x1b[33m    In new terminals those CLIs would fail (e.g. codex: Missing environment variable: OPENAI_API_KEY).\x1b[0m"
     );
 
     if !std::io::stderr().is_terminal() || !std::io::stdin().is_terminal() {
+        // Headless: apply the interactive default (strip) instead of
+        // leaving broken hard-pointing configs behind (G1, 2026-07-13).
+        shell_integration::apply_third_party_cli_configs(&[], crate::commands_proxy::proxy_port());
         eprintln!(
-            "    Clean them up with: \x1b[36maikey unuse <provider>\x1b[0m  \u{2014} or re-enable the hook: \x1b[36maikey hook install\x1b[0m"
+            "  \u{2713} aikey routing removed from the configs above (bindings kept; \
+             next `aikey use` or `aikey hook install` re-applies them)."
         );
         return;
     }
