@@ -59,16 +59,36 @@ pub fn run() -> io::Result<()> {
         return last_active();
     }
 
+    // Pool-account login pending? Takes precedence over the usage receipt
+    // (20260703 OAuth组成员登录提示): while the proxy's bypass state file
+    // exists, every request 401s anyway — a receipt would be stale noise,
+    // and this row is where the member actually SEES the sign-in link
+    // (claude's own error line scrolls away; this one persists). The proxy
+    // clears the file on the next successful group resolve, so the receipt
+    // comes back on its own after login. One stat() on the hot path.
+    if let Some(line) = group_login_required_line() {
+        let mut out = io::stdout().lock();
+        write!(out, "{}", line)?;
+        return Ok(());
+    }
+
+    // Control-plane sync degraded? (SyncRail §5.5) Unlike the login hint this
+    // does NOT replace the receipt — usage keeps flowing off cached material —
+    // so it renders as a prefix segment when a receipt exists, or alone when
+    // none does. Presence-based: the proxy removes the file on recovery.
+    let sync_warn = sync_health_line();
+
     let ctx = read_stdin_ctx().unwrap_or_default();
 
     // `scan_wal_backward` walks newest-first with a bounded budget; see
     // §5.1 of the design doc for why a fixed "tail N" is insufficient.
     let opts = ScanOptions::default();
     let Some(dir) = default_wal_dir() else {
-        return Ok(());
+        return emit_optional_line(sync_warn);
     };
     if !dir.exists() {
-        return Ok(()); // proxy never wrote a WAL on this machine
+        // proxy never wrote a WAL on this machine
+        return emit_optional_line(sync_warn);
     }
 
     let sid = ctx.session_id.as_deref().unwrap_or("");
@@ -116,8 +136,9 @@ pub fn run() -> io::Result<()> {
     };
 
     let Some(ev) = exact.or(fallback) else {
-        // Nothing to show — Claude Code hides the row when stdout is empty.
-        return Ok(());
+        // No receipt — Claude Code hides the row when stdout stays empty, but a
+        // degraded sync rail must still surface.
+        return emit_optional_line(sync_warn);
     };
 
     // Freshness guard: even after a match, if the latest event for this
@@ -126,7 +147,7 @@ pub fn run() -> io::Result<()> {
     // has stopped and the previous value is no longer representative.
     if let Some(age) = ev.age(std::time::SystemTime::now()) {
         if age > Duration::from_secs(3600) {
-            return Ok(());
+            return emit_optional_line(sync_warn);
         }
     }
 
@@ -138,7 +159,22 @@ pub fn run() -> io::Result<()> {
     use colored::Colorize;
     let line = render_line(&ev);
     let mut out = io::stdout().lock();
+    if let Some(warn) = sync_warn {
+        write!(out, "{} {} ", warn, "|".dimmed())?;
+    }
     write!(out, "{} {}", "[receipt]".dimmed(), line)?;
+    // Receipt delivered → advance the health heartbeat.
+    record_receipt_ok("claude");
+    Ok(())
+}
+
+/// Writes an optional status row (used by the receipt-less exit points so a
+/// degraded sync rail still surfaces; None keeps stdout empty → row hidden).
+fn emit_optional_line(line: Option<String>) -> io::Result<()> {
+    if let Some(l) = line {
+        let mut out = io::stdout().lock();
+        write!(out, "{}", l)?;
+    }
     Ok(())
 }
 
@@ -147,6 +183,172 @@ fn env_flag(name: &str) -> bool {
         std::env::var(name).ok().as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
     )
+}
+
+/// Wire shape of the proxy's bypass login-required state file — a cross-repo
+/// contract with aikey-proxy `internal/proxy/group_login_state.go`
+/// (20260703 OAuth组成员登录提示). Written on OAUTH_GROUP_MEMBER_LOGIN_REQUIRED
+/// 401s, removed on the next successful group resolve.
+#[derive(Debug, Deserialize)]
+struct GroupLoginState {
+    #[serde(default)]
+    login_url: String,
+    /// Unix millis; 0/absent ⇒ malformed writer, ignore the file.
+    #[serde(default)]
+    written_at: i64,
+}
+
+/// Same resolution as the proxy writer: $AIKEY_RUN_DIR override (tests),
+/// else ~/.aikey/run/ — mirrors `runtime_snapshot_path` in commands_proxy.rs.
+fn group_login_state_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("AIKEY_RUN_DIR") {
+        return PathBuf::from(dir).join("group-login-required.json");
+    }
+    crate::commands_account::resolve_aikey_dir()
+        .join("run")
+        .join("group-login-required.json")
+}
+
+/// Returns the rendered "login required" status row while the proxy's state
+/// file exists, or None. Presence-based on purpose: a pending sign-in can
+/// legitimately sit for days, and the proxy deterministically removes the
+/// file once the member's token lands — no staleness heuristic beats that.
+/// Malformed / URL-less content ⇒ None (never render a broken hint).
+fn group_login_required_line() -> Option<String> {
+    let raw = std::fs::read_to_string(group_login_state_path()).ok()?;
+    let st: GroupLoginState = serde_json::from_str(&raw).ok()?;
+    if st.written_at <= 0 || st.login_url.is_empty() {
+        return None;
+    }
+    use colored::Colorize;
+    Some(format!(
+        "{} {} {}",
+        "[aikey]".dimmed(),
+        "⚠ team account sign-in required →".yellow(),
+        st.login_url.underline()
+    ))
+}
+
+/// Cross-repo contract with aikey-proxy railset.go `syncHealthBody` — the
+/// SyncRail framework writes this file on rail state TRANSITIONS only
+/// (degraded rails present ⇒ file exists; all healthy ⇒ file removed).
+#[derive(serde::Deserialize)]
+struct SyncHealthState {
+    rails: std::collections::HashMap<String, SyncHealthRail>,
+    written_at: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct SyncHealthRail {
+    state: String,
+    /// Unix seconds of the first failure in the current streak — the reader
+    /// renders a LIVE outage duration without the proxy re-writing the file.
+    failed_since: i64,
+}
+
+fn sync_health_state_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("AIKEY_RUN_DIR") {
+        return PathBuf::from(dir).join("sync-health.json");
+    }
+    crate::commands_account::resolve_aikey_dir()
+        .join("run")
+        .join("sync-health.json")
+}
+
+/// Returns the rendered "control-plane sync degraded" status row while the
+/// proxy's sync-health file exists, or None (SyncRail §5.5, 2026-07-03
+/// incident: two sync rails were silently dead for 7+ hours — this row makes
+/// that state visible BEFORE a request fails). Presence-based like the login
+/// hint: the proxy removes the file when every rail recovers. Renders the
+/// WORST rail (offline > stale) with a live duration; malformed ⇒ None.
+fn sync_health_line() -> Option<String> {
+    let raw = std::fs::read_to_string(sync_health_state_path()).ok()?;
+    let st: SyncHealthState = serde_json::from_str(&raw).ok()?;
+    if st.written_at <= 0 || st.rails.is_empty() {
+        return None;
+    }
+    let worst = st
+        .rails
+        .values()
+        .max_by_key(|r| (r.state == "offline", r.failed_since.saturating_neg()))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let secs = (now - worst.failed_since).max(0);
+    let dur = if secs >= 3600 {
+        format!("{} h", secs / 3600)
+    } else if secs >= 60 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{} s", secs)
+    };
+    use colored::Colorize;
+    Some(format!(
+        "{} {}",
+        "[aikey]".dimmed(),
+        format!("⚠ team sync {} {} — serving cached data", worst.state, dur).yellow()
+    ))
+}
+
+// ── Usage-receipt pipeline heartbeat (health-signal-surface) ────────────────
+//
+// Why: the receipt render path couples to third-party CLIs' session layout and
+// Stop-hook payload shape. Those break silently on a tool upgrade — the render
+// just `return Ok(())`s and receipts quietly stop. A bare log line is not enough
+// (health-signal-surface.md: pipeline health "必须暴露一个可读取的健康端点").
+// So on every SUCCESSFUL delivery we stamp a per-tool heartbeat file; `aikey
+// doctor` reads it to surface "receipts last landed Nh ago / never observed",
+// which is how an operator notices a tool upgrade silently killed the pipeline.
+//
+// Per-tool files + atomic last-writer-wins write (no read-modify-write) so
+// concurrent hook subprocesses never corrupt or race the state.
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn receipt_health_path(tool: &str) -> PathBuf {
+    let base = if let Ok(dir) = std::env::var("AIKEY_RUN_DIR") {
+        PathBuf::from(dir)
+    } else {
+        crate::commands_account::resolve_aikey_dir().join("run")
+    };
+    base.join(format!("receipt-health-{tool}.json"))
+}
+
+/// Stamp the tool's last-successful-receipt timestamp. Called only after a
+/// receipt actually landed (not on the common "no new events" no-op), so a
+/// stale heartbeat genuinely means "delivery stopped", not "user idle".
+fn record_receipt_ok(tool: &str) {
+    write_receipt_ok_at(&receipt_health_path(tool), tool, unix_now_secs());
+}
+
+/// Path-explicit core (testable without env). Atomic tmp+rename, last-writer-
+/// wins, no read-modify-write → concurrent hook subprocesses can't corrupt it.
+fn write_receipt_ok_at(path: &Path, tool: &str, ts: i64) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body = format!("{{\"last_ok_at\":{ts},\"tool\":\"{tool}\"}}\n");
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Read a tool's last-successful-receipt unix timestamp (None = never observed).
+pub(crate) fn receipt_last_ok(tool: &str) -> Option<i64> {
+    read_receipt_ok_at(&receipt_health_path(tool))
+}
+
+fn read_receipt_ok_at(path: &Path) -> Option<i64> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("last_ok_at").and_then(|x| x.as_i64())
 }
 
 fn read_stdin_ctx() -> io::Result<ClaudeCodeCtx> {
@@ -158,7 +360,18 @@ fn read_stdin_ctx() -> io::Result<ClaudeCodeCtx> {
     if buf.trim().is_empty() {
         return Ok(ClaudeCodeCtx::default());
     }
-    serde_json::from_str(&buf).or_else(|_| Ok(ClaudeCodeCtx::default()))
+    serde_json::from_str(&buf).or_else(|_| {
+        // Non-empty stdin that won't parse = Claude Code changed its statusLine
+        // payload shape (or a foreign caller). Degrade to default so the row
+        // just hides, but log it — a silent default here is exactly how a Claude
+        // upgrade would invisibly kill the receipt row.
+        crate::observability::log_warn_event(
+            crate::observability::EVENT_RECEIPT_CLAUDE_PAYLOAD_UNRECOGNIZED,
+            "claude statusLine stdin payload did not parse; rendering empty receipt row",
+            Some(crate::observability::ERRCODE_CLAUDE_STATUSLINE_PAYLOAD_UNRECOGNIZED),
+        );
+        Ok(ClaudeCodeCtx::default())
+    })
 }
 
 /// `aikey statusline last-active` — scan the WAL for the newest event and
@@ -265,9 +478,25 @@ pub fn render_kimi() -> io::Result<()> {
         return Ok(());
     }
     let Ok(ctx) = serde_json::from_str::<KimiStopCtx>(&buf) else {
+        // Non-empty payload that won't parse = kimi changed its Stop-hook JSON.
+        // No-op (must not crash the hook) but log it, else a kimi upgrade would
+        // invisibly kill receipts.
+        if !buf.trim().is_empty() {
+            crate::observability::log_warn_event(
+                crate::observability::EVENT_RECEIPT_KIMI_PAYLOAD_UNRECOGNIZED,
+                "kimi Stop-hook stdin payload did not parse; skipping receipt",
+                Some(crate::observability::ERRCODE_KIMI_STOP_PAYLOAD_UNRECOGNIZED),
+            );
+        }
         return Ok(());
     };
     if ctx.session_id.is_empty() || ctx.cwd.is_empty() {
+        // Parsed, but the fields we key on are absent = kimi renamed/moved them.
+        crate::observability::log_warn_event(
+            crate::observability::EVENT_RECEIPT_KIMI_PAYLOAD_UNRECOGNIZED,
+            "kimi Stop-hook payload missing session_id/cwd; skipping receipt",
+            Some(crate::observability::ERRCODE_KIMI_STOP_PAYLOAD_UNRECOGNIZED),
+        );
         return Ok(());
     }
 
@@ -280,7 +509,18 @@ pub fn render_kimi() -> io::Result<()> {
     }
     let session_dir = kimi_session_dir(&ctx.cwd, &ctx.session_id);
     if !session_dir.exists() {
-        // Kimi session dir gone (user closed Kimi mid-turn?); skip silently.
+        // We derived kimi's session dir via its `WorkDirMeta` md5(cwd) formula
+        // but it isn't there. Usually benign (session closed mid-turn), but it
+        // is ALSO the signature of kimi-cli changing that derivation on upgrade
+        // — the exact silent-drift class as the config `hooks=[]` bug. Log at
+        // WARN (not a health-degrade, to avoid crying wolf on closed sessions);
+        // a persistent stream of these in the log is the drift tell.
+        crate::observability::log_warn_event(
+            crate::observability::EVENT_RECEIPT_KIMI_SESSION_DIR_MISSING,
+            "kimi session dir (md5(cwd)/session_id) not found; skipping receipt \
+             (session closed, or kimi-cli session layout changed on upgrade)",
+            Some(crate::observability::ERRCODE_KIMI_SESSION_DIR_MISSING),
+        );
         return Ok(());
     }
 
@@ -387,6 +627,9 @@ pub fn render_kimi() -> io::Result<()> {
     if write_kimi_notification(&session_dir, &ctx.session_id, &title, hits.len()).is_err() {
         return Ok(());
     }
+
+    // Receipt delivered → advance the health heartbeat (read by `aikey doctor`).
+    record_receipt_ok("kimi");
 
     // 8. Advance watermark. Any error here is non-fatal: next turn will
     // re-aggregate these events (at-least-once display).
@@ -1735,6 +1978,110 @@ fn format_number(n: i64) -> String {
 mod tests {
     use super::*;
 
+    // group_login_required_line contract tests (20260703 OAuth组成员登录提示).
+    // NOTE: env-var mutation (AIKEY_RUN_DIR is process-global) — every test that
+    // sets it must hold RUN_DIR_LOCK for its whole body, or parallel test
+    // threads repoint the dir mid-read (observed flake, 2026-07-03).
+    static RUN_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[test]
+    fn group_login_line_renders_url_and_clears_with_file() {
+        let _guard = RUN_DIR_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("aikey-sl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIKEY_RUN_DIR", &dir);
+
+        let path = dir.join("group-login-required.json");
+        std::fs::write(
+            &path,
+            r#"{"provider":"anthropic","account_id":"acc-1","login_url":"http://127.0.0.1:8090/user/team-oauth","written_at":1776439425000}"#,
+        )
+        .unwrap();
+        let line = group_login_required_line().expect("state file present → hint rendered");
+        assert!(
+            line.contains("http://127.0.0.1:8090/user/team-oauth"),
+            "hint must carry the clickable login URL: {line}"
+        );
+        assert!(
+            line.contains("sign-in required"),
+            "hint must say WHY the receipt is replaced: {line}"
+        );
+
+        // Proxy removed the file after a successful resolve → receipt path resumes.
+        std::fs::remove_file(&path).unwrap();
+        assert!(group_login_required_line().is_none());
+
+        // Malformed writer (no written_at / empty URL) must never render a
+        // broken hint — silence over garbage.
+        std::fs::write(&path, r#"{"login_url":"","written_at":0}"#).unwrap();
+        assert!(group_login_required_line().is_none());
+        std::fs::write(&path, "not-json").unwrap();
+        assert!(group_login_required_line().is_none());
+
+        std::fs::remove_file(&path).ok();
+        std::env::remove_var("AIKEY_RUN_DIR");
+    }
+
+    // sync_health_line contract tests (SyncRail §5.5, 2026-07-03): the proxy
+    // writes sync-health.json on rail state transitions; the row renders the
+    // WORST rail with a live duration and disappears with the file.
+    #[test]
+    fn sync_health_line_renders_worst_rail_and_clears_with_file() {
+        let _guard = RUN_DIR_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("aikey-sl-sync-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIKEY_RUN_DIR", &dir);
+
+        let path = dir.join("sync-health.json");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"rails":{{"group_runtime":{{"state":"stale","failed_since":{}}},"routing_override":{{"state":"offline","failed_since":{}}}}},"written_at":1776439425000}}"#,
+                now - 200,
+                now - 23 * 60,
+            ),
+        )
+        .unwrap();
+        let line = sync_health_line().expect("state file present → warning rendered");
+        assert!(
+            line.contains("offline"),
+            "worst rail (offline beats stale) must win: {line}"
+        );
+        assert!(
+            line.contains("23 min"),
+            "live outage duration must render from failed_since: {line}"
+        );
+        assert!(
+            line.contains("serving cached data"),
+            "warning must say the data path still serves (offline-first): {line}"
+        );
+
+        // Proxy removed the file on recovery → warning disappears.
+        std::fs::remove_file(&path).unwrap();
+        assert!(sync_health_line().is_none());
+    }
+
+    #[test]
+    fn sync_health_line_malformed_or_empty_is_silent() {
+        let _guard = RUN_DIR_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("aikey-sl-sync-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("AIKEY_RUN_DIR", &dir);
+        let path = dir.join("sync-health.json");
+
+        std::fs::write(&path, "{not-json").unwrap();
+        assert!(
+            sync_health_line().is_none(),
+            "malformed file must not render"
+        );
+
+        std::fs::write(&path, r#"{"rails":{},"written_at":1}"#).unwrap();
+        assert!(sync_health_line().is_none(), "empty rails must not render");
+    }
+
     fn ev(
         session_id: &str,
         model: &str,
@@ -2181,6 +2528,33 @@ mod tests {
             s.contains(&format!("/{expect_hex}/")),
             "md5 hex missing: {s}"
         );
+    }
+
+    #[test]
+    fn receipt_heartbeat_round_trip_and_absent() {
+        let dir = std::env::temp_dir().join(format!(
+            "aikey-test-receipt-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let path = dir.join("receipt-health-kimi.json");
+
+        // Absent → None (never observed).
+        assert_eq!(read_receipt_ok_at(&path), None);
+
+        // Write then read back the exact timestamp.
+        write_receipt_ok_at(&path, "kimi", 1_720_000_000);
+        assert_eq!(read_receipt_ok_at(&path), Some(1_720_000_000));
+
+        // Last-writer-wins overwrite (idempotent stamp on each success).
+        write_receipt_ok_at(&path, "kimi", 1_720_000_500);
+        assert_eq!(read_receipt_ok_at(&path), Some(1_720_000_500));
+
+        // Malformed content → None (never render a broken signal).
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(read_receipt_ok_at(&path), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

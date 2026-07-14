@@ -50,7 +50,7 @@ pub struct StartSessionResponse {
     pub expires_in_seconds: u64,
 }
 
-/// Returned by POST /v1/auth/cli/login/poll and /v1/auth/cli/login/exchange.
+/// Returned by POST /v1/auth/cli/login/poll.
 ///
 /// `status` is one of: "pending" | "approved" | "denied" | "expired" | "token_claimed"
 /// Token fields are non-None when `status == "approved"`.
@@ -62,6 +62,32 @@ pub struct PollResponse {
     pub token_type: Option<String>,
     pub expires_in: Option<i64>,
     pub account: Option<AccountInfo>,
+}
+
+/// Returned by POST /v1/auth/cli/login/exchange.
+///
+/// The copy-paste fallback exchange is not a polling endpoint: success is
+/// represented by HTTP 200 plus the token payload, with no `status` field.
+#[derive(Debug, Deserialize)]
+struct LoginTokenExchangeResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub token_type: Option<String>,
+    pub expires_in: Option<i64>,
+    pub account: AccountInfo,
+}
+
+impl From<LoginTokenExchangeResponse> for PollResponse {
+    fn from(value: LoginTokenExchangeResponse) -> Self {
+        PollResponse {
+            status: "approved".to_string(),
+            access_token: Some(value.access_token),
+            refresh_token: Some(value.refresh_token),
+            token_type: value.token_type,
+            expires_in: value.expires_in,
+            account: Some(value.account),
+        }
+    }
 }
 
 /// Returned by POST /v1/auth/cli/token/refresh
@@ -117,6 +143,26 @@ pub struct ManagedKeySnapshotItem {
     #[serde(default)]
     pub expires_at: Option<i64>,
     pub sync_version: i64,
+    /// Oauth-group binding target (N6). Present only when the VK's binding targets
+    /// a oauth_group instead of a single credential. `None` for direct-bind VKs.
+    #[serde(default)]
+    pub oauth_group_id: Option<String>,
+    /// Seat's ranked candidate set for a group-bound VK (N6): array of
+    /// `{account_id, identity, provider_code, priority, assigned}`. `None`/absent
+    /// for direct-bind VKs. Stored verbatim into the cache as JSON text.
+    #[serde(default)]
+    pub group_accounts: Option<serde_json::Value>,
+    /// The group's routing knobs JSON (exhaustion_signals / util_cap / ratios),
+    /// for the proxy's offline routing (N6 follow-up). `"{}"`/absent for
+    /// direct-bind VKs. Stored verbatim into the cache.
+    #[serde(default)]
+    pub routing_config: Option<String>,
+    /// The OAuth group's human-facing name (oauth_group.alias), so /user/vault +
+    /// `aikey use` can label WHICH group a VK belongs to — a member in multiple
+    /// groups gets one VK per group and picks by name (2026-07-01). `None`/empty for
+    /// direct-bind VKs or an unnamed group.
+    #[serde(default)]
+    pub group_alias: Option<String>,
 }
 
 /// Returned by GET /accounts/me/managed-keys-snapshot.
@@ -132,6 +178,114 @@ pub struct ManagedKeysSnapshotResponse {
     /// seat propagates as an empty list that clears stale rules.
     #[serde(default)]
     pub quota: Option<QuotaSnapshot>,
+    /// The deployment's key-delivery contract, told to us EXPLICITLY by the
+    /// server (2026-07-13). `None` = an older control plane that predates the
+    /// field; the client then falls back to inferring the form the old way
+    /// (a resolved cluster node ⇒ central), so nothing regresses.
+    ///
+    /// Why this exists: the client used to infer its form purely from whether a
+    /// cluster node had ever been resolved into the local sidecar. That guess
+    /// desynced from the server's rule in BOTH directions — a fresh machine on a
+    /// central cluster tried to download material and ate an opaque 403, while a
+    /// box carrying a stray CLUSTER_DELIVERY_ORG_ID refused delivery though it
+    /// was not a cluster at all. The server knows; now it says so.
+    #[serde(default)]
+    pub key_delivery_form: Option<String>,
+}
+
+/// How this deployment delivers key material — the client mirror of the
+/// server's `config.KeyDeliveryForm` (single source of truth lives there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyDeliveryForm {
+    /// Material is delivered to this machine; sync downloads it as usual.
+    /// (Personal, plain Production, and cluster form-⓪.)
+    Local,
+    /// Material never leaves the cluster's central nodes — per-VK delivery is
+    /// refused BY DESIGN. The client must NOT ask for material; it routes tools
+    /// at its resolved node instead. (Cluster form-①.)
+    Central,
+}
+
+impl KeyDeliveryForm {
+    /// Parse the wire value, falling back to the legacy inference when the field
+    /// is absent (older server): a resolved cluster node meant "central".
+    ///
+    /// Fail-safe direction matters: an UNRECOGNIZED value must not silently relax
+    /// the "keys stay central" guarantee, so anything we don't understand on a
+    /// cluster is treated as Central.
+    pub fn from_wire(wire: Option<&str>, has_cluster_node: bool) -> Self {
+        match wire.map(|w| w.trim().to_ascii_lowercase()) {
+            Some(w) if w == "local" => Self::Local,
+            Some(w) if w == "central" => Self::Central,
+            // Unknown value from a newer/garbled server: fail safe.
+            Some(_) => {
+                if has_cluster_node {
+                    Self::Central
+                } else {
+                    Self::Local
+                }
+            }
+            // Legacy server (no field): the historical inference.
+            None => {
+                if has_cluster_node {
+                    Self::Central
+                } else {
+                    Self::Local
+                }
+            }
+        }
+    }
+
+    pub fn is_central(self) -> bool {
+        matches!(self, Self::Central)
+    }
+}
+
+#[cfg(test)]
+mod key_delivery_form_tests {
+    use super::KeyDeliveryForm;
+
+    #[test]
+    fn explicit_server_contract_wins_over_inference() {
+        // The whole point: the server's word beats the sidecar guess. A fresh
+        // machine (no node yet) on a central cluster must NOT try to download.
+        assert_eq!(
+            KeyDeliveryForm::from_wire(Some("central"), false),
+            KeyDeliveryForm::Central
+        );
+        // And a box that happens to have a stale node sidecar but whose server
+        // says "local" must download normally (the 2026-07-13 incident shape).
+        assert_eq!(
+            KeyDeliveryForm::from_wire(Some("local"), true),
+            KeyDeliveryForm::Local
+        );
+    }
+
+    #[test]
+    fn legacy_server_falls_back_to_node_inference() {
+        assert_eq!(KeyDeliveryForm::from_wire(None, true), KeyDeliveryForm::Central);
+        assert_eq!(KeyDeliveryForm::from_wire(None, false), KeyDeliveryForm::Local);
+    }
+
+    #[test]
+    fn unknown_value_fails_safe_on_a_cluster() {
+        assert_eq!(
+            KeyDeliveryForm::from_wire(Some("teleport"), true),
+            KeyDeliveryForm::Central
+        );
+        assert_eq!(
+            KeyDeliveryForm::from_wire(Some("teleport"), false),
+            KeyDeliveryForm::Local
+        );
+    }
+
+    #[test]
+    fn case_and_whitespace_insensitive() {
+        assert_eq!(
+            KeyDeliveryForm::from_wire(Some("  LOCAL "), true),
+            KeyDeliveryForm::Local
+        );
+    }
 }
 
 /// The quota payload inlined in the delivery snapshot. Mirrors the server's
@@ -422,7 +576,8 @@ impl PlatformClient {
             .set("Content-Type", "application/json")
             .send_json(&body)
             .map_err(|e| format!("exchange request failed: {}", e))?;
-        resp.into_json::<PollResponse>()
+        resp.into_json::<LoginTokenExchangeResponse>()
+            .map(PollResponse::from)
             .map_err(|e| format!("failed to parse exchange response: {}", e))
     }
 
@@ -707,6 +862,60 @@ mod cluster_resolve_tests {
         format!("http://{}", addr)
     }
 
+    fn mock_control_draining_request(status: u16, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 512];
+                let mut header_end = None;
+                while header_end.is_none() {
+                    match s.read(&mut tmp) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            header_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+                        }
+                    }
+                }
+                if let Some(pos) = header_end {
+                    let headers = String::from_utf8_lossy(&buf[..pos + 4]).to_ascii_lowercase();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let already_read = buf.len().saturating_sub(pos + 4);
+                    let mut remaining = content_length.saturating_sub(already_read);
+                    while remaining > 0 {
+                        match s.read(&mut tmp) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => remaining = remaining.saturating_sub(n),
+                        }
+                    }
+                }
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    404 => "Not Found",
+                    _ => "X",
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    reason,
+                    body.len(),
+                    body
+                );
+            }
+        });
+        format!("http://{}", addr)
+    }
+
     // 2026-06-12 fence (L8 次生缺口): the three-way resolution semantics.
     // If a refactor ever collapses 401 back into "not a cluster", a dead
     // token during sync will again clear persisted cluster routing and
@@ -750,5 +959,25 @@ mod cluster_resolve_tests {
             ClusterNodeResolution::Unknown(_) => {}
             other => panic!("transport error must be Unknown, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn exchange_login_token_accepts_statusless_token_body() {
+        let base = mock_control_draining_request(
+            200,
+            r#"{"access_token":"jwt-123","refresh_token":"rt-456","token_type":"Bearer","expires_in":3600,"account":{"account_id":"acct-1","email":"admin@aikey.local"}}"#,
+        );
+
+        let resp = PlatformClient::exchange_login_token(&base, "session-1", "login-token-1")
+            .expect("statusless exchange token payload should parse");
+
+        assert_eq!(resp.status, "approved");
+        assert_eq!(resp.access_token.as_deref(), Some("jwt-123"));
+        assert_eq!(resp.refresh_token.as_deref(), Some("rt-456"));
+        assert_eq!(resp.token_type.as_deref(), Some("Bearer"));
+        assert_eq!(resp.expires_in, Some(3600));
+        let account = resp.account.expect("account should be preserved");
+        assert_eq!(account.account_id, "acct-1");
+        assert_eq!(account.email, "admin@aikey.local");
     }
 }

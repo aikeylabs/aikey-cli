@@ -109,10 +109,13 @@ pub fn oauth_addons_for(provider_code: &str) -> Option<ProtocolAddons> {
         // completions,且必须用 store=false + stream=true + Codex-specific
         // 模型 (ChatGPT 账户只支持 Codex-specific 模型)。
         //
-        // Model resolution = codex_probe_model() — see that function for
-        // the single-truth chain. Short version: read the user's own
-        // ~/.codex/config.toml so codex-cli updates are auto-tracked,
-        // fall back to a hardcoded recent model only if config is missing.
+        // Model resolution = codex_probe_model() — see that function for the
+        // single-truth chain. Short version: use the model the proxy last
+        // observed on a real Codex OAuth request (~/.aikey/state/codex_last_model,
+        // self-healing across codex-cli upgrades with no aikey release), falling
+        // back to the CODEX_PROBE_FALLBACK_MODEL constant only before the proxy
+        // has ever seen a request. (This does NOT read ~/.codex/config.toml —
+        // an earlier version of this comment claimed it did; it never has.)
         "openai" => Some(ProtocolAddons {
             query: &[],
             body_inject: || vec![],

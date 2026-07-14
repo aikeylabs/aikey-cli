@@ -101,7 +101,10 @@ pub fn detect_edition() -> Option<Edition> {
     let home = crate::commands_account::resolve_user_home();
     let path = home.join(".aikey/install-state.json");
     let raw = fs::read_to_string(&path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    // strip_bom: shipped PS 5.1 trial installers wrote this file WITH a BOM
+    // (encoding sweep 2026-07-07 H1) and serde rejects it — without the strip
+    // a whole trial install reads as "not installed" here.
+    let parsed: serde_json::Value = serde_json::from_str(crate::strip_bom(&raw)).ok()?;
     let components = parsed.get("installed_components")?.as_array()?;
     // Why Trial wins over local-server when both appear: trial-server
     // is a superset bundle that includes local-server's user-side
@@ -585,6 +588,104 @@ fn find_listening_pid(port: u16) -> Option<u32> {
 ///   - "local-server: running on port N (vault: locked|unlocked)"
 ///   - "local-server: NOT RUNNING on port N\n    Start:  <hint>"
 ///   - "local-server: NOT CONFIGURED — <discovery error>"
+///
+/// Compact one-line status for the `aikey service status` aggregate.
+/// Returns `(running, "<detail>")`. Reuses the same port discovery +
+/// `probe_vault_status` truth source as `local_server_status_line()` so the
+/// aggregate stays consistent with `aikey web status`; only verbosity differs.
+/// A host without local-server installed reports `(false, "not installed")`
+/// rather than an error — "not installed" is a legitimate status.
+pub fn status_summary() -> (bool, String) {
+    if !is_local_server_installed() {
+        return (false, "not installed".to_string());
+    }
+    match read_local_server_port_or_default() {
+        Err(e) => (false, format!("not configured — {}", e)),
+        Ok(port) => {
+            let base = format!("http://127.0.0.1:{}", port);
+            match probe_vault_status(&base) {
+                Ok(unlocked) => (
+                    true,
+                    format!(
+                        "running on http://127.0.0.1:{} (vault: {})",
+                        port,
+                        if unlocked { "unlocked" } else { "locked" }
+                    ),
+                ),
+                Err(_) => (false, format!("not running (would use port {})", port)),
+            }
+        }
+    }
+}
+
+// ── launchd supervision self-heal (§S5, 2026-07-04) ─────────────────────────
+// Observed live (2026-07-04): `make restart-personal` left the launchd agent
+// silently unloaded — 8090 dead, `launchctl print` "Could not find service",
+// zero-byte logs — while the binary itself ran fine when started by hand. A
+// status probe that already KNOWS the server is down can heal that state
+// instead of only printing a hint (owner: recovery must be self-healing and
+// idempotent, no manual steps).
+
+/// Pure decision core (unit-tested): heal ONLY when the plist exists (the
+/// installer wired supervision) AND launchd does NOT know the service. A
+/// service launchd knows about but that is down is crashed/throttled — its
+/// KeepAlive/ThrottleInterval owns the restart; fighting it would flap.
+pub(crate) fn launchd_selfheal_applicable(
+    plist_exists: bool,
+    service_known_to_launchd: bool,
+) -> bool {
+    plist_exists && !service_known_to_launchd
+}
+
+/// macOS: try to re-bootstrap the local-server launchd agent when the probe
+/// says it is down. Best-effort and idempotent (`launchctl bootstrap` of an
+/// already-known service just fails → None). Returns the recovered status
+/// line on success; None → caller prints the normal NOT RUNNING hint.
+#[cfg(target_os = "macos")]
+fn try_launchd_selfheal(base: &str, port: u16) -> Option<String> {
+    use std::process::Command;
+    let plist =
+        dirs::home_dir()?.join("Library/LaunchAgents/com.aikeylabs.aikey-local-server.plist");
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().ok()?.stdout)
+        .ok()?
+        .trim()
+        .to_string();
+    let label = format!("gui/{}/com.aikeylabs.aikey-local-server", uid);
+    let known = Command::new("launchctl")
+        .args(["print", &label])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !launchd_selfheal_applicable(plist.exists(), known) {
+        return None;
+    }
+    let ok = Command::new("launchctl")
+        .args(["bootstrap", &format!("gui/{}", uid), plist.to_str()?])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !ok {
+        return None;
+    }
+    // Give launchd a moment, then re-probe — only claim recovery on evidence.
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if let Ok(unlocked) = probe_vault_status(base) {
+            return Some(format!(
+                "local-server: recovered on port {} (vault: {}) — launchd agent was unloaded; re-bootstrapped automatically",
+                port,
+                if unlocked { "unlocked" } else { "locked" }
+            ));
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn try_launchd_selfheal(_base: &str, _port: u16) -> Option<String> {
+    None // supervision differs per platform; non-macOS keeps the manual hint
+}
+
 pub fn local_server_status_line() -> String {
     // `_or_default`: if the host has local-server installed but the YAML
     // hasn't been rendered, falling back to the canonical default port
@@ -602,6 +703,11 @@ pub fn local_server_status_line() -> String {
                     if unlocked { "unlocked" } else { "locked" }
                 ),
                 Err(_) => {
+                    // §S5 self-heal: an unloaded launchd agent is recoverable
+                    // right here — only fall back to the hint when it isn't.
+                    if let Some(recovered) = try_launchd_selfheal(&base, port) {
+                        return recovered;
+                    }
                     let hint = start_command_hint();
                     format!(
                         "local-server: NOT RUNNING on port {}\n    Start:  {}",
@@ -1252,6 +1358,25 @@ mod tests {
     }
 
     #[test]
+    fn detect_edition_tolerates_utf8_bom() {
+        // Encoding sweep 2026-07-07 H1: shipped PS 5.1 trial installers
+        // wrote install-state.json WITH a UTF-8 BOM (`Set-Content -Encoding
+        // UTF8`), serde rejects BOM at byte 0, and the `.ok()?` swallowed
+        // the error — a whole trial install read as "not installed".
+        // Readers must tolerate BOM'd files forever (they're already on
+        // customer machines).
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        write_install_state(
+            tmp.path(),
+            "\u{feff}{\"installed_components\":[\"full-trial\"]}",
+        );
+        with_home(tmp.path(), || {
+            assert_eq!(detect_edition(), Some(Edition::Trial));
+        });
+    }
+
+    #[test]
     fn detect_edition_prefers_trial_when_both_listed() {
         // If a host's install-state.json mentions both (unusual but
         // possible on a machine that ran both installers), the running
@@ -1437,5 +1562,32 @@ mod tests {
         }
 
         assert!(line.contains("NOT CONFIGURED"), "got: {}", line);
+    }
+}
+
+#[cfg(test)]
+mod launchd_selfheal_tests {
+    use super::launchd_selfheal_applicable;
+
+    // §S5 decision core: heal ONLY the "installer wired supervision but launchd
+    // lost the service" state. 能红: invert either condition and this fails.
+    #[test]
+    fn heals_only_when_plist_exists_and_service_unknown() {
+        assert!(
+            launchd_selfheal_applicable(true, false),
+            "unloaded agent + plist → heal"
+        );
+        assert!(
+            !launchd_selfheal_applicable(true, true),
+            "launchd owns a crashed service (KeepAlive/Throttle) → do not fight it"
+        );
+        assert!(
+            !launchd_selfheal_applicable(false, false),
+            "no plist → nothing to bootstrap (not installed as agent)"
+        );
+        assert!(
+            !launchd_selfheal_applicable(false, true),
+            "inconsistent state → hands off"
+        );
     }
 }

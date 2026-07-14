@@ -669,7 +669,10 @@ fn list_wal_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// Best-effort RFC3339 → unix seconds parser. Returns None on any format
 /// we don't recognize (the WAL should always emit RFC3339 with offset, but
 /// being defensive keeps a rogue line from aborting the whole scan).
-fn parse_rfc3339_secs(s: &str) -> Option<i64> {
+/// pub(crate): also reused by `aikey proxy status` to parse the daemon's
+/// `started_at` from proxy-runtime.json (2026-07-08) — same wire format,
+/// one parser (single source of truth, no chrono dependency).
+pub(crate) fn parse_rfc3339_secs(s: &str) -> Option<i64> {
     // Accept the common patterns the proxy emits:
     //   2026-04-13T11:54:40.122225+08:00
     //   2026-04-17T15:23:45.123Z

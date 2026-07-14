@@ -252,6 +252,52 @@ pub const EVENT_CLI_PROXY_REQUEST_STARTED: &str = "cli.proxy.request.started";
 pub const EVENT_CLI_PROXY_REQUEST_COMPLETED: &str = "cli.proxy.request.completed";
 pub const EVENT_CLI_PROXY_REQUEST_FAILED: &str = "cli.proxy.request.failed";
 
+// Usage-receipt pipeline degradation signals. These fire when a third-party CLI
+// (kimi / claude) upgrade changes a contract we depend on (Stop-hook payload
+// shape, session-dir derivation), so a break becomes visible in the log instead
+// of a silent `return Ok(())`. See workflow/versions/compatible/ for the full
+// coupling inventory. Paired with the `receipt-health-<tool>.json` heartbeat so
+// the state is externally readable (health-signal-surface principle).
+pub const EVENT_RECEIPT_KIMI_PAYLOAD_UNRECOGNIZED: &str = "cli.receipt.kimi_payload_unrecognized";
+pub const EVENT_RECEIPT_KIMI_SESSION_DIR_MISSING: &str = "cli.receipt.kimi_session_dir_missing";
+pub const EVENT_RECEIPT_CLAUDE_PAYLOAD_UNRECOGNIZED: &str =
+    "cli.receipt.claude_payload_unrecognized";
+
+// Binding auto-write visibility (2026-07-06 incident): an automatic post-sync
+// reconcile bound a material-unreachable team VK as a provider Primary with no
+// trace in audit_log or the internal log — root-causing required timestamp
+// cross-referencing across three stores. Every non-user-initiated binding write
+// now emits an event, and the material guard's skip decision logs at WARN.
+// audit_log is deliberately NOT used here: its rows are HMAC-signed with a
+// vault_key-derived audit_key, and most automatic binding paths have no key
+// context (unsigned rows would trip verify_audit_log as tampering).
+// See roadmap20260320/技术实现/update/20260706-绑定材料守卫与Web解锁态全量sync.md.
+pub const EVENT_CLI_BINDING_AUTO_ASSIGNED: &str = "cli.binding.auto_assigned";
+pub const EVENT_CLI_BINDING_RECONCILED: &str = "cli.binding.reconciled";
+pub const EVENT_CLI_BINDING_AUTO_ASSIGN_SKIPPED: &str =
+    "cli.binding.auto_assign_skipped_unreachable";
+
+// UPPER_SNAKE error codes (logging-conventions.md).
+pub const ERRCODE_BINDING_MATERIAL_UNREACHABLE: &str = "BINDING_MATERIAL_UNREACHABLE";
+pub const ERRCODE_KIMI_STOP_PAYLOAD_UNRECOGNIZED: &str = "KIMI_STOP_PAYLOAD_UNRECOGNIZED";
+pub const ERRCODE_KIMI_SESSION_DIR_MISSING: &str = "KIMI_SESSION_DIR_MISSING";
+pub const ERRCODE_CLAUDE_STATUSLINE_PAYLOAD_UNRECOGNIZED: &str =
+    "CLAUDE_STATUSLINE_PAYLOAD_UNRECOGNIZED";
+
+/// Convenience: log a WARN with an event name + optional error code. Used by
+/// degrade-to-default code paths that must not stay silent (logging-conventions:
+/// "解析失败、字段缺失、shape 不匹配回落默认值必须配 WARN 日志").
+pub fn log_warn_event(event_name: &str, message: &str, error_code: Option<&str>) {
+    write_log(
+        Level::Warn,
+        message,
+        Some(event_name),
+        error_code,
+        None,
+        BTreeMap::new(),
+    );
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Returns the current time as an ISO 8601 string (RFC 3339 format).

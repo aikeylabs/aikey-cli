@@ -72,7 +72,8 @@ pub struct PersistedTestResult {
 /// credential, in input order (groups are visited in first-seen order).
 ///
 /// Aggregation rules per credential:
-///   - status     = "pass" if any row has api_ok = true, else "fail"
+///   - status     = "pass" if any row reaches the deepest enabled probe:
+///                  Chat when it ran, otherwise API when Chat is skipped
 ///   - latency_ms = on pass: min api_ms across passing rows in the group
 ///                  on fail: max ping_ms in the group (omitted if 0)
 ///   - error_code / error_message: from the first failing row in the
@@ -127,13 +128,13 @@ pub fn aggregate_test_outcome(outcome: &SuiteOutcome) -> Vec<AggregatedTestRecor
         let ping_ok = group_rows.iter().any(|(_t, r)| r.ping_ok);
         let api_ok = group_rows.iter().any(|(_t, r)| r.api_ok);
         let chat_ok = group_rows.iter().any(|(_t, r)| r.chat_ok);
+        let chat_skipped = group_rows.iter().all(|(_t, r)| r.chat_skipped);
         // Overall status keeps the old pass/fail signal for back-compat
         // with anything reading just `status`; new code should read the
-        // three phase booleans + colour by user-spec:
-        //   chat_ok                 → green
-        //   !chat_ok && ping_ok     → amber  (reach but key/chat broken)
-        //   !ping_ok                → red    (cannot even reach upstream)
-        let pass = chat_ok;
+        // phase booleans + skipped marker. Chat is no longer a required
+        // connectivity phase, so API success is enough when every row
+        // skipped Chat by policy.
+        let pass = if chat_skipped { api_ok } else { chat_ok };
 
         let mut record = serde_json::Map::new();
         record.insert("at".into(), json!(now));
@@ -141,6 +142,7 @@ pub fn aggregate_test_outcome(outcome: &SuiteOutcome) -> Vec<AggregatedTestRecor
         record.insert("ping_ok".into(), json!(ping_ok));
         record.insert("api_ok".into(), json!(api_ok));
         record.insert("chat_ok".into(), json!(chat_ok));
+        record.insert("chat_skipped".into(), json!(chat_skipped));
 
         if pass {
             let best_ms = group_rows
@@ -180,7 +182,10 @@ pub fn aggregate_test_outcome(outcome: &SuiteOutcome) -> Vec<AggregatedTestRecor
                 } else {
                     record.insert("error_code".into(), json!("API_NO_HTTP_STATUS"));
                 }
-            } else if let Some((_, r)) = group_rows.iter().find(|(_, r)| !r.chat_ok) {
+            } else if let Some((_, r)) = group_rows
+                .iter()
+                .find(|(_, r)| !r.chat_ok && !r.chat_skipped)
+            {
                 // API succeeded but Chat probe failed — most commonly upstream
                 // model-policy rejection (Anthropic 400 "invalid model"
                 // for the probe model, OpenAI 401 for org-scoped keys hitting
@@ -390,6 +395,8 @@ mod tests {
             chat_ok: true,
             chat_ms: 812,
             chat_status: Some(200),
+            chat_skipped: false,
+            chat_skip_reason: None,
             ..Default::default()
         };
         let agg = aggregate_test_outcome(&single(CredentialKind::PersonalApi, r));
@@ -399,11 +406,54 @@ mod tests {
         assert_eq!(lt["ping_ok"], true);
         assert_eq!(lt["api_ok"], true);
         assert_eq!(lt["chat_ok"], true);
+        assert_eq!(lt["chat_skipped"], false);
         assert_eq!(lt["latency_ms"], 186);
         assert!(
             lt.get("error_code").is_none(),
             "pass row must NOT carry error_code"
         );
+    }
+
+    #[test]
+    fn chat_skipped_api_pass_counts_as_pass() {
+        let r = ConnectivityResult {
+            ping_ok: true,
+            ping_ms: 42,
+            api_ok: true,
+            api_ms: 186,
+            api_status: Some(200),
+            chat_ok: false,
+            chat_skipped: true,
+            chat_skip_reason: Some("skipped by connectivity policy".into()),
+            ..Default::default()
+        };
+        let agg = aggregate_test_outcome(&single(CredentialKind::PersonalApi, r));
+        let lt = &agg[0].last_test;
+        assert_eq!(lt["status"], "pass");
+        assert_eq!(lt["api_ok"], true);
+        assert_eq!(lt["chat_ok"], false);
+        assert_eq!(lt["chat_skipped"], true);
+        assert_eq!(lt["latency_ms"], 186);
+        assert!(lt.get("error_code").is_none());
+    }
+
+    #[test]
+    fn chat_skipped_api_failure_still_fails() {
+        let r = ConnectivityResult {
+            ping_ok: true,
+            ping_ms: 42,
+            api_ok: false,
+            api_status: Some(401),
+            api_body_snippet: Some("Invalid API key".into()),
+            chat_ok: false,
+            chat_skipped: true,
+            ..Default::default()
+        };
+        let agg = aggregate_test_outcome(&single(CredentialKind::PersonalApi, r));
+        let lt = &agg[0].last_test;
+        assert_eq!(lt["status"], "fail");
+        assert_eq!(lt["chat_skipped"], true);
+        assert_eq!(lt["error_code"], "HTTP_401");
     }
 
     #[test]

@@ -234,10 +234,22 @@ pub fn targets_from_alias(
             return Vec::new();
         }
         // Team keys have a single authoritative provider; honour the override
-        // only when the user supplied one (keeps probe URL consistent).
+        // only when the user supplied one (keeps probe URL consistent). GROUP
+        // VKs (oauth_group_id set) carry an EMPTY VK-level provider_code BY DESIGN
+        // (provider lives per-account in group_accounts) — fall back to the VK's
+        // supported_providers (synced from the group's account set) so the probe
+        // URL gets the right /<prefix>. Same root cause as the proxy-side
+        // 2026-06-25-group-vk-empty-provider-code-502 fix, applied here on the
+        // CLI probe side.
         let provider = provider_override
             .map(|p| p.to_lowercase())
-            .unwrap_or_else(|| vk.provider_code.clone());
+            .unwrap_or_else(|| {
+                if !vk.provider_code.is_empty() {
+                    vk.provider_code.clone()
+                } else {
+                    vk.supported_providers.first().cloned().unwrap_or_default()
+                }
+            });
         // Cluster form-①: the provider key material stays central on the hub-
         // resolved node, so this VK's local cache entry has
         // provider_key_ciphertext = None BY DESIGN. Probe the SAME way a real
@@ -261,9 +273,17 @@ pub fn targets_from_alias(
                 &provider,
             )];
         }
-        if vk.provider_key_ciphertext.is_none() {
-            // Non-cluster team VK with no local material (never delivered) —
-            // genuinely unprobeable. Caller surfaces I_CREDENTIAL_NOT_FOUND.
+        // GROUP VKs have NO local key material (provider_key_ciphertext = None)
+        // BY DESIGN — the per-account credential is pulled by the proxy via
+        // channel ③ (group-runtime) and injected at route time, never stored
+        // locally. So the ciphertext guard (which means "direct-bind VK not yet
+        // delivered → unprobeable") must NOT apply to group VKs: probe them
+        // through the proxy with the aikey_team_<vk_id> bearer exactly like a
+        // real group request (the proxy resolves the account + injects its key).
+        if vk.oauth_group_id.is_none() && vk.provider_key_ciphertext.is_none() {
+            // Non-cluster, direct-bind team VK with no local material (never
+            // delivered) — genuinely unprobeable. Caller surfaces
+            // I_CREDENTIAL_NOT_FOUND.
             return Vec::new();
         }
         return vec![team_target(&vk.virtual_key_id, &provider, proxy_port)];
@@ -370,9 +390,11 @@ pub fn targets_from_all_keys(proxy_port: u16) -> (Vec<TestTarget>, Vec<BuildTarg
     if proxy_up {
         if let Ok(team_entries) = storage::list_virtual_key_cache_readonly() {
             for vk in team_entries {
-                // Skip keys without ciphertext (server hasn't delivered the
-                // real key yet) — probe path can't decrypt nothing.
-                if vk.provider_key_ciphertext.is_none() {
+                // Skip direct-bind keys without ciphertext (server hasn't
+                // delivered the real key yet) — probe can't decrypt nothing.
+                // GROUP VKs (oauth_group_id set) have NO local ciphertext BY
+                // DESIGN (material via proxy channel ③), so don't skip them.
+                if vk.oauth_group_id.is_none() && vk.provider_key_ciphertext.is_none() {
                     continue;
                 }
                 // Skip stale / disabled rows (matches the runtime route
@@ -387,7 +409,15 @@ pub fn targets_from_all_keys(proxy_port: u16) -> (Vec<TestTarget>, Vec<BuildTarg
                 // (canonical, e.g. `key-335923591-0011-1`). vk_id tail is
                 // useless to humans — never surface it as the display label
                 // when a real alias is available.
-                let mut t = team_target(&vk.virtual_key_id, &vk.provider_code, proxy_port);
+                // Group VKs carry an empty VK-level provider_code; use the
+                // synced supported_providers as the probe URL prefix source
+                // (proxy resolves the real per-account provider at route time).
+                let provider = if !vk.provider_code.is_empty() {
+                    vk.provider_code.clone()
+                } else {
+                    vk.supported_providers.first().cloned().unwrap_or_default()
+                };
+                let mut t = team_target(&vk.virtual_key_id, &provider, proxy_port);
                 t.display_alias = vk.local_alias.clone().unwrap_or_else(|| vk.alias.clone());
                 targets.push(t);
             }

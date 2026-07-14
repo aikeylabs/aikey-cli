@@ -96,6 +96,8 @@ mod usage_wal;
 mod test_env_lock;
 
 use aikeylabs_aikey_cli::prompt_hidden;
+#[allow(unused_imports)] // available as crate::strip_bom to bin-side modules
+use aikeylabs_aikey_cli::strip_bom;
 use clap::Parser;
 use cli::*;
 use secrecy::{ExposeSecret, SecretString};
@@ -287,35 +289,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!();
             eprintln!("  {}", "Get started:".bold());
             eprintln!(
-                "    aikey quickstart                       {}",
-                "See what to do next (state-aware)".dimmed()
-            );
-            eprintln!(
-                "    aikey add                              {}",
-                "Add a personal API key to the local vault".dimmed()
-            );
-            eprintln!(
-                "    aikey auth login <claude|codex|kimi>   {}",
-                "Sign in with an OAuth provider account".dimmed()
-            );
-            eprintln!(
-                "    aikey list                             {}",
-                "Show your keys (personal, team, OAuth)".dimmed()
-            );
-            eprintln!(
-                "    aikey route                            {}",
-                "Print proxy config for AI clients".dimmed()
-            );
-            eprintln!(
-                "    aikey web                              {}",
+                "    aikey web        {}",
                 "Open the User Console in the browser".dimmed()
+            );
+            eprintln!(
+                "    aikey login      {}",
+                "Log in to the aikey service".dimmed()
+            );
+            eprintln!(
+                "    aikey use        {}",
+                "Select the active key for routing".dimmed()
+            );
+            eprintln!(
+                "    aikey list       {}",
+                "Show your keys (personal, team, OAuth)".dimmed()
             );
             eprintln!();
             eprintln!("  {}", "Run 'aikey --help' for all commands.".dimmed());
             // Blink runs AFTER the full screen is painted so the user sees
             // banner + hints together instead of being held by the animation.
-            // 10 = blank + "Get started" + 6 commands + blank + hint.
-            cli::animate_banner_blink(10);
+            // 8 = blank + "Get started" + 4 commands + blank + hint.
+            cli::animate_banner_blink(8);
             std::process::exit(1);
         }
     }
@@ -591,7 +585,40 @@ fn run_unified_list(
                 .map(|b| b.provider_code.as_str())
                 .collect();
             // Unified status display: valid (hidden), expired, invalid, pending.
-            let status = if e.provider_key_ciphertext.is_none() {
+            let is_group_vk = e
+                .oauth_group_id
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let status = if is_group_vk {
+                // Group VK: per-account material rides channel ③ (group-runtime), so
+                // it has NO local provider_key_ciphertext BY DESIGN. The "pending"
+                // (awaiting static-key delivery) branch below would mislabel EVERY
+                // group VK as pending forever. Health here = does the seat still have
+                // usable candidates? Non-empty group_accounts → ready (blank, like a
+                // valid key); empty → no usable account (the seat was unbound from the
+                // group, or the group has no enabled accounts) so the key won't route
+                // until that's fixed — show it so the member isn't left guessing.
+                match e.key_status.as_str() {
+                    "active" => {
+                        let has_candidates = e
+                            .group_accounts
+                            .as_deref()
+                            .map(|s| {
+                                let t = s.trim();
+                                !t.is_empty() && t != "[]" && t != "null"
+                            })
+                            .unwrap_or(false);
+                        if has_candidates {
+                            String::new()
+                        } else {
+                            "no access".to_string()
+                        }
+                    }
+                    "expired" => "expired".to_string(),
+                    _ => "invalid".to_string(),
+                }
+            } else if e.provider_key_ciphertext.is_none() {
                 "pending".to_string() // key not yet delivered to local vault
             } else {
                 match e.local_state.as_str() {
@@ -1023,11 +1050,26 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // key state if it has changed since the last local pull. Skipped for proxy
     // lifecycle and init commands which either predate the vault or manage the
     // process themselves.
+    //
+    // `_internal` is exempt (2026-07-07, evidence-based revision of an
+    // earlier "keep it for OAuth-pool freshness" decision): a bridge child
+    // exits ~50ms after dispatch, killing the detached sync thread before
+    // its first HTTP round-trip can complete — the implicit sync from
+    // `_internal` NEVER actually delivered a sync; it only paid the thread-
+    // creation cost (~1.2s under endpoint AV like Norton, profiled live —
+    // the whole vault-page latency). OAuth-pool freshness for the web is
+    // genuinely delivered by the server-side explicit trigger
+    // (aikey-control CRUDHandlers.triggerBackgroundSnapshotSync →
+    // `_internal query snapshot_sync`, which runs the sync INSIDE the
+    // handler and completes), plus interactive commands below which keep
+    // the implicit path. A detached worker PROCESS was also evaluated and
+    // rejected: AV taxes spawning our unsigned binary the same ~1.4s.
     match command {
         Commands::Proxy { .. }
         | Commands::Init
         | Commands::Db { .. }
         | Commands::Version
+        | Commands::Internal { .. }
         | Commands::Statusline { action: None }
         | Commands::Statusline {
             action: Some(cli::StatuslineAction::Render { .. }),
@@ -1063,9 +1105,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         _ => {
             if let Ok(vault_path) = storage::get_vault_path() {
                 if vault_path.exists() {
-                    if let Ok(conn) = rusqlite::Connection::open(&vault_path) {
-                        let _ = migrations::upgrade_all(&conn);
-                    }
+                    // Marker-gated: read-only probe when this build already
+                    // replayed, full idempotent replay otherwise. The old
+                    // unconditional upgrade_all took the vault WRITE lock on
+                    // every command — `_internal` bridge children spawned by
+                    // the web console then queued on that lock and the vault
+                    // page crawled (2026-07-07, see ensure_schema_current
+                    // docs). `aikey db upgrade` still force-replays.
+                    let _ = migrations::ensure_schema_current(&vault_path);
                 }
             }
         }
@@ -1127,6 +1174,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let conn = rusqlite::Connection::open(&vault_path)
                     .map_err(|e| format!("Failed to open vault: {}", e))?;
                 migrations::upgrade_all(&conn)?;
+                // Explicit upgrade counts as this build's replay — stamp the
+                // marker so the next command takes the read-only fast path.
+                migrations::stamp_schema_marker(&conn)?;
                 eprintln!("[db upgrade] Done");
             }
             DbAction::Rollback { to } => {
@@ -1140,6 +1190,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let conn = rusqlite::Connection::open(&vault_path)
                     .map_err(|e| format!("Failed to open vault: {}", e))?;
                 migrations::rollback_to(&conn, &to)?;
+                // Drop the replay marker so the next command re-converges —
+                // preserves the pre-marker behavior for same-binary rollbacks
+                // (the documented flow installs an older binary next anyway).
+                migrations::clear_schema_marker(&conn);
                 eprintln!("[db rollback] Vault schema rolled back to {}", to);
             }
         },
@@ -1568,7 +1622,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let outcome = commands_project::run_connectivity_suite(targets, opts, false);
                     if !outcome.any_chat_ok {
                         eprintln!();
-                        eprint!("  \u{25c6} No chat test passed. Add anyway? [y/N] (default N): ");
+                        eprint!("  \u{25c6} No API connectivity test passed. Add anyway? [y/N] (default N): ");
                         io::stdout().flush()?;
                         let mut input = String::new();
                         io::stdin().read_line(&mut input)?;
@@ -1656,6 +1710,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     source_ref: alias,
                     providers: &resolved_providers,
                 },
+                commands_account::audit_key_from_password(&password).as_ref(),
             )
             .unwrap_or_default();
             let newly_primary = lifecycle.newly_primary;
@@ -1847,8 +1902,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             // Single funnel — runs reconcile per event, refresh + apply once.
             if !events.is_empty() {
-                let outcomes =
-                    commands_account::apply_credential_lifecycle_batch(&events).unwrap_or_default();
+                let outcomes = commands_account::apply_credential_lifecycle_batch(
+                    &events,
+                    commands_account::audit_key_from_password(&password).as_ref(),
+                )
+                .unwrap_or_default();
                 // Walk outcomes in lockstep with successful per_alias rows
                 // and copy reconcile_actions back so the UX renderer below
                 // can show them per-alias.
@@ -2067,8 +2125,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             //   - else → 1 (couldn't reach upstream via proxy)
             //
             // Across multiple rows (e.g. a personal key bound to N providers),
-            // success on ANY counts as overall success — matches the
-            // `any_chat_ok` semantics used by `aikey add`.
+            // success on ANY counts as overall success.
             fn exit_code_from_outcome(outcome: &commands_project::SuiteOutcome) -> i32 {
                 if outcome.rows.iter().any(|(_, r)| r.api_ok) {
                     return EXIT_OK;
@@ -2170,7 +2227,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     });
                     eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
-                std::process::exit(exit_code_from_outcome(&outcome));
+                let code = exit_code_from_outcome(&outcome);
+                print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
+                std::process::exit(code);
             } else if let Some(ref alias) = alias {
                 // ── Single-alias mode: resolve across personal/team/OAuth ──
                 let targets = commands_project::targets_from_alias(
@@ -2248,7 +2307,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     });
                     eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
-                std::process::exit(exit_code_from_outcome(&outcome));
+                let code = exit_code_from_outcome(&outcome);
+                print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
+                std::process::exit(code);
             } else {
                 // ── No alias: test all active bindings (personal/team/OAuth) ──
                 let (targets, build_errors) =
@@ -2315,7 +2376,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     });
                     eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
-                std::process::exit(exit_code_from_outcome(&outcome));
+                let code = exit_code_from_outcome(&outcome);
+                print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
+                std::process::exit(code);
             }
         }
         Commands::Export { pattern, output } => {
@@ -2953,6 +3016,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                     source_type: "personal",
                                     source_ref: name,
                                 },
+                                commands_account::audit_key_from_password(&password).as_ref(),
                             )
                             .unwrap_or_default();
                             let actions = outcome.reconcile_actions;
@@ -3275,8 +3339,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             })
                             .collect();
-                        commands_account::apply_credential_lifecycle_batch(&events)
-                            .map_err(|e| format!("Failed to apply use: {}", e))?;
+                        commands_account::apply_credential_lifecycle_batch(
+                            &events,
+                            commands_account::try_audit_key_from_session().as_ref(),
+                        )
+                        .map_err(|e| format!("Failed to apply use: {}", e))?;
                         if !*no_hook {
                             commands_account::ensure_shell_hook(false);
                         }
@@ -3441,6 +3508,140 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("  {}", "(no proxy env vars detected)".dimmed());
                     }
 
+                    // Upstream proxy egress — the DAEMON's layered decision
+                    // (2026-07-08 需求: 逐级显示 user-set > env > system proxy).
+                    // Fetched live from /admin/upstream-proxy because the
+                    // daemon's env is its spawn snapshot, not this shell, and
+                    // its effective value comes from the same resolver the
+                    // forwarding transport uses (display == behavior).
+                    eprintln!();
+                    eprintln!("{}", "Upstream proxy egress (running daemon):".bold());
+                    match commands_proxy::fetch_egress_state() {
+                        Ok(Some(eg)) => {
+                            // Layer 1: user-set URL (Settings > Upstream proxy).
+                            let l1 = if eg.explicit_url.is_empty() {
+                                "(not set)".to_string()
+                            } else {
+                                eg.explicit_url.clone()
+                            };
+                            eprintln!("  1. User-set (Settings > Upstream proxy)  {}", l1.dimmed());
+
+                            // Layer 2: EXPLICIT aikey env config (proxy.env,
+                            // CLI-marked at spawn). 2026-07-08 refinement:
+                            // inherited shell env is layer 4, BELOW the system
+                            // proxy — otherwise Clash users' .zshrc exports
+                            // permanently masked system-proxy auto-follow.
+                            if eg.env_vars.is_empty() {
+                                eprintln!(
+                                    "  2. proxy.env explicit (HTTP(S)_PROXY)    {}",
+                                    "(not set)".dimmed()
+                                );
+                            } else {
+                                let vars = eg
+                                    .env_vars
+                                    .iter()
+                                    .map(|(k, v)| format!("{}={}", k, v))
+                                    .collect::<Vec<_>>()
+                                    .join("  ");
+                                let note = if eg.env_authoritative {
+                                    "  [authoritative — lower layers skipped]"
+                                } else {
+                                    ""
+                                };
+                                eprintln!(
+                                    "  2. proxy.env explicit (HTTP(S)_PROXY)    {}{}",
+                                    vars.dimmed(),
+                                    note.dimmed()
+                                );
+                            }
+
+                            // Layer 3: live OS system proxy.
+                            let l3 = if !eg.system_supported {
+                                "(unsupported on this platform)".to_string()
+                            } else if eg.env_authoritative {
+                                "(not consulted — proxy.env takes precedence)".to_string()
+                            } else if eg.system_http.is_empty()
+                                && eg.system_https.is_empty()
+                                && eg.system_socks.is_empty()
+                            {
+                                "(none detected)".to_string()
+                            } else {
+                                let mut parts = Vec::new();
+                                if !eg.system_https.is_empty() {
+                                    parts.push(format!("https={}", eg.system_https));
+                                }
+                                if !eg.system_http.is_empty() {
+                                    parts.push(format!("http={}", eg.system_http));
+                                }
+                                if !eg.system_socks.is_empty() {
+                                    parts.push(format!("socks={}", eg.system_socks));
+                                }
+                                parts.join("  ")
+                            };
+                            eprintln!("  3. OS system proxy (live, auto-refresh)  {}", l3.dimmed());
+
+                            // Layer 4: shell-inherited env — fallback only.
+                            if eg.env_inherited_vars.is_empty() {
+                                eprintln!(
+                                    "  4. Inherited shell env (fallback)        {}",
+                                    "(not set)".dimmed()
+                                );
+                            } else {
+                                let vars = eg
+                                    .env_inherited_vars
+                                    .iter()
+                                    .map(|(k, v)| format!("{}={}", k, v))
+                                    .collect::<Vec<_>>()
+                                    .join("  ");
+                                let note = if eg.effective_source == "env_inherited" {
+                                    ""
+                                } else {
+                                    "  [outranked by a higher layer]"
+                                };
+                                eprintln!(
+                                    "  4. Inherited shell env (fallback)        {}{}",
+                                    vars.dimmed(),
+                                    note.dimmed()
+                                );
+                            }
+
+                            // Effective result, as the transport resolves it.
+                            let source = match eg.effective_source.as_str() {
+                                "explicit" => "user-set",
+                                "env" => "proxy.env",
+                                "system" => "system proxy",
+                                "env_inherited" => "inherited shell env",
+                                _ => "direct",
+                            };
+                            let value = if eg.effective_url.is_empty() {
+                                "direct (no proxy)".to_string()
+                            } else {
+                                eg.effective_url.clone()
+                            };
+                            eprintln!(
+                                "  {} {}  {}",
+                                "=> Effective for AI providers".bold(),
+                                value,
+                                format!("[source: {}]", source).dimmed()
+                            );
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "  {}",
+                                "(daemon predates layered egress reporting — update aikey-proxy)"
+                                    .dimmed()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("  {}", format!("(unavailable: {})", e).dimmed());
+                            eprintln!(
+                                "  {}",
+                                "Start the proxy to see the live decision: aikey proxy start"
+                                    .dimmed()
+                            );
+                        }
+                    }
+
                     // Injected provider configs: third-party CLI toml files
                     // (kimi, codex) where aikey has written its managed
                     // region. Hidden when no injection has happened so the
@@ -3577,6 +3778,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // not meaningful for service actions, so we ignore them on
             // that branch.
             if let Some(action) = page.as_deref() {
+                // `status` is read-only (no vault password, no spawn) so it
+                // routes to its own handler, not handle_web_service.
+                if action == "status" {
+                    commands_account::handle_web_status(cli.json)?;
+                    return Ok(());
+                }
                 if matches!(action, "start" | "stop" | "restart") {
                     commands_account::handle_web_service(action, cli.json)?;
                     return Ok(());
@@ -3639,10 +3846,55 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Proxy { action } => {
             match action {
                 ProxyAction::Start { config, foreground } => {
-                    let password = prompt_vault_password(cli.password_stdin, cli.json)?;
-                    // Verify the password is valid before handing it to the proxy.
-                    executor::list_secrets(&password)
-                        .map_err(|e| format!("vault authentication failed: {}", e))?;
+                    // Unattended service-start path (L9 fix A extended, parity
+                    // audit 2026-07-07 P1-1): launchd / systemd / Windows
+                    // ScheduledTask run exactly `aikey proxy start --foreground`
+                    // with no TTY. `prompt_vault_password` only consults the
+                    // TTL-gated cache (`try_get`), so a boot-after-idle service
+                    // start fell through to the interactive prompt — which
+                    // hangs or errors with no terminal. Mirror
+                    // `ensure_proxy_for_use`'s no-TTY branch: read the raw
+                    // session store (TTL deliberately skipped, see
+                    // try_get_unattended docs) and fail fast with actionable
+                    // guidance instead of prompting. Env vars still win (they
+                    // are checked first inside prompt_vault_password, and the
+                    // env-set case never enters this branch).
+                    use std::io::IsTerminal;
+                    let env_pw_set = ["AIKEY_MASTER_PASSWORD", "AK_TEST_PASSWORD"]
+                        .iter()
+                        .any(|v| std::env::var(v).map(|s| !s.is_empty()).unwrap_or(false));
+                    let unattended =
+                        !io::stderr().is_terminal() && !cli.password_stdin && !env_pw_set;
+                    let password = if unattended {
+                        match session::try_get_unattended() {
+                            Some(pw) => pw,
+                            None => {
+                                return Err("unattended proxy start: no master password available. \
+                                     Set AIKEY_MASTER_PASSWORD in the service environment, or run \
+                                     `aikey proxy start` interactively once to populate the session cache."
+                                    .into());
+                            }
+                        }
+                    } else {
+                        prompt_vault_password(cli.password_stdin, cli.json)?
+                    };
+                    // Verify the password is valid before handing it to the
+                    // proxy. On the unattended path a stale cache (master
+                    // password changed) must invalidate, same discipline as
+                    // ensure_proxy_for_use — otherwise every service start
+                    // re-fails on the same dead cache entry.
+                    if let Err(e) = executor::list_secrets(&password) {
+                        if unattended {
+                            session::invalidate();
+                            return Err(format!(
+                                "unattended proxy start: cached vault password rejected ({}). \
+                                 Run `aikey proxy start` interactively to refresh it.",
+                                e
+                            )
+                            .into());
+                        }
+                        return Err(format!("vault authentication failed: {}", e).into());
+                    }
                     // Why: default is background (detach=true) so the terminal is not blocked.
                     // Use --foreground for debugging or when running under a process manager.
                     commands_proxy::handle_start(
@@ -3812,6 +4064,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 // failure can't break `claude` startup — the wrapper script
                 // already pipes `|| true` defensively, but defense-in-depth.
                 let _ = commands_statusline::ensure();
+            }
+        },
+        Commands::Desktop { action } => match action {
+            cli::DesktopAction::Status { json } => {
+                commands_account::claude_desktop::handle_desktop_status(*json || cli.json)?;
+            }
+            cli::DesktopAction::Install => {
+                commands_account::claude_desktop::handle_desktop_install()?;
+            }
+            cli::DesktopAction::Uninstall => {
+                commands_account::claude_desktop::handle_desktop_uninstall()?;
             }
         },
         Commands::Watch => {
@@ -5155,13 +5418,18 @@ fn pick_providers_interactively(
     // ciphertext by design); `key_material_reachable` treats it as usable so the
     // picker surfaces it, matching `aikey use <alias>` (2026-06-15 central-key fix).
     let on_cluster = crate::commands_account::read_cluster_node().is_some();
+    // 2026-07-06 (update/20260706-绑定材料守卫与Web解锁态全量sync.md): material-
+    // unreachable team keys are no longer HIDDEN — they show as dimmed,
+    // non-selectable "pending" rows. Hiding them made the picker show
+    // "nothing selected" while the same key was the active binding and the
+    // web vault labeled it IN USE. Visibility set = web vault's; only
+    // SELECTABILITY is gated on material.
     let usable_team: Vec<_> = team
         .iter()
         .filter(|e| {
             e.key_status == "active"
                 && !e.local_state.starts_with("disabled_by_")
                 && e.local_state != "stale"
-                && e.key_material_reachable(on_cluster)
         })
         .collect();
     for e in &usable_team {
@@ -5265,6 +5533,7 @@ fn pick_providers_interactively(
                     source_type: "personal".to_string(),
                     source_ref: e.alias.clone(),
                     display_type: None,
+                    pending: false,
                 });
             }
         }
@@ -5276,16 +5545,25 @@ fn pick_providers_interactively(
                 vec![e.provider_code.clone()]
             };
             if providers.iter().any(|p| p.to_lowercase() == *prov) {
+                let pending = !e.key_material_reachable(on_cluster);
                 let label = e
                     .local_alias
                     .as_deref()
                     .unwrap_or(e.alias.as_str())
                     .to_string();
+                let label = if pending {
+                    // Inline tag so the width calc (visible_len on label)
+                    // sizes the box for it; renderer adds dim styling.
+                    format!("{} \x1b[2;33m(pending sync)\x1b[0m", label)
+                } else {
+                    label
+                };
                 candidates.push(ui_select::KeyCandidate {
                     label,
                     source_type: "team".to_string(),
                     source_ref: e.virtual_key_id.clone(),
                     display_type: None,
+                    pending,
                 });
             }
         }
@@ -5331,6 +5609,7 @@ fn pick_providers_interactively(
                     source_type: "personal_oauth_account".to_string(), // DB value
                     source_ref: acct.provider_account_id.clone(),
                     display_type: Some(source_display), // UI: "oauth" or "oauth(f)"
+                    pending: false,
                 });
             }
         }
@@ -6362,6 +6641,12 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 loaded_hash.as_deref(),
             );
 
+            // Layer 2 line (2026-07-10): file-hash state alone told users
+            // "in-sync" while the rc had no `source` line at all — the
+            // exact web-only-onboarding blind spot. Same probe the
+            // `_internal hook-op status` bridge uses (shared core).
+            let (_, rc_wired, _) = commands_account::hook_status_probe();
+
             println!("hook file:   {}", hook_path.display());
             println!(
                 "file hash:   {}",
@@ -6373,6 +6658,14 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 loaded_hash
                     .as_deref()
                     .unwrap_or("<not set in this process env>")
+            );
+            println!(
+                "rc wired:    {}",
+                if rc_wired {
+                    "yes".to_string()
+                } else {
+                    "no (run: aikey hook install)".to_string()
+                }
             );
             println!("state:       {}", state);
             Ok(())
@@ -6530,6 +6823,10 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "\x1b[90m  No aikey shell hook block found in any rc file — nothing to remove.\x1b[0m"
         );
+        // Even when nothing was wired, stale third-party CLI configs are
+        // exactly as broken (no env channel) — reconcile them too.
+        commands_account::reconcile_cli_configs_after_hook_uninstall();
+        commands_account::claude_desktop::restore_quiet();
         return Ok(());
     }
     for t in &touched {
@@ -6546,6 +6843,17 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
         "\x1b[90m  New shells won't load the hook. Already-open shells keep their current env\x1b[0m"
     );
     eprintln!("\x1b[90m  until you open a new terminal.\x1b[0m");
+    // X8 (2026-07-12): codex/kimi configs that route through aikey only work
+    // WITH the hook env — offer to strip them (TTY) or warn loudly (non-TTY).
+    commands_account::reconcile_cli_configs_after_hook_uninstall();
+    // 阶段7 D8② (2026-07-13): Desktop is a persisted-file surface, not env-
+    // injected — left in 3p after hook uninstall it breaks silently once the
+    // proxy stops, with no diagnosable symptom in the GUI. Deliberate
+    // exception: bare `hook uninstall` also restores Desktop (soft-fail,
+    // proxy-independent; clears an `always` grant per D6 supplement).
+    // `hook uninstall openclaw` and `hook reinstall` never reach this
+    // handler — verified, no reinstall flip-flop.
+    commands_account::claude_desktop::restore_quiet();
     Ok(())
 }
 
@@ -6588,6 +6896,88 @@ fn compute_hook_status_state(
         }
         Some(_) => "in-sync",
         None => "in-sync (loaded hash unknown — old hook or unsourced shell)",
+    }
+}
+
+/// Pure classifier for the `aikey test` tail warning (2026-07-10).
+///
+/// Why: `aikey test` probes through the proxy directly, while interactive
+/// `claude`/`codex` need the shell hook to inject env — so "test passes"
+/// is routinely misread as "claude will route through aikey" even when the
+/// rc was never wired (web-only onboarding) . Historical incident: bugfix
+/// 2026-04-29-active-env-flat-rename-access-denied-on-windows.md — `aikey
+/// test` green while claude.exe launched with no ANTHROPIC_* env.
+///
+/// Contract: NEVER affects the exit code — wrapper scripts branch on the
+/// EXIT_* codes documented in the Test handler.
+fn test_rc_unwired_warning(
+    connectivity_ok: bool,
+    has_active_bindings: bool,
+    rc_wired: bool,
+    hook_opted_out: bool,
+) -> Option<&'static str> {
+    if connectivity_ok && has_active_bindings && !rc_wired && !hook_opted_out {
+        Some(
+            "\u{25b2} Connectivity OK, but the shell rc is not wired \u{2014} interactive \
+             `claude`/`codex` will NOT inherit aikey env.\n  Fix: run `aikey hook install`, \
+             then open a new terminal.",
+        )
+    } else {
+        None
+    }
+}
+
+/// Effectful wrapper around `test_rc_unwired_warning` — gathers shell/rc/
+/// binding state and prints the warning to stderr. Called by all three
+/// `aikey test` branches right before their `process::exit`.
+fn print_test_rc_unwired_warning(json_mode: bool, connectivity_ok: bool) {
+    if json_mode {
+        return;
+    }
+    let shell_supported = !matches!(
+        commands_account::shell_kind(),
+        commands_account::ShellKind::Cmd | commands_account::ShellKind::Unknown
+    );
+    if !shell_supported {
+        return;
+    }
+    let opted_out = std::env::var("AIKEY_NO_HOOK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let has_bindings =
+        !storage::list_provider_bindings_readonly(profile_activation::DEFAULT_PROFILE)
+            .unwrap_or_default()
+            .is_empty();
+    let rc_wired = commands_account::shell_rc_has_aikey_block();
+    if let Some(w) = test_rc_unwired_warning(connectivity_ok, has_bindings, rc_wired, opted_out) {
+        eprintln!("\n  \x1b[33m{}\x1b[0m", w);
+    }
+}
+
+#[cfg(test)]
+mod test_rc_unwired_warning_tests {
+    use super::test_rc_unwired_warning;
+
+    #[test]
+    fn warns_only_when_ok_bindings_active_and_rc_unwired() {
+        assert!(test_rc_unwired_warning(true, true, false, false).is_some());
+    }
+
+    #[test]
+    fn silent_when_rc_wired_or_no_bindings_or_failed_or_opted_out() {
+        assert!(test_rc_unwired_warning(true, true, true, false).is_none());
+        assert!(test_rc_unwired_warning(true, false, false, false).is_none());
+        // Connectivity already failed — the failure output is the signal;
+        // don't stack a hook warning on top of it.
+        assert!(test_rc_unwired_warning(false, true, false, false).is_none());
+        assert!(test_rc_unwired_warning(true, true, false, true).is_none());
+    }
+
+    #[test]
+    fn warning_points_at_hook_install() {
+        let w = test_rc_unwired_warning(true, true, false, false).unwrap();
+        assert!(w.contains("aikey hook install"));
+        assert!(w.contains("NOT inherit aikey env"));
     }
 }
 

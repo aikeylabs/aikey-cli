@@ -90,6 +90,12 @@ pub struct LifecycleOutcome {
     /// `None` on success or when no event in the batch touched bindings
     /// (tail skipped).
     pub hook_failure_reason: Option<crate::commands_account::HookFailureReason>,
+    /// 阶段7 (2026-07-13) — Claude Desktop takeover/consent state after this
+    /// event's tail. `None` when the tail didn't run or anthropic wasn't
+    /// active. Rides the vault-op envelope as `data.desktop_switch` so the
+    /// web can pop the consent modal / restart toast (same channel pattern
+    /// as `hook_file_installed`). Shared across all outcomes in a batch.
+    pub desktop_switch: Option<crate::commands_account::claude_desktop::DesktopSwitch>,
 }
 
 /// Single-event entry: equivalent to `apply_credential_lifecycle_batch(&[event])`
@@ -97,8 +103,9 @@ pub struct LifecycleOutcome {
 /// that only do one write per command.
 pub fn apply_credential_lifecycle(
     event: CredentialLifecycleEvent,
+    audit: Option<&crate::audit::VerifiedVaultKey>,
 ) -> Result<LifecycleOutcome, String> {
-    let mut outcomes = apply_credential_lifecycle_batch(&[event])?;
+    let mut outcomes = apply_credential_lifecycle_batch(&[event], audit)?;
     Ok(outcomes.pop().unwrap_or_default())
 }
 
@@ -112,8 +119,13 @@ pub fn apply_credential_lifecycle(
 /// On any per-event error: returns immediately without running the tail
 /// (DB writes that already landed stay; tail not run, so caller's UX may
 /// observe stale active.env until next operation).
+/// `audit`: a verified vault key when the calling command holds one — every
+/// binding write in the batch then signs a tamper-evident `bind` audit row
+/// (B-2, 2026-07-06). `None` keeps the pre-B-2 behavior (observability events
+/// only) for contexts without key material.
 pub fn apply_credential_lifecycle_batch(
     events: &[CredentialLifecycleEvent<'_>],
+    audit: Option<&crate::audit::VerifiedVaultKey>,
 ) -> Result<Vec<LifecycleOutcome>, String> {
     let mut outcomes: Vec<LifecycleOutcome> = Vec::with_capacity(events.len());
     let mut any_binding_touched = false;
@@ -128,7 +140,7 @@ pub fn apply_credential_lifecycle_batch(
             } => {
                 if !providers.is_empty() {
                     let primaries =
-                        auto_assign_primaries_for_key(source_type, source_ref, providers)
+                        auto_assign_primaries_for_key(source_type, source_ref, providers, audit)
                             .unwrap_or_default();
                     outcome.newly_primary = primaries;
                     // Treat presence of providers as a binding touch so
@@ -147,6 +159,7 @@ pub fn apply_credential_lifecycle_batch(
                         providers,
                         source_type,
                         source_ref,
+                        audit,
                     )?;
                     outcome.newly_primary = providers.to_vec();
                     any_binding_touched = true;
@@ -156,8 +169,9 @@ pub fn apply_credential_lifecycle_batch(
                 source_type,
                 source_ref,
             } => {
-                let actions = reconcile_provider_primary_after_key_removal(source_type, source_ref)
-                    .unwrap_or_default();
+                let actions =
+                    reconcile_provider_primary_after_key_removal(source_type, source_ref, audit)
+                        .unwrap_or_default();
                 if !actions.is_empty() {
                     any_binding_touched = true;
                 }
@@ -187,7 +201,8 @@ pub fn apply_credential_lifecycle_batch(
                 .iter()
                 .map(|b| b.provider_code.clone())
                 .collect();
-            crate::commands_account::apply_third_party_cli_configs(&active_providers, proxy_port);
+            let third_party =
+                crate::commands_account::apply_third_party_cli_configs(&active_providers, proxy_port);
             // Layer 1 hook file — write once, share result across batch
             // outcomes. Best-effort: failure here surfaces via
             // `hook_failure_reason` for the Web envelope but doesn't
@@ -199,6 +214,7 @@ pub fn apply_credential_lifecycle_batch(
             for outcome in &mut outcomes {
                 outcome.active_env_refreshed = true;
                 outcome.active_providers = active_providers.clone();
+                outcome.desktop_switch = third_party.desktop;
                 outcome.hook_file_installed = hook_file_installed;
                 outcome.hook_failure_reason = hook_failure_reason;
             }

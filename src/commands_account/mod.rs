@@ -622,22 +622,43 @@ pub fn handle_set_control_url(
         // Also update proxy collector_url (nginx proxies collector on same origin).
         configure_proxy_collector(url, json_mode);
 
+        // SyncRail §5.2 (2026-07-03): nudge the running proxy so the URL change
+        // converges NOW — the reload re-reads aikey-proxy.yaml (reporter creds)
+        // and kicks the control-plane sync rails (routing/group material re-pull
+        // against the NEW server, team credential rebuilt). Best-effort by
+        // design: when the proxy isn't running (or the POST fails) the rails'
+        // per-cycle URL re-check still self-heals within ≤60s of the next start,
+        // so this replaces the old "Restart proxy to apply" manual step for BOTH
+        // entrances (CLI set-url and the Web Settings page, which subprocesses
+        // this same core — internal-command-reuses-public-core).
+        let proxy_running = crate::commands_proxy::proxy_is_running_managed();
+        if proxy_running {
+            crate::commands_proxy::try_reload_proxy();
+        }
+
         if json_mode {
             crate::json_output::print_json(serde_json::json!({
                 "ok": true,
                 "old_url": old_url,
                 "new_url": url,
+                "proxy_reloaded": proxy_running,
             }));
         } else {
             println!("{} Control URL updated.", "\u{2713}".green());
             println!("  {} → {}", old_url.dimmed(), url.bold());
             println!("  Proxy collector URL also updated.");
             println!();
-            println!(
-                "  {} Restart proxy to apply: {}",
-                "\u{2192}".dimmed(),
-                "aikey proxy restart".bold()
-            );
+            if proxy_running {
+                println!(
+                    "  {} Proxy reloaded — the new URL is live (sync rails re-pull within seconds).",
+                    "\u{2713}".green()
+                );
+            } else {
+                println!(
+                    "  {} Proxy not running — it picks up the new URL on next start.",
+                    "\u{2192}".dimmed()
+                );
+            }
         }
     } else {
         // Not logged in — only save to config.json.
@@ -705,6 +726,17 @@ pub fn handle_login(
         if !json_mode {
             eprintln!("  Control Panel: {}", default_url);
         }
+        default_url
+    } else if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        // No TTY (spawned from a script / service / web bridge): reading
+        // stdin here blocks forever on a silent pipe — observed live as an
+        // `aikey login` process hung >1h on Windows (parity audit 2026-07-07
+        // P2-5). Behave like json_mode: take the default without prompting;
+        // a wrong default fails loudly downstream instead of hanging here.
+        eprintln!(
+            "  Control Panel: {} (no TTY — using default; pass --control-url to override)",
+            default_url
+        );
         default_url
     } else {
         print!("Control Panel URL [{}]: ", default_url);
@@ -829,7 +861,12 @@ pub fn handle_login(
         std::thread::sleep(poll_interval);
 
         if SystemTime::now() > deadline {
-            if !json_mode {
+            // TTY guard (parity audit 2026-07-07 P2-5): without it, a
+            // scripted/service-spawned login that outlived the poll window
+            // fell into the paste-token read_line below and blocked forever
+            // on a silent stdin (observed live: `aikey login` hung >1h on
+            // Windows after the ~1h poll window expired).
+            if !json_mode && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                 eprintln!();
                 eprintln!("  {}", "Session expired.".yellow());
                 eprintln!(
@@ -1061,6 +1098,12 @@ fn finish_login(
     // daemon wires the proxy identically — see persist_control_url_sidecar.
     persist_control_url_sidecar(&control_url, json_mode);
 
+    // Unified-origin landing (方案A, 2026-07-03): the ACTIVATION PAGE swaps
+    // itself to the local console once it observes the gateway live (its
+    // polling probe reads /system/team-url). The CLI deliberately does NOT
+    // also open a tab — two openers meant two console tabs. `aikey web`
+    // remains the manual entry (P3 gateway branch).
+
     Ok(())
 }
 
@@ -1068,18 +1111,37 @@ fn finish_login(
 // Browser helper
 // ---------------------------------------------------------------------------
 
+/// Returns the `(program, args)` invocation that opens `url` in the default
+/// browser on the given OS (`std::env::consts::OS` values), or `None` on
+/// unsupported platforms.
+///
+/// Why this is a pure function: so unit tests on any host can pin the
+/// Windows invocation without cross-compiling (see `browser_launch_tests`).
+///
+/// Why Windows uses `rundll32 url.dll,FileProtocolHandler` and MUST NOT go
+/// through `cmd /c start`: cmd.exe treats a bare `&` in its command line as
+/// a command separator, so login URLs (`?s=...&d=...&email=...`) were
+/// truncated at the first `&` — the browser opened with only `s`, the login
+/// page failed with "Missing session parameters", and cmd spawned garbage
+/// `d=...` / `email=...` commands (bugfix
+/// 20260702-windows-login-url-ampersand-truncation). rundll32 receives the
+/// URL as a plain argv entry with no shell parsing — same pattern as
+/// `try_open_browser` (commands_import.rs) and `open_browser`
+/// (commands_auth/mod.rs).
+fn browser_launch_command<'a>(os: &str, url: &'a str) -> Option<(&'static str, Vec<&'a str>)> {
+    match os {
+        "macos" => Some(("open", vec![url])),
+        "linux" => Some(("xdg-open", vec![url])),
+        "windows" => Some(("rundll32", vec!["url.dll,FileProtocolHandler", url])),
+        _ => None, // unsupported platform — silently skip
+    }
+}
+
 /// Opens a URL in the default system browser (best-effort; failures are ignored).
 fn open_url_silently(url: &str) {
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    let _ = url; // unsupported platform — silently skip
+    if let Some((program, args)) = browser_launch_command(std::env::consts::OS, url) {
+        let _ = std::process::Command::new(program).args(args).spawn();
+    }
 }
 
 /// Delivers the browse URL either by opening the browser (default) or by
@@ -1574,6 +1636,37 @@ pub fn handle_browse(
         }
     }
 
+    // Unified-origin composing gateway (P3, 2026-07-03 design doc
+    // 20260703-web统一origin-本地网关方案): when the co-installed local-server
+    // composes the team side on 127.0.0.1, `aikey web` opens the LOCAL
+    // origin. Team pages/data are reachable there same-origin (which is why
+    // the 2026-06-01 "logged-in must land on the team panel" pushback no
+    // longer applies), and this path performs NO remote token refresh —
+    // refresh hard-blocked `aikey web` whenever the team server's address
+    // changed (2026-07-02 report: Connection refused on token/refresh).
+    // OLD local-servers don't advertise the gateway → fall through to the
+    // pre-existing team-origin flow below, unchanged (progressive
+    // enhancement, no hard cutover). Explicit --port keeps its meaning.
+    if port.is_none() {
+        if let Some(base) = local_gateway_base() {
+            let url = format!("{}/go/{}", base, alias);
+            if json_mode {
+                crate::json_output::print_json(serde_json::json!({
+                    "ok": true,
+                    "url": &url,
+                    "mode": "local-gateway",
+                }));
+            } else if !copy_url {
+                println!("Opening User Console (unified local origin)...");
+                println!("  {}", url);
+            }
+            // Local origin needs no auth token in the URL — the gateway
+            // injects the vault JWT server-side for team requests.
+            deliver_browse_url(&url, copy_url, json_mode, &url);
+            return Ok(());
+        }
+    }
+
     // JWT-based browse (team/trial mode).
     let acc = storage::get_platform_account()?.ok_or("Not logged in. Run 'aikey login' first.")?;
 
@@ -1694,7 +1787,16 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
                 match crate::local_server_probe::read_local_server_port_or_default() {
                     Ok(port) => crate::local_server_probe::wait_for_reachable(
                         port,
-                        std::time::Duration::from_secs(8),
+                        // find#10 (2026-07-07): 8s was too short on Windows. The
+                        // local-server cold start (Go binary + embedded web +
+                        // SQLite open, plus an antivirus scan of a freshly-written
+                        // .exe) routinely exceeds 8s, so `aikey service start web`
+                        // reported "did not come up within 8s" as a FALSE NEGATIVE
+                        // even though the console bound :8090 a few seconds later.
+                        // wait_for_reachable polls every 200ms and returns on the
+                        // FIRST success, so a larger ceiling never slows a fast
+                        // start — it only stops the premature failure verdict.
+                        std::time::Duration::from_secs(25),
                     )
                     .map(|()| Some(port)),
                     Err(strict_err) => Err(strict_err),
@@ -1757,6 +1859,32 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
             Err(e.into())
         }
     }
+}
+
+/// `aikey web status` (and `aikey service status web`) — read-only report of
+/// the local web service (Personal local-server / Trial trial-server).
+///
+/// Distinct from `handle_web_service` (which drives start/stop/restart and
+/// mutates state): status never spawns anything, needs no vault password, and
+/// on a host with no local web service reports that as a non-error status.
+/// Both entry points call this single core so the two CLI spellings agree.
+pub fn handle_web_status(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (running, detail) = crate::local_server_probe::status_summary();
+    if json_mode {
+        let edition = crate::local_server_probe::detect_edition().map(|e| e.label());
+        crate::json_output::print_json(serde_json::json!({
+            "ok": true,
+            "service": "web",
+            "running": running,
+            "edition": edition,
+            "detail": detail,
+        }));
+    } else {
+        // Reuse the richer multi-line line for the dedicated command — it
+        // already includes a Start hint on the NOT RUNNING path.
+        println!("{}", crate::local_server_probe::local_server_status_line());
+    }
+    Ok(())
 }
 
 /// `aikey master [page] [--port PORT]` — open Master Console in the default browser.
@@ -2061,8 +2189,11 @@ fn local_server_preflight_for_browse(json_mode: bool) -> BrowseLocalPreflight {
 
     println!("Starting local-server…");
     let start_result = crate::local_server_probe::spawn_start_command();
+    // find#10 (2026-07-07): 5s was too short on Windows — same cold-start
+    // false-negative as `aikey service start web` (mod.rs:1787). Poll returns
+    // on first success, so a larger ceiling only helps slow starts.
     let wait =
-        crate::local_server_probe::wait_for_reachable(port, std::time::Duration::from_secs(5));
+        crate::local_server_probe::wait_for_reachable(port, std::time::Duration::from_secs(25));
 
     match (start_result, &wait) {
         (Ok(()), Ok(())) => {
@@ -2184,9 +2315,13 @@ fn read_install_state() -> Option<serde_json::Value> {
 ///                                   from `control_url` so cookie domain /
 ///                                   CORS / CSP stay aligned with the host
 ///                                   the login flow wrote — see `host_loopback_parts`).
-///   2. Env var `AIKEY_WEB_URL` →  use as-is
+///   2. Env var `AIKEY_WEB_URL` →  use as-is (trailing slash trimmed)
 ///   3. Auto-detect: if control_url is loopback, probe dev-server ports
-///   4. Fall back to the stored `control_url`
+///   4. Fall back to the stored `control_url` (trailing slash trimmed)
+///
+/// CONTRACT: the returned base NEVER has a trailing slash, so callers can join
+/// it with a leading-slash path (`/go/<alias>`) without producing a `//` that
+/// the browser would treat as a protocol-relative (cross-origin) URL.
 fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> String {
     use std::net::TcpStream;
     use std::time::Duration;
@@ -2209,7 +2344,11 @@ fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> Str
     // 2. Env var override
     if let Ok(url) = std::env::var("AIKEY_WEB_URL") {
         if !url.is_empty() {
-            return url;
+            // Strip any trailing slash: the caller joins this base with a
+            // leading-slash path (`/go/<alias>`), so a trailing slash here would
+            // produce `//go/...` — a PROTOCOL-RELATIVE URL the browser resolves to
+            // a foreign origin (`http://go/...`) and rejects in history.replaceState.
+            return url.trim_end_matches('/').to_string();
         }
     }
 
@@ -2239,8 +2378,15 @@ fn resolve_browse_base_url(control_url: &str, explicit_port: Option<u16>) -> Str
         }
     }
 
-    // 4. Fall back to control_url
-    control_url.to_string()
+    // 4. Fall back to control_url. Strip any trailing slash so the deep link
+    //    joins cleanly with the leading-slash `/go/<alias>` path — a stored
+    //    control_url like `http://host:3000/` would otherwise yield
+    //    `http://host:3000//go/overview`, which the browser treats as a
+    //    protocol-relative URL (`http://go/overview`) and rejects with a
+    //    SecurityError in the SPA's history.replaceState (cross-origin).
+    //    Normalizing at READ time also fixes installs that already stored a
+    //    trailing-slash control_url, with no re-login/migration.
+    control_url.trim_end_matches('/').to_string()
 }
 
 /// Extracts `(scheme, host)` from a URL like `http://127.0.0.1:3000/foo` or
@@ -2723,6 +2869,9 @@ fn apply_snapshot_to_cache(
             supported_providers: item.supported_providers.clone(),
             provider_base_urls: item.provider_base_urls.clone(),
             owner_account_id: Some(current_account_id.to_string()),
+            owner_email: None,   // upsert stamps the current account's email
+            group_runtime: None, // proxy-owned (channel ③) — never written from here
+
             // Sync writers MUST always set extra: None. The value is
             // ignored by upsert (extra is omitted from the UPSERT's
             // DO UPDATE SET — see upsert_virtual_key_cache doc); the
@@ -2730,6 +2879,16 @@ fn apply_snapshot_to_cache(
             // requirement. Putting any other value here would be
             // misleading, not destructive.
             extra: None,
+            // N6: fold the oauth-group candidate set from the snapshot. These ARE
+            // server-owned (in the upsert's DO UPDATE SET). group_accounts is
+            // stored as raw JSON text; None for a direct-bind VK.
+            oauth_group_id: item.oauth_group_id.clone(),
+            group_accounts: item
+                .group_accounts
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string())),
+            routing_config: item.routing_config.clone(),
+            group_alias: item.group_alias.clone(),
         };
 
         let _ = storage::upsert_virtual_key_cache(&entry);
@@ -2754,16 +2913,24 @@ fn apply_snapshot_to_cache(
         }
     }
 
-    // Mark stale: keys the current account owns locally but the server no longer returns.
-    // This includes the currently-active key: if the server has removed it from the
-    // snapshot, it is no longer valid and must be deactivated immediately.
+    // Prune: keys the current account owns locally but the server no longer
+    // returns are DELETED (2026-07-04 self-heal, replaces the old mark-stale).
+    // WHY delete, not stale: the server is the single authority for the
+    // owner's keys — a server-deleted key kept as a local `stale` row rendered
+    // forever as a "revoked / inactive" ghost in /user/vault (the exact user
+    // confusion on 2026-07-03), and for DETERMINISTIC group-VK aliases the
+    // ghost also shadowed the freshly re-issued key. Scope guard: ONLY rows
+    // owned by the CURRENT account are pruned — other accounts' rows keep the
+    // re-login recovery semantics (see clear_virtual_key_cache's doc note).
+    // Idempotent: the second sync finds nothing absent to prune.
+    // This includes the currently-active key: if the server removed it, it is
+    // no longer valid and must be deactivated immediately.
     if let Ok(cached) = storage::list_virtual_key_cache() {
+        let mut pruned = 0usize;
         for entry in cached {
             if entry.owner_account_id.as_deref() == Some(current_account_id)
                 && !seen_ids.contains(&entry.virtual_key_id)
-                && entry.local_state != "stale"
             {
-                let _ = storage::set_virtual_key_local_state(&entry.virtual_key_id, "stale");
                 // If this key was the active proxy key, clear the active key config
                 // so the proxy stops routing it on next reload.
                 if entry.local_state == "active" {
@@ -2775,7 +2942,23 @@ fn apply_snapshot_to_cache(
                         }
                     }
                 }
+                match storage::delete_virtual_key_cache_row(&entry.virtual_key_id) {
+                    Ok(()) => pruned += 1,
+                    Err(e) => {
+                        // Fall back to the legacy stale mark so the row at least
+                        // stops being usable; visible per the mandatory-WARN rule.
+                        eprintln!(
+                            "[aikey] warn: prune of server-removed key {} failed ({}); marked stale instead",
+                            entry.virtual_key_id, e
+                        );
+                        let _ =
+                            storage::set_virtual_key_local_state(&entry.virtual_key_id, "stale");
+                    }
+                }
             }
+        }
+        if pruned > 0 {
+            println!("  pruned {pruned} server-removed key(s) from local cache");
         }
     }
 }
@@ -2968,6 +3151,14 @@ pub(crate) fn upsert_delivered_key(
 ) -> Result<(), String> {
     let (nonce, ciphertext) = crypto::encrypt(vault_key, plaintext_provider_key.as_bytes())
         .map_err(|e| format!("encrypt: {}", e))?;
+    // N6: this is a direct-bind key-delivery path (single credential ciphertext),
+    // NOT the oauth-group structural sync — but it shares upsert_virtual_key_cache,
+    // whose DO UPDATE SET now includes the server-owned oauth_group columns. Carry
+    // forward the existing row's group fields so accepting a key never wipes the
+    // candidate set a prior snapshot sync folded in.
+    let existing = storage::get_virtual_key_cache(&dk.virtual_key_id)
+        .ok()
+        .flatten();
     let entry = VirtualKeyCacheEntry {
         virtual_key_id: dk.virtual_key_id.clone(),
         org_id: dk.org_id.clone(),
@@ -2990,9 +3181,18 @@ pub(crate) fn upsert_delivered_key(
         supported_providers: dk.supported_providers.clone(),
         provider_base_urls: dk.provider_base_urls.clone(),
         owner_account_id: dk.owner_account_id.clone(),
+        owner_email: None,   // upsert stamps the current account's email
+        group_runtime: None, // proxy-owned (channel ③) — never written from here
+
         // Sync writers MUST always pass extra: None; upsert ignores this
         // field. See doc on VirtualKeyCacheEntry::extra.
         extra: None,
+        // Carry forward server-synced group fields (this path isn't authoritative
+        // over them) so a key-accept doesn't clobber them to NULL.
+        oauth_group_id: existing.as_ref().and_then(|e| e.oauth_group_id.clone()),
+        group_accounts: existing.as_ref().and_then(|e| e.group_accounts.clone()),
+        routing_config: existing.as_ref().and_then(|e| e.routing_config.clone()),
+        group_alias: existing.as_ref().and_then(|e| e.group_alias.clone()),
     };
     storage::upsert_virtual_key_cache(&entry)
 }
@@ -3110,9 +3310,41 @@ fn run_full_snapshot_sync_opts(
     // clean pass below, and a *separate* marker from `local_seen_sync_version`
     // so the no-password lightweight sync can't consume the signal.
     let material_stale = snapshot.sync_version > storage::get_last_material_sync_version();
+
+    // The deployment's delivery form — the SERVER's word, not our guess
+    // (2026-07-13). Until now this was inferred purely from `on_cluster` (does a
+    // cluster-node sidecar exist?), which desynced from the server's rule in both
+    // directions and produced the two failure shapes we kept hitting:
+    //   - fresh machine on a central cluster (no sidecar yet) → we tried to
+    //     download → opaque 403 → "run `aikey key sync`" while running it;
+    //   - a box carrying a stray CLUSTER_DELIVERY_ORG_ID → the server refused
+    //     delivery even though it was not a cluster at all.
+    // `from_wire` falls back to the old inference when the field is absent (older
+    // control plane), so nothing regresses.
+    let delivery_form = crate::platform_client::KeyDeliveryForm::from_wire(
+        snapshot.key_delivery_form.as_deref(),
+        on_cluster,
+    );
+    let central_form = delivery_form.is_central();
+
     let mut had_download_error = false;
+    // Set when the control plane refuses delivery BY DESIGN (form-①). Not an
+    // error: it means this deployment keeps material central and we should route
+    // through the cluster node instead of downloading. Reported once at the end
+    // rather than once per key.
+    let mut central_refused = false;
 
     for entry in &cached {
+        // Group VKs carry NO static key material — their per-account material is
+        // pulled by the proxy via channel ③ (group-runtime), not CLI claim/delivery.
+        // The master delivery endpoint denies group VKs (403 access_denied), which
+        // otherwise surfaces as a spurious "could not fetch key" + "0 downloaded"
+        // during sync. Skip claim/delivery entirely for them; their metadata
+        // (oauth_group_id / group_accounts / routing_config) was already folded into
+        // the cache by apply_snapshot_to_cache above.
+        if entry.oauth_group_id.is_some() {
+            continue;
+        }
         // Needs claim: pending_claim but not yet claimed on server.
         let needs_claim = entry.share_status == "pending_claim" && entry.key_status == "active";
         // Needs download: claimed (or about to be) AND either we have no local
@@ -3124,7 +3356,11 @@ fn run_full_snapshot_sync_opts(
         // pulls its OWN seat's material even on a cluster — the control plane's
         // seat-scoped delivery check is the enforcement authority (only the
         // caller's own digital_employee seat is honored there).
-        let needs_download = (!on_cluster || allow_cluster_key_download)
+        // Gate on the SERVER-DECLARED form (2026-07-13), not on "do I have a node
+        // sidecar". Under `central`, asking for material is refused by design, so
+        // we must not ask at all — that request is what produced the misleading
+        // 403. The form-② agent daemon keeps its documented exception.
+        let needs_download = (!central_form || allow_cluster_key_download)
             && (entry.provider_key_ciphertext.is_none() || material_stale)
             && entry.key_status == "active"
             && !entry.local_state.starts_with("disabled_by_");
@@ -3206,6 +3442,21 @@ fn run_full_snapshot_sync_opts(
                 }
             }
             Err(e) => {
+                // Self-correcting refusal (2026-07-13): a BIZ_DELIVERY_CENTRAL_ONLY
+                // 403 is not a failure to retry — it is the control plane telling us
+                // our understanding of the deployment was wrong. Adopt the truth,
+                // stop asking for material this run, and say what the user should do
+                // instead. Retrying (had_download_error = true) would re-issue the
+                // same refused request forever and pin the material watermark.
+                //
+                // Why check the message: the delivery client returns a formatted
+                // error string; the code is the stable, localized-message-proof
+                // discriminator the server now sends precisely so we can do this.
+                let msg = e.to_string();
+                if msg.contains("BIZ_DELIVERY_CENTRAL_ONLY") {
+                    central_refused = true;
+                    continue;
+                }
                 eprintln!(
                     "  {} could not fetch key '{}': {}",
                     "✗".red(),
@@ -3224,8 +3475,39 @@ fn run_full_snapshot_sync_opts(
     // syncs skip re-download until the next server-side change bumps it again
     // (credential/VK rotation → material_stale again). A failed delivery fetch
     // above keeps the marker behind so the stale key is retried next time.
-    if !had_download_error {
+    //
+    // Under a download-suppressing form the marker must ALSO stay behind
+    // (2026-07-13, caught by the SYNC-DELIVERY-01 integration closure): central
+    // form skips every fetch, so "no download error" is vacuously true while NO
+    // ciphertext reflects this sync_version. Advancing here would make a later
+    // return to local form (e.g. the admin fixes EMPLOYEE_KEY_MODE) silently
+    // skip every rotation that happened meanwhile — stale material forever.
+    // The form-② agent daemon (allow_cluster_key_download) really downloads,
+    // so it keeps stamping. A legacy-server refusal (central_refused) means
+    // material was asked for and denied — same conclusion, keep it behind.
+    let downloads_suppressed = (central_form && !allow_cluster_key_download) || central_refused;
+    if !had_download_error && !downloads_suppressed {
         storage::set_last_material_sync_version(snapshot.sync_version);
+    }
+
+    // Form-① is not a failure — tell the user what the deployment IS and what to
+    // do, instead of the bare "403" + "run `aikey key sync`" (the command they are
+    // running) this used to surface. 2026-07-13. Printed here (the core fn) because
+    // the form state lives here; threading it out to handle_key_sync would mean
+    // changing the return type through every sync wrapper and call site.
+    if central_form || central_refused {
+        eprintln!(
+            "  {} This deployment keeps key material on its cluster nodes (central delivery);",
+            "\u{2139}".cyan()
+        );
+        eprintln!("     keys are not downloaded here by design \u{2014} your tools route through your node.");
+        if shell_integration::read_cluster_node().is_none() {
+            eprintln!(
+                "     {} No cluster node is resolved yet, so nothing can route: check the hub is reachable,",
+                "\u{25b2}".yellow()
+            );
+            eprintln!("       or ask an admin to enable EMPLOYEE_KEY_MODE=local if keys should live on your machine.");
+        }
     }
 
     Ok(downloaded)
@@ -3268,10 +3550,78 @@ pub fn check_sync_version_changed() -> Result<bool, String> {
 ///
 /// Non-blocking: the calling command is not delayed.
 /// All errors are silently suppressed — the local cache remains usable offline.
+/// Cross-process debounce window for the implicit background snapshot sync.
+///
+/// Why this exists (2026-07-07, profiled live on the Windows box): the sync's
+/// own sync_version fast-check runs INSIDE the spawned thread, but
+/// `std::thread::spawn` ITSELF cost ~1.2s there — endpoint AV (Norton)
+/// intercepts thread creation. Every short-lived `_internal` bridge child
+/// paid that before any version check could run, which is exactly the
+/// vault-page latency. The in-process SYNC_IN_PROGRESS flag can't help:
+/// each bridge call is a NEW process, so every one of them spawned a thread.
+///
+/// The debounce is therefore a FILE (cross-process): if any aikey process
+/// attempted the sync within the window, later processes skip the spawn
+/// entirely (sub-ms stat+read on the hot path). Freshness bound for
+/// OAuth-pool material (the reason the implicit sync exists — user decision
+/// 2026-07-07: keep it, don't exempt `_internal`) becomes the window below,
+/// on top of the server-side page-load trigger which is unaffected.
+const SNAPSHOT_SYNC_DEBOUNCE_SECS: u64 = 30;
+
+fn snapshot_sync_debounce_path() -> std::path::PathBuf {
+    crate::commands_account::resolve_aikey_dir()
+        .join("run")
+        .join("snapshot-sync-last-attempt")
+}
+
+/// True when a sync attempt was recorded within the debounce window.
+/// State-file reads follow the "enhancement, not dependency" rule: any
+/// IO/parse failure reads as "stale" so the sync still runs.
+fn snapshot_sync_recently_attempted(path: &std::path::Path, now_epoch: u64) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(last) = raw.trim().parse::<u64>() else {
+        return false;
+    };
+    // `last > now` (clock jumped backwards) reads as stale — never lets a
+    // future timestamp suppress syncs indefinitely.
+    now_epoch >= last && now_epoch - last < SNAPSHOT_SYNC_DEBOUNCE_SECS
+}
+
+/// Record "an attempt happened now". Written BEFORE the sync runs so
+/// concurrent processes inside the window skip even while the winner is
+/// still working; a failed sync simply retries after the window (bounded
+/// cadence for a best-effort path). Write failures are ignored.
+fn record_snapshot_sync_attempt(path: &std::path::Path, now_epoch: u64) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, now_epoch.to_string());
+}
+
 pub fn try_background_snapshot_sync() {
     use std::sync::atomic::{AtomicBool, Ordering};
     // Static flag: true while a background sync thread is running.
     static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+    // Cross-process debounce (see SNAPSHOT_SYNC_DEBOUNCE_SECS): skip the
+    // expensive thread spawn when any process attempted a sync recently.
+    //
+    // Why thread::spawn and not a detached worker PROCESS (evaluated and
+    // measured 2026-07-07): endpoint AV taxes creating a process from our
+    // unsigned binary just as hard as creating a thread (~1.4s vs ~1.2s,
+    // Norton live box) — the earlier "process creation is ~30ms" datum was
+    // for SIGNED system binaries (cmd.exe) and does not transfer. A worker
+    // process buys nothing and adds detach/handle-inheritance hazards.
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let debounce = snapshot_sync_debounce_path();
+    if snapshot_sync_recently_attempted(&debounce, now_epoch) {
+        return;
+    }
 
     // compare_exchange(expected=false, new=true): only one thread wins.
     if SYNC_IN_PROGRESS
@@ -3281,6 +3631,7 @@ pub fn try_background_snapshot_sync() {
         return; // another sync is already running — skip
     }
 
+    record_snapshot_sync_attempt(&debounce, now_epoch);
     std::thread::spawn(|| {
         let _ = run_snapshot_sync();
         SYNC_IN_PROGRESS.store(false, Ordering::Release);
@@ -3402,9 +3753,20 @@ pub fn sync_managed_key_metadata() -> bool {
             supported_providers,
             provider_base_urls,
             owner_account_id: Some(acc.account_id.clone()),
+            owner_email: Some(acc.email.clone()), // owner email for /user/vault
+            group_runtime: None, // proxy-owned (channel ③) — never written from here
+
             // Sync writers MUST always pass extra: None; upsert ignores
             // this field. See doc on VirtualKeyCacheEntry::extra.
             extra: None,
+            // N6: this lightweight metadata sync (KeyItem) does NOT carry oauth-group
+            // data — carry forward existing values so it doesn't clobber what the
+            // full snapshot sync folded in. The full sync (apply_snapshot_to_cache)
+            // is authoritative over these.
+            oauth_group_id: existing.as_ref().and_then(|e| e.oauth_group_id.clone()),
+            group_accounts: existing.as_ref().and_then(|e| e.group_accounts.clone()),
+            routing_config: existing.as_ref().and_then(|e| e.routing_config.clone()),
+            group_alias: existing.as_ref().and_then(|e| e.group_alias.clone()),
         };
         let _ = storage::upsert_virtual_key_cache(&entry);
 
@@ -3465,6 +3827,13 @@ pub fn handle_key_sync(
     // Force a full sync by resetting local_seen_sync_version to 0.
     storage::set_local_seen_sync_version(0);
     let downloaded = run_full_snapshot_sync(password)?;
+    // B-2 (2026-07-06): sign post-sync auto-assign binding writes. The full
+    // sync above already strict-verified this password's derived key, so
+    // VerifiedVaultKey::new cannot fail here except on a concurrent password
+    // change — in which case signing is correctly skipped (best-effort None).
+    let audit_key = derive_vault_key(password)
+        .ok()
+        .and_then(|k| crate::audit::VerifiedVaultKey::new(k).ok());
 
     // v1.0.2: reconcile provider primaries after sync.
     let cached = storage::list_virtual_key_cache().unwrap_or_default();
@@ -3483,9 +3852,11 @@ pub fn handle_key_sync(
         })
         .filter(|(_, p)| !p.is_empty())
         .collect();
-    let reconciled =
-        crate::profile_activation::reconcile_provider_primaries_after_team_key_sync(&synced_keys)
-            .unwrap_or_default();
+    let reconciled = crate::profile_activation::reconcile_provider_primaries_after_team_key_sync(
+        &synced_keys,
+        audit_key.as_ref(),
+    )
+    .unwrap_or_default();
     if !reconciled.is_empty() {
         let _ = crate::profile_activation::refresh_implicit_profile_activation();
     }
@@ -4104,6 +4475,7 @@ pub(crate) fn write_bindings_canonical(
     providers: &[String],
     key_type_str: &str,
     key_ref: &str,
+    audit: Option<&crate::audit::VerifiedVaultKey>,
 ) -> Result<(), String> {
     for raw_provider in providers {
         let raw = raw_provider.to_lowercase();
@@ -4122,6 +4494,23 @@ pub(crate) fn write_bindings_canonical(
             key_ref,
         )
         .map_err(|e| format!("set_provider_binding: {}", e))?;
+        // B-2 (2026-07-06): sign one tamper-evident `bind` audit row per
+        // binding write when the caller holds a verified vault key — the
+        // incident write (post-sync auto-assign) was invisible in audit_log
+        // AND the internal log. BEST-EFFORT by design: the binding write above
+        // already landed; an audit insert failure must never fail activation
+        // (fail-visible via WARN instead). `None` (keyless automatic contexts)
+        // still leaves the observability event emitted by the caller.
+        if let Some(vk) = audit {
+            if let Err(e) = crate::audit::log_audit_event_from_vault_key(
+                vk.as_bytes(),
+                crate::audit::AuditOperation::Bind,
+                Some(&format!("{}:{}:{}", canonical, key_type_str, key_ref)),
+                true,
+            ) {
+                eprintln!("[aikey] warning: bind audit row not written: {}", e);
+            }
+        }
     }
     Ok(())
 }
@@ -4245,6 +4634,13 @@ pub use shell_integration::*;
 // config via `openclaw config patch`. Reuses `aikey route` primitives.
 pub(crate) mod openclaw_hook;
 
+// Claude Desktop takeover (阶段7, D1–D10): pure file layer that flips the
+// GUI app between official (1p) and aikey-gateway (3p) modes, following the
+// active anthropic binding. P1 = writer core only; the P2 funnel hook lives
+// inside `apply_third_party_cli_configs` so BOTH production call sites
+// (lifecycle tail + handle_key_unuse's parallel copy) cover it.
+pub(crate) mod claude_desktop;
+
 // Credential lifecycle: single funnel for all binding writes + read-only
 // state audit. See `lifecycle/mod.rs` for the design rationale (Phase 5
 // of bugfix 2026-05-07-handle-add-skips-third-party-cli-config).
@@ -4259,6 +4655,10 @@ pub use lifecycle::*;
 // sibling, mainly relevant to Windows users), not a compilation gate.
 // See shell_integration_windows.rs module docstring.
 mod shell_integration_windows;
+// ExecutionPolicy wired-but-dead probe (2026-07-12 X2) — consumed by doctor.
+pub use shell_integration_windows::powershell_profile_load_blocked;
+// pwsh-7 dual-profile wiring gap probe (2026-07-12 3a) — consumed by doctor.
+pub use shell_integration_windows::pwsh_profile_wiring_gap;
 
 /// Resolve an OAuth account by `provider_account_id`, `local_alias`, OR
 /// `display_identity` (email). Returns `None` when no match — caller treats
@@ -4385,7 +4785,18 @@ pub fn handle_key_use(
         if on_cluster && entry.provider_key_ciphertext.is_none() {
             eprintln!("  Key '{}' → cluster node (key stays central)", entry.alias);
         }
-        if entry.provider_key_ciphertext.is_none() && !on_cluster {
+        // Group VKs (oauth_group_id set) carry NO local key material BY DESIGN — the
+        // per-account credential is pulled by the proxy via channel ③ (group runtime),
+        // so `use` (set active routing) works without local ciphertext, exactly like a
+        // cluster central key. Without this exemption a group VK fell into the "not
+        // delivered" sync below, the sync produced no ciphertext (it never will), and
+        // `aikey use` errored with "downloaded no key material — admin may need to
+        // attach a credential" — misleading, the VK routes fine. Mirrors the web
+        // set-route fix (key_material_reachable) + connectivity-probe / proxy
+        // group-route fixes (the same "组 VK 无本地物料是设计" systemic root cause; this
+        // is the CLI public-command path, separate from vault_op's web path). (2026-06-26)
+        if entry.provider_key_ciphertext.is_none() && !on_cluster && entry.oauth_group_id.is_none()
+        {
             // Why: key material is NULL when the VK was synced but not yet delivered
             // (share_status=pending_claim). Auto-trigger a full snapshot sync (which
             // includes key material download) instead of forcing a separate command.
@@ -4659,11 +5070,14 @@ pub fn handle_key_use(
     // refresh → apply_third_party_cli_configs. Drive off the refreshed
     // binding set so switching one provider away from kimi/codex correctly
     // unconfigures the corresponding toml region.
-    let _lifecycle = apply_credential_lifecycle(CredentialLifecycleEvent::Switched {
-        source_type: key_type.as_str(),
-        source_ref: &key_ref,
-        providers: &target_providers,
-    })
+    let lifecycle = apply_credential_lifecycle(
+        CredentialLifecycleEvent::Switched {
+            source_type: key_type.as_str(),
+            source_ref: &key_ref,
+            providers: &target_providers,
+        },
+        try_audit_key_from_session().as_ref(),
+    )
     .map_err(|e| format!("Failed to apply use: {}", e))?;
 
     // ── 6. Shell hook (one-time, first use) ───────────────────────────────────
@@ -4689,6 +5103,10 @@ pub fn handle_key_use(
             "promoted_providers": target_providers,
             "all_active_providers": bindings.iter().map(|b| &b.provider_code).collect::<Vec<_>>(),
             "active_env_written": true,
+            // 阶段7 (2026-07-13): Desktop takeover state from the funnel —
+            // same wire shape as the vault-op envelope, so scripted `aikey
+            // use --json` callers (E2E DS-13) can assert consent semantics.
+            "desktop_switch": lifecycle.desktop_switch,
         }));
     } else {
         // Stage 4 (active-state cross-shell sync, 2026-04-27): the previous
@@ -4697,11 +5115,22 @@ pub fn handle_key_use(
         // precmd hook picks up the new active.env on the user's next prompt
         // (free, unconditional), but if they want to use the new key in
         // *this* prompt they can `source` the file. State that plainly.
-        let status = if hook_msg.is_some() {
-            "\u{2192} Shell hook just installed. Open a new terminal or: source ~/.aikey/active.env"
-        } else {
-            "\u{2713} Active key updated. Next prompt picks it up automatically.\n     To apply right now: source ~/.aikey/active.env"
-        };
+        //
+        // Use-effectiveness self-check (2026-07-10): "next prompt picks it
+        // up automatically" is only true when the hook is actually loaded
+        // in the invoking shell. Classify via the exported
+        // _AIKEY_HOOK_LOADED_HASH marker + rc wiring state instead of
+        // asserting it unconditionally — a terminal opened before hook
+        // install got a claim that silently never came true.
+        let status = use_status_line(
+            hook_msg.as_deref(),
+            std::env::var("_AIKEY_HOOK_LOADED_HASH").is_ok(),
+            shell_integration::shell_rc_has_aikey_block(),
+            no_hook
+                || std::env::var("AIKEY_NO_HOOK")
+                    .map(|v| v == "1")
+                    .unwrap_or(false),
+        );
 
         let mut rows: Vec<String> = Vec::new();
         for b in &bindings {
@@ -4724,7 +5153,7 @@ pub fn handle_key_use(
             }
         }
         rows.push(String::new());
-        rows.push(status.to_string());
+        rows.push(status);
 
         let title = format!(
             "Set '{}' as Primary for {}",
@@ -4732,6 +5161,15 @@ pub fn handle_key_use(
             target_providers.join(", ")
         );
         crate::ui_frame::print_box("\u{1F7E2}", &title, &rows);
+        // 阶段7: Desktop is a cold-switch surface — when THIS use rewrote
+        // its config the user must restart the app, and silence here would
+        // read as "done" (防呆: every takeover needs visible feedback).
+        if lifecycle
+            .desktop_switch
+            .is_some_and(|d| d.restart_required)
+        {
+            println!("  \u{21BB} Claude Desktop config updated — restart Desktop to apply.");
+        }
         println!();
     }
 
@@ -4741,6 +5179,184 @@ pub fn handle_key_use(
     // unuse.md for why the previous one-sided install call was hiding a
     // matching uninstall gap.
     Ok(())
+}
+
+/// Classify the `aikey use` summary line so it never overpromises
+/// (use-effectiveness self-check, 2026-07-10).
+///
+/// Problem this solves: the old summary claimed "Next prompt picks it up
+/// automatically" unconditionally whenever the rc was already wired
+/// (AlreadyV3 → `hook_msg == None`). In a terminal opened BEFORE the hook
+/// was wired, precmd was never registered there, so the claim silently
+/// never came true — the user ran `claude` bare and nothing routed through
+/// aikey, with zero feedback. Re-running `aikey use` with the SAME key hit
+/// the same silent path.
+///
+/// Detection: the hook file exports `_AIKEY_HOOK_LOADED_HASH` at source
+/// time (see `hook_content_with_hash_header`), so a child process seeing
+/// that env var knows the invoking shell loaded the hook. aikey cannot
+/// source the hook into the parent shell on the user's behalf — the honest
+/// remediation is a precise, actionable hint.
+///
+/// Transitional caveat: shells that loaded a pre-export hook (< 2026-07-10
+/// template) don't expose the marker until the auto-reload picks up the
+/// regenerated file at the next prompt; they may see one warning that a
+/// fresh prompt (or new terminal) resolves. Self-healing, accepted.
+pub(crate) fn use_status_line(
+    hook_msg: Option<&str>,
+    hook_loaded_in_shell: bool,
+    rc_wired: bool,
+    hook_opted_out: bool,
+) -> String {
+    // Platform-aware immediate-apply hint (2026-07-12, Windows X4/X5):
+    // `source ~/.aikey/active.env` is a dead instruction on PowerShell/cmd.
+    let apply_now = shell_integration::apply_now_hint();
+    if hook_opted_out {
+        return format!(
+            "\u{2713} Active key updated. Shell hook disabled (AIKEY_NO_HOOK) \u{2014} apply manually: {apply_now}"
+        );
+    }
+    // ensure_shell_hook spoke (installed / migrated / declined / non-TTY
+    // hint): surface its exact message instead of the old generic "hook
+    // just installed" line, which mislabeled hints and declines. The
+    // message text was previously swallowed (only is_some() was checked).
+    if let Some(msg) = hook_msg {
+        return format!(
+            "\u{2192} {}\n     To apply right now: {apply_now}",
+            msg.trim_start()
+        );
+    }
+    if hook_loaded_in_shell {
+        return format!(
+            "\u{2713} Active key updated. Next prompt picks it up automatically.\n     To apply right now: {apply_now}"
+        );
+    }
+    if rc_wired {
+        // Platform-aware remediation (2026-07-12, found on Windows real-machine
+        // verification): the first draft hardcoded "~/.zshrc / ~/.bashrc",
+        // which is a dead instruction for PowerShell users — their hook lives
+        // in $PROFILE.CurrentUserAllHosts. reload_hint_for_shell() owns the
+        // per-shell dispatch.
+        format!(
+            "\x1b[33m\u{25b2} Active key updated, but aikey env is NOT loaded in this shell (terminal opened before the hook was installed?).\n     Apply: open a new terminal, or run: {}\x1b[0m",
+            shell_integration::reload_hint_for_shell()
+        )
+    } else {
+        "\x1b[33m\u{25b2} Active key updated, but the shell hook is not wired \u{2014} `claude`/`codex` will NOT route through aikey.\n     Fix: run `aikey hook install`, then open a new terminal.\x1b[0m".to_string()
+    }
+}
+
+#[cfg(test)]
+mod use_status_line_tests {
+    use super::use_status_line;
+
+    #[test]
+    fn opted_out_is_neutral_and_never_warns() {
+        let s = use_status_line(None, false, false, true);
+        assert!(s.contains("AIKEY_NO_HOOK"));
+        assert!(!s.contains("\u{25b2}"), "opt-out users chose this — no warning");
+    }
+
+    #[test]
+    fn hook_msg_is_surfaced_verbatim_not_swallowed() {
+        // Regression: the old code only checked is_some() and replaced the
+        // actual hint ("Skipped...", "needs interactive confirmation...")
+        // with a generic "hook just installed" line — wrong for declines.
+        let s = use_status_line(Some("  Skipped. To apply once: source ~/.aikey/hook.zsh"), false, false, false);
+        assert!(s.contains("Skipped. To apply once"));
+    }
+
+    #[test]
+    fn loaded_shell_keeps_autopickup_promise() {
+        let s = use_status_line(None, true, true, false);
+        assert!(s.contains("Next prompt picks it up automatically"));
+        assert!(!s.contains("\u{25b2}"));
+    }
+
+    #[test]
+    fn wired_but_stale_shell_warns_with_reload_hint() {
+        let s = use_status_line(None, false, true, false);
+        assert!(s.contains("NOT loaded in this shell"));
+        assert!(s.contains("new terminal"));
+    }
+
+    #[test]
+    fn unwired_shell_warns_with_hook_install_hint() {
+        let s = use_status_line(None, false, false, false);
+        assert!(s.contains("aikey hook install"));
+        assert!(s.contains("NOT route through aikey"));
+    }
+}
+
+/// Post-`aikey hook uninstall` third-party CLI config reconciliation
+/// (2026-07-12, user report X8: Windows `hook uninstall` → `codex` dies
+/// with "Missing environment variable: OPENAI_API_KEY").
+///
+/// Why: `hook uninstall` removes the env-injection channel but used to
+/// leave `~/.codex/config.toml` (`model_provider=aikey`, env_key) and the
+/// kimi config pointing at aikey — configs that only work WITH the hook.
+/// New terminals then fail with a cryptic upstream error. `aikey unuse`
+/// got symmetric cleanup in 2026-05-18 (B1/B2); this is the same lifecycle
+/// gap on the hook-uninstall edge.
+///
+/// Behavior:
+/// - 2026-07-12 (X8, option b): interactive sessions get a Y/n prompt to
+///   strip aikey routing from the affected CLI configs (bindings are KEPT —
+///   re-wiring the hook or the next `aikey use` re-configures them).
+/// - 2026-07-13 (G1 revision, user-approved): non-TTY callers now get the
+///   SAME default applied (strip) instead of a warn-and-leave. Sandbox
+///   repro showed the warn path left `model_provider="aikey"` in codex's
+///   toml, and scripted callers swallow stderr — users hit "Missing
+///   environment variable: OPENAI_API_KEY" with no visible cause. The
+///   strip is harmless + reversible (next `aikey use` / `hook install`
+///   re-applies), same rationale as the unconditional Claude Desktop
+///   restore (D8②). "Never silent": we print the stripped list — the
+///   TTY prompt remains the opt-out chance when a human is present.
+pub fn reconcile_cli_configs_after_hook_uninstall() {
+    use std::io::{IsTerminal, Write};
+
+    let injected = shell_integration::injected_provider_toml_paths();
+    if injected.is_empty() {
+        return;
+    }
+    eprintln!(
+        "\x1b[33m  \u{25b2} These CLI configs still route through aikey, but the hook (env channel) is now unwired:\x1b[0m"
+    );
+    for (label, path) in &injected {
+        eprintln!("\x1b[33m      {:<6} {}\x1b[0m", label, path.display());
+    }
+    eprintln!(
+        "\x1b[33m    In new terminals those CLIs would fail (e.g. codex: Missing environment variable: OPENAI_API_KEY).\x1b[0m"
+    );
+
+    if !std::io::stderr().is_terminal() || !std::io::stdin().is_terminal() {
+        // Headless: apply the interactive default (strip) instead of
+        // leaving broken hard-pointing configs behind (G1, 2026-07-13).
+        shell_integration::apply_third_party_cli_configs(&[], crate::commands_proxy::proxy_port());
+        eprintln!(
+            "  \u{2713} aikey routing removed from the configs above (bindings kept; \
+             next `aikey use` or `aikey hook install` re-applies them)."
+        );
+        return;
+    }
+
+    eprint!("  Remove aikey routing from these CLI configs now? [Y/n] (default Y): ");
+    let _ = std::io::stderr().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_ok()
+        && matches!(input.trim().to_lowercase().as_str(), "n" | "no")
+    {
+        eprintln!(
+            "    Kept. Clean up later with: \x1b[36maikey unuse <provider>\x1b[0m  \u{2014} or re-enable: \x1b[36maikey hook install\x1b[0m"
+        );
+        return;
+    }
+
+    // Empty provider set = unconfigure every aikey-managed third-party CLI
+    // config (same funnel `aikey unuse` drives after removing the last
+    // binding). Bindings themselves are untouched.
+    shell_integration::apply_third_party_cli_configs(&[], crate::commands_proxy::proxy_port());
+    eprintln!("  \u{2713} aikey routing removed from third-party CLI configs (bindings kept; next `aikey use` re-applies them).");
 }
 
 /// `aikey unuse <PROVIDERS...>` — remove the active binding for one or more
@@ -4779,6 +5395,7 @@ pub fn handle_key_unuse(
     // refresh active.env → apply third-party CLI configs → hook file.
     // This ensures env vars and toml regions for unbound providers are
     // removed immediately.
+    let mut desktop_switch: Option<claude_desktop::DesktopSwitch> = None;
     if !unbound.is_empty() {
         if let Ok(refresh) = crate::profile_activation::refresh_implicit_profile_activation() {
             let proxy_port = crate::commands_proxy::proxy_port();
@@ -4787,7 +5404,12 @@ pub fn handle_key_unuse(
                 .iter()
                 .map(|b| b.provider_code.clone())
                 .collect();
-            apply_third_party_cli_configs(&active_providers, proxy_port);
+            // Second (parallel) funnel call site — Desktop takeover/restore
+            // rides INSIDE apply_third_party_cli_configs, so `unuse
+            // anthropic` restores Desktop and `unuse <other>` leaves it
+            // alone with no extra wiring here (阶段7 §4.1).
+            let third_party = apply_third_party_cli_configs(&active_providers, proxy_port);
+            desktop_switch = third_party.desktop;
             let _ = web_install_hook_file_layer1();
         }
     }
@@ -4797,6 +5419,7 @@ pub fn handle_key_unuse(
             "ok": true,
             "unbound_providers": unbound,
             "already_unbound": already_unbound,
+            "desktop_switch": desktop_switch,
         }));
     } else {
         if unbound.is_empty() && !already_unbound.is_empty() {
@@ -4915,6 +5538,27 @@ pub fn handle_key_alias(
 
 /// Derives the vault AES key from the master password.
 /// Uses the same salt + KDF parameters stored in the vault DB.
+/// B-2 (2026-07-06): best-effort audit signer for binding writes in commands
+/// that don't already hold the master password. Reads the CACHED session
+/// password (keychain/file) — non-interactive by contract, NEVER prompts
+/// (interaction-simplicity-first: audit must not add a password prompt).
+/// None ⇒ the binding write proceeds unsigned (observability events only).
+pub(crate) fn try_audit_key_from_session() -> Option<crate::audit::VerifiedVaultKey> {
+    let pw = crate::session::try_get()?;
+    let key = derive_vault_key(&pw).ok()?;
+    crate::audit::VerifiedVaultKey::new(key).ok()
+}
+
+/// B-2 sibling for commands that already hold the master password (add /
+/// delete / key sync): derive + verify, best-effort (None on mismatch — the
+/// command's own executor already failed loudly in that case).
+pub(crate) fn audit_key_from_password(
+    password: &SecretString,
+) -> Option<crate::audit::VerifiedVaultKey> {
+    let key = derive_vault_key(password).ok()?;
+    crate::audit::VerifiedVaultKey::new(key).ok()
+}
+
 fn derive_vault_key(password: &SecretString) -> Result<[u8; crypto::KEY_SIZE], String> {
     let salt = storage::get_salt()?;
     let (m, t, p) = storage::get_kdf_params()?;
@@ -4929,6 +5573,51 @@ fn resolve_binding_display_name(source_type: &str, source_ref: &str) -> String {
         }
     }
     source_ref.to_string()
+}
+
+#[cfg(test)]
+mod browser_launch_tests {
+    //! Fence for bugfix 20260702-windows-login-url-ampersand-truncation.
+    //!
+    //! On Windows the login URL (`?s=...&d=...&email=...`) was launched via
+    //! `cmd /c start "" <url>`; cmd.exe splits its command line at bare `&`,
+    //! so the browser opened a URL truncated at the first `&` ("Missing
+    //! session parameters" on the login page) and cmd tried to run `d=...` /
+    //! `email=...` as commands. The URL must reach a non-shell launcher as
+    //! one intact argv entry.
+
+    use super::browser_launch_command;
+
+    const LOGIN_URL: &str = "http://127.0.0.1:3000/auth/cli/login?s=abc&d=def&email=ZmFuZw";
+
+    #[test]
+    fn windows_never_routes_through_cmd_start() {
+        let (program, args) =
+            browser_launch_command("windows", LOGIN_URL).expect("windows is supported");
+        assert_ne!(
+            program, "cmd",
+            "cmd.exe shell-parses bare `&` — truncates the URL"
+        );
+        assert_eq!(program, "rundll32");
+        assert_eq!(args, vec!["url.dll,FileProtocolHandler", LOGIN_URL]);
+    }
+
+    #[test]
+    fn unix_launchers_take_url_as_single_arg() {
+        assert_eq!(
+            browser_launch_command("macos", LOGIN_URL),
+            Some(("open", vec![LOGIN_URL]))
+        );
+        assert_eq!(
+            browser_launch_command("linux", LOGIN_URL),
+            Some(("xdg-open", vec![LOGIN_URL]))
+        );
+    }
+
+    #[test]
+    fn unsupported_platform_skips() {
+        assert_eq!(browser_launch_command("freebsd", LOGIN_URL), None);
+    }
 }
 
 #[cfg(test)]
@@ -5196,7 +5885,9 @@ mod provider_mapping_tests {
         // 三个 family 内 provider_code 各自的 KIMI_MODEL_NAME / MAX_CONTEXT_SIZE 不同
         // (避免上游 reject + 客户端预估错):
         //   kimi_code → kimi-k2.5 / 131072(api.kimi.com 自家 model,128K context)
-        //   moonshot  → moonshot-v1-8k / 8192(模型名编码 context 上限,默认配最便宜)
+        //   moonshot  → moonshot-v1-128k / 131072(2026-07-08 从 moonshot-v1-8k/8192
+        //               反转,原 8k 默认使 Kimi CLI 开箱即废;选 v1-128k 而非更新的
+        //               kimi-latest 因后者账号权限门控会 404,基础 v1 家族最广兼容)
         //   kimi(deprecated)→ 与 kimi_code 一致(经 oauth_alias 解析)
         let kimi_code = provider_extra_env_vars("kimi_code");
         assert!(kimi_code
@@ -5207,22 +5898,26 @@ mod provider_mapping_tests {
             .any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "131072"));
 
         let moonshot = provider_extra_env_vars("moonshot");
+        // 2026-07-08 默认模型反转为 moonshot-v1-128k: Kimi CLI 最小提示词 ~12.4K > 8192,
+        // 原 moonshot-v1-8k 从第一句就 400 token-limit-exceeded(开箱即废)。选基础 v1
+        // 家族的 128k 而非更新的 kimi-latest —— 后者在 api.moonshot.cn 账号权限门控,
+        // 实测 404 Permission denied;DEFAULT 要最广兼容而非最新。
         assert!(moonshot
             .iter()
-            .any(|(k, v)| *k == "KIMI_MODEL_NAME" && *v == "moonshot-v1-8k"));
-        // Moonshot 模型族名字直接编码 context 上限: moonshot-v1-8k=8192, -32k=32768,
-        // -128k=131072。default 配 8k 模型必须配 8192 context, 否则 kimi-cli 端会做错截断预估。
+            .any(|(k, v)| *k == "KIMI_MODEL_NAME" && *v == "moonshot-v1-128k"));
+        // MAX_CONTEXT 匹配 128K 上限,否则 kimi-cli 端会按旧 8192 错误截断。
         assert!(moonshot
             .iter()
-            .any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "8192"));
+            .any(|(k, v)| *k == "KIMI_MODEL_MAX_CONTEXT_SIZE" && *v == "131072"));
 
         // deprecated 'kimi' alias 解析到 kimi_code,继承 kimi-k2.5 / 131072
         let kimi_alias = provider_extra_env_vars("kimi");
         assert_eq!(kimi_alias, kimi_code);
 
-        // 关键不变量:moonshot 的 model 不应该是 kimi-k2.5(pre-fix bug)
+        // 关键不变量:moonshot 的 model 不应该是 kimi-k2.5(pre-fix bug — 会被
+        // api.moonshot.cn reject);现默认 moonshot-v1-128k,仍与 kimi_code 不同。
         assert_ne!(moonshot, kimi_code,
-            "moonshot extras must use moonshot-v1-8k, not kimi-k2.5 (would be rejected by api.moonshot.cn)");
+            "moonshot extras must use moonshot-v1-128k, not kimi-k2.5 (would be rejected by api.moonshot.cn)");
     }
 
     #[test]
@@ -5355,6 +6050,49 @@ mod sync_tests {
 // is designed to prevent.
 // ============================================================================
 #[cfg(test)]
+mod snapshot_sync_debounce_tests {
+    use super::*;
+
+    // Pins the cross-process debounce contract (2026-07-07 vault-page
+    // latency): within the window → skip (this is what saves the ~1.2s
+    // AV-taxed thread::spawn per bridge child); stale / missing / corrupt /
+    // future-clock states all read as "attempt now" so the sync semantics
+    // the OAuth-pool design relies on are never silently lost.
+    #[test]
+    fn debounce_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run").join("snapshot-sync-last-attempt");
+        let now = 1_000_000u64;
+
+        // Missing file → not recently attempted (sync runs).
+        assert!(!snapshot_sync_recently_attempted(&path, now));
+
+        // Recorded just now → suppressed for the window.
+        record_snapshot_sync_attempt(&path, now);
+        assert!(snapshot_sync_recently_attempted(&path, now));
+        assert!(snapshot_sync_recently_attempted(
+            &path,
+            now + SNAPSHOT_SYNC_DEBOUNCE_SECS - 1
+        ));
+
+        // Window elapsed → stale again.
+        assert!(!snapshot_sync_recently_attempted(
+            &path,
+            now + SNAPSHOT_SYNC_DEBOUNCE_SECS
+        ));
+
+        // Corrupt content → stale (enhancement-not-dependency).
+        std::fs::write(&path, "not-a-number").unwrap();
+        assert!(!snapshot_sync_recently_attempted(&path, now));
+
+        // Future timestamp (clock jumped back) → stale, never a permanent
+        // suppression.
+        std::fs::write(&path, (now + 10_000).to_string()).unwrap();
+        assert!(!snapshot_sync_recently_attempted(&path, now));
+    }
+}
+
+#[cfg(test)]
 mod core_tests {
     use super::*;
     use secrecy::SecretString;
@@ -5383,6 +6121,128 @@ mod core_tests {
         // Any 32-byte key works for apply_add_core tests — it's used purely
         // for AES-GCM encryption. Decryption round-trips aren't tested here.
         [0x42u8; 32]
+    }
+
+    // ── N6: oauth-group fold + extra fence ─────────────────────────────────────
+
+    fn vk_entry(
+        vk: &str,
+        oauth_group_id: Option<&str>,
+        group_accounts: Option<&str>,
+        routing_config: Option<&str>,
+    ) -> storage::VirtualKeyCacheEntry {
+        storage::VirtualKeyCacheEntry {
+            virtual_key_id: vk.into(),
+            org_id: "org-1".into(),
+            seat_id: "seat-1".into(),
+            alias: "k".into(),
+            provider_code: "anthropic".into(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: String::new(),
+            credential_revision: String::new(),
+            virtual_key_revision: "r1".into(),
+            key_status: "active".into(),
+            share_status: "claimed".into(),
+            local_state: "synced_inactive".into(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: None,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec![],
+            provider_base_urls: std::collections::HashMap::new(),
+            owner_account_id: Some("acct-1".into()),
+            owner_email: Some("acct-1@test".into()),
+            group_runtime: None,
+            group_alias: None,
+            extra: None,
+            oauth_group_id: oauth_group_id.map(|s| s.to_string()),
+            group_accounts: group_accounts.map(|s| s.to_string()),
+            routing_config: routing_config.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn n6_group_fields_fold_and_extra_survives_sync() {
+        let (_dir, _guard) = setup_vault();
+
+        // First sync: a group-bound VK with a candidate set + routing config.
+        let ga = r#"[{"account_id":"acc-A","identity":"a@t.com","provider_code":"anthropic","priority":1,"assigned":true}]"#;
+        let rc = r#"{"exhaustion_signals":["unified_rate_limited"]}"#;
+        storage::upsert_virtual_key_cache(&vk_entry("vk-1", Some("grp-1"), Some(ga), Some(rc)))
+            .unwrap();
+
+        let got = storage::get_virtual_key_cache("vk-1").unwrap().unwrap();
+        assert_eq!(
+            got.oauth_group_id.as_deref(),
+            Some("grp-1"),
+            "oauth_group_id folded"
+        );
+        assert!(
+            got.group_accounts.as_deref().unwrap().contains("acc-A"),
+            "group_accounts folded"
+        );
+        assert_eq!(
+            got.routing_config.as_deref(),
+            Some(rc),
+            "routing_config folded"
+        );
+
+        // User records a connectivity-test result into the user-owned `extra` blob.
+        {
+            let conn = crate::storage::open_connection().unwrap();
+            conn.execute(
+                "UPDATE managed_virtual_keys_cache SET extra = ?1 WHERE virtual_key_id = ?2",
+                rusqlite::params![r#"{"last_test":{"ok":true}}"#, "vk-1"],
+            )
+            .unwrap();
+        }
+
+        // Second sync: candidate set changed (server authoritative) — must UPDATE
+        // group fields BUT leave `extra` intact (the 2026-05-22 fence invariant).
+        let ga2 = r#"[{"account_id":"acc-B","identity":"b@t.com","provider_code":"anthropic","priority":1,"assigned":true}]"#;
+        let rc2 = r#"{"reject_ratio":5}"#;
+        storage::upsert_virtual_key_cache(&vk_entry("vk-1", Some("grp-2"), Some(ga2), Some(rc2)))
+            .unwrap();
+
+        let got = storage::get_virtual_key_cache("vk-1").unwrap().unwrap();
+        assert_eq!(
+            got.oauth_group_id.as_deref(),
+            Some("grp-2"),
+            "oauth_group_id updated by sync"
+        );
+        assert_eq!(
+            got.routing_config.as_deref(),
+            Some(rc2),
+            "routing_config updated by sync"
+        );
+        assert!(
+            got.group_accounts.as_deref().unwrap().contains("acc-B"),
+            "group_accounts updated"
+        );
+        assert!(
+            !got.group_accounts.as_deref().unwrap().contains("acc-A"),
+            "old candidate replaced"
+        );
+        // The critical fence: sync touching group fields must NOT wipe extra.
+        let extra = got.extra.expect("extra survived sync");
+        assert_eq!(
+            extra["last_test"]["ok"],
+            serde_json::json!(true),
+            "user-owned extra preserved"
+        );
+    }
+
+    #[test]
+    fn n6_direct_bind_vk_has_no_group_fields() {
+        let (_dir, _guard) = setup_vault();
+        // A direct-bind VK syncs with no seat group → all group columns NULL.
+        storage::upsert_virtual_key_cache(&vk_entry("vk-2", None, None, None)).unwrap();
+        let got = storage::get_virtual_key_cache("vk-2").unwrap().unwrap();
+        assert_eq!(got.oauth_group_id, None);
+        assert_eq!(got.group_accounts, None);
+        assert_eq!(got.routing_config, None);
     }
 
     // ── apply_quota_snapshot_to_cache (Phase 2 Stage 2b) ──────────────────────
@@ -5795,6 +6655,7 @@ mod core_tests {
             &["claude".to_string()],
             "personal_oauth_account",
             "acct-xyz",
+            None,
         )
         .expect("write ok");
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
@@ -5823,6 +6684,7 @@ mod core_tests {
             &["codex".to_string()],
             "personal_oauth_account",
             "fresh-uuid",
+            None,
         )
         .unwrap();
 
@@ -5855,10 +6717,11 @@ mod core_tests {
         //   ④ 跨 family 不受影响(anthropic 不被 mutex 触动)
         let (_dir, _lock) = setup_vault();
         // 先写 anthropic 作为 cross-family 不受影响的对照
-        write_bindings_canonical(&["anthropic".to_string()], "personal", "k-claude").unwrap();
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "k-claude", None).unwrap();
         // 然后顺序写入 kimi family 两个成员
-        write_bindings_canonical(&["moonshot".to_string()], "personal", "k-moonshot").unwrap();
-        write_bindings_canonical(&["kimi".to_string()], "personal", "k-kimi").unwrap();
+        write_bindings_canonical(&["moonshot".to_string()], "personal", "k-moonshot", None)
+            .unwrap();
+        write_bindings_canonical(&["kimi".to_string()], "personal", "k-kimi", None).unwrap();
 
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
         // ① + ② 最后写入的 'kimi' 经 alias → kimi_code,独占 family
@@ -5884,8 +6747,8 @@ mod core_tests {
     #[test]
     fn write_bindings_canonical_upserts_same_canonical() {
         let (_dir, _lock) = setup_vault();
-        write_bindings_canonical(&["anthropic".to_string()], "personal", "first").unwrap();
-        write_bindings_canonical(&["anthropic".to_string()], "personal", "second").unwrap();
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "first", None).unwrap();
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "second", None).unwrap();
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
         let anthropic_rows: Vec<_> = bindings
             .iter()
@@ -5897,6 +6760,229 @@ mod core_tests {
             "UPSERT should leave exactly one row per canonical"
         );
         assert_eq!(anthropic_rows[0].key_source_ref, "second");
+    }
+
+    // ── binding material guard (2026-07-06 incident) ─────────────────────────
+    //
+    // A post-`aikey key sync` reconcile auto-bound a team VK with NO local
+    // provider_key_ciphertext as the anthropic Primary. Result: proxy 503s,
+    // the picker hides the key (material filter), the web vault shows it as
+    // "IN USE" — three surfaces disagreeing about the active key. The guard:
+    // automatic binding fills (auto_assign / removal-reconcile replacement)
+    // must skip material-unreachable team VKs and rather leave the slot empty.
+    // See update/20260706-绑定材料守卫与Web解锁态全量sync.md.
+    //
+    // NOTE: these tests assume the non-cluster environment (no
+    // ~/.aikey/active-cluster.json) — `key_material_reachable(false)` requires
+    // local ciphertext unless the VK is a group VK.
+
+    fn guard_vk(vk: &str, group: Option<&str>, ciphertext: Option<&[u8]>) -> () {
+        let mut e = vk_entry(vk, group, None, None);
+        e.provider_key_ciphertext = ciphertext.map(|c| c.to_vec());
+        e.provider_key_nonce = ciphertext.map(|_| vec![0u8; 12]);
+        storage::upsert_virtual_key_cache(&e).unwrap();
+    }
+
+    #[test]
+    fn auto_assign_skips_material_unreachable_team_vk() {
+        let (_dir, _lock) = setup_vault();
+        // Direct-bind VK, no local ciphertext, no group → unreachable.
+        guard_vk("vk-nomat", None, None);
+
+        let assigned = crate::profile_activation::auto_assign_primaries_for_key(
+            "team",
+            "vk-nomat",
+            &["anthropic".to_string()],
+            None,
+        )
+        .expect("auto_assign must not error");
+        assert!(assigned.is_empty(), "unreachable VK must not be promoted");
+        let bindings = storage::list_provider_bindings_readonly("default").unwrap();
+        assert!(
+            bindings.iter().all(|b| b.key_source_ref != "vk-nomat"),
+            "no binding may reference the unreachable VK, got: {:?}",
+            bindings
+        );
+    }
+
+    #[test]
+    fn auto_assign_allows_group_vk_without_ciphertext() {
+        let (_dir, _lock) = setup_vault();
+        // Group VK: no local material BY DESIGN (proxy channel ③) → reachable.
+        guard_vk("vk-grp", Some("grp-1"), None);
+
+        let assigned = crate::profile_activation::auto_assign_primaries_for_key(
+            "team",
+            "vk-grp",
+            &["anthropic".to_string()],
+            None,
+        )
+        .expect("auto_assign ok");
+        assert_eq!(assigned, vec!["anthropic".to_string()]);
+    }
+
+    #[test]
+    fn auto_assign_allows_team_vk_with_local_ciphertext() {
+        let (_dir, _lock) = setup_vault();
+        guard_vk("vk-mat", None, Some(b"cipher"));
+
+        let assigned = crate::profile_activation::auto_assign_primaries_for_key(
+            "team",
+            "vk-mat",
+            &["anthropic".to_string()],
+            None,
+        )
+        .expect("auto_assign ok");
+        assert_eq!(assigned, vec!["anthropic".to_string()]);
+    }
+
+    /// Pins the exact incident path: `aikey key sync`'s post-sync reconcile
+    /// wrapper must not bind a material-unreachable VK even when it is the
+    /// only anthropic candidate — an empty slot is the correct outcome.
+    #[test]
+    fn post_sync_reconcile_does_not_bind_material_unreachable_vk() {
+        let (_dir, _lock) = setup_vault();
+        guard_vk("vk-nomat", None, None);
+
+        let reconciled =
+            crate::profile_activation::reconcile_provider_primaries_after_team_key_sync(
+                &[("vk-nomat".to_string(), vec!["anthropic".to_string()])],
+                None,
+            )
+            .expect("reconcile ok");
+        assert!(reconciled.is_empty(), "nothing may be promoted");
+        let bindings = storage::list_provider_bindings_readonly("default").unwrap();
+        assert!(
+            bindings.iter().all(|b| b.provider_code != "anthropic"),
+            "anthropic slot must stay EMPTY rather than bind an unusable key"
+        );
+    }
+
+    /// Removal-reconcile replacement search must skip the unreachable VK and
+    /// promote the reachable one, regardless of cache iteration order.
+    #[test]
+    fn removal_reconcile_replacement_skips_unreachable_vk() {
+        let (_dir, _lock) = setup_vault();
+        // Current primary that is about to be removed.
+        guard_vk("vk-old", None, Some(b"cipher-old"));
+        write_bindings_canonical(&["anthropic".to_string()], "team", "vk-old", None).unwrap();
+        // Two candidates: unreachable direct-bind VK (inserted first) and a
+        // reachable group VK.
+        guard_vk("vk-nomat", None, None);
+        guard_vk("vk-grp", Some("grp-1"), None);
+
+        let actions = crate::profile_activation::reconcile_provider_primary_after_key_removal(
+            "team", "vk-old", None,
+        )
+        .expect("reconcile ok");
+        let anthropic = actions
+            .iter()
+            .find(|a| a.provider_code == "anthropic")
+            .expect("anthropic action");
+        match &anthropic.outcome {
+            crate::profile_activation::ReconcileOutcome::Replaced { new_source_ref, .. } => {
+                assert_eq!(
+                    new_source_ref, "vk-grp",
+                    "replacement must be the reachable VK, not the material-less one"
+                );
+            }
+            other => panic!("expected Replaced, got {:?}", other),
+        }
+    }
+
+    // ── B-2 bind audit rows (2026-07-06) ─────────────────────────────────────
+    //
+    // Every binding write through write_bindings_canonical must sign a
+    // tamper-evident `bind` audit row when the caller holds a VerifiedVaultKey.
+    // The incident write (post-sync auto-assign) had NO trace in audit_log —
+    // root-causing required timestamp cross-referencing across three stores.
+
+    fn verified_key() -> crate::audit::VerifiedVaultKey {
+        // setup_vault stored password_hash = derived key of "test_password";
+        // derive the same way the CLI does and let the newtype verify it.
+        let pw = SecretString::new("test_password".to_string());
+        let key = derive_vault_key(&pw).expect("derive");
+        crate::audit::VerifiedVaultKey::new(key).expect("verified")
+    }
+
+    fn bind_audit_rows() -> Vec<String> {
+        let conn = storage::open_connection().expect("open");
+        let mut stmt = conn
+            .prepare("SELECT alias FROM audit_log WHERE operation = 'bind' ORDER BY id")
+            .expect("prepare");
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    }
+
+    #[test]
+    fn bind_write_with_verified_key_signs_audit_row() {
+        let (_dir, _lock) = setup_vault();
+        crate::audit::initialize_audit_log().expect("audit table");
+        let vk = verified_key();
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "k-1", Some(&vk))
+            .expect("write");
+        let rows = bind_audit_rows();
+        assert_eq!(rows, vec!["anthropic:personal:k-1".to_string()]);
+        // Chain integrity: the signed row must VERIFY (a wrong-key signature
+        // would surface as a tampered entry and poison the whole chain).
+        let pw = SecretString::new("test_password".to_string());
+        let (verified, tampered) = crate::audit::verify_audit_log(&pw).expect("verify");
+        assert!(verified >= 1, "bind row must be part of the verified chain");
+        assert!(
+            tampered.is_empty(),
+            "bind row signed with VerifiedVaultKey must not read as tampered: {:?}",
+            tampered
+        );
+    }
+
+    #[test]
+    fn bind_write_without_key_stays_unsigned_but_succeeds() {
+        let (_dir, _lock) = setup_vault();
+        crate::audit::initialize_audit_log().expect("audit table");
+        write_bindings_canonical(&["anthropic".to_string()], "personal", "k-2", None)
+            .expect("keyless binding write must not fail");
+        assert!(
+            bind_audit_rows().is_empty(),
+            "no VerifiedVaultKey → no audit row (observability event only)"
+        );
+        // The binding itself must still land (audit is an overlay, never a gate).
+        let bindings = storage::list_provider_bindings_readonly("default").unwrap();
+        assert!(bindings.iter().any(|b| b.key_source_ref == "k-2"));
+    }
+
+    #[test]
+    fn verified_vault_key_rejects_wrong_key() {
+        let (_dir, _lock) = setup_vault();
+        let err = crate::audit::VerifiedVaultKey::new([0x41u8; 32]);
+        assert!(
+            err.is_err(),
+            "a non-matching key must NOT be constructible — it would sign rows that read as tampered"
+        );
+    }
+
+    #[test]
+    fn auto_assign_with_verified_key_signs_bind_row() {
+        let (_dir, _lock) = setup_vault();
+        crate::audit::initialize_audit_log().expect("audit table");
+        guard_vk("vk-audit", None, Some(b"cipher"));
+        let vk = verified_key();
+        let assigned = crate::profile_activation::auto_assign_primaries_for_key(
+            "team",
+            "vk-audit",
+            &["anthropic".to_string()],
+            Some(&vk),
+        )
+        .expect("auto_assign");
+        assert_eq!(assigned, vec!["anthropic".to_string()]);
+        assert_eq!(
+            bind_audit_rows(),
+            vec!["anthropic:team:vk-audit".to_string()],
+            "the previously-invisible auto-assign write must now leave a signed audit row"
+        );
     }
 
     // ── snapshot sync verify (2026-05-11 fix) ────────────────────────────────
@@ -6667,6 +7753,16 @@ mod browse_url_tests {
         let got = resolve_browse_base_url("https://team.example.com", None);
         assert_eq!(got, "https://team.example.com");
     }
+
+    #[test]
+    fn resolve_browse_base_url_strips_trailing_slash_on_fallback() {
+        // Regression: a LAN control_url stored WITH a trailing slash must not
+        // leak it into the base — otherwise `base + /go/<alias>` becomes
+        // `http://host:3000//go/overview`, a protocol-relative URL the SPA's
+        // history.replaceState rejects with a SecurityError (cross-origin).
+        let got = resolve_browse_base_url("http://192.168.0.240:3000/", None);
+        assert_eq!(got, "http://192.168.0.240:3000");
+    }
 }
 
 // ============================================================================
@@ -6770,5 +7866,188 @@ mod probe_token_tests {
         assert!(err.contains("aikey login"));
         assert!(err.contains("user@example.com"));
         assert!(err.contains("http://127.0.0.1:0"));
+    }
+}
+
+#[cfg(test)]
+mod sync_prune_tests {
+    // Sync prune self-heal (2026-07-04): keys the server no longer returns for
+    // the OWNING account are DELETED from the local cache (not stale-marked) —
+    // a server-deleted key kept as `stale` rendered a permanent ghost row and,
+    // for deterministic group-VK aliases, shadowed the re-issued key. Other
+    // accounts' rows keep the re-login recovery semantics. 能红: revert the
+    // prune to mark-stale and `owner_absent_row_is_deleted` fails.
+    use super::*;
+    use crate::storage;
+    use secrecy::SecretString;
+
+    fn setup_vault() -> (
+        tempfile::TempDir,
+        (
+            std::sync::MutexGuard<'static, ()>,
+            std::sync::MutexGuard<'static, ()>,
+        ),
+    ) {
+        // AK_VAULT_PATH is guarded by storage::TEST_VAULT_LOCK (the vault
+        // lock domain used by core_tests / query / executor / storage
+        // tests). This module used to take ONLY ENV_MUTATION_LOCK here —
+        // the sole offender in the crate — so it raced every vault-lock
+        // test mutating the same var (surfaced 2026-07-13 as a flaky
+        // 2-rows-vs-1 assert here that poisoned the env lock and cascaded
+        // into 22 local_server_probe PoisonErrors). Hold BOTH, in the
+        // crate-wide order established by claude_desktop::p2_tests::
+        // EnvSandbox: ENV_MUTATION_LOCK first, TEST_VAULT_LOCK second.
+        let env_guard = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let vault_guard = crate::storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).expect("salt");
+        storage::initialize_vault(&salt, &SecretString::new("test_password".to_string()))
+            .expect("init vault");
+        (dir, (env_guard, vault_guard))
+    }
+
+    fn cache_entry(vk_id: &str, owner: &str) -> storage::VirtualKeyCacheEntry {
+        storage::VirtualKeyCacheEntry {
+            virtual_key_id: vk_id.to_string(),
+            org_id: "org-1".to_string(),
+            seat_id: "seat-1".to_string(),
+            alias: format!("alias-{vk_id}"),
+            provider_code: "anthropic".to_string(),
+            protocol_type: "anthropic".to_string(),
+            base_url: String::new(),
+            credential_id: "cred-1".to_string(),
+            credential_revision: "r1".to_string(),
+            virtual_key_revision: "vr1".to_string(),
+            key_status: "active".to_string(),
+            share_status: "claimed".to_string(),
+            local_state: "synced_inactive".to_string(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: None,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec!["anthropic".to_string()],
+            provider_base_urls: Default::default(),
+            owner_account_id: Some(owner.to_string()),
+            owner_email: None,
+            extra: None,
+            oauth_group_id: None,
+            group_accounts: None,
+            routing_config: None,
+            group_alias: None,
+            group_runtime: None,
+        }
+    }
+
+    #[test]
+    fn owner_absent_row_is_deleted_other_account_kept_idempotent() {
+        let (_dir, _lock) = setup_vault();
+        storage::upsert_virtual_key_cache(&cache_entry("vk-mine-gone", "acct-A")).unwrap();
+        storage::upsert_virtual_key_cache(&cache_entry("vk-other-acct", "acct-B")).unwrap();
+
+        // Empty snapshot for acct-A → its row must be DELETED; acct-B's row
+        // (another server session's cache) must be untouched.
+        apply_snapshot_to_cache(&[], "acct-A");
+
+        let left = storage::list_virtual_key_cache().unwrap();
+        assert!(
+            !left.iter().any(|e| e.virtual_key_id == "vk-mine-gone"),
+            "owner's server-removed key must be pruned, not stale-marked: {left:?}"
+        );
+        let other = left
+            .iter()
+            .find(|e| e.virtual_key_id == "vk-other-acct")
+            .expect("other account's row must survive the prune");
+        assert_ne!(
+            other.local_state, "stale",
+            "other account's row must be untouched"
+        );
+
+        // Idempotent: a second pass has nothing to prune and must not error.
+        apply_snapshot_to_cache(&[], "acct-A");
+        assert_eq!(storage::list_virtual_key_cache().unwrap().len(), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified-origin composing gateway probe (P3, 20260703-web统一origin design)
+// ---------------------------------------------------------------------------
+
+/// Decides whether the local console can serve as the unified origin, from
+/// the parsed /system/team-url response. Pure so unit tests can pin the
+/// gating rule without a live server (same pattern as
+/// `browser_launch_command`).
+///
+/// Gate = `gateway:true` AND a non-empty team_url: the gateway capability
+/// exists only on new local-server binaries, and it composes nothing until
+/// the CLI is logged in — both must hold or `aikey web` must keep the
+/// pre-gateway team-origin behavior.
+fn gateway_base_from_team_url_response(v: &serde_json::Value, port: u16) -> Option<String> {
+    let gateway = v.get("gateway").and_then(|g| g.as_bool()).unwrap_or(false);
+    let team = v.get("team_url").and_then(|t| t.as_str()).unwrap_or("");
+    if gateway && !team.is_empty() {
+        Some(format!("http://127.0.0.1:{}", port))
+    } else {
+        None
+    }
+}
+
+/// Probes the co-installed local-server for the composing gateway. Returns
+/// the local console base URL when the RUNNING server advertises it.
+///
+/// Why probe at call time instead of trusting install-state: the gateway is
+/// login-gated per request inside the server and only exists on new
+/// binaries; a 400ms loopback probe is cheap and always current, and a
+/// failed probe simply falls back to the old flow (never blocks).
+fn local_gateway_base() -> Option<String> {
+    let port = crate::local_server_probe::read_local_server_port_or_default().unwrap_or(8090);
+    let url = format!("http://127.0.0.1:{}/system/team-url", port);
+    let resp = ureq::get(&url)
+        .timeout(std::time::Duration::from_millis(400))
+        .call()
+        .ok()?;
+    let v: serde_json::Value = resp.into_json().ok()?;
+    gateway_base_from_team_url_response(&v, port)
+}
+
+#[cfg(test)]
+mod gateway_probe_tests {
+    use super::gateway_base_from_team_url_response;
+    use serde_json::json;
+
+    // Fence for the P3 gating rule: `aikey web` may only route to the local
+    // origin when the server EXPLICITLY advertises the composing gateway AND
+    // a team login exists. Every other shape (old server without the field,
+    // logged-out, malformed) must fall back to the team-origin flow.
+    #[test]
+    fn routes_local_only_when_gateway_and_logged_in() {
+        let yes = json!({"team_url": "http://192.168.0.120:3000", "gateway": true});
+        assert_eq!(
+            gateway_base_from_team_url_response(&yes, 8090).as_deref(),
+            Some("http://127.0.0.1:8090")
+        );
+    }
+
+    #[test]
+    fn old_server_without_gateway_field_falls_back() {
+        let old = json!({"team_url": "http://192.168.0.120:3000"});
+        assert!(gateway_base_from_team_url_response(&old, 8090).is_none());
+    }
+
+    #[test]
+    fn logged_out_or_malformed_falls_back() {
+        let out = json!({"team_url": "", "gateway": true});
+        assert!(gateway_base_from_team_url_response(&out, 8090).is_none());
+        let weird = json!({"gateway": "yes"});
+        assert!(gateway_base_from_team_url_response(&weird, 8090).is_none());
     }
 }

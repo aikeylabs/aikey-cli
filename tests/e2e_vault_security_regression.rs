@@ -117,17 +117,31 @@ fn wrong_password_rejected_when_password_hash_missing() {
     );
 
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Contract updated 2026-05-11 (008eafe): missing-hash is now a hard
+    // "vault state inconsistent" refusal for ANY password (fail-loud),
+    // superseding the 2026-04-11 decrypt-verification message. Either way the
+    // core security property holds: the wrong password is never accepted.
     assert!(
-        stderr.contains("Invalid master password")
+        stderr.contains("vault state inconsistent")
+            || stderr.contains("Invalid master password")
             || stderr.contains("invalid")
             || stderr.contains("corrupted"),
-        "rejection message should mention password validity, got:\n{}",
+        "rejection message should mention password validity or vault inconsistency, got:\n{}",
         stderr
     );
 }
 
 #[test]
-fn correct_password_still_works_when_password_hash_missing() {
+fn missing_password_hash_refuses_all_passwords_with_guidance() {
+    // Contract history:
+    // - 2026-04-11 fix: missing hash → verify by decrypting an entry, so the
+    //   CORRECT password kept working (this test's original expectation).
+    // - 2026-05-11 (008eafe) superseded it: master_salt present + hash missing
+    //   is an INCONSISTENT vault — ANY password (even the correct one) is
+    //   refused fail-loud with actionable guidance (`aikey init` / restore),
+    //   because silently accepting an unverifiable password is the exact
+    //   shape of the original 2026-04-11 bypass. Downstream code recognizes
+    //   the message (executor.rs), so this is the durable contract.
     let env = Env::new("pwbypass-right");
     env.add_key("correct-pw", "k1", "openai", "sk-1");
 
@@ -136,8 +150,6 @@ fn correct_password_still_works_when_password_hash_missing() {
         .execute("DELETE FROM config WHERE key = 'password_hash'", [])
         .expect("delete hash");
 
-    // Correct password must still work — the fix should verify by decrypting
-    // an existing entry, not lock the user out.
     let out = env
         .cmd_with_password("correct-pw")
         .args(["add", "k2", "--provider", "anthropic"])
@@ -145,11 +157,17 @@ fn correct_password_still_works_when_password_hash_missing() {
         .output()
         .expect("spawn add");
     assert!(
-        out.status.success(),
-        "correct password MUST still work even with password_hash missing.\n\
+        !out.status.success(),
+        "inconsistent vault (hash missing) must refuse even the correct password.\n\
          stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("vault state inconsistent") && stderr.contains("aikey init"),
+        "refusal must explain the inconsistency AND give the remediation step, got:\n{}",
+        stderr
     );
 }
 

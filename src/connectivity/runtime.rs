@@ -72,6 +72,8 @@ pub struct ConnectivityResult {
     pub chat_ok: bool,
     pub chat_ms: u128,
     pub chat_status: Option<u16>,
+    pub chat_skipped: bool,
+    pub chat_skip_reason: Option<String>,
     /// First ~512 chars of the API response body when the probe got an HTTP
     /// status (success or error). Used by api_status_hint to disambiguate
     /// "upstream rejected the key" from "local proxy didn't recognize the
@@ -487,6 +489,8 @@ where
         on_phase(ProbePhase::Api, ProbeStage::Started);
         on_phase(ProbePhase::Api, ProbeStage::Finished(&result));
         on_phase(ProbePhase::Chat, ProbeStage::Started);
+        result.chat_skipped = true;
+        result.chat_skip_reason = Some("skipped because proxy ping failed".to_string());
         on_phase(ProbePhase::Chat, ProbeStage::Finished(&result));
         return result;
     }
@@ -498,13 +502,30 @@ where
     // short-circuit returned api_status=999 before the real probe ran.
     // Removed in same PR. See bugfix/2026-04-29-oauth-probe-tier2-503.md.
 
-    let agent = build_proxy_aware_agent(Duration::from_secs(10));
-
     // Is this probe flowing through our own local aikey-proxy? If so the
     // X-Aikey-Probe header suppresses usage-event logging on the proxy side
     // (see proxy/middleware.go::isAikeyProbe). Tagging the header for
     // upstream-direct probes would be harmless but misleading, so gate it.
     let via_aikey_proxy = base_url.contains("127.0.0.1") || base_url.contains("localhost");
+
+    // Loopback probes (through our local aikey-proxy on 127.0.0.1) MUST bypass any
+    // external HTTP proxy. build_proxy_aware_agent honors http(s)_proxy but NOT
+    // NO_PROXY, so a non-loopback proxy (e.g. a host-level Clash at 192.168.64.1
+    // as a VM sees it) makes ureq send the 127.0.0.1:27200 probe THROUGH that
+    // proxy — which resolves 127.0.0.1 to ITSELF and hijacks the probe to the
+    // WRONG aikey-proxy instance (the host's), whose registry doesn't have this
+    // VK → spurious 401 "Route token not found in registry" even though the real
+    // route works. NO_PROXY=127.0.0.1 is the standard signal; honor it by using a
+    // direct agent for loopback targets. Only upstream-direct probes (non-loopback
+    // base_url) keep the proxy-aware agent.
+    // bugfix: 2026-06-26-connectivity-probe-loopback-proxy-hijack.
+    let agent = if via_aikey_proxy {
+        ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(10))
+            .build()
+    } else {
+        build_proxy_aware_agent(Duration::from_secs(10))
+    };
 
     // ── Phase 3: API probe ───────────────────────────────────────────────
     // GET — lightweight, no side effects. Treats ANY HTTP response
@@ -630,99 +651,16 @@ where
         // a trivial Chat Started/Finished pair so the column animation can
         // step out of the API column and land on the line cleanly.
         on_phase(ProbePhase::Chat, ProbeStage::Started);
+        result.chat_skipped = true;
+        result.chat_skip_reason = Some("skipped because API probe failed".to_string());
         on_phase(ProbePhase::Chat, ProbeStage::Finished(&result));
         return result;
     }
 
     // ── Phase 4: Chat probe ──────────────────────────────────────────────
-    // Minimal completion request (max_tokens=1). Short-circuit on API
-    // failure prevents this from hammering an upstream that just rejected
-    // our auth — some providers count that against rate limits.
-    //
-    // Bugfix 20260523: previously this branch used `is_via_proxy` (a
-    // proxy-variable that's TRUE for ANY credential routed through
-    // aikey-proxy) as a stand-in for "is OAuth flow". That misjudged
-    // personal API keys whose base_url legitimately points at the local
-    // proxy (e.g. routed to a custom anthropic gateway like aicoding) —
-    // they got the OAuth-only `?beta=true` query and the gateway returned
-    // 404. Fix: drive protocol addons off `kind == OAuth` via a config
-    // table (see protocol_addons.rs), kept as the single source of truth
-    // for future proxy outbound-transform middleware too.
-    let (chat_url, body) = build_chat_probe(provider_code, base_url, api_key, kind);
-    let (chat_auth_key, chat_auth_val) = probe_auth(provider_code, api_key);
-
-    let chat_agent = build_proxy_aware_agent(Duration::from_secs(15));
-    let chat_start = Instant::now();
-    let mut req = chat_agent
-        .post(&chat_url)
-        .set("Content-Type", "application/json");
-    // Google uses ?key= in URL; skip header auth. Others use header.
-    if provider_code != "google" {
-        req = req.set(chat_auth_key, &chat_auth_val);
-    }
-    if provider_code == "anthropic" {
-        req = req.set("anthropic-version", "2023-06-01");
-    }
-    if via_aikey_proxy {
-        req = req.set("X-Aikey-Probe", "1");
-    }
-    // Why: KIMI Coding API (api.kimi.com/coding/v1) requires a User-Agent
-    // matching its coding-agent whitelist (e.g. "claude-code", "kimi-cli").
-    // Without it, KIMI returns access_terminated_error (HTTP 403).
-    // We use "claude-code/1.0 (aikey)" to satisfy the whitelist while
-    // identifying ourselves. This only affects the connectivity probe.
-    //
-    // 2026-05-08 Kimi 双平台拆分: 'kimi_code' 是新 canonical code (api.kimi.com
-    // 上游),沿用同样的 coding-agent whitelist 要求;'kimi' 是 deprecated alias
-    // 仍兼容老 vault 数据 / 任何残留的 'kimi' 字面值。Moonshot (api.moonshot.cn)
-    // 不在 whitelist 范围内,**不**注入此 header,避免污染请求形态。
-    if provider_code == "kimi_code" || provider_code == "kimi" {
-        req = req.set("User-Agent", "claude-code/1.0");
-    }
     on_phase(ProbePhase::Chat, ProbeStage::Started);
-    let chat_result = req.send_string(&body.to_string());
-    let chat_ms = chat_start.elapsed().as_millis();
-
-    let (chat_ok, chat_status, chat_body_snippet) = match chat_result {
-        Ok(r) => {
-            let s = r.status();
-            let body = r.into_string().ok().map(truncate_body_snippet);
-            (s >= 200 && s < 300, Some(s), body)
-        }
-        Err(ureq::Error::Status(code, response)) => {
-            let body = response.into_string().ok().map(truncate_body_snippet);
-            // 429 = auth passed but rate limited → connectivity OK.
-            //   Claude OAuth returns 429 as business rejection when persona
-            //   headers are incomplete, but also for genuine rate limits.
-            //   Either way, the key is valid and the provider is reachable.
-            //
-            // 404 = endpoint reachable, content-level rejection → also OK.
-            //   Reported in the wild 2026-04-25:
-            //     - Anthropic personal: probe model `claude-haiku-4-5-20251001`
-            //       isn't available on every account tier → 404 "Model not
-            //       found", but auth itself succeeded (otherwise we'd see 401).
-            //     - Kimi Coding API at `/coding/v1/chat/completions`: probe
-            //       model `moonshot-v1-8k` isn't a coding-tier model → 404,
-            //       same shape.
-            //     - OpenAI OAuth via Codex proxy: `/v1/chat/completions`
-            //       doesn't exist there (Codex uses Responses API) → 404,
-            //       same shape — actual usage works regardless.
-            //   In all three the request reached the upstream and the upstream
-            //   answered authoritatively; flagging this as red "fail" with
-            //   `chat HTTP 404 — unexpected` (the previous behavior) misled
-            //   users into thinking their key was broken when it wasn't.
-            //   Treating 404 as OK with a "reachable, model unavailable" hint
-            //   keeps the column green and points at the real fix (use a
-            //   different model name) without falsely signalling auth failure.
-            let ok = code == 429 || code == 404;
-            (ok, Some(code), body)
-        }
-        Err(_) => (false, None, None),
-    };
-    result.chat_ok = chat_ok;
-    result.chat_ms = chat_ms;
-    result.chat_status = chat_status;
-    result.chat_body_snippet = chat_body_snippet;
+    result.chat_skipped = true;
+    result.chat_skip_reason = Some("skipped by connectivity policy".to_string());
     on_phase(ProbePhase::Chat, ProbeStage::Finished(&result));
 
     result
@@ -1394,9 +1332,8 @@ pub fn chat_status_hint(status: u16, body: Option<&str>) -> String {
         400 => "bad request".to_string(),
         401 => "invalid key".to_string(),
         403 => "forbidden".to_string(),
-        // 404 paired with `chat_ok = true` per the match arm in
-        // `test_provider_connectivity_with_progress`: route + auth worked,
-        // upstream rejected the specific (model, endpoint) combination.
+        // Legacy Chat probe mapping: route + auth worked, upstream rejected
+        // the specific (model, endpoint) combination.
         // Most often a probe-time model-name mismatch — the user's key is
         // fine, real usage with their own model name will succeed.
         404 => "reachable, model unavailable".to_string(),
@@ -1477,7 +1414,7 @@ pub fn run_connectivity_suite(
     if json_mode {
         for t in &targets {
             let r = test_provider_connectivity(&t.provider_code, &t.base_url, &t.bearer, t.kind);
-            if r.chat_ok {
+            if r.chat_ok || (r.chat_skipped && r.api_ok) {
                 any_chat_ok = true;
             }
             if r.ping_ok {
@@ -1514,6 +1451,8 @@ pub fn run_connectivity_suite(
                 "chat_ok":            r.chat_ok,
                 "chat_ms":            r.chat_ms,
                 "chat_status":        r.chat_status,
+                "chat_skipped":       r.chat_skipped,
+                "chat_skip_reason":   r.chat_skip_reason.as_deref(),
                 "chat_body_snippet":  trunc(&r.chat_body_snippet),
             }));
             rows.push((t.clone(), r));
@@ -1786,10 +1725,14 @@ pub fn run_connectivity_suite(
                     }
                 }
                 3 => {
-                    // Chat — em-dash if ping or api failed; otherwise green
-                    // ok with chat hint or red fail with HTTP-status hint.
+                    // Chat — this phase is intentionally skipped by policy
+                    // once Ping/API have supplied the connectivity signal.
                     if !r.ping_ok || !r.api_ok {
                         "\u{2014}".dimmed().to_string()
+                    } else if r.chat_skipped {
+                        format!("{:<w$}", "\u{2014} skipped", w = W_CHAT_ANIM)
+                            .dimmed()
+                            .to_string()
                     } else if r.chat_ok {
                         let h = r
                             .chat_status
@@ -1858,7 +1801,7 @@ pub fn run_connectivity_suite(
         if r.ping_ok {
             any_reachable = true;
         }
-        if r.chat_ok {
+        if r.chat_ok || (r.chat_skipped && r.api_ok) {
             any_chat_ok = true;
         }
 
@@ -1884,7 +1827,7 @@ pub fn run_connectivity_suite(
                 "{}: API unreachable — check base URL or provider status",
                 display
             ));
-        } else if !r.chat_ok {
+        } else if !r.chat_ok && !r.chat_skipped {
             // Actionable hint tailored to credential kind + status.
             let suggestion = match (r.chat_status, t.kind, t.provider_code.as_str()) {
                 (Some(404), CredentialKind::OAuth, "openai") =>

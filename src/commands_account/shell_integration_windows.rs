@@ -43,9 +43,11 @@
 //! The functions here (`v3_rc_block_powershell`,
 //! `powershell_profile_candidates`, `ensure_powershell_hook`) are
 //! "PowerShell-specific" in concept but **not** "Windows-only" in
-//! compilation: none of them use windows-sys / winapi imports. They
-//! just produce PowerShell-syntax strings + paths that happen to
-//! describe Windows folder layout. Critically:
+//! compilation: almost none of them use windows-sys / winapi imports
+//! (sole exception: `documents_known_folder`, individually gated with
+//! `#[cfg(windows)]` — see its docstring). The rest just produce
+//! PowerShell-syntax strings + paths that happen to describe Windows
+//! folder layout. Critically:
 //!
 //!   - cross-platform tests in `stage3_powershell_hook_tests` reference
 //!     `v3_rc_block_powershell` to assert PowerShell-syntax invariants;
@@ -128,10 +130,31 @@ pub(super) fn v3_rc_block_powershell() -> String {
 ///   - PowerShell 7+ on macOS / Linux: `~/.config/powershell/profile.ps1`
 ///
 /// We don't spawn a PowerShell subprocess to query the actual value
-/// because that costs ~200 ms per `aikey use`. Instead we replicate the
-/// path resolution from PowerShell's source (SHGetKnownFolderPath
-/// FOLDERID_Documents lookup on Windows; XDG `$HOME/.config/powershell`
-/// on Unix-y pwsh 7+).
+/// because that costs ~200 ms per `aikey use`. Instead we ask the SAME
+/// Win32 API PowerShell's own resolution bottoms out in
+/// (SHGetKnownFolderPath FOLDERID_Documents on Windows; XDG
+/// `$HOME/.config/powershell` on Unix-y pwsh 7+).
+///
+/// COMPAT LAYER (2026-07-08, minimal by user decision): the Documents
+/// known folder can be REDIRECTED away from `<home>\Documents`
+/// (Parallels/VMware shared profiles, OneDrive folder redirection,
+/// roaming profiles) and PowerShell follows the redirect. The previous
+/// hardcoded `<home>\Documents` wrote the hook into a profile PowerShell
+/// never reads on such machines — active.env vars silently never reached
+/// any shell, and the post-`aikey use` hint
+/// (`. $PROFILE.CurrentUserAllHosts`) died with CommandNotFoundException
+/// (Parallels box, 2026-07-08: interactive Documents =
+/// `C:\Mac\Home\Documents`). Known-folder candidates therefore come
+/// FIRST; the hardcoded paths are KEPT UNCHANGED as fallbacks (API
+/// failure + hooks written by older builds must stay findable). On a
+/// non-redirected machine the known folder equals `<home>\Documents`,
+/// dedup collapses the list to exactly the old one — zero behavior
+/// change for machines that already work.
+///
+/// The known-folder value can be SESSION-DEPENDENT (Parallels:
+/// interactive sessions see the Mac-shared path, SSH sessions the local
+/// default). Reading it live per-invocation makes the write location
+/// agree with the shells the user opens next to this `aikey use`.
 ///
 /// Returns the candidates in stable preference order. We don't filter
 /// to existing-parent here because the user might be installing pwsh
@@ -148,16 +171,22 @@ pub(super) fn powershell_profile_candidates() -> Vec<std::path::PathBuf> {
 
     #[cfg(windows)]
     {
-        out.push(
+        if let Some(docs) = documents_known_folder() {
+            out.push(docs.join("PowerShell").join("profile.ps1"));
+            out.push(docs.join("WindowsPowerShell").join("profile.ps1"));
+        }
+        for fb in [
             home.join("Documents")
                 .join("PowerShell")
                 .join("profile.ps1"),
-        );
-        out.push(
             home.join("Documents")
                 .join("WindowsPowerShell")
                 .join("profile.ps1"),
-        );
+        ] {
+            if !out.contains(&fb) {
+                out.push(fb);
+            }
+        }
     }
     #[cfg(not(windows))]
     {
@@ -165,6 +194,44 @@ pub(super) fn powershell_profile_candidates() -> Vec<std::path::PathBuf> {
     }
 
     out
+}
+
+/// Resolve the Documents known folder via `SHGetKnownFolderPath` — the
+/// same resolution PowerShell performs for `$PROFILE`, so redirection
+/// (Parallels / OneDrive / roaming) is honored identically. `None` on
+/// any API failure; callers fall back to `<home>\Documents`.
+///
+/// This is the module's one windows-sys use — kept behind
+/// `#[cfg(windows)]` so the module (and its PowerShell-syntax tests)
+/// still compiles and runs on macOS / Linux.
+#[cfg(windows)]
+fn documents_known_folder() -> Option<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Documents, SHGetKnownFolderPath};
+
+    unsafe {
+        let mut pw: windows_sys::core::PWSTR = std::ptr::null_mut();
+        // dwFlags = 0 (KF_FLAG_DEFAULT), hToken = 0 (current user; HANDLE
+        // is isize in windows-sys 0.52) — mirrors PowerShell's
+        // Environment.GetFolderPath(MyDocuments).
+        let hr = SHGetKnownFolderPath(&FOLDERID_Documents, 0, 0, &mut pw);
+        if hr != 0 || pw.is_null() {
+            return None;
+        }
+        let mut len = 0usize;
+        while *pw.add(len) != 0 {
+            len += 1;
+        }
+        let s = OsString::from_wide(std::slice::from_raw_parts(pw, len));
+        CoTaskMemFree(pw as *const core::ffi::c_void);
+        if s.is_empty() {
+            None
+        } else {
+            Some(std::path::PathBuf::from(s))
+        }
+    }
 }
 
 /// Stage 3.2: PowerShell sibling of `ensure_shell_hook`.
@@ -200,35 +267,42 @@ pub(super) fn ensure_powershell_hook() -> Option<String> {
 
     let v3_block = v3_rc_block_powershell();
 
-    // 2. Look for an existing marker in any candidate profile path.
-    //    Idempotent rewrite when found.
-    let candidates = powershell_profile_candidates();
-    for profile in &candidates {
-        let contents = match std::fs::read_to_string(profile) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        if contents.contains(V3_BEGIN) {
-            if let Some(updated) = replace_between_markers(&contents, V3_BEGIN, V3_END, &v3_block) {
-                if updated != contents {
-                    let _ = std::fs::write(profile, updated);
+    // 2. 3a (2026-07-12): wire EVERY present PowerShell flavor. pwsh 7 and
+    //    PS 5.1 read different profile files; the old "first candidate with
+    //    a marker / first parent dir that exists" logic wired exactly one,
+    //    leaving the other flavor's sessions hookless while the OR-logic
+    //    detectors reported wired. Already-wired targets get an idempotent
+    //    in-place rewrite; missing ones need consent below.
+    let targets = powershell_wire_targets();
+    let mut missing: Vec<std::path::PathBuf> = Vec::new();
+    for target in &targets {
+        match std::fs::read_to_string(target) {
+            Ok(c) if c.contains(V3_BEGIN) => {
+                if let Some(updated) = replace_between_markers(&c, V3_BEGIN, V3_END, &v3_block) {
+                    if updated != c {
+                        let _ = std::fs::write(target, updated);
+                    }
                 }
             }
-            return None;
+            _ => missing.push(target.clone()),
         }
     }
+    if missing.is_empty() {
+        return None;
+    }
 
-    // 3. No marker found — fresh install. Same H1.5 non-TTY hard
-    //    constraint as bash/zsh: rc-file mutation requires interactive
-    //    confirmation. Without it, piped/CI invocations would silently
-    //    rewrite $PROFILE — exactly the contract surprise H1.5 prevents.
+    // 3. Unwired flavors remain — fresh install for those. Same H1.5
+    //    non-TTY hard constraint as bash/zsh: rc-file mutation requires
+    //    interactive confirmation. Without it, piped/CI invocations would
+    //    silently rewrite $PROFILE — exactly the contract surprise H1.5
+    //    prevents.
     if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
         return Some(format!(
             "  Shell hook file rendered, but {} (rc-file) wiring needs interactive confirmation.\n  \
              Run interactively: \x1b[36maikey hook install\x1b[0m\n  \
              Or silence this hint: \x1b[36mset AIKEY_NO_HOOK=1\x1b[0m (or `$env:AIKEY_NO_HOOK = '1'` in PowerShell)\n  \
              To apply right now without rc wiring: \x1b[36m. {}\x1b[0m",
-            candidates
+            missing
                 .first()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "$PROFILE.CurrentUserAllHosts".to_string()),
@@ -236,37 +310,14 @@ pub(super) fn ensure_powershell_hook() -> Option<String> {
         ));
     }
 
-    // Fresh install: pick the candidate whose PARENT DIR already exists
-    // (signal that the user actually has that PowerShell version installed).
-    // Falling back to candidates.first() (pwsh 7+) when no parent exists
-    // means a fresh-install user gets the modern path — but a PS-5.1-only
-    // user (no `Documents\PowerShell\`, only `Documents\WindowsPowerShell\`)
-    // gets the 5.1 path, which is what their actual PS sessions read.
-    //
-    // Without this, PS 5.1-only users would silently get a hook installed
-    // to the pwsh 7+ profile path that their sessions never source —
-    // hours of "why doesn't aikey use work" debugging.
-    let target = candidates
-        .iter()
-        .find(|p| p.parent().map(|d| d.exists()).unwrap_or(false))
-        .cloned()
-        .or_else(|| candidates.first().cloned());
-    let target = match target {
-        Some(p) => p,
-        None => {
-            return Some(
-                "  No PowerShell profile candidate path resolved. Set $PROFILE.CurrentUserAllHosts manually."
-                    .to_string(),
-            );
-        }
-    };
-    let target_display = target.display().to_string();
-
-    let rows = vec![
-        format!("Shell:  PowerShell (CurrentUserAllHosts)"),
-        format!("File:   {}", target_display),
-        format!("Add:    . {}  (v3)", display_aikey_path("hook.ps1")),
-    ];
+    let mut rows = vec![format!("Shell:  PowerShell (CurrentUserAllHosts)")];
+    for m in &missing {
+        rows.push(format!("File:   {}", m.display()));
+    }
+    rows.push(format!(
+        "Add:    . {}  (v3)",
+        display_aikey_path("hook.ps1")
+    ));
     crate::ui_frame::eprint_box("\u{2753}", "Install PowerShell Shell Hook", &rows);
     eprint!("  Proceed? [Y/n] (default Y): ");
     {
@@ -283,25 +334,291 @@ pub(super) fn ensure_powershell_hook() -> Option<String> {
         ));
     }
 
-    // Create parent dir (pwsh 7+ profile dir is often missing on a
-    // freshly-installed pwsh) and append the v3 block. Use OpenOptions
-    // append — never overwrite user content already present.
-    if let Some(parent) = target.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    // Consent granted → wire each missing flavor. The shared helper
+    // carries the H2 UTF-16 guard (encoding sweep 2026-07-07): NEVER
+    // byte-append UTF-8 onto a profile that isn't UTF-8 — PS 5.1 commonly
+    // produces UTF-16LE $PROFILE files, and appending corrupts the whole
+    // file into per-session parse errors. Failures are reported per file
+    // with the conversion recipe; other flavors still get wired.
+    let mut failed: Vec<String> = Vec::new();
+    for target in &missing {
+        if super::shell_integration::wire_one_powershell_profile(target, &v3_block).is_err() {
+            failed.push(target.display().to_string());
+        }
     }
-    let block = format!("\n{}", v3_block);
-    let write_result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&target)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, block.as_bytes()));
-    if write_result.is_err() {
+    if !failed.is_empty() {
         return Some(format!(
-            "  Could not write to {}. Source {} manually.",
-            target_display,
+            "  Could not wire: {}\n  \
+             If the file is UTF-16 (common from PS 5.1 redirection), convert once:\n  \
+             \x1b[36m(Get-Content <file> -Raw) | Set-Content <file> -Encoding utf8\x1b[0m  then re-run \x1b[36maikey hook install\x1b[0m.\n  \
+             Or source manually: \x1b[36m. {}\x1b[0m",
+            failed.join(", "),
             display_aikey_path("hook.ps1"),
         ));
     }
+    let target_display = missing
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
 
-    Some(format!("  Shell hook installed in {}", target_display))
+    // ExecutionPolicy wired-but-dead guard (2026-07-12, Windows real-machine
+    // exploratory testing X2): on default client Windows every policy scope
+    // is Undefined → effective Restricted → profile.ps1 REFUSES to load, so
+    // the block we just wired never runs and every detector still reports
+    // "wired". Surface it at the moment of wiring, with the exact fix.
+    let mut done = format!("  Shell hook installed in {}", target_display);
+    if let Some(warn) = powershell_profile_load_blocked() {
+        done.push_str(&format!("\n{}", warn));
+    }
+    Some(done)
+}
+
+/// pwsh-7 flavor-presence predicate (3a, 2026-07-12): pwsh 7+ keeps its
+/// profile in `Documents\PowerShell\` — a DIFFERENT directory from
+/// PS 5.1's `Documents\WindowsPowerShell\`. Wiring only one of them leaves
+/// the other flavor's sessions hookless while every wired-detector (OR
+/// over candidates) reports green. Pure so the decision table is testable
+/// cross-platform.
+pub(super) fn pwsh7_is_wire_target(profile_dir_exists: bool, pwsh_on_path: bool) -> bool {
+    profile_dir_exists || pwsh_on_path
+}
+
+/// Is `pwsh` resolvable on PATH? Plain PATH scan (no spawn — this runs on
+/// every `aikey use` via ensure_powershell_hook, spawning would add ~100ms).
+pub(super) fn pwsh_on_path() -> bool {
+    let exe = if cfg!(windows) { "pwsh.exe" } else { "pwsh" };
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(exe).is_file()))
+        .unwrap_or(false)
+}
+
+/// The profile files each PRESENT PowerShell flavor will actually load —
+/// the write-side counterpart of `powershell_profile_candidates()` (which
+/// stays permissive OR-logic for read-side detection).
+///
+/// Windows: PS 5.1 ships with the OS → its profile is always a target;
+/// pwsh 7+ only when present (dir or PATH). Unix pwsh uses the single
+/// XDG path. Order matters for messages: modern flavor first.
+pub(super) fn powershell_wire_targets() -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        let docs = documents_known_folder()
+            .unwrap_or_else(|| resolve_user_home().join("Documents"));
+        let pwsh_dir = docs.join("PowerShell");
+        if pwsh7_is_wire_target(pwsh_dir.exists(), pwsh_on_path()) {
+            out.push(pwsh_dir.join("profile.ps1"));
+        }
+        out.push(docs.join("WindowsPowerShell").join("profile.ps1"));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pwsh_on_path; // referenced so the fn isn't dead on unix builds
+        out.push(
+            resolve_user_home()
+                .join(".config")
+                .join("powershell")
+                .join("profile.ps1"),
+        );
+    }
+    out
+}
+
+/// doctor probe (3a): pwsh 7+ is present but its profile lacks the v3
+/// block → pwsh sessions silently run hookless. `None` when fine or on
+/// non-Windows.
+pub fn pwsh_profile_wiring_gap() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        let docs = documents_known_folder()
+            .unwrap_or_else(|| resolve_user_home().join("Documents"));
+        let pwsh_dir = docs.join("PowerShell");
+        if !pwsh7_is_wire_target(pwsh_dir.exists(), pwsh_on_path()) {
+            return None;
+        }
+        let profile = pwsh_dir.join("profile.ps1");
+        let wired = std::fs::read_to_string(&profile)
+            .map(|c| c.contains(V3_BEGIN))
+            .unwrap_or(false);
+        if wired {
+            None
+        } else {
+            Some(profile)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+mod pwsh_dual_profile_tests {
+    use super::pwsh7_is_wire_target;
+
+    #[test]
+    fn pwsh7_targeted_only_when_present() {
+        // dir exists (pwsh ran at least once) → target
+        assert!(pwsh7_is_wire_target(true, false));
+        // freshly installed pwsh, never launched (no profile dir yet) → PATH wins
+        assert!(pwsh7_is_wire_target(false, true));
+        // no pwsh anywhere → do NOT create Documents\PowerShell for a
+        // flavor the user doesn't have
+        assert!(!pwsh7_is_wire_target(false, false));
+    }
+}
+
+/// Effective ExecutionPolicy a FRESH PowerShell session would see, computed
+/// from `Get-ExecutionPolicy -List` scope pairs. Precedence per PowerShell
+/// docs: MachinePolicy > UserPolicy > Process > CurrentUser > LocalMachine —
+/// but a fresh session has no Process-scope value, so Process is skipped
+/// (the CALLING context often runs under `-ExecutionPolicy Bypass`, which
+/// must not mask the user's real steady-state). All-Undefined defaults to
+/// Restricted on client SKUs — the case that kills profile loading.
+pub(super) fn effective_policy_for_new_session(scopes: &[(String, String)]) -> String {
+    for wanted in ["MachinePolicy", "UserPolicy", "CurrentUser", "LocalMachine"] {
+        if let Some((_, v)) = scopes
+            .iter()
+            .find(|(s, v)| s == wanted && !v.eq_ignore_ascii_case("Undefined"))
+        {
+            return v.clone();
+        }
+    }
+    "Restricted".to_string()
+}
+
+/// Whether `effective` blocks loading an UNSIGNED profile.ps1 (ours is).
+pub(super) fn policy_blocks_profile(effective: &str) -> bool {
+    effective.eq_ignore_ascii_case("Restricted") || effective.eq_ignore_ascii_case("AllSigned")
+}
+
+/// Windows-only probe: does the current ExecutionPolicy prevent the wired
+/// profile (and therefore the aikey hook) from ever loading? Returns a
+/// user-facing warning with the scoped fix when blocked, `None` when fine
+/// (or on any probe failure — a diagnostics helper must not create noise).
+/// GPO-managed scopes (MachinePolicy/UserPolicy) get a "contact IT" variant
+/// because `Set-ExecutionPolicy -Scope CurrentUser` cannot override them.
+#[cfg(windows)]
+pub fn powershell_profile_load_blocked() -> Option<String> {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-ExecutionPolicy -List | ForEach-Object { $_.Scope.ToString() + '=' + $_.ExecutionPolicy.ToString() }",
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let scopes: Vec<(String, String)> = text
+        .lines()
+        .filter_map(|l| {
+            let (s, v) = l.trim().split_once('=')?;
+            Some((s.to_string(), v.to_string()))
+        })
+        .collect();
+    if scopes.is_empty() {
+        return None;
+    }
+    let effective = effective_policy_for_new_session(&scopes);
+    if !policy_blocks_profile(&effective) {
+        return None;
+    }
+    let gpo_managed = scopes.iter().any(|(s, v)| {
+        (s == "MachinePolicy" || s == "UserPolicy") && !v.eq_ignore_ascii_case("Undefined")
+    });
+    Some(if gpo_managed {
+        format!(
+            "  \x1b[33m\u{25b2} ExecutionPolicy '{}' is enforced by Group Policy \u{2014} PowerShell will NOT load the wired profile, so the aikey hook never runs.\n     Ask your IT admin to allow RemoteSigned for your user.\x1b[0m",
+            effective
+        )
+    } else {
+        format!(
+            "  \x1b[33m\u{25b2} ExecutionPolicy '{}' blocks profile loading \u{2014} the wired aikey hook will NEVER run in new sessions.\n     Fix once: \x1b[36mSet-ExecutionPolicy -Scope CurrentUser RemoteSigned\x1b[0m",
+            effective
+        )
+    })
+}
+
+/// Non-Windows stub — the policy concept doesn't exist for zsh/bash, and
+/// pwsh-on-Unix defaults to Unrestricted.
+#[cfg(not(windows))]
+pub fn powershell_profile_load_blocked() -> Option<String> {
+    None
+}
+
+#[cfg(test)]
+mod execution_policy_tests {
+    use super::{effective_policy_for_new_session, policy_blocks_profile};
+
+    fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn all_undefined_defaults_to_restricted_the_dead_hook_case() {
+        // Factory client Windows: every scope Undefined → Restricted →
+        // profile never loads. This is exploratory finding X2.
+        let p = pairs(&[
+            ("MachinePolicy", "Undefined"),
+            ("UserPolicy", "Undefined"),
+            ("Process", "Undefined"),
+            ("CurrentUser", "Undefined"),
+            ("LocalMachine", "Undefined"),
+        ]);
+        let eff = effective_policy_for_new_session(&p);
+        assert_eq!(eff, "Restricted");
+        assert!(policy_blocks_profile(&eff));
+    }
+
+    #[test]
+    fn process_scope_bypass_must_not_mask_steady_state() {
+        // The probe itself often runs under `-ExecutionPolicy Bypass`
+        // (Process scope). A fresh session won't have that — skip it.
+        let p = pairs(&[
+            ("MachinePolicy", "Undefined"),
+            ("UserPolicy", "Undefined"),
+            ("Process", "Bypass"),
+            ("CurrentUser", "Undefined"),
+            ("LocalMachine", "Undefined"),
+        ]);
+        assert_eq!(effective_policy_for_new_session(&p), "Restricted");
+    }
+
+    #[test]
+    fn current_user_remotesigned_unblocks() {
+        let p = pairs(&[
+            ("MachinePolicy", "Undefined"),
+            ("UserPolicy", "Undefined"),
+            ("Process", "Bypass"),
+            ("CurrentUser", "RemoteSigned"),
+            ("LocalMachine", "Undefined"),
+        ]);
+        let eff = effective_policy_for_new_session(&p);
+        assert_eq!(eff, "RemoteSigned");
+        assert!(!policy_blocks_profile(&eff));
+    }
+
+    #[test]
+    fn gpo_machine_policy_wins_over_current_user() {
+        let p = pairs(&[
+            ("MachinePolicy", "Restricted"),
+            ("UserPolicy", "Undefined"),
+            ("CurrentUser", "RemoteSigned"),
+            ("LocalMachine", "Undefined"),
+        ]);
+        let eff = effective_policy_for_new_session(&p);
+        assert_eq!(eff, "Restricted");
+        assert!(policy_blocks_profile(&eff));
+    }
+
+    #[test]
+    fn allsigned_blocks_our_unsigned_profile() {
+        assert!(policy_blocks_profile("AllSigned"));
+        assert!(!policy_blocks_profile("Unrestricted"));
+        assert!(!policy_blocks_profile("Bypass"));
+    }
 }
