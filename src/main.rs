@@ -4245,6 +4245,45 @@ fn provider_proxy_path(code: &str) -> String {
         .unwrap_or_else(|| code.to_lowercase())
 }
 
+/// True when `aikey route` should hint that OpenAI-SDK-style clients
+/// (OpenCode, openai-python, …) must APPEND `/v1` to the displayed base_url.
+///
+/// Two client conventions exist for the same provider:
+///   - codex treats base_url as the ROOT and prepends `/v1` in its request
+///     paths → wants `http://127.0.0.1:<port>/openai` (the value we display —
+///     tested live via ~/.codex/config.toml; MUST NOT change).
+///   - OpenAI-SDK clients treat base_url as ALREADY CONTAINING `/v1` and
+///     append bare `/chat/completions` → they need `…/openai/v1` or the proxy
+///     forwards a `/chat/completions` upstream and 404s.
+///
+/// So the displayed base_url stays as-is and qualifying rows get a HINT line.
+/// Qualifying is DERIVED from the registry where possible: the upstream
+/// `default_base_url` ending in `/v1` means this provider's SDK convention
+/// carries `/v1` inside the base URL; if `proxy_path` does not already embed
+/// it (openai, deepseek — unlike `kimi/v1`, `groq/openai/v1`), the client must
+/// add it. Registry evolution keeps that arm correct with no code change.
+///
+/// anthropic is the one explicit inclusion the derivation misses: its registry
+/// default is the OFFICIAL-SDK root convention (no `/v1` — that SDK prepends
+/// `/v1/messages` itself), but AI-SDK clients like OpenCode default their
+/// anthropic baseURL to `https://api.anthropic.com/v1` (INCLUDING `/v1`), and
+/// the project's own OpenCode doc example — user-tested — configures
+/// `http://127.0.0.1:27200/anthropic/v1`. Upstream serves `/v1/*`, so the
+/// appended form routes correctly.
+///
+/// google is deliberately NOT hinted: its upstream paths are `/v1beta/...`,
+/// so appending `/v1` would 404 — false-negative (no hint) is harmless,
+/// a wrong hint is not.
+fn provider_needs_v1_hint(code: &str) -> bool {
+    let Some(e) = provider_registry::lookup(code) else {
+        return false;
+    };
+    if e.proxy_path.trim_end_matches('/').ends_with("/v1") {
+        return false; // displayed base_url already ends in /v1 — it IS the OpenCode value
+    }
+    e.code == "anthropic" || e.default_base_url.trim_end_matches('/').ends_with("/v1")
+}
+
 /// Threshold (in chars) below which a token is shown in full. Above it, the token
 /// is truncated as "first 15 chars + ... + last 4 chars". Keep in sync with the
 /// truncation formula so padding math stays consistent.
@@ -4345,6 +4384,45 @@ fn print_route_config(entries: &[&RouteEntry]) {
     println!();
     println!("  {}", "or activate for this terminal:".dimmed());
     println!("    aikey activate {}", head.label.cyan());
+
+    // Follow-active alternative (2026-07-13 user request): the api_key above
+    // pins THIS key forever; `aikey_active_<provider>` instead follows
+    // whatever `aikey use` has activated for that provider (proxy
+    // Tier3ActiveSentinel — same value the shell hook exports; the suffix is
+    // informational, routing comes from the base_url path).
+    println!();
+    println!(
+        "  {}",
+        "or follow the active key (tracks `aikey use`) — use as api_key:".dimmed()
+    );
+    {
+        let mut seen = std::collections::HashSet::new();
+        for e in entries {
+            if seen.insert(e.provider.as_str()) {
+                println!("    aikey_active_{}", e.provider);
+            }
+        }
+    }
+
+    // OpenCode-style clients (2026-07-13 user request): a HINT, not a change —
+    // the displayed base_url is codex-convention (base = root, tested live)
+    // and must stay /v1-less. See provider_needs_v1_hint for the two-client
+    // convention split and the registry-derived qualification rule.
+    let mut v1_seen = std::collections::HashSet::new();
+    let v1_rows: Vec<&&RouteEntry> = entries
+        .iter()
+        .filter(|e| provider_needs_v1_hint(&e.provider) && v1_seen.insert(e.provider.as_str()))
+        .collect();
+    if !v1_rows.is_empty() {
+        println!();
+        println!(
+            "  {}",
+            "OpenCode & other AI-SDK clients expect /v1 in base_url — use:".dimmed()
+        );
+        for e in v1_rows {
+            println!("    {}/v1", e.base_url);
+        }
+    }
     println!();
 }
 
@@ -6978,6 +7056,52 @@ mod test_rc_unwired_warning_tests {
         let w = test_rc_unwired_warning(true, true, false, false).unwrap();
         assert!(w.contains("aikey hook install"));
         assert!(w.contains("NOT inherit aikey env"));
+    }
+}
+
+
+#[cfg(test)]
+mod route_v1_hint_tests {
+    use super::provider_needs_v1_hint;
+
+    // Fence for the `aikey route` OpenCode hint (2026-07-13 user request).
+    // The rule is DERIVED from provider_registry.yaml (upstream default ends
+    // in /v1 but proxy_path doesn't embed it), so these tests double as a
+    // registry-consistency check: if someone "fixes" openai's proxy_path to
+    // include /v1 (which would break codex's root-convention config — its
+    // tested live value is /v1-less), or strips /v1 from kimi's, this fails.
+
+    #[test]
+    fn openai_family_needs_the_hint() {
+        // Upstream https://api.openai.com/v1 + proxy_path "openai" → an
+        // AI-SDK client (OpenCode) must append /v1 itself.
+        assert!(provider_needs_v1_hint("openai"));
+        assert!(provider_needs_v1_hint("deepseek"));
+    }
+
+    #[test]
+    fn anthropic_needs_it_too_via_ai_sdk_convention() {
+        // The registry default is the official-SDK ROOT convention, but
+        // OpenCode's AI-SDK anthropic provider treats baseURL as containing
+        // /v1 — the project's user-tested OpenCode doc example configures
+        // http://127.0.0.1:27200/anthropic/v1. Explicit inclusion.
+        assert!(provider_needs_v1_hint("anthropic"));
+    }
+
+    #[test]
+    fn v1beta_upstreams_and_already_v1_paths_do_not() {
+        // google upstream serves /v1beta/... — appending /v1 would 404.
+        assert!(!provider_needs_v1_hint("google"));
+        // kimi/moonshot/groq: proxy_path already embeds /v1, so the displayed
+        // base_url is already the AI-SDK-suitable value — no extra hint.
+        assert!(!provider_needs_v1_hint("kimi_code"));
+        assert!(!provider_needs_v1_hint("moonshot"));
+        assert!(!provider_needs_v1_hint("groq"));
+    }
+
+    #[test]
+    fn unknown_provider_stays_silent() {
+        assert!(!provider_needs_v1_hint("no-such-provider"));
     }
 }
 
