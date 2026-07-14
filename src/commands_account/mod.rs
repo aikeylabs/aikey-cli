@@ -3310,7 +3310,29 @@ fn run_full_snapshot_sync_opts(
     // clean pass below, and a *separate* marker from `local_seen_sync_version`
     // so the no-password lightweight sync can't consume the signal.
     let material_stale = snapshot.sync_version > storage::get_last_material_sync_version();
+
+    // The deployment's delivery form — the SERVER's word, not our guess
+    // (2026-07-13). Until now this was inferred purely from `on_cluster` (does a
+    // cluster-node sidecar exist?), which desynced from the server's rule in both
+    // directions and produced the two failure shapes we kept hitting:
+    //   - fresh machine on a central cluster (no sidecar yet) → we tried to
+    //     download → opaque 403 → "run `aikey key sync`" while running it;
+    //   - a box carrying a stray CLUSTER_DELIVERY_ORG_ID → the server refused
+    //     delivery even though it was not a cluster at all.
+    // `from_wire` falls back to the old inference when the field is absent (older
+    // control plane), so nothing regresses.
+    let delivery_form = crate::platform_client::KeyDeliveryForm::from_wire(
+        snapshot.key_delivery_form.as_deref(),
+        on_cluster,
+    );
+    let central_form = delivery_form.is_central();
+
     let mut had_download_error = false;
+    // Set when the control plane refuses delivery BY DESIGN (form-①). Not an
+    // error: it means this deployment keeps material central and we should route
+    // through the cluster node instead of downloading. Reported once at the end
+    // rather than once per key.
+    let mut central_refused = false;
 
     for entry in &cached {
         // Group VKs carry NO static key material — their per-account material is
@@ -3334,7 +3356,11 @@ fn run_full_snapshot_sync_opts(
         // pulls its OWN seat's material even on a cluster — the control plane's
         // seat-scoped delivery check is the enforcement authority (only the
         // caller's own digital_employee seat is honored there).
-        let needs_download = (!on_cluster || allow_cluster_key_download)
+        // Gate on the SERVER-DECLARED form (2026-07-13), not on "do I have a node
+        // sidecar". Under `central`, asking for material is refused by design, so
+        // we must not ask at all — that request is what produced the misleading
+        // 403. The form-② agent daemon keeps its documented exception.
+        let needs_download = (!central_form || allow_cluster_key_download)
             && (entry.provider_key_ciphertext.is_none() || material_stale)
             && entry.key_status == "active"
             && !entry.local_state.starts_with("disabled_by_");
@@ -3416,6 +3442,21 @@ fn run_full_snapshot_sync_opts(
                 }
             }
             Err(e) => {
+                // Self-correcting refusal (2026-07-13): a BIZ_DELIVERY_CENTRAL_ONLY
+                // 403 is not a failure to retry — it is the control plane telling us
+                // our understanding of the deployment was wrong. Adopt the truth,
+                // stop asking for material this run, and say what the user should do
+                // instead. Retrying (had_download_error = true) would re-issue the
+                // same refused request forever and pin the material watermark.
+                //
+                // Why check the message: the delivery client returns a formatted
+                // error string; the code is the stable, localized-message-proof
+                // discriminator the server now sends precisely so we can do this.
+                let msg = e.to_string();
+                if msg.contains("BIZ_DELIVERY_CENTRAL_ONLY") {
+                    central_refused = true;
+                    continue;
+                }
                 eprintln!(
                     "  {} could not fetch key '{}': {}",
                     "✗".red(),
@@ -3434,8 +3475,39 @@ fn run_full_snapshot_sync_opts(
     // syncs skip re-download until the next server-side change bumps it again
     // (credential/VK rotation → material_stale again). A failed delivery fetch
     // above keeps the marker behind so the stale key is retried next time.
-    if !had_download_error {
+    //
+    // Under a download-suppressing form the marker must ALSO stay behind
+    // (2026-07-13, caught by the SYNC-DELIVERY-01 integration closure): central
+    // form skips every fetch, so "no download error" is vacuously true while NO
+    // ciphertext reflects this sync_version. Advancing here would make a later
+    // return to local form (e.g. the admin fixes EMPLOYEE_KEY_MODE) silently
+    // skip every rotation that happened meanwhile — stale material forever.
+    // The form-② agent daemon (allow_cluster_key_download) really downloads,
+    // so it keeps stamping. A legacy-server refusal (central_refused) means
+    // material was asked for and denied — same conclusion, keep it behind.
+    let downloads_suppressed = (central_form && !allow_cluster_key_download) || central_refused;
+    if !had_download_error && !downloads_suppressed {
         storage::set_last_material_sync_version(snapshot.sync_version);
+    }
+
+    // Form-① is not a failure — tell the user what the deployment IS and what to
+    // do, instead of the bare "403" + "run `aikey key sync`" (the command they are
+    // running) this used to surface. 2026-07-13. Printed here (the core fn) because
+    // the form state lives here; threading it out to handle_key_sync would mean
+    // changing the return type through every sync wrapper and call site.
+    if central_form || central_refused {
+        eprintln!(
+            "  {} This deployment keeps key material on its cluster nodes (central delivery);",
+            "\u{2139}".cyan()
+        );
+        eprintln!("     keys are not downloaded here by design \u{2014} your tools route through your node.");
+        if shell_integration::read_cluster_node().is_none() {
+            eprintln!(
+                "     {} No cluster node is resolved yet, so nothing can route: check the hub is reachable,",
+                "\u{25b2}".yellow()
+            );
+            eprintln!("       or ask an admin to enable EMPLOYEE_KEY_MODE=local if keys should live on your machine.");
+        }
     }
 
     Ok(downloaded)

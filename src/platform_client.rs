@@ -178,6 +178,114 @@ pub struct ManagedKeysSnapshotResponse {
     /// seat propagates as an empty list that clears stale rules.
     #[serde(default)]
     pub quota: Option<QuotaSnapshot>,
+    /// The deployment's key-delivery contract, told to us EXPLICITLY by the
+    /// server (2026-07-13). `None` = an older control plane that predates the
+    /// field; the client then falls back to inferring the form the old way
+    /// (a resolved cluster node ⇒ central), so nothing regresses.
+    ///
+    /// Why this exists: the client used to infer its form purely from whether a
+    /// cluster node had ever been resolved into the local sidecar. That guess
+    /// desynced from the server's rule in BOTH directions — a fresh machine on a
+    /// central cluster tried to download material and ate an opaque 403, while a
+    /// box carrying a stray CLUSTER_DELIVERY_ORG_ID refused delivery though it
+    /// was not a cluster at all. The server knows; now it says so.
+    #[serde(default)]
+    pub key_delivery_form: Option<String>,
+}
+
+/// How this deployment delivers key material — the client mirror of the
+/// server's `config.KeyDeliveryForm` (single source of truth lives there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyDeliveryForm {
+    /// Material is delivered to this machine; sync downloads it as usual.
+    /// (Personal, plain Production, and cluster form-⓪.)
+    Local,
+    /// Material never leaves the cluster's central nodes — per-VK delivery is
+    /// refused BY DESIGN. The client must NOT ask for material; it routes tools
+    /// at its resolved node instead. (Cluster form-①.)
+    Central,
+}
+
+impl KeyDeliveryForm {
+    /// Parse the wire value, falling back to the legacy inference when the field
+    /// is absent (older server): a resolved cluster node meant "central".
+    ///
+    /// Fail-safe direction matters: an UNRECOGNIZED value must not silently relax
+    /// the "keys stay central" guarantee, so anything we don't understand on a
+    /// cluster is treated as Central.
+    pub fn from_wire(wire: Option<&str>, has_cluster_node: bool) -> Self {
+        match wire.map(|w| w.trim().to_ascii_lowercase()) {
+            Some(w) if w == "local" => Self::Local,
+            Some(w) if w == "central" => Self::Central,
+            // Unknown value from a newer/garbled server: fail safe.
+            Some(_) => {
+                if has_cluster_node {
+                    Self::Central
+                } else {
+                    Self::Local
+                }
+            }
+            // Legacy server (no field): the historical inference.
+            None => {
+                if has_cluster_node {
+                    Self::Central
+                } else {
+                    Self::Local
+                }
+            }
+        }
+    }
+
+    pub fn is_central(self) -> bool {
+        matches!(self, Self::Central)
+    }
+}
+
+#[cfg(test)]
+mod key_delivery_form_tests {
+    use super::KeyDeliveryForm;
+
+    #[test]
+    fn explicit_server_contract_wins_over_inference() {
+        // The whole point: the server's word beats the sidecar guess. A fresh
+        // machine (no node yet) on a central cluster must NOT try to download.
+        assert_eq!(
+            KeyDeliveryForm::from_wire(Some("central"), false),
+            KeyDeliveryForm::Central
+        );
+        // And a box that happens to have a stale node sidecar but whose server
+        // says "local" must download normally (the 2026-07-13 incident shape).
+        assert_eq!(
+            KeyDeliveryForm::from_wire(Some("local"), true),
+            KeyDeliveryForm::Local
+        );
+    }
+
+    #[test]
+    fn legacy_server_falls_back_to_node_inference() {
+        assert_eq!(KeyDeliveryForm::from_wire(None, true), KeyDeliveryForm::Central);
+        assert_eq!(KeyDeliveryForm::from_wire(None, false), KeyDeliveryForm::Local);
+    }
+
+    #[test]
+    fn unknown_value_fails_safe_on_a_cluster() {
+        assert_eq!(
+            KeyDeliveryForm::from_wire(Some("teleport"), true),
+            KeyDeliveryForm::Central
+        );
+        assert_eq!(
+            KeyDeliveryForm::from_wire(Some("teleport"), false),
+            KeyDeliveryForm::Local
+        );
+    }
+
+    #[test]
+    fn case_and_whitespace_insensitive() {
+        assert_eq!(
+            KeyDeliveryForm::from_wire(Some("  LOCAL "), true),
+            KeyDeliveryForm::Local
+        );
+    }
 }
 
 /// The quota payload inlined in the delivery snapshot. Mirrors the server's
