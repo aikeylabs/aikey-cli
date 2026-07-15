@@ -19,6 +19,7 @@ use crate::commands_account::{
 use crate::commands_proxy;
 use crate::credential_type;
 use crate::storage::{self, ProviderBinding};
+use colored::Colorize;
 
 /// Default profile id used throughout v1.0.2 (implicit unique profile).
 pub const DEFAULT_PROFILE: &str = "default";
@@ -315,10 +316,14 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
     // continue rather than aborting the whole activation.
     if let Err(e) = write_claude_json_approvals(&bindings) {
         eprintln!(
-            "\x1b[33m[aikey] warn: could not pre-approve ANTHROPIC_API_KEY in \
+            "{}",
+            format!(
+                "[aikey] warn: could not pre-approve ANTHROPIC_API_KEY in \
              ~/.claude.json: {} \
-             (claude may still ask to /login on first run)\x1b[0m",
-            e,
+                 (claude may still ask to /login on first run)",
+                e,
+            )
+            .yellow()
         );
     }
 
@@ -684,10 +689,14 @@ fn write_active_env_file_at(
         // to chase the underlying disk / perms issue.
         if let Err(e) = atomic_write(&flat_path, (flat_lines.join("\n") + "\n").as_bytes()) {
             eprintln!(
-                "\x1b[33m[aikey] warn: failed to update {}: {} \
-                 (Windows deactivate may restore stale env)\x1b[0m",
-                flat_path.display(),
-                e,
+                "{}",
+                format!(
+                    "[aikey] warn: failed to update {}: {} \
+                     (Windows deactivate may restore stale env)",
+                    flat_path.display(),
+                    e,
+                )
+                .yellow()
             );
         } else {
             // Same owner-only hardening as active.env (carries the same values).
@@ -785,9 +794,13 @@ fn apply_claude_json_approvals_at(
             Ok(v) => v,
             Err(_) => {
                 eprintln!(
-                    "\x1b[33m[aikey] warn: {} is not valid JSON; skipping \
-                     customApiKeyResponses update (will retry on next aikey use)\x1b[0m",
-                    claude_json_path.display(),
+                    "{}",
+                    format!(
+                        "[aikey] warn: {} is not valid JSON; skipping \
+                         customApiKeyResponses update (will retry on next aikey use)",
+                        claude_json_path.display(),
+                    )
+                    .yellow()
                 );
                 return Ok(());
             }
@@ -798,9 +811,13 @@ fn apply_claude_json_approvals_at(
         // Top-level is something other than an object (array, string, ...).
         // Same conservative posture as malformed JSON: don't clobber.
         eprintln!(
-            "\x1b[33m[aikey] warn: {} top-level is not a JSON object; \
-             skipping customApiKeyResponses update\x1b[0m",
-            claude_json_path.display(),
+            "{}",
+            format!(
+                "[aikey] warn: {} top-level is not a JSON object; \
+                 skipping customApiKeyResponses update",
+                claude_json_path.display(),
+            )
+            .yellow()
         );
         return Ok(());
     }

@@ -1511,7 +1511,11 @@ fn table_header_line(sort: SortKey) -> String {
 fn table_divider() -> String {
     use colored::Colorize;
     let rule_len = COL_KEY + COL_TYPE + COL_PROVIDER + COL_TOKENS + COL_TOKENS + COL_SESSION + 5;
-    "─".repeat(rule_len).truecolor(85, 85, 85).to_string()
+    crate::symbols::BOX_H
+        .s()
+        .repeat(rule_len)
+        .truecolor(85, 85, 85)
+        .to_string()
 }
 
 /// One data row with full styling applied: KEY primary, TYPE/PROVIDER dim,

@@ -117,7 +117,11 @@ pub fn get_vault_path() -> Result<PathBuf, String> {
 pub(crate) fn open_connection() -> Result<Connection, String> {
     let conn = open_connection_raw()?;
     if let Err(e) = crate::migrations::upgrade_all(&conn) {
-        eprintln!("⚠️  vault migration failed: {}", e);
+        eprintln!(
+            "{}  vault migration failed: {}",
+            crate::symbols::WARN.s(),
+            e
+        );
         eprintln!(
             "    Subsequent list / status output may show 0 entries; \
              this is NOT data loss — the underlying schema is out of sync. \

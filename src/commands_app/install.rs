@@ -336,7 +336,7 @@ pub fn handle_install(slug: &str, json_mode: bool) -> Result<(), Box<dyn std::er
     }
 
     if !json_mode {
-        println!("✓ {} install complete", slug);
+        println!("{} {} install complete", crate::symbols::CHECK.s(), slug);
         if let Some(doc) = manifest.doc_url.as_deref() {
             println!("  Docs: {}", doc);
         }
@@ -440,8 +440,11 @@ fn handle_uninstall_first_party(
     let counts = crate::commands_app::delete_all_app_state(slug)?;
     if !json_mode {
         println!(
-            "✓ Vault cleaned: app_keys={}, bindings={}, app_records={}",
-            counts.app_keys_deleted, counts.bindings_deleted, counts.app_records_deleted,
+            "{} Vault cleaned: app_keys={}, bindings={}, app_records={}",
+            crate::symbols::CHECK.s(),
+            counts.app_keys_deleted,
+            counts.bindings_deleted,
+            counts.app_records_deleted,
         );
     }
 
@@ -450,12 +453,16 @@ fn handle_uninstall_first_party(
     // already succeeded.
     if let Err(e) = remove_cached_manifest(slug) {
         if !json_mode {
-            eprintln!("⚠ Failed to remove cached manifest (non-fatal): {}", e);
+            eprintln!(
+                "{} Failed to remove cached manifest (non-fatal): {}",
+                crate::symbols::WARN.s(),
+                e
+            );
         }
     }
 
     if !json_mode {
-        println!("✓ {} uninstall complete", slug);
+        println!("{} {} uninstall complete", crate::symbols::CHECK.s(), slug);
         println!("  Re-install any time with: aikey app install {}", slug);
     }
     Ok(())
@@ -507,11 +514,14 @@ fn handle_uninstall_third_party(
     let counts = crate::commands_app::delete_third_party_app_identity(slug)?;
     if !json_mode {
         println!(
-            "✓ Vault updated: app_keys revoked={} (history preserved), \
+            "{} Vault updated: app_keys revoked={} (history preserved), \
              bindings deleted={}, app_records deleted={}",
-            counts.app_keys_revoked, counts.bindings_deleted, counts.app_records_deleted,
+            crate::symbols::CHECK.s(),
+            counts.app_keys_revoked,
+            counts.bindings_deleted,
+            counts.app_records_deleted,
         );
-        println!("✓ {} uninstall complete", slug);
+        println!("{} {} uninstall complete", crate::symbols::CHECK.s(), slug);
         println!(
             "  Re-register any time with: aikey app register --slug {} ...",
             slug
@@ -649,8 +659,9 @@ fn fetch_and_verify_manifest(
     if trusted.manifest_sha256 == "PENDING_LAUNCH_RELEASE" {
         if !json_mode {
             eprintln!(
-                "⚠ Using built-in DEV manifest for '{}' (TRUSTED_APPS entry still has PENDING_LAUNCH_RELEASE placeholder).\n\
+                "{} Using built-in DEV manifest for '{}' (TRUSTED_APPS entry still has PENDING_LAUNCH_RELEASE placeholder).\n\
                  This bypasses SHA-256 verification — DO NOT release a CLI binary while this branch is live.",
+                crate::symbols::WARN.s(),
                 trusted.slug
             );
         }
@@ -744,10 +755,10 @@ fn proxy_misconfiguration_hint() -> String {
         // the lowercase proxy and IT couldn't reach the upstream —
         // tell the user to verify the proxy app is actually running.
         return format!(
-            "\n\n│ hint: detected lowercase proxy env ({}) — the CLI did try \
+            "\n\n{v} hint: detected lowercase proxy env ({}) — the CLI did try \
              routing through it. Verify the proxy app is running:\n\
-             │   curl -sI {} | head -1   # should print HTTP/2 200 or 302\n\
-             │ If curl works but this fetch failed, the proxy is dropping \
+             {v}   curl -sI {} | head -1   # should print HTTP/2 200 or 302\n\
+             {v} If curl works but this fetch failed, the proxy is dropping \
              non-curl clients; try restarting the proxy app.",
             lower_https
                 .as_ref()
@@ -755,17 +766,20 @@ fn proxy_misconfiguration_hint() -> String {
                 .or(lower_all.as_ref())
                 .map(|s| s.as_str())
                 .unwrap_or(""),
-            "https://github.com/aikeylabs/launch/releases/latest"
+            "https://github.com/aikeylabs/launch/releases/latest",
+            v = crate::symbols::BOX_V.s()
         );
     }
     if !lowercase_set && !uppercase_set && !has_proxy_env_file {
         // No proxy configured anywhere. Likely direct-internet failure
         // (China mainland blocks GitHub Releases CDN intermittently).
-        return "\n\n│ hint: no proxy env or ~/.aikey/proxy.env detected. \
+        return format!(
+            "\n\n{v} hint: no proxy env or ~/.aikey/proxy.env detected. \
              If you're behind a restricted network (e.g. China mainland), \
              export HTTPS_PROXY=http://<host>:<port> (or write it to \
-             ~/.aikey/proxy.env) and retry."
-            .to_string();
+             ~/.aikey/proxy.env) and retry.",
+            v = crate::symbols::BOX_V.s()
+        );
     }
     // Everything else (proxy.env set, or both casings set): hand back
     // the raw error with no hint. Adding noise here would dilute the

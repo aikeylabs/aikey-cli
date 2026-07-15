@@ -120,7 +120,7 @@ fn handle_login(
             if !json_mode {
                 eprintln!("  {} {} (HTTP {})", "\u{25c6}".red(), msg, code);
                 if !hint.is_empty() {
-                    eprintln!("  \u{2502} {}", hint);
+                    eprintln!("  {v} {}", hint, v = crate::symbols::BOX_V.s());
                 }
             }
             return Err(msg.to_string().into());
@@ -185,18 +185,18 @@ fn login_setup_token(
         );
         eprintln!(
             "  {} Open this URL and click 'Authorize':",
-            "\u{2502}".dimmed()
+            crate::symbols::BOX_V.s().dimmed()
         );
-        eprintln!("  {}", "\u{2502}".dimmed());
-        eprintln!("  {}   {}", "\u{2502}".dimmed(), auth_url);
-        eprintln!("  {}", "\u{2502}".dimmed());
+        eprintln!("  {}", crate::symbols::BOX_V.s().dimmed());
+        eprintln!("  {}   {}", crate::symbols::BOX_V.s().dimmed(), auth_url);
+        eprintln!("  {}", crate::symbols::BOX_V.s().dimmed());
         if clipboard_ok {
             eprintln!(
                 "  {} {}",
-                "\u{2502}".dimmed(),
+                crate::symbols::BOX_V.s().dimmed(),
                 "Auth URL copied to clipboard.".dimmed()
             );
-            eprintln!("  {}", "\u{2502}".dimmed());
+            eprintln!("  {}", crate::symbols::BOX_V.s().dimmed());
         }
     }
 
@@ -374,18 +374,18 @@ fn login_auth_code(
         if clipboard_ok {
             eprintln!(
                 "  {} {}",
-                "\u{2502}".dimmed(),
+                crate::symbols::BOX_V.s().dimmed(),
                 "Auth URL copied to clipboard.".dimmed()
             );
         }
-        eprintln!("  {}", "\u{2502}".dimmed());
+        eprintln!("  {}", crate::symbols::BOX_V.s().dimmed());
     }
     let _ = open_browser(auth_url);
 
     if !json_mode {
         eprintln!(
             "  {} Waiting for authorization... (Ctrl+C to cancel)",
-            "\u{2502}".dimmed()
+            crate::symbols::BOX_V.s().dimmed()
         );
     }
 
@@ -411,22 +411,33 @@ fn login_device_code(
     if !json_mode {
         eprintln!();
         eprintln!("  {} Open this URL and enter the code:", "\u{25c6}".cyan());
-        eprintln!("  {}   URL:  {}", "\u{2502}".dimmed(), verify_url);
-        eprintln!("  {}   Code: {}", "\u{2502}".dimmed(), user_code.bold());
+        eprintln!(
+            "  {}   URL:  {}",
+            crate::symbols::BOX_V.s().dimmed(),
+            verify_url
+        );
+        eprintln!(
+            "  {}   Code: {}",
+            crate::symbols::BOX_V.s().dimmed(),
+            user_code.bold()
+        );
         if clipboard_ok {
             eprintln!(
                 "  {}   {}",
-                "\u{2502}".dimmed(),
+                crate::symbols::BOX_V.s().dimmed(),
                 "Verification URL copied to clipboard.".dimmed()
             );
         }
-        eprintln!("  {}", "\u{2502}".dimmed());
+        eprintln!("  {}", crate::symbols::BOX_V.s().dimmed());
     }
 
     let _ = open_browser(verify_url);
 
     if !json_mode {
-        eprintln!("  {} Waiting for authorization...", "\u{2502}".dimmed());
+        eprintln!(
+            "  {} Waiting for authorization...",
+            crate::symbols::BOX_V.s().dimmed()
+        );
     }
 
     // Device Code: use POST /oauth/poll (triggers provider poll on each call).
@@ -465,10 +476,10 @@ fn submit_code_and_finish(
             if !json_mode {
                 eprintln!("  {} {} (HTTP {})", "\u{25c6}".red(), msg, code);
                 if !hint.is_empty() {
-                    eprintln!("  \u{2502} {}", hint);
+                    eprintln!("  {v} {}", hint, v = crate::symbols::BOX_V.s());
                 }
                 if !err_code.is_empty() {
-                    eprintln!("  \u{2502} error: {}", err_code);
+                    eprintln!("  {v} error: {}", err_code, v = crate::symbols::BOX_V.s());
                 }
             }
             return Err(msg.to_string().into());
@@ -794,7 +805,10 @@ fn poll_device_code(
                             net_error_count,
                             e
                         );
-                        eprintln!("  \u{2502} Check: proxy is running, network is reachable");
+                        eprintln!(
+                            "  {v} Check: proxy is running, network is reachable",
+                            v = crate::symbols::BOX_V.s()
+                        );
                     }
                     return Err(format!(
                         "Polling aborted after {} network errors: {}",
@@ -891,7 +905,10 @@ fn set_display_identity(
         }
         Err(e) => {
             eprintln!("  {} Failed to save display name: {}", "\u{25c6}".red(), e);
-            eprintln!("  \u{2502} Account created; you can retry via API later.");
+            eprintln!(
+                "  {v} Account created; you can retry via API later.",
+                v = crate::symbols::BOX_V.s()
+            );
             Ok(()) // Don't fail the login flow — account creation already succeeded.
         }
     }
@@ -923,7 +940,10 @@ fn prompt_display_identity(base: &str, account_id: &str) -> Result<(), Box<dyn s
 
     // Validation: skip empty, reject too-long, reject whitespace-only (already trimmed).
     if input.is_empty() {
-        eprintln!("  {} Skipped. Update later via API.", "\u{2502}".dimmed());
+        eprintln!(
+            "  {} Skipped. Update later via API.",
+            crate::symbols::BOX_V.s().dimmed()
+        );
         return Ok(());
     }
     if input.len() > MAX_DISPLAY_LEN {
@@ -955,7 +975,10 @@ fn prompt_display_identity(base: &str, account_id: &str) -> Result<(), Box<dyn s
         Err(e) => {
             // Server rejected or network error — surface it instead of silent "success".
             eprintln!("  {} Failed to save display name: {}", "\u{25c6}".red(), e);
-            eprintln!("  \u{2502} Account created; you can retry via API later.");
+            eprintln!(
+                "  {v} Account created; you can retry via API later.",
+                v = crate::symbols::BOX_V.s()
+            );
             Ok(()) // Don't fail the login flow — account creation already succeeded.
         }
     }
@@ -1325,11 +1348,15 @@ fn handle_doctor(
     match check_proxy_running(proxy_port) {
         Ok(_) => eprintln!(
             "  {} Proxy running on port {}",
-            "\u{2713}".green(),
+            crate::symbols::CHECK.s().green(),
             proxy_port
         ),
         Err(e) => {
-            eprintln!("  {} Proxy not running: {}", "\u{2717}".red(), e);
+            eprintln!(
+                "  {} Proxy not running: {}",
+                crate::symbols::CROSS.s().red(),
+                e
+            );
             return Ok(());
         }
     }
@@ -1341,7 +1368,7 @@ fn handle_doctor(
     } else {
         eprintln!(
             "  {} {} OAuth account(s) found",
-            "\u{2713}".green(),
+            crate::symbols::CHECK.s().green(),
             accounts.len()
         );
         for a in &accounts {

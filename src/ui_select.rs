@@ -23,6 +23,8 @@ use crate::ui_frame::{pad_visible, visible_len};
 use std::io::Read;
 use std::io::{self, Write};
 
+use colored::Colorize;
+
 /// Result of `box_select`: chosen index or cancelled.
 pub enum SelectResult {
     /// User pressed Enter on a selectable row.
@@ -121,7 +123,7 @@ fn fallback_select(
 
 /// Compute the inner width for the box based on content.
 pub(crate) fn compute_inner_w(title: &str, header: &str, items: &[String]) -> usize {
-    let icon_title = format!("\u{1F50D} {}", title);
+    let icon_title = format!("{}{}", crate::symbols::ICON_SEARCH.pre(), title);
     let title_vis = visible_len(&icon_title);
     let header_vis = visible_len(header);
 
@@ -144,9 +146,9 @@ pub(crate) fn compute_inner_w(title: &str, header: &str, items: &[String]) -> us
 /// interactive redraw math is identical in both modes.
 pub(crate) fn format_row(item: &str, is_cursor: bool, inner_w: usize) -> String {
     let marker = if is_cursor {
-        "\x1b[36;1m> \x1b[0m"
+        "> ".cyan().bold().to_string()
     } else {
-        "  "
+        "  ".to_string()
     }; // cyan bold ">"
     let content = format!("{}{}", marker, item);
     let pad_target = inner_w.saturating_sub(4);
@@ -154,8 +156,9 @@ pub(crate) fn format_row(item: &str, is_cursor: bool, inner_w: usize) -> String 
         format!("  {}", content)
     } else {
         format!(
-            "  \u{2502}  {}  \u{2502}",
-            pad_visible(&content, pad_target)
+            "  {v}  {}  {v}",
+            pad_visible(&content, pad_target),
+            v = crate::symbols::BOX_V.s()
         )
     }
 }
@@ -213,13 +216,18 @@ fn interactive_select(
     let _guard = RawGuard { fd: tty_fd, orig };
 
     let inner_w = compute_inner_w(title, header, items);
-    let border = "\u{2500}".repeat(inner_w);
+    let border = crate::symbols::BOX_H.s().repeat(inner_w);
     let narrow = crate::ui_frame::is_narrow();
 
     // Title with icon.
-    let icon_title = format!("\u{1F50D} {}", title);
+    let icon_title = format!("{}{}", crate::symbols::ICON_SEARCH.pre(), title);
     let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
-    let title_bar = format!("\u{2500} {} {}", icon_title, "\u{2500}".repeat(title_fill));
+    let title_bar = format!(
+        "{} {} {}",
+        crate::symbols::BOX_H.s(),
+        icon_title,
+        crate::symbols::BOX_H.s().repeat(title_fill)
+    );
 
     let mut out = io::stderr();
 
@@ -232,23 +240,30 @@ fn interactive_select(
     if narrow {
         // Compact header: title on its own line, a thin horizontal rule, then
         // the column labels. No vertical walls, no corner glyphs.
-        let rule = "\u{2500}".repeat(pad_target);
+        let rule = crate::symbols::BOX_H.s().repeat(pad_target);
         write!(out, "\r\n  {}\r\n", icon_title)?;
         write!(out, "  {}\r\n", rule)?;
         write!(out, "  {}\r\n", header)?;
-        write!(out, "  \x1b[90m{}\x1b[0m\r\n", rule)?;
+        write!(out, "  {}\r\n", rule.bright_black())?;
     } else {
         // Top border.
-        write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
+        write!(
+            out,
+            "\r\n  {}{}{}\r\n",
+            crate::symbols::BOX_TL.s(),
+            title_bar,
+            crate::symbols::BOX_TR.s()
+        )?;
         // Header row — same padding as content rows: inner_w - 4 visible cols.
         write!(
             out,
-            "  \u{2502}  {}  \u{2502}\r\n",
-            pad_visible(header, pad_target)
+            "  {v}  {}  {v}\r\n",
+            pad_visible(header, pad_target),
+            v = crate::symbols::BOX_V.s()
         )?;
         // Separator.
-        let sep = "\u{2500}".repeat(pad_target + 2); // fills content + right margin
-        write!(out, "  \u{2502} {} \u{2502}\r\n", sep)?;
+        let sep = crate::symbols::BOX_H.s().repeat(pad_target + 2); // fills content + right margin
+        write!(out, "  {v} {} {v}\r\n", sep, v = crate::symbols::BOX_V.s())?;
     }
 
     // Cursor init.
@@ -264,16 +279,23 @@ fn interactive_select(
 
     // Bottom border.
     if narrow {
-        let rule = "\u{2500}".repeat(pad_target);
+        let rule = crate::symbols::BOX_H.s().repeat(pad_target);
         write!(out, "  {}\r\n", rule)?;
     } else {
-        write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
+        write!(
+            out,
+            "  {}{}{}\r\n",
+            crate::symbols::BOX_BL.s(),
+            border,
+            crate::symbols::BOX_BR.s()
+        )?;
     }
 
     // Hint line (no trailing newline — cursor stays here).
     write!(
         out,
-        "  [\u{2191}\u{2193} move, \x1b[1;33mEnter\x1b[0m select, Esc cancel]"
+        "  [\u{2191}\u{2193} move, {} select, Esc cancel]",
+        "Enter".yellow().bold()
     )?;
     out.flush()?;
 
@@ -544,26 +566,27 @@ pub(crate) fn format_multi_row(
     inner_w: usize,
 ) -> String {
     let cursor_mark = if is_cursor {
-        "\x1b[36;1m> \x1b[0m"
+        "> ".cyan().bold().to_string()
     } else {
-        "  "
+        "  ".to_string()
     };
     let check_mark = if is_checked {
-        "\x1b[32m[\x1b[1m*\x1b[0m\x1b[32m]\x1b[0m"
+        format!("{}{}{}", "[".green(), "*".bold(), "]".green())
     } else {
-        "[ ]"
+        "[ ]".to_string()
     };
-    let num = format!("\x1b[90m{}\x1b[0m", index + 1); // dim number
+    let num = (index + 1).to_string().bright_black().to_string(); // dim number
     let label = if is_cursor {
-        format!("\x1b[1m{}\x1b[0m", item)
+        format!("{}", item.bold())
     } else {
         item.to_string()
     };
     let content = format!("{}{} {} {}", cursor_mark, num, check_mark, label);
     let pad_target = inner_w.saturating_sub(4);
     format!(
-        "  \u{2502}  {}  \u{2502}",
-        pad_visible(&content, pad_target)
+        "  {v}  {}  {v}",
+        pad_visible(&content, pad_target),
+        v = crate::symbols::BOX_V.s()
     )
 }
 
@@ -613,15 +636,20 @@ fn interactive_multi_select(
         o: orig,
     };
 
-    let icon_title = format!("\u{2611} {}", title);
+    let icon_title = format!("{}{}", crate::symbols::CHECKBOX_ON.pre(), title);
     let items_max = items.iter().map(|s| visible_len(s) + 8).max().unwrap_or(20);
     let max_inner = crate::ui_frame::term_width().saturating_sub(6);
     let inner_w = (visible_len(&icon_title) + 4)
         .max(items_max + 10)
         .min(max_inner);
-    let border = "\u{2500}".repeat(inner_w);
+    let border = crate::symbols::BOX_H.s().repeat(inner_w);
     let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
-    let title_bar = format!("\u{2500} {} {}", icon_title, "\u{2500}".repeat(title_fill));
+    let title_bar = format!(
+        "{} {} {}",
+        crate::symbols::BOX_H.s(),
+        icon_title,
+        crate::symbols::BOX_H.s().repeat(title_fill)
+    );
 
     let mut out = io::stderr();
     let mut checked: Vec<bool> = initially_checked.to_vec();
@@ -633,30 +661,45 @@ fn interactive_multi_select(
     //   2. Has selection, just selected (no move) → "toggle" (may want to undo)
     //   3. Has selection, cursor on unselected   → "select" (guide adding more)
     //   4. Has selection, cursor on selected     → "toggle" (guide deselect)
-    const HINT_INITIAL: &str =
-        "  \x1b[1;33mEnter\x1b[0m select \u{2022} \u{2191}\u{2193} move \u{2022} 1\u{2013}9 jump \u{2022} Esc cancel";
-    const HINT_TOGGLE: &str =
-        "  \x1b[1;33mEnter\x1b[0m to confirm \u{2022} \u{2191}\u{2193} select more \u{2022} Space/1\u{2013}9 toggle \u{2022} Esc cancel";
-    const HINT_SELECT_MORE: &str =
-        "  \x1b[1;33mEnter\x1b[0m to confirm \u{2022} Space/1\u{2013}9 select \u{2022} \u{2191}\u{2193} select more \u{2022} Esc cancel";
+    fn enter_key() -> String {
+        "Enter".yellow().bold().to_string()
+    }
+    let hint_initial = format!(
+        "  {} select \u{2022} \u{2191}\u{2193} move \u{2022} 1\u{2013}9 jump \u{2022} Esc cancel",
+        enter_key()
+    );
+    let hint_toggle = format!(
+        "  {} to confirm \u{2022} \u{2191}\u{2193} select more \u{2022} Space/1\u{2013}9 toggle \u{2022} Esc cancel",
+        enter_key()
+    );
+    let hint_select_more = format!(
+        "  {} to confirm \u{2022} Space/1\u{2013}9 select \u{2022} \u{2191}\u{2193} select more \u{2022} Esc cancel",
+        enter_key()
+    );
 
     let mut has_moved = false;
-    let pick_hint = |checked: &[bool], cursor: usize, moved: bool| -> &'static str {
+    let pick_hint = |checked: &[bool], cursor: usize, moved: bool| -> &str {
         if !checked.iter().any(|&c| c) {
-            return HINT_INITIAL;
+            return &hint_initial;
         }
         if !moved {
-            return HINT_TOGGLE;
+            return &hint_toggle;
         }
         if checked[cursor] {
-            HINT_TOGGLE
+            &hint_toggle
         } else {
-            HINT_SELECT_MORE
+            &hint_select_more
         }
     };
 
     write!(out, "\x1b[?25l")?;
-    write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
+    write!(
+        out,
+        "\r\n  {}{}{}\r\n",
+        crate::symbols::BOX_TL.s(),
+        title_bar,
+        crate::symbols::BOX_TR.s()
+    )?;
     for (i, item) in items.iter().enumerate() {
         write!(
             out,
@@ -664,7 +707,13 @@ fn interactive_multi_select(
             format_multi_row(item, i, i == cursor, checked[i], inner_w)
         )?;
     }
-    write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
+    write!(
+        out,
+        "  {}{}{}\r\n",
+        crate::symbols::BOX_BL.s(),
+        border,
+        crate::symbols::BOX_BR.s()
+    )?;
     write!(out, "{}", pick_hint(&checked, cursor, has_moved))?;
     out.flush()?;
 
@@ -1030,9 +1079,9 @@ pub(crate) fn format_tree_row(
     type_col_w: usize,
 ) -> String {
     let cursor_mark = if is_cursor {
-        "\x1b[36;1m> \x1b[0m"
+        "> ".cyan().bold().to_string()
     } else {
-        "  "
+        "  ".to_string()
     };
     let pad_target = inner_w.saturating_sub(4);
     let content = match row {
@@ -1052,10 +1101,13 @@ pub(crate) fn format_tree_row(
             let (display_name, alias) = crate::provider_registry::family_display(family);
             match alias {
                 Some(a) => format!(
-                    "{}{} \x1b[1m{}\x1b[0m \x1b[2m({})\x1b[0m",
-                    cursor_mark, arrow, display_name, a,
+                    "{}{} {} {}",
+                    cursor_mark,
+                    arrow,
+                    display_name.bold(),
+                    format!("({})", a).dimmed(),
                 ),
-                None => format!("{}{} \x1b[1m{}\x1b[0m", cursor_mark, arrow, display_name),
+                None => format!("{}{} {}", cursor_mark, arrow, display_name.bold()),
             }
         }
         TreeRow::Candidate(gi, ci) => {
@@ -1066,17 +1118,17 @@ pub(crate) fn format_tree_row(
             // downloaded). Green would claim health it doesn't have.
             let radio = if g.selected == Some(*ci) {
                 if c.pending {
-                    "\x1b[33m(*)\x1b[0m"
+                    "(*)".yellow().to_string()
                 } else {
-                    "\x1b[32m(*)\x1b[0m"
+                    "(*)".green().to_string()
                 }
             } else {
-                "( )"
+                "( )".to_string()
             };
             let label_raw = if is_cursor {
-                format!("\x1b[1m{}\x1b[0m", c.label)
+                format!("{}", c.label.bold())
             } else if c.pending {
-                format!("\x1b[2m{}\x1b[0m", c.label)
+                format!("{}", c.label.dimmed())
             } else {
                 c.label.clone()
             };
@@ -1090,15 +1142,15 @@ pub(crate) fn format_tree_row(
                     });
             // Pad type to fixed width, then append dot for selected items.
             // This ensures the dot column is aligned regardless of type length.
-            let type_padded = pad_visible(&format!("\x1b[90m{}\x1b[0m", display_type), type_col_w);
+            let type_padded = pad_visible(&display_type.bright_black().to_string(), type_col_w);
             let dot = if g.selected == Some(*ci) {
                 if c.pending {
-                    " \x1b[33m\u{25cf}\x1b[0m"
+                    format!(" {}", format!("{}", crate::symbols::RADIO_ON.s()).yellow())
                 } else {
-                    " \x1b[32m\u{25cf}\x1b[0m"
+                    format!(" {}", format!("{}", crate::symbols::RADIO_ON.s()).green())
                 }
             } else {
-                ""
+                String::new()
             };
             format!(
                 "{}    {} {} {}{}",
@@ -1107,32 +1159,42 @@ pub(crate) fn format_tree_row(
         }
         TreeRow::Blank => String::new(),
         TreeRow::Separator => {
-            format!("  {}", "\u{2500}".repeat(pad_target.saturating_sub(2)))
+            format!(
+                "  {}",
+                crate::symbols::BOX_H
+                    .s()
+                    .repeat(pad_target.saturating_sub(2))
+            )
         }
         TreeRow::Confirm => {
             if is_cursor {
                 format!(
-                    "{}\x1b[1;32mConfirm\x1b[0m \x1b[90m(press Enter to confirm)\x1b[0m",
-                    cursor_mark
+                    "{}{} {}",
+                    cursor_mark,
+                    "Confirm".green().bold(),
+                    "(press Enter to confirm)".bright_black()
                 )
             } else {
-                format!("{}\x1b[32mConfirm \x1b[33m(Y)\x1b[0m", cursor_mark)
+                format!("{}{} {}", cursor_mark, "Confirm".green(), "(Y)".yellow())
             }
         }
         TreeRow::Cancel => {
             if is_cursor {
                 format!(
-                    "{}\x1b[1;33mCancel\x1b[0m \x1b[90m(press Enter to cancel)\x1b[0m",
-                    cursor_mark
+                    "{}{} {}",
+                    cursor_mark,
+                    "Cancel".yellow().bold(),
+                    "(press Enter to cancel)".bright_black()
                 )
             } else {
-                format!("{}\x1b[33mCancel \x1b[33m(N)\x1b[0m", cursor_mark)
+                format!("{}{} {}", cursor_mark, "Cancel".yellow(), "(N)".yellow())
             }
         }
     };
     format!(
-        "  \u{2502}  {}  \u{2502}",
-        pad_visible(&content, pad_target)
+        "  {v}  {}  {v}",
+        pad_visible(&content, pad_target),
+        v = crate::symbols::BOX_V.s()
     )
 }
 
@@ -1180,7 +1242,7 @@ fn interactive_provider_tree(
     };
 
     let title = "Provider Key Selection";
-    let icon_title = format!("\u{1F310} {}", title);
+    let icon_title = format!("{}{}", crate::symbols::ICON_GLOBE.pre(), title);
     let mut out = io::stderr();
     let mut cursor: usize = 0;
 
@@ -1190,11 +1252,13 @@ fn interactive_provider_tree(
     // the box itself remains the focal element.
     write!(
         out,
-        "\r\n  \x1b[2mPick the default key for each provider.\x1b[0m\r\n",
+        "\r\n  {}\r\n",
+        "Pick the default key for each provider.".dimmed()
     )?;
     write!(
         out,
-        "  \x1b[2mYour CLI tools (claude / codex / kimi …) will route through these keys until you switch again.\x1b[0m\r\n",
+        "  {}\r\n",
+        "Your CLI tools (claude / codex / kimi …) will route through these keys until you switch again.".dimmed()
     )?;
 
     loop {
@@ -1226,16 +1290,27 @@ fn interactive_provider_tree(
         let inner_w = (visible_len(&icon_title) + 4)
             .max(content_min_w)
             .min(max_inner);
-        let border = "\u{2500}".repeat(inner_w);
+        let border = crate::symbols::BOX_H.s().repeat(inner_w);
         let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
-        let title_bar = format!("\u{2500} {} {}", icon_title, "\u{2500}".repeat(title_fill));
+        let title_bar = format!(
+            "{} {} {}",
+            crate::symbols::BOX_H.s(),
+            icon_title,
+            crate::symbols::BOX_H.s().repeat(title_fill)
+        );
 
         if cursor >= total || !is_focusable(&rows[cursor]) {
             cursor = rows.iter().position(|r| is_focusable(r)).unwrap_or(0);
         }
 
         write!(out, "\x1b[?25l")?;
-        write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
+        write!(
+            out,
+            "\r\n  {}{}{}\r\n",
+            crate::symbols::BOX_TL.s(),
+            title_bar,
+            crate::symbols::BOX_TR.s()
+        )?;
         for (i, row) in rows.iter().enumerate() {
             write!(
                 out,
@@ -1243,8 +1318,20 @@ fn interactive_provider_tree(
                 format_tree_row(row, groups, i == cursor, inner_w, label_col_w, max_type_w)
             )?;
         }
-        write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
-        write!(out, "  [\u{2191}\u{2193} move \u{2022} \x1b[1;33mSpace\x1b[0m select/expand \u{2022} \x1b[1;33mEnter\x1b[0m confirm \u{2022} \x1b[1;33mEsc\x1b[0m cancel]\r\n")?;
+        write!(
+            out,
+            "  {}{}{}\r\n",
+            crate::symbols::BOX_BL.s(),
+            border,
+            crate::symbols::BOX_BR.s()
+        )?;
+        write!(
+            out,
+            "  [\u{2191}\u{2193} move \u{2022} {} select/expand \u{2022} {} confirm \u{2022} {} cancel]\r\n",
+            "Space".yellow().bold(),
+            "Enter".yellow().bold(),
+            "Esc".yellow().bold()
+        )?;
         out.flush()?;
 
         let key = read_key(&tty)?;

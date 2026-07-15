@@ -121,10 +121,15 @@ pub fn handle_register(
         r.upstreams.join(",")
     );
     if r.bearer_was_new {
-        println!("✓ Issued bearer for '{}':", r.name);
+        println!(
+            "{} Issued bearer for '{}':",
+            crate::symbols::CHECK.s(),
+            r.name
+        );
     } else {
         println!(
-            "✓ Reusing existing bearer for '{}' (pass --rotate-bearer to rotate):",
+            "{} Reusing existing bearer for '{}' (pass --rotate-bearer to rotate):",
+            crate::symbols::CHECK.s(),
             r.name
         );
     }
@@ -135,7 +140,8 @@ pub fn handle_register(
 
     if r.follow_user_active {
         println!(
-            "Mode: ⚠ follow-user-active (this app dynamically tracks your `aikey use` selection)."
+            "Mode: {} follow-user-active (this app dynamically tracks your `aikey use` selection).",
+            crate::symbols::WARN.s()
         );
         println!("    Any change you make via `aikey use` will affect this app immediately.");
         if r.cleaned_stale_bindings > 0 {
@@ -171,7 +177,10 @@ pub fn handle_register(
             }
             if !r.missing_upstreams.is_empty() {
                 println!();
-                println!("⚠️  No active key for these declared upstreams:");
+                println!(
+                    "{}  No active key for these declared upstreams:",
+                    crate::symbols::WARN.s()
+                );
                 for u in &r.missing_upstreams {
                     println!("       - {}", u);
                 }
@@ -674,7 +683,11 @@ pub fn handle_route(
     // resolver (which goes to default profile when follow_user_active=true).
     if rec.follow_user_active {
         println!();
-        println!("⚠ Note: app '{}' is in follow-user-active mode.", slug);
+        println!(
+            "{} Note: app '{}' is in follow-user-active mode.",
+            crate::symbols::WARN.s(),
+            slug
+        );
         println!("    Bindings you set via `aikey app route` will be IGNORED at request time;");
         println!("    the resolver always uses your `aikey use` (default profile) selection.");
         println!("    Re-register without --follow-user-active to make per-app binding effective.");
@@ -713,7 +726,8 @@ pub fn handle_route(
     if active_keys.is_empty() {
         println!();
         println!(
-            "⚠ This app has no active bearer. Run `aikey app register --slug {} --upstreams ...`",
+            "{} This app has no active bearer. Run `aikey app register --slug {} --upstreams ...`",
+            crate::symbols::WARN.s(),
             slug
         );
         println!("    to issue one. (Route only updates bindings; register issues bearers.)");
@@ -923,7 +937,8 @@ fn parse_key_type(s: &str) -> Result<CredentialType, Box<dyn std::error::Error>>
 
 fn print_bearer_consent_prompt(rec: &AppRecord, bindings: &[(String, CredentialType, String)]) {
     println!();
-    println!("─── About to issue bearer token for app ───");
+    let rule = crate::symbols::BOX_H.s().repeat(3);
+    println!("{rule} About to issue bearer token for app {rule}");
     println!("  slug:      {}", rec.slug);
     println!("  name:      {}", rec.name);
     if !rec.vendor.is_empty() {
@@ -931,7 +946,10 @@ fn print_bearer_consent_prompt(rec: &AppRecord, bindings: &[(String, CredentialT
     }
     println!("  kind:      {}", rec.app_kind);
     if rec.follow_user_active {
-        println!("  mode:      ⚠ follow-active (shares your `aikey use` selection)");
+        println!(
+            "  mode:      {} follow-active (shares your `aikey use` selection)",
+            crate::symbols::WARN.s()
+        );
     }
     println!("  upstreams: {}", rec.upstreams.join(", "));
     if !rec.requested_permissions.is_empty() {
@@ -943,7 +961,10 @@ fn print_bearer_consent_prompt(rec: &AppRecord, bindings: &[(String, CredentialT
     }
     if is_first_party(&rec.slug) && rec.follow_user_active {
         println!();
-        println!("⚠  first-party + follow-active: this app will see ANY future");
+        println!(
+            "{}  first-party + follow-active: this app will see ANY future",
+            crate::symbols::WARN.s()
+        );
         println!("   `aikey use` change. Make sure you trust this app.");
     }
     println!();

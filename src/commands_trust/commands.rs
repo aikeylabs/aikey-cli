@@ -3,6 +3,7 @@
 use crate::cli::SyncTarget;
 use crate::commands_trust::client::{StatusSummary, TrustClient, VerifyDetail};
 use crate::storage::open_connection_readonly;
+use colored::Colorize;
 use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -124,9 +125,9 @@ fn poll_until_done(
 
 fn print_verify_result(d: &VerifyDetail) {
     let icon = match d.status.as_str() {
-        "pass" => "\x1b[1;32m✓\x1b[0m",
-        "fail" => "\x1b[1;31m✗\x1b[0m",
-        _ => "\x1b[1;33m?\x1b[0m",
+        "pass" => crate::symbols::CHECK.s().green().bold().to_string(),
+        "fail" => crate::symbols::CROSS.s().red().bold().to_string(),
+        _ => "?".yellow().bold().to_string(),
     };
     let n_pass = d
         .scoring_detail
@@ -233,7 +234,11 @@ fn print_status_table(items: &[StatusSummary]) {
             .last_verified_at
             .map(format_relative)
             .unwrap_or_else(|| "never".to_string());
-        let badge = if s.anomaly_suggested { " ⚠" } else { "" };
+        let badge = if s.anomaly_suggested {
+            format!(" {}", crate::symbols::WARN.s())
+        } else {
+            String::new()
+        };
         println!(
             "{:<24} {:<14} {:<28} {:>8} {:<14} {}{}",
             s.alias_name, s.provider_id, s.model, score, verdict, verified, badge,
@@ -256,7 +261,12 @@ fn print_status_detail(s: &StatusSummary) {
         println!("verified:   {}", format_relative(ts));
     }
     if s.anomaly_suggested {
-        println!("\n\x1b[1;33m⚠ ANOMALY SUGGESTED\x1b[0m");
+        println!(
+            "\n{}",
+            format!("{} ANOMALY SUGGESTED", crate::symbols::WARN.s())
+                .yellow()
+                .bold()
+        );
         println!("  D1/D2 hits crossed threshold in the last 24h.");
         println!("  Recommended: aikey trust verify {}", s.alias_name);
     }
@@ -456,9 +466,9 @@ pub(crate) fn handle_refresh(alias: Option<&str>, json: bool) -> Result<(), Stri
                 })
                 .unwrap_or_else(|| "no observations in window".to_string());
             let anomaly_tag = if r.anomaly_suggested {
-                "  ⚠ANOMALY"
+                format!("  {}ANOMALY", crate::symbols::WARN.s())
             } else {
-                ""
+                String::new()
             };
             println!(
                 "  {} ({}/{}) s_l1={} {}{}",
@@ -570,10 +580,10 @@ fn format_ureq_err(client: &TrustClient, e: ureq::Error, ctx: &str) -> String {
 
 fn colorize_verdict(s: &str) -> String {
     match s {
-        "pass" => format!("\x1b[1;32m{}\x1b[0m", s),
-        "fail" => format!("\x1b[1;31m{}\x1b[0m", s),
-        "inconclusive" => format!("\x1b[1;33m{}\x1b[0m", s),
-        "running" => format!("\x1b[1;34m{}\x1b[0m", s),
+        "pass" => s.green().bold().to_string(),
+        "fail" => s.red().bold().to_string(),
+        "inconclusive" => s.yellow().bold().to_string(),
+        "running" => s.blue().bold().to_string(),
         _ => s.to_string(),
     }
 }

@@ -1,6 +1,6 @@
 use crate::config::ProjectConfig;
 use crate::env_renderer::EnvRenderer;
-use crate::{core, storage, global_config};
+use crate::{core, global_config, storage};
 use secrecy::SecretString;
 use zeroize::Zeroizing;
 
@@ -10,7 +10,11 @@ fn prompt_password_for_env(json_mode: bool) -> Result<SecretString, Box<dyn std:
         return Ok(SecretString::new(test_password));
     }
 
-    let prompt_str = if json_mode { "" } else { "\u{1F512} Enter Master Password: " };
+    let prompt_str = if json_mode {
+        String::new()
+    } else {
+        format!("{}Enter Master Password: ", crate::symbols::ICON_LOCK.pre())
+    };
     let password = crate::prompt_hidden(prompt_str)?;
     let password_raw = Zeroizing::new(password);
     Ok(SecretString::new(password_raw.trim().to_string()))
@@ -22,8 +26,12 @@ pub fn handle_env_generate(
     env_file_override: Option<&str>,
     json_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (config_path, config) = ProjectConfig::discover()?
-        .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
+    let (config_path, config) = ProjectConfig::discover()?.ok_or_else(|| {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No aikey.config.json found",
+        )) as Box<dyn std::error::Error>
+    })?;
 
     let env_target = env_file_override.unwrap_or(&config.env.target);
     let env_path = std::path::Path::new(env_target);
@@ -31,8 +39,16 @@ pub fn handle_env_generate(
     // Get current profile
     let password = prompt_password_for_env(json_mode)?;
     let current_profile = global_config::get_current_profile()
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?
-        .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No active profile")) as Box<dyn std::error::Error>)?;
+        .map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+                as Box<dyn std::error::Error>
+        })?
+        .ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No active profile",
+            )) as Box<dyn std::error::Error>
+        })?;
 
     // Resolve environment variables
     let resolved = resolve_env_direct(&config, &current_profile, &password, Some(&config_path))?;
@@ -44,10 +60,8 @@ pub fn handle_env_generate(
         None
     };
 
-    let (added, updated, missing) = EnvRenderer::get_changes_summary(
-        existing_content.as_deref(),
-        &resolved,
-    );
+    let (added, updated, missing) =
+        EnvRenderer::get_changes_summary(existing_content.as_deref(), &resolved);
 
     if json_mode {
         let response = serde_json::json!({
@@ -65,9 +79,14 @@ pub fn handle_env_generate(
         println!("Profile: {}", current_profile);
 
         // P0 Security Warning: Inform users that secrets are not written to .env
-        let has_secrets = resolved.iter().any(|v| !matches!(v.name.as_str(), "AIKEY_PROJECT" | "AIKEY_ENV" | "AIKEY_PROFILE"));
+        let has_secrets = resolved.iter().any(|v| {
+            !matches!(
+                v.name.as_str(),
+                "AIKEY_PROJECT" | "AIKEY_ENV" | "AIKEY_PROFILE"
+            )
+        });
         if has_secrets {
-            println!("\n⚠️  Security Notice:");
+            println!("\n{}  Security Notice:", crate::symbols::WARN.s());
             println!("   API keys and secrets are NOT written to .env files.");
             println!("   Only non-sensitive context (AIKEY_PROJECT, AIKEY_ENV, AIKEY_PROFILE) is written.");
             println!("   Secrets are injected at runtime via 'aikey run -- <command>'.");
@@ -99,7 +118,7 @@ pub fn handle_env_generate(
         } else {
             // Write the file
             EnvRenderer::write_env_file(env_path, &resolved, true)?;
-            println!("\n✓ Updated {}", env_target);
+            println!("\n{} Updated {}", crate::symbols::CHECK.s(), env_target);
         }
     }
 
@@ -108,14 +127,26 @@ pub fn handle_env_generate(
 
 /// Handle `aikey env inject` command
 pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let (config_path, config) = ProjectConfig::discover()?
-        .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
+    let (config_path, config) = ProjectConfig::discover()?.ok_or_else(|| {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No aikey.config.json found",
+        )) as Box<dyn std::error::Error>
+    })?;
 
     // Get current profile
     let password = prompt_password_for_env(json_mode)?;
     let current_profile = global_config::get_current_profile()
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?
-        .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No active profile")) as Box<dyn std::error::Error>)?;
+        .map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+                as Box<dyn std::error::Error>
+        })?
+        .ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No active profile",
+            )) as Box<dyn std::error::Error>
+        })?;
 
     // Resolve environment variables
     let resolved = resolve_env_direct(&config, &current_profile, &password, Some(&config_path))?;
@@ -141,7 +172,9 @@ pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
         let is_eval_mode = std::env::var("AIKEY_INJECT_MODE").unwrap_or_default() == "eval";
 
         if is_eval_mode {
-            eprintln!("❌ ERROR: Plaintext shell injection is not supported in this Stage 0 Rust CLI.");
+            eprintln!(
+                "❌ ERROR: Plaintext shell injection is not supported in this Stage 0 Rust CLI."
+            );
             eprintln!();
             eprintln!("   'aikey env inject' in eval mode would expose secrets in your shell.");
             eprintln!();
@@ -149,7 +182,7 @@ pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
             eprintln!();
             return Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "Plaintext secret exposure is not supported (use aikey run instead)"
+                "Plaintext secret exposure is not supported (use aikey run instead)",
             )));
         }
 
@@ -160,7 +193,11 @@ pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
         println!("\nVariables to inject:");
 
         for var in &resolved {
-            let status = if var.value.is_some() { "✓" } else { "✗" };
+            let status = if var.value.is_some() {
+                crate::symbols::CHECK.s()
+            } else {
+                crate::symbols::CROSS.s()
+            };
             println!("  {} {}", status, var.name);
         }
 
@@ -184,8 +221,16 @@ pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
     // Get current profile
     let password = prompt_password_for_env(json_mode)?;
     let current_profile = global_config::get_current_profile()
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?
-        .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No active profile")) as Box<dyn std::error::Error>)?;
+        .map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+                as Box<dyn std::error::Error>
+        })?
+        .ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "No active profile",
+            )) as Box<dyn std::error::Error>
+        })?;
 
     // Resolve environment variables
     let resolved = resolve_env_direct(&config, &current_profile, &password, Some(&config_path))?;
@@ -215,14 +260,19 @@ pub fn handle_env_check(json_mode: bool) -> Result<(), Box<dyn std::error::Error
         if !missing.is_empty() {
             println!("\nMissing variables:");
             for var in &missing {
-                println!("  ✗ {}", var.name);
+                println!("  {} {}", crate::symbols::CROSS.s(), var.name);
             }
             println!("\nTo configure these variables:");
             println!("  • Add keys to your local vault: 'aikey add <provider>:<alias>'");
             println!("  • Run 'aikey project map' / 'aikey provider add' to bind vars to keys");
-            println!("  • Then run 'aikey env generate' to create non-sensitive placeholders in .env");
+            println!(
+                "  • Then run 'aikey env generate' to create non-sensitive placeholders in .env"
+            );
         } else {
-            println!("\n✓ All required variables are configured");
+            println!(
+                "\n{} All required variables are configured",
+                crate::symbols::CHECK.s()
+            );
         }
     }
 
@@ -243,8 +293,12 @@ pub fn handle_env_run(
     tenant: Option<&str>,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_, config) = ProjectConfig::discover()?
-        .ok_or_else(|| Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "No aikey.config.json found")) as Box<dyn std::error::Error>)?;
+    let (_, config) = ProjectConfig::discover()?.ok_or_else(|| {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No aikey.config.json found",
+        )) as Box<dyn std::error::Error>
+    })?;
 
     // P0-B1: env inject -- <cmd> uses the same execution path as run -- <cmd>
     // This ensures: same injection-set algorithm, same dry-run contract, same exit codes, same events
@@ -288,7 +342,14 @@ pub fn handle_env_run(
     } else {
         // Execute mode: run the command with injected secrets
         let password = prompt_password_for_env(json_mode)?;
-        match crate::executor::run_with_project_config(&config, &password, command, json_mode, logical_model, tenant) {
+        match crate::executor::run_with_project_config(
+            &config,
+            &password,
+            command,
+            json_mode,
+            logical_model,
+            tenant,
+        ) {
             Ok((_, exit_code)) => {
                 if exit_code != 0 {
                     std::process::exit(exit_code);
@@ -300,7 +361,8 @@ pub fn handle_env_run(
                 if let Some(code_str) = e.strip_prefix("Command exited with code ") {
                     std::process::exit(code_str.parse::<i32>().unwrap_or(1));
                 }
-                Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)
+                Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    as Box<dyn std::error::Error>)
             }
         }
     }
@@ -313,10 +375,14 @@ fn resolve_env_direct(
     password: &SecretString,
     _config_path: Option<&std::path::Path>,
 ) -> Result<Vec<crate::env_resolver::ResolvedVar>, Box<dyn std::error::Error>> {
-    let conn = storage::open_connection()
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
-    let context = core::Core::resolve_environment_with_config(&conn, password, config)
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>)?;
+    let conn = storage::open_connection().map_err(|e| {
+        Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn std::error::Error>
+    })?;
+    let context =
+        core::Core::resolve_environment_with_config(&conn, password, config).map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+                as Box<dyn std::error::Error>
+        })?;
 
     Ok(context.resolved_vars)
 }

@@ -457,12 +457,18 @@ pub(crate) fn install(model: Option<&str>) -> Result<(), String> {
     if is_repoint_mode() {
         let managed_model = de_manages_gateway().then_some(model);
         openclaw_config_patch(&build_repoint_patch(&pid, &token, &base_url, managed_model))?;
-        println!("\u{2713} OpenClaw provider '{pid}' repointed through AiKey.");
+        println!(
+            "{} OpenClaw provider '{pid}' repointed through AiKey.",
+            crate::symbols::CHECK.s()
+        );
         println!("  baseUrl  : {base_url}");
         println!("  (real provider key stays in the vault; OpenClaw only holds the team VK)");
     } else {
         openclaw_config_patch(&build_install_patch(&pid, &token, &base_url, model))?;
-        println!("\u{2713} OpenClaw configured to route through AiKey.");
+        println!(
+            "{} OpenClaw configured to route through AiKey.",
+            crate::symbols::CHECK.s()
+        );
         println!("  provider : {pid}");
         println!("  baseUrl  : {base_url}");
         println!("  model    : {pid}/{model}");
@@ -539,7 +545,10 @@ pub(crate) fn uninstall() -> Result<(), String> {
             .output()
             .map_err(|e| format!("OpenClaw CLI not runnable ('{bin}'): {e}"))?;
         if out.status.success() {
-            println!("\u{2713} Cleared the AiKey key from OpenClaw provider '{pid}' (provider kept; restore the original baseUrl from the installer backup).");
+            println!(
+                "{} Cleared the AiKey key from OpenClaw provider '{pid}' (provider kept; restore the original baseUrl from the installer backup).",
+                crate::symbols::CHECK.s()
+            );
             return Ok(());
         }
         return Err(format!(
@@ -552,7 +561,10 @@ pub(crate) fn uninstall() -> Result<(), String> {
         .output()
         .map_err(|e| format!("OpenClaw CLI not runnable ('{bin}'): {e}"))?;
     if out.status.success() {
-        println!("\u{2713} Removed the '{pid}' provider from OpenClaw config.");
+        println!(
+            "{} Removed the '{pid}' provider from OpenClaw config.",
+            crate::symbols::CHECK.s()
+        );
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -562,7 +574,8 @@ pub(crate) fn uninstall() -> Result<(), String> {
     // degrade to a clear manual-removal hint instead of crashing.
     if stderr.contains("size-drop") || stderr.contains("rejected") {
         println!(
-            "\u{26a0} OpenClaw declined to auto-remove the provider (its config-shrink safety guard)."
+            "{} OpenClaw declined to auto-remove the provider (its config-shrink safety guard).",
+            crate::symbols::WARN.s()
         );
         println!(
             "  Remove it manually: edit ~/.openclaw/openclaw.json and delete the \"{pid}\" entry under models.providers."
@@ -653,7 +666,10 @@ pub(crate) fn status() -> Result<(), String> {
         .map_err(|e| format!("OpenClaw CLI not runnable ('{bin}'): {e}"))?;
     let body = String::from_utf8_lossy(&out.stdout);
     if out.status.success() && body.contains("baseUrl") {
-        println!("\u{2713} OpenClaw is wired to AiKey (provider '{pid}').");
+        println!(
+            "{} OpenClaw is wired to AiKey (provider '{pid}').",
+            crate::symbols::CHECK.s()
+        );
         // Show the base_url line if present (apiKey is redacted by OpenClaw).
         for line in body.lines() {
             if line.contains("baseUrl") {
@@ -662,7 +678,8 @@ pub(crate) fn status() -> Result<(), String> {
         }
     } else {
         println!(
-            "\u{2717} OpenClaw is not wired to AiKey. Run `aikey hook install openclaw` first."
+            "{} OpenClaw is not wired to AiKey. Run `aikey hook install openclaw` first.",
+            crate::symbols::CROSS.s()
         );
     }
     Ok(())

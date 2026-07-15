@@ -15,6 +15,7 @@
 // during Stage 2 development isn't drowned in deprecation noise.
 #![allow(deprecated)]
 
+use colored::Colorize;
 use secrecy::{ExposeSecret, SecretString};
 use std::fs;
 use std::io;
@@ -407,7 +408,7 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
                 from_cache = true;
                 cached
             } else if password_stdin {
-                eprint!("\u{1F512} Enter Master Password: ");
+                eprint!("{}Enter Master Password: ", crate::symbols::ICON_LOCK.pre());
                 let _ = io::stderr().flush();
                 let mut line = String::new();
                 let _ = io::stdin().read_line(&mut line);
@@ -416,7 +417,10 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
                 SecretString::new(line.trim().to_string())
             } else {
                 prompted = true;
-                match crate::prompt_hidden("\u{1F512} Enter Master Password: ") {
+                match crate::prompt_hidden(&format!(
+                    "{}Enter Master Password: ",
+                    crate::symbols::ICON_LOCK.pre()
+                )) {
                     Ok(p) => SecretString::new(p),
                     Err(_) => {
                         eprintln!(
@@ -853,8 +857,10 @@ fn handle_start_background(
     match crate::proxy_lifecycle::start_proxy(password, opts) {
         Ok(state) => {
             eprintln!(
-                "\x1b[32m✓\x1b[0m aikey-proxy running (pid: {}, http://{})",
-                state.pid, state.listen_addr
+                "{} aikey-proxy running (pid: {}, http://{})",
+                crate::symbols::CHECK.s().green(),
+                state.pid,
+                state.listen_addr
             );
             // Quick connectivity check for overseas providers after proxy starts.
             // Only warn when a provider is unreachable — no noise when all is fine.
@@ -1339,7 +1345,8 @@ pub fn handle_restart(
     match restart_proxy(password, opts, DEFAULT_STOP_TIMEOUT, |s| eprintln!("{s}")) {
         Ok(state) => {
             eprintln!(
-                "\x1b[32m✓\x1b[0m aikey-proxy running (pid: {}, http://{})",
+                "{} aikey-proxy running (pid: {}, http://{})",
+                crate::symbols::CHECK.s().green(),
                 state.pid, state.listen_addr
             );
             if let Ok(seq) = crate::storage::get_vault_change_seq() {
@@ -1491,10 +1498,14 @@ fn check_overseas_connectivity() {
     if !unreachable.is_empty() {
         eprintln!();
         eprintln!(
-            "  \x1b[33m[warn]\x1b[0m  Cannot reach: {}",
+            "  {}  Cannot reach: {}",
+            "[warn]".yellow(),
             unreachable.join(", ")
         );
-        eprintln!("  \x1b[33m[warn]\x1b[0m  If you use these providers, configure HTTP_PROXY / HTTPS_PROXY");
+        eprintln!(
+            "  {}  If you use these providers, configure HTTP_PROXY / HTTPS_PROXY",
+            "[warn]".yellow()
+        );
         eprintln!("          and restart the proxy: aikey proxy restart");
     }
 }
@@ -1851,10 +1862,14 @@ fn resolve_config(explicit: Option<&str>) -> Result<PathBuf, Box<dyn std::error:
     let cwd_cfg = PathBuf::from(DEFAULT_CONFIG_NAME);
     if cwd_cfg.exists() {
         eprintln!(
-            "\x1b[33m[aikey] WARN: local `./{}` detected but NOT loaded (cwd-first removed 2026-05-21).\n  \
-             To load it intentionally:  aikey proxy start --config ./{}\n  \
-             Otherwise default source:  ~/.aikey/config/{}\x1b[0m",
-            DEFAULT_CONFIG_NAME, DEFAULT_CONFIG_NAME, DEFAULT_CONFIG_NAME,
+            "{}",
+            format!(
+                "[aikey] WARN: local `./{}` detected but NOT loaded (cwd-first removed 2026-05-21).\n  \
+                 To load it intentionally:  aikey proxy start --config ./{}\n  \
+                 Otherwise default source:  ~/.aikey/config/{}",
+                DEFAULT_CONFIG_NAME, DEFAULT_CONFIG_NAME, DEFAULT_CONFIG_NAME,
+            )
+            .yellow()
         );
     }
 
@@ -1919,14 +1934,16 @@ pub fn warn_if_proxy_down() {
         ProxyState::Stopped | ProxyState::Crashed { .. } => {
             eprintln!();
             eprintln!(
-                "  \x1b[33m\u{26A0}\x1b[0m  Proxy is not running. Start it with: aikey proxy start"
+                "  {}  Proxy is not running. Start it with: aikey proxy start",
+                crate::symbols::WARN.s().yellow()
             );
         }
         ProxyState::Unresponsive { pid, port } => {
             eprintln!();
             eprintln!(
-                "  \x1b[33m\u{26A0}\x1b[0m  Proxy (pid {pid}) is unresponsive on port {port} \
-                       (port bound, /health failing). Try: aikey proxy restart"
+                "  {}  Proxy (pid {pid}) is unresponsive on port {port} \
+                       (port bound, /health failing). Try: aikey proxy restart",
+                crate::symbols::WARN.s().yellow()
             );
         }
         ProxyState::OrphanedPort {
@@ -1936,8 +1953,9 @@ pub fn warn_if_proxy_down() {
         } => {
             eprintln!();
             eprintln!(
-                "  \x1b[33m\u{26A0}\x1b[0m  Port {port} is held by something we cannot manage \
+                "  {}  Port {port} is held by something we cannot manage \
                        — {}",
+                crate::symbols::WARN.s().yellow(),
                 reason.hint(port, owner_pid)
             );
             eprintln!("       Run `aikey proxy status` for details.");

@@ -263,8 +263,14 @@ mod key_delivery_form_tests {
 
     #[test]
     fn legacy_server_falls_back_to_node_inference() {
-        assert_eq!(KeyDeliveryForm::from_wire(None, true), KeyDeliveryForm::Central);
-        assert_eq!(KeyDeliveryForm::from_wire(None, false), KeyDeliveryForm::Local);
+        assert_eq!(
+            KeyDeliveryForm::from_wire(None, true),
+            KeyDeliveryForm::Central
+        );
+        assert_eq!(
+            KeyDeliveryForm::from_wire(None, false),
+            KeyDeliveryForm::Local
+        );
     }
 
     #[test]

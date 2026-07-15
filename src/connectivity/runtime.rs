@@ -202,12 +202,26 @@ pub enum ProbeStage<'a> {
 /// reads as alive rather than mechanical — short enough that probe-level
 /// jitter (typical Ping-D / Ping-PROXY ~500 ms) catches the user mid-frame
 /// instead of leaving them staring at a frozen open-eye glyph.
-const BLINK_FRAMES: &[(&str, u64)] = &[
+const BLINK_FRAMES_FANCY: &[(&str, u64)] = &[
     ("\u{276C}\u{29BF}\u{B7}\u{29BF}\u{276D}", 1500), // ❬⦿·⦿❭
     ("\u{276C}-\u{B7}-\u{276D}", 130),                // ❬-·-❭
     ("\u{276C}\u{29BF}\u{B7}\u{29BF}\u{276D}", 180),  // ❬⦿·⦿❭
     ("\u{276C}-\u{B7}-\u{276D}", 130),                // ❬-·-❭
 ];
+// win10-conhost-compat: conhost fonts have no ❬ ⦿ ❭ glyphs. The Safe tier
+// keeps the same cadence with ASCII eyes so the "alive" affordance survives.
+const BLINK_FRAMES_SAFE: &[(&str, u64)] = &[
+    ("(o.o)", 1500),
+    ("(-.-)", 130),
+    ("(o.o)", 180),
+    ("(-.-)", 130),
+];
+fn blink_frames() -> &'static [(&'static str, u64)] {
+    match crate::term_caps::unicode_tier() {
+        crate::term_caps::UnicodeTier::Fancy => BLINK_FRAMES_FANCY,
+        crate::term_caps::UnicodeTier::Safe => BLINK_FRAMES_SAFE,
+    }
+}
 
 /// Internal animation event — `Started(col)` moves the blink, `Finished(col, S)`
 /// freezes the just-completed column to its formatted result and the blink
@@ -284,7 +298,7 @@ where
     let mut all_done = false;
 
     let paint = |rendered: &Vec<Option<String>>, current_col: Option<usize>, frame_idx: usize| {
-        let (frame_text, _) = BLINK_FRAMES[frame_idx % BLINK_FRAMES.len()];
+        let (frame_text, _) = blink_frames()[frame_idx % blink_frames().len()];
         eprint!("\x1b8\x1b[K");
         for (i, &w) in widths.iter().enumerate() {
             if let Some(s) = &rendered[i] {
@@ -332,7 +346,7 @@ where
         }
 
         // Advance frame on dwell timeout.
-        let (_, frame_dur) = BLINK_FRAMES[frame_idx % BLINK_FRAMES.len()];
+        let (_, frame_dur) = blink_frames()[frame_idx % blink_frames().len()];
         if frame_start.elapsed() >= Duration::from_millis(frame_dur) {
             frame_idx += 1;
             frame_start = Instant::now();
@@ -1555,7 +1569,7 @@ pub fn run_connectivity_suite(
 
     if let Some(header) = opts.header_label {
         eprintln!();
-        eprintln!("  \u{1F50C} {}", header.bold());
+        eprintln!("  {}{}", crate::symbols::ICON_PLUG.pre(), header.bold());
     }
     if opts.show_key_column {
         eprintln!(
@@ -1574,7 +1588,8 @@ pub fn run_connectivity_suite(
         );
         eprintln!(
             "  {}",
-            "\u{2500}"
+            crate::symbols::BOX_H
+                .s()
                 .repeat(key_w + label_w + W_PD + W_PING + W_API + 22)
                 .dimmed()
         );
@@ -1593,7 +1608,8 @@ pub fn run_connectivity_suite(
         );
         eprintln!(
             "  {}",
-            "\u{2500}"
+            crate::symbols::BOX_H
+                .s()
                 .repeat(label_w + W_PD + W_PING + W_API + 22)
                 .dimmed()
         );
@@ -1855,7 +1871,8 @@ pub fn run_connectivity_suite(
     if !rows.is_empty() {
         eprintln!(
             "  {}",
-            "\u{2500}"
+            crate::symbols::BOX_H
+                .s()
                 .repeat(label_w + W_PD + W_PING + W_API + 22)
                 .dimmed()
         );

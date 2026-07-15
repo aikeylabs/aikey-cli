@@ -266,8 +266,10 @@ pub fn ensure_vault_integrity_or_quarantine() -> Result<(), String> {
     std::fs::rename(&vault_path, &quarantine_path)
         .map_err(|e| format!("could not quarantine corrupt vault: {}", e))?;
     eprintln!(
-        "\n  \u{26A0}  Vault at {} appeared corrupted and was moved to:\n      {}\n  A fresh empty vault has been created in its place.\n  To restore data, use `aikey import` with your last backup, or copy the\n  quarantined file back once the corruption is diagnosed.\n",
-        vault_path.display(), quarantine_path.display()
+        "\n  {}  Vault at {} appeared corrupted and was moved to:\n      {}\n  A fresh empty vault has been created in its place.\n  To restore data, use `aikey import` with your last backup, or copy the\n  quarantined file back once the corruption is diagnosed.\n",
+        crate::symbols::WARN.s(),
+        vault_path.display(),
+        quarantine_path.display()
     );
     Ok(())
 }

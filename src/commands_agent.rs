@@ -112,7 +112,8 @@ pub(crate) fn register(
     set_de_collector_base(&control_url);
 
     println!(
-        "\u{2713} Registered as digital employee: {}",
+        "{} Registered as digital employee: {}",
+        crate::symbols::CHECK.s(),
         res.display_name
     );
     println!("  org_id  : {}", res.org_id);
@@ -302,11 +303,14 @@ pub(crate) fn start(interval_secs: u64) -> Result<(), String> {
 pub(crate) fn status() -> Result<(), String> {
     match storage::get_platform_account().ok().flatten() {
         None => {
-            println!("\u{2717} Not registered. Run `aikey agent register --join-token <token>`.");
+            println!(
+                "{} Not registered. Run `aikey agent register --join-token <token>`.",
+                crate::symbols::CROSS.s()
+            );
             return Ok(());
         }
         Some(acc) => {
-            println!("\u{2713} Registered digital employee");
+            println!("{} Registered digital employee", crate::symbols::CHECK.s());
             println!("  account : {}", acc.account_id);
             println!("  control : {}", acc.control_url);
         }

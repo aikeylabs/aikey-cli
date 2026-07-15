@@ -133,7 +133,7 @@ pub fn handle_project_init(json_mode: bool) -> Result<(), Box<dyn std::error::Er
     config.save(config_path)?;
 
     if !json_mode {
-        println!("\n✓ Created aikey.config.json");
+        println!("\n{} Created aikey.config.json", crate::symbols::CHECK.s());
         println!("\nNext steps:");
         println!("  1. Run 'aikey add <provider>:<alias>' to add provider keys (e.g. aikey add anthropic:default)");
         println!(
@@ -219,7 +219,10 @@ pub fn handle_project_status(json_mode: bool) -> Result<(), Box<dyn std::error::
             }
             println!("\nRun 'aikey env generate' to update your .env file");
         } else {
-            println!("\n✓ All required variables are satisfied");
+            println!(
+                "\n{} All required variables are satisfied",
+                crate::symbols::CHECK.s()
+            );
         }
     }
 
@@ -294,12 +297,15 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
         "  {}",
         "Next steps tailored to your current state.".dimmed()
     );
-    println!("  {}", "\u{2500}".repeat(68).dimmed());
+    println!("  {}", crate::symbols::BOX_H.s().repeat(68).dimmed());
     println!();
 
     // --- Section 1: no raw key yet → add one -------------------------
     if total_keys == 0 {
-        println!("  {}", "\u{1F511} Add your first API key".bold());
+        println!(
+            "  {}",
+            format!("{}Add your first API key", crate::symbols::ICON_KEY.pre()).bold()
+        );
         tip("aikey add my-key --provider openai", "or anthropic | kimi");
         println!();
     }
@@ -311,7 +317,11 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
             total_keys,
             if total_keys == 1 { "" } else { "s" }
         );
-        println!("  {} {}", "\u{2713}".green().bold(), summary.bold());
+        println!(
+            "  {} {}",
+            crate::symbols::CHECK.s().green().bold(),
+            summary.bold()
+        );
         tip("aikey use", "pick which key to activate for routing");
         tip("aikey list", "review every credential");
         println!();
@@ -319,14 +329,20 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
 
     // --- Section 3: no OAuth account → offer to add one ------------
     if oauth_active == 0 {
-        println!("  {}", "\u{29BF} Add a subscription account".bold());
+        println!(
+            "  {}",
+            format!("{} Add a subscription account", crate::symbols::SUB_DOT.s()).bold()
+        );
         tip("aikey auth login claude", "or codex | kimi");
         println!();
     }
 
     // --- Section 4: not logged into a team → offer team login ------
     if !logged_in {
-        println!("  {}", "\u{1F465} Join your team".bold());
+        println!(
+            "  {}",
+            format!("{}Join your team", crate::symbols::ICON_PEOPLE.pre()).bold()
+        );
         tip(
             "aikey login --control-url https://your.team.host",
             "team-managed keys auto-sync",
@@ -336,7 +352,14 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
 
     // --- Section 5: two or more credentials → show route picker ----
     if total_credentials >= 2 {
-        println!("  {}", "\u{1F517} Multiple routes available".bold());
+        println!(
+            "  {}",
+            format!(
+                "{}Multiple routes available",
+                crate::symbols::ICON_LINK.pre()
+            )
+            .bold()
+        );
         tip(
             "aikey route",
             "pick a base_url + api_key for your IDE or CLI",
@@ -346,20 +369,32 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
 
     // --- Section 6: logged in → web console shortcut --------------
     if logged_in {
-        println!("  {}", "\u{1F310} Manage via the User Console".bold());
+        println!(
+            "  {}",
+            format!(
+                "{}Manage via the User Console",
+                crate::symbols::ICON_GLOBE.pre()
+            )
+            .bold()
+        );
         tip("aikey web", "open the web console in your browser");
         println!();
     }
 
     // --- Section 7: proxy not running → nudge to start ------------
     if !proxy_running {
-        println!("  {}", "\u{26A0}  Proxy is not running".yellow().bold());
+        println!(
+            "  {}",
+            format!("{}  Proxy is not running", crate::symbols::WARN.s())
+                .yellow()
+                .bold()
+        );
         tip("aikey proxy start", "required for routing to work");
         println!();
     }
 
     // --- Footer --------------------------------------------------
-    println!("  {}", "\u{2500}".repeat(68).dimmed());
+    println!("  {}", crate::symbols::BOX_H.s().repeat(68).dimmed());
     tip("aikey doctor", "check system health");
     tip("aikey --help", "all commands");
     println!();
@@ -383,7 +418,7 @@ pub fn handle_project_map(
     let prompt_str = if json_mode {
         ""
     } else {
-        "\u{1F512} Enter Master Password: "
+        &format!("{}Enter Master Password: ", crate::symbols::ICON_LOCK.pre())
     };
     let password = crate::prompt_hidden(prompt_str)?;
     let password_raw = Zeroizing::new(password);
@@ -665,7 +700,11 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                     println!("      {}", format!("· {}", h).dimmed());
                 }
             } else {
-                let icon = if ok { "✓".green() } else { "✗".red() };
+                let icon = if ok {
+                    crate::symbols::CHECK.s().green()
+                } else {
+                    crate::symbols::CROSS.s().red()
+                };
                 // Label column width 20 = longest label (`compliance-deep-scan`).
                 println!("{} {:<20} {}", icon, label, detail);
                 if let Some(h) = hint {
@@ -687,7 +726,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     if !json_mode {
-        println!("{}", "─".repeat(52).dimmed());
+        println!("{}", crate::symbols::BOX_H.s().repeat(52).dimmed());
     }
 
     // ── 0. Version info ─────────────────────────────────────
@@ -834,7 +873,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         }
 
         if !json_mode {
-            println!("{}", "─".repeat(52).dimmed());
+            println!("{}", crate::symbols::BOX_H.s().repeat(52).dimmed());
         }
     }
 
@@ -920,11 +959,13 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     {
         let report = crate::commands_account::audit_credential_lifecycle(false);
         // Drift hint: highlight the two actionable commands in cyan-bold
-        // inside the surrounding dim emit-wrap. `\x1b[0m\x1b[2m` after each
-        // cyan close reapplies dim so text after the cyan portion stays dim
-        // (else `\x1b[0m` would reset all attributes including dim).
+        // inside the surrounding dim emit-wrap. `style::cmd_in_dim` resumes
+        // the outer dim after each cyan segment (a raw resume byte colored
+        // cannot express — see src/style.rs).
         let drift_hint = format!(
-            "run \x1b[1;36maikey use <alias>\x1b[0m\x1b[2m to force a reconcile, or \x1b[1;36maikey doctor --detail\x1b[0m\x1b[2m for per-source diff",
+            "run {} to force a reconcile, or {} for per-source diff",
+            crate::style::cmd_in_dim("aikey use <alias>"),
+            crate::style::cmd_in_dim("aikey doctor --detail"),
         );
         emit(
             "active state sync",
@@ -1418,7 +1459,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     // Why both: proxy /metrics shows the "sender side" (is reporter working?),
     // diagnostics shows the "receiver side" (did data arrive and get projected?).
     if !json_mode {
-        println!("{}", "─".repeat(52).dimmed());
+        println!("{}", crate::symbols::BOX_H.s().repeat(52).dimmed());
     }
     // 2026-06-23 UX: print a dim "↻ checking pipeline metrics…" placeholder
     // BEFORE the silent 3–9s HTTP fan-out below (proxy /metrics + control
@@ -1592,9 +1633,9 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
 
         if !json_mode {
             let icon = if ok_for_json {
-                "✓".green()
+                crate::symbols::CHECK.s().green()
             } else {
-                "⚠".yellow()
+                crate::symbols::WARN.s().yellow()
             };
             // Label column width 20 = longest label (`compliance-deep-scan`).
             println!("{} {:<20} {}", icon, label, detail);
@@ -1618,7 +1659,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     if !json_mode {
-        println!("{}", "─".repeat(52).dimmed());
+        println!("{}", crate::symbols::BOX_H.s().repeat(52).dimmed());
         if any_failed {
             println!("{}", "Some checks failed — see hints above.".yellow());
         } else {
@@ -1950,8 +1991,16 @@ fn check_usage_pipeline(
         // Canary checks ODS and DWD only (no query-stage check yet — P2/P3).
         let stages = format!(
             "ODS {} DWD {}",
-            if ods { "✓" } else { "✗" },
-            if dwd { "✓" } else { "✗" }
+            if ods {
+                crate::symbols::CHECK.s()
+            } else {
+                crate::symbols::CROSS.s()
+            },
+            if dwd {
+                crate::symbols::CHECK.s()
+            } else {
+                crate::symbols::CROSS.s()
+            }
         );
 
         let detail = if status == "unavailable" {
@@ -2065,7 +2114,10 @@ mod hook_wiring_check_tests {
         let (ok, detail, hint) = hook_wiring_check(true, false);
         assert!(!ok);
         assert!(detail.contains("NOT route through aikey"));
-        assert_eq!(hint, Some("run `aikey hook install`, then open a new terminal"));
+        assert_eq!(
+            hint,
+            Some("run `aikey hook install`, then open a new terminal")
+        );
     }
 
     #[test]
@@ -2078,7 +2130,7 @@ mod hook_wiring_check_tests {
 
 pub fn handle_doctor_detail() -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
-    let dim_rule = "─".repeat(52).dimmed();
+    let dim_rule = crate::symbols::BOX_H.s().repeat(52).dimmed();
 
     // B2: the first two panels read the Trial-server ODS pipeline
     // (control-trial.db / .log) and are meaningful ONLY on a Trial host.
@@ -2097,7 +2149,14 @@ pub fn handle_doctor_detail() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("{}", dim_rule);
-    println!("{}", "🔍 Recent failures (last 5 ODS errors)".bold());
+    println!(
+        "{}",
+        format!(
+            "{}Recent failures (last 5 ODS errors)",
+            crate::symbols::ICON_SEARCH.pre()
+        )
+        .bold()
+    );
     if is_trial {
         println!("{}  {}", dim_rule, "from control-trial.db".dimmed());
         render_recent_failures();
@@ -2107,7 +2166,14 @@ pub fn handle_doctor_detail() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("{}", dim_rule);
-    println!("{}", "🔍 Ingest health (signal-based)".bold());
+    println!(
+        "{}",
+        format!(
+            "{}Ingest health (signal-based)",
+            crate::symbols::ICON_SEARCH.pre()
+        )
+        .bold()
+    );
     if is_trial {
         println!("{}  {}", dim_rule, "from control-trial.log".dimmed());
         render_ingest_health();
@@ -2117,7 +2183,10 @@ pub fn handle_doctor_detail() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("{}", dim_rule);
-    println!("{}", "🔍 4xx body captures".bold());
+    println!(
+        "{}",
+        format!("{}4xx body captures", crate::symbols::ICON_SEARCH.pre()).bold()
+    );
     println!(
         "{}  {}",
         dim_rule,
@@ -2393,7 +2462,7 @@ fn render_ingest_health() {
     if any_insert_fail == 0 {
         println!(
             "{} {}",
-            "✓".green(),
+            crate::symbols::CHECK.s().green(),
             "no insert failures in recent log window"
         );
         return;
@@ -2431,7 +2500,7 @@ fn render_ingest_health() {
     let mut printed_any = false;
     if !missing_live.is_empty() {
         printed_any = true;
-        println!("{} Schema drift detected:", "✗".red());
+        println!("{} Schema drift detected:", crate::symbols::CROSS.s().red());
         let mut entries = missing_live.clone();
         entries.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
         for (col, n) in entries {
@@ -2483,7 +2552,7 @@ fn render_ingest_health() {
         printed_any = true;
         println!(
             "{} NOT NULL violations (collector emitted NULL where schema requires value):",
-            "✗".red()
+            crate::symbols::CROSS.s().red()
         );
         let mut entries: Vec<_> = not_null_cols.iter().collect();
         entries.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
@@ -2501,7 +2570,10 @@ fn render_ingest_health() {
     }
     if !check_violations.is_empty() {
         printed_any = true;
-        println!("{} CHECK constraint violations:", "✗".red());
+        println!(
+            "{} CHECK constraint violations:",
+            crate::symbols::CROSS.s().red()
+        );
         for (constraint, n) in check_violations {
             println!(
                 "   {}: {} occurrences",
@@ -2517,7 +2589,7 @@ fn render_ingest_health() {
     if !printed_any {
         println!(
             "{} {} insert failures matched no known pattern (regex needs updating)",
-            "⚠".yellow(),
+            crate::symbols::WARN.s().yellow(),
             any_insert_fail.to_string()
         );
         println!("   {} grep ~/.aikey/logs/control-trial.log for 'insert event failed' to inspect raw lines",

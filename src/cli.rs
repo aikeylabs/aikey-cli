@@ -2520,6 +2520,22 @@ pub(crate) fn print_banner() {
         .display()
         .to_string();
 
+    // win10-conhost-compat: the owl art uses glyphs (╍ ⟨⦿⟩ ╭╮ ▀▄) that
+    // conhost fonts cannot render — the logo would come out as □ noise.
+    // Safe tier keeps the same information rows (name/version, tagline,
+    // URL) as plain text and skips the art + blink entirely.
+    if crate::term_caps::unicode_tier() == crate::term_caps::UnicodeTier::Safe {
+        eprintln!();
+        eprintln!("  {}   v{}", "AiKey CLI".bold(), version);
+        eprintln!("  {}", "FinOps & AI Governance Center".cyan().bold());
+        eprintln!(
+            "  {}",
+            "https://github.com/aikeylabs".bright_black().underline()
+        );
+        eprintln!();
+        return;
+    }
+
     // Lines 2–5 of the icon carry side labels (title/divider/tagline/home).
     // Lines 1 and 6 are purely decorative. Initial eyes render OPEN —
     // `animate_banner_blink` drives the close-and-reopen blink once the
@@ -2587,6 +2603,12 @@ pub(crate) fn animate_banner_blink(extra_lines: usize) {
     let enabled = std::io::stderr().is_terminal()
         && std::env::var("AIKEY_NO_ANIMATION").map_or(true, |v| v != "1" && v != "true");
     if !enabled {
+        return;
+    }
+    // win10-conhost-compat: Safe tier renders the text banner (no eye row),
+    // so there is nothing to blink — and rewriting 5 rows up would clobber
+    // unrelated output.
+    if crate::term_caps::unicode_tier() == crate::term_caps::UnicodeTier::Safe {
         return;
     }
 
@@ -2777,7 +2799,7 @@ mod tests {
         assert!(validate_secret_name("has space").is_err());
         assert!(validate_secret_name("has/slash").is_err());
         assert!(validate_secret_name("has@at").is_err());
-        assert!(validate_secret_name("emoji🔑").is_err());
+        assert!(validate_secret_name("emoji\u{1f511}").is_err());
     }
 
     // ── format_date ──────────────────────────────────────────────────────

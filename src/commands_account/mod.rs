@@ -229,7 +229,10 @@ fn configure_proxy_collector(control_url: &str, json_mode: bool) {
             cached
         } else if !json_mode {
             eprintln!("    Restart proxy to apply.");
-            match crate::prompt_hidden("    \u{1F512} Enter Master Password: ") {
+            match crate::prompt_hidden(&format!(
+                "    {}Enter Master Password: ",
+                crate::symbols::ICON_LOCK.pre()
+            )) {
                 Ok(p) => SecretString::new(p),
                 Err(_) => {
                     eprintln!("\n    Run {} manually.", "'aikey proxy restart'".bold());
@@ -644,14 +647,14 @@ pub fn handle_set_control_url(
                 "proxy_reloaded": proxy_running,
             }));
         } else {
-            println!("{} Control URL updated.", "\u{2713}".green());
+            println!("{} Control URL updated.", crate::symbols::CHECK.s().green());
             println!("  {} → {}", old_url.dimmed(), url.bold());
             println!("  Proxy collector URL also updated.");
             println!();
             if proxy_running {
                 println!(
                     "  {} Proxy reloaded — the new URL is live (sync rails re-pull within seconds).",
-                    "\u{2713}".green()
+                    crate::symbols::CHECK.s().green()
                 );
             } else {
                 println!(
@@ -669,7 +672,10 @@ pub fn handle_set_control_url(
                 "note": "not logged in — saved to config only",
             }));
         } else {
-            println!("{} Control URL saved to config.", "\u{2713}".green());
+            println!(
+                "{} Control URL saved to config.",
+                crate::symbols::CHECK.s().green()
+            );
             println!("  URL: {}", url.bold());
             println!(
                 "  Log in with: {}",
@@ -1044,7 +1050,7 @@ fn finish_login(
     if crate::storage::get_salt().is_err() {
         if !json_mode {
             eprintln!();
-            eprint!("  \u{1F512} Set Master Password: ");
+            eprint!("  {}Set Master Password: ", crate::symbols::ICON_LOCK.pre());
         }
         let pw = if let Ok(val) = std::env::var("AK_TEST_PASSWORD") {
             secrecy::SecretString::new(val)
@@ -1086,7 +1092,7 @@ fn finish_login(
         println!();
         println!(
             "  {} Logged in as {}",
-            "✓".green().bold(),
+            crate::symbols::CHECK.s().green().bold(),
             account.email.bold()
         );
         println!("    Run {} to view your team keys.", "'aikey list'".bold());
@@ -2626,7 +2632,11 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     rows.push(String::new());
 
     // ── Login ───────────────────────────────────────────────────────────────
-    rows.push(format!("\u{1F464} {}", "Login".bold()));
+    rows.push(format!(
+        "{}{}",
+        crate::symbols::ICON_PERSON.pre(),
+        "Login".bold()
+    ));
     match &account {
         Some(a) => {
             rows.push(format!("  status:  {}", "logged in".green()));
@@ -2641,7 +2651,11 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     rows.push(String::new());
 
     // ── Keys ────────────────────────────────────────────────────────────────
-    rows.push(format!("\u{1F511} {}", "Keys".bold()));
+    rows.push(format!(
+        "{}{}",
+        crate::symbols::ICON_KEY.pre(),
+        "Keys".bold()
+    ));
     rows.push(format!("  personal:  {}", personal_count));
     rows.push(format!(
         "  team:      {} total, {} active",
@@ -2694,7 +2708,11 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     rows.push(String::new());
 
     // ── Protocols ───────────────────────────────────────────────────────────
-    rows.push(format!("\u{1F50C} {}", "Protocols".bold()));
+    rows.push(format!(
+        "{}{}",
+        crate::symbols::ICON_PLUG.pre(),
+        "Protocols".bold()
+    ));
     if providers.is_empty() {
         rows.push(format!("  {}", "no protocols configured".dimmed()));
         rows.push("  hint:    add a key with `aikey add <alias> --provider <code>`".to_string());
@@ -2705,7 +2723,7 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
         ));
     }
 
-    crate::ui_frame::print_box("\u{1F4CA}", "Status", &rows);
+    crate::ui_frame::print_box(crate::symbols::ICON_CHART.s(), "Status", &rows);
 
     Ok(())
 }
@@ -3372,7 +3390,12 @@ fn run_full_snapshot_sync_opts(
         // Claim on server first if pending.
         if needs_claim {
             if let Err(e) = client.claim_key(&entry.virtual_key_id) {
-                eprintln!("  {} could not claim {}: {}", "✗".red(), entry.alias, e);
+                eprintln!(
+                    "  {} could not claim {}: {}",
+                    crate::symbols::CROSS.s().red(),
+                    entry.alias,
+                    e
+                );
                 continue;
             }
         }
@@ -3432,7 +3455,7 @@ fn run_full_snapshot_sync_opts(
 
                         eprintln!(
                             "  {} New key: {} {}",
-                            "✓".green().bold(),
+                            crate::symbols::CHECK.s().green().bold(),
                             payload.alias.bold(),
                             format!("[{}]", binding.provider_code).dimmed()
                         );
@@ -3459,7 +3482,7 @@ fn run_full_snapshot_sync_opts(
                 }
                 eprintln!(
                     "  {} could not fetch key '{}': {}",
-                    "✗".red(),
+                    crate::symbols::CROSS.s().red(),
                     entry.alias,
                     e
                 );
@@ -3874,7 +3897,7 @@ pub fn handle_key_sync(
             for p in providers {
                 eprintln!(
                     "  {} Team key '{}' auto-activated as Primary for {}",
-                    "\u{2B50}".yellow(),
+                    crate::symbols::STAR.s().yellow(),
                     vk_id.bold(),
                     p
                 );
@@ -4838,8 +4861,11 @@ pub fn handle_key_use(
                         )
                         .into());
                     }
-                    let raw = crate::prompt_hidden("  \u{1F512} Enter Master Password: ")
-                        .map_err(|e| format!("prompt: {}", e))?;
+                    let raw = crate::prompt_hidden(&format!(
+                        "  {}Enter Master Password: ",
+                        crate::symbols::ICON_LOCK.pre()
+                    ))
+                    .map_err(|e| format!("prompt: {}", e))?;
                     let pw_fresh = secrecy::SecretString::new(raw);
                     // Persist to session cache so subsequent commands don't re-prompt.
                     crate::session::maybe_configure_backend();
@@ -5141,13 +5167,15 @@ pub fn handle_key_use(
                 let arrow_ref = format!("\u{2192} {}", display_ref);
                 let arrow_padded = format!("{:<22}", arrow_ref);
                 let arrow_col = if is_changed {
-                    format!("\x1b[32m{}\x1b[0m", arrow_padded)
+                    format!("{}", arrow_padded.green())
                 } else {
                     arrow_padded
                 };
                 rows.push(format!(
-                    "  {:<14} {} \x1b[90m[{}]\x1b[0m",
-                    b.provider_code, arrow_col, b.key_source_type
+                    "  {:<14} {} {}",
+                    b.provider_code,
+                    arrow_col,
+                    format!("[{}]", b.key_source_type).bright_black()
                 ));
                 let _ = api_key_var;
             }
@@ -5160,14 +5188,11 @@ pub fn handle_key_use(
             display_name,
             target_providers.join(", ")
         );
-        crate::ui_frame::print_box("\u{1F7E2}", &title, &rows);
+        crate::ui_frame::print_box(crate::symbols::ICON_GREEN_DOT.s(), &title, &rows);
         // 阶段7: Desktop is a cold-switch surface — when THIS use rewrote
         // its config the user must restart the app, and silence here would
         // read as "done" (防呆: every takeover needs visible feedback).
-        if lifecycle
-            .desktop_switch
-            .is_some_and(|d| d.restart_required)
-        {
+        if lifecycle.desktop_switch.is_some_and(|d| d.restart_required) {
             println!("  \u{21BB} Claude Desktop config updated — restart Desktop to apply.");
         }
         println!();
@@ -5213,7 +5238,8 @@ pub(crate) fn use_status_line(
     let apply_now = shell_integration::apply_now_hint();
     if hook_opted_out {
         return format!(
-            "\u{2713} Active key updated. Shell hook disabled (AIKEY_NO_HOOK) \u{2014} apply manually: {apply_now}"
+            "{} Active key updated. Shell hook disabled (AIKEY_NO_HOOK) \u{2014} apply manually: {apply_now}",
+            crate::symbols::CHECK.s()
         );
     }
     // ensure_shell_hook spoke (installed / migrated / declined / non-TTY
@@ -5228,7 +5254,8 @@ pub(crate) fn use_status_line(
     }
     if hook_loaded_in_shell {
         return format!(
-            "\u{2713} Active key updated. Next prompt picks it up automatically.\n     To apply right now: {apply_now}"
+            "{} Active key updated. Next prompt picks it up automatically.\n     To apply right now: {apply_now}",
+            crate::symbols::CHECK.s()
         );
     }
     if rc_wired {
@@ -5238,11 +5265,17 @@ pub(crate) fn use_status_line(
         // in $PROFILE.CurrentUserAllHosts. reload_hint_for_shell() owns the
         // per-shell dispatch.
         format!(
-            "\x1b[33m\u{25b2} Active key updated, but aikey env is NOT loaded in this shell (terminal opened before the hook was installed?).\n     Apply: open a new terminal, or run: {}\x1b[0m",
-            shell_integration::reload_hint_for_shell()
+            "{}",
+            format!(
+                "\u{25b2} Active key updated, but aikey env is NOT loaded in this shell (terminal opened before the hook was installed?).\n     Apply: open a new terminal, or run: {}",
+                shell_integration::reload_hint_for_shell()
+            )
+            .yellow()
         )
     } else {
-        "\x1b[33m\u{25b2} Active key updated, but the shell hook is not wired \u{2014} `claude`/`codex` will NOT route through aikey.\n     Fix: run `aikey hook install`, then open a new terminal.\x1b[0m".to_string()
+        "\u{25b2} Active key updated, but the shell hook is not wired \u{2014} `claude`/`codex` will NOT route through aikey.\n     Fix: run `aikey hook install`, then open a new terminal."
+            .yellow()
+            .to_string()
     }
 }
 
@@ -5254,7 +5287,10 @@ mod use_status_line_tests {
     fn opted_out_is_neutral_and_never_warns() {
         let s = use_status_line(None, false, false, true);
         assert!(s.contains("AIKEY_NO_HOOK"));
-        assert!(!s.contains("\u{25b2}"), "opt-out users chose this — no warning");
+        assert!(
+            !s.contains("\u{25b2}"),
+            "opt-out users chose this — no warning"
+        );
     }
 
     #[test]
@@ -5262,7 +5298,12 @@ mod use_status_line_tests {
         // Regression: the old code only checked is_some() and replaced the
         // actual hint ("Skipped...", "needs interactive confirmation...")
         // with a generic "hook just installed" line — wrong for declines.
-        let s = use_status_line(Some("  Skipped. To apply once: source ~/.aikey/hook.zsh"), false, false, false);
+        let s = use_status_line(
+            Some("  Skipped. To apply once: source ~/.aikey/hook.zsh"),
+            false,
+            false,
+            false,
+        );
         assert!(s.contains("Skipped. To apply once"));
     }
 
@@ -5320,13 +5361,18 @@ pub fn reconcile_cli_configs_after_hook_uninstall() {
         return;
     }
     eprintln!(
-        "\x1b[33m  \u{25b2} These CLI configs still route through aikey, but the hook (env channel) is now unwired:\x1b[0m"
+        "  {}",
+        "\u{25b2} These CLI configs still route through aikey, but the hook (env channel) is now unwired:".yellow()
     );
     for (label, path) in &injected {
-        eprintln!("\x1b[33m      {:<6} {}\x1b[0m", label, path.display());
+        eprintln!(
+            "{}",
+            format!("      {:<6} {}", label, path.display()).yellow()
+        );
     }
     eprintln!(
-        "\x1b[33m    In new terminals those CLIs would fail (e.g. codex: Missing environment variable: OPENAI_API_KEY).\x1b[0m"
+        "    {}",
+        "In new terminals those CLIs would fail (e.g. codex: Missing environment variable: OPENAI_API_KEY).".yellow()
     );
 
     if !std::io::stderr().is_terminal() || !std::io::stdin().is_terminal() {
@@ -5334,8 +5380,9 @@ pub fn reconcile_cli_configs_after_hook_uninstall() {
         // leaving broken hard-pointing configs behind (G1, 2026-07-13).
         shell_integration::apply_third_party_cli_configs(&[], crate::commands_proxy::proxy_port());
         eprintln!(
-            "  \u{2713} aikey routing removed from the configs above (bindings kept; \
-             next `aikey use` or `aikey hook install` re-applies them)."
+            "  {} aikey routing removed from the configs above (bindings kept; \
+             next `aikey use` or `aikey hook install` re-applies them).",
+            crate::symbols::CHECK.s()
         );
         return;
     }
@@ -5347,7 +5394,9 @@ pub fn reconcile_cli_configs_after_hook_uninstall() {
         && matches!(input.trim().to_lowercase().as_str(), "n" | "no")
     {
         eprintln!(
-            "    Kept. Clean up later with: \x1b[36maikey unuse <provider>\x1b[0m  \u{2014} or re-enable: \x1b[36maikey hook install\x1b[0m"
+            "    Kept. Clean up later with: {}  \u{2014} or re-enable: {}",
+            "aikey unuse <provider>".cyan(),
+            "aikey hook install".cyan()
         );
         return;
     }
@@ -5356,7 +5405,10 @@ pub fn reconcile_cli_configs_after_hook_uninstall() {
     // config (same funnel `aikey unuse` drives after removing the last
     // binding). Bindings themselves are untouched.
     shell_integration::apply_third_party_cli_configs(&[], crate::commands_proxy::proxy_port());
-    eprintln!("  \u{2713} aikey routing removed from third-party CLI configs (bindings kept; next `aikey use` re-applies them).");
+    eprintln!(
+        "  {} aikey routing removed from third-party CLI configs (bindings kept; next `aikey use` re-applies them).",
+        crate::symbols::CHECK.s()
+    );
 }
 
 /// `aikey unuse <PROVIDERS...>` — remove the active binding for one or more
@@ -5430,15 +5482,22 @@ pub fn handle_key_unuse(
         } else if !unbound.is_empty() {
             let rows: Vec<String> = unbound
                 .iter()
-                .map(|p| format!("  {} {}", "\u{2717}".red(), p))
+                .map(|p| format!("  {} {}", crate::symbols::CROSS.s().red(), p))
                 .collect();
             crate::ui_frame::print_box(
-                "\u{1F7E1}",
+                crate::symbols::ICON_YELLOW_DOT.s(),
                 &format!("Unbound: {}", unbound.join(", ")),
                 &rows,
             );
             println!();
-            println!("{}", "\u{2713} active.env and CLI configs updated. Next prompt picks it up automatically.".dimmed());
+            println!(
+                "{}",
+                format!(
+                    "{} active.env and CLI configs updated. Next prompt picks it up automatically.",
+                    crate::symbols::CHECK.s()
+                )
+                .dimmed()
+            );
             if !already_unbound.is_empty() {
                 println!(
                     "  {} already had no binding: {}",
@@ -5523,7 +5582,7 @@ pub fn handle_key_alias(
         };
         println!(
             "{} Renamed {} → {}  {}",
-            "✓".green().bold(),
+            crate::symbols::CHECK.s().green().bold(),
             format!("'{}'", old_alias).dimmed(),
             format!("'{}'", outcome.new_value).bold(),
             suffix.dimmed()

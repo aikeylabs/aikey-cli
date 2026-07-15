@@ -189,13 +189,15 @@ pub fn render_box(icon: &str, title: &str, rows: &[String]) -> String {
     let inner_w = (content_max.max(title_vis) + 4 + RIGHT_MARGIN).min(max_inner);
 
     let title_fill = inner_w.saturating_sub(title_vis + 3);
-    let border = "\u{2500}".repeat(inner_w);
+    let border = crate::symbols::BOX_H.s().repeat(inner_w);
 
-    // Outer frame glyphs use a mid-gray (256-color 245), noticeably brighter
-    // than `\x1b[90m` (which is already used for the inner separator) but
-    // still clearly secondary to the content.
-    const FRAME: &str = "\x1b[38;5;245m";
-    const RESET: &str = "\x1b[0m";
+    // Outer frame glyphs use a mid-gray (truecolor #8a8a8a ≈ 256-color 245),
+    // noticeably brighter than bright_black (which is already used for the
+    // inner separator) but still clearly secondary to the content. Styled
+    // via `colored` so the global colorize switch (NO_COLOR / non-tty /
+    // term_caps degrade) is the single on/off truth.
+    use colored::Colorize;
+    let frame = |g: &str| g.truecolor(138, 138, 138);
 
     let mut out = String::new();
     let pad_target = inner_w.saturating_sub(4);
@@ -204,18 +206,19 @@ pub fn render_box(icon: &str, title: &str, rows: &[String]) -> String {
         // Compact layout: skip the vertical `│` walls and corner glyphs to
         // reclaim ~12 cols on a tight terminal. Title + horizontal rules
         // still fence the section visually.
-        let rule = "\u{2500}".repeat(pad_target);
+        let rule = crate::symbols::BOX_H.s().repeat(pad_target);
         out.push_str(&format!("  {}\n", icon_title));
-        out.push_str(&format!("  {f}{}{r}\n", rule, f = FRAME, r = RESET));
+        out.push_str(&format!("  {}\n", frame(&rule)));
         for row in rows {
-            let is_separator = !row.is_empty() && row.chars().all(|c| c == '\u{2500}');
+            let is_separator =
+                !row.is_empty() && row.chars().all(|c| c == crate::symbols::hrule_char());
             if is_separator {
-                out.push_str(&format!("  \x1b[90m{}\x1b[0m\n", rule));
+                out.push_str(&format!("  {}\n", rule.bright_black()));
             } else {
                 out.push_str(&format!("  {}\n", row));
             }
         }
-        out.push_str(&format!("  {f}{}{r}", rule, f = FRAME, r = RESET));
+        out.push_str(&format!("  {}", frame(&rule)));
         return out;
     }
 
@@ -223,39 +226,47 @@ pub fn render_box(icon: &str, title: &str, rows: &[String]) -> String {
     // Top border with title. Only the frame glyphs are colored — the title
     // text keeps whatever color the caller passed in.
     out.push_str(&format!(
-        "  {f}\u{250C}\u{2500}{r} {} {f}{}\u{2510}{r}\n",
+        "  {} {} {}\n",
+        frame(&format!(
+            "{}{}",
+            crate::symbols::BOX_TL.s(),
+            crate::symbols::BOX_H.s()
+        )),
         icon_title,
-        "\u{2500}".repeat(title_fill),
-        f = FRAME,
-        r = RESET
+        frame(&format!(
+            "{}{}",
+            crate::symbols::BOX_H.s().repeat(title_fill),
+            crate::symbols::BOX_TR.s()
+        ))
     ));
     // Content rows: format is `│  {content}  │`
     // Left margin = 2 spaces, right margin = 2 spaces → content width = inner_w - 4
+    let wall = frame(crate::symbols::BOX_V.s());
     for row in rows {
         // Auto-stretch separator lines (pure ─ characters) to fill the content area.
-        let is_separator = !row.is_empty() && row.chars().all(|c| c == '\u{2500}');
+        let is_separator =
+            !row.is_empty() && row.chars().all(|c| c == crate::symbols::hrule_char());
         if is_separator {
             out.push_str(&format!(
-                "  {f}\u{2502}{r}  \x1b[90m{}\x1b[0m  {f}\u{2502}{r}\n",
-                "\u{2500}".repeat(pad_target),
-                f = FRAME,
-                r = RESET
+                "  {wall}  {}  {wall}\n",
+                crate::symbols::BOX_H.s().repeat(pad_target).bright_black()
             ));
         } else {
             out.push_str(&format!(
-                "  {f}\u{2502}{r}  {}  {f}\u{2502}{r}\n",
-                pad_visible(row, pad_target),
-                f = FRAME,
-                r = RESET
+                "  {wall}  {}  {wall}\n",
+                pad_visible(row, pad_target)
             ));
         }
     }
     // Bottom border.
     out.push_str(&format!(
-        "  {f}\u{2514}{}\u{2518}{r}",
-        border,
-        f = FRAME,
-        r = RESET
+        "  {}",
+        frame(&format!(
+            "{}{}{}",
+            crate::symbols::BOX_BL.s(),
+            border,
+            crate::symbols::BOX_BR.s()
+        ))
     ));
     out
 }

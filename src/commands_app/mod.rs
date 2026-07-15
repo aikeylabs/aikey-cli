@@ -1048,7 +1048,11 @@ pub fn delete_third_party_app_identity_with_conn(
             // We only log because the primary operation succeeded; failing
             // to flip the PRAGMA back is a developer-environment issue
             // (e.g. weird platform behavior), not a vault data issue.
-            eprintln!("⚠ failed to restore foreign_keys=ON after uninstall: {}", e);
+            eprintln!(
+                "{} failed to restore foreign_keys=ON after uninstall: {}",
+                crate::symbols::WARN.s(),
+                e
+            );
         }
     }
 

@@ -2,6 +2,7 @@
 //!
 //! Extracted from `commands_account.rs` — pure structural refactor, no logic changes.
 
+use colored::Colorize;
 use std::io;
 use std::path::Path;
 
@@ -720,7 +721,7 @@ pub fn configure_kimi_cli(_proxy_port: u16) {
                     if first_time && io::stderr().is_terminal() {
                         eprintln!(
                             "  {} Kimi CLI auto-configured: {}",
-                            "✓".green().bold(),
+                            crate::symbols::CHECK.s().green().bold(),
                             config_path.display().to_string().dimmed()
                         );
                     }
@@ -1080,7 +1081,7 @@ pub fn configure_codex_cli(proxy_port: u16) {
             if first_time && io::stderr().is_terminal() {
                 eprintln!(
                     "  {} Codex CLI auto-configured: {}",
-                    "\u{2713}".green().bold(),
+                    crate::symbols::CHECK.s().green().bold(),
                     config_path.display().to_string().dimmed()
                 );
                 if !model_provider_written {
@@ -1899,11 +1900,13 @@ fn hook_write_notice(filename: &str, old_hash: Option<&str>, new_hash: &str) -> 
     match old_hash {
         Some(h) if h == new_hash => None,
         Some(h) => Some(format!(
-            "  \u{2713} Updated ~/.aikey/{filename} (hook template {h} \u{2192} {new_hash}). \
-             Running shells auto-reload at the next prompt."
+            "  {} Updated ~/.aikey/{filename} (hook template {h} \u{2192} {new_hash}). \
+             Running shells auto-reload at the next prompt.",
+            crate::symbols::CHECK.s()
         )),
         None => Some(format!(
-            "  \u{2713} Rendered ~/.aikey/{filename} (hook template {new_hash})."
+            "  {} Rendered ~/.aikey/{filename} (hook template {new_hash}).",
+            crate::symbols::CHECK.s()
         )),
     }
 }
@@ -2083,9 +2086,11 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
                 return Some(format!(
                     "  Detected legacy aikey hook (v1/v2) in {}.\n  \
                      Migration to v3 needs interactive confirmation.\n  \
-                     Run interactively: \x1b[36maikey hook install\x1b[0m\n  \
-                     Or silence: \x1b[36mexport AIKEY_NO_HOOK=1\x1b[0m",
+                     Run interactively: {}\n  \
+                     Or silence: {}",
                     rc_file.display(),
+                    "aikey hook install".cyan(),
+                    "export AIKEY_NO_HOOK=1".cyan(),
                 ));
             }
             // TTY present → consent granted. Write through the helper.
@@ -2120,11 +2125,13 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
             if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
                 return Some(format!(
                     "  Shell hook file rendered, but ~/.{} (rc-file) wiring needs interactive confirmation.\n  \
-                     Run interactively: \x1b[36maikey hook install\x1b[0m\n  \
-                     Or silence this hint: \x1b[36mexport AIKEY_NO_HOOK=1\x1b[0m\n  \
-                     To apply right now without rc wiring: \x1b[36msource ~/.aikey/{}\x1b[0m",
+                     Run interactively: {}\n  \
+                     Or silence this hint: {}\n  \
+                     To apply right now without rc wiring: {}",
                     if is_zsh { "zshrc" } else { "bashrc" },
-                    hook_filename,
+                    "aikey hook install".cyan(),
+                    "export AIKEY_NO_HOOK=1".cyan(),
+                    format!("source ~/.aikey/{}", hook_filename).cyan(),
                 ));
             }
 
@@ -2199,9 +2206,12 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
             // will be fine.
             let rc_file_str = rc_file_disp.display().to_string();
             return Some(format!(
-                "  Shell hook installed in {}{}\n  \
-                 \x1b[33m▲ Run \x1b[36msource {}\x1b[33m (or open a new shell tab) so `claude`/`codex`/`kimi` use the proxy.\x1b[0m",
-                rc_file_str, extra_msg, rc_file_str
+                "  Shell hook installed in {}{}\n  {}{}{}",
+                rc_file_str,
+                extra_msg,
+                "▲ Run ".yellow(),
+                format!("source {}", rc_file_str).cyan(),
+                " (or open a new shell tab) so `claude`/`codex`/`kimi` use the proxy.".yellow()
             ));
         }
     }

@@ -76,6 +76,14 @@ mod prompt_hidden_windows;
 mod providers;
 mod proxy_env;
 mod resolver;
+#[allow(dead_code)]
+mod style;
+#[allow(dead_code)]
+mod symbols;
+#[allow(dead_code)]
+mod term_caps;
+#[cfg(windows)]
+mod term_caps_windows;
 mod ui_frame;
 #[cfg(windows)]
 #[allow(dead_code)]
@@ -100,6 +108,7 @@ use aikeylabs_aikey_cli::prompt_hidden;
 use aikeylabs_aikey_cli::strip_bom;
 use clap::Parser;
 use cli::*;
+use colored::Colorize;
 use secrecy::{ExposeSecret, SecretString};
 use std::env;
 use std::io::{self, IsTerminal, Write};
@@ -109,6 +118,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialise process-global trace context (trace_id, span_id, command_id).
     // This must be called before any logging or proxy calls.
     observability::init_trace();
+
+    // win10-conhost-compat: enable VT processing on Windows console handles
+    // (conhost supports but does not default-enable it) and snapshot the
+    // terminal's glyph tier. Must run before any user-visible output so
+    // colors/symbols never render as `←[32m` / □ garbage on Win10 conhost.
+    term_caps::init();
 
     let cli = Cli::try_parse().unwrap_or_else(|err| {
         // Intercept "unrecognized subcommand" errors and show a friendly message
@@ -121,7 +136,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Check if this is the top-level help (no subcommand context).
             // Clap's rendered help for subcommands contains "Usage: aikey <subcmd>",
             // while top-level contains "Usage: aikey [OPTIONS]".
-            let rendered = err.to_string();
+            // clap help_template is a compile-time attribute string with baked
+            // SGR codes (cannot use colored builders) — strip here when color
+            // is off so the degrade path stays escape-free. See src/style.rs.
+            let rendered = crate::style::paint(&err.to_string()).into_owned();
             if rendered.contains("aikey [OPTIONS]") {
                 print_short_help();
                 std::process::exit(0);
@@ -693,7 +711,7 @@ fn run_unified_list(
             } else {
                 pf_padded
             };
-            let created_col = format!("\x1b[90m{}\x1b[0m", r.created);
+            let created_col = r.created.bright_black().to_string();
             let prov_display = if r.providers.len() > w_prov {
                 format!("{}...", &r.providers[..w_prov - 3])
             } else {
@@ -718,22 +736,27 @@ fn run_unified_list(
 
         let mut rows: Vec<String> = Vec::new();
         rows.push(format!(
-            "\u{1F464} Personal \x1b[90m({})\x1b[0m",
-            entries.len()
+            "{}Personal {}",
+            crate::symbols::ICON_PERSON.pre(),
+            format!("({})", entries.len()).bright_black()
         ));
         rows.push(format!(
-            "\x1b[2m  {:<wa$}  {:<wp$}  {:<wf$}  {:<ws$}  {}\x1b[0m",
-            headers[0],
-            headers[1],
-            headers[2],
-            headers[3],
-            headers[4],
-            wa = w_alias,
-            wp = w_prov,
-            wf = w_primary,
-            ws = w_status
+            "{}",
+            format!(
+                "  {:<wa$}  {:<wp$}  {:<wf$}  {:<ws$}  {}",
+                headers[0],
+                headers[1],
+                headers[2],
+                headers[3],
+                headers[4],
+                wa = w_alias,
+                wp = w_prov,
+                wf = w_primary,
+                ws = w_status
+            )
+            .dimmed()
         ));
-        rows.push("\u{2500}".repeat(sep_width));
+        rows.push(crate::symbols::BOX_H.s().repeat(sep_width));
         if personal_rows.is_empty() {
             rows.push("(none)".to_string());
         } else {
@@ -743,8 +766,12 @@ fn run_unified_list(
         }
 
         rows.push(String::new());
-        rows.push(format!("\u{1F465} Team \x1b[90m({})\x1b[0m", managed.len()));
-        rows.push("\u{2500}".repeat(sep_width));
+        rows.push(format!(
+            "{}Team {}",
+            crate::symbols::ICON_PEOPLE.pre(),
+            format!("({})", managed.len()).bright_black()
+        ));
+        rows.push(crate::symbols::BOX_H.s().repeat(sep_width));
         if team_rows.is_empty() {
             rows.push("(none)".to_string());
         } else {
@@ -884,24 +911,29 @@ fn run_unified_list(
 
             rows.push(String::new());
             rows.push(format!(
-                "\u{1F517} OAuth Accounts \x1b[90m({})\x1b[0m",
-                oauth_accounts.len()
+                "{}OAuth Accounts {}",
+                crate::symbols::ICON_LINK.pre(),
+                format!("({})", oauth_accounts.len()).bright_black()
             ));
             rows.push(format!(
-                "\x1b[2m  {:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}\x1b[0m",
-                "IDENTITY",
-                "PROTOCOL",
-                "USING FOR",
-                "STATUS",
-                "TIER",
-                "EXPIRES",
-                wi = w_id,
-                wp = w_prov,
-                wu = w_uf,
-                ws = w_st,
-                wt = w_tier
+                "{}",
+                format!(
+                    "  {:<wi$}{:<wp$}  {:<wu$}  {:<ws$}  {:<wt$}  {}",
+                    "IDENTITY",
+                    "PROTOCOL",
+                    "USING FOR",
+                    "STATUS",
+                    "TIER",
+                    "EXPIRES",
+                    wi = w_id,
+                    wp = w_prov,
+                    wu = w_uf,
+                    ws = w_st,
+                    wt = w_tier
+                )
+                .dimmed()
             ));
-            rows.push("\u{2500}".repeat(sep_width));
+            rows.push(crate::symbols::BOX_H.s().repeat(sep_width));
             for r in &oauth_rows {
                 let uf_padded = format!("{:<w$}", r.use_for, w = w_uf);
                 let uf_col = if r.has_use {
@@ -909,8 +941,10 @@ fn run_unified_list(
                 } else {
                     uf_padded
                 };
-                let tier_dim = format!("\x1b[90m{:<w$}\x1b[0m", r.tier, w = w_tier);
-                let expires_dim = format!("\x1b[90m{}\x1b[0m", r.expires);
+                let tier_dim = format!("{:<w$}", r.tier, w = w_tier)
+                    .bright_black()
+                    .to_string();
+                let expires_dim = r.expires.bright_black().to_string();
                 // Active when this account is currently serving at least
                 // one provider (matches the `aikey route` convention).
                 let marker = if r.has_use {
@@ -934,7 +968,7 @@ fn run_unified_list(
             }
         }
 
-        ui_frame::print_box("\u{1F511}", "Keys", &rows);
+        ui_frame::print_box(crate::symbols::ICON_KEY.s(), "Keys", &rows);
         // Legend lives outside the box so the frame stays focused on data.
         println!(
             "  {} {}",
@@ -1133,7 +1167,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // web-driven first-run flow (per
             // 20260430-个人vault-Web首次设置-方案A.md).
             let password = prompt_password_secure(
-                "\u{1F512} Set Master Password: ",
+                &format!("{}Set Master Password: ", crate::symbols::ICON_LOCK.pre()),
                 cli.password_stdin,
                 cli.json,
             )?;
@@ -1506,9 +1540,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .collect();
                     if !default_urls.is_empty() {
-                        eprintln!("  \u{2502} Default Base URLs:");
+                        eprintln!("  {v} Default Base URLs:", v = crate::symbols::BOX_V.s());
                         for u in &default_urls {
-                            eprintln!("  \u{2502}   {}", u);
+                            eprintln!("  {v}   {}", u, v = crate::symbols::BOX_V.s());
                         }
                     }
                     print!("  \u{25c6} Base URL (press Enter to use defaults above): ");
@@ -1522,9 +1556,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         Some(url_input)
                     };
 
-                    eprintln!("  \u{2502} Protocols: {}", selected.join(", ").bold());
+                    eprintln!(
+                        "  {v} Protocols: {}",
+                        selected.join(", ").bold(),
+                        v = crate::symbols::BOX_V.s()
+                    );
                     if let Some(ref u) = base_url {
-                        eprintln!("  \u{2502} Base URL:  {}", u.dimmed());
+                        eprintln!(
+                            "  {v} Base URL:  {}",
+                            u.dimmed(),
+                            v = crate::symbols::BOX_V.s()
+                        );
                     }
                     (selected, base_url)
                 } else {
@@ -1739,24 +1781,33 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 use colored::Colorize;
                 eprintln!("  {} API Key '{}' added.", "\u{25c6}".green(), alias.bold());
                 eprintln!(
-                    "  \u{2502} providers: {}",
-                    resolved_providers.join(", ").dimmed()
+                    "  {v} providers: {}",
+                    resolved_providers.join(", ").dimmed(),
+                    v = crate::symbols::BOX_V.s()
                 );
                 if let Some(ref url) = resolved_base_url {
-                    eprintln!("  \u{2502} base_url:  {}", url.dimmed());
+                    eprintln!(
+                        "  {v} base_url:  {}",
+                        url.dimmed(),
+                        v = crate::symbols::BOX_V.s()
+                    );
                 }
                 if !newly_primary.is_empty() {
                     eprintln!(
-                        "  \u{2502} {} Primary for: {}",
-                        "\u{2B50}".yellow(),
-                        newly_primary.join(", ").bold()
+                        "  {v} {} Primary for: {}",
+                        crate::symbols::STAR.s().yellow(),
+                        newly_primary.join(", ").bold(),
+                        v = crate::symbols::BOX_V.s()
                     );
                 }
-                eprintln!("  \u{2502} Added key and refreshed current default activation.");
+                eprintln!(
+                    "  {v} Added key and refreshed current default activation.",
+                    v = crate::symbols::BOX_V.s()
+                );
                 if let Some(ref msg) = hook_msg {
-                    eprintln!("  \u{2502}");
+                    eprintln!("  {v}", v = crate::symbols::BOX_V.s());
                     for line in msg.lines() {
-                        eprintln!("  \u{2502} {}", line.trim_start());
+                        eprintln!("  {v} {}", line.trim_start(), v = crate::symbols::BOX_V.s());
                     }
                 }
 
@@ -1947,7 +1998,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 for (alias, result, actions) in &per_alias {
                     match result {
                         Ok(()) => {
-                            eprintln!("  {} API Key '{}' deleted.", "\u{2713}".green(), alias);
+                            eprintln!(
+                                "  {} API Key '{}' deleted.",
+                                crate::symbols::CHECK.s().green(),
+                                alias
+                            );
                             for action in actions {
                                 match &action.outcome {
                                     profile_activation::ReconcileOutcome::Replaced {
@@ -1956,20 +2011,20 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                     } => {
                                         eprintln!(
                                             "    {} '{}' promoted to Primary for {}",
-                                            "\u{2B50}".yellow(),
+                                            crate::symbols::STAR.s().yellow(),
                                             new_source_ref.bold(),
                                             action.provider_code
                                         );
                                     }
                                     profile_activation::ReconcileOutcome::Cleared => {
                                         eprintln!("    {} No replacement for {} — provider has no Primary",
-                                            "\u{26A0}".yellow(), action.provider_code);
+                                            crate::symbols::WARN.s().yellow(), action.provider_code);
                                     }
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("  {} '{}': {}", "\u{2717}".red(), alias, e);
+                            eprintln!("  {} '{}': {}", crate::symbols::CROSS.s().red(), alias, e);
                         }
                     }
                 }
@@ -2026,13 +2081,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Zeroizing::new(test_secret)
             } else if std::io::stdin().is_terminal() {
                 // Hidden prompt on TTY
-                let val = prompt_hidden("\u{1F511} Enter new API Key value: ")
-                    .map_err(|e| format!("Failed to read API Key value: {}", e))?;
+                let val = prompt_hidden(&format!(
+                    "{}Enter new API Key value: ",
+                    crate::symbols::ICON_KEY.pre()
+                ))
+                .map_err(|e| format!("Failed to read API Key value: {}", e))?;
                 Zeroizing::new(val)
             } else {
                 // Plain stdin for pipes / automation
                 if !cli.json {
-                    print!("\u{1F511} Enter new API Key value: ");
+                    print!(
+                        "{}Enter new API Key value: ",
+                        crate::symbols::ICON_KEY.pre()
+                    );
                     io::stdout().flush()?;
                 }
                 let mut secret = Zeroizing::new(String::new());
@@ -2063,7 +2124,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }));
             } else {
                 use colored::Colorize;
-                eprintln!("  {} API Key '{}' updated.", "\u{2713}".green(), alias);
+                eprintln!(
+                    "  {} API Key '{}' updated.",
+                    crate::symbols::CHECK.s().green(),
+                    alias
+                );
                 commands_proxy::maybe_warn_stale();
             }
         }
@@ -2383,12 +2448,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::Export { pattern, output } => {
             let vault_password = prompt_password_secure(
-                "\u{1F512} Enter Master Password: ",
+                &format!("{}Enter Master Password: ", crate::symbols::ICON_LOCK.pre()),
                 cli.password_stdin,
                 cli.json,
             )?;
             let export_password = prompt_password_secure(
-                "\u{1F512} Enter Export Password: ",
+                &format!("{}Enter Export Password: ", crate::symbols::ICON_LOCK.pre()),
                 cli.password_stdin,
                 cli.json,
             )?;
@@ -2631,14 +2696,26 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Commands::ChangePassword => {
             let old_password = prompt_password_secure(
-                "\u{1F512} Enter Master Password: ",
+                &format!("{}Enter Master Password: ", crate::symbols::ICON_LOCK.pre()),
                 cli.password_stdin,
                 cli.json,
             )?;
-            let new_password =
-                prompt_password_secure("\u{1F512} Enter New Master Password: ", false, cli.json)?;
-            let confirm_password =
-                prompt_password_secure("\u{1F512} Confirm New Master Password: ", false, cli.json)?;
+            let new_password = prompt_password_secure(
+                &format!(
+                    "{}Enter New Master Password: ",
+                    crate::symbols::ICON_LOCK.pre()
+                ),
+                false,
+                cli.json,
+            )?;
+            let confirm_password = prompt_password_secure(
+                &format!(
+                    "{}Confirm New Master Password: ",
+                    crate::symbols::ICON_LOCK.pre()
+                ),
+                false,
+                cli.json,
+            )?;
 
             if new_password.expose_secret() != confirm_password.expose_secret() {
                 if cli.json {
@@ -2757,8 +2834,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     // Read secret value: hidden prompt on TTY, plain stdin for pipes
                     let secret = if std::io::stdin().is_terminal() {
-                        let val = prompt_hidden("\u{1F511} Enter API Key value: ")
-                            .map_err(|e| format!("Failed to read secret value: {}", e))?;
+                        let val = prompt_hidden(&format!(
+                            "{}Enter API Key value: ",
+                            crate::symbols::ICON_KEY.pre()
+                        ))
+                        .map_err(|e| format!("Failed to read secret value: {}", e))?;
                         Zeroizing::new(val)
                     } else {
                         let mut buf = Zeroizing::new(String::new());
@@ -2867,8 +2947,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                     // Read secret value: hidden prompt on TTY, plain stdin for pipes
                     let secret = if std::io::stdin().is_terminal() {
-                        let val = prompt_hidden("\u{1F511} Enter API Key value: ")
-                            .map_err(|e| format!("Failed to read secret value: {}", e))?;
+                        let val = prompt_hidden(&format!(
+                            "{}Enter API Key value: ",
+                            crate::symbols::ICON_KEY.pre()
+                        ))
+                        .map_err(|e| format!("Failed to read secret value: {}", e))?;
                         Zeroizing::new(val)
                     } else {
                         let mut buf = Zeroizing::new(String::new());
@@ -3038,14 +3121,14 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                         } => {
                                             eprintln!(
                                                 "  {} '{}' promoted to Primary for {}",
-                                                "\u{2B50}".yellow(),
+                                                crate::symbols::STAR.s().yellow(),
                                                 new_source_ref.bold(),
                                                 action.provider_code
                                             );
                                         }
                                         profile_activation::ReconcileOutcome::Cleared => {
                                             eprintln!("  {} No replacement for {} — provider has no Primary",
-                                                "\u{26A0}".yellow(), action.provider_code);
+                                                crate::symbols::WARN.s().yellow(), action.provider_code);
                                         }
                                     }
                                 }
@@ -3123,7 +3206,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         io::stdin().read_line(&mut buf)?;
                         buf
                     } else if std::io::stdin().is_terminal() {
-                        let val = prompt_hidden(&format!("\u{1F511} New value for '{}': ", name))
+                        let val = prompt_hidden(&format!(
+                            "{}New value for '{}': ",
+                            crate::symbols::ICON_KEY.pre(),
+                            name
+                        ))
                             .map_err(|e| format!(
                                 "Failed to read new key value: {}.\n\
                                  Tip: in non-interactive mode pass --from-stdin and pipe the value in, \
@@ -3373,15 +3460,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 value_padded
                             };
                             box_rows.push(format!(
-                                "  {:<14} {} \x1b[90m[{}]\x1b[0m",
-                                b.provider_code, value_col, b.key_source_type
+                                "  {:<14} {} {}",
+                                b.provider_code,
+                                value_col,
+                                format!("[{}]", b.key_source_type).bright_black()
                             ));
                         }
                         box_rows.push(String::new());
                         box_rows.push(format!("{} Saved provider primary selections and refreshed current activation.",
-                            "\u{2713}".green()));
+                            crate::symbols::CHECK.s().green()));
                         ui_frame::print_box(
-                            "\u{1F7E2}",
+                            crate::symbols::ICON_GREEN_DOT.s(),
                             "Provider Key Selection — Confirmed",
                             &box_rows,
                         );
@@ -3399,9 +3488,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         if std::env::var("AIKEY_ACTIVE_KEYS").is_err() {
                             let hint = commands_account::reload_hint_for_shell();
                             if commands_account::reload_hint_has_runnable_command() {
-                                eprintln!("  \x1b[33m!\x1b[0m Run: \x1b[1m{hint}\x1b[0m  (or open a new terminal)");
+                                eprintln!(
+                                    "  {} Run: {}  (or open a new terminal)",
+                                    "!".yellow(),
+                                    hint.bold()
+                                );
                             } else {
-                                eprintln!("  \x1b[33m!\x1b[0m {hint}");
+                                eprintln!("  {} {hint}", "!".yellow());
                             }
                         }
                         println!();
@@ -3705,7 +3798,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     proxy_env::write_proxy_env(&existing)?;
 
                     let path = proxy_env::proxy_env_path().unwrap_or_default();
-                    eprintln!("{} Updated {}", "\u{2713}".green(), path.display());
+                    eprintln!(
+                        "{} Updated {}",
+                        crate::symbols::CHECK.s().green(),
+                        path.display()
+                    );
                     for (k, _) in &new_entries {
                         eprintln!("  {} {}", "+".green(), k);
                     }
@@ -3728,13 +3825,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                     Ok(()) => {
                                         eprintln!(
                                             "  {} Proxy restarted with new env.",
-                                            "\u{2713}".green()
+                                            crate::symbols::CHECK.s().green()
                                         );
                                     }
                                     Err(e) => {
                                         eprintln!(
                                             "  {} Auto-restart failed: {}",
-                                            "\u{26A0}".yellow(),
+                                            crate::symbols::WARN.s().yellow(),
                                             e
                                         );
                                         eprintln!(
@@ -3747,7 +3844,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             None => {
                                 eprintln!(
                                     "  {} Cannot auto-restart (no cached password).",
-                                    "\u{26A0}".yellow()
+                                    crate::symbols::WARN.s().yellow()
                                 );
                                 eprintln!("  Run manually: {}", "aikey proxy restart".bold());
                             }
@@ -4343,12 +4440,13 @@ fn print_route_config(entries: &[&RouteEntry]) {
 
     println!();
     println!(
-        "  \u{1F511}  {}  {}  {}",
+        "  {}  {}  {}  {}",
+        crate::symbols::ICON_KEY.s(),
         head.label.bold(),
         type_badge,
         format!("\u{2192} {}", providers).dimmed()
     );
-    println!("  {}", "\u{2500}".repeat(68).dimmed());
+    println!("  {}", crate::symbols::BOX_H.s().repeat(68).dimmed());
     println!();
 
     // Key/value block. Values are plain (no color) so they survive copy-paste.
@@ -4555,7 +4653,7 @@ fn handle_route(
                 // skip pre-fix).
                 eprintln!(
                     "  {} Failed to get route token for OAuth account '{}': {}",
-                    "\u{26a0}".yellow(),
+                    crate::symbols::WARN.s().yellow(),
                     label_str,
                     e
                 );
@@ -4604,7 +4702,7 @@ fn handle_route(
             Err(e) => {
                 eprintln!(
                     "  {} Failed to read route token for personal key '{}': {}",
-                    "\u{26a0}".yellow(),
+                    crate::symbols::WARN.s().yellow(),
                     meta.alias,
                     e
                 );
@@ -4711,7 +4809,13 @@ fn handle_route(
         li = label_inner,
         kw = TOKEN_DISPLAY_WIDTH
     );
-    eprintln!("  {}", "\u{2500}".repeat(total_width.min(120)).dimmed());
+    eprintln!(
+        "  {}",
+        crate::symbols::BOX_H
+            .s()
+            .repeat(total_width.min(120))
+            .dimmed()
+    );
 
     let mut prev_token = String::new();
     let mut i = 0;
@@ -4731,14 +4835,14 @@ fn handle_route(
         for (idx, entry) in entries[i..group_end].iter().enumerate() {
             let real_idx = i + idx;
             let connector = if real_idx == last_in_group {
-                "└─"
+                crate::symbols::TREE_LAST.s()
             } else {
-                "├─"
+                crate::symbols::TREE_BRANCH.s()
             };
 
             // Collapse duplicate tokens on consecutive rows (same key, different providers).
             let token_display = if entry.api_key == prev_token {
-                "\u{21b3} (same)".to_string()
+                format!("{} (same)", crate::symbols::SAME_AS_ABOVE.s())
             } else if full || entry.api_key.len() <= TOKEN_TRUNCATE_THRESHOLD {
                 entry.api_key.clone()
             } else {
@@ -4754,7 +4858,7 @@ fn handle_route(
             // inflate the byte count passed to {:<N} and break column alignment.
             let token_padded = format!("{:<kw$}", token_display, kw = TOKEN_DISPLAY_WIDTH);
             let active_marker = if entry.active {
-                "\u{25cf}".green().to_string()
+                crate::symbols::RADIO_ON.s().green().to_string()
             } else {
                 " ".to_string()
             };
@@ -4789,7 +4893,8 @@ fn handle_route(
         "  {}",
         format!(
             "{} = active (set by `aikey use`),  {} = same token as previous row",
-            "\u{25cf}", "\u{21b3}"
+            crate::symbols::RADIO_ON.s(),
+            crate::symbols::SAME_AS_ABOVE.s()
         )
         .dimmed()
     );
@@ -4807,7 +4912,7 @@ fn handle_route(
         eprintln!();
         eprintln!(
             "  {} {} keys missing route token. Run `aikey use` or `aikey add` to complete setup.",
-            "\u{26a0}".yellow(),
+            crate::symbols::WARN.s().yellow(),
             missing_token_count
         );
     }
@@ -4815,7 +4920,7 @@ fn handle_route(
         eprintln!();
         eprintln!(
             "  {} {} database error(s) while reading route tokens — check vault integrity.",
-            "\u{26a0}".red(),
+            crate::symbols::WARN.s().red(),
             db_error_count
         );
     }
@@ -4827,7 +4932,7 @@ fn handle_route(
         eprintln!();
         eprintln!(
             "  {} Proxy is not running. Start with: aikey proxy start",
-            "\u{26a0}".yellow()
+            crate::symbols::WARN.s().yellow()
         );
     }
 
@@ -4886,7 +4991,7 @@ fn handle_route(
                     _ => {
                         eprintln!(
                             "  {} Invalid selection — expected a number between 1 and {}.",
-                            "\u{26a0}".yellow(),
+                            crate::symbols::WARN.s().yellow(),
                             entries.len()
                         );
                     }
@@ -4958,7 +5063,7 @@ fn handle_shell_command(json_mode: bool) -> Result<(), Box<dyn std::error::Error
         println!("Profile: {}", profile);
     }
     println!();
-    println!("⚠️  Security Notice:");
+    println!("{}  Security Notice:", crate::symbols::WARN.s());
     println!("   Secrets are NOT exported to this shell.");
     println!("   Use 'aikey run -- <command>' to inject secrets per-command.");
     println!();
@@ -5089,7 +5194,7 @@ fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Res
     if vault_initialized {
         // Existing vault — just ask for the password
         prompt_password_secure(
-            "\u{1F512} Enter Master Password: ",
+            &format!("{}Enter Master Password: ", crate::symbols::ICON_LOCK.pre()),
             password_stdin,
             json_mode,
         )
@@ -5098,16 +5203,32 @@ fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Res
         // Why confirm: prevent typos from locking the user out permanently.
         if !json_mode && !password_stdin && std::env::var("AK_TEST_PASSWORD").is_err() {
             eprintln!();
-            eprintln!("  \u{1F510} No vault found — setting up for the first time.");
+            eprintln!(
+                "  {}No vault found — setting up for the first time.",
+                crate::symbols::ICON_LOCK_KEY.pre()
+            );
             eprintln!("  Choose a master password to protect your API Keys.");
-            eprintln!("  \u{26A0}\u{FE0F}  This password cannot be recovered if lost.");
+            eprintln!(
+                "  {}  This password cannot be recovered if lost.",
+                crate::symbols::WARN.s()
+            );
             eprintln!();
 
             // Confirm password to prevent typo lockout
             loop {
-                let pw1 = prompt_password_secure("\u{1F512} Set Master Password: ", false, false)?;
-                let pw2 =
-                    prompt_password_secure("\u{1F512} Confirm Master Password: ", false, false)?;
+                let pw1 = prompt_password_secure(
+                    &format!("{}Set Master Password: ", crate::symbols::ICON_LOCK.pre()),
+                    false,
+                    false,
+                )?;
+                let pw2 = prompt_password_secure(
+                    &format!(
+                        "{}Confirm Master Password: ",
+                        crate::symbols::ICON_LOCK.pre()
+                    ),
+                    false,
+                    false,
+                )?;
                 if pw1.expose_secret() == pw2.expose_secret() {
                     return Ok(pw1);
                 }
@@ -5115,7 +5236,11 @@ fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Res
             }
         } else {
             // Non-interactive or test mode — single prompt, no confirm
-            prompt_password_secure("\u{1F512} Set Master Password: ", password_stdin, json_mode)
+            prompt_password_secure(
+                &format!("{}Set Master Password: ", crate::symbols::ICON_LOCK.pre()),
+                password_stdin,
+                json_mode,
+            )
         }
     }
 }
@@ -5237,7 +5362,7 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
                     is_active: bool|
      -> String {
         let use_mark = if in_use {
-            "\u{25CF}".green().to_string()
+            crate::symbols::RADIO_ON.s().green().to_string()
         } else {
             " ".to_string()
         };
@@ -5263,9 +5388,9 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
         let n = personal.len();
         for (i, entry) in personal.iter().enumerate() {
             let connector = if i + 1 == n {
-                "\u{2514}\u{2500}"
+                crate::symbols::TREE_LAST.s()
             } else {
-                "\u{251C}\u{2500}"
+                crate::symbols::TREE_BRANCH.s()
             };
             let provider_col = match (&entry.base_url, &entry.provider_code) {
                 (Some(url), _) if !url.is_empty() => url.clone(),
@@ -5304,9 +5429,9 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
         let n = own_team.len();
         for (i, e) in own_team.iter().enumerate() {
             let connector = if i + 1 == n {
-                "\u{2514}\u{2500}"
+                crate::symbols::TREE_LAST.s()
             } else {
-                "\u{251C}\u{2500}"
+                crate::symbols::TREE_BRANCH.s()
             };
             let display_name = e.local_alias.as_deref().unwrap_or(e.alias.as_str());
             let in_use = bindings.iter().any(|b| {
@@ -5343,9 +5468,9 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
         let n = oauth_usable.len();
         for (i, acct) in oauth_usable.iter().enumerate() {
             let connector = if i + 1 == n {
-                "\u{2514}\u{2500}"
+                crate::symbols::TREE_LAST.s()
             } else {
-                "\u{251C}\u{2500}"
+                crate::symbols::TREE_BRANCH.s()
             };
             let identity = acct.effective_label();
             let in_use = bindings.iter().any(|b| {
@@ -5372,7 +5497,11 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
 
     // Other-account team keys: shown at the bottom, dimmed, not selectable.
     if !other_account_team.is_empty() {
-        let sep = format!("{}", "───── Other accounts (not selectable) ─────".dimmed());
+        let rule = crate::symbols::BOX_H.s().repeat(5);
+        let sep = format!(
+            "{}",
+            format!("{rule} Other accounts (not selectable) {rule}").dimmed()
+        );
         items.push(sep);
         aliases.push(String::new());
         selectable.push(false);
@@ -5632,7 +5761,7 @@ fn pick_providers_interactively(
                 let label = if pending {
                     // Inline tag so the width calc (visible_len on label)
                     // sizes the box for it; renderer adds dim styling.
-                    format!("{} \x1b[2;33m(pending sync)\x1b[0m", label)
+                    format!("{} {}", label, "(pending sync)".yellow().dimmed())
                 } else {
                     label
                 };
@@ -6163,15 +6292,29 @@ fn handle_activate(
     // stderr. That's the supported invocation pattern.
     if io::stdout().is_terminal() {
         eprintln!();
-        eprintln!("\x1b[1;33m  \u{26a0} Activation needs `eval` to apply env vars to your current shell.\x1b[0m");
+        eprintln!(
+            "{}",
+            format!(
+                "  {} Activation needs `eval` to apply env vars to your current shell.",
+                crate::symbols::WARN.s()
+            )
+            .yellow()
+            .bold()
+        );
         eprintln!();
         eprintln!("  Run:");
         eprintln!(
-            "    \x1b[1;36meval $(aikey activate {} --shell {})\x1b[0m",
-            alias, shell
+            "    {}",
+            format!("eval $(aikey activate {} --shell {})", alias, shell)
+                .cyan()
+                .bold()
         );
         eprintln!();
-        eprintln!("\x1b[90m  (A direct call only prints the eval-able shell snippet — it does NOT activate.)\x1b[0m");
+        eprintln!(
+            "{}",
+            "  (A direct call only prints the eval-able shell snippet — it does NOT activate.)"
+                .bright_black()
+        );
         return Ok(());
     }
 
@@ -6179,21 +6322,23 @@ fn handle_activate(
     // so the original hint pattern is safe — stderr stays visible to the user
     // while stdout contains only the eval target.
     eprintln!(
-        "\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m",
-        shell
+        "{}",
+        format!("  Detected shell: {}. Wrap with eval to apply:", shell).bright_black()
     );
     eprintln!(
-        "\x1b[90m  eval $(aikey activate {} --shell {})\x1b[0m",
-        alias, shell
+        "{}",
+        format!("  eval $(aikey activate {} --shell {})", alias, shell).bright_black()
     );
 
     // M2: warn if alias collides across sources. Priority (team > OAuth > personal)
     // is preserved by resolve_activate_key, but silent selection can confuse users.
     let sources = probe_alias_sources(alias);
     if sources.len() > 1 {
-        eprintln!("\x1b[33m  \u{26a0} Alias '{}' exists in multiple sources: {}. Using {} (priority: team > OAuth > personal).\x1b[0m",
-            alias, sources.join(", "), sources[0]);
-        eprintln!("\x1b[90m    Rename one with `aikey rename` to remove the ambiguity.\x1b[0m");
+        eprintln!("{}", format!("  {} Alias '{}' exists in multiple sources: {}. Using {} (priority: team > OAuth > personal).", crate::symbols::WARN.s(), alias, sources.join(", "), sources[0]).yellow());
+        eprintln!(
+            "{}",
+            "    Rename one with `aikey rename` to remove the ambiguity.".bright_black()
+        );
     }
 
     let (label, token, provider) = resolve_activate_key(alias, provider_override)?;
@@ -6360,8 +6505,8 @@ fn handle_activate(
 
     // Human-readable confirmation on stderr (not captured by wrapper).
     eprintln!(
-        "\x1b[90m  Activated: {} \u{2192} {} ({})\x1b[0m",
-        label, provider, shell
+        "{}",
+        format!("  Activated: {} \u{2192} {} ({})", label, provider, shell).bright_black()
     );
 
     // Show how to undo. The `quit` shell-local function is defined above for
@@ -6372,7 +6517,12 @@ fn handle_activate(
     // unaware there's a softer "stay in shell, drop the active key" path.
     // Surfacing it once at activate time costs one dim line.
     if shell != "cmd" {
-        eprintln!("\x1b[90m  Run \x1b[36m`quit`\x1b[0m\x1b[90m to deactivate this shell.\x1b[0m");
+        eprintln!(
+            "{}{}{}",
+            "  Run ".bright_black(),
+            "`quit`".cyan(),
+            " to deactivate this shell.".bright_black()
+        );
     }
 
     // Auto-install Claude Code status line when activating an anthropic key.
@@ -6394,12 +6544,12 @@ fn handle_deactivate(shell: Option<&str>) -> Result<(), Box<dyn std::error::Erro
         None => {
             detected = detect_shell().ok_or_else(shell_detection_error)?;
             eprintln!(
-                "\x1b[90m  Detected shell: {}. Wrap with eval to apply:\x1b[0m",
-                detected
+                "{}",
+                format!("  Detected shell: {}. Wrap with eval to apply:", detected).bright_black()
             );
             eprintln!(
-                "\x1b[90m  eval $(aikey deactivate --shell {})\x1b[0m",
-                detected
+                "{}",
+                format!("  eval $(aikey deactivate --shell {})", detected).bright_black()
             );
             detected
         }
@@ -6515,8 +6665,8 @@ fn handle_deactivate(shell: Option<&str>) -> Result<(), Box<dyn std::error::Erro
     }
 
     eprintln!(
-        "\x1b[90m  Deactivated: restored global settings ({})\x1b[0m",
-        shell
+        "{}",
+        format!("  Deactivated: restored global settings ({})", shell).bright_black()
     );
     Ok(())
 }
@@ -6590,7 +6740,10 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 .map(|v| v == "1")
                 .unwrap_or(false)
             {
-                eprintln!("\x1b[90m  Skipped: AIKEY_NO_HOOK=1 set in environment.\x1b[0m");
+                eprintln!(
+                    "{}",
+                    "  Skipped: AIKEY_NO_HOOK=1 set in environment.".bright_black()
+                );
                 return Ok(());
             }
             // Pre-flight: warn if running elevated on Windows. The native
@@ -6605,18 +6758,34 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             // other shells, not to elevate.
             // See bugfix 2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure.md.
             if profile_activation::is_running_elevated() {
-                eprintln!("\x1b[33m  ⚠ Running elevated on Windows.\x1b[0m");
                 eprintln!(
-                    "\x1b[90m    Elevation does not help `aikey hook update` succeed —\x1b[0m"
+                    "{}",
+                    format!(
+                        "  {} Running elevated on Windows.",
+                        crate::symbols::WARN.s()
+                    )
+                    .yellow()
                 );
-                eprintln!("\x1b[90m    EACCES on hook.ps1 is typically caused by another\x1b[0m");
                 eprintln!(
-                    "\x1b[90m    PowerShell session holding the file open, not by ACL.\x1b[0m"
+                    "{}",
+                    "    Elevation does not help `aikey hook update` succeed —".bright_black()
                 );
                 eprintln!(
-                    "\x1b[90m    If this command fails: close other PS shells, then run\x1b[0m"
+                    "{}",
+                    "    EACCES on hook.ps1 is typically caused by another".bright_black()
                 );
-                eprintln!("\x1b[90m    `aikey hook update` again WITHOUT sudo.\x1b[0m");
+                eprintln!(
+                    "{}",
+                    "    PowerShell session holding the file open, not by ACL.".bright_black()
+                );
+                eprintln!(
+                    "{}",
+                    "    If this command fails: close other PS shells, then run".bright_black()
+                );
+                eprintln!(
+                    "{}",
+                    "    `aikey hook update` again WITHOUT sudo.".bright_black()
+                );
             }
             // Stage 8 / reviewer round-3 fix: use the *pure* refresh path that
             // only rewrites ~/.aikey/hook.{zsh,bash}. The earlier draft called
@@ -6629,15 +6798,27 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             match commands_account::refresh_hook_file_only(None) {
                 Ok(path) => {
                     eprintln!(
-                        "\x1b[90m  ✓ Regenerated {} from current binary.\x1b[0m",
-                        path.display()
+                        "{}",
+                        format!(
+                            "  {} Regenerated {} from current binary.",
+                            crate::symbols::CHECK.s(),
+                            path.display()
+                        )
+                        .bright_black()
                     );
                     let basename = path
                         .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or("hook.zsh");
-                    eprintln!("\x1b[90m    Open shells will pick it up via the drift detector on next prompt,\x1b[0m");
-                    eprintln!("\x1b[90m    or run: source ~/.aikey/{}\x1b[0m", basename);
+                    eprintln!(
+                        "{}",
+                        "    Open shells will pick it up via the drift detector on next prompt,"
+                            .bright_black()
+                    );
+                    eprintln!(
+                        "{}",
+                        format!("    or run: source ~/.aikey/{}", basename).bright_black()
+                    );
                     // Helpful follow-up: if rc isn't yet wired (typical of
                     // recovery scenarios where the user blew away their
                     // dotfiles), tell them how to install it without us
@@ -6654,10 +6835,26 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                                 .unwrap_or(false)
                         });
                     if !rc_has_source {
-                        eprintln!("\x1b[90m    Note: no rc-file `source` line detected. To install it, run\x1b[0m");
-                        eprintln!("\x1b[90m      \x1b[36maikey hook install\x1b[0m\x1b[90m            (rc only, no binding change), or\x1b[0m");
-                        eprintln!("\x1b[90m      \x1b[36maikey use <alias>\x1b[0m\x1b[90m             (also activates that key).\x1b[0m");
-                        eprintln!("\x1b[90m    Both prompt for confirmation before touching your rc file.\x1b[0m");
+                        eprintln!(
+                            "{}",
+                            "    Note: no rc-file `source` line detected. To install it, run"
+                                .bright_black()
+                        );
+                        eprintln!(
+                            "      {}{}",
+                            "aikey hook install".cyan(),
+                            "            (rc only, no binding change), or".bright_black()
+                        );
+                        eprintln!(
+                            "      {}{}",
+                            "aikey use <alias>".cyan(),
+                            "             (also activates that key).".bright_black()
+                        );
+                        eprintln!(
+                            "{}",
+                            "    Both prompt for confirmation before touching your rc file."
+                                .bright_black()
+                        );
                     }
                     Ok(())
                 }
@@ -6786,7 +6983,10 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 .map(|v| v == "1")
                 .unwrap_or(false)
             {
-                eprintln!("\x1b[90m  Skipped: AIKEY_NO_HOOK=1 set in environment.\x1b[0m");
+                eprintln!(
+                    "{}",
+                    "  Skipped: AIKEY_NO_HOOK=1 set in environment.".bright_black()
+                );
                 return Ok(());
             }
 
@@ -6794,11 +6994,18 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 match commands_account::refresh_hook_file_only(shell.as_deref()) {
                     Ok(path) => {
                         eprintln!(
-                            "\x1b[90m  ✓ Hook file rendered at {} (Layer 1 only; rc untouched).\x1b[0m",
-                            path.display(),
+                            "{}",
+                            format!(
+                                "  {} Hook file rendered at {} (Layer 1 only; rc untouched).",
+                                crate::symbols::CHECK.s(),
+                                path.display()
+                            )
+                            .bright_black()
                         );
                         eprintln!(
-                            "\x1b[90m    To wire rc later: \x1b[36maikey hook install\x1b[0m",
+                            "{}{}",
+                            "    To wire rc later: ".bright_black(),
+                            "aikey hook install".cyan(),
                         );
                         Ok(())
                     }
@@ -6817,10 +7024,20 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                         // `source ~/.zshrc` because that's a dead instruction
                         // for non-POSIX shells.
                         let reload = commands_account::reload_hint_for_shell();
-                        eprintln!("\x1b[90m  ✓ Shell hook installed and rc wired.\x1b[0m");
                         eprintln!(
-                            "\x1b[90m    Activate now: \x1b[1;36m{}\x1b[0m\x1b[90m  or  \x1b[1;36mopen a new terminal\x1b[0m",
-                            reload,
+                            "{}",
+                            format!(
+                                "  {} Shell hook installed and rc wired.",
+                                crate::symbols::CHECK.s()
+                            )
+                            .bright_black()
+                        );
+                        eprintln!(
+                            "{}{}{}{}",
+                            "    Activate now: ".bright_black(),
+                            reload.cyan().bold(),
+                            "  or  ".bright_black(),
+                            "open a new terminal".cyan().bold(),
                         );
                     }
                 }
@@ -6864,8 +7081,13 @@ fn handle_hook_reinstall(shell: Option<&str>) -> Result<(), Box<dyn std::error::
     let reload = commands_account::reload_hint_for_shell();
 
     eprintln!(
-        "\x1b[90m  ✓ Hook file regenerated at {}.\x1b[0m",
-        hook_path.display()
+        "{}",
+        format!(
+            "  {} Hook file regenerated at {}.",
+            crate::symbols::CHECK.s(),
+            hook_path.display()
+        )
+        .bright_black()
     );
     match l2_msg {
         Some(msg) => {
@@ -6875,15 +7097,25 @@ fn handle_hook_reinstall(shell: Option<&str>) -> Result<(), Box<dyn std::error::
         }
         None => {
             // AlreadyV3 silent-rewrite path. Reinstall makes this visible.
-            eprintln!("\x1b[90m  ✓ Shell rc block rewritten in place.\x1b[0m");
+            eprintln!(
+                "{}",
+                format!(
+                    "  {} Shell rc block rewritten in place.",
+                    crate::symbols::CHECK.s()
+                )
+                .bright_black()
+            );
         }
     }
     // Highlight both actions with bold cyan via raw ANSI — `colored` strips
     // styling under non-TTY pipes, but raw ANSI prints unconditionally and
     // matches the surrounding gray frame.
     eprintln!(
-        "\x1b[90m    Activate now: \x1b[1;36m{}\x1b[0m\x1b[90m  or  \x1b[1;36mopen a new terminal\x1b[0m",
-        reload,
+        "{}{}{}{}",
+        "    Activate now: ".bright_black(),
+        reload.cyan().bold(),
+        "  or  ".bright_black(),
+        "open a new terminal".cyan().bold(),
     );
     Ok(())
 }
@@ -6899,7 +7131,8 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
     let touched = commands_account::uninstall_shell_hook();
     if touched.is_empty() {
         eprintln!(
-            "\x1b[90m  No aikey shell hook block found in any rc file — nothing to remove.\x1b[0m"
+            "{}",
+            "  No aikey shell hook block found in any rc file — nothing to remove.".bright_black()
         );
         // Even when nothing was wired, stale third-party CLI configs are
         // exactly as broken (no env channel) — reconcile them too.
@@ -6909,18 +7142,28 @@ fn handle_hook_uninstall() -> Result<(), Box<dyn std::error::Error>> {
     }
     for t in &touched {
         eprintln!(
-            "\x1b[90m  ✓ Removed hook block from {} \x1b[0m\x1b[90m(backup: {}).\x1b[0m",
-            t.rc_file.display(),
-            t.backup.display()
+            "{}{}",
+            format!(
+                "  {} Removed hook block from {} ",
+                crate::symbols::CHECK.s(),
+                t.rc_file.display()
+            )
+            .bright_black(),
+            format!("(backup: {}).", t.backup.display()).bright_black()
         );
     }
     eprintln!(
-        "\x1b[90m  Layer 1 hook files under ~/.aikey/ were kept — run \x1b[36maikey hook install\x1b[0m\x1b[90m to re-wire.\x1b[0m"
+        "{}{}{}",
+        "  Layer 1 hook files under ~/.aikey/ were kept — run ".bright_black(),
+        "aikey hook install".cyan(),
+        " to re-wire.".bright_black()
     );
     eprintln!(
-        "\x1b[90m  New shells won't load the hook. Already-open shells keep their current env\x1b[0m"
+        "{}",
+        "  New shells won't load the hook. Already-open shells keep their current env"
+            .bright_black()
     );
-    eprintln!("\x1b[90m  until you open a new terminal.\x1b[0m");
+    eprintln!("{}", "  until you open a new terminal.".bright_black());
     // X8 (2026-07-12): codex/kimi configs that route through aikey only work
     // WITH the hook env — offer to strip them (TTY) or warn loudly (non-TTY).
     commands_account::reconcile_cli_configs_after_hook_uninstall();
@@ -7028,7 +7271,7 @@ fn print_test_rc_unwired_warning(json_mode: bool, connectivity_ok: bool) {
             .is_empty();
     let rc_wired = commands_account::shell_rc_has_aikey_block();
     if let Some(w) = test_rc_unwired_warning(connectivity_ok, has_bindings, rc_wired, opted_out) {
-        eprintln!("\n  \x1b[33m{}\x1b[0m", w);
+        eprintln!("\n  {}", w.yellow());
     }
 }
 
@@ -7058,7 +7301,6 @@ mod test_rc_unwired_warning_tests {
         assert!(w.contains("NOT inherit aikey env"));
     }
 }
-
 
 #[cfg(test)]
 mod route_v1_hint_tests {

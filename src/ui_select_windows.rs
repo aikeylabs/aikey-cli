@@ -42,6 +42,8 @@
 #![cfg(windows)]
 
 use std::io::{self, Write};
+
+use colored::Colorize;
 use std::mem::MaybeUninit;
 
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
@@ -358,12 +360,17 @@ pub(crate) fn interactive_select_windows(
     };
 
     let inner_w = compute_inner_w(title, header, items);
-    let border = "\u{2500}".repeat(inner_w);
+    let border = crate::symbols::BOX_H.s().repeat(inner_w);
     let narrow = crate::ui_frame::is_narrow();
 
-    let icon_title = format!("\u{1F50D} {}", title);
+    let icon_title = format!("{}{}", crate::symbols::ICON_SEARCH.pre(), title);
     let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
-    let title_bar = format!("\u{2500} {} {}", icon_title, "\u{2500}".repeat(title_fill));
+    let title_bar = format!(
+        "{} {} {}",
+        crate::symbols::BOX_H.s(),
+        icon_title,
+        crate::symbols::BOX_H.s().repeat(title_fill)
+    );
 
     let mut out = io::stderr();
 
@@ -372,20 +379,27 @@ pub(crate) fn interactive_select_windows(
 
     let pad_target = inner_w.saturating_sub(4);
     if narrow {
-        let rule = "\u{2500}".repeat(pad_target);
+        let rule = crate::symbols::BOX_H.s().repeat(pad_target);
         write!(out, "\r\n  {}\r\n", icon_title)?;
         write!(out, "  {}\r\n", rule)?;
         write!(out, "  {}\r\n", header)?;
-        write!(out, "  \x1b[90m{}\x1b[0m\r\n", rule)?;
+        write!(out, "  {}\r\n", rule.bright_black())?;
     } else {
-        write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
         write!(
             out,
-            "  \u{2502}  {}  \u{2502}\r\n",
-            pad_visible(header, pad_target)
+            "\r\n  {}{}{}\r\n",
+            crate::symbols::BOX_TL.s(),
+            title_bar,
+            crate::symbols::BOX_TR.s()
         )?;
-        let sep = "\u{2500}".repeat(pad_target + 2);
-        write!(out, "  \u{2502} {} \u{2502}\r\n", sep)?;
+        write!(
+            out,
+            "  {v}  {}  {v}\r\n",
+            pad_visible(header, pad_target),
+            v = crate::symbols::BOX_V.s()
+        )?;
+        let sep = crate::symbols::BOX_H.s().repeat(pad_target + 2);
+        write!(out, "  {v} {} {v}\r\n", sep, v = crate::symbols::BOX_V.s())?;
     }
 
     let mut cursor = initial;
@@ -398,15 +412,22 @@ pub(crate) fn interactive_select_windows(
     }
 
     if narrow {
-        let rule = "\u{2500}".repeat(pad_target);
+        let rule = crate::symbols::BOX_H.s().repeat(pad_target);
         write!(out, "  {}\r\n", rule)?;
     } else {
-        write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
+        write!(
+            out,
+            "  {}{}{}\r\n",
+            crate::symbols::BOX_BL.s(),
+            border,
+            crate::symbols::BOX_BR.s()
+        )?;
     }
 
     write!(
         out,
-        "  [\u{2191}\u{2193} move, \x1b[1;33mEnter\x1b[0m select, Esc cancel]"
+        "  [\u{2191}\u{2193} move, {} select, Esc cancel]",
+        "Enter".yellow().bold()
     )?;
     out.flush()?;
 
@@ -450,45 +471,65 @@ pub(crate) fn interactive_multi_select_windows(
 ) -> Result<MultiSelectResult, Box<dyn std::error::Error>> {
     let rc = RawConsole::open()?;
 
-    let icon_title = format!("\u{2611} {}", title);
+    let icon_title = format!("{}{}", crate::symbols::CHECKBOX_ON.pre(), title);
     let items_max = items.iter().map(|s| visible_len(s) + 8).max().unwrap_or(20);
     let max_inner = crate::ui_frame::term_width().saturating_sub(6);
     let inner_w = (visible_len(&icon_title) + 4)
         .max(items_max + 10)
         .min(max_inner);
-    let border = "\u{2500}".repeat(inner_w);
+    let border = crate::symbols::BOX_H.s().repeat(inner_w);
     let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
-    let title_bar = format!("\u{2500} {} {}", icon_title, "\u{2500}".repeat(title_fill));
+    let title_bar = format!(
+        "{} {} {}",
+        crate::symbols::BOX_H.s(),
+        icon_title,
+        crate::symbols::BOX_H.s().repeat(title_fill)
+    );
 
     let mut out = io::stderr();
     let mut checked: Vec<bool> = initially_checked.to_vec();
     let mut cursor: usize = 0;
     let total = items.len();
 
-    const HINT_INITIAL: &str =
-        "  \x1b[1;33mEnter\x1b[0m select \u{2022} \u{2191}\u{2193} move \u{2022} 1\u{2013}9 jump \u{2022} Esc cancel";
-    const HINT_TOGGLE: &str =
-        "  \x1b[1;33mEnter\x1b[0m to confirm \u{2022} \u{2191}\u{2193} select more \u{2022} Space/1\u{2013}9 toggle \u{2022} Esc cancel";
-    const HINT_SELECT_MORE: &str =
-        "  \x1b[1;33mEnter\x1b[0m to confirm \u{2022} Space/1\u{2013}9 select \u{2022} \u{2191}\u{2193} select more \u{2022} Esc cancel";
+    fn enter_key() -> String {
+        "Enter".yellow().bold().to_string()
+    }
+    let hint_initial = format!(
+        "  {} select \u{2022} \u{2191}\u{2193} move \u{2022} 1\u{2013}9 jump \u{2022} Esc cancel",
+        enter_key()
+    );
+    let hint_toggle = format!(
+        "  {} to confirm \u{2022} \u{2191}\u{2193} select more \u{2022} Space/1\u{2013}9 toggle \u{2022} Esc cancel",
+        enter_key()
+    );
+    let hint_select_more = format!(
+        "  {} to confirm \u{2022} Space/1\u{2013}9 select \u{2022} \u{2191}\u{2193} select more \u{2022} Esc cancel",
+        enter_key()
+    );
 
     let mut has_moved = false;
-    let pick_hint = |checked: &[bool], cursor: usize, moved: bool| -> &'static str {
+    let pick_hint = |checked: &[bool], cursor: usize, moved: bool| -> &str {
         if !checked.iter().any(|&c| c) {
-            return HINT_INITIAL;
+            return &hint_initial;
         }
         if !moved {
-            return HINT_TOGGLE;
+            return &hint_toggle;
         }
         if checked[cursor] {
-            HINT_TOGGLE
+            &hint_toggle
         } else {
-            HINT_SELECT_MORE
+            &hint_select_more
         }
     };
 
     write!(out, "\x1b[?25l")?;
-    write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
+    write!(
+        out,
+        "\r\n  {}{}{}\r\n",
+        crate::symbols::BOX_TL.s(),
+        title_bar,
+        crate::symbols::BOX_TR.s()
+    )?;
     for (i, item) in items.iter().enumerate() {
         write!(
             out,
@@ -496,7 +537,13 @@ pub(crate) fn interactive_multi_select_windows(
             format_multi_row(item, i, i == cursor, checked[i], inner_w)
         )?;
     }
-    write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
+    write!(
+        out,
+        "  {}{}{}\r\n",
+        crate::symbols::BOX_BL.s(),
+        border,
+        crate::symbols::BOX_BR.s()
+    )?;
     write!(out, "{}", pick_hint(&checked, cursor, has_moved))?;
     out.flush()?;
 
@@ -610,7 +657,7 @@ pub(crate) fn interactive_provider_tree_windows(
     let rc = RawConsole::open()?;
 
     let title = "Provider Key Selection";
-    let icon_title = format!("\u{1F310} {}", title);
+    let icon_title = format!("{}{}", crate::symbols::ICON_GLOBE.pre(), title);
     let mut out = io::stderr();
     let mut cursor: usize = 0;
 
@@ -638,16 +685,27 @@ pub(crate) fn interactive_provider_tree_windows(
         let inner_w = (visible_len(&icon_title) + 4)
             .max(content_min_w)
             .min(max_inner);
-        let border = "\u{2500}".repeat(inner_w);
+        let border = crate::symbols::BOX_H.s().repeat(inner_w);
         let title_fill = inner_w.saturating_sub(visible_len(&icon_title) + 3);
-        let title_bar = format!("\u{2500} {} {}", icon_title, "\u{2500}".repeat(title_fill));
+        let title_bar = format!(
+            "{} {} {}",
+            crate::symbols::BOX_H.s(),
+            icon_title,
+            crate::symbols::BOX_H.s().repeat(title_fill)
+        );
 
         if cursor >= total || !is_focusable(&rows[cursor]) {
             cursor = rows.iter().position(is_focusable).unwrap_or(0);
         }
 
         write!(out, "\x1b[?25l")?;
-        write!(out, "\r\n  \u{250C}{}\u{2510}\r\n", title_bar)?;
+        write!(
+            out,
+            "\r\n  {}{}{}\r\n",
+            crate::symbols::BOX_TL.s(),
+            title_bar,
+            crate::symbols::BOX_TR.s()
+        )?;
         for (i, row) in rows.iter().enumerate() {
             write!(
                 out,
@@ -655,8 +713,20 @@ pub(crate) fn interactive_provider_tree_windows(
                 format_tree_row(row, groups, i == cursor, inner_w, label_col_w, max_type_w)
             )?;
         }
-        write!(out, "  \u{2514}{}\u{2518}\r\n", border)?;
-        write!(out, "  [\u{2191}\u{2193} move \u{2022} \x1b[1;33mSpace\x1b[0m select/expand \u{2022} \x1b[1;33mEnter\x1b[0m confirm \u{2022} \x1b[1;33mEsc\x1b[0m cancel]\r\n")?;
+        write!(
+            out,
+            "  {}{}{}\r\n",
+            crate::symbols::BOX_BL.s(),
+            border,
+            crate::symbols::BOX_BR.s()
+        )?;
+        write!(
+            out,
+            "  [\u{2191}\u{2193} move \u{2022} {} select/expand \u{2022} {} confirm \u{2022} {} cancel]\r\n",
+            "Space".yellow().bold(),
+            "Enter".yellow().bold(),
+            "Esc".yellow().bold()
+        )?;
         out.flush()?;
 
         let key = read_key_windows(&rc)?;

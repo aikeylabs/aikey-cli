@@ -39,8 +39,13 @@ pub mod session;
 pub mod shell_quote;
 pub mod storage;
 pub mod storage_acl;
+pub mod style;
+pub mod symbols;
 pub mod synapse;
 pub mod team_token_normalize;
+pub mod term_caps;
+#[cfg(windows)]
+pub mod term_caps_windows;
 pub mod ui_frame;
 // Windows-only siblings — never compile on macOS / Linux. Each module
 // is `#[cfg(windows)]`-internal so the declaration here is a no-op on

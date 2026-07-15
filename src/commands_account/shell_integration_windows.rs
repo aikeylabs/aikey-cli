@@ -63,6 +63,8 @@
 
 use std::io;
 
+use colored::Colorize;
+
 use super::shell_integration::{
     display_aikey_path, replace_between_markers, resolve_user_home, write_hook_file, HookKind,
     V3_BEGIN, V3_END,
@@ -299,14 +301,16 @@ pub(super) fn ensure_powershell_hook() -> Option<String> {
     if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
         return Some(format!(
             "  Shell hook file rendered, but {} (rc-file) wiring needs interactive confirmation.\n  \
-             Run interactively: \x1b[36maikey hook install\x1b[0m\n  \
-             Or silence this hint: \x1b[36mset AIKEY_NO_HOOK=1\x1b[0m (or `$env:AIKEY_NO_HOOK = '1'` in PowerShell)\n  \
-             To apply right now without rc wiring: \x1b[36m. {}\x1b[0m",
+             Run interactively: {}\n  \
+             Or silence this hint: {} (or `$env:AIKEY_NO_HOOK = '1'` in PowerShell)\n  \
+             To apply right now without rc wiring: {}",
             missing
                 .first()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "$PROFILE.CurrentUserAllHosts".to_string()),
-            display_aikey_path("hook.ps1"),
+            "aikey hook install".cyan(),
+            "set AIKEY_NO_HOOK=1".cyan(),
+            format!(". {}", display_aikey_path("hook.ps1")).cyan(),
         ));
     }
 
@@ -350,10 +354,12 @@ pub(super) fn ensure_powershell_hook() -> Option<String> {
         return Some(format!(
             "  Could not wire: {}\n  \
              If the file is UTF-16 (common from PS 5.1 redirection), convert once:\n  \
-             \x1b[36m(Get-Content <file> -Raw) | Set-Content <file> -Encoding utf8\x1b[0m  then re-run \x1b[36maikey hook install\x1b[0m.\n  \
-             Or source manually: \x1b[36m. {}\x1b[0m",
+             {}  then re-run {}.\n  \
+             Or source manually: {}",
             failed.join(", "),
-            display_aikey_path("hook.ps1"),
+            "(Get-Content <file> -Raw) | Set-Content <file> -Encoding utf8".cyan(),
+            "aikey hook install".cyan(),
+            format!(". {}", display_aikey_path("hook.ps1")).cyan(),
         ));
     }
     let target_display = missing
@@ -404,8 +410,8 @@ pub(super) fn powershell_wire_targets() -> Vec<std::path::PathBuf> {
     let mut out: Vec<std::path::PathBuf> = Vec::new();
     #[cfg(windows)]
     {
-        let docs = documents_known_folder()
-            .unwrap_or_else(|| resolve_user_home().join("Documents"));
+        let docs =
+            documents_known_folder().unwrap_or_else(|| resolve_user_home().join("Documents"));
         let pwsh_dir = docs.join("PowerShell");
         if pwsh7_is_wire_target(pwsh_dir.exists(), pwsh_on_path()) {
             out.push(pwsh_dir.join("profile.ps1"));
@@ -431,8 +437,8 @@ pub(super) fn powershell_wire_targets() -> Vec<std::path::PathBuf> {
 pub fn pwsh_profile_wiring_gap() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
-        let docs = documents_known_folder()
-            .unwrap_or_else(|| resolve_user_home().join("Documents"));
+        let docs =
+            documents_known_folder().unwrap_or_else(|| resolve_user_home().join("Documents"));
         let pwsh_dir = docs.join("PowerShell");
         if !pwsh7_is_wire_target(pwsh_dir.exists(), pwsh_on_path()) {
             return None;
@@ -530,13 +536,22 @@ pub fn powershell_profile_load_blocked() -> Option<String> {
     });
     Some(if gpo_managed {
         format!(
-            "  \x1b[33m\u{25b2} ExecutionPolicy '{}' is enforced by Group Policy \u{2014} PowerShell will NOT load the wired profile, so the aikey hook never runs.\n     Ask your IT admin to allow RemoteSigned for your user.\x1b[0m",
-            effective
+            "  {}",
+            format!(
+                "\u{25b2} ExecutionPolicy '{}' is enforced by Group Policy \u{2014} PowerShell will NOT load the wired profile, so the aikey hook never runs.\n     Ask your IT admin to allow RemoteSigned for your user.",
+                effective
+            )
+            .yellow()
         )
     } else {
         format!(
-            "  \x1b[33m\u{25b2} ExecutionPolicy '{}' blocks profile loading \u{2014} the wired aikey hook will NEVER run in new sessions.\n     Fix once: \x1b[36mSet-ExecutionPolicy -Scope CurrentUser RemoteSigned\x1b[0m",
-            effective
+            "  {}{}",
+            format!(
+                "\u{25b2} ExecutionPolicy '{}' blocks profile loading \u{2014} the wired aikey hook will NEVER run in new sessions.\n     Fix once: ",
+                effective
+            )
+            .yellow(),
+            "Set-ExecutionPolicy -Scope CurrentUser RemoteSigned".cyan()
         )
     })
 }

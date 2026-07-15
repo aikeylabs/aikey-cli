@@ -224,7 +224,11 @@ fn group_login_required_line() -> Option<String> {
     Some(format!(
         "{} {} {}",
         "[aikey]".dimmed(),
-        "⚠ team account sign-in required →".yellow(),
+        format!(
+            "{} team account sign-in required →",
+            crate::symbols::WARN.s()
+        )
+        .yellow(),
         st.login_url.underline()
     ))
 }
@@ -287,7 +291,13 @@ fn sync_health_line() -> Option<String> {
     Some(format!(
         "{} {}",
         "[aikey]".dimmed(),
-        format!("⚠ team sync {} {} — serving cached data", worst.state, dur).yellow()
+        format!(
+            "{} team sync {} {} — serving cached data",
+            crate::symbols::WARN.s(),
+            worst.state,
+            dur
+        )
+        .yellow()
     ))
 }
 
@@ -928,8 +938,11 @@ fn render_line(ev: &UsageEvent) -> String {
     // non-complete stream so users see why the numbers look partial.
     let completion = ev.completion.as_deref().unwrap_or("complete");
     let prefix = match completion {
-        "partial" => format!("{} ", "⚠ partial".yellow()),
-        "interrupted" => format!("{} ", "⚠ error".red()),
+        "partial" => format!(
+            "{} ",
+            format!("{} partial", crate::symbols::WARN.s()).yellow()
+        ),
+        "interrupted" => format!("{} ", format!("{} error", crate::symbols::WARN.s()).red()),
         _ => String::new(),
     };
 
@@ -944,8 +957,8 @@ fn render_line(ev: &UsageEvent) -> String {
     // glyph in modern programming fonts. Semantics unchanged — up = input,
     // down = output. Cache segment uses a different glyph family (`↺`/`+`)
     // on purpose so the eye can tell "primary tokens" from "cache detail".
-    let up = "⇡".bold().cyan();
-    let down = "⇣".bold().cyan();
+    let up = crate::symbols::STAT_UP.s().bold().cyan();
+    let down = crate::symbols::STAT_DOWN.s().bold().cyan();
     // Primary token numbers are bold + bright white so they anchor the row.
     // format_number already returns an uncolored String; wrap here.
     let in_s = format_number(in_tok).bold();
@@ -975,8 +988,10 @@ fn render_line(ev: &UsageEvent) -> String {
     let cache_write = ev.cache_creation_input_tokens.unwrap_or(0);
     let cache_seg = if cache_read > 0 || cache_write > 0 {
         let body = format!(
-            "↺{} ⊕{}",
+            "{}{} {}{}",
+            crate::symbols::CACHE_READ.s(),
             format_number(cache_read),
+            crate::symbols::CACHE_WRITE.s(),
             format_number(cache_write),
         );
         body.truecolor(130, 130, 130).to_string()
@@ -1018,7 +1033,7 @@ fn render_line(ev: &UsageEvent) -> String {
         parts.push(format!("{}", label.dimmed()));
     }
 
-    let brand = "❬⦿·⦿❭".dimmed();
+    let brand = crate::symbols::BRAND.s().dimmed();
     // Brand becomes the final `·`-joined segment so it aligns visually
     // with model/label and doesn't look like a ragged appendix.
     parts.push(format!("{}", brand));
@@ -1244,7 +1259,7 @@ pub fn install(target: Option<&str>, all: bool, force: bool) -> io::Result<()> {
             use colored::Colorize;
             eprintln!(
                 "  {} Unknown statusline target: {} (expected: claude | kimi | --all)",
-                "✗".red(),
+                crate::symbols::CROSS.s().red(),
                 other
             );
         }
@@ -1274,7 +1289,7 @@ pub fn install_kimi() -> io::Result<()> {
     crate::commands_account::configure_kimi_cli(proxy_port);
     eprintln!(
         "  {} Kimi CLI scaffold ensured at {} (token overrides via KIMI_API_KEY).",
-        "✓".green(),
+        crate::symbols::CHECK.s().green(),
         "~/.kimi/config.toml".dimmed()
     );
     eprintln!(
@@ -1305,7 +1320,7 @@ fn install_inner(force: bool, quiet: bool) -> io::Result<InstallOutcome> {
         if !quiet {
             eprintln!(
                 "  {} {}",
-                "ⓘ".cyan(),
+                crate::symbols::INFO.s().cyan(),
                 format!(
                     "Claude Code config directory not found: {}",
                     claude_dir.display()
@@ -1326,7 +1341,7 @@ fn install_inner(force: bool, quiet: bool) -> io::Result<InstallOutcome> {
             // Malformed settings is always user-actionable — print regardless.
             eprintln!(
                 "  {} {}",
-                "✗".red(),
+                crate::symbols::CROSS.s().red(),
                 format!("Cannot parse {}: {}", settings_path.display(), e).red()
             );
             eprintln!(
@@ -1356,7 +1371,7 @@ fn install_inner(force: bool, quiet: bool) -> io::Result<InstallOutcome> {
         if !quiet {
             eprintln!(
                 "  {} {}",
-                "✓".green(),
+                crate::symbols::CHECK.s().green(),
                 "Claude Code status line already points to aikey.".dimmed()
             );
         }
@@ -1403,7 +1418,10 @@ fn install_inner(force: bool, quiet: bool) -> io::Result<InstallOutcome> {
 
     write_settings_atomic(&settings_path, &merged)?;
     if !quiet {
-        eprintln!("  {} Claude Code status line installed.", "✓".green());
+        eprintln!(
+            "  {} Claude Code status line installed.",
+            crate::symbols::CHECK.s().green()
+        );
         eprintln!("    {} {}", "file:".dimmed(), settings_path.display());
         eprintln!("    {} {}", "command:".dimmed(), aikey_cmd);
     }
@@ -1536,7 +1554,7 @@ pub fn uninstall(target: Option<&str>, all: bool) -> io::Result<()> {
             use colored::Colorize;
             eprintln!(
                 "  {} Unknown statusline target: {} (expected: claude | kimi | --all)",
-                "✗".red(),
+                crate::symbols::CROSS.s().red(),
                 other
             );
         }
@@ -1554,7 +1572,7 @@ pub fn uninstall_kimi() -> io::Result<()> {
         KimiUninstallOutcome::Removed => {
             eprintln!(
                 "  {} Removed aikey-managed region from ~/.kimi/config.toml.",
-                "✓".green()
+                crate::symbols::CHECK.s().green()
             );
             eprintln!(
                 "    {}",
@@ -1605,7 +1623,7 @@ pub fn uninstall_claude(quiet: bool) -> io::Result<()> {
             if !quiet {
                 eprintln!(
                     "  {} {}",
-                    "✗".red(),
+                    crate::symbols::CROSS.s().red(),
                     format!("Cannot parse settings.json: {}", e).red()
                 );
             }
@@ -1639,7 +1657,7 @@ pub fn uninstall_claude(quiet: bool) -> io::Result<()> {
         if !quiet {
             eprintln!(
                 "  {} Restored {} from backup.",
-                "✓".green(),
+                crate::symbols::CHECK.s().green(),
                 settings_path.display()
             );
         }
@@ -1659,7 +1677,7 @@ pub fn uninstall_claude(quiet: bool) -> io::Result<()> {
         if !quiet {
             eprintln!(
                 "  {} Removed {} (file was otherwise empty).",
-                "✓".green(),
+                crate::symbols::CHECK.s().green(),
                 settings_path.display()
             );
         }
@@ -1668,7 +1686,7 @@ pub fn uninstall_claude(quiet: bool) -> io::Result<()> {
         if !quiet {
             eprintln!(
                 "  {} Removed aikey statusLine from {}.",
-                "✓".green(),
+                crate::symbols::CHECK.s().green(),
                 settings_path.display()
             );
         }
@@ -1733,7 +1751,7 @@ fn print_status_claude() -> io::Result<()> {
             if env_flag("AIKEY_DISABLE_STATUSLINE_ENSURE") {
                 println!(
                     "  {} {}",
-                    "ⓘ".cyan(),
+                    crate::symbols::INFO.s().cyan(),
                     "AIKEY_DISABLE_STATUSLINE_ENSURE=1 — wrapper auto-install is disabled."
                         .dimmed()
                 );
@@ -1757,7 +1775,7 @@ fn print_status_claude() -> io::Result<()> {
             // out. Tell the user why their receipt isn't showing.
             println!(
                 "  {} {}",
-                "ⓘ".cyan(),
+                crate::symbols::INFO.s().cyan(),
                 "Another tool owns the Claude statusLine — aikey receipt is suppressed.".dimmed()
             );
             println!(
@@ -2292,17 +2310,20 @@ mod tests {
         e.cache_creation_input_tokens = Some(32);
         let rendered = strip_ansi(&render_line(&e));
         assert!(
-            rendered.contains("⇡70.1K"),
+            rendered.contains(&format!("{}70.1K", crate::symbols::STAT_UP.s())),
             "missing total input: {rendered}"
         );
-        assert!(rendered.contains("⇣153"), "missing output: {rendered}");
+        assert!(
+            rendered.contains(&format!("{}153", crate::symbols::STAT_DOWN.s())),
+            "missing output: {rendered}"
+        );
         // New compact form.
         assert!(
-            rendered.contains("↺53.1K"),
+            rendered.contains(&format!("{}53.1K", crate::symbols::CACHE_READ.s())),
             "missing cache-read: {rendered}"
         );
         assert!(
-            rendered.contains("⊕32"),
+            rendered.contains(&format!("{}32", crate::symbols::CACHE_WRITE.s())),
             "missing cache-creation: {rendered}"
         );
         // Old form must not regress.
@@ -2315,12 +2336,12 @@ mod tests {
             "'cache)' suffix was dropped: {rendered}"
         );
         assert!(
-            !rendered.contains("(↺"),
+            !rendered.contains(&format!("({}", crate::symbols::CACHE_READ.s())),
             "leading '(' around cache was dropped: {rendered}"
         );
         assert!(
             !rendered.contains("+32 "),
-            "bare '+' was replaced by '⊕': {rendered}"
+            "bare '+' was replaced by the circled-plus cache glyph: {rendered}"
         );
     }
 
@@ -2330,11 +2351,11 @@ mod tests {
         // omitted (no zero-filled `↺0 ⊕0` noise).
         let rendered = strip_ansi(&render_line(&ev("s", "kimi-k2.5", "complete", 8377, 11)));
         assert!(
-            !rendered.contains("↺"),
+            !rendered.contains(crate::symbols::CACHE_READ.s()),
             "should omit cache segment: {rendered}"
         );
         assert!(
-            !rendered.contains("⊕"),
+            !rendered.contains(crate::symbols::CACHE_WRITE.s()),
             "should omit cache segment: {rendered}"
         );
     }
@@ -2380,7 +2401,9 @@ mod tests {
         // Clock's exact HH:MM depends on local tz (renderer is now local),
         // so we anchor on the "HH:MM\0" shape at the end instead of a fixed
         // literal.
-        let brand_idx = complete.find("❬⦿·⦿❭").expect("brand present");
+        let brand_idx = complete
+            .find(crate::symbols::BRAND.s())
+            .expect("brand present");
         let clock_idx = complete.len() - 5;
         assert!(
             brand_idx < clock_idx,
@@ -2388,13 +2411,13 @@ mod tests {
         );
         // Brand is not leading any more.
         assert!(
-            !complete.starts_with("❬⦿·⦿❭"),
+            !complete.starts_with(crate::symbols::BRAND.s()),
             "brand must not lead the line: {complete}"
         );
 
         let partial = strip_ansi(&render_line(&ev("s", "kimi-k2.5", "partial", 42, 9)));
         assert!(
-            partial.starts_with("⚠ partial"),
+            partial.starts_with(&format!("{} partial", crate::symbols::WARN.s())),
             "partial warning must be at the very front: {partial}"
         );
         // Tail is a HH:MM (local tz) — shape check only.
@@ -2413,7 +2436,7 @@ mod tests {
             "clock stays at tail even on partial row: {partial}"
         );
         assert!(
-            partial.contains("❬⦿·⦿❭"),
+            partial.contains(crate::symbols::BRAND.s()),
             "brand must still appear between warning and clock: {partial}"
         );
     }
@@ -2431,14 +2454,16 @@ mod tests {
             .replace("\u{1b}[1m", "");
         // Strip ANSI crudely by keeping visible sequence; assert structural order.
         let stripped = strip_ansi(&rendered);
-        let up_idx = stripped.find("⇡").expect("⇡ present");
+        let up_idx = stripped
+            .find(crate::symbols::STAT_UP.s())
+            .expect("input-tokens glyph present");
         let label_idx = stripped.find("aikey").unwrap_or(stripped.len());
         assert!(
             up_idx < label_idx,
             "tokens should render before label: {stripped}"
         );
-        assert!(stripped.contains("⇡3"));
-        assert!(stripped.contains("⇣22"));
+        assert!(stripped.contains(&format!("{}3", crate::symbols::STAT_UP.s())));
+        assert!(stripped.contains(&format!("{}22", crate::symbols::STAT_DOWN.s())));
         let _ = plain; // silence warning about unused pre-stripped copy
     }
 
@@ -2675,14 +2700,25 @@ mod tests {
 
     #[test]
     fn strip_ansi_escapes_drops_csi_keeps_text() {
-        let s = "\u{1b}[1;36m⇡42\u{1b}[0m tokens \u{1b}[2m(12:34)\u{1b}[0m";
-        let out = strip_ansi_escapes(s);
-        assert_eq!(out, "⇡42 tokens (12:34)");
+        let s = format!(
+            "\u{1b}[1;36m{}42\u{1b}[0m tokens \u{1b}[2m(12:34)\u{1b}[0m",
+            crate::symbols::STAT_UP.fancy
+        );
+        let out = strip_ansi_escapes(&s);
+        assert_eq!(
+            out,
+            format!("{}42 tokens (12:34)", crate::symbols::STAT_UP.fancy)
+        );
     }
 
     #[test]
     fn strip_ansi_escapes_no_escape_is_identity() {
-        assert_eq!(strip_ansi_escapes("plain 1,234 ⇡⇣"), "plain 1,234 ⇡⇣");
+        let plain = format!(
+            "plain 1,234 {}{}",
+            crate::symbols::STAT_UP.fancy,
+            crate::symbols::STAT_DOWN.fancy
+        );
+        assert_eq!(strip_ansi_escapes(&plain), plain);
         assert_eq!(strip_ansi_escapes(""), "");
     }
 
@@ -2700,7 +2736,12 @@ mod tests {
         ));
         std::fs::create_dir_all(&session_dir).unwrap();
 
-        write_kimi_notification(&session_dir, "sess-atomic", "⇡1 ⇣2 · m", 1).unwrap();
+        let title = format!(
+            "{}1 {}2 · m",
+            crate::symbols::STAT_UP.fancy,
+            crate::symbols::STAT_DOWN.fancy
+        );
+        write_kimi_notification(&session_dir, "sess-atomic", &title, 1).unwrap();
 
         let notifs_root = session_dir.join("notifications");
         let entries: Vec<_> = std::fs::read_dir(&notifs_root)
@@ -2732,7 +2773,12 @@ mod tests {
         ));
         std::fs::create_dir_all(&session_dir).unwrap();
 
-        write_kimi_notification(&session_dir, "sess-7", "⇡42 ⇣9 · sonnet-4-6", 3).unwrap();
+        let title = format!(
+            "{}42 {}9 · sonnet-4-6",
+            crate::symbols::STAT_UP.fancy,
+            crate::symbols::STAT_DOWN.fancy
+        );
+        write_kimi_notification(&session_dir, "sess-7", &title, 3).unwrap();
 
         // Exactly one notification dir under notifications/, named n + 8 hex.
         let notifs_root = session_dir.join("notifications");
@@ -2761,7 +2807,7 @@ mod tests {
         assert_eq!(event["type"], "receipt");
         assert_eq!(event["source_kind"], "aikey");
         assert_eq!(event["severity"], "info");
-        assert_eq!(event["title"], "⇡42 ⇣9 · sonnet-4-6");
+        assert_eq!(event["title"], title.as_str());
         let targets = event["targets"].as_array().expect("targets array");
         assert_eq!(targets.len(), 1, "exactly one target");
         assert_eq!(targets[0], "shell", "must be shell (never llm)");

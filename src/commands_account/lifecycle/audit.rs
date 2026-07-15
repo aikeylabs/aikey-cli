@@ -32,7 +32,7 @@ use crate::storage;
 /// of the surrounding dim text and match the cyan convention used by
 /// installer / status output elsewhere.
 fn cmd(s: &str) -> String {
-    format!("\x1b[1;36m{}\x1b[0m\x1b[2m", s)
+    crate::style::cmd_in_dim(s)
 }
 
 /// Which two source-of-truths a `DiffEntry` is comparing.

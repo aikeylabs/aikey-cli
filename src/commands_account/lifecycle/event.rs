@@ -201,8 +201,10 @@ pub fn apply_credential_lifecycle_batch(
                 .iter()
                 .map(|b| b.provider_code.clone())
                 .collect();
-            let third_party =
-                crate::commands_account::apply_third_party_cli_configs(&active_providers, proxy_port);
+            let third_party = crate::commands_account::apply_third_party_cli_configs(
+                &active_providers,
+                proxy_port,
+            );
             // Layer 1 hook file — write once, share result across batch
             // outcomes. Best-effort: failure here surfaces via
             // `hook_failure_reason` for the Web envelope but doesn't

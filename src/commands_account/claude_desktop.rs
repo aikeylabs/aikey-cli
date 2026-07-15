@@ -47,8 +47,17 @@ const REGISTRY_CLIENT: &str = "claude-desktop";
 /// (tempdir injection — tests never touch the real HOME).
 #[derive(Debug, Clone)]
 pub(crate) struct DesktopPaths {
-    /// `.../Claude` — presence = "Desktop is installed" detection signal.
+    /// `.../Claude` — the deploymentMode config dir. On Windows this dir is
+    /// created BY takeover (it does not exist on a clean install), so it is NOT
+    /// a valid "installed" signal there — use `install_marker` for that.
     pub normal_dir: PathBuf,
+    /// Path whose existence means "Claude Desktop is installed".
+    /// macOS: same as `normal_dir` (`~/Library/Application Support/Claude`,
+    /// created on first run). Windows: the app dir `%LOCALAPPDATA%\AnthropicClaude`
+    /// (where claude.exe lives) — because `normal_dir` (`%LOCALAPPDATA%\Claude`)
+    /// only appears after a takeover, so keying detection off it would falsely
+    /// report a freshly-installed Windows Claude as "not installed".
+    pub install_marker: PathBuf,
     pub threep_dir: PathBuf,
     pub normal_config: PathBuf,
     pub threep_config: PathBuf,
@@ -65,6 +74,11 @@ pub(crate) fn paths_from_dirs(normal_dir: PathBuf, threep_dir: PathBuf) -> Deskt
         profile: config_library.join(format!("{}.json", PROFILE_ID)),
         meta: config_library.join("_meta.json"),
         config_library,
+        // Default: the config dir doubles as the install marker (true on
+        // macOS, where `~/Library/Application Support/Claude` is created on
+        // first run). Platform builders that separate the two (Windows)
+        // override `install_marker` after calling this.
+        install_marker: normal_dir.clone(),
         normal_dir,
         threep_dir,
     }
@@ -91,11 +105,22 @@ pub(crate) fn macos_paths_from_home(home: &Path) -> DesktopPaths {
 /// the Windows spike leg's real-dir-name observation (risk 8). If the spike
 /// sees a variant name, upgrade this to the scan — exact-name misses would
 /// silently report detected=false (feature silently off).
+///
+/// Windows spike (2026-07-15): the app installs to
+/// `%LOCALAPPDATA%\AnthropicClaude` (claude.exe), while `%LOCALAPPDATA%\Claude`
+/// / `Claude-3p` (the deploymentMode config dirs) only appear AFTER a takeover.
+/// So the app dir is the install marker; the config dirs are created by
+/// `takeover_at`. Verified against Claude Desktop `1.21459.0`.
 pub(crate) fn windows_paths_from_local_app_data(local_app_data: &Path) -> DesktopPaths {
-    paths_from_dirs(
+    let mut paths = paths_from_dirs(
         local_app_data.join("Claude"),
         local_app_data.join("Claude-3p"),
-    )
+    );
+    // The config dir (`Claude`) does not exist on a clean install — detect
+    // "installed" via the app dir instead, or a freshly-installed Windows
+    // Claude is falsely reported NotInstalled and takeover refuses to run.
+    paths.install_marker = local_app_data.join("AnthropicClaude");
+    paths
 }
 
 /// Platform paths for the real process environment. `None` on platforms
@@ -176,9 +201,14 @@ pub(crate) fn is_claude_safe_model_id(name: &str) -> bool {
     if name.contains("[1m]") {
         return false;
     }
-    ["claude-sonnet-", "claude-opus-", "claude-haiku-", "claude-fable-"]
-        .iter()
-        .any(|p| name.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
+    [
+        "claude-sonnet-",
+        "claude-opus-",
+        "claude-haiku-",
+        "claude-fable-",
+    ]
+    .iter()
+    .any(|p| name.strip_prefix(p).is_some_and(|rest| !rest.is_empty()))
 }
 
 /// Menu entries from `provider_registry.yaml` `clients.claude-desktop.models`,
@@ -240,8 +270,8 @@ pub(crate) enum DesktopState {
 }
 
 fn read_json_object(path: &Path) -> Result<Value, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let v: Value = serde_json::from_str(crate::strip_bom(&content))
         .map_err(|e| format!("parse {}: {}", path.display(), e))?;
     if !v.is_object() {
@@ -273,7 +303,7 @@ fn applied_id(meta_path: &Path) -> Option<String> {
 }
 
 pub(crate) fn detect_state(paths: &DesktopPaths) -> DesktopState {
-    if !paths.normal_dir.exists() {
+    if !paths.install_marker.exists() {
         return DesktopState::NotInstalled;
     }
     // The NORMAL config is the authoritative mode switch (the app reads it
@@ -378,8 +408,8 @@ pub(crate) fn takeover_at(
     paths: &DesktopPaths,
     material: &RouteMaterial,
 ) -> Result<TakeoverResult, String> {
-    if !paths.normal_dir.exists() {
-        return Err("Claude Desktop not detected (normal dir missing)".to_string());
+    if !paths.install_marker.exists() {
+        return Err("Claude Desktop not detected (app not installed)".to_string());
     }
 
     let profile_json = build_gateway_profile(material);
@@ -406,6 +436,12 @@ pub(crate) fn takeover_at(
         }
     }
 
+    // Create both the config dir and the 3p config-library. On Windows these
+    // do NOT exist on a clean install (only the app dir does), and atomic_write
+    // does not create parents — so writing normal_config would fail without this.
+    // config_library's create_dir_all also makes threep_dir (its parent).
+    std::fs::create_dir_all(&paths.normal_dir)
+        .map_err(|e| format!("create {}: {}", paths.normal_dir.display(), e))?;
     std::fs::create_dir_all(&paths.config_library)
         .map_err(|e| format!("create {}: {}", paths.config_library.display(), e))?;
 
@@ -424,10 +460,8 @@ pub(crate) fn takeover_at(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &paths.profile,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ =
+                std::fs::set_permissions(&paths.profile, std::fs::Permissions::from_mode(0o600));
         }
         write_meta_applied(&paths.meta)?;
         write_deployment_mode(&paths.normal_config, "3p")?;
@@ -656,9 +690,7 @@ pub(crate) fn restore_quiet_at(paths: &DesktopPaths) {
     match restore_at(paths) {
         Ok(RestoreResult::Restored) => {
             let _ = crate::global_config::clear_claude_desktop_consent_always();
-            eprintln!(
-                "  Claude Desktop restored to official mode (1p) — restart Desktop to apply"
-            );
+            eprintln!("  Claude Desktop restored to official mode (1p) — restart Desktop to apply");
         }
         Ok(RestoreResult::NotOursSkipped) | Ok(RestoreResult::NothingToDo) => {}
         Err(e) => {
@@ -719,7 +751,11 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
             .set("Authorization", &format!("Bearer {}", token))
             .call()
             .is_ok();
-        if ok { "ok" } else { "fail" }
+        if ok {
+            "ok"
+        } else {
+            "fail"
+        }
     });
 
     // Account-plane probe (risk 9): geo-blocked claude.ai = chat hangs at
@@ -786,8 +822,9 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
                 }
                 if stale_port {
                     println!(
-                        "    ⚠ stale-port:   profile points at a different port than the \
+                        "    {} stale-port:   profile points at a different port than the \
                          running proxy ({}) — run `aikey use <claude credential>` to heal",
+                        crate::symbols::WARN.s(),
                         proxy_port
                     );
                 }
@@ -801,9 +838,10 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
     println!("    claude.ai:      {}", account_plane);
     if account_plane == "blocked-in-region" {
         println!(
-            "    ⚠ Desktop chat needs claude.ai reachability (account plane) — \
+            "    {} Desktop chat needs claude.ai reachability (account plane) — \
              the aikey gateway only carries inference. Provide international \
-             egress (proxy) or Desktop will hang at \"starting session\"."
+             egress (proxy) or Desktop will hang at \"starting session\".",
+            crate::symbols::WARN.s()
         );
     }
     Ok(())
@@ -825,7 +863,7 @@ pub(crate) fn handle_desktop_install() -> Result<(), Box<dyn std::error::Error>>
         return Err(format!(
             "[I_DESKTOP_NOT_INSTALLED] Claude Desktop not found (looked at {}). \
              Install it first, then re-run `aikey desktop install`.",
-            paths.normal_dir.display()
+            paths.install_marker.display()
         )
         .into());
     }
@@ -861,14 +899,19 @@ pub(crate) fn handle_desktop_install() -> Result<(), Box<dyn std::error::Error>>
     let switch = perform_takeover(&paths, proxy_port);
     if !switch.configured {
         return Err(
-            "[I_DESKTOP_WRITE_FAILED] takeover did not complete — see the warning above"
-                .into(),
+            "[I_DESKTOP_WRITE_FAILED] takeover did not complete — see the warning above".into(),
         );
     }
     if switch.restart_required {
-        println!("  ✓ Claude Desktop now routes through aikey — restart Desktop to apply.");
+        println!(
+            "  {} Claude Desktop now routes through aikey — restart Desktop to apply.",
+            crate::symbols::CHECK.s()
+        );
     } else {
-        println!("  ✓ Claude Desktop already routed through aikey (no changes).");
+        println!(
+            "  {} Claude Desktop already routed through aikey (no changes).",
+            crate::symbols::CHECK.s()
+        );
     }
     Ok(())
 }
@@ -887,7 +930,10 @@ pub(crate) fn handle_desktop_uninstall() -> Result<(), Box<dyn std::error::Error
     let _ = crate::global_config::clear_claude_desktop_consent();
     match result {
         RestoreResult::Restored => {
-            println!("  ✓ Claude Desktop restored to official mode (1p) — restart Desktop to apply.");
+            println!(
+                "  {} Claude Desktop restored to official mode (1p) — restart Desktop to apply.",
+                crate::symbols::CHECK.s()
+            );
         }
         RestoreResult::NotOursSkipped => {
             println!(
@@ -959,7 +1005,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&paths.profile).unwrap().permissions().mode();
+            let mode = std::fs::metadata(&paths.profile)
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600, "profile must be owner-only");
         }
     }
@@ -971,13 +1020,19 @@ mod tests {
         let paths = installed_paths(&tmp);
         takeover_at(&paths, &material()).unwrap();
 
-        let before = std::fs::metadata(&paths.profile).unwrap().modified().unwrap();
+        let before = std::fs::metadata(&paths.profile)
+            .unwrap()
+            .modified()
+            .unwrap();
         let bytes_before = std::fs::read(&paths.profile).unwrap();
 
         let r = takeover_at(&paths, &material()).unwrap();
         assert_eq!(r, TakeoverResult::Unchanged);
         assert_eq!(
-            std::fs::metadata(&paths.profile).unwrap().modified().unwrap(),
+            std::fs::metadata(&paths.profile)
+                .unwrap()
+                .modified()
+                .unwrap(),
             before,
             "profile mtime must not change on a no-op takeover"
         );
@@ -1140,14 +1195,11 @@ mod tests {
         assert!(models.iter().any(|m| m.supports_1m));
         assert!(models.iter().any(|m| !m.supports_1m));
         // Unknown client key resolves to empty, not an error.
-        assert!(
-            crate::provider_registry::client_models("anthropic", "no-such-client").is_empty()
-        );
+        assert!(crate::provider_registry::client_models("anthropic", "no-such-client").is_empty());
         // The structured entry renders as an object in the profile.
         let profile = build_gateway_profile(&material());
         let arr = profile["inferenceModels"].as_array().unwrap();
-        assert!(arr.iter().any(|v| v.is_object()
-            && v["supports1m"] == true));
+        assert!(arr.iter().any(|v| v.is_object() && v["supports1m"] == true));
         assert!(arr.iter().any(|v| v.is_string()));
     }
 
@@ -1157,7 +1209,9 @@ mod tests {
         let mac = macos_paths_from_home(Path::new("/Users/alice"));
         assert_eq!(
             mac.normal_config,
-            PathBuf::from("/Users/alice/Library/Application Support/Claude/claude_desktop_config.json")
+            PathBuf::from(
+                "/Users/alice/Library/Application Support/Claude/claude_desktop_config.json"
+            )
         );
         assert_eq!(
             mac.profile,
@@ -1177,6 +1231,69 @@ mod tests {
         assert!(win.normal_dir.to_string_lossy().contains("Claude"));
         assert!(win.threep_dir.to_string_lossy().contains("Claude-3p"));
         assert!(win.meta.to_string_lossy().contains("configLibrary"));
+    }
+
+    // Bug 1 (Windows spike 2026-07-15) regression fence: the "installed"
+    // signal must be the app dir (`AnthropicClaude`), NOT the config dir
+    // (`Claude`), which only appears after a takeover. Keying detection off
+    // the config dir falsely reports a fresh Windows Claude as NotInstalled
+    // and refuses takeover.
+    #[test]
+    fn windows_install_marker_is_app_dir_not_config_dir() {
+        let win = windows_paths_from_local_app_data(Path::new(r"C:\Users\alice\AppData\Local"));
+        assert!(
+            win.install_marker
+                .to_string_lossy()
+                .ends_with("AnthropicClaude"),
+            "install marker should be the app dir, got {}",
+            win.install_marker.display()
+        );
+        // The config dir is a DIFFERENT path (created by takeover, not the marker).
+        assert_ne!(win.install_marker, win.normal_dir);
+        assert!(win.normal_dir.to_string_lossy().ends_with("Claude"));
+    }
+
+    // Fresh Windows Claude: app dir present, config dir absent (never taken
+    // over) ⇒ Official (installed), NOT NotInstalled.
+    #[test]
+    fn windows_fresh_install_detects_official_not_notinstalled() {
+        let tmp = TempDir::new().unwrap();
+        let mut paths = paths_from_dirs(tmp.path().join("Claude"), tmp.path().join("Claude-3p"));
+        paths.install_marker = tmp.path().join("AnthropicClaude");
+        // Create ONLY the app dir (as a clean Windows install would have).
+        std::fs::create_dir_all(&paths.install_marker).unwrap();
+        assert!(
+            !paths.normal_dir.exists(),
+            "config dir must be absent (pre-takeover)"
+        );
+        assert_eq!(
+            detect_state(&paths),
+            DesktopState::Official,
+            "app-dir-present + config-dir-absent must be Official, not NotInstalled"
+        );
+        // And takeover must succeed (creating the config dir itself).
+        assert!(takeover_at(&paths, &material()).is_ok());
+        assert!(
+            paths.normal_dir.exists(),
+            "takeover must create the config dir"
+        );
+        assert_eq!(detect_state(&paths), DesktopState::OursActive);
+    }
+
+    // No app dir at all ⇒ NotInstalled (marker absent).
+    #[test]
+    fn windows_no_app_dir_is_not_installed() {
+        let tmp = TempDir::new().unwrap();
+        let mut paths = paths_from_dirs(tmp.path().join("Claude"), tmp.path().join("Claude-3p"));
+        paths.install_marker = tmp.path().join("AnthropicClaude");
+        assert_eq!(detect_state(&paths), DesktopState::NotInstalled);
+    }
+
+    // macOS regression guard: marker == config dir (no behavior change).
+    #[test]
+    fn macos_install_marker_equals_config_dir() {
+        let mac = macos_paths_from_home(Path::new("/Users/alice"));
+        assert_eq!(mac.install_marker, mac.normal_dir);
     }
 
     // extra · uninstalled → detect NotInstalled; restore is a no-op
@@ -1226,9 +1343,7 @@ mod p2_tests {
 
     impl EnvSandbox {
         fn new(tmp: TempDir) -> Self {
-            let env_guard = ENV_MUTATION_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let env_guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let vault_guard = crate::storage::TEST_VAULT_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
