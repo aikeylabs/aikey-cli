@@ -3842,7 +3842,7 @@ pub fn handle_key_sync(
             use colored::Colorize;
             eprintln!(
                 "  {} Cleared local ciphertext on {} active team key(s); re-downloading...",
-                "↻".cyan(),
+                crate::symbols::REFRESH.s().cyan(),
                 cleared
             );
         }

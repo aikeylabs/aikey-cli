@@ -18,13 +18,19 @@
 //! If this fence turns red on your change: use `symbols::<CONST>.s()` (add a
 //! table row if the glyph is new) instead of writing the glyph inline.
 //!
-//! Deliberately NOT fenced (verified present in BOTH NSimSun/GBK — the
-//! zh-CN conhost font — and Consolas — the en-US conhost font — so they
-//! never render as □): `· — … • – → ← ↑ ↓ ●`. On zh-CN conhost some render
+//! Deliberately NOT fenced — GDI GetGlyphIndicesW-verified present in BOTH
+//! the default Win10 Lucida Console AND Consolas (2026-07-15 probe on a real
+//! Win10 19045 conhost): `· — … • – → ← ↑ ↓ ▲`. On zh-CN conhost some render
 //! full-width (East Asian ambiguous width), which wobbles alignment but
 //! stays readable — a pre-existing cosmetic issue, out of scope here.
 //! Box-drawing IS fenced despite font coverage: frames are alignment-
 //! critical and full-width borders visually collapse the box on zh conhost.
+//!
+//! NOTE: `●` was previously in the not-fenced list on the ASSUMPTION it was
+//! font-safe; the probe found it MISSING in Lucida Console (the Win10
+//! default) → □. It, plus `↗ ↻ ➤ ❌`, are now fenced. Lesson: font coverage
+//! is an empirical fact to probe, not assume (there is no default font that
+//! covers everything — pick the ASCII fallback).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +51,12 @@ const FENCED: &[char] = &[
     '\u{29bf}', // ⦿
     '\u{276d}', // ❭
     '\u{2611}', // ☑
+    '\u{25cf}', // ● — MISSING in Lucida Console (Win10 default) → □; use RADIO_ON
+    '\u{25cb}', // ○ — empty circle, same font risk; use RADIO_OFF
+    '\u{2197}', // ↗ — MISSING in Lucida Console + Consolas; use LINK_OUT
+    '\u{21bb}', // ↻ — MISSING in Lucida Console + Consolas; use REFRESH
+    '\u{27a4}', // ➤ — MISSING in Lucida Console + Consolas; use POINTER
+    '\u{274c}', // ❌ — MISSING in every conhost font (emoji); use CROSS
     '\u{2500}', // ─
     '\u{2502}', // │
     '\u{250c}', // ┌

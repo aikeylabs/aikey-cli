@@ -75,6 +75,23 @@ pub const INFO: Sym = Sym {
     safe: "i",
 }; // ⓘ
 
+// ── Action / status prefixes (2026-07-15: GDI glyph-coverage probe on a real
+// Win10 conhost found these MISSING in the default Lucida Console font — they
+// rendered as □. Earlier they were left inline as "font-safe"; that was an
+// untested assumption. Now table-driven so Safe tier degrades them to ASCII.)
+pub const LINK_OUT: Sym = Sym {
+    fancy: "\u{2197}",
+    safe: "->",
+}; // ↗ open-external (list browser deeplink)
+pub const REFRESH: Sym = Sym {
+    fancy: "\u{21bb}",
+    safe: "~",
+}; // ↻ refreshed / updated (use / doctor)
+pub const POINTER: Sym = Sym {
+    fancy: "\u{27a4}",
+    safe: ">",
+}; // ➤ action pointer (route copy hint)
+
 // ── Statusline metrics (single line, width-flexible) ───────────────────────
 pub const STAT_UP: Sym = Sym {
     fancy: "\u{21e1}",
@@ -101,7 +118,11 @@ pub const BRAND: Sym = Sym {
 pub const RADIO_ON: Sym = Sym {
     fancy: "\u{25cf}",
     safe: "*",
-}; // ● selected / active
+}; // ● selected / active / running
+pub const RADIO_OFF: Sym = Sym {
+    fancy: "\u{25cb}",
+    safe: "o",
+}; // ○ stopped / inactive (service status)
 pub const CHECKBOX_ON: Sym = Sym {
     fancy: "\u{2611}",
     safe: "[x]",

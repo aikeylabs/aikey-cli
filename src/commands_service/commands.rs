@@ -129,7 +129,11 @@ fn status_all(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         for (name, running, detail) in &rows {
             // Aligned two-column table: fixed-width name, state glyph, detail.
-            let glyph = if *running { "●" } else { "○" };
+            let glyph = if *running {
+                crate::symbols::RADIO_ON.s()
+            } else {
+                crate::symbols::RADIO_OFF.s()
+            };
             println!("{glyph} {name:<12}  {detail}");
         }
     }

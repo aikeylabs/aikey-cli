@@ -173,7 +173,8 @@ pub fn handle_env_inject(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
 
         if is_eval_mode {
             eprintln!(
-                "❌ ERROR: Plaintext shell injection is not supported in this Stage 0 Rust CLI."
+                "{} ERROR: Plaintext shell injection is not supported in this Stage 0 Rust CLI.",
+                crate::symbols::CROSS.s()
             );
             eprintln!();
             eprintln!("   'aikey env inject' in eval mode would expose secrets in your shell.");

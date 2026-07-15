@@ -1378,11 +1378,17 @@ fn render_header(
 
     let (proxy_bullet, proxy_text) = match (state.proxy_pid_cache, state.proxy_alive_cache) {
         (Some(pid), true) => (
-            "●".truecolor(95, 200, 120).to_string(),
+            crate::symbols::RADIO_ON
+                .s()
+                .truecolor(95, 200, 120)
+                .to_string(),
             format!("proxy: ok (pid {})", pid),
         ),
         (Some(pid), false) => (
-            "●".truecolor(225, 95, 95).to_string(),
+            crate::symbols::RADIO_ON
+                .s()
+                .truecolor(225, 95, 95)
+                .to_string(),
             format!("proxy: DOWN (pid {} not responding)", pid),
         ),
         (None, _) => {
@@ -1396,7 +1402,13 @@ fn render_header(
                 }
                 None => "proxy: no activity recorded".to_string(),
             };
-            ("●".truecolor(210, 180, 90).to_string(), text)
+            (
+                crate::symbols::RADIO_ON
+                    .s()
+                    .truecolor(210, 180, 90)
+                    .to_string(),
+                text,
+            )
         }
     };
 
@@ -1567,7 +1579,11 @@ fn table_data_line(k: &KeyAggregate, now: SystemTime, sort: SortKey) -> String {
 fn decorate_session(cell: &str) -> String {
     use colored::Colorize;
     if cell.contains("· active") {
-        format!("{} {}", "●".truecolor(95, 200, 120), cell)
+        format!(
+            "{} {}",
+            crate::symbols::RADIO_ON.s().truecolor(95, 200, 120),
+            cell
+        )
     } else {
         cell.to_string()
     }

@@ -701,7 +701,7 @@ fn run_unified_list(
         // columns line up across Personal / Team / OAuth sections.
         let fmt_row = |r: &RowData| -> String {
             let marker = if r.active {
-                "●".green().to_string()
+                crate::symbols::RADIO_ON.s().green().to_string()
             } else {
                 " ".to_string()
             };
@@ -948,7 +948,7 @@ fn run_unified_list(
                 // Active when this account is currently serving at least
                 // one provider (matches the `aikey route` convention).
                 let marker = if r.has_use {
-                    "●".green().to_string()
+                    crate::symbols::RADIO_ON.s().green().to_string()
                 } else {
                     " ".to_string()
                 };
@@ -972,7 +972,7 @@ fn run_unified_list(
         // Legend lives outside the box so the frame stays focused on data.
         println!(
             "  {} {}",
-            "●".green(),
+            crate::symbols::RADIO_ON.s().green(),
             "= active (set by `aikey use`)".dimmed()
         );
 
@@ -993,12 +993,12 @@ fn run_unified_list(
         let vault_url = format!("{}/user/vault", vault_url);
         println!(
             "  {} {}",
-            "↗".dimmed(),
+            crate::symbols::LINK_OUT.s().dimmed(),
             format!("Open in browser: {}", vault_url).dimmed()
         );
         println!(
             "  {} {}",
-            "↗".dimmed(),
+            crate::symbols::LINK_OUT.s().dimmed(),
             "or run `aikey web --vault`".dimmed()
         );
     }
@@ -5018,7 +5018,7 @@ fn handle_route(
             .unwrap_or("my-key");
         eprintln!(
             "  {} {} {}",
-            "\u{27a4}".cyan(),
+            crate::symbols::POINTER.s().cyan(),
             "Copy-paste config:".bold(),
             format!("aikey route {}", example_label).cyan()
         );

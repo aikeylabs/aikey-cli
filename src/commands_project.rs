@@ -1476,7 +1476,10 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
     if pipeline_hint_on {
         use colored::Colorize;
         use std::io::Write;
-        println!("  {}", "↻ checking pipeline metrics…".dimmed());
+        println!(
+            "  {}",
+            format!("{} checking pipeline metrics…", crate::symbols::REFRESH.s()).dimmed()
+        );
         let _ = std::io::stdout().flush();
     }
     {
