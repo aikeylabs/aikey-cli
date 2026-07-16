@@ -975,6 +975,37 @@ fn detect_codex_model_provider_conflict(content: &str) -> Option<String> {
 ///
 /// Idempotent: repeated calls with no config change are safe (short-circuits
 /// on `desired == existing`).
+/// Answers to the first-time Codex consent prompt (方案一 2026-07-16).
+/// Deliberately no `Always` variant — see the `codexConsent` field docs in
+/// global_config.rs: a granted consent persists as the written aikey block
+/// itself, so "always" would be dead weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexConsentAnswer {
+    Yes,
+    No,
+    Never,
+}
+
+/// Empty input = Yes: preserves the pre-方案一 `[Y/n]` default so the
+/// onboarding path (`aikey add` first openai key → plain Enter) keeps
+/// configuring Codex. Keyword set mirrors claude_desktop's parser minus
+/// "always"/"a" (those fall through to No here).
+fn parse_codex_consent(input: &str) -> CodexConsentAnswer {
+    match input.trim().to_lowercase().as_str() {
+        "" | "y" | "yes" => CodexConsentAnswer::Yes,
+        "never" => CodexConsentAnswer::Never,
+        _ => CodexConsentAnswer::No,
+    }
+}
+
+/// A standing "never" refusal blocks only the FIRST write (the takeover
+/// decision itself). Once the aikey block exists — consent was granted
+/// materially — later reconciles must keep flowing (base_url port refresh,
+/// bearer-token upgrades) even if a stale pref value lingers in config.json.
+fn codex_consent_blocks(first_time: bool, stored: Option<&str>) -> bool {
+    first_time && stored == Some("never")
+}
+
 pub fn configure_codex_cli(proxy_port: u16) {
     use colored::Colorize;
     use std::io::{IsTerminal, Write};
@@ -995,11 +1026,26 @@ pub fn configure_codex_cli(proxy_port: u16) {
     let first_time = !existing.contains("model_providers.aikey")
         && !existing.contains(AIKEY_BEGIN)
         && !existing.contains(CODEX_LINE_MARKER);
+
+    // 方案一 (2026-07-16, user decision): one consent for the one physical
+    // switch — this config.toml is read by Codex CLI, the IDE extension AND
+    // the ChatGPT desktop app (Codex mode), so the prompt names all three
+    // surfaces, and a "never" answer holds as a standing refusal across
+    // every future activation event, TTY or headless (web add). Exit:
+    // `aikey hook install codex`. Unlike Claude Desktop there is no
+    // per-surface knob to gate separately — dropping only the desktop lines
+    // would leave the desktop routed-but-unauthenticated (worse than either
+    // state); see research/codex-desktop-takeover/2026-07-16-codex-desktop.md.
+    let stored_consent = crate::global_config::get_codex_consent().unwrap_or(None);
+    if codex_consent_blocks(first_time, stored_consent.as_deref()) {
+        return;
+    }
     if first_time && io::stderr().is_terminal() {
         let mut rows: Vec<String> = vec![
             format!("File:    {}", display_path(".codex/config.toml")),
             "Add:     openai_base_url + [model_providers.aikey]".to_string(),
             "         env_key = \"OPENAI_API_KEY\" (per-shell token)".to_string(),
+            "Routes:  Codex CLI, IDE extension, ChatGPT desktop app".to_string(),
         ];
         if !existing.is_empty() {
             rows.push(format!(
@@ -1007,13 +1053,30 @@ pub fn configure_codex_cli(proxy_port: u16) {
                 display_path(".codex/config.aikey_backup.toml")
             ));
         }
-        crate::ui_frame::eprint_box(crate::symbols::QUESTION.s(), "Configure Codex CLI", &rows);
-        eprint!("  Proceed? [Y/n] (default Y): ");
+        crate::ui_frame::eprint_box(crate::symbols::QUESTION.s(), "Configure Codex", &rows);
+        eprint!("  Proceed? [Y/n/never] (default Y): ");
         io::stderr().flush().ok();
         let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("n") {
-            eprintln!("  {}", "Skipped. Run 'aikey use' again to retry.".dimmed());
-            return;
+        if io::stdin().read_line(&mut input).is_err() {
+            // Unreadable stdin on a TTY → default Y (pre-方案一 behavior:
+            // the old code only skipped on an explicit "n").
+            input.clear();
+        }
+        match parse_codex_consent(&input) {
+            CodexConsentAnswer::Yes => {}
+            CodexConsentAnswer::No => {
+                eprintln!("  {}", "Skipped. Run 'aikey use' again to retry.".dimmed());
+                return;
+            }
+            CodexConsentAnswer::Never => {
+                let _ = crate::global_config::set_codex_consent_never();
+                eprintln!(
+                    "  {}",
+                    "Skipped permanently — aikey won't ask again. Undo: aikey hook install codex"
+                        .dimmed()
+                );
+                return;
+            }
         }
     }
 
@@ -4070,6 +4133,42 @@ tool_call_timeout_ms = 60000\n"
         assert!(out.contains(r#"env_key = "OPENAI_API_KEY""#));
         // Still valid TOML.
         out.parse::<toml_edit::Document>().expect("valid toml");
+    }
+
+    // 方案一 (2026-07-16): first-time consent prompt contract. Empty input
+    // must stay Yes (the `aikey add` onboarding path answers with a plain
+    // Enter), and "never" is the only keyword that persists a refusal —
+    // regressing either silently changes who gets configured.
+    #[test]
+    fn codex_consent_parser_contract() {
+        use CodexConsentAnswer::*;
+        assert_eq!(parse_codex_consent(""), Yes);
+        assert_eq!(parse_codex_consent("\n"), Yes);
+        assert_eq!(parse_codex_consent("y\n"), Yes);
+        assert_eq!(parse_codex_consent("YES"), Yes);
+        assert_eq!(parse_codex_consent("n"), No);
+        assert_eq!(parse_codex_consent("no"), No);
+        assert_eq!(parse_codex_consent("x"), No);
+        // claude_desktop accepts "always"/"a"; codex has no always semantics
+        // (the written block is the persistence) so these fall through to No.
+        assert_eq!(parse_codex_consent("always"), No);
+        assert_eq!(parse_codex_consent("a"), No);
+        assert_eq!(parse_codex_consent("never"), Never);
+        assert_eq!(parse_codex_consent(" NEVER \n"), Never);
+    }
+
+    // 方案一: a standing "never" blocks only the FIRST write. Once the block
+    // exists (consent granted materially), reconciles — port refresh,
+    // bearer-token upgrades — must keep flowing even with a stale pref.
+    #[test]
+    fn codex_never_blocks_first_write_only() {
+        assert!(codex_consent_blocks(true, Some("never")));
+        assert!(!codex_consent_blocks(false, Some("never")));
+        assert!(!codex_consent_blocks(true, None));
+        assert!(!codex_consent_blocks(false, None));
+        // Defensive: unknown stored values never block (mirrors the
+        // global_config reader filtering to exactly "never").
+        assert!(!codex_consent_blocks(true, Some("garbage")));
     }
 
     #[test]

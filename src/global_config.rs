@@ -23,6 +23,16 @@ pub struct GlobalConfig {
     #[serde(rename = "claudeDesktopConsent")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_desktop_consent: Option<String>,
+    /// Codex takeover persistent refusal (方案一 2026-07-16): `"never"` =
+    /// never ask again, never write `~/.codex/config.toml`. Unlike Claude
+    /// Desktop there is deliberately no `"always"` — a granted consent
+    /// persists as the written aikey block in config.toml itself (the
+    /// first-time prompt can never fire again once the block exists).
+    /// Cleared by `aikey hook install codex` (explicit actionable consent,
+    /// mirrors `aikey desktop install` lifting Claude Desktop's refusal).
+    #[serde(rename = "codexConsent")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_consent: Option<String>,
 }
 
 impl Default for GlobalConfig {
@@ -33,6 +43,7 @@ impl Default for GlobalConfig {
             current_env: None,
             current_org: None,
             claude_desktop_consent: None,
+            codex_consent: None,
         }
     }
 }
@@ -151,6 +162,31 @@ pub fn clear_claude_desktop_consent() -> Result<(), String> {
     let mut config = load_config()?;
     if config.claude_desktop_consent.is_some() {
         config.claude_desktop_consent = None;
+        save_config(&config)?;
+    }
+    Ok(())
+}
+
+/// Codex takeover consent (方案一). Only `"never"` is meaningful; anything
+/// else stored is treated as absent by readers (defensive, mirrors the
+/// claude reader above). See the `codex_consent` field docs for why there
+/// is no `"always"` counterpart.
+pub fn get_codex_consent() -> Result<Option<String>, String> {
+    Ok(load_config()?.codex_consent.filter(|v| v == "never"))
+}
+
+pub fn set_codex_consent_never() -> Result<(), String> {
+    let mut config = load_config()?;
+    config.codex_consent = Some("never".to_string());
+    save_config(&config)
+}
+
+/// Exit from a standing "never" — wired to `aikey hook install codex`
+/// (running that command is itself actionable consent).
+pub fn clear_codex_consent() -> Result<(), String> {
+    let mut config = load_config()?;
+    if config.codex_consent.is_some() {
+        config.codex_consent = None;
         save_config(&config)?;
     }
     Ok(())

@@ -1147,6 +1147,8 @@ pub(crate) enum HookAction {
         /// Integration target. Omit = install the shell precmd hook (default).
         /// `openclaw` = wire OpenClaw (龙虾 digital employee) to route its LLM
         /// calls through the local aikey proxy using the active team key.
+        /// `codex` = clear a standing Codex "never" refusal so the next
+        /// `aikey use` of an OpenAI key offers Codex configuration again.
         #[arg(value_name = "TARGET")]
         target: Option<String>,
         /// Override shell detection (zsh | bash). Default: detect from $SHELL.

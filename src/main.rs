@@ -6972,8 +6972,28 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                 Some("openclaw") => {
                     return commands_account::openclaw_hook::install(None).map_err(|e| e.into());
                 }
+                Some("codex") => {
+                    // 方案一 never-undo (2026-07-16): an explicit
+                    // `aikey hook install codex` is actionable consent —
+                    // clear the standing "never" so the next activation
+                    // event re-prompts (mirrors `aikey desktop install`
+                    // lifting Claude Desktop's refusal). No immediate
+                    // config write here on purpose: whether openai is
+                    // active is vault state we don't open for a pref
+                    // flip; the lifecycle funnel
+                    // (apply_third_party_cli_configs) owns the write.
+                    global_config::clear_codex_consent()?;
+                    eprintln!(
+                        "  {} Codex consent reset. Codex will be configured on your next `aikey use` of an OpenAI key.",
+                        crate::symbols::CHECK.s()
+                    );
+                    return Ok(());
+                }
                 Some(t) => {
-                    return Err(format!("unknown hook target '{t}' (supported: openclaw)").into());
+                    return Err(format!(
+                        "unknown hook target '{t}' (supported: openclaw, codex)"
+                    )
+                    .into());
                 }
                 None => {}
             }
