@@ -202,11 +202,14 @@ pub enum ProbeStage<'a> {
 /// reads as alive rather than mechanical — short enough that probe-level
 /// jitter (typical Ping-D / Ping-PROXY ~500 ms) catches the user mid-frame
 /// instead of leaving them staring at a frozen open-eye glyph.
+// glyph-fence-allow: these Fancy frames are emitted ONLY when unicode_tier()
+// is Fancy — blink_frames() swaps in BLINK_FRAMES_SAFE (ASCII eyes) on bare
+// conhost, so the ❬⦿❭ glyphs never reach a glyph-poor terminal.
 const BLINK_FRAMES_FANCY: &[(&str, u64)] = &[
-    ("\u{276C}\u{29BF}\u{B7}\u{29BF}\u{276D}", 1500), // ❬⦿·⦿❭
-    ("\u{276C}-\u{B7}-\u{276D}", 130),                // ❬-·-❭
-    ("\u{276C}\u{29BF}\u{B7}\u{29BF}\u{276D}", 180),  // ❬⦿·⦿❭
-    ("\u{276C}-\u{B7}-\u{276D}", 130),                // ❬-·-❭
+    ("\u{276C}\u{29BF}\u{B7}\u{29BF}\u{276D}", 1500), // ❬⦿·⦿❭ glyph-fence-allow
+    ("\u{276C}-\u{B7}-\u{276D}", 130),                // ❬-·-❭ glyph-fence-allow
+    ("\u{276C}\u{29BF}\u{B7}\u{29BF}\u{276D}", 180),  // ❬⦿·⦿❭ glyph-fence-allow
+    ("\u{276C}-\u{B7}-\u{276D}", 130),                // ❬-·-❭ glyph-fence-allow
 ];
 // win10-conhost-compat: conhost fonts have no ❬ ⦿ ❭ glyphs. The Safe tier
 // keeps the same cadence with ASCII eyes so the "alive" affordance survives.

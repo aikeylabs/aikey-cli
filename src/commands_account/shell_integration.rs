@@ -671,7 +671,7 @@ pub fn configure_kimi_cli(_proxy_port: u16) {
             }
             r
         };
-        crate::ui_frame::eprint_box("\u{2753}", "Configure Kimi CLI", &rows);
+        crate::ui_frame::eprint_box(crate::symbols::QUESTION.s(), "Configure Kimi CLI", &rows);
         eprint!("  Proceed? [Y/n] (default Y): ");
         io::stderr().flush().ok();
         let mut input = String::new();
@@ -896,6 +896,17 @@ pub(super) fn codex_merge(existing: &str, base_url: &str) -> (TomlMergeOutcome, 
     aikey_tbl["name"] = value("aikey");
     aikey_tbl["base_url"] = value(base_url);
     aikey_tbl["env_key"] = value("OPENAI_API_KEY");
+    // Codex Desktop (ChatGPT app's Codex mode) reads this same config.toml but
+    // runs outside the shell, so it never sees the `OPENAI_API_KEY` the shell
+    // wrapper exports — `env_key` alone can't reach it. Codex's auth chain
+    // (codex-rs model-provider `bearer_auth_for_provider`) tries `env_key`
+    // first, then falls through to this literal `experimental_bearer_token`
+    // when the env var is unset — so writing the follow-active sentinel here
+    // is what covers the desktop. CLI is unaffected: env_key wins when the
+    // shell wrapper has set OPENAI_API_KEY (same sentinel value, so consistent).
+    // Empirically verified 2026-07-16 (Codex Desktop sent this literal as the
+    // Bearer); see workflow/CI/research/codex-desktop-takeover/2026-07-16-codex-desktop.md.
+    aikey_tbl["experimental_bearer_token"] = value("aikey_active_openai");
     aikey_tbl["wire_api"] = value("responses");
     aikey_tbl["requires_openai_auth"] = value(false);
 
@@ -996,7 +1007,7 @@ pub fn configure_codex_cli(proxy_port: u16) {
                 display_path(".codex/config.aikey_backup.toml")
             ));
         }
-        crate::ui_frame::eprint_box("\u{2753}", "Configure Codex CLI", &rows);
+        crate::ui_frame::eprint_box(crate::symbols::QUESTION.s(), "Configure Codex CLI", &rows);
         eprint!("  Proceed? [Y/n] (default Y): ");
         io::stderr().flush().ok();
         let mut input = String::new();
@@ -2145,7 +2156,7 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
                 format!("File:   {}", canonical_rc_file.display()),
                 format!("Add:    source ~/.aikey/{}  (v3)", hook_filename),
             ];
-            crate::ui_frame::eprint_box("\u{2753}", "Install Shell Hook", &rows);
+            crate::ui_frame::eprint_box(crate::symbols::QUESTION.s(), "Install Shell Hook", &rows);
             eprint!("  Proceed? [Y/n] (default Y): ");
             io::stderr().flush().ok();
             let mut input = String::new();
@@ -3540,6 +3551,48 @@ mod hook_tests {
     }
 
     #[test]
+    fn hook_preflight_skips_diagnostic_probe_when_headless() {
+        // 2026-07-15 contract: with no TTY on stdin or stderr (Claude Code
+        // Bash-tool snapshot replay, IDE/SDK spawns, `zsh -ilc` CI runners)
+        // the y/N prompt can't be answered and the probe table can't be
+        // read. Before the guard, a failed probe silently aborted the
+        // wrapped CLI (`read` on /dev/null → default No → exit 1) or hung
+        // on an open-but-empty pipe, and every headless invocation paid a
+        // real upstream API probe. The wrapper must skip the diagnostic
+        // probe but STILL auto-start the proxy (prompt-free, the one
+        // preflight action headless callers need) and fail open.
+        for (label, c) in [("zsh", hook_zsh_content()), ("bash", hook_bash_content())] {
+            assert!(
+                c.contains("! -t 0") && c.contains("! -t 2"),
+                "{}: aikey_preflight must gate the diagnostic probe on \
+                 stdin AND stderr being TTYs",
+                label
+            );
+        }
+        // PowerShell has no `-t`; it must use the .NET redirection probes.
+        let ps1 = hook_ps1_content();
+        assert!(
+            ps1.contains("IsInputRedirected") && ps1.contains("IsErrorRedirected"),
+            "hook.ps1: headless guard must check [Console]::IsInputRedirected \
+             / IsErrorRedirected"
+        );
+        // The guard block is identifiable by its marker comment in all three
+        // templates — a refactor that drops the branch (or its proxy
+        // auto-start) trips this fence.
+        for (label, c) in [
+            ("zsh", hook_zsh_content()),
+            ("bash", hook_bash_content()),
+            ("ps1", hook_ps1_content()),
+        ] {
+            assert!(
+                c.contains("Headless guard"),
+                "{}: headless guard block missing from aikey_preflight",
+                label
+            );
+        }
+    }
+
+    #[test]
     fn hook_preflight_hints_when_no_active_binding() {
         // Missing AIKEY_ACTIVE_KEYS means the user hasn't run `aikey use`
         // yet. Silently passing through would leave first-time users staring
@@ -3996,6 +4049,27 @@ tool_call_timeout_ms = 60000\n"
             o => panic!("{o:?}"),
         };
         assert!(out.contains("127.0.0.1:19999"));
+    }
+
+    // Codex Desktop takeover (2026-07-16): the ChatGPT app's Codex mode reads
+    // this config.toml but runs outside the shell (no OPENAI_API_KEY env), so
+    // only the literal experimental_bearer_token reaches it. Fence both the new
+    // field AND that the CLI's env_key path is left intact.
+    #[test]
+    fn codex_merge_writes_experimental_bearer_token_for_desktop() {
+        let (outcome, _) = codex_merge("", "http://127.0.0.1:27200/openai");
+        let out = match outcome {
+            TomlMergeOutcome::Changed(s) => s,
+            o => panic!("{o:?}"),
+        };
+        assert!(
+            out.contains(r#"experimental_bearer_token = "aikey_active_openai""#),
+            "missing experimental_bearer_token (Codex Desktop takeover):\n{out}"
+        );
+        // CLI path unchanged: env_key still present (shell wrapper sets it).
+        assert!(out.contains(r#"env_key = "OPENAI_API_KEY""#));
+        // Still valid TOML.
+        out.parse::<toml_edit::Document>().expect("valid toml");
     }
 
     #[test]
@@ -6306,7 +6380,7 @@ mod stage3_review_fix_tests {
         // Managed VK + cluster node ⇒ node + THIS VK's real token.
         let (auth, token) =
             cluster_route_with(&CredentialType::ManagedVirtualKey, "vk-abc", node.clone())
-                .expect("managed VK on a cluster ⇒ node");
+                .expect("managed VK on a cluster => node");
         assert_eq!(auth, "10.0.0.5:27200");
         assert_eq!(
             token, "aikey_team_vk-abc",
@@ -6327,14 +6401,14 @@ mod stage3_review_fix_tests {
         let dir = tmp.path();
         assert!(
             read_cluster_node_in(dir).is_none(),
-            "absent ⇒ None (all local)"
+            "absent => None (all local)"
         );
         std::fs::write(cluster_node_path_in(dir), r#"{"authority":"node2:27200"}"#).unwrap();
         assert_eq!(read_cluster_node_in(dir).as_deref(), Some("node2:27200"));
         std::fs::write(cluster_node_path_in(dir), r#"{"authority":""}"#).unwrap();
         assert!(
             read_cluster_node_in(dir).is_none(),
-            "blank authority ⇒ None"
+            "blank authority => None"
         );
     }
 

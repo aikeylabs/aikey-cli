@@ -292,7 +292,11 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
 
     // --- Banner --------------------------------------------------------
     println!();
-    println!("  \u{1F680} {}", "AiKey Quickstart".bold());
+    println!(
+        "  {}{}",
+        crate::symbols::ICON_ROCKET.pre(),
+        "AiKey Quickstart".bold()
+    );
     println!(
         "  {}",
         "Next steps tailored to your current state.".dimmed()
@@ -693,7 +697,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 let trimmed = label.trim_start();
                 println!(
                     "    {} {}",
-                    format!("↳ {:<16}", trimmed).dimmed(),
+                    format!("{} {:<16}", crate::symbols::HINT_ARROW.s(), trimmed).dimmed(),
                     detail.dimmed()
                 );
                 if let Some(h) = hint {
@@ -708,7 +712,10 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 // Label column width 20 = longest label (`compliance-deep-scan`).
                 println!("{} {:<20} {}", icon, label, detail);
                 if let Some(h) = hint {
-                    println!("  {}", format!("↳ {}", h).dimmed());
+                    println!(
+                        "  {}",
+                        format!("{} {}", crate::symbols::HINT_ARROW.s(), h).dimmed()
+                    );
                 }
             }
         }
@@ -1643,7 +1650,10 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
             // Label column width 20 = longest label (`compliance-deep-scan`).
             println!("{} {:<20} {}", icon, label, detail);
             if let Some(ref h) = hint {
-                println!("  {}", format!("↳ Start: {}", h).dimmed());
+                println!(
+                    "  {}",
+                    format!("{} Start: {}", crate::symbols::HINT_ARROW.s(), h).dimmed()
+                );
             }
         }
         results.push(serde_json::json!({
@@ -2513,7 +2523,7 @@ fn render_ingest_health() {
             );
             println!(
                 "   {} {} occurrences in tail window",
-                "↳".dimmed(),
+                crate::symbols::HINT_ARROW.s().dimmed(),
                 n.to_string().dimmed()
             );
         }
@@ -2544,12 +2554,12 @@ fn render_ingest_health() {
             .join(", ");
         println!(
             "{} {} historical insert failures (already fixed — column now present in DB):",
-            "ℹ".cyan(),
+            crate::symbols::INFO_I.s().cyan(),
             total.to_string().dimmed()
         );
         println!("   {}", cols_str.dimmed());
         println!("   {} log retains pre-fix entries; run a fresh canary or `aikey doctor --detail` later to confirm clean tail",
-            "↳".dimmed());
+            crate::symbols::HINT_ARROW.s().dimmed());
     }
     if !not_null_cols.is_empty() {
         printed_any = true;
@@ -2568,7 +2578,7 @@ fn render_ingest_health() {
         }
         println!(
             "   {} usually means proxy emitted an event with a missing field — check reportable.go",
-            "↳".dimmed()
+            crate::symbols::HINT_ARROW.s().dimmed()
         );
     }
     if !check_violations.is_empty() {
@@ -2586,7 +2596,7 @@ fn render_ingest_health() {
         }
         println!(
             "   {} an enum value drifted out of allowed range — check provider extractor",
-            "↳".dimmed()
+            crate::symbols::HINT_ARROW.s().dimmed()
         );
     }
     if !printed_any {
@@ -2596,7 +2606,7 @@ fn render_ingest_health() {
             any_insert_fail.to_string()
         );
         println!("   {} grep ~/.aikey/logs/control-trial.log for 'insert event failed' to inspect raw lines",
-            "↳".dimmed());
+            crate::symbols::HINT_ARROW.s().dimmed());
     }
 }
 

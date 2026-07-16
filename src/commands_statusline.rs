@@ -1390,7 +1390,7 @@ fn install_inner(force: bool, quiet: bool) -> io::Result<InstallOutcome> {
             format!("(the existing value will be backed up)"),
         ];
         crate::ui_frame::eprint_box(
-            "\u{2753}",
+            crate::symbols::QUESTION.s(),
             "Claude Code statusLine already configured",
             &rows,
         );

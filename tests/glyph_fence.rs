@@ -35,9 +35,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Glyphs that must not appear outside src/symbols.rs: missing from conhost
-/// fonts (render as □) or alignment-critical box drawing, plus a blanket
-/// ban on emoji/symbol planes.
+/// Documentation of specific known-offender glyphs and their replacements.
+/// NOTE: `is_fenced` no longer consults this list — it blanket-fences the
+/// whole `0x2010..=0x2BFF` symbol/arrow/box/dingbat swath (plus emoji) minus
+/// `ALLOWED_INLINE`. This allowlist flip is deliberate: the old denylist
+/// leaked `●`, then `↳◆ℹ❓`, then `↔◀▶`, across three rounds — each a glyph
+/// nobody thought to list. Kept here purely as a "what maps to what" index.
+#[allow(dead_code)]
 const FENCED: &[char] = &[
     '\u{2713}', // ✓
     '\u{2717}', // ✗
@@ -57,6 +61,11 @@ const FENCED: &[char] = &[
     '\u{21bb}', // ↻ — MISSING in Lucida Console + Consolas; use REFRESH
     '\u{27a4}', // ➤ — MISSING in Lucida Console + Consolas; use POINTER
     '\u{274c}', // ❌ — MISSING in every conhost font (emoji); use CROSS
+    '\u{21b3}', // ↳ — MISSING in Lucida Console (doctor hints); use HINT_ARROW
+    '\u{25c6}', // ◆ — MISSING in Lucida Console (add/auth prompts); use PROMPT
+    '\u{2139}', // ℹ — MISSING in Lucida Console; use INFO_I
+    '\u{2753}', // ❓ — MISSING in Lucida Console (dialog icons); use QUESTION
+    '\u{23f1}', // ⏱ — MISSING in every conhost font (emoji); use STOPWATCH
     '\u{2500}', // ─
     '\u{2502}', // │
     '\u{250c}', // ┌
@@ -65,8 +74,69 @@ const FENCED: &[char] = &[
     '\u{2518}', // ┘
 ];
 
+/// The ONLY non-ASCII glyphs allowed inline in output strings — GDI
+/// GetGlyphIndicesW-verified present in ALL THREE conhost fonts a Win10 user
+/// might have: Lucida Console (en default), Consolas, and NSimSun (zh-CN
+/// default). Everything else in the symbol/arrow/box/dingbat/emoji range is
+/// fenced (allowlist, not denylist — denylist leaked ●, ↳◆, then ↔ across
+/// three rounds). `·`(00B7) and `×`(00D7) sit below the fenced range so they
+/// need no entry here.
+const ALLOWED_INLINE: &[char] = &[
+    '\u{2192}', // →
+    '\u{2190}', // ←
+    '\u{2191}', // ↑
+    '\u{2193}', // ↓
+    '\u{2014}', // —
+    '\u{2013}', // –
+    '\u{2026}', // …
+    '\u{2022}', // •
+    '\u{25b2}', // ▲
+    '\u{2264}', // ≤ — GDI-ok on Lucida/Consolas/NSimSun (test & error messages)
+    '\u{2260}', // ≠ — GDI-ok on all three
+    '\u{2265}', // ≥ — GDI-ok on all three
+];
+
 fn is_fenced(c: char) -> bool {
-    FENCED.contains(&c) || (c as u32) >= 0x1F000 // emoji & symbol planes
+    if ALLOWED_INLINE.contains(&c) {
+        return false;
+    }
+    let cp = c as u32;
+    // Blanket-fence the Unicode blocks conhost fonts routinely lack a glyph
+    // for (arrows, math, misc-technical, box, block, geometric, misc-symbols,
+    // dingbats, supplemental arrows) plus the emoji planes. This is the
+    // root-cause close: a NEW glyph anywhere in this swath is auto-caught, so
+    // it must go through src/symbols.rs (Fancy/Safe) instead of shipping □.
+    // FENCED is kept only as documentation of the specific known offenders.
+    let _ = FENCED;
+    (0x2010..=0x2bff).contains(&cp) || cp >= 0x1f000
+}
+
+/// Find the first `\u{XXXX}` escape in `code` whose decoded codepoint is
+/// fenced. Catches escaped-form offenders (e.g. `"\u{25c6}"`) that a raw
+/// `chars()` scan misses. Returns the offending char, not the escape text.
+fn escaped_fenced(code: &str) -> Option<char> {
+    let bytes = code.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b'\\' && bytes[i + 1] == b'u' && bytes[i + 2] == b'{' {
+            let start = i + 3;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b'}' {
+                j += 1;
+            }
+            if let Ok(cp) = u32::from_str_radix(&code[start..j], 16) {
+                if let Some(c) = char::from_u32(cp) {
+                    if is_fenced(c) {
+                        return Some(c);
+                    }
+                }
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Strip `//` line comments and `/* */` block comments, quote-aware:
@@ -207,11 +277,29 @@ fn user_visible_glyphs_only_in_symbols_table() {
         if path.file_name().is_some_and(|n| n == "symbols.rs") {
             continue; // the single allowed home for these glyphs
         }
+        // cli.rs's only fancy glyphs are the owl banner art, which
+        // `print_banner` renders ONLY in Fancy tier (Safe tier prints a plain
+        // text banner and returns early) — those literals never reach a
+        // glyph-poor conhost. Its help_template is ASCII + SGR (no glyphs).
+        let banner_art_file = path.file_name().is_some_and(|n| n == "cli.rs");
         let text = fs::read_to_string(&path).expect("readable source file");
         let mut in_block = false;
         for (idx, line) in text.lines().enumerate() {
+            // Lines carrying a Safe-tier-gated art marker (e.g. the connectivity
+            // blink animation, whose Fancy frames are swapped for ASCII in Safe
+            // tier) are legitimately allowed to hold fenced glyphs inline.
+            if banner_art_file || line.contains("glyph-fence-allow") {
+                continue;
+            }
             let code = strip_comments(line, &mut in_block);
-            if let Some(c) = code.chars().find(|&c| is_fenced(c)) {
+            // Check BOTH raw glyph literals AND `\u{XXXX}` escape spellings —
+            // the SGR→colored migration produced escaped forms, and hand-written
+            // escapes (e.g. "\u{25c6}") would otherwise evade a raw-char scan.
+            let offender = code
+                .chars()
+                .find(|&c| is_fenced(c))
+                .or_else(|| escaped_fenced(&code));
+            if let Some(c) = offender {
                 violations.push(format!(
                     "{}:{}: fenced glyph '{}' (U+{:04X}) — route it through src/symbols.rs",
                     path.strip_prefix(&src).unwrap_or(&path).display(),

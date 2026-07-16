@@ -262,6 +262,11 @@ pub(crate) struct ClusterSnapshotPayload {
     /// platform_client.rs (the cli-channel twin).
     #[serde(default)]
     quota_snapshot: Option<ClusterQuotaSnapshot>,
+    /// org-wide seat-keyed OAuth token bundle (alpha.5, §3.2) — the material
+    /// for group-backed VKs. Absent from old controls → group VKs (if any)
+    /// keep their last-known group_runtime (no clobber on partial upgrade).
+    #[serde(default)]
+    oauth_group_runtime: Option<ClusterGroupRuntime>,
     /// Optional node master password. When present, aikey derives the vault key
     /// itself (single source of truth for the Argon2id derivation) instead of
     /// the caller passing a pre-derived `vault_key_hex`. Used by the cluster
@@ -320,6 +325,77 @@ struct ClusterVk {
     /// across the seat's VKs — deduped by seat_id when building cache entries.
     #[serde(default)]
     seat_quota: Vec<ClusterSeatQuota>,
+    /// Group-VK fields (alpha.5 online-agent, §3.2/§3.3). oauth_group_id marks a
+    /// group-backed VK: it arrives with NO slots (its material rides the
+    /// payload's `oauth_group_runtime`) and is written through the group path.
+    /// token_seat_id is the seat whose member tokens this VK borrows — the
+    /// PARENT seat for an agent VK (INV-A, projected by master at delivery).
+    #[serde(default)]
+    oauth_group_id: Option<String>,
+    #[serde(default)]
+    token_seat_id: Option<String>,
+    /// Protocol of the group binding (group rows only; slot-less).
+    #[serde(default)]
+    protocol_type: Option<String>,
+}
+
+// ---- oauth_group_runtime (alpha.5, §3.2): org-wide seat-keyed OAuth tokens ----
+//
+// NOTE deliberately NO refresh field anywhere in these shapes (master never
+// sends one; a stray field would be dropped by serde and never stored).
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ClusterGroupRuntime {
+    #[serde(default)]
+    groups: Vec<ClusterRuntimeGroup>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClusterRuntimeGroup {
+    oauth_group_id: String,
+    #[serde(default)]
+    provider_code: String,
+    #[serde(default)]
+    routing_config: String,
+    #[serde(default)]
+    accounts: Vec<ClusterRuntimeAccount>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClusterRuntimeAccount {
+    #[serde(default)]
+    account_id: String,
+    credential_id: String,
+    #[serde(default)]
+    identity: String,
+    #[serde(default)]
+    external_id: String,
+    #[serde(default)]
+    priority: i64,
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    window_max_util_pct: Option<i64>,
+    #[serde(default)]
+    window_status: String,
+    #[serde(default)]
+    window_reset_at: Option<i64>,
+    /// Per-account egress proxy (§11.7, P7). Non-secret operational routing
+    /// config — projected PLAINTEXT into group_runtime material (not encrypted,
+    /// unlike access_token). "" when unset → proxy uses its node-level egress
+    /// chain.
+    #[serde(default)]
+    egress_proxy_url: String,
+    /// seat_id → token. The apply projects member_tokens[token_seat_id] per VK.
+    #[serde(default)]
+    member_tokens: std::collections::HashMap<String, ClusterMemberToken>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClusterMemberToken {
+    access_token: String,
+    #[serde(default)]
+    token_expires_at: i64,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -470,6 +546,174 @@ pub(crate) fn resolve_cluster_vault_key(
     Ok(key)
 }
 
+/// Applies one GROUP-backed VK (alpha.5, §3.3): upserts the structural cache row
+/// (oauth_group_id / routing_config / group_accounts — same columns the member
+/// rail's structural sync writes) and then writes `group_runtime` — the
+/// map[account_id]material JSON the proxy reader (vkeys.GroupRuntimeAccount)
+/// already parses on the member rail, so the proxy hot path needs ZERO changes.
+///
+/// INV-A is enforced HERE: each account's secret is the token of
+/// `member_tokens[vk.token_seat_id]` — master set token_seat_id to the PARENT
+/// seat for agent VKs. A seat with no usable token becomes a needs_login row
+/// (proxy answers LOGIN_REQUIRED for that account, distinct from absent).
+///
+/// At-rest format contract: AES-256-GCM with the vault derived key, 12-byte
+/// nonce, nonce/ciphertext base64(std) in secret_nonce/secret_ciphertext —
+/// byte-compatible with the proxy writer supervisor.buildGroupRuntimeJSON.
+/// PURE projection of one group's bundle into (group_accounts refs,
+/// group_runtime material map) for ONE borrowing seat (token_seat). Split out
+/// of apply_group_vk so the INV-A projection + at-rest format are unit-testable
+/// without a vault. See apply_group_vk's doc for the format contract.
+fn build_group_runtime_material(
+    key: &[u8; 32],
+    g: &ClusterRuntimeGroup,
+    token_seat: &str,
+) -> Result<
+    (
+        Vec<serde_json::Value>,
+        serde_json::Map<String, serde_json::Value>,
+    ),
+    String,
+> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut refs: Vec<serde_json::Value> = Vec::new();
+    let mut material = serde_json::Map::new();
+    for a in g.accounts.iter().filter(|a| a.enabled) {
+        refs.push(serde_json::json!({
+            "account_id": a.account_id,
+            "identity": a.identity,
+            "provider_code": g.provider_code,
+            "priority": a.priority,
+            "assigned": false,
+            "credential_id": a.credential_id,
+        }));
+        let mut m = serde_json::Map::new();
+        m.insert("credential_type".into(), "oauth_account".into());
+        if !a.identity.is_empty() {
+            m.insert("identity".into(), a.identity.clone().into());
+        }
+        if !g.provider_code.is_empty() {
+            m.insert("provider_code".into(), g.provider_code.clone().into());
+        }
+        m.insert("priority".into(), a.priority.into());
+        // Per-account egress proxy (§11.7, P7): account-level routing config,
+        // written PLAINTEXT (non-secret) and OUTSIDE the token match — it
+        // applies to the account regardless of whether the borrowed seat has a
+        // usable token. "" → omitted, so the proxy falls back to its node-level
+        // egress chain (byte-unchanged material for accounts with no override).
+        if !a.egress_proxy_url.is_empty() {
+            m.insert("egress_proxy_url".into(), a.egress_proxy_url.clone().into());
+        }
+        match a.member_tokens.get(token_seat) {
+            Some(tok) if !tok.access_token.is_empty() => {
+                let (nonce, ct) = crate::crypto::encrypt(key, tok.access_token.as_bytes())?;
+                m.insert("secret_nonce".into(), b64.encode(nonce).into());
+                m.insert("secret_ciphertext".into(), b64.encode(ct).into());
+                if tok.token_expires_at > 0 {
+                    m.insert("expires_at".into(), tok.token_expires_at.into());
+                }
+                if !a.external_id.is_empty() {
+                    m.insert("external_id".into(), a.external_id.clone().into());
+                }
+                if let Some(w) = a.window_max_util_pct {
+                    m.insert("window_max_util_pct".into(), w.into());
+                }
+                if !a.window_status.is_empty() {
+                    m.insert("window_status".into(), a.window_status.clone().into());
+                }
+                if let Some(w) = a.window_reset_at {
+                    m.insert("window_reset_at".into(), w.into());
+                }
+            }
+            _ => {
+                // No usable token for the borrowed seat → explicit needs_login
+                // marker (P1 semantics): the proxy returns LOGIN_REQUIRED for
+                // THIS account, and the member (the agent's parent) is the one
+                // who must log in.
+                m.insert("needs_login".into(), true.into());
+            }
+        }
+        material.insert(a.account_id.clone(), serde_json::Value::Object(m));
+    }
+    Ok((refs, material))
+}
+
+fn apply_group_vk(
+    key: &[u8; 32],
+    payload: &ClusterSnapshotPayload,
+    vk: &ClusterVk,
+    gid: &str,
+) -> Result<(), String> {
+    let bundle = payload
+        .oauth_group_runtime
+        .as_ref()
+        .and_then(|rt| rt.groups.iter().find(|g| g.oauth_group_id == gid));
+    let token_seat = vk.token_seat_id.as_deref().unwrap_or(&vk.seat_id);
+
+    let (provider_code, routing_config) = bundle
+        .map(|g| (g.provider_code.clone(), g.routing_config.clone()))
+        .unwrap_or_default();
+
+    // group_accounts refs (ranking candidates) + group_runtime material map.
+    let (refs, material) = match bundle {
+        Some(g) => build_group_runtime_material(key, g, token_seat)?,
+        None => (Vec::new(), serde_json::Map::new()),
+    };
+
+    let entry = storage::VirtualKeyCacheEntry {
+        virtual_key_id: vk.virtual_key_id.clone(),
+        org_id: payload.org_id.clone(),
+        seat_id: vk.seat_id.clone(),
+        alias: vk.alias.clone(),
+        provider_code: provider_code.clone(),
+        protocol_type: vk.protocol_type.clone().unwrap_or_default(),
+        base_url: String::new(), // group routing resolves per-account upstream, not via a static base_url
+        credential_id: String::new(),
+        credential_revision: String::new(),
+        virtual_key_revision: vk.virtual_key_revision.clone(),
+        key_status: vk.key_status.clone(),
+        share_status: "claimed".to_string(),
+        local_state: "synced_inactive".to_string(),
+        expires_at: vk.expires_at,
+        provider_key_nonce: None, // no static key material on a group VK
+        provider_key_ciphertext: None,
+        synced_at: 0,
+        local_alias: None,
+        supported_providers: if provider_code.is_empty() {
+            Vec::new()
+        } else {
+            vec![provider_code]
+        },
+        provider_base_urls: std::collections::HashMap::new(),
+        owner_account_id: Some(vk.owner_account_id.clone()),
+        owner_email: None,
+        group_runtime: None, // written below via the dedicated setter (upsert fences it)
+        extra: None,
+        oauth_group_id: Some(gid.to_string()),
+        group_accounts: Some(serde_json::to_string(&refs).unwrap_or_else(|_| "[]".to_string())),
+        routing_config: if routing_config.is_empty() {
+            Some("{}".to_string())
+        } else {
+            Some(routing_config)
+        },
+        group_alias: None,
+    };
+    storage::upsert_virtual_key_cache(&entry)?;
+
+    // Material write is separate on purpose: the structural upsert fences
+    // group_runtime out of DO UPDATE SET (member-rail proxy ownership); on a
+    // worker node THIS apply is the sole writer. When the bundle is absent
+    // (old control), skip — keep the last-known material instead of clobbering.
+    if bundle.is_some() {
+        storage::set_group_runtime_for_vk(
+            &vk.virtual_key_id,
+            &serde_json::Value::Object(material).to_string(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Core of cluster_apply_snapshot: encrypt + upsert each VK (owner taken per-VK
 /// from the payload) into managed_virtual_keys_cache, then mark any cached VK not
 /// in the snapshot stale. Pure of stdin/stdout so it's unit-testable. The caller
@@ -484,6 +728,24 @@ pub(crate) fn apply_cluster_snapshot(
     let mut skipped = 0usize;
 
     for vk in &payload.virtual_keys {
+        // Group-backed VK (alpha.5): slot-less by design — its material rides
+        // oauth_group_runtime, joined here via token_seat_id (§3.3 projection).
+        if let Some(gid) = vk.oauth_group_id.as_deref().filter(|s| !s.is_empty()) {
+            match apply_group_vk(key, payload, vk, gid) {
+                Ok(()) => {
+                    applied += 1;
+                    seen.insert(vk.virtual_key_id.clone());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[_internal cluster_apply WARN] group vk {}: {}",
+                        vk.virtual_key_id, e
+                    );
+                    skipped += 1;
+                }
+            }
+            continue;
+        }
         // Primary binding = first target of the first slot.
         let (slot, target) = match vk
             .slots
@@ -2795,5 +3057,202 @@ mod hook_envelope_tests {
         });
 
         assert_eq!(json["hook_rc_wired"], serde_json::json!(true));
+    }
+
+    /// FENCE (alpha.5 §3.3, INV-A projection): a group VK's material is built
+    /// from member_tokens[token_seat] — for an agent VK master sets token_seat
+    /// to the PARENT, so the encrypted secret MUST round-trip to the PARENT's
+    /// token (never another seat's). Seats without a usable token become
+    /// explicit needs_login rows; the wire carries NO refresh material.
+    #[test]
+    fn group_runtime_material_projects_parent_token() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let key = [7u8; 32];
+
+        let mut tokens_a = std::collections::HashMap::new();
+        tokens_a.insert(
+            "seat-parent".to_string(),
+            ClusterMemberToken {
+                access_token: "parent-token-AAA".into(),
+                token_expires_at: 4200,
+            },
+        );
+        tokens_a.insert(
+            "seat-other".to_string(),
+            ClusterMemberToken {
+                access_token: "other-token-BBB".into(),
+                token_expires_at: 4300,
+            },
+        );
+        let g = ClusterRuntimeGroup {
+            oauth_group_id: "g1".into(),
+            provider_code: "anthropic".into(),
+            routing_config: "{}".into(),
+            accounts: vec![
+                ClusterRuntimeAccount {
+                    account_id: "acc-1".into(),
+                    credential_id: "cred-1".into(),
+                    identity: "a@x.io".into(),
+                    external_id: "ext-1".into(),
+                    priority: 1,
+                    enabled: true,
+                    window_max_util_pct: Some(80),
+                    window_status: "ok".into(),
+                    window_reset_at: None,
+                    egress_proxy_url: "socks5://10.0.0.9:1080".into(),
+                    member_tokens: tokens_a,
+                },
+                ClusterRuntimeAccount {
+                    account_id: "acc-2".into(),
+                    credential_id: "cred-2".into(),
+                    identity: String::new(),
+                    external_id: String::new(),
+                    priority: 2,
+                    enabled: true,
+                    window_max_util_pct: None,
+                    window_status: String::new(),
+                    window_reset_at: None,
+                    egress_proxy_url: String::new(), // no override → falls back to node chain
+                    member_tokens: std::collections::HashMap::new(), // parent never logged in
+                },
+                ClusterRuntimeAccount {
+                    account_id: "acc-off".into(),
+                    credential_id: "cred-off".into(),
+                    identity: String::new(),
+                    external_id: String::new(),
+                    priority: 3,
+                    enabled: false, // disabled → excluded entirely
+                    window_max_util_pct: None,
+                    window_status: String::new(),
+                    window_reset_at: None,
+                    egress_proxy_url: String::new(),
+                    member_tokens: std::collections::HashMap::new(),
+                },
+            ],
+        };
+
+        // token_seat = the PARENT (what master stamps for an agent VK).
+        let (refs, material) =
+            build_group_runtime_material(&key, &g, "seat-parent").expect("build");
+
+        assert_eq!(refs.len(), 2, "disabled account must not appear in refs");
+        assert_eq!(
+            material.len(),
+            2,
+            "disabled account must not appear in material"
+        );
+
+        // acc-1: encrypted secret round-trips to the PARENT's token (INV-A).
+        let m1 = material["acc-1"].as_object().unwrap();
+        let nonce = b64.decode(m1["secret_nonce"].as_str().unwrap()).unwrap();
+        let ct = b64
+            .decode(m1["secret_ciphertext"].as_str().unwrap())
+            .unwrap();
+        let plain = crate::crypto::decrypt(&key, &nonce, &ct).expect("decrypt");
+        assert_eq!(
+            String::from_utf8(plain.to_vec()).unwrap(),
+            "parent-token-AAA",
+            "material must be the PARENT seat's token, never another seat's"
+        );
+        assert_eq!(m1["expires_at"], serde_json::json!(4200));
+        assert_eq!(m1["external_id"], serde_json::json!("ext-1"));
+        assert_eq!(m1["credential_type"], serde_json::json!("oauth_account"));
+        assert!(m1.get("needs_login").is_none());
+        // Per-account egress proxy (§11.7, P7): projected PLAINTEXT, account-level.
+        assert_eq!(
+            m1["egress_proxy_url"],
+            serde_json::json!("socks5://10.0.0.9:1080"),
+            "configured egress must project to node vault material"
+        );
+
+        // acc-2: parent has no token → explicit needs_login, no secret fields.
+        let m2 = material["acc-2"].as_object().unwrap();
+        assert_eq!(m2["needs_login"], serde_json::json!(true));
+        assert!(m2.get("secret_ciphertext").is_none());
+        // Empty egress override is OMITTED → proxy falls back to its node-level
+        // egress chain (byte-unchanged material for accounts with no override).
+        assert!(
+            m2.get("egress_proxy_url").is_none(),
+            "blank egress must be omitted, not written as empty string"
+        );
+
+        // Structural no-refresh invariant on the serialized bytes.
+        let wire = serde_json::Value::Object(material).to_string();
+        assert!(
+            !wire.to_lowercase().contains("refresh"),
+            "group_runtime wire must carry no refresh material: {wire}"
+        );
+    }
+
+    /// FENCE (五跳合约, hop 1→3): a VERBATIM sample of master's org
+    /// key-delivery response (handler_org_delivery.go orgVirtualKey +
+    /// groupruntime.OrgGroupRuntime wire tags) must deserialize into
+    /// ClusterSnapshotPayload with every group field populated. Catches JSON
+    /// key drift between repos — if master renames a tag, this red-lines on
+    /// the cli side instead of silently deserializing defaults (the daemon
+    /// relays verbatim, so master⇄cli is the only drift surface).
+    #[test]
+    fn cluster_payload_parses_master_group_wire_sample() {
+        let sample = serde_json::json!({
+            "org_id": "org-cluster",
+            "virtual_keys": [{
+                "virtual_key_id": "vk-agent",
+                "owner_account_id": "acct-svc",
+                "seat_id": "seat-agent",
+                "alias": "team-oauth-pool",
+                "key_status": "active",
+                "virtual_key_revision": "r1",
+                "slots": [],
+                "oauth_group_id": "g1",
+                "token_seat_id": "seat-parent",
+                "protocol_type": "anthropic"
+            }],
+            "oauth_group_runtime": {
+                "groups": [{
+                    "oauth_group_id": "g1",
+                    "provider_code": "anthropic",
+                    "routing_config": "{}",
+                    "accounts": [{
+                        "account_id": "acc-1",
+                        "credential_id": "cred-1",
+                        "identity": "a@x.io",
+                        "external_id": "ext-1",
+                        "priority": 1,
+                        "enabled": true,
+                        "egress_proxy_url": "socks5://10.0.0.9:1080",
+                        "member_tokens": {
+                            "seat-parent": {
+                                "access_token": "tok-abc",
+                                "token_expires_at": 4200,
+                                "token_status": "logged_in"
+                            }
+                        }
+                    }]
+                }]
+            }
+        });
+        let p: ClusterSnapshotPayload =
+            serde_json::from_value(sample).expect("master wire sample must parse");
+        let vk = &p.virtual_keys[0];
+        assert_eq!(vk.oauth_group_id.as_deref(), Some("g1"));
+        assert_eq!(vk.token_seat_id.as_deref(), Some("seat-parent"));
+        assert_eq!(vk.protocol_type.as_deref(), Some("anthropic"));
+        let g = &p.oauth_group_runtime.as_ref().expect("runtime").groups[0];
+        assert_eq!(g.provider_code, "anthropic");
+        let a = &g.accounts[0];
+        assert_eq!(a.account_id, "acc-1");
+        assert!(a.enabled);
+        assert_eq!(
+            a.egress_proxy_url, "socks5://10.0.0.9:1080",
+            "per-account egress_proxy_url must survive the master<->cli wire (§11.7)"
+        );
+        assert_eq!(
+            a.member_tokens
+                .get("seat-parent")
+                .map(|t| t.access_token.as_str()),
+            Some("tok-abc"),
+            "seat-keyed member_tokens must survive the wire"
+        );
     }
 }

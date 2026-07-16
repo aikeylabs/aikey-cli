@@ -91,6 +91,42 @@ pub const POINTER: Sym = Sym {
     fancy: "\u{27a4}",
     safe: ">",
 }; // ➤ action pointer (route copy hint)
+pub const HINT_ARROW: Sym = Sym {
+    fancy: "\u{21b3}",
+    safe: "->",
+}; // ↳ doctor sub-item / remediation hint (distinct from SAME_AS_ABOVE ditto)
+pub const PROMPT: Sym = Sym {
+    fancy: "\u{25c6}",
+    safe: "*",
+}; // ◆ interactive input prompt + auth status bullet
+pub const INFO_I: Sym = Sym {
+    fancy: "\u{2139}",
+    safe: "i",
+}; // ℹ information (letterlike; distinct fancy from INFO's ⓘ)
+pub const QUESTION: Sym = Sym {
+    fancy: "\u{2753}",
+    safe: "",
+}; // ❓ dialog-box icon (decorative → dropped in Safe tier)
+pub const STOPWATCH: Sym = Sym {
+    fancy: "\u{23f1}",
+    safe: "",
+}; // ⏱ timing icon (decorative → dropped in Safe tier)
+pub const COMPARE: Sym = Sym {
+    fancy: "\u{2194}",
+    safe: "<->",
+}; // ↔ two-source compare (doctor drift labels; □ on NSimSun)
+pub const TREE_EXPANDED: Sym = Sym {
+    fancy: "\u{25bc}",
+    safe: "v",
+}; // ▼ expanded group (picker)
+pub const TREE_COLLAPSED: Sym = Sym {
+    fancy: "\u{25b6}",
+    safe: ">",
+}; // ▶ collapsed group (picker; □ on all conhost fonts)
+pub const ACTIVE_ARROW: Sym = Sym {
+    fancy: "\u{25c0}",
+    safe: "<",
+}; // ◀ active-row marker (□ on all conhost fonts)
 
 // ── Statusline metrics (single line, width-flexible) ───────────────────────
 pub const STAT_UP: Sym = Sym {
@@ -181,6 +217,14 @@ pub const ICON_LOCK_KEY: Sym = Sym {
     fancy: "\u{1f510}",
     safe: "",
 }; // 🔐
+pub const ICON_ROCKET: Sym = Sym {
+    fancy: "\u{1f680}",
+    safe: "",
+}; // 🚀 quickstart banner
+pub const ICON_SATELLITE: Sym = Sym {
+    fancy: "\u{1f6f0}",
+    safe: "",
+}; // 🛰 gateway section header
 pub const STAR: Sym = Sym {
     fancy: "\u{2b50}",
     safe: "*",

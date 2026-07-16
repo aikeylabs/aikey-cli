@@ -681,6 +681,29 @@ impl VirtualKeyCacheEntry {
 ///
 /// `provider_key_nonce` / `provider_key_ciphertext` may be `None` until
 /// the key is accepted.
+/// Sets a group VK's `group_runtime` column (alpha.5 CLUSTER rail, §3.3).
+///
+/// WHY a dedicated setter and not the structural upsert: on the MEMBER rail
+/// group_runtime is proxy-owned (channel ③ 60s poll) and the upsert fences it
+/// out of DO UPDATE SET so a structural sync can never clobber fresh tokens.
+/// On a CLUSTER WORKER node there is no member-JWT channel-③ poller — the
+/// cluster daemon's `cluster_apply_snapshot` (this CLI) is the SOLE writer of
+/// the column, projecting `oauth_group_runtime.member_tokens[token_seat_id]`
+/// into the same at-rest format the proxy reader (vkeys.GroupRuntimeAccount)
+/// already parses. Single-writer-per-deployment-form preserved.
+pub fn set_group_runtime_for_vk(
+    virtual_key_id: &str,
+    group_runtime_json: &str,
+) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "UPDATE managed_virtual_keys_cache SET group_runtime = ?1 WHERE virtual_key_id = ?2",
+        params![group_runtime_json, virtual_key_id],
+    )
+    .map_err(|e| format!("set group_runtime: {}", e))?;
+    Ok(())
+}
+
 pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), String> {
     let conn = open_connection()?;
     // owner_email is stamped as the CURRENT logged-in account's email — every sync

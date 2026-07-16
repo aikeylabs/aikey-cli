@@ -2625,7 +2625,11 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     let mut rows: Vec<String> = Vec::new();
 
     // ── Gateway ─────────────────────────────────────────────────────────────
-    rows.push(format!("\u{1F6F0}  {}", "Gateway".bold()));
+    rows.push(format!(
+        "{}{}",
+        crate::symbols::ICON_SATELLITE.pre(),
+        "Gateway".bold()
+    ));
     for line in crate::commands_proxy::status_rows() {
         rows.push(format!("  {}", line));
     }
@@ -3521,7 +3525,7 @@ fn run_full_snapshot_sync_opts(
     if central_form || central_refused {
         eprintln!(
             "  {} This deployment keeps key material on its cluster nodes (central delivery);",
-            "\u{2139}".cyan()
+            crate::symbols::INFO_I.s().cyan()
         );
         eprintln!("     keys are not downloaded here by design \u{2014} your tools route through your node.");
         if shell_integration::read_cluster_node().is_none() {
@@ -5193,7 +5197,10 @@ pub fn handle_key_use(
         // its config the user must restart the app, and silence here would
         // read as "done" (防呆: every takeover needs visible feedback).
         if lifecycle.desktop_switch.is_some_and(|d| d.restart_required) {
-            println!("  \u{21BB} Claude Desktop config updated — restart Desktop to apply.");
+            println!(
+                "  {} Claude Desktop config updated — restart Desktop to apply.",
+                crate::symbols::REFRESH.s()
+            );
         }
         println!();
     }
@@ -5501,7 +5508,7 @@ pub fn handle_key_unuse(
             if !already_unbound.is_empty() {
                 println!(
                     "  {} already had no binding: {}",
-                    "\u{2139}\u{FE0F}".dimmed(),
+                    crate::symbols::INFO_I.s().dimmed(),
                     already_unbound.join(", ")
                 );
             }

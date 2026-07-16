@@ -52,12 +52,13 @@ pub enum DiffSource {
 }
 
 impl DiffSource {
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> String {
+        let c = crate::symbols::COMPARE.s();
         match self {
-            Self::DbVsActiveEnv => "DB ↔ active.env",
-            Self::ActiveEnvVsKimiToml => "active.env ↔ kimi.toml",
-            Self::ActiveEnvVsCodexToml => "active.env ↔ codex.toml",
-            Self::DbVsProxyCache => "DB ↔ proxy cache",
+            Self::DbVsActiveEnv => format!("DB {c} active.env"),
+            Self::ActiveEnvVsKimiToml => format!("active.env {c} kimi.toml"),
+            Self::ActiveEnvVsCodexToml => format!("active.env {c} codex.toml"),
+            Self::DbVsProxyCache => format!("DB {c} proxy cache"),
         }
     }
 }
@@ -583,15 +584,22 @@ mod tests {
     #[test]
     fn diff_source_labels_stable() {
         // Pin label strings — doctor depends on these for output formatting.
-        assert_eq!(DiffSource::DbVsActiveEnv.label(), "DB ↔ active.env");
+        let c = crate::symbols::COMPARE.s();
+        assert_eq!(
+            DiffSource::DbVsActiveEnv.label(),
+            format!("DB {c} active.env")
+        );
         assert_eq!(
             DiffSource::ActiveEnvVsKimiToml.label(),
-            "active.env ↔ kimi.toml"
+            format!("active.env {c} kimi.toml")
         );
         assert_eq!(
             DiffSource::ActiveEnvVsCodexToml.label(),
-            "active.env ↔ codex.toml"
+            format!("active.env {c} codex.toml")
         );
-        assert_eq!(DiffSource::DbVsProxyCache.label(), "DB ↔ proxy cache");
+        assert_eq!(
+            DiffSource::DbVsProxyCache.label(),
+            format!("DB {c} proxy cache")
+        );
     }
 }

@@ -322,7 +322,11 @@ pub(super) fn ensure_powershell_hook() -> Option<String> {
         "Add:    . {}  (v3)",
         display_aikey_path("hook.ps1")
     ));
-    crate::ui_frame::eprint_box("\u{2753}", "Install PowerShell Shell Hook", &rows);
+    crate::ui_frame::eprint_box(
+        crate::symbols::QUESTION.s(),
+        "Install PowerShell Shell Hook",
+        &rows,
+    );
     eprint!("  Proceed? [Y/n] (default Y): ");
     {
         use std::io::Write;

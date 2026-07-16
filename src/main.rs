@@ -1356,8 +1356,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
                 Zeroizing::new(test_secret)
             } else if std::io::stdin().is_terminal() {
-                let val = prompt_hidden("  \u{25c6} Enter API Key: ")
-                    .map_err(|e| format!("Failed to read API Key value: {}", e))?;
+                let val =
+                    prompt_hidden(&format!("  {} Enter API Key: ", crate::symbols::PROMPT.s()))
+                        .map_err(|e| format!("Failed to read API Key value: {}", e))?;
                 Zeroizing::new(val)
             } else {
                 // Non-TTY (pipe / automation): read from stdin directly — no flag needed.
@@ -1504,7 +1505,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         if wants_custom {
-                            print!("  \u{25c6} Other protocol type(s), comma-separated: ");
+                            print!(
+                                "  {} Other protocol type(s), comma-separated: ",
+                                crate::symbols::PROMPT.s()
+                            );
                             io::stdout().flush()?;
                             let mut custom = String::new();
                             io::stdin().read_line(&mut custom)?;
@@ -1526,7 +1530,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         use colored::Colorize;
                         eprintln!(
                             "  {} At least one protocol is required.\n",
-                            "\u{25c6}".yellow()
+                            crate::symbols::PROMPT.s().yellow()
                         );
                     }
 
@@ -1545,7 +1549,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("  {v}   {}", u, v = crate::symbols::BOX_V.s());
                         }
                     }
-                    print!("  \u{25c6} Base URL (press Enter to use defaults above): ");
+                    print!(
+                        "  {} Base URL (press Enter to use defaults above): ",
+                        crate::symbols::PROMPT.s()
+                    );
                     io::stdout().flush()?;
                     let mut url_input = String::new();
                     io::stdin().read_line(&mut url_input)?;
@@ -1664,7 +1671,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let outcome = commands_project::run_connectivity_suite(targets, opts, false);
                     if !outcome.any_chat_ok {
                         eprintln!();
-                        eprint!("  \u{25c6} No API connectivity test passed. Add anyway? [y/N] (default N): ");
+                        eprint!(
+                            "  {} No API connectivity test passed. Add anyway? [y/N] (default N): ",
+                            crate::symbols::PROMPT.s()
+                        );
                         io::stdout().flush()?;
                         let mut input = String::new();
                         io::stdin().read_line(&mut input)?;
@@ -1779,7 +1789,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }));
             } else {
                 use colored::Colorize;
-                eprintln!("  {} API Key '{}' added.", "\u{25c6}".green(), alias.bold());
+                eprintln!(
+                    "  {} API Key '{}' added.",
+                    crate::symbols::PROMPT.s().green(),
+                    alias.bold()
+                );
                 eprintln!(
                     "  {v} providers: {}",
                     resolved_providers.join(", ").dimmed(),
@@ -5001,7 +5015,7 @@ fn handle_route(
                 eprintln!();
                 eprintln!(
                     "  {} No selection within {}s — exiting.",
-                    "\u{23f1}".dimmed(),
+                    crate::symbols::STOPWATCH.s().dimmed(),
                     PICKER_TIMEOUT.as_secs()
                 );
             }
@@ -5366,7 +5380,11 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
         } else {
             " ".to_string()
         };
-        let active_mk = if is_active { " \u{25C0} active" } else { "" };
+        let active_mk = if is_active {
+            format!(" {} active", crate::symbols::ACTIVE_ARROW.s())
+        } else {
+            String::new()
+        };
         format!(
             "{} {} {:<aw$}  {:<pw$}{}",
             use_mark,

@@ -1087,7 +1087,11 @@ pub(crate) fn format_tree_row(
     let content = match row {
         TreeRow::Provider(gi) => {
             let g = &groups[*gi];
-            let arrow = if g.expanded { "\u{25BC}" } else { "\u{25B6}" };
+            let arrow = if g.expanded {
+                crate::symbols::TREE_EXPANDED.s()
+            } else {
+                crate::symbols::TREE_COLLAPSED.s()
+            };
             // 2026-05-08 V-layer family-grouping: header 文字用 family 而不是 provider_code。
             // 单 platform family family_of(code)==code, 行为不变 (e.g. anthropic / openai)。
             // 多 platform family (kimi: kimi/kimi_code/moonshot 共享) 显示 "kimi"。

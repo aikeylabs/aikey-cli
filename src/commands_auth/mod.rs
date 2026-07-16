@@ -118,7 +118,12 @@ fn handle_login(
             let msg = body["message"].as_str().unwrap_or("Failed to start login");
             let hint = body["hint"].as_str().unwrap_or("");
             if !json_mode {
-                eprintln!("  {} {} (HTTP {})", "\u{25c6}".red(), msg, code);
+                eprintln!(
+                    "  {} {} (HTTP {})",
+                    crate::symbols::PROMPT.s().red(),
+                    msg,
+                    code
+                );
                 if !hint.is_empty() {
                     eprintln!("  {v} {}", hint, v = crate::symbols::BOX_V.s());
                 }
@@ -181,7 +186,7 @@ fn login_setup_token(
         eprintln!();
         eprintln!(
             "  {} Note: Claude OAuth requires a Pro or Max subscription.",
-            "\u{25c6}".cyan()
+            crate::symbols::PROMPT.s().cyan()
         );
         eprintln!(
             "  {} Open this URL and click 'Authorize':",
@@ -272,11 +277,16 @@ fn read_code_with_retry(
 
     for attempt in 1..=MAX_PASTE_ATTEMPTS {
         let prompt = if attempt == 1 {
-            "  \u{25c6} Paste the code (format: code#state): ".to_string()
+            format!(
+                "  {} Paste the code (format: code#state): ",
+                crate::symbols::PROMPT.s()
+            )
         } else {
             format!(
-                "  \u{25c6} Paste the code again [attempt {}/{}] (format: code#state, empty to cancel): ",
-                attempt, MAX_PASTE_ATTEMPTS
+                "  {} Paste the code again [attempt {}/{}] (format: code#state, empty to cancel): ",
+                crate::symbols::PROMPT.s(),
+                attempt,
+                MAX_PASTE_ATTEMPTS
             )
         };
         let pasted =
@@ -294,7 +304,7 @@ fn read_code_with_retry(
                 // up to a whitespace/control char. Re-prompt without y/N noise.
                 eprintln!(
                     "  {} Pasted code is missing the `#state` suffix — please paste the full `code#state` value.",
-                    "\u{25c6}".yellow()
+                    crate::symbols::PROMPT.s().yellow()
                 );
                 if attempt == MAX_PASTE_ATTEMPTS {
                     return Err("Too many invalid pastes. Run 'aikey auth login' again.".into());
@@ -309,11 +319,14 @@ fn read_code_with_retry(
         // re-prompts instead of bailing.
         eprintln!(
             "  {} state mismatch — pasted state differs from expected (CSRF risk)",
-            "\u{25c6}".yellow()
+            crate::symbols::PROMPT.s().yellow()
         );
         if attempt == MAX_PASTE_ATTEMPTS {
             // Last attempt: don't offer retry, just continue/cancel.
-            eprint!("  {} Continue anyway? [y/N] ", "\u{25c6}".yellow());
+            eprint!(
+                "  {} Continue anyway? [y/N] ",
+                crate::symbols::PROMPT.s().yellow()
+            );
             io::stderr().flush()?;
             let mut confirm = String::new();
             io::stdin().lock().read_line(&mut confirm)?;
@@ -325,7 +338,7 @@ fn read_code_with_retry(
         }
         eprint!(
             "  {} [R]etry paste / [y] continue anyway / [n] cancel (default R): ",
-            "\u{25c6}".yellow()
+            crate::symbols::PROMPT.s().yellow()
         );
         io::stderr().flush()?;
         let mut confirm = String::new();
@@ -368,7 +381,7 @@ fn login_auth_code(
         eprintln!();
         eprintln!(
             "  {} Opening browser for {} login...",
-            "\u{25c6}".cyan(),
+            crate::symbols::PROMPT.s().cyan(),
             provider
         );
         if clipboard_ok {
@@ -410,7 +423,10 @@ fn login_device_code(
 
     if !json_mode {
         eprintln!();
-        eprintln!("  {} Open this URL and enter the code:", "\u{25c6}".cyan());
+        eprintln!(
+            "  {} Open this URL and enter the code:",
+            crate::symbols::PROMPT.s().cyan()
+        );
         eprintln!(
             "  {}   URL:  {}",
             crate::symbols::BOX_V.s().dimmed(),
@@ -474,7 +490,12 @@ fn submit_code_and_finish(
             let hint = body["hint"].as_str().unwrap_or("");
             let err_code = body["error"].as_str().unwrap_or("");
             if !json_mode {
-                eprintln!("  {} {} (HTTP {})", "\u{25c6}".red(), msg, code);
+                eprintln!(
+                    "  {} {} (HTTP {})",
+                    crate::symbols::PROMPT.s().red(),
+                    msg,
+                    code
+                );
                 if !hint.is_empty() {
                     eprintln!("  {v} {}", hint, v = crate::symbols::BOX_V.s());
                 }
@@ -548,7 +569,7 @@ fn submit_code_and_finish(
         let days = expires_in / 86400;
         eprintln!(
             "  {} Logged in as {} ({}), expires in {} days",
-            "\u{25c6}".green(),
+            crate::symbols::PROMPT.s().green(),
             display.bold(),
             provider,
             days
@@ -640,7 +661,7 @@ fn poll_login_status(
                 } else {
                     eprintln!(
                         "{} Logged in as {} ({})",
-                        "\u{25c6}".green(),
+                        crate::symbols::PROMPT.s().green(),
                         display.bold(),
                         provider
                     );
@@ -670,7 +691,7 @@ fn poll_login_status(
             "failed" => {
                 let err = resp["error"].as_str().unwrap_or("Login failed");
                 if !json_mode {
-                    eprintln!("{} {}", "\u{25c6}".red(), err);
+                    eprintln!("{} {}", crate::symbols::PROMPT.s().red(), err);
                 }
                 return Err(err.to_string().into());
             }
@@ -747,7 +768,7 @@ fn poll_device_code(
                     eprintln!();
                     eprintln!(
                         "{} Logged in as {} ({})",
-                        "\u{25c6}".green(),
+                        crate::symbols::PROMPT.s().green(),
                         display.bold(),
                         provider
                     );
@@ -789,7 +810,12 @@ fn poll_device_code(
                     .unwrap_or("Device code login failed");
                 if !json_mode {
                     eprintln!();
-                    eprintln!("{} {} (HTTP {})", "\u{25c6}".red(), msg, code);
+                    eprintln!(
+                        "{} {} (HTTP {})",
+                        crate::symbols::PROMPT.s().red(),
+                        msg,
+                        code
+                    );
                 }
                 return Err(msg.to_string().into());
             }
@@ -801,7 +827,7 @@ fn poll_device_code(
                         eprintln!();
                         eprintln!(
                             "  {} Network errors during polling ({} in a row): {}",
-                            "\u{25c6}".red(),
+                            crate::symbols::PROMPT.s().red(),
                             net_error_count,
                             e
                         );
@@ -820,7 +846,7 @@ fn poll_device_code(
                     eprintln!();
                     eprintln!(
                         "  {} network error ({}), retrying in {}s... [{}/{}]",
-                        "\u{25c6}".yellow(),
+                        crate::symbols::PROMPT.s().yellow(),
                         e,
                         backoff.as_secs(),
                         net_error_count,
@@ -900,11 +926,19 @@ fn set_display_identity(
 
     match resp {
         Ok(_) => {
-            eprintln!("{} Display name set: {}", "\u{25c6}".green(), input);
+            eprintln!(
+                "{} Display name set: {}",
+                crate::symbols::PROMPT.s().green(),
+                input
+            );
             Ok(())
         }
         Err(e) => {
-            eprintln!("  {} Failed to save display name: {}", "\u{25c6}".red(), e);
+            eprintln!(
+                "  {} Failed to save display name: {}",
+                crate::symbols::PROMPT.s().red(),
+                e
+            );
             eprintln!(
                 "  {v} Account created; you can retry via API later.",
                 v = crate::symbols::BOX_V.s()
@@ -969,12 +1003,20 @@ fn prompt_display_identity(base: &str, account_id: &str) -> Result<(), Box<dyn s
 
     match resp {
         Ok(_) => {
-            eprintln!("{} Display name set: {}", "\u{25c6}".green(), input);
+            eprintln!(
+                "{} Display name set: {}",
+                crate::symbols::PROMPT.s().green(),
+                input
+            );
             Ok(())
         }
         Err(e) => {
             // Server rejected or network error — surface it instead of silent "success".
-            eprintln!("  {} Failed to save display name: {}", "\u{25c6}".red(), e);
+            eprintln!(
+                "  {} Failed to save display name: {}",
+                crate::symbols::PROMPT.s().red(),
+                e
+            );
             eprintln!(
                 "  {v} Account created; you can retry via API later.",
                 v = crate::symbols::BOX_V.s()
@@ -1186,7 +1228,7 @@ fn handle_use(
     } else {
         eprintln!(
             "{} Now using {}/{} (OAuth) for {}",
-            "\u{25c6}".green(),
+            crate::symbols::PROMPT.s().green(),
             target.provider,
             display.bold(),
             canonical
@@ -1275,7 +1317,7 @@ fn handle_logout(
     } else {
         eprintln!(
             "{} Logged out from {}/{}",
-            "\u{25c6}".green(),
+            crate::symbols::PROMPT.s().green(),
             acct.provider,
             display
         );
@@ -1364,7 +1406,7 @@ fn handle_doctor(
     // [2] OAuth accounts
     let accounts = storage::list_provider_accounts().unwrap_or_default();
     if accounts.is_empty() {
-        eprintln!("  {} No OAuth accounts", "\u{25c6}".cyan());
+        eprintln!("  {} No OAuth accounts", crate::symbols::PROMPT.s().cyan());
     } else {
         eprintln!(
             "  {} {} OAuth account(s) found",

@@ -449,7 +449,7 @@ mod tests {
         // block.provider_hint 取首 token "🔑"(丢 keyword),E3 scan block 内遇 Credential 即 break。
         // 无 E6 的话 inferred_provider = None(spike 验证过)。E6 InlineLabelKeyword 兜底 → moonshot
         // (2026-05-08 Kimi 双平台拆分后,decision #4: keyword "kimi" 单字默认 moonshot)。
-        let text = "\u{1F511} kimi: sk-moonshot_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO";
+        let text = "\u{1F511} kimi: sk-moonshot_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO"; // glyph-fence-allow: test fixture (realistic chat input)
         let cands = vec![cand(
             Kind::SecretLike,
             "sk-moonshot_AAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLLMMMNNNOOO",
@@ -467,7 +467,7 @@ mod tests {
     fn e6_inline_label_keyword_yunwu_aggregator() {
         // BUG-05 regression guard: `🔑 yunwu: sk-...` 行内 label 识别 aggregator family。
         // 合约:yunwu ∈ aggregator_families → protocol_types = [](UI 让用户手选)。
-        let text = "\u{1F511} yunwu: sk-yunwugenericAAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLL";
+        let text = "\u{1F511} yunwu: sk-yunwugenericAAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLL"; // glyph-fence-allow: test fixture (realistic chat input)
         let cands = vec![cand(
             Kind::SecretLike,
             "sk-yunwugenericAAABBBCCCDDDEEEFFFGGGHHHIIIJJJKKKLLL",
