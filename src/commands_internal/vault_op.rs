@@ -3203,7 +3203,12 @@ mod hook_envelope_tests {
                 "alias": "team-oauth-pool",
                 "key_status": "active",
                 "virtual_key_revision": "r1",
-                "slots": [],
+                // A group VK carries NO slots on the real org-delivery wire. The
+                // master OMITS the field (json:"slots,omitempty"); this fixture must
+                // mirror that (absent, NOT "[]") — the earlier "[]" masked a real bug
+                // where the master emitted "slots": null and this parse rejected it,
+                // failing the whole cluster apply (bugfix 2026-07-16, caught by the
+                // cross-process TestWorkerClusterApply_PullsTeamOauthAccountsAndVK).
                 "oauth_group_id": "g1",
                 "token_seat_id": "seat-parent",
                 "protocol_type": "anthropic"

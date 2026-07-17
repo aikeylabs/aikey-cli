@@ -34,6 +34,7 @@ mod synapse;
 mod team_token_normalize;
 // mod commands_env; // removed: env commands dropped
 mod commands_proxy;
+mod enterprise_proxy; // Production form-⓪ multi-protocol proxy delivery (Phase 3)
 // Layer 1 (state-machine read path) + Layer 2 (write path). Stage 1-2
 // of proxy lifecycle state machine refactor; commands_proxy.rs is in
 // the process of being migrated to thin shells over these.
@@ -2308,6 +2309,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let code = exit_code_from_outcome(&outcome);
                 print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
+                // §5.4: confirm per-account egress configs are in effect (if any).
+                // Presence only — no dial, so the wrapper preflight hot path stays
+                // fast; silent when none configured. Never changes the exit code.
+                if !cli.json {
+                    commands_proxy::print_egress_presence();
+                }
                 std::process::exit(code);
             } else if let Some(ref alias) = alias {
                 // ── Single-alias mode: resolve across personal/team/OAuth ──
@@ -2388,6 +2395,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let code = exit_code_from_outcome(&outcome);
                 print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
+                // §5.4: confirm per-account egress configs are in effect (if any).
+                // Presence only — no dial, so the wrapper preflight hot path stays
+                // fast; silent when none configured. Never changes the exit code.
+                if !cli.json {
+                    commands_proxy::print_egress_presence();
+                }
                 std::process::exit(code);
             } else {
                 // ── No alias: test all active bindings (personal/team/OAuth) ──
@@ -2457,6 +2470,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let code = exit_code_from_outcome(&outcome);
                 print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
+                // §5.4: confirm per-account egress configs are in effect (if any).
+                // Presence only — no dial, so the wrapper preflight hot path stays
+                // fast; silent when none configured. Never changes the exit code.
+                if !cli.json {
+                    commands_proxy::print_egress_presence();
+                }
                 std::process::exit(code);
             }
         }
@@ -3949,9 +3968,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands_account::handle_whoami(cli.json)?;
         }
         Commands::Doctor { detail } => {
-            commands_project::handle_doctor(cli.json)?;
+            // handle_doctor now renders the egress section inline (before its
+            // summary) and returns whether ALL configured per-account egress
+            // failed. All-fail → non-zero exit so the breakage is visible to
+            // scripts/CI, not just printed ("失败要显眼").
+            let egress_all_failed = commands_project::handle_doctor(cli.json)?;
             if *detail && !cli.json {
                 commands_project::handle_doctor_detail()?;
+            }
+            if egress_all_failed {
+                std::process::exit(1);
             }
         }
         Commands::Proxy { action } => {
@@ -6990,10 +7016,9 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                     return Ok(());
                 }
                 Some(t) => {
-                    return Err(format!(
-                        "unknown hook target '{t}' (supported: openclaw, codex)"
-                    )
-                    .into());
+                    return Err(
+                        format!("unknown hook target '{t}' (supported: openclaw, codex)").into(),
+                    );
                 }
                 None => {}
             }

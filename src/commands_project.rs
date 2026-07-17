@@ -673,7 +673,11 @@ fn doctor_plugin_registry() -> Vec<DoctorPlugin> {
     ]
 }
 
-pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// Runs the doctor checks. Returns `true` iff there is ≥1 configured per-account
+/// egress and ALL of them failed connectivity — the caller maps that to a
+/// non-zero exit ("失败要显眼"). All other check failures stay advisory (doctor
+/// has always exited 0 on them).
+pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>> {
     use colored::Colorize;
     use std::time::Instant;
 
@@ -1671,6 +1675,15 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         // is a Personal-edition convenience problem, not a doctor failure.
     }
 
+    // Per-account egress connectivity (§5.4): dial each configured egress and
+    // print it HERE — with the other connectivity checks, before the summary.
+    // Silent when none is configured (Personal nodes always → no noise). All-fail
+    // folds into any_failed so the summary line and exit code both reflect it.
+    let egress_all_failed = crate::commands_proxy::print_egress_doctor(json_mode);
+    if egress_all_failed {
+        any_failed = true;
+    }
+
     if !json_mode {
         println!("{}", crate::symbols::BOX_H.s().repeat(52).dimmed());
         if any_failed {
@@ -1685,7 +1698,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
         }));
     }
 
-    Ok(())
+    Ok(egress_all_failed)
 }
 
 // ---------------------------------------------------------------------------

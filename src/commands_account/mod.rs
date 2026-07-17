@@ -3854,6 +3854,12 @@ pub fn handle_key_sync(
     // Force a full sync by resetting local_seen_sync_version to 0.
     storage::set_local_seen_sync_version(0);
     let downloaded = run_full_snapshot_sync(password)?;
+
+    // Production form-⓪ multi-protocol delivery (Phase 3, 20260717): if this
+    // member's control panel serves the enterprise (mihomo) proxy, pull + verify
+    // + swap it in. Best-effort + idempotent — never fails the sync; a no-op on
+    // personal / OSS panels (manifest 404).
+    crate::enterprise_proxy::sync_enterprise_proxy_best_effort(json_mode);
     // B-2 (2026-07-06): sign post-sync auto-assign binding writes. The full
     // sync above already strict-verified this password's derived key, so
     // VerifiedVaultKey::new cannot fail here except on a concurrent password

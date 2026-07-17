@@ -12,6 +12,7 @@ pub mod commands_init;
 pub mod commands_internal;
 pub mod commands_project;
 pub mod commands_proxy;
+pub mod enterprise_proxy;
 pub mod config;
 pub mod connectivity;
 pub mod credential_type;

@@ -1515,7 +1515,7 @@ fn check_overseas_connectivity() {
 /// 2. Same directory as the running `aikey` binary — co-installed layout
 /// 3. `~/.aikey/bin/aikey-proxy` — user-local install
 /// 4. System `PATH` — standard install via `make install`
-fn find_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
+pub(crate) fn find_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let bin_name = if cfg!(windows) {
         "aikey-proxy.exe"
     } else {
@@ -2073,6 +2073,149 @@ pub fn fetch_egress_state() -> Result<Option<EgressState>, String> {
         .into_json()
         .map_err(|e| format!("invalid /admin/upstream-proxy response: {e}"))?;
     Ok(body.egress)
+}
+
+// ── Per-account egress connectivity self-check (§5.4) ───────────────────────
+//
+// The proxy owns the egress engine (Rust can't dial a mihomo group), so the CLI
+// only calls GET /admin/egress/selfcheck and displays. Two modes:
+//   - presence (dial=false): `aikey test` — which pool accounts have egress
+//     configured. No network → hot-path (wrapper preflight) stays fast and never
+//     probes on a cadence.
+//   - dial=1: `aikey doctor` — actually probe each account's egress, showing the
+//     exit IP + latency so the user can verify reachability and whether the paths
+//     share one exit IP.
+
+/// One account's egress self-check row from the daemon. Mirrors aikey-proxy's
+/// admin.EgressCheckResult wire format.
+#[derive(Debug, serde::Deserialize)]
+pub struct EgressCheck {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub dialed: bool,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub engine: String,
+    #[serde(default)]
+    pub exit_ip: String,
+    #[serde(default)]
+    pub latency_ms: i64,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(serde::Deserialize)]
+struct EgressSelfCheckResponse {
+    #[serde(default)]
+    paths: Vec<EgressCheck>,
+}
+
+/// Fetch the per-account egress self-check from the running daemon. `dial=true`
+/// makes the daemon actually probe each egress (slower); `false` is presence
+/// only. `Err` = daemon unreachable / older binary without the endpoint.
+pub fn fetch_egress_selfcheck(dial: bool) -> Result<Vec<EgressCheck>, String> {
+    let addr = proxy_listen_addr(None);
+    // Plain agent on purpose (loopback admin call, never through this shell's
+    // proxy env). Generous timeout: with dial=true the daemon dials each account
+    // sequentially (per-account ~10s server-side), so allow for a few accounts.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(if dial { 60 } else { 3 }))
+        .build();
+    let url = format!(
+        "http://{addr}/admin/egress/selfcheck{}",
+        if dial { "?dial=1" } else { "" }
+    );
+    let resp = agent
+        .get(&url)
+        .call()
+        .map_err(|e| format!("cannot reach proxy admin at {addr}: {e}"))?;
+    let body: EgressSelfCheckResponse = resp
+        .into_json()
+        .map_err(|e| format!("invalid /admin/egress/selfcheck response: {e}"))?;
+    Ok(body.paths)
+}
+
+/// `aikey test` egress line: presence-only confirmation that per-account egress
+/// configs ARE in effect (if any). Silent when none configured (the common
+/// Personal case) so the hot-path wrapper preflight adds no noise. Never affects
+/// the test exit code. Best-effort: a proxy hiccup is swallowed silently.
+pub fn print_egress_presence() {
+    let paths = match fetch_egress_selfcheck(false) {
+        Ok(p) if !p.is_empty() => p,
+        _ => return, // none configured, or proxy unreachable — say nothing
+    };
+    println!(
+        "{} egress: {} per-account route(s) active — run `aikey doctor` to test connectivity",
+        crate::symbols::INFO.s(),
+        paths.len()
+    );
+}
+
+/// `aikey doctor` egress section: dials each account's configured egress once and
+/// prints OK/fail + exit IP + latency. Returns `true` when there is ≥1 configured
+/// egress and ALL of them failed (caller maps that to a non-zero exit — "失败要显
+/// 眼"). Returns `false` when none configured, proxy down, or ≥1 path is OK.
+pub fn print_egress_doctor(json_mode: bool) -> bool {
+    let paths = match fetch_egress_selfcheck(true) {
+        Ok(p) => p,
+        Err(_) => return false, // proxy unreachable is a separate doctor check
+    };
+    // Silent when there's nothing to test — per-account egress is a team/pool-only
+    // feature, so a Personal node ALWAYS has none: printing "no per-account egress
+    // configured" on every `ak doctor` is pure noise. Matches `aikey test`, which
+    // is also silent when empty. Only surface the section when there ARE egress
+    // routes to report.
+    if paths.is_empty() {
+        return false;
+    }
+    if !json_mode {
+        println!("\nEgress connectivity (per-account):");
+    }
+    let mut ok_count = 0;
+    for p in &paths {
+        if p.ok {
+            ok_count += 1;
+        }
+        if json_mode {
+            continue;
+        }
+        if p.ok {
+            let ip = if p.exit_ip.is_empty() {
+                "?".to_string()
+            } else {
+                p.exit_ip.clone()
+            };
+            println!(
+                "  {} {:<28} exit {} ({} ms)",
+                crate::symbols::CHECK.s(),
+                p.label,
+                ip.cyan(),
+                p.latency_ms
+            );
+        } else {
+            let reason = if p.reason.is_empty() {
+                "unreachable".to_string()
+            } else {
+                p.reason.clone()
+            };
+            println!(
+                "  {} {:<28} {}",
+                crate::symbols::CROSS.s(),
+                p.label,
+                reason.red()
+            );
+        }
+    }
+    let all_failed = ok_count == 0;
+    if all_failed && !json_mode {
+        println!(
+            "  {} all egress paths are unreachable — check the proxy line(s) for these accounts",
+            crate::symbols::WARN.s()
+        );
+    }
+    all_failed
 }
 
 #[cfg(test)]
