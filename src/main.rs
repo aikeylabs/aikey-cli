@@ -35,9 +35,9 @@ mod team_token_normalize;
 // mod commands_env; // removed: env commands dropped
 mod commands_proxy;
 mod enterprise_proxy; // Production form-⓪ multi-protocol proxy delivery (Phase 3)
-// Layer 1 (state-machine read path) + Layer 2 (write path). Stage 1-2
-// of proxy lifecycle state machine refactor; commands_proxy.rs is in
-// the process of being migrated to thin shells over these.
+                      // Layer 1 (state-machine read path) + Layer 2 (write path). Stage 1-2
+                      // of proxy lifecycle state machine refactor; commands_proxy.rs is in
+                      // the process of being migrated to thin shells over these.
 #[allow(dead_code)]
 mod commands_account;
 mod commands_agent;
@@ -1009,6 +1009,47 @@ fn run_unified_list(
     Ok(())
 }
 
+/// Whether the pre-dispatch hook may silently auto-start the proxy for `command`.
+///
+/// Excluded: proxy lifecycle commands which manage the process themselves, and
+/// version/init which predate the proxy.
+///
+/// WHY a named predicate and not an inline `match`: this list is a correctness
+/// boundary, not a style choice (see the Agent arm below — a wrong entry spawns a
+/// duplicate proxy that silently corrupts a customer's OpenClaw config). A comment
+/// cannot stop a future refactor from dropping an arm; a fence test can, and that
+/// needs a pure function to call. See `auto_start_proxy_exclusion_tests`.
+fn should_auto_start_proxy(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::Proxy { .. }
+            | Commands::Init
+            | Commands::Db { .. }
+            | Commands::Version
+            // `aikey agent start` is the form-② digital-employee daemon, and its
+            // proxy is owned by a SEPARATE systemd unit (aikey-de-agent.service
+            // declares Wants/After aikey-de-proxy.service) — the same "manages the
+            // process itself" rule as Commands::Proxy above. The unit injects
+            // AIKEY_MASTER_PASSWORD so the daemon can open the vault to sync VKs;
+            // without this arm that env alone makes the hook spawn a SECOND proxy,
+            // which finds :27200 already held by the real DE proxy and port-drifts
+            // to :27201. The daemon then repoints the customer's OpenClaw provider
+            // at its own drifted copy, and the leftover provider entries deadlock
+            // the next brownfield install's auto-pick.
+            // 2026-07-17: this is what polluted both staging lobsters.
+            | Commands::Agent { .. }
+            | Commands::Statusline { action: None }
+            | Commands::Statusline {
+                action: Some(cli::StatuslineAction::Render { .. }),
+            }
+            | Commands::Statusline {
+                action: Some(cli::StatuslineAction::Ensure),
+            }
+            | Commands::Watch
+            | Commands::Audit { .. }
+    )
+}
+
 fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let command = cli.command.as_ref().unwrap();
 
@@ -1060,25 +1101,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let _ = executor::ensure_vault_integrity_or_quarantine();
 
     // Auto-start proxy silently when AIKEY_MASTER_PASSWORD (or AK_TEST_PASSWORD)
-    // is available in the environment.  Skipped for proxy lifecycle commands which
-    // manage the process themselves, and for version/init which predate the proxy.
-    match command {
-        Commands::Proxy { .. }
-        | Commands::Init
-        | Commands::Db { .. }
-        | Commands::Version
-        | Commands::Statusline { action: None }
-        | Commands::Statusline {
-            action: Some(cli::StatuslineAction::Render { .. }),
-        }
-        | Commands::Statusline {
-            action: Some(cli::StatuslineAction::Ensure),
-        }
-        | Commands::Watch
-        | Commands::Audit { .. } => {}
-        _ => {
-            commands_proxy::try_auto_start_from_env();
-        }
+    // is available in the environment.
+    if should_auto_start_proxy(command) {
+        commands_proxy::try_auto_start_from_env();
     }
 
     // Non-blocking snapshot sync: checks server sync_version and pulls fresh
@@ -7604,3 +7629,55 @@ mod hook_update_error_hint_tests {
 #[cfg(test)]
 #[path = "activate_tests.rs"]
 mod activate_tests;
+
+#[cfg(test)]
+mod auto_start_proxy_exclusion_tests {
+    use super::should_auto_start_proxy;
+    use crate::cli::Cli;
+    use clap::Parser;
+
+    /// Drive the REAL argv through the REAL parser (not a hand-built enum), so the
+    /// fence breaks if either the parser shape or the exclusion list drifts.
+    fn auto_starts(argv: &[&str]) -> bool {
+        let cli = Cli::try_parse_from(argv).expect("argv must parse");
+        should_auto_start_proxy(cli.command.as_ref().expect("a subcommand"))
+    }
+
+    /// THE fence (2026-07-17). `aikey agent start` is the form-② DE daemon whose
+    /// systemd/launchd unit runs aikey-de-proxy.service alongside it AND injects
+    /// AIKEY_MASTER_PASSWORD. If this arm is ever dropped, that env alone makes the
+    /// pre-dispatch hook spawn a SECOND proxy → :27200 busy → port-drift to :27201
+    /// → the daemon repoints the customer's OpenClaw at its own drifted copy → the
+    /// stale provider entries deadlock the next brownfield install's auto-pick.
+    /// Both staging lobsters were polluted exactly this way.
+    /// 能红: delete `| Commands::Agent { .. }` from should_auto_start_proxy → fails.
+    #[test]
+    fn agent_daemon_must_never_auto_start_a_proxy() {
+        assert!(
+            !auto_starts(&["aikey", "agent", "start"]),
+            "`aikey agent start` must NOT auto-start a proxy — its unit owns one"
+        );
+        assert!(
+            !auto_starts(&["aikey", "agent", "status"]),
+            "no `aikey agent` subcommand may auto-start a proxy"
+        );
+    }
+
+    /// The other half of the fence: excluding Agent must not have broadened into
+    /// "nothing auto-starts". Personal's everyday commands still rely on the hook
+    /// (AIKEY_MASTER_PASSWORD-injected sessions expect a proxy to come up).
+    #[test]
+    fn ordinary_commands_still_auto_start() {
+        assert!(auto_starts(&["aikey", "list"]));
+        assert!(auto_starts(&["aikey", "status"]));
+    }
+
+    /// Guards the pre-existing exclusions the Agent arm was added next to, so a
+    /// refactor of this list can't silently regress them either.
+    #[test]
+    fn proxy_lifecycle_and_pre_proxy_commands_stay_excluded() {
+        assert!(!auto_starts(&["aikey", "proxy", "status"]));
+        assert!(!auto_starts(&["aikey", "version"]));
+        assert!(!auto_starts(&["aikey", "watch"]));
+    }
+}

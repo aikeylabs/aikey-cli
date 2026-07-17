@@ -73,7 +73,10 @@ pub fn atomic_swap(target: &Path, bytes: &[u8]) -> Result<(), String> {
     // Same-dir temp so the rename is atomic (cross-fs rename is a copy → not atomic).
     let tmp = dir.join(format!(
         ".{}.enterprise-new",
-        target.file_name().and_then(|n| n.to_str()).unwrap_or("aikey-proxy")
+        target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("aikey-proxy")
     ));
     {
         let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create temp: {e}"))?;
