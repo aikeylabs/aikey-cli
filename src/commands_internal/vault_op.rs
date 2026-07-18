@@ -247,10 +247,31 @@ pub fn handle(env: StdinEnvelope) {
 // owner_account_id is taken per-VK from the payload (the seat's claimer) — the
 // P0-2 multi-user attribution fix; a single fallback account would mis-bill.
 
+/// serde backstop for the cluster wire: accept explicit JSON `null` on
+/// collection fields (→ empty collection).
+///
+/// WHY: the Go control plane serializes a nil slice/map as `null`, not
+/// `[]`/`{}`. `#[serde(default)]` only covers an ABSENT field — an explicit
+/// `null` still enters the Vec/HashMap deserializer and errors, and because
+/// the snapshot is applied as ONE unit, a single null field sinks the ENTIRE
+/// cluster apply (the node stops receiving credential updates). Hit twice on
+/// the real wire: `slots: null` (bugfix 2026-07-16) and `accounts: null`
+/// inside oauth_group_runtime (bugfix 2026-07-18, staging cluster outage).
+/// Producers are fixed to emit `[]`, but the worker must stay robust to a
+/// wire-shape variant an older / different-version control can still produce.
+fn null_to_default<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    use serde::Deserialize;
+    Ok(Option::<T>::deserialize(de)?.unwrap_or_default())
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct ClusterSnapshotPayload {
     org_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     virtual_keys: Vec<ClusterVk>,
     /// FULL quota snapshot (seat + GROUP subjects, members, rules, baselines) —
     /// the same structure the cli channel ships. Preferred over the flattened
@@ -285,7 +306,7 @@ pub(crate) struct ClusterSnapshotPayload {
 #[derive(Debug, serde::Deserialize)]
 struct ComplianceConfig {
     enabled: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     packs: Vec<String>,
 }
 
@@ -318,12 +339,12 @@ struct ClusterVk {
     virtual_key_revision: String,
     #[serde(default)]
     expires_at: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     slots: Vec<ClusterSlot>,
     /// Per-seat quota rows (metric, period, used, limit) from the org delivery.
     /// Written to quota_rules_cache so the proxy enforces (2c). Same seat repeats
     /// across the seat's VKs — deduped by seat_id when building cache entries.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     seat_quota: Vec<ClusterSeatQuota>,
     /// Group-VK fields (alpha.5 online-agent, §3.2/§3.3). oauth_group_id marks a
     /// group-backed VK: it arrives with NO slots (its material rides the
@@ -346,7 +367,7 @@ struct ClusterVk {
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct ClusterGroupRuntime {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     groups: Vec<ClusterRuntimeGroup>,
 }
 
@@ -357,7 +378,11 @@ struct ClusterRuntimeGroup {
     provider_code: String,
     #[serde(default)]
     routing_config: String,
-    #[serde(default)]
+    /// null-tolerant (not just `default`): the 2026-07-18 staging outage was a
+    /// group with zero deliverable OAuth accounts wiring `"accounts": null` —
+    /// the plain Vec deserializer rejected it and the whole snapshot apply
+    /// failed on every node.
+    #[serde(default, deserialize_with = "null_to_default")]
     accounts: Vec<ClusterRuntimeAccount>,
 }
 
@@ -387,7 +412,8 @@ struct ClusterRuntimeAccount {
     #[serde(default)]
     egress_proxy_url: String,
     /// seat_id → token. The apply projects member_tokens[token_seat_id] per VK.
-    #[serde(default)]
+    /// null-tolerant like the Vec fields: a Go nil map also wires as `null`.
+    #[serde(default, deserialize_with = "null_to_default")]
     member_tokens: std::collections::HashMap<String, ClusterMemberToken>,
 }
 
@@ -413,7 +439,7 @@ struct ClusterSeatQuota {
 /// that schema; the daemon only persists).
 #[derive(Debug, serde::Deserialize)]
 struct ClusterQuotaSnapshot {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     subjects: Vec<ClusterQuotaSubject>,
 }
 
@@ -421,7 +447,7 @@ struct ClusterQuotaSnapshot {
 struct ClusterQuotaSubject {
     subject_id: String,
     subject_kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     members: Vec<String>,
     #[serde(default)]
     rules: serde_json::Value,
@@ -432,7 +458,7 @@ struct ClusterQuotaSubject {
 #[derive(Debug, serde::Deserialize)]
 struct ClusterSlot {
     protocol_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     targets: Vec<ClusterTarget>,
 }
 
@@ -3258,6 +3284,83 @@ mod hook_envelope_tests {
                 .map(|t| t.access_token.as_str()),
             Some("tok-abc"),
             "seat-keyed member_tokens must survive the wire"
+        );
+    }
+
+    // Regression (bugfix 2026-07-18, staging cluster outage): a Go nil
+    // slice/map wires as EXPLICIT `null`, which `#[serde(default)]` alone does
+    // NOT cover — and one null field failed the ENTIRE snapshot apply, so both
+    // staging workers received no credential updates for hours. The live trigger
+    // was `"accounts": null` (an active OAuth group with zero deliverable
+    // accounts); this fixture nulls EVERY collection field of the cluster wire
+    // so any future field regressing to a plain Vec/HashMap turns this red.
+    #[test]
+    fn cluster_payload_tolerates_explicit_null_collections() {
+        let sample = serde_json::json!({
+            "org_id": "org-cluster",
+            "virtual_keys": [{
+                "virtual_key_id": "vk-1",
+                "owner_account_id": "acct-1",
+                "seat_id": "seat-1",
+                "key_status": "active",
+                "virtual_key_revision": "r1",
+                "slots": null,       // 2026-07-16 wire shape (old control)
+                "seat_quota": null
+            }],
+            "oauth_group_runtime": {
+                "groups": [{
+                    "oauth_group_id": "g-empty",
+                    "provider_code": "anthropic",
+                    "accounts": null // 2026-07-18 live staging wire shape
+                }]
+            },
+            "quota_snapshot": { "subjects": null },
+            "compliance": { "enabled": false, "packs": null }
+        });
+        let p: ClusterSnapshotPayload = serde_json::from_value(sample)
+            .expect("explicit null collections must parse as empty, not fail the whole apply");
+        assert!(p.virtual_keys[0].slots.is_empty());
+        assert!(p.virtual_keys[0].seat_quota.is_empty());
+        let g = &p.oauth_group_runtime.as_ref().expect("runtime").groups[0];
+        assert_eq!(g.oauth_group_id, "g-empty");
+        assert!(g.accounts.is_empty());
+        assert!(p
+            .quota_snapshot
+            .as_ref()
+            .expect("quota")
+            .subjects
+            .is_empty());
+
+        // top-level nulls: virtual_keys / groups themselves
+        let top_null = serde_json::json!({
+            "org_id": "org-cluster",
+            "virtual_keys": null,
+            "oauth_group_runtime": { "groups": null }
+        });
+        let p2: ClusterSnapshotPayload =
+            serde_json::from_value(top_null).expect("top-level null arrays must parse");
+        assert!(p2.virtual_keys.is_empty());
+        assert!(p2
+            .oauth_group_runtime
+            .as_ref()
+            .expect("runtime")
+            .groups
+            .is_empty());
+
+        // member_tokens: a Go nil map is `null` too
+        let null_map = serde_json::json!({
+            "org_id": "org-cluster",
+            "oauth_group_runtime": { "groups": [{
+                "oauth_group_id": "g1",
+                "accounts": [{ "credential_id": "c1", "member_tokens": null }]
+            }]}
+        });
+        let p3: ClusterSnapshotPayload =
+            serde_json::from_value(null_map).expect("null member_tokens map must parse");
+        assert!(
+            p3.oauth_group_runtime.as_ref().expect("runtime").groups[0].accounts[0]
+                .member_tokens
+                .is_empty()
         );
     }
 }
