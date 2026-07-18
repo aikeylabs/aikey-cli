@@ -5640,7 +5640,7 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
                         }))
             })
         })
-        .and_then(|i| if selectable[i] { Some(i) } else { None });
+        .filter(|&i| selectable[i]);
     let initial = by_label
         .or(by_cfg)
         .or_else(|| selectable.iter().position(|&s| s))
