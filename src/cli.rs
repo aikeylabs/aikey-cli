@@ -2505,6 +2505,18 @@ const BANNER_EYE_SHUT: &str =
     "\u{254D}\u{2588}  \u{27E8}\u{2014}\u{27E9} \u{27E8}\u{2014}\u{27E9}  \u{2588}\u{254D}";
 const BANNER_EYE_RIGHT: &str = "------------------------------------";
 
+// Tagline shared between the initial banner render and the shimmer animation
+// (like BANNER_EYE_* above — one source so the animated row can never drift
+// from the statically-printed one). 2026-07-18: "FinOps & AI Governance
+// Center" → "AI RUNTIME GOVERNANCE" per brand.
+const BANNER_TAGLINE: &str = "AI RUNTIME GOVERNANCE";
+// The owl mouth row art (`╍█  ▼  █╍`) that sits to the LEFT of the tagline;
+// the shimmer redraws the whole row so it needs this prefix verbatim.
+const BANNER_ROW_MOUTH_ART: &str = "\u{254D}\u{2588}     \u{25BC}     \u{2588}\u{254D}";
+// Repo URL — 2026-07-18 moved out of the banner (was on the logo feet row)
+// down to the very bottom under the "Run 'aikey --help'" hint (print_repo_url).
+const BANNER_REPO_URL: &str = "https://github.com/aikeylabs";
+
 // Muted gold: RGB(160, 135, 75). Defined here so both functions colorize
 // consistently without duplicating the tuple.
 fn banner_gold(s: &str) -> colored::ColoredString {
@@ -2529,11 +2541,8 @@ pub(crate) fn print_banner() {
     if crate::term_caps::unicode_tier() == crate::term_caps::UnicodeTier::Safe {
         eprintln!();
         eprintln!("  {}   v{}", "AiKey CLI".bold(), version);
-        eprintln!("  {}", "FinOps & AI Governance Center".cyan().bold());
-        eprintln!(
-            "  {}",
-            "https://github.com/aikeylabs".bright_black().underline()
-        );
+        eprintln!("  {}", BANNER_TAGLINE.cyan().bold());
+        // URL moved to the bottom (print_repo_url) — see art-tier comment below.
         eprintln!();
         return;
     }
@@ -2560,10 +2569,13 @@ pub(crate) fn print_banner() {
     //              renders as solid medium-grey vs `.dimmed()` which is
     //              a faint-intensity attribute that some terminals
     //              under-render)
+    // Tagline printed in its FINAL static style (cyan + bold). When a TTY is
+    // present, animate_banner_shimmer redraws this row with a left→right
+    // brightness sweep, then settles it back to exactly this.
     eprintln!(
         "  {}        {}",
-        banner_gold("\u{254D}\u{2588}     \u{25BC}     \u{2588}\u{254D}"),
-        "FinOps & AI Governance Center".cyan().bold()
+        banner_gold(BANNER_ROW_MOUTH_ART),
+        BANNER_TAGLINE.cyan().bold()
     );
     // 2026-05-29 — banner restructured per UX:
     //   - Path row removed (aikey_home was here; redundant with `aikey
@@ -2575,14 +2587,24 @@ pub(crate) fn print_banner() {
     //     exactly (workflow commit chain b4b3a2a → 6b8b9f6 → follow-up)
     //     so brand looks identical at install time and every `ak` run.
     let _ = aikey_home; // kept reachable for future re-introduction
-                        // 2026-05-29 user-requested: drop "Source:" prefix on banner feet
-                        // row — URL alone is self-explanatory next to the brand logo,
-                        // cleaner visual. Mirrors workflow installer banner commit chain.
-    eprintln!("   {}       {}",
-        banner_gold("\u{2570}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2588}\u{2588}\u{256F}"),
-        "https://github.com/aikeylabs".bright_black().underline());
+                        // 2026-07-18 user request: the repo URL moved off this feet row down to
+                        // the very bottom of the no-arg screen (under "Run 'aikey --help'"), so
+                        // the logo bottom is now just the owl feet. print_repo_url() emits the URL
+                        // at its new home. (Previously the URL sat here as a top-of-banner trust
+                        // signal; the user preferred it as a footer.)
+    eprintln!("   {}",
+        banner_gold("\u{2570}\u{2588}\u{2588}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2588}\u{2588}\u{256F}"));
     eprintln!("       {}", banner_gold("\u{2579}   \u{2579}"));
     eprintln!();
+}
+
+/// Print the open-source repo URL as its own footer line (bright_black +
+/// underline so it reads as a quiet clickable link). 2026-07-18: extracted so
+/// both the `--version` banner and the no-command screen render the same URL
+/// line at their respective bottoms (it left the banner's logo feet row).
+pub(crate) fn print_repo_url() {
+    use colored::Colorize;
+    eprintln!("  {}", BANNER_REPO_URL.bright_black().underline());
 }
 
 /// Run the banner's one-shot eye blink: ⦿ → ● → ⦿. Call AFTER all static
@@ -2654,6 +2676,80 @@ pub(crate) fn animate_banner_blink(extra_lines: usize) {
             let _ = err.flush();
         }
     }
+}
+
+/// Sweep a left→right brightness highlight across the "AI RUNTIME GOVERNANCE"
+/// tagline (like Codex's shimmering "wait" text), then settle it back to the
+/// static cyan style. Call AFTER all static output, same as
+/// `animate_banner_blink`; `extra_lines` is the number of lines the caller
+/// printed after `print_banner()` returned. The tagline sits on banner row 4,
+/// which is `4 + extra_lines` rows above the final cursor.
+///
+/// No-ops on non-TTY, when `AIKEY_NO_ANIMATION=1`, in the Safe unicode tier
+/// (no owl art there), or when colour is disabled (`NO_COLOR` etc.) — a moving
+/// highlight is meaningless without truecolor, so we skip the redraws entirely
+/// rather than flicker uncoloured text.
+pub(crate) fn animate_banner_shimmer(extra_lines: usize) {
+    use colored::Colorize;
+    use std::io::{IsTerminal, Write};
+
+    let enabled = std::io::stderr().is_terminal()
+        && std::env::var("AIKEY_NO_ANIMATION").map_or(true, |v| v != "1" && v != "true")
+        && colored::control::SHOULD_COLORIZE.should_colorize();
+    if !enabled || crate::term_caps::unicode_tier() == crate::term_caps::UnicodeTier::Safe {
+        return;
+    }
+
+    let up = 4 + extra_lines;
+    let art = banner_gold(BANNER_ROW_MOUTH_ART);
+    let chars: Vec<char> = BANNER_TAGLINE.chars().collect();
+    let n = chars.len() as f64;
+    let mut err = std::io::stderr().lock();
+
+    // Base = the resting cyan; peak = a near-white crest. Each char blends
+    // between them by proximity to the moving sweep centre `p` (triangular
+    // falloff, smoothstep-eased), so a soft bright band glides across.
+    const BASE: (f64, f64, f64) = (99.0, 188.0, 205.0);
+    const PEAK: (f64, f64, f64) = (245.0, 248.0, 255.0);
+    const WINDOW: f64 = 4.0; // half-width of the bright band, in chars
+    const PASSES: usize = 1; // 2026-07-18 user request: sweep exactly once
+    const STEP_MS: u64 = 20;
+
+    let lerp = |a: f64, b: f64, t: f64| (a + (b - a) * t).round() as u8;
+    let frame_for = |p: f64| -> String {
+        let mut tag = String::new();
+        for (i, &ch) in chars.iter().enumerate() {
+            let dist = (i as f64 - p).abs();
+            let mut f = (1.0 - dist / WINDOW).max(0.0);
+            f = f * f * (3.0 - 2.0 * f); // smoothstep
+            let (r, g, b) = (
+                lerp(BASE.0, PEAK.0, f),
+                lerp(BASE.1, PEAK.1, f),
+                lerp(BASE.2, PEAK.2, f),
+            );
+            let c = ch.to_string().truecolor(r, g, b);
+            let c = if f > 0.5 { c.bold() } else { c };
+            tag.push_str(&c.to_string());
+        }
+        // Rewrite the full row (clear-line wiped the gold art too).
+        format!("\x1b[{up}A\r\x1b[2K  {art}        {tag}\r\x1b[{up}B")
+    };
+
+    for _ in 0..PASSES {
+        let mut p = -WINDOW;
+        while p <= n + WINDOW {
+            let _ = err.write_all(frame_for(p).as_bytes());
+            let _ = err.flush();
+            std::thread::sleep(std::time::Duration::from_millis(STEP_MS));
+            p += 1.0;
+        }
+    }
+
+    // Settle back to exactly the static style print_banner first drew.
+    let final_tag = BANNER_TAGLINE.cyan().bold();
+    let _ = err
+        .write_all(format!("\x1b[{up}A\r\x1b[2K  {art}        {final_tag}\r\x1b[{up}B").as_bytes());
+    let _ = err.flush();
 }
 
 /// Format a unix timestamp as YYYY/MM/DD.
