@@ -2167,7 +2167,10 @@ pub fn handle_doctor_last_errors(json_mode: bool) -> Result<(), Box<dyn std::err
         _ => match dirs::home_dir() {
             Some(h) => h.join(".aikey/run/last-errors.json"),
             None => {
-                println!("{}", "  (no home dir — cannot locate last-errors state)".dimmed());
+                println!(
+                    "{}",
+                    "  (no home dir — cannot locate last-errors state)".dimmed()
+                );
                 return Ok(());
             }
         },
@@ -2199,7 +2202,11 @@ pub fn handle_doctor_last_errors(json_mode: bool) -> Result<(), Box<dyn std::err
     }
 
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::json!({}));
-    let entries = parsed.get("entries").and_then(|e| e.as_array()).cloned().unwrap_or_default();
+    let entries = parsed
+        .get("entries")
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
     if entries.is_empty() {
         println!("  {}", "No recent proxy errors recorded.".green());
         return Ok(());
@@ -2214,12 +2221,24 @@ pub fn handle_doctor_last_errors(json_mode: bool) -> Result<(), Box<dyn std::err
         let code = e.get("code").and_then(|v| v.as_str()).unwrap_or("");
         let trace = e.get("trace_id").and_then(|v| v.as_str()).unwrap_or("");
         let req_path = e.get("request_path").and_then(|v| v.as_str()).unwrap_or("");
-        let upstream_id = e.get("upstream_request_id").and_then(|v| v.as_str()).unwrap_or("");
+        let upstream_id = e
+            .get("upstream_request_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         // Top line: the request + status. Caused-by lines below name the origin.
         let status_str = format!("{status}");
-        let status_col = if status >= 500 { status_str.red() } else { status_str.yellow() };
-        println!("  {} {}  {}", status_col.bold(), req_path.bold(), code.dimmed());
+        let status_col = if status >= 500 {
+            status_str.red()
+        } else {
+            status_str.yellow()
+        };
+        println!(
+            "  {} {}  {}",
+            status_col.bold(),
+            req_path.bold(),
+            code.dimmed()
+        );
         // origin = the ROOT CAUSE (deepest producer), rendered Java caused-by style.
         let origin_label = describe_origin(origin);
         println!("    {} {}", "└─ caused by:".dimmed(), origin_label);
@@ -2252,17 +2271,25 @@ pub fn handle_doctor_last_errors(json_mode: bool) -> Result<(), Box<dyn std::err
 fn describe_origin(origin: &str) -> String {
     use colored::Colorize;
     if origin.is_empty() {
-        return "unknown (error had no origin tag — likely nginx or a pre-P1 hop)".dimmed().to_string();
+        return "unknown (error had no origin tag — likely nginx or a pre-P1 hop)"
+            .dimmed()
+            .to_string();
     }
     if let Some(provider) = origin.strip_prefix("upstream:") {
-        return format!("{} — the {} upstream returned this; not an aikey fault", origin.cyan(), provider)
-            .to_string();
+        return format!(
+            "{} — the {} upstream returned this; not an aikey fault",
+            origin.cyan(),
+            provider
+        )
+        .to_string();
     }
     // component.CODE
     let component = origin.split('.').next().unwrap_or(origin);
     let hint = match component {
         "oauth-ingress" => "the cluster ingress produced it — check the request path / allowlist",
-        "worker-proxy" => "a cluster worker produced it — check that node (routing / account / egress)",
+        "worker-proxy" => {
+            "a cluster worker produced it — check that node (routing / account / egress)"
+        }
         "local-proxy" => "your local proxy produced it — check local config / vault / binding",
         _ => "an aikey component produced it",
     };

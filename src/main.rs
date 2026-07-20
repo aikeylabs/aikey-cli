@@ -4001,7 +4001,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Whoami => {
             commands_account::handle_whoami(cli.json)?;
         }
-        Commands::Doctor { detail, last_errors } => {
+        Commands::Doctor {
+            detail,
+            last_errors,
+        } => {
             // --last-errors is a focused view (proxy's recent error responses as
             // a caused-by tree); it stands alone and skips the full doctor run.
             if *last_errors {
