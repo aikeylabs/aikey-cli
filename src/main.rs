@@ -2340,6 +2340,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if !cli.json {
                     commands_proxy::print_egress_presence();
                 }
+                // P3.5 tail WARN: mapping configured-but-not-effective. Never
+                // changes the exit code; skipped in --json (wrapper hot path).
+                commands_proxy::print_mapping_tail_warn(cli.json);
                 std::process::exit(code);
             } else if let Some(ref alias) = alias {
                 // ── Single-alias mode: resolve across personal/team/OAuth ──
@@ -2426,6 +2429,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if !cli.json {
                     commands_proxy::print_egress_presence();
                 }
+                // P3.5 tail WARN: mapping configured-but-not-effective. Never
+                // changes the exit code; skipped in --json (wrapper hot path).
+                commands_proxy::print_mapping_tail_warn(cli.json);
                 std::process::exit(code);
             } else {
                 // ── No alias: test all active bindings (personal/team/OAuth) ──
@@ -2501,6 +2507,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if !cli.json {
                     commands_proxy::print_egress_presence();
                 }
+                // P3.5 tail WARN: mapping configured-but-not-effective. Never
+                // changes the exit code; skipped in --json (wrapper hot path).
+                commands_proxy::print_mapping_tail_warn(cli.json);
                 std::process::exit(code);
             }
         }

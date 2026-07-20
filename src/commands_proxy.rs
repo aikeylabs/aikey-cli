@@ -2075,6 +2075,107 @@ pub fn fetch_egress_state() -> Result<Option<EgressState>, String> {
     Ok(body.egress)
 }
 
+// ── Model-mapping health (P3.5 four-surface visibility · task 7.9) ──────────
+//
+// The proxy's `mappingHealth` (GET /v1/diagnostics/pipeline) is the SINGLE source
+// of truth for "is a mapping configured but not taking effect?". The CLI surfaces
+// (aikey doctor / aikey test) render its verdict verbatim — 🚫 no client-side
+// re-derivation of the state (3.5: one judgment function, not per-caller markers).
+
+#[derive(Debug, serde::Deserialize)]
+pub struct MappingHealthWire {
+    /// "ok" | "degraded" | "inactive".
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub applied: i64,
+    #[serde(default)]
+    pub rejected: i64,
+    #[serde(default)]
+    pub passthrough_missing: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct RegistryProvenanceWire {
+    #[serde(default)]
+    pub digest: String,
+    #[serde(default)]
+    pub route_rows: i64,
+    #[serde(default)]
+    pub providers_with_model_map: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PipelineDiagnosticsWire {
+    #[serde(default)]
+    pub registry: RegistryProvenanceWire,
+    #[serde(default)]
+    pub model_mapping: MappingHealthWire,
+}
+
+impl Default for RegistryProvenanceWire {
+    fn default() -> Self {
+        Self { digest: String::new(), route_rows: 0, providers_with_model_map: Vec::new() }
+    }
+}
+impl Default for MappingHealthWire {
+    fn default() -> Self {
+        Self {
+            status: String::new(),
+            reason: String::new(),
+            applied: 0,
+            rejected: 0,
+            passthrough_missing: 0,
+        }
+    }
+}
+
+/// Fetch the proxy's read-only model-mapping diagnostics. `Err` = proxy
+/// unreachable (not running / older binary without the endpoint).
+pub fn fetch_pipeline_diagnostics() -> Result<PipelineDiagnosticsWire, String> {
+    let addr = proxy_listen_addr(None);
+    // Loopback admin call — never route through this shell's proxy env.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(3))
+        .build();
+    let resp = agent
+        .get(&format!("http://{addr}/v1/diagnostics/pipeline"))
+        .call()
+        .map_err(|e| format!("cannot reach proxy at {addr}: {e}"))?;
+    resp.into_json()
+        .map_err(|e| format!("invalid diagnostics response: {e}"))
+}
+
+/// P3.5 `aikey test` tail surface: emit a WARN line when a model mapping is
+/// configured but NOT taking effect ("degraded"). 🚫 never changes the exit code
+/// (3.5: tail WARN is informational). Skipped in `--json` mode — so the wrapper
+/// hot path (claude/codex/kimi preflight, always --json) pays zero cost; only a
+/// human `aikey test` sees it. Silent when mapping is ok/inactive or the proxy
+/// diagnostics are unavailable (the proxy-not-running case is already surfaced).
+pub fn print_mapping_tail_warn(json_mode: bool) {
+    use colored::Colorize;
+    if json_mode {
+        return;
+    }
+    if let Ok(diag) = fetch_pipeline_diagnostics() {
+        if diag.model_mapping.status == "degraded" {
+            let reason = if diag.model_mapping.reason.is_empty() {
+                "a model mapping is configured but recent requests didn't match it".to_string()
+            } else {
+                diag.model_mapping.reason.clone()
+            };
+            eprintln!(
+                "{} model-mapping: {} (registry {})",
+                crate::symbols::WARN.s().yellow(),
+                reason,
+                diag.registry.digest
+            );
+        }
+    }
+}
+
 // ── Per-account egress connectivity self-check (§5.4) ───────────────────────
 //
 // The proxy owns the egress engine (Rust can't dial a mihomo group), so the CLI

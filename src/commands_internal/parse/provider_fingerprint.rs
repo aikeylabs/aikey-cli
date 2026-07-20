@@ -64,7 +64,7 @@ pub struct Disambiguator {
 /// v4.3 (2026-05-01): per-host upstream routing entry. See yaml `provider_routes`
 /// section for full schema. Replaces former family_base_urls + host_to_base_url
 /// + proxy applyBaseURL tail-overlap dedup with a single declarative table.
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize)]
 pub struct ProviderRoute {
     pub host: String,
     pub protocol: String,
@@ -72,6 +72,41 @@ pub struct ProviderRoute {
     pub base_url: String,
     #[serde(default)]
     pub version: String,
+    /// P1b / design D-2b: second half of the row key. A host may carry
+    /// multiple rows distinguished by the stored base_url's path prefix
+    /// (GLM open.bigmodel.cn has /api/anthropic vs /api/coding/paas/v4
+    /// endpoints). `route_for_base_url` does a segment-aligned
+    /// longest-prefix match on this field, mirroring Go's Table.Lookup.
+    /// Default "" is the host fallback row; with all-empty prefixes lookup
+    /// degrades to exact host match, so the pre-P1b 18 rows are unchanged.
+    /// skip_serializing_if keeps the rules-endpoint JSON identical to Go's
+    /// `omitempty` for cross-language parity (P1c).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path_prefix: String,
+}
+
+/// P1 / design D-2: one model_map rule (client model name → upstream model).
+/// `match` is a Rust keyword → renamed. Mirrors Go providerroutes.ModelRule.
+#[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize)]
+pub struct ModelRule {
+    #[serde(rename = "match")]
+    pub match_: String,
+    pub requested_model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_1m: bool,
+}
+
+/// P1 / design D-2: a provider's model_map (keyed by provider CODE). Mirrors
+/// Go providerroutes.ModelMap.
+#[derive(Debug, Clone, PartialEq, Deserialize, serde::Serialize)]
+pub struct ModelMap {
+    pub provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub unmatched: String,
+    #[serde(default)]
+    pub models: Vec<ModelRule>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +114,11 @@ struct Registry {
     #[allow(dead_code)]
     version: u32,
     providers: Vec<ProviderEntry>,
+    /// P1 / design D-2: per-provider-code model name maps. See yaml
+    /// `provider_model_maps` section. Parsed for cross-language parity with
+    /// Go's providerroutes (the proxy is the primary consumer).
+    #[serde(default)]
+    provider_model_maps: Vec<ModelMap>,
     /// v4.1 Stage 5+: 聚合网关 family 清单(openrouter / yunwu / zeroeleven 等)
     /// 见 yaml 顶部 `aggregator_families` 段落。
     #[serde(default)]
@@ -108,6 +148,8 @@ pub struct FingerprintClassifier {
     /// version). 同一 provider 可有多 host 行 (e.g. kimi 下 api.kimi.com 与
     /// api.moonshot.cn 是两行,都 provider=kimi 但 base_url 不同)。
     provider_routes: Vec<ProviderRoute>,
+    /// P1 / design D-2: per-provider-code model_map (keyed by provider code).
+    provider_model_maps: Vec<ModelMap>,
 }
 
 impl FingerprintClassifier {
@@ -127,12 +169,48 @@ impl FingerprintClassifier {
             reg.aggregator_families.into_iter().collect();
         let family_login_urls = reg.family_login_urls;
         let provider_routes = reg.provider_routes;
+        let provider_model_maps = reg.provider_model_maps;
         Self {
             entries,
             aggregator_families,
             family_login_urls,
             provider_routes,
+            provider_model_maps,
         }
+    }
+
+    /// P1 / design D-2: the model_map for a provider code (case-insensitive).
+    pub fn model_map_for(&self, provider: &str) -> Option<&ModelMap> {
+        self.provider_model_maps
+            .iter()
+            .find(|m| m.provider.eq_ignore_ascii_case(provider))
+    }
+
+    /// P1 / design D-2 & D-3: resolve a client model to the upstream model via
+    /// a provider's model_map. Precedence exact → role → wildcard. Returns
+    /// (effective_model, matched). Mirrors Go providerroutes.ResolveModel.
+    pub fn resolve_model(&self, provider: &str, requested: &str) -> (String, bool) {
+        let Some(mm) = self.model_map_for(provider) else {
+            return (requested.to_string(), false);
+        };
+        for r in &mm.models {
+            if r.match_ == requested {
+                return (r.requested_model.clone(), true);
+            }
+        }
+        if let Some(role) = role_of_model(requested) {
+            for r in &mm.models {
+                if is_role_token(&r.match_) && r.match_.eq_ignore_ascii_case(&role) {
+                    return (r.requested_model.clone(), true);
+                }
+            }
+        }
+        for r in &mm.models {
+            if r.match_ == "*" {
+                return (r.requested_model.clone(), true);
+            }
+        }
+        (requested.to_string(), false)
     }
 
     /// v4.1 Stage 5+: 从 inferred provider family 派生 protocol_types 列表。
@@ -161,6 +239,29 @@ impl FingerprintClassifier {
             .find(|r| r.host.eq_ignore_ascii_case(host))
     }
 
+    /// P1b / design D-2b: path-aware route lookup. Extracts host + path from
+    /// a stored base_url and does a segment-aligned longest-prefix match on
+    /// `path_prefix`, mirroring Go's `Table.Lookup`. This keeps CLI display
+    /// (`official_url_for_route`) consistent with proxy execution for
+    /// multi-endpoint hosts (GLM's /api/anthropic vs /api/paas). For
+    /// single-row hosts it returns the same row as `route_for_host`.
+    pub fn route_for_base_url(&self, base_url: &str) -> Option<&ProviderRoute> {
+        let host = route_host_of(base_url)?;
+        let path = route_path_of(base_url);
+        let mut best: Option<&ProviderRoute> = None;
+        let mut best_len: i64 = -1;
+        for r in &self.provider_routes {
+            if r.host.eq_ignore_ascii_case(&host)
+                && path_prefix_matches(&r.path_prefix, &path)
+                && (r.path_prefix.len() as i64) > best_len
+            {
+                best_len = r.path_prefix.len() as i64;
+                best = Some(r);
+            }
+        }
+        best
+    }
+
     /// v4.3: lookup the FIRST route matching a provider_code. Used as a family-
     /// level fallback when no host info is available (e.g. user picks a
     /// provider chip without pasting a URL). Multi-host providers (kimi)
@@ -184,6 +285,11 @@ impl FingerprintClassifier {
     /// 整张 provider_routes 列表 (供 `_internal rules` 透传给 Web UI / proxy 编译期 embed)
     pub fn provider_routes(&self) -> &[ProviderRoute] {
         &self.provider_routes
+    }
+
+    /// P1 / design D-2: whole provider_model_maps list (cross-language parity).
+    pub fn provider_model_maps(&self) -> &[ModelMap] {
+        &self.provider_model_maps
     }
 
     /// 全量 family → 登录页 URL 映射 (用于 `_internal rules` 把整张表透出给 Web UI)
@@ -385,6 +491,74 @@ pub fn shell_var_family_and_pattern(var_name: &str) -> Option<(String, String)> 
     None
 }
 
+/// P1b / design D-2b: lowercase host of a base_url ("" scheme tolerant).
+fn route_host_of(url: &str) -> Option<String> {
+    let after = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let end = after.find(['/', '?', '#', ':']).unwrap_or(after.len());
+    let host = &after[..end];
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// P1b / design D-2b: path component of a base_url (leading '/', no query).
+fn route_path_of(url: &str) -> String {
+    let after = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    match after.find('/') {
+        Some(i) => {
+            let rest = &after[i..];
+            let end = rest.find(['?', '#']).unwrap_or(rest.len());
+            rest[..end].to_string()
+        }
+        None => String::new(),
+    }
+}
+
+/// P1b / design D-2b: segment-aligned prefix match, mirror of Go's
+/// `pathPrefixMatches`. "/api/anthropic" matches "/api/anthropic" and
+/// "/api/anthropic/v1" but NOT "/api/anthropicfoo". "" is the fallback.
+fn path_prefix_matches(prefix: &str, path: &str) -> bool {
+    if prefix.is_empty() {
+        return true;
+    }
+    if path == prefix {
+        return true;
+    }
+    path.starts_with(&format!("{prefix}/"))
+}
+
+/// P1 / design D-3: known role families a model_map `match` may name.
+const KNOWN_ROLES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
+
+fn is_role_token(s: &str) -> bool {
+    KNOWN_ROLES.iter().any(|r| r.eq_ignore_ascii_case(s))
+}
+
+/// Extract the role family from a claude-style model id ("claude-opus-4-8" →
+/// "opus"). Mirrors Go roleOfModel.
+fn role_of_model(model: &str) -> Option<String> {
+    let lower = model.to_ascii_lowercase();
+    for role in KNOWN_ROLES {
+        if lower == role
+            || lower.contains(&format!("-{role}-"))
+            || lower.starts_with(&format!("{role}-"))
+            || lower.ends_with(&format!("-{role}"))
+            || lower.contains(&format!("-{role}"))
+        {
+            return Some(role.to_string());
+        }
+    }
+    None
+}
+
 /// URL host → family (E5 UrlHostPattern)
 ///
 /// 从 URL 抽 host,匹配 substring → 返回 (family, matched_pattern)
@@ -449,6 +623,123 @@ mod tests {
         let c = FingerprintClassifier::new_embedded();
         // Registry 至少 22 条（参考 POC 基线）
         assert!(c.entries.len() >= 20, "registry size: {}", c.entries.len());
+    }
+
+    // --- P1b / design D-2b: (host, path_prefix) longest-prefix lookup ---
+
+    #[test]
+    fn path_prefix_matches_segment_aligned() {
+        assert!(path_prefix_matches("", "/anything"));
+        assert!(path_prefix_matches("/api/anthropic", "/api/anthropic"));
+        assert!(path_prefix_matches("/api/anthropic", "/api/anthropic/v1"));
+        // segment alignment: must NOT swallow
+        assert!(!path_prefix_matches("/api/anthropic", "/api/anthropicfoo"));
+        assert!(!path_prefix_matches("/api/anth", "/api/anthropic"));
+    }
+
+    #[test]
+    fn route_host_and_path_extraction() {
+        assert_eq!(
+            route_host_of("https://open.bigmodel.cn/api/anthropic").as_deref(),
+            Some("open.bigmodel.cn")
+        );
+        assert_eq!(route_path_of("https://open.bigmodel.cn/api/anthropic"), "/api/anthropic");
+        assert_eq!(route_path_of("https://open.bigmodel.cn"), "");
+        assert_eq!(route_path_of("https://open.bigmodel.cn/api/paas?x=1"), "/api/paas");
+    }
+
+    #[test]
+    fn route_for_base_url_selects_glm_endpoint() {
+        let c = instance();
+        // anthropic endpoint → anthropic row
+        let r = c
+            .route_for_base_url("https://open.bigmodel.cn/api/anthropic")
+            .expect("anthropic row");
+        assert_eq!(r.protocol, "anthropic");
+        assert_eq!(r.base_url, "https://open.bigmodel.cn/api/anthropic");
+        // coding endpoint → openai row
+        let r2 = c
+            .route_for_base_url("https://open.bigmodel.cn/api/coding/paas/v4")
+            .expect("coding row");
+        assert_eq!(r2.protocol, "openai_compatible");
+        // bare host → "" fallback (paas)
+        let r3 = c
+            .route_for_base_url("https://open.bigmodel.cn")
+            .expect("fallback row");
+        assert_eq!(r3.base_url, "https://open.bigmodel.cn/api/paas");
+    }
+
+    // P1c (design D-9): Rust half of the cross-language golden-fixture parity.
+    // Deserializes the SAME golden file the Go test uses (pkg/providerroutes/
+    // testdata/registry_golden.json) with Rust structs and asserts the Rust
+    // parse of the embedded yaml matches it. If serde and Go's yaml.v3 diverge,
+    // one side fails against the shared golden. Path is relative to the crate
+    // root (cargo test CWD) in the monorepo workspace.
+    #[test]
+    fn golden_fixture_parity_rust() {
+        #[derive(serde::Deserialize)]
+        struct Golden {
+            provider_routes: Vec<ProviderRoute>,
+            provider_model_maps: Vec<ModelMap>,
+        }
+        let path = "../pkg/providerroutes/testdata/registry_golden.json";
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|e| panic!("read golden {path}: {e} (monorepo workspace required)"));
+        let golden: Golden = serde_json::from_slice(&bytes).expect("parse golden json");
+        // 防空断言
+        assert!(
+            !golden.provider_routes.is_empty(),
+            "golden has zero routes — anti-empty assertion"
+        );
+
+        let c = instance();
+        assert_eq!(
+            c.provider_routes(),
+            golden.provider_routes.as_slice(),
+            "Rust provider_routes parse != golden (regenerate golden + mirror in Go)"
+        );
+        assert_eq!(
+            c.provider_model_maps(),
+            golden.provider_model_maps.as_slice(),
+            "Rust provider_model_maps parse != golden"
+        );
+    }
+
+    #[test]
+    fn model_map_resolve_zhipu_embedded() {
+        // P1 / design D-2/D-3: embedded zhipu map resolves opus family + exact.
+        let c = instance();
+        assert_eq!(
+            c.resolve_model("zhipu", "claude-opus-4-8"),
+            ("glm-4.6".to_string(), true)
+        );
+        // role opus (升版本不失效)
+        assert_eq!(
+            c.resolve_model("zhipu", "claude-opus-4-9"),
+            ("glm-4.6".to_string(), true)
+        );
+        assert_eq!(
+            c.resolve_model("zhipu", "claude-sonnet-4-6"),
+            ("glm-4.5".to_string(), true)
+        );
+        // provider without a map → passthrough, unmatched
+        let (m, matched) = c.resolve_model("openai", "gpt-4o");
+        assert!(!matched);
+        assert_eq!(m, "gpt-4o");
+    }
+
+    #[test]
+    fn route_for_base_url_backward_compat_single_row_hosts() {
+        // Fence (task 1b.4): a pre-P1b single-row host resolves identically
+        // for any path — extended key degrades to exact host match.
+        let c = instance();
+        let by_host = c.route_for_host("api.anthropic.com").expect("host row");
+        for p in ["", "/v1/messages", "/deep/path"] {
+            let url = format!("https://api.anthropic.com{p}");
+            let r = c.route_for_base_url(&url).expect("must resolve");
+            assert_eq!(r.provider, by_host.provider, "url={url}");
+            assert_eq!(r.base_url, by_host.base_url, "url={url}");
+        }
     }
 
     #[test]

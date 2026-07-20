@@ -407,6 +407,31 @@ fn team_protocol_source<'a>(provider_code: &'a str, protocol_type: &'a str) -> O
     }
 }
 
+/// P1f / design D-12/D-13: the two-axis binding read model. Protocol and
+/// provider are SEPARATE axes — protocol from the route row (endpoint truth,
+/// D-12; falls back to the stored protocol_type), provider is the brand code,
+/// provider_display_alias is the brand alias (GLM for zhipu). Returned as an
+/// ARRAY from the start (length 1 today; multi-binding when the per-binding
+/// cache lands, P1e) so web never has to migrate a scalar→array contract (D-13).
+/// 🚫 Web must NOT derive protocol from provider (前端 §7) — that's why the
+/// backend/CLI owns this projection.
+fn two_axis_bindings(provider_code: &str, protocol_type: &str, base_url: &str) -> serde_json::Value {
+    let classifier = crate::commands_internal::parse::provider_fingerprint::instance();
+    let protocol = classifier
+        .route_for_base_url(base_url)
+        .map(|r| r.protocol.clone())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| protocol_type.to_string());
+    let display_alias = crate::provider_registry::lookup(provider_code)
+        .and_then(|e| e.display_alias)
+        .unwrap_or("");
+    json!([{
+        "protocol": protocol,
+        "provider": provider_code,
+        "provider_display_alias": display_alias,
+    }])
+}
+
 fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Value> {
     let entries = match storage::list_virtual_key_cache_readonly() {
         Ok(v) => v,
@@ -483,6 +508,10 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
                 "local_alias": t.local_alias,
                 "protocol_family": protocol_family_of(team_protocol_source(&t.provider_code, &t.protocol_type)),
                 "supported_providers": t.supported_providers,
+                // P1f / D-12/D-13: two-axis bindings (protocol ≠ provider). Web
+                // groups by binding.protocol + shows provider as a chip. Kept
+                // alongside protocol_family (deprecated) for backward compat.
+                "bindings": two_axis_bindings(&t.provider_code, &t.protocol_type, &t.base_url),
                 "share_status": share_status_wire,
                 "effective_status": effective_status,
                 "expires_at": expires_at_iso,
@@ -2013,6 +2042,42 @@ mod prefix_suffix_tests {
         assert_eq!(p, "sk-ant-api03");
         assert_eq!(sfx, "1234");
         assert_eq!(len, s.chars().count());
+    }
+}
+
+#[cfg(test)]
+mod two_axis_bindings_tests {
+    use super::two_axis_bindings;
+
+    // P1f / D-12: protocol comes from the route row (endpoint), provider is the
+    // brand — the two axes are SEPARATE, and the display alias is the brand alias.
+    #[test]
+    fn glm_anthropic_endpoint_two_axis() {
+        // zhipu credential whose base_url is GLM's anthropic endpoint.
+        let b = two_axis_bindings("zhipu", "openai_compatible", "https://open.bigmodel.cn/api/anthropic");
+        let arr = b.as_array().expect("bindings is an array");
+        assert_eq!(arr.len(), 1, "D-13: array from the start");
+        // protocol from the ROUTE ROW (anthropic), NOT the stale stored protocol_type
+        assert_eq!(arr[0]["protocol"], "anthropic");
+        assert_eq!(arr[0]["provider"], "zhipu");
+        assert_eq!(arr[0]["provider_display_alias"], "GLM");
+    }
+
+    #[test]
+    fn falls_back_to_protocol_type_when_host_unknown() {
+        let b = two_axis_bindings("acme", "openai_compatible", "https://unknown.example");
+        let arr = b.as_array().unwrap();
+        assert_eq!(arr[0]["protocol"], "openai_compatible"); // fallback
+        assert_eq!(arr[0]["provider"], "acme");
+        assert_eq!(arr[0]["provider_display_alias"], ""); // no alias for unknown
+    }
+
+    #[test]
+    fn anthropic_official_two_axis() {
+        let b = two_axis_bindings("anthropic", "anthropic", "https://api.anthropic.com");
+        let arr = b.as_array().unwrap();
+        assert_eq!(arr[0]["protocol"], "anthropic");
+        assert_eq!(arr[0]["provider"], "anthropic");
     }
 }
 

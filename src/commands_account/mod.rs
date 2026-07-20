@@ -2845,12 +2845,23 @@ fn apply_snapshot_to_cache(
     current_account_id: &str,
 ) {
     use std::collections::HashSet;
-    let seen_ids: HashSet<String> = items.iter().map(|i| i.virtual_key_id.clone()).collect();
+    // P1e (design D-11): the cache is one row per binding, so the sync tracks the
+    // full (vk, protocol, provider) triple — preserving each binding's own local
+    // ciphertext and pruning a single removed binding without touching the VK's
+    // other bindings. \x1f cannot appear in an id (matches the projection prune).
+    let binding_key = |vk: &str, proto: &str, prov: &str| format!("{vk}\u{1f}{proto}\u{1f}{prov}");
+    let seen_bindings: HashSet<String> = items
+        .iter()
+        .map(|i| binding_key(&i.virtual_key_id, &i.protocol_type, &i.provider_code))
+        .collect();
 
     for item in items {
-        let existing = storage::get_virtual_key_cache(&item.virtual_key_id)
-            .ok()
-            .flatten();
+        // Read THIS binding's existing row (not just any row for the VK) so the
+        // preserved ciphertext/nonce belongs to the right credential.
+        let existing =
+            storage::get_virtual_key_cache_binding(&item.virtual_key_id, &item.protocol_type, &item.provider_code)
+                .ok()
+                .flatten();
 
         // Preserve local-only fields from the existing cache entry.
         let local_alias = existing.as_ref().and_then(|e| e.local_alias.clone());
@@ -2951,11 +2962,17 @@ fn apply_snapshot_to_cache(
         let mut pruned = 0usize;
         for entry in cached {
             if entry.owner_account_id.as_deref() == Some(current_account_id)
-                && !seen_ids.contains(&entry.virtual_key_id)
+                && !seen_bindings.contains(&binding_key(
+                    &entry.virtual_key_id,
+                    &entry.protocol_type,
+                    &entry.provider_code,
+                ))
             {
-                // If this key was the active proxy key, clear the active key config
-                // so the proxy stops routing it on next reload.
-                if entry.local_state == "active" {
+                // If this binding's VK was the active proxy key AND the whole VK is
+                // gone (no surviving binding), clear the active key config so the
+                // proxy stops routing it on next reload.
+                let vk_gone = !items.iter().any(|i| i.virtual_key_id == entry.virtual_key_id);
+                if entry.local_state == "active" && vk_gone {
                     if let Ok(Some(cfg)) = storage::get_active_key_config() {
                         if cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey
                             && cfg.key_ref == entry.virtual_key_id
@@ -2964,7 +2981,11 @@ fn apply_snapshot_to_cache(
                         }
                     }
                 }
-                match storage::delete_virtual_key_cache_row(&entry.virtual_key_id) {
+                match storage::delete_virtual_key_cache_binding(
+                    &entry.virtual_key_id,
+                    &entry.protocol_type,
+                    &entry.provider_code,
+                ) {
                     Ok(()) => pruned += 1,
                     Err(e) => {
                         // Fall back to the legacy stale mark so the row at least
@@ -3407,7 +3428,21 @@ fn run_full_snapshot_sync_opts(
         // Download the delivery payload (plaintext provider key over TLS).
         match client.get_key_delivery(&entry.virtual_key_id) {
             Ok(payload) => {
-                match payload.primary_binding() {
+                // P1e (design D-11): pull THIS cache row's OWN binding material.
+                // The cache is one row per binding (vk, protocol, provider), and the
+                // delivery payload carries every binding's plaintext key in its own
+                // slot/target — so a VK holding GLM + official gets each key stored
+                // under its own binding row (each loop iteration handles one). Match
+                // by (protocol, provider); fall back to the primary binding for a
+                // legacy single-binding row whose provider_code is empty/unset.
+                let matched = payload
+                    .binding_for(&entry.protocol_type, &entry.provider_code)
+                    .or_else(|| {
+                        payload
+                            .primary_binding()
+                            .map(|b| (payload.primary_protocol_type(), b))
+                    });
+                match matched {
                     None => {
                         eprintln!(
                             "  {} key '{}' has no active bindings — skipping.",
@@ -3415,8 +3450,8 @@ fn run_full_snapshot_sync_opts(
                             entry.alias
                         );
                     }
-                    Some(binding) => {
-                        let protocol_type = payload.primary_protocol_type().to_string();
+                    Some((slot_protocol, binding)) => {
+                        let protocol_type = slot_protocol.to_string();
                         let sync_supported_providers = if !payload.supported_providers.is_empty() {
                             payload.supported_providers.clone()
                         } else if !binding.provider_code.is_empty() {
@@ -5034,7 +5069,10 @@ pub fn handle_key_use(
             for (i, p) in providers.iter().enumerate() {
                 println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p);
             }
-            print!("Select protocol(s) to set as Primary (comma-separated): ");
+            // P1f.11② (§19.9): this list is `supported_providers` (PROVIDER codes),
+            // not protocols — the old "Select protocol(s)" mislabel conflated the two
+            // axes (名词字典 provider≠protocol). Prompt for providers.
+            print!("Select provider(s) to set as Primary (comma-separated): ");
             io::stdout().flush()?;
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
@@ -5075,12 +5113,13 @@ pub fn handle_key_use(
         for (i, p) in providers.iter().enumerate() {
             println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p);
         }
-        print!("Select protocol(s) to set as Primary (comma-separated): ");
+        // P1f.11② (§19.9): PROVIDER codes, not protocols — fix the mislabel.
+        print!("Select provider(s) to set as Primary (comma-separated): ");
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         if input.trim().is_empty() {
-            return Err("No protocol selected.".into());
+            return Err("No provider selected.".into());
         }
         let mut selected = Vec::new();
         for part in input.trim().split(',').map(|s| s.trim()) {
@@ -5168,7 +5207,18 @@ pub fn handle_key_use(
                     .unwrap_or(false),
         );
 
+        // P1f.11① (§19.9): two-axis summary — PROTOCOL (route-row truth) and
+        // PROVIDER (brand + display_alias, e.g. `zhipu(GLM)`) shown as SEPARATE
+        // columns, matching the vault page's two axes so `aikey use` never conflates
+        // them again. Header row makes the axes explicit (product-designer §5.3).
+        use colored::Colorize as _;
         let mut rows: Vec<String> = Vec::new();
+        rows.push(format!(
+            "  {:<12} {:<20} {}",
+            "PROTOCOL".dimmed(),
+            "PROVIDER".dimmed(),
+            "KEY".dimmed()
+        ));
         for b in &bindings {
             if let Some((api_key_var, _)) = provider_env_vars(&b.provider_code) {
                 let display_ref =
@@ -5181,9 +5231,19 @@ pub fn handle_key_use(
                 } else {
                     arrow_padded
                 };
+                // Provider axis: `code(alias)` — GLM alias muted-in-parens, matching
+                // the vault chip (zhipu → `zhipu(GLM)`). 🚫 alias never replaces code.
+                let provider_disp = match crate::provider_registry::lookup(&b.provider_code)
+                    .and_then(|e| e.display_alias)
+                {
+                    Some(alias) if !alias.is_empty() => format!("{}({})", b.provider_code, alias),
+                    _ => b.provider_code.clone(),
+                };
+                let protocol = resolve_binding_protocol(b);
                 rows.push(format!(
-                    "  {:<14} {} {}",
-                    b.provider_code,
+                    "  {:<12} {:<20} {} {}",
+                    protocol,
+                    provider_disp,
                     arrow_col,
                     format!("[{}]", b.key_source_type).bright_black()
                 ));
@@ -5217,6 +5277,41 @@ pub fn handle_key_use(
     // unuse.md for why the previous one-sided install call was hiding a
     // matching uninstall gap.
     Ok(())
+}
+
+/// P1f.11① (§19.9, L1): resolve the WIRE PROTOCOL for a provider binding shown in
+/// the `aikey use` summary, from the fingerprint route row that owns its endpoint
+/// — the SAME endpoint-truth source as the vault two-axis read model
+/// (`commands_internal::query::two_axis_bindings`). This is a protocol, NOT the
+/// provider family: the summary shows the two axes separately so a GLM-via-anthropic
+/// binding reads "anthropic · zhipu(GLM)" instead of collapsing them. Multi-binding
+/// per provider is an L3 (P1e) concern; at L1 each provider has one active binding.
+fn resolve_binding_protocol(b: &storage::ProviderBinding) -> String {
+    use crate::credential_type::CredentialType;
+    let classifier = crate::commands_internal::parse::provider_fingerprint::instance();
+    let via_base_url = |base_url: &str, fallback: &str| -> Option<String> {
+        classifier
+            .route_for_base_url(base_url)
+            .map(|r| r.protocol.clone())
+            .filter(|p| !p.is_empty())
+            .or_else(|| (!fallback.is_empty()).then(|| fallback.to_string()))
+    };
+    let resolved = match b.key_source_type {
+        // Team keys carry base_url + protocol_type in the local cache.
+        CredentialType::ManagedVirtualKey => storage::get_virtual_key_cache(&b.key_source_ref)
+            .ok()
+            .flatten()
+            .and_then(|vk| via_base_url(&vk.base_url, &vk.protocol_type)),
+        // Personal keys: resolve via the entry's stored base_url.
+        _ => storage::get_entry_base_url(&b.key_source_ref)
+            .ok()
+            .flatten()
+            .and_then(|url| via_base_url(&url, "")),
+    };
+    // Honest fallback when the endpoint can't be resolved (e.g. an OAuth binding
+    // with no cached base_url): the provider's canonical family label. Best-effort
+    // only — the route row is authoritative whenever present.
+    resolved.unwrap_or_else(|| crate::provider_registry::family_of(&b.provider_code).to_string())
 }
 
 /// Classify the `aikey use` summary line so it never overpromises

@@ -1057,10 +1057,21 @@ pub fn change_password(
     // bad row — would have us emit a new wrong-key ciphertext under the new
     // master and permanently lock that vk_id out, exactly the silent failure
     // we are trying to surface.
-    let mvk_rows: Vec<(String, Vec<u8>, Vec<u8>)> = {
+    // 🔴 P1e (design D-11): the cache is now ONE ROW PER BINDING
+    // `(virtual_key_id, protocol_type, provider_code)`, and EACH binding row
+    // carries its OWN provider_key_ciphertext (e.g. one VK holds a GLM key on
+    // the zhipu/anthropic binding AND the official key on the anthropic/anthropic
+    // binding). The re-encrypt therefore MUST key both the SELECT and the UPDATE
+    // on the full composite key — the pre-P1e `WHERE virtual_key_id = ?` would
+    // stamp every binding of a VK with the LAST binding's re-encrypted ciphertext,
+    // silently destroying the other credentials (第 1 级安全: irreversible
+    // ciphertext corruption). Each row is decrypted, re-encrypted, and written
+    // back to its own row independently.
+    let mvk_rows: Vec<(String, String, String, Vec<u8>, Vec<u8>)> = {
         let mut stmt = tx
             .prepare(
-                "SELECT virtual_key_id, provider_key_nonce, provider_key_ciphertext
+                "SELECT virtual_key_id, protocol_type, provider_code,
+                        provider_key_nonce, provider_key_ciphertext
                  FROM managed_virtual_keys_cache
                  WHERE provider_key_nonce IS NOT NULL
                    AND provider_key_ciphertext IS NOT NULL",
@@ -1070,8 +1081,10 @@ pub fn change_password(
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
                 ))
             })
             .map_err(|e| format!("Failed to query managed_virtual_keys_cache: {}", e))?;
@@ -1079,17 +1092,19 @@ pub fn change_password(
         collected
             .map_err(|e| format!("Failed to collect managed_virtual_keys_cache rows: {}", e))?
     };
-    for (vk_id, old_nonce, old_ciphertext) in mvk_rows {
+    for (vk_id, protocol_type, provider_code, old_nonce, old_ciphertext) in mvk_rows {
         let plaintext =
             crate::crypto::decrypt(&old_key, &old_nonce, &old_ciphertext).map_err(|e| {
                 format!(
-                    "Failed to decrypt team key '{vk}' during password change: {err}. \
-                 This row's ciphertext was written with a different vault_key than \
-                 the current password_hash — change-password cannot rotate it. \
-                 Recover by running `aikey key sync --force-reencrypt` first \
-                 (clears stale ciphertext + re-downloads under the current key), \
+                    "Failed to decrypt team key '{vk}' (binding {proto}/{prov}) during \
+                 password change: {err}. This binding's ciphertext was written with a \
+                 different vault_key than the current password_hash — change-password \
+                 cannot rotate it. Recover by running `aikey key sync --force-reencrypt` \
+                 first (clears stale ciphertext + re-downloads under the current key), \
                  then retry `aikey change-password`.",
                     vk = vk_id,
+                    proto = protocol_type,
+                    prov = provider_code,
                     err = e
                 )
             })?;
@@ -1098,8 +1113,8 @@ pub fn change_password(
         tx.execute(
             "UPDATE managed_virtual_keys_cache
                 SET provider_key_nonce = ?, provider_key_ciphertext = ?
-              WHERE virtual_key_id = ?",
-            params![new_nonce, new_ciphertext, vk_id],
+              WHERE virtual_key_id = ? AND protocol_type = ? AND provider_code = ?",
+            params![new_nonce, new_ciphertext, vk_id, protocol_type, provider_code],
         )
         .map_err(|e| format!("Failed to update team key '{}': {}", vk_id, e))?;
     }
@@ -2258,6 +2273,155 @@ mod tests {
             crate::crypto::decrypt(&old_key, &new_nonce, &new_ct).is_err(),
             "old vault_key must no longer decrypt the rotated ciphertext"
         );
+    }
+
+    // 🔴 P1e (design D-11) CORRUPTION FENCE. One VK now carries multiple bindings,
+    // each with its OWN provider_key_ciphertext (e.g. GLM key on the zhipu binding
+    // AND the official key on the anthropic binding). change-password must
+    // re-encrypt EACH binding row independently — the pre-P1e `UPDATE ... WHERE
+    // virtual_key_id = ?` would stamp every binding of a VK with the LAST binding's
+    // re-encrypted ciphertext, irreversibly destroying the other credential. This
+    // test MUST go red if the UPDATE ever drops the (protocol_type, provider_code)
+    // key columns from its WHERE clause.
+    #[test]
+    fn change_password_reencrypts_each_binding_independently() {
+        let (_dir, _db_path, _lock) = setup_vault();
+        let conn = open_connection().expect("open");
+        let _ = crate::storage::list_virtual_key_cache(); // run platform migrations
+
+        let old_key = derive_current("test_password");
+        let glm_key = b"sk-glm-zhipu-key-AAAA";
+        let official_key = b"sk-ant-official-key-BBBB";
+        let (glm_nonce, glm_ct) = crate::crypto::encrypt(&old_key, glm_key).expect("enc glm");
+        let (off_nonce, off_ct) = crate::crypto::encrypt(&old_key, official_key).expect("enc off");
+
+        // Two bindings on ONE virtual key, distinct (protocol_type, provider_code).
+        for (prov, proto, base, nonce, ct) in [
+            ("zhipu", "anthropic", "https://open.bigmodel.cn/api/anthropic", &glm_nonce, &glm_ct),
+            ("anthropic", "anthropic", "https://api.anthropic.com", &off_nonce, &off_ct),
+        ] {
+            conn.execute(
+                "INSERT INTO managed_virtual_keys_cache
+                    (virtual_key_id, org_id, seat_id, alias, provider_code, protocol_type,
+                     base_url, credential_id, credential_revision, virtual_key_revision,
+                     key_status, share_status, local_state,
+                     provider_key_nonce, provider_key_ciphertext, synced_at)
+                 VALUES ('vk-multi','org-1','seat-1','dual-key', ?1, ?2, ?3,
+                         'cred','rev','vrev','active','claimed','synced_inactive',
+                         ?4, ?5, strftime('%s','now'))",
+                params![prov, proto, base, nonce, ct],
+            )
+            .expect("insert binding row");
+        }
+
+        let old = SecretString::new("test_password".to_string());
+        let new = SecretString::new("new_password_xyz".to_string());
+        change_password(&old, &new).expect("change_password ok");
+
+        // Each binding must still decrypt to ITS OWN original key under the new vault_key.
+        let conn = open_connection().expect("reopen");
+        let new_key = derive_current("new_password_xyz");
+        let read_binding = |prov: &str| -> Vec<u8> {
+            let (n, c): (Vec<u8>, Vec<u8>) = conn
+                .query_row(
+                    "SELECT provider_key_nonce, provider_key_ciphertext
+                     FROM managed_virtual_keys_cache
+                     WHERE virtual_key_id='vk-multi' AND provider_code=?1",
+                    params![prov],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("read binding");
+            crate::crypto::decrypt(&new_key, &n, &c)
+                .expect("decrypt under new key")
+                .to_vec()
+        };
+        assert_eq!(read_binding("zhipu").as_slice(), glm_key, "GLM binding key must survive rotation intact");
+        assert_eq!(
+            read_binding("anthropic").as_slice(),
+            official_key,
+            "official binding key must survive rotation intact (NOT clobbered by the GLM binding)"
+        );
+    }
+
+    // P1e migration fence: a pre-P1e vault (single-column PK on virtual_key_id)
+    // must be re-grained IN PLACE to the composite binding PK, losslessly, and the
+    // re-grain must be idempotent (no-op on the already-migrated shape).
+    #[test]
+    fn regrain_migration_preserves_data_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("legacy.sqlite3");
+        let conn = Connection::open(&db).expect("open legacy");
+
+        // Pre-P1e one-VK-one-row table (single-column PK).
+        conn.execute_batch(
+            "CREATE TABLE managed_virtual_keys_cache (
+                virtual_key_id       TEXT PRIMARY KEY,
+                org_id               TEXT NOT NULL,
+                seat_id              TEXT NOT NULL,
+                alias                TEXT NOT NULL,
+                provider_code        TEXT NOT NULL,
+                protocol_type        TEXT NOT NULL DEFAULT 'openai_compatible',
+                base_url             TEXT NOT NULL,
+                credential_id        TEXT NOT NULL,
+                credential_revision  TEXT NOT NULL,
+                virtual_key_revision TEXT NOT NULL,
+                key_status           TEXT NOT NULL DEFAULT 'active',
+                share_status         TEXT NOT NULL DEFAULT 'pending_claim',
+                local_state          TEXT NOT NULL DEFAULT 'synced_inactive',
+                expires_at           INTEGER,
+                provider_key_nonce      BLOB,
+                provider_key_ciphertext BLOB,
+                cache_schema_version INTEGER NOT NULL DEFAULT 1,
+                synced_at            INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+            INSERT INTO managed_virtual_keys_cache
+                (virtual_key_id, org_id, seat_id, alias, provider_code, protocol_type,
+                 base_url, credential_id, credential_revision, virtual_key_revision,
+                 provider_key_ciphertext)
+             VALUES ('vk-legacy','o','s','legacy-key','anthropic','anthropic',
+                     'https://api.anthropic.com','c','r','v', X'DEADBEEF');",
+        )
+        .expect("seed legacy table");
+
+        // Precondition: single-column PK.
+        let pk_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('managed_virtual_keys_cache') WHERE pk > 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pk_before, 1, "precondition: legacy single-column PK");
+
+        crate::migrations::upgrade_all(&conn).expect("migrate");
+
+        // Composite PK now, row + ciphertext preserved byte-for-byte, version bumped.
+        let pk_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('managed_virtual_keys_cache') WHERE pk > 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pk_after, 3, "re-grain to composite (vk, protocol, provider) PK");
+
+        let (ct, ver): (Vec<u8>, i64) = conn
+            .query_row(
+                "SELECT provider_key_ciphertext, cache_schema_version
+                 FROM managed_virtual_keys_cache WHERE virtual_key_id='vk-legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("row preserved");
+        assert_eq!(ct, vec![0xDE, 0xAD, 0xBE, 0xEF], "ciphertext copied byte-for-byte (no re-encrypt)");
+        assert_eq!(ver, 2, "cache_schema_version bumped to the binding grain");
+
+        // Idempotent: a second run is a no-op (still composite, still one row).
+        crate::migrations::upgrade_all(&conn).expect("migrate again");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM managed_virtual_keys_cache", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "idempotent re-run leaves data untouched");
     }
 
     // Fence test for the Phase 2 extraction (B): the shared delivered-key core

@@ -270,6 +270,25 @@ pub fn delete_virtual_key_cache_row(virtual_key_id: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// P1e (design D-11): delete ONE binding row `(vk, protocol, provider)`. The
+/// cache is one row per binding; the vk-level `delete_virtual_key_cache_row`
+/// removes ALL of a VK's bindings, but the sync-prune needs to drop a single
+/// binding that the server no longer projects while its VK survives.
+pub fn delete_virtual_key_cache_binding(
+    virtual_key_id: &str,
+    protocol_type: &str,
+    provider_code: &str,
+) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "DELETE FROM managed_virtual_keys_cache
+          WHERE virtual_key_id = ?1 AND protocol_type = ?2 AND provider_code = ?3",
+        params![virtual_key_id, protocol_type, provider_code],
+    )
+    .map_err(|e| format!("Failed to delete virtual key cache binding: {}", e))?;
+    Ok(())
+}
+
 pub fn clear_virtual_key_cache() -> Result<(), String> {
     let conn = open_connection()?;
     conn.execute("DELETE FROM managed_virtual_keys_cache", [])
@@ -744,12 +763,10 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              ?19, ?20,
              ?21, ?22, ?23, ?24, ?25
          )
-         ON CONFLICT(virtual_key_id) DO UPDATE SET
+         ON CONFLICT(virtual_key_id, protocol_type, provider_code) DO UPDATE SET
              org_id                  = excluded.org_id,
              seat_id                 = excluded.seat_id,
              alias                   = excluded.alias,
-             provider_code           = excluded.provider_code,
-             protocol_type           = excluded.protocol_type,
              base_url                = excluded.base_url,
              credential_id           = excluded.credential_id,
              credential_revision     = excluded.credential_revision,
@@ -1003,6 +1020,45 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
         Ok(entry) => Ok(Some(entry)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(format!("Failed to get virtual key cache entry: {}", e)),
+    }
+}
+
+/// P1e (design D-11): returns the ONE binding row `(vk, protocol, provider)`, or
+/// `None`. The cache is one row per binding, so a structural sync must preserve
+/// EACH binding's own local ciphertext — reading by `virtual_key_id` alone would
+/// carry the wrong binding's material. Same column-cascade as `get_virtual_key_cache`.
+pub fn get_virtual_key_cache_binding(
+    virtual_key_id: &str,
+    protocol_type: &str,
+    provider_code: &str,
+) -> Result<Option<VirtualKeyCacheEntry>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_connection()?;
+    let sel = |cols: &str| {
+        format!(
+            "SELECT {} FROM managed_virtual_keys_cache \
+             WHERE virtual_key_id = ?1 AND protocol_type = ?2 AND provider_code = ?3",
+            cols
+        )
+    };
+    let p = params![virtual_key_id, protocol_type, provider_code];
+    let result = conn
+        .query_row(&sel(VK_CACHE_COLUMNS_GROUP), p, row_to_virtual_key_cache)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(&sel(VK_CACHE_COLUMNS_FULL), p, row_to_virtual_key_cache),
+        })
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(&sel(VK_CACHE_COLUMNS_LEGACY), p, row_to_virtual_key_cache),
+        });
+    match result {
+        Ok(entry) => Ok(Some(entry)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to get virtual key cache binding: {}", e)),
     }
 }
 

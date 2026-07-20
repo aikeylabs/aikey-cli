@@ -469,14 +469,26 @@ pub mod v1_0_0_baseline {
         )
         .map_err(|e| format!("Failed to ensure provider_account_tokens table: {}", e))?;
 
-        // Team-managed virtual key cache
+        // Team-managed virtual key cache.
+        //
+        // P1e / design D-11 (解 R-D): the grain is ONE ROW PER BINDING
+        // `(virtual_key_id, protocol_type, provider_code)` with the provider key
+        // ciphertext RIDING EACH ROW — so one VK can carry GLM(GLM key) AND the
+        // official Anthropic(official key) at once, each binding's material and
+        // upstream resolved independently. The pre-P1e grain was one-VK-one-row
+        // with a SCALAR credential (multiple providers were half-expressed via
+        // the `supported_providers`/`provider_base_urls` blobs, which only ever
+        // carried URLs — never a second protocol or a second key). Fresh installs
+        // get the composite-PK shape here; existing one-VK-one-row DBs are rebuilt
+        // in place by the idempotent re-grain block after the column retrofits
+        // below. `cache_schema_version` = 2 marks the binding grain.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS managed_virtual_keys_cache (
-                virtual_key_id       TEXT PRIMARY KEY,
+                virtual_key_id       TEXT NOT NULL,
                 org_id               TEXT NOT NULL,
                 seat_id              TEXT NOT NULL,
                 alias                TEXT NOT NULL,
-                provider_code        TEXT NOT NULL,
+                provider_code        TEXT NOT NULL DEFAULT '',
                 protocol_type        TEXT NOT NULL DEFAULT 'openai_compatible',
                 base_url             TEXT NOT NULL,
                 credential_id        TEXT NOT NULL,
@@ -488,8 +500,9 @@ pub mod v1_0_0_baseline {
                 expires_at           INTEGER,
                 provider_key_nonce      BLOB,
                 provider_key_ciphertext BLOB,
-                cache_schema_version INTEGER NOT NULL DEFAULT 1,
-                synced_at            INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                cache_schema_version INTEGER NOT NULL DEFAULT 2,
+                synced_at            INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                PRIMARY KEY (virtual_key_id, protocol_type, provider_code)
             )",
             [],
         )
@@ -587,6 +600,112 @@ pub mod v1_0_0_baseline {
         ] {
             ensure_column(conn, "managed_virtual_keys_cache", col, ddl)?;
         }
+
+        // ── P1e / design D-11: re-grain managed_virtual_keys_cache in place ──
+        //
+        // A pre-P1e vault has this table with a SINGLE-column primary key
+        // (`virtual_key_id`). SQLite cannot change a primary key with ALTER, so
+        // move to the binding grain `(virtual_key_id, protocol_type, provider_code)`
+        // via the canonical create-copy-swap. Guard: only run when the live table
+        // still has exactly one PK column — fresh installs (created composite above)
+        // and already-migrated vaults have three, so this is a no-op on re-run
+        // (idempotent; safe to execute on every startup).
+        //
+        // Backfill semantics (🔴 lossless, one-way faithful): each existing
+        // one-VK-one-row row becomes EXACTLY ONE binding row — its scalar
+        // `(protocol_type, provider_code)` are already the composite key, and its
+        // `provider_key_ciphertext` rides that row unchanged. The extra providers
+        // that lived URL-only in `supported_providers`/`provider_base_urls` are NOT
+        // exploded into credential-less binding rows (they have no key material —
+        // that was exactly the pre-P1e limitation); they stay on the primary
+        // binding row's blobs and are superseded when the re-grained server
+        // projection re-syncs real per-binding material. NO ciphertext is decrypted,
+        // re-encrypted, or moved across the encryption boundary here — the BLOB is
+        // copied byte-for-byte, so the vault_key derivation and AES-GCM envelope are
+        // untouched (第 1 级安全评审 §1e.4: this migration does not widen the
+        // plaintext exposure window).
+        let cache_pk_cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('managed_virtual_keys_cache') WHERE pk > 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if cache_pk_cols == 1 {
+            // Rebuild inside one transaction so a crash mid-migration leaves the
+            // old table intact (all-or-nothing; 🚫 no partial grain).
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| format!("mvkc re-grain: begin tx: {}", e))?;
+            tx.execute_batch(
+                "CREATE TABLE managed_virtual_keys_cache__p1e_new (
+                    virtual_key_id       TEXT NOT NULL,
+                    org_id               TEXT NOT NULL,
+                    seat_id              TEXT NOT NULL,
+                    alias                TEXT NOT NULL,
+                    provider_code        TEXT NOT NULL DEFAULT '',
+                    protocol_type        TEXT NOT NULL DEFAULT 'openai_compatible',
+                    base_url             TEXT NOT NULL,
+                    credential_id        TEXT NOT NULL,
+                    credential_revision  TEXT NOT NULL,
+                    virtual_key_revision TEXT NOT NULL,
+                    key_status           TEXT NOT NULL DEFAULT 'active',
+                    share_status         TEXT NOT NULL DEFAULT 'pending_claim',
+                    local_state          TEXT NOT NULL DEFAULT 'synced_inactive',
+                    expires_at           INTEGER,
+                    provider_key_nonce      BLOB,
+                    provider_key_ciphertext BLOB,
+                    cache_schema_version INTEGER NOT NULL DEFAULT 2,
+                    synced_at            INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                    local_alias            TEXT,
+                    supported_providers    TEXT,
+                    provider_base_urls     TEXT,
+                    owner_account_id       TEXT,
+                    extra                  TEXT,
+                    oauth_group_id         TEXT,
+                    group_accounts         TEXT,
+                    routing_config         TEXT,
+                    my_assignment_override TEXT,
+                    group_runtime          TEXT,
+                    owner_email            TEXT,
+                    group_alias            TEXT,
+                    PRIMARY KEY (virtual_key_id, protocol_type, provider_code)
+                );
+                 INSERT INTO managed_virtual_keys_cache__p1e_new (
+                    virtual_key_id, org_id, seat_id, alias,
+                    provider_code, protocol_type, base_url,
+                    credential_id, credential_revision, virtual_key_revision,
+                    key_status, share_status, local_state, expires_at,
+                    provider_key_nonce, provider_key_ciphertext,
+                    cache_schema_version, synced_at,
+                    local_alias, supported_providers, provider_base_urls, owner_account_id,
+                    extra, oauth_group_id, group_accounts, routing_config,
+                    my_assignment_override, group_runtime, owner_email, group_alias
+                 )
+                 SELECT
+                    virtual_key_id, org_id, seat_id, alias,
+                    provider_code, protocol_type, base_url,
+                    credential_id, credential_revision, virtual_key_revision,
+                    key_status, share_status, local_state, expires_at,
+                    provider_key_nonce, provider_key_ciphertext,
+                    2, synced_at,
+                    local_alias, supported_providers, provider_base_urls, owner_account_id,
+                    extra, oauth_group_id, group_accounts, routing_config,
+                    my_assignment_override, group_runtime, owner_email, group_alias
+                 FROM managed_virtual_keys_cache;
+                 DROP TABLE managed_virtual_keys_cache;
+                 ALTER TABLE managed_virtual_keys_cache__p1e_new RENAME TO managed_virtual_keys_cache;",
+            )
+            .map_err(|e| format!("mvkc re-grain rebuild: {}", e))?;
+            tx.commit()
+                .map_err(|e| format!("mvkc re-grain: commit: {}", e))?;
+        }
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mvkc_local_state ON managed_virtual_keys_cache(local_state)",
+            [],
+        )
+        .map_err(|e| format!("Failed to re-ensure managed_virtual_keys_cache index after re-grain: {}", e))?;
 
         // Enterprise quota rules cache (Phase 2 — design §0.5/§5.2). The proxy
         // is a client-side component with no access to the control DB, so quota
