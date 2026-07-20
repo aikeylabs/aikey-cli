@@ -357,6 +357,11 @@ pub(crate) enum Commands {
         /// files / SQLite; no network calls beyond the existing checks.
         #[arg(long)]
         detail: bool,
+        /// Show the proxy's most-recent error responses as a caused-by tree
+        /// (origin → who produced it, path → hops traversed, trace_id → the
+        /// log anchor). Reads ~/.aikey/run/last-errors.json; no network.
+        #[arg(long)]
+        last_errors: bool,
     },
     /// View or set proxy environment variables
     #[command(display_order = 8)]

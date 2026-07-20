@@ -4001,7 +4001,13 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Whoami => {
             commands_account::handle_whoami(cli.json)?;
         }
-        Commands::Doctor { detail } => {
+        Commands::Doctor { detail, last_errors } => {
+            // --last-errors is a focused view (proxy's recent error responses as
+            // a caused-by tree); it stands alone and skips the full doctor run.
+            if *last_errors {
+                commands_project::handle_doctor_last_errors(cli.json)?;
+                return Ok(());
+            }
             // handle_doctor now renders the egress section inline (before its
             // summary) and returns whether ALL configured per-account egress
             // failed. All-fail → non-zero exit so the breakage is visible to
