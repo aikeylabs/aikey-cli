@@ -179,6 +179,27 @@ impl FingerprintClassifier {
         }
     }
 
+    /// Test-only: build a classifier from an arbitrary yaml string, mirroring
+    /// new_embedded's construction path. Lets resolve-parity hand-vectors use
+    /// the SAME yaml as the Go TestResolveModelAnchoredRoles fence.
+    #[cfg(test)]
+    fn from_yaml_str(yaml: &str) -> Result<Self, String> {
+        let reg: Registry = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
+        let mut entries = Vec::new();
+        for p in reg.providers {
+            let compiled =
+                Regex::new(&format!("(?s){}", p.regex)).map_err(|e| e.to_string())?;
+            entries.push((p, compiled));
+        }
+        Ok(Self {
+            entries,
+            aggregator_families: reg.aggregator_families.into_iter().collect(),
+            family_login_urls: reg.family_login_urls,
+            provider_routes: reg.provider_routes,
+            provider_model_maps: reg.provider_model_maps,
+        })
+    }
+
     /// P1 / design D-2: the model_map for a provider code (case-insensitive).
     pub fn model_map_for(&self, provider: &str) -> Option<&ModelMap> {
         self.provider_model_maps
@@ -535,7 +556,11 @@ fn path_prefix_matches(prefix: &str, path: &str) -> bool {
     path.starts_with(&format!("{prefix}/"))
 }
 
-/// P1 / design D-3: known role families a model_map `match` may name.
+/// P1 / design D-3: known role families a model_map `match` may name, in a
+/// FIXED iteration order (mirror of Go rolesInMatchOrder). The order is
+/// load-bearing: when two role tokens co-occur in one id (e.g.
+/// "claude-opus-haiku-1"), role_of_model returns the first match in THIS order.
+/// An array iterates deterministically, matching Go's ordered slice.
 const KNOWN_ROLES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
 
 fn is_role_token(s: &str) -> bool {
@@ -544,14 +569,24 @@ fn is_role_token(s: &str) -> bool {
 
 /// Extract the role family from a claude-style model id ("claude-opus-4-8" →
 /// "opus"). Mirrors Go roleOfModel.
+///
+/// Segment-aligned ONLY — the role must be a whole "-"-delimited token: exact,
+/// prefix ("opus-…"), suffix ("…-opus"), or infix ("…-opus-…"). A loose
+/// `contains("-{role}")` fallback used to live here; it made the anchored arms
+/// dead code and mis-classified ids like "claude-haikuish-1" as haiku. Removed
+/// — it feeds resolve_model → wrong upstream model otherwise.
+///
+/// Case-folding parity: Rust to_ascii_lowercase and Go strings.ToLower (Unicode)
+/// agree on the claude-id charset (ASCII a–z / 0–9 / '-'). They diverge only on
+/// non-ASCII code points, none of which appear in a claude model id — no
+/// residual behavioral difference on real ids.
 fn role_of_model(model: &str) -> Option<String> {
     let lower = model.to_ascii_lowercase();
     for role in KNOWN_ROLES {
         if lower == role
-            || lower.contains(&format!("-{role}-"))
             || lower.starts_with(&format!("{role}-"))
             || lower.ends_with(&format!("-{role}"))
-            || lower.contains(&format!("-{role}"))
+            || lower.contains(&format!("-{role}-"))
         {
             return Some(role.to_string());
         }
@@ -726,6 +761,59 @@ mod tests {
         let (m, matched) = c.resolve_model("openai", "gpt-4o");
         assert!(!matched);
         assert_eq!(m, "gpt-4o");
+    }
+
+    // Unit-level resolve-parity fence for the role extractor. Mirror of the Go
+    // `TestRoleOfModelAnchored` test — the two must agree token-for-token.
+    // Covers every anchored position, ASCII case-folding, deterministic
+    // co-occurrence, and the NEGATIVE the old loose contains() missed.
+    #[test]
+    fn role_of_model_anchored() {
+        assert_eq!(role_of_model("claude-opus-4-8").as_deref(), Some("opus")); // infix
+        assert_eq!(role_of_model("opus-4").as_deref(), Some("opus")); // prefix
+        assert_eq!(role_of_model("claude-4-haiku").as_deref(), Some("haiku")); // suffix
+        assert_eq!(role_of_model("sonnet").as_deref(), Some("sonnet")); // exact
+        assert_eq!(role_of_model("CLAUDE-OPUS-4-8").as_deref(), Some("opus")); // case-fold
+        // co-occurrence → first in KNOWN_ROLES order (deterministic)
+        assert_eq!(role_of_model("claude-opus-haiku-1").as_deref(), Some("opus"));
+        assert_eq!(role_of_model("gpt-4o"), None); // no role token
+        // NEGATIVE: the removed loose contains("-haiku") would have mis-matched.
+        assert_eq!(role_of_model("claude-haikuish-1"), None);
+    }
+
+    // Resolve-level (not just parse-level) parity fence. Hand-vectors mirror the
+    // Go `TestResolveModelAnchoredRoles` fence 1:1 against the SAME yaml. Shared
+    // golden of (provider,requested)->(effective,matched,policy) deferred as a
+    // follow-up: resolve_model returns (effective, matched) without policy, so a
+    // policy-carrying golden would need a wider signature (out of scope here).
+    #[test]
+    fn resolve_model_anchored_roles() {
+        let yaml = r#"
+version: 1
+providers: []
+provider_model_maps:
+  - provider: zhipu
+    unmatched: reject
+    models:
+      - { match: "opus",   requested_model: "glm-4.6" }
+      - { match: "sonnet", requested_model: "glm-4.5" }
+      - { match: "haiku",  requested_model: "glm-4.5-air" }
+      - { match: "fable",  requested_model: "glm-4-flash" }
+      - { match: "claude-opus-4-8", requested_model: "glm-4.6-pinned" }
+"#;
+        let c = FingerprintClassifier::from_yaml_str(yaml).expect("parse test yaml");
+        let want = |s: &str, m: bool| (s.to_string(), m);
+        assert_eq!(c.resolve_model("zhipu", "claude-opus-4-8"), want("glm-4.6-pinned", true)); // exact beats role
+        assert_eq!(c.resolve_model("zhipu", "claude-opus-4-9"), want("glm-4.6", true)); // infix
+        assert_eq!(c.resolve_model("zhipu", "haiku-4-5"), want("glm-4.5-air", true)); // prefix
+        assert_eq!(c.resolve_model("zhipu", "claude-4-fable"), want("glm-4-flash", true)); // suffix
+        assert_eq!(c.resolve_model("zhipu", "sonnet"), want("glm-4.5", true)); // exact token
+        assert_eq!(c.resolve_model("zhipu", "claude-opus-haiku-1"), want("glm-4.6", true)); // co-occurrence → opus
+        // NEGATIVE: no wildcard + anchored role → genuine miss.
+        assert_eq!(
+            c.resolve_model("zhipu", "claude-haikuish-1"),
+            want("claude-haikuish-1", false)
+        );
     }
 
     #[test]
