@@ -2117,7 +2117,11 @@ pub struct PipelineDiagnosticsWire {
 
 impl Default for RegistryProvenanceWire {
     fn default() -> Self {
-        Self { digest: String::new(), route_rows: 0, providers_with_model_map: Vec::new() }
+        Self {
+            digest: String::new(),
+            route_rows: 0,
+            providers_with_model_map: Vec::new(),
+        }
     }
 }
 impl Default for MappingHealthWire {

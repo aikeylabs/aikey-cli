@@ -2858,10 +2858,13 @@ fn apply_snapshot_to_cache(
     for item in items {
         // Read THIS binding's existing row (not just any row for the VK) so the
         // preserved ciphertext/nonce belongs to the right credential.
-        let existing =
-            storage::get_virtual_key_cache_binding(&item.virtual_key_id, &item.protocol_type, &item.provider_code)
-                .ok()
-                .flatten();
+        let existing = storage::get_virtual_key_cache_binding(
+            &item.virtual_key_id,
+            &item.protocol_type,
+            &item.provider_code,
+        )
+        .ok()
+        .flatten();
 
         // Preserve local-only fields from the existing cache entry.
         let local_alias = existing.as_ref().and_then(|e| e.local_alias.clone());
@@ -2971,7 +2974,9 @@ fn apply_snapshot_to_cache(
                 // If this binding's VK was the active proxy key AND the whole VK is
                 // gone (no surviving binding), clear the active key config so the
                 // proxy stops routing it on next reload.
-                let vk_gone = !items.iter().any(|i| i.virtual_key_id == entry.virtual_key_id);
+                let vk_gone = !items
+                    .iter()
+                    .any(|i| i.virtual_key_id == entry.virtual_key_id);
                 if entry.local_state == "active" && vk_gone {
                     if let Ok(Some(cfg)) = storage::get_active_key_config() {
                         if cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey

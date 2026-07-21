@@ -415,7 +415,11 @@ fn team_protocol_source<'a>(provider_code: &'a str, protocol_type: &'a str) -> O
 /// cache lands, P1e) so web never has to migrate a scalar→array contract (D-13).
 /// 🚫 Web must NOT derive protocol from provider (前端 §7) — that's why the
 /// backend/CLI owns this projection.
-fn two_axis_bindings(provider_code: &str, protocol_type: &str, base_url: &str) -> serde_json::Value {
+fn two_axis_bindings(
+    provider_code: &str,
+    protocol_type: &str,
+    base_url: &str,
+) -> serde_json::Value {
     let classifier = crate::commands_internal::parse::provider_fingerprint::instance();
     let protocol = classifier
         .route_for_base_url(base_url)
@@ -2054,7 +2058,11 @@ mod two_axis_bindings_tests {
     #[test]
     fn glm_anthropic_endpoint_two_axis() {
         // zhipu credential whose base_url is GLM's anthropic endpoint.
-        let b = two_axis_bindings("zhipu", "openai_compatible", "https://open.bigmodel.cn/api/anthropic");
+        let b = two_axis_bindings(
+            "zhipu",
+            "openai_compatible",
+            "https://open.bigmodel.cn/api/anthropic",
+        );
         let arr = b.as_array().expect("bindings is an array");
         assert_eq!(arr.len(), 1, "D-13: array from the start");
         // protocol from the ROUTE ROW (anthropic), NOT the stale stored protocol_type

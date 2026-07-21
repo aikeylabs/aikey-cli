@@ -1114,7 +1114,13 @@ pub fn change_password(
             "UPDATE managed_virtual_keys_cache
                 SET provider_key_nonce = ?, provider_key_ciphertext = ?
               WHERE virtual_key_id = ? AND protocol_type = ? AND provider_code = ?",
-            params![new_nonce, new_ciphertext, vk_id, protocol_type, provider_code],
+            params![
+                new_nonce,
+                new_ciphertext,
+                vk_id,
+                protocol_type,
+                provider_code
+            ],
         )
         .map_err(|e| format!("Failed to update team key '{}': {}", vk_id, e))?;
     }
@@ -2297,8 +2303,20 @@ mod tests {
 
         // Two bindings on ONE virtual key, distinct (protocol_type, provider_code).
         for (prov, proto, base, nonce, ct) in [
-            ("zhipu", "anthropic", "https://open.bigmodel.cn/api/anthropic", &glm_nonce, &glm_ct),
-            ("anthropic", "anthropic", "https://api.anthropic.com", &off_nonce, &off_ct),
+            (
+                "zhipu",
+                "anthropic",
+                "https://open.bigmodel.cn/api/anthropic",
+                &glm_nonce,
+                &glm_ct,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "https://api.anthropic.com",
+                &off_nonce,
+                &off_ct,
+            ),
         ] {
             conn.execute(
                 "INSERT INTO managed_virtual_keys_cache
@@ -2335,7 +2353,11 @@ mod tests {
                 .expect("decrypt under new key")
                 .to_vec()
         };
-        assert_eq!(read_binding("zhipu").as_slice(), glm_key, "GLM binding key must survive rotation intact");
+        assert_eq!(
+            read_binding("zhipu").as_slice(),
+            glm_key,
+            "GLM binding key must survive rotation intact"
+        );
         assert_eq!(
             read_binding("anthropic").as_slice(),
             official_key,
@@ -2403,7 +2425,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(pk_after, 3, "re-grain to composite (vk, protocol, provider) PK");
+        assert_eq!(
+            pk_after, 3,
+            "re-grain to composite (vk, protocol, provider) PK"
+        );
 
         let (ct, ver): (Vec<u8>, i64) = conn
             .query_row(
@@ -2413,13 +2438,19 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .expect("row preserved");
-        assert_eq!(ct, vec![0xDE, 0xAD, 0xBE, 0xEF], "ciphertext copied byte-for-byte (no re-encrypt)");
+        assert_eq!(
+            ct,
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
+            "ciphertext copied byte-for-byte (no re-encrypt)"
+        );
         assert_eq!(ver, 2, "cache_schema_version bumped to the binding grain");
 
         // Idempotent: a second run is a no-op (still composite, still one row).
         crate::migrations::upgrade_all(&conn).expect("migrate again");
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM managed_virtual_keys_cache", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM managed_virtual_keys_cache", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1, "idempotent re-run leaves data untouched");
     }

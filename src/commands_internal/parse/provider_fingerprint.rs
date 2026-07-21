@@ -187,8 +187,7 @@ impl FingerprintClassifier {
         let reg: Registry = serde_yaml::from_str(yaml).map_err(|e| e.to_string())?;
         let mut entries = Vec::new();
         for p in reg.providers {
-            let compiled =
-                Regex::new(&format!("(?s){}", p.regex)).map_err(|e| e.to_string())?;
+            let compiled = Regex::new(&format!("(?s){}", p.regex)).map_err(|e| e.to_string())?;
             entries.push((p, compiled));
         }
         Ok(Self {
@@ -678,9 +677,15 @@ mod tests {
             route_host_of("https://open.bigmodel.cn/api/anthropic").as_deref(),
             Some("open.bigmodel.cn")
         );
-        assert_eq!(route_path_of("https://open.bigmodel.cn/api/anthropic"), "/api/anthropic");
+        assert_eq!(
+            route_path_of("https://open.bigmodel.cn/api/anthropic"),
+            "/api/anthropic"
+        );
         assert_eq!(route_path_of("https://open.bigmodel.cn"), "");
-        assert_eq!(route_path_of("https://open.bigmodel.cn/api/paas?x=1"), "/api/paas");
+        assert_eq!(
+            route_path_of("https://open.bigmodel.cn/api/paas?x=1"),
+            "/api/paas"
+        );
     }
 
     #[test]
@@ -774,10 +779,13 @@ mod tests {
         assert_eq!(role_of_model("claude-4-haiku").as_deref(), Some("haiku")); // suffix
         assert_eq!(role_of_model("sonnet").as_deref(), Some("sonnet")); // exact
         assert_eq!(role_of_model("CLAUDE-OPUS-4-8").as_deref(), Some("opus")); // case-fold
-        // co-occurrence → first in KNOWN_ROLES order (deterministic)
-        assert_eq!(role_of_model("claude-opus-haiku-1").as_deref(), Some("opus"));
+                                                                               // co-occurrence → first in KNOWN_ROLES order (deterministic)
+        assert_eq!(
+            role_of_model("claude-opus-haiku-1").as_deref(),
+            Some("opus")
+        );
         assert_eq!(role_of_model("gpt-4o"), None); // no role token
-        // NEGATIVE: the removed loose contains("-haiku") would have mis-matched.
+                                                   // NEGATIVE: the removed loose contains("-haiku") would have mis-matched.
         assert_eq!(role_of_model("claude-haikuish-1"), None);
     }
 
@@ -803,13 +811,28 @@ provider_model_maps:
 "#;
         let c = FingerprintClassifier::from_yaml_str(yaml).expect("parse test yaml");
         let want = |s: &str, m: bool| (s.to_string(), m);
-        assert_eq!(c.resolve_model("zhipu", "claude-opus-4-8"), want("glm-4.6-pinned", true)); // exact beats role
-        assert_eq!(c.resolve_model("zhipu", "claude-opus-4-9"), want("glm-4.6", true)); // infix
-        assert_eq!(c.resolve_model("zhipu", "haiku-4-5"), want("glm-4.5-air", true)); // prefix
-        assert_eq!(c.resolve_model("zhipu", "claude-4-fable"), want("glm-4-flash", true)); // suffix
+        assert_eq!(
+            c.resolve_model("zhipu", "claude-opus-4-8"),
+            want("glm-4.6-pinned", true)
+        ); // exact beats role
+        assert_eq!(
+            c.resolve_model("zhipu", "claude-opus-4-9"),
+            want("glm-4.6", true)
+        ); // infix
+        assert_eq!(
+            c.resolve_model("zhipu", "haiku-4-5"),
+            want("glm-4.5-air", true)
+        ); // prefix
+        assert_eq!(
+            c.resolve_model("zhipu", "claude-4-fable"),
+            want("glm-4-flash", true)
+        ); // suffix
         assert_eq!(c.resolve_model("zhipu", "sonnet"), want("glm-4.5", true)); // exact token
-        assert_eq!(c.resolve_model("zhipu", "claude-opus-haiku-1"), want("glm-4.6", true)); // co-occurrence → opus
-        // NEGATIVE: no wildcard + anchored role → genuine miss.
+        assert_eq!(
+            c.resolve_model("zhipu", "claude-opus-haiku-1"),
+            want("glm-4.6", true)
+        ); // co-occurrence → opus
+           // NEGATIVE: no wildcard + anchored role → genuine miss.
         assert_eq!(
             c.resolve_model("zhipu", "claude-haikuish-1"),
             want("claude-haikuish-1", false)

@@ -91,13 +91,18 @@ fn list_shows_two_axes_and_collapses_multi_binding_vk() {
         .stdin(Stdio::null())
         .output()
         .expect("aikey add");
-    assert!(out.status.success(), "add failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // Seed team VK rows through the real sync write path.
     std::env::set_var("AK_VAULT_PATH", &vault);
     let salt = storage::get_salt().unwrap();
     let (m, t, p) = storage::get_kdf_params().unwrap();
-    let key = crypto::derive_key_with_params(&SecretString::new(PW.to_string()), &salt, m, t, p).unwrap();
+    let key =
+        crypto::derive_key_with_params(&SecretString::new(PW.to_string()), &salt, m, t, p).unwrap();
     let mut vk = [0u8; 32];
     vk.copy_from_slice(key.as_slice());
     let enc = |s: &str| crypto::encrypt(&vk, s.as_bytes()).unwrap();
@@ -105,25 +110,64 @@ fn list_shows_two_axes_and_collapses_multi_binding_vk() {
     // (1) single-binding team VK — GLM via anthropic.
     let (n, c) = enc("glm-single");
     storage::upsert_virtual_key_cache(&vk_row(
-        "vk-solo", "glm-team", "zhipu", "anthropic",
-        "https://open.bigmodel.cn/api/anthropic", n, c,
-    )).unwrap();
+        "vk-solo",
+        "glm-team",
+        "zhipu",
+        "anthropic",
+        "https://open.bigmodel.cn/api/anthropic",
+        n,
+        c,
+    ))
+    .unwrap();
 
     // (2) multi-binding team VK — 2 protocols × 4 providers → collapse on both axes.
     let bindings = [
-        ("zhipu", "anthropic", "https://open.bigmodel.cn/api/anthropic"),
-        ("zhipu", "openai_compatible", "https://open.bigmodel.cn/api/paas/v4"),
-        ("moonshot", "openai_compatible", "https://api.moonshot.cn/v1"),
-        ("qwen", "openai_compatible", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        ("doubao", "openai_compatible", "https://ark.cn-beijing.volces.com/api/v3"),
+        (
+            "zhipu",
+            "anthropic",
+            "https://open.bigmodel.cn/api/anthropic",
+        ),
+        (
+            "zhipu",
+            "openai_compatible",
+            "https://open.bigmodel.cn/api/paas/v4",
+        ),
+        (
+            "moonshot",
+            "openai_compatible",
+            "https://api.moonshot.cn/v1",
+        ),
+        (
+            "qwen",
+            "openai_compatible",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ),
+        (
+            "doubao",
+            "openai_compatible",
+            "https://ark.cn-beijing.volces.com/api/v3",
+        ),
     ];
     for (prov, proto, url) in bindings {
         let (n, c) = enc(&format!("mat-{prov}-{proto}"));
-        storage::upsert_virtual_key_cache(&vk_row("vk-multi", "everything-team", prov, proto, url, n, c)).unwrap();
+        storage::upsert_virtual_key_cache(&vk_row(
+            "vk-multi",
+            "everything-team",
+            prov,
+            proto,
+            url,
+            n,
+            c,
+        ))
+        .unwrap();
     }
 
     // Live run: `aikey list`.
-    let out = base_cmd(&tmp, &vault).arg("list").stdin(Stdio::null()).output().expect("aikey list");
+    let out = base_cmd(&tmp, &vault)
+        .arg("list")
+        .stdin(Stdio::null())
+        .output()
+        .expect("aikey list");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -133,15 +177,32 @@ fn list_shows_two_axes_and_collapses_multi_binding_vk() {
 
     assert!(out.status.success(), "aikey list failed:\n{text}");
     // Two-axis header.
-    assert!(text.contains("PROTOCOL") && text.contains("PROVIDER"), "missing two-axis header:\n{text}");
+    assert!(
+        text.contains("PROTOCOL") && text.contains("PROVIDER"),
+        "missing two-axis header:\n{text}"
+    );
     // Single-binding VK renders both axes plainly.
     assert!(text.contains("glm-team"), "missing glm-team row:\n{text}");
-    assert!(text.contains("zhipu(GLM)"), "provider axis not rendered as zhipu(GLM):\n{text}");
+    assert!(
+        text.contains("zhipu(GLM)"),
+        "provider axis not rendered as zhipu(GLM):\n{text}"
+    );
     // Multi-binding VK renders ONCE with the collapse markers on both axes.
-    let multi_lines: Vec<&str> = text.lines().filter(|l| l.contains("everything-team")).collect();
-    assert_eq!(multi_lines.len(), 1, "multi-binding VK should be ONE row, got {}:\n{text}", multi_lines.len());
+    let multi_lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("everything-team"))
+        .collect();
+    assert_eq!(
+        multi_lines.len(),
+        1,
+        "multi-binding VK should be ONE row, got {}:\n{text}",
+        multi_lines.len()
+    );
     let line = multi_lines[0];
-    assert!(line.contains("(+"), "expected a `(+N more)` collapse on the multi VK row:\n{line}");
+    assert!(
+        line.contains("(+"),
+        "expected a `(+N more)` collapse on the multi VK row:\n{line}"
+    );
 
     println!("\n✓ two-axis `aikey list` + multi-binding collapse verified live\n");
     let _ = std::fs::remove_dir_all(&tmp);

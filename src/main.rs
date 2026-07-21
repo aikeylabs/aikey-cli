@@ -568,7 +568,11 @@ fn run_unified_list(
                 .map(|r| r.protocol.clone())
                 .filter(|p| !p.is_empty())
                 .or_else(|| (!declared.is_empty()).then(|| declared.to_string()))
-                .or_else(|| classifier.route_for_provider(provider).map(|r| r.protocol.clone()))
+                .or_else(|| {
+                    classifier
+                        .route_for_provider(provider)
+                        .map(|r| r.protocol.clone())
+                })
                 .unwrap_or_default()
         };
         // Provider axis label: `code(alias)` (e.g. `zhipu(GLM)`); the alias never
@@ -791,19 +795,23 @@ fn run_unified_list(
         }
 
         let all_data: Vec<&RowData> = personal_rows.iter().chain(team_rows.iter()).collect();
-        let headers = ["ALIAS", "PROTOCOL", "PROVIDER", "USING FOR", "STATUS", "CREATED"];
+        let headers = [
+            "ALIAS",
+            "PROTOCOL",
+            "PROVIDER",
+            "USING FOR",
+            "STATUS",
+            "CREATED",
+        ];
         let pad = 2;
         let w_alias = headers[0]
             .len()
             .max(all_data.iter().map(|r| r.alias.len()).max().unwrap_or(0))
             + pad;
-        let w_proto = headers[1].len().max(
-            all_data
-                .iter()
-                .map(|r| r.protocol.len())
-                .max()
-                .unwrap_or(0),
-        ) + pad;
+        let w_proto = headers[1]
+            .len()
+            .max(all_data.iter().map(|r| r.protocol.len()).max().unwrap_or(0))
+            + pad;
         let w_prov = headers[2].len().max(
             all_data
                 .iter()
