@@ -23,7 +23,41 @@ pub struct LoginResponse {
 #[derive(Debug, Deserialize)]
 pub struct AccountInfo {
     pub account_id: String,
+    /// The account's login handle. For an SSO member who first logged in
+    /// through Feishu without an email, this is the SYNTHETIC handle
+    /// (`sso+feishu.<32hex>@sso.local`) — an internal identifier, never
+    /// something to show a human. Use [`AccountInfo::display_label`].
     pub email: String,
+    /// Human-readable identity, composed server-side as
+    /// `李承熙 · feishu:6ad2973d` — display name plus a short discriminator so
+    /// two colleagues with the same name stay distinguishable.
+    ///
+    /// Optional because older servers do not send it; the CLI falls back to
+    /// `email`, which is the correct value on every email-based account and
+    /// the only value those servers have.
+    #[serde(default)]
+    pub display_identity: Option<String>,
+}
+
+impl AccountInfo {
+    /// What a human is shown after logging in.
+    ///
+    /// 🔴 Decision contract (damon, 2026-07-21): the terminal shows
+    /// `Logged in as 李承熙 · feishu:6ad2973d`. The synthetic handle must NOT
+    /// be shown — an SSO member has no idea what `sso+feishu.<32hex>@sso.local`
+    /// is, cannot type it anywhere, and it puts a digest of their Feishu
+    /// union_id on screen and into terminal scrollback.
+    ///
+    /// Empty-string guard, not just `Option`: a server that sends
+    /// `"display_identity": ""` would otherwise print a blank name, which reads
+    /// as "logged in as nobody". Same shape as the `unwrap_or(account_id)`
+    /// fallback the provider-OAuth poll already uses in commands_auth.
+    pub fn display_label(&self) -> &str {
+        match self.display_identity.as_deref() {
+            Some(label) if !label.trim().is_empty() => label,
+            _ => &self.email,
+        }
+    }
 }
 
 // ── OAuth device flow types ──────────────────────────────────────────────────
@@ -985,5 +1019,56 @@ mod cluster_resolve_tests {
         let account = resp.account.expect("account should be preserved");
         assert_eq!(account.account_id, "acct-1");
         assert_eq!(account.email, "admin@aikey.local");
+        // A server that predates display_identity must still parse — the field
+        // is absent here, and that is the whole point of this assertion.
+        assert_eq!(account.display_label(), "admin@aikey.local");
+    }
+
+    /// 🔴 Decision contract (damon, 2026-07-21): after a Feishu first login the
+    /// terminal shows `Logged in as 李承熙 · feishu:6ad2973d`, never the
+    /// synthetic handle. This pins the value `finish_login` prints.
+    ///
+    /// 🔴 MUTATION PROOF — verbatim, 2026-07-21. Revert display_label to
+    /// `&self.email`:
+    ///   assertion `left == right` failed: the synthetic handle must never
+    ///   reach a human
+    ///     left: "sso+feishu.6ad2973d1e4b4c2f8a9b0c1d2e3f4a5b@sso.local"
+    ///    right: "李承熙 · feishu:6ad2973d"
+    #[test]
+    fn display_label_prefers_display_identity_over_synthetic_handle() {
+        let poll: PollResponse = serde_json::from_str(
+            r#"{"status":"approved","access_token":"jwt","refresh_token":"rt","expires_in":3600,
+                "account":{"account_id":"acct-1",
+                           "email":"sso+feishu.6ad2973d1e4b4c2f8a9b0c1d2e3f4a5b@sso.local",
+                           "display_identity":"李承熙 · feishu:6ad2973d"}}"#,
+        )
+        .expect("poll payload with display_identity should parse");
+
+        let account = poll.account.expect("account present");
+        assert_eq!(
+            account.display_label(),
+            "李承熙 · feishu:6ad2973d",
+            "the synthetic handle must never reach a human"
+        );
+        assert!(
+            !account.display_label().contains("@sso.local"),
+            "display label leaked the synthetic handle: {}",
+            account.display_label()
+        );
+    }
+
+    /// An empty display_identity is a server bug, not a display name. Falling
+    /// back keeps `Logged in as ` from rendering with nothing after it.
+    #[test]
+    fn display_label_falls_back_when_display_identity_is_blank() {
+        let poll: PollResponse = serde_json::from_str(
+            r#"{"status":"approved",
+                "account":{"account_id":"a","email":"user@corp.com","display_identity":"   "}}"#,
+        )
+        .expect("blank display_identity should parse");
+        assert_eq!(
+            poll.account.expect("account present").display_label(),
+            "user@corp.com"
+        );
     }
 }
