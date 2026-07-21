@@ -2082,7 +2082,7 @@ pub fn fetch_egress_state() -> Result<Option<EgressState>, String> {
 // (aikey doctor / aikey test) render its verdict verbatim — 🚫 no client-side
 // re-derivation of the state (3.5: one judgment function, not per-caller markers).
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 pub struct MappingHealthWire {
     /// "ok" | "degraded" | "inactive".
     #[serde(default)]
@@ -2097,7 +2097,7 @@ pub struct MappingHealthWire {
     pub passthrough_missing: i64,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 pub struct RegistryProvenanceWire {
     #[serde(default)]
     pub digest: String,
@@ -2113,27 +2113,6 @@ pub struct PipelineDiagnosticsWire {
     pub registry: RegistryProvenanceWire,
     #[serde(default)]
     pub model_mapping: MappingHealthWire,
-}
-
-impl Default for RegistryProvenanceWire {
-    fn default() -> Self {
-        Self {
-            digest: String::new(),
-            route_rows: 0,
-            providers_with_model_map: Vec::new(),
-        }
-    }
-}
-impl Default for MappingHealthWire {
-    fn default() -> Self {
-        Self {
-            status: String::new(),
-            reason: String::new(),
-            applied: 0,
-            rejected: 0,
-            passthrough_missing: 0,
-        }
-    }
 }
 
 /// Fetch the proxy's read-only model-mapping diagnostics. `Err` = proxy
