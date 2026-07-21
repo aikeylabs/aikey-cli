@@ -288,6 +288,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             json_output::success(cli::build_version_json());
         } else {
             print_banner();
+            // The repo URL left the banner's logo feet row (2026-07-18); print
+            // it right after so `aikey --version` still shows the project link.
+            cli::print_repo_url();
         }
         return Ok(());
     }
@@ -325,10 +328,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             eprintln!();
             eprintln!("  {}", "Run 'aikey --help' for all commands.".dimmed());
-            // Blink runs AFTER the full screen is painted so the user sees
+            // Repo URL now lives at the very bottom, under the help hint
+            // (2026-07-18 user request — moved off the banner's logo feet row).
+            cli::print_repo_url();
+            // Animations run AFTER the full screen is painted so the user sees
             // banner + hints together instead of being held by the animation.
-            // 8 = blank + "Get started" + 4 commands + blank + hint.
-            cli::animate_banner_blink(8);
+            // Order (2026-07-18 user request): the owl blinks FIRST, then the
+            // tagline shimmer sweeps left→right exactly once.
+            // 9 = blank + "Get started" + 4 commands + blank + hint + repo URL.
+            cli::animate_banner_blink(9);
+            cli::animate_banner_shimmer(9);
             std::process::exit(1);
         }
     }
@@ -4128,7 +4137,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Whoami => {
             commands_account::handle_whoami(cli.json)?;
         }
-        Commands::Doctor { detail } => {
+        Commands::Doctor {
+            detail,
+            last_errors,
+        } => {
+            // --last-errors is a focused view (proxy's recent error responses as
+            // a caused-by tree); it stands alone and skips the full doctor run.
+            if *last_errors {
+                commands_project::handle_doctor_last_errors(cli.json)?;
+                return Ok(());
+            }
             // handle_doctor now renders the egress section inline (before its
             // summary) and returns whether ALL configured per-account egress
             // failed. All-fail → non-zero exit so the breakage is visible to
