@@ -1090,10 +1090,14 @@ fn finish_login(
         }));
     } else {
         println!();
+        // display_label(), not .email: for a Feishu member who first logged in
+        // without an email the stored handle is synthetic
+        // (sso+feishu.<32hex>@sso.local) and must never be shown. See
+        // AccountInfo::display_label.
         println!(
             "  {} Logged in as {}",
             crate::symbols::CHECK.s().green().bold(),
-            account.email.bold()
+            account.display_label().bold()
         );
         println!("    Run {} to view your team keys.", "'aikey list'".bold());
     }
