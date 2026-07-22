@@ -293,7 +293,8 @@ pub fn meta_path() -> std::io::Result<std::path::PathBuf> {
             "cannot determine home directory for proxy-meta.json",
         )
     })?;
-    Ok(home.join(".aikey").join("run").join(SIDECAR_META_FILENAME))
+    let _ = &home; // kept: its absence is still the error reported above
+    Ok(crate::commands_account::resolve_aikey_dir().join("run").join(SIDECAR_META_FILENAME))
 }
 
 /// Read + parse the sidecar meta file at the given path.
@@ -809,7 +810,8 @@ pub fn pidfile_path() -> std::io::Result<std::path::PathBuf> {
             "cannot determine home directory for proxy.pid",
         )
     })?;
-    Ok(home.join(".aikey").join("run").join("proxy.pid"))
+    let _ = &home; // kept: its absence is still the error reported above
+    Ok(crate::commands_account::resolve_aikey_dir().join("run").join("proxy.pid"))
 }
 
 #[cfg(test)]

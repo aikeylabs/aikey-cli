@@ -373,7 +373,8 @@ fn start_service(edition: Edition) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     let bin_file = bin_name.to_string();
 
-    let bin = home.join(".aikey").join("bin").join(&bin_file);
+    let _ = &home;
+    let bin = crate::commands_account::resolve_aikey_dir().join("bin").join(&bin_file);
 
     if !bin.exists() {
         return Err(format!(

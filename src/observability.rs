@@ -133,9 +133,7 @@ struct LogRecord<'a> {
 static LOG_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
 fn log_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".aikey")
+    crate::commands_account::resolve_aikey_dir()
         .join("logs")
         .join("aikey-cli")
 }

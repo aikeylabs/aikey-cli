@@ -1314,12 +1314,73 @@ pub fn resolve_user_home() -> std::path::PathBuf {
     std::path::PathBuf::from(".")
 }
 
-/// Resolve the ~/.aikey directory path consistently across platforms.
-/// Thin wrapper over `resolve_user_home()` — kept as a named helper so
-/// callsites read intent-fully and so this stays the only place the
-/// `.aikey` literal appears in the home-resolution path.
+/// Resolve this install's AiKey directory, consistently across platforms.
+///
+/// Honours `AIKEY_HOME` (absolute path) first, then falls back to
+/// `resolve_user_home()/.aikey` — the historical behaviour, unchanged for every
+/// ordinary install.
+///
+/// Why `AIKEY_HOME` exists (2026-07-22): the installer has always supported
+/// `--install-dir` / `--sandbox`, which put the whole install somewhere other
+/// than `~/.aikey`. The CLI had no notion of that at all — every path was
+/// derived from the user's home — so a relocated install's `aikey` operated on
+/// the DEFAULT install's vault, config and run state. Two installs, one data
+/// plane, no error message. The installer already exports `AIKEY_HOME` for its
+/// own steps; this makes the CLI agree with it.
+///
+/// A RELATIVE value is ignored rather than honoured: these paths are handed to
+/// services and written into config, where a value that depends on the current
+/// working directory is a latent bug (the same class as the CWD-relative
+/// `.aikey/...` collapse that bit aikey-local-server under systemd). Ignoring is
+/// also the safer failure — it lands on the historical default rather than
+/// somewhere arbitrary.
 pub fn resolve_aikey_dir() -> std::path::PathBuf {
+    if let Ok(explicit) = std::env::var("AIKEY_HOME") {
+        let p = std::path::PathBuf::from(&explicit);
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    if let Some(p) = aikey_dir_from_own_exe() {
+        return p;
+    }
     resolve_user_home().join(".aikey")
+}
+
+/// Derive this install's root from where THIS binary lives: `<root>/bin/aikey`
+/// → `<root>`. Returns `None` when the layout doesn't match or the candidate
+/// doesn't look like an install.
+///
+/// This is what makes relocation work without the user exporting anything.
+/// `AIKEY_HOME` covers the installer's own sub-invocations, but a user typing
+/// `aikey` in a plain shell six months later has no such variable — and the
+/// binary they invoked already knows which install it belongs to. Deriving from
+/// argv[0]'s real path needs no rc edits, no wrapper, and cannot drift out of
+/// sync with where the files actually are.
+///
+/// Two guards keep this from firing wrongly:
+///   - the parent directory must be named `bin`, so a dev build under
+///     `target/debug/aikey` falls through to the home-derived default;
+///   - the candidate root must actually contain an install marker, so a shim
+///     dropped in `/usr/local/bin` doesn't make us treat `/usr/local` as an
+///     AiKey install and start writing a vault there.
+/// `current_exe()` resolves symlinks, so a link in `~/bin` still points back at
+/// the real install.
+fn aikey_dir_from_own_exe() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let bin_dir = exe.parent()?;
+    if bin_dir.file_name().and_then(|s| s.to_str()) != Some("bin") {
+        return None;
+    }
+    let root = bin_dir.parent()?;
+    let looks_like_install = root.join("install-state.json").exists()
+        || root.join("config").is_dir()
+        || root.file_name().and_then(|s| s.to_str()) == Some(".aikey");
+    if looks_like_install {
+        Some(root.to_path_buf())
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5434,6 +5495,7 @@ mod path_helper_tests {
     #[test]
     fn resolve_aikey_dir_appends_dot_aikey() {
         let _snap = EnvSnapshot::take();
+        std::env::remove_var("AIKEY_HOME");
         std::env::set_var("HOME", "/tmp/aikey-base");
         let dir = resolve_aikey_dir();
         // PathBuf join may use different separators on Windows; check via
@@ -5442,6 +5504,110 @@ mod path_helper_tests {
         assert_eq!(last, Some(".aikey"));
         let parent = dir.parent().and_then(|p| p.to_str());
         assert_eq!(parent, Some("/tmp/aikey-base"));
+    }
+
+    // ── AIKEY_HOME: relocated installs (2026-07-22) ─────────────────────────
+    //
+    // The installer has always supported --install-dir / --sandbox, but the CLI
+    // had no notion of it: every path came from the user's home, so a relocated
+    // install's `aikey` operated on the DEFAULT install's vault, config and run
+    // state. Two installs, one data plane, silently.
+
+    #[test]
+    fn aikey_home_overrides_the_home_derived_default() {
+        let _snap = EnvSnapshot::take();
+        std::env::set_var("HOME", "/tmp/aikey-base");
+        std::env::set_var("AIKEY_HOME", "/opt/aikey-instance-b");
+        assert_eq!(
+            resolve_aikey_dir(),
+            std::path::PathBuf::from("/opt/aikey-instance-b"),
+            "a relocated install must use its own directory, not $HOME/.aikey"
+        );
+    }
+
+    #[test]
+    fn aikey_home_is_used_verbatim_without_appending_dot_aikey() {
+        // The installer's AIKEY_HOME already IS the install root (it is
+        // "<sandbox>/personal", not "<sandbox>/personal/.aikey"), so appending
+        // would point one level too deep at a directory nothing creates.
+        let _snap = EnvSnapshot::take();
+        std::env::set_var("HOME", "/tmp/aikey-base");
+        std::env::set_var("AIKEY_HOME", "/tmp/sbx/personal");
+        let dir = resolve_aikey_dir();
+        assert_eq!(dir.file_name().and_then(|s| s.to_str()), Some("personal"));
+        assert!(!dir.ends_with(".aikey"));
+    }
+
+    #[test]
+    fn relative_aikey_home_is_ignored() {
+        // A CWD-relative install root would resolve differently depending on
+        // where the binary happened to be launched from, and these paths get
+        // written into config and handed to services. Falling back to the
+        // historical default is the safer of the two failures.
+        let _snap = EnvSnapshot::take();
+        std::env::set_var("HOME", "/tmp/aikey-base");
+        std::env::set_var("AIKEY_HOME", "relative/path");
+        assert_eq!(
+            resolve_aikey_dir(),
+            std::path::PathBuf::from("/tmp/aikey-base/.aikey"),
+            "a relative AIKEY_HOME must be ignored, not honoured"
+        );
+    }
+
+    #[test]
+    fn empty_aikey_home_falls_back_to_home() {
+        let _snap = EnvSnapshot::take();
+        std::env::set_var("HOME", "/tmp/aikey-base");
+        std::env::set_var("AIKEY_HOME", "");
+        assert_eq!(
+            resolve_aikey_dir(),
+            std::path::PathBuf::from("/tmp/aikey-base/.aikey")
+        );
+    }
+
+    #[test]
+    fn own_exe_derivation_requires_a_bin_parent_and_an_install_marker() {
+        let _snap = EnvSnapshot::take();
+        std::env::remove_var("AIKEY_HOME");
+        // A dev build lives at target/debug/aikey — parent is "debug", so the
+        // derivation must decline and leave the home-derived default in place.
+        let tmp = tempfile::tempdir().unwrap();
+        let devish = tmp.path().join("target").join("debug");
+        std::fs::create_dir_all(&devish).unwrap();
+        assert!(
+            devish.file_name().and_then(|s| s.to_str()) != Some("bin"),
+            "fixture sanity: a dev build's parent dir is not named bin"
+        );
+
+        // A shim in /usr/local/bin has a "bin" parent but /usr/local is not an
+        // install — without the marker check we would treat it as one and start
+        // writing a vault there.
+        let shim_root = tmp.path().join("usr-local");
+        std::fs::create_dir_all(shim_root.join("bin")).unwrap();
+        assert!(
+            !shim_root.join("install-state.json").exists()
+                && !shim_root.join("config").is_dir(),
+            "fixture sanity: the shim root carries no install marker"
+        );
+
+        // A real install does carry one.
+        let real_root = tmp.path().join("personal");
+        std::fs::create_dir_all(real_root.join("bin")).unwrap();
+        std::fs::write(real_root.join("install-state.json"), "{}").unwrap();
+        assert!(real_root.join("install-state.json").exists());
+    }
+
+    #[test]
+    fn aikey_home_wins_over_exe_derivation() {
+        let _snap = EnvSnapshot::take();
+        std::env::set_var("HOME", "/tmp/aikey-base");
+        std::env::set_var("AIKEY_HOME", "/opt/explicit-install");
+        // Explicit beats inferred: the installer knows which install it is
+        // configuring even when the binary running is somewhere else.
+        assert_eq!(
+            resolve_aikey_dir(),
+            std::path::PathBuf::from("/opt/explicit-install")
+        );
     }
 
     // ── kimi_config_paths / codex_config_paths ──────────────────────────────

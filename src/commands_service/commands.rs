@@ -371,18 +371,17 @@ mod trust_local {
     /// `~/.aikey/bin/trust-local` (Unix) or `%USERPROFILE%\.aikey\bin\trust-local.exe`
     /// (Windows). Mirrors install_service.ps1's `$BinaryPath` resolution.
     fn aikey_home_bin_path() -> std::path::PathBuf {
-        let home = if cfg!(windows) {
-            std::env::var("USERPROFILE").unwrap_or_default()
-        } else {
-            std::env::var("HOME").unwrap_or_default()
-        };
+        // resolve_aikey_dir() rather than a local HOME/USERPROFILE read: it is
+        // the single place that knows about AIKEY_HOME, so a relocated install
+        // (--install-dir / --sandbox) finds ITS trust-local instead of the
+        // default install's. The platform split it used to do by hand is the
+        // same one resolve_user_home() already does behind that helper.
         let binary_name = if cfg!(windows) {
             "trust-local.exe"
         } else {
             "trust-local"
         };
-        std::path::PathBuf::from(home)
-            .join(".aikey")
+        crate::commands_account::resolve_aikey_dir()
             .join("bin")
             .join(binary_name)
     }

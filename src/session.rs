@@ -38,7 +38,7 @@ const KEYRING_USER: &str = "master-password";
 // ---------------------------------------------------------------------------
 
 fn aikey_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".aikey"))
+    Some(crate::commands_account::resolve_aikey_dir())
 }
 
 fn session_meta_path() -> Option<PathBuf> {
