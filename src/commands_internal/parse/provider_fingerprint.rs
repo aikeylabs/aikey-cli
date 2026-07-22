@@ -362,6 +362,83 @@ pub fn instance() -> &'static FingerprintClassifier {
     INSTANCE.get_or_init(FingerprintClassifier::new_embedded)
 }
 
+/// The ONE protocol-axis resolver. Every surface that prints a PROTOCOL column
+/// must call this so they cannot disagree about the same key.
+///
+/// Resolution order, most authoritative first:
+///   1. the route row owning `base_url` — endpoint truth, same source as the
+///      vault two-axis read model;
+///   2. `declared` — what the record itself says (team keys cache
+///      `protocol_type` alongside their base_url);
+///   3. the provider's own first route row — heuristic for multi-host
+///      providers, but still a PROTOCOL.
+///
+/// Returns empty when nothing resolves. 🚫 Never fall back to a provider
+/// family/code here: this column is the protocol axis, and a provider name in
+/// it is the exact two-axis conflation this work exists to kill.
+///
+/// Why it exists: `aikey list` grew steps 1-3 while `aikey use` had only 1-2
+/// and then fell back to `provider_registry::family_of()`. For any key without
+/// a stored base_url — every key created by `aikey add --provider x` with no
+/// `--base-url` — `use` printed `zhipu` / `openai` (provider families) where
+/// `list` printed `openai_compatible`. Same key, two commands, two answers, and
+/// one of them naming the wrong axis.
+pub fn protocol_for(base_url: &str, provider: &str, declared: &str) -> String {
+    let c = instance();
+    c.route_for_base_url(base_url)
+        .map(|r| r.protocol.clone())
+        .filter(|p| !p.is_empty())
+        .or_else(|| (!declared.is_empty()).then(|| declared.to_string()))
+        .or_else(|| {
+            c.route_for_provider(provider)
+                .map(|r| r.protocol.clone())
+                .filter(|p| !p.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod protocol_axis_tests {
+    use super::protocol_for;
+
+    #[test]
+    fn base_url_wins_over_declared() {
+        // anthropic's official endpoint speaks the anthropic protocol even if a
+        // stale record declares otherwise
+        let p = protocol_for("https://api.anthropic.com", "anthropic", "openai_compatible");
+        assert_eq!(p, "anthropic");
+    }
+
+    #[test]
+    fn declared_is_used_when_base_url_is_unknown() {
+        let p = protocol_for("https://gateway.invalid/v1", "zhipu", "anthropic");
+        assert_eq!(p, "anthropic");
+    }
+
+    /// The regression: no base_url, nothing declared. `aikey use` used to print
+    /// the provider family here (`zhipu`, `openai`) — a PROVIDER in the
+    /// PROTOCOL column, and a disagreement with `aikey list`.
+    #[test]
+    fn falls_back_to_the_providers_route_protocol_never_to_a_provider_name() {
+        for (provider, expected) in [("openai", "openai_compatible"), ("anthropic", "anthropic")] {
+            let p = protocol_for("", provider, "");
+            assert_eq!(p, expected, "provider {provider} resolved to {p}");
+        }
+        // `anthropic` above is a protocol that happens to share its provider's
+        // name, so it can't witness the bug. `openai` can: the provider family
+        // is `openai`, the protocol is `openai_compatible`, and printing the
+        // former under a PROTOCOL header is exactly what regressed.
+        assert_ne!(protocol_for("", "openai", ""), "openai");
+        assert_ne!(protocol_for("", "zhipu", ""), "zhipu");
+    }
+
+    #[test]
+    fn unknown_provider_resolves_to_empty_rather_than_its_own_name() {
+        let p = protocol_for("", "totally-unknown-provider", "");
+        assert!(p.is_empty(), "expected empty, got {p}");
+    }
+}
+
 // ─── v4.1 Stage 3 L3 enrich 扩展 ────────────────────────────────────────
 //
 // V4.1 spike 在 YAML 里为每个 provider 增加了 `provider_family` /

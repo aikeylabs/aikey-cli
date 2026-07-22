@@ -5076,7 +5076,15 @@ pub fn handle_key_use(
             use colored::Colorize;
             println!("Key '{}' supports multiple providers:", display_name.bold());
             for (i, p) in providers.iter().enumerate() {
-                println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p);
+                // Same labeller as the summary table, the title line and `aikey list` —
+                // the picker showed bare `zhipu` while every other surface said
+                // `zhipu(GLM)`, so the list you choose FROM and the confirmation you get
+                // BACK spelled the same provider two different ways.
+                println!(
+                    "  {}  {}",
+                    format!("[{}]", i + 1).dimmed(),
+                    crate::provider_registry::display_label(p)
+                );
             }
             // P1f.11② (§19.9): this list is `supported_providers` (PROVIDER codes),
             // not protocols — the old "Select protocol(s)" mislabel conflated the two
@@ -5120,7 +5128,15 @@ pub fn handle_key_use(
         use colored::Colorize;
         println!("Key '{}' supports multiple providers:", display_name.bold());
         for (i, p) in providers.iter().enumerate() {
-            println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p);
+            // Same labeller as the summary table, the title line and `aikey list` —
+            // the picker showed bare `zhipu` while every other surface said
+            // `zhipu(GLM)`, so the list you choose FROM and the confirmation you get
+            // BACK spelled the same provider two different ways.
+            println!(
+                "  {}  {}",
+                format!("[{}]", i + 1).dimmed(),
+                crate::provider_registry::display_label(p)
+            );
         }
         // P1f.11② (§19.9): PROVIDER codes, not protocols — fix the mislabel.
         print!("Select provider(s) to set as Primary (comma-separated): ");
@@ -5221,12 +5237,42 @@ pub fn handle_key_use(
         // columns, matching the vault page's two axes so `aikey use` never conflates
         // them again. Header row makes the axes explicit (product-designer §5.3).
         use colored::Colorize as _;
+        // Auto-width both axis columns. The fixed `{:<12}` PROTOCOL column could
+        // not hold `openai_compatible` (17 chars) — the longest protocol simply
+        // pushed every following column out of alignment, and it is the protocol
+        // most likely to appear. Width is computed from the values actually
+        // being printed, so no new protocol can overflow it either.
+        let axis_cells: Vec<(String, String)> = bindings
+            .iter()
+            .filter(|b| provider_env_vars(&b.provider_code).is_some())
+            .map(|b| {
+                (
+                    resolve_binding_protocol(b),
+                    crate::provider_registry::display_label(&b.provider_code),
+                )
+            })
+            .collect();
+        let proto_w = axis_cells
+            .iter()
+            .map(|(p, _)| p.chars().count())
+            .chain(std::iter::once("PROTOCOL".len()))
+            .max()
+            .unwrap_or("PROTOCOL".len());
+        let prov_w = axis_cells
+            .iter()
+            .map(|(_, p)| p.chars().count())
+            .chain(std::iter::once("PROVIDER".len()))
+            .max()
+            .unwrap_or("PROVIDER".len());
+
         let mut rows: Vec<String> = Vec::new();
         rows.push(format!(
-            "  {:<12} {:<20} {}",
+            "  {:<pw$} {:<vw$} {}",
             "PROTOCOL".dimmed(),
             "PROVIDER".dimmed(),
-            "KEY".dimmed()
+            "KEY".dimmed(),
+            pw = proto_w,
+            vw = prov_w
         ));
         for b in &bindings {
             if let Some((api_key_var, _)) = provider_env_vars(&b.provider_code) {
@@ -5245,11 +5291,13 @@ pub fn handle_key_use(
                 let provider_disp = crate::provider_registry::display_label(&b.provider_code);
                 let protocol = resolve_binding_protocol(b);
                 rows.push(format!(
-                    "  {:<12} {:<20} {} {}",
+                    "  {:<pw$} {:<vw$} {} {}",
                     protocol,
                     provider_disp,
                     arrow_col,
-                    format!("[{}]", b.key_source_type).bright_black()
+                    format!("[{}]", b.key_source_type).bright_black(),
+                    pw = proto_w,
+                    vw = prov_w
                 ));
                 let _ = api_key_var;
             }
@@ -5296,30 +5344,31 @@ pub fn handle_key_use(
 /// per provider is an L3 (P1e) concern; at L1 each provider has one active binding.
 fn resolve_binding_protocol(b: &storage::ProviderBinding) -> String {
     use crate::credential_type::CredentialType;
-    let classifier = crate::commands_internal::parse::provider_fingerprint::instance();
-    let via_base_url = |base_url: &str, fallback: &str| -> Option<String> {
-        classifier
-            .route_for_base_url(base_url)
-            .map(|r| r.protocol.clone())
-            .filter(|p| !p.is_empty())
-            .or_else(|| (!fallback.is_empty()).then(|| fallback.to_string()))
-    };
-    let resolved = match b.key_source_type {
+    use crate::commands_internal::parse::provider_fingerprint::protocol_for;
+    let (base_url, declared) = match b.key_source_type {
         // Team keys carry base_url + protocol_type in the local cache.
         CredentialType::ManagedVirtualKey => storage::get_virtual_key_cache(&b.key_source_ref)
             .ok()
             .flatten()
-            .and_then(|vk| via_base_url(&vk.base_url, &vk.protocol_type)),
+            .map(|vk| (vk.base_url, vk.protocol_type))
+            .unwrap_or_default(),
         // Personal keys: resolve via the entry's stored base_url.
-        _ => storage::get_entry_base_url(&b.key_source_ref)
-            .ok()
-            .flatten()
-            .and_then(|url| via_base_url(&url, "")),
+        _ => (
+            storage::get_entry_base_url(&b.key_source_ref)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            String::new(),
+        ),
     };
-    // Honest fallback when the endpoint can't be resolved (e.g. an OAuth binding
-    // with no cached base_url): the provider's canonical family label. Best-effort
-    // only — the route row is authoritative whenever present.
-    resolved.unwrap_or_else(|| crate::provider_registry::family_of(&b.provider_code).to_string())
+    // Shared with `aikey list` — see `protocol_for`. It resolves endpoint-first
+    // and, when there is no endpoint, falls back to the PROVIDER'S ROUTE ROW,
+    // which is still a protocol. The previous last resort here was
+    // `provider_registry::family_of()`, i.e. a provider family printed under a
+    // PROTOCOL header, which also made `use` disagree with `list` for every key
+    // stored without a base_url. Empty when genuinely unresolvable — an honest
+    // blank beats a confident wrong axis.
+    protocol_for(&base_url, &b.provider_code, &declared)
 }
 
 /// Classify the `aikey use` summary line so it never overpromises

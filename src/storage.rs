@@ -264,6 +264,24 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
             .map_err(|e| format!("Failed to set directory permissions: {}", e))?;
     }
 
+    // A 0-byte vault.db is never a real vault: SQLite writes a 100-byte header
+    // on first use, so an empty file can only be the shell left by an init that
+    // died between `Connection::open` and the first write. Clear it and start
+    // clean — otherwise the probe below opens it, and the caller sees a
+    // confusing "Vault already initialized" or "unable to open database file"
+    // for what is really leftover debris.
+    if db_path.metadata().map(|m| m.len() == 0).unwrap_or(false) {
+        fs::remove_file(&db_path).map_err(|e| {
+            format!(
+                "Found an empty {} left by an interrupted vault init, and could not \
+                 remove it: {}. Delete that file (as an administrator if its \
+                 permissions were left broken) and re-run.",
+                db_path.display(),
+                e
+            )
+        })?;
+    }
+
     // If the DB file exists, check whether it was fully initialized (has master_salt).
     // The file may exist without salt if session-backend selection created it first.
     if db_path.exists() {
@@ -283,23 +301,62 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         // DB exists but no salt — fall through to complete initialization
     }
 
-    let conn =
-        Connection::open(&db_path).map_err(|e| format!("Failed to create database: {}", e))?;
+    // Whether THIS call is what brings vault.db into existence. If it is, any
+    // failure below must not leave the empty shell behind — `Connection::open`
+    // creates a 0-byte file before anything is written to it, and an error
+    // after that point used to leave exactly that on disk, so a `aikey add`
+    // that failed reported "Failed to set database permissions" and left what
+    // looks like a vault but has no master_salt.
+    let db_created_here = !db_path.exists();
+    let cleanup_partial = |e: String| -> String {
+        if db_created_here {
+            let _ = fs::remove_file(&db_path);
+        }
+        e
+    };
 
-    // Stage 2.4 windows-compat: belt-and-suspenders — vault_dir's ACL
-    // already inherits owner-only to vault.db on Windows, but we set it
-    // explicitly here so even a vault.db that pre-existed (e.g. user
-    // manually copied an old vault file in) gets re-hardened.
-    storage_acl::enforce_owner_only_file(&db_path)
-        .map_err(|e| format!("Failed to set database permissions: {}", e))?;
+    let conn = Connection::open(&db_path)
+        .map_err(|e| cleanup_partial(format!("Failed to create database: {}", e)))?;
+
+    // Stage 2.4 windows-compat: the DIRECTORY ACL is the control that matters —
+    // NTFS inheritance carries it to vault.db (see storage_acl module doc), and
+    // on Unix the 0o700 dir does the same job. Enforce it here too, not only on
+    // the create-the-dir path above, so a vault dir that already existed (or was
+    // restored from a backup) is hardened as well.
+    let dir_hardened = storage_acl::enforce_owner_only_dir(&vault_dir);
+
+    // The per-file call is explicitly belt-and-suspenders on top of that
+    // inheritance. Treating its failure as fatal aborted vault creation outright
+    // in contexts where icacls cannot name the caller — e.g. running as a service
+    // (LocalSystem resolves to the MACHINE$ account: "icacls /grant:r failed for
+    // HOST$"). Fail only when the belt failed too; otherwise the vault is still
+    // owner-only, and a warning is the honest report.
+    if let Err(file_err) = storage_acl::enforce_owner_only_file(&db_path) {
+        match dir_hardened {
+            Ok(()) => eprintln!(
+                "  ! Could not set an explicit ACL on {} ({}). \
+                 The vault directory's owner-only permissions still apply to it.",
+                db_path.display(),
+                file_err
+            ),
+            Err(dir_err) => {
+                return Err(cleanup_partial(format!(
+                    "Failed to set database permissions: {} (vault directory could not be \
+                     secured either: {}) — refusing to create a vault that other users \
+                     could read",
+                    file_err, dir_err
+                )))
+            }
+        }
+    }
 
     // SECURITY: Enable secure delete to overwrite deleted data with zeros
     conn.pragma_update(None, "secure_delete", "ON")
-        .map_err(|e| format!("Failed to enable secure delete: {}", e))?;
+        .map_err(|e| cleanup_partial(format!("Failed to enable secure delete: {}", e)))?;
 
     // SECURITY: Enable auto-vacuum to reclaim space and prevent data remnants
     conn.pragma_update(None, "auto_vacuum", "FULL")
-        .map_err(|e| format!("Failed to enable auto-vacuum: {}", e))?;
+        .map_err(|e| cleanup_partial(format!("Failed to enable auto-vacuum: {}", e)))?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS config (
@@ -308,7 +365,7 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         )",
         [],
     )
-    .map_err(|e| format!("Failed to create config table: {}", e))?;
+    .map_err(|e| cleanup_partial(format!("Failed to create config table: {}", e)))?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS entries (
@@ -322,7 +379,7 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         )",
         [],
     )
-    .map_err(|e| format!("Failed to create entries table: {}", e))?;
+    .map_err(|e| cleanup_partial(format!("Failed to create entries table: {}", e)))?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS profiles (
@@ -333,7 +390,7 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         )",
         [],
     )
-    .map_err(|e| format!("Failed to create profiles table: {}", e))?;
+    .map_err(|e| cleanup_partial(format!("Failed to create profiles table: {}", e)))?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS bindings (
@@ -346,36 +403,36 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         )",
         [],
     )
-    .map_err(|e| format!("Failed to create bindings table: {}", e))?;
+    .map_err(|e| cleanup_partial(format!("Failed to create bindings table: {}", e)))?;
 
     conn.execute(
         "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
         params!["master_salt", salt],
     )
-    .map_err(|e| format!("Failed to store salt: {}", e))?;
+    .map_err(|e| cleanup_partial(format!("Failed to store salt: {}", e)))?;
 
     // Store KDF parameters for future use (e.g., password changes)
     conn.execute(
         "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
         params!["kdf_m_cost", &crate::crypto::ARGON2_M_COST.to_le_bytes()],
     )
-    .map_err(|e| format!("Failed to store KDF m_cost: {}", e))?;
+    .map_err(|e| cleanup_partial(format!("Failed to store KDF m_cost: {}", e)))?;
 
     conn.execute(
         "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
         params!["kdf_t_cost", &crate::crypto::ARGON2_T_COST.to_le_bytes()],
     )
-    .map_err(|e| format!("Failed to store KDF t_cost: {}", e))?;
+    .map_err(|e| cleanup_partial(format!("Failed to store KDF t_cost: {}", e)))?;
 
     conn.execute(
         "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
         params!["kdf_p_cost", &crate::crypto::ARGON2_P_COST.to_le_bytes()],
     )
-    .map_err(|e| format!("Failed to store KDF p_cost: {}", e))?;
+    .map_err(|e| cleanup_partial(format!("Failed to store KDF p_cost: {}", e)))?;
 
     // Derive key directly from password parameter instead of environment variable
     let key = crate::crypto::derive_key(password, salt)
-        .map_err(|e| format!("Key derivation failed: {}", e))?;
+        .map_err(|e| cleanup_partial(format!("Key derivation failed: {}", e)))?;
 
     // Use &*key to dereference SecureBuffer and get &[u8; 32]
     let password_hash = &*key;
@@ -384,7 +441,7 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
         params!["password_hash", password_hash],
     )
-    .map_err(|e| format!("Failed to store password hash: {}", e))?;
+    .map_err(|e| cleanup_partial(format!("Failed to store password hash: {}", e)))?;
 
     // Seed the delivery-integrity source identity once, at vault creation, so
     // the proxy reads a stable per-source id from its very first start. Inserted
@@ -395,7 +452,7 @@ pub fn initialize_vault(salt: &[u8], password: &SecretString) -> Result<(), Stri
         "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
         params![SOURCE_IDENTITY_KEY, generate_uuid_v4().as_bytes().to_vec()],
     )
-    .map_err(|e| format!("Failed to store source identity: {}", e))?;
+    .map_err(|e| cleanup_partial(format!("Failed to store source identity: {}", e)))?;
 
     Ok(())
 }
