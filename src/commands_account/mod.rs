@@ -3953,7 +3953,7 @@ pub fn handle_key_sync(
                     "  {} Team key '{}' auto-activated as Primary for {}",
                     crate::symbols::STAR.s().yellow(),
                     vk_id.bold(),
-                    p
+                    crate::provider_registry::display_label(p)
                 );
             }
         }
@@ -5242,12 +5242,7 @@ pub fn handle_key_use(
                 };
                 // Provider axis: `code(alias)` — GLM alias muted-in-parens, matching
                 // the vault chip (zhipu → `zhipu(GLM)`). 🚫 alias never replaces code.
-                let provider_disp = match crate::provider_registry::lookup(&b.provider_code)
-                    .and_then(|e| e.display_alias)
-                {
-                    Some(alias) if !alias.is_empty() => format!("{}({})", b.provider_code, alias),
-                    _ => b.provider_code.clone(),
-                };
+                let provider_disp = crate::provider_registry::display_label(&b.provider_code);
                 let protocol = resolve_binding_protocol(b);
                 rows.push(format!(
                     "  {:<12} {:<20} {} {}",
@@ -5265,7 +5260,11 @@ pub fn handle_key_use(
         let title = format!(
             "Set '{}' as Primary for {}",
             display_name,
-            target_providers.join(", ")
+            target_providers
+                .iter()
+                .map(|p| crate::provider_registry::display_label(p))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         crate::ui_frame::print_box(crate::symbols::ICON_GREEN_DOT.s(), &title, &rows);
         // 阶段7: Desktop is a cold-switch surface — when THIS use rewrote

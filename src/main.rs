@@ -577,12 +577,8 @@ fn run_unified_list(
         };
         // Provider axis label: `code(alias)` (e.g. `zhipu(GLM)`); the alias never
         // replaces the code — same convention as the vault chip + `aikey use`.
-        let provider_label = |code: &str| -> String {
-            match crate::provider_registry::lookup(code).and_then(|e| e.display_alias) {
-                Some(a) if !a.is_empty() => format!("{}({})", code, a),
-                _ => code.to_string(),
-            }
-        };
+        let provider_label =
+            |code: &str| -> String { crate::provider_registry::display_label(code) };
         // Push `v` into `acc` iff not already present (distinct, order-preserving).
         let push_distinct = |acc: &mut Vec<String>, v: String| {
             if !v.is_empty() && !acc.contains(&v) {
@@ -653,7 +649,11 @@ fn run_unified_list(
                 alias: entry.alias.clone(),
                 protocol: collapse_axis(&proto_vals),
                 providers: collapse_axis(&prov_vals),
-                primary_for: pf.join(","),
+                primary_for: pf
+                    .iter()
+                    .map(|c| provider_label(c))
+                    .collect::<Vec<_>>()
+                    .join(","),
                 has_primary: !pf.is_empty(),
                 status: String::new(), // valid → not displayed
                 created: entry
@@ -785,7 +785,11 @@ fn run_unified_list(
                 alias: display,
                 protocol: collapse_axis(&proto_vals),
                 providers: collapse_axis(&prov_vals),
-                primary_for: pf.join(","),
+                primary_for: pf
+                    .iter()
+                    .map(|c| provider_label(c))
+                    .collect::<Vec<_>>()
+                    .join(","),
                 has_primary: !pf.is_empty(),
                 status,
                 created: format_date(rep.synced_at),
