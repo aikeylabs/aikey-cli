@@ -5736,6 +5736,17 @@ pub(crate) fn audit_key_from_password(
 }
 
 fn derive_vault_key(password: &SecretString) -> Result<[u8; crypto::KEY_SIZE], String> {
+    // First-run bootstrap (2026-07-21): on a fresh machine the caller has just
+    // prompted the user to SET a new master password (`prompt_vault_password_fresh`'s
+    // no-vault branch), but nothing has written the vault yet — that path only
+    // collects the password, it doesn't initialize. Reading the salt straight away
+    // then failed with "Salt not found in vault. Vault may be corrupted.", which
+    // wedged `aikey key sync` / `aikey use` on every new install and told the user
+    // their vault was damaged when it had simply never been created.
+    //
+    // Delegating to the same helper VaultContext::new uses keeps ONE definition of
+    // "first run" — 🚫 don't inline a second salt-generation here.
+    crate::executor::ensure_vault_initialized(password)?;
     let salt = storage::get_salt()?;
     let (m, t, p) = storage::get_kdf_params()?;
     let secure_key = crypto::derive_key_with_params(password, &salt, m, t, p)?;
@@ -6265,6 +6276,77 @@ mod snapshot_sync_debounce_tests {
         // suppression.
         std::fs::write(&path, (now + 10_000).to_string()).unwrap();
         assert!(!snapshot_sync_recently_attempted(&path, now));
+    }
+}
+
+#[cfg(test)]
+mod first_run_vault_bootstrap_tests {
+    //! Fence for the 2026-07-21 first-run regression: on a machine with no
+    //! vault, `aikey key sync` prompted the user to SET a master password and
+    //! then died with "Salt not found in vault. Vault may be corrupted."
+    //!
+    //! Cause: `derive_vault_key` read `storage::get_salt()` directly, while the
+    //! password prompt for a brand-new vault only COLLECTS the password —
+    //! nothing had written `config.master_salt` yet. Every fresh install hit it
+    //! (`key sync`, and `use`/web-session via the same helper), and the message
+    //! blamed corruption for a vault that had simply never been created.
+    //!
+    //! These pin the two halves: the bootstrap happens, and it is idempotent
+    //! (a second call must NOT re-salt an existing vault — that would silently
+    //! orphan every entry encrypted under the old key).
+
+    use super::*;
+    use secrecy::SecretString;
+    use tempfile::TempDir;
+
+    /// Fresh dir, NO `initialize_vault` — exactly the state a new machine is in.
+    fn setup_uninitialized_vault() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
+        (dir, guard)
+    }
+
+    #[test]
+    fn derive_vault_key_bootstraps_a_brand_new_vault() {
+        let (_dir, _guard) = setup_uninitialized_vault();
+        // Precondition: this is the broken state — no salt at all.
+        assert!(
+            storage::get_salt().is_err(),
+            "test setup wrong: vault already initialized"
+        );
+
+        let pw = SecretString::new("first-run-password".to_string());
+        let key = derive_vault_key(&pw).expect(
+            "derive_vault_key must bootstrap a fresh vault instead of reporting corruption",
+        );
+
+        assert_eq!(key.len(), crypto::KEY_SIZE);
+        assert!(
+            storage::get_salt().is_ok(),
+            "master_salt must be persisted after first-run bootstrap"
+        );
+    }
+
+    #[test]
+    fn bootstrap_is_idempotent_and_never_resalts() {
+        let (_dir, _guard) = setup_uninitialized_vault();
+        let pw = SecretString::new("first-run-password".to_string());
+
+        let key1 = derive_vault_key(&pw).expect("first derive");
+        let salt1 = storage::get_salt().expect("salt after first derive");
+        let key2 = derive_vault_key(&pw).expect("second derive");
+        let salt2 = storage::get_salt().expect("salt after second derive");
+
+        // A re-salt here would change the derived key and orphan every entry
+        // already encrypted under the old one.
+        assert_eq!(salt1, salt2, "second call must not re-salt the vault");
+        assert_eq!(key1, key2, "same password must derive the same key");
     }
 }
 

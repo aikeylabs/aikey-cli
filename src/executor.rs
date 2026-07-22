@@ -39,31 +39,47 @@ struct VaultContext {
     salt: Vec<u8>,
 }
 
+/// First-run vault bootstrap: create + salt the vault if it isn't initialized yet.
+///
+/// Idempotent — a no-op once `master_salt` exists. Extracted from
+/// `VaultContext::new` so paths that derive a vault key WITHOUT going through
+/// VaultContext get the same auto-init instead of dying on a missing salt.
+///
+/// Why this is a shared helper and not duplicated: `commands_account::
+/// derive_vault_key` used to read `storage::get_salt()` directly, so on a fresh
+/// machine `aikey key sync` prompted for a NEW master password, wrote nothing,
+/// and then failed with "Salt not found in vault. Vault may be corrupted." —
+/// a misleading message, since the vault was never initialized rather than
+/// damaged. One bootstrap implementation means that class of drift can't recur.
+pub fn ensure_vault_initialized(password: &SecretString) -> Result<(), String> {
+    // Integrity check is delegated to `ensure_vault_integrity_or_quarantine`
+    // so callers that bypass VaultContext (e.g. `aikey list` via
+    // storage::list_entries_with_metadata) still benefit — the same helper
+    // is invoked from run_command's dispatch prelude.
+    ensure_vault_integrity_or_quarantine()?;
+    let vault_path = storage::get_vault_path()?;
+    let needs_init = if vault_path.exists() {
+        // Size-0 or post-quarantine path both surface as "salt missing",
+        // which means this is a fresh/reset vault that needs init.
+        storage::get_salt().is_err()
+    } else {
+        true
+    };
+    if needs_init {
+        let mut salt = [0u8; 16];
+        crypto::generate_salt(&mut salt)?;
+        storage::initialize_vault(&salt, password)?;
+        let _ = audit::initialize_audit_log();
+        let _ = audit::log_audit_event(password, audit::AuditOperation::Init, None, true);
+    }
+    Ok(())
+}
+
 impl VaultContext {
     fn new(password: &SecretString) -> Result<Self, String> {
         // Auto-initialize vault on first use so the user never needs a separate
         // initialization step before using any vault command.
-        //
-        // Integrity check is delegated to `ensure_vault_integrity_or_quarantine`
-        // so callers that bypass VaultContext (e.g. `aikey list` via
-        // storage::list_entries_with_metadata) still benefit — the same helper
-        // is invoked from run_command's dispatch prelude.
-        ensure_vault_integrity_or_quarantine()?;
-        let vault_path = storage::get_vault_path()?;
-        let needs_init = if vault_path.exists() {
-            // Size-0 or post-quarantine path both surface as "salt missing",
-            // which means this is a fresh/reset vault that needs init.
-            storage::get_salt().is_err()
-        } else {
-            true
-        };
-        if needs_init {
-            let mut salt = [0u8; 16];
-            crypto::generate_salt(&mut salt)?;
-            storage::initialize_vault(&salt, password)?;
-            let _ = audit::initialize_audit_log();
-            let _ = audit::log_audit_event(password, audit::AuditOperation::Init, None, true);
-        }
+        ensure_vault_initialized(password)?;
 
         // Check rate limiting before attempting authentication
         let mut rate_limiter = crate::ratelimit::RateLimiter::load()?;
