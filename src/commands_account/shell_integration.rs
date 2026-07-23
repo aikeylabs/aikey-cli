@@ -4052,7 +4052,8 @@ tool_call_timeout_ms = 60000\n"
             .expect("[model_providers.aikey] table");
 
         assert_eq!(
-            tbl.get("experimental_bearer_token").and_then(|v| v.as_str()),
+            tbl.get("experimental_bearer_token")
+                .and_then(|v| v.as_str()),
             Some("aikey_active_openai"),
             "credential channel missing:\n{out}"
         );
@@ -4119,7 +4120,8 @@ tool_call_timeout_ms = 60000\n"
              until they hand-edit config.toml:\n{out}"
         );
         assert_eq!(
-            tbl.get("experimental_bearer_token").and_then(|v| v.as_str()),
+            tbl.get("experimental_bearer_token")
+                .and_then(|v| v.as_str()),
             Some("aikey_active_openai"),
             "self-heal must keep the credential channel intact:\n{out}"
         );
