@@ -808,6 +808,46 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             }
         }
 
+        // ── Model mapping (P3.5 four-surface visibility · reads task-7.9 endpoint) ──
+        // Surface "configured but not effective". The proxy's mappingHealth is the
+        // single source of truth — doctor renders its verdict, never re-derives it.
+        // 3.6: mapping-missing is NOT user-fixable (ships with the installer), so it
+        // shows as an informational WARN (never fails the overall doctor). Silent when
+        // the proxy is down (the proxy-version row above already flagged that).
+        if let Ok(diag) = crate::commands_proxy::fetch_pipeline_diagnostics() {
+            let mm = &diag.model_mapping;
+            let reg = &diag.registry;
+            match mm.status.as_str() {
+                "degraded" => emit(
+                    "model-mapping",
+                    true, // informational — not a doctor failure (unfixable client-side)
+                    &format!(
+                        "{} configured but not taking effect (registry {})",
+                        crate::symbols::WARN.s(),
+                        reg.digest
+                    ),
+                    Some(if mm.reason.is_empty() {
+                        "a mapping is set but recent requests didn't match it — update the installer to change mappings"
+                    } else {
+                        mm.reason.as_str()
+                    }),
+                ),
+                "ok" => emit(
+                    "model-mapping",
+                    true,
+                    &format!("active · registry {} · {} applied", reg.digest, mm.applied),
+                    None,
+                ),
+                "inactive" => emit(
+                    "model-mapping",
+                    true,
+                    &format!("none configured · registry {}", reg.digest),
+                    None,
+                ),
+                _ => {}
+            }
+        }
+
         // Usage-receipt pipeline heartbeat. Surfaces "receipts last landed N ago
         // / never observed" so a third-party CLI upgrade that silently broke the
         // kimi/claude receipt path (session-layout / payload drift) is visible

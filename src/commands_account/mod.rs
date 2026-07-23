@@ -2849,12 +2849,26 @@ fn apply_snapshot_to_cache(
     current_account_id: &str,
 ) {
     use std::collections::HashSet;
-    let seen_ids: HashSet<String> = items.iter().map(|i| i.virtual_key_id.clone()).collect();
+    // P1e (design D-11): the cache is one row per binding, so the sync tracks the
+    // full (vk, protocol, provider) triple — preserving each binding's own local
+    // ciphertext and pruning a single removed binding without touching the VK's
+    // other bindings. \x1f cannot appear in an id (matches the projection prune).
+    let binding_key = |vk: &str, proto: &str, prov: &str| format!("{vk}\u{1f}{proto}\u{1f}{prov}");
+    let seen_bindings: HashSet<String> = items
+        .iter()
+        .map(|i| binding_key(&i.virtual_key_id, &i.protocol_type, &i.provider_code))
+        .collect();
 
     for item in items {
-        let existing = storage::get_virtual_key_cache(&item.virtual_key_id)
-            .ok()
-            .flatten();
+        // Read THIS binding's existing row (not just any row for the VK) so the
+        // preserved ciphertext/nonce belongs to the right credential.
+        let existing = storage::get_virtual_key_cache_binding(
+            &item.virtual_key_id,
+            &item.protocol_type,
+            &item.provider_code,
+        )
+        .ok()
+        .flatten();
 
         // Preserve local-only fields from the existing cache entry.
         let local_alias = existing.as_ref().and_then(|e| e.local_alias.clone());
@@ -2955,11 +2969,19 @@ fn apply_snapshot_to_cache(
         let mut pruned = 0usize;
         for entry in cached {
             if entry.owner_account_id.as_deref() == Some(current_account_id)
-                && !seen_ids.contains(&entry.virtual_key_id)
+                && !seen_bindings.contains(&binding_key(
+                    &entry.virtual_key_id,
+                    &entry.protocol_type,
+                    &entry.provider_code,
+                ))
             {
-                // If this key was the active proxy key, clear the active key config
-                // so the proxy stops routing it on next reload.
-                if entry.local_state == "active" {
+                // If this binding's VK was the active proxy key AND the whole VK is
+                // gone (no surviving binding), clear the active key config so the
+                // proxy stops routing it on next reload.
+                let vk_gone = !items
+                    .iter()
+                    .any(|i| i.virtual_key_id == entry.virtual_key_id);
+                if entry.local_state == "active" && vk_gone {
                     if let Ok(Some(cfg)) = storage::get_active_key_config() {
                         if cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey
                             && cfg.key_ref == entry.virtual_key_id
@@ -2968,7 +2990,11 @@ fn apply_snapshot_to_cache(
                         }
                     }
                 }
-                match storage::delete_virtual_key_cache_row(&entry.virtual_key_id) {
+                match storage::delete_virtual_key_cache_binding(
+                    &entry.virtual_key_id,
+                    &entry.protocol_type,
+                    &entry.provider_code,
+                ) {
                     Ok(()) => pruned += 1,
                     Err(e) => {
                         // Fall back to the legacy stale mark so the row at least
@@ -3411,7 +3437,21 @@ fn run_full_snapshot_sync_opts(
         // Download the delivery payload (plaintext provider key over TLS).
         match client.get_key_delivery(&entry.virtual_key_id) {
             Ok(payload) => {
-                match payload.primary_binding() {
+                // P1e (design D-11): pull THIS cache row's OWN binding material.
+                // The cache is one row per binding (vk, protocol, provider), and the
+                // delivery payload carries every binding's plaintext key in its own
+                // slot/target — so a VK holding GLM + official gets each key stored
+                // under its own binding row (each loop iteration handles one). Match
+                // by (protocol, provider); fall back to the primary binding for a
+                // legacy single-binding row whose provider_code is empty/unset.
+                let matched = payload
+                    .binding_for(&entry.protocol_type, &entry.provider_code)
+                    .or_else(|| {
+                        payload
+                            .primary_binding()
+                            .map(|b| (payload.primary_protocol_type(), b))
+                    });
+                match matched {
                     None => {
                         eprintln!(
                             "  {} key '{}' has no active bindings — skipping.",
@@ -3419,8 +3459,8 @@ fn run_full_snapshot_sync_opts(
                             entry.alias
                         );
                     }
-                    Some(binding) => {
-                        let protocol_type = payload.primary_protocol_type().to_string();
+                    Some((slot_protocol, binding)) => {
+                        let protocol_type = slot_protocol.to_string();
                         let sync_supported_providers = if !payload.supported_providers.is_empty() {
                             payload.supported_providers.clone()
                         } else if !binding.provider_code.is_empty() {
@@ -3913,7 +3953,7 @@ pub fn handle_key_sync(
                     "  {} Team key '{}' auto-activated as Primary for {}",
                     crate::symbols::STAR.s().yellow(),
                     vk_id.bold(),
-                    p
+                    crate::provider_registry::display_label(p)
                 );
             }
         }
@@ -5036,9 +5076,20 @@ pub fn handle_key_use(
             use colored::Colorize;
             println!("Key '{}' supports multiple providers:", display_name.bold());
             for (i, p) in providers.iter().enumerate() {
-                println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p);
+                // Same labeller as the summary table, the title line and `aikey list` —
+                // the picker showed bare `zhipu` while every other surface said
+                // `zhipu(GLM)`, so the list you choose FROM and the confirmation you get
+                // BACK spelled the same provider two different ways.
+                println!(
+                    "  {}  {}",
+                    format!("[{}]", i + 1).dimmed(),
+                    crate::provider_registry::display_label(p)
+                );
             }
-            print!("Select protocol(s) to set as Primary (comma-separated): ");
+            // P1f.11② (§19.9): this list is `supported_providers` (PROVIDER codes),
+            // not protocols — the old "Select protocol(s)" mislabel conflated the two
+            // axes (名词字典 provider≠protocol). Prompt for providers.
+            print!("Select provider(s) to set as Primary (comma-separated): ");
             io::stdout().flush()?;
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
@@ -5077,14 +5128,23 @@ pub fn handle_key_use(
         use colored::Colorize;
         println!("Key '{}' supports multiple providers:", display_name.bold());
         for (i, p) in providers.iter().enumerate() {
-            println!("  {}  {}", format!("[{}]", i + 1).dimmed(), p);
+            // Same labeller as the summary table, the title line and `aikey list` —
+            // the picker showed bare `zhipu` while every other surface said
+            // `zhipu(GLM)`, so the list you choose FROM and the confirmation you get
+            // BACK spelled the same provider two different ways.
+            println!(
+                "  {}  {}",
+                format!("[{}]", i + 1).dimmed(),
+                crate::provider_registry::display_label(p)
+            );
         }
-        print!("Select protocol(s) to set as Primary (comma-separated): ");
+        // P1f.11② (§19.9): PROVIDER codes, not protocols — fix the mislabel.
+        print!("Select provider(s) to set as Primary (comma-separated): ");
         io::stdout().flush()?;
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
         if input.trim().is_empty() {
-            return Err("No protocol selected.".into());
+            return Err("No provider selected.".into());
         }
         let mut selected = Vec::new();
         for part in input.trim().split(',').map(|s| s.trim()) {
@@ -5172,7 +5232,48 @@ pub fn handle_key_use(
                     .unwrap_or(false),
         );
 
+        // P1f.11① (§19.9): two-axis summary — PROTOCOL (route-row truth) and
+        // PROVIDER (brand + display_alias, e.g. `zhipu(GLM)`) shown as SEPARATE
+        // columns, matching the vault page's two axes so `aikey use` never conflates
+        // them again. Header row makes the axes explicit (product-designer §5.3).
+        use colored::Colorize as _;
+        // Auto-width both axis columns. The fixed `{:<12}` PROTOCOL column could
+        // not hold `openai_compatible` (17 chars) — the longest protocol simply
+        // pushed every following column out of alignment, and it is the protocol
+        // most likely to appear. Width is computed from the values actually
+        // being printed, so no new protocol can overflow it either.
+        let axis_cells: Vec<(String, String)> = bindings
+            .iter()
+            .filter(|b| provider_env_vars(&b.provider_code).is_some())
+            .map(|b| {
+                (
+                    resolve_binding_protocol(b),
+                    crate::provider_registry::display_label(&b.provider_code),
+                )
+            })
+            .collect();
+        let proto_w = axis_cells
+            .iter()
+            .map(|(p, _)| p.chars().count())
+            .chain(std::iter::once("PROTOCOL".len()))
+            .max()
+            .unwrap_or("PROTOCOL".len());
+        let prov_w = axis_cells
+            .iter()
+            .map(|(_, p)| p.chars().count())
+            .chain(std::iter::once("PROVIDER".len()))
+            .max()
+            .unwrap_or("PROVIDER".len());
+
         let mut rows: Vec<String> = Vec::new();
+        rows.push(format!(
+            "  {:<pw$} {:<vw$} {}",
+            "PROTOCOL".dimmed(),
+            "PROVIDER".dimmed(),
+            "KEY".dimmed(),
+            pw = proto_w,
+            vw = prov_w
+        ));
         for b in &bindings {
             if let Some((api_key_var, _)) = provider_env_vars(&b.provider_code) {
                 let display_ref =
@@ -5185,11 +5286,18 @@ pub fn handle_key_use(
                 } else {
                     arrow_padded
                 };
+                // Provider axis: `code(alias)` — GLM alias muted-in-parens, matching
+                // the vault chip (zhipu → `zhipu(GLM)`). 🚫 alias never replaces code.
+                let provider_disp = crate::provider_registry::display_label(&b.provider_code);
+                let protocol = resolve_binding_protocol(b);
                 rows.push(format!(
-                    "  {:<14} {} {}",
-                    b.provider_code,
+                    "  {:<pw$} {:<vw$} {} {}",
+                    protocol,
+                    provider_disp,
                     arrow_col,
-                    format!("[{}]", b.key_source_type).bright_black()
+                    format!("[{}]", b.key_source_type).bright_black(),
+                    pw = proto_w,
+                    vw = prov_w
                 ));
                 let _ = api_key_var;
             }
@@ -5200,7 +5308,11 @@ pub fn handle_key_use(
         let title = format!(
             "Set '{}' as Primary for {}",
             display_name,
-            target_providers.join(", ")
+            target_providers
+                .iter()
+                .map(|p| crate::provider_registry::display_label(p))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         crate::ui_frame::print_box(crate::symbols::ICON_GREEN_DOT.s(), &title, &rows);
         // 阶段7: Desktop is a cold-switch surface — when THIS use rewrote
@@ -5221,6 +5333,42 @@ pub fn handle_key_use(
     // unuse.md for why the previous one-sided install call was hiding a
     // matching uninstall gap.
     Ok(())
+}
+
+/// P1f.11① (§19.9, L1): resolve the WIRE PROTOCOL for a provider binding shown in
+/// the `aikey use` summary, from the fingerprint route row that owns its endpoint
+/// — the SAME endpoint-truth source as the vault two-axis read model
+/// (`commands_internal::query::two_axis_bindings`). This is a protocol, NOT the
+/// provider family: the summary shows the two axes separately so a GLM-via-anthropic
+/// binding reads "anthropic · zhipu(GLM)" instead of collapsing them. Multi-binding
+/// per provider is an L3 (P1e) concern; at L1 each provider has one active binding.
+fn resolve_binding_protocol(b: &storage::ProviderBinding) -> String {
+    use crate::credential_type::CredentialType;
+    use crate::commands_internal::parse::provider_fingerprint::protocol_for;
+    let (base_url, declared) = match b.key_source_type {
+        // Team keys carry base_url + protocol_type in the local cache.
+        CredentialType::ManagedVirtualKey => storage::get_virtual_key_cache(&b.key_source_ref)
+            .ok()
+            .flatten()
+            .map(|vk| (vk.base_url, vk.protocol_type))
+            .unwrap_or_default(),
+        // Personal keys: resolve via the entry's stored base_url.
+        _ => (
+            storage::get_entry_base_url(&b.key_source_ref)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            String::new(),
+        ),
+    };
+    // Shared with `aikey list` — see `protocol_for`. It resolves endpoint-first
+    // and, when there is no endpoint, falls back to the PROVIDER'S ROUTE ROW,
+    // which is still a protocol. The previous last resort here was
+    // `provider_registry::family_of()`, i.e. a provider family printed under a
+    // PROTOCOL header, which also made `use` disagree with `list` for every key
+    // stored without a base_url. Empty when genuinely unresolvable — an honest
+    // blank beats a confident wrong axis.
+    protocol_for(&base_url, &b.provider_code, &declared)
 }
 
 /// Classify the `aikey use` summary line so it never overpromises
@@ -5636,6 +5784,17 @@ pub(crate) fn audit_key_from_password(
 }
 
 fn derive_vault_key(password: &SecretString) -> Result<[u8; crypto::KEY_SIZE], String> {
+    // First-run bootstrap (2026-07-21): on a fresh machine the caller has just
+    // prompted the user to SET a new master password (`prompt_vault_password_fresh`'s
+    // no-vault branch), but nothing has written the vault yet — that path only
+    // collects the password, it doesn't initialize. Reading the salt straight away
+    // then failed with "Salt not found in vault. Vault may be corrupted.", which
+    // wedged `aikey key sync` / `aikey use` on every new install and told the user
+    // their vault was damaged when it had simply never been created.
+    //
+    // Delegating to the same helper VaultContext::new uses keeps ONE definition of
+    // "first run" — 🚫 don't inline a second salt-generation here.
+    crate::executor::ensure_vault_initialized(password)?;
     let salt = storage::get_salt()?;
     let (m, t, p) = storage::get_kdf_params()?;
     let secure_key = crypto::derive_key_with_params(password, &salt, m, t, p)?;
@@ -6165,6 +6324,77 @@ mod snapshot_sync_debounce_tests {
         // suppression.
         std::fs::write(&path, (now + 10_000).to_string()).unwrap();
         assert!(!snapshot_sync_recently_attempted(&path, now));
+    }
+}
+
+#[cfg(test)]
+mod first_run_vault_bootstrap_tests {
+    //! Fence for the 2026-07-21 first-run regression: on a machine with no
+    //! vault, `aikey key sync` prompted the user to SET a master password and
+    //! then died with "Salt not found in vault. Vault may be corrupted."
+    //!
+    //! Cause: `derive_vault_key` read `storage::get_salt()` directly, while the
+    //! password prompt for a brand-new vault only COLLECTS the password —
+    //! nothing had written `config.master_salt` yet. Every fresh install hit it
+    //! (`key sync`, and `use`/web-session via the same helper), and the message
+    //! blamed corruption for a vault that had simply never been created.
+    //!
+    //! These pin the two halves: the bootstrap happens, and it is idempotent
+    //! (a second call must NOT re-salt an existing vault — that would silently
+    //! orphan every entry encrypted under the old key).
+
+    use super::*;
+    use secrecy::SecretString;
+    use tempfile::TempDir;
+
+    /// Fresh dir, NO `initialize_vault` — exactly the state a new machine is in.
+    fn setup_uninitialized_vault() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::storage::TEST_VAULT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
+        (dir, guard)
+    }
+
+    #[test]
+    fn derive_vault_key_bootstraps_a_brand_new_vault() {
+        let (_dir, _guard) = setup_uninitialized_vault();
+        // Precondition: this is the broken state — no salt at all.
+        assert!(
+            storage::get_salt().is_err(),
+            "test setup wrong: vault already initialized"
+        );
+
+        let pw = SecretString::new("first-run-password".to_string());
+        let key = derive_vault_key(&pw).expect(
+            "derive_vault_key must bootstrap a fresh vault instead of reporting corruption",
+        );
+
+        assert_eq!(key.len(), crypto::KEY_SIZE);
+        assert!(
+            storage::get_salt().is_ok(),
+            "master_salt must be persisted after first-run bootstrap"
+        );
+    }
+
+    #[test]
+    fn bootstrap_is_idempotent_and_never_resalts() {
+        let (_dir, _guard) = setup_uninitialized_vault();
+        let pw = SecretString::new("first-run-password".to_string());
+
+        let key1 = derive_vault_key(&pw).expect("first derive");
+        let salt1 = storage::get_salt().expect("salt after first derive");
+        let key2 = derive_vault_key(&pw).expect("second derive");
+        let salt2 = storage::get_salt().expect("salt after second derive");
+
+        // A re-salt here would change the derived key and orphan every entry
+        // already encrypted under the old one.
+        assert_eq!(salt1, salt2, "second call must not re-salt the vault");
+        assert_eq!(key1, key2, "same password must derive the same key");
     }
 }
 

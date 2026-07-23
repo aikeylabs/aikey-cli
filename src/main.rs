@@ -536,6 +536,11 @@ fn run_unified_list(
                 "virtual_key_id": e.virtual_key_id,
                 "alias":          e.alias,
                 "provider_code":  e.provider_code,
+                // Two-axis (P1f): protocol is a distinct axis from provider — a
+                // GLM key served via the anthropic wire protocol is
+                // provider_code=zhipu, protocol_type=anthropic.
+                "protocol_type":  e.protocol_type,
+                "base_url":       e.base_url,
                 "key_status":     e.key_status,
                 "share_status":   e.share_status,
                 "local_state":    e.local_state,
@@ -548,12 +553,54 @@ fn run_unified_list(
         let bindings = storage::list_provider_bindings(profile_activation::DEFAULT_PROFILE)
             .unwrap_or_default();
 
+        // Two-axis (P1f) list model: PROTOCOL (wire protocol) and PROVIDER
+        // (brand + display alias) are shown as SEPARATE columns — the same two
+        // axes as the vault page and the `aikey use` summary, so `aikey list`
+        // never re-collapses them. A team VK spanning several bindings appears
+        // as ONE row; the multi-valued axes render `primary (+N more)`.
+        let classifier = crate::commands_internal::parse::provider_fingerprint::instance();
+        // Resolve the wire protocol for a (base_url, provider, declared) triple —
+        // the SAME endpoint-truth source used by the vault two-axis read model and
+        // `commands_account::resolve_binding_protocol`.
+        let resolve_protocol = |base_url: &str, provider: &str, declared: &str| -> String {
+            classifier
+                .route_for_base_url(base_url)
+                .map(|r| r.protocol.clone())
+                .filter(|p| !p.is_empty())
+                .or_else(|| (!declared.is_empty()).then(|| declared.to_string()))
+                .or_else(|| {
+                    classifier
+                        .route_for_provider(provider)
+                        .map(|r| r.protocol.clone())
+                })
+                .unwrap_or_default()
+        };
+        // Provider axis label: `code(alias)` (e.g. `zhipu(GLM)`); the alias never
+        // replaces the code — same convention as the vault chip + `aikey use`.
+        let provider_label =
+            |code: &str| -> String { crate::provider_registry::display_label(code) };
+        // Push `v` into `acc` iff not already present (distinct, order-preserving).
+        let push_distinct = |acc: &mut Vec<String>, v: String| {
+            if !v.is_empty() && !acc.contains(&v) {
+                acc.push(v);
+            }
+        };
+        // Collapse a distinct, primary-first axis into `primary (+N more)`.
+        let collapse_axis = |vals: &[String]| -> String {
+            match vals.len() {
+                0 => String::new(),
+                1 => vals[0].clone(),
+                n => format!("{} (+{} more)", vals[0], n - 1),
+            }
+        };
+
         // Collect row data for auto-width calculation.
         // `active` = has at least one provider binding routing to this key.
         // Matches the `aikey route` convention: if the proxy is currently
         // serving some provider via this key, it's considered active.
         struct RowData {
             alias: String,
+            protocol: String,
             providers: String,
             primary_for: String,
             has_primary: bool,
@@ -566,14 +613,11 @@ fn run_unified_list(
         let mut team_rows: Vec<RowData> = Vec::new();
 
         for entry in &entries {
-            let providers = if let Some(ref sp) = entry.supported_providers {
-                if !sp.is_empty() {
-                    sp.join(",")
-                } else {
-                    entry.provider_code.clone().unwrap_or_default()
-                }
-            } else {
-                entry.provider_code.clone().unwrap_or_default()
+            // Provider codes this key supports (legacy single `provider_code` when
+            // `supported_providers` is absent).
+            let codes: Vec<String> = match entry.supported_providers.as_ref() {
+                Some(sp) if !sp.is_empty() => sp.clone(),
+                _ => entry.provider_code.clone().into_iter().collect(),
             };
             let pf: Vec<&str> = bindings
                 .iter()
@@ -583,11 +627,33 @@ fn run_unified_list(
                 })
                 .map(|b| b.provider_code.as_str())
                 .collect();
+            // Primary axis value = the active-binding provider if any, else the
+            // first supported provider. Order the distinct set primary-first.
+            let primary_code = pf
+                .first()
+                .map(|s| s.to_string())
+                .or_else(|| codes.first().cloned())
+                .unwrap_or_default();
+            let base_url = entry.base_url.as_deref().unwrap_or("");
+            let mut prov_vals: Vec<String> = Vec::new();
+            let mut proto_vals: Vec<String> = Vec::new();
+            for code in std::iter::once(&primary_code)
+                .chain(codes.iter())
+                .filter(|c| !c.is_empty())
+            {
+                push_distinct(&mut prov_vals, provider_label(code));
+                push_distinct(&mut proto_vals, resolve_protocol(base_url, code, ""));
+            }
             let is_active = !pf.is_empty();
             personal_rows.push(RowData {
                 alias: entry.alias.clone(),
-                providers,
-                primary_for: pf.join(","),
+                protocol: collapse_axis(&proto_vals),
+                providers: collapse_axis(&prov_vals),
+                primary_for: pf
+                    .iter()
+                    .map(|c| provider_label(c))
+                    .collect::<Vec<_>>()
+                    .join(","),
                 has_primary: !pf.is_empty(),
                 status: String::new(), // valid → not displayed
                 created: entry
@@ -598,26 +664,73 @@ fn run_unified_list(
                 active: is_active,
             });
         }
+
+        // Group the (per-binding, post-P1e-re-grain) managed cache rows by VK so a
+        // multi-protocol / multi-provider team key renders as ONE row.
+        let mut vk_order: Vec<&str> = Vec::new();
+        let mut vk_groups: std::collections::HashMap<&str, Vec<&storage::VirtualKeyCacheEntry>> =
+            std::collections::HashMap::new();
         for e in &managed {
-            let display = e
+            let id = e.virtual_key_id.as_str();
+            if !vk_groups.contains_key(id) {
+                vk_order.push(id);
+            }
+            vk_groups.entry(id).or_default().push(e);
+        }
+        for vk_id in &vk_order {
+            let group = &vk_groups[vk_id];
+            let rep = group[0]; // VK-level fields are identical across its bindings.
+            let display = rep
                 .local_alias
                 .as_deref()
-                .unwrap_or(e.alias.as_str())
+                .unwrap_or(rep.alias.as_str())
                 .to_string();
             let pf: Vec<&str> = bindings
                 .iter()
                 .filter(|b| {
                     b.key_source_type == credential_type::CredentialType::ManagedVirtualKey
-                        && b.key_source_ref == e.virtual_key_id
+                        && b.key_source_ref == *vk_id
                 })
                 .map(|b| b.provider_code.as_str())
                 .collect();
+            // Primary provider = the active-binding provider if any, else the VK's
+            // first binding. Both axes render primary-first.
+            let primary_prov = pf
+                .first()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| rep.provider_code.clone());
+            let primary_row = group
+                .iter()
+                .find(|e| e.provider_code == primary_prov)
+                .copied()
+                .unwrap_or(rep);
+            let mut prov_vals: Vec<String> = Vec::new();
+            let mut proto_vals: Vec<String> = Vec::new();
+            push_distinct(&mut prov_vals, provider_label(&primary_prov));
+            push_distinct(
+                &mut proto_vals,
+                resolve_protocol(
+                    &primary_row.base_url,
+                    &primary_row.provider_code,
+                    &primary_row.protocol_type,
+                ),
+            );
+            for e in group.iter() {
+                push_distinct(&mut prov_vals, provider_label(&e.provider_code));
+                push_distinct(
+                    &mut proto_vals,
+                    resolve_protocol(&e.base_url, &e.provider_code, &e.protocol_type),
+                );
+            }
             // Unified status display: valid (hidden), expired, invalid, pending.
-            let is_group_vk = e
+            let is_group_vk = rep
                 .oauth_group_id
                 .as_deref()
                 .map(|s| !s.is_empty())
                 .unwrap_or(false);
+            // Post-P1e ciphertext is per binding — the VK is delivered when ANY of
+            // its bindings carries local key material.
+            let has_material = group.iter().any(|e| e.provider_key_ciphertext.is_some());
             let status = if is_group_vk {
                 // Group VK: per-account material rides channel ③ (group-runtime), so
                 // it has NO local provider_key_ciphertext BY DESIGN. The "pending"
@@ -627,9 +740,9 @@ fn run_unified_list(
                 // valid key); empty → no usable account (the seat was unbound from the
                 // group, or the group has no enabled accounts) so the key won't route
                 // until that's fixed — show it so the member isn't left guessing.
-                match e.key_status.as_str() {
+                match rep.key_status.as_str() {
                     "active" => {
-                        let has_candidates = e
+                        let has_candidates = rep
                             .group_accounts
                             .as_deref()
                             .map(|s| {
@@ -646,11 +759,11 @@ fn run_unified_list(
                     "expired" => "expired".to_string(),
                     _ => "invalid".to_string(),
                 }
-            } else if e.provider_key_ciphertext.is_none() {
+            } else if !has_material {
                 "pending".to_string() // key not yet delivered to local vault
             } else {
-                match e.local_state.as_str() {
-                    "active" | "synced_inactive" => match e.key_status.as_str() {
+                match rep.local_state.as_str() {
+                    "active" | "synced_inactive" => match rep.key_status.as_str() {
                         "active" => String::new(), // valid → not displayed
                         "expired" => "expired".to_string(),
                         _ => "invalid".to_string(), // revoked, recycled, etc.
@@ -662,46 +775,62 @@ fn run_unified_list(
                     _ => "invalid".to_string(),
                 }
             };
-            let suffix = if e.local_alias.is_some() {
-                format!(" (\u{2190} {})", e.alias)
+            let suffix = if rep.local_alias.is_some() {
+                format!(" (\u{2190} {})", rep.alias)
             } else {
                 String::new()
             };
             let is_active = !pf.is_empty();
             team_rows.push(RowData {
                 alias: display,
-                providers: e.provider_code.clone(),
-                primary_for: pf.join(","),
+                protocol: collapse_axis(&proto_vals),
+                providers: collapse_axis(&prov_vals),
+                primary_for: pf
+                    .iter()
+                    .map(|c| provider_label(c))
+                    .collect::<Vec<_>>()
+                    .join(","),
                 has_primary: !pf.is_empty(),
                 status,
-                created: format_date(e.synced_at),
+                created: format_date(rep.synced_at),
                 suffix,
                 active: is_active,
             });
         }
 
         let all_data: Vec<&RowData> = personal_rows.iter().chain(team_rows.iter()).collect();
-        let headers = ["ALIAS", "PROTOCOLS", "USING FOR", "STATUS", "CREATED"];
+        let headers = [
+            "ALIAS",
+            "PROTOCOL",
+            "PROVIDER",
+            "USING FOR",
+            "STATUS",
+            "CREATED",
+        ];
         let pad = 2;
         let w_alias = headers[0]
             .len()
             .max(all_data.iter().map(|r| r.alias.len()).max().unwrap_or(0))
             + pad;
-        let w_prov = headers[1].len().max(
+        let w_proto = headers[1]
+            .len()
+            .max(all_data.iter().map(|r| r.protocol.len()).max().unwrap_or(0))
+            + pad;
+        let w_prov = headers[2].len().max(
             all_data
                 .iter()
                 .map(|r| r.providers.len())
                 .max()
                 .unwrap_or(0),
         ) + pad;
-        let w_primary = headers[2].len().max(
+        let w_primary = headers[3].len().max(
             all_data
                 .iter()
                 .map(|r| r.primary_for.len())
                 .max()
                 .unwrap_or(0),
         ) + pad;
-        let w_status = headers[3]
+        let w_status = headers[4]
             .len()
             .max(all_data.iter().map(|r| r.status.len()).max().unwrap_or(0))
             + pad;
@@ -722,27 +851,35 @@ fn run_unified_list(
                 pf_padded
             };
             let created_col = r.created.bright_black().to_string();
+            let proto_display = if r.protocol.len() > w_proto {
+                format!("{}...", &r.protocol[..w_proto - 3])
+            } else {
+                r.protocol.clone()
+            };
             let prov_display = if r.providers.len() > w_prov {
                 format!("{}...", &r.providers[..w_prov - 3])
             } else {
                 r.providers.clone()
             };
             format!(
-                "{} {:<wa$}  {:<wp$}  {}  {:<ws$}  {}{}",
+                "{} {:<wa$}  {:<wt$}  {:<wp$}  {}  {:<ws$}  {}{}",
                 marker,
                 r.alias,
+                proto_display,
                 prov_display,
                 pf_col,
                 r.status,
                 created_col,
                 r.suffix,
                 wa = w_alias,
+                wt = w_proto,
                 wp = w_prov,
                 ws = w_status
             )
         };
         // +2 accounts for the `● ` marker prefix that the row renderer adds.
-        let sep_width = 2 + w_alias + 2 + w_prov + 2 + w_primary + 2 + w_status + 2 + 10;
+        let sep_width =
+            2 + w_alias + 2 + w_proto + 2 + w_prov + 2 + w_primary + 2 + w_status + 2 + 10;
 
         let mut rows: Vec<String> = Vec::new();
         rows.push(format!(
@@ -753,13 +890,15 @@ fn run_unified_list(
         rows.push(format!(
             "{}",
             format!(
-                "  {:<wa$}  {:<wp$}  {:<wf$}  {:<ws$}  {}",
+                "  {:<wa$}  {:<wt$}  {:<wp$}  {:<wf$}  {:<ws$}  {}",
                 headers[0],
                 headers[1],
                 headers[2],
                 headers[3],
                 headers[4],
+                headers[5],
                 wa = w_alias,
+                wt = w_proto,
                 wp = w_prov,
                 wf = w_primary,
                 ws = w_status
@@ -779,7 +918,7 @@ fn run_unified_list(
         rows.push(format!(
             "{}Team {}",
             crate::symbols::ICON_PEOPLE.pre(),
-            format!("({})", managed.len()).bright_black()
+            format!("({})", team_rows.len()).bright_black()
         ));
         rows.push(crate::symbols::BOX_H.s().repeat(sep_width));
         if team_rows.is_empty() {
@@ -2349,6 +2488,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if !cli.json {
                     commands_proxy::print_egress_presence();
                 }
+                // P3.5 tail WARN: mapping configured-but-not-effective. Never
+                // changes the exit code; skipped in --json (wrapper hot path).
+                commands_proxy::print_mapping_tail_warn(cli.json);
                 std::process::exit(code);
             } else if let Some(ref alias) = alias {
                 // ── Single-alias mode: resolve across personal/team/OAuth ──
@@ -2435,6 +2577,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if !cli.json {
                     commands_proxy::print_egress_presence();
                 }
+                // P3.5 tail WARN: mapping configured-but-not-effective. Never
+                // changes the exit code; skipped in --json (wrapper hot path).
+                commands_proxy::print_mapping_tail_warn(cli.json);
                 std::process::exit(code);
             } else {
                 // ── No alias: test all active bindings (personal/team/OAuth) ──
@@ -2510,6 +2655,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 if !cli.json {
                     commands_proxy::print_egress_presence();
                 }
+                // P3.5 tail WARN: mapping configured-but-not-effective. Never
+                // changes the exit code; skipped in --json (wrapper hot path).
+                commands_proxy::print_mapping_tail_warn(cli.json);
                 std::process::exit(code);
             }
         }

@@ -428,6 +428,30 @@ impl DeliveryPayload {
         self.slots.first()?.binding_targets.first()
     }
 
+    /// P1e (design D-11): find the binding target for a specific
+    /// (protocol_type, provider_code) so each per-binding cache row pulls ITS
+    /// OWN credential material — a VK can carry e.g. GLM(zhipu key) AND the
+    /// official Anthropic(official key), one per slot/target, each with its own
+    /// `provider_key`. An empty `protocol_type` matches any slot (older cache
+    /// rows). Returns the matched slot's protocol_type alongside the target.
+    pub fn binding_for(
+        &self,
+        protocol_type: &str,
+        provider_code: &str,
+    ) -> Option<(&str, &BindingTarget)> {
+        for slot in &self.slots {
+            if !protocol_type.is_empty() && slot.protocol_type != protocol_type {
+                continue;
+            }
+            for bt in &slot.binding_targets {
+                if bt.provider_code == provider_code {
+                    return Some((slot.protocol_type.as_str(), bt));
+                }
+            }
+        }
+        None
+    }
+
     /// Returns the protocol type of the primary slot.
     pub fn primary_protocol_type(&self) -> &str {
         self.slots

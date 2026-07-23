@@ -71,30 +71,30 @@ fn enforce_owner_only(path: &Path, is_dir: bool) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn enforce_owner_only(path: &Path, is_dir: bool) -> std::io::Result<()> {
-    use std::process::Command;
-
     // Why icacls over Win32 FFI: see module-level docs.
     //
-    // Steps:
-    //   1. /inheritance:r       — strip all inherited ACEs (the source of
-    //                              the Authenticated Users readability we
-    //                              want to remove).
-    //   2. /grant:r %USERNAME%  — full control for current user. ":r"
-    //                              replaces any existing grant for that
-    //                              principal so re-running the helper is
-    //                              idempotent.
-    //   3. /grant:r SYSTEM      — SYSTEM is needed for backup APIs and
-    //                              system services (Windows Defender,
-    //                              shadow copy) that legitimately need
-    //                              read access to administrative storage.
-    //   4. /grant:r Administrators — needed so an elevated admin (e.g.
-    //                              IT support) can recover the vault if
-    //                              the user account is locked. Same
-    //                              principle as Unix `root` having access
-    //                              even with mode 0o600.
+    // ORDER MATTERS, and it is the opposite of the obvious one:
     //
-    // (OI)(CI)F = object + container inheritance, full control. Only
-    // applied on directories; files just get F.
+    //   1. /grant:r for each principal — adds explicit ACEs. Inherited ACEs
+    //      are still in place at this point, so the path stays reachable no
+    //      matter which grant fails.
+    //   2. /inheritance:r LAST — drops the inherited ACEs (the source of the
+    //      Authenticated Users readability we came to remove), leaving exactly
+    //      the explicit grants from step 1.
+    //
+    // 🔴 The original order was the reverse — strip, then grant. `icacls
+    // /inheritance:r` on a path with no explicit ACEs yet leaves an EMPTY
+    // DACL, so any failure in the grant loop left a file that NOBODY could
+    // open or delete, SYSTEM included. That is exactly what happened when the
+    // CLI ran as a service: USERNAME resolves to the machine account
+    // (`HOST$`), its grant failed, and vault.db was left 0 bytes with an empty
+    // DACL — permanently poisoning that vault path, because every later run
+    // died at "unable to open database file" and could not even remove it.
+    // Granting first makes the failure mode "still too permissive, and the
+    // caller gets an Err" instead of "unrecoverable".
+    //
+    // (OI)(CI)F = object + container inheritance, full control. Only applied
+    // on directories; files just get F.
 
     // Early-out for a non-existent path — matches the Go aikeycompat
     // contract ("returns nil if path doesn't exist; caller's
@@ -106,13 +106,49 @@ fn enforce_owner_only(path: &Path, is_dir: bool) -> std::io::Result<()> {
     }
 
     let path_str = path.as_os_str();
+    let inherit_flags = if is_dir { ":(OI)(CI)F" } else { ":F" };
 
-    // Step 1: disable inheritance.
-    // Why .output() not .status(): icacls writes a localised success
-    // line to stdout ("Successfully processed 1 files") on every call,
-    // which pollutes our own stdout when running interactively or in
-    // tests. We don't need the output content, just the exit code.
-    let result = Command::new("icacls")
+    // SYSTEM: needed for backup APIs and system services (Defender, shadow
+    // copy) that legitimately read administrative storage.
+    // Administrators: lets an elevated admin recover the vault if the user
+    // account is locked — same principle as Unix root reading a 0o600 file.
+    // These two are the floor: without at least one of them nobody can
+    // recover the path, so they are applied first and are mandatory.
+    for principal in ["SYSTEM", "Administrators"] {
+        grant(path, path_str, principal, inherit_flags)?;
+    }
+
+    // The current user, when we can name one. USERNAME unset → SYSTEM +
+    // Administrators only, matching the Go aikeycompat behaviour ("more
+    // secure than failing open").
+    let username = std::env::var("USERNAME").unwrap_or_default();
+    if !username.is_empty() {
+        // ASCII-only sanity check — usernames with embedded ":" or newlines
+        // would corrupt the icacls grant string. Defensive.
+        if username.contains(':') || username.contains('\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("USERNAME contains forbidden char(s): {username:?}"),
+            ));
+        }
+        // Non-fatal: a service-context USERNAME is the machine account, which
+        // icacls often cannot resolve on the local machine. SYSTEM is already
+        // granted above and IS the identity such a process runs as, so the
+        // path stays usable. Hard-failing here is what used to abort vault
+        // creation outright for every service-context caller.
+        if let Err(e) = grant(path, path_str, &username, inherit_flags) {
+            eprintln!(
+                "  ! Could not grant {} on {} ({}). SYSTEM and Administrators \
+                 retain access; the path is not world-readable.",
+                username,
+                path.display(),
+                e
+            );
+        }
+    }
+
+    // Only now drop the inherited ACEs.
+    let result = std::process::Command::new("icacls")
         .arg(path_str)
         .arg("/inheritance:r")
         .output()?;
@@ -123,76 +159,36 @@ fn enforce_owner_only(path: &Path, is_dir: bool) -> std::io::Result<()> {
         ));
     }
 
-    let inherit_flags = if is_dir { ":(OI)(CI)F" } else { ":F" };
-
-    // USERNAME unset → fall through to SYSTEM + Administrators only,
-    // matching the Go aikeycompat behaviour: "more secure than failing
-    // open". The path will be unreadable to the current user, which is
-    // a hard error the user can see immediately by running `aikey
-    // status` — better than a half-applied ACL that looks safe but
-    // leaks via the inherited Authenticated Users grant we just left
-    // unstripped.
-    let username = std::env::var("USERNAME").unwrap_or_default();
-    let principals: &[&str] = if username.is_empty() {
-        &["SYSTEM", "Administrators"]
-    } else {
-        // ASCII-only sanity check — usernames with embedded ":" or
-        // newlines would corrupt the icacls grant string. Defensive.
-        if username.contains(':') || username.contains('\n') {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("USERNAME contains forbidden char(s): {username:?}"),
-            ));
-        }
-        // Two-element slice with the dynamic username first.
-        return enforce_with_username(path, path_str, &username, inherit_flags);
-    };
-
-    for principal in principals {
-        let result = Command::new("icacls")
-            .arg(path_str)
-            .arg("/grant:r")
-            .arg(format!("{principal}{inherit_flags}"))
-            .output()?;
-        if !result.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "icacls /grant:r failed for {} on {}",
-                    principal,
-                    path.display()
-                ),
-            ));
-        }
-    }
-
     Ok(())
 }
 
+/// One `icacls /grant:r` call. `:r` replaces any existing grant for that
+/// principal, so re-running the helper is idempotent.
+///
+/// Why `.output()` and not `.status()`: icacls writes a localised success line
+/// ("Successfully processed 1 files") on every call, which would pollute our
+/// stdout when running interactively or in tests. We only need the exit code.
 #[cfg(windows)]
-fn enforce_with_username(
+fn grant(
     path: &Path,
     path_str: &std::ffi::OsStr,
-    username: &str,
+    principal: &str,
     inherit_flags: &str,
 ) -> std::io::Result<()> {
-    use std::process::Command;
-    for principal in [username, "SYSTEM", "Administrators"] {
-        let result = Command::new("icacls")
-            .arg(path_str)
-            .arg("/grant:r")
-            .arg(format!("{principal}{inherit_flags}"))
-            .output()?;
-        if !result.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "icacls /grant:r failed for {} on {}",
-                    principal,
-                    path.display()
-                ),
-            ));
-        }
+    let result = std::process::Command::new("icacls")
+        .arg(path_str)
+        .arg("/grant:r")
+        .arg(format!("{principal}{inherit_flags}"))
+        .output()?;
+    if !result.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "icacls /grant:r failed for {} on {}",
+                principal,
+                path.display()
+            ),
+        ));
     }
     Ok(())
 }

@@ -1,7 +1,12 @@
 # Provider Fingerprint Registry (POC)
 #
-# 用途：对已抽取的 secret token 做 provider 软性分类 + 二次校验
-# Why YAML：ControlPanel 可下发热更，新 provider 出现无需改代码发版
+# 用途：对已抽取的 secret token 做 provider 软性分类 + 二次校验 + 上游路由/模型映射真相源
+# Why YAML：单一真相源、跨语言（Rust serde / Go yaml.v3）共读的声明式配置。
+#   🔴 勘误（2026-07-18）：本文件**编译期内嵌**（Rust include_str! / Go go:embed），
+#   **不是** ControlPanel 下发热更。改任一行 = 改源码 = 重编译四消费方 = 走完整发版
+#   （round +1，Stage 4-6 重跑）。runtime override + 签名校验是 B8（Rust doc 自陈 v1.1+），本期不做。
+#   🔴 本文件随二进制分发给所有客户，是**公开的厂商事实表** —— 🚫 严禁写入任何 secret / key /
+#   base_url_override / 客户数据（越级反例：用第 1 级安全换第 8 级实现）。
 #
 # tier 含义：
 #   confirmed  —— 前缀极具特异性，FP 几乎为 0（sk-ant-api03 / AKIA / gsk_ 等）
@@ -108,7 +113,12 @@ provider_routes:
   - { host: "openrouter.ai",                      protocol: openai_compatible, provider: openrouter,    base_url: "https://openrouter.ai/api",                  version: "/v1"     }
   - { host: "api.perplexity.ai",                  protocol: openai_compatible, provider: perplexity,    base_url: "https://api.perplexity.ai",                  version: ""        }
   - { host: "generativelanguage.googleapis.com",  protocol: gemini,            provider: google_gemini, base_url: "https://generativelanguage.googleapis.com",  version: "/v1beta" }
-  - { host: "open.bigmodel.cn",                   protocol: openai_compatible, provider: zhipu,         base_url: "https://open.bigmodel.cn/api/paas",          version: ""        }
+  # zhipu / GLM (open.bigmodel.cn) 一 host 三协议端点 —— P1b/D-2b 扩键 (host, path_prefix)。
+  # 兜底行 path_prefix:"" 保持既有 openai_compatible + /api/paas 语义不变（向后兼容，18 行零改动围栏锁定）。
+  # 另两行显式 path_prefix，让客户粘贴的 /api/anthropic 与 /api/coding/paas/v4 端点各自命中正确协议/base_url。
+  - { host: "open.bigmodel.cn",                   protocol: openai_compatible, provider: zhipu,         base_url: "https://open.bigmodel.cn/api/paas",          version: ""       }
+  - { host: "open.bigmodel.cn", path_prefix: "/api/anthropic",       protocol: anthropic,         provider: zhipu, base_url: "https://open.bigmodel.cn/api/anthropic",       version: "/v1" }
+  - { host: "open.bigmodel.cn", path_prefix: "/api/coding/paas/v4",  protocol: openai_compatible, provider: zhipu, base_url: "https://open.bigmodel.cn/api/coding/paas",  version: "/v4" }
   - { host: "ark.cn-beijing.volces.com",          protocol: openai_compatible, provider: doubao,        base_url: "https://ark.cn-beijing.volces.com/api",      version: "/v3"     }
   - { host: "dashscope.aliyuncs.com",             protocol: openai_compatible, provider: qwen,          base_url: "https://dashscope.aliyuncs.com/compatible-mode", version: "/v1" }
   - { host: "api.siliconflow.cn",                 protocol: openai_compatible, provider: siliconflow,   base_url: "https://api.siliconflow.cn",                 version: "/v1"     }
@@ -129,6 +139,30 @@ aggregator_families:
   - openrouter
   - yunwu        # 云雾 yunwu.ai
   - zeroeleven   # 0011.ai
+
+# ── provider_model_maps (P1 / design D-2): per-provider-CODE 模型名映射 ──────────
+#
+# 解 R-A：让「客户端固定用某模型名、上游真实模型名不同」的接入无需改客户端即可打通。
+# 键 = provider CODE（对齐 provider_routes.provider），故独立成 code-keyed 段：
+#   - 🚫 不挂 provider_routes 行（一 provider 多端点行会重复 = 分裂真相源，禁止 #13）
+#   - 🚫 不挂 classifier `providers` 段（那段按 classifier id 键控，非 provider code）
+#   仿 family_login_urls 的 per-key map 先例。查表：路由行定出 provider → ModelMapFor(provider)。
+#
+# match ∈ { 字面 client id "claude-opus-4-8" | 角色 opus/sonnet/haiku/fable | 通配 "*" }
+# 匹配序（精确 > 角色 > 通配，歧义不猜，design D-3）；requested_model = 上游真实模型名。
+# unmatched ∈ { reject（异模型上游默认）| passthrough（官方同名） }。
+# 构建期校验（ValidateModelMaps）：规则歧义 → MODEL_MAPPING_AMBIGUOUS；字面 claude-* 须 is_claude_safe；
+#   🚫 任何 secret 形态字符串。
+provider_model_maps:
+  - provider: zhipu
+    unmatched: reject
+    models:
+      # 角色键控：Claude 升版本（4-8→4-9）映射不失效，且不触发发版（design D-3）
+      - { match: "opus",   requested_model: "glm-4.6" }
+      - { match: "sonnet", requested_model: "glm-4.5" }
+      - { match: "haiku",  requested_model: "glm-4.5-air" }
+      # 字面精确：需要钉具体版本时用（精确优先于角色）
+      - { match: "claude-opus-4-8", requested_model: "glm-4.6" }
 
 providers:
   # ============ Tier: confirmed（前缀高特异性，直接打上provider标签） ============

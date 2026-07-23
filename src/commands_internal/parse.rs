@@ -316,13 +316,14 @@ fn run_parse_v2_rules(payload: &ParsePayload) -> Result<serde_json::Value, (&'st
         if let Some(family) = &d.inferred_provider {
             d.login_url = classifier.login_url_for_family(family);
 
+            // P1b / design D-2b: path-aware lookup so a GLM base_url ending
+            // in /api/anthropic resolves the anthropic row (not the /api/paas
+            // fallback). Falls back to provider-only when no base_url given.
             let route = d
                 .fields
                 .base_url
                 .as_deref()
-                .and_then(extract_url_domain)
-                .map(|h| h.to_lowercase())
-                .and_then(|h| classifier.route_for_host(&h))
+                .and_then(|u| classifier.route_for_base_url(u))
                 .or_else(|| classifier.route_for_provider(family));
             d.official_base_url =
                 route.map(provider_fingerprint::FingerprintClassifier::official_url_for_route);

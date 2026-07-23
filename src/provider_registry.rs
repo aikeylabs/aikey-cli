@@ -257,6 +257,29 @@ pub fn lookup(code: &str) -> Option<&'static RegistryEntry> {
     s.index.get(&lower).map(|&i| &s.entries[i])
 }
 
+/// Canonical PROVIDER-axis label: `code(alias)` — e.g. `zhipu` → `zhipu(GLM)`.
+/// Unknown / alias-less codes render as the bare code.
+///
+/// 🚫 The alias never REPLACES the code: the code is the identity the rest of
+/// the system (bindings, events, config) speaks; the alias is only the brand a
+/// human recognizes.
+///
+/// Why this is one shared function: several surfaces render this axis — the
+/// `aikey list` PROVIDER column, its USING FOR column, the `aikey use` summary
+/// rows and its title, and the sync auto-activate lines. Each had (or lacked) a
+/// private copy, so within a SINGLE table one column said `zhipu(GLM)` while
+/// another said `zhipu`. That inconsistency is worse than cosmetic here: with a
+/// vendor like Anthropic whose provider code (`anthropic`) is spelled exactly
+/// like a wire protocol (`anthropic`), a bare list such as `anthropic,zhipu`
+/// reads as if the two axes had been mixed together. Labelling the axis the
+/// same way everywhere keeps the provider axis unmistakably the provider axis.
+pub fn display_label(code: &str) -> String {
+    match lookup(code).and_then(|e| e.display_alias) {
+        Some(alias) if !alias.is_empty() => format!("{}({})", code, alias),
+        _ => code.to_string(),
+    }
+}
+
 /// Iterate all entries in YAML declaration order. Stable across processes
 /// (used by the `aikey add` picker so provider list ordering is deterministic).
 pub fn entries() -> &'static [RegistryEntry] {
@@ -563,5 +586,54 @@ mod tests {
         // 表现为独立 family group(picker / vault list 显示与改前一致)。
         let unknown = family_of("custom-vendor-xyz");
         assert_eq!(unknown, "custom-vendor-xyz");
+    }
+}
+
+#[cfg(test)]
+mod display_label_tests {
+    //! Fence for the provider-axis rendering inconsistency found 2026-07-21.
+    //!
+    //! `aikey list` printed the PROVIDER column as `zhipu(GLM)` but the
+    //! USING FOR column — the SAME axis — as a bare `zhipu`, and the
+    //! `aikey use` title / sync lines did the same. With Anthropic, whose
+    //! provider code is spelled exactly like the anthropic wire protocol,
+    //! `USING FOR: anthropic,zhipu` then reads as if a protocol and a
+    //! provider had been mixed into one list (they hadn't — both are
+    //! providers). One labeller keeps the axis self-identifying.
+
+    use super::display_label;
+
+    #[test]
+    fn aliased_provider_renders_code_and_alias() {
+        // zhipu ships a display_alias in the registry; the code must survive —
+        // it is the identity bindings/events/config speak.
+        let got = display_label("zhipu");
+        assert!(
+            got == "zhipu" || got == "zhipu(GLM)",
+            "unexpected label for zhipu: {got}"
+        );
+        if got.contains('(') {
+            assert!(
+                got.starts_with("zhipu("),
+                "alias must not replace the code: {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_provider_falls_back_to_bare_code() {
+        // Custom/self-hosted providers aren't in the registry — they must still
+        // render, never blank out a table cell.
+        assert_eq!(
+            display_label("totally-made-up-provider"),
+            "totally-made-up-provider"
+        );
+    }
+
+    #[test]
+    fn empty_code_stays_empty() {
+        // Callers collapse empty values out of the axis list; returning "()"
+        // here would materialize a bogus cell.
+        assert_eq!(display_label(""), "");
     }
 }
