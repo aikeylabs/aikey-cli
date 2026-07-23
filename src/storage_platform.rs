@@ -3,7 +3,7 @@
 //! Extracted from `storage.rs` for maintainability — all items are re-exported
 //! by the parent module so existing callers are unaffected.
 
-use super::{get_vault_path, open_connection, open_connection_readonly};
+use super::{get_vault_path, has_column, open_connection, open_connection_readonly};
 use crate::credential_type::CredentialType;
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
@@ -862,6 +862,29 @@ pub fn list_virtual_key_cache_readonly() -> Result<Vec<VirtualKeyCacheEntry>, St
     query_virtual_key_cache(&open_connection_readonly()?)
 }
 
+/// Returns every exact binding row for one managed virtual key. A virtual key
+/// may bind the same Provider through more than one Protocol (for example the
+/// master-resident Mock Provider), so routing code must use this API instead
+/// of treating `virtual_key_id` as a unique row key.
+pub fn list_virtual_key_cache_bindings(
+    virtual_key_id: &str,
+) -> Result<Vec<VirtualKeyCacheEntry>, String> {
+    Ok(list_virtual_key_cache()?
+        .into_iter()
+        .filter(|entry| entry.virtual_key_id == virtual_key_id)
+        .collect())
+}
+
+/// Read-only counterpart used by UI/query projections.
+pub fn list_virtual_key_cache_bindings_readonly(
+    virtual_key_id: &str,
+) -> Result<Vec<VirtualKeyCacheEntry>, String> {
+    Ok(list_virtual_key_cache_readonly()?
+        .into_iter()
+        .filter(|entry| entry.virtual_key_id == virtual_key_id)
+        .collect())
+}
+
 // ── managed_virtual_keys_cache column cascade ──────────────────────────
 //
 // Three tiers, tried newest→oldest so each vault generation reads as many
@@ -979,7 +1002,9 @@ fn query_virtual_key_cache(conn: &Connection) -> Result<Vec<VirtualKeyCacheEntry
         .map_err(|e| format!("Failed to read virtual key cache rows: {}", e))
 }
 
-/// Returns a single cached entry by virtual_key_id, or `None`.
+/// Returns a deterministic representative row by virtual_key_id, or `None`.
+/// This API is for VK-level metadata only. Routing/credential consumers must
+/// use `get_virtual_key_cache_binding` or `list_virtual_key_cache_bindings`.
 pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCacheEntry>, String> {
     let db_path = get_vault_path()?;
     if !db_path.exists() {
@@ -990,7 +1015,8 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
     // never QueryReturnedNoRows (that's the real "absent" answer).
     let sel = |cols: &str| {
         format!(
-            "SELECT {} FROM managed_virtual_keys_cache WHERE virtual_key_id = ?1",
+            "SELECT {} FROM managed_virtual_keys_cache WHERE virtual_key_id = ?1 \
+             ORDER BY protocol_type, provider_code LIMIT 1",
             cols
         )
     };
@@ -1062,8 +1088,8 @@ pub fn get_virtual_key_cache_binding(
     }
 }
 
-/// Looks up a cached entry by alias (tries `local_alias` first, then `alias`).
-/// Returns `None` if no entry matches.
+/// Looks up a deterministic VK-level metadata representative by alias (tries
+/// `local_alias` first, then `alias`). Exact routing must use a binding API.
 pub fn get_virtual_key_cache_by_alias(alias: &str) -> Result<Option<VirtualKeyCacheEntry>, String> {
     let db_path = get_vault_path()?;
     if !db_path.exists() {
@@ -1071,7 +1097,8 @@ pub fn get_virtual_key_cache_by_alias(alias: &str) -> Result<Option<VirtualKeyCa
     }
     let conn = open_connection()?;
     let where_clause = "WHERE local_alias = ?1 OR alias = ?1 \
-         ORDER BY CASE WHEN local_alias = ?1 THEN 0 ELSE 1 END LIMIT 1";
+         ORDER BY CASE WHEN local_alias = ?1 THEN 0 ELSE 1 END, \
+                  protocol_type, provider_code LIMIT 1";
     // Try GROUP columns first (includes oauth_group_id / group_accounts /
     // routing_config), then FULL, then LEGACY — mirrors get_virtual_key_cache
     // (by id). Before this, the by-alias path only tried FULL+LEGACY, so
@@ -1294,11 +1321,18 @@ pub fn set_virtual_key_share_status_local(
 
 // ---- User profile provider bindings CRUD ----
 
-/// A per-provider key source binding within a user profile.
+/// One active client-route selection within a user profile.
+///
+/// The on-disk table keeps its released name and legacy `provider_code`
+/// primary-key column, but that physical column is interpreted as
+/// `client_route`. `provider_code` below is the actual upstream supplier and
+/// `protocol_type` is the exact wire protocol of the selected credential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderBinding {
     pub profile_id: String,
+    pub client_route: String,
     pub provider_code: String,
+    pub protocol_type: String,
     pub key_source_type: CredentialType,
     pub key_source_ref: String, // alias (personal), virtual_key_id (team), or provider_account_id (oauth)
     pub updated_at: Option<i64>,
@@ -1326,24 +1360,39 @@ fn query_provider_bindings(
     conn: &Connection,
     profile_id: &str,
 ) -> Result<Vec<ProviderBinding>, String> {
+    let two_axis = has_column(
+        conn,
+        "user_profile_provider_bindings",
+        "binding_provider_code",
+    ) && has_column(conn, "user_profile_provider_bindings", "protocol_type");
+    let sql = if two_axis {
+        "SELECT profile_id, provider_code, binding_provider_code, protocol_type,
+                key_source_type, key_source_ref, updated_at
+           FROM user_profile_provider_bindings
+          WHERE profile_id = ?1
+          ORDER BY provider_code"
+    } else {
+        "SELECT profile_id, provider_code, provider_code, '',
+                key_source_type, key_source_ref, updated_at
+           FROM user_profile_provider_bindings
+          WHERE profile_id = ?1
+          ORDER BY provider_code"
+    };
     let mut stmt = conn
-        .prepare(
-            "SELECT profile_id, provider_code, key_source_type, key_source_ref, updated_at
-               FROM user_profile_provider_bindings
-              WHERE profile_id = ?1
-              ORDER BY provider_code",
-        )
+        .prepare(sql)
         .map_err(|e| format!("Failed to prepare provider bindings query: {}", e))?;
 
     let rows = stmt
         .query_map(params![profile_id], |row| {
-            let raw_type: String = row.get(2)?;
+            let raw_type: String = row.get(4)?;
             Ok(ProviderBinding {
                 profile_id: row.get(0)?,
-                provider_code: row.get(1)?,
+                client_route: row.get(1)?,
+                provider_code: row.get(2)?,
+                protocol_type: row.get(3)?,
                 key_source_type: CredentialType::from_db_str(&raw_type),
-                key_source_ref: row.get(3)?,
-                updated_at: row.get(4).ok(),
+                key_source_ref: row.get(5)?,
+                updated_at: row.get(6).ok(),
             })
         })
         .map_err(|e| format!("Failed to query provider bindings: {}", e))?
@@ -1356,22 +1405,25 @@ fn query_provider_bindings(
 /// Returns the binding for a specific provider in a profile, or `None`.
 pub fn get_provider_binding(
     profile_id: &str,
-    provider_code: &str,
+    client_route: &str,
 ) -> Result<Option<ProviderBinding>, String> {
     let conn = open_connection()?;
     let result = conn.query_row(
-        "SELECT profile_id, provider_code, key_source_type, key_source_ref, updated_at
+        "SELECT profile_id, provider_code, binding_provider_code, protocol_type,
+                key_source_type, key_source_ref, updated_at
            FROM user_profile_provider_bindings
           WHERE profile_id = ?1 AND provider_code = ?2",
-        params![profile_id, provider_code],
+        params![profile_id, client_route],
         |row| {
-            let raw_type: String = row.get(2)?;
+            let raw_type: String = row.get(4)?;
             Ok(ProviderBinding {
                 profile_id: row.get(0)?,
-                provider_code: row.get(1)?,
+                client_route: row.get(1)?,
+                provider_code: row.get(2)?,
+                protocol_type: row.get(3)?,
                 key_source_type: CredentialType::from_db_str(&raw_type),
-                key_source_ref: row.get(3)?,
-                updated_at: row.get(4).ok(),
+                key_source_ref: row.get(5)?,
+                updated_at: row.get(6).ok(),
             })
         },
     );
@@ -1417,37 +1469,103 @@ pub fn set_provider_binding(
     key_source_type: &str,
     key_source_ref: &str,
 ) -> Result<(), String> {
+    let canonical = crate::provider_registry::canonical(provider_code);
+    let protocols = crate::commands_internal::parse::provider_fingerprint::instance()
+        .protocols_for_provider(canonical);
+    let protocol = if protocols.len() == 1 {
+        protocols[0].as_str()
+    } else {
+        ""
+    };
+    let client_route = crate::provider_registry::client_route_for_binding(canonical, protocol);
+    set_client_route_binding(
+        profile_id,
+        client_route,
+        canonical,
+        protocol,
+        key_source_type,
+        key_source_ref,
+    )
+}
+
+/// Sets one exact client-route selection. This is the canonical write path for
+/// multi-protocol Providers; callers must pass the Protocol stored on the
+/// selected credential binding rather than deriving it from Provider.
+pub fn set_client_route_binding(
+    profile_id: &str,
+    client_route: &str,
+    provider_code: &str,
+    protocol_type: &str,
+    key_source_type: &str,
+    key_source_ref: &str,
+) -> Result<(), String> {
     let mut conn = open_connection()?;
     let tx = conn.transaction().map_err(|e| format!("begin tx: {}", e))?;
 
-    // family 互斥: 写入 Kimi family code 时,先 deactivate 同 family 其它成员
-    if KIMI_FAMILY_CODES.contains(&provider_code) {
-        for other in KIMI_FAMILY_CODES.iter().filter(|c| **c != provider_code) {
-            tx.execute(
-                "DELETE FROM user_profile_provider_bindings
-                  WHERE profile_id = ?1 AND provider_code = ?2",
-                params![profile_id, other],
-            )
-            .map_err(|e| format!("family mutex deactivate {}: {}", other, e))?;
-        }
-    }
-
-    // UPSERT 主体写入
+    // One row per client route makes Kimi mutual exclusion and
+    // Mock-anthropic/Mock-openai coexistence structural, not procedural.
     tx.execute(
         "INSERT INTO user_profile_provider_bindings
-            (profile_id, provider_code, key_source_type, key_source_ref, updated_at)
-         VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))
+            (profile_id, provider_code, binding_provider_code, protocol_type,
+             key_source_type, key_source_ref, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s', 'now'))
          ON CONFLICT (profile_id, provider_code) DO UPDATE SET
+            binding_provider_code = excluded.binding_provider_code,
+            protocol_type = excluded.protocol_type,
             key_source_type = excluded.key_source_type,
             key_source_ref  = excluded.key_source_ref,
             updated_at      = excluded.updated_at",
-        params![profile_id, provider_code, key_source_type, key_source_ref],
+        params![
+            profile_id,
+            client_route,
+            provider_code,
+            protocol_type,
+            key_source_type,
+            key_source_ref
+        ],
     )
     .map_err(|e| format!("Failed to set provider binding: {}", e))?;
 
     tx.commit()
         .map_err(|e| format!("commit binding tx: {}", e))?;
     Ok(())
+}
+
+/// Inserts one exact client-route selection only when that client slot is
+/// still empty. Automatic lifecycle reconciliation must never overwrite an
+/// explicit user selection merely because the upstream Provider code differs
+/// (for example Mock+Anthropic still occupies the `anthropic` client route).
+///
+/// The conflict decision is made by SQLite in the same statement, avoiding a
+/// check-then-upsert race between concurrent sync commands. Returns true only
+/// when this call inserted the row.
+pub fn set_client_route_binding_if_absent(
+    profile_id: &str,
+    client_route: &str,
+    provider_code: &str,
+    protocol_type: &str,
+    key_source_type: &str,
+    key_source_ref: &str,
+) -> Result<bool, String> {
+    let conn = open_connection()?;
+    let changed = conn
+        .execute(
+            "INSERT INTO user_profile_provider_bindings
+                (profile_id, provider_code, binding_provider_code, protocol_type,
+                 key_source_type, key_source_ref, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s', 'now'))
+             ON CONFLICT (profile_id, provider_code) DO NOTHING",
+            params![
+                profile_id,
+                client_route,
+                provider_code,
+                protocol_type,
+                key_source_type,
+                key_source_ref
+            ],
+        )
+        .map_err(|e| format!("Failed to fill empty client-route binding: {}", e))?;
+    Ok(changed == 1)
 }
 
 /// Removes a provider binding from a profile.
@@ -1505,28 +1623,42 @@ pub fn remove_bindings_by_key_source_type(
 
 /// Removes all bindings that reference a specific key source.
 /// Used when a key is deleted to clean up any dangling bindings.
-/// Returns the list of provider_codes whose bindings were removed.
+/// Returns the exact binding rows that were removed. The client route is the
+/// replacement slot; Provider and Protocol remain independent metadata.
 pub fn remove_bindings_by_key_source(
     profile_id: &str,
     key_source_type: &str,
     key_source_ref: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ProviderBinding>, String> {
     let conn = open_connection()?;
 
     let mut stmt = conn
         .prepare(
-            "SELECT provider_code FROM user_profile_provider_bindings
+            "SELECT profile_id, provider_code, binding_provider_code, protocol_type,
+                    key_source_type, key_source_ref, updated_at
+               FROM user_profile_provider_bindings
               WHERE profile_id = ?1 AND key_source_type = ?2 AND key_source_ref = ?3",
         )
         .map_err(|e| format!("Failed to prepare binding cleanup query: {}", e))?;
 
-    let affected: Vec<String> = stmt
+    let affected: Vec<ProviderBinding> = stmt
         .query_map(
             params![profile_id, key_source_type, key_source_ref],
-            |row| row.get(0),
+            |row| {
+                let raw_type: String = row.get(4)?;
+                Ok(ProviderBinding {
+                    profile_id: row.get(0)?,
+                    client_route: row.get(1)?,
+                    provider_code: row.get(2)?,
+                    protocol_type: row.get(3)?,
+                    key_source_type: CredentialType::from_db_str(&raw_type),
+                    key_source_ref: row.get(5)?,
+                    updated_at: row.get(6).ok(),
+                })
+            },
         )
         .map_err(|e| format!("Failed to query affected bindings: {}", e))?
-        .collect::<SqlResult<Vec<String>>>()
+        .collect::<SqlResult<Vec<ProviderBinding>>>()
         .map_err(|e| format!("Failed to collect affected bindings: {}", e))?;
 
     if !affected.is_empty() {
@@ -1550,6 +1682,9 @@ pub fn remove_bindings_by_key_source(
 pub struct ProviderAccountInfo {
     pub provider_account_id: String,
     pub provider: String,
+    /// Exact wire protocol used by this OAuth credential. Provider is the
+    /// supplier identity; it must not be reused as a protocol discriminator.
+    pub protocol_type: String,
     pub auth_type: String,
     pub credential_type: CredentialType,
     pub status: String,
@@ -1614,6 +1749,7 @@ fn row_to_provider_account(row: &rusqlite::Row) -> rusqlite::Result<ProviderAcco
     Ok(ProviderAccountInfo {
         provider_account_id: row.get(0)?,
         provider: row.get(1)?,
+        protocol_type: row.get(14).unwrap_or_default(),
         auth_type: row.get(2)?,
         credential_type: CredentialType::from_db_str(&raw_ctype),
         status: row.get(4)?,
@@ -1642,19 +1778,25 @@ fn row_to_provider_account(row: &rusqlite::Row) -> rusqlite::Result<ProviderAcco
 const PROVIDER_ACCOUNT_COLUMNS_FULL: &str =
     "provider_account_id, provider, auth_type, credential_type, status, \
      external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
-     use_count, local_alias, extra";
+     use_count, local_alias, extra, protocol_type";
 const PROVIDER_ACCOUNT_COLUMNS_NO_EXTRA: &str =
     "provider_account_id, provider, auth_type, credential_type, status, \
      external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
-     use_count, local_alias, NULL";
+     use_count, local_alias, NULL, \
+     CASE lower(provider) WHEN 'anthropic' THEN 'anthropic' WHEN 'claude' THEN 'anthropic' \
+       ELSE 'openai_compatible' END";
 const PROVIDER_ACCOUNT_COLUMNS_NO_LOCAL_ALIAS: &str =
     "provider_account_id, provider, auth_type, credential_type, status, \
      external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
-     use_count, NULL, NULL";
+     use_count, NULL, NULL, \
+     CASE lower(provider) WHEN 'anthropic' THEN 'anthropic' WHEN 'claude' THEN 'anthropic' \
+       ELSE 'openai_compatible' END";
 const PROVIDER_ACCOUNT_COLUMNS_LEGACY: &str =
     "provider_account_id, provider, auth_type, credential_type, status, \
      external_id, display_identity, org_uuid, account_tier, created_at, last_used_at, \
-     0, NULL, NULL";
+     0, NULL, NULL, \
+     CASE lower(provider) WHEN 'anthropic' THEN 'anthropic' WHEN 'claude' THEN 'anthropic' \
+       ELSE 'openai_compatible' END";
 
 /// List all provider OAuth accounts (write connection with migrations).
 pub fn list_provider_accounts() -> Result<Vec<ProviderAccountInfo>, String> {

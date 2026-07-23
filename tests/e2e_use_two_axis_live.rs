@@ -147,6 +147,24 @@ fn use_two_axis_summary_and_mislabel_prompt() {
     ))
     .expect("seed multi vk");
 
+    // (c) Team OAuth group VK backed by Mock Provider. It intentionally has no
+    // direct ciphertext: the member proxy consumes per-account group_runtime.
+    let (n3, c3) = enc("unused-group-placeholder");
+    let mut group = vk_row(
+        "vk-mock-group",
+        "mock-group",
+        "mock",
+        "anthropic",
+        "http://127.0.0.1:3000/mock-provider/anthropic",
+        &["mock"],
+        n3,
+        c3,
+    );
+    group.provider_key_nonce = None;
+    group.provider_key_ciphertext = None;
+    group.oauth_group_id = Some("group-e2e".to_string());
+    storage::upsert_virtual_key_cache(&group).expect("seed mock group vk");
+
     // ── 3. Live run A: `aikey use glm-team` → two-axis summary box ────────────
     let a = base_cmd(&tmp, &vault)
         .args(["use", "glm-team", "--no-hook"])
@@ -188,7 +206,27 @@ fn use_two_axis_summary_and_mislabel_prompt() {
     );
     println!("\n================ LIVE B: `aikey use multi-team` (PTY) ================\n{b_out}");
 
-    // ── 5. Assertions ────────────────────────────────────────────────────────
+    // ── 5. Live run C: cluster sidecar must NOT divert member group VK ──────
+    let aikey_dir = tmp.join(".aikey");
+    std::fs::create_dir_all(&aikey_dir).unwrap();
+    std::fs::write(
+        aikey_dir.join("active-cluster.json"),
+        r#"{"authority":"127.0.0.1:19088"}"#,
+    )
+    .unwrap();
+    let c = base_cmd(&tmp, &vault)
+        .args(["use", "mock-group", "--no-hook"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run aikey use mock-group");
+    let c_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&c.stdout),
+        String::from_utf8_lossy(&c.stderr)
+    );
+    println!("\n================ LIVE C: member OAuth group with cluster sidecar ================\n{c_out}");
+
+    // ── 6. Assertions ────────────────────────────────────────────────────────
     // Two-axis summary: PROTOCOL + PROVIDER header, anthropic protocol, zhipu(GLM).
     assert!(a.status.success(), "aikey use glm-team failed:\n{a_out}");
     assert!(
@@ -214,6 +252,29 @@ fn use_two_axis_summary_and_mislabel_prompt() {
         "old mislabel 'Select protocol(s)' still present:\n{b_out}"
     );
 
-    println!("\n✓ two-axis summary + mislabel fix verified live against the real binary\n");
+    assert!(c.status.success(), "aikey use mock-group failed:\n{c_out}");
+    assert!(
+        !c_out.contains("cluster node (key stays central)"),
+        "member OAuth group VK was misclassified as ingress/central:\n{c_out}"
+    );
+    assert!(
+        c_out.contains("Primary for anthropic")
+            && c_out.contains("anthropic")
+            && c_out.contains("mock"),
+        "group activation must show Client Route=anthropic and Provider=mock:\n{c_out}"
+    );
+    let active_env = std::fs::read_to_string(aikey_dir.join("active.env")).expect("active.env");
+    assert!(
+        active_env.contains("ANTHROPIC_API_KEY='aikey_active_anthropic'")
+            && active_env.contains("ANTHROPIC_BASE_URL='http://127.0.0.1:27200/anthropic'"),
+        "member OAuth group must stay on local proxy:\n{active_env}"
+    );
+    assert!(
+        !active_env.contains("export AIKEY_MOCK_PROVIDER_")
+            && !active_env.contains("http://127.0.0.1:19088/anthropic"),
+        "member active.env leaked Mock/ingress route:\n{active_env}"
+    );
+
+    println!("\n✓ two-axis summary + member/Agent route boundary verified live\n");
     let _ = std::fs::remove_dir_all(&tmp);
 }

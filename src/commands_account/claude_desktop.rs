@@ -154,8 +154,9 @@ pub(crate) fn desktop_paths() -> Option<DesktopPaths> {
 
 /// What the gateway profile points at. Local editions: local proxy +
 /// per-provider sentinel (credential-independent — D1's zero-rewrite-on-
-/// credential-switch property). Cluster: central node + real vk_token
-/// (same exposure level as active.env on cluster, risk 3).
+/// credential-switch property). Cluster direct-bind VK: central node + real
+/// vk_token (same exposure level as active.env on cluster, risk 3). Team OAuth
+/// account-pool VKs remain member-local, matching active.env.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouteMaterial {
     pub base_url: String,

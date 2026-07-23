@@ -2541,6 +2541,17 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
 // `aikey status` — combined overview dashboard
 // ---------------------------------------------------------------------------
 
+fn active_team_key_count(bindings: &[storage::ProviderBinding]) -> usize {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.key_source_type == crate::credential_type::CredentialType::ManagedVirtualKey
+        })
+        .map(|binding| binding.key_source_ref.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
 pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::BTreeSet;
 
@@ -2556,26 +2567,47 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
         0
     };
     let team_keys = storage::list_virtual_key_cache().unwrap_or_default();
-    let active_team = team_keys
-        .iter()
-        .filter(|k| k.local_state == "active")
-        .count();
     let team_total = team_keys.len();
+    // Provider bindings are the routing SSOT. `local_state` is sync/eligibility
+    // metadata and no longer flips to `active` for every selected protocol, so
+    // counting it made status report zero while the proxy was actively routing
+    // a Team VK. Count distinct bound VKs (one VK may own several routes).
+    let active_bindings = match storage::list_provider_bindings_readonly(
+        crate::profile_activation::DEFAULT_PROFILE,
+    ) {
+        Ok(bindings) => bindings,
+        Err(error) => {
+            eprintln!("[aikey] warning: could not read active bindings for status: {error}");
+            Vec::new()
+        }
+    };
+    let active_team = active_team_key_count(&active_bindings);
 
-    // Collect unique providers from personal keys + team keys + bindings.
+    // Supplier Providers and client-facing protocol routes are separate axes.
+    // Keep both: JSON's historical `providers` field remains compatible, while
+    // the human "Protocols" section and new JSON `protocols` field use the
+    // client route derived from exact Provider+Protocol truth.
     let mut providers = BTreeSet::new();
+    let mut protocols = BTreeSet::new();
     if vault_exists {
         if let Ok(entries) = storage::list_entries_with_metadata() {
             for e in &entries {
+                let base_url = e.base_url.as_deref().unwrap_or("");
                 if let Some(ref pc) = e.provider_code {
                     if !pc.is_empty() {
                         providers.insert(pc.clone());
+                        if let Some(route) = status_client_route(pc, "", base_url) {
+                            protocols.insert(route);
+                        }
                     }
                 }
                 if let Some(ref sp) = e.supported_providers {
                     for p in sp {
                         if !p.is_empty() {
                             providers.insert(p.clone());
+                            if let Some(route) = status_client_route(p, "", base_url) {
+                                protocols.insert(route);
+                            }
                         }
                     }
                 }
@@ -2585,11 +2617,31 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     for k in &team_keys {
         if !k.provider_code.is_empty() {
             providers.insert(k.provider_code.clone());
+            if let Some(route) =
+                status_client_route(&k.provider_code, &k.protocol_type, &k.base_url)
+            {
+                protocols.insert(route);
+            }
         }
         for p in &k.supported_providers {
             if !p.is_empty() {
                 providers.insert(p.clone());
+                if let Some(route) = status_client_route(p, &k.protocol_type, &k.base_url) {
+                    protocols.insert(route);
+                }
             }
+        }
+    }
+    // Bindings are the most exact local routing rows. Derive again from their
+    // Provider+Protocol axes instead of trusting a legacy client_route that may
+    // still contain `mock` from a pre-migration cache.
+    for binding in &active_bindings {
+        if !binding.provider_code.is_empty() {
+            providers.insert(binding.provider_code.clone());
+        }
+        if let Some(route) = status_client_route(&binding.provider_code, &binding.protocol_type, "")
+        {
+            protocols.insert(route);
         }
     }
 
@@ -2622,6 +2674,7 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
             },
             "active_key": active_json,
             "providers": providers.iter().collect::<Vec<_>>(),
+            "protocols": protocols.iter().collect::<Vec<_>>(),
         }));
         return Ok(());
     }
@@ -2721,19 +2774,86 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
         crate::symbols::ICON_PLUG.pre(),
         "Protocols".bold()
     ));
-    if providers.is_empty() {
+    if protocols.is_empty() {
         rows.push(format!("  {}", "no protocols configured".dimmed()));
         rows.push("  hint:    add a key with `aikey add <alias> --provider <code>`".to_string());
     } else {
         rows.push(format!(
             "  {}",
-            providers.iter().cloned().collect::<Vec<_>>().join(", ")
+            protocols.iter().cloned().collect::<Vec<_>>().join(", ")
         ));
     }
 
     crate::ui_frame::print_box(crate::symbols::ICON_CHART.s(), "Status", &rows);
 
     Ok(())
+}
+
+fn status_client_route(provider_code: &str, protocol_type: &str, base_url: &str) -> Option<String> {
+    if provider_code.is_empty() {
+        return None;
+    }
+    let classifier = crate::commands_internal::parse::provider_fingerprint::instance();
+    let protocol = (!protocol_type.is_empty())
+        .then(|| protocol_type.to_string())
+        .or_else(|| {
+            (!base_url.is_empty())
+                .then(|| classifier.route_for_base_url(base_url))
+                .flatten()
+                .map(|route| route.protocol.clone())
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            let declared = classifier.protocols_for_provider(provider_code);
+            (declared.len() == 1).then(|| declared[0].clone())
+        });
+
+    if let Some(protocol) = protocol {
+        return Some(
+            crate::provider_registry::client_route_for_binding(provider_code, &protocol)
+                .to_string(),
+        );
+    }
+
+    // A multi-protocol supplier without an exact protocol cannot honestly be
+    // presented as a protocol. Mock is the concrete production case. Native or
+    // custom single-route providers retain the legacy self-named fallback.
+    let fallback = crate::provider_registry::client_route_for_binding(provider_code, "");
+    (fallback != "mock").then(|| fallback.to_string())
+}
+
+#[cfg(test)]
+mod status_protocol_tests {
+    use super::status_client_route;
+
+    #[test]
+    fn mock_supplier_is_classified_by_wire_protocol() {
+        assert_eq!(
+            status_client_route("mock", "anthropic", "").as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            status_client_route("mock", "openai_compatible", "").as_deref(),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn mock_without_protocol_is_not_reported_as_one() {
+        assert_eq!(status_client_route("mock", "", ""), None);
+    }
+
+    #[test]
+    fn native_provider_keeps_its_client_route() {
+        assert_eq!(
+            status_client_route("anthropic", "anthropic", "").as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            status_client_route("zhipu", "openai_compatible", "").as_deref(),
+            Some("zhipu")
+        );
+    }
 }
 
 pub fn handle_logout(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -2837,6 +2957,91 @@ fn compute_local_state_from_effective(
     }
 }
 
+/// The subset of an active managed-key binding that can change when server
+/// metadata is refreshed, without the binding row itself changing.
+///
+/// `active.env` is rendered from provider bindings, but two rendered values
+/// still come from the managed-key cache: the display alias in
+/// `AIKEY_ACTIVE_KEYS`, and whether the key is a Team OAuth group (which must
+/// stay on the member-local proxy instead of following a cluster-node route).
+/// Capture those values before/after metadata sync so the sync path can invoke
+/// the canonical writer exactly once when its projection really changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveManagedEnvProjection {
+    client_route: String,
+    provider_code: String,
+    protocol_type: String,
+    key_source_ref: String,
+    display_name: String,
+    cluster_route: Option<(String, String)>,
+}
+
+fn active_managed_env_projection() -> Result<Vec<ActiveManagedEnvProjection>, String> {
+    let mut projection =
+        storage::list_provider_bindings(crate::profile_activation::DEFAULT_PROFILE)?
+            .into_iter()
+            .filter(|binding| {
+                binding.key_source_type == crate::credential_type::CredentialType::ManagedVirtualKey
+            })
+            .map(|binding| ActiveManagedEnvProjection {
+                client_route: binding.client_route.clone(),
+                provider_code: binding.provider_code.clone(),
+                protocol_type: binding.protocol_type.clone(),
+                key_source_ref: binding.key_source_ref.clone(),
+                display_name: crate::profile_activation::active_binding_display(&binding),
+                cluster_route: shell_integration::cluster_route(
+                    &binding.key_source_type,
+                    &binding.key_source_ref,
+                ),
+            })
+            .collect::<Vec<_>>();
+    projection.sort_by(|left, right| left.client_route.cmp(&right.client_route));
+    Ok(projection)
+}
+
+fn refresh_active_env_if_managed_projection_changed(
+    before: Result<Vec<ActiveManagedEnvProjection>, String>,
+    sync_source: &str,
+) {
+    let after = active_managed_env_projection();
+    if let Err(error) = &before {
+        eprintln!(
+            "[aikey] warning: could not capture active environment before {sync_source}: {error}; refreshing defensively"
+        );
+    }
+    if let Err(error) = &after {
+        eprintln!(
+            "[aikey] warning: could not capture active environment after {sync_source}: {error}; refreshing defensively"
+        );
+    }
+    if !managed_projection_changed_or_unknown(&before, &after) {
+        return;
+    }
+
+    // Do not resurrect the legacy `write_active_env`: it projected supplier
+    // names (notably `mock`) into shell protocol variables. Provider bindings
+    // remain the routing SSOT; this call only restores the old sync trigger by
+    // delegating to the one canonical renderer after the batch is complete.
+    if let Err(error) = crate::profile_activation::refresh_implicit_profile_activation() {
+        eprintln!(
+            "[aikey] warning: active environment refresh after {sync_source} failed: {error}"
+        );
+    }
+}
+
+/// An unreadable before/after projection is not evidence that nothing changed.
+/// Fail open to the canonical refresh path: it performs its own authoritative
+/// reads and reports a concrete error if the vault is genuinely unavailable.
+fn managed_projection_changed_or_unknown(
+    before: &Result<Vec<ActiveManagedEnvProjection>, String>,
+    after: &Result<Vec<ActiveManagedEnvProjection>, String>,
+) -> bool {
+    match (before, after) {
+        (Ok(before), Ok(after)) => before != after,
+        _ => true,
+    }
+}
+
 /// Merges a server snapshot into the local managed_virtual_keys_cache.
 ///
 /// Coverage rules (design doc §5.3):
@@ -2849,6 +3054,7 @@ fn apply_snapshot_to_cache(
     current_account_id: &str,
 ) {
     use std::collections::HashSet;
+    let active_env_before = active_managed_env_projection();
     // P1e (design D-11): the cache is one row per binding, so the sync tracks the
     // full (vk, protocol, provider) triple — preserving each binding's own local
     // ciphertext and pruning a single removed binding without touching the VK's
@@ -2931,26 +3137,15 @@ fn apply_snapshot_to_cache(
             group_alias: item.group_alias.clone(),
         };
 
-        let _ = storage::upsert_virtual_key_cache(&entry);
-
-        // If this key is currently active in the proxy, refresh active.env so the
-        // proxy picks up any updated provider list without requiring a restart.
-        if !entry.supported_providers.is_empty() {
-            if let Ok(Some(active_cfg)) = crate::storage::get_active_key_config() {
-                if active_cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey
-                    && active_cfg.key_ref == entry.virtual_key_id
-                {
-                    let display = entry.local_alias.as_deref().unwrap_or(entry.alias.as_str());
-                    let _ = write_active_env(
-                        "team",
-                        &entry.virtual_key_id,
-                        display,
-                        &entry.supported_providers,
-                        crate::commands_proxy::proxy_port(),
-                    );
-                }
-            }
+        if let Err(error) = storage::upsert_virtual_key_cache(&entry) {
+            eprintln!(
+                "[aikey] warning: snapshot cache update failed for {} ({}/{}): {}",
+                entry.virtual_key_id, entry.provider_code, entry.protocol_type, error
+            );
         }
+
+        // Never project `supported_providers` into shell variables here. It names
+        // upstream suppliers (for example "mock"), not client protocol routes.
     }
 
     // Prune: keys the current account owns locally but the server no longer
@@ -3013,6 +3208,8 @@ fn apply_snapshot_to_cache(
             println!("  pruned {pruned} server-removed key(s) from local cache");
         }
     }
+
+    refresh_active_env_if_managed_projection_changed(active_env_before, "snapshot sync");
 }
 
 /// Persists the quota rules carried by a delivery snapshot into the local
@@ -3713,6 +3910,51 @@ pub fn try_background_snapshot_sync() {
 // Managed key metadata sync (shared helper)
 // ---------------------------------------------------------------------------
 
+fn metadata_binding_axes(
+    item: &crate::platform_client::KeyItem,
+    existing: &[VirtualKeyCacheEntry],
+) -> Vec<(String, String)> {
+    let mut axes = item
+        .bindings
+        .iter()
+        .filter(|axis| !axis.provider.is_empty() && !axis.protocol.is_empty())
+        .map(|axis| (axis.provider.clone(), axis.protocol.clone()))
+        .collect::<Vec<_>>();
+
+    // Rolling-upgrade fallback: releases before the binding array exposed one
+    // root-level Provider+Protocol pair.
+    if axes.is_empty() && !item.provider_code.is_empty() && !item.protocol_type.is_empty() {
+        axes.push((item.provider_code.clone(), item.protocol_type.clone()));
+    }
+
+    // An inactive/revoked key may no longer have active server binding axes.
+    // Update each locally-known exact row instead of fabricating a protocol.
+    if axes.is_empty() {
+        axes.extend(
+            existing
+                .iter()
+                .filter(|entry| !entry.provider_code.is_empty() && !entry.protocol_type.is_empty())
+                .map(|entry| (entry.provider_code.clone(), entry.protocol_type.clone())),
+        );
+    }
+
+    // Last compatibility fallback for a genuinely new row from an old server:
+    // inference is safe only when the Provider declares exactly one protocol.
+    // Mock intentionally declares two, so it fails closed until the canonical
+    // snapshot or a new all-keys response supplies an exact binding axis.
+    if axes.is_empty() && !item.provider_code.is_empty() {
+        let protocols = crate::commands_internal::parse::provider_fingerprint::instance()
+            .protocols_for_provider(&item.provider_code);
+        if protocols.len() == 1 {
+            axes.push((item.provider_code.clone(), protocols[0].clone()));
+        }
+    }
+
+    axes.sort();
+    axes.dedup();
+    axes
+}
+
 /// Silently syncs managed virtual key metadata from the server into the local cache.
 ///
 /// - Non-active keys (revoked/recycled/expired) are forced to `local_state =
@@ -3737,129 +3979,113 @@ pub fn sync_managed_key_metadata() -> bool {
         Ok(i) => i,
         Err(_) => return false,
     };
+    let active_env_before = active_managed_env_projection();
 
     for item in &items {
-        let existing = match storage::get_virtual_key_cache(&item.virtual_key_id) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        // If the key was scope-disabled (belonged to a different account) but
-        // the server is now returning it for the current account, restore it.
-        let existing_state = existing
-            .as_ref()
-            .map(|e| e.local_state.as_str())
-            .unwrap_or("");
-        let local_state = match (item.key_status.as_str(), existing_state) {
-            // Server says key is active; restore scope-disabled back to synced_inactive
-            // (the current account now owns it again after re-login).
-            ("active", "disabled_by_account_scope") => "synced_inactive".to_string(),
-            // Server says key is active; preserve non-disabled states (active, synced_inactive,
-            // prompt_dismissed).
-            ("active", state) if !state.starts_with("disabled_by_") => {
-                if state.is_empty() {
-                    "synced_inactive".to_string()
-                } else {
-                    state.to_string()
-                }
+        let existing_bindings = match storage::list_virtual_key_cache_bindings(&item.virtual_key_id)
+        {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!(
+                    "[aikey] warning: metadata cache lookup failed for {}: {}",
+                    item.virtual_key_id, error
+                );
+                continue;
             }
-            // Any other combination: fall back to synced_inactive.
-            _ => "synced_inactive".to_string(),
         };
-        // Preserve key material and delivery-time fields (base_url, credential_id, etc.).
-        let nonce = existing.as_ref().and_then(|e| e.provider_key_nonce.clone());
-        let ciphertext = existing
-            .as_ref()
-            .and_then(|e| e.provider_key_ciphertext.clone());
-        let base_url = existing
-            .as_ref()
-            .map(|e| e.base_url.clone())
-            .unwrap_or_default();
-        let credential_id = existing
-            .as_ref()
-            .map(|e| e.credential_id.clone())
-            .unwrap_or_default();
-        let credential_revision = existing
-            .as_ref()
-            .map(|e| e.credential_revision.clone())
-            .unwrap_or_default();
-        let virtual_key_revision = existing
-            .as_ref()
-            .map(|e| e.virtual_key_revision.clone())
-            .unwrap_or_default();
+        let axes = metadata_binding_axes(item, &existing_bindings);
+        if axes.is_empty() {
+            eprintln!(
+                "[aikey] warning: skipped ambiguous metadata row for virtual key {} (provider={}, no exact protocol binding)",
+                item.virtual_key_id, item.provider_code
+            );
+            continue;
+        }
 
-        let local_alias = existing.as_ref().and_then(|e| e.local_alias.clone());
-        // Preserve supported_providers from existing cache; update from server if non-empty.
-        let supported_providers = if !item.supported_providers.is_empty() {
-            item.supported_providers.clone()
-        } else {
-            existing
-                .as_ref()
-                .map(|e| e.supported_providers.clone())
-                .unwrap_or_default()
-        };
-        // Preserve existing provider_base_urls — server metadata sync doesn't re-deliver base URLs.
-        let provider_base_urls = existing
-            .as_ref()
-            .map(|e| e.provider_base_urls.clone())
-            .unwrap_or_default();
-        let entry = VirtualKeyCacheEntry {
-            virtual_key_id: item.virtual_key_id.clone(),
-            org_id: item.org_id.clone(),
-            seat_id: item.seat_id.clone(),
-            alias: item.alias.clone(),
-            provider_code: item.provider_code.clone(),
-            protocol_type: "openai_compatible".to_string(),
-            base_url,
-            credential_id,
-            credential_revision,
-            virtual_key_revision,
-            key_status: item.key_status.clone(),
-            share_status: item.share_status.clone(),
-            local_state,
-            expires_at: None,
-            provider_key_nonce: nonce,
-            provider_key_ciphertext: ciphertext,
-            synced_at: 0,
-            local_alias,
-            supported_providers,
-            provider_base_urls,
-            owner_account_id: Some(acc.account_id.clone()),
-            owner_email: Some(acc.email.clone()), // owner email for /user/vault
-            group_runtime: None, // proxy-owned (channel ③) — never written from here
-
-            // Sync writers MUST always pass extra: None; upsert ignores
-            // this field. See doc on VirtualKeyCacheEntry::extra.
-            extra: None,
-            // N6: this lightweight metadata sync (KeyItem) does NOT carry oauth-group
-            // data — carry forward existing values so it doesn't clobber what the
-            // full snapshot sync folded in. The full sync (apply_snapshot_to_cache)
-            // is authoritative over these.
-            oauth_group_id: existing.as_ref().and_then(|e| e.oauth_group_id.clone()),
-            group_accounts: existing.as_ref().and_then(|e| e.group_accounts.clone()),
-            routing_config: existing.as_ref().and_then(|e| e.routing_config.clone()),
-            group_alias: existing.as_ref().and_then(|e| e.group_alias.clone()),
-        };
-        let _ = storage::upsert_virtual_key_cache(&entry);
-
-        // If this key is currently active, refresh ~/.aikey/active.env with updated providers.
-        // Handles the case where sync adds new providers to an already-active key.
-        if !entry.supported_providers.is_empty() {
-            if let Ok(Some(active_cfg)) = crate::storage::get_active_key_config() {
-                if active_cfg.key_type == crate::credential_type::CredentialType::ManagedVirtualKey
-                    && active_cfg.key_ref == entry.virtual_key_id
-                {
-                    let display = entry.local_alias.as_deref().unwrap_or(entry.alias.as_str());
-                    let _ = write_active_env(
-                        "team",
-                        &entry.virtual_key_id,
-                        display,
-                        &entry.supported_providers,
-                        crate::commands_proxy::proxy_port(),
-                    );
+        for (provider_code, protocol_type) in axes {
+            let existing = existing_bindings.iter().find(|entry| {
+                entry.provider_code == provider_code && entry.protocol_type == protocol_type
+            });
+            // If the key was scope-disabled (belonged to a different account) but
+            // the server is now returning it for the current account, restore it.
+            let existing_state = existing.map(|e| e.local_state.as_str()).unwrap_or("");
+            let local_state = match (item.key_status.as_str(), existing_state) {
+                ("active", "disabled_by_account_scope") => "synced_inactive".to_string(),
+                ("active", state) if !state.starts_with("disabled_by_") => {
+                    if state.is_empty() {
+                        "synced_inactive".to_string()
+                    } else {
+                        state.to_string()
+                    }
                 }
+                _ => "synced_inactive".to_string(),
+            };
+
+            let supported_providers = if !item.supported_providers.is_empty() {
+                item.supported_providers.clone()
+            } else if let Some(existing) = existing {
+                existing.supported_providers.clone()
+            } else {
+                vec![provider_code.clone()]
+            };
+            let entry = VirtualKeyCacheEntry {
+                virtual_key_id: item.virtual_key_id.clone(),
+                org_id: item.org_id.clone(),
+                seat_id: item.seat_id.clone(),
+                alias: item.alias.clone(),
+                provider_code,
+                protocol_type,
+                base_url: existing.map(|e| e.base_url.clone()).unwrap_or_default(),
+                credential_id: existing
+                    .map(|e| e.credential_id.clone())
+                    .unwrap_or_default(),
+                credential_revision: existing
+                    .map(|e| e.credential_revision.clone())
+                    .unwrap_or_default(),
+                virtual_key_revision: existing
+                    .map(|e| e.virtual_key_revision.clone())
+                    .unwrap_or_default(),
+                key_status: item.key_status.clone(),
+                share_status: item.share_status.clone(),
+                local_state,
+                expires_at: existing.and_then(|e| e.expires_at),
+                provider_key_nonce: existing.and_then(|e| e.provider_key_nonce.clone()),
+                provider_key_ciphertext: existing.and_then(|e| e.provider_key_ciphertext.clone()),
+                synced_at: 0,
+                local_alias: existing.and_then(|e| e.local_alias.clone()),
+                supported_providers,
+                // Lightweight metadata does not deliver per-binding endpoints or
+                // key material; preserve those fields from this exact row only.
+                provider_base_urls: existing
+                    .map(|e| e.provider_base_urls.clone())
+                    .unwrap_or_default(),
+                owner_account_id: Some(acc.account_id.clone()),
+                owner_email: Some(acc.email.clone()),
+                group_runtime: None, // proxy-owned (channel ③) — never written from here
+                extra: None,         // user-owned; ignored by the UPSERT update clause
+                // Group data is snapshot-owned. Preserve the exact binding row's
+                // last-good projection; this endpoint is not allowed to erase it.
+                oauth_group_id: existing.and_then(|e| e.oauth_group_id.clone()),
+                group_accounts: existing.and_then(|e| e.group_accounts.clone()),
+                routing_config: existing.and_then(|e| e.routing_config.clone()),
+                group_alias: existing.and_then(|e| e.group_alias.clone()),
+            };
+            if let Err(error) = storage::upsert_virtual_key_cache(&entry) {
+                eprintln!(
+                    "[aikey] warning: metadata cache update failed for {} ({}/{}): {}",
+                    entry.virtual_key_id, entry.provider_code, entry.protocol_type, error
+                );
             }
         }
+
+        // Metadata sync must not project supplier names into client shell routes.
+        // Existing provider bindings remain authoritative and unchanged here.
     }
+
+    refresh_active_env_if_managed_projection_changed(
+        active_env_before,
+        "managed-key metadata sync",
+    );
 
     true
 }
@@ -4038,7 +4264,9 @@ pub fn provider_extra_env_vars_pub(provider_code: &str) -> Vec<(&'static str, &'
 }
 
 pub(crate) fn provider_env_vars(provider_code: &str) -> Option<(&'static str, &'static str)> {
-    provider_info(provider_code).map(|i| i.env_vars)
+    provider_info(provider_code)
+        .map(|i| i.env_vars)
+        .filter(|(key, base)| !key.is_empty() && !base.is_empty())
 }
 
 /// Provider-specific extra env vars beyond (api_key, base_url).
@@ -4521,39 +4749,291 @@ pub fn apply_rename_core(
     }
 }
 
-/// Writes provider bindings for one key across `providers`, normalizing
-/// every provider_code to its canonical API-protocol form (claude →
-/// anthropic, codex → openai) and cleaning any pre-fix stale alias row
-/// left over from older CLI versions.
+/// Resolves one source credential to exact `(client route, Provider,
+/// Protocol)` bindings. Provider and Protocol are independent axes; the
+/// client route is only the local CLI selection slot.
+pub(crate) fn exact_binding_specs_for_source(
+    provider_code: &str,
+    key_type_str: &str,
+    key_ref: &str,
+) -> Result<Vec<(String, String, String)>, String> {
+    let provider = oauth_provider_to_canonical(provider_code).to_string();
+    let classifier = crate::commands_internal::parse::provider_fingerprint::instance();
+    let mut protocols = Vec::<String>::new();
+
+    match crate::credential_type::CredentialType::from_db_str(key_type_str) {
+        crate::credential_type::CredentialType::ManagedVirtualKey => {
+            for binding in storage::list_virtual_key_cache_bindings(key_ref)? {
+                if !binding.provider_code.eq_ignore_ascii_case(&provider)
+                    && !(binding.provider_code.is_empty()
+                        && binding
+                            .supported_providers
+                            .iter()
+                            .any(|value| value.eq_ignore_ascii_case(&provider)))
+                {
+                    continue;
+                }
+                let protocol = classifier
+                    .route_for_base_url(&binding.base_url)
+                    .map(|route| route.protocol.clone())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(binding.protocol_type);
+                if !protocol.is_empty()
+                    && !protocols
+                        .iter()
+                        .any(|value| value.eq_ignore_ascii_case(&protocol))
+                {
+                    protocols.push(protocol);
+                }
+            }
+        }
+        crate::credential_type::CredentialType::PersonalApiKey => {
+            // Missing legacy metadata may still be resolved from a provider
+            // with one declared protocol below. Treat an unavailable optional
+            // URL as absent; multi-protocol providers remain fail-closed.
+            if let Some(base_url) = storage::get_entry_base_url(key_ref).ok().flatten() {
+                if let Some(route) = classifier.route_for_base_url(&base_url) {
+                    protocols.push(route.protocol.clone());
+                }
+            }
+        }
+        crate::credential_type::CredentialType::PersonalOAuthAccount => {
+            if let Some(account) = storage::get_provider_account(key_ref)? {
+                if !account.protocol_type.is_empty() {
+                    protocols.push(account.protocol_type);
+                }
+            }
+        }
+    }
+
+    if protocols.is_empty() {
+        let declared = classifier.protocols_for_provider(&provider);
+        if declared.len() == 1 {
+            protocols = declared;
+        } else {
+            return Err(format!(
+                "Cannot select provider '{}' without an exact protocol binding for {} '{}'. Select the credential from `aikey use` or refresh its metadata.",
+                provider, key_type_str, key_ref
+            ));
+        }
+    }
+
+    Ok(protocols
+        .into_iter()
+        .map(|protocol| {
+            let client_route =
+                crate::provider_registry::client_route_for_binding(&provider, &protocol);
+            (client_route.to_string(), provider.clone(), protocol)
+        })
+        .collect())
+}
+
+/// Resolve a user-facing `--provider` selector to the upstream Provider row(s)
+/// that should be promoted. The historical flag name is retained for CLI
+/// compatibility, but users select the client slot they run (`anthropic`,
+/// `openai`, `kimi`). A supplier code remains accepted as a compatibility
+/// alias. This is the bridge that keeps Provider and Protocol separate for
+/// supplier-only implementations such as Mock Provider.
+pub(crate) fn providers_for_client_selector(
+    providers: &[String],
+    key_type_str: &str,
+    key_ref: &str,
+    selector: &str,
+) -> Result<Vec<String>, String> {
+    let selector = oauth_provider_to_canonical(selector).to_lowercase();
+
+    // Compatibility: an exact upstream provider selection still works.
+    let mut direct = providers
+        .iter()
+        .filter(|provider| oauth_provider_to_canonical(provider).eq_ignore_ascii_case(&selector))
+        .cloned()
+        .collect::<Vec<_>>();
+    direct.sort();
+    direct.dedup();
+    if !direct.is_empty() {
+        return Ok(direct);
+    }
+
+    let mut provider_routes = Vec::<(String, String)>::new();
+    for provider in providers {
+        let specs = exact_binding_specs_for_source(provider, key_type_str, key_ref)?;
+        for (client_route, upstream_provider, _) in specs {
+            provider_routes.push((upstream_provider, client_route));
+        }
+    }
+
+    let matched = providers_matching_client_route(&provider_routes, &selector);
+    if matched.len() == 1 {
+        return Ok(matched);
+    }
+    if matched.len() > 1 {
+        return Err(format!(
+            "Client route '{}' matches multiple providers ({}); select an exact provider code.",
+            selector,
+            matched.join(", ")
+        ));
+    }
+
+    let mut supported_routes = provider_routes
+        .into_iter()
+        .map(|(_, client_route)| client_route)
+        .collect::<Vec<_>>();
+    supported_routes.sort();
+    supported_routes.dedup();
+    Err(format!(
+        "does not support client route '{}'. Supported routes: {}; providers: {}",
+        selector,
+        supported_routes.join(", "),
+        providers.join(", ")
+    ))
+}
+
+fn providers_matching_client_route(
+    provider_routes: &[(String, String)],
+    selector: &str,
+) -> Vec<String> {
+    let mut matched = provider_routes
+        .iter()
+        .filter(|(_, client_route)| client_route.eq_ignore_ascii_case(selector))
+        .map(|(provider, _)| provider.clone())
+        .collect::<Vec<_>>();
+    matched.sort();
+    matched.dedup();
+    matched
+}
+
+/// Exact client routes exposed by a source credential. Used by temporary
+/// activation so it emits SDK env vars for the protocol client surface, never
+/// a supplier-only namespace such as `mock`.
+pub(crate) fn client_routes_for_source(
+    providers: &[String],
+    key_type_str: &str,
+    key_ref: &str,
+) -> Result<Vec<String>, String> {
+    let mut routes = Vec::new();
+    for provider in providers {
+        for (client_route, _, _) in exact_binding_specs_for_source(provider, key_type_str, key_ref)?
+        {
+            if !routes
+                .iter()
+                .any(|route: &String| route.eq_ignore_ascii_case(&client_route))
+            {
+                routes.push(client_route);
+            }
+        }
+    }
+    Ok(routes)
+}
+
+/// Resolve the exact upstream `(Provider, Protocol)` for one source credential
+/// when the caller already owns the client-route slot (for example an Agent
+/// app manifest declares `anthropic`). This keeps app-scoped and default
+/// profile bindings on the same two-axis model.
+pub(crate) fn binding_spec_for_client_route(
+    client_route: &str,
+    key_type_str: &str,
+    key_ref: &str,
+) -> Result<(String, String), String> {
+    let mut providers = match crate::credential_type::CredentialType::from_db_str(key_type_str) {
+        crate::credential_type::CredentialType::ManagedVirtualKey => {
+            let mut values = Vec::new();
+            for row in storage::list_virtual_key_cache_bindings(key_ref)? {
+                if !row.provider_code.is_empty() {
+                    values.push(row.provider_code);
+                } else {
+                    values.extend(row.supported_providers);
+                }
+            }
+            values
+        }
+        crate::credential_type::CredentialType::PersonalOAuthAccount => {
+            storage::get_provider_account(key_ref)?
+                .map(|account| vec![account.provider])
+                .unwrap_or_default()
+        }
+        crate::credential_type::CredentialType::PersonalApiKey => {
+            storage::resolve_supported_providers(key_ref).unwrap_or_default()
+        }
+    };
+
+    // Compatibility for old/native rows and test fixtures that predate source
+    // metadata: the declared client route is also a Provider only when that
+    // Provider has one unambiguous protocol.
+    if providers.is_empty() {
+        providers.push(oauth_provider_to_canonical(client_route).to_string());
+    }
+    providers.sort();
+    providers.dedup();
+
+    let mut matches = Vec::<(String, String)>::new();
+    for provider in providers {
+        if let Ok(specs) = exact_binding_specs_for_source(&provider, key_type_str, key_ref) {
+            for (route, exact_provider, protocol) in specs {
+                if route.eq_ignore_ascii_case(client_route)
+                    && !matches.iter().any(|(p, t)| {
+                        p.eq_ignore_ascii_case(&exact_provider) && t.eq_ignore_ascii_case(&protocol)
+                    })
+                {
+                    matches.push((exact_provider, protocol));
+                }
+            }
+        }
+    }
+
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(format!(
+            "credential {} '{}' does not expose client route '{}'",
+            key_type_str, key_ref, client_route
+        )),
+        _ => Err(format!(
+            "credential {} '{}' has multiple bindings for client route '{}'; refresh its metadata",
+            key_type_str, key_ref, client_route
+        )),
+    }
+}
+
+/// Writes exact client-route bindings for one key across `providers`, while
+/// cleaning any pre-fix alias row left by older CLI versions.
 ///
 /// # Why this is the single write-path for `user_profile_provider_bindings`
 ///
-/// The bindings table PRIMARY KEY is `(profile_id, provider_code)`. Before
-/// this helper existed, `aikey use <codex-oauth>` wrote a row with
-/// provider_code="codex" and `aikey use <openai-key>` wrote one with
-/// provider_code="openai" — two distinct rows, both legal per the schema.
-/// At runtime both rows would then race to write OPENAI_API_KEY into
-/// active.env (last-writer-wins silently), and the vault Web UI's "in use"
-/// indicator would light up on BOTH rows under the same protocol family,
-/// violating the one-active-per-family rule users expect.
-///
-/// Funneling all binding writes through this helper guarantees the table
-/// only ever holds rows keyed by canonical codes, so the same rule is
-/// enforced structurally via the PRIMARY KEY constraint (UPSERT replaces
-/// the prior in-family active automatically).
-///
-/// 2026-05-08 Kimi family 互斥(详见 update/20260508-Kimi-family互斥-active-env
-/// 统一KIMI写入.md 决策 #2):family 内 kimi_code / moonshot / kimi(deprecated)
-/// 三者 binding 互斥(同时只 1 个 active);env var 全部统一 KIMI_*,proxy_path
-/// 区分上游路由(kimi_code 与 deprecated kimi 走 /kimi/v1,moonshot 走 /moonshot/v1)。
-/// 互斥逻辑下沉到 set_provider_binding 内事务包裹,所有 lifecycle event(Switched/
-/// Added/team-sync/reconcile)统一遵守。
+/// The table keeps its historical physical `provider_code` column as the
+/// client-route key for migration compatibility; `binding_provider_code` and
+/// `protocol_type` preserve the exact upstream identity. The primary key then
+/// enforces one selection per client route without collapsing Mock into a
+/// protocol or merging Kimi with generic OpenAI-compatible credentials.
 pub(crate) fn write_bindings_canonical(
     providers: &[String],
     key_type_str: &str,
     key_ref: &str,
     audit: Option<&crate::audit::VerifiedVaultKey>,
 ) -> Result<(), String> {
+    write_bindings_canonical_internal(providers, key_type_str, key_ref, audit, false).map(|_| ())
+}
+
+/// Automatic lifecycle counterpart of [`write_bindings_canonical`]. It fills
+/// only client routes that are currently empty and returns the routes actually
+/// inserted. Provider identity is deliberately not used as the emptiness key:
+/// Mock+Anthropic and official Anthropic compete for the same `anthropic`
+/// client slot.
+pub(crate) fn write_unbound_bindings_canonical(
+    providers: &[String],
+    key_type_str: &str,
+    key_ref: &str,
+    audit: Option<&crate::audit::VerifiedVaultKey>,
+) -> Result<Vec<String>, String> {
+    write_bindings_canonical_internal(providers, key_type_str, key_ref, audit, true)
+}
+
+fn write_bindings_canonical_internal(
+    providers: &[String],
+    key_type_str: &str,
+    key_ref: &str,
+    audit: Option<&crate::audit::VerifiedVaultKey>,
+    only_if_unbound: bool,
+) -> Result<Vec<String>, String> {
+    let mut written_routes = Vec::new();
     for raw_provider in providers {
         let raw = raw_provider.to_lowercase();
         let canonical = oauth_provider_to_canonical(&raw);
@@ -4564,37 +5044,65 @@ pub(crate) fn write_bindings_canonical(
             let _ =
                 storage::remove_provider_binding(crate::profile_activation::DEFAULT_PROFILE, &raw);
         }
-        storage::set_provider_binding(
-            crate::profile_activation::DEFAULT_PROFILE,
-            canonical,
-            key_type_str,
-            key_ref,
-        )
-        .map_err(|e| format!("set_provider_binding: {}", e))?;
-        // B-2 (2026-07-06): sign one tamper-evident `bind` audit row per
-        // binding write when the caller holds a verified vault key — the
-        // incident write (post-sync auto-assign) was invisible in audit_log
-        // AND the internal log. BEST-EFFORT by design: the binding write above
-        // already landed; an audit insert failure must never fail activation
-        // (fail-visible via WARN instead). `None` (keyless automatic contexts)
-        // still leaves the observability event emitted by the caller.
-        if let Some(vk) = audit {
-            if let Err(e) = crate::audit::log_audit_event_from_vault_key(
-                vk.as_bytes(),
-                crate::audit::AuditOperation::Bind,
-                Some(&format!("{}:{}:{}", canonical, key_type_str, key_ref)),
-                true,
-            ) {
-                eprintln!("[aikey] warning: bind audit row not written: {}", e);
+        let specs = exact_binding_specs_for_source(canonical, key_type_str, key_ref)?;
+        for (client_route, provider, protocol) in specs {
+            let wrote = if only_if_unbound {
+                storage::set_client_route_binding_if_absent(
+                    crate::profile_activation::DEFAULT_PROFILE,
+                    &client_route,
+                    &provider,
+                    &protocol,
+                    key_type_str,
+                    key_ref,
+                )
+                .map_err(|e| format!("fill empty client-route binding: {}", e))?
+            } else {
+                storage::set_client_route_binding(
+                    crate::profile_activation::DEFAULT_PROFILE,
+                    &client_route,
+                    &provider,
+                    &protocol,
+                    key_type_str,
+                    key_ref,
+                )
+                .map_err(|e| format!("set client-route binding: {}", e))?;
+                true
+            };
+            if !wrote {
+                continue;
+            }
+            written_routes.push(client_route.clone());
+            // B-2 (2026-07-06): sign one tamper-evident `bind` audit row per
+            // binding write when the caller holds a verified vault key — the
+            // incident write (post-sync auto-assign) was invisible in audit_log
+            // AND the internal log. BEST-EFFORT by design: the binding write above
+            // already landed; an audit insert failure must never fail activation
+            // (fail-visible via WARN instead). `None` (keyless automatic contexts)
+            // still leaves the observability event emitted by the caller.
+            if let Some(vk) = audit {
+                if let Err(e) = crate::audit::log_audit_event_from_vault_key(
+                    vk.as_bytes(),
+                    crate::audit::AuditOperation::Bind,
+                    Some(&format!(
+                        "{}:{}:{}:{}:{}",
+                        client_route, provider, protocol, key_type_str, key_ref
+                    )),
+                    true,
+                ) {
+                    eprintln!("[aikey] warning: bind audit row not written: {}", e);
+                }
             }
         }
     }
-    Ok(())
+    written_routes.sort();
+    written_routes.dedup();
+    Ok(written_routes)
 }
 
 pub(crate) fn provider_proxy_prefix(provider_code: &str) -> &'static str {
     provider_info(provider_code)
         .map(|i| i.proxy_path)
+        .filter(|path| !path.is_empty())
         .unwrap_or("openai")
 }
 
@@ -4854,12 +5362,17 @@ pub fn handle_key_use(
             };
             return Err(reason.into());
         }
-        // §5.5: a cluster VK's key material lives on the central node, not on this
-        // machine — skip the local delivery below; the up-front resolve set the node
-        // and the refresh routes the tool straight to it. Only non-cluster managed
-        // VKs (key served by the local proxy) still deliver locally.
-        let on_cluster = shell_integration::read_cluster_node().is_some();
-        if on_cluster && entry.provider_key_ciphertext.is_none() {
+        // §5.5 has two consumers of the same managed VK shape. A direct-bind
+        // cluster VK routes to its resolved node, while a Team OAuth group VK used
+        // by the MEMBER CLI stays on the local proxy (online Agents receive their
+        // ingress base_url from control-master and never enter this command).
+        // Therefore node presence alone is not enough to decide material reachability.
+        let routes_to_cluster = shell_integration::cluster_route(
+            &crate::credential_type::CredentialType::ManagedVirtualKey,
+            &entry.virtual_key_id,
+        )
+        .is_some();
+        if routes_to_cluster && entry.provider_key_ciphertext.is_none() {
             eprintln!("  Key '{}' → cluster node (key stays central)", entry.alias);
         }
         // Group VKs (oauth_group_id set) carry NO local key material BY DESIGN — the
@@ -4872,7 +5385,9 @@ pub fn handle_key_use(
         // set-route fix (key_material_reachable) + connectivity-probe / proxy
         // group-route fixes (the same "组 VK 无本地物料是设计" systemic root cause; this
         // is the CLI public-command path, separate from vault_op's web path). (2026-06-26)
-        if entry.provider_key_ciphertext.is_none() && !on_cluster && entry.oauth_group_id.is_none()
+        if entry.provider_key_ciphertext.is_none()
+            && !routes_to_cluster
+            && entry.oauth_group_id.is_none()
         {
             // Why: key material is NULL when the VK was synced but not yet delivered
             // (share_status=pending_claim). Auto-trigger a full snapshot sync (which
@@ -5056,17 +5571,8 @@ pub fn handle_key_use(
     // 不会再遇到 supports kimi_code+moonshot 的同 key entry。
     let target_providers: Vec<String> = if let Some(ov) = provider_override {
         if !ov.is_empty() {
-            let code = ov.to_lowercase();
-            if !providers.iter().any(|p| p.to_lowercase() == code) {
-                return Err(format!(
-                    "Key '{}' does not support provider '{}'. Supported: {}",
-                    display_name,
-                    code,
-                    providers.join(", ")
-                )
-                .into());
-            }
-            vec![code]
+            providers_for_client_selector(&providers, key_type.as_str(), &key_ref, ov)
+                .map_err(|reason| format!("Key '{}': {}", display_name, reason))?
         } else if providers.len() == 1 {
             providers.clone()
         } else {
@@ -5190,6 +5696,24 @@ pub fn handle_key_use(
     // Bindings reread for the JSON envelope below (apply already wrote
     // active.env). Cheap; single DB read.
     let bindings = crate::storage::list_provider_bindings_readonly("default").unwrap_or_default();
+    let mut promoted_routes = bindings
+        .iter()
+        .filter(|b| {
+            b.key_source_type == key_type
+                && b.key_source_ref == key_ref
+                && target_providers
+                    .iter()
+                    .any(|provider| provider.eq_ignore_ascii_case(&b.provider_code))
+        })
+        .map(|b| b.client_route.clone())
+        .collect::<Vec<_>>();
+    promoted_routes.sort();
+    promoted_routes.dedup();
+    if promoted_routes.is_empty() {
+        // Defensive compatibility for an old cache row whose exact binding could
+        // not be reconstructed. Do not fail an activation that already succeeded.
+        promoted_routes = target_providers.clone();
+    }
     // Suppress unused-warning when json_mode skips the helper apply.
     let _ = proxy_port;
 
@@ -5201,6 +5725,7 @@ pub fn handle_key_use(
             "key_ref": key_ref,
             "display_name": display_name,
             "promoted_providers": target_providers,
+            "promoted_routes": promoted_routes,
             "all_active_providers": bindings.iter().map(|b| &b.provider_code).collect::<Vec<_>>(),
             "active_env_written": true,
             // 阶段7 (2026-07-13): Desktop takeover state from the funnel —
@@ -5275,10 +5800,14 @@ pub fn handle_key_use(
             vw = prov_w
         ));
         for b in &bindings {
-            if let Some((api_key_var, _)) = provider_env_vars(&b.provider_code) {
+            if let Some((api_key_var, _)) = provider_env_vars(&b.client_route) {
                 let display_ref =
                     resolve_binding_display_name(b.key_source_type.as_str(), &b.key_source_ref);
-                let is_changed = target_providers.contains(&b.provider_code);
+                let is_changed = b.key_source_type == key_type
+                    && b.key_source_ref == key_ref
+                    && target_providers
+                        .iter()
+                        .any(|provider| provider.eq_ignore_ascii_case(&b.provider_code));
                 let arrow_ref = format!("\u{2192} {}", display_ref);
                 let arrow_padded = format!("{:<22}", arrow_ref);
                 let arrow_col = if is_changed {
@@ -5343,6 +5872,9 @@ pub fn handle_key_use(
 /// binding reads "anthropic · zhipu(GLM)" instead of collapsing them. Multi-binding
 /// per provider is an L3 (P1e) concern; at L1 each provider has one active binding.
 fn resolve_binding_protocol(b: &storage::ProviderBinding) -> String {
+    if !b.protocol_type.is_empty() {
+        return b.protocol_type.clone();
+    }
     use crate::credential_type::CredentialType;
     use crate::commands_internal::parse::provider_fingerprint::protocol_for;
     let (base_url, declared) = match b.key_source_type {
@@ -5596,15 +6128,33 @@ pub fn handle_key_unuse(
     let mut already_unbound: Vec<String> = Vec::new();
 
     for raw in providers {
-        let canonical = oauth_provider_to_canonical(&raw.to_lowercase());
-        let removed =
-            storage::remove_provider_binding(crate::profile_activation::DEFAULT_PROFILE, canonical)
-                .map_err(|e| format!("remove binding for {}: {}", canonical, e))?;
+        let selector = oauth_provider_to_canonical(&raw.to_lowercase()).to_string();
+        let bindings = storage::list_provider_bindings(crate::profile_activation::DEFAULT_PROFILE)
+            .map_err(|e| format!("list active bindings: {}", e))?;
+        let mut routes = bindings
+            .iter()
+            .filter(|binding| {
+                binding.client_route.eq_ignore_ascii_case(&selector)
+                    || binding.provider_code.eq_ignore_ascii_case(&selector)
+            })
+            .map(|binding| binding.client_route.clone())
+            .collect::<Vec<_>>();
+        routes.sort();
+        routes.dedup();
 
-        if removed {
-            unbound.push(canonical.to_string());
-        } else {
-            already_unbound.push(canonical.to_string());
+        if routes.is_empty() {
+            already_unbound.push(selector);
+            continue;
+        }
+        for route in routes {
+            let removed = storage::remove_provider_binding(
+                crate::profile_activation::DEFAULT_PROFILE,
+                &route,
+            )
+            .map_err(|e| format!("remove binding for {}: {}", route, e))?;
+            if removed {
+                unbound.push(route);
+            }
         }
     }
 
@@ -5619,7 +6169,7 @@ pub fn handle_key_unuse(
             let active_providers: Vec<String> = refresh
                 .bindings
                 .iter()
-                .map(|b| b.provider_code.clone())
+                .map(|b| b.client_route.clone())
                 .collect();
             // Second (parallel) funnel call site — Desktop takeover/restore
             // rides INSIDE apply_third_party_cli_configs, so `unuse
@@ -5763,12 +6313,13 @@ pub fn handle_key_alias(
 /// Derives the vault AES key from the master password.
 /// Uses the same salt + KDF parameters stored in the vault DB.
 /// B-2 (2026-07-06): best-effort audit signer for binding writes in commands
-/// that don't already hold the master password. Reads the CACHED session
-/// password (keychain/file) — non-interactive by contract, NEVER prompts
-/// (interaction-simplicity-first: audit must not add a password prompt).
+/// that don't already hold the master password. Reads only a cached encrypted-
+/// file session; keychain-backed sessions are skipped because an OS keychain
+/// read may block on system UI. Non-interactive by contract, NEVER prompts
+/// (interaction-simplicity-first: audit must not delay the primary operation).
 /// None ⇒ the binding write proceeds unsigned (observability events only).
 pub(crate) fn try_audit_key_from_session() -> Option<crate::audit::VerifiedVaultKey> {
-    let pw = crate::session::try_get()?;
+    let pw = crate::session::try_get_without_os_prompt()?;
     let key = derive_vault_key(&pw).ok()?;
     crate::audit::VerifiedVaultKey::new(key).ok()
 }
@@ -5861,7 +6412,31 @@ mod provider_mapping_tests {
     //! BEFORE attempting to consolidate with main.rs::canonical_provider.
     //! Any refactor (L5) must pass all of these.
 
-    use super::{provider_env_vars, provider_extra_env_vars, provider_proxy_prefix};
+    use super::{
+        provider_env_vars, provider_extra_env_vars, provider_proxy_prefix,
+        providers_matching_client_route,
+    };
+
+    #[test]
+    fn mock_supplier_is_selected_through_protocol_client_route() {
+        let routes = vec![("mock".to_string(), "openai".to_string())];
+        assert_eq!(
+            providers_matching_client_route(&routes, "openai"),
+            vec!["mock".to_string()]
+        );
+    }
+
+    #[test]
+    fn ambiguous_supplier_match_remains_explicit() {
+        let routes = vec![
+            ("mock-a".to_string(), "anthropic".to_string()),
+            ("mock-b".to_string(), "anthropic".to_string()),
+        ];
+        assert_eq!(
+            providers_matching_client_route(&routes, "anthropic"),
+            vec!["mock-a".to_string(), "mock-b".to_string()]
+        );
+    }
 
     // ── provider_env_vars: (API_KEY, BASE_URL) per provider ─────────────────
 
@@ -6168,6 +6743,37 @@ mod provider_mapping_tests {
 }
 
 #[cfg(test)]
+mod status_tests {
+    use super::active_team_key_count;
+    use crate::credential_type::CredentialType;
+    use crate::storage::ProviderBinding;
+
+    fn binding(route: &str, source_type: CredentialType, source_ref: &str) -> ProviderBinding {
+        ProviderBinding {
+            profile_id: "default".to_string(),
+            client_route: route.to_string(),
+            provider_code: "mock".to_string(),
+            protocol_type: "anthropic".to_string(),
+            key_source_type: source_type,
+            key_source_ref: source_ref.to_string(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn active_team_count_uses_distinct_binding_sources() {
+        let bindings = vec![
+            binding("anthropic", CredentialType::ManagedVirtualKey, "vk-team"),
+            binding("openai", CredentialType::ManagedVirtualKey, "vk-team"),
+            binding("kimi", CredentialType::ManagedVirtualKey, "vk-other"),
+            binding("zhipu", CredentialType::PersonalApiKey, "personal-key"),
+        ];
+
+        assert_eq!(active_team_key_count(&bindings), 2);
+    }
+}
+
+#[cfg(test)]
 mod sync_tests {
     use super::compute_local_state_from_effective;
 
@@ -6404,18 +7010,13 @@ mod core_tests {
     use secrecy::SecretString;
     use tempfile::TempDir;
 
-    fn setup_vault() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
-        // Share the crate-level TEST_VAULT_LOCK with storage::tests so
-        // parallel cargo threads don't race on AK_VAULT_PATH. See
-        // storage.rs::TEST_VAULT_LOCK docstring.
-        let guard = crate::storage::TEST_VAULT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    fn setup_vault() -> (TempDir, crate::test_env_lock::HomeVaultEnvGuard) {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("vault.db");
-        unsafe {
-            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
-        }
+        // These tests exercise cluster-aware material reachability. Isolate
+        // HOME as well as the vault so a developer's live
+        // ~/.aikey/active-cluster.json cannot change their meaning.
+        let guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
         let mut salt = [0u8; 16];
         crate::crypto::generate_salt(&mut salt).expect("salt");
         let pw = SecretString::new("test_password".to_string());
@@ -6467,6 +7068,136 @@ mod core_tests {
             group_accounts: group_accounts.map(|s| s.to_string()),
             routing_config: routing_config.map(|s| s.to_string()),
         }
+    }
+
+    #[test]
+    fn managed_metadata_change_refreshes_only_the_canonical_active_env_projection() {
+        let (dir, _guard) = setup_vault();
+        let mut entry = vk_entry("vk-mock-anthropic", Some("group-1"), Some("[]"), None);
+        entry.alias = "old-team-alias".into();
+        entry.provider_code = "mock".into();
+        entry.protocol_type = "anthropic".into();
+        entry.supported_providers = vec!["mock".into()];
+        storage::upsert_virtual_key_cache(&entry).unwrap();
+        storage::set_client_route_binding(
+            crate::profile_activation::DEFAULT_PROFILE,
+            "anthropic",
+            "mock",
+            "anthropic",
+            "team",
+            &entry.virtual_key_id,
+        )
+        .unwrap();
+        crate::profile_activation::refresh_implicit_profile_activation().unwrap();
+
+        let before = active_managed_env_projection();
+        entry.alias = "renamed-team-alias".into();
+        storage::upsert_virtual_key_cache(&entry).unwrap();
+        refresh_active_env_if_managed_projection_changed(before, "unit-test metadata sync");
+
+        let env = std::fs::read_to_string(dir.path().join(".aikey/active.env")).unwrap();
+        assert!(
+            env.contains("AIKEY_ACTIVE_KEYS='anthropic=renamed-team-alias'"),
+            "server-renamed active VK must update the shell display: {env}"
+        );
+        assert!(
+            env.contains("ANTHROPIC_API_KEY='aikey_active_anthropic'"),
+            "mock+anthropic must render the anthropic client route: {env}"
+        );
+        assert!(
+            !env.contains("export AIKEY_MOCK_PROVIDER_TOKEN="),
+            "supplier identity must never become a shell protocol namespace: {env}"
+        );
+
+        let seq = storage::get_vault_change_seq().unwrap();
+        let unchanged = active_managed_env_projection();
+        refresh_active_env_if_managed_projection_changed(unchanged, "unchanged unit-test sync");
+        assert_eq!(
+            storage::get_vault_change_seq().unwrap(),
+            seq,
+            "an unchanged metadata poll must not rewrite active.env or reload the proxy"
+        );
+    }
+
+    #[test]
+    fn unreadable_managed_projection_refreshes_defensively() {
+        let (_dir, _guard) = setup_vault();
+        let known = Ok(Vec::<ActiveManagedEnvProjection>::new());
+        let unknown = Err("vault temporarily unavailable".to_string());
+        assert!(managed_projection_changed_or_unknown(&unknown, &known));
+        assert!(managed_projection_changed_or_unknown(&known, &unknown));
+        assert!(managed_projection_changed_or_unknown(
+            &unknown,
+            &Err("second read also failed".to_string())
+        ));
+        assert!(!managed_projection_changed_or_unknown(&known, &known));
+
+        let seq = storage::get_vault_change_seq().unwrap();
+        refresh_active_env_if_managed_projection_changed(
+            Err("simulated pre-sync read failure".to_string()),
+            "unit-test defensive refresh",
+        );
+        assert!(
+            storage::get_vault_change_seq().unwrap() > seq,
+            "an unknown before-state must invoke the canonical renderer instead of suppressing refresh"
+        );
+    }
+
+    fn metadata_item(
+        provider_code: &str,
+        protocol_type: &str,
+        bindings: Vec<crate::platform_client::KeyBindingAxis>,
+    ) -> crate::platform_client::KeyItem {
+        crate::platform_client::KeyItem {
+            virtual_key_id: "vk-metadata".into(),
+            org_id: "org-1".into(),
+            seat_id: "seat-1".into(),
+            alias: "metadata-key".into(),
+            provider_code: provider_code.into(),
+            key_status: "active".into(),
+            share_status: "claimed".into(),
+            supported_providers: vec![],
+            protocol_type: protocol_type.into(),
+            bindings,
+        }
+    }
+
+    #[test]
+    fn lightweight_metadata_uses_exact_binding_axes_and_never_guesses_mock_protocol() {
+        let exact = metadata_item(
+            "mock",
+            "",
+            vec![
+                crate::platform_client::KeyBindingAxis {
+                    provider: "mock".into(),
+                    protocol: "anthropic".into(),
+                },
+                crate::platform_client::KeyBindingAxis {
+                    provider: "mock".into(),
+                    protocol: "openai_compatible".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            metadata_binding_axes(&exact, &[]),
+            vec![
+                ("mock".into(), "anthropic".into()),
+                ("mock".into(), "openai_compatible".into()),
+            ]
+        );
+
+        let ambiguous_legacy_mock = metadata_item("mock", "", vec![]);
+        assert!(
+            metadata_binding_axes(&ambiguous_legacy_mock, &[]).is_empty(),
+            "a multi-protocol supplier without a binding axis must fail closed"
+        );
+
+        let old_single_protocol_server = metadata_item("anthropic", "", vec![]);
+        assert_eq!(
+            metadata_binding_axes(&old_single_protocol_server, &[]),
+            vec![("anthropic".into(), "anthropic".into())],
+            "single-protocol Providers retain rolling-upgrade compatibility"
+        );
     }
 
     #[test]
@@ -6978,12 +7709,21 @@ mod core_tests {
     fn write_bindings_canonical_cleans_stale_alias_row() {
         let (_dir, _lock) = setup_vault();
         // Simulate a pre-fix CLI version that wrote a raw "codex" binding.
-        storage::set_provider_binding("default", "codex", "personal_oauth_account", "stale-uuid")
-            .unwrap();
+        let conn = storage::open_connection().unwrap();
+        conn.execute(
+            "INSERT INTO user_profile_provider_bindings
+             (profile_id, provider_code, binding_provider_code, protocol_type,
+              key_source_type, key_source_ref)
+             VALUES ('default', 'codex', 'openai', 'openai_compatible',
+                     'personal_oauth_account', 'stale-uuid')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
         assert!(storage::list_provider_bindings_readonly("default")
             .unwrap()
             .iter()
-            .any(|b| b.provider_code == "codex"));
+            .any(|b| b.client_route == "codex"));
 
         // Now write canonical via the shared helper.
         write_bindings_canonical(
@@ -6997,14 +7737,14 @@ mod core_tests {
         let bindings = storage::list_provider_bindings_readonly("default").unwrap();
         // Stale raw-alias row must be gone.
         assert!(
-            bindings.iter().all(|b| b.provider_code != "codex"),
+            bindings.iter().all(|b| b.client_route != "codex"),
             "expected no 'codex' row after canonical write, got: {:?}",
             bindings
         );
         // Canonical row must exist with the new ref.
         let row = bindings
             .iter()
-            .find(|b| b.provider_code == "openai")
+            .find(|b| b.client_route == "openai" && b.provider_code == "openai")
             .expect("openai row");
         assert_eq!(row.key_source_ref, "fresh-uuid");
     }
@@ -7089,6 +7829,15 @@ mod core_tests {
         storage::upsert_virtual_key_cache(&e).unwrap();
     }
 
+    fn mock_group_vk(vk: &str, protocol: &str) {
+        let mut e = vk_entry(vk, Some("mock-group"), None, None);
+        e.provider_code = "mock".to_string();
+        e.protocol_type = protocol.to_string();
+        e.base_url = format!("http://127.0.0.1:19082/{}", protocol);
+        e.supported_providers = vec!["mock".to_string()];
+        storage::upsert_virtual_key_cache(&e).unwrap();
+    }
+
     #[test]
     fn auto_assign_skips_material_unreachable_team_vk() {
         let (_dir, _lock) = setup_vault();
@@ -7140,6 +7889,59 @@ mod core_tests {
         )
         .expect("auto_assign ok");
         assert_eq!(assigned, vec!["anthropic".to_string()]);
+    }
+
+    #[test]
+    fn auto_assign_mock_does_not_overwrite_anthropic_client_route() {
+        let (_dir, _lock) = setup_vault();
+        write_bindings_canonical(
+            &["anthropic".to_string()],
+            "personal",
+            "official-anthropic",
+            None,
+        )
+        .unwrap();
+        mock_group_vk("vk-mock-anthropic", "anthropic");
+
+        let assigned = crate::profile_activation::auto_assign_primaries_for_key(
+            "team",
+            "vk-mock-anthropic",
+            &["mock".to_string()],
+            None,
+        )
+        .expect("auto_assign ok");
+
+        assert!(
+            assigned.is_empty(),
+            "occupied client route must not be replaced"
+        );
+        let binding = storage::get_provider_binding("default", "anthropic")
+            .unwrap()
+            .expect("anthropic binding");
+        assert_eq!(binding.provider_code, "anthropic");
+        assert_eq!(binding.key_source_ref, "official-anthropic");
+    }
+
+    #[test]
+    fn auto_assign_mock_fills_empty_anthropic_client_route() {
+        let (_dir, _lock) = setup_vault();
+        mock_group_vk("vk-mock-anthropic", "anthropic");
+
+        let assigned = crate::profile_activation::auto_assign_primaries_for_key(
+            "team",
+            "vk-mock-anthropic",
+            &["mock".to_string()],
+            None,
+        )
+        .expect("auto_assign ok");
+
+        assert_eq!(assigned, vec!["mock".to_string()]);
+        let binding = storage::get_provider_binding("default", "anthropic")
+            .unwrap()
+            .expect("anthropic binding");
+        assert_eq!(binding.provider_code, "mock");
+        assert_eq!(binding.protocol_type, "anthropic");
+        assert_eq!(binding.key_source_ref, "vk-mock-anthropic");
     }
 
     /// Pins the exact incident path: `aikey key sync`'s post-sync reconcile
@@ -7196,6 +7998,38 @@ mod core_tests {
         }
     }
 
+    #[test]
+    fn removal_reconcile_finds_mock_replacement_by_client_route() {
+        let (_dir, _lock) = setup_vault();
+        mock_group_vk("vk-mock-a", "anthropic");
+        mock_group_vk("vk-mock-b", "anthropic");
+        write_bindings_canonical(&["mock".to_string()], "team", "vk-mock-a", None)
+            .expect("bind first Mock account pool key");
+
+        let actions = crate::profile_activation::reconcile_provider_primary_after_key_removal(
+            "team",
+            "vk-mock-a",
+            None,
+        )
+        .expect("reconcile ok");
+        assert!(actions.iter().any(|action| {
+            action.provider_code == "anthropic"
+                && matches!(
+                    &action.outcome,
+                    crate::profile_activation::ReconcileOutcome::Replaced {
+                        new_source_ref,
+                        ..
+                    } if new_source_ref == "vk-mock-b"
+                )
+        }));
+        let binding = storage::get_provider_binding("default", "anthropic")
+            .unwrap()
+            .expect("replacement binding");
+        assert_eq!(binding.provider_code, "mock");
+        assert_eq!(binding.protocol_type, "anthropic");
+        assert_eq!(binding.key_source_ref, "vk-mock-b");
+    }
+
     // ── B-2 bind audit rows (2026-07-06) ─────────────────────────────────────
     //
     // Every binding write through write_bindings_canonical must sign a
@@ -7232,7 +8066,10 @@ mod core_tests {
         write_bindings_canonical(&["anthropic".to_string()], "personal", "k-1", Some(&vk))
             .expect("write");
         let rows = bind_audit_rows();
-        assert_eq!(rows, vec!["anthropic:personal:k-1".to_string()]);
+        assert_eq!(
+            rows,
+            vec!["anthropic:anthropic:anthropic:personal:k-1".to_string()]
+        );
         // Chain integrity: the signed row must VERIFY (a wrong-key signature
         // would surface as a tampered entry and poison the whole chain).
         let pw = SecretString::new("test_password".to_string());
@@ -7286,7 +8123,7 @@ mod core_tests {
         assert_eq!(assigned, vec!["anthropic".to_string()]);
         assert_eq!(
             bind_audit_rows(),
-            vec!["anthropic:team:vk-audit".to_string()],
+            vec!["anthropic:anthropic:anthropic:team:vk-audit".to_string()],
             "the previously-invisible auto-assign write must now leave a signed audit row"
         );
     }
@@ -8185,40 +9022,30 @@ mod sync_prune_tests {
     // prune to mark-stale and `owner_absent_row_is_deleted` fails.
     use super::*;
     use crate::storage;
-    use secrecy::SecretString;
 
-    fn setup_vault() -> (
-        tempfile::TempDir,
-        (
-            std::sync::MutexGuard<'static, ()>,
-            std::sync::MutexGuard<'static, ()>,
-        ),
-    ) {
-        // AK_VAULT_PATH is guarded by storage::TEST_VAULT_LOCK (the vault
-        // lock domain used by core_tests / query / executor / storage
-        // tests). This module used to take ONLY ENV_MUTATION_LOCK here —
-        // the sole offender in the crate — so it raced every vault-lock
-        // test mutating the same var (surfaced 2026-07-13 as a flaky
-        // 2-rows-vs-1 assert here that poisoned the env lock and cascaded
-        // into 22 local_server_probe PoisonErrors). Hold BOTH, in the
-        // crate-wide order established by claude_desktop::p2_tests::
-        // EnvSandbox: ENV_MUTATION_LOCK first, TEST_VAULT_LOCK second.
-        let env_guard = crate::test_env_lock::ENV_MUTATION_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let vault_guard = crate::storage::TEST_VAULT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    fn setup_vault() -> (tempfile::TempDir, crate::test_env_lock::HomeVaultEnvGuard) {
+        // Reuse the shared HOME/vault guard. The former hand-written setup
+        // acquired both locks but never restored process-wide AK_VAULT_PATH on
+        // drop. A later parallel test could then reopen a deleted temp DB while
+        // another migration was running, fail with duplicate-column, and poison
+        // ENV_MUTATION_LOCK for the local_server_probe suite.
         let dir = tempfile::TempDir::new().expect("tempdir");
         let db_path = dir.path().join("vault.db");
-        unsafe {
-            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
-        }
+        let guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
         let mut salt = [0u8; 16];
         crate::crypto::generate_salt(&mut salt).expect("salt");
-        storage::initialize_vault(&salt, &SecretString::new("test_password".to_string()))
-            .expect("init vault");
-        (dir, (env_guard, vault_guard))
+        storage::initialize_vault(
+            &salt,
+            &secrecy::SecretString::new("test_password".to_string()),
+        )
+        .expect("init vault");
+        // initialize_vault creates the baseline tables; normal storage APIs
+        // lazily run the versioned migration registry on their first open.
+        // Complete that lazy phase while this fixture still owns both global
+        // guards, rather than making the first assertion's upsert the migration
+        // trigger in the middle of the parallel test suite.
+        drop(storage::open_connection().expect("migrate test vault"));
+        (dir, guard)
     }
 
     fn cache_entry(vk_id: &str, owner: &str) -> storage::VirtualKeyCacheEntry {

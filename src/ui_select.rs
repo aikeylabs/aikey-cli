@@ -880,6 +880,10 @@ pub struct KeyCandidate {
     pub label: String,
     pub source_type: String, // DB value: "personal", "team", "personal_oauth_account"
     pub source_ref: String,
+    /// Actual upstream supplier selected by this row.
+    pub provider_code: String,
+    /// Exact wire protocol carried by the credential binding.
+    pub protocol_type: String,
     pub display_type: Option<String>, // UI display override (e.g., "oauth(f)"). None → auto from source_type.
     /// Key material not reachable (team VK pending download / not claimed).
     /// Rendered dimmed and NOT selectable — but still VISIBLE, and still shows
@@ -890,20 +894,20 @@ pub struct KeyCandidate {
     pub pending: bool,
 }
 #[derive(Clone)]
-pub struct ProviderGroup {
-    pub provider_code: String,
+pub struct ClientRouteGroup {
+    pub client_route: String,
     pub candidates: Vec<KeyCandidate>,
     pub selected: Option<usize>,
     pub expanded: bool,
 }
 
 pub enum ProviderTreeResult {
-    Confirmed(Vec<ProviderGroup>),
+    Confirmed(Vec<ClientRouteGroup>),
     Cancelled,
 }
 
 pub fn provider_tree_select(
-    groups: &mut Vec<ProviderGroup>,
+    groups: &mut Vec<ClientRouteGroup>,
 ) -> Result<ProviderTreeResult, Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
@@ -927,7 +931,7 @@ pub fn provider_tree_select(
 }
 
 fn fallback_provider_tree(
-    groups: &mut Vec<ProviderGroup>,
+    groups: &mut Vec<ClientRouteGroup>,
 ) -> Result<ProviderTreeResult, Box<dyn std::error::Error>> {
     use std::io::BufRead;
     for g in groups.iter() {
@@ -935,7 +939,7 @@ fn fallback_provider_tree(
             .selected
             .map(|i| g.candidates[i].label.as_str())
             .unwrap_or("(none)");
-        eprintln!("  {} \u{2192} {}", g.provider_code, cur);
+        eprintln!("  {} \u{2192} {}", g.client_route, cur);
         for (i, c) in g.candidates.iter().enumerate() {
             eprintln!(
                 "    {} {} [{}]{}",
@@ -959,7 +963,7 @@ fn fallback_provider_tree(
         }
         if let Some((prov, num)) = line.split_once('=') {
             if let Ok(n) = num.trim().parse::<usize>() {
-                if let Some(g) = groups.iter_mut().find(|g| g.provider_code == prov.trim()) {
+                if let Some(g) = groups.iter_mut().find(|g| g.client_route == prov.trim()) {
                     if n >= 1 && n <= g.candidates.len() {
                         if g.candidates[n - 1].pending {
                             eprintln!(
@@ -979,7 +983,7 @@ fn fallback_provider_tree(
 
 #[derive(Clone)]
 pub(crate) enum TreeRow {
-    Provider(usize),
+    ClientRoute(usize),
     Candidate(usize, usize),
     Blank,
     Separator,
@@ -989,20 +993,14 @@ pub(crate) enum TreeRow {
 
 /// V-layer family-aware: toggle 同 family 全部 group 的 expanded 一起翻转,
 /// 确保 picker 视觉合并时折叠/展开状态一致。Caller 是 Space 键 on Provider header。
-pub(crate) fn family_aware_toggle_expanded(groups: &mut Vec<ProviderGroup>, gi: usize) {
-    let target_fam = crate::provider_registry::family_of(&groups[gi].provider_code);
-    let new_state = !groups[gi].expanded;
-    for og in groups.iter_mut() {
-        if crate::provider_registry::family_of(&og.provider_code) == target_fam {
-            og.expanded = new_state;
-        }
-    }
+pub(crate) fn route_toggle_expanded(groups: &mut Vec<ClientRouteGroup>, gi: usize) {
+    groups[gi].expanded = !groups[gi].expanded;
 }
 
 /// V-layer family-aware: 选中 candidate 时清空同 family 其它 group 的 selection,
 /// picker 层 family-mutex 视觉一致 (DB 层互斥仍由 set_provider_binding transaction 兜底)。
 /// Caller 是 Space 键 on Candidate row。
-pub(crate) fn family_aware_select(groups: &mut Vec<ProviderGroup>, gi: usize, ci: usize) {
+pub(crate) fn route_select(groups: &mut Vec<ClientRouteGroup>, gi: usize, ci: usize) {
     // Pending (material-unreachable) candidates are visible but not selectable —
     // selecting one would recreate the "IN USE but proxy 503s" state the
     // 2026-07-06 binding material guard exists to prevent. Space is a no-op;
@@ -1015,42 +1013,23 @@ pub(crate) fn family_aware_select(groups: &mut Vec<ProviderGroup>, gi: usize, ci
     {
         return;
     }
-    let target_fam = crate::provider_registry::family_of(&groups[gi].provider_code);
-    for (other_gi, og) in groups.iter_mut().enumerate() {
-        if other_gi != gi && crate::provider_registry::family_of(&og.provider_code) == target_fam {
-            og.selected = None;
-        }
-    }
     groups[gi].selected = Some(ci);
 }
 
-pub(crate) fn build_tree_rows(groups: &[ProviderGroup]) -> Vec<TreeRow> {
-    // 2026-05-08 显示层 family-grouping (V-layer render-merge,详见 update/
-    // 20260508-display-family-grouping.md):同 family 的连续 group 共享一个 header,
-    // candidates 按 group 顺序展开在同一 header 下。
-    //
-    // 前提:caller 已按 family-then-code 排好序 (main.rs run_use_picker 里 sort
-    // by (family_of, code)),所以 family 边界与 group 顺序一致。
-    //
-    // M 层零改动:groups 仍是 N 个 ProviderGroup (每 provider_code 一个),candidates
-    // 也保留所属 group 索引;选中绑定时仍读 g.provider_code 写真值 (不是 family)。
+pub(crate) fn build_tree_rows(groups: &[ClientRouteGroup]) -> Vec<TreeRow> {
+    // One header per client route. Provider is row metadata, never a grouping
+    // key, so Mock+anthropic appears under Claude and Mock+openai under Codex.
     let mut rows = Vec::new();
-    let mut prev_family: Option<&'static str> = None;
     for (gi, g) in groups.iter().enumerate() {
-        let cur_family = crate::provider_registry::family_of(&g.provider_code);
-        let new_family = prev_family != Some(cur_family);
-        if new_family {
-            if !rows.is_empty() {
-                rows.push(TreeRow::Blank);
-            }
-            rows.push(TreeRow::Provider(gi));
+        if !rows.is_empty() {
+            rows.push(TreeRow::Blank);
         }
+        rows.push(TreeRow::ClientRoute(gi));
         if g.expanded {
             for ci in 0..g.candidates.len() {
                 rows.push(TreeRow::Candidate(gi, ci));
             }
         }
-        prev_family = Some(cur_family);
     }
     rows
 }
@@ -1060,7 +1039,7 @@ pub(crate) fn is_focusable(row: &TreeRow) -> bool {
 }
 
 /// Compute the maximum visible label width across all candidates in all groups.
-pub(crate) fn max_candidate_label_width(groups: &[ProviderGroup]) -> usize {
+pub(crate) fn max_candidate_label_width(groups: &[ClientRouteGroup]) -> usize {
     groups
         .iter()
         .flat_map(|g| g.candidates.iter())
@@ -1072,7 +1051,7 @@ pub(crate) fn max_candidate_label_width(groups: &[ProviderGroup]) -> usize {
 
 pub(crate) fn format_tree_row(
     row: &TreeRow,
-    groups: &[ProviderGroup],
+    groups: &[ClientRouteGroup],
     is_cursor: bool,
     inner_w: usize,
     label_col_w: usize,
@@ -1085,7 +1064,7 @@ pub(crate) fn format_tree_row(
     };
     let pad_target = inner_w.saturating_sub(4);
     let content = match row {
-        TreeRow::Provider(gi) => {
+        TreeRow::ClientRoute(gi) => {
             let g = &groups[*gi];
             let arrow = if g.expanded {
                 crate::symbols::TREE_EXPANDED.s()
@@ -1101,8 +1080,7 @@ pub(crate) fn format_tree_row(
             // families where the canonical code isn't the brand users
             // recognize. Multi-platform families (kimi) get no alias at
             // family level (see provider_registry::family_display).
-            let family = crate::provider_registry::family_of(&g.provider_code);
-            let (display_name, alias) = crate::provider_registry::family_display(family);
+            let (display_name, alias) = crate::provider_registry::family_display(&g.client_route);
             match alias {
                 Some(a) => format!(
                     "{}{} {} {}",
@@ -1204,7 +1182,7 @@ pub(crate) fn format_tree_row(
 
 #[cfg(unix)]
 fn interactive_provider_tree(
-    groups: &mut Vec<ProviderGroup>,
+    groups: &mut Vec<ClientRouteGroup>,
 ) -> Result<ProviderTreeResult, Box<dyn std::error::Error>> {
     use std::os::unix::io::AsRawFd;
     let tty = std::fs::OpenOptions::new()
@@ -1245,7 +1223,7 @@ fn interactive_provider_tree(
         o: orig,
     };
 
-    let title = "Provider Key Selection";
+    let title = "CLI Route Selection";
     let icon_title = format!("{}{}", crate::symbols::ICON_GLOBE.pre(), title);
     let mut out = io::stderr();
     let mut cursor: usize = 0;
@@ -1257,7 +1235,7 @@ fn interactive_provider_tree(
     write!(
         out,
         "\r\n  {}\r\n",
-        "Pick the default key for each provider.".dimmed()
+        "Pick the default key for each CLI route.".dimmed()
     )?;
     write!(
         out,
@@ -1375,11 +1353,10 @@ fn interactive_provider_tree(
                 }
             }
             Key::Space => {
-                // 2026-05-08 V-layer family-grouping: Space 键 family-aware,详见
-                // family_aware_toggle_expanded / family_aware_select 单测。
+                // A client route is the selection mutex boundary.
                 match &rows[cursor] {
-                    TreeRow::Provider(gi) => family_aware_toggle_expanded(groups, *gi),
-                    TreeRow::Candidate(gi, ci) => family_aware_select(groups, *gi, *ci),
+                    TreeRow::ClientRoute(gi) => route_toggle_expanded(groups, *gi),
+                    TreeRow::Candidate(gi, ci) => route_select(groups, *gi, *ci),
                     _ => {}
                 }
             }
@@ -1400,23 +1377,19 @@ fn interactive_provider_tree(
 }
 
 #[cfg(test)]
-mod family_grouping_tests {
+mod client_route_grouping_tests {
     use super::*;
 
-    // 2026-05-08 显示层 family-grouping (详见 update/20260508-display-family-grouping.md)
-    // 验证 V-layer render-merge 行为:
-    //   - 同 family 连续 group 共享 header
-    //   - 不同 family 独立 header
-    //   - Space 键 family-aware (同步展开 / 同步互斥选中)
-
-    fn group(provider_code: &str, candidate_count: usize, expanded: bool) -> ProviderGroup {
-        ProviderGroup {
-            provider_code: provider_code.to_string(),
+    fn group(client_route: &str, candidate_count: usize, expanded: bool) -> ClientRouteGroup {
+        ClientRouteGroup {
+            client_route: client_route.to_string(),
             candidates: (0..candidate_count)
                 .map(|i| KeyCandidate {
                     label: format!("k{}", i),
                     source_type: "personal".to_string(),
                     source_ref: format!("k{}", i),
+                    provider_code: client_route.to_string(),
+                    protocol_type: "openai_compatible".to_string(),
                     display_type: None,
                     pending: false,
                 })
@@ -1426,9 +1399,9 @@ mod family_grouping_tests {
         }
     }
 
-    fn count_provider_headers(rows: &[TreeRow]) -> usize {
+    fn count_route_headers(rows: &[TreeRow]) -> usize {
         rows.iter()
-            .filter(|r| matches!(r, TreeRow::Provider(_)))
+            .filter(|r| matches!(r, TreeRow::ClientRoute(_)))
             .count()
     }
 
@@ -1437,34 +1410,19 @@ mod family_grouping_tests {
         // anthropic / openai 各自单 platform → 各 1 header (与改前行为一致)
         let groups = vec![group("anthropic", 2, true), group("openai", 1, true)];
         let rows = build_tree_rows(&groups);
-        assert_eq!(count_provider_headers(&rows), 2);
+        assert_eq!(count_route_headers(&rows), 2);
     }
 
     #[test]
-    fn build_tree_rows_kimi_family_three_codes_emit_one_combined_header() {
-        // kimi family 三个 provider_code 必须共享 1 个 header
-        // (caller 已按 family-then-code 排序,所以同 family 相邻)
-        let groups = vec![
-            group("kimi", 1, true),      // family=kimi
-            group("kimi_code", 1, true), // family=kimi
-            group("moonshot", 1, true),  // family=kimi
-        ];
+    fn build_tree_rows_one_header_per_client_route() {
+        let groups = vec![group("anthropic", 1, true), group("openai", 1, true)];
         let rows = build_tree_rows(&groups);
-        assert_eq!(
-            count_provider_headers(&rows),
-            1,
-            "Kimi family 3 个 code 必须只 emit 1 个 header"
-        );
+        assert_eq!(count_route_headers(&rows), 2);
     }
 
     #[test]
-    fn build_tree_rows_kimi_family_candidates_all_under_one_header() {
-        // 三个 group 共 6 个 candidate 都应展开在同一 header 下
-        let groups = vec![
-            group("kimi", 2, true),      // 2 candidates
-            group("kimi_code", 1, true), // 1 candidate
-            group("moonshot", 3, true),  // 3 candidates
-        ];
+    fn build_tree_rows_candidates_stay_under_their_route() {
+        let groups = vec![group("kimi", 6, true)];
         let rows = build_tree_rows(&groups);
         let candidate_count = rows
             .iter()
@@ -1474,29 +1432,11 @@ mod family_grouping_tests {
     }
 
     #[test]
-    fn build_tree_rows_mixed_families_each_family_has_own_header() {
-        // anthropic + kimi family + openai → 3 个 header
-        let groups = vec![
-            group("anthropic", 1, true),
-            group("kimi", 1, true),
-            group("kimi_code", 1, true),
-            group("moonshot", 1, true),
-            group("openai", 1, true),
-        ];
-        let rows = build_tree_rows(&groups);
-        assert_eq!(
-            count_provider_headers(&rows),
-            3,
-            "anthropic / kimi family / openai → 各 1 header"
-        );
-    }
-
-    #[test]
     fn build_tree_rows_collapsed_group_no_candidates_emitted() {
         // collapsed group 不展开 candidates,但 header 仍显示
         let groups = vec![group("anthropic", 3, false)];
         let rows = build_tree_rows(&groups);
-        assert_eq!(count_provider_headers(&rows), 1);
+        assert_eq!(count_route_headers(&rows), 1);
         assert_eq!(
             rows.iter()
                 .filter(|r| matches!(r, TreeRow::Candidate(_, _)))
@@ -1506,68 +1446,19 @@ mod family_grouping_tests {
     }
 
     #[test]
-    fn family_aware_toggle_synchronizes_kimi_family_expansion() {
-        // toggle 任一 group 必须同步同 family 全部 group
-        let mut groups = vec![
-            group("anthropic", 1, true), // 控制组,不应被影响
-            group("kimi", 1, true),
-            group("kimi_code", 1, true),
-            group("moonshot", 1, true),
-        ];
-        // 折叠 kimi family (toggle index 1 即 kimi group)
-        family_aware_toggle_expanded(&mut groups, 1);
-        assert_eq!(groups[0].expanded, true, "anthropic 不受影响");
-        assert_eq!(groups[1].expanded, false, "kimi → collapsed");
-        assert_eq!(groups[2].expanded, false, "kimi_code → 同 family 跟随");
-        assert_eq!(groups[3].expanded, false, "moonshot → 同 family 跟随");
-        // 展开回去 (toggle index 2 即 kimi_code group, 应同样同步)
-        family_aware_toggle_expanded(&mut groups, 2);
-        assert_eq!(groups[1].expanded, true);
-        assert_eq!(groups[2].expanded, true);
-        assert_eq!(groups[3].expanded, true);
+    fn route_toggle_only_changes_the_target_route() {
+        let mut groups = vec![group("anthropic", 1, true), group("openai", 1, true)];
+        route_toggle_expanded(&mut groups, 0);
+        assert!(!groups[0].expanded);
+        assert!(groups[1].expanded);
     }
 
     #[test]
-    fn family_aware_select_kimi_family_mutex_clears_other_selections() {
-        // 选中 kimi family 内一个 candidate 时,同 family 其它 group 的 selection 清空
-        let mut groups = vec![
-            group("anthropic", 1, true),
-            group("kimi_code", 1, true),
-            group("moonshot", 1, true),
-        ];
-        // 先选中 anthropic 和 moonshot
-        groups[0].selected = Some(0);
-        groups[2].selected = Some(0);
-        // 现在选中 kimi_code candidate
-        family_aware_select(&mut groups, 1, 0);
-        assert_eq!(
-            groups[0].selected,
-            Some(0),
-            "anthropic 不受影响 (跨 family)"
-        );
-        assert_eq!(groups[1].selected, Some(0), "kimi_code 选中");
-        assert_eq!(groups[2].selected, None, "moonshot 同 family 互斥被清");
-    }
-
-    #[test]
-    fn family_aware_select_does_not_clear_self_selection() {
-        // 选中本组的 candidate (不清空自己)
-        let mut groups = vec![group("kimi_code", 2, true)];
-        family_aware_select(&mut groups, 0, 1);
+    fn route_select_changes_only_that_route() {
+        let mut groups = vec![group("anthropic", 2, true), group("openai", 1, true)];
+        groups[1].selected = Some(0);
+        route_select(&mut groups, 0, 1);
         assert_eq!(groups[0].selected, Some(1));
-    }
-
-    #[test]
-    fn family_aware_toggle_independent_families_unaffected() {
-        // 切 anthropic 不影响 kimi family
-        let mut groups = vec![
-            group("anthropic", 1, true),
-            group("kimi", 1, true),
-            group("moonshot", 1, true),
-        ];
-        family_aware_toggle_expanded(&mut groups, 0);
-        assert_eq!(groups[0].expanded, false, "anthropic 折叠");
-        assert_eq!(groups[1].expanded, true, "kimi 不受影响");
-        assert_eq!(groups[2].expanded, true, "moonshot 不受影响");
+        assert_eq!(groups[1].selected, Some(0));
     }
 }

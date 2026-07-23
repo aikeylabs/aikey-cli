@@ -13,16 +13,55 @@
 
 use std::collections::HashSet;
 
-use crate::commands_account::{
-    provider_env_vars_pub, provider_extra_env_vars_pub, provider_proxy_prefix_pub,
-};
+use crate::commands_account::{provider_env_vars_pub, provider_extra_env_vars_pub};
 use crate::commands_proxy;
 use crate::credential_type;
 use crate::storage::{self, ProviderBinding};
 use colored::Colorize;
 
+/// Shell variables emitted by short-lived, pre-four-axis projections. They
+/// are deliberately kept outside the provider registry: registering them
+/// would reintroduce Mock Provider as a client route. New active.env files
+/// must unset them so re-sourcing also cleans already-running shells.
+const LEGACY_PROJECTION_ENV_VARS: &[&str] = &[
+    "AIKEY_MOCK_PROVIDER_TOKEN",
+    "AIKEY_MOCK_PROVIDER_BASE_URL",
+    "AIKEY_ACTIVE_CLIENT_ROUTES",
+];
+
 /// Default profile id used throughout v1.0.2 (implicit unique profile).
 pub const DEFAULT_PROFILE: &str = "default";
+
+/// Render the value stored beside a client route in `AIKEY_ACTIVE_KEYS`.
+///
+/// This is deliberately shared with lifecycle audit: the generated env file
+/// and its verifier must resolve OAuth identities and Team-key aliases with
+/// the same rule, otherwise every healthy non-personal binding looks stale.
+pub(crate) fn active_binding_display(binding: &ProviderBinding) -> String {
+    match binding.key_source_type {
+        credential_type::CredentialType::PersonalOAuthAccount => {
+            if let Ok(Some(account)) = storage::get_provider_account(&binding.key_source_ref) {
+                account
+                    .display_identity
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| account.external_id.as_deref().filter(|s| !s.is_empty()))
+                    .unwrap_or(&binding.key_source_ref)
+                    .to_string()
+            } else {
+                binding.key_source_ref.clone()
+            }
+        }
+        credential_type::CredentialType::ManagedVirtualKey => {
+            storage::get_virtual_key_cache(&binding.key_source_ref)
+                .ok()
+                .flatten()
+                .map(|entry| entry.local_alias.unwrap_or(entry.alias))
+                .unwrap_or_else(|| binding.key_source_ref.clone())
+        }
+        credential_type::CredentialType::PersonalApiKey => binding.key_source_ref.clone(),
+    }
+}
 
 /// For every env var registered in `provider_registry::entries()` that was
 /// NOT in `emitted_export_vars`, append an `unset VAR 2>/dev/null` line to
@@ -59,11 +98,48 @@ fn append_unset_lines_for_inactive_providers(
         };
     for entry in crate::provider_registry::entries() {
         let (api_key_var, base_url_var) = entry.env_vars;
-        emit(env_lines, api_key_var, &mut already_unset);
-        emit(env_lines, base_url_var, &mut already_unset);
+        if !api_key_var.is_empty() {
+            emit(env_lines, api_key_var, &mut already_unset);
+        }
+        if !base_url_var.is_empty() {
+            emit(env_lines, base_url_var, &mut already_unset);
+        }
         for (extra_var, _) in entry.extra_env_vars {
             emit(env_lines, extra_var, &mut already_unset);
         }
+    }
+}
+
+fn append_unset_lines_for_legacy_projections(env_lines: &mut Vec<String>) {
+    env_lines.extend(
+        LEGACY_PROJECTION_ENV_VARS
+            .iter()
+            .map(|var| format!("unset {} 2>/dev/null", var)),
+    );
+}
+
+/// Insert or replace one generated export while keeping active.env and its
+/// shell-free `.flat` mirror byte-for-byte consistent.
+fn upsert_active_export(
+    env_lines: &mut Vec<String>,
+    flat_pairs: &mut Vec<(String, String)>,
+    emitted_export_vars: &mut HashSet<String>,
+    var: &str,
+    value: &str,
+) {
+    let rendered = crate::shell_quote::active_env_export_line(var, value);
+    if emitted_export_vars.insert(var.to_string()) {
+        env_lines.push(rendered);
+        flat_pairs.push((var.to_string(), value.to_string()));
+        return;
+    }
+
+    let prefix = format!("export {}=", var);
+    if let Some(line) = env_lines.iter_mut().find(|line| line.starts_with(&prefix)) {
+        *line = rendered;
+    }
+    if let Some((_, existing)) = flat_pairs.iter_mut().find(|(key, _)| key == var) {
+        *existing = value.to_string();
     }
 }
 
@@ -113,6 +189,7 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
     // registry-known vars need an `unset` line at the end (see comment
     // before the unset loop for rationale).
     let mut emitted_export_vars: HashSet<String> = HashSet::new();
+    let mut anthropic_approval_tokens: Vec<String> = Vec::new();
 
     // 2026-05-08 Kimi family corrupt-state pre-scan(详见 update/20260508-Kimi-family
     // 互斥-active-env统一KIMI写入.md 决策 #4):
@@ -147,7 +224,17 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             continue;
         }
 
-        if let Some((api_key_var, base_url_var)) = provider_env_vars_pub(&b.provider_code) {
+        if let Some((api_key_var, base_url_var)) = provider_env_vars_pub(&b.client_route) {
+            let Some(proxy_path) = crate::provider_registry::proxy_path_for_binding(
+                &b.provider_code,
+                &b.protocol_type,
+            ) else {
+                eprintln!(
+                    "  [aikey] WARN: skipping invalid active binding provider={} protocol={} route={}",
+                    b.provider_code, b.protocol_type, b.client_route
+                );
+                continue;
+            };
             // Canonicalize before deriving the sentinel. See
             // sentinel_token's doc-comment + spec §6.1 in
             // 20260429-token前缀按角色重命名.md: `<provider>` MUST be a
@@ -156,33 +243,22 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             // whose provider_code is e.g. "claude.ai" would produce
             // `aikey_active_claude.ai`, breaking the namespace-isolation
             // invariant in §3 and the proxy `aikey_*` tier switch.
-            let canonical_provider = crate::commands_account::oauth_provider_to_canonical(
-                &b.provider_code.to_lowercase(),
+            let canonical_route = crate::commands_account::oauth_provider_to_canonical(
+                &b.client_route.to_lowercase(),
             );
             // §5.5 PER-PROVIDER routing (this IS the single write-path for
-            // `aikey use`): a managed VK whose user is on a cluster → the central
-            // node + that VK's real token; every other binding (personal/native/
-            // OAuth, or a managed VK in a non-cluster deployment) → local proxy +
-            // sentinel. Mixed local-key + cluster-VK bindings coexist, each
-            // provider routed to its own proxy.
+            // `aikey use`): a direct-bind managed VK whose user is on a cluster
+            // → the central node + that VK's real token; every other binding
+            // (personal/native/OAuth, Team OAuth account-pool VK, or a direct-bind
+            // VK in a non-cluster deployment) → local proxy + sentinel. Mixed
+            // local-key + cluster-VK bindings coexist per provider.
             let (token, base_url) =
                 match crate::commands_account::cluster_route(&b.key_source_type, &b.key_source_ref)
                 {
-                    Some((node, vk_token)) => (
-                        vk_token,
-                        format!(
-                            "http://{}/{}",
-                            node,
-                            provider_proxy_prefix_pub(&b.provider_code)
-                        ),
-                    ),
+                    Some((node, vk_token)) => (vk_token, format!("http://{}/{}", node, proxy_path)),
                     None => (
-                        sentinel_token(canonical_provider),
-                        format!(
-                            "http://127.0.0.1:{}/{}",
-                            proxy_port,
-                            provider_proxy_prefix_pub(&b.provider_code)
-                        ),
+                        sentinel_token(canonical_route),
+                        format!("http://127.0.0.1:{}/{}", proxy_port, proxy_path),
                     ),
                 };
             // 2026-05-08 Kimi 双平台拆分 review self-review fix: 如果同一个 env
@@ -193,28 +269,30 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             // + bug-trace 噪声)。emitted_export_vars HashSet 已经在跟踪此信息,
             // 这里复用它做幂等门控。
             if !emitted_export_vars.contains(api_key_var) {
-                env_lines.push(crate::shell_quote::active_env_export_line(
+                upsert_active_export(
+                    &mut env_lines,
+                    &mut flat_pairs,
+                    &mut emitted_export_vars,
                     api_key_var,
                     &token,
-                ));
-                flat_pairs.push((api_key_var.to_string(), token.clone()));
-                emitted_export_vars.insert(api_key_var.to_string());
+                );
             }
             // Why: Codex v0.118+ warns when OPENAI_BASE_URL env var is set,
             // because it now reads openai_base_url from ~/.codex/config.toml.
             // We inject that config via configure_codex_cli(), so skip the
             // env var to avoid the deprecation warning.
             let skip_base_url = matches!(
-                b.provider_code.to_lowercase().as_str(),
+                b.client_route.to_lowercase().as_str(),
                 "openai" | "gpt" | "chatgpt"
             );
             if !skip_base_url && !emitted_export_vars.contains(base_url_var) {
-                env_lines.push(crate::shell_quote::active_env_export_line(
+                upsert_active_export(
+                    &mut env_lines,
+                    &mut flat_pairs,
+                    &mut emitted_export_vars,
                     base_url_var,
                     &base_url,
-                ));
-                flat_pairs.push((base_url_var.to_string(), base_url.clone()));
-                emitted_export_vars.insert(base_url_var.to_string());
+                );
             }
             // Provider-specific extras (e.g. KIMI_MODEL_NAME for the
             // minimal-scaffold Kimi config — see commands_account docstring).
@@ -222,14 +300,19 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
             // 作为 extra,不去重则重复出现)。
             for (extra_var, extra_val) in provider_extra_env_vars_pub(&b.provider_code) {
                 if !emitted_export_vars.contains(extra_var) {
-                    env_lines.push(crate::shell_quote::active_env_export_line(
-                        extra_var, extra_val,
-                    ));
-                    flat_pairs.push((extra_var.to_string(), extra_val.to_string()));
-                    emitted_export_vars.insert(extra_var.to_string());
+                    upsert_active_export(
+                        &mut env_lines,
+                        &mut flat_pairs,
+                        &mut emitted_export_vars,
+                        extra_var,
+                        extra_val,
+                    );
                 }
             }
-            activated_providers.push(b.provider_code.clone());
+            if b.client_route == "anthropic" && !anthropic_approval_tokens.contains(&token) {
+                anthropic_approval_tokens.push(token);
+            }
+            activated_providers.push(b.client_route.clone());
         }
     }
 
@@ -259,30 +342,8 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
     // Covers all credential types: personal API key (alias), team key (alias), OAuth (email).
     let mut active_pairs: Vec<String> = Vec::new();
     for b in &bindings {
-        let display = match b.key_source_type {
-            credential_type::CredentialType::PersonalOAuthAccount => {
-                if let Ok(Some(acct)) = storage::get_provider_account(&b.key_source_ref) {
-                    acct.display_identity
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| acct.external_id.as_deref().filter(|s| !s.is_empty()))
-                        .unwrap_or(&b.key_source_ref)
-                        .to_string()
-                } else {
-                    b.key_source_ref.clone()
-                }
-            }
-            credential_type::CredentialType::ManagedVirtualKey => {
-                // Team key: try to resolve local alias, fallback to virtual_key_id
-                storage::get_virtual_key_cache(&b.key_source_ref)
-                    .ok()
-                    .flatten()
-                    .map(|e| e.local_alias.unwrap_or(e.alias))
-                    .unwrap_or_else(|| b.key_source_ref.clone())
-            }
-            _ => b.key_source_ref.clone(), // Personal API key: alias is the ref
-        };
-        active_pairs.push(format!("{}={}", b.provider_code, display));
+        let display = active_binding_display(b);
+        active_pairs.push(format!("{}={}", b.client_route, display));
     }
     if !active_pairs.is_empty() {
         // PRIMARY injection surface: active_pairs embed the display alias of
@@ -299,6 +360,10 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
         env_lines.push("unset AIKEY_ACTIVE_KEYS 2>/dev/null".to_string());
     }
 
+    // Remove all short-lived provider-keyed projections if an older
+    // active.env introduced them. The binding row is the complete route truth.
+    append_unset_lines_for_legacy_projections(&mut env_lines);
+
     // Write active.env
     write_active_env_file(&env_lines, &flat_pairs)?;
 
@@ -314,7 +379,7 @@ pub fn refresh_implicit_profile_activation() -> Result<RefreshResult, String> {
     // Anthropic marked closed-not-planned). A failure here just degrades to
     // the original symptom — equivalent to current state — so we warn and
     // continue rather than aborting the whole activation.
-    if let Err(e) = write_claude_json_approvals(&bindings) {
+    if let Err(e) = write_claude_json_approvals(&anthropic_approval_tokens) {
         eprintln!(
             "{}",
             format!(
@@ -437,25 +502,27 @@ pub fn auto_assign_primaries_for_key(
             continue;
         }
 
-        let existing = storage::get_provider_binding(DEFAULT_PROFILE, &canonical)?;
-        if existing.is_none() {
-            // Funnels through the shared canonical-write helper so any
-            // stale non-canonical alias row (e.g. a prior "codex" row from
-            // a pre-fix CLI) is cleaned up as a side effect.
-            crate::commands_account::write_bindings_canonical(
-                &[canonical.clone()],
-                key_source_type,
-                key_source_ref,
-                audit,
-            )?;
+        // Fill empty CLIENT ROUTES atomically. Provider is the upstream
+        // supplier, not the user's selection slot: `mock + anthropic` must
+        // respect an existing official-Anthropic primary, and vice versa.
+        let written_routes = crate::commands_account::write_unbound_bindings_canonical(
+            &[canonical.clone()],
+            key_source_type,
+            key_source_ref,
+            audit,
+        )?;
+        if !written_routes.is_empty() {
             // Traceability (2026-07-06): automatic binding writes bypass the
             // user-facing audit chain, so they MUST leave a structured event —
             // this write was previously invisible in every log store.
             crate::observability::log_event(
                 crate::observability::EVENT_CLI_BINDING_AUTO_ASSIGNED,
                 &format!(
-                    "auto-assigned {} ({}) as primary for {}",
-                    key_source_ref, key_source_type, canonical
+                    "auto-assigned {} ({}) as primary for {} via provider {}",
+                    key_source_ref,
+                    key_source_type,
+                    written_routes.join(","),
+                    canonical
                 ),
             );
             newly_assigned.push(canonical);
@@ -504,45 +571,69 @@ pub fn reconcile_provider_primary_after_key_removal(
     audit: Option<&crate::audit::VerifiedVaultKey>,
 ) -> Result<Vec<ReconcileAction>, String> {
     // Remove all bindings referencing this key.
-    let affected_providers =
+    let affected_bindings =
         storage::remove_bindings_by_key_source(DEFAULT_PROFILE, key_source_type, key_source_ref)?;
 
     let mut actions: Vec<ReconcileAction> = Vec::new();
 
-    for provider in &affected_providers {
-        // Try to find a replacement candidate.
-        let replacement = find_replacement_candidate(provider, key_source_type, key_source_ref)?;
+    for removed in &affected_bindings {
+        // Replacement compatibility is defined by the client route. Requiring
+        // the same supplier would incorrectly exclude Mock+Anthropic from an
+        // Anthropic slot (and official Anthropic from the inverse case).
+        let replacement =
+            find_replacement_candidate(&removed.client_route, key_source_type, key_source_ref)?;
         match replacement {
-            Some((src_type, src_ref)) => {
-                // Canonical-write (2026-04-24 rule) — replacement bindings
-                // go through the same helper as every other write path so
-                // stale alias rows self-heal.
-                crate::commands_account::write_bindings_canonical(
-                    &[provider.clone()],
-                    &src_type,
-                    &src_ref,
-                    audit,
+            Some(candidate) => {
+                storage::set_client_route_binding(
+                    DEFAULT_PROFILE,
+                    &removed.client_route,
+                    &candidate.provider_code,
+                    &candidate.protocol_type,
+                    &candidate.source_type,
+                    &candidate.source_ref,
                 )?;
+                if let Some(vk) = audit {
+                    if let Err(err) = crate::audit::log_audit_event_from_vault_key(
+                        vk.as_bytes(),
+                        crate::audit::AuditOperation::Bind,
+                        Some(&format!(
+                            "{}:{}:{}:{}:{}",
+                            removed.client_route,
+                            candidate.provider_code,
+                            candidate.protocol_type,
+                            candidate.source_type,
+                            candidate.source_ref
+                        )),
+                        true,
+                    ) {
+                        eprintln!("[aikey] warning: bind audit row not written: {}", err);
+                    }
+                }
                 // Traceability (2026-07-06): automatic binding writes must
                 // leave a structured event (see auto_assign counterpart).
                 crate::observability::log_event(
                     crate::observability::EVENT_CLI_BINDING_RECONCILED,
                     &format!(
-                        "reconcile promoted {} ({}) as primary for {} after removal of {} ({})",
-                        src_ref, src_type, provider, key_source_ref, key_source_type
+                        "reconcile promoted {} ({}) as primary for {} via provider {} after removal of {} ({})",
+                        candidate.source_ref,
+                        candidate.source_type,
+                        removed.client_route,
+                        candidate.provider_code,
+                        key_source_ref,
+                        key_source_type
                     ),
                 );
                 actions.push(ReconcileAction {
-                    provider_code: provider.clone(),
+                    provider_code: removed.client_route.clone(),
                     outcome: ReconcileOutcome::Replaced {
-                        new_source_type: src_type,
-                        new_source_ref: src_ref,
+                        new_source_type: candidate.source_type,
+                        new_source_ref: candidate.source_ref,
                     },
                 });
             }
             None => {
                 actions.push(ReconcileAction {
-                    provider_code: provider.clone(),
+                    provider_code: removed.client_route.clone(),
                     outcome: ReconcileOutcome::Cleared,
                 });
             }
@@ -593,7 +684,7 @@ fn sync_active_key_config_from_bindings(bindings: &[ProviderBinding]) -> Result<
 
     // Use the first binding as the representative key.
     let first = &bindings[0];
-    let all_providers: Vec<String> = bindings.iter().map(|b| b.provider_code.clone()).collect();
+    let all_providers: Vec<String> = bindings.iter().map(|b| b.client_route.clone()).collect();
 
     storage::set_active_key_config(&storage::ActiveKeyConfig {
         key_type: first.key_source_type.clone(),
@@ -603,10 +694,70 @@ fn sync_active_key_config_from_bindings(bindings: &[ProviderBinding]) -> Result<
     Ok(())
 }
 
+/// Resolve the effective wire protocol for one active Provider binding.
+///
+/// Team VKs carry an explicit protocol in the local binding-granular cache.
+/// Personal/OAuth entries are resolved from their stored endpoint through the
+/// canonical fingerprint. The stored protocol is authoritative; the fallback
+/// exists only for pre-two-axis rows.
+pub fn resolve_binding_protocol(binding: &ProviderBinding) -> String {
+    if !binding.protocol_type.is_empty() {
+        return binding.protocol_type.clone();
+    }
+    use crate::credential_type::CredentialType;
+    let classifier = crate::commands_internal::parse::provider_fingerprint::instance();
+    let via_base_url = |base_url: &str, fallback: &str| -> Option<String> {
+        classifier
+            .route_for_base_url(base_url)
+            .map(|route| route.protocol.clone())
+            .filter(|protocol| !protocol.is_empty())
+            .or_else(|| (!fallback.is_empty()).then(|| fallback.to_string()))
+    };
+
+    let resolved = match binding.key_source_type {
+        CredentialType::ManagedVirtualKey => {
+            storage::list_virtual_key_cache_bindings(&binding.key_source_ref)
+                .ok()
+                .and_then(|rows| {
+                    let mut candidates = rows
+                        .into_iter()
+                        .filter(|vk| {
+                            binding.provider_code.is_empty()
+                                || vk
+                                    .provider_code
+                                    .eq_ignore_ascii_case(&binding.provider_code)
+                                || (vk.provider_code.is_empty()
+                                    && vk.supported_providers.iter().any(|provider| {
+                                        provider.eq_ignore_ascii_case(&binding.provider_code)
+                                    }))
+                        })
+                        .filter_map(|vk| via_base_url(&vk.base_url, &vk.protocol_type));
+                    let first = candidates.next()?;
+                    candidates
+                        .all(|protocol| protocol == first)
+                        .then_some(first)
+                })
+        }
+        _ => storage::get_entry_base_url(&binding.key_source_ref)
+            .ok()
+            .flatten()
+            .and_then(|url| via_base_url(&url, "")),
+    };
+
+    resolved.unwrap_or_else(|| {
+        let protocols = classifier.protocols_for_provider(&binding.provider_code);
+        if protocols.len() == 1 {
+            protocols[0].clone()
+        } else {
+            "unknown".to_string()
+        }
+    })
+}
+
 /// Builds the sentinel token that the proxy expects in env vars for the
 /// "follow active binding" routing semantic.
 ///
-/// The token is per-provider (e.g. `aikey_active_anthropic`) — independent of
+/// The token is per-client-route (e.g. `aikey_active_anthropic`) — independent of
 /// which credential is currently bound. The proxy's tier-3 fallthrough uses
 /// the URL path's canonical provider code to look up the active binding from
 /// the vault DB on every request, so the suffix here is purely informational
@@ -617,8 +768,8 @@ fn sync_active_key_config_from_bindings(bindings: &[ProviderBinding]) -> Result<
 /// bugs.
 ///
 /// Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md
-fn sentinel_token(canonical_provider: &str) -> String {
-    format!("aikey_active_{}", canonical_provider)
+fn sentinel_token(client_route: &str) -> String {
+    format!("aikey_active_{}", client_route)
 }
 
 /// Writes the env lines to `~/.aikey/active.env` atomically.
@@ -729,26 +880,12 @@ fn write_active_env_file_at(
 /// code may have an open handle on `~/.claude.json` while we try to
 /// rewrite — same sharing-violation class as the
 /// 2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure bug.
-fn write_claude_json_approvals(bindings: &[ProviderBinding]) -> Result<(), String> {
-    // Collect last-20-char tails of every anthropic-bound sentinel token.
-    // Dedupe inside this batch (one provider may appear once; defensive).
+fn write_claude_json_approvals(tokens: &[String]) -> Result<(), String> {
+    // Approve the token Claude will actually receive from the anthropic client
+    // route, independent of which Provider implements that binding.
     let mut tails: Vec<String> = Vec::new();
-    for b in bindings {
-        let canonical =
-            crate::commands_account::oauth_provider_to_canonical(&b.provider_code.to_lowercase());
-        if canonical != "anthropic" {
-            continue;
-        }
-        // Pass the canonical provider — the upstream MAC refactor
-        // (20260429-token前缀按角色重命名) collapsed sentinel_token to a
-        // single canonical_provider arg, but missed propagating the
-        // signature change here. Using `&canonical` produces
-        // `aikey_active_anthropic`, matching the cross-role invariant
-        // documented in sentinel_token's doc-comment ("sentinel stays
-        // the same; only the binding table changes" across role
-        // switches).
-        let tok = sentinel_token(&canonical);
-        let tail = last_n_chars(&tok, 20);
+    for token in tokens {
+        let tail = last_n_chars(token, 20);
         if !tails.contains(&tail) {
             tails.push(tail);
         }
@@ -1031,21 +1168,18 @@ pub(crate) fn is_running_elevated() -> bool {
 ///
 /// Strategy: oldest personal key first, then oldest team key.
 /// The removed key (`excluded_type`/`excluded_ref`) is skipped.
+struct ReplacementCandidate {
+    source_type: String,
+    source_ref: String,
+    provider_code: String,
+    protocol_type: String,
+}
+
 fn find_replacement_candidate(
-    provider_code: &str,
+    client_route: &str,
     excluded_type: &str,
     excluded_ref: &str,
-) -> Result<Option<(String, String)>, String> {
-    // Canonicalize the target on entry, then canonicalize each candidate's
-    // provider on comparison. Why both sides: bindings rows go through
-    // `write_bindings_canonical`, but personal entries / VK cache rows from
-    // earlier code paths or server payloads can still hold raw OAuth /
-    // broker vocabulary (`claude` / `codex` / `moonshot`). A naïve `==`
-    // would silently miss a perfectly valid replacement and the user
-    // would see "no candidate" despite having one — same family as the
-    // 2026-04-25 activate canonicalization bug.
-    let target = crate::commands_account::oauth_provider_to_canonical(provider_code);
-
+) -> Result<Option<ReplacementCandidate>, String> {
     // Search personal keys, sorted by created_at (oldest first) for
     // deterministic "earliest added" backfill order.
     let mut entries = storage::list_entries_with_metadata().unwrap_or_default();
@@ -1054,12 +1188,19 @@ fn find_replacement_candidate(
         if entry.alias == excluded_ref && excluded_type == "personal" {
             continue;
         }
-        let providers = resolve_providers_for_entry(entry);
-        if providers
-            .iter()
-            .any(|p| crate::commands_account::oauth_provider_to_canonical(p) == target)
+        if let Ok((provider_code, protocol_type)) =
+            crate::commands_account::binding_spec_for_client_route(
+                client_route,
+                "personal",
+                &entry.alias,
+            )
         {
-            return Ok(Some(("personal".to_string(), entry.alias.clone())));
+            return Ok(Some(ReplacementCandidate {
+                source_type: "personal".to_string(),
+                source_ref: entry.alias.clone(),
+                provider_code,
+                protocol_type,
+            }));
         }
     }
 
@@ -1084,43 +1225,23 @@ fn find_replacement_candidate(
         if !vk.key_material_reachable(on_cluster) {
             continue;
         }
-        let providers = if !vk.supported_providers.is_empty() {
-            &vk.supported_providers
-        } else if !vk.provider_code.is_empty() {
-            // Borrow a temporary vec — just check inline.
-            if crate::commands_account::oauth_provider_to_canonical(&vk.provider_code) == target {
-                return Ok(Some(("team".to_string(), vk.virtual_key_id.clone())));
-            }
-            continue;
-        } else {
-            continue;
-        };
-        if providers
-            .iter()
-            .any(|p| crate::commands_account::oauth_provider_to_canonical(p) == target)
+        if let Ok((provider_code, protocol_type)) =
+            crate::commands_account::binding_spec_for_client_route(
+                client_route,
+                "team",
+                &vk.virtual_key_id,
+            )
         {
-            return Ok(Some(("team".to_string(), vk.virtual_key_id.clone())));
+            return Ok(Some(ReplacementCandidate {
+                source_type: "team".to_string(),
+                source_ref: vk.virtual_key_id.clone(),
+                provider_code,
+                protocol_type,
+            }));
         }
     }
 
     Ok(None)
-}
-
-/// Resolve providers for a personal key entry using the same priority as
-/// `storage::resolve_supported_providers`, but without an extra DB call
-/// (we already have the metadata in memory).
-fn resolve_providers_for_entry(entry: &storage::SecretMetadata) -> Vec<String> {
-    if let Some(ref sp) = entry.supported_providers {
-        if !sp.is_empty() {
-            return sp.clone();
-        }
-    }
-    if let Some(ref code) = entry.provider_code {
-        if !code.is_empty() {
-            return vec![code.clone()];
-        }
-    }
-    vec![]
 }
 
 #[cfg(test)]
@@ -1134,6 +1255,19 @@ mod unset_inactive_tests {
     //! Tests target the pure helper `append_unset_lines_for_inactive_providers`
     //! so they run without a real vault DB.
     use super::*;
+
+    #[test]
+    fn legacy_mock_projection_is_explicitly_unset() {
+        let mut lines = Vec::new();
+        append_unset_lines_for_legacy_projections(&mut lines);
+        let blob = lines.join("\n");
+        for var in LEGACY_PROJECTION_ENV_VARS {
+            assert!(
+                blob.contains(&format!("unset {} 2>/dev/null", var)),
+                "expected legacy projection {var} to be unset, got:\n{blob}"
+            );
+        }
+    }
 
     #[test]
     fn unset_emitted_for_kimi_when_only_anthropic_active() {
@@ -1206,6 +1340,9 @@ mod unset_inactive_tests {
         // Sanity: every registry entry's api_key_var must show up.
         for entry in crate::provider_registry::entries() {
             let (api_key_var, _) = entry.env_vars;
+            if api_key_var.is_empty() {
+                continue;
+            }
             assert!(
                 blob.contains(&format!("unset {} 2>/dev/null", api_key_var)),
                 "missing `unset {}` for empty-active state, got:\n{}",
@@ -1222,8 +1359,12 @@ mod unset_inactive_tests {
         let mut exported = HashSet::new();
         for entry in crate::provider_registry::entries() {
             let (api, base) = entry.env_vars;
-            exported.insert(api.to_string());
-            exported.insert(base.to_string());
+            if !api.is_empty() {
+                exported.insert(api.to_string());
+            }
+            if !base.is_empty() {
+                exported.insert(base.to_string());
+            }
             for (extra_var, _) in entry.extra_env_vars {
                 exported.insert(extra_var.to_string());
             }

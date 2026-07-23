@@ -57,10 +57,10 @@ use windows_sys::Win32::System::Console::{
 // + KEY_EVENT_RECORD parsing, which doesn't need VT input mode.
 
 use crate::ui_select::{
-    build_tree_rows, compute_inner_w, family_aware_select, family_aware_toggle_expanded,
-    format_multi_row, format_row, format_tree_row, is_focusable, max_candidate_label_width,
-    next_selectable, redraw_multi_one, redraw_multi_two, redraw_two, Key, MultiSelectResult,
-    ProviderGroup, ProviderTreeResult, SelectResult, TreeRow,
+    build_tree_rows, compute_inner_w, format_multi_row, format_row, format_tree_row, is_focusable,
+    max_candidate_label_width, next_selectable, redraw_multi_one, redraw_multi_two, redraw_two,
+    route_select, route_toggle_expanded, ClientRouteGroup, Key, MultiSelectResult,
+    ProviderTreeResult, SelectResult, TreeRow,
 };
 
 // Width / padding helpers live in ui_frame (cross-platform).
@@ -652,11 +652,11 @@ pub(crate) fn interactive_multi_select_windows(
 // ============================================================================
 
 pub(crate) fn interactive_provider_tree_windows(
-    groups: &mut Vec<ProviderGroup>,
+    groups: &mut Vec<ClientRouteGroup>,
 ) -> Result<ProviderTreeResult, Box<dyn std::error::Error>> {
     let rc = RawConsole::open()?;
 
-    let title = "Provider Key Selection";
+    let title = "CLI Route Selection";
     let icon_title = format!("{}{}", crate::symbols::ICON_GLOBE.pre(), title);
     let mut out = io::stderr();
     let mut cursor: usize = 0;
@@ -767,8 +767,8 @@ pub(crate) fn interactive_provider_tree_windows(
             // 2026-05-08 V-layer family-grouping: Space 键 family-aware (与 ui_select.rs Unix
             // 路径同款),详见 update/20260508-display-family-grouping.md。
             Key::Space => match &rows[cursor] {
-                TreeRow::Provider(gi) => family_aware_toggle_expanded(groups, *gi),
-                TreeRow::Candidate(gi, ci) => family_aware_select(groups, *gi, *ci),
+                TreeRow::ClientRoute(gi) => route_toggle_expanded(groups, *gi),
+                TreeRow::Candidate(gi, ci) => route_select(groups, *gi, *ci),
                 _ => {}
             },
             Key::Enter => {

@@ -295,6 +295,24 @@ pub fn try_get() -> Option<SecretString> {
     pw
 }
 
+/// Best-effort cached-password read for optional side effects that must never
+/// trigger OS UI or block the user's primary command.
+///
+/// A macOS Keychain read can wait indefinitely while the login keychain is
+/// locked (and may present a system dialog even when the CLI itself is running
+/// non-interactively). Callers such as audit signing are explicitly optional,
+/// so they may use the encrypted-file backend but must skip a keychain-backed
+/// session. Password-required operations continue to use [`try_get`] and retain
+/// the normal interactive security behavior.
+pub fn try_get_without_os_prompt() -> Option<SecretString> {
+    let meta = load_meta()?;
+    match meta.backend.as_str() {
+        "file" => file_get(),
+        "keychain" => None,
+        _ => None,
+    }
+}
+
 /// Unattended read for SERVICE START paths (launchd/systemd-managed
 /// `aikey proxy start` with no TTY) — reads the configured backend store
 /// directly, WITHOUT the 30-minute sliding-TTL gate that `try_get` applies.
@@ -567,6 +585,37 @@ mod tests {
                 pw.expose_secret(),
                 "round-tripped password must match"
             );
+        });
+    }
+
+    #[test]
+    fn optional_read_uses_file_backend() {
+        with_temp_home(|| {
+            let pw = SecretString::new("optional-audit-password".to_string());
+            assert!(file_store(&pw));
+            save_meta(&SessionMeta {
+                backend: "file".to_string(),
+                expires_at: now_secs() + 100,
+                vault_seq: 0,
+            });
+
+            assert_eq!(
+                try_get_without_os_prompt().unwrap().expose_secret(),
+                pw.expose_secret()
+            );
+        });
+    }
+
+    #[test]
+    fn optional_read_skips_keychain_backend_without_touching_keychain() {
+        with_temp_home(|| {
+            save_meta(&SessionMeta {
+                backend: "keychain".to_string(),
+                expires_at: now_secs() + 100,
+                vault_seq: 0,
+            });
+
+            assert!(try_get_without_os_prompt().is_none());
         });
     }
 

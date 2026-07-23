@@ -103,16 +103,21 @@ family_login_urls:
 provider_routes:
   - { host: "api.anthropic.com",                  protocol: anthropic,         provider: anthropic,     base_url: "https://api.anthropic.com",                  version: "/v1"     }
   - { host: "api.openai.com",                     protocol: openai_compatible, provider: openai,        base_url: "https://api.openai.com",                     version: "/v1"     }
-  - { host: "api.kimi.com",                       protocol: openai_compatible, provider: kimi_code,     base_url: "https://api.kimi.com/coding",                version: "/v1"     }
+  # Master-resident Mock Provider. The stable logical host is public build
+  # metadata; edition-specific reachable addresses are written as each Mock
+  # credential's base_url_override by Master.
+  - { host: "mock-provider.aikey.internal", path_prefix: "/anthropic", protocol: anthropic,         provider: mock, base_url: "http://mock-provider.aikey.internal/anthropic", version: "/v1" }
+  - { host: "mock-provider.aikey.internal", path_prefix: "/openai",    protocol: openai_compatible, provider: mock, base_url: "http://mock-provider.aikey.internal/openai",    version: "/v1" }
+  - { host: "api.kimi.com",                       protocol: openai_compatible, provider: kimi_code,     base_url: "https://api.kimi.com/coding",                version: "/v1", default: true }
   - { host: "www.kimi.com",                       protocol: openai_compatible, provider: kimi_code,     base_url: "https://api.kimi.com/coding",                version: "/v1"     }
-  - { host: "api.moonshot.cn",                    protocol: openai_compatible, provider: moonshot,      base_url: "https://api.moonshot.cn",                    version: "/v1"     }
+  - { host: "api.moonshot.cn",                    protocol: openai_compatible, provider: moonshot,      base_url: "https://api.moonshot.cn",                    version: "/v1", default: true }
   - { host: "platform.moonshot.cn",               protocol: openai_compatible, provider: moonshot,      base_url: "https://api.moonshot.cn",                    version: "/v1"     }
   - { host: "api.deepseek.com",                   protocol: openai_compatible, provider: deepseek,      base_url: "https://api.deepseek.com",                   version: "/v1"     }
   - { host: "api.groq.com",                       protocol: openai_compatible, provider: groq,          base_url: "https://api.groq.com/openai",                version: "/v1"     }
-  - { host: "api.x.ai",                           protocol: openai_compatible, provider: xai_grok,      base_url: "https://api.x.ai",                           version: "/v1"     }
+  - { host: "api.x.ai",                           protocol: openai_compatible, provider: xai,           base_url: "https://api.x.ai",                           version: "/v1"     }
   - { host: "openrouter.ai",                      protocol: openai_compatible, provider: openrouter,    base_url: "https://openrouter.ai/api",                  version: "/v1"     }
   - { host: "api.perplexity.ai",                  protocol: openai_compatible, provider: perplexity,    base_url: "https://api.perplexity.ai",                  version: ""        }
-  - { host: "generativelanguage.googleapis.com",  protocol: gemini,            provider: google_gemini, base_url: "https://generativelanguage.googleapis.com",  version: "/v1beta" }
+  - { host: "generativelanguage.googleapis.com",  protocol: gemini,            provider: google,         base_url: "https://generativelanguage.googleapis.com",  version: "/v1beta" }
   # zhipu / GLM (open.bigmodel.cn) 一 host 三协议端点 —— P1b/D-2b 扩键 (host, path_prefix)。
   # 兜底行 path_prefix:"" 保持既有 openai_compatible + /api/paas 语义不变（向后兼容，18 行零改动围栏锁定）。
   # 另两行显式 path_prefix，让客户粘贴的 /api/anthropic 与 /api/coding/paas/v4 端点各自命中正确协议/base_url。

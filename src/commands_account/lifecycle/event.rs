@@ -48,6 +48,16 @@ pub enum CredentialLifecycleEvent<'a> {
         source_ref: &'a str,
         providers: &'a [String],
     },
+    /// User selected one exact client route and one exact credential binding.
+    /// This is required when Provider and Protocol are independent axes (for
+    /// example Mock+anthropic vs Mock+openai_compatible).
+    ClientRouteSwitched {
+        client_route: &'a str,
+        provider_code: &'a str,
+        protocol_type: &'a str,
+        source_type: &'a str,
+        source_ref: &'a str,
+    },
     /// A credential was just deleted. Reconcile finds a replacement primary
     /// from the same source_type pool, or clears the binding if none.
     /// `providers` is not needed — reconcile reads it from the binding rows
@@ -165,6 +175,37 @@ pub fn apply_credential_lifecycle_batch(
                     any_binding_touched = true;
                 }
             }
+            CredentialLifecycleEvent::ClientRouteSwitched {
+                client_route,
+                provider_code,
+                protocol_type,
+                source_type,
+                source_ref,
+            } => {
+                crate::storage::set_client_route_binding(
+                    crate::profile_activation::DEFAULT_PROFILE,
+                    client_route,
+                    provider_code,
+                    protocol_type,
+                    source_type,
+                    source_ref,
+                )?;
+                if let Some(vk) = audit {
+                    if let Err(err) = crate::audit::log_audit_event_from_vault_key(
+                        vk.as_bytes(),
+                        crate::audit::AuditOperation::Bind,
+                        Some(&format!(
+                            "{}:{}:{}:{}:{}",
+                            client_route, provider_code, protocol_type, source_type, source_ref
+                        )),
+                        true,
+                    ) {
+                        eprintln!("[aikey] warning: bind audit row not written: {}", err);
+                    }
+                }
+                outcome.newly_primary = vec![client_route.to_string()];
+                any_binding_touched = true;
+            }
             CredentialLifecycleEvent::Removed {
                 source_type,
                 source_ref,
@@ -199,7 +240,7 @@ pub fn apply_credential_lifecycle_batch(
             let active_providers: Vec<String> = refresh
                 .bindings
                 .iter()
-                .map(|b| b.provider_code.clone())
+                .map(|b| b.client_route.clone())
                 .collect();
             let third_party = crate::commands_account::apply_third_party_cli_configs(
                 &active_providers,

@@ -306,8 +306,10 @@ fn test_json_delete_success() {
     let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
     assert_eq!(json["status"], "success");
-    assert_eq!(json["alias"], "DELETE_KEY");
-    assert_eq!(json["message"], "API Key deleted successfully");
+    assert_eq!(json["deleted"], 1);
+    assert_eq!(json["failed"], 0);
+    assert_eq!(json["items"][0]["alias"], "DELETE_KEY");
+    assert_eq!(json["items"][0]["ok"], true);
 }
 
 #[test]
@@ -326,8 +328,14 @@ fn test_json_delete_not_found() {
     let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
     let json: Value = serde_json::from_str(&stderr).expect("Should be valid JSON");
 
-    assert_eq!(json["status"], "error");
-    assert!(json["error"].as_str().unwrap().contains("not found"));
+    assert_eq!(json["deleted"], 0);
+    assert_eq!(json["failed"], 1);
+    assert_eq!(json["items"][0]["alias"], "NONEXISTENT");
+    assert_eq!(json["items"][0]["ok"], false);
+    assert!(json["items"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("not found"));
 }
 
 #[test]

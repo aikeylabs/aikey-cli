@@ -6,6 +6,31 @@
 
 use super::*;
 
+// ── Team-key availability ──────────────────────────────────────────────────
+
+#[test]
+fn activate_accepts_valid_team_key_without_making_it_global_primary() {
+    assert!(team_key_available_for_activate("active"));
+    assert!(team_key_available_for_activate("synced_inactive"));
+    assert!(team_key_available_for_activate("prompt_dismissed"));
+}
+
+#[test]
+fn activate_rejects_stale_or_disabled_team_key() {
+    for state in [
+        "stale",
+        "disabled_by_account_scope",
+        "disabled_by_account_status",
+        "disabled_by_seat_status",
+        "disabled_by_key_status",
+    ] {
+        assert!(
+            !team_key_available_for_activate(state),
+            "state {state} must not be activatable"
+        );
+    }
+}
+
 // ── shell_escape ────────────────────────────────────────────────────────
 
 #[test]

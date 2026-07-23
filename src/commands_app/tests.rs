@@ -1017,7 +1017,13 @@ use crate::storage::ProviderBinding;
 fn binding(profile: &str, provider: &str, kt: CredentialType, kr: &str) -> ProviderBinding {
     ProviderBinding {
         profile_id: profile.to_string(),
+        client_route: provider.to_string(),
         provider_code: provider.to_string(),
+        protocol_type: if provider == "anthropic" {
+            "anthropic".to_string()
+        } else {
+            "openai_compatible".to_string()
+        },
         key_source_type: kt,
         key_source_ref: kr.to_string(),
         updated_at: Some(1_700_000_000),
@@ -1059,6 +1065,26 @@ fn classify_register_all_from_default_snapshot() {
     assert!(snapshotted
         .iter()
         .any(|(u, _, r)| u == "openai" && r == "my-openai"));
+}
+
+#[test]
+fn classify_register_matches_client_route_not_supplier() {
+    let upstreams = vec!["anthropic".to_string()];
+    let default = vec![ProviderBinding {
+        profile_id: "default".to_string(),
+        client_route: "anthropic".to_string(),
+        provider_code: "mock".to_string(),
+        protocol_type: "anthropic".to_string(),
+        key_source_type: CredentialType::ManagedVirtualKey,
+        key_source_ref: "vk-mock-anthropic".to_string(),
+        updated_at: Some(1_700_000_000),
+    }];
+
+    let outcome = classify_upstreams_for_register(&upstreams, &[], &default);
+    assert_eq!(outcome.snapshotted.len(), 1);
+    assert!(outcome.missing.is_empty());
+    assert_eq!(outcome.snapshotted[0].0, "anthropic");
+    assert_eq!(outcome.snapshotted[0].2, "vk-mock-anthropic");
 }
 
 #[test]

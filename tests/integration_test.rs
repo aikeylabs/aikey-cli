@@ -253,7 +253,9 @@ fn test_02_crud_operations() {
         .arg("NONEXISTENT")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Error"));
+        .stderr(
+            predicate::str::contains("'NONEXISTENT'").and(predicate::str::contains("not found")),
+        );
 }
 
 #[test]
