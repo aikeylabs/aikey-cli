@@ -2537,6 +2537,17 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
 // `aikey status` — combined overview dashboard
 // ---------------------------------------------------------------------------
 
+fn active_team_key_count(bindings: &[storage::ProviderBinding]) -> usize {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.key_source_type == crate::credential_type::CredentialType::ManagedVirtualKey
+        })
+        .map(|binding| binding.key_source_ref.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
 pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::BTreeSet;
 
@@ -2552,11 +2563,21 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
         0
     };
     let team_keys = storage::list_virtual_key_cache().unwrap_or_default();
-    let active_team = team_keys
-        .iter()
-        .filter(|k| k.local_state == "active")
-        .count();
     let team_total = team_keys.len();
+    // Provider bindings are the routing SSOT. `local_state` is sync/eligibility
+    // metadata and no longer flips to `active` for every selected protocol, so
+    // counting it made status report zero while the proxy was actively routing
+    // a Team VK. Count distinct bound VKs (one VK may own several routes).
+    let active_bindings = match storage::list_provider_bindings_readonly(
+        crate::profile_activation::DEFAULT_PROFILE,
+    ) {
+        Ok(bindings) => bindings,
+        Err(error) => {
+            eprintln!("[aikey] warning: could not read active bindings for status: {error}");
+            Vec::new()
+        }
+    };
+    let active_team = active_team_key_count(&active_bindings);
 
     // Supplier Providers and client-facing protocol routes are separate axes.
     // Keep both: JSON's historical `providers` field remains compatible, while
@@ -2610,18 +2631,13 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     // Bindings are the most exact local routing rows. Derive again from their
     // Provider+Protocol axes instead of trusting a legacy client_route that may
     // still contain `mock` from a pre-migration cache.
-    if let Ok(bindings) =
-        storage::list_provider_bindings(crate::profile_activation::DEFAULT_PROFILE)
-    {
-        for binding in bindings {
-            if !binding.provider_code.is_empty() {
-                providers.insert(binding.provider_code.clone());
-            }
-            if let Some(route) =
-                status_client_route(&binding.provider_code, &binding.protocol_type, "")
-            {
-                protocols.insert(route);
-            }
+    for binding in &active_bindings {
+        if !binding.provider_code.is_empty() {
+            providers.insert(binding.provider_code.clone());
+        }
+        if let Some(route) = status_client_route(&binding.provider_code, &binding.protocol_type, "")
+        {
+            protocols.insert(route);
         }
     }
 
@@ -6684,6 +6700,37 @@ mod provider_mapping_tests {
                 p
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::active_team_key_count;
+    use crate::credential_type::CredentialType;
+    use crate::storage::ProviderBinding;
+
+    fn binding(route: &str, source_type: CredentialType, source_ref: &str) -> ProviderBinding {
+        ProviderBinding {
+            profile_id: "default".to_string(),
+            client_route: route.to_string(),
+            provider_code: "mock".to_string(),
+            protocol_type: "anthropic".to_string(),
+            key_source_type: source_type,
+            key_source_ref: source_ref.to_string(),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn active_team_count_uses_distinct_binding_sources() {
+        let bindings = vec![
+            binding("anthropic", CredentialType::ManagedVirtualKey, "vk-team"),
+            binding("openai", CredentialType::ManagedVirtualKey, "vk-team"),
+            binding("kimi", CredentialType::ManagedVirtualKey, "vk-other"),
+            binding("zhipu", CredentialType::PersonalApiKey, "personal-key"),
+        ];
+
+        assert_eq!(active_team_key_count(&bindings), 2);
     }
 }
 

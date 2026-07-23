@@ -6455,6 +6455,18 @@ fn probe_alias_sources(alias: &str) -> Vec<&'static str> {
 ///
 /// Resolution order: team keys → OAuth accounts → personal keys.
 /// Mirrors `handle_route`'s data sources and `handle_key_use`'s resolution.
+fn team_key_available_for_activate(local_state: &str) -> bool {
+    // `activate` pins an explicit route token in the current shell; it does not
+    // require the key to be the persistent `aikey use` primary. Keep this in
+    // sync with the states offered by the activate picker. Disabled/stale rows
+    // remain unavailable, while a valid synced key and a dismissed prompt are
+    // both legitimate explicit choices.
+    matches!(
+        local_state,
+        "active" | "synced_inactive" | "prompt_dismissed"
+    )
+}
+
 fn resolve_activate_key(
     alias: &str,
     provider_override: Option<&str>,
@@ -6474,9 +6486,10 @@ fn resolve_activate_key(
             )
             .into());
         }
-        // Why: must match the same filter used by `aikey route` (local_state == "active")
-        // so users never activate a key that is invisible in the route table.
-        if vk.local_state != "active" {
+        // A temporary pin is intentionally independent from the persistent
+        // `aikey use` primary. The drawer and picker expose synced-but-inactive
+        // Team VKs, so rejecting them here made their advertised action fail.
+        if !team_key_available_for_activate(&vk.local_state) {
             return Err(format!(
                 "Key '{}' is not available (state: {}). Run 'aikey key sync' to refresh.",
                 vk.alias, vk.local_state
