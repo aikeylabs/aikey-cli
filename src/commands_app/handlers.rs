@@ -365,12 +365,12 @@ fn cleanup_stale_app_bindings(slug: &str) -> Result<usize, Box<dyn std::error::E
     };
     let mut deleted = 0usize;
     for b in existing {
-        match storage::remove_provider_binding(&profile_id, &b.provider_code) {
+        match storage::remove_provider_binding(&profile_id, &b.client_route) {
             Ok(true) => deleted += 1,
             Ok(false) => {}
             Err(e) => eprintln!(
                 "[aikey app] WARN: failed to delete stale binding for {}: {}",
-                b.provider_code, e
+                b.client_route, e
             ),
         }
     }
@@ -416,7 +416,7 @@ pub fn classify_upstreams_for_register(
         // 优先看 app-specific. 已存在则 preserve, 一行字节不动 (Bug 1 修复)。
         if let Some(b) = existing_app_bindings
             .iter()
-            .find(|b| b.provider_code == *upstream)
+            .find(|b| b.client_route == *upstream)
         {
             preserved.push((
                 upstream.clone(),
@@ -428,7 +428,7 @@ pub fn classify_upstreams_for_register(
         // 没 app-specific → 看默认能 snapshot 吗。
         match default_bindings
             .iter()
-            .find(|b| b.provider_code == *upstream)
+            .find(|b| b.client_route == *upstream)
         {
             Some(b) => {
                 snapshotted.push((
@@ -856,22 +856,22 @@ struct KeyCandidate {
 fn collect_key_candidates(upstream: &str) -> Result<Vec<KeyCandidate>, Box<dyn std::error::Error>> {
     let mut out = Vec::new();
 
-    // 1. Personal aliases (vault.entries with this provider_code).
-    let conn = storage::open_connection()?;
-    let mut stmt = conn.prepare(
-        "SELECT alias FROM entries
-          WHERE provider_code = ?1
-             OR (supported_providers IS NOT NULL
-                 AND supported_providers LIKE ?2)
-          ORDER BY alias",
-    )?;
-    let like_pattern = format!("%\"{}\"%", upstream);
-    let alias_rows = stmt
-        .query_map(rusqlite::params![upstream, like_pattern], |r| {
-            r.get::<_, String>(0)
-        })?
-        .filter_map(Result::ok);
-    for alias in alias_rows {
+    // 1. Personal aliases. Match by derived client route, not supplier code:
+    // a multi-protocol supplier can expose an Anthropic client slot without
+    // itself being named "anthropic".
+    let mut personal = storage::list_entries_with_metadata().unwrap_or_default();
+    personal.sort_by(|a, b| a.alias.cmp(&b.alias));
+    for entry in personal {
+        if crate::commands_account::binding_spec_for_client_route(
+            upstream,
+            "personal",
+            &entry.alias,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        let alias = entry.alias;
         out.push(KeyCandidate {
             label: alias.clone(),
             kind_display: "personal",

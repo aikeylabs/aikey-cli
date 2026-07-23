@@ -124,6 +124,9 @@ impl CredentialKind {
 #[derive(Clone, Debug)]
 pub struct TestTarget {
     pub provider_code: String,
+    pub protocol_type: String,
+    pub client_route: String,
+    pub(crate) probe_provider_code: String,
     pub base_url: String,
     pub bearer: String,
     pub kind: CredentialKind,
@@ -141,10 +144,41 @@ pub struct TestTarget {
     pub display_alias: String,
 }
 
+fn target_axes(raw_provider: &str, explicit_protocol: &str) -> (String, String, String, String) {
+    let provider = crate::commands_account::oauth_provider_to_canonical(raw_provider).to_string();
+    let protocol = if explicit_protocol.is_empty() {
+        let declared = crate::commands_internal::parse::provider_fingerprint::instance()
+            .protocols_for_provider(&provider);
+        if declared.len() == 1 {
+            declared[0].clone()
+        } else {
+            String::new()
+        }
+    } else {
+        explicit_protocol.to_string()
+    };
+    let client_route =
+        crate::provider_registry::client_route_for_binding(&provider, &protocol).to_string();
+    let probe_provider = crate::provider_registry::lookup(&provider)
+        .filter(|entry| !entry.proxy_path.is_empty())
+        .map(|_| provider.clone())
+        .unwrap_or_else(|| client_route.clone());
+    (provider, protocol, client_route, probe_provider)
+}
+
 impl TestTarget {
-    /// "kimi" / "anthropic (oauth)" / "openai (team)" — the table label.
+    /// Protocol/client-route label for the connectivity table. When the
+    /// upstream supplier differs from the native route, keep it as an
+    /// explicit `via` qualifier instead of presenting it as a protocol.
     pub fn display_label(&self) -> String {
-        format!("{}{}", self.provider_code, self.kind.display_suffix())
+        let route_label = format!("{}{}", self.client_route, self.kind.display_suffix());
+        if crate::provider_registry::family_of(&self.provider_code)
+            .eq_ignore_ascii_case(&self.client_route)
+        {
+            route_label
+        } else {
+            format!("{} via {}", route_label, self.provider_code)
+        }
     }
 
     /// Friendly identifier for the optional Key column. Falls back to
@@ -180,10 +214,21 @@ impl TestTarget {
 /// server-side via `GetPersonalKeyByAlias`.
 ///
 /// 2026-04-29 prefix rename: legacy probe sentinel form replaced by `aikey_probe_*`.
-pub fn personal_target(source_ref: &str, provider_code: &str, proxy_port: u16) -> TestTarget {
-    let prefix = crate::commands_account::provider_proxy_prefix_pub(provider_code);
+pub fn personal_target(
+    source_ref: &str,
+    provider_code: &str,
+    protocol_type: &str,
+    proxy_port: u16,
+) -> TestTarget {
+    let (provider, protocol, client_route, probe_provider) =
+        target_axes(provider_code, protocol_type);
+    let prefix = crate::provider_registry::proxy_path_for_binding(&provider, &protocol)
+        .unwrap_or("__invalid_binding__");
     TestTarget {
-        provider_code: provider_code.to_string(),
+        provider_code: provider,
+        protocol_type: protocol,
+        client_route,
+        probe_provider_code: probe_provider,
         base_url: format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
         bearer: format!("aikey_probe_{}", source_ref),
         kind: CredentialKind::PersonalApi,
@@ -202,12 +247,16 @@ pub fn personal_target_direct(
     provider_code: &str,
     base_url_override: Option<&str>,
 ) -> TestTarget {
+    let (provider, protocol, client_route, probe_provider) = target_axes(provider_code, "");
     let base_url = base_url_override
         .map(str::to_string)
-        .or_else(|| default_base_url(provider_code).map(str::to_string))
+        .or_else(|| default_base_url(&provider).map(str::to_string))
         .unwrap_or_else(|| "https://unknown".to_string());
     TestTarget {
-        provider_code: provider_code.to_string(),
+        provider_code: provider,
+        protocol_type: protocol,
+        client_route,
+        probe_provider_code: probe_provider,
         base_url,
         bearer: plaintext.trim().to_string(),
         kind: CredentialKind::PersonalApi,
@@ -220,15 +269,26 @@ pub fn personal_target_direct(
 /// local-proxy URL. Goes through the shared `team_token_from_vk_id` helper
 /// so any historical-prefix residue in the cached vk_id is normalized away;
 /// matches the form `handle_route` and `resolve_activate_key` emit.
-pub fn team_target(virtual_key_id: &str, provider_code: &str, proxy_port: u16) -> TestTarget {
-    let prefix = crate::commands_account::provider_proxy_prefix_pub(provider_code);
+pub fn team_target(
+    virtual_key_id: &str,
+    provider_code: &str,
+    protocol_type: &str,
+    proxy_port: u16,
+) -> TestTarget {
+    let (provider, protocol, client_route, probe_provider) =
+        target_axes(provider_code, protocol_type);
+    let prefix = crate::provider_registry::proxy_path_for_binding(&provider, &protocol)
+        .unwrap_or("__invalid_binding__");
     // Empty vk_id is upstream bug; helper returns Err. Fall back to a clearly
     // invalid bearer so the test row surfaces the issue rather than silently
     // probing a degenerate token.
     let bearer = crate::team_token_normalize::team_token_from_vk_id(virtual_key_id)
         .unwrap_or_else(|_| "aikey_team_<empty-vk_id>".to_string());
     TestTarget {
-        provider_code: provider_code.to_string(),
+        provider_code: provider,
+        protocol_type: protocol,
+        client_route,
+        probe_provider_code: probe_provider,
         base_url: format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
         bearer,
         kind: CredentialKind::ManagedTeam,
@@ -256,10 +316,17 @@ pub fn team_target_cluster(
     token: &str,
     virtual_key_id: &str,
     provider_code: &str,
+    protocol_type: &str,
 ) -> TestTarget {
-    let prefix = crate::commands_account::provider_proxy_prefix_pub(provider_code);
+    let (provider, protocol, client_route, probe_provider) =
+        target_axes(provider_code, protocol_type);
+    let prefix = crate::provider_registry::proxy_path_for_binding(&provider, &protocol)
+        .unwrap_or("__invalid_binding__");
     TestTarget {
-        provider_code: provider_code.to_string(),
+        provider_code: provider,
+        protocol_type: protocol,
+        client_route,
+        probe_provider_code: probe_provider,
         base_url: format!("http://{}/{}", node_authority, prefix),
         bearer: token.to_string(),
         kind: CredentialKind::ManagedTeam,
@@ -278,11 +345,21 @@ pub fn team_target_cluster(
 /// that keeps the `TestTarget.provider_code` canonical invariant honest.
 ///
 /// 2026-04-29 prefix rename: legacy OAuth sentinel form replaced by `aikey_probe_<account_id>`.
-pub fn oauth_target(account_id: &str, raw_provider: &str, proxy_port: u16) -> TestTarget {
-    let provider = crate::commands_account::oauth_provider_to_canonical(raw_provider).to_string();
-    let prefix = crate::commands_account::provider_proxy_prefix_pub(&provider);
+pub fn oauth_target(
+    account_id: &str,
+    raw_provider: &str,
+    protocol_type: &str,
+    proxy_port: u16,
+) -> TestTarget {
+    let (provider, protocol, client_route, probe_provider) =
+        target_axes(raw_provider, protocol_type);
+    let prefix = crate::provider_registry::proxy_path_for_binding(&provider, &protocol)
+        .unwrap_or("__invalid_binding__");
     TestTarget {
         provider_code: provider,
+        protocol_type: protocol,
+        client_route,
+        probe_provider_code: probe_provider,
         base_url: format!("http://127.0.0.1:{}/{}", proxy_port, prefix),
         bearer: format!("aikey_probe_{}", account_id),
         kind: CredentialKind::OAuth,
@@ -466,6 +543,9 @@ mod connectivity_suite_tests {
     fn test_target_display_label_shapes() {
         let personal = TestTarget {
             provider_code: "kimi".into(),
+            protocol_type: "openai_compatible".into(),
+            client_route: "kimi".into(),
+            probe_provider_code: "kimi".into(),
             base_url: "https://api.kimi.com/coding/v1".into(),
             bearer: "sk-redacted".into(),
             kind: CredentialKind::PersonalApi,
@@ -510,7 +590,7 @@ mod connectivity_suite_tests {
         );
         assert_eq!(targets.len(), 1);
         let t = &targets[0];
-        assert_eq!(t.provider_code, "kimi");
+        assert_eq!(t.provider_code, "kimi_code");
         assert_eq!(
             t.bearer, "sk-plaintext",
             "bearer must be trimmed before probe"
@@ -554,8 +634,8 @@ mod connectivity_suite_tests {
         let providers: Vec<&str> = targets.iter().map(|t| t.provider_code.as_str()).collect();
         assert_eq!(
             providers,
-            vec!["openai", "anthropic", "kimi"],
-            "target order must mirror caller input — stable for UX"
+            vec!["openai", "anthropic", "kimi_code"],
+            "target order must mirror caller input after canonicalization — stable for UX"
         );
     }
 
@@ -737,7 +817,7 @@ mod connectivity_suite_tests {
 
     #[test]
     fn oauth_target_canonicalizes_claude_input() {
-        let t = oauth_target("acc_123", "claude", 27200);
+        let t = oauth_target("acc_123", "claude", "anthropic", 27200);
         assert_eq!(
             t.provider_code, "anthropic",
             "oauth_target MUST normalize broker vocab so downstream persona \
@@ -759,7 +839,7 @@ mod connectivity_suite_tests {
 
     #[test]
     fn oauth_target_canonicalizes_codex_input() {
-        let t = oauth_target("acc_456", "codex", 27200);
+        let t = oauth_target("acc_456", "codex", "openai_compatible", 27200);
         assert_eq!(t.provider_code, "openai");
         assert_eq!(t.display_label(), "openai (oauth)");
     }
@@ -768,15 +848,33 @@ mod connectivity_suite_tests {
     fn oauth_target_idempotent_on_already_canonical() {
         // Bindings store canonical codes — calling `oauth_target` with one
         // must not accidentally re-map to something else.
-        let t = oauth_target("acc_789", "anthropic", 27200);
+        let t = oauth_target("acc_789", "anthropic", "anthropic", 27200);
         assert_eq!(t.provider_code, "anthropic");
-        let t2 = oauth_target("acc_789", "openai", 27200);
+        let t2 = oauth_target("acc_789", "openai", "openai_compatible", 27200);
         assert_eq!(t2.provider_code, "openai");
     }
 
     #[test]
+    fn mock_targets_keep_supplier_but_probe_through_protocol_client() {
+        let anthropic = oauth_target("acc-mock-a", "mock", "anthropic", 27200);
+        assert_eq!(anthropic.provider_code, "mock");
+        assert_eq!(anthropic.protocol_type, "anthropic");
+        assert_eq!(anthropic.client_route, "anthropic");
+        assert_eq!(anthropic.probe_provider_code, "anthropic");
+        assert_eq!(anthropic.base_url, "http://127.0.0.1:27200/anthropic");
+        assert_eq!(anthropic.display_label(), "anthropic (oauth) via mock");
+
+        let openai = team_target("vk-mock-o", "mock", "openai_compatible", 27200);
+        assert_eq!(openai.provider_code, "mock");
+        assert_eq!(openai.client_route, "openai");
+        assert_eq!(openai.probe_provider_code, "openai");
+        assert_eq!(openai.base_url, "http://127.0.0.1:27200/openai");
+        assert_eq!(openai.display_label(), "openai (team) via mock");
+    }
+
+    #[test]
     fn team_target_uses_team_bearer_and_proxy_url() {
-        let t = team_target("vk_abc", "anthropic", 27200);
+        let t = team_target("vk_abc", "anthropic", "anthropic", 27200);
         assert_eq!(t.kind, CredentialKind::ManagedTeam);
         // 2026-04-29 prefix rename: legacy team prefix → `aikey_team_<vk_id>`
         // (via team_token_from_vk_id helper for normalization).
@@ -796,6 +894,7 @@ mod connectivity_suite_tests {
             "aikey_team_vk_xyz",
             "vk_xyz",
             "anthropic",
+            "anthropic",
         );
         assert_eq!(t.kind, CredentialKind::ManagedTeam);
         assert_eq!(t.bearer, "aikey_team_vk_xyz");
@@ -811,7 +910,7 @@ mod connectivity_suite_tests {
     fn personal_target_routes_via_proxy_with_probe_sentinel() {
         // Plan D (2026-04-22): bearer is the sentinel, URL is local proxy.
         // 2026-04-29 prefix rename: legacy probe sentinel → aikey_probe_<alias>
-        let t = personal_target("my-key", "kimi", 27200);
+        let t = personal_target("my-key", "kimi", "openai_compatible", 27200);
         assert_eq!(t.kind, CredentialKind::PersonalApi);
         assert_eq!(
             t.bearer, "aikey_probe_my-key",

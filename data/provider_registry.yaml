@@ -6,7 +6,7 @@
 #   - default base URL (for connectivity probes + drawer "official URL" hint)
 #   - picker visibility (shown in `aikey add` interactive provider select)
 #   - oauth broker aliases (claude→anthropic normalization at binding write)
-#   - protocol family (vault Web UI grouping key — merged with aliases)
+#   - native client route (the `family` field; e.g. kimi_code→kimi)
 #   - extra env vars (e.g. KIMI_MODEL_NAME for SDKs that need it)
 #
 # Consumers (all Rust-side, loaded via src/provider_registry.rs):
@@ -94,6 +94,21 @@ providers:
     picker: true
     display: openai
     display_alias: codex
+
+  # Master-resident test provider. It is deliberately absent from the normal
+  # API-key picker; the feature-gated OAuth account dialog is its only creation
+  # entry. Supported protocols and upstream URLs come exclusively from
+  # provider_routes. It intentionally has NO client env namespace or proxy
+  # path: Mock is a Provider, not a Protocol/client surface. An exact
+  # Mock+anthropic binding is selected through the anthropic/Claude route; an
+  # exact Mock+openai_compatible binding through the openai/Codex route.
+  - code: mock
+    proxy_path: ""
+    env_api_key: ""
+    env_base_url: ""
+    default_base_url: ""
+    picker: false
+    display: Mock Provider
 
   - code: google
     oauth_aliases: [gemini]

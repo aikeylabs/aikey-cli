@@ -339,6 +339,22 @@ pub struct KeyItem {
     /// Added in v0.7; older servers return an empty array via `#[serde(default)]`.
     #[serde(default)]
     pub supported_providers: Vec<String>,
+    /// Legacy single-binding protocol projection. New servers also return the
+    /// binding-granular `bindings` array below; keep this field as a fallback
+    /// for rolling upgrades.
+    #[serde(default)]
+    pub protocol_type: String,
+    /// Exact Provider+Protocol axes for every active VK binding. The lightweight
+    /// metadata sync must consume these instead of inventing one protocol from
+    /// `provider_code` (Mock Provider is intentionally multi-protocol).
+    #[serde(default)]
+    pub bindings: Vec<KeyBindingAxis>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct KeyBindingAxis {
+    pub protocol: String,
+    pub provider: String,
 }
 
 /// One binding target inside a protocol slot from GET /virtual-keys/{id}/delivery.

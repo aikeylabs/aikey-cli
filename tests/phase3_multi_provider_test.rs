@@ -84,15 +84,15 @@ fn e2e_add_multi_provider_keys_writes_all_env_vars() {
 
     let content = env.active_env_content();
     assert!(
-        content.contains("ANTHROPIC_API_KEY"),
+        content.contains("export ANTHROPIC_API_KEY="),
         "should contain ANTHROPIC_API_KEY"
     );
     assert!(
-        content.contains("OPENAI_API_KEY"),
+        content.contains("export OPENAI_API_KEY="),
         "should contain OPENAI_API_KEY"
     );
     assert!(
-        content.contains("GOOGLE_API_KEY"),
+        content.contains("export GOOGLE_API_KEY="),
         "should contain GOOGLE_API_KEY"
     );
 
@@ -101,16 +101,16 @@ fn e2e_add_multi_provider_keys_writes_all_env_vars() {
     // ~/.codex/config.toml instead). See profile_activation.rs:51-61 for the
     // skip_base_url rationale.
     assert!(
-        content.contains("ANTHROPIC_BASE_URL"),
+        content.contains("export ANTHROPIC_BASE_URL="),
         "should contain ANTHROPIC_BASE_URL"
     );
     assert!(
-        content.contains("GOOGLE_BASE_URL"),
+        content.contains("export GOOGLE_BASE_URL="),
         "should contain GOOGLE_BASE_URL"
     );
     assert!(
-        !content.contains("OPENAI_BASE_URL"),
-        "OPENAI_BASE_URL should be omitted (Codex compat), got:\n{}",
+        content.contains("unset OPENAI_BASE_URL"),
+        "OPENAI_BASE_URL should be actively cleared (Codex compat), got:\n{}",
         content
     );
 }
@@ -224,8 +224,8 @@ fn e2e_delete_only_key_clears_provider() {
     env.add_key("gpt-main", "openai").success();
 
     let content1 = env.active_env_content();
-    assert!(content1.contains("ANTHROPIC_API_KEY"));
-    assert!(content1.contains("OPENAI_API_KEY"));
+    assert!(content1.contains("export ANTHROPIC_API_KEY="));
+    assert!(content1.contains("export OPENAI_API_KEY="));
 
     // Delete the only anthropic key.
     env.cmd()
@@ -238,12 +238,13 @@ fn e2e_delete_only_key_clears_provider() {
     // Anthropic should be gone from active.env; OpenAI remains.
     let content2 = env.active_env_content();
     assert!(
-        !content2.contains("ANTHROPIC_API_KEY"),
+        !content2.contains("export ANTHROPIC_API_KEY=")
+            && content2.contains("unset ANTHROPIC_API_KEY"),
         "anthropic should be cleared. Content:\n{}",
         content2
     );
     assert!(
-        content2.contains("OPENAI_API_KEY"),
+        content2.contains("export OPENAI_API_KEY="),
         "openai should remain. Content:\n{}",
         content2
     );

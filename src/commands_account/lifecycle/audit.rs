@@ -13,7 +13,7 @@
 //!
 //! Design split — each diff is a comparison between exactly two
 //! source-of-truths. We deliberately do NOT compute a global "set of all
-//! active providers" and diff that, because the failure modes we want to
+//! active client routes" and diff that, because the failure modes we want to
 //! pin are pair-local (e.g., "DB has kimi binding but kimi.toml has no
 //! region" vs "active.env has KIMI_API_KEY but kimi.toml has no region" —
 //! same symptom but different root cause).
@@ -112,6 +112,8 @@ impl DiffEntry {
 pub struct AuditReport {
     pub diffs: Vec<DiffEntry>,
     pub is_consistent: bool,
+    /// Number of active client routes. The field name is retained for API
+    /// compatibility with existing doctor/status callers.
     pub active_provider_count: usize,
     /// One-line summary for the doctor row's right column.
     pub summary: String,
@@ -142,12 +144,12 @@ pub fn audit_credential_lifecycle(include_proxy: bool) -> AuditReport {
     diffs.extend(diff_active_env_vs_kimi_toml(
         &active_env_lines,
         kimi_region_present,
-        bindings_has_provider(&bindings, &["kimi", "moonshot"]),
+        bindings_has_client_route(&bindings, &["kimi"]),
     ));
     diffs.extend(diff_active_env_vs_codex_toml(
         &active_env_lines,
         codex_region_present,
-        bindings_has_provider(&bindings, &["openai", "gpt", "chatgpt"]),
+        bindings_has_client_route(&bindings, &["openai"]),
     ));
 
     if include_proxy {
@@ -168,7 +170,7 @@ pub fn audit_credential_lifecycle(include_proxy: bool) -> AuditReport {
 
     let summary = if diffs.is_empty() {
         format!(
-            "{} active providers, all source-of-truths agree",
+            "{} active client routes, all source-of-truths agree",
             active_provider_count
         )
     } else if critical_count > 0 {
@@ -192,19 +194,24 @@ pub fn audit_credential_lifecycle(include_proxy: bool) -> AuditReport {
 // Pure diff helpers — unit-testable
 // ============================================================================
 
-fn bindings_has_provider(bindings: &[storage::ProviderBinding], candidates: &[&str]) -> bool {
+fn bindings_has_client_route(bindings: &[storage::ProviderBinding], candidates: &[&str]) -> bool {
     bindings.iter().any(|b| {
-        let c = b.provider_code.to_lowercase();
+        let c = b.client_route.to_lowercase();
         candidates.iter().any(|x| *x == c.as_str())
     })
 }
 
 /// Format the AIKEY_ACTIVE_KEYS value the way profile_activation writes it:
-/// `provider1=ref1,provider2=ref2,...` sorted by provider name.
+/// `client_route1=ref1,client_route2=ref2,...` sorted by client route.
 fn expected_active_keys(bindings: &[storage::ProviderBinding]) -> String {
     let mut entries: Vec<(String, String)> = bindings
         .iter()
-        .map(|b| (b.provider_code.clone(), b.key_source_ref.clone()))
+        .map(|b| {
+            (
+                b.client_route.clone(),
+                crate::profile_activation::active_binding_display(b),
+            )
+        })
         .collect();
     entries.sort();
     entries
@@ -230,10 +237,10 @@ fn diff_db_vs_active_env(
         // For OAuth bindings the active.env writer substitutes the OAuth
         // display_identity (email/name) for the raw account_id, so the
         // strings look different even when consistent. Detect that case
-        // by checking if every DB provider has SOME entry in active.env
-        // (regardless of value); only Critical when a provider is wholly
+        // by checking if every DB client route has SOME entry in active.env
+        // (regardless of value); only Critical when a route is wholly
         // missing.
-        let actual_providers: std::collections::HashSet<String> = actual
+        let actual_routes: std::collections::HashSet<String> = actual
             .split(',')
             .filter_map(|s| s.split_once('='))
             .map(|(p, _)| p.to_string())
@@ -241,16 +248,16 @@ fn diff_db_vs_active_env(
         let missing: Vec<&str> = bindings
             .iter()
             .filter_map(|b| {
-                if !actual_providers.contains(&b.provider_code) {
-                    Some(b.provider_code.as_str())
+                if !actual_routes.contains(&b.client_route) {
+                    Some(b.client_route.as_str())
                 } else {
                     None
                 }
             })
             .collect();
-        let extra: Vec<&str> = actual_providers
+        let extra: Vec<&str> = actual_routes
             .iter()
-            .filter(|p| !bindings.iter().any(|b| &b.provider_code == *p))
+            .filter(|p| !bindings.iter().any(|b| &b.client_route == *p))
             .map(|s| s.as_str())
             .collect();
 
@@ -258,7 +265,10 @@ fn diff_db_vs_active_env(
             out.push(DiffEntry {
                 source: DiffSource::DbVsActiveEnv,
                 provider: Some(missing.join(",")),
-                a_says: format!("DB has binding(s) for {}", missing.join(",")),
+                a_says: format!(
+                    "DB has binding(s) for client route(s) {}",
+                    missing.join(",")
+                ),
                 b_says: "active.env AIKEY_ACTIVE_KEYS missing entry".into(),
                 severity: DiffSeverity::Critical,
                 hint: Some(format!(
@@ -281,7 +291,7 @@ fn diff_db_vs_active_env(
             });
         }
         if missing.is_empty() && extra.is_empty() {
-            // Same provider set, just different raw values (likely
+            // Same client-route set, just different raw values (likely
             // OAuth display_identity rendering). Recoverable.
             out.push(DiffEntry {
                 source: DiffSource::DbVsActiveEnv,
@@ -437,7 +447,13 @@ mod tests {
     fn binding(provider: &str, ref_: &str, kind: CredentialType) -> ProviderBinding {
         ProviderBinding {
             profile_id: "default".into(),
+            client_route: provider.into(),
             provider_code: provider.into(),
+            protocol_type: if provider == "anthropic" {
+                "anthropic".into()
+            } else {
+                "openai_compatible".into()
+            },
             key_source_type: kind,
             key_source_ref: ref_.into(),
             updated_at: Some(0),
@@ -569,14 +585,35 @@ mod tests {
         assert_eq!(diffs[0].severity, DiffSeverity::Warning);
     }
 
-    // --- bindings_has_provider ---
+    // --- bindings_has_client_route ---
 
     #[test]
-    fn bindings_has_provider_matches_aliases() {
-        let b = vec![binding("moonshot", "k1", CredentialType::PersonalApiKey)];
-        // moonshot should match kimi-family check
-        assert!(bindings_has_provider(&b, &["kimi", "moonshot"]));
-        assert!(!bindings_has_provider(&b, &["openai"]));
+    fn bindings_has_client_route_does_not_confuse_mock_supplier_with_protocol_route() {
+        let mut mock_anthropic = binding("mock", "k1", CredentialType::ManagedVirtualKey);
+        mock_anthropic.client_route = "anthropic".into();
+        mock_anthropic.protocol_type = "anthropic".into();
+
+        let b = vec![mock_anthropic];
+        assert!(bindings_has_client_route(&b, &["anthropic"]));
+        assert!(!bindings_has_client_route(&b, &["mock"]));
+        assert!(!bindings_has_client_route(&b, &["openai"]));
+    }
+
+    #[test]
+    fn mock_supplier_active_keys_and_diff_use_client_route() {
+        let mut mock_anthropic = binding("mock", "account-1", CredentialType::ManagedVirtualKey);
+        mock_anthropic.client_route = "anthropic".into();
+        mock_anthropic.protocol_type = "anthropic".into();
+
+        assert_eq!(
+            expected_active_keys(&[mock_anthropic.clone()]),
+            "anthropic=account-1"
+        );
+        let e = env(&[("AIKEY_ACTIVE_KEYS", "anthropic=admin@aikey.local")]);
+        let diffs = diff_db_vs_active_env(&[mock_anthropic], &e);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].severity, DiffSeverity::Warning);
+        assert!(!diffs[0].describe().contains("missing entry"));
     }
 
     // --- DiffSource label ---

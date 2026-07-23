@@ -689,7 +689,7 @@ pub fn insert_active_app_key(slug: &str) -> Result<(String, String), String> {
 /// failure can't leave the user with "token exists but bindings missing"
 /// (which would 409 every Agent request).
 ///
-/// `initial_bindings` is the list of `(provider_code, key_source_type,
+/// `initial_bindings` is the list of `(client_route, key_source_type,
 /// key_source_ref)` triples to UPSERT under `profile_id = "app:<slug>"`.
 /// An empty slice ⇒ no binding writes (user can set via `aikey app route`
 /// later).
@@ -722,6 +722,20 @@ pub fn authorize_atomic_with_conn(
     slug: &str,
     initial_bindings: &[(String, CredentialType, String)],
 ) -> Result<(String, String), String> {
+    // Resolve every source to exact axes before opening the transaction. If
+    // metadata is inconsistent, authorization fails without minting a bearer.
+    let exact_bindings = initial_bindings
+        .iter()
+        .map(|(client_route, key_type, key_ref)| {
+            let (provider, protocol) = crate::commands_account::binding_spec_for_client_route(
+                client_route,
+                key_type.as_str(),
+                key_ref,
+            )?;
+            Ok((client_route, key_type, key_ref, provider, protocol))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
     let key_id = uuid_v4_simple();
     let route_token = storage::generate_app_route_token();
     let tx = conn
@@ -747,21 +761,31 @@ pub fn authorize_atomic_with_conn(
         .map_err(|e| format!("seed user_profiles row for {}: {}", profile_id, e))?;
     }
 
-    for (provider_code, key_type, key_ref) in initial_bindings {
+    for (client_route, key_type, key_ref, provider_code, protocol_type) in exact_bindings {
         tx.execute(
             "INSERT INTO user_profile_provider_bindings
-                (profile_id, provider_code, key_source_type, key_source_ref, updated_at)
-             VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))
+                (profile_id, provider_code, binding_provider_code, protocol_type,
+                 key_source_type, key_source_ref, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s', 'now'))
              ON CONFLICT (profile_id, provider_code) DO UPDATE SET
+                binding_provider_code = excluded.binding_provider_code,
+                protocol_type = excluded.protocol_type,
                 key_source_type = excluded.key_source_type,
                 key_source_ref  = excluded.key_source_ref,
                 updated_at      = excluded.updated_at",
-            params![profile_id, provider_code, key_type.as_str(), key_ref],
+            params![
+                profile_id,
+                client_route,
+                provider_code,
+                protocol_type,
+                key_type.as_str(),
+                key_ref
+            ],
         )
         .map_err(|e| {
             format!(
-                "UPSERT binding profile={} provider={}: {}",
-                profile_id, provider_code, e
+                "UPSERT binding profile={} route={} provider={}: {}",
+                profile_id, client_route, provider_code, e
             )
         })?;
     }
@@ -779,7 +803,7 @@ pub fn authorize_atomic_with_conn(
 /// for why) so the binding write doesn't fail FK. Idempotent.
 pub fn set_app_binding(
     slug: &str,
-    provider_code: &str,
+    client_route: &str,
     key_source_type: &str,
     key_source_ref: &str,
 ) -> Result<(), String> {
@@ -793,7 +817,19 @@ pub fn set_app_binding(
     .map_err(|e| format!("seed user_profiles row for {}: {}", profile_id, e))?;
     drop(conn);
 
-    storage::set_provider_binding(&profile_id, provider_code, key_source_type, key_source_ref)?;
+    let (provider_code, protocol_type) = crate::commands_account::binding_spec_for_client_route(
+        client_route,
+        key_source_type,
+        key_source_ref,
+    )?;
+    storage::set_client_route_binding(
+        &profile_id,
+        client_route,
+        &provider_code,
+        &protocol_type,
+        key_source_type,
+        key_source_ref,
+    )?;
     let _ = storage::bump_vault_change_seq();
     Ok(())
 }
@@ -1375,35 +1411,26 @@ pub struct OAuthAccountCandidate {
 /// matching account — never errors out (interactive picker treats as
 /// "no candidates").
 pub fn list_oauth_accounts_for_provider(
-    provider: &str,
+    client_route: &str,
 ) -> Result<Vec<OAuthAccountCandidate>, String> {
-    let conn = storage::open_connection()?;
-    let mut stmt = match conn.prepare(
-        "SELECT provider_account_id, COALESCE(display_label, provider_account_id)
-           FROM provider_accounts
-          WHERE provider = ?1
-          ORDER BY provider_account_id",
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            if e.to_string().contains("no such table") || e.to_string().contains("no such column") {
-                return Ok(Vec::new());
-            }
-            return Err(format!("prepare list_oauth_accounts: {}", e));
-        }
-    };
-    let rows = stmt
-        .query_map(params![provider], |r| {
-            Ok(OAuthAccountCandidate {
-                provider_account_id: r.get::<_, String>(0)?,
-                display_label: r.get::<_, String>(1)?,
-            })
+    let mut out = storage::list_provider_accounts()?
+        .into_iter()
+        .filter(|account| {
+            crate::provider_registry::client_route_for_binding(
+                &account.provider,
+                &account.protocol_type,
+            )
+            .eq_ignore_ascii_case(client_route)
         })
-        .map_err(|e| format!("query list_oauth_accounts: {}", e))?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.map_err(|e| format!("scan list_oauth_accounts: {}", e))?);
-    }
+        .map(|account| {
+            let display_label = account.effective_label().to_string();
+            OAuthAccountCandidate {
+                provider_account_id: account.provider_account_id,
+                display_label,
+            }
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| a.provider_account_id.cmp(&b.provider_account_id));
     Ok(out)
 }
 
@@ -1416,35 +1443,55 @@ pub struct TeamKeyCandidate {
 
 /// SELECT managed virtual keys (team) for a given provider. Empty Vec
 /// when the cache table isn't present or no matching row.
-pub fn list_team_keys_for_provider(provider: &str) -> Result<Vec<TeamKeyCandidate>, String> {
+pub fn list_team_keys_for_provider(client_route: &str) -> Result<Vec<TeamKeyCandidate>, String> {
     let conn = storage::open_connection()?;
     let mut stmt = match conn.prepare(
-        "SELECT virtual_key_id, alias
+        "SELECT virtual_key_id, alias, local_alias, provider_code, protocol_type
            FROM managed_virtual_keys_cache
-          WHERE provider_code = ?1
-            AND COALESCE(deleted_at, 0) = 0
-          ORDER BY alias",
+          WHERE COALESCE(deleted_at, 0) = 0
+          ORDER BY COALESCE(local_alias, alias)",
     ) {
-        Ok(s) => s,
-        Err(e) => {
-            if e.to_string().contains("no such table") || e.to_string().contains("no such column") {
-                return Ok(Vec::new());
-            }
-            return Err(format!("prepare list_team_keys: {}", e));
+        Ok(stmt) => stmt,
+        Err(err)
+            if err.to_string().contains("no such table")
+                || err.to_string().contains("no such column") =>
+        {
+            return Ok(Vec::new());
         }
+        Err(err) => return Err(format!("prepare list_team_keys: {}", err)),
     };
     let rows = stmt
-        .query_map(params![provider], |r| {
-            Ok(TeamKeyCandidate {
-                virtual_key_id: r.get::<_, String>(0)?,
-                alias: r.get::<_, String>(1)?,
-            })
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
         })
-        .map_err(|e| format!("query list_team_keys: {}", e))?;
+        .map_err(|err| format!("query list_team_keys: {}", err))?;
     let mut out = Vec::new();
     for row in rows {
-        out.push(row.map_err(|e| format!("scan list_team_keys: {}", e))?);
+        let (virtual_key_id, alias, local_alias, provider_code, protocol_type) =
+            row.map_err(|err| format!("scan list_team_keys: {}", err))?;
+        if !crate::provider_registry::client_route_for_binding(&provider_code, &protocol_type)
+            .eq_ignore_ascii_case(client_route)
+        {
+            continue;
+        }
+        if out
+            .iter()
+            .any(|candidate: &TeamKeyCandidate| candidate.virtual_key_id == virtual_key_id)
+        {
+            continue;
+        }
+        out.push(TeamKeyCandidate {
+            virtual_key_id,
+            alias: local_alias.unwrap_or(alias),
+        });
     }
+    out.sort_by(|a, b| a.alias.cmp(&b.alias));
     Ok(out)
 }
 

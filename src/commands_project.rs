@@ -2281,7 +2281,11 @@ pub fn handle_doctor_last_errors(json_mode: bool) -> Result<(), Box<dyn std::err
         );
         // origin = the ROOT CAUSE (deepest producer), rendered Java caused-by style.
         let origin_label = describe_origin(origin);
-        println!("    {} {}", "└─ caused by:".dimmed(), origin_label);
+        println!(
+            "    {} {}",
+            format!("{} caused by:", crate::symbols::TREE_LAST.s()).dimmed(),
+            origin_label
+        );
         if !hops.is_empty() {
             println!("       {} {}", "hops:".dimmed(), hops.dimmed());
         }

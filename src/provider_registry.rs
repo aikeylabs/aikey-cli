@@ -310,6 +310,49 @@ pub fn family_of(code: &str) -> &'static str {
     }
 }
 
+/// Returns the client selection slot for an exact Provider+Protocol binding.
+///
+/// Providers with a native client integration keep their registry family
+/// (`kimi_code`/`moonshot` → `kimi`). Providers without one, such as the
+/// resident Mock Provider, are routed through the canonical client surface
+/// for their stored wire protocol. Protocol compatibility itself remains
+/// owned exclusively by provider_fingerprint.yaml.
+pub fn client_route_for_binding(provider_code: &str, protocol_type: &str) -> &'static str {
+    if let Some(entry) = lookup(provider_code) {
+        if !entry.env_vars.0.is_empty()
+            && !entry.env_vars.1.is_empty()
+            && !entry.proxy_path.is_empty()
+        {
+            return entry.family;
+        }
+    }
+    match protocol_type {
+        "anthropic" => "anthropic",
+        "openai_compatible" => "openai",
+        _ => canonical(provider_code),
+    }
+}
+
+/// Returns the proxy URL path for one exact Provider+Protocol binding.
+///
+/// Client route and proxy path are deliberately separate axes. Native
+/// providers keep their own path (`moonshot` -> `moonshot/v1`) even when they
+/// share a client slot (`kimi`). A provider without a native client namespace
+/// (currently Mock) inherits the path of the protocol client surface instead
+/// (`mock+anthropic` -> `anthropic`, `mock+openai_compatible` -> `openai`).
+pub fn proxy_path_for_binding(provider_code: &str, protocol_type: &str) -> Option<&'static str> {
+    if let Some(entry) = lookup(provider_code) {
+        if !entry.proxy_path.is_empty() {
+            return Some(entry.proxy_path);
+        }
+    }
+
+    let client_route = client_route_for_binding(provider_code, protocol_type);
+    lookup(client_route)
+        .map(|entry| entry.proxy_path)
+        .filter(|path| !path.is_empty())
+}
+
 /// Resolve display label + brand alias for the FAMILY-level header (e.g.
 /// the Provider row in `aikey use`'s tree picker, or the Vault page's
 /// group chip).
@@ -404,6 +447,47 @@ mod tests {
         let e = lookup("anthropic").expect("anthropic present");
         assert_eq!(e.code, "anthropic");
         assert_eq!(e.env_vars.0, "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn mock_has_no_fake_client_namespace_and_routes_by_protocol() {
+        let mock = lookup("mock").unwrap();
+        assert_eq!(mock.env_vars, ("", ""));
+        assert_eq!(mock.proxy_path, "");
+        assert_eq!(client_route_for_binding("mock", "anthropic"), "anthropic");
+        assert_eq!(
+            client_route_for_binding("mock", "openai_compatible"),
+            "openai"
+        );
+        assert_eq!(
+            proxy_path_for_binding("mock", "anthropic"),
+            Some("anthropic")
+        );
+        assert_eq!(
+            proxy_path_for_binding("mock", "openai_compatible"),
+            Some("openai")
+        );
+        assert_eq!(proxy_path_for_binding("mock", ""), None);
+    }
+
+    #[test]
+    fn native_provider_path_is_not_collapsed_to_client_route() {
+        assert_eq!(
+            client_route_for_binding("kimi_code", "openai_compatible"),
+            "kimi"
+        );
+        assert_eq!(
+            proxy_path_for_binding("kimi_code", "openai_compatible"),
+            Some("kimi/v1")
+        );
+        assert_eq!(
+            client_route_for_binding("moonshot", "openai_compatible"),
+            "kimi"
+        );
+        assert_eq!(
+            proxy_path_for_binding("moonshot", "openai_compatible"),
+            Some("moonshot/v1")
+        );
     }
 
     #[test]
@@ -526,6 +610,20 @@ mod tests {
         // anthropic should be first (YAML declaration order) — if someone
         // reorders the YAML, this pins the expectation.
         assert_eq!(list[0].code, "anthropic");
+    }
+
+    #[test]
+    fn mock_provider_is_registered_but_hidden_from_normal_picker() {
+        let mock = lookup("mock").expect("Mock Provider identity must be registered");
+        assert_eq!(mock.display, "Mock Provider");
+        assert!(
+            !mock.picker,
+            "Mock Provider must not pollute the API-key picker"
+        );
+        assert!(
+            picker_entries().iter().all(|entry| entry.code != "mock"),
+            "picker_entries must honor picker=false"
+        );
     }
 
     // ── family_of helper (V-layer) ───────────────────────────────────

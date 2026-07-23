@@ -623,19 +623,22 @@ fn run_unified_list(
                 Some(sp) if !sp.is_empty() => sp.clone(),
                 _ => entry.provider_code.clone().into_iter().collect(),
             };
-            let pf: Vec<&str> = bindings
+            let active_bindings: Vec<&storage::ProviderBinding> = bindings
                 .iter()
                 .filter(|b| {
                     b.key_source_type == credential_type::CredentialType::PersonalApiKey
                         && b.key_source_ref == entry.alias
                 })
-                .map(|b| b.provider_code.as_str())
+                .collect();
+            let pf: Vec<&str> = active_bindings
+                .iter()
+                .map(|b| b.client_route.as_str())
                 .collect();
             // Primary axis value = the active-binding provider if any, else the
             // first supported provider. Order the distinct set primary-first.
-            let primary_code = pf
+            let primary_code = active_bindings
                 .first()
-                .map(|s| s.to_string())
+                .map(|b| b.provider_code.clone())
                 .or_else(|| codes.first().cloned())
                 .unwrap_or_default();
             let base_url = entry.base_url.as_deref().unwrap_or("");
@@ -685,23 +688,32 @@ fn run_unified_list(
                 .as_deref()
                 .unwrap_or(rep.alias.as_str())
                 .to_string();
-            let pf: Vec<&str> = bindings
+            let active_bindings: Vec<&storage::ProviderBinding> = bindings
                 .iter()
                 .filter(|b| {
                     b.key_source_type == credential_type::CredentialType::ManagedVirtualKey
                         && b.key_source_ref == *vk_id
                 })
-                .map(|b| b.provider_code.as_str())
+                .collect();
+            let pf: Vec<&str> = active_bindings
+                .iter()
+                .map(|b| b.client_route.as_str())
                 .collect();
             // Primary provider = the active-binding provider if any, else the VK's
             // first binding. Both axes render primary-first.
-            let primary_prov = pf
+            let primary_prov = active_bindings
                 .first()
-                .map(|s| s.to_string())
+                .map(|b| b.provider_code.clone())
                 .unwrap_or_else(|| rep.provider_code.clone());
             let primary_row = group
                 .iter()
-                .find(|e| e.provider_code == primary_prov)
+                .find(|e| {
+                    e.provider_code == primary_prov
+                        && active_bindings.first().map_or(true, |binding| {
+                            binding.protocol_type.is_empty()
+                                || e.protocol_type == binding.protocol_type
+                        })
+                })
                 .copied()
                 .unwrap_or(rep);
             let mut prov_vals: Vec<String> = Vec::new();
@@ -970,7 +982,7 @@ fn run_unified_list(
                                 == credential_type::CredentialType::PersonalOAuthAccount
                                 && b.key_source_ref == acct.provider_account_id
                         })
-                        .map(|b| b.provider_code.as_str())
+                        .map(|b| b.client_route.as_str())
                         .collect();
                     let token_expires =
                         storage::get_provider_token_expires_at(&acct.provider_account_id)
@@ -1170,6 +1182,13 @@ fn should_auto_start_proxy(command: &Commands) -> bool {
             | Commands::Init
             | Commands::Db { .. }
             | Commands::Version
+            // `_internal` is an IPC bridge used by local-server and the cluster
+            // daemon, not a user request to manage proxy lifecycle. Their hosting
+            // topology starts the proxy independently. Letting an env-injected
+            // AIKEY_MASTER_PASSWORD auto-start one here races that explicit
+            // service: the bridge grabs :27200 first and the real cluster proxy
+            // silently drifts to :27201.
+            | Commands::Internal { .. }
             // `aikey agent start` is the form-② digital-employee daemon, and its
             // proxy is owned by a SEPARATE systemd unit (aikey-de-agent.service
             // declares Wants/After aikey-de-proxy.service) — the same "manages the
@@ -2911,22 +2930,39 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 cli.password_stdin,
                 cli.json,
             )?;
-            let new_password = prompt_password_secure(
-                &format!(
-                    "{}Enter New Master Password: ",
-                    crate::symbols::ICON_LOCK.pre()
-                ),
-                false,
-                cli.json,
-            )?;
-            let confirm_password = prompt_password_secure(
-                &format!(
-                    "{}Confirm New Master Password: ",
-                    crate::symbols::ICON_LOCK.pre()
-                ),
-                false,
-                cli.json,
-            )?;
+            // `AK_TEST_PASSWORD` already enables the binary's explicit
+            // non-interactive test mode. Within that mode, honor the paired
+            // new-password input for both prompts; otherwise the generic
+            // prompt helper returns the old password three times and makes a
+            // scripted success-path test impossible. Never accept the new
+            // password variable on its own in normal production execution.
+            let test_new_password = std::env::var("AK_TEST_PASSWORD")
+                .ok()
+                .and_then(|_| std::env::var("AK_TEST_NEW_PASSWORD").ok())
+                .filter(|value| !value.is_empty())
+                .map(SecretString::new);
+            let new_password = match test_new_password.clone() {
+                Some(password) => password,
+                None => prompt_password_secure(
+                    &format!(
+                        "{}Enter New Master Password: ",
+                        crate::symbols::ICON_LOCK.pre()
+                    ),
+                    false,
+                    cli.json,
+                )?,
+            };
+            let confirm_password = match test_new_password {
+                Some(password) => password,
+                None => prompt_password_secure(
+                    &format!(
+                        "{}Confirm New Master Password: ",
+                        crate::symbols::ICON_LOCK.pre()
+                    ),
+                    false,
+                    cli.json,
+                )?,
+            };
 
             if new_password.expose_secret() != confirm_password.expose_secret() {
                 if cli.json {
@@ -3624,16 +3660,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             commands_account::ensure_shell_hook(false);
                         }
                     } else {
-                        // Single funnel: each (provider, source_type, source_ref)
-                        // tuple becomes a Switched event. Batch flavor runs
+                        // Single funnel: each exact client-route binding becomes
+                        // a lifecycle event. Batch flavor runs
                         // write_bindings_canonical N times then refresh + apply ONCE.
                         let events: Vec<commands_account::CredentialLifecycleEvent> = changes
                             .iter()
-                            .map(|(prov, src_type, src_ref)| {
-                                commands_account::CredentialLifecycleEvent::Switched {
-                                    source_type: src_type.as_str(),
-                                    source_ref: src_ref.as_str(),
-                                    providers: std::slice::from_ref(prov),
+                            .map(|change| {
+                                commands_account::CredentialLifecycleEvent::ClientRouteSwitched {
+                                    client_route: change.client_route.as_str(),
+                                    provider_code: change.provider_code.as_str(),
+                                    protocol_type: change.protocol_type.as_str(),
+                                    source_type: change.source_type.as_str(),
+                                    source_ref: change.source_ref.as_str(),
                                 }
                             })
                             .collect();
@@ -3654,15 +3692,17 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
                         // Print a summary box showing the final state.
                         use colored::Colorize;
-                        let changed_providers: Vec<&str> =
-                            changes.iter().map(|(p, _, _)| p.as_str()).collect();
+                        let changed_providers: Vec<&str> = changes
+                            .iter()
+                            .map(|change| change.client_route.as_str())
+                            .collect();
                         let mut box_rows: Vec<String> = Vec::new();
                         for b in &bindings {
                             let display_name = commands_app::resolve_binding_label(
                                 b.key_source_type.as_str(),
                                 &b.key_source_ref,
                             );
-                            let is_changed = changed_providers.contains(&b.provider_code.as_str());
+                            let is_changed = changed_providers.contains(&b.client_route.as_str());
                             let value_raw = format!("\u{2192} {}", display_name);
                             let value_padded = format!("{:<28}", value_raw);
                             let value_col = if is_changed {
@@ -3672,17 +3712,19 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                             };
                             box_rows.push(format!(
                                 "  {:<14} {} {}",
-                                b.provider_code,
+                                b.client_route,
                                 value_col,
                                 format!("[{}]", b.key_source_type).bright_black()
                             ));
                         }
                         box_rows.push(String::new());
-                        box_rows.push(format!("{} Saved provider primary selections and refreshed current activation.",
-                            crate::symbols::CHECK.s().green()));
+                        box_rows.push(format!(
+                            "{} Saved CLI route selections and refreshed current activation.",
+                            crate::symbols::CHECK.s().green()
+                        ));
                         ui_frame::print_box(
                             crate::symbols::ICON_GREEN_DOT.s(),
-                            "Provider Key Selection — Confirmed",
+                            "CLI Route Selection — Confirmed",
                             &box_rows,
                         );
 
@@ -4554,20 +4596,18 @@ fn provider_canonical(code: &str) -> String {
         .unwrap_or_else(|| code.to_lowercase())
 }
 
+#[cfg(test)]
+fn provider_proxy_path(code: &str) -> String {
+    commands_account::provider_info(code)
+        .map(|info| info.proxy_path.to_string())
+        .unwrap_or_else(|| code.to_lowercase())
+}
+
 // 2026-05-08 Kimi 双平台拆分 review feedback: ProviderInfo 已暴露 `family`
 // 字段供想做 family-level 分组的 caller 直接用 (`provider_info(code).family`)。
 // 此处之前曾加过 `fn provider_family(code) -> String` helper, self-review 时
 // 发现没有 caller —— 删除不预先抽象 (CLAUDE.md "Don't design for hypothetical
 // future requirements"),避免 dead code。如未来 UI 需要再加回。
-
-/// Provider code → proxy URL path segment used when building `base_url` for
-/// third-party clients. Unknown codes fall back to the lowercased input so new
-/// providers registered server-side keep working before the CLI knows them.
-fn provider_proxy_path(code: &str) -> String {
-    commands_account::provider_info(code)
-        .map(|i| i.proxy_path.to_string())
-        .unwrap_or_else(|| code.to_lowercase())
-}
 
 /// True when `aikey route` should hint that OpenAI-SDK-style clients
 /// (OpenCode, openai-python, …) must APPEND `/v1` to the displayed base_url.
@@ -4763,22 +4803,7 @@ fn handle_route(
     let mut missing_token_count = 0usize;
     let mut db_error_count = 0usize;
 
-    // Pre-index active bindings for O(1) lookup instead of O(N*M) linear scan.
     let bindings = storage::list_provider_bindings_readonly("default").unwrap_or_default();
-    let active_set: std::collections::HashSet<(&'static str, String)> = bindings
-        .iter()
-        .map(|b| {
-            let kind: &'static str = match b.key_source_type {
-                credential_type::CredentialType::ManagedVirtualKey => "team",
-                credential_type::CredentialType::PersonalApiKey => "personal",
-                credential_type::CredentialType::PersonalOAuthAccount => "oauth",
-            };
-            (kind, b.key_source_ref.clone())
-        })
-        .collect();
-    let is_active = |source_type: &'static str, source_ref: &str| -> bool {
-        active_set.contains(&(source_type, source_ref.to_string()))
-    };
 
     // 1. Team managed keys
     for vk in storage::list_virtual_key_cache_readonly().unwrap_or_default() {
@@ -4805,23 +4830,40 @@ fn handle_route(
                 continue;
             }
         };
-        let providers = if vk.supported_providers.is_empty() {
-            vec![vk.provider_code.clone()]
-        } else {
-            vk.supported_providers.clone()
-        };
-        for prov in &providers {
+        for provider in team_binding_providers(&vk) {
+            let protocol = if vk.protocol_type.is_empty() {
+                protocol_for_provider_base_url(&provider, &vk.base_url)
+            } else {
+                vk.protocol_type.clone()
+            };
+            let client_route =
+                crate::provider_registry::client_route_for_binding(&provider, &protocol);
+            let Some(proxy_path) =
+                crate::provider_registry::proxy_path_for_binding(&provider, &protocol)
+            else {
+                eprintln!(
+                    "  {} Skipping invalid route provider={} protocol={}",
+                    crate::symbols::WARN.s().yellow(),
+                    provider,
+                    protocol
+                );
+                continue;
+            };
+            let active = route_binding_is_active(
+                &bindings,
+                &credential_type::CredentialType::ManagedVirtualKey,
+                &vk.virtual_key_id,
+                client_route,
+                &provider,
+                &protocol,
+            );
             entries.push(RouteEntry {
-                provider: prov.clone(),
+                provider: client_route.to_string(),
                 key_type: "team".to_string(),
                 label: display_alias.to_string(),
                 api_key: token.clone(),
-                base_url: format!(
-                    "http://127.0.0.1:{}/{}",
-                    proxy_port,
-                    provider_proxy_path(prov)
-                ),
-                active: is_active("team", &vk.virtual_key_id),
+                base_url: format!("http://127.0.0.1:{}/{}", proxy_port, proxy_path),
+                active,
             });
         }
     }
@@ -4860,17 +4902,39 @@ fn handle_route(
             };
         match token_result {
             Ok(token) => {
+                let provider = provider_canonical(&acct.provider);
+                let protocol = if acct.protocol_type.is_empty() {
+                    protocol_for_provider_base_url(&provider, "")
+                } else {
+                    acct.protocol_type.clone()
+                };
+                let client_route =
+                    crate::provider_registry::client_route_for_binding(&provider, &protocol);
+                let Some(proxy_path) =
+                    crate::provider_registry::proxy_path_for_binding(&provider, &protocol)
+                else {
+                    eprintln!(
+                        "  {} Skipping invalid OAuth route provider={} protocol={}",
+                        crate::symbols::WARN.s().yellow(),
+                        provider,
+                        protocol
+                    );
+                    continue;
+                };
                 entries.push(RouteEntry {
-                    provider: provider_canonical(&acct.provider),
+                    provider: client_route.to_string(),
                     key_type: "oauth".to_string(),
                     label: label_str.to_string(),
                     api_key: token,
-                    base_url: format!(
-                        "http://127.0.0.1:{}/{}",
-                        proxy_port,
-                        provider_proxy_path(&acct.provider)
+                    base_url: format!("http://127.0.0.1:{}/{}", proxy_port, proxy_path),
+                    active: route_binding_is_active(
+                        &bindings,
+                        &credential_type::CredentialType::PersonalOAuthAccount,
+                        &acct.provider_account_id,
+                        client_route,
+                        &provider,
+                        &protocol,
                     ),
-                    active: is_active("oauth", &acct.provider_account_id),
                 });
             }
             Err(e) => {
@@ -4909,17 +4973,38 @@ fn handle_route(
                     _ => Vec::new(),
                 };
                 for prov in &providers {
+                    let provider = provider_canonical(prov);
+                    let protocol = protocol_for_provider_base_url(
+                        &provider,
+                        meta.base_url.as_deref().unwrap_or(""),
+                    );
+                    let client_route =
+                        crate::provider_registry::client_route_for_binding(&provider, &protocol);
+                    let Some(proxy_path) =
+                        crate::provider_registry::proxy_path_for_binding(&provider, &protocol)
+                    else {
+                        eprintln!(
+                            "  {} Skipping invalid personal route provider={} protocol={}",
+                            crate::symbols::WARN.s().yellow(),
+                            provider,
+                            protocol
+                        );
+                        continue;
+                    };
                     entries.push(RouteEntry {
-                        provider: prov.clone(),
+                        provider: client_route.to_string(),
                         key_type: "personal".to_string(),
                         label: meta.alias.clone(),
                         api_key: token.clone(),
-                        base_url: format!(
-                            "http://127.0.0.1:{}/{}",
-                            proxy_port,
-                            provider_proxy_path(prov)
+                        base_url: format!("http://127.0.0.1:{}/{}", proxy_port, proxy_path),
+                        active: route_binding_is_active(
+                            &bindings,
+                            &credential_type::CredentialType::PersonalApiKey,
+                            &meta.alias,
+                            client_route,
+                            &provider,
+                            &protocol,
                         ),
-                        active: is_active("personal", &meta.alias),
                     });
                 }
             }
@@ -5820,10 +5905,85 @@ fn pick_key_interactively() -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
-/// Build provider groups and show the provider-tree interactive editor.
-/// Returns a list of (provider_code, source_type, source_ref) changes to apply.
-fn pick_providers_interactively(
-) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientRouteChange {
+    client_route: String,
+    provider_code: String,
+    protocol_type: String,
+    source_type: String,
+    source_ref: String,
+}
+
+fn protocol_for_provider_base_url(provider_code: &str, base_url: &str) -> String {
+    let classifier = crate::commands_internal::parse::provider_fingerprint::instance();
+    if !base_url.is_empty() {
+        if let Some(route) = classifier.route_for_base_url(base_url) {
+            return route.protocol.clone();
+        }
+    }
+    let protocols = classifier.protocols_for_provider(provider_code);
+    if protocols.len() == 1 {
+        protocols[0].clone()
+    } else {
+        String::new()
+    }
+}
+
+fn route_binding_is_active(
+    bindings: &[storage::ProviderBinding],
+    source_type: &credential_type::CredentialType,
+    source_ref: &str,
+    client_route: &str,
+    provider: &str,
+    protocol: &str,
+) -> bool {
+    bindings.iter().any(|binding| {
+        &binding.key_source_type == source_type
+            && binding.key_source_ref == source_ref
+            && binding.client_route.eq_ignore_ascii_case(client_route)
+            && binding.provider_code.eq_ignore_ascii_case(provider)
+            && (binding.protocol_type.is_empty()
+                || binding.protocol_type.eq_ignore_ascii_case(protocol))
+    })
+}
+
+/// Returns the actual Provider axis for one cached team binding. Direct VK
+/// rows carry it in `provider_code`; group VK rows intentionally leave that
+/// scalar empty and retain the pool supplier in `supported_providers`.
+fn team_binding_providers(vk: &storage::VirtualKeyCacheEntry) -> Vec<String> {
+    let raw = if !vk.provider_code.is_empty() {
+        vec![vk.provider_code.clone()]
+    } else {
+        vk.supported_providers.clone()
+    };
+    let mut providers = Vec::new();
+    for provider in raw {
+        let canonical = provider_canonical(&provider);
+        if !canonical.is_empty()
+            && !providers
+                .iter()
+                .any(|seen: &String| seen.eq_ignore_ascii_case(&canonical))
+        {
+            providers.push(canonical);
+        }
+    }
+    providers
+}
+
+fn picker_display_type(source: &str, provider_code: &str, client_route: &str) -> Option<String> {
+    if crate::provider_registry::family_of(provider_code) == client_route {
+        return None;
+    }
+    let label = crate::provider_registry::lookup(provider_code)
+        .map(|entry| entry.display)
+        .unwrap_or(provider_code);
+    Some(format!("{} · {}", source, label))
+}
+
+/// Build client-route groups and show the interactive editor. Provider and
+/// Protocol remain exact metadata on every candidate; one Virtual Key is
+/// emitted at most once for a given exact binding in a route.
+fn pick_providers_interactively() -> Result<Vec<ClientRouteChange>, Box<dyn std::error::Error>> {
     let personal = storage::list_entries_with_metadata().unwrap_or_default();
     let team = storage::list_virtual_key_cache().unwrap_or_default();
     let oauth_accounts = storage::list_provider_accounts().unwrap_or_default();
@@ -5835,21 +5995,27 @@ fn pick_providers_interactively(
     let bindings =
         storage::list_provider_bindings(profile_activation::DEFAULT_PROFILE).unwrap_or_default();
 
-    // Collect all known provider codes.
-    let mut all_providers: Vec<String> = Vec::new();
-    let mut add_prov = |code: &str| {
+    // Collect client-route slots, never Provider categories.
+    let mut all_routes: Vec<String> = Vec::new();
+    let mut add_route = |code: &str| {
         let lc = code.to_lowercase();
-        if !lc.is_empty() && !all_providers.contains(&lc) {
-            all_providers.push(lc);
+        if !lc.is_empty() && !all_routes.contains(&lc) {
+            all_routes.push(lc);
         }
     };
     for e in &personal {
-        if let Some(ref sp) = e.supported_providers {
-            for p in sp {
-                add_prov(p);
-            }
-        } else if let Some(ref code) = e.provider_code {
-            add_prov(code);
+        let providers = e
+            .supported_providers
+            .clone()
+            .or_else(|| e.provider_code.clone().map(|p| vec![p]))
+            .unwrap_or_default();
+        for provider in providers {
+            let canonical = provider_canonical(&provider);
+            let protocol =
+                protocol_for_provider_base_url(&canonical, e.base_url.as_deref().unwrap_or(""));
+            add_route(crate::provider_registry::client_route_for_binding(
+                &canonical, &protocol,
+            ));
         }
     }
     // On a cluster, a central key's material stays on the central node (no local
@@ -5871,36 +6037,28 @@ fn pick_providers_interactively(
         })
         .collect();
     for e in &usable_team {
-        if !e.supported_providers.is_empty() {
-            for p in &e.supported_providers {
-                add_prov(p);
-            }
-        } else {
-            add_prov(&e.provider_code);
+        for provider in team_binding_providers(e) {
+            add_route(crate::provider_registry::client_route_for_binding(
+                &provider,
+                &e.protocol_type,
+            ));
         }
     }
     for b in &bindings {
-        // Map OAuth provider names in bindings to canonical codes
-        // (older aikey auth use may have written "claude" instead of "anthropic").
-        // Delegates to provider_canonical so a new alias added to provider_registry.yaml
-        // (e.g. grok→xai) lights up here without touching this file — the prior inline
-        // match was the kind of duplicated-canonicalization landmine flagged in
-        // CLAUDE.md "禁止偷懒默认 → 重复代码".
-        add_prov(&provider_canonical(&b.provider_code));
+        add_route(&b.client_route);
     }
-    // Add OAuth account providers (mapped to canonical)
     for acct in &oauth_accounts {
-        add_prov(&provider_canonical(&acct.provider));
+        let provider = provider_canonical(&acct.provider);
+        let protocol = if acct.protocol_type.is_empty() {
+            protocol_for_provider_base_url(&provider, "")
+        } else {
+            acct.protocol_type.clone()
+        };
+        add_route(crate::provider_registry::client_route_for_binding(
+            &provider, &protocol,
+        ));
     }
-    // 2026-05-08 V-layer family-grouping (详见 update/20260508-display-family-grouping.md):
-    // 按 (family, code) 排序,让同 family 的 provider_code 在 picker 里相邻;ui_select.rs
-    // build_tree_rows 依赖此顺序做"同 family 共享 header"的 render-merge。
-    // M 层零改动 — groups 仍 1 group/provider_code,只是顺序变了。
-    all_providers.sort_by(|a, b| {
-        let fa = provider_registry::family_of(a);
-        let fb = provider_registry::family_of(b);
-        (fa, a.as_str()).cmp(&(fb, b.as_str()))
-    });
+    all_routes.sort();
 
     // Probe pending-but-not-downloaded team keys. Why we always probe (not
     // only when all_providers.is_empty()): `aikey ls` shows pending team
@@ -5924,7 +6082,7 @@ fn pick_providers_interactively(
         .map(|e| e.local_alias.as_deref().unwrap_or(e.alias.as_str()))
         .collect();
 
-    if all_providers.is_empty() {
+    if all_routes.is_empty() {
         if !pending_download.is_empty() {
             return Err(format!(
                 "Found {} team key(s) pending download: {}. Run `aikey key sync` to claim and download.",
@@ -5951,10 +6109,9 @@ fn pick_providers_interactively(
         eprintln!();
     }
 
-    // Build ProviderGroup for each provider.
-    let mut groups: Vec<ui_select::ProviderGroup> = Vec::new();
+    let mut groups: Vec<ui_select::ClientRouteGroup> = Vec::new();
 
-    for prov in &all_providers {
+    for client_route in &all_routes {
         let mut candidates: Vec<ui_select::KeyCandidate> = Vec::new();
 
         for e in &personal {
@@ -5965,24 +6122,34 @@ fn pick_providers_interactively(
             } else {
                 vec![]
             };
-            if providers.iter().any(|p| p.to_lowercase() == *prov) {
+            for raw_provider in providers {
+                let provider = provider_canonical(&raw_provider);
+                let protocol =
+                    protocol_for_provider_base_url(&provider, e.base_url.as_deref().unwrap_or(""));
+                if crate::provider_registry::client_route_for_binding(&provider, &protocol)
+                    != client_route
+                {
+                    continue;
+                }
                 candidates.push(ui_select::KeyCandidate {
                     label: e.alias.clone(),
                     source_type: "personal".to_string(),
                     source_ref: e.alias.clone(),
-                    display_type: None,
+                    provider_code: provider.clone(),
+                    protocol_type: protocol,
+                    display_type: picker_display_type("personal", &provider, client_route),
                     pending: false,
                 });
             }
         }
 
         for e in &usable_team {
-            let providers = if !e.supported_providers.is_empty() {
-                e.supported_providers.clone()
-            } else {
-                vec![e.provider_code.clone()]
-            };
-            if providers.iter().any(|p| p.to_lowercase() == *prov) {
+            for provider in team_binding_providers(e) {
+                if crate::provider_registry::client_route_for_binding(&provider, &e.protocol_type)
+                    != client_route
+                {
+                    continue;
+                }
                 let pending = !e.key_material_reachable(on_cluster);
                 let label = e
                     .local_alias
@@ -6000,7 +6167,9 @@ fn pick_providers_interactively(
                     label,
                     source_type: "team".to_string(),
                     source_ref: e.virtual_key_id.clone(),
-                    display_type: None,
+                    provider_code: provider.clone(),
+                    protocol_type: e.protocol_type.clone(),
+                    display_type: picker_display_type("team", &provider, client_route),
                     pending,
                 });
             }
@@ -6010,7 +6179,15 @@ fn pick_providers_interactively(
         // Same family as the bindings loop above: delegate to provider_canonical
         // instead of duplicating the alias map inline.
         for acct in &oauth_accounts {
-            if provider_canonical(&acct.provider) == *prov {
+            let provider = provider_canonical(&acct.provider);
+            let protocol = if acct.protocol_type.is_empty() {
+                protocol_for_provider_base_url(&provider, "")
+            } else {
+                acct.protocol_type.clone()
+            };
+            if crate::provider_registry::client_route_for_binding(&provider, &protocol)
+                == client_route
+            {
                 // Precedence: local_alias → display_identity → trunc(external_id)
                 // → provider_account_id. v1.0.1-alpha.1 added local_alias on top.
                 let identity = acct
@@ -6046,11 +6223,26 @@ fn pick_providers_interactively(
                     label,
                     source_type: "personal_oauth_account".to_string(), // DB value
                     source_ref: acct.provider_account_id.clone(),
+                    provider_code: provider.clone(),
+                    protocol_type: protocol,
                     display_type: Some(source_display), // UI: "oauth" or "oauth(f)"
                     pending: false,
                 });
             }
         }
+
+        // Defensive de-duplication at the business grain. A re-grained VK has
+        // one cache row per binding, while legacy supported_providers blobs may
+        // repeat the same business candidate across those rows.
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|candidate| {
+            seen.insert((
+                candidate.source_type.clone(),
+                candidate.source_ref.clone(),
+                candidate.provider_code.clone(),
+                candidate.protocol_type.clone(),
+            ))
+        });
 
         // Match binding by canonical provider code (claude→anthropic, codex→openai).
         // The `|| b.provider_code == *prov` tail keeps the legacy raw-equality path
@@ -6064,23 +6256,20 @@ fn pick_providers_interactively(
         // 'kimi_code'。此时 groups[kimi] 自身的 b.provider_code/canonical 比对都不命中,
         // 但视觉上应该显示 (*) 在 kimi-official 行。fallback 到 family 级匹配:同 family
         // 的 binding 也算"该 group 当前 active",候选位置由 candidates 自身命中决定。
-        let current_binding = bindings.iter().find(|b| {
-            let canon = provider_canonical(&b.provider_code);
-            if canon == *prov || b.provider_code == *prov {
-                return true;
-            }
-            provider_registry::family_of(&canon) == provider_registry::family_of(prov)
-        });
+        let current_binding = bindings.iter().find(|b| b.client_route == *client_route);
         // Selection 仍按候选 source_type/source_ref 匹配,确保 binding 指向的 entry
         // 必须真的在本 group 的 candidates 列表中才会显示 (*) — 防止跨 group 误标。
         let selected = current_binding.and_then(|b| {
             candidates.iter().position(|c| {
-                c.source_type == b.key_source_type.as_str() && c.source_ref == b.key_source_ref
+                c.source_type == b.key_source_type.as_str()
+                    && c.source_ref == b.key_source_ref
+                    && c.provider_code == b.provider_code
+                    && (b.protocol_type.is_empty() || c.protocol_type == b.protocol_type)
             })
         });
 
-        groups.push(ui_select::ProviderGroup {
-            provider_code: prov.clone(),
+        groups.push(ui_select::ClientRouteGroup {
+            client_route: client_route.clone(),
             candidates,
             selected,
             expanded: true,
@@ -6105,21 +6294,23 @@ fn pick_providers_interactively(
 /// `selected` differs from the snapshot, emit one (provider_code, source_type,
 /// source_ref) change.
 fn collect_picker_changes(
-    updated_groups: &[ui_select::ProviderGroup],
+    updated_groups: &[ui_select::ClientRouteGroup],
     original_selections: &[Option<usize>],
-) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
-    let mut changes: Vec<(String, String, String)> = Vec::new();
+) -> Result<Vec<ClientRouteChange>, Box<dyn std::error::Error>> {
+    let mut changes: Vec<ClientRouteChange> = Vec::new();
     for (i, g) in updated_groups.iter().enumerate() {
         if g.selected == original_selections[i] {
             continue;
         }
         let Some(sel) = g.selected else { continue };
         let c = &g.candidates[sel];
-        changes.push((
-            g.provider_code.clone(),
-            c.source_type.clone(),
-            c.source_ref.clone(),
-        ));
+        changes.push(ClientRouteChange {
+            client_route: g.client_route.clone(),
+            provider_code: c.provider_code.clone(),
+            protocol_type: c.protocol_type.clone(),
+            source_type: c.source_type.clone(),
+            source_ref: c.source_ref.clone(),
+        });
     }
     Ok(changes)
 }
@@ -6310,7 +6501,45 @@ fn resolve_activate_key(
         } else {
             vec![]
         };
-        let target = resolve_single_provider(&display, &providers, provider_override)?;
+        let target = if let Some(selector) = provider_override {
+            let selected = commands_account::providers_for_client_selector(
+                &providers,
+                crate::credential_type::CredentialType::ManagedVirtualKey.as_str(),
+                &vk.virtual_key_id,
+                selector,
+            )
+            .map_err(|reason| format!("Key '{}': {}", display, reason))?;
+            let routes = commands_account::client_routes_for_source(
+                &selected,
+                crate::credential_type::CredentialType::ManagedVirtualKey.as_str(),
+                &vk.virtual_key_id,
+            )?;
+            if routes.len() != 1 {
+                return Err(format!(
+                    "Key '{}' resolves selector '{}' to client routes: {}. Select one client route.",
+                    display,
+                    selector,
+                    routes.join(", ")
+                )
+                .into());
+            }
+            routes[0].clone()
+        } else {
+            let routes = commands_account::client_routes_for_source(
+                &providers,
+                crate::credential_type::CredentialType::ManagedVirtualKey.as_str(),
+                &vk.virtual_key_id,
+            )?;
+            if routes.len() != 1 {
+                return Err(format!(
+                    "Key '{}' supports multiple client routes: {}. Specify --provider <route>.",
+                    display,
+                    routes.join(", ")
+                )
+                .into());
+            }
+            routes[0].clone()
+        };
         return Ok((display, token, target));
     }
 
@@ -7598,6 +7827,55 @@ mod route_v1_hint_tests {
 }
 
 #[cfg(test)]
+mod route_binding_active_tests {
+    use super::route_binding_is_active;
+    use crate::credential_type::CredentialType;
+    use crate::storage::ProviderBinding;
+
+    fn binding(route: &str, provider: &str, protocol: &str) -> ProviderBinding {
+        ProviderBinding {
+            profile_id: "default".into(),
+            client_route: route.into(),
+            provider_code: provider.into(),
+            protocol_type: protocol.into(),
+            key_source_type: CredentialType::ManagedVirtualKey,
+            key_source_ref: "vk-1".into(),
+            updated_at: Some(1),
+        }
+    }
+
+    #[test]
+    fn active_marker_requires_exact_route_provider_and_protocol() {
+        let bindings = vec![binding("anthropic", "mock", "anthropic")];
+        let kind = CredentialType::ManagedVirtualKey;
+        assert!(route_binding_is_active(
+            &bindings,
+            &kind,
+            "vk-1",
+            "anthropic",
+            "mock",
+            "anthropic"
+        ));
+        assert!(!route_binding_is_active(
+            &bindings,
+            &kind,
+            "vk-1",
+            "openai",
+            "mock",
+            "openai_compatible"
+        ));
+        assert!(!route_binding_is_active(
+            &bindings,
+            &kind,
+            "vk-1",
+            "anthropic",
+            "anthropic",
+            "anthropic"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod hook_command_tests {
     use super::compute_hook_status_state;
 
@@ -7841,5 +8119,17 @@ mod auto_start_proxy_exclusion_tests {
         assert!(!auto_starts(&["aikey", "proxy", "status"]));
         assert!(!auto_starts(&["aikey", "version"]));
         assert!(!auto_starts(&["aikey", "watch"]));
+        assert!(!auto_starts(&[
+            "aikey",
+            "_internal",
+            "init",
+            "--stdin-json"
+        ]));
+        assert!(!auto_starts(&[
+            "aikey",
+            "_internal",
+            "vault-op",
+            "--stdin-json"
+        ]));
     }
 }

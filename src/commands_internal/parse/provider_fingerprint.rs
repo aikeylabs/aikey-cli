@@ -83,6 +83,14 @@ pub struct ProviderRoute {
     /// `omitempty` for cross-language parity (P1c).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path_prefix: String,
+    /// Explicit canonical endpoint for a Provider+Protocol pair that has
+    /// multiple hosts. This keeps fallback routing independent of YAML order.
+    #[serde(
+        default,
+        rename = "default",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub is_default: bool,
 }
 
 /// P1 / design D-2: one model_map rule (client model name → upstream model).
@@ -282,14 +290,70 @@ impl FingerprintClassifier {
         best
     }
 
-    /// v4.3: lookup the FIRST route matching a provider_code. Used as a family-
-    /// level fallback when no host info is available (e.g. user picks a
-    /// provider chip without pasting a URL). Multi-host providers (kimi)
-    /// return their first row's route — caller knows this is heuristic.
+    /// Compatibility lookup for callers that know only a Provider. It succeeds
+    /// only when the Provider declares one protocol; the exact pair resolver
+    /// then requires a unique or explicitly-defaulted endpoint.
     pub fn route_for_provider(&self, provider: &str) -> Option<&ProviderRoute> {
-        self.provider_routes
+        let protocols = self.protocols_for_provider(provider);
+        (protocols.len() == 1)
+            .then(|| self.route_for_provider_protocol(provider, &protocols[0]))
+            .flatten()
+    }
+
+    /// Exact Provider+Protocol lookup. This is the only safe provider-level
+    /// lookup for multi-protocol suppliers such as Mock Provider.
+    pub fn route_for_provider_protocol(
+        &self,
+        provider: &str,
+        protocol: &str,
+    ) -> Option<&ProviderRoute> {
+        let matches = self
+            .provider_routes
             .iter()
-            .find(|r| r.provider.eq_ignore_ascii_case(provider))
+            .filter(|r| {
+                r.provider.eq_ignore_ascii_case(provider)
+                    && r.protocol.eq_ignore_ascii_case(protocol)
+            })
+            .collect::<Vec<_>>();
+        let defaults = matches
+            .iter()
+            .copied()
+            .filter(|r| r.is_default)
+            .collect::<Vec<_>>();
+        match defaults.as_slice() {
+            [route] => return Some(*route),
+            [] => {}
+            _ => return None,
+        }
+        match matches.as_slice() {
+            [route] => Some(*route),
+            _ => {
+                let catchalls = matches
+                    .iter()
+                    .copied()
+                    .filter(|r| r.path_prefix.is_empty())
+                    .collect::<Vec<_>>();
+                match catchalls.as_slice() {
+                    [route] => Some(*route),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Distinct protocols declared for a Provider, in YAML order.
+    pub fn protocols_for_provider(&self, provider: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for route in &self.provider_routes {
+            if route.provider.eq_ignore_ascii_case(provider)
+                && !out
+                    .iter()
+                    .any(|p: &String| p.eq_ignore_ascii_case(&route.protocol))
+            {
+                out.push(route.protocol.clone());
+            }
+        }
+        out
     }
 
     /// v4.3: full official URL = base_url + version (with empty-version edge case).
@@ -742,6 +806,30 @@ mod tests {
             c.provider_model_maps(),
             golden.provider_model_maps.as_slice(),
             "Rust provider_model_maps parse != golden"
+        );
+    }
+
+    #[test]
+    fn provider_protocol_default_is_explicit_and_multi_protocol_provider_is_not_collapsed() {
+        let c = instance();
+        let kimi = c
+            .route_for_provider_protocol("kimi_code", "openai_compatible")
+            .expect("kimi_code explicit default");
+        assert_eq!(kimi.host, "api.kimi.com");
+        assert!(kimi.is_default);
+
+        assert!(c.route_for_provider("mock").is_none());
+        assert_eq!(
+            c.route_for_provider_protocol("mock", "anthropic")
+                .expect("mock anthropic")
+                .protocol,
+            "anthropic"
+        );
+        assert_eq!(
+            c.route_for_provider_protocol("mock", "openai_compatible")
+                .expect("mock openai")
+                .protocol,
+            "openai_compatible"
         );
     }
 

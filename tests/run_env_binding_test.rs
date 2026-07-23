@@ -22,7 +22,13 @@ fn src_type_from_str(s: &str) -> Option<CredentialType> {
 fn make_binding(provider: &str, src_type: &str, src_ref: &str) -> ProviderBinding {
     ProviderBinding {
         profile_id: "default".to_string(),
+        client_route: provider.to_string(),
         provider_code: provider.to_string(),
+        protocol_type: match provider {
+            "anthropic" => "anthropic",
+            _ => "openai_compatible",
+        }
+        .to_string(),
         key_source_type: src_type_from_str(src_type)
             .unwrap_or_else(|| panic!("unknown src_type '{}' in test fixture", src_type)),
         key_source_ref: src_ref.to_string(),
@@ -110,6 +116,52 @@ fn multi_provider_mixed_sources() {
     assert_eq!(env.len(), 6);
 }
 
+#[test]
+fn mock_binding_uses_protocol_client_env_without_mock_namespace() {
+    let binding = ProviderBinding {
+        profile_id: "default".to_string(),
+        client_route: "anthropic".to_string(),
+        provider_code: "mock".to_string(),
+        protocol_type: "anthropic".to_string(),
+        key_source_type: CredentialType::ManagedVirtualKey,
+        key_source_ref: "vk-mock".to_string(),
+        updated_at: Some(1000),
+    };
+
+    let (env, providers, _) = build_run_env(&[binding], None, 27200).unwrap();
+    assert_eq!(providers, vec!["anthropic"]);
+    assert_eq!(
+        env.get("ANTHROPIC_API_KEY").unwrap(),
+        "aikey_active_anthropic"
+    );
+    assert_eq!(
+        env.get("ANTHROPIC_BASE_URL").unwrap(),
+        "http://127.0.0.1:27200/anthropic"
+    );
+    assert!(env.keys().all(|key| !key.contains("MOCK")));
+}
+
+#[test]
+fn moonshot_binding_keeps_kimi_env_and_moonshot_proxy_path() {
+    let binding = ProviderBinding {
+        profile_id: "default".to_string(),
+        client_route: "kimi".to_string(),
+        provider_code: "moonshot".to_string(),
+        protocol_type: "openai_compatible".to_string(),
+        key_source_type: CredentialType::PersonalApiKey,
+        key_source_ref: "moonshot-key".to_string(),
+        updated_at: Some(1000),
+    };
+
+    let (env, providers, _) = build_run_env(&[binding], None, 27200).unwrap();
+    assert_eq!(providers, vec!["kimi"]);
+    assert_eq!(env.get("KIMI_API_KEY").unwrap(), "aikey_active_kimi");
+    assert_eq!(
+        env.get("KIMI_BASE_URL").unwrap(),
+        "http://127.0.0.1:27200/moonshot/v1"
+    );
+}
+
 // ============================================================================
 // No bindings — error when no legacy config either
 // ============================================================================
@@ -137,12 +189,13 @@ fn legacy_fallback_team_key() {
 
     assert!(used_legacy);
     assert_eq!(providers, vec!["anthropic", "openai"]);
-    // Both providers get the same team token (legacy single-key behavior).
+    // The legacy config selects one source for both routes, while each route
+    // still uses its own active sentinel namespace.
     assert_eq!(
         env.get("ANTHROPIC_API_KEY").unwrap(),
         "aikey_active_anthropic"
     );
-    assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "aikey_active_anthropic");
+    assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "aikey_active_openai");
 }
 
 #[test]

@@ -259,7 +259,10 @@ fn test_json_output_delete_command() {
     let json = parse_json_output(&output);
 
     assert_eq!(json["status"], "success");
-    assert_eq!(json["alias"], "DELETE_KEY");
+    assert_eq!(json["deleted"], 1);
+    assert_eq!(json["failed"], 0);
+    assert_eq!(json["items"][0]["alias"], "DELETE_KEY");
+    assert_eq!(json["items"][0]["ok"], true);
 }
 
 #[test]
@@ -432,13 +435,22 @@ fn test_json_output_preserves_error_codes() {
 
         let json = parse_json_output(&output);
 
-        assert_eq!(json["status"], "error");
-        assert!(
-            json["error"].as_str().unwrap().contains(expected_error),
-            "Command {} should contain error: {}",
-            command,
-            expected_error
-        );
+        if command == "delete" {
+            assert_eq!(json["deleted"], 0);
+            assert_eq!(json["failed"], 1);
+            assert!(json["items"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains(expected_error));
+        } else {
+            assert_eq!(json["status"], "error");
+            assert!(
+                json["error"].as_str().unwrap().contains(expected_error),
+                "Command {} should contain error: {}",
+                command,
+                expected_error
+            );
+        }
     }
 }
 

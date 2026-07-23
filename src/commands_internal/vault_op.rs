@@ -394,6 +394,10 @@ struct ClusterRuntimeAccount {
     #[serde(default)]
     identity: String,
     #[serde(default)]
+    protocol_type: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
     external_id: String,
     #[serde(default)]
     priority: i64,
@@ -405,6 +409,12 @@ struct ClusterRuntimeAccount {
     window_status: String,
     #[serde(default)]
     window_reset_at: Option<i64>,
+    #[serde(default)]
+    window_7d_max_util_pct: Option<i64>,
+    #[serde(default)]
+    window_7d_status: String,
+    #[serde(default)]
+    window_7d_reset_at: Option<i64>,
     /// Per-account egress proxy (§11.7, P7). Non-secret operational routing
     /// config — projected PLAINTEXT into group_runtime material (not encrypted,
     /// unlike access_token). "" when unset → proxy uses its node-level egress
@@ -610,6 +620,8 @@ fn build_group_runtime_material(
             "account_id": a.account_id,
             "identity": a.identity,
             "provider_code": g.provider_code,
+            "protocol_type": a.protocol_type,
+            "base_url": a.base_url,
             "priority": a.priority,
             "assigned": false,
             "credential_id": a.credential_id,
@@ -621,6 +633,12 @@ fn build_group_runtime_material(
         }
         if !g.provider_code.is_empty() {
             m.insert("provider_code".into(), g.provider_code.clone().into());
+        }
+        if !a.protocol_type.is_empty() {
+            m.insert("protocol_type".into(), a.protocol_type.clone().into());
+        }
+        if !a.base_url.is_empty() {
+            m.insert("base_url".into(), a.base_url.clone().into());
         }
         m.insert("priority".into(), a.priority.into());
         // Per-account egress proxy (§11.7, P7): account-level routing config,
@@ -650,6 +668,15 @@ fn build_group_runtime_material(
                 }
                 if let Some(w) = a.window_reset_at {
                     m.insert("window_reset_at".into(), w.into());
+                }
+                if let Some(w) = a.window_7d_max_util_pct {
+                    m.insert("window_7d_max_util_pct".into(), w.into());
+                }
+                if !a.window_7d_status.is_empty() {
+                    m.insert("window_7d_status".into(), a.window_7d_status.clone().into());
+                }
+                if let Some(w) = a.window_7d_reset_at {
+                    m.insert("window_7d_reset_at".into(), w.into());
                 }
             }
             _ => {
@@ -3120,12 +3147,17 @@ mod hook_envelope_tests {
                     account_id: "acc-1".into(),
                     credential_id: "cred-1".into(),
                     identity: "a@x.io".into(),
+                    protocol_type: "anthropic".into(),
+                    base_url: "http://mock-provider.aikey.internal/anthropic".into(),
                     external_id: "ext-1".into(),
                     priority: 1,
                     enabled: true,
                     window_max_util_pct: Some(80),
                     window_status: "ok".into(),
                     window_reset_at: None,
+                    window_7d_max_util_pct: Some(88),
+                    window_7d_status: "active".into(),
+                    window_7d_reset_at: None,
                     egress_proxy_url: "socks5://10.0.0.9:1080".into(),
                     member_tokens: tokens_a,
                 },
@@ -3133,12 +3165,17 @@ mod hook_envelope_tests {
                     account_id: "acc-2".into(),
                     credential_id: "cred-2".into(),
                     identity: String::new(),
+                    protocol_type: String::new(),
+                    base_url: String::new(),
                     external_id: String::new(),
                     priority: 2,
                     enabled: true,
                     window_max_util_pct: None,
                     window_status: String::new(),
                     window_reset_at: None,
+                    window_7d_max_util_pct: None,
+                    window_7d_status: String::new(),
+                    window_7d_reset_at: None,
                     egress_proxy_url: String::new(), // no override → falls back to node chain
                     member_tokens: std::collections::HashMap::new(), // parent never logged in
                 },
@@ -3146,12 +3183,17 @@ mod hook_envelope_tests {
                     account_id: "acc-off".into(),
                     credential_id: "cred-off".into(),
                     identity: String::new(),
+                    protocol_type: String::new(),
+                    base_url: String::new(),
                     external_id: String::new(),
                     priority: 3,
                     enabled: false, // disabled → excluded entirely
                     window_max_util_pct: None,
                     window_status: String::new(),
                     window_reset_at: None,
+                    window_7d_max_util_pct: None,
+                    window_7d_status: String::new(),
+                    window_7d_reset_at: None,
                     egress_proxy_url: String::new(),
                     member_tokens: std::collections::HashMap::new(),
                 },
@@ -3184,6 +3226,13 @@ mod hook_envelope_tests {
         assert_eq!(m1["expires_at"], serde_json::json!(4200));
         assert_eq!(m1["external_id"], serde_json::json!("ext-1"));
         assert_eq!(m1["credential_type"], serde_json::json!("oauth_account"));
+        assert_eq!(m1["window_7d_max_util_pct"], serde_json::json!(88));
+        assert_eq!(m1["protocol_type"], serde_json::json!("anthropic"));
+        assert_eq!(
+            m1["base_url"],
+            serde_json::json!("http://mock-provider.aikey.internal/anthropic")
+        );
+        assert_eq!(refs[0]["protocol_type"], serde_json::json!("anthropic"));
         assert!(m1.get("needs_login").is_none());
         // Per-account egress proxy (§11.7, P7): projected PLAINTEXT, account-level.
         assert_eq!(
