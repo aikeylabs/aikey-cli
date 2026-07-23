@@ -4925,6 +4925,22 @@ pub(crate) fn client_routes_for_source(
     Ok(routes)
 }
 
+/// Prefer the post-write route projection, but preserve the exact pre-write
+/// client routes when a cache reread is transiently empty. Neither input is a
+/// Provider-axis list, so supplier codes can never leak into route output.
+fn finalize_promoted_routes(
+    mut projected_routes: Vec<String>,
+    exact_client_routes: Vec<String>,
+) -> Vec<String> {
+    projected_routes.sort();
+    projected_routes.dedup();
+    if projected_routes.is_empty() {
+        exact_client_routes
+    } else {
+        projected_routes
+    }
+}
+
 /// Resolve the exact upstream `(Provider, Protocol)` for one source credential
 /// when the caller already owns the client-route slot (for example an Agent
 /// app manifest declares `anthropic`). This keeps app-scoped and default
@@ -5669,6 +5685,14 @@ pub fn handle_key_use(
         selected
     };
 
+    // Resolve the client-facing route before mutating activation state. Provider
+    // is the upstream supplier axis (`mock`, `zhipu`, ...); it must never become
+    // an SDK route or an AIKEY_* env namespace. Keep this exact projection as the
+    // fail-closed fallback if the post-write binding reread is temporarily empty.
+    let target_client_routes =
+        client_routes_for_source(&target_providers, key_type.as_str(), &key_ref)
+            .map_err(|reason| format!("Key '{}': {}", display_name, reason))?;
+
     // (The cluster node was resolved up front, before the delivery check — see the
     // top of handle_key_use. The funnel's refresh reads it per-binding via cluster_route.)
 
@@ -5696,7 +5720,7 @@ pub fn handle_key_use(
     // Bindings reread for the JSON envelope below (apply already wrote
     // active.env). Cheap; single DB read.
     let bindings = crate::storage::list_provider_bindings_readonly("default").unwrap_or_default();
-    let mut promoted_routes = bindings
+    let promoted_routes = bindings
         .iter()
         .filter(|b| {
             b.key_source_type == key_type
@@ -5707,13 +5731,10 @@ pub fn handle_key_use(
         })
         .map(|b| b.client_route.clone())
         .collect::<Vec<_>>();
-    promoted_routes.sort();
-    promoted_routes.dedup();
-    if promoted_routes.is_empty() {
-        // Defensive compatibility for an old cache row whose exact binding could
-        // not be reconstructed. Do not fail an activation that already succeeded.
-        promoted_routes = target_providers.clone();
-    }
+    // The activation already resolved exact bindings before it wrote state.
+    // Reuse that client-route projection when the reread is empty; falling back
+    // to target_providers would resurrect supplier-only routes such as `mock`.
+    let promoted_routes = finalize_promoted_routes(promoted_routes, target_client_routes);
     // Suppress unused-warning when json_mode skips the helper apply.
     let _ = proxy_port;
 
@@ -5769,7 +5790,7 @@ pub fn handle_key_use(
         // being printed, so no new protocol can overflow it either.
         let axis_cells: Vec<(String, String)> = bindings
             .iter()
-            .filter(|b| provider_env_vars(&b.provider_code).is_some())
+            .filter(|b| provider_env_vars(&b.client_route).is_some())
             .map(|b| {
                 (
                     resolve_binding_protocol(b),
@@ -5837,11 +5858,7 @@ pub fn handle_key_use(
         let title = format!(
             "Set '{}' as Primary for {}",
             display_name,
-            target_providers
-                .iter()
-                .map(|p| crate::provider_registry::display_label(p))
-                .collect::<Vec<_>>()
-                .join(", ")
+            promoted_routes.join(", ")
         );
         crate::ui_frame::print_box(crate::symbols::ICON_GREEN_DOT.s(), &title, &rows);
         // 阶段7: Desktop is a cold-switch surface — when THIS use rewrote
@@ -5864,43 +5881,11 @@ pub fn handle_key_use(
     Ok(())
 }
 
-/// P1f.11① (§19.9, L1): resolve the WIRE PROTOCOL for a provider binding shown in
-/// the `aikey use` summary, from the fingerprint route row that owns its endpoint
-/// — the SAME endpoint-truth source as the vault two-axis read model
-/// (`commands_internal::query::two_axis_bindings`). This is a protocol, NOT the
-/// provider family: the summary shows the two axes separately so a GLM-via-anthropic
-/// binding reads "anthropic · zhipu(GLM)" instead of collapsing them. Multi-binding
-/// per provider is an L3 (P1e) concern; at L1 each provider has one active binding.
+/// Keep the `aikey use` presenter on the same protocol resolver as active.env.
+/// In particular, legacy Team VKs may have multiple binding-granular cache rows;
+/// looking up an arbitrary representative row here can select another protocol.
 fn resolve_binding_protocol(b: &storage::ProviderBinding) -> String {
-    if !b.protocol_type.is_empty() {
-        return b.protocol_type.clone();
-    }
-    use crate::credential_type::CredentialType;
-    use crate::commands_internal::parse::provider_fingerprint::protocol_for;
-    let (base_url, declared) = match b.key_source_type {
-        // Team keys carry base_url + protocol_type in the local cache.
-        CredentialType::ManagedVirtualKey => storage::get_virtual_key_cache(&b.key_source_ref)
-            .ok()
-            .flatten()
-            .map(|vk| (vk.base_url, vk.protocol_type))
-            .unwrap_or_default(),
-        // Personal keys: resolve via the entry's stored base_url.
-        _ => (
-            storage::get_entry_base_url(&b.key_source_ref)
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
-            String::new(),
-        ),
-    };
-    // Shared with `aikey list` — see `protocol_for`. It resolves endpoint-first
-    // and, when there is no endpoint, falls back to the PROVIDER'S ROUTE ROW,
-    // which is still a protocol. The previous last resort here was
-    // `provider_registry::family_of()`, i.e. a provider family printed under a
-    // PROTOCOL header, which also made `use` disagree with `list` for every key
-    // stored without a base_url. Empty when genuinely unresolvable — an honest
-    // blank beats a confident wrong axis.
-    protocol_for(&base_url, &b.provider_code, &declared)
+    crate::profile_activation::resolve_binding_protocol(b)
 }
 
 /// Classify the `aikey use` summary line so it never overpromises
@@ -6413,8 +6398,8 @@ mod provider_mapping_tests {
     //! Any refactor (L5) must pass all of these.
 
     use super::{
-        provider_env_vars, provider_extra_env_vars, provider_proxy_prefix,
-        providers_matching_client_route,
+        finalize_promoted_routes, provider_env_vars, provider_extra_env_vars,
+        provider_proxy_prefix, providers_matching_client_route,
     };
 
     #[test]
@@ -6436,6 +6421,13 @@ mod provider_mapping_tests {
             providers_matching_client_route(&routes, "anthropic"),
             vec!["mock-a".to_string(), "mock-b".to_string()]
         );
+    }
+
+    #[test]
+    fn empty_projection_falls_back_to_exact_client_route_not_supplier() {
+        let routes = finalize_promoted_routes(Vec::new(), vec!["openai".to_string()]);
+        assert_eq!(routes, vec!["openai".to_string()]);
+        assert!(!routes.iter().any(|route| route == "mock"));
     }
 
     // ── provider_env_vars: (API_KEY, BASE_URL) per provider ─────────────────

@@ -469,7 +469,11 @@ mod protocol_axis_tests {
     fn base_url_wins_over_declared() {
         // anthropic's official endpoint speaks the anthropic protocol even if a
         // stale record declares otherwise
-        let p = protocol_for("https://api.anthropic.com", "anthropic", "openai_compatible");
+        let p = protocol_for(
+            "https://api.anthropic.com",
+            "anthropic",
+            "openai_compatible",
+        );
         assert_eq!(p, "anthropic");
     }
 
