@@ -991,15 +991,23 @@ pub(crate) enum TreeRow {
     Cancel,
 }
 
-/// V-layer family-aware: toggle 同 family 全部 group 的 expanded 一起翻转,
-/// 确保 picker 视觉合并时折叠/展开状态一致。Caller 是 Space 键 on Provider header。
+/// Toggle THIS route group's expanded state. Caller 是 Space 键 on route header。
+///
+/// 不再跨 group 遍历 family：分组键已经是 client route
+/// (`provider_registry::client_route_for_binding`)，kimi_code/moonshot 这类同
+/// family 的 provider 按构造落在同一个 group 里（围栏
+/// `native_provider_path_is_not_collapsed_to_client_route`），所以旧
+/// `family_aware_toggle_expanded` 的跨组同步在这个模型下没有可同步的对象。
 pub(crate) fn route_toggle_expanded(groups: &mut Vec<ClientRouteGroup>, gi: usize) {
     groups[gi].expanded = !groups[gi].expanded;
 }
 
-/// V-layer family-aware: 选中 candidate 时清空同 family 其它 group 的 selection,
-/// picker 层 family-mutex 视觉一致 (DB 层互斥仍由 set_provider_binding transaction 兜底)。
-/// Caller 是 Space 键 on Candidate row。
+/// Select a candidate within its route group. Caller 是 Space 键 on Candidate row。
+///
+/// 组内单选 (`selected: Option<usize>`) 即 family-mutex：同 family 候选都在同一
+/// group（见 route_toggle_expanded 的分组键说明），选中即替换，无需再像旧
+/// `family_aware_select` 那样清空其它 group。DB 层互斥仍由
+/// set_provider_binding transaction 兜底。
 pub(crate) fn route_select(groups: &mut Vec<ClientRouteGroup>, gi: usize, ci: usize) {
     // Pending (material-unreachable) candidates are visible but not selectable —
     // selecting one would recreate the "IN USE but proxy 503s" state the
@@ -1460,5 +1468,25 @@ mod client_route_grouping_tests {
         route_select(&mut groups, 0, 1);
         assert_eq!(groups[0].selected, Some(1));
         assert_eq!(groups[1].selected, Some(0));
+    }
+
+    // 2026-07-06 binding-material guard, UI layer (update/20260706-绑定材料守卫…):
+    // a pending candidate (team VK material not yet reachable) is VISIBLE but not
+    // selectable — selecting it would recreate the "IN USE but proxy 503s" state.
+    // Space must be a no-op AND must not clobber an existing valid selection.
+    #[test]
+    fn route_select_pending_candidate_is_a_noop() {
+        let mut groups = vec![group("anthropic", 2, true)];
+        groups[0].candidates[1].pending = true;
+
+        // No prior selection: selecting the pending row selects nothing.
+        route_select(&mut groups, 0, 1);
+        assert_eq!(groups[0].selected, None);
+
+        // Prior valid selection survives an attempt to select the pending row.
+        route_select(&mut groups, 0, 0);
+        assert_eq!(groups[0].selected, Some(0));
+        route_select(&mut groups, 0, 1);
+        assert_eq!(groups[0].selected, Some(0));
     }
 }
