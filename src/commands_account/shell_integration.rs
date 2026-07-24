@@ -571,7 +571,8 @@ pub fn apply_third_party_cli_configs(
 
     // Codex CLI: install full aikey scaffold when openai provider is active.
     // Writes (1) `[model_providers.aikey]` block (custom provider with
-    // env_key=OPENAI_API_KEY + base_url=proxy + requires_openai_auth=false),
+    // experimental_bearer_token sentinel + base_url=proxy +
+    // requires_openai_auth=false — one credential channel only, see §Codex),
     // (2) legacy `openai_base_url = ...` line for back-compat, (3) conditional
     // top-level `model_provider = "aikey"` (only if no conflicting user setting).
     // The shell wrapper around `codex` injects `-c model_provider=aikey` at
@@ -806,10 +807,37 @@ pub fn unconfigure_kimi_cli() {
 // (ChatGPT OAuth token or piped API key). Also `OPENAI_BASE_URL` env var is not
 // supported at all (only `openai_base_url` in config.toml).
 //
-// To get true per-shell Kimi-style isolation, we define a custom provider
-// `[model_providers.aikey]` with `env_key = "OPENAI_API_KEY"`. Codex reads the
-// env var at each request, so each shell's `OPENAI_API_KEY` (set by `aikey use` /
-// `aikey activate`) routes independently through the local proxy.
+// We define a custom provider `[model_providers.aikey]` whose ONLY credential
+// channel is `experimental_bearer_token`. Writing `env_key` alongside it is
+// FORBIDDEN — see the short-circuit note below.
+//
+// CREDENTIAL CHANNEL: exactly one, never two (2026-07-23).
+//
+// Codex's auth resolution is a SHORT-CIRCUIT chain, not a set of parallel
+// fallbacks: when `env_key` is set but that environment variable is unset,
+// codex aborts with `Missing environment variable: <VAR>` and never consults
+// `experimental_bearer_token` nor `~/.codex/auth.json`. So writing both fields
+// is not belt-and-braces — the first silently masks the second, and every
+// surface without a shell breaks. Codex Desktop and the IDE extension run
+// outside the shell and never see the `OPENAI_API_KEY` that `aikey use`
+// exports, so `env_key` made desktop takeover fail 100% of the time.
+//
+// Wire-level A/B on codex-cli 0.144.5 (Win10 guest, dumb listener capturing the
+// Authorization header; each row differs only in the named fields):
+//   env_key + bearer                  → ERROR Missing environment variable
+//   env_key + bearer + auth.json      → ERROR Missing environment variable
+//   bearer only                       → `Bearer aikey_active_openai`  ✓
+//   bearer only + ChatGPT auth.json   → `Bearer aikey_active_openai`  ✓ (bearer wins)
+// The last row is why we do NOT also write `~/.codex/auth.json`: it buys
+// nothing and would mean owning a file holding the user's OAuth refresh_token.
+// Record: workflow/CI/bugfix/2026-07-23-codex-env-key-shortcircuits-desktop.md
+//
+// Hardcoding the literal sentinel is safe and does NOT pin a credential:
+// aikey-proxy classifies `aikey_active_*` as Tier3ActiveSentinel and resolves
+// the binding from the URL path's canonical provider — the suffix is
+// informational (aikey-proxy internal/proxy/dispatch.go). So this constant and
+// whatever `aikey use` exports into OPENAI_API_KEY resolve to the SAME active
+// binding, OAuth account pools included.
 //
 // File structure we write (three pieces):
 //   1. Line: `openai_base_url = "..."  # managed by aikey`  (legacy back-compat)
@@ -819,7 +847,7 @@ pub fn unconfigure_kimi_cli() {
 //        [model_providers.aikey]
 //        name = "aikey"
 //        base_url = "..."
-//        env_key = "OPENAI_API_KEY"
+//        experimental_bearer_token = "aikey_active_openai"
 //        wire_api = "responses"
 //        requires_openai_auth = false
 //        # END aikey
@@ -838,9 +866,10 @@ pub fn unconfigure_kimi_cli() {
 const CODEX_LINE_MARKER: &str = "# managed by aikey";
 
 /// Codex config.toml base_url (§5.5 per-provider). If the openai-family active
-/// binding (openai/gpt/chatgpt) is a managed VK on a cluster, point codex at the
-/// central node; else the local proxy. Codex's token rides OPENAI_API_KEY in
-/// active.env (per-provider there), so only the base_url is routed here.
+/// binding (openai/gpt/chatgpt) is a direct-bind managed VK on a cluster, point
+/// codex at the central node; else (including Team OAuth pools) use the local
+/// proxy. Codex's token rides the `experimental_bearer_token` sentinel written
+/// into the provider block, so only the base_url is routed here.
 fn codex_base_url(proxy_port: u16) -> String {
     for p in ["openai", "gpt", "chatgpt"] {
         if let Ok(Some(b)) =
@@ -895,17 +924,13 @@ pub(super) fn codex_merge(existing: &str, base_url: &str) -> (TomlMergeOutcome, 
     let mut aikey_tbl = Table::new();
     aikey_tbl["name"] = value("aikey");
     aikey_tbl["base_url"] = value(base_url);
-    aikey_tbl["env_key"] = value("OPENAI_API_KEY");
-    // Codex Desktop (ChatGPT app's Codex mode) reads this same config.toml but
-    // runs outside the shell, so it never sees the `OPENAI_API_KEY` the shell
-    // wrapper exports — `env_key` alone can't reach it. Codex's auth chain
-    // (codex-rs model-provider `bearer_auth_for_provider`) tries `env_key`
-    // first, then falls through to this literal `experimental_bearer_token`
-    // when the env var is unset — so writing the follow-active sentinel here
-    // is what covers the desktop. CLI is unaffected: env_key wins when the
-    // shell wrapper has set OPENAI_API_KEY (same sentinel value, so consistent).
-    // Empirically verified 2026-07-16 (Codex Desktop sent this literal as the
-    // Bearer); see workflow/CI/research/codex-desktop-takeover/2026-07-16-codex-desktop.md.
+    // The ONE credential channel. Do NOT add `env_key` back, and do NOT add a
+    // second channel "for safety" — codex short-circuits on the first one it
+    // finds, so a second channel is dead code at best and a hard failure at
+    // worst (`env_key` present + env var unset ⇒ codex aborts before ever
+    // reading this line, which broke Desktop takeover 100%). Full A/B matrix
+    // and the proxy-side reason this literal is credential-agnostic are in the
+    // module header above. Fenced by `codex_block_has_exactly_one_credential_channel`.
     aikey_tbl["experimental_bearer_token"] = value("aikey_active_openai");
     aikey_tbl["wire_api"] = value("responses");
     aikey_tbl["requires_openai_auth"] = value(false);
@@ -1017,7 +1042,7 @@ pub fn configure_codex_cli(proxy_port: u16) {
         .unwrap_or_else(|| resolve_user_home().join(".codex"));
 
     // Cluster form-① (P5, §5.5 per-provider): node if the openai binding is a
-    // managed VK on a cluster, else local proxy. See codex_base_url.
+    // direct-bind managed VK on a cluster, else local proxy. See codex_base_url.
     let base_url = codex_base_url(proxy_port);
     let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
 
@@ -1584,11 +1609,12 @@ pub fn display_aikey_path(relative: &str) -> String {
 /// Cluster form-① PER-PROVIDER routing (P5, design §5.5 "本地/中央共存 · VK 路由").
 ///
 /// `aikey use` routes PER KEY TYPE, and local keys + cluster VKs COEXIST on the
-/// same machine: a managed VK whose user is on a cluster goes to the central node
-/// with that VK's real token; every other binding (personal API key / native /
-/// OAuth) stays on the LOCAL proxy with the `aikey_active_*` sentinel. So
-/// anthropic-on-personal-OAuth and openai-on-cluster-VK each hit their own proxy —
-/// the tool sees two BASE_URLs, the user doesn't notice (§5.5 line 588).
+/// same machine: a direct-bind managed VK whose user is on a cluster goes to the
+/// central node with that VK's real token; every other binding (personal API key /
+/// native / OAuth, plus a Team OAuth account-pool VK) stays on the LOCAL proxy
+/// with the `aikey_active_*` sentinel. Team OAuth must remain local because its
+/// per-member account material, cooldown state, and `current_routed` projection
+/// are owned by the member proxy, not by the cluster ingress/worker.
 ///
 /// The sidecar stores ONLY the user's resolved node authority (one resolve per
 /// `aikey use`, hashed by user → one node for all the user's VKs). The PER-PROVIDER
@@ -1631,156 +1657,47 @@ pub(crate) fn clear_cluster_node() {
 }
 
 /// Per-provider route (§5.5). Returns Some((node_authority, vk_token)) ONLY when
-/// this binding is a managed VK AND the user is on a cluster (node resolved) — the
-/// caller then targets the central node with the VK's real token. None ⇒ caller
-/// uses the local proxy (localhost + sentinel): personal/native/OAuth always, and
-/// managed VKs in a non-cluster deployment (key served by the local proxy).
+/// this binding is a direct-bind managed VK AND the user is on a cluster (node
+/// resolved) — the caller then targets the central node with the VK's real token.
+/// None ⇒ caller uses the local proxy (localhost + sentinel): personal/native/
+/// OAuth always, member-visible Team OAuth account-pool VKs always, and direct-bind
+/// managed VKs in a non-cluster deployment. Online-Agent group VKs belong to an
+/// independent agent seat, are not delivered to this member `ak use` path, and get
+/// their ingress base_url from control-master's onlineagent service.
 pub(crate) fn cluster_route(
     key_source_type: &crate::credential_type::CredentialType,
     key_source_ref: &str,
 ) -> Option<(String, String)> {
-    cluster_route_with(key_source_type, key_source_ref, read_cluster_node())
+    let is_oauth_group = *key_source_type
+        == crate::credential_type::CredentialType::ManagedVirtualKey
+        && crate::storage::get_virtual_key_cache(key_source_ref)
+            .ok()
+            .flatten()
+            .and_then(|entry| entry.oauth_group_id)
+            .is_some_and(|group_id| !group_id.trim().is_empty());
+
+    cluster_route_with(
+        key_source_type,
+        key_source_ref,
+        read_cluster_node(),
+        is_oauth_group,
+    )
 }
 fn cluster_route_with(
     key_source_type: &crate::credential_type::CredentialType,
     key_source_ref: &str,
     node: Option<String>,
+    is_oauth_group: bool,
 ) -> Option<(String, String)> {
     if *key_source_type != crate::credential_type::CredentialType::ManagedVirtualKey {
         return None; // personal / native / oauth → always local proxy
     }
+    if is_oauth_group {
+        return None; // Team OAuth account pool → member-local proxy owns routing state
+    }
     let node = node?; // managed VK but no cluster node → local proxy (non-cluster team)
     let token = crate::team_token_normalize::team_token_from_vk_id(key_source_ref).ok()?;
     Some((node, token))
-}
-
-pub(super) fn write_active_env(
-    _key_type: &str, // legacy parameter — token is now per-provider sentinel (see body)
-    _key_ref: &str,  // legacy parameter — see _key_type
-    display_name: &str,
-    providers: &[String],
-    proxy_port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let aikey_dir = resolve_aikey_dir();
-    std::fs::create_dir_all(&aikey_dir)?;
-    // Re-assert owner-only on ~/.aikey (don't depend on vault-init ordering),
-    // since the files written below can carry a cluster node's real token.
-    let _ = crate::storage_acl::enforce_owner_only_dir(&aikey_dir);
-    let env_path = aikey_dir.join("active.env");
-
-    // Collect plain key-value pairs (no shell expressions) for both files.
-    //
-    // AIKEY_ACTIVE_SEQ inclusion (Stage 3 review fix, 2026-04-29):
-    // hook.bash / hook.zsh use this value to short-circuit the precmd
-    // re-source on prompts where nothing changed. The other writer
-    // (`profile_activation::refresh_implicit_profile_activation`)
-    // already embeds it; without doing the same here, an `aikey use`
-    // would produce an active.env / active.env.flat with no SEQ line —
-    // both bash and the new PowerShell hook (`hook.ps1`) would have to
-    // fall back to unconditional re-source on every prompt.
-    //
-    // We READ the seq (vs `bump_vault_change_seq`) because the bump is
-    // the responsibility of `profile_activation` — that's the proper
-    // change-driver. write_active_env reflects current state.
-    let active_seq = crate::storage::get_vault_change_seq().unwrap_or(0);
-    let mut kv_pairs: Vec<(String, String)> = vec![
-        ("AIKEY_ACTIVE_SEQ".to_string(), active_seq.to_string()),
-        ("AIKEY_ACTIVE_KEY".to_string(), display_name.to_string()),
-    ];
-
-    for provider in providers {
-        if let Some((api_key_var, base_url_var)) = super::provider_env_vars(provider) {
-            // §5.5 PER-PROVIDER routing: look up THIS provider's active binding
-            // (write_active_env only has provider names) — a managed VK on a
-            // cluster → node + the VK's real token; everything else → local proxy
-            // + the `aikey_active_<provider>` sentinel (proxy tier-3 resolves it).
-            // Mixed local-key + cluster-VK coexist, each to its own proxy.
-            // Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md
-            let route = crate::storage::get_provider_binding(
-                crate::profile_activation::DEFAULT_PROFILE,
-                provider,
-            )
-            .ok()
-            .flatten()
-            .and_then(|b| cluster_route(&b.key_source_type, &b.key_source_ref));
-            let (token_value, base_url) = match route {
-                Some((node, tok)) => (
-                    tok,
-                    format!("http://{}/{}", node, super::provider_proxy_prefix(provider)),
-                ),
-                None => (
-                    format!("aikey_active_{}", provider),
-                    format!(
-                        "http://127.0.0.1:{}/{}",
-                        proxy_port,
-                        super::provider_proxy_prefix(provider)
-                    ),
-                ),
-            };
-            kv_pairs.push((api_key_var.to_string(), token_value));
-            kv_pairs.push((base_url_var.to_string(), base_url));
-            // Provider-specific extras (e.g. KIMI_MODEL_NAME for the
-            // minimal-scaffold Kimi config).
-            for (extra_var, extra_val) in super::provider_extra_env_vars(provider) {
-                kv_pairs.push((extra_var.to_string(), extra_val.to_string()));
-            }
-        }
-    }
-
-    // no_proxy/NO_PROXY: plain value for the flat file, shell-expansion for sh file.
-    let no_proxy_value = "127.0.0.1,localhost";
-    if !providers.is_empty() {
-        kv_pairs.push(("no_proxy".to_string(), no_proxy_value.to_string()));
-        kv_pairs.push(("NO_PROXY".to_string(), no_proxy_value.to_string()));
-    }
-
-    // ── 1. Write active.env (sh format, sourced by zsh/bash precmd) ─────────
-    //
-    // v3 architecture: active.env contains only env vars (no source statements).
-    // Wrapper functions and precmd/preexec logic live in ~/.aikey/hook.{zsh,bash}
-    // and are loaded once from shell rc. No live-upgrade indirection here — after
-    // `aikey init` rewrites hook.*, users open a new shell or `source ~/.aikey/hook.zsh`.
-    let mut sh_lines = vec![
-        "# aikey active key — auto-generated by 'aikey use', do not edit manually".to_string(),
-    ];
-    for (k, v) in &kv_pairs {
-        // Quoting policy (single-quote untrusted values; keep SEQ / no_proxy
-        // double-quoted) lives in one place — see active_env_export_line.
-        sh_lines.push(crate::shell_quote::active_env_export_line(k, v));
-    }
-    // Append to existing no_proxy (shell expansion) instead of clobbering.
-    // Why separate from the flat kv_pairs: ${no_proxy:-} is sh syntax, not valid in
-    // PowerShell/cmd. The flat file gets the base value; the sh file appends to existing.
-    if !providers.is_empty() {
-        let content = sh_lines.join("\n") + "\n";
-        let content = content
-            .replace(
-                &format!("export no_proxy=\"{}\"", no_proxy_value),
-                &format!("export no_proxy=\"127.0.0.1,localhost,${{no_proxy:-}}\""),
-            )
-            .replace(
-                &format!("export NO_PROXY=\"{}\"", no_proxy_value),
-                &format!("export NO_PROXY=\"127.0.0.1,localhost,${{NO_PROXY:-}}\""),
-            );
-        std::fs::write(&env_path, content)?;
-    } else {
-        std::fs::write(&env_path, sh_lines.join("\n") + "\n")?;
-    }
-    // Harden active.env to 0600 / owner-only ACL (may carry a real cluster token).
-    let _ = crate::storage_acl::enforce_owner_only_file(&env_path);
-
-    // ── 2. Write active.env.flat (plain KEY=VALUE, no shell syntax) ─────────
-    // Why: PowerShell/cmd deactivate needs to restore env vars but cannot parse
-    // sh-style ${...} expressions. This file contains only literal values.
-    let flat_path = aikey_dir.join("active.env.flat");
-    let flat_lines: Vec<String> = kv_pairs
-        .iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect();
-    std::fs::write(&flat_path, flat_lines.join("\n") + "\n")?;
-    let _ = crate::storage_acl::enforce_owner_only_file(&flat_path);
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4160,7 +4077,9 @@ tool_call_timeout_ms = 60000\n"
         let table_pos = out.find("[projects.x]").unwrap();
         assert!(base_pos < table_pos, "scalar must precede table:\n{out}");
         assert!(out.contains("[model_providers.aikey]"));
-        assert!(out.contains("env_key = \"OPENAI_API_KEY\""));
+        // Credential-field assertions live in
+        // `codex_block_has_exactly_one_credential_channel`; this test only owns
+        // the scalar-above-table ordering invariant.
         assert!(out.contains("http://127.0.0.1:27200/openai"));
         assert!(out.contains("requires_openai_auth = false"));
     }
@@ -4175,25 +4094,98 @@ tool_call_timeout_ms = 60000\n"
         assert!(out.contains("127.0.0.1:19999"));
     }
 
-    // Codex Desktop takeover (2026-07-16): the ChatGPT app's Codex mode reads
-    // this config.toml but runs outside the shell (no OPENAI_API_KEY env), so
-    // only the literal experimental_bearer_token reaches it. Fence both the new
-    // field AND that the CLI's env_key path is left intact.
+    // Codex takeover credential contract (2026-07-23). Codex resolves auth via
+    // a SHORT-CIRCUIT chain, so the block must expose exactly ONE credential
+    // channel. The previous version of this test asserted only that
+    // `experimental_bearer_token` was present — it stayed green while a
+    // co-resident `env_key` masked it and broke Desktop/IDE takeover 100%.
+    // Asserting the exact key set is what makes this fence able to go red.
     #[test]
-    fn codex_merge_writes_experimental_bearer_token_for_desktop() {
+    fn codex_block_has_exactly_one_credential_channel() {
         let (outcome, _) = codex_merge("", "http://127.0.0.1:27200/openai");
         let out = match outcome {
             TomlMergeOutcome::Changed(s) => s,
             o => panic!("{o:?}"),
         };
-        assert!(
-            out.contains(r#"experimental_bearer_token = "aikey_active_openai""#),
-            "missing experimental_bearer_token (Codex Desktop takeover):\n{out}"
+        let doc = out.parse::<toml_edit::Document>().expect("valid toml");
+        let tbl = doc["model_providers"]["aikey"]
+            .as_table()
+            .expect("[model_providers.aikey] table");
+
+        assert_eq!(
+            tbl.get("experimental_bearer_token")
+                .and_then(|v| v.as_str()),
+            Some("aikey_active_openai"),
+            "credential channel missing:\n{out}"
         );
-        // CLI path unchanged: env_key still present (shell wrapper sets it).
-        assert!(out.contains(r#"env_key = "OPENAI_API_KEY""#));
-        // Still valid TOML.
-        out.parse::<toml_edit::Document>().expect("valid toml");
+        assert!(
+            tbl.get("env_key").is_none(),
+            "`env_key` is back. It short-circuits codex's auth chain: when the \
+             env var is unset codex aborts with `Missing environment variable` \
+             BEFORE reading experimental_bearer_token, which breaks every \
+             shell-less surface (Codex Desktop / IDE). See \
+             workflow/CI/bugfix/2026-07-23-codex-env-key-shortcircuits-desktop.md\n{out}"
+        );
+
+        // Exact key set. This block is a wire contract against an external
+        // program whose resolution order we do not control, so adding a field
+        // must be a deliberate edit here plus a re-run of the A/B matrix
+        // against a real codex binary — never an incidental addition.
+        let mut keys: Vec<&str> = tbl.iter().map(|(k, _)| k).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "base_url",
+                "experimental_bearer_token",
+                "name",
+                "requires_openai_auth",
+                "wire_api",
+            ],
+            "[model_providers.aikey] key set changed — re-run the codex \
+             credential A/B matrix (bugfix 2026-07-23) before accepting.\n{out}"
+        );
+    }
+
+    // Existing-user self-heal (2026-07-23). Users configured before the fix
+    // carry a stale `env_key` in their config.toml, which keeps Desktop/IDE
+    // broken. We claim in the bugfix record that no manual edit / reinstall is
+    // needed because the block is an all-or-nothing table upsert rather than a
+    // field-level merge — that claim is load-bearing for support, so fence it
+    // instead of trusting a read of the merge code.
+    #[test]
+    fn codex_merge_strips_stale_env_key_from_existing_block() {
+        let stale = concat!(
+            "model_provider = \"aikey\"\n",
+            "\n",
+            "[model_providers.aikey]\n",
+            "name = \"aikey\"\n",
+            "base_url = \"http://127.0.0.1:27200/openai\"\n",
+            "env_key = \"OPENAI_API_KEY\"\n",
+            "experimental_bearer_token = \"aikey_active_openai\"\n",
+            "wire_api = \"responses\"\n",
+            "requires_openai_auth = false\n",
+        );
+        let (outcome, _) = codex_merge(stale, "http://127.0.0.1:27200/openai");
+        let out = match outcome {
+            // Must be Changed, not Unchanged — an Unchanged verdict here would
+            // mean stale configs never self-heal on `aikey use`.
+            TomlMergeOutcome::Changed(s) => s,
+            o => panic!("stale env_key must trigger a rewrite, got {o:?}"),
+        };
+        let doc = out.parse::<toml_edit::Document>().expect("valid toml");
+        let tbl = doc["model_providers"]["aikey"].as_table().unwrap();
+        assert!(
+            tbl.get("env_key").is_none(),
+            "stale env_key survived the upsert — existing users stay broken \
+             until they hand-edit config.toml:\n{out}"
+        );
+        assert_eq!(
+            tbl.get("experimental_bearer_token")
+                .and_then(|v| v.as_str()),
+            Some("aikey_active_openai"),
+            "self-heal must keep the credential channel intact:\n{out}"
+        );
     }
 
     // 方案一 (2026-07-16): first-time consent prompt contract. Empty input
@@ -6588,39 +6580,13 @@ mod stage3_review_fix_tests {
         );
     }
 
-    // ── Issue: write_active_env must include AIKEY_ACTIVE_SEQ (review fix) ──
-
-    /// Pre-fix: write_active_env's kv_pairs started with only
-    /// AIKEY_ACTIVE_KEY — no SEQ. Both active.env (for bash/zsh hooks)
-    /// AND active.env.flat (for PS hook) ended up missing SEQ on the
-    /// `aikey use` flow. Bash hook had a fallback for this; PS hook now
-    /// has one too — but write_active_env itself should also write SEQ
-    /// so the cheap-diff path is taken.
-    #[test]
-    fn write_active_env_includes_active_seq_in_flat() {
-        // We can't directly call write_active_env without setting up a
-        // full vault context, but we can pin the contract by reading the
-        // function's source and asserting the AIKEY_ACTIVE_SEQ kv_pair is
-        // pushed before any provider iteration. This is a structure test
-        // — it intentionally couples to the source layout, which is the
-        // right level of fixation for "this MUST be present".
-        let src = include_str!("shell_integration.rs");
-        // Find the write_active_env function body and look for the SEQ push.
-        let needle = r#"("AIKEY_ACTIVE_SEQ".to_string(), active_seq.to_string())"#;
-        assert!(
-            src.contains(needle),
-            "write_active_env's kv_pairs must push AIKEY_ACTIVE_SEQ \
-             so active.env.flat carries the seq for cheap PS-hook diff",
-        );
-    }
-
     // ── P5 form-① §5.5: per-provider routing fences ───────────────────────────
 
     /// The §5.5 coexistence fence: local keys + cluster VKs route INDEPENDENTLY.
-    /// A personal/native/OAuth binding ALWAYS routes local (None) even when a
-    /// cluster node is present (it must not get hijacked to the node); a managed
-    /// VK routes to the node ONLY when the user is on a cluster, with the VK's own
-    /// token. This is the property the old global sidecar violated.
+    /// A personal/native/OAuth binding and a Team OAuth account-pool VK ALWAYS
+    /// route local (None) even when a cluster node is present; a direct-bind
+    /// managed VK routes to the node ONLY when the user is on a cluster, with the
+    /// VK's own token. This is the property the old global sidecar violated.
     #[test]
     fn cluster_route_is_per_provider_local_and_cluster_coexist() {
         use crate::credential_type::CredentialType;
@@ -6629,23 +6595,34 @@ mod stage3_review_fix_tests {
         // Personal key + cluster node present ⇒ still LOCAL (coexistence: a
         // personal-OAuth provider keeps using the local proxy, not the node).
         assert!(
-            cluster_route_with(&CredentialType::PersonalApiKey, "my-alias", node.clone()).is_none(),
+            cluster_route_with(
+                &CredentialType::PersonalApiKey,
+                "my-alias",
+                node.clone(),
+                false,
+            )
+            .is_none(),
             "personal API key must route local even when a cluster node exists",
         );
         assert!(
             cluster_route_with(
                 &CredentialType::PersonalOAuthAccount,
                 "acct-1",
-                node.clone()
+                node.clone(),
+                false,
             )
             .is_none(),
             "personal OAuth must route local even when a cluster node exists",
         );
 
         // Managed VK + cluster node ⇒ node + THIS VK's real token.
-        let (auth, token) =
-            cluster_route_with(&CredentialType::ManagedVirtualKey, "vk-abc", node.clone())
-                .expect("managed VK on a cluster => node");
+        let (auth, token) = cluster_route_with(
+            &CredentialType::ManagedVirtualKey,
+            "vk-abc",
+            node.clone(),
+            false,
+        )
+        .expect("direct-bind managed VK on a cluster => node");
         assert_eq!(auth, "10.0.0.5:27200");
         assert_eq!(
             token, "aikey_team_vk-abc",
@@ -6654,8 +6631,21 @@ mod stage3_review_fix_tests {
 
         // Managed VK + NO node (non-cluster team) ⇒ LOCAL (local proxy serves it).
         assert!(
-            cluster_route_with(&CredentialType::ManagedVirtualKey, "vk-abc", None).is_none(),
+            cluster_route_with(&CredentialType::ManagedVirtualKey, "vk-abc", None, false).is_none(),
             "a managed VK with no cluster node falls back to the local proxy",
+        );
+
+        // Team OAuth is a managed VK at the ownership layer, but its account
+        // pool is member-local. A cluster sidecar must not divert it to ingress.
+        assert!(
+            cluster_route_with(
+                &CredentialType::ManagedVirtualKey,
+                "vk-oauth-group",
+                node,
+                true,
+            )
+            .is_none(),
+            "Team OAuth group VK must stay on the member-local proxy",
         );
     }
 

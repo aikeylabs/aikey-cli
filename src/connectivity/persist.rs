@@ -362,6 +362,9 @@ mod tests {
     fn target(source_ref: &str, kind: CredentialKind) -> TestTarget {
         TestTarget {
             provider_code: "openai".into(),
+            protocol_type: "openai_compatible".into(),
+            client_route: "openai".into(),
+            probe_provider_code: "openai".into(),
             base_url: "https://api.openai.com/v1".into(),
             bearer: "test".into(),
             kind,

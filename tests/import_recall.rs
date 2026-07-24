@@ -381,12 +381,15 @@ fn evaluate_rule_only(path: &std::path::Path) -> EvalResult {
 
         let is_adversarial = s.expected.drafts.is_empty();
         if is_adversarial {
-            // 对抗样本：任何 **非 warn-tier** candidate 都是 FP。
+            // 对抗样本：任何 **非 warn-tier credential** candidate 都是 FP。
             // Why 排除 warn：H 层 Fingerprint 把 UUID/short_hex 标 warn，UI 默认不
             // 勾选也不自动导入。用户看到橙色警示需主动确认 —— 不算"静默误导入"。
+            // `title` 是分组展示元数据，不能单独形成或导入凭证；把自然语言首行
+            // 识别成 title 不属于 credential FP，也不应稀释下面的真实凭证门禁。
             for c in &cands {
                 let tier = c["tier"].as_str().unwrap_or("unknown");
-                if tier == "warn" {
+                let kind = c["kind"].as_str().unwrap_or("unknown");
+                if tier == "warn" || kind == "title" {
                     continue;
                 }
                 adv_fp += 1;
@@ -556,7 +559,7 @@ fn evaluate_fingerprint(path: &std::path::Path) -> FingerprintEval {
             //   而 classifier 用 URL 上下文精化到了它的 siblings 之一（如 kimi），
             //   应判为 correct —— URL 上下文提供了更具体的 provider 信息，UI 展示更准
             //   （对应 POC `classify_with_context` 两轨：direct vs with_ctx）
-            if is_valid_classification(expected, &actual) {
+            if is_valid_classification(expected, &actual, expected_secret) {
                 correct += 1;
             } else {
                 let display_tok = if expected_secret.len() > 40 {
@@ -577,28 +580,18 @@ fn evaluate_fingerprint(path: &std::path::Path) -> FingerprintEval {
 }
 
 /// 判定分类是否 valid。接受精确匹配 + "ambiguous 基类 → siblings 精化"
-fn is_valid_classification(expected: &str, actual: &str) -> bool {
+fn is_valid_classification(expected: &str, actual: &str, token: &str) -> bool {
     if expected == actual {
         return true;
     }
-    // generic_sk 可被 URL 上下文精化为具体 provider（与 YAML siblings 字段对齐）
-    if expected == "generic_sk" {
-        return [
-            "kimi",
-            "deepseek",
-            "yunwu",
-            "zeroeleven",
-            "mistral",
-            "siliconflow",
-            "generic_other",
-        ]
-        .contains(&actual);
-    }
-    // zhipu_glm 类似
-    if expected == "zhipu_glm" {
-        return ["bigmodel", "generic_other"].contains(&actual);
-    }
-    false
+    // Ambiguous fingerprints may be refined by URL context. The embedded YAML
+    // is the single source of truth for valid siblings; keeping a second list
+    // here previously went stale when `kimi` split into moonshot/kimi_code.
+    aikeylabs_aikey_cli::commands_internal::parse::provider_fingerprint::instance()
+        .classify(token)
+        .filter(|entry| entry.id == expected)
+        .map(|entry| entry.siblings.iter().any(|sibling| sibling == actual))
+        .unwrap_or(false)
 }
 
 #[test]

@@ -39,31 +39,47 @@ struct VaultContext {
     salt: Vec<u8>,
 }
 
+/// First-run vault bootstrap: create + salt the vault if it isn't initialized yet.
+///
+/// Idempotent — a no-op once `master_salt` exists. Extracted from
+/// `VaultContext::new` so paths that derive a vault key WITHOUT going through
+/// VaultContext get the same auto-init instead of dying on a missing salt.
+///
+/// Why this is a shared helper and not duplicated: `commands_account::
+/// derive_vault_key` used to read `storage::get_salt()` directly, so on a fresh
+/// machine `aikey key sync` prompted for a NEW master password, wrote nothing,
+/// and then failed with "Salt not found in vault. Vault may be corrupted." —
+/// a misleading message, since the vault was never initialized rather than
+/// damaged. One bootstrap implementation means that class of drift can't recur.
+pub fn ensure_vault_initialized(password: &SecretString) -> Result<(), String> {
+    // Integrity check is delegated to `ensure_vault_integrity_or_quarantine`
+    // so callers that bypass VaultContext (e.g. `aikey list` via
+    // storage::list_entries_with_metadata) still benefit — the same helper
+    // is invoked from run_command's dispatch prelude.
+    ensure_vault_integrity_or_quarantine()?;
+    let vault_path = storage::get_vault_path()?;
+    let needs_init = if vault_path.exists() {
+        // Size-0 or post-quarantine path both surface as "salt missing",
+        // which means this is a fresh/reset vault that needs init.
+        storage::get_salt().is_err()
+    } else {
+        true
+    };
+    if needs_init {
+        let mut salt = [0u8; 16];
+        crypto::generate_salt(&mut salt)?;
+        storage::initialize_vault(&salt, password)?;
+        let _ = audit::initialize_audit_log();
+        let _ = audit::log_audit_event(password, audit::AuditOperation::Init, None, true);
+    }
+    Ok(())
+}
+
 impl VaultContext {
     fn new(password: &SecretString) -> Result<Self, String> {
         // Auto-initialize vault on first use so the user never needs a separate
         // initialization step before using any vault command.
-        //
-        // Integrity check is delegated to `ensure_vault_integrity_or_quarantine`
-        // so callers that bypass VaultContext (e.g. `aikey list` via
-        // storage::list_entries_with_metadata) still benefit — the same helper
-        // is invoked from run_command's dispatch prelude.
-        ensure_vault_integrity_or_quarantine()?;
-        let vault_path = storage::get_vault_path()?;
-        let needs_init = if vault_path.exists() {
-            // Size-0 or post-quarantine path both surface as "salt missing",
-            // which means this is a fresh/reset vault that needs init.
-            storage::get_salt().is_err()
-        } else {
-            true
-        };
-        if needs_init {
-            let mut salt = [0u8; 16];
-            crypto::generate_salt(&mut salt)?;
-            storage::initialize_vault(&salt, password)?;
-            let _ = audit::initialize_audit_log();
-            let _ = audit::log_audit_event(password, audit::AuditOperation::Init, None, true);
-        }
+        ensure_vault_initialized(password)?;
 
         // Check rate limiting before attempting authentication
         let mut rate_limiter = crate::ratelimit::RateLimiter::load()?;
@@ -1285,7 +1301,7 @@ pub fn run_with_provider(
 /// Build env var map from provider bindings for injection into a child process.
 ///
 /// Pure logic extracted from `run_with_active_key` for testability.
-/// Returns `(env_map, injected_provider_codes, used_legacy_fallback)`.
+/// Returns `(env_map, injected_client_routes, used_legacy_fallback)`.
 pub fn build_run_env(
     bindings: &[crate::storage::ProviderBinding],
     legacy_cfg: Option<&crate::storage::ActiveKeyConfig>,
@@ -1294,7 +1310,7 @@ pub fn build_run_env(
     use crate::commands_account::{provider_env_vars_pub, provider_proxy_prefix_pub};
 
     let mut env_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut injected_providers: Vec<String> = Vec::new();
+    let mut injected_client_routes: Vec<String> = Vec::new();
     let mut used_legacy = false;
 
     if !bindings.is_empty() {
@@ -1306,16 +1322,22 @@ pub fn build_run_env(
         // env, and `aikey run` follows whatever `aikey use` set most recently.
         // Spec: roadmap20260320/技术实现/update/20260429-token前缀按角色重命名.md
         for binding in bindings {
-            if let Some((api_var, base_var)) = provider_env_vars_pub(&binding.provider_code) {
-                let token = format!("aikey_active_{}", binding.provider_code);
+            if let Some((api_var, base_var)) = provider_env_vars_pub(&binding.client_route) {
+                let proxy_path = crate::provider_registry::proxy_path_for_binding(
+                    &binding.provider_code,
+                    &binding.protocol_type,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "No proxy path for provider={} protocol={}",
+                        binding.provider_code, binding.protocol_type
+                    )
+                })?;
+                let token = format!("aikey_active_{}", binding.client_route);
                 env_map.insert(api_var.to_string(), token);
-                let base_url = format!(
-                    "http://127.0.0.1:{}/{}",
-                    proxy_port,
-                    provider_proxy_prefix_pub(&binding.provider_code),
-                );
+                let base_url = format!("http://127.0.0.1:{}/{}", proxy_port, proxy_path,);
                 env_map.insert(base_var.to_string(), base_url);
-                injected_providers.push(binding.provider_code.clone());
+                injected_client_routes.push(binding.client_route.clone());
             }
         }
     } else if let Some(active_cfg) = legacy_cfg {
@@ -1343,7 +1365,7 @@ pub fn build_run_env(
                     provider_proxy_prefix_pub(provider),
                 );
                 env_map.insert(base_var.to_string(), base_url);
-                injected_providers.push(provider.clone());
+                injected_client_routes.push(provider.clone());
             }
         }
         // active_cfg's key_type / key_ref intentionally unused — we used to
@@ -1352,7 +1374,7 @@ pub fn build_run_env(
         let _ = active_cfg;
     }
 
-    Ok((env_map, injected_providers, used_legacy))
+    Ok((env_map, injected_client_routes, used_legacy))
 }
 
 /// Execute a command using provider-level key bindings via proxy.
@@ -1377,10 +1399,10 @@ pub fn run_with_active_key(command: &[String], json_mode: bool) -> Result<(usize
 
     let proxy_port: u16 = crate::commands_proxy::proxy_port();
 
-    let (env_map, injected_providers, used_legacy) =
+    let (env_map, injected_client_routes, used_legacy) =
         build_run_env(&bindings, legacy_cfg.as_ref(), proxy_port)?;
 
-    if injected_providers.is_empty() {
+    if injected_client_routes.is_empty() {
         return Err(
             "No provider bindings configured. Run `aikey use` to set up provider key bindings."
                 .to_string(),
@@ -1395,16 +1417,26 @@ pub fn run_with_active_key(command: &[String], json_mode: bool) -> Result<(usize
 
     if !json_mode {
         eprintln!(
-            "Injecting {} provider(s) via proxy:",
-            injected_providers.len()
+            "Injecting {} client route(s) via proxy:",
+            injected_client_routes.len()
         );
         if !used_legacy {
             for binding in &bindings {
-                if injected_providers.contains(&binding.provider_code) {
-                    eprintln!(
-                        "  {} -> {}:{}",
-                        binding.provider_code, binding.key_source_type, binding.key_source_ref
-                    );
+                if injected_client_routes.contains(&binding.client_route) {
+                    if binding.client_route == binding.provider_code {
+                        eprintln!(
+                            "  {} -> {}:{}",
+                            binding.client_route, binding.key_source_type, binding.key_source_ref
+                        );
+                    } else {
+                        eprintln!(
+                            "  {} -> provider={} {}:{}",
+                            binding.client_route,
+                            binding.provider_code,
+                            binding.key_source_type,
+                            binding.key_source_ref
+                        );
+                    }
                 }
             }
         } else {

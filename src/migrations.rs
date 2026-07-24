@@ -284,11 +284,21 @@ pub mod v1_0_0_baseline {
 
     /// Adds a column to a table if it does not already exist.
     fn ensure_column(conn: &Connection, table: &str, col: &str, ddl: &str) -> Result<(), String> {
-        if !has_column(conn, table, col) {
-            conn.execute(ddl, [])
-                .map_err(|e| format!("Failed to add {}.{}: {}", table, col, e))?;
+        if has_column(conn, table, col) {
+            return Ok(());
         }
-        Ok(())
+        match conn.execute(ddl, []) {
+            Ok(_) => Ok(()),
+            Err(_) if has_column(conn, table, col) => {
+                // Concurrent first-run schema replays can both observe the
+                // column as absent. SQLite serializes their ALTER statements;
+                // after the winner commits, the loser sees "duplicate column".
+                // Re-read schema truth instead of treating that harmless race
+                // as a broken vault. Preserve every other failure below.
+                Ok(())
+            }
+            Err(error) => Err(format!("Failed to add {}.{}: {}", table, col, error)),
+        }
     }
 
     /// Forward migration: ensure the baseline vault schema. All statements
@@ -416,6 +426,7 @@ pub mod v1_0_0_baseline {
             "CREATE TABLE IF NOT EXISTS provider_accounts (
                 provider_account_id  TEXT PRIMARY KEY,
                 provider             TEXT NOT NULL,
+                protocol_type        TEXT NOT NULL DEFAULT '',
                 auth_type            TEXT NOT NULL,
                 credential_type      TEXT NOT NULL DEFAULT 'personal_oauth_account',
                 status               TEXT NOT NULL DEFAULT 'active',
@@ -469,14 +480,26 @@ pub mod v1_0_0_baseline {
         )
         .map_err(|e| format!("Failed to ensure provider_account_tokens table: {}", e))?;
 
-        // Team-managed virtual key cache
+        // Team-managed virtual key cache.
+        //
+        // P1e / design D-11 (解 R-D): the grain is ONE ROW PER BINDING
+        // `(virtual_key_id, protocol_type, provider_code)` with the provider key
+        // ciphertext RIDING EACH ROW — so one VK can carry GLM(GLM key) AND the
+        // official Anthropic(official key) at once, each binding's material and
+        // upstream resolved independently. The pre-P1e grain was one-VK-one-row
+        // with a SCALAR credential (multiple providers were half-expressed via
+        // the `supported_providers`/`provider_base_urls` blobs, which only ever
+        // carried URLs — never a second protocol or a second key). Fresh installs
+        // get the composite-PK shape here; existing one-VK-one-row DBs are rebuilt
+        // in place by the idempotent re-grain block after the column retrofits
+        // below. `cache_schema_version` = 2 marks the binding grain.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS managed_virtual_keys_cache (
-                virtual_key_id       TEXT PRIMARY KEY,
+                virtual_key_id       TEXT NOT NULL,
                 org_id               TEXT NOT NULL,
                 seat_id              TEXT NOT NULL,
                 alias                TEXT NOT NULL,
-                provider_code        TEXT NOT NULL,
+                provider_code        TEXT NOT NULL DEFAULT '',
                 protocol_type        TEXT NOT NULL DEFAULT 'openai_compatible',
                 base_url             TEXT NOT NULL,
                 credential_id        TEXT NOT NULL,
@@ -488,8 +511,9 @@ pub mod v1_0_0_baseline {
                 expires_at           INTEGER,
                 provider_key_nonce      BLOB,
                 provider_key_ciphertext BLOB,
-                cache_schema_version INTEGER NOT NULL DEFAULT 1,
-                synced_at            INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                cache_schema_version INTEGER NOT NULL DEFAULT 2,
+                synced_at            INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                PRIMARY KEY (virtual_key_id, protocol_type, provider_code)
             )",
             [],
         )
@@ -587,6 +611,112 @@ pub mod v1_0_0_baseline {
         ] {
             ensure_column(conn, "managed_virtual_keys_cache", col, ddl)?;
         }
+
+        // ── P1e / design D-11: re-grain managed_virtual_keys_cache in place ──
+        //
+        // A pre-P1e vault has this table with a SINGLE-column primary key
+        // (`virtual_key_id`). SQLite cannot change a primary key with ALTER, so
+        // move to the binding grain `(virtual_key_id, protocol_type, provider_code)`
+        // via the canonical create-copy-swap. Guard: only run when the live table
+        // still has exactly one PK column — fresh installs (created composite above)
+        // and already-migrated vaults have three, so this is a no-op on re-run
+        // (idempotent; safe to execute on every startup).
+        //
+        // Backfill semantics (🔴 lossless, one-way faithful): each existing
+        // one-VK-one-row row becomes EXACTLY ONE binding row — its scalar
+        // `(protocol_type, provider_code)` are already the composite key, and its
+        // `provider_key_ciphertext` rides that row unchanged. The extra providers
+        // that lived URL-only in `supported_providers`/`provider_base_urls` are NOT
+        // exploded into credential-less binding rows (they have no key material —
+        // that was exactly the pre-P1e limitation); they stay on the primary
+        // binding row's blobs and are superseded when the re-grained server
+        // projection re-syncs real per-binding material. NO ciphertext is decrypted,
+        // re-encrypted, or moved across the encryption boundary here — the BLOB is
+        // copied byte-for-byte, so the vault_key derivation and AES-GCM envelope are
+        // untouched (第 1 级安全评审 §1e.4: this migration does not widen the
+        // plaintext exposure window).
+        let cache_pk_cols: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('managed_virtual_keys_cache') WHERE pk > 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if cache_pk_cols == 1 {
+            // Rebuild inside one transaction so a crash mid-migration leaves the
+            // old table intact (all-or-nothing; 🚫 no partial grain).
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| format!("mvkc re-grain: begin tx: {}", e))?;
+            tx.execute_batch(
+                "CREATE TABLE managed_virtual_keys_cache__p1e_new (
+                    virtual_key_id       TEXT NOT NULL,
+                    org_id               TEXT NOT NULL,
+                    seat_id              TEXT NOT NULL,
+                    alias                TEXT NOT NULL,
+                    provider_code        TEXT NOT NULL DEFAULT '',
+                    protocol_type        TEXT NOT NULL DEFAULT 'openai_compatible',
+                    base_url             TEXT NOT NULL,
+                    credential_id        TEXT NOT NULL,
+                    credential_revision  TEXT NOT NULL,
+                    virtual_key_revision TEXT NOT NULL,
+                    key_status           TEXT NOT NULL DEFAULT 'active',
+                    share_status         TEXT NOT NULL DEFAULT 'pending_claim',
+                    local_state          TEXT NOT NULL DEFAULT 'synced_inactive',
+                    expires_at           INTEGER,
+                    provider_key_nonce      BLOB,
+                    provider_key_ciphertext BLOB,
+                    cache_schema_version INTEGER NOT NULL DEFAULT 2,
+                    synced_at            INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                    local_alias            TEXT,
+                    supported_providers    TEXT,
+                    provider_base_urls     TEXT,
+                    owner_account_id       TEXT,
+                    extra                  TEXT,
+                    oauth_group_id         TEXT,
+                    group_accounts         TEXT,
+                    routing_config         TEXT,
+                    my_assignment_override TEXT,
+                    group_runtime          TEXT,
+                    owner_email            TEXT,
+                    group_alias            TEXT,
+                    PRIMARY KEY (virtual_key_id, protocol_type, provider_code)
+                );
+                 INSERT INTO managed_virtual_keys_cache__p1e_new (
+                    virtual_key_id, org_id, seat_id, alias,
+                    provider_code, protocol_type, base_url,
+                    credential_id, credential_revision, virtual_key_revision,
+                    key_status, share_status, local_state, expires_at,
+                    provider_key_nonce, provider_key_ciphertext,
+                    cache_schema_version, synced_at,
+                    local_alias, supported_providers, provider_base_urls, owner_account_id,
+                    extra, oauth_group_id, group_accounts, routing_config,
+                    my_assignment_override, group_runtime, owner_email, group_alias
+                 )
+                 SELECT
+                    virtual_key_id, org_id, seat_id, alias,
+                    provider_code, protocol_type, base_url,
+                    credential_id, credential_revision, virtual_key_revision,
+                    key_status, share_status, local_state, expires_at,
+                    provider_key_nonce, provider_key_ciphertext,
+                    2, synced_at,
+                    local_alias, supported_providers, provider_base_urls, owner_account_id,
+                    extra, oauth_group_id, group_accounts, routing_config,
+                    my_assignment_override, group_runtime, owner_email, group_alias
+                 FROM managed_virtual_keys_cache;
+                 DROP TABLE managed_virtual_keys_cache;
+                 ALTER TABLE managed_virtual_keys_cache__p1e_new RENAME TO managed_virtual_keys_cache;",
+            )
+            .map_err(|e| format!("mvkc re-grain rebuild: {}", e))?;
+            tx.commit()
+                .map_err(|e| format!("mvkc re-grain: commit: {}", e))?;
+        }
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mvkc_local_state ON managed_virtual_keys_cache(local_state)",
+            [],
+        )
+        .map_err(|e| format!("Failed to re-ensure managed_virtual_keys_cache index after re-grain: {}", e))?;
 
         // Enterprise quota rules cache (Phase 2 — design §0.5/§5.2). The proxy
         // is a client-side component with no access to the control DB, so quota
@@ -744,6 +874,28 @@ pub mod v1_0_0_baseline {
             ensure_column(
                 conn,
                 "provider_accounts",
+                "protocol_type",
+                "ALTER TABLE provider_accounts ADD COLUMN protocol_type TEXT NOT NULL DEFAULT ''",
+            )?;
+            conn.execute(
+                "UPDATE provider_accounts
+                    SET protocol_type = CASE lower(provider)
+                        WHEN 'anthropic' THEN 'anthropic'
+                        WHEN 'claude' THEN 'anthropic'
+                        WHEN 'openai' THEN 'openai_compatible'
+                        WHEN 'codex' THEN 'openai_compatible'
+                        WHEN 'kimi' THEN 'openai_compatible'
+                        WHEN 'kimi_code' THEN 'openai_compatible'
+                        ELSE protocol_type
+                    END
+                  WHERE protocol_type = ''",
+                [],
+            )
+            .map_err(|e| format!("Failed to backfill provider account protocol: {}", e))?;
+
+            ensure_column(
+                conn,
+                "provider_accounts",
                 "local_alias",
                 "ALTER TABLE provider_accounts ADD COLUMN local_alias TEXT",
             )?;
@@ -783,6 +935,8 @@ pub mod v1_0_0_baseline {
             "CREATE TABLE IF NOT EXISTS user_profile_provider_bindings (
                 profile_id TEXT NOT NULL,
                 provider_code TEXT NOT NULL,
+                binding_provider_code TEXT NOT NULL DEFAULT '',
+                protocol_type TEXT NOT NULL DEFAULT '',
                 key_source_type TEXT NOT NULL,
                 key_source_ref TEXT NOT NULL,
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
@@ -793,7 +947,35 @@ pub mod v1_0_0_baseline {
         )
         .map_err(|e| format!("Failed to ensure user_profile_provider_bindings: {}", e))?;
 
+        // 2026-07-21 Provider/Protocol/client-route split. The released table
+        // name and `provider_code` primary-key column are retained for online
+        // upgrade compatibility, but that key is now the client-route slot
+        // (`anthropic`, `openai`, `kimi`, ...). The actual upstream Provider
+        // and Protocol live in the two additive columns below. This lets one
+        // Provider (notably `mock`) be selected independently for Claude and
+        // Codex without adding another table or guessing from timestamps.
+        ensure_column(
+            conn,
+            "user_profile_provider_bindings",
+            "binding_provider_code",
+            "ALTER TABLE user_profile_provider_bindings ADD COLUMN binding_provider_code TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            conn,
+            "user_profile_provider_bindings",
+            "protocol_type",
+            "ALTER TABLE user_profile_provider_bindings ADD COLUMN protocol_type TEXT NOT NULL DEFAULT ''",
+        )?;
+        conn.execute(
+            "UPDATE user_profile_provider_bindings
+                SET binding_provider_code = provider_code
+              WHERE binding_provider_code = ''",
+            [],
+        )
+        .map_err(|e| format!("Failed to backfill binding provider identity: {}", e))?;
+
         migrate_active_key_config_to_default_profile(conn)?;
+        migrate_provider_bindings_to_client_routes(conn)?;
 
         // platform_account OAuth columns (predates v1.0.2's same retrofit;
         // both are idempotent).
@@ -1344,12 +1526,163 @@ pub mod v1_0_0_baseline {
         }
         for p in &providers {
             conn.execute(
-                "INSERT OR IGNORE INTO user_profile_provider_bindings (profile_id, provider_code, key_source_type, key_source_ref) VALUES ('default', ?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO user_profile_provider_bindings
+                    (profile_id, provider_code, binding_provider_code, key_source_type, key_source_ref)
+                 VALUES ('default', ?1, ?1, ?2, ?3)",
                 params![p, key_type, key_ref],
             )
             .map_err(|e| format!("migrate binding {}: {}", p, e))?;
         }
         mark_migration(conn, SENTINEL)
+    }
+
+    /// Re-grains the released `(profile, provider_code)` selection rows into
+    /// `(profile, client_route)` rows while retaining the actual Provider and
+    /// Protocol as independent columns. This is deliberately replay-safe:
+    /// baseline migrations run on every binary upgrade, including existing
+    /// vaults that already contain a `mock` selection written by the first
+    /// resident-Mock implementation.
+    fn migrate_provider_bindings_to_client_routes(conn: &Connection) -> Result<(), String> {
+        #[derive(Debug)]
+        struct LegacyBinding {
+            profile_id: String,
+            old_route: String,
+            provider_code: String,
+            protocol_type: String,
+            source_type: String,
+            source_ref: String,
+            updated_at: i64,
+        }
+
+        let rows = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT profile_id, provider_code, binding_provider_code,
+                            protocol_type, key_source_type, key_source_ref, updated_at
+                       FROM user_profile_provider_bindings",
+                )
+                .map_err(|e| format!("prepare client-route binding migration: {}", e))?;
+            let mapped = stmt
+                .query_map([], |row| {
+                    Ok(LegacyBinding {
+                        profile_id: row.get(0)?,
+                        old_route: row.get(1)?,
+                        provider_code: row.get(2)?,
+                        protocol_type: row.get(3)?,
+                        source_type: row.get(4)?,
+                        source_ref: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                })
+                .map_err(|e| format!("query client-route binding migration: {}", e))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read client-route binding migration: {}", e))?
+        };
+
+        let fingerprint = crate::commands_internal::parse::provider_fingerprint::instance();
+        for row in rows {
+            let mut provider_code =
+                crate::provider_registry::canonical(&row.provider_code).to_string();
+            let mut protocol_type = row.protocol_type.clone();
+
+            if row.source_type == "personal_oauth_account" {
+                if let Ok((account_provider, account_protocol)) = conn.query_row(
+                    "SELECT provider, protocol_type FROM provider_accounts
+                      WHERE provider_account_id = ?1",
+                    params![row.source_ref],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                ) {
+                    provider_code =
+                        crate::provider_registry::canonical(&account_provider).to_string();
+                    if protocol_type.is_empty() {
+                        protocol_type = account_protocol;
+                    }
+                }
+            }
+
+            if protocol_type.is_empty()
+                && matches!(row.source_type.as_str(), "team" | "managed_virtual_key")
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT DISTINCT protocol_type
+                           FROM managed_virtual_keys_cache
+                          WHERE virtual_key_id = ?1
+                            AND (lower(provider_code) = lower(?2) OR provider_code = '')
+                            AND protocol_type <> ''
+                          ORDER BY protocol_type",
+                    )
+                    .map_err(|e| format!("prepare managed binding protocol lookup: {}", e))?;
+                let protocols = stmt
+                    .query_map(params![row.source_ref, provider_code], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .map_err(|e| format!("query managed binding protocol: {}", e))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("read managed binding protocol: {}", e))?;
+                if protocols.len() == 1 {
+                    protocol_type = protocols[0].clone();
+                }
+            }
+
+            if protocol_type.is_empty() {
+                let protocols = fingerprint.protocols_for_provider(&provider_code);
+                if protocols.len() == 1 {
+                    protocol_type = protocols[0].clone();
+                }
+            }
+
+            // A multi-protocol Provider without recoverable protocol cannot be
+            // projected into a client route. Keeping the legacy `mock` key
+            // would recreate a fake Mock protocol group and could send traffic
+            // through an arbitrary dialect, so discard only that stale active
+            // selection; the credential remains available for explicit reselect.
+            if provider_code == "mock" && protocol_type.is_empty() {
+                conn.execute(
+                    "DELETE FROM user_profile_provider_bindings
+                      WHERE profile_id = ?1 AND provider_code = ?2",
+                    params![row.profile_id, row.old_route],
+                )
+                .map_err(|e| format!("remove ambiguous legacy Mock binding: {}", e))?;
+                continue;
+            }
+
+            let client_route =
+                crate::provider_registry::client_route_for_binding(&provider_code, &protocol_type);
+            conn.execute(
+                "INSERT INTO user_profile_provider_bindings
+                    (profile_id, provider_code, binding_provider_code, protocol_type,
+                     key_source_type, key_source_ref, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT (profile_id, provider_code) DO UPDATE SET
+                    binding_provider_code = excluded.binding_provider_code,
+                    protocol_type = excluded.protocol_type,
+                    key_source_type = excluded.key_source_type,
+                    key_source_ref = excluded.key_source_ref,
+                    updated_at = excluded.updated_at
+                 WHERE excluded.updated_at >= user_profile_provider_bindings.updated_at",
+                params![
+                    row.profile_id,
+                    client_route,
+                    provider_code,
+                    protocol_type,
+                    row.source_type,
+                    row.source_ref,
+                    row.updated_at
+                ],
+            )
+            .map_err(|e| format!("upsert migrated client-route binding: {}", e))?;
+            if client_route != row.old_route {
+                conn.execute(
+                    "DELETE FROM user_profile_provider_bindings
+                      WHERE profile_id = ?1 AND provider_code = ?2",
+                    params![row.profile_id, row.old_route],
+                )
+                .map_err(|e| format!("remove legacy provider-keyed binding: {}", e))?;
+            }
+        }
+        Ok(())
     }
 
     fn mark_migration(conn: &Connection, sentinel: &str) -> Result<(), String> {
@@ -1479,6 +1812,78 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open");
         upgrade_all(&conn).expect("first upgrade_all");
         upgrade_all(&conn).expect("second upgrade_all (must be idempotent)");
+    }
+
+    #[test]
+    fn legacy_mock_binding_is_rekeyed_to_its_protocol_client_route() {
+        let conn = fresh_vault();
+        conn.execute(
+            "INSERT INTO managed_virtual_keys_cache
+                (virtual_key_id, org_id, seat_id, alias, provider_code,
+                 protocol_type, base_url, credential_id,
+                 credential_revision, virtual_key_revision, supported_providers)
+             VALUES ('vk-mock-a', 'o1', 's1', 'mock-a', '',
+                     'anthropic', '', 'c1', '1', '1', '[\"mock\"]')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO user_profile_provider_bindings
+                (profile_id, provider_code, binding_provider_code, protocol_type,
+                 key_source_type, key_source_ref, updated_at)
+             VALUES ('default', 'mock', 'mock', '', 'team', 'vk-mock-a', 42)",
+            [],
+        )
+        .unwrap();
+
+        upgrade_all(&conn).expect("replay migration");
+
+        let got: (String, String, String) = conn
+            .query_row(
+                "SELECT provider_code, binding_provider_code, protocol_type
+                   FROM user_profile_provider_bindings WHERE profile_id='default'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(got, ("anthropic".into(), "mock".into(), "anthropic".into()));
+    }
+
+    #[test]
+    fn ambiguous_legacy_mock_binding_is_removed_instead_of_becoming_a_mock_route() {
+        let conn = fresh_vault();
+        for protocol in ["anthropic", "openai_compatible"] {
+            conn.execute(
+                "INSERT INTO managed_virtual_keys_cache
+                    (virtual_key_id, org_id, seat_id, alias, provider_code,
+                     protocol_type, base_url, credential_id,
+                     credential_revision, virtual_key_revision)
+                 VALUES ('vk-mock-both', 'o1', 's1', 'mock-both', 'mock',
+                         ?1, 'http://mock', ?2, '1', '1')",
+                params![protocol, format!("c-{protocol}")],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO user_profile_provider_bindings
+                (profile_id, provider_code, binding_provider_code, protocol_type,
+                 key_source_type, key_source_ref, updated_at)
+             VALUES ('default', 'mock', 'mock', '', 'team', 'vk-mock-both', 42)",
+            [],
+        )
+        .unwrap();
+
+        upgrade_all(&conn).expect("replay migration");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_profile_provider_bindings
+                  WHERE profile_id='default' AND provider_code='mock'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "fake Mock client route must not survive upgrade");
     }
 
     /// Delivery-integrity regression (2026-06-01, caught by live E2E): an

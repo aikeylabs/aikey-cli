@@ -18,7 +18,7 @@
 //!   代价是能访问 local-server 端口的进程不需主密码就能枚举 alias。实际风险边界几乎不变 ——
 //!   同机攻击者本就可直读 vault.db 明文列。生产版 Web 本身不挂 /user/vault，不影响。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -45,13 +45,27 @@ use super::stdin_json::{decode_vault_key, emit, emit_error};
 /// `handle_list_personal_with_masked`, `handle_list_metadata_locked`)
 /// all need the same computation and the result flows through to the
 /// vault Web drawer as `route_url`.
-fn route_url_for(provider_code: &str) -> Option<String> {
-    let info = provider_info(provider_code)?;
+fn route_url_for(provider_code: &str, protocol_type: &str) -> Option<String> {
+    provider_info(provider_code)?;
     Some(format!(
         "http://127.0.0.1:{}/{}",
         proxy_port(),
-        info.proxy_path
+        crate::provider_registry::proxy_path_for_binding(provider_code, protocol_type)?
     ))
+}
+
+fn route_url_for_personal(provider_code: &str, base_url: Option<&str>) -> Option<String> {
+    let classifier = crate::commands_internal::parse::provider_fingerprint::instance();
+    let protocol = base_url
+        .filter(|url| !url.is_empty())
+        .and_then(|url| classifier.route_for_base_url(url))
+        .map(|route| route.protocol.clone())
+        .or_else(|| {
+            let declared = classifier.protocols_for_provider(provider_code);
+            (declared.len() == 1).then(|| declared[0].clone())
+        })
+        .unwrap_or_default();
+    route_url_for(provider_code, &protocol)
 }
 
 // ========== in-use detection ==========
@@ -227,7 +241,11 @@ pub(crate) fn team_effective_status(
 ///     not a bare UUID). The snapshot keeps supplying the finer `auth_failed`/`revoked`
 ///     unusable reason.
 ///   - **Fast rail empty/absent** (proxy hasn't polled yet / direct-bind): fall back to
-///     the key-sync snapshot list, `current_routed=false` (no live routing signal).
+///     the key-sync snapshot list and leave `current_routed` absent. Absence means
+///     "routing projection not available yet"; explicit `false` from a present rail
+///     means "the proxy currently has no usable routed account". Keeping those states
+///     distinct prevents the web from relabelling the static default as live routing
+///     when every account is cooling down.
 ///
 /// Returns None when there are no parseable snapshot candidates (direct-bind VK → the web
 /// renders no group panel).
@@ -242,15 +260,11 @@ fn merge_group_accounts_live(
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default();
 
-    // No live rail yet → snapshot list, current_routed defaulted false (legacy path).
+    // No live rail yet → snapshot list. Do NOT synthesize current_routed=false:
+    // absence is the backward-compatible signal that consumers may temporarily use
+    // the static assigned account while waiting for the proxy's first projection.
     if runtime.is_empty() {
-        let mut cands = snapshot;
-        for c in cands.iter_mut() {
-            if let Some(obj) = c.as_object_mut() {
-                obj.entry("current_routed").or_insert(Value::Bool(false));
-            }
-        }
-        return Some(Value::Array(cands));
+        return Some(Value::Array(snapshot));
     }
 
     // Fast rail authoritative for membership. Index the snapshot for metadata fallback.
@@ -285,6 +299,11 @@ fn merge_group_accounts_live(
                     "provider_code".into(),
                     Value::String(live_str(live, "provider_code")),
                 );
+                o.insert(
+                    "protocol_type".into(),
+                    Value::String(live_str(live, "protocol_type")),
+                );
+                o.insert("base_url".into(), Value::String(live_str(live, "base_url")));
                 o.insert(
                     "credential_type".into(),
                     Value::String(live_str(live, "credential_type")),
@@ -321,6 +340,26 @@ fn merge_group_accounts_live(
             "login_status".into(),
             Value::String(login_status.to_string()),
         );
+        // The fast rail is authoritative for local runtime observations too. Keep
+        // these optional: an older proxy/master simply omits them, and a genuine
+        // utilization value of 0 remains a JSON number rather than "unknown".
+        for key in [
+            "window_max_util_pct",
+            "window_status",
+            "window_reset_at",
+            "window_7d_max_util_pct",
+            "window_7d_status",
+            "window_7d_reset_at",
+            "route_status",
+            "route_retry_at",
+            "util_5h",
+            "util_7d",
+            "util_observed_at",
+        ] {
+            if let Some(value) = live.get(key) {
+                obj.insert(key.into(), value.clone());
+            }
+        }
         merged.push(Value::Object(obj));
     }
     // Deterministic display order: priority asc, then account_id (serde_json::Map's own
@@ -353,10 +392,12 @@ fn merge_group_accounts_live(
 ///     (genuinely unusable — GROUP_NO_CANDIDATES; nothing to log into).
 ///
 /// Routed account = the candidate the proxy flagged `current_routed` (engine override
-/// ?? rank-0). Before the proxy has stamped it (brief post-sync window), fall back to
-/// the static default (`assigned` = master rank-0) — which IS the routed account when
-/// there is no engine override. Being logged into a DIFFERENT, non-routed account does
-/// NOT count: the engine decides where traffic goes, and that account is what needs a token.
+/// ?? rank-0). Before the proxy has stamped it (brief post-sync window, field absent),
+/// fall back to the static default (`assigned` = master rank-0). Once the live rail is
+/// present, explicit `false` on every candidate is authoritative: the pool has no usable
+/// routed account and must be reported inactive rather than falling back cosmetically.
+/// Being logged into a DIFFERENT, non-routed account does NOT count: the engine decides
+/// where traffic goes, and that account is what needs a token.
 #[derive(PartialEq, Eq, Debug)]
 enum RoutedState {
     LoggedIn,
@@ -370,10 +411,19 @@ fn routed_candidate_state(merged: Option<&serde_json::Value>) -> RoutedState {
     };
     let flagged =
         |c: &&serde_json::Value, key: &str| c.get(key).and_then(|b| b.as_bool()) == Some(true);
+    let live_projection_present = arr.iter().any(|c| {
+        c.get("current_routed")
+            .and_then(|value| value.as_bool())
+            .is_some()
+    });
     let routed = arr
         .iter()
         .find(|c| flagged(c, "current_routed"))
-        .or_else(|| arr.iter().find(|c| flagged(c, "assigned")));
+        .or_else(|| {
+            (!live_projection_present)
+                .then(|| arr.iter().find(|c| flagged(c, "assigned")))
+                .flatten()
+        });
     match routed {
         None => RoutedState::NoCandidate,
         Some(c) => {
@@ -386,25 +436,36 @@ fn routed_candidate_state(merged: Option<&serde_json::Value>) -> RoutedState {
     }
 }
 
-/// The protocol source for a team VK's `protocol_family`, priority ordered:
-/// VK-level `provider_code` (direct VKs / present) → `protocol_type` (2026-07-03).
-///
-/// **Why the protocol_type fallback**: a group VK's `provider_code` is ALWAYS empty
-/// (it binds a group, not one provider). Normally the web recovers the protocol from
-/// the routed pool account's provider — but when the seat is unbound from the group
-/// the candidate set (`group_accounts`) AND `supported_providers` both go empty, so
-/// there is nothing account-derived left and the protocol column falls to "unknown"
-/// for the orphaned VK. `protocol_type` comes from the VK's group BINDING (not the
-/// accounts), so it SURVIVES member removal ("anthropic" stays) — the stable source.
-/// `None` only when both are empty (truly no protocol info) → caller renders "unknown".
-fn team_protocol_source<'a>(provider_code: &'a str, protocol_type: &'a str) -> Option<&'a str> {
-    if !provider_code.is_empty() {
-        Some(provider_code)
-    } else if !protocol_type.is_empty() {
-        Some(protocol_type)
-    } else {
-        None
-    }
+/// P1f / design D-12/D-13: the two-axis binding read model. Protocol and
+/// provider are SEPARATE axes — protocol from the route row (endpoint truth,
+/// D-12; falls back to the stored protocol_type), provider is the brand code,
+/// provider_display_alias is the brand alias (GLM for zhipu). Returned as an
+/// ARRAY from the start (length 1 today; multi-binding when the per-binding
+/// cache lands, P1e) so web never has to migrate a scalar→array contract (D-13).
+/// 🚫 Web must NOT derive protocol from provider (前端 §7) — that's why the
+/// backend/CLI owns this projection.
+fn two_axis_bindings(
+    provider_code: &str,
+    protocol_type: &str,
+    base_url: &str,
+) -> serde_json::Value {
+    let classifier = crate::commands_internal::parse::provider_fingerprint::instance();
+    let protocol = classifier
+        .route_for_base_url(base_url)
+        .map(|r| r.protocol.clone())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| protocol_type.to_string());
+    let display_alias = crate::provider_registry::lookup(provider_code)
+        .and_then(|e| e.display_alias)
+        .unwrap_or("");
+    let client_route = crate::provider_registry::client_route_for_binding(provider_code, &protocol);
+    json!([{
+        "protocol": protocol,
+        "provider": provider_code,
+        "provider_display_alias": display_alias,
+        "client_route": client_route,
+        "route_url": route_url_for(provider_code, &protocol),
+    }])
 }
 
 fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Value> {
@@ -416,9 +477,64 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
     // cluster a claimed central key routes via the node and IS usable
     // without local ciphertext (key_material_reachable's contract).
     let on_cluster = crate::commands_account::read_cluster_node().is_some();
-    entries
-        .into_iter()
-        .map(|t| {
+    let mut grouped = BTreeMap::<String, Vec<storage::VirtualKeyCacheEntry>>::new();
+    for entry in entries {
+        grouped
+            .entry(entry.virtual_key_id.clone())
+            .or_default()
+            .push(entry);
+    }
+    grouped
+        .into_values()
+        .filter_map(|rows| {
+            let mut binding_values = Vec::<serde_json::Value>::new();
+            let mut supported_providers = Vec::<String>::new();
+            for row in &rows {
+                let providers = if !row.provider_code.is_empty() {
+                    vec![row.provider_code.clone()]
+                } else {
+                    // Group VK rows intentionally have no scalar Provider;
+                    // their pool supplier(s) remain in supported_providers.
+                    row.supported_providers.clone()
+                };
+                for provider in providers {
+                    if !supported_providers
+                        .iter()
+                        .any(|p| p.eq_ignore_ascii_case(&provider))
+                    {
+                        supported_providers.push(provider.clone());
+                    }
+                    let base_url = row
+                        .provider_base_urls
+                        .get(&provider)
+                        .map(String::as_str)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or(&row.base_url);
+                    if let Some(value) = two_axis_bindings(&provider, &row.protocol_type, base_url)
+                        .as_array()
+                        .and_then(|values| values.first())
+                        .cloned()
+                    {
+                        if !binding_values.iter().any(|existing| {
+                            existing.get("provider") == value.get("provider")
+                                && existing.get("protocol") == value.get("protocol")
+                        }) {
+                            binding_values.push(value);
+                        }
+                    }
+                }
+            }
+            for row in &rows {
+                for provider in &row.supported_providers {
+                    if !supported_providers
+                        .iter()
+                        .any(|p| p.eq_ignore_ascii_case(provider))
+                    {
+                        supported_providers.push(provider.clone());
+                    }
+                }
+            }
+            let t = rows.into_iter().next()?;
             let effective_alias = t.local_alias.clone().unwrap_or_else(|| t.alias.clone());
             let route_token = format!("aikey_team_{}", t.virtual_key_id);
             // Merge the proxy's fresh live status onto the candidate snapshot ONCE —
@@ -475,18 +591,41 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
             // of B's response). Manual conversion to avoid pulling chrono
             // in for one format call.
             let expires_at_iso = t.expires_at.map(unix_to_rfc3339);
-            json!({
+            let legacy_route_url = if binding_values.len() == 1 {
+                binding_values[0]
+                    .get("route_url")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::Value::Null
+            };
+            let legacy_client_route = if binding_values.len() == 1 {
+                binding_values[0]
+                    .get("client_route")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+            } else {
+                "unknown"
+            };
+            Some(json!({
                 "target": "team",
                 "id": t.virtual_key_id,
                 "virtual_key_id": t.virtual_key_id,
                 "alias": effective_alias,
                 "local_alias": t.local_alias,
-                "protocol_family": protocol_family_of(team_protocol_source(&t.provider_code, &t.protocol_type)),
-                "supported_providers": t.supported_providers,
+                "protocol_family": legacy_client_route,
+                "supported_providers": supported_providers,
+                // P1f / D-12/D-13: two-axis bindings (protocol ≠ provider). Web
+                // groups by binding.protocol + shows provider as a chip. Kept
+                // alongside protocol_family (deprecated) for backward compat.
+                "bindings": binding_values,
                 "share_status": share_status_wire,
                 "effective_status": effective_status,
                 "expires_at": expires_at_iso,
-                "route_url": route_url_for(&t.provider_code),
+                // A VK can expose more than one client route. Per-binding
+                // route_url above is authoritative; keep the legacy scalar
+                // only for an unambiguous single binding.
+                "route_url": legacy_route_url,
                 "route_token": route_token,
                 // in_use_for: per-provider active binding membership. Same
                 // semantics as personal — empty vec means "not bound
@@ -528,7 +667,7 @@ fn team_records_for_emit(active_team: &ActiveBindingMap) -> Vec<serde_json::Valu
                 // /user/vault show "Owner: <email>" in the drawer — persists for a
                 // group VK left behind after that account logs out.
                 "owner_email": t.owner_email,
-            })
+            }))
         })
         .collect()
 }
@@ -544,13 +683,13 @@ fn load_active_binding_refs() -> (ActiveBindingMap, ActiveBindingMap, ActiveBind
                     personal
                         .entry(b.key_source_ref)
                         .or_default()
-                        .push(b.provider_code);
+                        .push(b.client_route);
                 }
                 CredentialType::PersonalOAuthAccount => {
                     oauth
                         .entry(b.key_source_ref)
                         .or_default()
-                        .push(b.provider_code);
+                        .push(b.client_route);
                 }
                 // Phase 3B (2026-05-11): team (ManagedVirtualKey) bindings
                 // also captured. Map keyed by virtual_key_id so the Web
@@ -563,7 +702,7 @@ fn load_active_binding_refs() -> (ActiveBindingMap, ActiveBindingMap, ActiveBind
                 CredentialType::ManagedVirtualKey => {
                     team.entry(b.key_source_ref)
                         .or_default()
-                        .push(b.provider_code);
+                        .push(b.client_route);
                 }
             }
         }
@@ -833,6 +972,10 @@ fn handle_get(env: StdinEnvelope) {
     };
 
     let official_base_url = meta.provider_code.as_deref().and_then(default_base_url);
+    let route_url = meta
+        .provider_code
+        .as_deref()
+        .and_then(|provider| route_url_for_personal(provider, meta.base_url.as_deref()));
     let data = json!({
         "alias": meta.alias,
         "created_at": meta.created_at,
@@ -842,7 +985,7 @@ fn handle_get(env: StdinEnvelope) {
         // callers know the real URL that gets used when base_url is
         // null, without having to embed PROVIDER_DEFAULTS client-side.
         "official_base_url": official_base_url,
-        "route_url": meta.provider_code.as_deref().and_then(route_url_for),
+        "route_url": route_url,
         "supported_providers": meta.supported_providers,
         "has_secret": true,
     });
@@ -981,6 +1124,10 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
         // extending an existing payload is lower blast radius than
         // adding a new endpoint for a 6-row lookup table.
         let official_base_url = m.provider_code.as_deref().and_then(default_base_url);
+        let route_url = m
+            .provider_code
+            .as_deref()
+            .and_then(|provider| route_url_for_personal(provider, m.base_url.as_deref()));
         out.push(json!({
             "target": "personal",
             "id": m.alias,
@@ -989,7 +1136,7 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
             "protocol_family": protocol_family_of(m.provider_code.as_deref()),
             "base_url": m.base_url,
             "official_base_url": official_base_url,
-        "route_url": m.provider_code.as_deref().and_then(route_url_for),
+            "route_url": route_url,
             "supported_providers": m.supported_providers,
             "created_at": m.created_at,
             "status": "active",
@@ -1112,6 +1259,20 @@ fn handle_list_oauth(env: StdinEnvelope) {
     let arr: Vec<_> = accounts
         .iter()
         .map(|a| {
+            let provider = oauth_provider_to_canonical(&a.provider);
+            let protocol = if a.protocol_type.is_empty() {
+                let declared = crate::commands_internal::parse::provider_fingerprint::instance()
+                    .protocols_for_provider(provider);
+                if declared.len() == 1 {
+                    declared[0].clone()
+                } else {
+                    "unknown".to_string()
+                }
+            } else {
+                a.protocol_type.clone()
+            };
+            let client_route =
+                crate::provider_registry::client_route_for_binding(provider, &protocol);
             // route_url + route_token mirror the personal-key payload (2026-05-06).
             // Why: the user/vault drawer needs the same SDK-base-url + opaque token
             // pair for OAuth accounts that it already shows for personal keys, so
@@ -1161,8 +1322,10 @@ fn handle_list_oauth(env: StdinEnvelope) {
                 "target": "oauth",
                 "id": a.provider_account_id,
                 "provider_account_id": a.provider_account_id,
-                "provider": a.provider,
-                "protocol_family": protocol_family_of(Some(&a.provider)),
+                "provider": provider,
+                "protocol": protocol,
+                "protocol_family": client_route,
+                "client_route": client_route,
                 "auth_type": a.auth_type,
                 "credential_type": a.credential_type.as_str(),
                 "display_identity": a.display_identity,
@@ -1179,7 +1342,7 @@ fn handle_list_oauth(env: StdinEnvelope) {
                 "in_use_for": active_oauth.get(&a.provider_account_id).cloned().unwrap_or_default(),
                 "in_use": active_oauth.contains_key(&a.provider_account_id),
                 "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
-                "route_url": route_url_for(&a.provider),
+                "route_url": route_url_for(provider, &protocol),
                 "route_token": route_token,
                 // 2026-05-22: same contract as list_personal — see SecretMetadata::extra.
                 "extra": a.extra,
@@ -1279,6 +1442,10 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                 // locked view is still the page users see before they
                 // unlock, and copying the default URL is read-only).
                 let official_base_url = m.provider_code.as_deref().and_then(default_base_url);
+                let route_url = m
+                    .provider_code
+                    .as_deref()
+                    .and_then(|provider| route_url_for_personal(provider, m.base_url.as_deref()));
                 // route_token is blanked in the locked-state response. It is
                 // a personal-bearer token accepted directly by aikey-proxy;
                 // exposing the real value to anonymous local_bypass callers
@@ -1298,7 +1465,7 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "protocol_family": protocol_family_of(m.provider_code.as_deref()),
                     "base_url": m.base_url,
                     "official_base_url": official_base_url,
-                    "route_url": m.provider_code.as_deref().and_then(route_url_for),
+                    "route_url": route_url,
                     "supported_providers": m.supported_providers,
                     "created_at": m.created_at,
                     "status": "active",
@@ -1344,6 +1511,21 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
     let oauth_count = match storage::list_provider_accounts() {
         Ok(accounts) => {
             for a in &accounts {
+                let provider = oauth_provider_to_canonical(&a.provider);
+                let protocol = if a.protocol_type.is_empty() {
+                    let declared =
+                        crate::commands_internal::parse::provider_fingerprint::instance()
+                            .protocols_for_provider(provider);
+                    if declared.len() == 1 {
+                        declared[0].clone()
+                    } else {
+                        "unknown".to_string()
+                    }
+                } else {
+                    a.protocol_type.clone()
+                };
+                let client_route =
+                    crate::provider_registry::client_route_for_binding(provider, &protocol);
                 // Effective alias = local_alias if user has renamed, else
                 // display_identity. Same rule as the unlocked-mode handler;
                 // see comment in handle_list_oauth.
@@ -1352,8 +1534,10 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "target": "oauth",
                     "id": a.provider_account_id,
                     "provider_account_id": a.provider_account_id,
-                    "provider": a.provider,
-                    "protocol_family": protocol_family_of(Some(&a.provider)),
+                    "provider": provider,
+                    "protocol": protocol,
+                    "protocol_family": client_route,
+                    "client_route": client_route,
                     "auth_type": a.auth_type,
                     "credential_type": a.credential_type.as_str(),
                     "display_identity": a.display_identity,
@@ -1373,7 +1557,7 @@ fn handle_list_metadata_locked(env: StdinEnvelope) {
                     "token_expires_at": expires_map.get(&a.provider_account_id).copied().flatten(),
                     // Public — same SDK base URL the proxy serves; safe to expose
                     // in locked mode so users see the routing target before unlocking.
-                    "route_url": route_url_for(&a.provider),
+                    "route_url": route_url_for(provider, &protocol),
                     // Blanked in locked mode (same policy as personal route_token):
                     // an opaque bearer the proxy accepts; emitting null preserves
                     // the TS shape contract `route_token: string | null`.
@@ -1494,7 +1678,8 @@ mod merge_group_accounts_live_tests {
     }
 
     // Fallback: proxy hasn't polled (no group_runtime) → snapshot login_status kept,
-    // current_routed defaults false (unknown, not wrongly true).
+    // current_routed stays absent so consumers can distinguish "not projected yet"
+    // from an authoritative live projection where every candidate is false.
     #[test]
     fn no_runtime_falls_back_to_snapshot() {
         let merged = merge_group_accounts_live(Some(SNAPSHOT), None).unwrap();
@@ -1504,8 +1689,8 @@ mod merge_group_accounts_live_tests {
             "snapshot fallback"
         );
         assert!(
-            !current_routed(&merged, "a1"),
-            "unknown routed → false, not true"
+            find(&merged, "a1").get("current_routed").is_none(),
+            "unknown routed state must stay absent"
         );
     }
 
@@ -1593,33 +1778,42 @@ mod merge_group_accounts_live_tests {
         assert_eq!(a1["assigned"], true, "snapshot assigned preserved");
         assert_eq!(a1["login_status"], "logged_in", "rail overlay");
     }
-}
 
-#[cfg(test)]
-mod team_protocol_source_tests {
-    use super::*;
-
-    // Direct VK: provider_code present → use it.
+    // The CLI is the bridge between the proxy's live group-runtime rail and both
+    // web drawers. Optional runtime fields must survive this merge verbatim; in
+    // particular, an observed 0% is data and must not collapse into "unknown".
     #[test]
-    fn provider_code_wins_when_present() {
-        assert_eq!(
-            team_protocol_source("anthropic", "openai_compatible"),
-            Some("anthropic")
-        );
-    }
+    fn runtime_status_and_utilization_are_overlaid() {
+        let runtime = r#"{
+            "a1":{
+                "needs_login":false,
+                "is_current_routed":false,
+                "route_status":"window_exhausted",
+                "route_retry_at":2001,
+                "util_5h":1.0,
+                "util_7d":0.0,
+                "util_observed_at":1999,
+                "window_max_util_pct":95,
+                "window_7d_max_util_pct":88,
+                "window_7d_status":"active",
+                "window_7d_reset_at":7000
+            },
+            "a2":{"needs_login":false,"is_current_routed":true}
+        }"#;
+        let merged = merge_group_accounts_live(Some(SNAPSHOT), Some(runtime)).unwrap();
+        let a1 = find(&merged, "a1");
 
-    // Orphaned group VK (seat unbound): provider_code empty → fall back to the stable,
-    // binding-derived protocol_type. 能红: drop the protocol_type fallback → returns
-    // None → protocol renders "unknown" for the orphaned VK (the reported bug).
-    #[test]
-    fn falls_back_to_protocol_type_when_provider_code_empty() {
-        assert_eq!(team_protocol_source("", "anthropic"), Some("anthropic"));
-    }
-
-    // Both empty → no protocol info at all → None (caller renders "unknown", honest).
-    #[test]
-    fn none_when_both_empty() {
-        assert_eq!(team_protocol_source("", ""), None);
+        assert_eq!(a1["route_status"], "window_exhausted");
+        assert_eq!(a1["route_retry_at"], 2001);
+        assert_eq!(a1["util_5h"], 1.0);
+        assert_eq!(a1["util_7d"], 0.0, "observed zero must remain present");
+        assert_eq!(a1["util_observed_at"], 1999);
+        assert_eq!(a1["window_max_util_pct"], 95);
+        assert_eq!(a1["window_7d_max_util_pct"], 88);
+        assert_eq!(a1["window_7d_status"], "active");
+        assert_eq!(a1["window_7d_reset_at"], 7000);
+        assert!(!current_routed(&merged, "a1"));
+        assert!(current_routed(&merged, "a2"));
     }
 }
 
@@ -1660,6 +1854,18 @@ mod routed_candidate_state_tests {
             {"account_id":"a2","assigned":false,"login_status":"needs_login"}
         ]);
         assert_eq!(routed_candidate_state(Some(&m)), RoutedState::LoggedIn);
+    }
+
+    // A present proxy rail with every flag false means every account is unusable
+    // (cooldown / exhausted / auth failure). It must not cosmetically resurrect the
+    // static default as a route.
+    #[test]
+    fn explicit_all_false_is_no_candidate() {
+        let m = json!([
+            {"account_id":"a1","assigned":true,"current_routed":false,"login_status":"logged_in"},
+            {"account_id":"a2","assigned":false,"current_routed":false,"login_status":"logged_in"}
+        ]);
+        assert_eq!(routed_candidate_state(Some(&m)), RoutedState::NoCandidate);
     }
 
     // 无可用账号: empty candidate set (seat unbound) → NoCandidate (→ genuine inactive,
@@ -2017,6 +2223,92 @@ mod prefix_suffix_tests {
 }
 
 #[cfg(test)]
+mod two_axis_bindings_tests {
+    use super::two_axis_bindings;
+
+    // P1f / D-12: protocol comes from the route row (endpoint), provider is the
+    // brand — the two axes are SEPARATE, and the display alias is the brand alias.
+    #[test]
+    fn glm_anthropic_endpoint_two_axis() {
+        // zhipu credential whose base_url is GLM's anthropic endpoint.
+        let b = two_axis_bindings(
+            "zhipu",
+            "openai_compatible",
+            "https://open.bigmodel.cn/api/anthropic",
+        );
+        let arr = b.as_array().expect("bindings is an array");
+        assert_eq!(arr.len(), 1, "D-13: array from the start");
+        // protocol from the ROUTE ROW (anthropic), NOT the stale stored protocol_type
+        assert_eq!(arr[0]["protocol"], "anthropic");
+        assert_eq!(arr[0]["provider"], "zhipu");
+        assert_eq!(arr[0]["provider_display_alias"], "GLM");
+    }
+
+    #[test]
+    fn falls_back_to_protocol_type_when_host_unknown() {
+        let b = two_axis_bindings("acme", "openai_compatible", "https://unknown.example");
+        let arr = b.as_array().unwrap();
+        assert_eq!(arr[0]["protocol"], "openai_compatible"); // fallback
+        assert_eq!(arr[0]["provider"], "acme");
+        assert_eq!(arr[0]["provider_display_alias"], ""); // no alias for unknown
+    }
+
+    #[test]
+    fn anthropic_official_two_axis() {
+        let b = two_axis_bindings("anthropic", "anthropic", "https://api.anthropic.com");
+        let arr = b.as_array().unwrap();
+        assert_eq!(arr[0]["protocol"], "anthropic");
+        assert_eq!(arr[0]["provider"], "anthropic");
+    }
+
+    #[test]
+    fn mock_anthropic_binding_uses_anthropic_client_route() {
+        let b = two_axis_bindings(
+            "mock",
+            "anthropic",
+            "http://127.0.0.1:3000/mock-provider/anthropic",
+        );
+        let arr = b.as_array().unwrap();
+        assert_eq!(arr[0]["provider"], "mock");
+        assert_eq!(arr[0]["protocol"], "anthropic");
+        assert_eq!(arr[0]["client_route"], "anthropic");
+        assert!(arr[0]["route_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/anthropic"));
+    }
+
+    #[test]
+    fn mock_openai_binding_uses_openai_client_route() {
+        let b = two_axis_bindings(
+            "mock",
+            "openai_compatible",
+            "http://127.0.0.1:3000/mock-provider/openai",
+        );
+        let arr = b.as_array().unwrap();
+        assert_eq!(arr[0]["provider"], "mock");
+        assert_eq!(arr[0]["protocol"], "openai_compatible");
+        assert_eq!(arr[0]["client_route"], "openai");
+        assert!(arr[0]["route_url"].as_str().unwrap().ends_with("/openai"));
+    }
+
+    #[test]
+    fn kimi_family_keeps_provider_specific_proxy_path() {
+        let b = two_axis_bindings(
+            "moonshot",
+            "openai_compatible",
+            "https://api.moonshot.cn/v1",
+        );
+        let arr = b.as_array().unwrap();
+        assert_eq!(arr[0]["client_route"], "kimi");
+        assert!(arr[0]["route_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/moonshot/v1"));
+    }
+}
+
+#[cfg(test)]
 mod protocol_family_of_tests {
     use super::protocol_family_of;
 
@@ -2113,15 +2405,13 @@ mod team_status_overlay_tests {
     use super::*;
     use crate::storage;
 
-    fn setup_vault() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
-        let guard = crate::storage::TEST_VAULT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    fn setup_vault() -> (tempfile::TempDir, crate::test_env_lock::HomeVaultEnvGuard) {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let db_path = dir.path().join("vault.db");
-        unsafe {
-            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
-        }
+        // The status overlay reads cluster routing from HOME. Keep it coupled
+        // to the same temporary world as the vault so a live developer
+        // active-cluster.json cannot turn this non-cluster fixture active.
+        let guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
         let mut salt = [0u8; 16];
         crate::crypto::generate_salt(&mut salt).expect("salt");
         let pw = secrecy::SecretString::new("test_password".to_string());
@@ -2171,6 +2461,32 @@ mod team_status_overlay_tests {
             .as_str()
             .expect("status string")
             .to_string()
+    }
+
+    #[test]
+    fn group_vk_projects_supported_supplier_as_exact_binding() {
+        let (_dir, _guard) = setup_vault();
+        let mut row = vk("vk-mock-group", Some(b"ciphertext"));
+        row.provider_code.clear();
+        row.protocol_type = "anthropic".into();
+        row.base_url.clear();
+        row.supported_providers = vec!["mock".into()];
+        row.provider_base_urls.insert(
+            "mock".into(),
+            "http://127.0.0.1:3000/mock-provider/anthropic".into(),
+        );
+        row.oauth_group_id = Some("group-mock".into());
+        storage::upsert_virtual_key_cache(&row).expect("upsert group row");
+
+        let records = team_records_for_emit(&HashMap::new());
+        let record = records
+            .iter()
+            .find(|record| record["virtual_key_id"] == "vk-mock-group")
+            .expect("group record");
+        assert_eq!(record["protocol_family"], "anthropic");
+        assert_eq!(record["bindings"][0]["provider"], "mock");
+        assert_eq!(record["bindings"][0]["protocol"], "anthropic");
+        assert_eq!(record["bindings"][0]["client_route"], "anthropic");
     }
 
     #[test]

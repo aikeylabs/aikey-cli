@@ -1430,7 +1430,8 @@ pub fn run_connectivity_suite(
     // ── JSON mode: probe all, collect, return; no stderr output. ─────────
     if json_mode {
         for t in &targets {
-            let r = test_provider_connectivity(&t.provider_code, &t.base_url, &t.bearer, t.kind);
+            let r =
+                test_provider_connectivity(&t.probe_provider_code, &t.base_url, &t.bearer, t.kind);
             if r.chat_ok || (r.chat_skipped && r.api_ok) {
                 any_chat_ok = true;
             }
@@ -1451,6 +1452,8 @@ pub fn run_connectivity_suite(
             };
             json_results.push(serde_json::json!({
                 "provider":           t.provider_code,
+                "protocol":           t.protocol_type,
+                "client_route":       t.client_route,
                 "kind":               match t.kind {
                     CredentialKind::PersonalApi  => "personal_api",
                     CredentialKind::ManagedTeam  => "managed_team",
@@ -1776,7 +1779,7 @@ pub fn run_connectivity_suite(
             }
         };
 
-        let provider_code = t.provider_code.clone();
+        let probe_provider_code = t.probe_provider_code.clone();
         let base_url = t.base_url.clone();
         let bearer = t.bearer.clone();
         let kind = t.kind;
@@ -1785,7 +1788,7 @@ pub fn run_connectivity_suite(
             format_cell,
             move |tx| {
                 test_provider_connectivity_with_progress(
-                    &provider_code,
+                    &probe_provider_code,
                     &base_url,
                     &bearer,
                     kind,

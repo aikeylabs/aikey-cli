@@ -21,6 +21,14 @@ use super::{
     team_target_cluster, BuildTargetError, TestTarget,
 };
 
+/// A direct-bind Team VK needs locally delivered ciphertext. A Team OAuth
+/// group VK never has VK-level ciphertext: the local proxy resolves its
+/// current account from group-runtime and injects that account's credential.
+/// Keep every connectivity resolver on this one predicate.
+fn team_key_missing_required_local_material(is_group_vk: bool, has_ciphertext: bool) -> bool {
+    !is_group_vk && !has_ciphertext
+}
+
 /// Build a TestTarget for a single provider binding.
 ///
 /// `_password_unused` is kept in the signature as `Option<&SecretString>` so
@@ -44,6 +52,20 @@ pub fn target_from_binding(
         CredentialType::PersonalOAuthAccount => " (oauth)",
     };
     let row_label = format!("{}{}", binding.provider_code, label_suffix);
+    if crate::provider_registry::proxy_path_for_binding(
+        &binding.provider_code,
+        &binding.protocol_type,
+    )
+    .is_none()
+    {
+        return Err(BuildTargetError::Unknown {
+            label: row_label,
+            detail: format!(
+                "invalid provider/protocol binding: provider={} protocol={}",
+                binding.provider_code, binding.protocol_type
+            ),
+        });
+    }
 
     match binding.key_source_type {
         // ── Personal API key: route via proxy with the alias sentinel. ────
@@ -56,6 +78,7 @@ pub fn target_from_binding(
             Ok(personal_target(
                 &binding.key_source_ref,
                 &binding.provider_code,
+                &binding.protocol_type,
                 proxy_port,
             ))
         }
@@ -65,14 +88,17 @@ pub fn target_from_binding(
             if !crate::commands_proxy::proxy_is_running_managed() {
                 return Err(BuildTargetError::ProxyNotRunning { label: row_label });
             }
-            // Sanity: team VK needs its ciphertext delivered for the proxy to
-            // forward it. Without that, proxy responds 503; we can surface
-            // that upfront as a clearer "run sync".
+            // Direct-bind Team VKs need local ciphertext. Group VKs do not:
+            // their per-account credential arrives through group-runtime and
+            // is resolved by the local proxy at request time.
             let vk = storage::get_virtual_key_cache(&binding.key_source_ref)
                 .ok()
                 .flatten();
             if let Some(ref v) = vk {
-                if v.provider_key_ciphertext.is_none() {
+                if team_key_missing_required_local_material(
+                    v.oauth_group_id.is_some(),
+                    v.provider_key_ciphertext.is_some(),
+                ) {
                     let display = v.local_alias.clone().unwrap_or_else(|| v.alias.clone());
                     return Err(BuildTargetError::TeamKeyNotDelivered {
                         virtual_key_id: binding.key_source_ref.clone(),
@@ -83,6 +109,7 @@ pub fn target_from_binding(
             Ok(team_target(
                 &binding.key_source_ref,
                 &binding.provider_code,
+                &binding.protocol_type,
                 proxy_port,
             ))
         }
@@ -117,6 +144,7 @@ pub fn target_from_binding(
             Ok(oauth_target(
                 &binding.key_source_ref,
                 &binding.provider_code,
+                &binding.protocol_type,
                 proxy_port,
             ))
         }
@@ -216,7 +244,7 @@ pub fn targets_from_alias(
 
         return providers
             .into_iter()
-            .map(|code| personal_target(alias, &code, proxy_port))
+            .map(|code| personal_target(alias, &code, "", proxy_port))
             .collect();
     }
 
@@ -250,8 +278,8 @@ pub fn targets_from_alias(
                     vk.supported_providers.first().cloned().unwrap_or_default()
                 }
             });
-        // Cluster form-①: the provider key material stays central on the hub-
-        // resolved node, so this VK's local cache entry has
+        // Cluster form-① direct-bind VK: the provider key material stays central
+        // on the hub-resolved node, so this VK's local cache entry has
         // provider_key_ciphertext = None BY DESIGN. Probe the SAME way a real
         // call routes (cluster_route → node authority + real VK token) instead
         // of demanding local ciphertext. Without this the cluster VK fell
@@ -271,6 +299,7 @@ pub fn targets_from_alias(
                 &token,
                 &vk.virtual_key_id,
                 &provider,
+                &vk.protocol_type,
             )];
         }
         // GROUP VKs have NO local key material (provider_key_ciphertext = None)
@@ -280,13 +309,21 @@ pub fn targets_from_alias(
         // delivered → unprobeable") must NOT apply to group VKs: probe them
         // through the proxy with the aikey_team_<vk_id> bearer exactly like a
         // real group request (the proxy resolves the account + injects its key).
-        if vk.oauth_group_id.is_none() && vk.provider_key_ciphertext.is_none() {
+        if team_key_missing_required_local_material(
+            vk.oauth_group_id.is_some(),
+            vk.provider_key_ciphertext.is_some(),
+        ) {
             // Non-cluster, direct-bind team VK with no local material (never
             // delivered) — genuinely unprobeable. Caller surfaces
             // I_CREDENTIAL_NOT_FOUND.
             return Vec::new();
         }
-        return vec![team_target(&vk.virtual_key_id, &provider, proxy_port)];
+        return vec![team_target(
+            &vk.virtual_key_id,
+            &provider,
+            &vk.protocol_type,
+            proxy_port,
+        )];
     }
 
     // ── 3. OAuth account (by ID, local_alias, or display_identity / email). ────
@@ -325,6 +362,7 @@ pub fn targets_from_alias(
             return vec![oauth_target(
                 &acct.provider_account_id,
                 &raw_provider,
+                &acct.protocol_type,
                 proxy_port,
             )];
         }
@@ -380,7 +418,7 @@ pub fn targets_from_all_keys(proxy_port: u16) -> (Vec<TestTarget>, Vec<BuildTarg
                     continue;
                 };
                 for code in providers {
-                    targets.push(personal_target(&m.alias, &code, proxy_port));
+                    targets.push(personal_target(&m.alias, &code, "", proxy_port));
                 }
             }
         }
@@ -394,7 +432,10 @@ pub fn targets_from_all_keys(proxy_port: u16) -> (Vec<TestTarget>, Vec<BuildTarg
                 // delivered the real key yet) — probe can't decrypt nothing.
                 // GROUP VKs (oauth_group_id set) have NO local ciphertext BY
                 // DESIGN (material via proxy channel ③), so don't skip them.
-                if vk.oauth_group_id.is_none() && vk.provider_key_ciphertext.is_none() {
+                if team_key_missing_required_local_material(
+                    vk.oauth_group_id.is_some(),
+                    vk.provider_key_ciphertext.is_some(),
+                ) {
                     continue;
                 }
                 // Skip stale / disabled rows (matches the runtime route
@@ -417,7 +458,8 @@ pub fn targets_from_all_keys(proxy_port: u16) -> (Vec<TestTarget>, Vec<BuildTarg
                 } else {
                     vk.supported_providers.first().cloned().unwrap_or_default()
                 };
-                let mut t = team_target(&vk.virtual_key_id, &provider, proxy_port);
+                let mut t =
+                    team_target(&vk.virtual_key_id, &provider, &vk.protocol_type, proxy_port);
                 t.display_alias = vk.local_alias.clone().unwrap_or_else(|| vk.alias.clone());
                 targets.push(t);
             }
@@ -437,7 +479,12 @@ pub fn targets_from_all_keys(proxy_port: u16) -> (Vec<TestTarget>, Vec<BuildTarg
                 ) {
                     continue;
                 }
-                let mut t = oauth_target(&acct.provider_account_id, &acct.provider, proxy_port);
+                let mut t = oauth_target(
+                    &acct.provider_account_id,
+                    &acct.provider,
+                    &acct.protocol_type,
+                    proxy_port,
+                );
                 // Friendly Key column: effective_label = local_alias → display_identity
                 // → account_id. Falls back to source_ref via TestTarget::key_display
                 // when it's empty (rare; only if all three are missing).
@@ -448,6 +495,22 @@ pub fn targets_from_all_keys(proxy_port: u16) -> (Vec<TestTarget>, Vec<BuildTarg
     }
 
     (targets, errors)
+}
+
+#[cfg(test)]
+mod group_vk_material_tests {
+    use super::team_key_missing_required_local_material;
+
+    #[test]
+    fn group_vk_without_ciphertext_is_probeable_via_group_runtime() {
+        assert!(!team_key_missing_required_local_material(true, false));
+    }
+
+    #[test]
+    fn direct_bind_vk_without_ciphertext_still_requires_delivery() {
+        assert!(team_key_missing_required_local_material(false, false));
+        assert!(!team_key_missing_required_local_material(false, true));
+    }
 }
 
 /// Build targets for the `aikey add` post-entry probe: one plaintext key

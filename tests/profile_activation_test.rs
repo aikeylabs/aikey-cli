@@ -5,23 +5,46 @@
 //!
 //! ## Running
 //!
-//! Must run with `--test-threads=1` because `setup()` mutates global env vars
-//! (`AK_VAULT_PATH`, `HOME`). Parallel test execution races on these vars.
-//!
-//! ```
-//! cargo test --test profile_activation_test -- --test-threads=1
-//! ```
+//! `setup()` serializes and restores the process-global `AK_VAULT_PATH` / `HOME`
+//! variables, so this target is safe under Cargo's default parallel runner.
 
 use aikeylabs_aikey_cli::credential_type::CredentialType;
 use aikeylabs_aikey_cli::profile_activation::{self, ReconcileOutcome, DEFAULT_PROFILE};
 use aikeylabs_aikey_cli::storage;
 use secrecy::SecretString;
+use std::ffi::OsString;
+use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
 
-/// Sets up an isolated vault and returns the temp dir guard.
-fn setup() -> TempDir {
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct TestEnvGuard {
+    _dir: TempDir,
+    _lock: MutexGuard<'static, ()>,
+    previous_vault_path: Option<OsString>,
+    previous_home: Option<OsString>,
+}
+
+impl Drop for TestEnvGuard {
+    fn drop(&mut self) {
+        match &self.previous_vault_path {
+            Some(value) => std::env::set_var("AK_VAULT_PATH", value),
+            None => std::env::remove_var("AK_VAULT_PATH"),
+        }
+        match &self.previous_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+/// Sets up an isolated vault and keeps its process-global environment locked.
+fn setup() -> TestEnvGuard {
+    let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("vault.db");
+    let previous_vault_path = std::env::var_os("AK_VAULT_PATH");
+    let previous_home = std::env::var_os("HOME");
     std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
     // Also point HOME to tempdir so active.env writes there.
     std::env::set_var("HOME", dir.path().to_str().unwrap());
@@ -31,7 +54,12 @@ fn setup() -> TempDir {
     rand::rngs::OsRng.fill_bytes(&mut salt);
     let pw = SecretString::new("test_password_123".to_string());
     storage::initialize_vault(&salt, &pw).expect("init vault");
-    dir
+    TestEnvGuard {
+        _dir: dir,
+        _lock: lock,
+        previous_vault_path,
+        previous_home,
+    }
 }
 
 /// Registers `vk` in the virtual-key cache WITH local ciphertext, so the

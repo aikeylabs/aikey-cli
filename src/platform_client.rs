@@ -373,6 +373,22 @@ pub struct KeyItem {
     /// Added in v0.7; older servers return an empty array via `#[serde(default)]`.
     #[serde(default)]
     pub supported_providers: Vec<String>,
+    /// Legacy single-binding protocol projection. New servers also return the
+    /// binding-granular `bindings` array below; keep this field as a fallback
+    /// for rolling upgrades.
+    #[serde(default)]
+    pub protocol_type: String,
+    /// Exact Provider+Protocol axes for every active VK binding. The lightweight
+    /// metadata sync must consume these instead of inventing one protocol from
+    /// `provider_code` (Mock Provider is intentionally multi-protocol).
+    #[serde(default)]
+    pub bindings: Vec<KeyBindingAxis>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct KeyBindingAxis {
+    pub protocol: String,
+    pub provider: String,
 }
 
 /// One binding target inside a protocol slot from GET /virtual-keys/{id}/delivery.
@@ -426,6 +442,30 @@ impl DeliveryPayload {
     /// Returns the primary (first) binding target, if any.
     pub fn primary_binding(&self) -> Option<&BindingTarget> {
         self.slots.first()?.binding_targets.first()
+    }
+
+    /// P1e (design D-11): find the binding target for a specific
+    /// (protocol_type, provider_code) so each per-binding cache row pulls ITS
+    /// OWN credential material — a VK can carry e.g. GLM(zhipu key) AND the
+    /// official Anthropic(official key), one per slot/target, each with its own
+    /// `provider_key`. An empty `protocol_type` matches any slot (older cache
+    /// rows). Returns the matched slot's protocol_type alongside the target.
+    pub fn binding_for(
+        &self,
+        protocol_type: &str,
+        provider_code: &str,
+    ) -> Option<(&str, &BindingTarget)> {
+        for slot in &self.slots {
+            if !protocol_type.is_empty() && slot.protocol_type != protocol_type {
+                continue;
+            }
+            for bt in &slot.binding_targets {
+                if bt.provider_code == provider_code {
+                    return Some((slot.protocol_type.as_str(), bt));
+                }
+            }
+        }
+        None
     }
 
     /// Returns the protocol type of the primary slot.

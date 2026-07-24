@@ -4,20 +4,54 @@
 //! legacy `active_key_config`, `resolve_supported_providers`, and the new
 //! entries `supported_providers` column.
 //!
-//! Run with `--test-threads=1` because setup mutates global env vars.
+//! The fixture serializes and restores its process-global vault path, so the
+//! target remains isolated under Cargo's default parallel runner.
 
 use aikeylabs_aikey_cli::credential_type::CredentialType;
 use aikeylabs_aikey_cli::storage;
 use rusqlite::{params, Connection};
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct TestVaultGuard {
+    _dir: TempDir,
+    _lock: MutexGuard<'static, ()>,
+    previous_vault_path: Option<OsString>,
+}
+
+impl Drop for TestVaultGuard {
+    fn drop(&mut self) {
+        match &self.previous_vault_path {
+            Some(value) => std::env::set_var("AK_VAULT_PATH", value),
+            None => std::env::remove_var("AK_VAULT_PATH"),
+        }
+    }
+}
+
+fn isolated_vault_path() -> (TestVaultGuard, PathBuf) {
+    let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("vault.db");
+    let previous_vault_path = std::env::var_os("AK_VAULT_PATH");
+    std::env::set_var("AK_VAULT_PATH", &db_path);
+    (
+        TestVaultGuard {
+            _dir: dir,
+            _lock: lock,
+            previous_vault_path,
+        },
+        db_path,
+    )
+}
 
 /// Sets up an isolated vault DB via `AK_VAULT_PATH` and returns the temp dir
 /// (must be kept alive for the duration of the test).
-fn setup_vault() -> (TempDir, PathBuf) {
-    let dir = TempDir::new().expect("tempdir");
-    let db_path = dir.path().join("vault.db");
-    std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+fn setup_vault() -> (TestVaultGuard, PathBuf) {
+    let (guard, db_path) = isolated_vault_path();
 
     // Trigger schema creation by initialising with a dummy password.
     use rand::RngCore;
@@ -27,7 +61,7 @@ fn setup_vault() -> (TempDir, PathBuf) {
     let pw = SecretString::new("test_password_123".to_string());
     storage::initialize_vault(&salt, &pw).expect("init vault");
 
-    (dir, db_path)
+    (guard, db_path)
 }
 
 /// Open a raw connection for assertions / manual seeding.
@@ -142,8 +176,12 @@ fn remove_bindings_by_key_source_cleans_all_providers() {
     let affected =
         storage::remove_bindings_by_key_source("default", "personal", "gateway-a").unwrap();
     assert_eq!(affected.len(), 2);
-    assert!(affected.contains(&"openai".to_string()));
-    assert!(affected.contains(&"anthropic".to_string()));
+    assert!(affected
+        .iter()
+        .any(|binding| binding.client_route == "openai"));
+    assert!(affected
+        .iter()
+        .any(|binding| binding.client_route == "anthropic"));
 
     // google untouched
     assert!(storage::get_provider_binding("default", "google")
@@ -221,9 +259,7 @@ fn migration_carries_over_legacy_active_key() {
     // We need to manually set up a legacy active key *before* the migration
     // runs.  Since `initialize_vault` triggers migrations, we'll create a
     // minimal DB, seed the legacy config, then open via the normal path.
-    let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("vault.db");
-    std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+    let (_guard, db_path) = isolated_vault_path();
 
     {
         // Create a minimal DB with only the config + entries tables

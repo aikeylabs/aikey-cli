@@ -895,7 +895,7 @@ fn rename_alias_rejects_identical_names() {
 }
 
 #[test]
-fn set_provider_updates_field() {
+fn removed_set_provider_action_is_rejected_without_mutation() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
@@ -913,15 +913,15 @@ fn set_provider_updates_field() {
             "payload": {"alias": "q-kimi", "provider": "moonshot"}
         }),
     );
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["data"]["provider_code"], "moonshot");
+    assert_eq!(v["status"], "error", "full response: {v}");
+    assert_eq!(v["error_code"], "I_UNKNOWN_ACTION");
 
     let meta1 = read_entry_meta(&env, "q-kimi");
-    assert_eq!(meta1["provider_code"], "moonshot");
+    assert!(meta1["provider_code"].is_null());
 }
 
 #[test]
-fn set_provider_null_clears() {
+fn removed_set_provider_null_action_is_rejected_without_mutation() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
@@ -935,13 +935,14 @@ fn set_provider_null_clears() {
             "payload": {"alias": "q-claude", "provider": null}
         }),
     );
-    assert_eq!(v["status"], "ok");
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["error_code"], "I_UNKNOWN_ACTION");
     let meta = read_entry_meta(&env, "q-claude");
-    assert!(meta["provider_code"].is_null());
+    assert_eq!(meta["provider_code"], "anthropic");
 }
 
 #[test]
-fn set_base_url_updates_field() {
+fn removed_set_base_url_action_is_rejected_without_mutation() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
@@ -955,17 +956,19 @@ fn set_base_url_updates_field() {
             "payload": {"alias": "q-openai", "base_url": "https://api.internal.corp/v1"}
         }),
     );
-    assert_eq!(v["status"], "ok");
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["error_code"], "I_UNKNOWN_ACTION");
     let meta = read_entry_meta(&env, "q-openai");
-    assert_eq!(meta["base_url"], "https://api.internal.corp/v1");
+    assert_ne!(meta["base_url"], "https://api.internal.corp/v1");
 }
 
 #[test]
-fn set_supported_providers_json_array() {
+fn removed_set_supported_providers_action_is_rejected_without_mutation() {
     let env = InternalTestEnv::new();
     env.init_vault();
     let key_hex = env.vault_key_hex();
     seed_credentials(&env, &key_hex);
+    let before = read_entry_meta(&env, "q-claude");
 
     let v = run_update_alias(
         &env,
@@ -975,12 +978,10 @@ fn set_supported_providers_json_array() {
             "payload": {"alias": "q-claude", "providers": ["anthropic", "openai-compat"]}
         }),
     );
-    assert_eq!(v["status"], "ok");
-    let meta = read_entry_meta(&env, "q-claude");
-    // 存储为 JSON string
-    let stored: String = meta["supported_providers"].as_str().unwrap().to_string();
-    let parsed: Vec<String> = serde_json::from_str(&stored).unwrap();
-    assert_eq!(parsed, vec!["anthropic", "openai-compat"]);
+    assert_eq!(v["status"], "error");
+    assert_eq!(v["error_code"], "I_UNKNOWN_ACTION");
+    let after = read_entry_meta(&env, "q-claude");
+    assert_eq!(after, before);
 }
 
 #[test]
@@ -1050,8 +1051,8 @@ fn update_alias_rejects_wrong_key() {
         &env,
         serde_json::json!({
             "vault_key_hex": "0".repeat(64),
-            "action": "set_provider",
-            "payload": {"alias": "q-claude", "provider": "malicious"}
+            "action": "set_metadata",
+            "payload": {"alias": "q-claude", "metadata": {"tag": "malicious"}}
         }),
     );
     assert_eq!(v["status"], "error");
@@ -1432,8 +1433,8 @@ fn update_alias_actions_write_audit() {
     let v = run_update_alias(
         &env,
         serde_json::json!({
-            "vault_key_hex": key_hex, "action": "set_provider",
-            "payload": {"alias": "q-kimi", "provider": "moonshot"}
+            "vault_key_hex": key_hex, "action": "set_metadata",
+            "payload": {"alias": "q-kimi", "metadata": {"tag": "audited"}}
         }),
     );
     assert_eq!(v["data"]["audit_logged"], true);

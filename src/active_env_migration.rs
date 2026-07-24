@@ -1,4 +1,4 @@
-//! `~/.aikey/active.env` legacy-form auto-migration (2026-04-29 prefix rename).
+//! `~/.aikey/active.env` legacy-contract auto-migration.
 //!
 //! After the prefix rename, old `active.env` files (with `aikey_vk_<...>`
 //! or `aikey_personal_<alias>` sentinel forms) must be regenerated with the
@@ -29,20 +29,28 @@
 
 use std::path::PathBuf;
 
-/// True if `active.env` exists AND contains a legacy-form token (and so
-/// would not work against the post-rename proxy). Returns false on any
-/// read error (worst case: caller doesn't refresh; safety net runs again
-/// next invocation).
+/// True if `active.env` or its Windows `active.env.flat` mirror contains a
+/// legacy contract that must be regenerated. Besides obsolete token prefixes,
+/// this includes the short-lived
+/// Mock Provider client namespace. Mock is an upstream supplier, so its active
+/// credentials must be projected through the Anthropic/OpenAI client routes;
+/// keeping `AIKEY_MOCK_PROVIDER_*`, `/mock`, or the old route side channel in
+/// the shell environment would bypass that model after a binary upgrade.
+///
+/// Returns false on any read error (worst case: caller doesn't refresh; the
+/// safety net runs again on the next invocation).
 pub fn active_env_has_legacy_form() -> bool {
     let path = match crate::proxy_env::active_env_path() {
         Ok(p) => p,
         Err(_) => return false,
     };
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    contents_have_legacy_form(&contents)
+    let flat_path = path.with_extension("env.flat");
+    let has_legacy = [&path, &flat_path].into_iter().any(|candidate| {
+        std::fs::read_to_string(candidate)
+            .map(|contents| contents_have_legacy_form(&contents))
+            .unwrap_or(false)
+    });
+    has_legacy
 }
 
 /// Pure logic — exposed for unit testing.
@@ -52,6 +60,10 @@ pub fn active_env_has_legacy_form() -> bool {
 ///   - `aikey_personal_<non-64-hex>` — old sentinel form (alias / account_id
 ///     suffix). NEW personal bearers are 64-hex; if a sentinel-form leaks
 ///     into active.env it's stale.
+///   - `AIKEY_MOCK_PROVIDER_TOKEN` / `AIKEY_MOCK_PROVIDER_BASE_URL` — obsolete
+///     provider-keyed client environment namespace.
+///   - `AIKEY_ACTIVE_CLIENT_ROUTES` — obsolete projection side channel that
+///     encoded `client_route=provider` outside the binding row.
 ///
 /// New forms passed:
 ///   - `aikey_active_<provider>` — current sentinel
@@ -59,7 +71,19 @@ pub fn active_env_has_legacy_form() -> bool {
 ///     not a legacy form — shouldn't trigger migration)
 ///   - `aikey_team_<vk_id>` — current team static bearer
 fn contents_have_legacy_form(contents: &str) -> bool {
-    if contents.contains("aikey_vk_") {
+    if contents.contains("aikey_vk_")
+        || [
+            "AIKEY_MOCK_PROVIDER_TOKEN",
+            "AIKEY_MOCK_PROVIDER_BASE_URL",
+            "AIKEY_ACTIVE_CLIENT_ROUTES",
+        ]
+        .iter()
+        .any(|name| {
+            contents
+                .lines()
+                .any(|line| line_assigns_env_var(line, name))
+        })
+    {
         return true;
     }
     // Look for `aikey_personal_*` followed by suffix that's NOT exactly
@@ -79,6 +103,17 @@ fn contents_have_legacy_form(contents: &str) -> bool {
         }
     }
     false
+}
+
+// The current renderer deliberately emits `unset OLD_VAR` cleanup lines so a
+// shell drops obsolete values inherited from its parent. Those lines are the
+// opposite of legacy configuration and must never re-trigger migration. Both
+// active.env (`export NAME=...`) and active.env.flat (`NAME=...`) are covered.
+fn line_assigns_env_var(line: &str, name: &str) -> bool {
+    let line = line.trim_start();
+    line.strip_prefix("export ")
+        .unwrap_or(line)
+        .starts_with(&format!("{}=", name))
 }
 
 /// True iff `s` is exactly 64 lowercase hex chars — the strict form for
@@ -155,7 +190,8 @@ fn prune_old_backups(dir: &std::path::Path, keep: usize) -> std::io::Result<()> 
 ///
 /// Behavior:
 ///   - If `if_legacy` is true and no legacy form is detected → no-op (Ok).
-///   - Otherwise: backup, then call `profile_activation::refresh_implicit_profile_activation`.
+///   - Otherwise: best-effort refresh the employee-facing cluster route,
+///     backup, then call `profile_activation::refresh_implicit_profile_activation`.
 ///   - Backup failure → Err (don't proceed with rewrite).
 ///   - Refresh failure (binding read / file write) → Err.
 ///   - No bindings → refresh writes an empty-but-marked active.env (per
@@ -183,6 +219,15 @@ pub fn refresh_active_env(if_legacy: bool) -> Result<RefreshOutcome, String> {
     if !vault_path.exists() {
         return Ok(RefreshOutcome::NoBindingsToFollow);
     }
+
+    // The route sidecar is deliberately independent from encrypted key
+    // material, so refreshing active.env must not require the vault password.
+    // Re-resolve it here before rendering: cluster topology and the
+    // employee-facing ingress authority can change across an upgrade while
+    // the selected bindings stay the same. On auth/transport failure the
+    // resolver preserves the last-known-good sidecar, keeping this operation
+    // best-effort and backward compatible.
+    let _ = crate::commands_account::try_resolve_and_persist_cluster_node();
 
     let backup = backup_active_env().map_err(|e| format!("backup before refresh failed: {}", e))?;
 
@@ -231,6 +276,33 @@ export AIKEY_ACTIVE_KEYS="anthropic=my-team-key"
         let env =
             r#"export ANTHROPIC_AUTH_TOKEN="aikey_personal_0123456789abcdef0123456789abcdef""#;
         assert!(contents_have_legacy_form(env));
+    }
+
+    #[test]
+    fn detects_obsolete_mock_provider_client_namespace() {
+        let env = r#"
+export AIKEY_MOCK_PROVIDER_TOKEN='aikey_team_example'
+export AIKEY_MOCK_PROVIDER_BASE_URL='http://node2:27200/mock'
+export ANTHROPIC_API_KEY='aikey_team_example'
+export ANTHROPIC_BASE_URL='http://node2:27200/mock'
+"#;
+        assert!(contents_have_legacy_form(env));
+    }
+
+    #[test]
+    fn detects_obsolete_client_route_projection_side_channel() {
+        let env = r#"export AIKEY_ACTIVE_CLIENT_ROUTES='anthropic=mock'"#;
+        assert!(contents_have_legacy_form(env));
+    }
+
+    #[test]
+    fn ignores_obsolete_namespace_cleanup_lines() {
+        let env = r#"
+unset AIKEY_MOCK_PROVIDER_TOKEN 2>/dev/null
+unset AIKEY_MOCK_PROVIDER_BASE_URL 2>/dev/null
+unset AIKEY_ACTIVE_CLIENT_ROUTES 2>/dev/null
+"#;
+        assert!(!contents_have_legacy_form(env));
     }
 
     #[test]
