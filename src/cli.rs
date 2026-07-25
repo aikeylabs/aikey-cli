@@ -569,9 +569,15 @@ pub(crate) enum Commands {
     /// thing. Bare `aikey service status` (no name) prints a one-line
     /// summary of every service at once.
     ///
+    /// The `all` meta-target fans out to every installed service (proxy + web
+    /// + trust-local): `aikey service start all` brings them all up in one
+    /// call, skipping any not installed on this edition and any already in the
+    /// target state. `all` is NOT itself a whitelisted service name.
+    ///
     /// Examples:
     ///   aikey service status                 # all services, one line each
     ///   aikey service status trust-local     # one service, full detail
+    ///   aikey service start all              # bring up proxy + web + trust-local
     ///   aikey service restart web
     ///   aikey service stop proxy
     #[command(display_order = 27)]
@@ -598,15 +604,16 @@ pub(crate) enum ConfigAction {
 
 #[derive(Subcommand)]
 pub(crate) enum ServiceAction {
-    /// Start a registered AiKey service.
+    /// Start a registered AiKey service, or `all` to bring up every installed
+    /// service (proxy + web + trust-local) in one call.
     Start {
-        /// Service short name (e.g. `trust-local`). Run without a
-        /// name to see the list of supported services.
+        /// Service short name (e.g. `trust-local`), or `all` to start every
+        /// installed service. Run without a name to see the supported list.
         name: Option<String>,
     },
-    /// Stop a registered AiKey service.
+    /// Stop a registered AiKey service, or `all` to stop every running service.
     Stop { name: Option<String> },
-    /// Restart a registered AiKey service.
+    /// Restart a registered AiKey service, or `all` for every installed service.
     Restart { name: Option<String> },
     /// Show service status. Without a name: one-line summary of every
     /// service. With a name (`web` / `proxy` / `trust-local`): full detail

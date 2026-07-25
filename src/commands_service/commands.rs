@@ -47,6 +47,22 @@ pub(crate) fn handle_service(
         return Ok(());
     };
 
+    // `all` is an explicit meta-target, NOT a whitelisted service. It fans out
+    // to every installed service: for read-only `status` it's an alias of the
+    // bare-`status` aggregate; for mutating verbs it runs the best-effort
+    // orchestrator. Handled BEFORE is_supported() on purpose — `all` is
+    // deliberately kept out of SUPPORTED_SERVICES so the web
+    // `/api/internal/services/<name>/<action>` endpoint (which shares that
+    // table as its security boundary) can only ever target one concrete
+    // service per call, never a fan-out.
+    if name == "all" {
+        return if verb == "status" {
+            status_all(json)
+        } else {
+            run_all(verb, json, password_stdin)
+        };
+    }
+
     if !is_supported(name) {
         let msg = format!(
             "unknown service '{}'. Supported: {}",
@@ -92,8 +108,9 @@ fn print_supported(json: bool) {
         for (name, label) in SUPPORTED_SERVICES {
             println!("  {:<14}  {}", name, label);
         }
+        println!("  {:<14}  {}", "all", "every installed service above (fan-out)");
         println!();
-        println!("Usage: aikey service <start|stop|restart|status> <name>");
+        println!("Usage: aikey service <start|stop|restart|status> <name|all>");
     }
 }
 
@@ -141,6 +158,171 @@ fn status_all(json: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ───────────────────────────────────────────────────────────────────
+// `all` meta-target orchestrator
+// ───────────────────────────────────────────────────────────────────
+
+/// Outcome plan for one service leg of `aikey service <verb> all`. Kept as a
+/// pure function so the orchestration policy (skip vs act) is unit-testable
+/// without spawning real services — the actual spawn is delegated to the
+/// already-tested per-service dispatchers.
+#[derive(Debug, PartialEq, Eq)]
+enum LegPlan {
+    /// Don't touch this service; the reason is shown to the user.
+    Skip(&'static str),
+    /// Perform the verb via the canonical per-service dispatcher.
+    Act,
+}
+
+/// Decide what `all` does for one service given its installed/running state.
+/// Idempotent by design:
+///   - not installed       → skip on every verb (an edition without this service)
+///   - start + running     → skip: avoids re-prompting the proxy vault password
+///                           and avoids bouncing trust-local, whose `start` is a
+///                           kill-restart (`launchctl kickstart -k`)
+///   - stop  + not running  → skip
+///   - restart / start-when-stopped / stop-when-running → act
+fn plan_leg(verb: &str, installed: bool, running: bool) -> LegPlan {
+    if !installed {
+        return LegPlan::Skip("not installed");
+    }
+    match verb {
+        "start" if running => LegPlan::Skip("already running"),
+        "stop" if !running => LegPlan::Skip("already stopped"),
+        _ => LegPlan::Act,
+    }
+}
+
+/// `aikey service <start|stop|restart> all` — best-effort orchestrator over
+/// every INSTALLED whitelist service (proxy + web + trust-local).
+///
+/// It owns no per-service lifecycle logic: each acting leg calls the same
+/// canonical dispatcher as `aikey service <verb> <name>`, so `all` can never
+/// drift from the single-service commands. It only adds orchestration:
+///   - ordering: proxy (main data-path link) comes up first; teardown reverses
+///     so the observer/console stop before the proxy,
+///   - idempotent + not-installed skips (see `plan_leg`),
+///   - best-effort execution: one service failing does NOT abort the others,
+///   - a loud aggregate: a non-zero exit when ANY installed service failed.
+///
+/// Output: each acting leg prints its own native line(s) (identical to the
+/// single-service command); this function adds a skip line per skipped service
+/// and a final summary. In `--json` mode the stream is newline-delimited JSON
+/// (the underlying command's object per acting leg + a skip object per skipped
+/// service + a final summary object) — this mirrors how json-ness already
+/// varies across the per-service mutating commands, rather than inventing a
+/// single-object shape that would require silencing them.
+fn run_all(
+    verb: &str,
+    json: bool,
+    password_stdin: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // proxy first (main link), then console, then observer. Teardown reverses.
+    let mut order = vec!["proxy", "web", "trust-local"];
+    if verb == "stop" {
+        order.reverse();
+    }
+
+    let (mut acted, mut skipped, mut failed) = (0u32, 0u32, 0u32);
+
+    for svc in order {
+        let (installed, running) = leg_state(svc);
+        match plan_leg(verb, installed, running) {
+            LegPlan::Skip(reason) => {
+                skipped += 1;
+                emit_skip(svc, verb, reason, json);
+            }
+            LegPlan::Act => {
+                let res = match svc {
+                    "proxy" => proxy::dispatch(verb, json, password_stdin),
+                    "web" => web::dispatch(verb, json),
+                    "trust-local" => trust_local::dispatch(verb, json),
+                    _ => unreachable!("order slice only holds whitelist names"),
+                };
+                match res {
+                    Ok(()) => acted += 1,
+                    Err(e) => {
+                        failed += 1;
+                        // The dispatcher already surfaced its own error in its
+                        // mode; add a service-attributed line so the aggregate
+                        // reads clearly even when several legs run.
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "name": svc, "action": verb,
+                                    "result": "failed", "detail": e.to_string(),
+                                })
+                            );
+                        } else {
+                            eprintln!("{} {}: {}", crate::symbols::CROSS.s(), svc, e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    emit_summary(verb, acted, skipped, failed, json);
+
+    if failed > 0 {
+        // Non-zero exit — failures must be loud (project principle).
+        return Err(format!("service {verb} all: {failed} service(s) failed").into());
+    }
+    Ok(())
+}
+
+/// (installed, running) for one whitelist service, via that service's existing
+/// read-only probe — never spawns, never prompts.
+fn leg_state(svc: &str) -> (bool, bool) {
+    match svc {
+        // proxy is edition-agnostic — always "installed".
+        "proxy" => (true, crate::commands_proxy::status_summary().0),
+        "web" => {
+            let installed = crate::local_server_probe::is_local_server_installed();
+            (
+                installed,
+                installed && crate::local_server_probe::status_summary().0,
+            )
+        }
+        "trust-local" => {
+            let installed = trust_local::is_installed();
+            (installed, installed && trust_local::status_summary().0)
+        }
+        _ => (false, false),
+    }
+}
+
+fn emit_skip(svc: &str, verb: &str, reason: &str, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "name": svc, "action": verb, "result": "skipped", "reason": reason,
+            })
+        );
+    } else {
+        println!("- {svc}: skipped ({reason})");
+    }
+}
+
+fn emit_summary(verb: &str, acted: u32, skipped: u32, failed: u32, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": failed == 0,
+                "action": format!("{verb} all"),
+                "acted": acted, "skipped": skipped, "failed": failed,
+                "summary": true,
+            })
+        );
+    } else {
+        println!();
+        println!("Summary: {acted} acted, {skipped} skipped, {failed} failed");
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────
 // per-service drivers
 // ───────────────────────────────────────────────────────────────────
 
@@ -166,6 +348,15 @@ mod trust_local {
         } else {
             (false, "not running".to_string())
         }
+    }
+
+    /// True when the trust-local binary is present — same path truth source as
+    /// `status_summary` and the `dispatch` install guard. Lets the `all`
+    /// orchestrator skip trust-local on hosts that never installed the
+    /// degrade-detector, instead of surfacing a hard TRUST_LOCAL_NOT_INSTALLED
+    /// error for the whole `all` run.
+    pub(super) fn is_installed() -> bool {
+        aikey_home_bin_path().exists()
     }
 
     /// Single-shot healthz check (no retry loop). Distinct from
@@ -580,6 +771,55 @@ mod tests {
         assert!(is_supported("trust-local"));
         assert!(is_supported("web"));
         assert!(is_supported("proxy"));
+    }
+
+    // `all` is a meta-target handled BEFORE is_supported() in handle_service.
+    // It must NOT leak into the whitelist, or the web
+    // /api/internal/services/<name>/<action> endpoint (which shares
+    // SUPPORTED_SERVICES) could be driven with name="all" and fan out — the
+    // exact single-concrete-service boundary that table exists to enforce.
+    #[test]
+    fn all_is_not_a_whitelisted_service() {
+        assert!(!is_supported("all"));
+    }
+
+    // Orchestration policy for `service <verb> all` — pure decision table, no
+    // service spawned. Pins the idempotent + not-installed skip semantics.
+    #[test]
+    fn plan_leg_skips_not_installed_on_every_verb() {
+        for verb in ["start", "stop", "restart"] {
+            assert_eq!(
+                plan_leg(verb, false, false),
+                LegPlan::Skip("not installed"),
+                "verb {verb}: not-installed must skip regardless of running flag"
+            );
+            assert_eq!(
+                plan_leg(verb, false, true),
+                LegPlan::Skip("not installed"),
+            );
+        }
+    }
+
+    #[test]
+    fn plan_leg_start_is_idempotent() {
+        // running → skip (don't re-prompt proxy password / bounce trust-local)
+        assert_eq!(plan_leg("start", true, true), LegPlan::Skip("already running"));
+        // stopped → act
+        assert_eq!(plan_leg("start", true, false), LegPlan::Act);
+    }
+
+    #[test]
+    fn plan_leg_stop_is_idempotent() {
+        // not running → skip
+        assert_eq!(plan_leg("stop", true, false), LegPlan::Skip("already stopped"));
+        // running → act
+        assert_eq!(plan_leg("stop", true, true), LegPlan::Act);
+    }
+
+    #[test]
+    fn plan_leg_restart_always_acts_when_installed() {
+        assert_eq!(plan_leg("restart", true, true), LegPlan::Act);
+        assert_eq!(plan_leg("restart", true, false), LegPlan::Act);
     }
 
     #[test]

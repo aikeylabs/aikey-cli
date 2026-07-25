@@ -232,6 +232,11 @@ aikey web status                            # local web console: running? port? 
 aikey proxy status                          # proxy: running? pid? listen addr?
 aikey service status trust-local            # a single service in detail
 
+# Bring services up/down together (`all` = every installed service)
+aikey service start all                     # start proxy + web + trust-local (skips not-installed / already-up)
+aikey service stop all                      # stop everything that's running
+aikey service restart all                   # restart every installed service
+
 # Delivery audit (financial-grade usage completeness)
 aikey audit status                          # per-source: allocated / confirmed / gaps / known-loss / quarantine
 aikey audit reconcile                       # actively reconcile now: re-send recoverable gaps, confirm true losses

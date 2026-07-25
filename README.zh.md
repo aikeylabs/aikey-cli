@@ -232,6 +232,11 @@ aikey web status                            # 本地 web 控制台: 是否运行
 aikey proxy status                          # proxy: 是否运行? pid? 监听地址?
 aikey service status trust-local            # 单个服务的详细状态
 
+# 一并启停(`all` = 全部已安装服务)
+aikey service start all                     # 一起拉起 proxy + web + trust-local(跳过未安装/已在跑)
+aikey service stop all                      # 停掉所有在运行的服务
+aikey service restart all                   # 重启每个已安装服务
+
 # 投递审计（财务对账级用量完整性）
 aikey audit status                          # 按源看：已分配 / 已确认 / 缺口 / 已知丢失 / 隔离
 aikey audit reconcile                       # 立即主动对账：补传可恢复缺口、确认真实丢失
