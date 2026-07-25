@@ -1154,6 +1154,21 @@ fn open_url_silently(url: &str) {
     }
 }
 
+fn with_display_time_zone(url: &str) -> String {
+    let preference = crate::time_zone::preference();
+    let (base, fragment) = url
+        .split_once('#')
+        .map_or((url, None), |(base, fragment)| (base, Some(fragment)));
+    let separator = if base.contains('?') { '&' } else { '?' };
+    let encoded = preference.replace('/', "%2F");
+    let mut result = format!("{}{}usage_tz={}", base, separator, encoded);
+    if let Some(fragment) = fragment {
+        result.push('#');
+        result.push_str(fragment);
+    }
+    result
+}
+
 /// Delivers the browse URL either by opening the browser (default) or by
 /// copying to the system clipboard (`copy_url=true`).
 ///
@@ -1609,6 +1624,7 @@ pub fn handle_browse(
                     println!("  {}", url);
                 }
                 // Local URL has no auth token, so display_url == url.
+                let url = with_display_time_zone(&url);
                 deliver_browse_url(&url, copy_url, json_mode, &url);
                 return Ok(());
             }
@@ -1672,6 +1688,7 @@ pub fn handle_browse(
             }
             // Local origin needs no auth token in the URL — the gateway
             // injects the vault JWT server-side for team requests.
+            let url = with_display_time_zone(&url);
             deliver_browse_url(&url, copy_url, json_mode, &url);
             return Ok(());
         }
@@ -1699,7 +1716,7 @@ pub fn handle_browse(
 
     let base_url = resolve_browse_base_url(&acc.control_url, port);
 
-    let url = format!("{}{}#auth_token={}", base_url, path, token);
+    let url = with_display_time_zone(&format!("{}{}#auth_token={}", base_url, path, token));
 
     if json_mode {
         crate::json_output::print_json(serde_json::json!({
@@ -1976,7 +1993,7 @@ pub fn handle_master_browse(
         return Err("No control panel URL found. Use --url <url> or --port <port>.".into());
     };
 
-    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let url = with_display_time_zone(&format!("{}{}", base_url.trim_end_matches('/'), path));
 
     if json_mode {
         crate::json_output::print_json(serde_json::json!({

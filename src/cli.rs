@@ -80,6 +80,12 @@ pub(crate) enum Commands {
     /// Show version info (CLI + local proxy if running)
     #[command(display_order = 100)]
     Version,
+    /// Configure device-level CLI preferences
+    #[command(display_order = 11)]
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Initialize the vault (runs automatically on first use)
     #[command(hide = true)]
     Init,
@@ -580,6 +586,16 @@ pub(crate) enum Commands {
 /// `name` is a short identifier (e.g. `trust-local`), not a launchd
 /// label. We map short name → label internally so the user doesn't
 /// have to memorize `aikey.trust-local`.
+#[derive(Subcommand)]
+pub(crate) enum ConfigAction {
+    /// Show or set the display time zone (`auto` or an IANA ID such as Asia/Shanghai)
+    #[command(name = "time-zone")]
+    TimeZone {
+        /// Omit to show the current preference
+        value: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum ServiceAction {
     /// Start a registered AiKey service.
@@ -1333,6 +1349,9 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
         None => "unknown".to_string(),
         Some(c) => match c {
             Commands::Init => "init".to_string(),
+            Commands::Config { action } => match action {
+                ConfigAction::TimeZone { .. } => "config.time-zone".to_string(),
+            },
             Commands::Db { action } => format!(
                 "db.{}",
                 match action {

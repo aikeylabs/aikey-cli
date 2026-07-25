@@ -2302,6 +2302,121 @@ pub fn print_egress_doctor(json_mode: bool) -> bool {
     all_failed
 }
 
+/// FNV-1a 32-bit over UTF-16 code units. A DISPLAY fingerprint, not a security
+/// primitive.
+///
+/// MUST match aikey-control/web `egress-summary.ts::egressFingerprint`
+/// byte-for-byte — same seed (0x811c9dc5), same prime (0x01000193), and crucially
+/// the same UTF-16 iteration (JS `charCodeAt` yields UTF-16 code units, so a
+/// fragment with a CJK proxy name must fingerprint identically here). This is what
+/// lets `aikey env` and the web console show the SAME `#xxxxxxxx` for one config,
+/// so a user can confirm the two surfaces agree at a glance.
+fn egress_fingerprint(s: &str) -> String {
+    let mut h: u32 = 0x811c_9dc5;
+    for unit in s.encode_utf16() {
+        h ^= u32::from(unit);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    format!("{h:08x}")
+}
+
+/// Compact one-line rendering of the daemon's EFFECTIVE egress value for
+/// `aikey env`, matching the web console's `egressSummary` for the multi-line
+/// case (2026-07-25).
+///
+/// WHY: when a multi-protocol mihomo fragment is user-set it wins the layered
+/// decision, so the effective value is byte-identical to the layer-1 value —
+/// the whole YAML block was being printed twice. Collapsing the effective line to
+/// `mihomo fragment · N lines · #fp` removes the repeat while the fingerprint keeps
+/// it verifiable against layer 1 (and against the web console, which prints the
+/// same string).
+///
+/// A single URL is returned UNCHANGED on purpose: it is one line, its repeat is
+/// not noise, and layer 1 already shows it in full — collapsing it here would only
+/// hide a value the CLI otherwise shows plainly. So only the multi-line fragment
+/// is summarized (scope: exactly the reported problem).
+pub fn egress_effective_display(effective_url: &str) -> String {
+    let trimmed = effective_url.trim();
+    let non_empty_lines = trimmed.split('\n').filter(|l| !l.trim().is_empty()).count();
+    if non_empty_lines <= 1 {
+        return effective_url.to_string();
+    }
+    format!(
+        "mihomo fragment · {} lines · #{}",
+        non_empty_lines,
+        egress_fingerprint(trimmed)
+    )
+}
+
+#[cfg(test)]
+mod egress_summary_tests {
+    use super::*;
+
+    // The fingerprint is a CROSS-SURFACE contract: aikey-control/web
+    // egress-summary.ts must produce the same value. These vectors are the ground
+    // truth — if they change, the web side (and its test) must change in lockstep,
+    // or `aikey env` and the console will disagree on the same config.
+    #[test]
+    fn fingerprint_matches_web_fnv1a() {
+        // FNV-1a 32-bit, UTF-16 code units. Verify a few fixed vectors so a broken
+        // port (e.g. iterating bytes or chars instead of UTF-16) is caught.
+        assert_eq!(egress_fingerprint(""), "811c9dc5"); // seed, empty input
+        assert_eq!(egress_fingerprint("a"), "e40c292c");
+        assert_eq!(egress_fingerprint("foobar"), "bf9cf968");
+    }
+
+    #[test]
+    fn fingerprint_uses_utf16_not_bytes() {
+        // A CJK proxy name is the realistic case (users name nodes "谷歌GCP").
+        // Verified equal to the web egress-summary.ts output (2026-07-25):
+        //   egressFingerprint("谷歌")    → 291560ce
+        //   egressFingerprint("谷歌GCP") → 237089b8
+        // Iterating UTF-8 BYTES instead of UTF-16 code units would give 4dae9dd1 /
+        // 4db87859 — a silent cross-surface mismatch. These vectors catch that.
+        assert_eq!(egress_fingerprint("谷歌"), "291560ce");
+        assert_eq!(egress_fingerprint("谷歌GCP"), "237089b8");
+    }
+
+    #[test]
+    fn single_url_is_left_unchanged() {
+        assert_eq!(
+            egress_effective_display("socks5://user:pass@host:1080"),
+            "socks5://user:pass@host:1080"
+        );
+        assert_eq!(
+            egress_effective_display("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
+    }
+
+    #[test]
+    fn multiline_fragment_is_summarized_with_line_count_and_fp() {
+        let frag = "proxies:\n  - name: res\n    type: socks5\n    server: h\n    port: 1";
+        let got = egress_effective_display(frag);
+        assert!(
+            got.starts_with("mihomo fragment · 5 lines · #"),
+            "got: {got}"
+        );
+        // The fingerprint is over the TRIMMED value (matches web), so trailing
+        // whitespace must not change it.
+        assert_eq!(
+            egress_effective_display(frag),
+            egress_effective_display(&format!("{frag}\n  "))
+        );
+    }
+
+    #[test]
+    fn blank_lines_do_not_count() {
+        // Web filters empty lines before counting; a 2-line fragment padded with
+        // blanks stays "2 lines".
+        let got = egress_effective_display("proxies:\n\n  - name: x\n\n");
+        assert!(
+            got.contains("2 lines"),
+            "blank lines must not inflate the count: {got}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod started_row_tests {
     use super::*;

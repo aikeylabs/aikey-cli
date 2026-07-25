@@ -598,6 +598,9 @@ fn local_date_string(ts: SystemTime) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    if let Some(formatted) = crate::time_zone::format_date(secs) {
+        return formatted;
+    }
     let local = secs + current_tz_offset_secs();
     let days = local / 86400;
     let (y, m, d) = civil_from_days(days);

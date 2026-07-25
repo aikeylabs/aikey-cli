@@ -215,6 +215,11 @@ aikey web                                   # 打开本地控制台(默认页)
 aikey web usage                             # 直接跳到 Usage 页
 aikey web vault                             # 直接跳到 Vault 页
 
+# 显示时区（仅影响 Web 和 CLI 的显示）
+aikey config time-zone Asia/Shanghai        # 北京 / 上海，中国标准时间
+aikey config time-zone auto                 # 跟随本设备系统时区
+aikey config time-zone --json               # 查看当前偏好
+
 # 维护
 aikey doctor                                # 诊断 PATH / hook / proxy / vault
 aikey doctor --last-errors                  # 用 caused-by 树解释最近 proxy 错误（仅读本地状态）

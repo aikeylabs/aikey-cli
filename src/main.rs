@@ -32,6 +32,7 @@ mod storage_acl;
 mod synapse;
 #[allow(dead_code)]
 mod team_token_normalize;
+mod time_zone;
 // mod commands_env; // removed: env commands dropped
 mod commands_proxy;
 mod enterprise_proxy; // Production form-⓪ multi-protocol proxy delivery (Phase 3)
@@ -1186,6 +1187,7 @@ fn should_auto_start_proxy(command: &Commands) -> bool {
             | Commands::Init
             | Commands::Db { .. }
             | Commands::Version
+            | Commands::Config { .. }
             // `_internal` is an IPC bridge used by local-server and the cluster
             // daemon, not a user request to manage proxy lifecycle. Their hosting
             // topology starts the proxy independently. Letting an env-injected
@@ -1230,7 +1232,10 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     // for the explicit RefreshActiveEnv command (avoid recursion) and for
     // commands that predate active.env (Init / Version).
     match command {
-        Commands::RefreshActiveEnv { .. } | Commands::Init | Commands::Version => {}
+        Commands::RefreshActiveEnv { .. }
+        | Commands::Init
+        | Commands::Version
+        | Commands::Config { .. } => {}
         _ => {
             if active_env_migration::active_env_has_legacy_form() {
                 match active_env_migration::refresh_active_env(true) {
@@ -1296,6 +1301,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         | Commands::Init
         | Commands::Db { .. }
         | Commands::Version
+        | Commands::Config { .. }
         | Commands::Internal { .. }
         | Commands::Statusline { action: None }
         | Commands::Statusline {
@@ -1354,6 +1360,20 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             return Ok(());
         }
+        Commands::Config { action } => match action {
+            cli::ConfigAction::TimeZone { value } => {
+                let current = if let Some(value) = value {
+                    time_zone::set_preference(value)?
+                } else {
+                    time_zone::preference()
+                };
+                if cli.json {
+                    println!("{}", serde_json::json!({"display_time_zone": current}));
+                } else {
+                    println!("Display time zone: {}", current);
+                }
+            }
+        },
         Commands::Init => {
             // CLI shell: prompt + delegate to the shared init core. The
             // same core is reused by `_internal vault-op init` for the
@@ -3963,10 +3983,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 "env_inherited" => "inherited shell env",
                                 _ => "direct",
                             };
+                            // Multi-protocol fragments are collapsed to a
+                            // one-line summary here so the effective value isn't a
+                            // second full dump of the layer-1 YAML (it is
+                            // byte-identical when user-set wins). Single URLs are
+                            // left in full. See commands_proxy::egress_effective_display.
                             let value = if eg.effective_url.is_empty() {
                                 "direct (no proxy)".to_string()
                             } else {
-                                eg.effective_url.clone()
+                                commands_proxy::egress_effective_display(&eg.effective_url)
                             };
                             eprintln!(
                                 "  {} {}  {}",

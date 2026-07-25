@@ -215,6 +215,11 @@ aikey web                                   # opens local console (default page)
 aikey web usage                             # jump straight to Usage page
 aikey web vault                             # jump straight to Vault page
 
+# Display time zone (Web and CLI presentation only)
+aikey config time-zone Asia/Shanghai        # Beijing / Shanghai, China Standard Time
+aikey config time-zone auto                 # follow this device's system time zone
+aikey config time-zone --json               # inspect the effective preference
+
 # Maintenance
 aikey doctor                                # diagnose PATH / hook / proxy / vault
 aikey doctor --last-errors                  # explain recent proxy errors as a caused-by tree (local state only)

@@ -459,6 +459,24 @@ pub fn set_text_config(key: &str, value: &str) {
     }
 }
 
+/// Write a plain-text config value and surface failures to interactive callers.
+pub fn try_set_text_config(key: &str, value: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+        params![key, value],
+    )
+    .map_err(|e| format!("Failed to save config '{}': {}", key, e))?;
+    Ok(())
+}
+
+pub fn delete_text_config(key: &str) -> Result<(), String> {
+    let conn = open_connection()?;
+    conn.execute("DELETE FROM config WHERE key = ?", params![key])
+        .map_err(|e| format!("Failed to clear config '{}': {}", key, e))?;
+    Ok(())
+}
+
 /// Returns the user's preferred session backend: `"keychain"`, `"file"`, `"disabled"`,
 /// or `None` if the user has not yet been asked.
 pub fn get_session_backend_pref() -> Option<String> {

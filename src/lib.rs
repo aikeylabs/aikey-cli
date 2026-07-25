@@ -47,6 +47,7 @@ pub mod team_token_normalize;
 pub mod term_caps;
 #[cfg(windows)]
 pub mod term_caps_windows;
+pub mod time_zone;
 pub mod ui_frame;
 // Windows-only siblings — never compile on macOS / Linux. Each module
 // is `#[cfg(windows)]`-internal so the declaration here is a no-op on
