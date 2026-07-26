@@ -1323,8 +1323,28 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             if tl_ok {
                 emit("trust-local", true, "running on :8801", None);
             } else {
-                emit("trust-local", false, "not reachable on :8801",
-                    Some("start it: aikey trust-local start  (or: launchctl kickstart -k gui/$UID/aikey.trust-local)"));
+                emit("trust-local", false, "not reachable on :8801", Some("attempting start..."));
+                // Auto-fix — mirrors the proxy + web + shell-hook auto-repair. An
+                // installed-but-stopped trust-local gets ONE start attempt in
+                // interactive mode via the canonical OS-service core
+                // `trust_local_service::start` (launchctl/systemctl/schtasks — NO
+                // master password). Same one implementation `aikey service start
+                // trust-local` uses (extracted to a lib module 2026-07-26 precisely
+                // so doctor, which compiles in the lib crate, can reach it). start()
+                // already waits up to 30s for the slow (PyInstaller onefile) daemon
+                // to answer /healthz, so its Ok/Err is the authoritative verdict.
+                // --json stays non-mutating. Bugfix 20260726-doctor-autostart-trust-local.
+                if !json_mode {
+                    match crate::trust_local_service::start() {
+                        Ok(()) => emit("trust-local start", true, "started — running on :8801", None),
+                        Err(_) => emit(
+                            "trust-local start",
+                            false,
+                            "start failed",
+                            Some("run 'aikey trust-local start' manually to debug"),
+                        ),
+                    }
+                }
             }
 
             // (b) rhythm observer health — read the freshest line
@@ -1658,12 +1678,33 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             match crate::local_server_probe::read_local_server_port_or_default() {
                 Ok(port) => {
                     let base = format!("http://127.0.0.1:{}", port);
-                    match crate::local_server_probe::probe_vault_status(&base) {
+                    let mut status = crate::local_server_probe::probe_vault_status(&base);
+                    // Auto-fix — mirrors the proxy + shell-hook auto-repair earlier
+                    // in this function. An installed-but-unanswering local-server
+                    // gets ONE start attempt in interactive mode. The web start is a
+                    // launchd/nohup spawn — NO master password needed — so it's safe
+                    // unprompted. Reuses the canonical `aikey service start web` core
+                    // (never a parallel path); --json stays non-mutating like the
+                    // existing auto-fixes. Bugfix 20260725-doctor-autostart-web-trust-local.
+                    let mut restarted = false;
+                    if status.is_err() && !json_mode {
+                        println!(
+                            "{} {:<20} {}",
+                            crate::symbols::WARN.s().yellow(),
+                            "local-server",
+                            format!("not running on port {port} — attempting start...")
+                        );
+                        let _ = crate::commands_account::handle_web_service("start", false);
+                        status = crate::local_server_probe::probe_vault_status(&base);
+                        restarted = true;
+                    }
+                    match status {
                         Ok(unlocked) => (
                             "local-server",
                             true,
                             format!(
-                                "running on port {} (vault: {})",
+                                "{}running on port {} (vault: {})",
+                                if restarted { "started — " } else { "" },
                                 port,
                                 if unlocked { "unlocked" } else { "locked" }
                             ),

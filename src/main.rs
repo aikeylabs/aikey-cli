@@ -68,6 +68,7 @@ mod events;
 #[allow(dead_code)]
 mod global_config;
 mod local_server_probe;
+mod trust_local_service;
 #[allow(dead_code)]
 mod observability;
 #[allow(dead_code)]

@@ -25,6 +25,7 @@ pub mod executor;
 pub mod global_config;
 pub mod json_output;
 pub mod local_server_probe;
+pub mod trust_local_service;
 pub mod migrations;
 pub mod observability;
 pub mod platform_client;
