@@ -68,7 +68,6 @@ mod events;
 #[allow(dead_code)]
 mod global_config;
 mod local_server_probe;
-mod trust_local_service;
 #[allow(dead_code)]
 mod observability;
 #[allow(dead_code)]
@@ -87,6 +86,7 @@ mod symbols;
 mod term_caps;
 #[cfg(windows)]
 mod term_caps_windows;
+mod trust_local_service;
 mod ui_frame;
 #[cfg(windows)]
 #[allow(dead_code)]

@@ -1323,7 +1323,12 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             if tl_ok {
                 emit("trust-local", true, "running on :8801", None);
             } else {
-                emit("trust-local", false, "not reachable on :8801", Some("attempting start..."));
+                emit(
+                    "trust-local",
+                    false,
+                    "not reachable on :8801",
+                    Some("attempting start..."),
+                );
                 // Auto-fix — mirrors the proxy + web + shell-hook auto-repair. An
                 // installed-but-stopped trust-local gets ONE start attempt in
                 // interactive mode via the canonical OS-service core
@@ -1336,7 +1341,12 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
                 // --json stays non-mutating. Bugfix 20260726-doctor-autostart-trust-local.
                 if !json_mode {
                     match crate::trust_local_service::start() {
-                        Ok(()) => emit("trust-local start", true, "started — running on :8801", None),
+                        Ok(()) => emit(
+                            "trust-local start",
+                            true,
+                            "started — running on :8801",
+                            None,
+                        ),
                         Err(_) => emit(
                             "trust-local start",
                             false,

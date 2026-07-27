@@ -108,7 +108,10 @@ fn print_supported(json: bool) {
         for (name, label) in SUPPORTED_SERVICES {
             println!("  {:<14}  {}", name, label);
         }
-        println!("  {:<14}  {}", "all", "every installed service above (fan-out)");
+        println!(
+            "  {:<14}  {}",
+            "all", "every installed service above (fan-out)"
+        );
         println!();
         println!("Usage: aikey service <start|stop|restart|status> <name|all>");
     }
@@ -211,11 +214,7 @@ fn plan_leg(verb: &str, installed: bool, running: bool) -> LegPlan {
 /// service + a final summary object) — this mirrors how json-ness already
 /// varies across the per-service mutating commands, rather than inventing a
 /// single-object shape that would require silencing them.
-fn run_all(
-    verb: &str,
-    json: bool,
-    password_stdin: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_all(verb: &str, json: bool, password_stdin: bool) -> Result<(), Box<dyn std::error::Error>> {
     // proxy first (main link), then console, then observer. Teardown reverses.
     let mut order = vec!["proxy", "web", "trust-local"];
     if verb == "stop" {
@@ -286,7 +285,10 @@ fn leg_state(svc: &str) -> (bool, bool) {
         }
         "trust-local" => {
             let installed = crate::trust_local_service::is_installed();
-            (installed, installed && crate::trust_local_service::status_summary().0)
+            (
+                installed,
+                installed && crate::trust_local_service::status_summary().0,
+            )
         }
         _ => (false, false),
     }
@@ -563,17 +565,17 @@ mod tests {
                 LegPlan::Skip("not installed"),
                 "verb {verb}: not-installed must skip regardless of running flag"
             );
-            assert_eq!(
-                plan_leg(verb, false, true),
-                LegPlan::Skip("not installed"),
-            );
+            assert_eq!(plan_leg(verb, false, true), LegPlan::Skip("not installed"),);
         }
     }
 
     #[test]
     fn plan_leg_start_is_idempotent() {
         // running → skip (don't re-prompt proxy password / bounce trust-local)
-        assert_eq!(plan_leg("start", true, true), LegPlan::Skip("already running"));
+        assert_eq!(
+            plan_leg("start", true, true),
+            LegPlan::Skip("already running")
+        );
         // stopped → act
         assert_eq!(plan_leg("start", true, false), LegPlan::Act);
     }
@@ -581,7 +583,10 @@ mod tests {
     #[test]
     fn plan_leg_stop_is_idempotent() {
         // not running → skip
-        assert_eq!(plan_leg("stop", true, false), LegPlan::Skip("already stopped"));
+        assert_eq!(
+            plan_leg("stop", true, false),
+            LegPlan::Skip("already stopped")
+        );
         // running → act
         assert_eq!(plan_leg("stop", true, true), LegPlan::Act);
     }
