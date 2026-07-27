@@ -177,6 +177,7 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Threading",  # OpenProcess / QueryFullProcessImageNameW / GetProcessTimes (proxy_proc.rs);
                                # also OpenProcessToken (profile_activation.rs is_running_elevated — bugfix
                                # 2026-04-29-aikey-hook-update-eacces-and-sudo-silent-failure)
+    "Win32_System_Diagnostics_ToolHelp", # exact trust-local process-tree discovery before taskkill /T
     "Win32_Security",          # GetTokenInformation / TOKEN_ELEVATION (profile_activation.rs is_running_elevated)
     "Win32_System_Time",       # FileTimeToSystemTime / SystemTimeToTzSpecificLocalTime (commands_statusline.rs event_time_hm)
     "Win32_System_Console",    # GetStdHandle / ReadConsoleW / GetConsoleMode / SetConsoleMode / GetConsoleScreenBufferInfo

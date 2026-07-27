@@ -72,8 +72,10 @@ pub fn start() -> Result<(), String> {
     platform_run("start").and_then(|()| probe_healthz())
 }
 
-/// Stop the daemon. No reachability probe — we trust the service manager to
-/// deliver SIGTERM (matches the pre-refactor `dispatch` behavior).
+/// Stop the daemon. Windows additionally verifies that the exact installed
+/// binary's process tree is gone: Task Scheduler `/End` terminates only the
+/// hidden launcher on some Win10 hosts and can orphan the PyInstaller
+/// parent/worker pair while incorrectly reporting success.
 pub fn stop() -> Result<(), String> {
     platform_run("stop")
 }
@@ -104,21 +106,14 @@ fn platform_run(verb: &str) -> Result<(), String> {
         },
         "linux" => systemctl_user(verb),
         "windows" => match verb {
-            "start" | "stop" => sc_action(verb),
+            "start" => sc_action(verb),
+            "stop" => windows_stop(),
             // Windows `sc.exe`/`schtasks` has no atomic restart; do stop +
             // wait-for-STOPPED + start. We can't just sleep a fixed interval
             // because the stop is async (returns immediately while the task
             // exits); starting before STOPPED can error "already running".
             "restart" => {
-                let _ = sc_action("stop");
-                // Poll for STOPPED state up to 10s. Match NSSM's stop timeout.
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while Instant::now() < deadline {
-                    if sc_is_stopped() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
+                windows_stop()?;
                 sc_action("start")
             }
             _ => Err(format!("unknown verb '{}'", verb)),
@@ -179,24 +174,123 @@ fn sc_action(verb: &str) -> Result<(), String> {
     run("schtasks", &[sw, "/TN", SERVICE_NAME])
 }
 
-/// Returns true when trust-local is NOT running. Used by the restart loop to
-/// wait for an async `/End` to finish before re-firing `/Run`.
-///
-/// We probe the process image name via `tasklist` rather than parsing
-/// `schtasks /Query` Status, because the Status strings are LOCALIZED and a
-/// substring match would break off English hosts. The image name
-/// `trust-local.exe` is not localized.
-fn sc_is_stopped() -> bool {
-    match std::process::Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq trust-local.exe", "/FO", "CSV", "/NH"])
-        .output()
-    {
-        Ok(out) => {
-            let s = String::from_utf8_lossy(&out.stdout).to_lowercase();
-            !s.contains("trust-local.exe")
-        }
-        Err(_) => false,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsProcess {
+    pid: u32,
+    parent_pid: u32,
+}
+
+/// Return only roots from a set of matching processes. `taskkill /T` on each
+/// root then terminates its full descendant tree without issuing redundant
+/// kills for the PyInstaller worker child.
+fn process_tree_roots(processes: &[WindowsProcess]) -> Vec<u32> {
+    processes
+        .iter()
+        .filter(|process| {
+            !processes
+                .iter()
+                .any(|candidate| candidate.pid == process.parent_pid)
+        })
+        .map(|process| process.pid)
+        .collect()
+}
+
+#[cfg(windows)]
+fn normalize_windows_path(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_start_matches(r"\\?\")
+        .to_lowercase()
+}
+
+/// Enumerate only processes whose OS-reported executable path exactly matches
+/// this user's installed trust-local.exe. Matching by image name alone would
+/// kill detector processes belonging to another Windows account or sandbox.
+#[cfg(windows)]
+fn windows_trust_local_processes() -> Result<Vec<WindowsProcess>, String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let expected = std::fs::canonicalize(bin_path()).unwrap_or_else(|_| bin_path());
+    let expected = normalize_windows_path(&expected);
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "CreateToolhelp32Snapshot: {}",
+            std::io::Error::last_os_error()
+        ));
     }
+
+    let mut matches = Vec::new();
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while more {
+        let pid = entry.th32ProcessID;
+        if pid != 0 {
+            if let Some(actual) = crate::proxy_proc::process_identity(pid) {
+                if normalize_windows_path(&actual) == expected {
+                    matches.push(WindowsProcess {
+                        pid,
+                        parent_pid: entry.th32ParentProcessID,
+                    });
+                }
+            }
+        }
+        more = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    Ok(matches)
+}
+
+/// Task Scheduler can report `/End` success after terminating only the hidden
+/// PowerShell launcher. Kill the exact installed binary's remaining roots with
+/// `/T`, then poll the process table and fail if anything survives.
+#[cfg(windows)]
+fn windows_stop() -> Result<(), String> {
+    // Always attempt /End first so the registered task no longer supervises or
+    // respawns the daemon. A Ready task may return a non-zero result while an
+    // orphan is still alive; final process state, not that localized message,
+    // is the authoritative stop result.
+    let scheduler_result = sc_action("stop");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let survivors = windows_trust_local_processes()?;
+        if survivors.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let pids = survivors
+                .iter()
+                .map(|process| process.pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let scheduler_detail = scheduler_result
+                .err()
+                .map(|detail| format!("; schtasks: {detail}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "trust-local process tree still running after stop (PID(s): {pids}){scheduler_detail}"
+            ));
+        }
+        // Re-enumerate and retry each pass. A parent can exit between the
+        // snapshot and taskkill, orphaning its child under a new parent; the
+        // next pass then treats that survivor as a root instead of waiting the
+        // full timeout without another termination attempt.
+        for pid in process_tree_roots(&survivors) {
+            let pid_arg = pid.to_string();
+            let _ = run("taskkill", &["/PID", &pid_arg, "/T", "/F"]);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(not(windows))]
+fn windows_stop() -> Result<(), String> {
+    Err("Windows trust-local stop requested on a non-Windows build".to_string())
 }
 
 fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
@@ -277,5 +371,24 @@ mod tests {
         let p = bin_path();
         assert!(p.ends_with("trust-local") || p.ends_with("trust-local.exe"));
         assert!(p.to_string_lossy().contains(".aikey"));
+    }
+
+    #[test]
+    fn process_tree_roots_avoid_redundant_child_kills() {
+        let processes = [
+            WindowsProcess {
+                pid: 100,
+                parent_pid: 50,
+            },
+            WindowsProcess {
+                pid: 101,
+                parent_pid: 100,
+            },
+            WindowsProcess {
+                pid: 200,
+                parent_pid: 75,
+            },
+        ];
+        assert_eq!(process_tree_roots(&processes), vec![100, 200]);
     }
 }
