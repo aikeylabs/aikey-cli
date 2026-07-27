@@ -673,6 +673,22 @@ fn doctor_plugin_registry() -> Vec<DoctorPlugin> {
     ]
 }
 
+/// Resolve a registry binary path for the current platform. Windows plugin
+/// installers ship PE binaries with an `.exe` suffix; checking the extensionless
+/// registry path made doctor report installed plugins as absent on Windows.
+fn doctor_plugin_bin_path(
+    home: &std::path::Path,
+    plugin: &DoctorPlugin,
+    windows: bool,
+) -> std::path::PathBuf {
+    let path = home.join(plugin.rel_path);
+    if windows {
+        path.with_extension("exe")
+    } else {
+        path
+    }
+}
+
 /// Runs the doctor checks. Returns `true` iff there is ≥1 configured per-account
 /// egress and ALL of them failed connectivity — the caller maps that to a
 /// non-zero exit ("失败要显眼"). All other check failures stay advisory (doctor
@@ -1300,7 +1316,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
     // "doctor doesn't check it". Not-installed renders dim/informational and
     // never bubbles to the overall pass/fail (these are opt-in).
     {
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let home = dirs::home_dir().unwrap_or_default();
         let plugins = doctor_plugin_registry();
         // Paths come from the registry (single source shared with the
         // consistency test); trust-local keeps its bespoke daemon+observer
@@ -1311,8 +1327,11 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             .expect("registry has the trust-local daemon entry");
 
         // ── degrade-detector / trust-local (daemon) ──
-        let trust_local_bin = home.join(trust_local_plugin.rel_path);
-        if trust_local_bin.exists() {
+        // Use the shared service module as the install-state truth source.
+        // On Windows it resolves %USERPROFILE%\.aikey\bin\trust-local.exe;
+        // the old `$HOME/.aikey/bin/trust-local` check bypassed auto-repair,
+        // printed "not installed", and left :8801 down (QA20).
+        if crate::trust_local_service::is_installed() {
             // (a) trust-local service liveness.
             let trust_local_url = "http://127.0.0.1:8801/healthz";
             let tl_ok = ureq::get(trust_local_url)
@@ -1362,8 +1381,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             // as `proxy.observer.built` (good) or
             // `proxy.observer.build_failed` (bad) within the first
             // few hundred lines after a restart.
-            let log_path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
-                .join(".aikey/logs/aikey-proxy/current.jsonl");
+            let log_path = home.join(".aikey/logs/aikey-proxy/current.jsonl");
             let observer_state = if log_path.exists() {
                 std::fs::read_to_string(&log_path).ok().and_then(|s| {
                     // Take the LAST observer line (most recent
@@ -1430,7 +1448,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
         // that the proxy *can* spawn it. Looped from the registry's
         // non-daemon entries so adding a filter app is a one-line table edit.
         for p in plugins.iter().filter(|p| !p.is_daemon) {
-            if home.join(p.rel_path).exists() {
+            if doctor_plugin_bin_path(&home, p, cfg!(windows)).exists() {
                 emit(p.label, true, "installed (proxy-spawned filter)", None);
             } else {
                 let hint = format!("enable: aikey app install {}", p.install_slug);
@@ -3067,6 +3085,21 @@ mod doctor_detail_tests {
         // relies on this — pin it so a future daemon plugin forces a review.
         let plugins = doctor_plugin_registry();
         assert_eq!(plugins.iter().filter(|p| p.is_daemon).count(), 1);
+    }
+
+    #[test]
+    fn doctor_plugin_paths_add_exe_on_windows() {
+        let home = std::path::Path::new(r"C:\Users\Administrator");
+        let plugins = doctor_plugin_registry();
+        let trust_local = plugins.iter().find(|p| p.is_daemon).unwrap();
+        assert!(
+            doctor_plugin_bin_path(home, trust_local, true).ends_with("trust-local.exe"),
+            "Windows doctor must look for the installed PE binary"
+        );
+        assert!(
+            doctor_plugin_bin_path(home, trust_local, false).ends_with("trust-local"),
+            "Unix doctor must keep the extensionless binary path"
+        );
     }
 }
 
