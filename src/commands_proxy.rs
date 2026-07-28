@@ -2202,8 +2202,13 @@ struct EgressSelfCheckResponse {
 pub fn fetch_egress_selfcheck(dial: bool) -> Result<Vec<EgressCheck>, String> {
     let addr = proxy_listen_addr(None);
     // Plain agent on purpose (loopback admin call, never through this shell's
-    // proxy env). Generous timeout: with dial=true the daemon dials each account
-    // sequentially (per-account ~10s server-side), so allow for a few accounts.
+    // proxy env). Generous timeout: since 2026-07-28 the daemon dials accounts
+    // CONCURRENTLY and caps itself at 15s, so 60s is far more than needed — but
+    // it is kept deliberately, NOT tightened to ~20s: in a mixed-version fleet
+    // this CLI still talks to OLDER proxy binaries that dial SERIALLY
+    // (per-account ~10s), and tightening here would break `aikey doctor` against
+    // exactly the nodes whose egress most needs diagnosing. A too-large timeout
+    // costs nothing on a healthy node (it returns in ~1s).
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(if dial { 60 } else { 3 }))
         .build();
@@ -2237,6 +2242,34 @@ pub fn print_egress_presence() {
     );
 }
 
+/// True when this row is a real probe RESULT rather than a budget cutoff.
+///
+/// The proxy's self-check bounds itself (2026-07-28) and reports accounts it
+/// could not get to as `dialed=false, ok=false` + a reason. Those rows carry NO
+/// verdict about the egress, so every consumer must exclude them before drawing
+/// conclusions. `p.ok` is part of the test as belt-and-braces: an OK row is by
+/// definition probed, whatever `dialed` says.
+pub fn egress_path_was_probed(p: &EgressCheck) -> bool {
+    p.dialed || p.ok
+}
+
+/// `aikey doctor`'s egress verdict: true only when EVERY account we actually
+/// probed failed.
+///
+/// WHY the `!probed.is_empty()` guard (bugfix 2026-07-28): the old form was
+/// `ok_count == 0`, which turns "we probed nothing" into "everything is broken".
+/// That maps to a non-zero `aikey doctor` exit and the line "all egress paths are
+/// unreachable — check the proxy line(s) for these accounts", i.e. it sends the
+/// user to fix accounts that were never tested. An absent measurement is not a
+/// failing measurement.
+pub fn egress_all_probed_failed(paths: &[EgressCheck]) -> bool {
+    let mut probed = paths
+        .iter()
+        .filter(|p| egress_path_was_probed(p))
+        .peekable();
+    probed.peek().is_some() && probed.all(|p| !p.ok)
+}
+
 /// `aikey doctor` egress section: dials each account's configured egress once and
 /// prints OK/fail + exit IP + latency. Returns `true` when there is ≥1 configured
 /// egress and ALL of them failed (caller maps that to a non-zero exit — "失败要显
@@ -2257,11 +2290,13 @@ pub fn print_egress_doctor(json_mode: bool) -> bool {
     if !json_mode {
         println!("\nEgress connectivity (per-account):");
     }
-    let mut ok_count = 0;
     for p in &paths {
-        if p.ok {
-            ok_count += 1;
-        }
+        // dialed=false + ok=false = the daemon's self-check budget ran out before
+        // this account got a slot (2026-07-28). It is NOT a verdict on the
+        // egress, so it must not be counted as a probe, must not be printed with
+        // the failure glyph, and must not drive the all-failed exit code — else
+        // `aikey doctor` tells the user to fix an account it never tested.
+        let probed = egress_path_was_probed(p);
         if json_mode {
             continue;
         }
@@ -2278,6 +2313,18 @@ pub fn print_egress_doctor(json_mode: bool) -> bool {
                 ip.cyan(),
                 p.latency_ms
             );
+        } else if !probed {
+            let reason = if p.reason.is_empty() {
+                "not probed within the proxy's self-check budget — re-run to test it".to_string()
+            } else {
+                p.reason.clone()
+            };
+            println!(
+                "  {} {:<28} {}",
+                crate::symbols::WARN.s(),
+                p.label,
+                reason.yellow()
+            );
         } else {
             let reason = if p.reason.is_empty() {
                 "unreachable".to_string()
@@ -2292,7 +2339,7 @@ pub fn print_egress_doctor(json_mode: bool) -> bool {
             );
         }
     }
-    let all_failed = ok_count == 0;
+    let all_failed = egress_all_probed_failed(&paths);
     if all_failed && !json_mode {
         println!(
             "  {} all egress paths are unreachable — check the proxy line(s) for these accounts",
