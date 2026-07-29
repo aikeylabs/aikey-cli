@@ -560,6 +560,25 @@ pub fn apply_third_party_cli_configs(
     providers: &[String],
     proxy_port: u16,
 ) -> ThirdPartyApplyOutcome {
+    use std::io::IsTerminal;
+    apply_third_party_cli_configs_with(providers, proxy_port, std::io::stderr().is_terminal())
+}
+
+/// Variant with an explicit `interactive` flag instead of sniffing the TTY.
+///
+/// Why it exists (20260728-端口漂移baseurl自愈回写): the port-drift reconcile
+/// guard runs at `claude`/`codex` wrapper launch where stderr IS a terminal,
+/// but a drift heal must never surface the Desktop takeover consent prompt —
+/// it only re-anchors configs that are already ours. Passing
+/// `interactive=false` makes `claude_desktop::reconcile_active` heal an
+/// existing takeover (OursActive → rewrite, no consent needed) while an
+/// undecided "ask" state stays untouched (needs_consent returned, nothing
+/// written). Binding-change call sites keep the TTY-sniffing wrapper above.
+pub fn apply_third_party_cli_configs_with(
+    providers: &[String],
+    proxy_port: u16,
+    interactive: bool,
+) -> ThirdPartyApplyOutcome {
     let has_kimi = providers_need_kimi_scaffold(providers);
     if has_kimi {
         // Token-agnostic: writes scaffold once; token comes from KIMI_API_KEY env var.
@@ -618,10 +637,9 @@ pub fn apply_third_party_cli_configs(
         // back on the envelope instead (P3 replays `use` with
         // desktop_consent after the modal).
         {
-            use std::io::IsTerminal;
             out.desktop = Some(crate::commands_account::claude_desktop::reconcile_active(
                 proxy_port,
-                std::io::stderr().is_terminal(),
+                interactive,
             ));
         }
     } else {
@@ -1377,6 +1395,26 @@ pub(super) fn codex_config_paths() -> (std::path::PathBuf, std::path::PathBuf) {
         dir.join("config.toml"),
         dir.join("config.aikey_backup.toml"),
     )
+}
+
+/// Local-proxy port currently written into `~/.codex/config.toml`'s
+/// top-level `openai_base_url`, or None when the file is absent, the line
+/// is missing, or it points at a non-loopback host (cluster direct-bind —
+/// never compared against the local proxy port).
+///
+/// Read-only doctor surface for the drift stale-port check
+/// (20260728-端口漂移baseurl自愈回写); healing itself always goes through
+/// `configure_codex_cli` via the reconcile funnel.
+pub fn codex_local_baseurl_port() -> Option<u16> {
+    let (config_path, _) = codex_config_paths();
+    let text = std::fs::read_to_string(config_path).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("openai_base_url") {
+            return crate::profile_activation::local_url_port(trimmed);
+        }
+    }
+    None
 }
 
 /// Format a relative-to-home path for display in user-facing messages.

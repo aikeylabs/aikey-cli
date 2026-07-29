@@ -824,6 +824,45 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             }
         }
 
+        // ── Baseurl sync (20260728-端口漂移baseurl自愈回写) ──
+        // Live actual port (runtime.json, pid-verified) vs the ports already
+        // WRITTEN into downstream configs. Port drift self-heals at the
+        // ensure-running / service-start seams; this row is the read-only
+        // backstop that makes a not-yet-healed stale port visible — before
+        // it, doctor probed the actual port and stayed green while claude
+        // hit the dead one written on disk ("失败要显眼"). Skipped silently
+        // when no live proxy (the proxy-version row above already flagged
+        // that) or when nothing local is written yet (no bindings/cluster).
+        {
+            let live_port = crate::commands_proxy::read_runtime_actual_addr()
+                .and_then(|a| a.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()));
+            if let Some(actual) = live_port {
+                // (surface, written local port) — None entries mean "surface
+                // not present / not local", which is healthy, not stale.
+                // Same collector the reconcile guard uses (single rule set).
+                let surfaces = crate::profile_activation::written_local_baseurl_ports();
+                let stale: Vec<String> = surfaces
+                    .iter()
+                    .filter_map(|(name, port)| {
+                        port.filter(|p| *p != actual)
+                            .map(|p| format!("{}:{}", name, p))
+                    })
+                    .collect();
+                if stale.is_empty() {
+                    if surfaces.iter().any(|(_, p)| p.is_some()) {
+                        emit("baseurl sync", true, &format!("port {}", actual), None);
+                    }
+                } else {
+                    emit(
+                        "baseurl sync",
+                        false,
+                        &format!("proxy on {} but stale: {}", actual, stale.join(", ")),
+                        Some("launch claude/codex once (auto-heals), or run `aikey use <alias>`"),
+                    );
+                }
+            }
+        }
+
         // ── Model mapping (P3.5 four-surface visibility · reads task-7.9 endpoint) ──
         // Surface "configured but not effective". The proxy's mappingHealth is the
         // single source of truth — doctor renders its verdict, never re-derives it.

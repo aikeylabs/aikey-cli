@@ -126,7 +126,7 @@ fn platform_run(verb: &str) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     // SAFETY: getuid() is a documented thread-safe syscall.
     unsafe { libc::getuid() }
 }
@@ -136,7 +136,7 @@ fn current_uid() -> u32 {
 // only so the windows-amd64 cross-compile target type-checks. BR-rc.5-50 —
 // `libc::getuid` is Unix-only and broke the Windows build under the rc.5 hotfix.
 #[cfg(not(unix))]
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     0
 }
 
@@ -293,7 +293,7 @@ fn windows_stop() -> Result<(), String> {
     Err("Windows trust-local stop requested on a non-Windows build".to_string())
 }
 
-fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
+pub(crate) fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
     let output = std::process::Command::new(cmd)
         .args(args)
         .output()

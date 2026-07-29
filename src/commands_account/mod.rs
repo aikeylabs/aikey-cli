@@ -1837,12 +1837,20 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
                     Ok(_) => (true, String::new()),
                     Err(e) => (false, e.clone()),
                 };
+                // On failure, ship the structured diagnosis too (additive
+                // field — existing consumers of ok/detail are unaffected).
+                let findings = if ok {
+                    None
+                } else {
+                    Some(diagnose_start_failure_json(edition))
+                };
                 crate::json_output::print_json(serde_json::json!({
                     "ok": ok,
                     "action": action,
                     "edition": edition.label(),
                     "port": final_state.as_ref().ok().and_then(|p| *p),
                     "detail": detail,
+                    "diagnosis": findings,
                 }));
             } else {
                 match &final_state {
@@ -1853,12 +1861,17 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
                         port
                     ),
                     Ok(None) => println!("{}: {} succeeded", edition.label(), action),
-                    Err(e) => eprintln!(
-                        "{}: {} dispatched but service did not come up: {}",
-                        edition.label(),
-                        action,
-                        e
-                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "{}: {} dispatched but service did not come up: {}",
+                            edition.label(),
+                            action,
+                            e
+                        );
+                        // The whole point of the 2026-07-29 fix: a timeout must
+                        // never be the LAST line the user sees.
+                        eprint_start_diagnosis(edition);
+                    }
                 }
             }
 
@@ -1875,9 +1888,11 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
                     "edition": edition.label(),
                     "error": "service_command_failed",
                     "detail": &e,
+                    "diagnosis": diagnose_start_failure_json(edition),
                 }));
             } else {
                 eprintln!("{}: {} failed — {}", edition.label(), action, e);
+                eprint_start_diagnosis(edition);
                 eprintln!(
                     "Manual command: {}",
                     crate::local_server_probe::service_command_hint(edition, action)
@@ -1886,6 +1901,41 @@ pub fn handle_web_service(action: &str, json_mode: bool) -> Result<(), Box<dyn s
             Err(e.into())
         }
     }
+}
+
+/// Collect + render the start-failure diagnosis to stderr (tty flows). One
+/// shared entry so `aikey web start` / `service start web|all` / the `ak web`
+/// browse preflight all print the identical analysis.
+fn eprint_start_diagnosis(edition: crate::local_server_probe::Edition) {
+    let port = crate::local_server_probe::read_local_server_port_or_default()
+        .unwrap_or(crate::local_server_probe::DEFAULT_PERSONAL_TRIAL_LOCAL_SERVER_PORT);
+    let probes = crate::local_server_diagnose::collect_start_failure_probes(edition, port);
+    let findings = crate::local_server_diagnose::diagnose(&probes);
+    eprintln!();
+    eprintln!(
+        "{}",
+        crate::local_server_diagnose::render_findings(&findings)
+    );
+}
+
+/// Same diagnosis as a JSON value for `--json` consumers (additive field).
+fn diagnose_start_failure_json(edition: crate::local_server_probe::Edition) -> serde_json::Value {
+    let port = crate::local_server_probe::read_local_server_port_or_default()
+        .unwrap_or(crate::local_server_probe::DEFAULT_PERSONAL_TRIAL_LOCAL_SERVER_PORT);
+    let probes = crate::local_server_diagnose::collect_start_failure_probes(edition, port);
+    let findings = crate::local_server_diagnose::diagnose(&probes);
+    serde_json::Value::Array(
+        findings
+            .into_iter()
+            .map(|f| {
+                serde_json::json!({
+                    "cause": f.cause,
+                    "evidence": f.evidence,
+                    "fix": f.fix,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// `aikey web status` (and `aikey service status web`) — read-only report of
@@ -2228,23 +2278,32 @@ fn local_server_preflight_for_browse(json_mode: bool) -> BrowseLocalPreflight {
         }
         (Err(e), _) => {
             // The start command itself failed to invoke (e.g. launchctl
-            // not on PATH, plist missing). Tell the user what we tried,
-            // then continue to open-browser per decision A-a so they
-            // see the underlying connection error in context.
+            // not on PATH, plist missing). Tell the user what we tried +
+            // the full local diagnosis, then continue to open-browser per
+            // decision A-a so they see the connection error in context.
             eprintln!("Auto-start failed: {}", e);
+            let edition = crate::local_server_probe::detect_edition()
+                .unwrap_or(crate::local_server_probe::Edition::Personal);
+            eprint_start_diagnosis(edition);
             eprintln!(
                 "Continuing to open the browser anyway — it will \
                        report the connection error directly."
             );
         }
         (Ok(()), Err(e)) => {
-            // Start command succeeded but service didn't come up within
-            // 5 s. Could be slow boot or a config error. Open browser
-            // per decision A-a.
+            // Start command succeeded but the service didn't come up within
+            // the wait ceiling. This used to be the SILENT 25s (live Win10
+            // 2026-07-29: broken data-dir ACL → SQLITE_CANTOPEN, and the
+            // user got nothing but this timeout line) — the diagnosis below
+            // is the fix: name the likely cause + evidence + paste-ready
+            // repair BEFORE falling through to the browser.
+            eprintln!("{}.", e);
+            let edition = crate::local_server_probe::detect_edition()
+                .unwrap_or(crate::local_server_probe::Edition::Personal);
+            eprint_start_diagnosis(edition);
             eprintln!(
-                "{}. Continuing to open the browser anyway — it \
-                       will report what local-server actually returns.",
-                e
+                "Continuing to open the browser anyway — it \
+                       will report what local-server actually returns."
             );
         }
     }

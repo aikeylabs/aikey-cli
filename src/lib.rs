@@ -24,6 +24,7 @@ pub mod events;
 pub mod executor;
 pub mod global_config;
 pub mod json_output;
+pub mod local_server_diagnose;
 pub mod local_server_probe;
 pub mod migrations;
 pub mod observability;

@@ -1306,7 +1306,11 @@ fn port_owned_by(port: u16, child_pid: u32) -> bool {
 /// THIS child (pid match) — the drift-discovery seam of the healthy loop
 /// above. Field names mirror aikey-proxy's internal/runtime Snapshot wire
 /// format (`pid`, `listen.actual_addr`).
-fn runtime_actual_addr_for_pid(pid: u32) -> Option<String> {
+///
+/// pub(crate): the foreground service-start path (commands_proxy::
+/// handle_start_foreground) also polls this to know when ITS child has
+/// bound, so the drift self-heal guard can run at boot (20260728).
+pub(crate) fn runtime_actual_addr_for_pid(pid: u32) -> Option<String> {
     let path = crate::commands_proxy::runtime_snapshot_path()?;
     let text = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;

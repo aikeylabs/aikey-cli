@@ -700,6 +700,24 @@ pub(crate) fn restore_quiet_at(paths: &DesktopPaths) {
     }
 }
 
+/// Local-proxy port currently written into the Desktop profile's
+/// `inferenceGatewayBaseUrl`, or None when Desktop isn't installed, the
+/// takeover isn't ours (`OursActive` only — a foreign gateway on a loopback
+/// port is not ours to compare), or the URL isn't loopback.
+///
+/// Read-only doctor surface for the drift stale-port check
+/// (20260728-端口漂移baseurl自愈回写); healing goes through
+/// `reconcile_active` via the third-party funnel.
+pub(crate) fn profile_local_baseurl_port() -> Option<u16> {
+    let paths = desktop_paths()?;
+    if !matches!(detect_state(&paths), DesktopState::OursActive) {
+        return None;
+    }
+    let profile = read_json_object(&paths.profile).ok()?;
+    let base_url = profile["inferenceGatewayBaseUrl"].as_str()?;
+    crate::profile_activation::local_url_port(base_url)
+}
+
 // ─── P2 · `aikey desktop` command handlers (plan §4.5) ──────────────────
 
 /// `aikey desktop status [--json]`. Read-only diagnosis surface — the ONLY

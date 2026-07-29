@@ -462,6 +462,206 @@ fn w2b_start_with_external_port_holder_drifts_to_next_port() {
     // proxy's responsibility on graceful shutdown.
 }
 
+/// W2C → 20260728-端口漂移baseurl自愈回写: a drifted start must re-anchor the
+/// on-disk baseurl configs, and the ensure-running consumption guard must
+/// heal a stale active.env even when the proxy came up out-of-band (launchd
+/// boot simulation). Regression fence for the 2026-07-17 incident class
+/// (squatter on the configured port → drift → downstream baseurls dead):
+/// before the guard existed, active.env kept the configured port forever and
+/// doctor stayed green while claude hit the dead port.
+#[test]
+fn w2c_drifted_start_reconciles_downstream_baseurls() {
+    let mut env = match Env::try_new("w2c-reconcile") {
+        Some(e) => e,
+        None => return skip("AIKEY_PROXY_BIN not found"),
+    };
+    // Re-pin this test to a free port PAIR outside the ephemeral range:
+    // drift lands on port+1, and pick_free_port()'s `:0` allocations (used
+    // by sibling tests running in parallel) are handed out sequentially by
+    // the OS — an ephemeral base here would squat a sibling's expected +1
+    // drift target (seen as w2b flaking to +2). A fixed-range scan keeps
+    // the pair exclusively ours.
+    let pair_base = (42400u16..42500)
+        .step_by(2)
+        .find(|p| {
+            let a = TcpListener::bind(("127.0.0.1", *p));
+            let b = TcpListener::bind(("127.0.0.1", p + 1));
+            a.is_ok() && b.is_ok()
+        })
+        .expect("no free port pair in 42400..42500");
+    env.port = pair_base;
+    env.with_drift_max(10);
+
+    let active_env_path = env.tmp.join(".aikey/active.env");
+    let codex_toml_path = env.tmp.join(".codex/config.toml");
+    let configured = format!("127.0.0.1:{}", env.port);
+    let drifted = format!("127.0.0.1:{}", env.port + 1);
+
+    // Phase 1 — genuine pre-drift state. __boot__ (openai) exists from the
+    // Env bootstrap; add an anthropic key too so BOTH port-carrying surfaces
+    // are exercised: active.env via ANTHROPIC_BASE_URL (openai deliberately
+    // skips the env export — Codex reads config.toml) and ~/.codex/config.toml
+    // via openai_base_url.
+    let add_out = env
+        .cmd()
+        .args(["add", "__claude__", "--provider", "anthropic"])
+        .env("AK_TEST_SECRET", "sk-claude")
+        .output()
+        .expect("aikey add anthropic");
+    assert!(
+        add_out.status.success(),
+        "add __claude__ failed:\n{}{}",
+        String::from_utf8_lossy(&add_out.stdout),
+        String::from_utf8_lossy(&add_out.stderr),
+    );
+    let use_out = env
+        .cmd()
+        .args(["use", "__claude__", "--no-hook"])
+        .output()
+        .expect("aikey use");
+    let pre = std::fs::read_to_string(&active_env_path).unwrap_or_else(|_| {
+        panic!(
+            "active.env must exist after `aikey use`; use output:\n{}{}",
+            String::from_utf8_lossy(&use_out.stdout),
+            String::from_utf8_lossy(&use_out.stderr),
+        )
+    });
+    assert!(
+        pre.contains(&configured),
+        "pre-drift active.env should carry the configured port {}; got:\n{}",
+        configured,
+        pre
+    );
+    let codex_pre = std::fs::read_to_string(&codex_toml_path).expect("codex config after use");
+    assert!(
+        codex_pre.contains(&configured),
+        "pre-drift codex config should carry the configured port {}; got:\n{}",
+        configured,
+        codex_pre
+    );
+    let seq_of = |text: &str| -> u64 {
+        text.lines()
+            .find_map(|l| {
+                l.strip_prefix("export AIKEY_ACTIVE_SEQ=\"")
+                    .and_then(|r| r.trim_end_matches('"').parse().ok())
+            })
+            .unwrap_or(0)
+    };
+    let pre_seq = seq_of(&pre);
+    // `use` best-effort-started the proxy on the configured port — stop it
+    // so the squatter below can take that port.
+    let _ = env.cmd().args(["proxy", "stop"]).output();
+
+    // Phase 2 — "reboot" with a squatter on the configured port: start
+    // drifts to port+1 and the start-path reconcile must rewrite active.env.
+    let _holder =
+        TcpListener::bind(format!("127.0.0.1:{}", env.port)).expect("bind external holder");
+    let out = env.cmd().args(["proxy", "start"]).output().expect("spawn");
+    assert!(
+        out.status.success(),
+        "drifted start should succeed; output:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let healed = std::fs::read_to_string(&active_env_path).expect("active.env after drift");
+    assert!(
+        healed.contains(&drifted),
+        "active.env should be re-anchored to the drifted port {}; got:\n{}",
+        drifted,
+        healed
+    );
+    assert!(
+        !healed.contains(&format!("{}/", configured)),
+        "active.env must no longer point any base_url at the dead configured \
+         port {}; got:\n{}",
+        configured,
+        healed
+    );
+    assert!(
+        seq_of(&healed) > pre_seq,
+        "AIKEY_ACTIVE_SEQ must bump on heal (open terminals re-source on next \
+         prompt); pre={} post={}",
+        pre_seq,
+        seq_of(&healed)
+    );
+    let codex_healed = std::fs::read_to_string(&codex_toml_path).expect("codex after drift");
+    assert!(
+        codex_healed.contains(&drifted) && !codex_healed.contains(&format!("{}/", configured)),
+        "codex config should be re-anchored to the drifted port {}; got:\n{}",
+        drifted,
+        codex_healed
+    );
+
+    // Phase 3 — launchd-boot simulation: the drifted proxy is RUNNING but
+    // active.env still has the old port (as if written before the boot).
+    // doctor must SEE it (能红 fence) and the wrapper's ensure-running
+    // fast-path must heal it without restarting anything.
+    let staled = healed.replace(&drifted, &configured);
+    std::fs::write(&active_env_path, &staled).expect("stale active.env");
+    let codex_staled = codex_healed.replace(&drifted, &configured);
+    std::fs::write(&codex_toml_path, &codex_staled).expect("stale codex config");
+
+    let doc_out = env
+        .cmd()
+        .args(["doctor", "--json"])
+        .output()
+        .expect("doctor");
+    // json_output routes doctor's JSON to stderr; accept either stream.
+    let doc_text = {
+        let stdout = String::from_utf8_lossy(&doc_out.stdout).trim().to_string();
+        if stdout.starts_with('{') {
+            stdout
+        } else {
+            String::from_utf8_lossy(&doc_out.stderr).trim().to_string()
+        }
+    };
+    let doc_json: serde_json::Value = serde_json::from_str(&doc_text)
+        .unwrap_or_else(|e| panic!("doctor --json should emit JSON ({e}); got:\n{}", doc_text));
+    let baseurl_row = doc_json["checks"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|r| r["check"].as_str() == Some("baseurl sync"))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "doctor should emit a `baseurl sync` row; got:\n{}",
+                doc_text
+            )
+        });
+    assert_eq!(
+        baseurl_row["ok"].as_bool(),
+        Some(false),
+        "doctor must flag the stale active.env port; row: {}",
+        baseurl_row
+    );
+
+    let er_out = env
+        .cmd()
+        .args(["proxy", "ensure-running"])
+        .output()
+        .expect("ensure-running");
+    let after = std::fs::read_to_string(&active_env_path).expect("active.env after ensure");
+    assert!(
+        after.contains(&drifted) && !after.contains(&format!("{}/", configured)),
+        "ensure-running fast-path must heal the stale active.env back to {}; \
+         ensure output:\n{}{}\nactive.env:\n{}",
+        drifted,
+        String::from_utf8_lossy(&er_out.stdout),
+        String::from_utf8_lossy(&er_out.stderr),
+        after
+    );
+    let codex_after = std::fs::read_to_string(&codex_toml_path).expect("codex after ensure");
+    assert!(
+        codex_after.contains(&drifted) && !codex_after.contains(&format!("{}/", configured)),
+        "ensure-running fast-path must heal the stale codex config back to {}; got:\n{}",
+        drifted,
+        codex_after
+    );
+
+    // Cleanup runs in Env::Drop (proxy stop).
+}
+
 /// W3 → scenario 4: child dies at init → start returns error.
 #[test]
 fn w3_start_with_child_dies_at_init_returns_error() {

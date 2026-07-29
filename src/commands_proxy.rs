@@ -23,7 +23,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Fallback proxy listen address when the config cannot be parsed.
 const PROXY_HEALTH_ADDR_DEFAULT: &str = "127.0.0.1:27200";
@@ -351,6 +351,13 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
         crate::proxy_state::proxy_state(&probe_listen),
         crate::proxy_state::ProxyState::Running { .. }
     ) {
+        // Drift self-heal guard (20260728-端口漂移baseurl自愈回写): this
+        // fast-path is the consumption-side reconcile point — launchd may
+        // have auto-started a DRIFTED proxy at boot with no CLI in the loop,
+        // so the wrapper's `ensure-running` (every claude/codex/kimi launch)
+        // is where stale on-disk baseurls get re-anchored. Cheap when in
+        // sync (two small file reads); advisory on failure.
+        let _ = crate::profile_activation::reconcile_baseurl_port();
         return;
     }
 
@@ -465,6 +472,9 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
             if let Ok(seq) = crate::storage::get_vault_change_seq() {
                 let _ = crate::storage::set_proxy_loaded_seq(seq);
             }
+            // Drift self-heal (20260728): fresh start may have drifted —
+            // re-anchor on-disk baseurls before the wrapper launches the CLI.
+            let _ = crate::profile_activation::reconcile_baseurl_port();
         }
         Err(StartError::OrphanedPort {
             port,
@@ -719,7 +729,13 @@ fn read_yaml_listen_addr(config_path: Option<&std::path::Path>) -> Option<String
 /// the recorded pid is alive. Returns None when the file is absent,
 /// malformed, or its pid is dead (stale residue from a crashed prior
 /// incarnation).
-fn read_runtime_actual_addr() -> Option<String> {
+///
+/// pub(crate): also the "is there a live proxy, and where?" gate for
+/// `profile_activation::reconcile_baseurl_port` — the drift self-heal
+/// guard must only rewrite downstream configs against a *live* actual
+/// port, never against intent-level fallbacks (yaml/env), or a stopped
+/// proxy would trigger speculative rewrites.
+pub(crate) fn read_runtime_actual_addr() -> Option<String> {
     let path = runtime_snapshot_path()?;
     let text = fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -872,6 +888,11 @@ fn handle_start_background(
             if let Ok(seq) = crate::storage::get_vault_change_seq() {
                 let _ = crate::storage::set_proxy_loaded_seq(seq);
             }
+            // Drift self-heal (20260728-端口漂移baseurl自愈回写): if this
+            // start drifted (27200 busy → bound N+k), downstream baseurl
+            // configs on disk still carry the old port — re-anchor them now.
+            // Idempotent no-op when in sync; advisory on failure.
+            let _ = crate::profile_activation::reconcile_baseurl_port();
             Ok(())
         }
         Err(crate::proxy_lifecycle::StartError::OrphanedPort {
@@ -1135,6 +1156,32 @@ fn handle_start_foreground(
     // shells' `aikey proxy stop / restart / status` see it as a
     // first-class managed instance via the sidecar meta.
     drop(_lock);
+
+    // Drift self-heal at service start (20260728-端口漂移baseurl自愈回写):
+    // launchd/systemd runs THIS path at boot with no other CLI in the loop.
+    // If the child had to drift (configured port busy), on-disk baseurl
+    // configs must be re-anchored NOW — already-open terminals then pick the
+    // fix up at their next prompt via the seq bump, instead of waiting for
+    // the next wrapper launch. Short poll: the proxy writes runtime.json
+    // right after bind (typically <1s); `try_wait` (not `process_alive`)
+    // detects an early-dead child immediately — a crashed child is a zombie
+    // until reaped, which `kill(pid,0)` still reports as alive, and that
+    // would stall a crashloop for the full deadline.
+    {
+        let reconcile_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if crate::proxy_lifecycle::runtime_actual_addr_for_pid(pid).is_some() {
+                let _ = crate::profile_activation::reconcile_baseurl_port();
+                break;
+            }
+            if matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+                || Instant::now() >= reconcile_deadline
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 
     let status = child.wait()?;
 

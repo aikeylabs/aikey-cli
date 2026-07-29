@@ -1244,6 +1244,216 @@ fn find_replacement_candidate(
     Ok(None)
 }
 
+// ============================================================================
+// reconcile_baseurl_port — port-drift self-healing guard
+// ============================================================================
+
+/// What `reconcile_baseurl_port` did — surfaced for seams' logging and tests.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PortReconcileOutcome {
+    /// No live proxy (runtime.json absent / pid dead) — nothing to compare
+    /// against; intent-level ports (yaml/env) are deliberately NOT used so a
+    /// stopped proxy never triggers speculative config rewrites.
+    NoLiveProxy,
+    /// No downstream surface carries a local (127.0.0.1) baseurl — either no
+    /// bindings yet or all routes point at cluster nodes. Nothing to heal.
+    NoSentinel,
+    /// Downstream configs already point at the live proxy's actual port.
+    InSync { port: u16 },
+    /// Drift detected and the full rewrite funnel ran (active.env + seq bump
+    /// + codex/kimi/statusline/Desktop via the third-party funnel).
+    Healed { from: u16, to: u16 },
+    /// Guard could not complete (vault DB unreadable, write failure, …).
+    /// Callers must treat this as advisory — never block the main flow.
+    Failed(String),
+}
+
+/// Idempotent reconcile: live proxy actual port vs the baseurl port already
+/// written into downstream configs; rewrite everything through the existing
+/// activation funnel when they disagree.
+///
+/// Why (20260728-端口漂移baseurl自愈回写): port drift (27200 busy → bind
+/// 27201..+10) updates `proxy-runtime.json`, and every *runtime* CLI port
+/// lookup follows it — but configs already ON DISK (active.env, codex toml,
+/// Desktop profile) kept the old port with no write-back mechanism, so
+/// claude/codex silently hit a dead port while `aikey doctor` stayed green
+/// (real incident: bugfix 2026-07-17 agent-daemon port-drift pollution).
+/// This guard is mounted on consumption paths (`ensure_proxy_for_use`) and
+/// start paths (foreground service start), per the "event-driven writes need
+/// an idempotent reconcile read" invariant: launchd can start a drifted proxy
+/// with no CLI in the loop, so a pure event hook would miss it.
+///
+/// Staleness is judged across ALL local surfaces (`written_local_baseurl_ports`),
+/// not just active.env: openai routes deliberately skip the OPENAI_BASE_URL
+/// env export (Codex v0.118+ reads `~/.codex/config.toml` instead), so an
+/// openai-only user's ONLY port-carrying surface is the codex toml.
+/// Cluster-node URLs (non-127.0.0.1) are never compared — drift must not
+/// rewrite cluster direct-bind routes.
+pub fn reconcile_baseurl_port() -> PortReconcileOutcome {
+    // 1. Live actual port only (pid-verified runtime.json).
+    let Some(actual_addr) = commands_proxy::read_runtime_actual_addr() else {
+        return PortReconcileOutcome::NoLiveProxy;
+    };
+    let Some(actual_port) = actual_addr
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+    else {
+        return PortReconcileOutcome::Failed(format!(
+            "runtime actual_addr has no parsable port: {actual_addr}"
+        ));
+    };
+
+    // 2. Ports already written to downstream surfaces; any local mismatch
+    // triggers the full funnel rewrite (all surfaces re-anchor together).
+    let surfaces = written_local_baseurl_ports();
+    let Some(written_port) = surfaces
+        .iter()
+        .find_map(|(_, p)| p.filter(|p| *p != actual_port))
+    else {
+        return if surfaces.iter().any(|(_, p)| p.is_some()) {
+            PortReconcileOutcome::InSync { port: actual_port }
+        } else {
+            PortReconcileOutcome::NoSentinel
+        };
+    };
+
+    // 3. Drift → rewrite through the single existing funnel (never a
+    // parallel write path). refresh bumps AIKEY_ACTIVE_SEQ, so already-open
+    // terminals re-source active.env at their next prompt via the hook.
+    eprintln!(
+        "[aikey] proxy port changed ({} -> {}) — refreshing baseurl configs \
+         (active.env / codex / desktop); open terminals update at next prompt",
+        written_port, actual_port
+    );
+    match refresh_implicit_profile_activation() {
+        Ok(refresh) => {
+            let active_providers: Vec<String> = refresh
+                .bindings
+                .iter()
+                .map(|b| b.client_route.clone())
+                .collect();
+            // interactive=false: heal only what is already ours — a drift
+            // reconcile must never pop the Desktop takeover consent prompt
+            // mid `claude` launch (see apply_third_party_cli_configs_with).
+            let _ = crate::commands_account::apply_third_party_cli_configs_with(
+                &active_providers,
+                actual_port,
+                false,
+            );
+            PortReconcileOutcome::Healed {
+                from: written_port,
+                to: actual_port,
+            }
+        }
+        Err(e) => {
+            // Advisory by design: a failed heal must not block the launch
+            // that triggered it (main-flow robustness > side repair).
+            eprintln!("[aikey] warning: baseurl refresh failed: {e}");
+            PortReconcileOutcome::Failed(e)
+        }
+    }
+}
+
+/// `(surface label, locally-written port)` for every downstream config that
+/// can carry a local-proxy baseurl. `None` = surface absent / not ours /
+/// pointing at a non-loopback (cluster) host — healthy, never stale.
+///
+/// Shared by the reconcile guard above and `aikey doctor`'s `baseurl sync`
+/// row so both apply identical staleness rules (single source of truth).
+pub(crate) fn written_local_baseurl_ports() -> [(&'static str, Option<u16>); 3] {
+    let active_env_port =
+        std::fs::read_to_string(crate::commands_account::resolve_aikey_dir().join("active.env"))
+            .ok()
+            .and_then(|t| parse_local_baseurl_port(&t));
+    [
+        ("active.env", active_env_port),
+        ("codex", crate::commands_account::codex_local_baseurl_port()),
+        (
+            "desktop",
+            crate::commands_account::claude_desktop::profile_local_baseurl_port(),
+        ),
+    ]
+}
+
+/// Pure core: first local-proxy port written in an active.env body.
+///
+/// Only generated `export *_BASE_URL='http://127.0.0.1:<port>/...'` lines
+/// count; `unset` lines and cluster-node URLs (non-loopback hosts) are
+/// skipped. Separated from IO for direct unit testing.
+pub(crate) fn parse_local_baseurl_port(active_env: &str) -> Option<u16> {
+    for line in active_env.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("export ") else {
+            continue;
+        };
+        let Some((var, value)) = rest.split_once('=') else {
+            continue;
+        };
+        if !var.ends_with("_BASE_URL") {
+            continue;
+        }
+        if let Some(p) = local_url_port(value) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Port of a loopback (`127.0.0.1`) URL embedded anywhere in `text`;
+/// None for non-local hosts. Shared by the active.env sentinel parse and
+/// the doctor's codex/Desktop stale-port checks so all surfaces apply the
+/// same "local URLs only — never compare cluster routes" rule.
+pub(crate) fn local_url_port(text: &str) -> Option<u16> {
+    let idx = text.find("://127.0.0.1:")?;
+    let digits: String = text[idx + "://127.0.0.1:".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<u16>().ok()
+}
+
+#[cfg(test)]
+mod reconcile_baseurl_tests {
+    //! Pins the sentinel-parse contract of the drift self-heal guard
+    //! (20260728-端口漂移baseurl自愈回写): local base_url wins, cluster
+    //! URLs and unset lines never do. The IO/funnel halves are covered by
+    //! the e2e case (占用 27200 → drift → assert rewrite).
+
+    use super::parse_local_baseurl_port;
+
+    #[test]
+    fn picks_first_local_baseurl_port() {
+        let env = "# aikey active key — auto-generated\n\
+                   export AIKEY_ACTIVE_SEQ=\"42\"\n\
+                   export ANTHROPIC_BASE_URL='http://127.0.0.1:27201/anthropic'\n\
+                   export OPENAI_BASE_URL='http://127.0.0.1:27201/openai'\n";
+        assert_eq!(parse_local_baseurl_port(env), Some(27201));
+    }
+
+    #[test]
+    fn skips_cluster_urls_and_unset_lines() {
+        let env = "unset KIMI_BASE_URL 2>/dev/null\n\
+                   export OPENAI_BASE_URL='http://10.1.2.3:8080/openai'\n";
+        assert_eq!(parse_local_baseurl_port(env), None);
+    }
+
+    #[test]
+    fn cluster_route_then_local_route_uses_local() {
+        // Mixed set: openai direct-bound to a cluster node, anthropic on the
+        // local proxy — the local line is the sentinel.
+        let env = "export OPENAI_BASE_URL='http://10.1.2.3:8080/openai'\n\
+                   export ANTHROPIC_BASE_URL='http://127.0.0.1:27203/anthropic'\n";
+        assert_eq!(parse_local_baseurl_port(env), Some(27203));
+    }
+
+    #[test]
+    fn no_baseurl_lines_yields_none() {
+        let env =
+            "export AIKEY_ACTIVE_SEQ=\"7\"\nexport ANTHROPIC_API_KEY='aikey_active_anthropic'\n";
+        assert_eq!(parse_local_baseurl_port(env), None);
+    }
+}
+
 #[cfg(test)]
 mod unset_inactive_tests {
     //! Regression coverage for the source-only-export gap (2026-05-07):
