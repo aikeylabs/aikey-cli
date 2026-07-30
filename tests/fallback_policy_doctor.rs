@@ -153,3 +153,37 @@ fn missing_block_is_reported_not_invented() {
     assert!(r.rows.is_empty(), "no block means no numbers to show: {:?}", r.rows);
     assert!(r.detail.contains("not reported"), "detail = {}", r.detail);
 }
+
+/// Task 3.5: the chain's live state has to be visible in `aikey doctor`, and only
+/// when there is something to see.
+///
+/// A permanently-present "switches 0 · cooling 0" trains the reader to skip that
+/// line — and then they skip it on the day it is not zero, which is the only day
+/// it mattered.
+#[test]
+fn chain_state_appears_only_when_something_happened() {
+    let mut quiet = status(
+        true,
+        Some(json!({"state": "ok", "consecutive_failures": 0})),
+        "org",
+    );
+    quiet["upstream_fallback"]["switches_total"] = json!(0);
+    let r = fallback_policy_report(Some(&quiet), 1_700_000_008);
+    assert!(
+        !r.detail.contains("switch(es)"),
+        "an idle chain still printed switch counters: {}",
+        r.detail
+    );
+
+    let mut busy = quiet.clone();
+    busy["upstream_fallback"]["switches_total"] = json!(4);
+    busy["upstream_fallback"]["cooling_bindings"] = json!({"b-primary": 212});
+    let r = fallback_policy_report(Some(&busy), 1_700_000_008);
+    assert!(
+        r.detail.contains("4 switch(es)") && r.detail.contains("1 upstream(s) cooling"),
+        "a chain that switched and is cooling did not say so: {}\n\
+         Without it, an administrator seeing the bill land on the fallback vendor \
+         cannot tell 'the primary is cooling' from 'somebody changed the configuration'",
+        r.detail
+    );
+}

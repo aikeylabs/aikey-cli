@@ -784,6 +784,20 @@ pub fn fallback_policy_report(
         rows.push((label.to_string(), format!("{:<12} ({})", shown, source)));
     }
 
+    // Chain state (task 3.5): how many upstreams are currently being routed
+    // around, and how many switches have happened. 🔴 Read-only — a diagnostic
+    // command must not change what it is diagnosing, and there is deliberately no
+    // way to clear a cooldown from here at all.
+    let cooling = fb
+        .get("cooling_bindings")
+        .and_then(|v| v.as_object())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let switches = fb
+        .get("switches_total")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
     let census = by_source
         .iter()
         .map(|(s, n)| format!("{} {}", s, n))
@@ -794,7 +808,16 @@ pub fn fallback_policy_report(
         (true, None) => format!("synced (v{})", version),
         (false, _) => "never synced".to_string(),
     };
-    let detail = format!("{} · rail {} · {}", census, rail_state, freshness);
+    let mut detail = format!("{} · rail {} · {}", census, rail_state, freshness);
+    if switches > 0 || cooling > 0 {
+        // Only shown when something actually happened. A permanent
+        // "switches 0 · cooling 0" trains the reader to skip the line, and then
+        // the one time it is not zero they skip it too.
+        detail.push_str(&format!(
+            " · {} switch(es) · {} upstream(s) cooling",
+            switches, cooling
+        ));
+    }
 
     // 🔴 What counts as a failure. Never-synced *with a rail running* means the
     // proxy is asking and not being answered — real, and the thresholds in force
