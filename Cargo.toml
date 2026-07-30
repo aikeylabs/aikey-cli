@@ -171,6 +171,10 @@ filetime = "0.2"    # Cross-platform set_file_times (Stage 1.5 windows-compat:
 libc = "0.2"        # System calls for mlock (memory pinning)
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "ApplicationModel",       # Package.Id.Name for Claude Desktop MSIX registration detection
+    "Management_Deployment", # PackageManager current-user package enumeration (no WindowsApps access)
+] }
 windows-sys = { version = "0.52", features = [
     "Win32_System_Memory",     # mlock-equivalent memory pinning (crypto.rs lock_memory)
     "Win32_Foundation",        # HANDLE / CloseHandle / FILETIME
