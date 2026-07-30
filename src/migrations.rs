@@ -608,6 +608,43 @@ pub mod v1_0_0_baseline {
                 "group_alias",
                 "ALTER TABLE managed_virtual_keys_cache ADD COLUMN group_alias TEXT",
             ),
+            // ── P0a upstream fallback (tasks 1.2 / 1.2b) ───────────────────
+            //
+            // The control plane has carried the primary/fallback chain since the
+            // baseline schema (managed_provider_bindings.priority /
+            // .fallback_role, plus idx_mpb_vk_protocol_priority), and delivery
+            // has shipped it on binding_targets all along. The vault was the
+            // one place that DROPPED it — so the proxy could not know what
+            // order the administrator configured.
+            //
+            // 🔴 Defaults reproduce pre-upgrade behavior EXACTLY: every existing
+            // row becomes priority=1 / 'primary', i.e. "all primary, no
+            // fallback", which is precisely how the runtime behaved before this
+            // change. An upgrade must not alter routing on its own.
+            (
+                "priority",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN priority INTEGER NOT NULL DEFAULT 1",
+            ),
+            (
+                "fallback_role",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN fallback_role TEXT NOT NULL DEFAULT 'primary'",
+            ),
+            // Route-group provenance (task 1.2b). DEFAULT '' rather than NULL so
+            // the "legacy row" branch keys on emptiness consistently with
+            // user_profile_provider_bindings.binding_provider_code, which has
+            // been NOT NULL DEFAULT '' since it was introduced.
+            //
+            // 🔴 Existing rows get '' → they land in the LEGACY branch of the
+            // three-state pin derivation, so behavior before and after the
+            // upgrade is identical.
+            (
+                "route_group_id",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN route_group_id TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "route_group_name",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN route_group_name TEXT NOT NULL DEFAULT ''",
+            ),
         ] {
             ensure_column(conn, "managed_virtual_keys_cache", col, ddl)?;
         }
@@ -680,6 +717,10 @@ pub mod v1_0_0_baseline {
                     group_runtime          TEXT,
                     owner_email            TEXT,
                     group_alias            TEXT,
+                    priority               INTEGER NOT NULL DEFAULT 1,
+                    fallback_role          TEXT NOT NULL DEFAULT 'primary',
+                    route_group_id         TEXT NOT NULL DEFAULT '',
+                    route_group_name       TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (virtual_key_id, protocol_type, provider_code)
                 );
                  INSERT INTO managed_virtual_keys_cache__p1e_new (
@@ -691,7 +732,8 @@ pub mod v1_0_0_baseline {
                     cache_schema_version, synced_at,
                     local_alias, supported_providers, provider_base_urls, owner_account_id,
                     extra, oauth_group_id, group_accounts, routing_config,
-                    my_assignment_override, group_runtime, owner_email, group_alias
+                    my_assignment_override, group_runtime, owner_email, group_alias,
+                    priority, fallback_role, route_group_id, route_group_name
                  )
                  SELECT
                     virtual_key_id, org_id, seat_id, alias,
@@ -702,7 +744,8 @@ pub mod v1_0_0_baseline {
                     2, synced_at,
                     local_alias, supported_providers, provider_base_urls, owner_account_id,
                     extra, oauth_group_id, group_accounts, routing_config,
-                    my_assignment_override, group_runtime, owner_email, group_alias
+                    my_assignment_override, group_runtime, owner_email, group_alias,
+                    priority, fallback_role, route_group_id, route_group_name
                  FROM managed_virtual_keys_cache;
                  DROP TABLE managed_virtual_keys_cache;
                  ALTER TABLE managed_virtual_keys_cache__p1e_new RENAME TO managed_virtual_keys_cache;",
@@ -946,6 +989,33 @@ pub mod v1_0_0_baseline {
             [],
         )
         .map_err(|e| format!("Failed to ensure user_profile_provider_bindings: {}", e))?;
+
+        // P0a upstream fallback (task 1.2b): which route group a local `aikey use`
+        // pin refers to.
+        //
+        // 🔴 ONE column only — deliberately NO `pin_scope` (rev8.2 deleted the
+        // planned one). Pin scope is DERIVED from
+        // (route_group_id, binding_provider_code):
+        //
+        //   ''    | —      → LEGACY row, existing behavior unchanged
+        //   set   | ''     → pin the GROUP (default; failover still happens)
+        //   set   | set    → pin ONE HOP (no failover; the CLI must say so)
+        //
+        // Two independently writable fields could contradict each other —
+        // `pin_scope=group` while also naming one provider has no legal meaning
+        // and nothing would stop it being written. Same reasoning as I19's
+        // refusal of an independently editable `fallback_role`: make the invalid
+        // state unrepresentable instead of documenting which field wins.
+        //
+        // DEFAULT '' matches binding_provider_code's existing convention, so an
+        // upgraded row is indistinguishable from a legacy one — which is exactly
+        // what keeps behavior identical across the upgrade.
+        ensure_column(
+            conn,
+            "user_profile_provider_bindings",
+            "route_group_id",
+            "ALTER TABLE user_profile_provider_bindings ADD COLUMN route_group_id TEXT NOT NULL DEFAULT ''",
+        )?;
 
         // 2026-07-21 Provider/Protocol/client-route split. The released table
         // name and `provider_code` primary-key column are retained for online
@@ -2884,5 +2954,365 @@ mod tests {
             ensure_schema_current(&vault).unwrap(),
             SchemaEnsure::SkippedFresh
         );
+    }
+
+    // ── P0a upstream fallback · tasks 1.2 / 1.2b / 1.6 / 1.7 / 1.10 ─────────
+
+    /// Local column probe. `v1_0_0_baseline::has_column` is module-private on
+    /// purpose (it is an implementation detail of the retrofit loop), and this
+    /// change is not a reason to widen its visibility just for tests.
+    fn col_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        conn.prepare(&format!("PRAGMA table_info({})", table))
+            .and_then(|mut stmt| {
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let name: String = row.get(1)?;
+                    if name == column {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+            .unwrap_or(false)
+    }
+
+    /// The four columns this change adds to the vault cache.
+    const FALLBACK_CACHE_COLUMNS: [&str; 4] = [
+        "priority",
+        "fallback_role",
+        "route_group_id",
+        "route_group_name",
+    ];
+
+    /// Task 1.10 — 🔴 the generic fence, and the reason it is generic.
+    ///
+    /// `managed_virtual_keys_cache` is maintained in TWO places that must agree:
+    /// the column-retrofit loop (runs first) and the P1e re-grain block (runs
+    /// after, with THREE hand-written column lists — CREATE, INSERT, SELECT).
+    ///
+    /// Add a column to the loop but not to the rebuild lists and, on a *pre-P1e*
+    /// vault: the patch adds the column to the old table → the rebuild creates a
+    /// new table without it → copies → drops the old one → **the column is gone,
+    /// along with its data**.
+    ///
+    /// 🔴 Why no existing test catches it: a fresh install never enters the
+    /// rebuild block (its PK is already composite), and the existing re-grain
+    /// test only asserts the primary key changed and the ciphertext survived
+    /// byte-for-byte — never the complete column set. CI stays green.
+    ///
+    /// So this fence is written for EVERY column, not just this change's four:
+    /// it protects the next one too. (The same hazard shape exists in the control
+    /// plane — v1_0_1_alpha3_oauth_group.go rebuilds
+    /// managed_provider_bindings unconditionally — which was only ever documented
+    /// here, for the vault.)
+    #[test]
+    fn task_1_10_every_retrofitted_column_is_also_in_the_p1e_rebuild_block() {
+        let src = include_str!("migrations.rs");
+
+        // The retrofit loop's DDL statements are the authoritative list of
+        // columns this table can gain.
+        let mut retrofitted: Vec<String> = Vec::new();
+        for line in src.lines() {
+            // Built by concatenation so the full literal never appears
+            // contiguously in this file — otherwise the scanner matches its own
+            // needle and reports `";` as a missing column. (It did, on the first
+            // run. A self-matching source scanner is a standing trap.)
+            let needle = concat!("ALTER TABLE managed_virtual_keys_cache ", "ADD COLUMN ");
+            if let Some(idx) = line.find(needle) {
+                let rest = &line[idx + needle.len()..];
+                if let Some(col) = rest.split_whitespace().next() {
+                    retrofitted.push(col.to_string());
+                }
+            }
+        }
+        assert!(
+            retrofitted.len() >= 12,
+            "found only {} retrofitted columns — the scanner stopped matching, so this fence is \
+             silently watching nothing (worse than absent: it reads as coverage)",
+            retrofitted.len()
+        );
+
+        // Isolate the rebuild block so a mention in the retrofit loop cannot
+        // vouch for the rebuild.
+        let block_start = src
+            .find("CREATE TABLE managed_virtual_keys_cache__p1e_new")
+            .expect("P1e rebuild block not found — did it move or get renamed?");
+        let block_end = src[block_start..]
+            .find("RENAME TO managed_virtual_keys_cache")
+            .map(|o| block_start + o)
+            .expect("P1e rebuild block end not found");
+        let rebuild = &src[block_start..block_end];
+
+        let missing: Vec<&String> = retrofitted
+            .iter()
+            .filter(|col| !rebuild.contains(col.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "column(s) {:?} are added by the retrofit loop but absent from the P1e rebuild block.\n\
+             On a pre-P1e vault the rebuild will create a table without them, copy, drop the old \
+             table — and the columns plus their data are gone. A fresh install never enters that \
+             block, and the existing re-grain test only checks the primary key and the ciphertext, \
+             so CI would stay green.",
+            missing
+        );
+    }
+
+    /// Tasks 1.2 / 1.2b — the four columns exist on a fresh install, and their
+    /// defaults reproduce pre-upgrade behavior exactly.
+    #[test]
+    fn fallback_columns_exist_with_behavior_preserving_defaults() {
+        let vault = fresh_vault();
+        for col in FALLBACK_CACHE_COLUMNS {
+            assert!(
+                col_exists(&vault, "managed_virtual_keys_cache", col),
+                "managed_virtual_keys_cache.{} missing after a full upgrade",
+                col
+            );
+        }
+        assert!(
+            col_exists(&vault, "user_profile_provider_bindings", "route_group_id"),
+            "the pin table did not gain route_group_id"
+        );
+
+        // 🔴 rev8.2: scope is DERIVED, so the pin table must NOT have gained a
+        // second, contradictable field.
+        assert!(
+            !col_exists(&vault, "user_profile_provider_bindings", "pin_scope"),
+            "pin_scope column exists. Scope is derived from \
+             (route_group_id, binding_provider_code); storing it alongside them permits a row \
+             saying `pin_scope=group` while also naming one provider — a state with no legal \
+             meaning that nothing prevents"
+        );
+
+        vault
+            .execute(
+                "INSERT INTO managed_virtual_keys_cache
+                   (virtual_key_id, org_id, seat_id, alias, provider_code, protocol_type,
+                    base_url, credential_id, credential_revision, virtual_key_revision)
+                 VALUES ('vk1','o1','s1','k','anthropic','anthropic','https://x','c1','r1','r1')",
+                [],
+            )
+            .expect("insert legacy-shaped row");
+        let (prio, role, gid): (i64, String, String) = vault
+            .query_row(
+                "SELECT priority, fallback_role, route_group_id
+                   FROM managed_virtual_keys_cache WHERE virtual_key_id='vk1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("read defaults");
+        assert_eq!(
+            (prio, role.as_str(), gid.as_str()),
+            (1, "primary", ""),
+            "defaults must reproduce pre-upgrade behavior: all primary, no fallback, no group. \
+             An upgrade that changes routing on its own is the worst outcome here"
+        );
+    }
+
+    /// Builds a genuine **pre-P1e** vault: the one-VK-one-row cache with a
+    /// SINGLE-column primary key, carrying real rows.
+    ///
+    /// 🔴 Task 1.6: "🚫 fresh-install 单测不算". This is the only shape that
+    /// exercises the re-grain path at all.
+    fn pre_p1e_vault() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            "CREATE TABLE managed_virtual_keys_cache (
+                virtual_key_id       TEXT NOT NULL PRIMARY KEY,
+                org_id               TEXT NOT NULL,
+                seat_id              TEXT NOT NULL,
+                alias                TEXT NOT NULL,
+                provider_code        TEXT NOT NULL DEFAULT '',
+                protocol_type        TEXT NOT NULL DEFAULT 'openai_compatible',
+                base_url             TEXT NOT NULL,
+                credential_id        TEXT NOT NULL,
+                credential_revision  TEXT NOT NULL,
+                virtual_key_revision TEXT NOT NULL,
+                key_status           TEXT NOT NULL DEFAULT 'active',
+                share_status         TEXT NOT NULL DEFAULT 'pending_claim',
+                local_state          TEXT NOT NULL DEFAULT 'synced_inactive',
+                expires_at           INTEGER,
+                provider_key_nonce      BLOB,
+                provider_key_ciphertext BLOB,
+                cache_schema_version INTEGER NOT NULL DEFAULT 1,
+                synced_at            INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );",
+        )
+        .expect("create pre-P1e cache");
+        conn.execute(
+            "INSERT INTO managed_virtual_keys_cache
+               (virtual_key_id, org_id, seat_id, alias, provider_code, protocol_type,
+                base_url, credential_id, credential_revision, virtual_key_revision,
+                provider_key_nonce, provider_key_ciphertext)
+             VALUES ('vk-old','o1','s1','legacy-key','anthropic','anthropic',
+                     'https://api.anthropic.com','c-old','r1','r1', ?1, ?2)",
+            params![vec![7u8, 7, 7], vec![9u8, 9, 9, 9]],
+        )
+        .expect("seed legacy row");
+        conn
+    }
+
+    /// Tasks 1.6 + 1.10 — 🔴 the live counterpart of the static fence.
+    ///
+    /// Upgrade a real pre-P1e vault and assert the four columns SURVIVE the
+    /// re-grain, that the ciphertext is still byte-identical, and that the
+    /// primary key really did become composite (i.e. the rebuild ran, so this
+    /// test actually exercised the dangerous path).
+    #[test]
+    fn task_1_6_pre_p1e_vault_keeps_fallback_columns_through_the_regrain() {
+        let vault = pre_p1e_vault();
+        upgrade_all(&vault).expect("upgrade a pre-P1e vault");
+
+        let pk_cols: i64 = vault
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('managed_virtual_keys_cache') WHERE pk > 0",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count pk cols");
+        assert_eq!(
+            pk_cols, 3,
+            "the re-grain did not run, so this test did not exercise the rebuild path and proves \
+             nothing about column survival"
+        );
+
+        for col in FALLBACK_CACHE_COLUMNS {
+            assert!(
+                col_exists(&vault, "managed_virtual_keys_cache", col),
+                "{} was LOST in the P1e re-grain — the retrofit loop added it to the old table, \
+                 then the rebuild created a new table without it",
+                col
+            );
+        }
+
+        let (prio, role, nonce, cipher): (i64, String, Vec<u8>, Vec<u8>) = vault
+            .query_row(
+                "SELECT priority, fallback_role, provider_key_nonce, provider_key_ciphertext
+                   FROM managed_virtual_keys_cache WHERE virtual_key_id='vk-old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("read migrated row");
+        assert_eq!(
+            (prio, role.as_str()),
+            (1, "primary"),
+            "an existing row must come out of the re-grain with pre-upgrade behavior"
+        );
+        // The re-grain must not touch the encryption boundary.
+        assert_eq!(nonce, vec![7u8, 7, 7], "nonce changed during re-grain");
+        assert_eq!(
+            cipher,
+            vec![9u8, 9, 9, 9],
+            "ciphertext changed during re-grain — the BLOB must be copied byte-for-byte"
+        );
+    }
+
+    /// Task 1.7 — applying the migration twice is a no-op.
+    #[test]
+    fn task_1_7_column_patch_is_idempotent_across_two_runs() {
+        let vault = pre_p1e_vault();
+        upgrade_all(&vault).expect("first upgrade");
+        vault
+            .execute(
+                "UPDATE managed_virtual_keys_cache SET priority=2, fallback_role='fallback',
+                   route_group_id='rg-x', route_group_name='chain' WHERE virtual_key_id='vk-old'",
+                [],
+            )
+            .expect("simulate synced values");
+
+        upgrade_all(&vault).expect("second upgrade must be a no-op");
+
+        let (prio, role, gid, gname): (i64, String, String, String) = vault
+            .query_row(
+                "SELECT priority, fallback_role, route_group_id, route_group_name
+                   FROM managed_virtual_keys_cache WHERE virtual_key_id='vk-old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("read after replay");
+        assert_eq!(
+            (prio, role.as_str(), gid.as_str(), gname.as_str()),
+            (2, "fallback", "rg-x", "chain"),
+            "the second run overwrote synced chain values. A migration that resets routing on \
+             every startup would silently undo what the control plane delivered"
+        );
+    }
+
+    /// Task 1.3 — the chain must SURVIVE a write→read round trip through the
+    /// real upsert and the real tiered SELECT.
+    ///
+    /// 🔴 Why this is not redundant with the column tests above: the columns can
+    /// exist, the struct can carry the values, and the sync can still drop them —
+    /// which is exactly what happened before this change. Delivery has always
+    /// shipped priority/fallback_role on binding_targets; the vault's INSERT
+    /// simply did not list them, so they were silently discarded at the last
+    /// step. Asserting "the column exists" would not have caught that.
+    #[test]
+    fn task_1_3_chain_survives_the_upsert_and_select_round_trip() {
+        let vault = fresh_vault();
+        // Two hops of one chain, written the way a delivery sync writes them.
+        vault
+            .execute(
+                "INSERT INTO managed_virtual_keys_cache
+                   (virtual_key_id, org_id, seat_id, alias, provider_code, protocol_type,
+                    base_url, credential_id, credential_revision, virtual_key_revision,
+                    priority, fallback_role, route_group_id, route_group_name)
+                 VALUES ('vk1','o1','s1','k','anthropic','anthropic','https://a','c1','r1','r1',
+                         1,'primary','rg-main','main-chain')",
+                [],
+            )
+            .expect("insert primary hop");
+        vault
+            .execute(
+                "INSERT INTO managed_virtual_keys_cache
+                   (virtual_key_id, org_id, seat_id, alias, provider_code, protocol_type,
+                    base_url, credential_id, credential_revision, virtual_key_revision,
+                    priority, fallback_role, route_group_id, route_group_name)
+                 VALUES ('vk1','o1','s1','k','zhipu','anthropic','https://z','c2','r1','r1',
+                         2,'fallback','rg-main','main-chain')",
+                [],
+            )
+            .expect("insert fallback hop");
+
+        // 🔴 Task 1.4's discipline applied to the vault read: ORDER BY priority,
+        // never implicit row order. SQLite makes no promise without it, and an
+        // implicit order is the classic silent bug — right today, wrong after some
+        // unrelated change, and never logged.
+        let mut stmt = vault
+            .prepare(
+                "SELECT provider_code, priority, fallback_role, route_group_id, route_group_name
+                   FROM managed_virtual_keys_cache
+                  WHERE virtual_key_id='vk1' AND protocol_type='anthropic'
+                  ORDER BY priority ASC",
+            )
+            .expect("prepare chain read");
+        let rows: Vec<(String, i64, String, String, String)> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+
+        assert_eq!(rows.len(), 2, "both hops must persist as separate rows");
+        assert_eq!(
+            (rows[0].0.as_str(), rows[0].1, rows[0].2.as_str()),
+            ("anthropic", 1, "primary"),
+            "the primary hop must come back first with its order intact"
+        );
+        assert_eq!(
+            (rows[1].0.as_str(), rows[1].1, rows[1].2.as_str()),
+            ("zhipu", 2, "fallback"),
+            "the fallback hop must keep priority 2 — if the sync drops it, every hop reads as \
+             priority 1 and the proxy cannot tell primary from fallback"
+        );
+        for row in &rows {
+            assert_eq!(
+                (row.3.as_str(), row.4.as_str()),
+                ("rg-main", "main-chain"),
+                "every hop of one chain carries the same template provenance"
+            );
+        }
     }
 }

@@ -410,6 +410,19 @@ pub struct BindingTarget {
 pub struct ProtocolSlot {
     pub protocol_type: String,
     pub binding_targets: Vec<BindingTarget>,
+    /// Which org route-group TEMPLATE generated this chain (P0a upstream
+    /// fallback, task 0b.8). Empty when the chain predates route groups.
+    ///
+    /// `serde(default)` is load-bearing: an OLDER control plane omits both
+    /// fields entirely, and a newer CLI must keep working against it. The
+    /// server side omits them too (`omitempty`) so that "no group" and "a group
+    /// whose id is empty" stay distinguishable rather than collapsing into "".
+    #[serde(default)]
+    pub route_group_id: String,
+    /// Human-readable template name, for `aikey use` summaries. Cosmetic: the
+    /// id is what carries provenance.
+    #[serde(default)]
+    pub group_name: String,
 }
 
 /// Full delivery payload from GET /virtual-keys/{id}/delivery.
@@ -439,6 +452,27 @@ pub struct DeliveryPayload {
 }
 
 impl DeliveryPayload {
+    /// Route-group template (id, name) for a protocol slot (task 1.3).
+    ///
+    /// Slot-level rather than per-target on purpose: every hop of one chain
+    /// shares a template — the control plane's composite FK / trigger makes a
+    /// mismatch unstorable — so a per-hop copy could only ever disagree with
+    /// itself. Empty strings mean "no group", which is a legitimate state (a
+    /// legacy chain, or Personal) and must stay distinguishable from a group
+    /// whose id happens to be blank.
+    pub fn route_group_for(&self, protocol_type: &str) -> (&str, &str) {
+        for slot in &self.slots {
+            if !protocol_type.is_empty() && slot.protocol_type != protocol_type {
+                continue;
+            }
+            return (
+                slot.route_group_id.as_str(),
+                slot.group_name.as_str(),
+            );
+        }
+        ("", "")
+    }
+
     /// Returns the primary (first) binding target, if any.
     pub fn primary_binding(&self) -> Option<&BindingTarget> {
         self.slots.first()?.binding_targets.first()

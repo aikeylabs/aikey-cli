@@ -2421,6 +2421,10 @@ mod team_status_overlay_tests {
 
     fn vk(id: &str, ciphertext: Option<&[u8]>) -> storage::VirtualKeyCacheEntry {
         storage::VirtualKeyCacheEntry {
+            priority: 1,
+            fallback_role: "primary".to_string(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
             virtual_key_id: id.into(),
             org_id: "org-1".into(),
             seat_id: "seat-1".into(),

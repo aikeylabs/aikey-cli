@@ -3162,6 +3162,20 @@ fn apply_snapshot_to_cache(
             .as_ref()
             .map(|e| e.local_state.as_str())
             .unwrap_or("");
+        // Task 1.3 carry-forward tuple: (priority, fallback_role, route_group_id,
+        // route_group_name). Defaults reproduce pre-upgrade behavior when the row
+        // is new — all primary, no fallback, no group.
+        let existing_chain: (i64, String, String, String) = existing
+            .as_ref()
+            .map(|e| {
+                (
+                    e.priority,
+                    e.fallback_role.clone(),
+                    e.route_group_id.clone(),
+                    e.route_group_name.clone(),
+                )
+            })
+            .unwrap_or_else(|| (1, "primary".to_string(), String::new(), String::new()));
 
         let local_state = compute_local_state_from_effective(
             &item.effective_status,
@@ -3175,6 +3189,16 @@ fn apply_snapshot_to_cache(
             seat_id: item.seat_id.clone(),
             alias: item.alias.clone(),
             provider_code: item.provider_code.clone(),
+            // 🔴 Task 1.3 — the SNAPSHOT sync does not carry the chain (only the
+            // key-delivery payload does), so preserve whatever delivery already
+            // wrote. Resetting to defaults here would silently flatten a
+            // configured chain to "all primary" on every snapshot poll — the
+            // failure would look like "failover stopped working" with nothing in
+            // the logs. Same carry-forward posture the oauth_group columns use.
+            priority: existing_chain.0,
+            fallback_role: existing_chain.1.clone(),
+            route_group_id: existing_chain.2.clone(),
+            route_group_name: existing_chain.3.clone(),
             protocol_type: item.protocol_type.clone(),
             base_url: item.base_url.clone(),
             credential_id: item.credential_id.clone(),
@@ -3459,6 +3483,14 @@ pub(crate) struct DeliveredKey {
     pub supported_providers: Vec<String>,
     pub provider_base_urls: std::collections::HashMap<String, String>,
     pub owner_account_id: Option<String>,
+    /// Primary/fallback chain position for THIS binding (task 1.3). Delivery has
+    /// always carried it on binding_targets; the vault used to drop it, which is
+    /// why the proxy could not honour the administrator's configured order.
+    pub priority: i64,
+    pub fallback_role: String,
+    /// Route-group template this chain was generated from. Empty = no group.
+    pub route_group_id: String,
+    pub route_group_name: String,
 }
 
 /// Encrypts `plaintext_provider_key` with the (already-verified) vault key and
@@ -3490,6 +3522,11 @@ pub(crate) fn upsert_delivered_key(
         seat_id: dk.seat_id.clone(),
         alias: dk.alias.clone(),
         provider_code: dk.provider_code.clone(),
+        // Task 1.3 — the delivery payload is authoritative for the chain here.
+        priority: dk.priority,
+        fallback_role: dk.fallback_role.clone(),
+        route_group_id: dk.route_group_id.clone(),
+        route_group_name: dk.route_group_name.clone(),
         protocol_type: dk.protocol_type.clone(),
         base_url: dk.base_url.clone(),
         credential_id: dk.credential_id.clone(),
@@ -3751,12 +3788,20 @@ fn run_full_snapshot_sync_opts(
 
                         // Encrypt + upsert via the shared delivered-key core
                         // (also used by the cluster daemon's `_internal` path).
+                        // Task 1.3: carry the chain through instead of discarding it.
+                        let (rg_id, rg_name) = payload.route_group_for(&protocol_type);
+                        let rg_id = rg_id.to_string();
+                        let rg_name = rg_name.to_string();
                         let dk = DeliveredKey {
                             virtual_key_id: payload.virtual_key_id.clone(),
                             org_id: payload.org_id.clone(),
                             seat_id: payload.seat_id.clone(),
                             alias: payload.alias.clone(),
                             provider_code: binding.provider_code.clone(),
+                            priority: binding.priority as i64,
+                            fallback_role: binding.fallback_role.clone(),
+                            route_group_id: rg_id,
+                            route_group_name: rg_name,
                             protocol_type,
                             base_url: binding.base_url.clone(),
                             credential_id: binding.credential_id.clone(),
@@ -4085,6 +4130,17 @@ pub fn sync_managed_key_metadata() -> bool {
             // If the key was scope-disabled (belonged to a different account) but
             // the server is now returning it for the current account, restore it.
             let existing_state = existing.map(|e| e.local_state.as_str()).unwrap_or("");
+            // Task 1.3 carry-forward, same reasoning as the other snapshot path.
+            let chain_carry: (i64, String, String, String) = existing
+                .map(|e| {
+                    (
+                        e.priority,
+                        e.fallback_role.clone(),
+                        e.route_group_id.clone(),
+                        e.route_group_name.clone(),
+                    )
+                })
+                .unwrap_or_else(|| (1, "primary".to_string(), String::new(), String::new()));
             let local_state = match (item.key_status.as_str(), existing_state) {
                 ("active", "disabled_by_account_scope") => "synced_inactive".to_string(),
                 ("active", state) if !state.starts_with("disabled_by_") => {
@@ -4110,6 +4166,12 @@ pub fn sync_managed_key_metadata() -> bool {
                 seat_id: item.seat_id.clone(),
                 alias: item.alias.clone(),
                 provider_code,
+                // 🔴 Task 1.3 — carry forward, same reasoning as the other
+                // snapshot path: a poll must not flatten a configured chain.
+                priority: chain_carry.0,
+                fallback_role: chain_carry.1.clone(),
+                route_group_id: chain_carry.2.clone(),
+                route_group_name: chain_carry.3.clone(),
                 protocol_type,
                 base_url: existing.map(|e| e.base_url.clone()).unwrap_or_default(),
                 credential_id: existing
@@ -7107,6 +7169,10 @@ mod core_tests {
         routing_config: Option<&str>,
     ) -> storage::VirtualKeyCacheEntry {
         storage::VirtualKeyCacheEntry {
+            priority: 1,
+            fallback_role: "primary".to_string(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
             virtual_key_id: vk.into(),
             org_id: "org-1".into(),
             seat_id: "seat-1".into(),
@@ -9118,6 +9184,10 @@ mod sync_prune_tests {
 
     fn cache_entry(vk_id: &str, owner: &str) -> storage::VirtualKeyCacheEntry {
         storage::VirtualKeyCacheEntry {
+            priority: 1,
+            fallback_role: "primary".to_string(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
             virtual_key_id: vk_id.to_string(),
             org_id: "org-1".to_string(),
             seat_id: "seat-1".to_string(),
