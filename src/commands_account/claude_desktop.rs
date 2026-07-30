@@ -40,6 +40,25 @@ const CONFIG_LIBRARY: &str = "configLibrary";
 /// The client key under `clients:` in provider_registry.yaml (D4 rev2).
 const REGISTRY_CLIENT: &str = "claude-desktop";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MsixDetection {
+    /// Non-Windows paths and test paths that do not need MSIX discovery.
+    NotApplicable,
+    /// Windows legacy marker was sufficient, so PackageManager was not called.
+    NotChecked,
+    Registered,
+    NotRegistered,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DesktopInstallation {
+    Legacy,
+    Msix,
+    NotInstalled,
+    DetectionFailed(String),
+}
+
 // ─── Paths ──────────────────────────────────────────────────────────────
 
 /// All filesystem locations the takeover touches. Constructed via
@@ -49,15 +68,21 @@ const REGISTRY_CLIENT: &str = "claude-desktop";
 pub(crate) struct DesktopPaths {
     /// `.../Claude` — the deploymentMode config dir. On Windows this dir is
     /// created BY takeover (it does not exist on a clean install), so it is NOT
-    /// a valid "installed" signal there — use `install_marker` for that.
+    /// a valid "installed" signal there — use the installation evidence below.
     pub normal_dir: PathBuf,
-    /// Path whose existence means "Claude Desktop is installed".
+    /// Legacy/unpackaged installation marker. Its existence is sufficient to
+    /// mean "Claude Desktop is installed"; its absence is not, because Store
+    /// installs are discovered from current-user package registration.
     /// macOS: same as `normal_dir` (`~/Library/Application Support/Claude`,
     /// created on first run). Windows: the app dir `%LOCALAPPDATA%\AnthropicClaude`
     /// (where claude.exe lives) — because `normal_dir` (`%LOCALAPPDATA%\Claude`)
     /// only appears after a takeover, so keying detection off it would falsely
     /// report a freshly-installed Windows Claude as "not installed".
     pub install_marker: PathBuf,
+    /// Result of the current-user Windows package-registration lookup. Kept
+    /// separate from config paths so Store/MSIX discovery never depends on
+    /// access to the protected WindowsApps directory.
+    msix_detection: MsixDetection,
     pub threep_dir: PathBuf,
     pub normal_config: PathBuf,
     pub threep_config: PathBuf,
@@ -79,6 +104,7 @@ pub(crate) fn paths_from_dirs(normal_dir: PathBuf, threep_dir: PathBuf) -> Deskt
         // first run). Platform builders that separate the two (Windows)
         // override `install_marker` after calling this.
         install_marker: normal_dir.clone(),
+        msix_detection: MsixDetection::NotApplicable,
         normal_dir,
         threep_dir,
     }
@@ -99,12 +125,9 @@ pub(crate) fn macos_paths_from_home(home: &Path) -> DesktopPaths {
 /// this to Roaming: verified against cc-switch
 /// `claude_desktop_config.rs::windows_paths_from_local_app_data` (D10②).
 ///
-/// MVP uses exact dir names. cc-switch additionally falls back to a
-/// `Claude*` prefix scan on Windows (`pick_windows_claude_dir`), implying
-/// name variants exist in the wild; whether we need that scan is gated on
-/// the Windows spike leg's real-dir-name observation (risk 8). If the spike
-/// sees a variant name, upgrade this to the scan — exact-name misses would
-/// silently report detected=false (feature silently off).
+/// Config uses exact dir names (also documented by cc-switch). Do not scan or
+/// write package-private/versioned directories: Store/MSIX installation is
+/// discovered independently through current-user Package registration.
 ///
 /// Windows spike (2026-07-15): the app installs to
 /// `%LOCALAPPDATA%\AnthropicClaude` (claude.exe), while `%LOCALAPPDATA%\Claude`
@@ -120,6 +143,7 @@ pub(crate) fn windows_paths_from_local_app_data(local_app_data: &Path) -> Deskto
     // "installed" via the app dir instead, or a freshly-installed Windows
     // Claude is falsely reported NotInstalled and takeover refuses to run.
     paths.install_marker = local_app_data.join("AnthropicClaude");
+    paths.msix_detection = MsixDetection::NotChecked;
     paths
 }
 
@@ -142,7 +166,20 @@ pub(crate) fn desktop_paths() -> Option<DesktopPaths> {
                     .join("AppData")
                     .join("Local")
             });
-        Some(windows_paths_from_local_app_data(&lad))
+        let mut paths = windows_paths_from_local_app_data(&lad);
+        // The unpackaged/legacy app directory is the cheapest and strongest
+        // signal. Only ask Windows when that marker is absent. A PackageManager
+        // error is retained as an explicit diagnostic state, never collapsed
+        // into "not installed".
+        if !paths.install_marker.exists() {
+            paths.msix_detection =
+                match super::claude_desktop_windows::is_claude_msix_registered_for_current_user() {
+                    Ok(true) => MsixDetection::Registered,
+                    Ok(false) => MsixDetection::NotRegistered,
+                    Err(e) => MsixDetection::Failed(e),
+                };
+        }
+        Some(paths)
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -259,8 +296,12 @@ pub(crate) fn build_gateway_profile(material: &RouteMaterial) -> Value {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DesktopState {
-    /// `Claude/` dir absent — Desktop not installed, skip everything.
+    /// Neither the platform marker nor current-user MSIX registration exists.
     NotInstalled,
+    /// Windows package registration could not be queried. This is distinct
+    /// from NotInstalled so diagnosis never turns an infrastructure failure
+    /// into a false negative.
+    DetectionFailed,
     /// Installed, `deploymentMode` != "3p" (or unset) — official mode.
     Official,
     /// `3p` and the applied profile is ours.
@@ -268,6 +309,21 @@ pub(crate) enum DesktopState {
     /// `3p` but applied by someone else (e.g. cc-switch). D5: silent
     /// takeover is allowed; their profile FILE is never touched.
     ForeignActive,
+}
+
+fn detect_installation(paths: &DesktopPaths) -> DesktopInstallation {
+    // Legacy wins even if a package lookup failed: a concrete app directory
+    // is enough evidence and keeps existing installations working.
+    if paths.install_marker.exists() {
+        return DesktopInstallation::Legacy;
+    }
+    match &paths.msix_detection {
+        MsixDetection::Registered => DesktopInstallation::Msix,
+        MsixDetection::Failed(e) => DesktopInstallation::DetectionFailed(e.clone()),
+        MsixDetection::NotApplicable | MsixDetection::NotChecked | MsixDetection::NotRegistered => {
+            DesktopInstallation::NotInstalled
+        }
+    }
 }
 
 fn read_json_object(path: &Path) -> Result<Value, String> {
@@ -304,8 +360,10 @@ fn applied_id(meta_path: &Path) -> Option<String> {
 }
 
 pub(crate) fn detect_state(paths: &DesktopPaths) -> DesktopState {
-    if !paths.install_marker.exists() {
-        return DesktopState::NotInstalled;
+    match detect_installation(paths) {
+        DesktopInstallation::NotInstalled => return DesktopState::NotInstalled,
+        DesktopInstallation::DetectionFailed(_) => return DesktopState::DetectionFailed,
+        DesktopInstallation::Legacy | DesktopInstallation::Msix => {}
     }
     // The NORMAL config is the authoritative mode switch (the app reads it
     // in both modes; the 3p copy exists for the 3p bundle's own view).
@@ -409,8 +467,14 @@ pub(crate) fn takeover_at(
     paths: &DesktopPaths,
     material: &RouteMaterial,
 ) -> Result<TakeoverResult, String> {
-    if !paths.install_marker.exists() {
-        return Err("Claude Desktop not detected (app not installed)".to_string());
+    match detect_installation(paths) {
+        DesktopInstallation::NotInstalled => {
+            return Err("Claude Desktop not detected (app not installed)".to_string())
+        }
+        DesktopInstallation::DetectionFailed(e) => {
+            return Err(format!("Claude Desktop installation detection failed: {e}"))
+        }
+        DesktopInstallation::Legacy | DesktopInstallation::Msix => {}
     }
 
     let profile_json = build_gateway_profile(material);
@@ -487,6 +551,12 @@ pub(crate) fn takeover_at(
 pub(crate) fn restore_at(paths: &DesktopPaths) -> Result<RestoreResult, String> {
     match detect_state(paths) {
         DesktopState::NotInstalled => Ok(RestoreResult::NothingToDo),
+        DesktopState::DetectionFailed => Err(match detect_installation(paths) {
+            DesktopInstallation::DetectionFailed(e) => {
+                format!("Claude Desktop installation detection failed: {e}")
+            }
+            _ => "Claude Desktop installation detection failed".to_string(),
+        }),
         DesktopState::ForeignActive => Ok(RestoreResult::NotOursSkipped),
         DesktopState::Official => {
             // Mode already official; clear any residue we left behind
@@ -574,6 +644,17 @@ pub(crate) fn reconcile_active_at(
 ) -> DesktopSwitch {
     match detect_state(paths) {
         DesktopState::NotInstalled => DesktopSwitch::default(),
+        DesktopState::DetectionFailed => {
+            let detail = match detect_installation(paths) {
+                DesktopInstallation::DetectionFailed(e) => e,
+                _ => "unknown Windows package discovery failure".to_string(),
+            };
+            eprintln!(
+                "[aikey] warning: Claude Desktop installation detection failed; active key was still updated: {}",
+                detail
+            );
+            DesktopSwitch::default()
+        }
         DesktopState::OursActive => perform_takeover(paths, proxy_port),
         DesktopState::Official | DesktopState::ForeignActive => {
             match crate::global_config::get_claude_desktop_consent()
@@ -727,11 +808,26 @@ pub(crate) fn profile_local_baseurl_port() -> Option<u16> {
 /// paths when nothing was detected (risk 8).
 pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     let paths = desktop_paths();
-    let (installed, state, profile_base_url) = match &paths {
-        None => (false, "unsupported-platform".to_string(), None),
+    let (installed, install_source, install_detection_error, state, profile_base_url) = match &paths
+    {
+        None => (false, None, None, "unsupported-platform".to_string(), None),
         Some(p) => {
+            let installation = detect_installation(p);
+            let (is_installed, source, detection_error) = match &installation {
+                DesktopInstallation::Legacy => {
+                    #[cfg(windows)]
+                    let source = "legacy";
+                    #[cfg(not(windows))]
+                    let source = "native";
+                    (true, Some(source), None)
+                }
+                DesktopInstallation::Msix => (true, Some("msix"), None),
+                DesktopInstallation::NotInstalled => (false, None, None),
+                DesktopInstallation::DetectionFailed(e) => (false, None, Some(e.to_string())),
+            };
             let st = match detect_state(p) {
                 DesktopState::NotInstalled => "not-installed",
+                DesktopState::DetectionFailed => "detection-failed",
                 DesktopState::Official => "official",
                 DesktopState::OursActive => "aikey",
                 DesktopState::ForeignActive => "other",
@@ -740,7 +836,9 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
                 .ok()
                 .and_then(|v| v["inferenceGatewayBaseUrl"].as_str().map(str::to_string));
             (
-                !matches!(detect_state(p), DesktopState::NotInstalled),
+                is_installed,
+                source,
+                detection_error,
                 st.to_string(),
                 base_url,
             )
@@ -810,12 +908,27 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
 
     let scanned: Vec<String> = paths
         .as_ref()
-        .map(|p| vec![p.normal_dir.display().to_string()])
+        .map(|p| {
+            #[cfg(windows)]
+            {
+                let mut inspected = vec![p.install_marker.display().to_string()];
+                if !matches!(p.msix_detection, MsixDetection::NotChecked) {
+                    inspected.push("windows-package-current-user:Claude".to_string());
+                }
+                inspected
+            }
+            #[cfg(not(windows))]
+            {
+                vec![p.install_marker.display().to_string()]
+            }
+        })
         .unwrap_or_default();
 
     if json_mode {
         crate::json_output::print_json(serde_json::json!({
             "installed": installed,
+            "install_source": install_source,
+            "install_detection_error": install_detection_error,
             "state": state,
             "consent_pref": pref,
             "profile_path": paths.as_ref().map(|p| p.profile.display().to_string()),
@@ -830,7 +943,17 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
 
     println!("  Claude Desktop");
     println!("    installed:      {}", installed);
+    if let Some(source) = install_source {
+        println!("    install source: {}", source);
+    }
     println!("    state:          {}", state);
+    if let Some(error) = &install_detection_error {
+        println!(
+            "    {} detection:     Windows package lookup failed: {}",
+            crate::symbols::WARN.s(),
+            error
+        );
+    }
     println!("    consent:        {}", pref.as_deref().unwrap_or("(ask)"));
     if let Some(p) = &paths {
         if installed {
@@ -850,8 +973,10 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
             }
             println!("    profile:        {}", p.profile.display());
         } else {
-            // Risk 8: the only diagnosis surface for name-variant misses.
-            println!("    scanned:        {}", p.normal_dir.display());
+            // Risk 8 / D11: expose every installation evidence surface used.
+            println!("    scanned:        {}", p.install_marker.display());
+            #[cfg(windows)]
+            println!("                    current-user package: Claude");
         }
     }
     println!("    claude.ai:      {}", account_plane);
@@ -878,13 +1003,32 @@ pub(crate) fn handle_desktop_install() -> Result<(), Box<dyn std::error::Error>>
                 .into(),
         );
     };
-    if detect_state(&paths) == DesktopState::NotInstalled {
-        return Err(format!(
-            "[I_DESKTOP_NOT_INSTALLED] Claude Desktop not found (looked at {}). \
-             Install it first, then re-run `aikey desktop install`.",
-            paths.install_marker.display()
-        )
-        .into());
+    match detect_installation(&paths) {
+        DesktopInstallation::NotInstalled => {
+            #[cfg(windows)]
+            let inspected = format!(
+                "{} and the current-user Windows package registration",
+                paths.install_marker.display()
+            );
+            #[cfg(not(windows))]
+            let inspected = paths.install_marker.display().to_string();
+            return Err(format!(
+                "[I_DESKTOP_NOT_INSTALLED] Claude Desktop not found (looked at {}). \
+                 Install it first, then re-run `aikey desktop install`.",
+                inspected
+            )
+            .into());
+        }
+        DesktopInstallation::DetectionFailed(e) => {
+            return Err(format!(
+                "[I_DESKTOP_DETECTION_FAILED] Claude Desktop installation could not be checked: \
+                 {}. The active key is unchanged; retry from a normal (non-service) user session \
+                 or run `aikey desktop status` for details.",
+                e
+            )
+            .into())
+        }
+        DesktopInstallation::Legacy | DesktopInstallation::Msix => {}
     }
     let proxy_port = crate::commands_proxy::proxy_port();
     if route_material_for_anthropic(proxy_port).is_none() {
@@ -1305,7 +1449,67 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut paths = paths_from_dirs(tmp.path().join("Claude"), tmp.path().join("Claude-3p"));
         paths.install_marker = tmp.path().join("AnthropicClaude");
+        paths.msix_detection = MsixDetection::NotRegistered;
         assert_eq!(detect_state(&paths), DesktopState::NotInstalled);
+    }
+
+    // Microsoft Store/MSIX installs have no `%LOCALAPPDATA%\AnthropicClaude`
+    // directory. Current-user package registration is sufficient evidence,
+    // and takeover still writes only the documented LocalAppData config dirs.
+    #[test]
+    fn windows_msix_registration_detects_and_supports_takeover() {
+        let tmp = TempDir::new().unwrap();
+        let mut paths = windows_paths_from_local_app_data(tmp.path());
+        paths.msix_detection = MsixDetection::Registered;
+
+        assert!(!paths.install_marker.exists());
+        assert_eq!(detect_installation(&paths), DesktopInstallation::Msix);
+        assert_eq!(detect_state(&paths), DesktopState::Official);
+        assert_eq!(
+            takeover_at(&paths, &material()).unwrap(),
+            TakeoverResult::Installed
+        );
+        assert_eq!(detect_state(&paths), DesktopState::OursActive);
+        assert!(paths.profile.exists());
+        assert!(paths.profile.starts_with(tmp.path().join("Claude-3p")));
+        assert!(paths
+            .profile
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .find("windowsapps")
+            .is_none());
+    }
+
+    #[test]
+    fn windows_legacy_marker_wins_over_msix_detection_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mut paths = windows_paths_from_local_app_data(tmp.path());
+        paths.msix_detection = MsixDetection::Failed("package API unavailable".to_string());
+        std::fs::create_dir_all(&paths.install_marker).unwrap();
+
+        assert_eq!(detect_installation(&paths), DesktopInstallation::Legacy);
+        assert_eq!(detect_state(&paths), DesktopState::Official);
+        assert!(takeover_at(&paths, &material()).is_ok());
+    }
+
+    #[test]
+    fn windows_msix_detection_failure_is_visible_and_side_effect_free() {
+        let tmp = TempDir::new().unwrap();
+        let mut paths = windows_paths_from_local_app_data(tmp.path());
+        paths.msix_detection = MsixDetection::Failed("package API unavailable".to_string());
+
+        assert_eq!(
+            detect_installation(&paths),
+            DesktopInstallation::DetectionFailed("package API unavailable".to_string())
+        );
+        assert_eq!(detect_state(&paths), DesktopState::DetectionFailed);
+        assert!(takeover_at(&paths, &material()).is_err());
+        assert_eq!(
+            reconcile_active_at(&paths, 27200, false),
+            DesktopSwitch::default()
+        );
+        assert!(!paths.normal_dir.exists());
+        assert!(!paths.threep_dir.exists());
     }
 
     // macOS regression guard: marker == config dir (no behavior change).

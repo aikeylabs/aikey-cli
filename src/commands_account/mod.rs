@@ -5317,6 +5317,8 @@ pub(crate) mod openclaw_hook;
 // inside `apply_third_party_cli_configs` so BOTH production call sites
 // (lifecycle tail + handle_key_unuse's parallel copy) cover it.
 pub(crate) mod claude_desktop;
+#[cfg(windows)]
+mod claude_desktop_windows;
 
 // Credential lifecycle: single funnel for all binding writes + read-only
 // state audit. See `lifecycle/mod.rs` for the design rationale (Phase 5
