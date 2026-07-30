@@ -6507,10 +6507,73 @@ fn team_key_available_for_activate(local_state: &str) -> bool {
     // sync with the states offered by the activate picker. Disabled/stale rows
     // remain unavailable, while a valid synced key and a dismissed prompt are
     // both legitimate explicit choices.
+    //
+    // 🔴 STATE ALONE IS NOT ENOUGH — see `team_key_activatable` below. This
+    // predicate answers "is this row's lifecycle state eligible", which is only
+    // half the question; the other half is whether the key MATERIAL is actually
+    // here.
     matches!(
         local_state,
         "active" | "synced_inactive" | "prompt_dismissed"
     )
+}
+
+/// Why a team key cannot be activated, or `None` when it can.
+///
+/// # 🔴 Two rules that both had to be true, and one that was missing
+///
+/// Two earlier changes pulled in opposite directions on `synced_inactive`, and
+/// each was right about a DIFFERENT key:
+///
+///   2026-04-16 (Bug 4)  activate must REJECT it — the token it produced 401'd
+///                       at the proxy.
+///   2026-07-23          activate must ACCEPT it — the picker and the drawer
+///                       offer such keys, so rejecting made an advertised
+///                       action fail.
+///
+/// Both observations are real because `local_state` CONFLATES two situations:
+///
+///   (a) metadata synced, key material NOT YET DELIVERED → a token the proxy
+///       cannot serve. This is Bug 4.
+///   (b) material present and valid, simply not the currently-selected primary
+///       → a perfectly legitimate explicit pin. This is what the picker offers.
+///
+/// No value of `local_state` separates those, so gating on it can only ever be
+/// wrong for one of the two. The real precondition is whether the MATERIAL is
+/// reachable — and this repository already has one predicate for exactly that,
+/// `VirtualKeyCacheEntry::key_material_reachable`, whose own documentation names
+/// the three callers that "must agree on" it: `aikey use`, the web set-route
+/// bridge, and `activate`.
+///
+/// 🔴 `activate` was the one that never joined. That is the whole defect: not a
+/// rule that was deleted, but a shared rule one caller never adopted — which is
+/// precisely the divergence that predicate was introduced to prevent.
+///
+/// Consulting it also keeps the two designed-to-be-material-free cases working,
+/// which a naive "must have local ciphertext" check would have broken: a cluster
+/// central key (material stays on the node) and a group VK (the proxy pulls the
+/// per-account credential at request time).
+fn team_key_activatable(vk: &storage::VirtualKeyCacheEntry) -> Option<String> {
+    if !team_key_available_for_activate(&vk.local_state) {
+        return Some(format!(
+            "Key '{}' is not available (state: {}). Run 'aikey key sync' to refresh.",
+            vk.alias, vk.local_state
+        ));
+    }
+    let on_cluster = crate::commands_account::read_cluster_node().is_some();
+    if !vk.key_material_reachable(on_cluster) {
+        // 🔴 Say WHICH of the two it is. "Not available" alone sends someone to
+        // re-check permissions or the server, when the answer is that the key
+        // simply has not been delivered to this machine yet — and the fix is one
+        // command.
+        return Some(format!(
+            "Key '{}' is not available (state: {}): its key material has not been \
+             delivered to this device yet, so activating it would produce a token \
+             the proxy cannot serve. Run 'aikey key sync' to fetch it.",
+            vk.alias, vk.local_state
+        ));
+    }
+    None
 }
 
 fn resolve_activate_key(
@@ -6534,13 +6597,11 @@ fn resolve_activate_key(
         }
         // A temporary pin is intentionally independent from the persistent
         // `aikey use` primary. The drawer and picker expose synced-but-inactive
-        // Team VKs, so rejecting them here made their advertised action fail.
-        if !team_key_available_for_activate(&vk.local_state) {
-            return Err(format!(
-                "Key '{}' is not available (state: {}). Run 'aikey key sync' to refresh.",
-                vk.alias, vk.local_state
-            )
-            .into());
+        // Team VKs, so rejecting them by STATE made their advertised action fail
+        // — but accepting them by state alone re-opened 2026-04-16 Bug 4. Both
+        // halves live in `team_key_activatable`.
+        if let Some(reason) = team_key_activatable(vk) {
+            return Err(reason.into());
         }
         let display = vk.local_alias.as_deref().unwrap_or(&vk.alias).to_string();
         // Team key static bearer — shared helper (same as handle_route's
