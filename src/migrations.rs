@@ -608,7 +608,22 @@ pub mod v1_0_0_baseline {
                 "group_alias",
                 "ALTER TABLE managed_virtual_keys_cache ADD COLUMN group_alias TEXT",
             ),
-            // ── P0a upstream fallback (tasks 1.2 / 1.2b) ───────────────────
+            // ── P0a upstream fallback (tasks 1.2 / 1.2b / 1.8) ─────────────
+            //
+            // 🔴 Task 1.8 — ROLLBACK SEMANTICS, claimed explicitly: there is NO
+            // automatic rollback for these four columns, and that is a decision
+            // rather than an omission.
+            //
+            // The vault cache is a REBUILDABLE PROJECTION of the control plane.
+            // If it ever needs undoing, deleting the vault and letting it re-sync
+            // is both simpler and safer than a `DROP COLUMN`: SQLite's DROP COLUMN
+            // is version-gated (unavailable before 3.35) and forces a full table
+            // rebuild — i.e. it would reintroduce exactly the re-grain hazard that
+            // task 1.10's fence exists to guard, in order to remove a column whose
+            // presence is harmless.
+            //
+            // Leaving the columns in place after a downgrade is safe: an older
+            // binary simply never selects them.
             //
             // The control plane has carried the primary/fallback chain since the
             // baseline schema (managed_provider_bindings.priority /
