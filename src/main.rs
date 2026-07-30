@@ -3647,6 +3647,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             alias_or_id,
             no_hook,
             provider,
+            only,
         } => {
             // One-time backfill: generate route_tokens for existing keys that lack them.
             // Why here: `aikey use` is the most common write-path command after upgrade.
@@ -3660,8 +3661,22 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     // `aikey use <alias>` — provider-level promotion via handle_key_use.
                     commands_proxy::ensure_proxy_for_use(cli.password_stdin);
                     commands_account::handle_key_use(a, *no_hook, provider.as_deref(), cli.json)?;
+                    // 🔴 Task 2.27c: the member pin is written AFTER the normal
+                    // binding write, so the default path is untouched. Pinning one
+                    // upstream removes failover for that client route, and the
+                    // consequence is printed here — at the moment the user asks for
+                    // it — because a pin that silently drops a capability is exactly
+                    // the trap decision D-1③ closed.
+                    if let Some(upstream) = only.as_deref() {
+                        commands_account::pin_chain_member(a, upstream, cli.json)?;
+                    }
                 }
                 None => {
+                    if only.is_some() {
+                        return Err("--only pins one upstream of a specific key, so it needs the key: \
+                                    aikey use <ALIAS> --only <UPSTREAM>"
+                            .into());
+                    }
                     // `aikey use` (no args) — provider-tree interactive editor.
                     if !std::io::stdin().is_terminal() || cli.json {
                         return Err(

@@ -9322,3 +9322,123 @@ mod gateway_probe_tests {
         assert!(gateway_base_from_team_url_response(&weird, 8090).is_none());
     }
 }
+
+/// Pins one client route to a SINGLE upstream inside the key's route group
+/// (`aikey use <alias> --only <upstream>`, task 2.27c).
+///
+/// # 🔴 Why this prints a warning and the default does not
+///
+/// Without `--only`, `aikey use` pins the route GROUP: the administrator's
+/// primary/fallback order still applies, and nothing about the user's mental model
+/// changes. With `--only`, automatic failover for that client route is GONE —
+/// when that upstream fails, nothing is tried after it.
+///
+/// Decision D-1③ chose "pin one hop = use only that hop" over "pin one hop = move
+/// it to the front" for a specific reason: the alternative would let a developer's
+/// local command rewrite an order the administrator set in the control plane,
+/// breaking control-plane authority and creating a second source of truth for the
+/// order at the same time.
+///
+/// The price of that choice is that a pin now removes a capability, so it must
+/// never be silent. This is the "say it at the moment it happens" half of the
+/// decision — 🚫 documenting it somewhere else does not count, because the person
+/// who will be confused is the one typing this command today.
+pub fn pin_chain_member(
+    alias_or_id: &str,
+    upstream_provider_code: &str,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entry = storage::get_virtual_key_cache(alias_or_id)?
+        .or_else(|| {
+            storage::get_virtual_key_cache_by_alias(alias_or_id)
+                .ok()
+                .flatten()
+        })
+        .ok_or_else(|| format!("'{}' is not a team key on this machine", alias_or_id))?;
+
+    if entry.route_group_id.is_empty() {
+        return Err(format!(
+            "Key '{}' has no route group, so there is nothing to pin within.\n  \
+             --only chooses ONE upstream out of a chain; this key has a single upstream already.",
+            entry.alias
+        )
+        .into());
+    }
+
+    // The chain for this key is every cached row sharing its (virtual_key,
+    // protocol). Validate against it rather than against the provider registry:
+    // pinning to a real provider that is NOT in this chain would write a pin that
+    // can never be satisfied, and the resulting failure would point at routing
+    // rather than at the typo.
+    let chain = storage::list_virtual_key_cache()?
+        .into_iter()
+        .filter(|e| {
+            e.virtual_key_id == entry.virtual_key_id && e.protocol_type == entry.protocol_type
+        })
+        .collect::<Vec<_>>();
+    let matched = chain
+        .iter()
+        .find(|e| e.provider_code.eq_ignore_ascii_case(upstream_provider_code));
+    let Some(matched) = matched else {
+        let available = chain
+            .iter()
+            .map(|e| e.provider_code.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "'{}' is not an upstream in this key's route group.\n  Available: {}",
+            upstream_provider_code, available
+        )
+        .into());
+    };
+
+    // The pin table is keyed by CLIENT ROUTE (`anthropic`, `openai`, …), which is
+    // not the same namespace as the upstream provider code — the reason the three
+    // namespaces have to be kept apart at all (F-16).
+    let client_route =
+        crate::provider_registry::client_route_for_binding(&matched.provider_code, &entry.protocol_type)
+            .to_string();
+    let stamped = storage::pin_client_route_to_group_member(
+        crate::profile_activation::DEFAULT_PROFILE,
+        &client_route,
+        &entry.route_group_id,
+        &matched.provider_code,
+    )?;
+    if !stamped {
+        return Err(format!(
+            "No active binding for client route '{}' to pin. Run `aikey use {}` first.",
+            client_route, entry.alias
+        )
+        .into());
+    }
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({
+                "pinned_upstream": matched.provider_code,
+                "route_group": entry.route_group_name,
+                "client_route": client_route,
+                "automatic_failover": false,
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "  Pinned {} to {} (route group: {}).",
+        client_route,
+        matched.provider_code,
+        if entry.route_group_name.is_empty() {
+            "unnamed"
+        } else {
+            &entry.route_group_name
+        }
+    );
+    println!("  Automatic failover is OFF for this route: if {} fails, no backup upstream is tried.",
+        matched.provider_code);
+    println!(
+        "  To restore it, run: aikey use {}   (pins the whole group)",
+        entry.alias
+    );
+    Ok(())
+}

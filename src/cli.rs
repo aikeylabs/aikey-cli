@@ -232,6 +232,17 @@ pub(crate) enum Commands {
         /// Without this flag, all default providers are injected (generic gateway mode).
         #[arg(long, value_name = "PROVIDER", num_args = 0..=1, default_missing_value = "")]
         provider: Option<String>,
+        /// Pin routing to ONE upstream in this key's route group, by upstream
+        /// provider code (e.g. --only zhipu).
+        ///
+        /// 🔴 This TURNS OFF automatic failover for this client route: when that
+        /// upstream fails, nothing is tried after it. Without the flag, `aikey use`
+        /// pins the route GROUP and the administrator's fallback order still
+        /// applies. The consequence is printed when the pin is written, because a
+        /// pin that silently removes a capability is the trap this option exists
+        /// to make explicit.
+        #[arg(long, value_name = "UPSTREAM")]
+        only: Option<String>,
     },
     /// Temporarily activate a key in the current terminal (does not write active.env)
     #[command(display_order = 4)]

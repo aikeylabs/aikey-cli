@@ -2316,3 +2316,34 @@ mod key_material_reachable_tests {
         assert!(entry(Some(vec![1, 2, 3]), "claimed").key_material_reachable(true));
     }
 }
+
+/// Stamps the route-group pin columns on an EXISTING client-route binding
+/// (P0a upstream fallback, task 2.27c).
+///
+/// Pin scope is DERIVED from the pair `(route_group_id, binding_provider_code)` —
+/// see `internal/proxy/pin_scope.go` for the table — so this writes both together
+/// and never invents a third field to disagree with them.
+///
+/// 🔴 It UPDATEs and never inserts. The row is created by the normal
+/// `aikey use` write path; producing one here would let a pin exist for a client
+/// route that has no binding, which is a state nothing downstream can serve.
+/// Returns false when there was no row to stamp.
+pub fn pin_client_route_to_group_member(
+    profile_id: &str,
+    client_route: &str,
+    route_group_id: &str,
+    upstream_provider_code: &str,
+) -> Result<bool, String> {
+    let conn = open_connection()?;
+    let changed = conn
+        .execute(
+            "UPDATE user_profile_provider_bindings
+                SET route_group_id = ?3,
+                    binding_provider_code = ?4,
+                    updated_at = strftime('%s', 'now')
+              WHERE profile_id = ?1 AND provider_code = ?2",
+            params![profile_id, client_route, route_group_id, upstream_provider_code],
+        )
+        .map_err(|e| format!("pin client route to a route-group member: {}", e))?;
+    Ok(changed == 1)
+}
