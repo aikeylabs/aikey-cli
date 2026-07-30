@@ -64,6 +64,13 @@ fn vk_row(
             m.insert(provider.to_string(), base_url.to_string());
             m
         },
+        // P0a task 1.2b: the chain columns. A legacy fixture is priority 1 /
+        // primary / no group — the pre-upgrade single-shot shape, which is what
+        // these tests are asserting about.
+        priority: 1,
+        fallback_role: "primary".to_string(),
+        route_group_id: String::new(),
+        route_group_name: String::new(),
         owner_account_id: None,
         owner_email: None,
         extra: None,
