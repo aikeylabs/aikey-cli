@@ -243,6 +243,19 @@ pub(crate) enum Commands {
         /// to make explicit.
         #[arg(long, value_name = "UPSTREAM")]
         only: Option<String>,
+        /// Select the chain by ROUTE GROUP instead of by key alias.
+        ///
+        /// 🔴 A route group is an org-level TEMPLATE, so several of your keys may
+        /// use the same one. When exactly one does, the group name is enough. When
+        /// more than one does, this FAILS and lists them — those are different
+        /// keys, with different credentials, different quota, and usage billed to
+        /// different owners, so guessing would quietly charge somebody else.
+        #[arg(long, value_name = "GROUP")]
+        group: Option<String>,
+        /// Which key, when a route group is shared by more than one of yours.
+        /// `--key <ALIAS> --group <GROUP>` always resolves.
+        #[arg(long, value_name = "ALIAS")]
+        key: Option<String>,
     },
     /// Temporarily activate a key in the current terminal (does not write active.env)
     #[command(display_order = 4)]

@@ -21,6 +21,9 @@ mod executor;
 mod json_output;
 #[allow(dead_code)]
 mod provider_registry;
+// Locating a chain by (key, route group) — see the module doc for why the group
+// name alone stopped being enough once route groups became org-level templates.
+mod route_group_select;
 mod ratelimit;
 mod session;
 mod shell_quote;
@@ -3648,6 +3651,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             no_hook,
             provider,
             only,
+            group,
+            key,
         } => {
             // One-time backfill: generate route_tokens for existing keys that lack them.
             // Why here: `aikey use` is the most common write-path command after upgrade.
@@ -3655,6 +3660,66 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             if backfilled > 0 {
                 let _ = storage::bump_vault_change_seq();
             }
+
+            // 🔴 Tasks 4.37/4.38 — resolve `--group` (optionally with `--key`) to a
+            // key alias BEFORE anything else runs, so the rest of this command stays
+            // the path it has always been. Once route groups became org-level
+            // templates a group name stopped identifying a single chain: several of
+            // this employee's keys can share one template, and choosing between them
+            // silently would SUCCEED — logging nothing, erroring nothing — while an
+            // entire session's usage landed on another key, i.e. another team's bill.
+            //
+            // 🔴 The two ARGUMENT-SHAPE errors are raised first, before any vault
+            // lookup. Resolving the group first meant `aikey use mykey --group g`
+            // answered "no route group named g" — true, but it sends the user to fix
+            // the group when their actual mistake was giving both coordinates. An
+            // error has to name the thing the user got wrong, not the first thing
+            // that failed downstream of it.
+            if group.is_some() && alias_or_id.is_some() {
+                return Err(format!(
+                    concat!(
+                        "Pass either a key name or --group, not both: you gave '{}' and --group {}.\n",
+                        "  To choose WHICH key inside a shared group, use both flags:\n",
+                        "    aikey use --key {} --group {}"
+                    ),
+                    alias_or_id.as_deref().unwrap_or(""),
+                    group.as_deref().unwrap_or(""),
+                    alias_or_id.as_deref().unwrap_or("<ALIAS>"),
+                    group.as_deref().unwrap_or("<GROUP>"),
+                )
+                .into());
+            }
+            if group.is_none() && key.is_some() {
+                // --key names one coordinate of a (key, group) pair. On its own it is
+                // just the positional argument spelled differently, and accepting it
+                // as such would leave two spellings of one thing.
+                return Err(concat!(
+                    "--key selects WHICH key inside a shared route group, so it needs the group too:\n",
+                    "    aikey use --key <ALIAS> --group <GROUP>\n",
+                    "  To activate a key by name, pass it positionally:\n",
+                    "    aikey use <ALIAS>"
+                )
+                .into());
+            }
+
+            let resolved_alias: Option<String> = match group.as_deref() {
+                Some(g) => {
+                    let rows = commands_account::chain_rows_for_selection()?;
+                    let sel = route_group_select::resolve(&rows, key.as_deref(), g);
+                    match sel {
+                        route_group_select::Selection::Resolved { key_alias, .. } => Some(key_alias),
+                        other => {
+                            // failure_message returns Some for every non-Resolved arm.
+                            return Err(route_group_select::failure_message(&other)
+                                .unwrap_or_else(|| format!("could not resolve route group '{}'", g))
+                                .into());
+                        }
+                    }
+                }
+                None => None,
+            };
+            let alias_or_id = resolved_alias.or_else(|| alias_or_id.clone());
+            let alias_or_id = alias_or_id.as_ref();
 
             match alias_or_id {
                 Some(a) => {

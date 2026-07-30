@@ -5926,6 +5926,34 @@ pub fn handle_key_use(
         // pushed every following column out of alignment, and it is the protocol
         // most likely to appear. Width is computed from the values actually
         // being printed, so no new protocol can overflow it either.
+        // 🔴 Task 4.39 — the summary went from three axes to FOUR when route groups
+        // became org-level templates: client route / protocol / KEY / route group.
+        //
+        // The KEY axis stops being optional at that point. A group name no longer
+        // identifies one chain, so a summary that shows the group without saying
+        // which key it belongs to describes something the user cannot act on — and
+        // the difference between two keys sharing a template is whose account pays.
+        //
+        // 🚫 The group name never goes in the PROVIDER column. Route group, provider
+        // code and client route are three namespaces (I30); printing one under
+        // another's heading is precisely the collapse `aikey use` has to avoid.
+        //
+        // ✅ Read from the local vault only — `route_group_name` is already delivered
+        // here. 🚫 No control-plane call: the data plane does not enter the control
+        // plane's hot path, and a summary that fails when the server is unreachable
+        // would be worse than no summary.
+        let chain_index = chain_rows_for_selection().unwrap_or_default();
+        let group_of = |key_ref: &str, provider: &str| -> Option<String> {
+            chain_index
+                .iter()
+                .find(|r| {
+                    (r.virtual_key_id == key_ref || r.key_alias == key_ref)
+                        && r.provider_code.eq_ignore_ascii_case(provider)
+                        && !r.route_group_name.is_empty()
+                })
+                .map(|r| r.route_group_name.clone())
+        };
+
         let axis_cells: Vec<(String, String)> = bindings
             .iter()
             .filter(|b| provider_env_vars(&b.client_route).is_some())
@@ -5949,12 +5977,22 @@ pub fn handle_key_use(
             .max()
             .unwrap_or("PROVIDER".len());
 
+        let route_w = bindings
+            .iter()
+            .filter(|b| provider_env_vars(&b.client_route).is_some())
+            .map(|b| b.client_route.chars().count())
+            .chain(std::iter::once("ROUTE".len()))
+            .max()
+            .unwrap_or("ROUTE".len());
+
         let mut rows: Vec<String> = Vec::new();
         rows.push(format!(
-            "  {:<pw$} {:<vw$} {}",
+            "  {:<rw$} {:<pw$} {:<vw$} {}",
+            "ROUTE".dimmed(),
             "PROTOCOL".dimmed(),
             "PROVIDER".dimmed(),
             "KEY".dimmed(),
+            rw = route_w,
             pw = proto_w,
             vw = prov_w
         ));
@@ -5978,18 +6016,72 @@ pub fn handle_key_use(
                 // the vault chip (zhipu → `zhipu(GLM)`). 🚫 alias never replaces code.
                 let provider_disp = crate::provider_registry::display_label(&b.provider_code);
                 let protocol = resolve_binding_protocol(b);
+                let group_col = match group_of(&b.key_source_ref, &b.provider_code) {
+                    // The group is its own trailing axis, tagged so it can never be
+                    // misread as a provider or a client route.
+                    Some(g) => format!(" {}", format!("group:{}", g).bright_black()),
+                    None => String::new(),
+                };
                 rows.push(format!(
-                    "  {:<pw$} {:<vw$} {} {}",
+                    "  {:<rw$} {:<pw$} {:<vw$} {} {}{}",
+                    b.client_route,
                     protocol,
                     provider_disp,
                     arrow_col,
                     format!("[{}]", b.key_source_type).bright_black(),
+                    group_col,
+                    rw = route_w,
                     pw = proto_w,
                     vw = prov_w
                 ));
                 let _ = api_key_var;
             }
         }
+        // The chain's ORDER, once per (key, group) — the fourth axis is only useful
+        // if it says what the group actually contains. Printed under the table
+        // rather than inside a cell: a four-hop chain in a column would push every
+        // other axis off the line, and the widths above are computed precisely so
+        // that does not happen.
+        let mut printed: Vec<(String, String)> = Vec::new();
+        for b in &bindings {
+            if provider_env_vars(&b.client_route).is_none() {
+                continue;
+            }
+            let Some(group) = group_of(&b.key_source_ref, &b.provider_code) else {
+                continue;
+            };
+            let Some(row) = chain_index.iter().find(|r| {
+                (r.virtual_key_id == b.key_source_ref || r.key_alias == b.key_source_ref)
+                    && r.route_group_name == group
+            }) else {
+                continue;
+            };
+            let ident = (row.key_alias.clone(), group.clone());
+            if printed.contains(&ident) {
+                continue;
+            }
+            printed.push(ident);
+            let mut hops: Vec<&crate::route_group_select::ChainRow> = chain_index
+                .iter()
+                .filter(|r| {
+                    r.virtual_key_id == row.virtual_key_id
+                        && r.protocol_type == row.protocol_type
+                })
+                .collect();
+            // By priority, never by the order the vault returned rows in.
+            hops.sort_by_key(|r| r.priority);
+            // One source for the sequence AND its labels (I19) — see chain_line.
+            let owned: Vec<crate::route_group_select::ChainRow> =
+                hops.into_iter().cloned().collect();
+            let chain = crate::route_group_select::chain_line(&owned);
+            rows.push(format!(
+                "  {} {}  {}",
+                "group:".bright_black(),
+                format!("{} ({})", group, row.key_alias),
+                chain.bright_black()
+            ));
+        }
+
         rows.push(String::new());
         rows.push(status);
 
@@ -9441,4 +9533,27 @@ pub fn pin_chain_member(
         entry.alias
     );
     Ok(())
+}
+
+/// The vault rows `--group` selection reasons over (task 4.38).
+///
+/// 🔴 READ-ONLY, from the local vault. 🚫 It must not call the control plane:
+/// `aikey use` is a data-plane action, and putting a control-plane round trip on it
+/// would make key selection fail whenever the server is unreachable — for a
+/// question the machine can already answer from what was delivered to it.
+pub fn chain_rows_for_selection(
+) -> Result<Vec<crate::route_group_select::ChainRow>, Box<dyn std::error::Error>> {
+    Ok(storage::list_virtual_key_cache()?
+        .into_iter()
+        .map(|e| crate::route_group_select::ChainRow {
+            virtual_key_id: e.virtual_key_id,
+            // What the user would actually type: the local rename wins over the
+            // server alias, because that is the name on their screen.
+            key_alias: e.local_alias.clone().unwrap_or(e.alias),
+            protocol_type: e.protocol_type,
+            route_group_name: e.route_group_name,
+            provider_code: e.provider_code,
+            priority: e.priority,
+        })
+        .collect())
 }
