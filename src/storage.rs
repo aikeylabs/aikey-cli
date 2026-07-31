@@ -2757,6 +2757,86 @@ mod tests {
         assert!(bl.contains("\"used\":1.5"), "baseline carries used: {}", bl);
     }
 
+    // 🔴 A cluster snapshot must write EVERY hop of a chain, not just the first
+    // (found on staging, 2026-07-31).
+    //
+    // apply_cluster_snapshot took `slots[0].targets[0]` and called it "the primary
+    // binding". That was right while a (key, protocol) had one upstream, and
+    // silently wrong once P0a made it a chain: hops 2..n were dropped on the
+    // floor while the control plane, the console and the delivery payload all
+    // showed them.
+    //
+    // 🔴 What the operator sees when this regresses is the reason it is asserted
+    // here rather than left to an integration test: the runtime answers
+    // UPSTREAM_FALLBACK_UNCONFIGURED — "this key has only one upstream configured
+    // for this protocol … ask your administrator to add a fallback upstream" —
+    // to an administrator who already added it. Every surface they would check to
+    // verify their work is correct. Only the node vault disagrees, and nothing
+    // points there.
+    #[test]
+    fn apply_cluster_snapshot_writes_every_hop_of_the_chain() {
+        let (_dir, _db, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache();
+        let key = derive_current("test_password");
+        // Two hops, one protocol, one route group — exactly what a P0a template
+        // produces and what the org-delivery wire carries.
+        let json = r#"{
+            "org_id":"o","virtual_keys":[
+                {"virtual_key_id":"vk-chain","owner_account_id":"a","seat_id":"seat-1",
+                 "key_status":"active","virtual_key_revision":"r",
+                 "slots":[{"protocol_type":"anthropic",
+                           "route_group_id":"rg-1","group_name":"main-chain",
+                           "targets":[
+                    {"provider_code":"zhipu","base_url":"http://primary","real_key":"sk-p",
+                     "credential_id":"c-p","credential_revision":"1","priority":1,
+                     "fallback_role":"primary"},
+                    {"provider_code":"anthropic","base_url":"http://fallback","real_key":"sk-f",
+                     "credential_id":"c-f","credential_revision":"1","priority":2,
+                     "fallback_role":"fallback"}]}]}
+            ]}"#;
+        let payload: crate::commands_internal::vault_op::ClusterSnapshotPayload =
+            serde_json::from_str(json).expect("parse");
+        let r = crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &payload);
+        assert_eq!(r.applied, 1, "the key was delivered, so it counts as applied");
+
+        let conn = crate::storage::open_connection().expect("conn");
+        let hops: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_virtual_keys_cache WHERE virtual_key_id = 'vk-chain'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count hops");
+        assert_eq!(
+            hops, 2,
+            "both hops must reach the node vault — a chain missing its fallback makes the \
+             runtime tell the administrator they never configured one"
+        );
+
+        // The fallback specifically: the hop that vanished.
+        let (base, role): (String, String) = conn
+            .query_row(
+                "SELECT base_url, fallback_role FROM managed_virtual_keys_cache \
+                 WHERE virtual_key_id = 'vk-chain' AND provider_code = 'anthropic'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the fallback hop must exist in the cache");
+        assert_eq!(base, "http://fallback");
+        assert_eq!(role, "fallback");
+
+        // Order is the chain: priority is what the candidate loop sorts on.
+        let first: String = conn
+            .query_row(
+                "SELECT provider_code FROM managed_virtual_keys_cache \
+                 WHERE virtual_key_id = 'vk-chain' ORDER BY priority ASC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("ordered read");
+        assert_eq!(first, "zhipu", "priority 1 is the primary");
+    }
+
     // 2026-06-12 通道结构统一 (设计: update/20260612-集群worker组级配额下发):
     // a cluster snapshot carrying the FULL `quota_snapshot` (preferred path)
     // persists subjects VERBATIM — including GROUP subjects with members —

@@ -831,18 +831,29 @@ pub(crate) fn apply_cluster_snapshot(
             }
             continue;
         }
-        // Primary binding = first target of the first slot.
-        let (slot, target) = match vk
-            .slots
-            .first()
-            .and_then(|s| s.targets.first().map(|t| (s, t)))
-        {
-            Some(pair) => pair,
-            None => {
-                skipped += 1;
-                continue;
-            }
-        };
+        // 🔴 EVERY hop of the chain has to land in the vault, not just the first.
+        //
+        // This used to take `slots[0].targets[0]` and call it "the primary
+        // binding" — correct while a (key, protocol) had exactly one upstream,
+        // and silently wrong the moment P0a made it a chain. The org-delivery
+        // wire carries all the hops (task 1.3) and the cache is keyed by
+        // (virtual_key_id, protocol_type, provider_code), so nothing below this
+        // line was ever the limitation: the writer simply dropped hops 2..n on
+        // the floor.
+        //
+        // How it presents, which is why it took a cluster to find: the control
+        // plane is right, the console shows the chain, the delivery payload
+        // contains both hops — and the runtime answers
+        // UPSTREAM_FALLBACK_UNCONFIGURED, "this key has only one upstream
+        // configured … ask your administrator to add a fallback upstream". The
+        // administrator has already added it. The error blames the one person
+        // who did their part, and every place they would look to check is
+        // correct. 🚫 That is why this must never degrade to writing fewer hops
+        // than were delivered.
+        if !vk.slots.iter().any(|s| !s.targets.is_empty()) {
+            skipped += 1;
+            continue;
+        }
 
         // supported_providers + provider_base_urls across all slot targets
         // (order-preserving dedup), mirroring the account sync's derivation.
@@ -861,45 +872,68 @@ pub(crate) fn apply_cluster_snapshot(
             }
         }
 
-        let dk = crate::commands_account::DeliveredKey {
-            virtual_key_id: vk.virtual_key_id.clone(),
-            org_id: payload.org_id.clone(),
-            seat_id: vk.seat_id.clone(),
-            alias: vk.alias.clone(),
-            provider_code: target.provider_code.clone(),
-            // Task 1.3 — Cluster reads the chain from the org-delivery wire.
-            priority: target.priority,
-            fallback_role: target.fallback_role.clone(),
-            route_group_id: slot.route_group_id.clone(),
-            route_group_name: slot.group_name.clone(),
-            protocol_type: slot.protocol_type.clone(),
-            base_url: target.base_url.clone(),
-            credential_id: target.credential_id.clone(),
-            credential_revision: target.credential_revision.clone(),
-            virtual_key_revision: vk.virtual_key_revision.clone(),
-            key_status: vk.key_status.clone(),
-            // Org-delivered keys are inherently claimed (they belong to a seat).
-            share_status: "claimed".to_string(),
-            // synced_inactive: valid + synced, not a local "active" selection
-            // (cluster has no `aikey use`). The cluster proxy serves managed keys
-            // by VK token, not by local_state (Phase 4).
-            local_state: "synced_inactive".to_string(),
-            expires_at: vk.expires_at,
-            local_alias: None,
-            supported_providers,
-            provider_base_urls,
-            owner_account_id: Some(vk.owner_account_id.clone()),
-        };
+        // One cache row per hop. 🔴 A partial write is reported as a failure for
+        // the whole key rather than counted as applied: a chain missing its
+        // fallback is the exact silent degradation this loop exists to prevent,
+        // and "applied" is what the operator reads to decide the sync is healthy.
+        let mut wrote = 0usize;
+        let mut hop_err: Option<String> = None;
+        for slot in &vk.slots {
+            for target in &slot.targets {
+                let dk = crate::commands_account::DeliveredKey {
+                    virtual_key_id: vk.virtual_key_id.clone(),
+                    org_id: payload.org_id.clone(),
+                    seat_id: vk.seat_id.clone(),
+                    alias: vk.alias.clone(),
+                    provider_code: target.provider_code.clone(),
+                    // Task 1.3 — Cluster reads the chain from the org-delivery wire.
+                    priority: target.priority,
+                    fallback_role: target.fallback_role.clone(),
+                    route_group_id: slot.route_group_id.clone(),
+                    route_group_name: slot.group_name.clone(),
+                    protocol_type: slot.protocol_type.clone(),
+                    base_url: target.base_url.clone(),
+                    credential_id: target.credential_id.clone(),
+                    credential_revision: target.credential_revision.clone(),
+                    virtual_key_revision: vk.virtual_key_revision.clone(),
+                    key_status: vk.key_status.clone(),
+                    // Org-delivered keys are inherently claimed (they belong to a seat).
+                    share_status: "claimed".to_string(),
+                    // synced_inactive: valid + synced, not a local "active" selection
+                    // (cluster has no `aikey use`). The cluster proxy serves managed keys
+                    // by VK token, not by local_state (Phase 4).
+                    local_state: "synced_inactive".to_string(),
+                    expires_at: vk.expires_at,
+                    local_alias: None,
+                    supported_providers: supported_providers.clone(),
+                    provider_base_urls: provider_base_urls.clone(),
+                    owner_account_id: Some(vk.owner_account_id.clone()),
+                };
+                match crate::commands_account::upsert_delivered_key(key, &dk, &target.real_key) {
+                    Ok(_) => wrote += 1,
+                    Err(e) => {
+                        if hop_err.is_none() {
+                            hop_err = Some(format!(
+                                "{} hop {}/{}: {}",
+                                slot.protocol_type, target.provider_code, target.priority, e
+                            ));
+                        }
+                    }
+                }
+            }
+        }
 
-        match crate::commands_account::upsert_delivered_key(key, &dk, &target.real_key) {
-            Ok(_) => {
+        match hop_err {
+            None if wrote > 0 => {
                 applied += 1;
                 seen.insert(vk.virtual_key_id.clone());
             }
-            Err(e) => {
+            e => {
                 eprintln!(
-                    "[_internal cluster_apply WARN] vk {}: {}",
-                    vk.virtual_key_id, e
+                    "[_internal cluster_apply WARN] vk {}: wrote {} hop(s){}",
+                    vk.virtual_key_id,
+                    wrote,
+                    e.map(|m| format!("; {}", m)).unwrap_or_default()
                 );
                 skipped += 1;
             }
