@@ -94,6 +94,13 @@ fn reachable_team_vk(vk: &str) {
         local_alias: None,
         supported_providers: vec![],
         provider_base_urls: std::collections::HashMap::new(),
+        // P0a task 1.2b: the chain columns. A legacy fixture is priority 1 /
+        // primary / no group — the pre-upgrade single-shot shape, which is what
+        // these tests are asserting about.
+        priority: 1,
+        fallback_role: "primary".to_string(),
+        route_group_id: String::new(),
+        route_group_name: String::new(),
         owner_account_id: Some("acct-1".into()),
         owner_email: Some("acct-1@test".into()),
         group_runtime: None,

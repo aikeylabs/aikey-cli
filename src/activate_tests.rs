@@ -31,6 +31,122 @@ fn activate_rejects_stale_or_disabled_team_key() {
     }
 }
 
+// ── The half `local_state` cannot answer ───────────────────────────────────
+//
+// 🔴 The two tests above check LIFECYCLE STATE, which is only half the rule.
+// `synced_inactive` covers two situations that no state value separates:
+//
+//   (a) metadata synced, material NOT delivered → the token 401s at the proxy
+//       (2026-04-16 Bug 4);
+//   (b) material present, simply not the selected primary → a legitimate pin,
+//       and what the picker offers.
+//
+// Gating on state alone is necessarily wrong for one of them. These fences pin
+// the other half — material reachability — which is the shared predicate
+// `aikey use`, the web set-route bridge and `activate` are all documented to
+// agree on.
+
+fn team_entry(local_state: &str, ciphertext: Option<Vec<u8>>) -> storage::VirtualKeyCacheEntry {
+    storage::VirtualKeyCacheEntry {
+        priority: 1,
+        fallback_role: "primary".to_string(),
+        route_group_id: String::new(),
+        route_group_name: String::new(),
+        virtual_key_id: "vk-activate-test".into(),
+        org_id: "org".into(),
+        seat_id: "seat".into(),
+        alias: "team-key".into(),
+        provider_code: "anthropic".into(),
+        protocol_type: "anthropic".into(),
+        base_url: String::new(),
+        credential_id: "c".into(),
+        credential_revision: String::new(),
+        virtual_key_revision: String::new(),
+        key_status: "active".into(),
+        share_status: "claimed".into(),
+        local_state: local_state.into(),
+        expires_at: None,
+        provider_key_nonce: None,
+        provider_key_ciphertext: ciphertext,
+        synced_at: 0,
+        local_alias: None,
+        supported_providers: vec![],
+        provider_base_urls: std::collections::HashMap::new(),
+        owner_account_id: None,
+        owner_email: None,
+        group_runtime: None,
+        group_alias: None,
+        extra: None,
+        oauth_group_id: None,
+        group_accounts: None,
+        routing_config: None,
+    }
+}
+
+#[test]
+fn activate_rejects_a_synced_inactive_key_whose_material_never_arrived() {
+    // 2026-04-16 Bug 4, stated as the condition that actually causes it. The row
+    // is state-eligible; what makes it unusable is that nothing was delivered.
+    let reason = team_key_activatable(&team_entry("synced_inactive", None))
+        .expect("a key with no delivered material must not be activatable");
+    assert!(
+        reason.contains("aikey key sync"),
+        "the error must point at the one command that fixes it, got: {reason}"
+    );
+    assert!(
+        reason.contains("delivered"),
+        "the error must say WHICH problem it is — 'not available' alone sends \
+         someone to re-check permissions or the server, when the key simply is \
+         not here yet. Got: {reason}"
+    );
+}
+
+#[test]
+fn activate_accepts_a_synced_inactive_key_that_has_material() {
+    // The 2026-07-23 case, and the reason a state-only rejection was wrong: the
+    // picker and drawer offer this key, and it works.
+    assert!(
+        team_key_activatable(&team_entry("synced_inactive", Some(vec![1, 2, 3]))).is_none(),
+        "a delivered key that simply is not the selected primary is a legitimate \
+         explicit pin — rejecting it makes an advertised action fail"
+    );
+    assert!(team_key_activatable(&team_entry("active", Some(vec![1, 2, 3]))).is_none());
+    assert!(team_key_activatable(&team_entry("prompt_dismissed", Some(vec![1, 2, 3]))).is_none());
+}
+
+#[test]
+fn activate_still_rejects_disabled_states_even_when_material_is_present() {
+    // Material presence must not become a way around the lifecycle gate: a key
+    // the server revoked is not activatable no matter what is cached locally.
+    for state in [
+        "stale",
+        "disabled_by_account_scope",
+        "disabled_by_account_status",
+        "disabled_by_seat_status",
+        "disabled_by_key_status",
+    ] {
+        assert!(
+            team_key_activatable(&team_entry(state, Some(vec![1, 2, 3]))).is_some(),
+            "state {state} must stay rejected even with local ciphertext"
+        );
+    }
+}
+
+#[test]
+fn activate_accepts_a_group_vk_that_carries_no_local_material_by_design() {
+    // 🔴 The case a naive "must have local ciphertext" check would have broken.
+    // A group VK holds no local material ON PURPOSE — the proxy pulls the
+    // per-account credential at request time — so it must stay activatable.
+    let mut vk = team_entry("synced_inactive", None);
+    vk.oauth_group_id = Some("grp-1".into());
+    assert!(
+        team_key_activatable(&vk).is_none(),
+        "a group VK routes without local ciphertext by design; rejecting it would \
+         re-introduce the same false negative that made `use` and web set-route \
+         refuse working keys"
+    );
+}
+
 // ── shell_escape ────────────────────────────────────────────────────────
 
 #[test]

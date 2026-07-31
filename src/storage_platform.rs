@@ -614,6 +614,22 @@ pub struct VirtualKeyCacheEntry {
     /// Per-provider upstream base URLs (JSON object). Keys: provider code, Values: base URL.
     /// Populated from delivery payload slots; empty map until first key accept/sync.
     pub provider_base_urls: std::collections::HashMap<String, String>,
+    /// Primary/fallback try order for THIS binding within its
+    /// (virtual_key, protocol) chain — 1 = primary (P0a upstream fallback,
+    /// task 1.3).
+    ///
+    /// 🔴 The control plane has carried this since the baseline schema and
+    /// delivery has always shipped it; the vault used to DROP it, which is why
+    /// the proxy could not honour the order an administrator configured.
+    pub priority: i64,
+    /// "primary" | "fallback". Derived from order upstream (I19) and carried
+    /// here for display; ordering decisions must use `priority`.
+    pub fallback_role: String,
+    /// Route-group template provenance (task 1.2b). Empty = legacy row, which
+    /// keeps the pre-upgrade single-shot behavior.
+    pub route_group_id: String,
+    /// Template name for display. Empty when there is no group.
+    pub route_group_name: String,
     /// The `account_id` that last synced/accepted this key. `None` for pre-v0.8 rows.
     /// Used to scope-disable keys when the user switches to a different account.
     pub owner_account_id: Option<String>,
@@ -768,7 +784,8 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              cache_schema_version, synced_at,
              local_alias, supported_providers,
              provider_base_urls, owner_account_id,
-             oauth_group_id, group_accounts, routing_config, owner_email, group_alias
+             oauth_group_id, group_accounts, routing_config, owner_email, group_alias,
+             priority, fallback_role, route_group_id, route_group_name
          ) VALUES (
              ?1,  ?2,  ?3,  ?4,
              ?5,  ?6,  ?7,
@@ -779,7 +796,8 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              1,   strftime('%s', 'now'),
              ?17, ?18,
              ?19, ?20,
-             ?21, ?22, ?23, ?24, ?25
+             ?21, ?22, ?23, ?24, ?25,
+             ?26, ?27, ?28, ?29
          )
          ON CONFLICT(virtual_key_id, protocol_type, provider_code) DO UPDATE SET
              org_id                  = excluded.org_id,
@@ -804,7 +822,16 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              group_accounts          = excluded.group_accounts,
              routing_config          = excluded.routing_config,
              owner_email             = excluded.owner_email,
-             group_alias             = excluded.group_alias
+             group_alias             = excluded.group_alias,
+             priority                = excluded.priority,
+             fallback_role           = excluded.fallback_role,
+             route_group_id          = excluded.route_group_id,
+             route_group_name        = excluded.route_group_name
+             /* priority / fallback_role / route_group_*: server-synced (task 1.3).
+                The control plane is authoritative for chain order (I8), so a
+                re-sync must overwrite — that is how an administrator's re-ordering
+                actually reaches the machine. Contrast `extra` and `group_runtime`
+                below, which are owned by other writers and therefore omitted. */
              /* group_alias: server-synced (parallel to oauth_group_id/routing_config)
                 — the OAuth group name so /user/vault + aikey use can label which
                 group a VK routes into (multi-group disambiguation). */
@@ -844,6 +871,10 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
             entry.routing_config,
             owner_email,
             entry.group_alias,
+            entry.priority,
+            entry.fallback_role,
+            entry.route_group_id,
+            entry.route_group_name,
         ],
     )
     .map_err(|e| format!("Failed to upsert virtual key cache: {}", e))?;
@@ -928,6 +959,20 @@ pub fn list_virtual_key_cache_bindings_readonly(
 // crate) for a single grep-able source per tier.
 //
 // Newest: real extra + real oauth_group columns.
+// Newest: the primary/fallback chain columns (P0a upstream fallback, task 1.3).
+// Tried FIRST; a vault that predates them falls through to GROUP below, where
+// literals stand in — 1 / 'primary' / '' / '' is exactly the pre-upgrade
+// behavior (all primary, no fallback, no group), so an un-migrated vault reads
+// as it always did instead of erroring.
+const VK_CACHE_COLUMNS_CHAIN: &str = "virtual_key_id, org_id, seat_id, alias, \
+     provider_code, protocol_type, base_url, \
+     credential_id, credential_revision, virtual_key_revision, \
+     key_status, share_status, local_state, \
+     expires_at, \
+     provider_key_nonce, provider_key_ciphertext, \
+     synced_at, local_alias, supported_providers, \
+     provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config, owner_email, group_runtime, group_alias, \
+     priority, fallback_role, route_group_id, route_group_name";
 const VK_CACHE_COLUMNS_GROUP: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
      credential_id, credential_revision, virtual_key_revision, \
@@ -935,7 +980,8 @@ const VK_CACHE_COLUMNS_GROUP: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config, owner_email, group_runtime, group_alias";
+     provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config, owner_email, group_runtime, group_alias, \
+     1, 'primary', '', ''";
 // Middle: real extra, no oauth_group columns yet (project NULL at 22/23).
 const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
@@ -944,7 +990,8 @@ const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, extra, NULL, NULL, NULL, NULL, NULL, NULL";
+     provider_base_urls, owner_account_id, extra, NULL, NULL, NULL, NULL, NULL, NULL, \
+     1, 'primary', '', ''";
 // Oldest: no extra, no oauth_group columns.
 const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
@@ -953,7 +1000,8 @@ const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      expires_at, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
-     provider_base_urls, owner_account_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL";
+     provider_base_urls, owner_account_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+     1, 'primary', '', ''";
 
 /// Single mapping from a SELECT row (in the column order declared by
 /// `VK_CACHE_COLUMNS_*` above) to a struct. Centralised here so adding
@@ -1001,13 +1049,23 @@ fn row_to_virtual_key_cache(row: &rusqlite::Row) -> rusqlite::Result<VirtualKeyC
         group_runtime: row.get::<_, Option<String>>(26).unwrap_or(None),
         // 27: group_alias (server-synced OAuth group name — NULL in FULL/LEGACY → None).
         group_alias: row.get::<_, Option<String>>(27).unwrap_or(None),
+        // 28-31: the primary/fallback chain (task 1.3). Older tiers project
+        // 1 / 'primary' / '' / '', which reproduces pre-upgrade behavior rather
+        // than inventing an order.
+        priority: row.get::<_, i64>(28).unwrap_or(1),
+        fallback_role: row
+            .get::<_, String>(29)
+            .unwrap_or_else(|_| "primary".to_string()),
+        route_group_id: row.get::<_, String>(30).unwrap_or_default(),
+        route_group_name: row.get::<_, String>(31).unwrap_or_default(),
     })
 }
 
 fn query_virtual_key_cache(conn: &Connection) -> Result<Vec<VirtualKeyCacheEntry>, String> {
     let order = " FROM managed_virtual_keys_cache ORDER BY COALESCE(local_alias, alias)";
     let mut stmt = conn
-        .prepare(&format!("SELECT {}{}", VK_CACHE_COLUMNS_GROUP, order))
+        .prepare(&format!("SELECT {}{}", VK_CACHE_COLUMNS_CHAIN, order))
+        .or_else(|_| conn.prepare(&format!("SELECT {}{}", VK_CACHE_COLUMNS_GROUP, order)))
         .or_else(|_| conn.prepare(&format!("SELECT {}{}", VK_CACHE_COLUMNS_FULL, order)))
         .or_else(|_| conn.prepare(&format!("SELECT {}{}", VK_CACHE_COLUMNS_LEGACY, order)))
         .map_err(|e| format!("Failed to prepare list query: {}", e))?;
@@ -1040,10 +1098,18 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
     };
     let result = conn
         .query_row(
-            &sel(VK_CACHE_COLUMNS_GROUP),
+            &sel(VK_CACHE_COLUMNS_CHAIN),
             params![virtual_key_id],
             row_to_virtual_key_cache,
         )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &sel(VK_CACHE_COLUMNS_GROUP),
+                params![virtual_key_id],
+                row_to_virtual_key_cache,
+            ),
+        })
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Err(e),
             _ => conn.query_row(
@@ -1090,7 +1156,11 @@ pub fn get_virtual_key_cache_binding(
     };
     let p = params![virtual_key_id, protocol_type, provider_code];
     let result = conn
-        .query_row(&sel(VK_CACHE_COLUMNS_GROUP), p, row_to_virtual_key_cache)
+        .query_row(&sel(VK_CACHE_COLUMNS_CHAIN), p, row_to_virtual_key_cache)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(&sel(VK_CACHE_COLUMNS_GROUP), p, row_to_virtual_key_cache),
+        })
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Err(e),
             _ => conn.query_row(&sel(VK_CACHE_COLUMNS_FULL), p, row_to_virtual_key_cache),
@@ -1130,11 +1200,22 @@ pub fn get_virtual_key_cache_by_alias(alias: &str) -> Result<Option<VirtualKeyCa
         .query_row(
             &format!(
                 "SELECT {} FROM managed_virtual_keys_cache {}",
-                VK_CACHE_COLUMNS_GROUP, where_clause
+                VK_CACHE_COLUMNS_CHAIN, where_clause
             ),
             params![alias],
             row_to_virtual_key_cache,
         )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &format!(
+                    "SELECT {} FROM managed_virtual_keys_cache {}",
+                    VK_CACHE_COLUMNS_GROUP, where_clause
+                ),
+                params![alias],
+                row_to_virtual_key_cache,
+            ),
+        })
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Err(e),
             _ => conn.query_row(
@@ -2116,6 +2197,79 @@ pub fn update_provider_account_status(id: &str, status: &str) -> Result<(), Stri
 }
 
 #[cfg(test)]
+mod chain_sync_fence_tests {
+    /// Task 1.3 — the sync statement must actually CARRY the chain columns.
+    ///
+    /// 🔴 Why this is a source fence rather than a behavioral test, stated plainly:
+    /// `upsert_virtual_key_cache` opens its own vault connection, so it cannot be
+    /// driven from a unit test without a real vault on disk. What CAN be checked
+    /// cheaply is the thing that actually broke historically — and the failure mode
+    /// is textual: delivery has always shipped priority/fallback_role on
+    /// binding_targets, and the vault's INSERT simply did not LIST them, so they
+    /// were discarded at the final step. A column-existence test does not catch
+    /// that; neither does a round-trip test written with raw SQL (I wrote one, and
+    /// injecting the regression left it green — which is how this fence got here).
+    ///
+    /// What it proves: the upsert names all four columns, binds them, and refreshes
+    /// them on conflict.
+    /// What it does NOT prove: that the values reaching it are correct. That is
+    /// covered upstream by the DeliveredKey population sites.
+    ///
+    /// 能红: drop any of the four from the INSERT list, the placeholder list, the
+    /// DO UPDATE SET, or the params! block.
+    #[test]
+    fn task_1_3_upsert_statement_carries_the_chain_columns() {
+        let src = include_str!("storage_platform.rs");
+        let start = src
+            .find("INSERT INTO managed_virtual_keys_cache (")
+            .expect("delivery upsert not found — did it move?");
+        let end = src[start..]
+            .find("cache_schema_version: omitted because")
+            .map(|o| start + o)
+            .expect("upsert end marker not found");
+        let stmt = &src[start..end];
+
+        // Slice the INSERT column list specifically. A plain `contains` over the
+        // whole statement is not enough: the columns also appear in the
+        // DO UPDATE SET, so dropping them from the column list alone would still
+        // match. (It did — this is the second tightening of this fence.)
+        let cols_end = stmt
+            .find(") VALUES (")
+            .expect("INSERT column list terminator not found");
+        let insert_cols = &stmt[..cols_end];
+
+        for col in ["priority", "fallback_role", "route_group_id", "route_group_name"] {
+            // Named in the INSERT column list.
+            assert!(
+                insert_cols.contains(col),
+                "the delivery upsert never mentions `{}`. The control plane ships it and the \
+                 struct carries it, but the statement drops it — the exact shape of the bug this \
+                 change exists to fix.",
+                col
+            );
+            // Refreshed on conflict: a re-sync is how an administrator's re-ordering
+            // reaches the machine, so a missing DO UPDATE SET clause means the first
+            // sync wins forever and later changes silently never arrive.
+            let assign = format!("{} ", col);
+            assert!(
+                stmt.contains(&format!("excluded.{}", col)) || stmt.contains(&assign),
+                "`{}` is inserted but not refreshed on conflict. The control plane is \
+                 authoritative for chain order (I8), so a re-sync must overwrite it — otherwise \
+                 the first sync wins forever and a re-order never takes effect.",
+                col
+            );
+            // Bound from the entry, not hard-coded.
+            assert!(
+                src[start..].contains(&format!("entry.{}", col)),
+                "`{}` is named in the statement but never bound from the entry — it would be \
+                 written as a literal or left at its default.",
+                col
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod key_material_reachable_tests {
     use super::*;
 
@@ -2123,6 +2277,10 @@ mod key_material_reachable_tests {
     /// (ciphertext + share_status) varied; everything else is a benign default.
     fn entry(ciphertext: Option<Vec<u8>>, share_status: &str) -> VirtualKeyCacheEntry {
         VirtualKeyCacheEntry {
+            priority: 1,
+            fallback_role: "primary".to_string(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
             virtual_key_id: "vk-1".into(),
             org_id: "org".into(),
             seat_id: "seat".into(),
@@ -2180,4 +2338,35 @@ mod key_material_reachable_tests {
         assert!(entry(Some(vec![1, 2, 3]), "claimed").key_material_reachable(false));
         assert!(entry(Some(vec![1, 2, 3]), "claimed").key_material_reachable(true));
     }
+}
+
+/// Stamps the route-group pin columns on an EXISTING client-route binding
+/// (P0a upstream fallback, task 2.27c).
+///
+/// Pin scope is DERIVED from the pair `(route_group_id, binding_provider_code)` —
+/// see `internal/proxy/pin_scope.go` for the table — so this writes both together
+/// and never invents a third field to disagree with them.
+///
+/// 🔴 It UPDATEs and never inserts. The row is created by the normal
+/// `aikey use` write path; producing one here would let a pin exist for a client
+/// route that has no binding, which is a state nothing downstream can serve.
+/// Returns false when there was no row to stamp.
+pub fn pin_client_route_to_group_member(
+    profile_id: &str,
+    client_route: &str,
+    route_group_id: &str,
+    upstream_provider_code: &str,
+) -> Result<bool, String> {
+    let conn = open_connection()?;
+    let changed = conn
+        .execute(
+            "UPDATE user_profile_provider_bindings
+                SET route_group_id = ?3,
+                    binding_provider_code = ?4,
+                    updated_at = strftime('%s', 'now')
+              WHERE profile_id = ?1 AND provider_code = ?2",
+            params![profile_id, client_route, route_group_id, upstream_provider_code],
+        )
+        .map_err(|e| format!("pin client route to a route-group member: {}", e))?;
+    Ok(changed == 1)
 }

@@ -689,6 +689,166 @@ fn doctor_plugin_bin_path(
     }
 }
 
+/// One rendered `fallback policy` doctor check (task 1b.10 of openspec change
+/// `aliyun-aigw-p0-upstream-fallback`).
+pub struct FallbackPolicyReport {
+    pub ok: bool,
+    /// Summary line: source census · rail state · freshness. Written to be
+    /// paste-able into a ticket on its own.
+    pub detail: String,
+    pub hint: Option<String>,
+    /// `(label, "<value> ms  (<source>)")`, overall-limit first.
+    pub rows: Vec<(String, String)>,
+}
+
+/// Builds the `fallback policy` doctor row from the proxy's `/status` body.
+///
+/// 🔴 WHY THE SOURCE IS THE POINT, NOT THE VALUE. All five thresholds are
+/// org-configurable and all five have a builtin default. An admin who set the idle
+/// gap to 5 minutes and an admin who never touched it produce an *identical*
+/// number on this screen. Without the source column the standard private-deployment
+/// conversation — "I definitely changed it in the console" — has no evidence on
+/// either side and burns an afternoon. With it, the answer is one line.
+///
+/// 🔴 A POLL FAILURE IS NOT AN OUTAGE. When the rail is stale or offline the data
+/// plane deliberately keeps enforcing the last known values (task 1b.4). The hint
+/// says that in the same breath as it reports the problem; otherwise an operator
+/// reads "offline" and starts restarting things that are working correctly.
+///
+/// `now` is passed in rather than read here so the freshness arithmetic is
+/// testable.
+pub fn fallback_policy_report(
+    status: Option<&serde_json::Value>,
+    now: i64,
+) -> FallbackPolicyReport {
+    let fb = status.and_then(|j| j.get("upstream_fallback"));
+    let Some(fb) = fb else {
+        // Honest absence: /status omits the block on a build where the capability
+        // is not wired. Printing defaults instead would invent five numbers that
+        // nothing is enforcing — the precise failure the source column exists to
+        // prevent, committed by the tool meant to detect it.
+        return FallbackPolicyReport {
+            ok: true,
+            detail: "not reported by this proxy build".to_string(),
+            hint: None,
+            rows: Vec::new(),
+        };
+    };
+
+    let synced = fb.get("synced").and_then(|v| v.as_bool()).unwrap_or(false);
+    let version = fb.get("version").and_then(|v| v.as_i64()).unwrap_or(0);
+    let last_success = fb.get("last_success_at").and_then(|v| v.as_i64());
+
+    // 🔴 Rail health is READ from the SyncRail framework's own block, not derived
+    // from a timestamp here. A second definition of "stale" living in the CLI
+    // would disagree with the proxy's the first time either side changed, and the
+    // operator would be left with two answers and no way to tell which one the
+    // data plane actually obeys.
+    let rail = status
+        .and_then(|j| j.get("control_plane_sync"))
+        .and_then(|s| s.get("fallback_policy"));
+    let rail_state = rail
+        .and_then(|r| r.get("state"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("not started");
+    let rail_failures = rail
+        .and_then(|r| r.get("consecutive_failures"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    // Overall limit first: the operator's question is "how long can this make me
+    // wait in total", so answer that before the per-attempt number feeding into it.
+    let fields: [(&str, &str); 5] = [
+        ("chain budget", "chain_total_budget_ms"),
+        ("attempt timeout", "upstream_attempt_timeout_ms"),
+        ("cooldown", "binding_cooldown_ms"),
+        ("idle gap", "idle_gap_ms"),
+        ("max stickiness", "max_stickiness_ms"),
+    ];
+    let thresholds = fb.get("thresholds");
+    let mut by_source: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for (label, key) in fields {
+        let entry = thresholds.and_then(|t| t.get(key));
+        let value = entry.and_then(|e| e.get("value")).and_then(|v| v.as_i64());
+        let source = entry
+            .and_then(|e| e.get("source"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        *by_source.entry(source.to_string()).or_insert(0) += 1;
+        let shown = match value {
+            Some(ms) => format!("{} ms", ms),
+            None => "—".to_string(),
+        };
+        rows.push((label.to_string(), format!("{:<12} ({})", shown, source)));
+    }
+
+    // Chain state (task 3.5): how many upstreams are currently being routed
+    // around, and how many switches have happened. 🔴 Read-only — a diagnostic
+    // command must not change what it is diagnosing, and there is deliberately no
+    // way to clear a cooldown from here at all.
+    let cooling = fb
+        .get("cooling_bindings")
+        .and_then(|v| v.as_object())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let switches = fb
+        .get("switches_total")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    let census = by_source
+        .iter()
+        .map(|(s, n)| format!("{} {}", s, n))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let freshness = match (synced, last_success) {
+        (true, Some(t)) => format!("synced {}s ago (v{})", (now - t).max(0), version),
+        (true, None) => format!("synced (v{})", version),
+        (false, _) => "never synced".to_string(),
+    };
+    let mut detail = format!("{} · rail {} · {}", census, rail_state, freshness);
+    if switches > 0 || cooling > 0 {
+        // Only shown when something actually happened. A permanent
+        // "switches 0 · cooling 0" trains the reader to skip the line, and then
+        // the one time it is not zero they skip it too.
+        detail.push_str(&format!(
+            " · {} switch(es) · {} upstream(s) cooling",
+            switches, cooling
+        ));
+    }
+
+    // 🔴 What counts as a failure. Never-synced *with a rail running* means the
+    // proxy is asking and not being answered — real, and the thresholds in force
+    // are not the ones in the console. Never-synced with NO rail is the Personal
+    // shape (there is no control plane to ask), which is the correct resting state
+    // rather than a fault. That distinction is read from the rail's presence,
+    // 🚫 never from an edition branch.
+    let rail_running = rail.is_some();
+    let ok = match rail_state {
+        "offline" | "stale" => false,
+        _ => synced || !rail_running,
+    };
+    let hint = if ok {
+        None
+    } else {
+        Some(format!(
+            "control plane not answering ({} consecutive failures); the proxy is still enforcing \
+             the last known values above — the data plane is NOT degraded. Check the control URL \
+             and this host's network to it.",
+            rail_failures
+        ))
+    };
+
+    FallbackPolicyReport {
+        ok,
+        detail,
+        hint,
+        rows,
+    }
+}
+
 /// Runs the doctor checks. Returns `true` iff there is ≥1 configured per-account
 /// egress and ALL of them failed connectivity — the caller maps that to a
 /// non-zero exit ("失败要显眼"). All other check failures stay advisory (doctor
@@ -1188,6 +1348,37 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
                     }
                 }
             }
+        }
+    }
+
+    // ── 4b. Upstream-fallback thresholds ────────────────────
+    //
+    // Task 1b.10 of openspec change `aliyun-aigw-p0-upstream-fallback`.
+    //
+    // The rendering lives in `fallback_policy_report` (pure, below) so it can be
+    // tested against the shapes that actually matter — never synced, stale rail,
+    // missing block — none of which are reachable from here without a live proxy
+    // in each of those states.
+    if proxy_up {
+        let url = format!("http://{}/status", proxy_addr);
+        let status_json: Option<serde_json::Value> = ureq::get(&url)
+            .timeout(std::time::Duration::from_secs(3))
+            .call()
+            .ok()
+            .and_then(|r| r.into_json().ok());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let report = fallback_policy_report(status_json.as_ref(), now);
+        emit(
+            "fallback policy",
+            report.ok,
+            &report.detail,
+            report.hint.as_deref(),
+        );
+        for (label, value) in &report.rows {
+            emit(&format!(" {}", label), true, value, None);
         }
     }
 

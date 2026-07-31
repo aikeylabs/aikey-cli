@@ -2527,6 +2527,10 @@ mod tests {
         let plaintext = "sk-real-provider-key-xyz";
 
         let dk = crate::commands_account::DeliveredKey {
+            priority: 1,
+            fallback_role: "primary".to_string(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
             virtual_key_id: "vk-deliver-1".to_string(),
             org_id: "org-9".to_string(),
             seat_id: "seat-9".to_string(),
@@ -2581,6 +2585,10 @@ mod tests {
 
         // Pre-seed a cache VK that the upcoming snapshot will NOT contain.
         let old = crate::commands_account::DeliveredKey {
+            priority: 1,
+            fallback_role: "primary".to_string(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
             virtual_key_id: "vk-old".to_string(),
             org_id: "org-1".to_string(),
             seat_id: "seat-old".to_string(),
@@ -2664,6 +2672,10 @@ mod tests {
 
         // Seed a VK owned by org-2.
         let foreign = crate::commands_account::DeliveredKey {
+            priority: 1,
+            fallback_role: "primary".to_string(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
             virtual_key_id: "vk-org2".to_string(),
             org_id: "org-2".to_string(),
             seat_id: "seat-2".to_string(),

@@ -3162,6 +3162,20 @@ fn apply_snapshot_to_cache(
             .as_ref()
             .map(|e| e.local_state.as_str())
             .unwrap_or("");
+        // Task 1.3 carry-forward tuple: (priority, fallback_role, route_group_id,
+        // route_group_name). Defaults reproduce pre-upgrade behavior when the row
+        // is new — all primary, no fallback, no group.
+        let existing_chain: (i64, String, String, String) = existing
+            .as_ref()
+            .map(|e| {
+                (
+                    e.priority,
+                    e.fallback_role.clone(),
+                    e.route_group_id.clone(),
+                    e.route_group_name.clone(),
+                )
+            })
+            .unwrap_or_else(|| (1, "primary".to_string(), String::new(), String::new()));
 
         let local_state = compute_local_state_from_effective(
             &item.effective_status,
@@ -3175,6 +3189,16 @@ fn apply_snapshot_to_cache(
             seat_id: item.seat_id.clone(),
             alias: item.alias.clone(),
             provider_code: item.provider_code.clone(),
+            // 🔴 Task 1.3 — the SNAPSHOT sync does not carry the chain (only the
+            // key-delivery payload does), so preserve whatever delivery already
+            // wrote. Resetting to defaults here would silently flatten a
+            // configured chain to "all primary" on every snapshot poll — the
+            // failure would look like "failover stopped working" with nothing in
+            // the logs. Same carry-forward posture the oauth_group columns use.
+            priority: existing_chain.0,
+            fallback_role: existing_chain.1.clone(),
+            route_group_id: existing_chain.2.clone(),
+            route_group_name: existing_chain.3.clone(),
             protocol_type: item.protocol_type.clone(),
             base_url: item.base_url.clone(),
             credential_id: item.credential_id.clone(),
@@ -3459,6 +3483,14 @@ pub(crate) struct DeliveredKey {
     pub supported_providers: Vec<String>,
     pub provider_base_urls: std::collections::HashMap<String, String>,
     pub owner_account_id: Option<String>,
+    /// Primary/fallback chain position for THIS binding (task 1.3). Delivery has
+    /// always carried it on binding_targets; the vault used to drop it, which is
+    /// why the proxy could not honour the administrator's configured order.
+    pub priority: i64,
+    pub fallback_role: String,
+    /// Route-group template this chain was generated from. Empty = no group.
+    pub route_group_id: String,
+    pub route_group_name: String,
 }
 
 /// Encrypts `plaintext_provider_key` with the (already-verified) vault key and
@@ -3490,6 +3522,11 @@ pub(crate) fn upsert_delivered_key(
         seat_id: dk.seat_id.clone(),
         alias: dk.alias.clone(),
         provider_code: dk.provider_code.clone(),
+        // Task 1.3 — the delivery payload is authoritative for the chain here.
+        priority: dk.priority,
+        fallback_role: dk.fallback_role.clone(),
+        route_group_id: dk.route_group_id.clone(),
+        route_group_name: dk.route_group_name.clone(),
         protocol_type: dk.protocol_type.clone(),
         base_url: dk.base_url.clone(),
         credential_id: dk.credential_id.clone(),
@@ -3751,12 +3788,20 @@ fn run_full_snapshot_sync_opts(
 
                         // Encrypt + upsert via the shared delivered-key core
                         // (also used by the cluster daemon's `_internal` path).
+                        // Task 1.3: carry the chain through instead of discarding it.
+                        let (rg_id, rg_name) = payload.route_group_for(&protocol_type);
+                        let rg_id = rg_id.to_string();
+                        let rg_name = rg_name.to_string();
                         let dk = DeliveredKey {
                             virtual_key_id: payload.virtual_key_id.clone(),
                             org_id: payload.org_id.clone(),
                             seat_id: payload.seat_id.clone(),
                             alias: payload.alias.clone(),
                             provider_code: binding.provider_code.clone(),
+                            priority: binding.priority as i64,
+                            fallback_role: binding.fallback_role.clone(),
+                            route_group_id: rg_id,
+                            route_group_name: rg_name,
                             protocol_type,
                             base_url: binding.base_url.clone(),
                             credential_id: binding.credential_id.clone(),
@@ -4085,6 +4130,17 @@ pub fn sync_managed_key_metadata() -> bool {
             // If the key was scope-disabled (belonged to a different account) but
             // the server is now returning it for the current account, restore it.
             let existing_state = existing.map(|e| e.local_state.as_str()).unwrap_or("");
+            // Task 1.3 carry-forward, same reasoning as the other snapshot path.
+            let chain_carry: (i64, String, String, String) = existing
+                .map(|e| {
+                    (
+                        e.priority,
+                        e.fallback_role.clone(),
+                        e.route_group_id.clone(),
+                        e.route_group_name.clone(),
+                    )
+                })
+                .unwrap_or_else(|| (1, "primary".to_string(), String::new(), String::new()));
             let local_state = match (item.key_status.as_str(), existing_state) {
                 ("active", "disabled_by_account_scope") => "synced_inactive".to_string(),
                 ("active", state) if !state.starts_with("disabled_by_") => {
@@ -4110,6 +4166,12 @@ pub fn sync_managed_key_metadata() -> bool {
                 seat_id: item.seat_id.clone(),
                 alias: item.alias.clone(),
                 provider_code,
+                // 🔴 Task 1.3 — carry forward, same reasoning as the other
+                // snapshot path: a poll must not flatten a configured chain.
+                priority: chain_carry.0,
+                fallback_role: chain_carry.1.clone(),
+                route_group_id: chain_carry.2.clone(),
+                route_group_name: chain_carry.3.clone(),
                 protocol_type,
                 base_url: existing.map(|e| e.base_url.clone()).unwrap_or_default(),
                 credential_id: existing
@@ -5866,6 +5928,34 @@ pub fn handle_key_use(
         // pushed every following column out of alignment, and it is the protocol
         // most likely to appear. Width is computed from the values actually
         // being printed, so no new protocol can overflow it either.
+        // 🔴 Task 4.39 — the summary went from three axes to FOUR when route groups
+        // became org-level templates: client route / protocol / KEY / route group.
+        //
+        // The KEY axis stops being optional at that point. A group name no longer
+        // identifies one chain, so a summary that shows the group without saying
+        // which key it belongs to describes something the user cannot act on — and
+        // the difference between two keys sharing a template is whose account pays.
+        //
+        // 🚫 The group name never goes in the PROVIDER column. Route group, provider
+        // code and client route are three namespaces (I30); printing one under
+        // another's heading is precisely the collapse `aikey use` has to avoid.
+        //
+        // ✅ Read from the local vault only — `route_group_name` is already delivered
+        // here. 🚫 No control-plane call: the data plane does not enter the control
+        // plane's hot path, and a summary that fails when the server is unreachable
+        // would be worse than no summary.
+        let chain_index = chain_rows_for_selection().unwrap_or_default();
+        let group_of = |key_ref: &str, provider: &str| -> Option<String> {
+            chain_index
+                .iter()
+                .find(|r| {
+                    (r.virtual_key_id == key_ref || r.key_alias == key_ref)
+                        && r.provider_code.eq_ignore_ascii_case(provider)
+                        && !r.route_group_name.is_empty()
+                })
+                .map(|r| r.route_group_name.clone())
+        };
+
         let axis_cells: Vec<(String, String)> = bindings
             .iter()
             .filter(|b| provider_env_vars(&b.client_route).is_some())
@@ -5889,12 +5979,22 @@ pub fn handle_key_use(
             .max()
             .unwrap_or("PROVIDER".len());
 
+        let route_w = bindings
+            .iter()
+            .filter(|b| provider_env_vars(&b.client_route).is_some())
+            .map(|b| b.client_route.chars().count())
+            .chain(std::iter::once("ROUTE".len()))
+            .max()
+            .unwrap_or("ROUTE".len());
+
         let mut rows: Vec<String> = Vec::new();
         rows.push(format!(
-            "  {:<pw$} {:<vw$} {}",
+            "  {:<rw$} {:<pw$} {:<vw$} {}",
+            "ROUTE".dimmed(),
             "PROTOCOL".dimmed(),
             "PROVIDER".dimmed(),
             "KEY".dimmed(),
+            rw = route_w,
             pw = proto_w,
             vw = prov_w
         ));
@@ -5918,18 +6018,72 @@ pub fn handle_key_use(
                 // the vault chip (zhipu → `zhipu(GLM)`). 🚫 alias never replaces code.
                 let provider_disp = crate::provider_registry::display_label(&b.provider_code);
                 let protocol = resolve_binding_protocol(b);
+                let group_col = match group_of(&b.key_source_ref, &b.provider_code) {
+                    // The group is its own trailing axis, tagged so it can never be
+                    // misread as a provider or a client route.
+                    Some(g) => format!(" {}", format!("group:{}", g).bright_black()),
+                    None => String::new(),
+                };
                 rows.push(format!(
-                    "  {:<pw$} {:<vw$} {} {}",
+                    "  {:<rw$} {:<pw$} {:<vw$} {} {}{}",
+                    b.client_route,
                     protocol,
                     provider_disp,
                     arrow_col,
                     format!("[{}]", b.key_source_type).bright_black(),
+                    group_col,
+                    rw = route_w,
                     pw = proto_w,
                     vw = prov_w
                 ));
                 let _ = api_key_var;
             }
         }
+        // The chain's ORDER, once per (key, group) — the fourth axis is only useful
+        // if it says what the group actually contains. Printed under the table
+        // rather than inside a cell: a four-hop chain in a column would push every
+        // other axis off the line, and the widths above are computed precisely so
+        // that does not happen.
+        let mut printed: Vec<(String, String)> = Vec::new();
+        for b in &bindings {
+            if provider_env_vars(&b.client_route).is_none() {
+                continue;
+            }
+            let Some(group) = group_of(&b.key_source_ref, &b.provider_code) else {
+                continue;
+            };
+            let Some(row) = chain_index.iter().find(|r| {
+                (r.virtual_key_id == b.key_source_ref || r.key_alias == b.key_source_ref)
+                    && r.route_group_name == group
+            }) else {
+                continue;
+            };
+            let ident = (row.key_alias.clone(), group.clone());
+            if printed.contains(&ident) {
+                continue;
+            }
+            printed.push(ident);
+            let mut hops: Vec<&crate::route_group_select::ChainRow> = chain_index
+                .iter()
+                .filter(|r| {
+                    r.virtual_key_id == row.virtual_key_id
+                        && r.protocol_type == row.protocol_type
+                })
+                .collect();
+            // By priority, never by the order the vault returned rows in.
+            hops.sort_by_key(|r| r.priority);
+            // One source for the sequence AND its labels (I19) — see chain_line.
+            let owned: Vec<crate::route_group_select::ChainRow> =
+                hops.into_iter().cloned().collect();
+            let chain = crate::route_group_select::chain_line(&owned);
+            rows.push(format!(
+                "  {} {}  {}",
+                "group:".bright_black(),
+                format!("{} ({})", group, row.key_alias),
+                chain.bright_black()
+            ));
+        }
+
         rows.push(String::new());
         rows.push(status);
 
@@ -7109,6 +7263,10 @@ mod core_tests {
         routing_config: Option<&str>,
     ) -> storage::VirtualKeyCacheEntry {
         storage::VirtualKeyCacheEntry {
+            priority: 1,
+            fallback_role: "primary".to_string(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
             virtual_key_id: vk.into(),
             org_id: "org-1".into(),
             seat_id: "seat-1".into(),
@@ -9120,6 +9278,10 @@ mod sync_prune_tests {
 
     fn cache_entry(vk_id: &str, owner: &str) -> storage::VirtualKeyCacheEntry {
         storage::VirtualKeyCacheEntry {
+            priority: 1,
+            fallback_role: "primary".to_string(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
             virtual_key_id: vk_id.to_string(),
             org_id: "org-1".to_string(),
             seat_id: "seat-1".to_string(),
@@ -9253,4 +9415,170 @@ mod gateway_probe_tests {
         let weird = json!({"gateway": "yes"});
         assert!(gateway_base_from_team_url_response(&weird, 8090).is_none());
     }
+}
+
+/// Pins one client route to a SINGLE upstream inside the key's route group
+/// (`aikey use <alias> --only <upstream>`, task 2.27c).
+///
+/// # 🔴 Why this prints a warning and the default does not
+///
+/// Without `--only`, `aikey use` pins the route GROUP: the administrator's
+/// primary/fallback order still applies, and nothing about the user's mental model
+/// changes. With `--only`, automatic failover for that client route is GONE —
+/// when that upstream fails, nothing is tried after it.
+///
+/// Decision D-1③ chose "pin one hop = use only that hop" over "pin one hop = move
+/// it to the front" for a specific reason: the alternative would let a developer's
+/// local command rewrite an order the administrator set in the control plane,
+/// breaking control-plane authority and creating a second source of truth for the
+/// order at the same time.
+///
+/// The price of that choice is that a pin now removes a capability, so it must
+/// never be silent. This is the "say it at the moment it happens" half of the
+/// decision — 🚫 documenting it somewhere else does not count, because the person
+/// who will be confused is the one typing this command today.
+pub fn pin_chain_member(
+    alias_or_id: &str,
+    upstream_provider_code: &str,
+    json_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entry = storage::get_virtual_key_cache(alias_or_id)?
+        .or_else(|| {
+            storage::get_virtual_key_cache_by_alias(alias_or_id)
+                .ok()
+                .flatten()
+        })
+        .ok_or_else(|| format!("'{}' is not a team key on this machine", alias_or_id))?;
+
+    if entry.route_group_id.is_empty() {
+        return Err(format!(
+            "Key '{}' has no route group, so there is nothing to pin within.\n  \
+             --only chooses ONE upstream out of a chain; this key has a single upstream already.",
+            entry.alias
+        )
+        .into());
+    }
+
+    // The chain for this key is every cached row sharing its (virtual_key,
+    // protocol). Validate against it rather than against the provider registry:
+    // pinning to a real provider that is NOT in this chain would write a pin that
+    // can never be satisfied, and the resulting failure would point at routing
+    // rather than at the typo.
+    let chain = storage::list_virtual_key_cache()?
+        .into_iter()
+        .filter(|e| {
+            e.virtual_key_id == entry.virtual_key_id && e.protocol_type == entry.protocol_type
+        })
+        .collect::<Vec<_>>();
+    let matched = chain
+        .iter()
+        .find(|e| e.provider_code.eq_ignore_ascii_case(upstream_provider_code));
+    let Some(matched) = matched else {
+        let available = chain
+            .iter()
+            .map(|e| e.provider_code.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "'{}' is not an upstream in this key's route group.\n  Available: {}",
+            upstream_provider_code, available
+        )
+        .into());
+    };
+
+    // The pin table is keyed by CLIENT ROUTE (`anthropic`, `openai`, …), which is
+    // not the same namespace as the upstream provider code — the reason the three
+    // namespaces have to be kept apart at all (F-16).
+    //
+    // 🔴 The route comes from the chain's PRIMARY hop, NOT from the member being
+    // pinned. A pin row is (client_route, route_group_id, binding_provider_code):
+    // the route says WHICH TRAFFIC this applies to, the provider code says WHICH
+    // HOP to restrict it to. Deriving the route from `matched` collapses those two
+    // into one name and writes the pin under the fallback's own route — which is a
+    // route the user is not sending traffic on, so the pin is stored where nothing
+    // will ever read it.
+    //
+    // That is not hypothetical: it made `--only` unusable for the exact case it
+    // exists for. In the plan's own sample chain (official anthropic → GLM),
+    // `--only zhipu` resolved the route to `zhipu`, found no active binding there,
+    // and told the user to run `aikey use <key>` — which they had just done, and
+    // which pins `anthropic`. An error whose remediation is the thing you already
+    // did is the signature of a wrong lookup, not a user mistake. (Found by the
+    // live e2e in tests/e2e_use_route_group_live.rs; the unit tests missed it
+    // because they never crossed the two namespaces.)
+    let chain_primary = chain
+        .iter()
+        .min_by_key(|e| (e.priority, e.provider_code.clone()))
+        .unwrap_or(matched);
+    let client_route = crate::provider_registry::client_route_for_binding(
+        &chain_primary.provider_code,
+        &entry.protocol_type,
+    )
+    .to_string();
+    let stamped = storage::pin_client_route_to_group_member(
+        crate::profile_activation::DEFAULT_PROFILE,
+        &client_route,
+        &entry.route_group_id,
+        &matched.provider_code,
+    )?;
+    if !stamped {
+        return Err(format!(
+            "No active binding for client route '{}' to pin. Run `aikey use {}` first.",
+            client_route, entry.alias
+        )
+        .into());
+    }
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({
+                "pinned_upstream": matched.provider_code,
+                "route_group": entry.route_group_name,
+                "client_route": client_route,
+                "automatic_failover": false,
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "  Pinned {} to {} (route group: {}).",
+        client_route,
+        matched.provider_code,
+        if entry.route_group_name.is_empty() {
+            "unnamed"
+        } else {
+            &entry.route_group_name
+        }
+    );
+    println!("  Automatic failover is OFF for this route: if {} fails, no backup upstream is tried.",
+        matched.provider_code);
+    println!(
+        "  To restore it, run: aikey use {}   (pins the whole group)",
+        entry.alias
+    );
+    Ok(())
+}
+
+/// The vault rows `--group` selection reasons over (task 4.38).
+///
+/// 🔴 READ-ONLY, from the local vault. 🚫 It must not call the control plane:
+/// `aikey use` is a data-plane action, and putting a control-plane round trip on it
+/// would make key selection fail whenever the server is unreachable — for a
+/// question the machine can already answer from what was delivered to it.
+pub fn chain_rows_for_selection(
+) -> Result<Vec<crate::route_group_select::ChainRow>, Box<dyn std::error::Error>> {
+    Ok(storage::list_virtual_key_cache()?
+        .into_iter()
+        .map(|e| crate::route_group_select::ChainRow {
+            virtual_key_id: e.virtual_key_id,
+            // What the user would actually type: the local rename wins over the
+            // server alias, because that is the name on their screen.
+            key_alias: e.local_alias.clone().unwrap_or(e.alias),
+            protocol_type: e.protocol_type,
+            route_group_name: e.route_group_name,
+            provider_code: e.provider_code,
+            priority: e.priority,
+        })
+        .collect())
 }

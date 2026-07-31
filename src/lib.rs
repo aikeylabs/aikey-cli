@@ -30,6 +30,9 @@ pub mod migrations;
 pub mod observability;
 pub mod platform_client;
 pub mod provider_registry;
+/// Locating a chain by (key, route group). Public so its rules are testable
+/// without a vault — the rules are where the mistakes are, not the SQL.
+pub mod route_group_select;
 pub mod providers;
 pub mod proxy_events;
 pub mod proxy_lifecycle;

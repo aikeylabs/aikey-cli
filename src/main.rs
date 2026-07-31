@@ -21,6 +21,9 @@ mod executor;
 mod json_output;
 #[allow(dead_code)]
 mod provider_registry;
+// Locating a chain by (key, route group) — see the module doc for why the group
+// name alone stopped being enough once route groups became org-level templates.
+mod route_group_select;
 mod ratelimit;
 mod session;
 mod shell_quote;
@@ -3647,6 +3650,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             alias_or_id,
             no_hook,
             provider,
+            only,
+            group,
+            key,
         } => {
             // One-time backfill: generate route_tokens for existing keys that lack them.
             // Why here: `aikey use` is the most common write-path command after upgrade.
@@ -3655,13 +3661,87 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = storage::bump_vault_change_seq();
             }
 
+            // 🔴 Tasks 4.37/4.38 — resolve `--group` (optionally with `--key`) to a
+            // key alias BEFORE anything else runs, so the rest of this command stays
+            // the path it has always been. Once route groups became org-level
+            // templates a group name stopped identifying a single chain: several of
+            // this employee's keys can share one template, and choosing between them
+            // silently would SUCCEED — logging nothing, erroring nothing — while an
+            // entire session's usage landed on another key, i.e. another team's bill.
+            //
+            // 🔴 The two ARGUMENT-SHAPE errors are raised first, before any vault
+            // lookup. Resolving the group first meant `aikey use mykey --group g`
+            // answered "no route group named g" — true, but it sends the user to fix
+            // the group when their actual mistake was giving both coordinates. An
+            // error has to name the thing the user got wrong, not the first thing
+            // that failed downstream of it.
+            if group.is_some() && alias_or_id.is_some() {
+                return Err(format!(
+                    concat!(
+                        "Pass either a key name or --group, not both: you gave '{}' and --group {}.\n",
+                        "  To choose WHICH key inside a shared group, use both flags:\n",
+                        "    aikey use --key {} --group {}"
+                    ),
+                    alias_or_id.as_deref().unwrap_or(""),
+                    group.as_deref().unwrap_or(""),
+                    alias_or_id.as_deref().unwrap_or("<ALIAS>"),
+                    group.as_deref().unwrap_or("<GROUP>"),
+                )
+                .into());
+            }
+            if group.is_none() && key.is_some() {
+                // --key names one coordinate of a (key, group) pair. On its own it is
+                // just the positional argument spelled differently, and accepting it
+                // as such would leave two spellings of one thing.
+                return Err(concat!(
+                    "--key selects WHICH key inside a shared route group, so it needs the group too:\n",
+                    "    aikey use --key <ALIAS> --group <GROUP>\n",
+                    "  To activate a key by name, pass it positionally:\n",
+                    "    aikey use <ALIAS>"
+                )
+                .into());
+            }
+
+            let resolved_alias: Option<String> = match group.as_deref() {
+                Some(g) => {
+                    let rows = commands_account::chain_rows_for_selection()?;
+                    let sel = route_group_select::resolve(&rows, key.as_deref(), g);
+                    match sel {
+                        route_group_select::Selection::Resolved { key_alias, .. } => Some(key_alias),
+                        other => {
+                            // failure_message returns Some for every non-Resolved arm.
+                            return Err(route_group_select::failure_message(&other)
+                                .unwrap_or_else(|| format!("could not resolve route group '{}'", g))
+                                .into());
+                        }
+                    }
+                }
+                None => None,
+            };
+            let alias_or_id = resolved_alias.or_else(|| alias_or_id.clone());
+            let alias_or_id = alias_or_id.as_ref();
+
             match alias_or_id {
                 Some(a) => {
                     // `aikey use <alias>` — provider-level promotion via handle_key_use.
                     commands_proxy::ensure_proxy_for_use(cli.password_stdin);
                     commands_account::handle_key_use(a, *no_hook, provider.as_deref(), cli.json)?;
+                    // 🔴 Task 2.27c: the member pin is written AFTER the normal
+                    // binding write, so the default path is untouched. Pinning one
+                    // upstream removes failover for that client route, and the
+                    // consequence is printed here — at the moment the user asks for
+                    // it — because a pin that silently drops a capability is exactly
+                    // the trap decision D-1③ closed.
+                    if let Some(upstream) = only.as_deref() {
+                        commands_account::pin_chain_member(a, upstream, cli.json)?;
+                    }
                 }
                 None => {
+                    if only.is_some() {
+                        return Err("--only pins one upstream of a specific key, so it needs the key: \
+                                    aikey use <ALIAS> --only <UPSTREAM>"
+                            .into());
+                    }
                     // `aikey use` (no args) — provider-tree interactive editor.
                     if !std::io::stdin().is_terminal() || cli.json {
                         return Err(
@@ -6492,10 +6572,73 @@ fn team_key_available_for_activate(local_state: &str) -> bool {
     // sync with the states offered by the activate picker. Disabled/stale rows
     // remain unavailable, while a valid synced key and a dismissed prompt are
     // both legitimate explicit choices.
+    //
+    // 🔴 STATE ALONE IS NOT ENOUGH — see `team_key_activatable` below. This
+    // predicate answers "is this row's lifecycle state eligible", which is only
+    // half the question; the other half is whether the key MATERIAL is actually
+    // here.
     matches!(
         local_state,
         "active" | "synced_inactive" | "prompt_dismissed"
     )
+}
+
+/// Why a team key cannot be activated, or `None` when it can.
+///
+/// # 🔴 Two rules that both had to be true, and one that was missing
+///
+/// Two earlier changes pulled in opposite directions on `synced_inactive`, and
+/// each was right about a DIFFERENT key:
+///
+///   2026-04-16 (Bug 4)  activate must REJECT it — the token it produced 401'd
+///                       at the proxy.
+///   2026-07-23          activate must ACCEPT it — the picker and the drawer
+///                       offer such keys, so rejecting made an advertised
+///                       action fail.
+///
+/// Both observations are real because `local_state` CONFLATES two situations:
+///
+///   (a) metadata synced, key material NOT YET DELIVERED → a token the proxy
+///       cannot serve. This is Bug 4.
+///   (b) material present and valid, simply not the currently-selected primary
+///       → a perfectly legitimate explicit pin. This is what the picker offers.
+///
+/// No value of `local_state` separates those, so gating on it can only ever be
+/// wrong for one of the two. The real precondition is whether the MATERIAL is
+/// reachable — and this repository already has one predicate for exactly that,
+/// `VirtualKeyCacheEntry::key_material_reachable`, whose own documentation names
+/// the three callers that "must agree on" it: `aikey use`, the web set-route
+/// bridge, and `activate`.
+///
+/// 🔴 `activate` was the one that never joined. That is the whole defect: not a
+/// rule that was deleted, but a shared rule one caller never adopted — which is
+/// precisely the divergence that predicate was introduced to prevent.
+///
+/// Consulting it also keeps the two designed-to-be-material-free cases working,
+/// which a naive "must have local ciphertext" check would have broken: a cluster
+/// central key (material stays on the node) and a group VK (the proxy pulls the
+/// per-account credential at request time).
+fn team_key_activatable(vk: &storage::VirtualKeyCacheEntry) -> Option<String> {
+    if !team_key_available_for_activate(&vk.local_state) {
+        return Some(format!(
+            "Key '{}' is not available (state: {}). Run 'aikey key sync' to refresh.",
+            vk.alias, vk.local_state
+        ));
+    }
+    let on_cluster = crate::commands_account::read_cluster_node().is_some();
+    if !vk.key_material_reachable(on_cluster) {
+        // 🔴 Say WHICH of the two it is. "Not available" alone sends someone to
+        // re-check permissions or the server, when the answer is that the key
+        // simply has not been delivered to this machine yet — and the fix is one
+        // command.
+        return Some(format!(
+            "Key '{}' is not available (state: {}): its key material has not been \
+             delivered to this device yet, so activating it would produce a token \
+             the proxy cannot serve. Run 'aikey key sync' to fetch it.",
+            vk.alias, vk.local_state
+        ));
+    }
+    None
 }
 
 fn resolve_activate_key(
@@ -6519,13 +6662,11 @@ fn resolve_activate_key(
         }
         // A temporary pin is intentionally independent from the persistent
         // `aikey use` primary. The drawer and picker expose synced-but-inactive
-        // Team VKs, so rejecting them here made their advertised action fail.
-        if !team_key_available_for_activate(&vk.local_state) {
-            return Err(format!(
-                "Key '{}' is not available (state: {}). Run 'aikey key sync' to refresh.",
-                vk.alias, vk.local_state
-            )
-            .into());
+        // Team VKs, so rejecting them by STATE made their advertised action fail
+        // — but accepting them by state alone re-opened 2026-04-16 Bug 4. Both
+        // halves live in `team_key_activatable`.
+        if let Some(reason) = team_key_activatable(vk) {
+            return Err(reason.into());
         }
         let display = vk.local_alias.as_deref().unwrap_or(&vk.alias).to_string();
         // Team key static bearer — shared helper (same as handle_route's

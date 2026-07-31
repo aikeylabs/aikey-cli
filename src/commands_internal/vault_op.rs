@@ -470,6 +470,12 @@ struct ClusterSlot {
     protocol_type: String,
     #[serde(default, deserialize_with = "null_to_default")]
     targets: Vec<ClusterTarget>,
+    /// Route-group template provenance (task 1.3). `serde(default)` so a NEWER
+    /// daemon keeps working against an OLDER control plane that omits them.
+    #[serde(default)]
+    route_group_id: String,
+    #[serde(default)]
+    group_name: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -481,6 +487,23 @@ struct ClusterTarget {
     credential_id: String,
     #[serde(default)]
     credential_revision: String,
+    /// Primary/fallback position (task 1.3). The org-delivery endpoint has always
+    /// emitted these; the daemon simply never read them, which is why Cluster
+    /// could not honour a configured chain either.
+    ///
+    /// Defaults reproduce pre-upgrade behavior: priority 1, role "primary".
+    #[serde(default = "cluster_default_priority")]
+    priority: i64,
+    #[serde(default = "cluster_default_fallback_role")]
+    fallback_role: String,
+}
+
+fn cluster_default_priority() -> i64 {
+    1
+}
+
+fn cluster_default_fallback_role() -> String {
+    "primary".to_string()
 }
 
 fn handle_cluster_apply_snapshot(env: StdinEnvelope) {
@@ -720,6 +743,15 @@ fn apply_group_vk(
         seat_id: vk.seat_id.clone(),
         alias: vk.alias.clone(),
         provider_code: provider_code.clone(),
+        // 🔴 This is the OAUTH-GROUP path. Group VKs are mutually exclusive with
+        // route groups (I37): their candidates are pool accounts, and the account
+        // axis already has its own failover. So the chain columns stay at their
+        // pre-upgrade defaults here — a route group on a group VK would be a group
+        // nothing ever reads, which is "configured but not in effect" all over again.
+        priority: 1,
+        fallback_role: "primary".to_string(),
+        route_group_id: String::new(),
+        route_group_name: String::new(),
         protocol_type: vk.protocol_type.clone().unwrap_or_default(),
         base_url: String::new(), // group routing resolves per-account upstream, not via a static base_url
         credential_id: String::new(),
@@ -835,6 +867,11 @@ pub(crate) fn apply_cluster_snapshot(
             seat_id: vk.seat_id.clone(),
             alias: vk.alias.clone(),
             provider_code: target.provider_code.clone(),
+            // Task 1.3 — Cluster reads the chain from the org-delivery wire.
+            priority: target.priority,
+            fallback_role: target.fallback_role.clone(),
+            route_group_id: slot.route_group_id.clone(),
+            route_group_name: slot.group_name.clone(),
             protocol_type: slot.protocol_type.clone(),
             base_url: target.base_url.clone(),
             credential_id: target.credential_id.clone(),
