@@ -7,7 +7,7 @@
 //! Mechanism (reverse-engineered by cc-switch v3.16.5, spike-verified
 //! 2026-07-13, record: `workflow/CI/research/claude-desktop-3p/`):
 //!   1. write a gateway profile at `Claude-3p/configLibrary/<PROFILE_ID>.json`
-//!   2. claim `configLibrary/_meta.json` `appliedId`
+//!   2. register the profile and claim `configLibrary/_meta.json` `appliedId`
 //!   3. flip `deploymentMode` to `"3p"` in BOTH `Claude/claude_desktop_config.json`
 //!      and `Claude-3p/claude_desktop_config.json` (preserving other keys)
 //!
@@ -51,13 +51,15 @@ pub(crate) struct DesktopPaths {
     /// created BY takeover (it does not exist on a clean install), so it is NOT
     /// a valid "installed" signal there — use `install_marker` for that.
     pub normal_dir: PathBuf,
-    /// Path whose existence means "Claude Desktop is installed".
+    /// Primary path whose existence means "Claude Desktop is installed".
     /// macOS: same as `normal_dir` (`~/Library/Application Support/Claude`,
     /// created on first run). Windows: the app dir `%LOCALAPPDATA%\AnthropicClaude`
-    /// (where claude.exe lives) — because `normal_dir` (`%LOCALAPPDATA%\Claude`)
-    /// only appears after a takeover, so keying detection off it would falsely
-    /// report a freshly-installed Windows Claude as "not installed".
+    /// for the standalone installer.
     pub install_marker: PathBuf,
+    /// Additional valid installation signals. Windows Store/MSIX installs do
+    /// not create `%LOCALAPPDATA%\AnthropicClaude`; their stable per-user
+    /// package directory is listed here instead.
+    pub additional_install_markers: Vec<PathBuf>,
     pub threep_dir: PathBuf,
     pub normal_config: PathBuf,
     pub threep_config: PathBuf,
@@ -79,6 +81,7 @@ pub(crate) fn paths_from_dirs(normal_dir: PathBuf, threep_dir: PathBuf) -> Deskt
         // first run). Platform builders that separate the two (Windows)
         // override `install_marker` after calling this.
         install_marker: normal_dir.clone(),
+        additional_install_markers: Vec::new(),
         normal_dir,
         threep_dir,
     }
@@ -106,11 +109,10 @@ pub(crate) fn macos_paths_from_home(home: &Path) -> DesktopPaths {
 /// sees a variant name, upgrade this to the scan — exact-name misses would
 /// silently report detected=false (feature silently off).
 ///
-/// Windows spike (2026-07-15): the app installs to
-/// `%LOCALAPPDATA%\AnthropicClaude` (claude.exe), while `%LOCALAPPDATA%\Claude`
-/// / `Claude-3p` (the deploymentMode config dirs) only appear AFTER a takeover.
-/// So the app dir is the install marker; the config dirs are created by
-/// `takeover_at`. Verified against Claude Desktop `1.21459.0`.
+/// Standalone Windows installs use `%LOCALAPPDATA%\AnthropicClaude`; Microsoft
+/// Store/MSIX installs use `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc`.
+/// Neither installation kind can be detected from `%LOCALAPPDATA%\Claude`,
+/// because that deployment config dir may only appear after takeover.
 pub(crate) fn windows_paths_from_local_app_data(local_app_data: &Path) -> DesktopPaths {
     let mut paths = paths_from_dirs(
         local_app_data.join("Claude"),
@@ -120,6 +122,8 @@ pub(crate) fn windows_paths_from_local_app_data(local_app_data: &Path) -> Deskto
     // "installed" via the app dir instead, or a freshly-installed Windows
     // Claude is falsely reported NotInstalled and takeover refuses to run.
     paths.install_marker = local_app_data.join("AnthropicClaude");
+    paths.additional_install_markers =
+        vec![local_app_data.join("Packages").join("Claude_pzs8sxrjxfjjc")];
     paths
 }
 
@@ -259,7 +263,7 @@ pub(crate) fn build_gateway_profile(material: &RouteMaterial) -> Value {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DesktopState {
-    /// `Claude/` dir absent — Desktop not installed, skip everything.
+    /// No standalone or packaged-app installation marker was found.
     NotInstalled,
     /// Installed, `deploymentMode` != "3p" (or unset) — official mode.
     Official,
@@ -303,8 +307,39 @@ fn applied_id(meta_path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+fn meta_has_profile_entry(meta_path: &Path) -> bool {
+    if !meta_path.exists() {
+        return false;
+    }
+    read_json_object(meta_path)
+        .ok()
+        .and_then(|meta| meta.get("entries")?.as_array().cloned())
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("id").and_then(Value::as_str) == Some(PROFILE_ID)
+                    && entry.get("name").and_then(Value::as_str) == Some(PROFILE_NAME)
+            })
+        })
+}
+
+fn installation_detected(paths: &DesktopPaths) -> bool {
+    paths.install_marker.exists()
+        || paths
+            .additional_install_markers
+            .iter()
+            .any(|marker| marker.exists())
+}
+
+fn install_marker_display(paths: &DesktopPaths) -> String {
+    std::iter::once(&paths.install_marker)
+        .chain(paths.additional_install_markers.iter())
+        .map(|marker| marker.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub(crate) fn detect_state(paths: &DesktopPaths) -> DesktopState {
-    if !paths.install_marker.exists() {
+    if !installation_detected(paths) {
         return DesktopState::NotInstalled;
     }
     // The NORMAL config is the authoritative mode switch (the app reads it
@@ -386,8 +421,9 @@ fn write_deployment_mode(config_path: &Path, mode: &str) -> Result<(), String> {
         .map_err(|e| format!("write {}: {}", config_path.display(), e))
 }
 
-/// Claim `_meta.json`'s `appliedId` (D5: taking over a foreign 3p setup
-/// claims the pointer but never deletes the foreign profile FILE).
+/// Register our profile in `_meta.json` and claim its `appliedId` (D5:
+/// taking over a foreign 3p setup claims the pointer but never deletes the
+/// foreign profile FILE or entry).
 fn write_meta_applied(meta_path: &Path) -> Result<(), String> {
     let mut obj = if meta_path.exists() {
         read_json_object(meta_path)?
@@ -395,6 +431,31 @@ fn write_meta_applied(meta_path: &Path) -> Result<(), String> {
         json!({})
     };
     obj["appliedId"] = Value::String(PROFILE_ID.to_string());
+    let entries = obj
+        .as_object_mut()
+        .expect("read_json_object/json object literal")
+        .entry("entries")
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| format!("{}: 'entries' is not a JSON array", meta_path.display()))?;
+
+    let mut found = false;
+    entries.retain_mut(|entry| {
+        if entry.get("id").and_then(Value::as_str) != Some(PROFILE_ID) {
+            return true;
+        }
+        if found {
+            return false;
+        }
+        found = true;
+        if let Some(entry_obj) = entry.as_object_mut() {
+            entry_obj.insert("name".to_string(), Value::String(PROFILE_NAME.to_string()));
+        }
+        true
+    });
+    if !found {
+        entries.push(json!({ "id": PROFILE_ID, "name": PROFILE_NAME }));
+    }
     let pretty = serde_json::to_string_pretty(&obj)
         .map_err(|e| format!("serialize {}: {}", meta_path.display(), e))?;
     crate::profile_activation::atomic_write(meta_path, pretty.as_bytes())
@@ -409,7 +470,7 @@ pub(crate) fn takeover_at(
     paths: &DesktopPaths,
     material: &RouteMaterial,
 ) -> Result<TakeoverResult, String> {
-    if !paths.install_marker.exists() {
+    if !installation_detected(paths) {
         return Err("Claude Desktop not detected (app not installed)".to_string());
     }
 
@@ -421,6 +482,7 @@ pub(crate) fn takeover_at(
     // identical ⇒ zero writes. Byte comparison (not JSON equality) so a
     // hand-edited profile counts as drift and gets rewritten.
     if detect_state(paths) == DesktopState::OursActive
+        && meta_has_profile_entry(&paths.meta)
         && deployment_mode(&paths.threep_config).as_deref() == Some("3p")
         && std::fs::read(&paths.profile)
             .map(|b| b == profile_pretty.as_bytes())
@@ -521,14 +583,25 @@ fn remove_our_residue(paths: &DesktopPaths) -> Result<bool, String> {
             .map_err(|e| format!("remove {}: {}", paths.profile.display(), e))?;
         removed = true;
     }
-    if applied_id(&paths.meta).as_deref() == Some(PROFILE_ID) {
+    if paths.meta.exists() {
         let mut obj = read_json_object(&paths.meta)?;
-        obj.as_object_mut().map(|m| m.remove("appliedId"));
-        let pretty = serde_json::to_string_pretty(&obj)
-            .map_err(|e| format!("serialize {}: {}", paths.meta.display(), e))?;
-        crate::profile_activation::atomic_write(&paths.meta, pretty.as_bytes())
-            .map_err(|e| format!("write {}: {}", paths.meta.display(), e))?;
-        removed = true;
+        let mut meta_changed = false;
+        if applied_id(&paths.meta).as_deref() == Some(PROFILE_ID) {
+            obj.as_object_mut().map(|m| m.remove("appliedId"));
+            meta_changed = true;
+        }
+        if let Some(entries) = obj.get_mut("entries").and_then(Value::as_array_mut) {
+            let before = entries.len();
+            entries.retain(|entry| entry.get("id").and_then(Value::as_str) != Some(PROFILE_ID));
+            meta_changed |= entries.len() != before;
+        }
+        if meta_changed {
+            let pretty = serde_json::to_string_pretty(&obj)
+                .map_err(|e| format!("serialize {}: {}", paths.meta.display(), e))?;
+            crate::profile_activation::atomic_write(&paths.meta, pretty.as_bytes())
+                .map_err(|e| format!("write {}: {}", paths.meta.display(), e))?;
+            removed = true;
+        }
     }
     Ok(removed)
 }
@@ -810,7 +883,12 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
 
     let scanned: Vec<String> = paths
         .as_ref()
-        .map(|p| vec![p.normal_dir.display().to_string()])
+        .map(|p| {
+            std::iter::once(&p.install_marker)
+                .chain(p.additional_install_markers.iter())
+                .map(|marker| marker.display().to_string())
+                .collect()
+        })
         .unwrap_or_default();
 
     if json_mode {
@@ -851,7 +929,7 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
             println!("    profile:        {}", p.profile.display());
         } else {
             // Risk 8: the only diagnosis surface for name-variant misses.
-            println!("    scanned:        {}", p.normal_dir.display());
+            println!("    scanned:        {}", install_marker_display(p));
         }
     }
     println!("    claude.ai:      {}", account_plane);
@@ -882,7 +960,7 @@ pub(crate) fn handle_desktop_install() -> Result<(), Box<dyn std::error::Error>>
         return Err(format!(
             "[I_DESKTOP_NOT_INSTALLED] Claude Desktop not found (looked at {}). \
              Install it first, then re-run `aikey desktop install`.",
-            paths.install_marker.display()
+            install_marker_display(&paths)
         )
         .into());
     }
@@ -1020,6 +1098,10 @@ mod tests {
         let meta: Value =
             serde_json::from_str(&std::fs::read_to_string(&paths.meta).unwrap()).unwrap();
         assert_eq!(meta["appliedId"], PROFILE_ID);
+        assert_eq!(
+            meta["entries"],
+            json!([{ "id": PROFILE_ID, "name": PROFILE_NAME }])
+        );
 
         #[cfg(unix)]
         {
@@ -1056,6 +1138,63 @@ mod tests {
             "profile mtime must not change on a no-op takeover"
         );
         assert_eq!(std::fs::read(&paths.profile).unwrap(), bytes_before);
+    }
+
+    #[test]
+    fn takeover_heals_missing_meta_entry_without_duplicating_profiles() {
+        let tmp = TempDir::new().unwrap();
+        let paths = installed_paths(&tmp);
+        takeover_at(&paths, &material()).unwrap();
+
+        std::fs::write(
+            &paths.meta,
+            br#"{"appliedId":"00000000-0000-4000-8000-0041494b4559"}"#,
+        )
+        .unwrap();
+        let r = takeover_at(&paths, &material()).unwrap();
+        assert_eq!(r, TakeoverResult::Installed);
+
+        let meta: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.meta).unwrap()).unwrap();
+        assert_eq!(meta["appliedId"], PROFILE_ID);
+        assert_eq!(
+            meta["entries"],
+            json!([{ "id": PROFILE_ID, "name": PROFILE_NAME }])
+        );
+
+        let r = takeover_at(&paths, &material()).unwrap();
+        assert_eq!(r, TakeoverResult::Unchanged);
+        let meta_after_second: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.meta).unwrap()).unwrap();
+        assert_eq!(meta_after_second["entries"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn takeover_preserves_foreign_meta_entries_and_repairs_ours_in_place() {
+        let tmp = TempDir::new().unwrap();
+        let paths = installed_paths(&tmp);
+        std::fs::create_dir_all(&paths.config_library).unwrap();
+        std::fs::write(
+            &paths.meta,
+            format!(
+                r#"{{"appliedId":"foreign","entries":[{{"id":"foreign","name":"Other","keep":true}},{{"id":"{}","name":"Stale","keep":true}},{{"id":"{}","name":"Duplicate"}}]}}"#,
+                PROFILE_ID, PROFILE_ID
+            ),
+        )
+        .unwrap();
+
+        takeover_at(&paths, &material()).unwrap();
+        let meta: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.meta).unwrap()).unwrap();
+        let entries = meta["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0],
+            json!({"id":"foreign","name":"Other","keep":true})
+        );
+        assert_eq!(entries[1]["id"], PROFILE_ID);
+        assert_eq!(entries[1]["name"], PROFILE_NAME);
+        assert_eq!(entries[1]["keep"], true);
     }
 
     // 3 · foreign 3p present → silent takeover, foreign profile preserved
@@ -1100,6 +1239,7 @@ mod tests {
         let meta: Value =
             serde_json::from_str(&std::fs::read_to_string(&paths.meta).unwrap()).unwrap();
         assert!(meta.get("appliedId").is_none());
+        assert_eq!(meta["entries"], json!([]));
         assert!(foreign_profile.exists());
     }
 
@@ -1270,6 +1410,10 @@ mod tests {
         // The config dir is a DIFFERENT path (created by takeover, not the marker).
         assert_ne!(win.install_marker, win.normal_dir);
         assert!(win.normal_dir.to_string_lossy().ends_with("Claude"));
+        assert_eq!(win.additional_install_markers.len(), 1);
+        let store_marker = win.additional_install_markers[0].to_string_lossy();
+        assert!(store_marker.contains("Packages"));
+        assert!(store_marker.ends_with("Claude_pzs8sxrjxfjjc"));
     }
 
     // Fresh Windows Claude: app dir present, config dir absent (never taken
@@ -1308,11 +1452,32 @@ mod tests {
         assert_eq!(detect_state(&paths), DesktopState::NotInstalled);
     }
 
+    // Microsoft Store/MSIX Claude does not create the standalone app dir.
+    // Its per-user package directory alone must enable takeover.
+    #[test]
+    fn windows_store_package_detects_official_and_allows_takeover() {
+        let tmp = TempDir::new().unwrap();
+        let mut paths = paths_from_dirs(tmp.path().join("Claude"), tmp.path().join("Claude-3p"));
+        paths.install_marker = tmp.path().join("AnthropicClaude");
+        let store_marker = tmp.path().join("Packages").join("Claude_pzs8sxrjxfjjc");
+        paths.additional_install_markers = vec![store_marker.clone()];
+        std::fs::create_dir_all(store_marker).unwrap();
+
+        assert!(!paths.install_marker.exists());
+        assert_eq!(detect_state(&paths), DesktopState::Official);
+        assert_eq!(
+            takeover_at(&paths, &material()).unwrap(),
+            TakeoverResult::Installed
+        );
+        assert_eq!(detect_state(&paths), DesktopState::OursActive);
+    }
+
     // macOS regression guard: marker == config dir (no behavior change).
     #[test]
     fn macos_install_marker_equals_config_dir() {
         let mac = macos_paths_from_home(Path::new("/Users/alice"));
         assert_eq!(mac.install_marker, mac.normal_dir);
+        assert!(mac.additional_install_markers.is_empty());
     }
 
     // extra · uninstalled → detect NotInstalled; restore is a no-op
