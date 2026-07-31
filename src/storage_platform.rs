@@ -578,6 +578,10 @@ pub fn set_last_material_sync_version(v: i64) {
 /// Row from `managed_virtual_keys_cache`.
 #[derive(Debug, Clone)]
 pub struct VirtualKeyCacheEntry {
+    /// The delivery wire's binding id for THIS hop. Empty on vaults written
+    /// before the column existed — never invent one, the proxy relies on empty
+    /// meaning "unknown".
+    pub binding_id: String,
     pub virtual_key_id: String,
     pub org_id: String,
     pub seat_id: String,
@@ -785,7 +789,8 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              local_alias, supported_providers,
              provider_base_urls, owner_account_id,
              oauth_group_id, group_accounts, routing_config, owner_email, group_alias,
-             priority, fallback_role, route_group_id, route_group_name
+             priority, fallback_role, route_group_id, route_group_name,
+             binding_id
          ) VALUES (
              ?1,  ?2,  ?3,  ?4,
              ?5,  ?6,  ?7,
@@ -797,7 +802,8 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              ?17, ?18,
              ?19, ?20,
              ?21, ?22, ?23, ?24, ?25,
-             ?26, ?27, ?28, ?29
+             ?26, ?27, ?28, ?29,
+             ?30
          )
          ON CONFLICT(virtual_key_id, protocol_type, provider_code) DO UPDATE SET
              org_id                  = excluded.org_id,
@@ -826,7 +832,12 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
              priority                = excluded.priority,
              fallback_role           = excluded.fallback_role,
              route_group_id          = excluded.route_group_id,
-             route_group_name        = excluded.route_group_name
+             route_group_name        = excluded.route_group_name,
+             binding_id              = excluded.binding_id
+             /* binding_id: server-synced for the same reason as the chain columns
+                — it is the hop's identity in the control plane's ledger, and a
+                re-sync must carry a re-issued binding's new id or cooldown,
+                stickiness and the fallback event would key on a stale one. */
              /* priority / fallback_role / route_group_*: server-synced (task 1.3).
                 The control plane is authoritative for chain order (I8), so a
                 re-sync must overwrite — that is how an administrator's re-ordering
@@ -875,6 +886,7 @@ pub fn upsert_virtual_key_cache(entry: &VirtualKeyCacheEntry) -> Result<(), Stri
             entry.fallback_role,
             entry.route_group_id,
             entry.route_group_name,
+            entry.binding_id,
         ],
     )
     .map_err(|e| format!("Failed to upsert virtual key cache: {}", e))?;
@@ -972,7 +984,7 @@ const VK_CACHE_COLUMNS_CHAIN: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
      provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config, owner_email, group_runtime, group_alias, \
-     priority, fallback_role, route_group_id, route_group_name";
+     priority, fallback_role, route_group_id, route_group_name, binding_id";
 const VK_CACHE_COLUMNS_GROUP: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
      credential_id, credential_revision, virtual_key_revision, \
@@ -981,7 +993,7 @@ const VK_CACHE_COLUMNS_GROUP: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
      provider_base_urls, owner_account_id, extra, oauth_group_id, group_accounts, routing_config, owner_email, group_runtime, group_alias, \
-     1, 'primary', '', ''";
+     1, 'primary', '', '', ''";
 // Middle: real extra, no oauth_group columns yet (project NULL at 22/23).
 const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
@@ -991,7 +1003,7 @@ const VK_CACHE_COLUMNS_FULL: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
      provider_base_urls, owner_account_id, extra, NULL, NULL, NULL, NULL, NULL, NULL, \
-     1, 'primary', '', ''";
+     1, 'primary', '', '', ''";
 // Oldest: no extra, no oauth_group columns.
 const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_code, protocol_type, base_url, \
@@ -1001,7 +1013,7 @@ const VK_CACHE_COLUMNS_LEGACY: &str = "virtual_key_id, org_id, seat_id, alias, \
      provider_key_nonce, provider_key_ciphertext, \
      synced_at, local_alias, supported_providers, \
      provider_base_urls, owner_account_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
-     1, 'primary', '', ''";
+     1, 'primary', '', '', ''";
 
 /// Single mapping from a SELECT row (in the column order declared by
 /// `VK_CACHE_COLUMNS_*` above) to a struct. Centralised here so adding
@@ -1058,6 +1070,11 @@ fn row_to_virtual_key_cache(row: &rusqlite::Row) -> rusqlite::Result<VirtualKeyC
             .unwrap_or_else(|_| "primary".to_string()),
         route_group_id: row.get::<_, String>(30).unwrap_or_default(),
         route_group_name: row.get::<_, String>(31).unwrap_or_default(),
+        // 32: binding_id. Older tiers project '' — an unknown identity, which the
+        // proxy must treat as "no stable id" rather than as a real one. 🔴 It was
+        // absent entirely until 2026-07-31, which is why cooldown, stickiness and
+        // the fallback event's from/to_binding_id all keyed on an empty string.
+        binding_id: row.get::<_, String>(32).unwrap_or_default(),
     })
 }
 
@@ -2282,6 +2299,7 @@ mod key_material_reachable_tests {
     /// (ciphertext + share_status) varied; everything else is a benign default.
     fn entry(ciphertext: Option<Vec<u8>>, share_status: &str) -> VirtualKeyCacheEntry {
         VirtualKeyCacheEntry {
+            binding_id: String::new(),
             priority: 1,
             fallback_role: "primary".to_string(),
             route_group_id: String::new(),

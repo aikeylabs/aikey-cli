@@ -3165,7 +3165,7 @@ fn apply_snapshot_to_cache(
         // Task 1.3 carry-forward tuple: (priority, fallback_role, route_group_id,
         // route_group_name). Defaults reproduce pre-upgrade behavior when the row
         // is new — all primary, no fallback, no group.
-        let existing_chain: (i64, String, String, String) = existing
+        let existing_chain: (i64, String, String, String, String) = existing
             .as_ref()
             .map(|e| {
                 (
@@ -3173,9 +3173,18 @@ fn apply_snapshot_to_cache(
                     e.fallback_role.clone(),
                     e.route_group_id.clone(),
                     e.route_group_name.clone(),
+                    e.binding_id.clone(),
                 )
             })
-            .unwrap_or_else(|| (1, "primary".to_string(), String::new(), String::new()));
+            .unwrap_or_else(|| {
+                (
+                    1,
+                    "primary".to_string(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                )
+            });
 
         let local_state = compute_local_state_from_effective(
             &item.effective_status,
@@ -3199,6 +3208,10 @@ fn apply_snapshot_to_cache(
             fallback_role: existing_chain.1.clone(),
             route_group_id: existing_chain.2.clone(),
             route_group_name: existing_chain.3.clone(),
+            // Carried forward for the same reason as the chain columns above: the
+            // snapshot does not carry hop identity, and blanking it would strip
+            // cooldown/stickiness of the id they key on.
+            binding_id: existing_chain.4.clone(),
             protocol_type: item.protocol_type.clone(),
             base_url: item.base_url.clone(),
             credential_id: item.credential_id.clone(),
@@ -3491,6 +3504,10 @@ pub(crate) struct DeliveredKey {
     /// Route-group template this chain was generated from. Empty = no group.
     pub route_group_id: String,
     pub route_group_name: String,
+    /// The control plane's id for THIS hop. Cooldown, stickiness and the fallback
+    /// event key on it; it was dropped here until 2026-07-31, so all three keyed
+    /// on an empty string instead. Empty stays legal and means "unknown".
+    pub binding_id: String,
 }
 
 /// Encrypts `plaintext_provider_key` with the (already-verified) vault key and
@@ -3527,6 +3544,7 @@ pub(crate) fn upsert_delivered_key(
         fallback_role: dk.fallback_role.clone(),
         route_group_id: dk.route_group_id.clone(),
         route_group_name: dk.route_group_name.clone(),
+        binding_id: dk.binding_id.clone(),
         protocol_type: dk.protocol_type.clone(),
         base_url: dk.base_url.clone(),
         credential_id: dk.credential_id.clone(),
@@ -3800,6 +3818,7 @@ fn run_full_snapshot_sync_opts(
                             provider_code: binding.provider_code.clone(),
                             priority: binding.priority as i64,
                             fallback_role: binding.fallback_role.clone(),
+                            binding_id: binding.binding_id.clone(),
                             route_group_id: rg_id,
                             route_group_name: rg_name,
                             protocol_type,
@@ -4131,16 +4150,25 @@ pub fn sync_managed_key_metadata() -> bool {
             // the server is now returning it for the current account, restore it.
             let existing_state = existing.map(|e| e.local_state.as_str()).unwrap_or("");
             // Task 1.3 carry-forward, same reasoning as the other snapshot path.
-            let chain_carry: (i64, String, String, String) = existing
+            let chain_carry: (i64, String, String, String, String) = existing
                 .map(|e| {
                     (
                         e.priority,
                         e.fallback_role.clone(),
                         e.route_group_id.clone(),
                         e.route_group_name.clone(),
+                        e.binding_id.clone(),
                     )
                 })
-                .unwrap_or_else(|| (1, "primary".to_string(), String::new(), String::new()));
+                .unwrap_or_else(|| {
+                    (
+                        1,
+                        "primary".to_string(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    )
+                });
             let local_state = match (item.key_status.as_str(), existing_state) {
                 ("active", "disabled_by_account_scope") => "synced_inactive".to_string(),
                 ("active", state) if !state.starts_with("disabled_by_") => {
@@ -4172,6 +4200,7 @@ pub fn sync_managed_key_metadata() -> bool {
                 fallback_role: chain_carry.1.clone(),
                 route_group_id: chain_carry.2.clone(),
                 route_group_name: chain_carry.3.clone(),
+                binding_id: chain_carry.4.clone(),
                 protocol_type,
                 base_url: existing.map(|e| e.base_url.clone()).unwrap_or_default(),
                 credential_id: existing
@@ -7262,6 +7291,7 @@ mod core_tests {
         routing_config: Option<&str>,
     ) -> storage::VirtualKeyCacheEntry {
         storage::VirtualKeyCacheEntry {
+            binding_id: String::new(),
             priority: 1,
             fallback_role: "primary".to_string(),
             route_group_id: String::new(),
@@ -9277,6 +9307,7 @@ mod sync_prune_tests {
 
     fn cache_entry(vk_id: &str, owner: &str) -> storage::VirtualKeyCacheEntry {
         storage::VirtualKeyCacheEntry {
+            binding_id: String::new(),
             priority: 1,
             fallback_role: "primary".to_string(),
             route_group_id: String::new(),

@@ -559,6 +559,15 @@ pub mod v1_0_0_baseline {
                 "extra",
                 "ALTER TABLE managed_virtual_keys_cache ADD COLUMN extra TEXT",
             ),
+            // 2026-07-31: the delivery wire's binding id for this hop. Cooldown,
+            // stickiness and the fallback event's from/to_binding_id all key on a
+            // hop's identity, and without this column they keyed on an empty
+            // string — which made cooldown a silent no-op rather than a failure.
+            // Nullable and empty on old vaults: "unknown", never a made-up id.
+            (
+                "binding_id",
+                "ALTER TABLE managed_virtual_keys_cache ADD COLUMN binding_id TEXT NOT NULL DEFAULT ''",
+            ),
             // 2026-06-24 (master v1.0.1-alpha.3): oauth_group fold. When a VK's
             // binding target is a oauth_group, the whole group folds into THIS
             // row — no separate client cache tables (技术方案 §2.3).
@@ -736,6 +745,7 @@ pub mod v1_0_0_baseline {
                     fallback_role          TEXT NOT NULL DEFAULT 'primary',
                     route_group_id         TEXT NOT NULL DEFAULT '',
                     route_group_name       TEXT NOT NULL DEFAULT '',
+                    binding_id             TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (virtual_key_id, protocol_type, provider_code)
                 );
                  INSERT INTO managed_virtual_keys_cache__p1e_new (
@@ -748,7 +758,8 @@ pub mod v1_0_0_baseline {
                     local_alias, supported_providers, provider_base_urls, owner_account_id,
                     extra, oauth_group_id, group_accounts, routing_config,
                     my_assignment_override, group_runtime, owner_email, group_alias,
-                    priority, fallback_role, route_group_id, route_group_name
+                    priority, fallback_role, route_group_id, route_group_name,
+                    binding_id
                  )
                  SELECT
                     virtual_key_id, org_id, seat_id, alias,
@@ -760,7 +771,8 @@ pub mod v1_0_0_baseline {
                     local_alias, supported_providers, provider_base_urls, owner_account_id,
                     extra, oauth_group_id, group_accounts, routing_config,
                     my_assignment_override, group_runtime, owner_email, group_alias,
-                    priority, fallback_role, route_group_id, route_group_name
+                    priority, fallback_role, route_group_id, route_group_name,
+                    binding_id
                  FROM managed_virtual_keys_cache;
                  DROP TABLE managed_virtual_keys_cache;
                  ALTER TABLE managed_virtual_keys_cache__p1e_new RENAME TO managed_virtual_keys_cache;",

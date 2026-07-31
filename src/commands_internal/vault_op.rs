@@ -480,6 +480,12 @@ struct ClusterSlot {
 
 #[derive(Debug, serde::Deserialize)]
 struct ClusterTarget {
+    /// The control plane's id for this hop. The org-delivery wire has always
+    /// carried it; the daemon dropped it, so cooldown, stickiness and the
+    /// fallback event all keyed on an empty string. `serde(default)` keeps a new
+    /// daemon working against an older control plane that omits it.
+    #[serde(default)]
+    binding_id: String,
     provider_code: String,
     base_url: String,
     real_key: String,
@@ -738,6 +744,10 @@ fn apply_group_vk(
     };
 
     let entry = storage::VirtualKeyCacheEntry {
+        // Group VKs are mutually exclusive with route groups (I37), so there is no
+        // chain hop to identify — the account axis owns their failover. Empty is
+        // the honest value, not a placeholder.
+        binding_id: String::new(),
         virtual_key_id: vk.virtual_key_id.clone(),
         org_id: payload.org_id.clone(),
         seat_id: vk.seat_id.clone(),
@@ -889,6 +899,7 @@ pub(crate) fn apply_cluster_snapshot(
                     // Task 1.3 — Cluster reads the chain from the org-delivery wire.
                     priority: target.priority,
                     fallback_role: target.fallback_role.clone(),
+                    binding_id: target.binding_id.clone(),
                     route_group_id: slot.route_group_id.clone(),
                     route_group_name: slot.group_name.clone(),
                     protocol_type: slot.protocol_type.clone(),

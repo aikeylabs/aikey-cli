@@ -2527,6 +2527,7 @@ mod tests {
         let plaintext = "sk-real-provider-key-xyz";
 
         let dk = crate::commands_account::DeliveredKey {
+            binding_id: String::new(),
             priority: 1,
             fallback_role: "primary".to_string(),
             route_group_id: String::new(),
@@ -2585,6 +2586,7 @@ mod tests {
 
         // Pre-seed a cache VK that the upcoming snapshot will NOT contain.
         let old = crate::commands_account::DeliveredKey {
+            binding_id: String::new(),
             priority: 1,
             fallback_role: "primary".to_string(),
             route_group_id: String::new(),
@@ -2672,6 +2674,7 @@ mod tests {
 
         // Seed a VK owned by org-2.
         let foreign = crate::commands_account::DeliveredKey {
+            binding_id: String::new(),
             priority: 1,
             fallback_role: "primary".to_string(),
             route_group_id: String::new(),
@@ -2797,7 +2800,10 @@ mod tests {
         let payload: crate::commands_internal::vault_op::ClusterSnapshotPayload =
             serde_json::from_str(json).expect("parse");
         let r = crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &payload);
-        assert_eq!(r.applied, 1, "the key was delivered, so it counts as applied");
+        assert_eq!(
+            r.applied, 1,
+            "the key was delivered, so it counts as applied"
+        );
 
         let conn = crate::storage::open_connection().expect("conn");
         let hops: i64 = conn
@@ -2835,6 +2841,60 @@ mod tests {
             )
             .expect("ordered read");
         assert_eq!(first, "zhipu", "priority 1 is the primary");
+    }
+
+    // 🔴 The hop's binding id must survive the wire → vault round trip.
+    //
+    // The org-delivery payload has always carried `binding_id` per target; the
+    // daemon dropped it, and the vault had nowhere to put it. Everything that
+    // identifies a hop then keyed on an empty string: cooldown, stickiness, and
+    // the fallback event's from_binding_id / to_binding_id (I4). Cooldown did not
+    // fail — it collapsed every candidate into one entry and quietly stopped
+    // reordering anything.
+    //
+    // 🚫 Asserting only "the column exists" would pass on a build that writes ''
+    // for every hop, which is the exact state this replaced.
+    #[test]
+    fn apply_cluster_snapshot_carries_the_binding_id_of_each_hop() {
+        let (_dir, _db, _lock) = setup_vault();
+        let _ = crate::storage::list_virtual_key_cache();
+        let key = derive_current("test_password");
+        let json = r#"{
+            "org_id":"o","virtual_keys":[
+                {"virtual_key_id":"vk-ids","owner_account_id":"a","seat_id":"seat-1",
+                 "key_status":"active","virtual_key_revision":"r",
+                 "slots":[{"protocol_type":"anthropic","route_group_id":"rg-1","group_name":"main",
+                   "targets":[
+                    {"binding_id":"b-primary","provider_code":"zhipu","base_url":"http://p",
+                     "real_key":"sk-p","credential_id":"c-p","credential_revision":"1",
+                     "priority":1,"fallback_role":"primary"},
+                    {"binding_id":"b-fallback","provider_code":"anthropic","base_url":"http://f",
+                     "real_key":"sk-f","credential_id":"c-f","credential_revision":"1",
+                     "priority":2,"fallback_role":"fallback"}]}]}
+            ]}"#;
+        let payload: crate::commands_internal::vault_op::ClusterSnapshotPayload =
+            serde_json::from_str(json).expect("parse");
+        let r = crate::commands_internal::vault_op::apply_cluster_snapshot(&key, &payload);
+        assert_eq!(r.applied, 1);
+
+        let conn = crate::storage::open_connection().expect("conn");
+        let mut got: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT priority, binding_id FROM managed_virtual_keys_cache \
+                 WHERE virtual_key_id = 'vk-ids' ORDER BY priority",
+            )
+            .expect("prepare")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(1, "b-primary".to_string()), (2, "b-fallback".to_string())],
+            "each hop must keep its own binding id — an empty or shared value is what made \
+             cooldown and stickiness key on nothing"
+        );
     }
 
     // 2026-06-12 通道结构统一 (设计: update/20260612-集群worker组级配额下发):
