@@ -6066,8 +6066,7 @@ pub fn handle_key_use(
             let mut hops: Vec<&crate::route_group_select::ChainRow> = chain_index
                 .iter()
                 .filter(|r| {
-                    r.virtual_key_id == row.virtual_key_id
-                        && r.protocol_type == row.protocol_type
+                    r.virtual_key_id == row.virtual_key_id && r.protocol_type == row.protocol_type
                 })
                 .collect();
             // By priority, never by the order the vault returned rows in.
@@ -9551,8 +9550,10 @@ pub fn pin_chain_member(
             &entry.route_group_name
         }
     );
-    println!("  Automatic failover is OFF for this route: if {} fails, no backup upstream is tried.",
-        matched.provider_code);
+    println!(
+        "  Automatic failover is OFF for this route: if {} fails, no backup upstream is tried.",
+        matched.provider_code
+    );
     println!(
         "  To restore it, run: aikey use {}   (pins the whole group)",
         entry.alias

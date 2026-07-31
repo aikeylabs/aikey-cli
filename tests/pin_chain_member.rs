@@ -55,7 +55,10 @@ fn help_states_that_pinning_one_upstream_disables_failover() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("--only"), "`--only` missing from help: {text}");
+    assert!(
+        text.contains("--only"),
+        "`--only` missing from help: {text}"
+    );
     let lowered = text.to_lowercase();
     assert!(
         lowered.contains("failover"),

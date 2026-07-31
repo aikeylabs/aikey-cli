@@ -115,7 +115,11 @@ fn use_under_route_groups_pins_group_by_default_and_says_so_when_it_does_not() {
         .stdin(Stdio::null())
         .output()
         .expect("run aikey add");
-    assert!(out.status.success(), "bootstrap failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "bootstrap failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // ── Seed a two-hop chain on ONE key, plus a second key sharing the same
     //    org-level template (that is what makes `--group` ambiguous) ─────────
@@ -132,28 +136,63 @@ fn use_under_route_groups_pins_group_by_default_and_says_so_when_it_does_not() {
 
     let (n1, c1) = enc("sk-ant-primary");
     storage::upsert_virtual_key_cache(&hop(
-        "vk-eng", "eng-key", "anthropic", "https://api.anthropic.com",
-        1, "primary", "rg-main", "main-chain", n1, c1,
-    )).expect("seed eng primary");
+        "vk-eng",
+        "eng-key",
+        "anthropic",
+        "https://api.anthropic.com",
+        1,
+        "primary",
+        "rg-main",
+        "main-chain",
+        n1,
+        c1,
+    ))
+    .expect("seed eng primary");
 
     let (n2, c2) = enc("sk-glm-fallback");
     storage::upsert_virtual_key_cache(&hop(
-        "vk-eng", "eng-key", "zhipu", "https://open.bigmodel.cn/api/anthropic",
-        2, "fallback", "rg-main", "main-chain", n2, c2,
-    )).expect("seed eng fallback");
+        "vk-eng",
+        "eng-key",
+        "zhipu",
+        "https://open.bigmodel.cn/api/anthropic",
+        2,
+        "fallback",
+        "rg-main",
+        "main-chain",
+        n2,
+        c2,
+    ))
+    .expect("seed eng fallback");
 
     // A DIFFERENT key built from the SAME template — different credentials,
     // different quota, billed to a different owner.
     let (n3, c3) = enc("sk-ant-data-team");
     storage::upsert_virtual_key_cache(&hop(
-        "vk-data", "data-key", "anthropic", "https://api.anthropic.com",
-        1, "primary", "rg-main", "main-chain", n3, c3,
-    )).expect("seed data primary");
+        "vk-data",
+        "data-key",
+        "anthropic",
+        "https://api.anthropic.com",
+        1,
+        "primary",
+        "rg-main",
+        "main-chain",
+        n3,
+        c3,
+    ))
+    .expect("seed data primary");
 
     let run = |args: &[&str]| -> (String, bool) {
-        let o = base_cmd(&tmp, &vault).args(args).stdin(Stdio::null()).output().expect("run aikey");
+        let o = base_cmd(&tmp, &vault)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run aikey");
         (
-            format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
             o.status.success(),
         )
     };

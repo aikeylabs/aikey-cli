@@ -2238,7 +2238,12 @@ mod chain_sync_fence_tests {
             .expect("INSERT column list terminator not found");
         let insert_cols = &stmt[..cols_end];
 
-        for col in ["priority", "fallback_role", "route_group_id", "route_group_name"] {
+        for col in [
+            "priority",
+            "fallback_role",
+            "route_group_id",
+            "route_group_name",
+        ] {
             // Named in the INSERT column list.
             assert!(
                 insert_cols.contains(col),
@@ -2365,7 +2370,12 @@ pub fn pin_client_route_to_group_member(
                     binding_provider_code = ?4,
                     updated_at = strftime('%s', 'now')
               WHERE profile_id = ?1 AND provider_code = ?2",
-            params![profile_id, client_route, route_group_id, upstream_provider_code],
+            params![
+                profile_id,
+                client_route,
+                route_group_id,
+                upstream_provider_code
+            ],
         )
         .map_err(|e| format!("pin client route to a route-group member: {}", e))?;
     Ok(changed == 1)

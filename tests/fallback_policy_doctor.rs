@@ -12,7 +12,11 @@
 use aikeylabs_aikey_cli::commands_project::fallback_policy_report;
 use serde_json::json;
 
-fn status(synced: bool, rail: Option<serde_json::Value>, attempt_source: &str) -> serde_json::Value {
+fn status(
+    synced: bool,
+    rail: Option<serde_json::Value>,
+    attempt_source: &str,
+) -> serde_json::Value {
     let mut v = json!({
         "upstream_fallback": {
             "synced": synced,
@@ -44,7 +48,10 @@ fn every_row_carries_its_source_and_the_summary_carries_freshness() {
     );
     let r = fallback_policy_report(Some(&s), 1_700_000_008);
 
-    assert!(r.ok, "a healthy rail with a synced policy must not be a failure");
+    assert!(
+        r.ok,
+        "a healthy rail with a synced policy must not be a failure"
+    );
     assert!(
         r.detail.contains("synced 8s ago (v7)"),
         "summary lost the freshness: {}. Without it an operator cannot tell a policy \
@@ -150,7 +157,11 @@ fn never_synced_with_a_running_rail_is_a_failure() {
 fn missing_block_is_reported_not_invented() {
     let r = fallback_policy_report(Some(&json!({"version": "x"})), 1_700_000_100);
     assert!(r.ok);
-    assert!(r.rows.is_empty(), "no block means no numbers to show: {:?}", r.rows);
+    assert!(
+        r.rows.is_empty(),
+        "no block means no numbers to show: {:?}",
+        r.rows
+    );
     assert!(r.detail.contains("not reported"), "detail = {}", r.detail);
 }
 

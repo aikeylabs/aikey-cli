@@ -23,8 +23,8 @@ mod json_output;
 mod provider_registry;
 // Locating a chain by (key, route group) — see the module doc for why the group
 // name alone stopped being enough once route groups became org-level templates.
-mod route_group_select;
 mod ratelimit;
+mod route_group_select;
 mod session;
 mod shell_quote;
 #[allow(dead_code)]
@@ -3707,7 +3707,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     let rows = commands_account::chain_rows_for_selection()?;
                     let sel = route_group_select::resolve(&rows, key.as_deref(), g);
                     match sel {
-                        route_group_select::Selection::Resolved { key_alias, .. } => Some(key_alias),
+                        route_group_select::Selection::Resolved { key_alias, .. } => {
+                            Some(key_alias)
+                        }
                         other => {
                             // failure_message returns Some for every non-Resolved arm.
                             return Err(route_group_select::failure_message(&other)
@@ -3738,9 +3740,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 None => {
                     if only.is_some() {
-                        return Err("--only pins one upstream of a specific key, so it needs the key: \
+                        return Err(
+                            "--only pins one upstream of a specific key, so it needs the key: \
                                     aikey use <ALIAS> --only <UPSTREAM>"
-                            .into());
+                                .into(),
+                        );
                     }
                     // `aikey use` (no args) — provider-tree interactive editor.
                     if !std::io::stdin().is_terminal() || cli.json {

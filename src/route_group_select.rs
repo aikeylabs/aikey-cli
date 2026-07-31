@@ -59,7 +59,10 @@ pub enum Selection {
         virtual_key_id: String,
     },
     /// No key on this machine uses that group.
-    NoSuchGroup { requested: String, known: Vec<String> },
+    NoSuchGroup {
+        requested: String,
+        known: Vec<String>,
+    },
     /// 🔴 Several keys use it. The caller must FAIL and print the candidates.
     Ambiguous {
         requested: String,
@@ -292,7 +295,10 @@ pub fn chain_line(hops: &[ChainRow]) -> String {
 /// that only describes the problem, because it costs the user a second round trip
 /// to discover the remedy was wrong.
 fn shell_arg(v: &str) -> String {
-    if v.is_empty() || v.chars().any(|c| c.is_whitespace() || "\"'\\$`".contains(c)) {
+    if v.is_empty()
+        || v.chars()
+            .any(|c| c.is_whitespace() || "\"'\\$`".contains(c))
+    {
         format!("'{}'", v.replace('\'', r"'\''"))
     } else {
         v.to_string()
@@ -464,7 +470,10 @@ mod tests {
 
     #[test]
     fn chain_line_of_one_hop_is_just_the_primary() {
-        assert_eq!(chain_line(&[row("vk", "k", "g", "anthropic", 1)]), "P1 anthropic");
+        assert_eq!(
+            chain_line(&[row("vk", "k", "g", "anthropic", 1)]),
+            "P1 anthropic"
+        );
     }
 
     #[test]
@@ -486,7 +495,11 @@ mod tests {
         ];
         let msg = failure_message(&resolve(&rows, None, "prod")).unwrap();
         assert!(msg.contains("--group prod"), "{}", msg);
-        assert!(!msg.contains("--group 'prod'"), "no needless quoting:\n{}", msg);
+        assert!(
+            !msg.contains("--group 'prod'"),
+            "no needless quoting:\n{}",
+            msg
+        );
     }
 
     #[test]

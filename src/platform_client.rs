@@ -465,10 +465,7 @@ impl DeliveryPayload {
             if !protocol_type.is_empty() && slot.protocol_type != protocol_type {
                 continue;
             }
-            return (
-                slot.route_group_id.as_str(),
-                slot.group_name.as_str(),
-            );
+            return (slot.route_group_id.as_str(), slot.group_name.as_str());
         }
         ("", "")
     }
