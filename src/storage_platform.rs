@@ -1098,10 +1098,18 @@ pub fn get_virtual_key_cache(virtual_key_id: &str) -> Result<Option<VirtualKeyCa
     };
     let result = conn
         .query_row(
-            &sel(VK_CACHE_COLUMNS_GROUP),
+            &sel(VK_CACHE_COLUMNS_CHAIN),
             params![virtual_key_id],
             row_to_virtual_key_cache,
         )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &sel(VK_CACHE_COLUMNS_GROUP),
+                params![virtual_key_id],
+                row_to_virtual_key_cache,
+            ),
+        })
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Err(e),
             _ => conn.query_row(
@@ -1148,7 +1156,11 @@ pub fn get_virtual_key_cache_binding(
     };
     let p = params![virtual_key_id, protocol_type, provider_code];
     let result = conn
-        .query_row(&sel(VK_CACHE_COLUMNS_GROUP), p, row_to_virtual_key_cache)
+        .query_row(&sel(VK_CACHE_COLUMNS_CHAIN), p, row_to_virtual_key_cache)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(&sel(VK_CACHE_COLUMNS_GROUP), p, row_to_virtual_key_cache),
+        })
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Err(e),
             _ => conn.query_row(&sel(VK_CACHE_COLUMNS_FULL), p, row_to_virtual_key_cache),
@@ -1188,11 +1200,22 @@ pub fn get_virtual_key_cache_by_alias(alias: &str) -> Result<Option<VirtualKeyCa
         .query_row(
             &format!(
                 "SELECT {} FROM managed_virtual_keys_cache {}",
-                VK_CACHE_COLUMNS_GROUP, where_clause
+                VK_CACHE_COLUMNS_CHAIN, where_clause
             ),
             params![alias],
             row_to_virtual_key_cache,
         )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Err(e),
+            _ => conn.query_row(
+                &format!(
+                    "SELECT {} FROM managed_virtual_keys_cache {}",
+                    VK_CACHE_COLUMNS_GROUP, where_clause
+                ),
+                params![alias],
+                row_to_virtual_key_cache,
+            ),
+        })
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Err(e),
             _ => conn.query_row(

@@ -9489,9 +9489,32 @@ pub fn pin_chain_member(
     // The pin table is keyed by CLIENT ROUTE (`anthropic`, `openai`, …), which is
     // not the same namespace as the upstream provider code — the reason the three
     // namespaces have to be kept apart at all (F-16).
-    let client_route =
-        crate::provider_registry::client_route_for_binding(&matched.provider_code, &entry.protocol_type)
-            .to_string();
+    //
+    // 🔴 The route comes from the chain's PRIMARY hop, NOT from the member being
+    // pinned. A pin row is (client_route, route_group_id, binding_provider_code):
+    // the route says WHICH TRAFFIC this applies to, the provider code says WHICH
+    // HOP to restrict it to. Deriving the route from `matched` collapses those two
+    // into one name and writes the pin under the fallback's own route — which is a
+    // route the user is not sending traffic on, so the pin is stored where nothing
+    // will ever read it.
+    //
+    // That is not hypothetical: it made `--only` unusable for the exact case it
+    // exists for. In the plan's own sample chain (official anthropic → GLM),
+    // `--only zhipu` resolved the route to `zhipu`, found no active binding there,
+    // and told the user to run `aikey use <key>` — which they had just done, and
+    // which pins `anthropic`. An error whose remediation is the thing you already
+    // did is the signature of a wrong lookup, not a user mistake. (Found by the
+    // live e2e in tests/e2e_use_route_group_live.rs; the unit tests missed it
+    // because they never crossed the two namespaces.)
+    let chain_primary = chain
+        .iter()
+        .min_by_key(|e| (e.priority, e.provider_code.clone()))
+        .unwrap_or(matched);
+    let client_route = crate::provider_registry::client_route_for_binding(
+        &chain_primary.provider_code,
+        &entry.protocol_type,
+    )
+    .to_string();
     let stamped = storage::pin_client_route_to_group_member(
         crate::profile_activation::DEFAULT_PROFILE,
         &client_route,
