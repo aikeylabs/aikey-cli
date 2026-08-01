@@ -1143,3 +1143,139 @@ mod cluster_resolve_tests {
         );
     }
 }
+
+// ── Task 6.4, L2 (contract) ────────────────────────────────────────────────
+//
+// The matrix's L2 row is the same for all three editions: "`binding_targets` 的
+// priority 顺序在金库里保住了；老代理收到新列静默忽略". The vault-INSERT half is
+// fenced textually in storage_platform.rs (`task_1_3_…`, with its own note on why
+// a round-trip test stayed green against the injected regression). This module
+// covers the WIRE half — what the CLI parses, in both compatibility directions.
+#[cfg(test)]
+mod chain_wire_contract_tests {
+    use super::*;
+
+    /// L2 — priority order and per-hop values survive deserialization.
+    ///
+    /// 🔴 The targets arrive DELIBERATELY out of order here. The server documents
+    /// "targets ordered by priority ASC", and the tempting reading is that the
+    /// client may therefore trust position. This asserts the values ride along
+    /// per hop, so a consumer sorts by `priority` rather than by arrival — the
+    /// same reason candidate_chain.go sorts again after the registry already did.
+    #[test]
+    fn task_6_4_l2_binding_target_order_and_values_survive_the_wire() {
+        let json = r#"{
+            "virtual_key_id":"vk-1","org_id":"o1","seat_id":"s1","alias":"k","current_revision":"r1",
+            "key_status":"active","share_status":"claimed",
+            "slots":[{"protocol_type":"anthropic","binding_targets":[
+              {"binding_id":"b3","provider_code":"openai","base_url":"https://o",
+               "provider_key":"k3","credential_id":"c3","credential_revision":"r",
+               "priority":3,"fallback_role":"fallback"},
+              {"binding_id":"b1","provider_code":"anthropic","base_url":"https://a",
+               "provider_key":"k1","credential_id":"c1","credential_revision":"r",
+               "priority":1,"fallback_role":"primary"},
+              {"binding_id":"b2","provider_code":"zhipu","base_url":"https://z",
+               "provider_key":"k2","credential_id":"c2","credential_revision":"r",
+               "priority":2,"fallback_role":"fallback"}
+            ]}]
+        }"#;
+        let payload: DeliveryPayload = serde_json::from_str(json).expect("parse delivery payload");
+        let targets = &payload.slots[0].binding_targets;
+        assert_eq!(targets.len(), 3, "a hop was dropped in deserialization");
+
+        let mut got: Vec<(i32, &str, &str)> = targets
+            .iter()
+            .map(|t| (t.priority, t.provider_code.as_str(), t.fallback_role.as_str()))
+            .collect();
+        got.sort_by_key(|t| t.0);
+        assert_eq!(
+            got,
+            vec![
+                (1, "anthropic", "primary"),
+                (2, "zhipu", "fallback"),
+                (3, "openai", "fallback"),
+            ],
+            "priority / fallback_role did not survive the wire per hop. Losing them here \
+             discards the administrator's order before the vault ever sees it, and every \
+             downstream test would still pass — the chain would simply run in arrival order."
+        );
+    }
+
+    /// L2 — a NEWER control plane's extra columns must not break an OLDER reader.
+    ///
+    /// 🔴 This is true today only because nothing on this path sets
+    /// `serde(deny_unknown_fields)`. That is a silent property: adding it
+    /// anywhere would compile, pass every existing test, and then make every
+    /// deployed older CLI fail to parse delivery the moment the server grows a
+    /// field — an outage triggered by a server-side change, on clients nobody
+    /// touched. The payload below carries fields this struct has never heard of.
+    #[test]
+    fn task_6_4_l2_unknown_future_columns_are_ignored_not_rejected() {
+        let json = r#"{
+            "virtual_key_id":"vk-1","org_id":"o1","seat_id":"s1","alias":"k","current_revision":"r1",
+            "key_status":"active","share_status":"claimed",
+            "a_field_from_the_future":{"nested":[1,2,3]},
+            "slots":[{"protocol_type":"anthropic","some_future_slot_field":"x",
+              "binding_targets":[
+              {"binding_id":"b1","provider_code":"anthropic","base_url":"https://a",
+               "provider_key":"k1","credential_id":"c1","credential_revision":"r",
+               "priority":1,"fallback_role":"primary",
+               "weight":7,"health_hint":"green"}
+            ]}]
+        }"#;
+        let payload: DeliveryPayload = serde_json::from_str(json)
+            .expect("an older reader must IGNORE unknown fields, not reject the payload");
+        assert_eq!(payload.slots[0].binding_targets[0].priority, 1);
+    }
+
+    /// L2, the other direction — an OLDER control plane omits the new fields
+    /// entirely and a NEWER CLI must still work. This is what `serde(default)`
+    /// on the route-group fields buys, and it is the upgrade order most
+    /// deployments actually have (clients update before the server).
+    #[test]
+    fn task_6_4_l2_missing_route_group_fields_default_rather_than_fail() {
+        let json = r#"{
+            "virtual_key_id":"vk-1","org_id":"o1","seat_id":"s1","alias":"k","current_revision":"r1",
+            "key_status":"active","share_status":"claimed",
+            "slots":[{"protocol_type":"anthropic","binding_targets":[
+              {"binding_id":"b1","provider_code":"anthropic","base_url":"https://a",
+               "provider_key":"k1","credential_id":"c1","credential_revision":"r",
+               "priority":1,"fallback_role":"primary"}
+            ]}]
+        }"#;
+        let payload: DeliveryPayload = serde_json::from_str(json)
+            .expect("a payload from an older control plane must still parse");
+        let (gid, gname) = payload.route_group_for("anthropic");
+        assert_eq!(
+            (gid, gname),
+            ("", ""),
+            "absent route-group fields must default to empty — empty means 'no group', which is \
+             a legitimate state (a legacy chain, or Personal) and must stay distinguishable"
+        );
+    }
+
+    /// The fence that keeps the two tests above meaningful.
+    #[test]
+    fn task_6_4_l2_delivery_structs_never_deny_unknown_fields() {
+        // 🔴 Match the ATTRIBUTE, not the words. The first version of this fence
+        // searched the whole file for the bare string and failed on its own
+        // failure message — a test that cannot survive describing what it checks
+        // gets weakened until it says nothing.
+        let offenders: Vec<usize> = include_str!("platform_client.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let t = l.trim_start();
+                t.starts_with("#[") && t.contains("deny_unknown_fields")
+            })
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "platform_client.rs applies serde's unknown-field rejection at line(s) {offenders:?}. \
+             Every deployed older CLI would then fail to parse delivery as soon as the control \
+             plane adds a field — a client-side outage caused by a server-side change, on clients \
+             nobody upgraded."
+        );
+    }
+}

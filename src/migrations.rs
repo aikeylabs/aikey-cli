@@ -3235,6 +3235,116 @@ mod tests {
         );
     }
 
+    /// Task 6.7 (rev5) — the re-grain must preserve the ORDER, not just the columns.
+    ///
+    /// 🔴 `task_1_6_…` above cannot make this claim, and that is worth spelling
+    /// out because it looks like it does. It seeds ONE row on a vault where the
+    /// columns do not exist yet, so the retrofit gives that row the DEFAULT
+    /// `priority = 1 / fallback_role = 'primary'` — and then asserts it reads
+    /// back as 1/'primary'. Replacing the SELECT's `priority, fallback_role`
+    /// with the literals `1, 'primary'` leaves that test GREEN (measured
+    /// 2026-07-31). A fence that cannot tell "copied" from "reset to the value I
+    /// happen to be expecting" is not fencing the rebuild.
+    ///
+    /// What a reset actually costs: a vault that has already synced real
+    /// per-binding priorities comes out of the re-grain with every hop flattened
+    /// to priority 1. Every candidate then shares a priority, which is the one
+    /// case `duplicatePriority` calls genuinely ambiguous — so the chain stops
+    /// serving with PROVIDER_ROUTE_AMBIGUOUS, on a configuration the
+    /// administrator never touched, during an upgrade.
+    ///
+    /// The state built here — fallback columns present AND populated, primary key
+    /// still single-column — is the one that distinguishes the two behaviours. It
+    /// is reachable in the field: the column patch and the re-grain are separate
+    /// statements, so a vault patched and synced before an interrupted upgrade
+    /// sits exactly here.
+    ///
+    /// 能红: put literals back into the re-grain's SELECT → this fails.
+    #[test]
+    fn task_6_7_regrain_preserves_configured_priority_order_not_just_the_columns() {
+        let vault = pre_p1e_vault();
+        // Bring the columns in the way the retrofit loop does, then populate them
+        // with DISTINCT, non-default values — the whole point is that the values
+        // must not be reproducible by a default.
+        for ddl in [
+            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN priority INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN fallback_role TEXT NOT NULL DEFAULT 'primary'",
+            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN route_group_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE managed_virtual_keys_cache ADD COLUMN route_group_name TEXT NOT NULL DEFAULT ''",
+        ] {
+            vault.execute(ddl, []).expect("patch column onto the pre-P1e table");
+        }
+        // 🔴 THREE separate keys, not three hops of one. A pre-P1e vault has
+        // `virtual_key_id` as its whole primary key, so "one key, several hops"
+        // is not representable there — which is precisely why the re-grain
+        // exists. Distinct values across distinct rows still separate "copied
+        // the column" from "wrote the default", which is what this fences.
+        vault
+            .execute(
+                "UPDATE managed_virtual_keys_cache
+                    SET priority = 1, fallback_role = 'primary',
+                        route_group_id = 'rg-1', route_group_name = 'prod chain'
+                  WHERE virtual_key_id = 'vk-old'",
+                [],
+            )
+            .expect("configure hop 1");
+        for (vk, provider, prio, role) in [
+            ("vk-two", "zhipu", 2_i64, "fallback"),
+            ("vk-three", "openai", 3_i64, "fallback"),
+        ] {
+            vault
+                .execute(
+                    "INSERT INTO managed_virtual_keys_cache
+                       (virtual_key_id, org_id, seat_id, alias, provider_code, protocol_type,
+                        base_url, credential_id, credential_revision, virtual_key_revision,
+                        priority, fallback_role, route_group_id, route_group_name)
+                     VALUES (?1,'o1','s1','legacy-key',?2,'anthropic',
+                             'https://example.test','c-old','r1','r1',?3,?4,'rg-1','prod chain')",
+                    params![vk, provider, prio, role],
+                )
+                .expect("seed extra row");
+        }
+
+        upgrade_all(&vault).expect("upgrade a patched-but-not-re-grained vault");
+
+        let pk_cols: i64 = vault
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('managed_virtual_keys_cache') WHERE pk > 0",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count pk cols");
+        assert_eq!(
+            pk_cols, 3,
+            "the re-grain did not run, so this test proves nothing about the rebuild"
+        );
+
+        let mut stmt = vault
+            .prepare(
+                "SELECT provider_code, priority, fallback_role, route_group_name
+                   FROM managed_virtual_keys_cache ORDER BY priority",
+            )
+            .expect("prepare");
+        let got: Vec<(String, i64, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+
+        assert_eq!(
+            got,
+            vec![
+                ("anthropic".to_string(), 1, "primary".to_string(), "prod chain".to_string()),
+                ("zhipu".to_string(), 2, "fallback".to_string(), "prod chain".to_string()),
+                ("openai".to_string(), 3, "fallback".to_string(), "prod chain".to_string()),
+            ],
+            "the re-grain did not carry the administrator's configured order through the rebuild.\n\
+             Flattening every hop to the default collapses the chain into one priority band, which \n\
+             the runtime treats as genuinely un-orderable (PROVIDER_ROUTE_AMBIGUOUS) — a chain that \n\
+             stops serving because of an upgrade, not a change."
+        );
+    }
+
     /// Task 1.7 — applying the migration twice is a no-op.
     #[test]
     fn task_1_7_column_patch_is_idempotent_across_two_runs() {
