@@ -1056,6 +1056,13 @@ fn handle_check_alias_exists(env: StdinEnvelope) {
 //   - Suffix is the last 4 chars. Secrets <= 8 chars return "****" for both
 //     fields to avoid exposing more than half of a short token.
 //   - `target` field is always "personal" per §2.0 unified-target rule.
+//
+// Record set contract (2026-08-01): this action returns the SAME set of
+// personal rows as `list_metadata_locked` — one row per `entries` row, no
+// exceptions. Rows whose ciphertext cannot be decrypted with the supplied
+// vault_key come back with `status:"undecryptable"`, `error_code:
+// "I_ENTRY_DECRYPT_FAILED"` and null secret_* fields rather than being
+// dropped. See the comment on the `masked` binding below for why.
 fn handle_list_personal_with_masked(env: StdinEnvelope) {
     let req_id = env.request_id.clone();
 
@@ -1087,31 +1094,43 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
 
     let mut out = Vec::with_capacity(metas.len() + team_records.len());
     for m in metas {
-        let (nonce, ciphertext) = match storage::get_entry(&m.alias) {
-            Ok(t) => t,
+        // Masked-secret triple (prefix, suffix4, len). `None` means this
+        // entry's ciphertext could not be read or could not be decrypted
+        // with the verified vault_key.
+        //
+        // Why `None` instead of `continue` (2026-08-01 bugfix): the previous
+        // code skipped such rows entirely, so the very same vault rendered
+        // FEWER keys after unlocking than before it — the locked list
+        // (`list_metadata_locked`) reads plaintext metadata only and never
+        // drops anything. A key silently vanishing from the Web page is the
+        // opposite of "失败要显眼": the user cannot see it, cannot delete it,
+        // and gets no clue why (the WARN below only reaches stderr). The row
+        // is now emitted with `status:"undecryptable"` so the page can render
+        // an explicit failure chip AND keep Delete reachable, which is the
+        // user's only way to clear an entry whose ciphertext no longer
+        // matches the current master key.
+        let masked: Option<(String, String, usize)> = match storage::get_entry(&m.alias) {
+            Ok((nonce, ciphertext)) => match crypto::decrypt(&key, &nonce, &ciphertext) {
+                Ok(plaintext) => {
+                    let secret = String::from_utf8_lossy(&plaintext);
+                    Some(extract_prefix_suffix(&secret))
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[_internal query list_personal_with_masked WARN] decrypt '{}' failed: {}",
+                        m.alias, e
+                    );
+                    None
+                }
+            },
             Err(e) => {
-                // Skip the entry instead of failing the whole list — a single
-                // corrupted row shouldn't black-hole the Web page. Log via
-                // stderr so operators can see it.
                 eprintln!(
                     "[_internal query list_personal_with_masked WARN] get_entry '{}' failed: {}",
                     m.alias, e
                 );
-                continue;
+                None
             }
         };
-        let plaintext = match crypto::decrypt(&key, &nonce, &ciphertext) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "[_internal query list_personal_with_masked WARN] decrypt '{}' failed: {}",
-                    m.alias, e
-                );
-                continue;
-            }
-        };
-        let secret = String::from_utf8_lossy(&plaintext);
-        let (prefix, suffix, len) = extract_prefix_suffix(&secret);
         // `official_base_url`: the provider's recommended URL when the
         // user didn't set a custom `base_url` (stored value is NULL).
         // Resolved from the canonical PROVIDER_DEFAULTS table in
@@ -1128,7 +1147,7 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
             .provider_code
             .as_deref()
             .and_then(|provider| route_url_for_personal(provider, m.base_url.as_deref()));
-        out.push(json!({
+        let mut record = json!({
             "target": "personal",
             "id": m.alias,
             "alias": m.alias,
@@ -1139,7 +1158,10 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
             "route_url": route_url,
             "supported_providers": m.supported_providers,
             "created_at": m.created_at,
-            "status": "active",
+            // "undecryptable" is the only non-"active" status a personal entry
+            // can carry: `entries` has no enabled column, so a row that decrypts
+            // is by definition usable.
+            "status": if masked.is_some() { "active" } else { "undecryptable" },
             "route_token": m.route_token,
             "last_used_at": m.last_used_at,
             "use_count": m.use_count.unwrap_or(0),
@@ -1155,10 +1177,20 @@ fn handle_list_personal_with_masked(env: StdinEnvelope) {
             // record.
             "in_use_for": active_personal.get(&m.alias).cloned().unwrap_or_default(),
             "in_use": active_personal.contains_key(&m.alias),
-            "secret_prefix": prefix,
-            "secret_suffix": suffix,
-            "secret_len": len,
-        }));
+            // Null on an undecryptable row — same sentinel the locked list
+            // emits, so the Web page's existing "no prefix known" rendering
+            // path is reused instead of a second masking convention.
+            "secret_prefix": masked.as_ref().map(|(p, _, _)| p.clone()),
+            "secret_suffix": masked.as_ref().map(|(_, s, _)| s.clone()),
+            "secret_len": masked.as_ref().map(|(_, _, l)| *l),
+        });
+        if masked.is_none() {
+            // Emitted only on the failure branch so callers can branch on
+            // presence. Code is in the same I_* namespace as every other
+            // _internal error code.
+            record["error_code"] = json!("I_ENTRY_DECRYPT_FAILED");
+        }
+        out.push(record);
     }
 
     // Phase 3B revised: append team records inline.

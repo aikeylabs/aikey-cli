@@ -727,6 +727,17 @@ pub fn get_kdf_params() -> Result<(u32, u32, u32), String> {
 /// here — write-path callers must fail loud on uncertainty, never silently
 /// proceed to encrypt.
 pub fn verify_vault_key(vault_key: &[u8]) -> Result<(), String> {
+    let conn = open_connection()?;
+    verify_vault_key_on_conn(&conn, vault_key)
+}
+
+/// `verify_vault_key` on a caller-owned connection. Exists so write paths that
+/// already hold a transaction (batch import) can verify without opening a
+/// second connection mid-transaction.
+pub fn verify_vault_key_on_conn(
+    conn: &rusqlite::Connection,
+    vault_key: &[u8],
+) -> Result<(), String> {
     if vault_key.len() != crate::crypto::KEY_SIZE {
         return Err(format!(
             "vault_key length mismatch (got {} bytes, expected {})",
@@ -734,7 +745,6 @@ pub fn verify_vault_key(vault_key: &[u8]) -> Result<(), String> {
             crate::crypto::KEY_SIZE
         ));
     }
-    let conn = open_connection()?;
     let stored: Result<Vec<u8>, rusqlite::Error> = conn.query_row(
         "SELECT value FROM config WHERE key = ?1",
         params!["password_hash"],
@@ -758,8 +768,57 @@ pub fn verify_vault_key(vault_key: &[u8]) -> Result<(), String> {
     }
 }
 
-/// Stores an encrypted entry in the vault
-pub fn store_entry(alias: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<(), String> {
+/// Stores an encrypted entry AFTER proving the key that produced the
+/// ciphertext is the vault's current key. This is the entry point every
+/// production caller must use.
+///
+/// Why this exists (2026-08-01): `verify_vault_key` was introduced for the
+/// 2026-05-11 team-key incident but was only wired into the
+/// `managed_virtual_keys_cache` write path. Personal `entries` writes kept
+/// relying on each caller having verified the key somewhere upstream, which
+/// is the kind of invariant that holds until someone adds a fourth caller.
+/// The failure mode is silent and permanent: ciphertext encrypted under a
+/// non-current key can never be decrypted again by anyone, it disappears
+/// from `aikey get` / the proxy registry, and it makes
+/// `aikey change-password` abort for the whole vault. Verifying at the
+/// single write door makes that state unreachable by construction.
+pub fn store_entry_verified(
+    alias: &str,
+    vault_key: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<(), String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Err(
+            "Vault not initialized. Run any aikey command to initialize it automatically."
+                .to_string(),
+        );
+    }
+    let conn = open_connection()?;
+    migrate_database(&conn)?;
+    store_entry_verified_on_conn(&conn, alias, vault_key, nonce, ciphertext)
+}
+
+/// Transactional variant of `store_entry_verified` — see `store_entry_on_conn`
+/// for why the `*_on_conn` split exists.
+pub fn store_entry_verified_on_conn(
+    conn: &rusqlite::Connection,
+    alias: &str,
+    vault_key: &[u8],
+    nonce: &[u8],
+    ciphertext: &[u8],
+) -> Result<(), String> {
+    verify_vault_key_on_conn(conn, vault_key)?;
+    store_entry_on_conn(conn, alias, nonce, ciphertext)
+}
+
+/// Stores an encrypted entry in the vault.
+///
+/// Low-level: performs NO key verification. Production callers must go
+/// through `store_entry_verified` instead — `tests/write_path_guard.rs`
+/// enforces that.
+pub(crate) fn store_entry(alias: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<(), String> {
     let db_path = get_vault_path()?;
 
     if !db_path.exists() {
@@ -787,6 +846,8 @@ pub fn store_entry(alias: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<(), S
 /// Migrations and vault-existence checks live with the wrapper; the inner
 /// helper assumes the connection is already initialised (open_connection
 /// applies migrations).
+///
+/// Low-level: performs NO key verification — see `store_entry_verified_on_conn`.
 pub(crate) fn store_entry_on_conn(
     conn: &rusqlite::Connection,
     alias: &str,
@@ -3234,6 +3295,40 @@ mod tests {
 
         // Length mismatch is a programmer error, not a credential error.
         assert!(verify_vault_key(&[0u8; 31]).is_err());
+    }
+
+    /// Fence for the 2026-08-01 bugfix: the entries write door must reject a
+    /// key that does not match `password_hash`, so no code path can mint an
+    /// orphan ciphertext again.
+    ///
+    /// Why this matters: ciphertext written under a non-current key is
+    /// unrecoverable — it vanishes from the unlocked vault list, `aikey get`
+    /// and the proxy registry can never decrypt it, and it makes
+    /// `aikey change-password` abort for the entire vault. Failing the write
+    /// is strictly better than accepting one.
+    #[test]
+    fn store_entry_verified_rejects_non_current_key() {
+        let (_dir, _db_path, _lock) = setup_vault();
+        let good = derive_current("test_password");
+        let wrong = [9u8; 32];
+
+        let (nonce, ciphertext) = crate::crypto::encrypt(&wrong, b"sk-orphan").expect("encrypt");
+        let err = store_entry_verified("orphan", &wrong, &nonce, &ciphertext)
+            .expect_err("a key that does not match password_hash must be refused");
+        assert!(
+            err.contains("password_hash"),
+            "rejection must name the check that failed, got: {}",
+            err
+        );
+        assert!(
+            get_entry("orphan").is_err(),
+            "refused write must not land a row"
+        );
+
+        // Control: the real key still writes.
+        let (n2, c2) = crate::crypto::encrypt(&good, b"sk-good").expect("encrypt");
+        store_entry_verified("healthy", &good, &n2, &c2).expect("current key must be accepted");
+        assert!(get_entry("healthy").is_ok());
     }
 
     #[test]

@@ -1467,3 +1467,137 @@ fn mutating_actions_reject_wrong_key() {
     assert_eq!(v["error_code"], "I_VAULT_KEY_INVALID");
     assert_eq!(count_entries(&env), before, "wrong key must not write");
 }
+
+// ========== Undecryptable entries stay in the list (2026-08-01 regression) ==========
+//
+// Bug: `list_personal_with_masked` decrypts every entry to build the masked
+// secret chip and used to `continue` past any row it could not decrypt. The
+// locked list (`list_metadata_locked`) reads plaintext metadata only and never
+// skips anything, so the SAME vault rendered fewer keys AFTER unlocking than
+// before it — the row vanished from the Web page with no way to see or delete
+// it, and the CLI's only signal was a stderr WARN the Go bridge discarded on
+// the success path.
+//
+// Fence: the two actions must return the same set of personal aliases, and the
+// bad row must be explicitly marked instead of dropped.
+// Regression doc: workflow/CI/bugfix/2026-08-01-vault-unlocked-list-drops-undecryptable-entries.md
+
+/// Overwrite one entry's ciphertext with a payload encrypted under a DIFFERENT
+/// 32-byte key, reproducing the production symptom (a well-formed AES-GCM blob
+/// that the vault's real key cannot authenticate). Not random bytes: an orphan
+/// ciphertext in the field is valid output of some other key, and we want the
+/// fence to exercise exactly that.
+fn corrupt_entry_with_foreign_key(env: &InternalTestEnv, alias: &str) {
+    use aes_gcm::aead::{Aead, KeyInit, OsRng};
+    use aes_gcm::{AeadCore, Aes256Gcm, Key, Nonce};
+    use rusqlite::Connection;
+
+    let foreign_key = [7u8; 32];
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&foreign_key));
+    let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, b"sk-orphan-written-under-another-master-key".as_ref())
+        .expect("encrypt with foreign key");
+
+    let db = env.vault_path.join("data").join("vault.db");
+    let conn = Connection::open(&db).expect("open vault");
+    let n = conn
+        .execute(
+            "UPDATE entries SET nonce = ?1, ciphertext = ?2 WHERE alias = ?3",
+            rusqlite::params![nonce_bytes.to_vec(), ciphertext, alias],
+        )
+        .expect("overwrite ciphertext");
+    assert_eq!(n, 1, "fixture must hit exactly one row for alias {}", alias);
+}
+
+/// Personal aliases in `list_personal_with_masked` (unlocked) output.
+fn unlocked_personal_aliases(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = v["data"]["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .filter(|r| r["target"] == "personal")
+        .map(|r| r["alias"].as_str().expect("alias").to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Personal aliases in `list_metadata_locked` output.
+fn locked_personal_aliases(v: &Value) -> Vec<String> {
+    let mut out: Vec<String> = v["data"]["records"]
+        .as_array()
+        .expect("records array")
+        .iter()
+        .filter(|r| r["target"] == "personal")
+        .map(|r| r["alias"].as_str().expect("alias").to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn undecryptable_entry_is_listed_not_dropped() {
+    let env = InternalTestEnv::new();
+    env.init_vault();
+    let key_hex = env.vault_key_hex();
+    seed_credentials(&env, &key_hex);
+    corrupt_entry_with_foreign_key(&env, "q-openai");
+
+    let unlocked = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": key_hex,
+            "action": "list_personal_with_masked",
+            "payload": {}
+        }),
+    );
+    let locked = run_query(
+        &env,
+        serde_json::json!({
+            "vault_key_hex": "0".repeat(64),
+            "action": "list_metadata_locked",
+            "payload": {}
+        }),
+    );
+    assert_eq!(unlocked["status"], "ok", "unlocked: {}", unlocked);
+    assert_eq!(locked["status"], "ok", "locked: {}", locked);
+
+    // The core invariant: unlocking must never shrink the vault list.
+    assert_eq!(
+        unlocked_personal_aliases(&unlocked),
+        locked_personal_aliases(&locked),
+        "locked and unlocked lists must expose the same personal aliases"
+    );
+
+    let entries = unlocked["data"]["entries"].as_array().expect("entries");
+    let bad = entries
+        .iter()
+        .find(|r| r["alias"] == "q-openai")
+        .expect("undecryptable entry must still be present");
+    assert_eq!(bad["status"], "undecryptable");
+    assert_eq!(bad["error_code"], "I_ENTRY_DECRYPT_FAILED");
+    assert!(bad["secret_prefix"].is_null(), "prefix must be null: {}", bad);
+    assert!(bad["secret_suffix"].is_null(), "suffix must be null: {}", bad);
+    assert!(bad["secret_len"].is_null(), "len must be null: {}", bad);
+    // Plaintext metadata still flows, so the row remains identifiable and
+    // deletable from the Web page.
+    assert_eq!(bad["provider_code"], "openai");
+
+    let good = entries
+        .iter()
+        .find(|r| r["alias"] == "q-claude")
+        .expect("healthy entry");
+    assert_eq!(good["status"], "active");
+    assert!(good["error_code"].is_null(), "healthy row carries no error_code");
+    assert!(!good["secret_prefix"].is_null());
+
+    // personal_count feeds the Web page's identity-strip counter; it must count
+    // the undecryptable row too, otherwise the number still jumps on unlock.
+    assert_eq!(
+        unlocked["data"]["personal_count"].as_u64(),
+        locked["data"]["counts"]["personal"].as_u64(),
+        "personal counts must match across lock states"
+    );
+}

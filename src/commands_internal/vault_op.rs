@@ -1703,7 +1703,10 @@ fn handle_update_secret(env: StdinEnvelope) {
             return;
         }
     };
-    if let Err(e) = storage::store_entry(&payload.alias, &nonce, &ciphertext) {
+    // `prepare_vault` already verified this key; going through the verified
+    // door anyway keeps the guarantee at the write site rather than in a
+    // caller's memory (see storage::store_entry_verified).
+    if let Err(e) = storage::store_entry_verified(&payload.alias, &key, &nonce, &ciphertext) {
         emit_error(req_id, "I_INTERNAL", format!("store_entry failed: {}", e));
         return;
     }

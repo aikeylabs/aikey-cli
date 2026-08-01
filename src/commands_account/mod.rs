@@ -4657,8 +4657,10 @@ pub(crate) fn apply_add_core_on_conn(
     let (nonce, ciphertext) = crate::crypto::encrypt(vault_key, secret_plaintext)
         .map_err(|e| format!("encrypt '{}': {}", validated, e))?;
 
-    // Vault ciphertext row (UPSERT semantics at storage layer).
-    storage::store_entry_on_conn(conn, &validated, &nonce, &ciphertext)
+    // Vault ciphertext row (UPSERT semantics at storage layer). Verified
+    // variant: the key arrives from the caller here, so the write door is the
+    // only place that can prove it matches the vault's password_hash.
+    storage::store_entry_verified_on_conn(conn, &validated, vault_key, &nonce, &ciphertext)
         .map_err(|e| format!("store_entry '{}': {}", validated, e))?;
 
     // Provider metadata — only touch when caller provided providers. An
@@ -7276,10 +7278,29 @@ mod core_tests {
         (dir, guard)
     }
 
-    fn dummy_vault_key() -> [u8; 32] {
-        // Any 32-byte key works for apply_add_core tests — it's used purely
-        // for AES-GCM encryption. Decryption round-trips aren't tested here.
-        [0x42u8; 32]
+    /// The vault's REAL key, derived from the password `setup_vault` used.
+    ///
+    /// Was a fixed `[0x42u8; 32]` until 2026-08-01 on the reasoning that "any
+    /// 32-byte key works, we never decrypt here". That is exactly the habit
+    /// that produced the orphan-ciphertext bug: entries written under a key
+    /// that doesn't match `config.password_hash` can never be read back, so
+    /// `store_entry_verified` now refuses them. Deriving the real key keeps
+    /// these tests testing what they mean to test (add/rename metadata
+    /// behaviour) instead of exercising a state production must not reach.
+    fn current_vault_key() -> [u8; 32] {
+        let salt = storage::get_salt().expect("salt");
+        let (m, t, p) = storage::get_kdf_params().expect("kdf params");
+        let key = crate::crypto::derive_key_with_params(
+            &SecretString::new("test_password".to_string()),
+            &salt,
+            m,
+            t,
+            p,
+        )
+        .expect("derive vault key");
+        let mut out = [0u8; 32];
+        out.copy_from_slice(key.as_slice());
+        out
     }
 
     // ── N6: oauth-group fold + extra fence ─────────────────────────────────────
@@ -7734,7 +7755,7 @@ mod core_tests {
     fn apply_add_core_writes_entry_with_canonical_providers() {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
-        let key = dummy_vault_key();
+        let key = current_vault_key();
 
         let outcome = apply_add_core_on_conn(
             &conn,
@@ -7758,7 +7779,7 @@ mod core_tests {
     fn apply_add_core_respects_on_conflict_error() {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
-        let key = dummy_vault_key();
+        let key = current_vault_key();
         apply_add_core_on_conn(
             &conn,
             &key,
@@ -7779,7 +7800,7 @@ mod core_tests {
     fn apply_add_core_on_conflict_replace_overwrites() {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
-        let key = dummy_vault_key();
+        let key = current_vault_key();
 
         apply_add_core_on_conn(
             &conn,
@@ -7809,7 +7830,7 @@ mod core_tests {
     fn apply_add_core_on_conflict_skip_noops() {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
-        let key = dummy_vault_key();
+        let key = current_vault_key();
 
         apply_add_core_on_conn(
             &conn,
@@ -7835,7 +7856,7 @@ mod core_tests {
     fn apply_add_core_writes_base_url() {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
-        let key = dummy_vault_key();
+        let key = current_vault_key();
         apply_add_core_on_conn(
             &conn,
             &key,
@@ -7858,7 +7879,7 @@ mod core_tests {
     fn apply_add_core_rejects_invalid_alias() {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
-        let key = dummy_vault_key();
+        let key = current_vault_key();
         let err = apply_add_core_on_conn(&conn, &key, "  ", b"s", &[], None, OnConflict::Error)
             .unwrap_err();
         assert!(err.contains("empty"), "err was: {}", err);
@@ -7882,7 +7903,7 @@ mod core_tests {
     fn apply_rename_core_personal_happy_path() {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
-        let key = dummy_vault_key();
+        let key = current_vault_key();
         apply_add_core_on_conn(&conn, &key, "old-name", b"s", &[], None, OnConflict::Error)
             .unwrap();
         drop(conn);
@@ -7907,7 +7928,7 @@ mod core_tests {
     fn apply_rename_core_personal_conflict_errors() {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
-        let key = dummy_vault_key();
+        let key = current_vault_key();
         apply_add_core_on_conn(&conn, &key, "a", b"s1", &[], None, OnConflict::Error).unwrap();
         apply_add_core_on_conn(&conn, &key, "b", b"s2", &[], None, OnConflict::Error).unwrap();
         drop(conn);
@@ -7920,7 +7941,7 @@ mod core_tests {
     fn apply_rename_core_personal_identical_errors() {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
-        let key = dummy_vault_key();
+        let key = current_vault_key();
         apply_add_core_on_conn(&conn, &key, "same", b"s", &[], None, OnConflict::Error).unwrap();
         drop(conn);
 
@@ -7932,7 +7953,7 @@ mod core_tests {
     fn apply_rename_core_personal_rejects_invalid_new_alias() {
         let (_dir, _lock) = setup_vault();
         let conn = storage::open_connection().expect("open");
-        let key = dummy_vault_key();
+        let key = current_vault_key();
         apply_add_core_on_conn(&conn, &key, "source", b"s", &[], None, OnConflict::Error).unwrap();
         drop(conn);
 

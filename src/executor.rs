@@ -357,7 +357,7 @@ pub fn add_secret(alias: &str, secret: &str, password: &SecretString) -> Result<
 
     let ctx = VaultContext::new(password)?;
     let (nonce, ciphertext) = ctx.encrypt(secret.as_bytes())?;
-    storage::store_entry(alias, &nonce, &ciphertext)?;
+    storage::store_entry_verified(alias, ctx.key.as_slice(), &nonce, &ciphertext)?;
     let _ = storage::bump_vault_change_seq();
     Ok(())
 }
@@ -453,7 +453,7 @@ pub fn update_secret(alias: &str, new_secret: &str, password: &SecretString) -> 
     // Encrypt and store the new value
     let ctx = VaultContext::new(password)?;
     let (nonce, ciphertext) = ctx.encrypt(new_secret.as_bytes())?;
-    storage::store_entry(alias, &nonce, &ciphertext)?;
+    storage::store_entry_verified(alias, ctx.key.as_slice(), &nonce, &ciphertext)?;
     let _ = storage::bump_vault_change_seq();
     Ok(())
 }
