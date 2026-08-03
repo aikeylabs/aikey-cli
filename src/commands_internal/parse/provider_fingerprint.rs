@@ -356,6 +356,50 @@ impl FingerprintClassifier {
         out
     }
 
+    /// Which protocol did this provider speak before anyone gave it a second face?
+    ///
+    /// Mirrors Go's `providerroutes.Table.LegacyProtocolForProvider` exactly —
+    /// see that doc comment for the full rationale. Short version: a credential
+    /// created before protocol became a stored axis could only have been saved
+    /// against a bare-host URL, and a bare-host URL resolves to the host's
+    /// EMPTY-`path_prefix` row. So the protocol of the empty-prefix rows is the
+    /// face such a credential was created against, and adding a second face
+    /// (which always arrives WITH an explicit `path_prefix`) cannot move it.
+    ///
+    /// 🚫 Deliberately not "the first row in YAML order" — row order is an
+    /// editing accident, not a routing decision anybody made.
+    ///
+    /// Returns `None` when the empty-prefix rows disagree, or when there are
+    /// none (`mock`: every row carries an explicit prefix). Failing closed there
+    /// is right — such a provider never had a protocol-less era.
+    ///
+    /// # Why it exists (2026-08-02, provider-credential-cascade)
+    ///
+    /// Callers used to resolve a protocol-less credential with "if the provider
+    /// declares exactly one protocol, use it". Giving deepseek / moonshot / qwen
+    /// / doubao / minimax their anthropic faces falsified that premise for five
+    /// providers at once, and `aikey use <provider>` began refusing every legacy
+    /// personal key on them with "Cannot select provider … without an exact
+    /// protocol binding". (`zhipu` had been multi-protocol since 2026-05 and was
+    /// ALREADY refusing this way.) Widening only: it can turn a previous `None`
+    /// into a truthful answer, never change an answer that already resolved.
+    pub fn legacy_protocol_for_provider(&self, provider: &str) -> Option<String> {
+        let mut found: Option<&str> = None;
+        for route in &self.provider_routes {
+            if !route.provider.eq_ignore_ascii_case(provider) || !route.path_prefix.is_empty() {
+                continue;
+            }
+            match found {
+                None => found = Some(route.protocol.as_str()),
+                Some(prev) if prev.eq_ignore_ascii_case(&route.protocol) => {}
+                // Two bare-host faces for one provider: no single "before" to
+                // point at. Don't guess.
+                Some(_) => return None,
+            }
+        }
+        found.map(str::to_string)
+    }
+
     /// v4.3: full official URL = base_url + version (with empty-version edge case).
     /// 这是用户在 UI 上看到 / 期望粘贴的 endpoint URL。
     pub fn official_url_for_route(route: &ProviderRoute) -> String {
@@ -887,6 +931,77 @@ mod tests {
             c.provider_model_maps(),
             golden.provider_model_maps.as_slice(),
             "Rust provider_model_maps parse != golden"
+        );
+    }
+
+    /// A provider that gains a SECOND protocol face must not orphan the legacy
+    /// credentials created against its first one.
+    ///
+    /// This is the Rust half of the regression that
+    /// `provider-credential-cascade` introduced and then fixed. Adding the
+    /// anthropic faces made `protocols_for_provider` return two values for five
+    /// providers at once, and the "exactly one declared protocol" fallback in
+    /// `commands_account` then refused every protocol-less personal key with
+    /// "Cannot select provider 'moonshot' without an exact protocol binding".
+    ///
+    /// It surfaced through ONE unrelated test
+    /// (`write_bindings_canonical_kimi_family_mutex_last_write_wins`) that
+    /// happened to exercise a moonshot binding — and its panic then poisoned a
+    /// shared test mutex, turning 1 real failure into 24 red tests and burying
+    /// the signal. Nothing asserted the property itself, so `zhipu` had been
+    /// broken this way since 2026-05 with nobody looking.
+    ///
+    /// This asserts the property directly, across the whole table.
+    #[test]
+    fn a_second_protocol_face_does_not_orphan_legacy_credentials() {
+        let c = instance();
+        let mut providers: Vec<&str> = c
+            .provider_routes()
+            .iter()
+            .map(|r| r.provider.as_str())
+            .collect();
+        providers.sort_unstable();
+        providers.dedup();
+        assert!(
+            !providers.is_empty(),
+            "zero providers — anti-vacuous assertion"
+        );
+
+        let mut checked = 0usize;
+        for provider in providers {
+            let has_bare_host_row = c
+                .provider_routes()
+                .iter()
+                .any(|r| r.provider.eq_ignore_ascii_case(provider) && r.path_prefix.is_empty());
+            let resolved = if c.protocols_for_provider(provider).len() == 1 {
+                Some(c.protocols_for_provider(provider)[0].clone())
+            } else {
+                c.legacy_protocol_for_provider(provider)
+            };
+            if has_bare_host_row {
+                assert!(
+                    resolved.is_some(),
+                    "provider '{provider}' has a bare-host route row, so credentials predating \
+                     the protocol axis exist for it — but no protocol resolves without an \
+                     explicit hint. Every such key now fails `aikey use {provider}` with \
+                     \"Cannot select provider … without an exact protocol binding\"."
+                );
+                checked += 1;
+            } else {
+                // No bare-host row => the provider never had a protocol-less era
+                // (mock is created only with an explicit protocol). Fail-closed
+                // is correct there and must STAY closed.
+                assert!(
+                    resolved.is_none() || c.protocols_for_provider(provider).len() == 1,
+                    "provider '{provider}' has no bare-host row, yet a protocol was guessed for \
+                     it. A provider whose every row carries an explicit path_prefix has no \
+                     'before' to fall back to — guessing one hides a real bug."
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "no provider exercised the legacy path — anti-vacuous assertion"
         );
     }
 
