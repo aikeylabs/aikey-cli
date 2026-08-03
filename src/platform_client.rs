@@ -1185,7 +1185,13 @@ mod chain_wire_contract_tests {
 
         let mut got: Vec<(i32, &str, &str)> = targets
             .iter()
-            .map(|t| (t.priority, t.provider_code.as_str(), t.fallback_role.as_str()))
+            .map(|t| {
+                (
+                    t.priority,
+                    t.provider_code.as_str(),
+                    t.fallback_role.as_str(),
+                )
+            })
             .collect();
         got.sort_by_key(|t| t.0);
         assert_eq!(
