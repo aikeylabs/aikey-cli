@@ -4979,6 +4979,22 @@ pub(crate) fn exact_binding_specs_for_source(
         let declared = classifier.protocols_for_provider(&provider);
         if declared.len() == 1 {
             protocols = declared;
+        } else if let Some(legacy) = classifier.legacy_protocol_for_provider(&provider) {
+            // 2026-08-02 (provider-credential-cascade): "exactly one declared
+            // protocol" used to be the only way a protocol-less legacy key could
+            // resolve. Giving deepseek / moonshot / qwen / doubao / minimax their
+            // anthropic faces falsified that premise for five providers at once,
+            // and `aikey use moonshot` began refusing every legacy personal key
+            // on them. (zhipu had been refusing this way since 2026-05 —
+            // unnoticed, because nothing asserted the property.)
+            //
+            // legacy_protocol_for_provider answers the narrower, still-truthful
+            // question: which face did this provider serve on its BARE HOST —
+            // i.e. the one a key predating the protocol axis must have been
+            // created against. Still fail-closed below when even that is
+            // ambiguous. Mirrors Go's provider.ProtocolFamily fallback so the
+            // CLI and the proxy cannot disagree about the same credential.
+            protocols = vec![legacy];
         } else {
             return Err(format!(
                 "Cannot select provider '{}' without an exact protocol binding for {} '{}'. Select the credential from `aikey use` or refresh its metadata.",

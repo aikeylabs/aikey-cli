@@ -91,7 +91,33 @@ family_login_urls:
 # Web import "use official" 按钮:
 #   user 粘贴 URL → 抽 host → lookup → official URL = base_url + version
 #
-# 数据来源 (2026-05-01 校对; 2026-05-08 Kimi 双平台拆分修订):
+# 数据来源 (2026-05-01 校对; 2026-05-08 Kimi 双平台拆分修订;
+#           2026-08-02 provider-credential-cascade 扩表 23 → 50 行):
+#
+# 2026-08-02 本轮新增厂商与调研分档 —— 逐条来源链接 + 抓取日期见
+#   roadmap20260320/技术实现/阶段8-平台化/供应商凭据三级联动/
+#   openspec/changes/provider-credential-cascade/research-provider-endpoints.md
+#
+#   A 档 (官方文档逐字抓取, 直接进表):
+#     anthropic 第二协议面 —— deepseek / moonshot(.cn+.ai) / qwen(百炼
+#       claude-code-proxy) / doubao(方舟 Coding Plan) / minimax(国内+国际) /
+#       zhipu(api.z.ai)
+#     openai_compatible 新厂商 —— mistral / minimax / stepfun / hunyuan /
+#       qianfan / together(.ai 规范 + .xyz 旧域名) / fireworks / cerebras /
+#       github_models / vercel_gateway
+#   B 档 (二级来源一致, 未取得官方原文; YAML 行内标 `# tier-B 待官方复核`,
+#         界面显示「社区验证」角标):
+#     zhipu 的 api.z.ai openai 面 / sambanova / aihubmix(主+备) / ai302
+#   C 档 (🚫 不进表, 未采纳原因见 research-provider-endpoints.md §3):
+#     cohere / yi / azure_openai / bedrock / vertex_ai /
+#     ollama·lmstudio·vllm(见 R-5) / novita·deepinfra·hyperbolic·nebius /
+#     客户自建 one-api·new-api·企业反代 (结构上进不了 host-keyed 表)
+#
+# 🔴 本表是 2026-08-02 的快照且**编译期内嵌**。厂商随时可能改地址(风险 X-7),
+#    而 **CI 不会告诉你某个厂商今天改了 URL** —— 那是测试方案 §6「路由表体检」
+#    这份人工发版前清单负责的事。
+#
+# 原始数据来源 (2026-05-01):
 #   - Anthropic:   官方 https://api.anthropic.com/v1
 #   - OpenAI:      官方 https://api.openai.com/v1
 #   - Kimi Code:   https://api.kimi.com/coding/v1 (sk-kimi-* KEY 形态稳定 → confirmed regex)
@@ -122,7 +148,14 @@ provider_routes:
   # 兜底行 path_prefix:"" 保持既有 openai_compatible + /api/paas 语义不变（向后兼容，18 行零改动围栏锁定）。
   # 另两行显式 path_prefix，让客户粘贴的 /api/anthropic 与 /api/coding/paas/v4 端点各自命中正确协议/base_url。
   - { host: "open.bigmodel.cn",                   protocol: openai_compatible, provider: zhipu,         base_url: "https://open.bigmodel.cn/api/paas",          version: ""       }
-  - { host: "open.bigmodel.cn", path_prefix: "/api/anthropic",       protocol: anthropic,         provider: zhipu, base_url: "https://open.bigmodel.cn/api/anthropic",       version: "/v1" }
+  # 2026-08-02 provider-credential-cascade / I-5: `default: true` added.
+  # api.z.ai also serves zhipu's /api/anthropic face, so (zhipu, anthropic) now
+  # matches TWO rows and NEITHER has an empty path_prefix → ByProviderProtocol
+  # would fall through to "no truthful default, return ok=false" and the console
+  # would silently auto-fill nothing. This flag is exactly what `default` exists
+  # for (kimi's two-host pair already uses it). Routing is unaffected: Default
+  # is read only by ByProviderProtocol, never by Lookup/LookupByBaseURL.
+  - { host: "open.bigmodel.cn", path_prefix: "/api/anthropic",       protocol: anthropic,         provider: zhipu, base_url: "https://open.bigmodel.cn/api/anthropic",       version: "/v1", default: true }
   - { host: "open.bigmodel.cn", path_prefix: "/api/coding/paas/v4",  protocol: openai_compatible, provider: zhipu, base_url: "https://open.bigmodel.cn/api/coding/paas",  version: "/v4" }
   - { host: "ark.cn-beijing.volces.com",          protocol: openai_compatible, provider: doubao,        base_url: "https://ark.cn-beijing.volces.com/api",      version: "/v3"     }
   - { host: "dashscope.aliyuncs.com",             protocol: openai_compatible, provider: qwen,          base_url: "https://dashscope.aliyuncs.com/compatible-mode", version: "/v1" }
@@ -130,6 +163,94 @@ provider_routes:
   - { host: "api-inference.huggingface.co",       protocol: openai_compatible, provider: huggingface,   base_url: "https://api-inference.huggingface.co",       version: "/v1"     }
   - { host: "yunwu.ai",                           protocol: openai_compatible, provider: yunwu,         base_url: "https://yunwu.ai",                           version: "/v1"     }
   - { host: "aicoding.2233.ai",                   protocol: openai_compatible, provider: zeroeleven,    base_url: "https://aicoding.2233.ai",                   version: "/v1"     }
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 2026-08-02 · provider-credential-cascade —— 27 行新增（23 → 50）
+  #
+  # 纪律：**只加行**。上面 23 行除 open.bigmodel.cn 的 /api/anthropic 按 I-5 补了
+  # `default: true` 外，逐字节未动。改既有行的 path_prefix（例如把 dashscope 兜底行
+  # 从 "" 改成 "/compatible-mode" 让它"更对称"）会让每一条只填了域名的存量凭据
+  # 一行都匹配不上 → LookupByBaseURL 返回 ok=false → 静默路由失败。
+  # **兜底行的 "" 是不可动的。**
+  #
+  # 调研落档（每条带来源链接 + 抓取日期）：
+  #   roadmap20260320/技术实现/阶段8-平台化/供应商凭据三级联动/
+  #   openspec/changes/provider-credential-cascade/research-provider-endpoints.md
+  #
+  # tier-B 行带 `# tier-B 待官方复核` 行内注释；codegen 据此在界面打「社区验证」角标
+  # （R-7），并登记进「待客户实测复核」清单。🚫 不许悄悄把 B 当 A。
+  # ══════════════════════════════════════════════════════════════════════════
+
+  # ── A 档：既有 provider 的 anthropic 第二协议面（本次最大价值）─────────────
+  #
+  # 🔴 这一组全部是"已知 host + 新 path_prefix"的形状，也正是 P0.5b 场景 A
+  # （混版静默错路由）命中的形状：老代理的兜底行永远匹配，/anthropic 段被当噪声
+  # 丢弃，Anthropic 请求体打到 OpenAI 端点，且 LookupByBaseURL 返回 ok=true
+  # 所以一条 WARN 都不打。R-9 定案 B 已给 stitch.go 补上那条 WARN。
+  # 受影响行逐条列举见 mixed-version-affected-rows.md（I-11 围栏读它）。
+  - { host: "api.deepseek.com",  path_prefix: "/anthropic", protocol: anthropic,         provider: deepseek, base_url: "https://api.deepseek.com/anthropic", version: "/v1" }
+  - { host: "api.moonshot.cn",   path_prefix: "/anthropic", protocol: anthropic,         provider: moonshot, base_url: "https://api.moonshot.cn/anthropic",  version: "/v1", default: true }
+  - { host: "api.moonshot.ai",   path_prefix: "/anthropic", protocol: anthropic,         provider: moonshot, base_url: "https://api.moonshot.ai/anthropic",  version: "/v1" }
+  - { host: "api.moonshot.ai",                              protocol: openai_compatible, provider: moonshot, base_url: "https://api.moonshot.ai",           version: "/v1" }
+  - { host: "dashscope.aliyuncs.com", path_prefix: "/api/v2/apps/claude-code-proxy", protocol: anthropic, provider: qwen, base_url: "https://dashscope.aliyuncs.com/api/v2/apps/claude-code-proxy", version: "/v1" }
+  # 🔴 I-4 前缀吞并：/api/coding/v3 必须比 /api/coding 长，否则 openai coding 端点
+  #    会被 anthropic 行吞掉 → openai 请求被 anthropic 适配器改写请求体。
+  #    Lookup 是段对齐最长前缀匹配，所以只要两行都在表里，更长者自然赢；
+  #    危险的是"只写短的那行"—— 客户照样会填 /api/coding/v3。围栏见 P1c.2 / T-2。
+  - { host: "ark.cn-beijing.volces.com", path_prefix: "/api/coding",    protocol: anthropic,         provider: doubao, base_url: "https://ark.cn-beijing.volces.com/api/coding", version: "/v1" }
+  - { host: "ark.cn-beijing.volces.com", path_prefix: "/api/coding/v3", protocol: openai_compatible, provider: doubao, base_url: "https://ark.cn-beijing.volces.com/api/coding", version: "/v3" }
+
+  # ── A 档：新 provider ──────────────────────────────────────────────────────
+  - { host: "api.mistral.ai",     protocol: openai_compatible, provider: mistral,        base_url: "https://api.mistral.ai",              version: "/v1" }
+  # MiniMax 国内(minimaxi.com)/国际(minimax.io) —— R-3 定案 A：同一个 code，不拆。
+  # 无可区分的 key 前缀特征、无模型目录分叉，与 R-2 (zhipu/z.ai) 同一把尺子。
+  - { host: "api.minimaxi.com",   protocol: openai_compatible, provider: minimax,        base_url: "https://api.minimaxi.com",            version: "/v1", default: true }
+  - { host: "api.minimax.io",     protocol: openai_compatible, provider: minimax,        base_url: "https://api.minimax.io",              version: "/v1" }
+  - { host: "api.minimaxi.com", path_prefix: "/anthropic", protocol: anthropic, provider: minimax, base_url: "https://api.minimaxi.com/anthropic", version: "/v1", default: true }
+  - { host: "api.minimax.io",   path_prefix: "/anthropic", protocol: anthropic, provider: minimax, base_url: "https://api.minimax.io/anthropic",   version: "/v1" }
+  - { host: "api.stepfun.com",    protocol: openai_compatible, provider: stepfun,        base_url: "https://api.stepfun.com",             version: "/v1" }
+  - { host: "api.hunyuan.cloud.tencent.com", protocol: openai_compatible, provider: hunyuan, base_url: "https://api.hunyuan.cloud.tencent.com", version: "/v1" }
+  - { host: "qianfan.baidubce.com", protocol: openai_compatible, provider: qianfan,      base_url: "https://qianfan.baidubce.com",        version: "/v2" }
+  # 🔴 Together 的规范域名是 api.together.ai（官方文档原文），**不是** api.together.xyz。
+  # .xyz 是旧域名，今天仍可用且被大量三方集成沿用，所以两行都进表。
+  # .xyz 行的 base_url **指向自己**，🚫 不照 www.kimi.com 的别名写法重写到 .ai ——
+  # .xyz 是一个真实可用的 API host，替客户做一个他没要求的域名迁移，会让他明明填了
+  # .xyz 却查不出为什么请求打到了别处。能不改写就不改写。
+  - { host: "api.together.ai",    protocol: openai_compatible, provider: together,       base_url: "https://api.together.ai",             version: "/v1", default: true }
+  - { host: "api.together.xyz",   protocol: openai_compatible, provider: together,       base_url: "https://api.together.xyz",            version: "/v1" }
+  - { host: "api.fireworks.ai",   protocol: openai_compatible, provider: fireworks,      base_url: "https://api.fireworks.ai/inference",  version: "/v1" }
+  - { host: "api.cerebras.ai",    protocol: openai_compatible, provider: cerebras,       base_url: "https://api.cerebras.ai",             version: "/v1" }
+  # 🔴 全表第二个 version: "" 的行（第一个是 api.perplexity.ai）。GitHub Models 的端点
+  #    直接是 /inference/chat/completions，没有 version 段。EffectiveUpstream 因此等于
+  #    base_url 本身 —— TS 侧拼接必须复刻这个分支，否则会拼出不存在的 /inference/v1。
+  - { host: "models.github.ai",   protocol: openai_compatible, provider: github_models,  base_url: "https://models.github.ai/inference",  version: "" }
+  - { host: "ai-gateway.vercel.sh", protocol: openai_compatible, provider: vercel_gateway, base_url: "https://ai-gateway.vercel.sh",      version: "/v1" }
+
+  # ── A 档：智谱国际站 api.z.ai —— R-2 定案 A：同一个 code `zhipu`，不拆 `zai` ──
+  #
+  # 原推荐是拆成 zai，实测证伪：kimi 拆分的真实驱动是**指纹分类器**（sk-kimi-* 前缀
+  # 稳定独占 → 可进 confirmed tier），而 zhipu 与 z.ai 的 key 同属上面 zhipu_glm 那条
+  # `^[A-Za-z0-9]{20,}\.[A-Za-z0-9]{20,}$` 规则 —— 分类器无论如何分不开，拆出来的
+  # `zai` 会是一个永远没有任何自动路径能填进去的死码。且两平台服务同一批 GLM 模型，
+  # 共享上面的 provider_model_maps 是收益不是代价。
+  - { host: "api.z.ai", path_prefix: "/api/anthropic", protocol: anthropic,         provider: zhipu, base_url: "https://api.z.ai/api/anthropic", version: "/v1" }
+  - { host: "api.z.ai", path_prefix: "/api/paas",      protocol: openai_compatible, provider: zhipu, base_url: "https://api.z.ai/api/paas",      version: "/v4" }   # tier-B 待官方复核
+
+  # ── 🚫 本地模型（ollama / lmstudio / vllm）不进表 —— R-5 定案 C ─────────────
+  # 表是 host-keyed 且 HostFromURL 返回的 u.Host **含端口**。写死 localhost:11434 只
+  # 覆盖"恰好默认端口 + 恰好写 localhost"这一种巧合；用 127.0.0.1、局域网 IP 或改过
+  # 端口的用户全部 miss，走的还是 Stitch 的 literal-prepend 降级路径 —— 也就是说
+  # 进表与不进表在绝大多数真实情况下行为完全相同。而在私有化部署里 localhost 指谁的
+  # 机器取决于**代理跑在哪**，预置一个"官方供应商"身份的本机地址是错的且错得隐蔽。
+  # ✅ 替代：三方模式加一段「接入本地模型」引导文案（零表行、零新数据，见 P3b.12）。
+
+  # ── B 档：进表并标注，首个客户接入后回收结论 ───────────────────────────────
+  # 🔴 sambanova 与 aihubmix 两条是"去抓了官方文档、但官方文档自己没写 base_url"的
+  #    结果（sambanova 官方页正文是占位符 your-sambanova-base-url），不是"没去查"。
+  - { host: "api.sambanova.ai", protocol: openai_compatible, provider: sambanova, base_url: "https://api.sambanova.ai", version: "/v1" }   # tier-B 待官方复核
+  - { host: "aihubmix.com",     protocol: openai_compatible, provider: aihubmix,  base_url: "https://aihubmix.com",     version: "/v1", default: true }   # tier-B 待官方复核
+  - { host: "api.aihubmix.com", protocol: openai_compatible, provider: aihubmix,  base_url: "https://api.aihubmix.com", version: "/v1" }   # tier-B 待官方复核（备域名）
+  - { host: "api.302.ai",       protocol: openai_compatible, provider: ai302,     base_url: "https://api.302.ai",       version: "/v1" }   # tier-B 待官方复核
 
 # v4.1 Stage 5+: 聚合网关 family 清单 (UI Provider 字段 multi-select 设计驱动)
 #
@@ -142,8 +263,14 @@ provider_routes:
 #   其他 family (官方厂商)         → [family]  (单元素)
 aggregator_families:
   - openrouter
-  - yunwu        # 云雾 yunwu.ai
-  - zeroeleven   # 0011.ai
+  - yunwu           # 云雾 yunwu.ai
+  - zeroeleven      # 0011.ai
+  # 2026-08-02 provider-credential-cascade 新增。判据与上面三家一致：这些 family
+  # 前面挂着多家底层厂商的多种协议，fingerprint 推断不出"严格协议类型"。
+  - aihubmix        # 🆕 aihubmix.com（500+ 模型聚合，tier-B）
+  - ai302           # 🆕 302.ai（tier-B）
+  - vercel_gateway  # 🆕 Vercel AI Gateway（一个 key 打通数百模型）
+  - github_models   # 🆕 GitHub Models（openai/anthropic/google/meta 同域分发）
 
 # ── provider_model_maps (P1 / design D-2): per-provider-CODE 模型名映射 ──────────
 #

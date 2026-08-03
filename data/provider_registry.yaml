@@ -110,13 +110,28 @@ providers:
     picker: false
     display: Mock Provider
 
+  # 2026-08-02 provider-credential-cascade R-8: picker true → false.
+  # Why: `gemini` has a route row, has observability vocabulary, and has NO
+  # forwarding adapter — aikey-proxy's provider.NewRegistry() registers only
+  # openai / anthropic / kimi / generic, so Get("gemini") returns
+  # `unknown provider protocol` and every one of the nine forwarding call
+  # sites 502s. A picker entry here is an entry point for building a
+  # credential that CANNOT work. picker:false closes the creation path the
+  # same way `mock` already does — zero new concept.
+  # 🚫 The provider_routes ROW stays: deleting it would change
+  # LookupByBaseURL("https://generativelanguage.googleapis.com/v1beta") and
+  # break the I-3 zero-regression fence, and `gemini` is referenced by
+  # vkeys/types.go, observer/conversation_audit and stream_accumulator.
+  # Existing google credentials keep RENDERING (and keep 502-ing — this
+  # change does not claim to fix Google access).
+  # See openspec/changes/provider-credential-cascade/defect-gemini-no-adapter.md
   - code: google
     oauth_aliases: [gemini]
     proxy_path: google
     env_api_key: GOOGLE_API_KEY
     env_base_url: GOOGLE_BASE_URL
     default_base_url: https://generativelanguage.googleapis.com
-    picker: true
+    picker: false
     display: google
     display_alias: gemini
 
@@ -298,3 +313,189 @@ providers:
     default_base_url: https://api.siliconflow.cn/v1
     picker: true
     display: siliconflow
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # 2026-08-02 · provider-credential-cascade · I-6 对账补齐（16 条）
+  #
+  # 不变量 I-6：provider_fingerprint.yaml 的 `provider_routes.provider` 集合
+  # 必须是本文件 `code` 集合的**子集**。破坏后的症状是界面显示机器码或空字符串。
+  #
+  # 🔴 这 16 条里有 3 条是**存量欠账**，不是本变更引入的：
+  #    huggingface / yunwu / zeroeleven 早就在路由表里、却从来没有 registry 条目。
+  #    之所以几个月没人发现：生成的 PROVIDER_PROTOCOL_MATRIX 自己写着
+  #    "This matrix has no web consumer today" —— **两个集合从来没被放在一起比较过**，
+  #    与 D-4（手写清单漂 9 条）是同一个形状。围栏 P1c.4 第一次跑就会抓到它们。
+  #
+  # 另 13 条是本次扩表新增的厂商。
+  # 🚫 不新增 `zai` —— R-2 定案 A：api.z.ai 的两行 provider 都是 `zhipu`。
+  #
+  # 字段填法：default_base_url 与 proxy_path 一律**镜像路由表里该 provider 的
+  # default 行的 EffectiveUpstream**（base_url + version），不另立一套地址。
+  # ══════════════════════════════════════════════════════════════════════════
+
+  # ── 存量欠账补齐（路由表早有，registry 一直缺）─────────────────────────────
+  - code: huggingface
+    oauth_aliases: [hf]
+    proxy_path: huggingface/v1
+    # HF 官方 SDK 约定读 HF_TOKEN，不是 HUGGINGFACE_API_KEY。
+    env_api_key: HF_TOKEN
+    env_base_url: HF_BASE_URL
+    default_base_url: https://api-inference.huggingface.co/v1
+    picker: true
+    display: huggingface
+    display_alias: HF
+
+  - code: yunwu
+    proxy_path: yunwu/v1
+    env_api_key: YUNWU_API_KEY
+    env_base_url: YUNWU_BASE_URL
+    default_base_url: https://yunwu.ai/v1
+    picker: true
+    display: yunwu
+    display_alias: 云雾
+
+  - code: zeroeleven
+    proxy_path: zeroeleven/v1
+    env_api_key: ZEROELEVEN_API_KEY
+    env_base_url: ZEROELEVEN_BASE_URL
+    default_base_url: https://aicoding.2233.ai/v1
+    picker: true
+    display: zeroeleven
+    display_alias: 0011.ai
+
+  # ── 本次扩表新增：西方厂商 ────────────────────────────────────────────────
+  - code: mistral
+    oauth_aliases: [mistralai]
+    proxy_path: mistral/v1
+    env_api_key: MISTRAL_API_KEY
+    env_base_url: MISTRAL_BASE_URL
+    default_base_url: https://api.mistral.ai/v1
+    picker: true
+    display: mistral
+
+  - code: together
+    oauth_aliases: [togetherai]
+    proxy_path: together/v1
+    env_api_key: TOGETHER_API_KEY
+    env_base_url: TOGETHER_BASE_URL
+    # 🔴 api.together.ai 是官方规范域名；api.together.xyz 是仍可用的旧域名，
+    #    路由表里两行都在，这里取 default 行（.ai）。
+    default_base_url: https://api.together.ai/v1
+    picker: true
+    display: together
+
+  - code: fireworks
+    oauth_aliases: [fireworksai]
+    # 上游 base 是 /inference（不是裸域名），proxy_path 必须携带它，
+    # 否则代理拼出的最终 URL 会漏掉这一段。
+    proxy_path: fireworks/inference/v1
+    env_api_key: FIREWORKS_API_KEY
+    env_base_url: FIREWORKS_BASE_URL
+    default_base_url: https://api.fireworks.ai/inference/v1
+    picker: true
+    display: fireworks
+
+  - code: cerebras
+    proxy_path: cerebras/v1
+    env_api_key: CEREBRAS_API_KEY
+    env_base_url: CEREBRAS_BASE_URL
+    default_base_url: https://api.cerebras.ai/v1
+    picker: true
+    display: cerebras
+
+  - code: github_models
+    oauth_aliases: [githubmodels]
+    # 🔴 无 version 段：端点直接是 /inference/chat/completions。
+    proxy_path: github_models/inference
+    # 🔴 刻意**不用** GITHUB_TOKEN，尽管那是 GitHub Models 文档的写法：
+    #    active.env 会把这个变量写进用户的 shell 环境，而 GITHUB_TOKEN 是
+    #    gh CLI / Actions / 无数脚本都在读的通用变量 —— 覆盖它等于拿一个
+    #    provider 的 key 顶掉用户的 git 鉴权。第 1 级安全压第 8 级实现。
+    env_api_key: GITHUB_MODELS_API_KEY
+    env_base_url: GITHUB_MODELS_BASE_URL
+    default_base_url: https://models.github.ai/inference
+    picker: true
+    display: github_models
+    display_alias: GitHub Models
+
+  - code: vercel_gateway
+    oauth_aliases: [vercel]
+    proxy_path: vercel_gateway/v1
+    # Vercel AI Gateway 文档约定 AI_GATEWAY_API_KEY。
+    env_api_key: AI_GATEWAY_API_KEY
+    env_base_url: AI_GATEWAY_BASE_URL
+    default_base_url: https://ai-gateway.vercel.sh/v1
+    picker: true
+    display: vercel_gateway
+    display_alias: Vercel AI Gateway
+
+  # ── 本次扩表新增：中国厂商 ────────────────────────────────────────────────
+  - code: minimax
+    # 国内 api.minimaxi.com（注意结尾多一个 i）/ 国际 api.minimax.io。
+    # R-3 定案 A：同一个 code 两组 host 行，国内行标 default。
+    oauth_aliases: [minimaxi]
+    proxy_path: minimax/v1
+    env_api_key: MINIMAX_API_KEY
+    env_base_url: MINIMAX_BASE_URL
+    default_base_url: https://api.minimaxi.com/v1
+    picker: true
+    display: minimax
+
+  - code: stepfun
+    oauth_aliases: [step]
+    proxy_path: stepfun/v1
+    env_api_key: STEPFUN_API_KEY
+    env_base_url: STEPFUN_BASE_URL
+    default_base_url: https://api.stepfun.com/v1
+    picker: true
+    display: stepfun
+    display_alias: 阶跃星辰
+
+  - code: hunyuan
+    proxy_path: hunyuan/v1
+    env_api_key: HUNYUAN_API_KEY
+    env_base_url: HUNYUAN_BASE_URL
+    default_base_url: https://api.hunyuan.cloud.tencent.com/v1
+    picker: true
+    display: hunyuan
+    display_alias: 腾讯混元
+
+  - code: qianfan
+    oauth_aliases: [ernie, wenxin]
+    # 🔴 千帆是 /v2，不是 /v1。
+    proxy_path: qianfan/v2
+    env_api_key: QIANFAN_API_KEY
+    env_base_url: QIANFAN_BASE_URL
+    default_base_url: https://qianfan.baidubce.com/v2
+    picker: true
+    display: qianfan
+    display_alias: 百度千帆
+
+  # ── 本次扩表新增：tier-B（路由行带 `# tier-B 待官方复核`，界面显示
+  #    「社区验证」角标）。这里只是身份条目，tier 归属的真相源是 fingerprint
+  #    的行内注释 —— 🚫 不在本文件再存一份 tier 字段（分裂真相源）。─────────
+  - code: sambanova
+    proxy_path: sambanova/v1
+    env_api_key: SAMBANOVA_API_KEY
+    env_base_url: SAMBANOVA_BASE_URL
+    default_base_url: https://api.sambanova.ai/v1
+    picker: true
+    display: sambanova
+
+  - code: aihubmix
+    proxy_path: aihubmix/v1
+    env_api_key: AIHUBMIX_API_KEY
+    env_base_url: AIHUBMIX_BASE_URL
+    default_base_url: https://aihubmix.com/v1
+    picker: true
+    display: aihubmix
+
+  - code: ai302
+    oauth_aliases: [302ai]
+    proxy_path: ai302/v1
+    env_api_key: AI302_API_KEY
+    env_base_url: AI302_BASE_URL
+    default_base_url: https://api.302.ai/v1
+    picker: true
+    display: ai302
+    display_alias: 302.AI
