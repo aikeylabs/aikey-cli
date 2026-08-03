@@ -1497,7 +1497,10 @@ fn corrupt_entry_with_foreign_key(env: &InternalTestEnv, alias: &str) {
     let nonce_bytes = Aes256Gcm::generate_nonce(&mut OsRng);
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, b"sk-orphan-written-under-another-master-key".as_ref())
+        .encrypt(
+            nonce,
+            b"sk-orphan-written-under-another-master-key".as_ref(),
+        )
         .expect("encrypt with foreign key");
 
     let db = env.vault_path.join("data").join("vault.db");
@@ -1578,8 +1581,16 @@ fn undecryptable_entry_is_listed_not_dropped() {
         .expect("undecryptable entry must still be present");
     assert_eq!(bad["status"], "undecryptable");
     assert_eq!(bad["error_code"], "I_ENTRY_DECRYPT_FAILED");
-    assert!(bad["secret_prefix"].is_null(), "prefix must be null: {}", bad);
-    assert!(bad["secret_suffix"].is_null(), "suffix must be null: {}", bad);
+    assert!(
+        bad["secret_prefix"].is_null(),
+        "prefix must be null: {}",
+        bad
+    );
+    assert!(
+        bad["secret_suffix"].is_null(),
+        "suffix must be null: {}",
+        bad
+    );
     assert!(bad["secret_len"].is_null(), "len must be null: {}", bad);
     // Plaintext metadata still flows, so the row remains identifiable and
     // deletable from the Web page.
@@ -1590,7 +1601,10 @@ fn undecryptable_entry_is_listed_not_dropped() {
         .find(|r| r["alias"] == "q-claude")
         .expect("healthy entry");
     assert_eq!(good["status"], "active");
-    assert!(good["error_code"].is_null(), "healthy row carries no error_code");
+    assert!(
+        good["error_code"].is_null(),
+        "healthy row carries no error_code"
+    );
     assert!(!good["secret_prefix"].is_null());
 
     // personal_count feeds the Web page's identity-strip counter; it must count

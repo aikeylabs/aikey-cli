@@ -50,7 +50,10 @@ fn entries_writes_go_through_the_verified_door() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     rust_sources(&src, &mut files);
-    assert!(!files.is_empty(), "no sources scanned — fence would be vacuous");
+    assert!(
+        !files.is_empty(),
+        "no sources scanned — fence would be vacuous"
+    );
 
     let mut offenders: Vec<String> = Vec::new();
     for file in files {
