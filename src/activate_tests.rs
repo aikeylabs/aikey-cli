@@ -48,6 +48,7 @@ fn activate_rejects_stale_or_disabled_team_key() {
 
 fn team_entry(local_state: &str, ciphertext: Option<Vec<u8>>) -> storage::VirtualKeyCacheEntry {
     storage::VirtualKeyCacheEntry {
+        binding_id: String::new(),
         priority: 1,
         fallback_role: "primary".to_string(),
         route_group_id: String::new(),

@@ -49,6 +49,7 @@ fn vk_row(
     ciphertext: Vec<u8>,
 ) -> storage::VirtualKeyCacheEntry {
     storage::VirtualKeyCacheEntry {
+        binding_id: String::new(),
         virtual_key_id: id.to_string(),
         org_id: "org-e2e".to_string(),
         seat_id: "seat-e2e".to_string(),
