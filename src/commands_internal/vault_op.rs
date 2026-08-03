@@ -318,6 +318,11 @@ pub(crate) struct ClusterApplyResult {
     pub applied: usize,
     pub skipped: usize,
     pub staled: usize,
+    /// Rows deleted because this snapshot delivered their VK under a different
+    /// (protocol, provider). Reported rather than done quietly: a sweep that
+    /// removes rows without saying so is indistinguishable from one that is
+    /// broken, and this is the count an operator needs when a pool misbehaves.
+    pub superseded: usize,
     /// None when the payload carried no compliance block; Some(enabled) after the
     /// cluster-compliance filter was set (true) / cleared (false).
     pub compliance_enabled: Option<bool>,
@@ -572,6 +577,7 @@ fn handle_cluster_apply_snapshot(env: StdinEnvelope) {
             "applied": r.applied,
             "skipped": r.skipped,
             "staled": r.staled,
+            "superseded": r.superseded,
             "compliance_enabled": r.compliance_enabled,
         }),
     ));
@@ -726,7 +732,7 @@ fn apply_group_vk(
     payload: &ClusterSnapshotPayload,
     vk: &ClusterVk,
     gid: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let bundle = payload
         .oauth_group_runtime
         .as_ref()
@@ -736,6 +742,7 @@ fn apply_group_vk(
     let (provider_code, routing_config) = bundle
         .map(|g| (g.provider_code.clone(), g.routing_config.clone()))
         .unwrap_or_default();
+    let entry_provider_code = provider_code.clone();
 
     // group_accounts refs (ranking candidates) + group_runtime material map.
     let (refs, material) = match bundle {
@@ -806,7 +813,10 @@ fn apply_group_vk(
             &serde_json::Value::Object(material).to_string(),
         )?;
     }
-    Ok(())
+    // The provider_code this row was written under. The caller records it so the
+    // binding-grain sweep can tell "the pool moved to a new provider_code" from
+    // "the pool is gone" — the row's own identity under the P1e cache key.
+    Ok(entry_provider_code)
 }
 
 /// Core of cluster_apply_snapshot: encrypt + upsert each VK (owner taken per-VK
@@ -819,6 +829,11 @@ pub(crate) fn apply_cluster_snapshot(
 ) -> ClusterApplyResult {
     use std::collections::HashSet;
     let mut seen: HashSet<String> = HashSet::new();
+    // Binding grain, matching the cache's own key. The VK-grain `seen` above
+    // cannot see a row whose provider_code changed under a VK that is still
+    // delivered — which is exactly what took every OAuth pool offline.
+    let mut seen_bindings: HashSet<String> = HashSet::new();
+    let binding_key = |vk: &str, proto: &str, prov: &str| format!("{vk}\u{1f}{proto}\u{1f}{prov}");
     let mut applied = 0usize;
     let mut skipped = 0usize;
 
@@ -827,9 +842,14 @@ pub(crate) fn apply_cluster_snapshot(
         // oauth_group_runtime, joined here via token_seat_id (§3.3 projection).
         if let Some(gid) = vk.oauth_group_id.as_deref().filter(|s| !s.is_empty()) {
             match apply_group_vk(key, payload, vk, gid) {
-                Ok(()) => {
+                Ok(written_provider) => {
                     applied += 1;
                     seen.insert(vk.virtual_key_id.clone());
+                    seen_bindings.insert(binding_key(
+                        &vk.virtual_key_id,
+                        vk.protocol_type.as_deref().unwrap_or_default(),
+                        &written_provider,
+                    ));
                 }
                 Err(e) => {
                     eprintln!(
@@ -921,7 +941,14 @@ pub(crate) fn apply_cluster_snapshot(
                     owner_account_id: Some(vk.owner_account_id.clone()),
                 };
                 match crate::commands_account::upsert_delivered_key(key, &dk, &target.real_key) {
-                    Ok(_) => wrote += 1,
+                    Ok(_) => {
+                        wrote += 1;
+                        seen_bindings.insert(binding_key(
+                            &vk.virtual_key_id,
+                            &slot.protocol_type,
+                            &target.provider_code,
+                        ));
+                    }
                     Err(e) => {
                         if hop_err.is_none() {
                             hop_err = Some(format!(
@@ -959,17 +986,66 @@ pub(crate) fn apply_cluster_snapshot(
     // personal-sync's routes if that invariant is ever violated — defensive +
     // matches the established pattern. R4-style: a cache read error is now a WARN
     // (was a silent skip that could leave revoked keys serving).
+    //
+    // 🔴 The sweep above is VK-GRAIN, and that is not enough (2026-08-03). The
+    // cache is keyed `(virtual_key_id, protocol_type, provider_code)` since P1e,
+    // so when a delivered VK's provider_code CHANGES — an OAuth pool projects an
+    // empty one until its provider resolves, then the real one — the new row is
+    // INSERTED beside the old rather than replacing it. The VK is still in the
+    // snapshot, so `seen` contains it and nothing here ever looked again. Both
+    // staging workers accumulated one such pair per pool, and the proxy read them
+    // as two chain entries at the defaulted priority 1: 409
+    // PROVIDER_ROUTE_AMBIGUOUS on every OAuth pool call.
+    //
+    // So a row under a VK this snapshot DID deliver, at a (protocol, provider)
+    // the snapshot did NOT deliver, is superseded and is DELETED — the row is not
+    // "a key that went away" (which is what stale means and what the proxy can
+    // still serve), it is a duplicate identity of a key that is right here.
+    //
+    // 🚫 Deliberately not applied to a VK missing from the snapshot entirely.
+    // That stays mark-stale, unchanged: it is the revoked/removed case, and
+    // deleting it here would discard local material the account path is
+    // responsible for.
     let mut staled = 0usize;
+    let mut superseded = 0usize;
     match storage::list_virtual_key_cache() {
         Ok(cached) => {
             for entry in cached {
                 if entry.org_id != payload.org_id {
                     continue; // not this org — never touch it
                 }
-                if !seen.contains(&entry.virtual_key_id) && entry.local_state != "stale" {
-                    let _ = storage::set_virtual_key_local_state(&entry.virtual_key_id, "stale");
-                    staled += 1;
+                if !seen.contains(&entry.virtual_key_id) {
+                    if entry.local_state != "stale" {
+                        let _ =
+                            storage::set_virtual_key_local_state(&entry.virtual_key_id, "stale");
+                        staled += 1;
+                    }
+                    continue;
                 }
+                if !seen_bindings.contains(&binding_key(
+                    &entry.virtual_key_id,
+                    &entry.protocol_type,
+                    &entry.provider_code,
+                )) {
+                    match storage::delete_virtual_key_cache_binding(
+                        &entry.virtual_key_id,
+                        &entry.protocol_type,
+                        &entry.provider_code,
+                    ) {
+                        Ok(()) => superseded += 1,
+                        Err(e) => eprintln!(
+                            "[_internal cluster_apply WARN] superseded binding {} ({}/{}) not removed ({}); \
+                             it will keep appearing as an extra chain entry",
+                            entry.virtual_key_id, entry.provider_code, entry.protocol_type, e
+                        ),
+                    }
+                }
+            }
+            if superseded > 0 {
+                eprintln!(
+                    "[_internal cluster_apply] removed {} superseded binding row(s)",
+                    superseded
+                );
             }
         }
         Err(e) => {
@@ -1135,6 +1211,7 @@ pub(crate) fn apply_cluster_snapshot(
         applied,
         skipped,
         staled,
+        superseded,
         compliance_enabled,
         compliance_ok,
     }

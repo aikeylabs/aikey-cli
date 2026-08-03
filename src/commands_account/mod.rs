@@ -3273,16 +3273,55 @@ fn apply_snapshot_to_cache(
     // Idempotent: the second sync finds nothing absent to prune.
     // This includes the currently-active key: if the server removed it, it is
     // no longer valid and must be deactivated immediately.
+    //
+    // ── The owner guard cannot be the ONLY gate (2026-08-03) ──────────────
+    //
+    // 🔴 It silently assumes one vault holds one account's keys. A CLUSTER
+    // WORKER's vault does not: it serves a whole org, and staging's held rows
+    // for 27 distinct accounts. A sync runs as ONE account, so 26 accounts'
+    // obsolete rows were unreachable by this prune forever.
+    //
+    // What that let through: a group VK whose projected provider_code CHANGED
+    // (empty until the pool's provider resolved, "anthropic" after). Under the
+    // P1e key `(vk, protocol, provider_code)` those are two different rows, so
+    // the new projection was INSERTED beside the old one — and the stale row
+    // then rode into the proxy's candidate chain as a second entry at the
+    // defaulted priority 1. Every OAuth pool on staging answered 409
+    // PROVIDER_ROUTE_AMBIGUOUS.
+    //
+    // So a second, owner-independent reason to prune: this sync's snapshot
+    // covered `(vk, protocol)` and did NOT list this provider_code. The server
+    // is authoritative for a whole virtual key — verified on staging: no
+    // virtual_key_id is projected under more than one account — so a local row
+    // under a provider the snapshot omits is superseded, whoever synced it.
+    //
+    // 🚫 This does NOT prune rows for a `(vk, protocol)` the snapshot did not
+    // mention at all. That is the case the owner guard is right about: another
+    // account's key, absent because THIS account cannot see it, whose re-login
+    // recovery semantics clear_virtual_key_cache documents.
+    //
+    // 🚫 And it does not touch a legitimate multi-provider chain: those bindings
+    // share one (vk, protocol) under one account, so a sync that returns the VK
+    // returns all of them and every row is in `seen_bindings` already.
+    let seen_vk_protocols: HashSet<String> = items
+        .iter()
+        .map(|i| format!("{}\u{1f}{}", i.virtual_key_id, i.protocol_type))
+        .collect();
     if let Ok(cached) = storage::list_virtual_key_cache() {
         let mut pruned = 0usize;
         for entry in cached {
-            if entry.owner_account_id.as_deref() == Some(current_account_id)
-                && !seen_bindings.contains(&binding_key(
+            if should_prune_cached_binding(
+                entry.owner_account_id.as_deref() == Some(current_account_id),
+                seen_vk_protocols.contains(&format!(
+                    "{}\u{1f}{}",
+                    entry.virtual_key_id, entry.protocol_type
+                )),
+                seen_bindings.contains(&binding_key(
                     &entry.virtual_key_id,
                     &entry.protocol_type,
                     &entry.provider_code,
-                ))
-            {
+                )),
+            ) {
                 // If this binding's VK was the active proxy key AND the whole VK is
                 // gone (no surviving binding), clear the active key config so the
                 // proxy stops routing it on next reload.
@@ -9650,4 +9689,81 @@ pub fn chain_rows_for_selection(
             priority: e.priority,
         })
         .collect())
+}
+
+/// Decides whether a cached binding row survives a sync's prune.
+///
+/// Extracted from `sync_managed_keys` so the rule can be exercised without a
+/// server: the prune sits inside a long network-fed function, and the 2026-08-03
+/// staging outage came from a case nobody could write a test for in place.
+///
+/// - `owned_by_this_account` — the row's `owner_account_id` is the syncing one.
+/// - `vk_protocol_in_snapshot` — this sync returned at least one binding for the
+///   row's `(virtual_key_id, protocol_type)`, under any provider.
+/// - `binding_in_snapshot` — it returned THIS exact `(vk, protocol, provider)`.
+pub(crate) fn should_prune_cached_binding(
+    owned_by_this_account: bool,
+    vk_protocol_in_snapshot: bool,
+    binding_in_snapshot: bool,
+) -> bool {
+    if binding_in_snapshot {
+        return false;
+    }
+    owned_by_this_account || vk_protocol_in_snapshot
+}
+
+#[cfg(test)]
+mod sync_prune_scope_tests {
+    use super::should_prune_cached_binding;
+
+    /// The staging outage: a group VK's projected provider_code changed from
+    /// empty to "anthropic", so under the P1e key the new row was INSERTED
+    /// beside the old one. The stale row is not owned by the account whose sync
+    /// is running (a cluster worker's vault held 27 accounts' rows), so the
+    /// owner guard alone left it in place forever — and the proxy read it as a
+    /// second chain entry at priority 1, answering every pool call with 409.
+    ///
+    /// 能红: drop the `vk_protocol_in_snapshot` arm and this returns false.
+    #[test]
+    fn prunes_a_binding_superseded_under_the_same_vk_and_protocol() {
+        assert!(
+            should_prune_cached_binding(false, true, false),
+            "a row whose (vk, protocol) the snapshot covers, under a provider the \
+             snapshot does not list, is superseded — the server is authoritative for \
+             the whole virtual key. Keeping it puts a second entry in the proxy's \
+             candidate chain at the defaulted priority 1."
+        );
+    }
+
+    /// The case the owner guard is right about, and which must NOT be widened:
+    /// another account's key, absent only because this account cannot see it.
+    /// Deleting it would destroy the re-login recovery `clear_virtual_key_cache`
+    /// documents.
+    ///
+    /// 能红: replace the rule with "prune whatever this snapshot did not return"
+    /// and this fails.
+    #[test]
+    fn keeps_another_accounts_key_the_snapshot_never_mentions() {
+        assert!(
+            !should_prune_cached_binding(false, false, false),
+            "the snapshot said nothing about this (vk, protocol) at all, so it is not \
+             evidence the binding is gone — only that this account cannot see it"
+        );
+    }
+
+    /// A legitimate multi-provider chain survives: those bindings share one
+    /// (vk, protocol) under one account, so a sync that returns the VK returns
+    /// every member and each is in the snapshot.
+    #[test]
+    fn keeps_every_binding_the_snapshot_returned() {
+        assert!(!should_prune_cached_binding(true, true, true));
+        assert!(!should_prune_cached_binding(false, true, true));
+    }
+
+    /// The pre-existing behaviour, unchanged: the syncing account's own row that
+    /// the server no longer returns is deleted (2026-07-04 self-heal).
+    #[test]
+    fn still_prunes_the_syncing_accounts_removed_key() {
+        assert!(should_prune_cached_binding(true, false, false));
+    }
 }
