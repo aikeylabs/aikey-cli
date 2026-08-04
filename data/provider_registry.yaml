@@ -403,20 +403,11 @@ providers:
     picker: true
     display: cerebras
 
-  - code: github_models
-    oauth_aliases: [githubmodels]
-    # 🔴 无 version 段：端点直接是 /inference/chat/completions。
-    proxy_path: github_models/inference
-    # 🔴 刻意**不用** GITHUB_TOKEN，尽管那是 GitHub Models 文档的写法：
-    #    active.env 会把这个变量写进用户的 shell 环境，而 GITHUB_TOKEN 是
-    #    gh CLI / Actions / 无数脚本都在读的通用变量 —— 覆盖它等于拿一个
-    #    provider 的 key 顶掉用户的 git 鉴权。第 1 级安全压第 8 级实现。
-    env_api_key: GITHUB_MODELS_API_KEY
-    env_base_url: GITHUB_MODELS_BASE_URL
-    default_base_url: https://models.github.ai/inference
-    picker: true
-    display: github_models
-    display_alias: GitHub Models
+  # 🚫 github_models 于 2026-08-03 删除（连同 provider_fingerprint.yaml 的路由行与
+  #    aggregator_families 成员）：GitHub 正在下线 Models API，两条候选路径都返回 410
+  #    github_models_retirement_brownout。留着 code 而删掉路由行是更坏的一半 ——
+  #    界面照样把它排进选择器，管理员选完却拿不到 Base URL。
+  #    证据：openspec/changes/provider-credential-cascade/staging-acceptance-2026-08-03.md §8.5。
 
   - code: vercel_gateway
     oauth_aliases: [vercel]
