@@ -72,7 +72,6 @@ fn hop(
     ciphertext: Vec<u8>,
 ) -> storage::VirtualKeyCacheEntry {
     storage::VirtualKeyCacheEntry {
-        binding_id: String::new(),
         virtual_key_id: vk_id.to_string(),
         org_id: "org-rg".to_string(),
         seat_id: "seat-rg".to_string(),
@@ -80,6 +79,17 @@ fn hop(
         provider_code: provider.to_string(),
         protocol_type: "anthropic".to_string(),
         base_url: base_url.to_string(),
+        // 🔴 Kept as ONE line on purpose (2026-08-04). Two commits fixed the same
+        // E0063 here independently — 17ea1f8 with `String::new()`, 91b98bd with
+        // this — and the merge that brought both together produced E0062
+        // (`binding_id` specified more than once), which stopped the ENTIRE
+        // `aikey-cli` test suite from compiling on develop-v1.0.5.
+        //
+        // A distinct id per hop is the right one here: this fixture stands in for
+        // a delivered route-group chain, where every hop has a real binding id.
+        // `String::new()` is the sentinel for "vault written before the column
+        // existed" (see VirtualKeyCacheEntry::binding_id) — correct for a legacy
+        // row, wrong for a wire this test says the server just sent.
         binding_id: format!("bind-{vk_id}-{provider}"),
         credential_id: format!("cred-{vk_id}-{provider}"),
         credential_revision: "1".to_string(),
