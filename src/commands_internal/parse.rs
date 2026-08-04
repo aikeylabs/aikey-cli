@@ -6,7 +6,12 @@
 //! - ⏸ Fingerprint：Phase 3 接入
 //!
 //! # 模块结构
-//! ```
+//!
+//! 🔴 围栏 `text`：这是一棵目录树，不是 Rust 代码。裸 ``` 会让 rustdoc 拿它当
+//! doctest 编译，`←`/`├` 直接是 `unknown start of token`。这条 doctest 自
+//! 2026-04-21 起就是红的，只是 2026-08-01 之后集成测试编译不过、`cargo test`
+//! 走不到 doctest 阶段，于是没人看见。
+//! ```text
 //! commands_internal/parse.rs    ← 本文件，handle() 入口 + 响应组装
 //! commands_internal/parse/
 //! ├── candidate.rs   ← Candidate / Kind / Tier / ProviderGuess
