@@ -18,6 +18,31 @@ use tempfile::TempDir;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+const TEST_PASSWORD: &str = "test_password_123";
+
+/// The vault key `setup` established, re-derived from the stored salt.
+///
+/// Entries must be written through the verifying door
+/// (`storage::store_entry_verified`): `store_entry` was narrowed to
+/// `pub(crate)` on 2026-08-01 precisely so that no caller — test code
+/// included — can put ciphertext into `entries` without proving the key that
+/// produced it is the vault's current one. See `tests/write_path_guard.rs`
+/// and the "vanishing keys" bugfix it references.
+///
+/// 🚫 Do NOT "fix" a compile error here by widening `store_entry` back to
+/// `pub`. That would reopen the unverified door for the whole crate, and the
+/// source-level fence only scans `src/`, so nothing would catch it.
+fn vault_key() -> secrecy::Secret<Vec<u8>> {
+    use secrecy::Secret;
+    let salt = storage::get_salt().expect("vault salt");
+    let key = aikeylabs_aikey_cli::crypto::derive_key(
+        &SecretString::new(TEST_PASSWORD.to_string()),
+        &salt,
+    )
+    .expect("derive vault key");
+    Secret::new(key.to_vec())
+}
+
 struct TestEnvGuard {
     _dir: TempDir,
     _lock: MutexGuard<'static, ()>,
@@ -52,7 +77,7 @@ fn setup() -> TestEnvGuard {
     let mut salt = [0u8; 16];
     use rand::RngCore;
     rand::rngs::OsRng.fill_bytes(&mut salt);
-    let pw = SecretString::new("test_password_123".to_string());
+    let pw = SecretString::new(TEST_PASSWORD.to_string());
     storage::initialize_vault(&salt, &pw).expect("init vault");
     TestEnvGuard {
         _dir: dir,
@@ -74,6 +99,7 @@ fn setup() -> TestEnvGuard {
 /// unreachable_team_vk and friends).
 fn reachable_team_vk(vk: &str) {
     let entry = storage::VirtualKeyCacheEntry {
+        binding_id: String::new(),
         virtual_key_id: vk.into(),
         org_id: "org-1".into(),
         seat_id: "seat-1".into(),
@@ -277,10 +303,22 @@ fn removal_promotes_replacement_personal_key() {
     let _dir = setup();
 
     // Two personal keys supporting anthropic.
-    storage::store_entry("key-a", &[0u8; 12], &[1u8; 32]).unwrap();
+    storage::store_entry_verified(
+        "key-a",
+        secrecy::ExposeSecret::expose_secret(&vault_key()),
+        &[0u8; 12],
+        &[1u8; 32],
+    )
+    .unwrap();
     storage::set_entry_supported_providers("key-a", &["anthropic".into()]).unwrap();
 
-    storage::store_entry("key-b", &[0u8; 12], &[1u8; 32]).unwrap();
+    storage::store_entry_verified(
+        "key-b",
+        secrecy::ExposeSecret::expose_secret(&vault_key()),
+        &[0u8; 12],
+        &[1u8; 32],
+    )
+    .unwrap();
     storage::set_entry_supported_providers("key-b", &["anthropic".into()]).unwrap();
 
     // key-a is the current primary.
@@ -320,7 +358,13 @@ fn removal_of_multi_provider_key_reconciles_each_provider() {
     storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "gateway").unwrap();
 
     // A backup key exists for openai only.
-    storage::store_entry("backup-openai", &[0u8; 12], &[1u8; 32]).unwrap();
+    storage::store_entry_verified(
+        "backup-openai",
+        secrecy::ExposeSecret::expose_secret(&vault_key()),
+        &[0u8; 12],
+        &[1u8; 32],
+    )
+    .unwrap();
     storage::set_entry_supported_providers("backup-openai", &["openai".into()]).unwrap();
 
     let actions = profile_activation::reconcile_provider_primary_after_key_removal(
@@ -366,10 +410,22 @@ fn replacement_search_finds_personal_entry_with_raw_oauth_provider_code() {
     // Two keys: the primary (anthropic, canonical) and a backup whose
     // supported_providers row still says raw "claude" (older add path
     // before write_bindings_canonical). Both should be eligible.
-    storage::store_entry("primary", &[0u8; 12], &[1u8; 32]).unwrap();
+    storage::store_entry_verified(
+        "primary",
+        secrecy::ExposeSecret::expose_secret(&vault_key()),
+        &[0u8; 12],
+        &[1u8; 32],
+    )
+    .unwrap();
     storage::set_entry_supported_providers("primary", &["anthropic".into()]).unwrap();
 
-    storage::store_entry("legacy-claude", &[0u8; 12], &[1u8; 32]).unwrap();
+    storage::store_entry_verified(
+        "legacy-claude",
+        secrecy::ExposeSecret::expose_secret(&vault_key()),
+        &[0u8; 12],
+        &[1u8; 32],
+    )
+    .unwrap();
     storage::set_entry_supported_providers("legacy-claude", &["claude".into()]).unwrap();
 
     storage::set_provider_binding(DEFAULT_PROFILE, "anthropic", "personal", "primary").unwrap();

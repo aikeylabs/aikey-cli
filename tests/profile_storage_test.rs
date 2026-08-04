@@ -10,12 +10,38 @@
 use aikeylabs_aikey_cli::credential_type::CredentialType;
 use aikeylabs_aikey_cli::storage;
 use rusqlite::{params, Connection};
+use secrecy::SecretString;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+const TEST_PASSWORD: &str = "test_password_123";
+
+/// The vault key `setup_vault` established, re-derived from the stored salt.
+///
+/// Entries must be written through the verifying door
+/// (`storage::store_entry_verified`): `store_entry` was narrowed to
+/// `pub(crate)` on 2026-08-01 precisely so that no caller — test code
+/// included — can put ciphertext into `entries` without proving the key that
+/// produced it is the vault's current one. See `tests/write_path_guard.rs`
+/// and the "vanishing keys" bugfix it references.
+///
+/// 🚫 Do NOT "fix" a compile error here by widening `store_entry` back to
+/// `pub`. That would reopen the unverified door for the whole crate, and the
+/// source-level fence only scans `src/`, so nothing would catch it.
+fn vault_key() -> secrecy::Secret<Vec<u8>> {
+    use secrecy::Secret;
+    let salt = storage::get_salt().expect("vault salt");
+    let key = aikeylabs_aikey_cli::crypto::derive_key(
+        &SecretString::new(TEST_PASSWORD.to_string()),
+        &salt,
+    )
+    .expect("derive vault key");
+    Secret::new(key.to_vec())
+}
 
 struct TestVaultGuard {
     _dir: TempDir,
@@ -58,7 +84,7 @@ fn setup_vault() -> (TestVaultGuard, PathBuf) {
     use secrecy::SecretString;
     let mut salt = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut salt);
-    let pw = SecretString::new("test_password_123".to_string());
+    let pw = SecretString::new(TEST_PASSWORD.to_string());
     storage::initialize_vault(&salt, &pw).expect("init vault");
 
     (guard, db_path)
@@ -205,7 +231,13 @@ fn set_and_resolve_supported_providers() {
     let (_dir, _db_path) = setup_vault();
 
     // Store a dummy entry
-    storage::store_entry("test-key", &[0u8; 12], &[1u8; 32]).unwrap();
+    storage::store_entry_verified(
+        "test-key",
+        secrecy::ExposeSecret::expose_secret(&vault_key()),
+        &[0u8; 12],
+        &[1u8; 32],
+    )
+    .unwrap();
 
     // Before setting, resolve should return empty (no provider_code either)
     let providers = storage::resolve_supported_providers("test-key").unwrap();
@@ -226,7 +258,13 @@ fn set_and_resolve_supported_providers() {
 fn resolve_falls_back_to_legacy_provider_code() {
     let (_dir, _db_path) = setup_vault();
 
-    storage::store_entry("legacy-key", &[0u8; 12], &[1u8; 32]).unwrap();
+    storage::store_entry_verified(
+        "legacy-key",
+        secrecy::ExposeSecret::expose_secret(&vault_key()),
+        &[0u8; 12],
+        &[1u8; 32],
+    )
+    .unwrap();
     // Set only the legacy single-value column
     storage::set_entry_provider_code("legacy-key", Some("anthropic")).unwrap();
 
@@ -238,7 +276,13 @@ fn resolve_falls_back_to_legacy_provider_code() {
 fn resolve_prefers_supported_providers_over_legacy() {
     let (_dir, _db_path) = setup_vault();
 
-    storage::store_entry("both-key", &[0u8; 12], &[1u8; 32]).unwrap();
+    storage::store_entry_verified(
+        "both-key",
+        secrecy::ExposeSecret::expose_secret(&vault_key()),
+        &[0u8; 12],
+        &[1u8; 32],
+    )
+    .unwrap();
     storage::set_entry_provider_code("both-key", Some("anthropic")).unwrap();
     storage::set_entry_supported_providers(
         "both-key",

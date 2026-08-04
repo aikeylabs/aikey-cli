@@ -80,7 +80,10 @@ family_login_urls:
 #              下 api.kimi.com 与 api.moonshot.cn 都是 provider=kimi)
 #   base_url   上游 root URL (host + 任何 path prefix BEFORE version,不含 version)
 #   version    API version path 段,proxy 会显式 append; 部分 provider 无 version
-#              (perplexity 直接 /chat/completions),写空字符串
+#              (perplexity 直接 /chat/completions),写空字符串。
+#              🔴 version "" **不等于**"把客户端自带的版本段放过去":剥掉客户端
+#              版本段这条规则是**无条件**的(2026-08-03),否则 perplexity 会被拨到
+#              /v1/chat/completions —— 实测该路径 404,而它声明的路径 401。
 #
 # proxy 拼接规则 (一条数学规则):
 #   final_url = base_url + version + (request_path 剥掉 leading version 后的部分)
@@ -92,7 +95,9 @@ family_login_urls:
 #   user 粘贴 URL → 抽 host → lookup → official URL = base_url + version
 #
 # 数据来源 (2026-05-01 校对; 2026-05-08 Kimi 双平台拆分修订;
-#           2026-08-02 provider-credential-cascade 扩表 23 → 50 行):
+#           2026-08-02 provider-credential-cascade 扩表 23 → 50 行;
+#           2026-08-03 §6 路由表体检落定 50 → 49 行: github_models 厂商下线删行,
+#                      zhipu /api/paas 补 version /v4 —— 见各行处注释):
 #
 # 2026-08-02 本轮新增厂商与调研分档 —— 逐条来源链接 + 抓取日期见
 #   roadmap20260320/技术实现/阶段8-平台化/供应商凭据三级联动/
@@ -104,7 +109,8 @@ family_login_urls:
 #       zhipu(api.z.ai)
 #     openai_compatible 新厂商 —— mistral / minimax / stepfun / hunyuan /
 #       qianfan / together(.ai 规范 + .xyz 旧域名) / fireworks / cerebras /
-#       github_models / vercel_gateway
+#       vercel_gateway
+#       (github_models 曾在此列, 2026-08-03 厂商 410 下线后删行)
 #   B 档 (二级来源一致, 未取得官方原文; YAML 行内标 `# tier-B 待官方复核`,
 #         界面显示「社区验证」角标):
 #     zhipu 的 api.z.ai openai 面 / sambanova / aihubmix(主+备) / ai302
@@ -147,7 +153,16 @@ provider_routes:
   # zhipu / GLM (open.bigmodel.cn) 一 host 三协议端点 —— P1b/D-2b 扩键 (host, path_prefix)。
   # 兜底行 path_prefix:"" 保持既有 openai_compatible + /api/paas 语义不变（向后兼容，18 行零改动围栏锁定）。
   # 另两行显式 path_prefix，让客户粘贴的 /api/anthropic 与 /api/coding/paas/v4 端点各自命中正确协议/base_url。
-  - { host: "open.bigmodel.cn",                   protocol: openai_compatible, provider: zhipu,         base_url: "https://open.bigmodel.cn/api/paas",          version: ""       }
+  # 🔴 2026-08-03 改动（这是**唯一**一条被改过的 pre-cascade 行，I-3 围栏里有具名例外）：
+  #    version "" → "/v4"。§6 无鉴权探测的实测：
+  #      /api/paas/v4/chat/completions → 401，**新信封** {"error":{"code":"1001",…}}
+  #      /api/paas/v1/chat/completions → HTTP **200**，**老信封** {"code":1001,"success":false}
+  #    两条都活着，所以没有任何 404 会提醒人 —— version "" 时 OpenAI 兼容客户端自带的
+  #    /v1 被原样带过去，打在**遗留 v1 API** 上，鉴权失败以 200 + 无 choices 的 body 返回，
+  #    客户端解析出一个并不存在的"成功"。它的 api.z.ai 兄弟行早就声明 /v4。
+  #    ⚠️ 这条改动会**重新指向**所有已存在的 zhipu openai 凭据（老 v1 → v4），是产品决策，
+  #    不是测试修补；升级后果在 I-3 例外表里逐字段记着并被断言。
+  - { host: "open.bigmodel.cn",                   protocol: openai_compatible, provider: zhipu,         base_url: "https://open.bigmodel.cn/api/paas",          version: "/v4"    }
   # 2026-08-02 provider-credential-cascade / I-5: `default: true` added.
   # api.z.ai also serves zhipu's /api/anthropic face, so (zhipu, anthropic) now
   # matches TWO rows and NEITHER has an empty path_prefix → ByProviderProtocol
@@ -166,12 +181,20 @@ provider_routes:
 
   # ══════════════════════════════════════════════════════════════════════════
   # 2026-08-02 · provider-credential-cascade —— 27 行新增（23 → 50）
+  # 2026-08-03 · §6 路由表体检 —— 删 1 行（github_models）、改 1 行（zhipu /api/paas 的 version）
   #
   # 纪律：**只加行**。上面 23 行除 open.bigmodel.cn 的 /api/anthropic 按 I-5 补了
   # `default: true` 外，逐字节未动。改既有行的 path_prefix（例如把 dashscope 兜底行
   # 从 "" 改成 "/compatible-mode" 让它"更对称"）会让每一条只填了域名的存量凭据
   # 一行都匹配不上 → LookupByBaseURL 返回 ok=false → 静默路由失败。
   # **兜底行的 "" 是不可动的。**
+  #
+  # 🔴 2026-08-03 破了一次这条纪律，且是**具名破的**：zhipu 兜底行的 version 从 ""
+  # 改成 "/v4"。path_prefix 仍是 ""（存量凭据照样匹配得上），改的只是 proxy 补哪个
+  # 版本段 —— 但那依然会把存量 zhipu openai 凭据从遗留 v1 API 重新指向 v4。
+  # I-3 围栏没有被放宽，而是加了一条**逐字段写明前后值并被断言**的例外
+  # （cascade_fences_test.go 的 intentionalRowChanges）：任何**其他**既有行被改动，
+  # 围栏照红。
   #
   # 调研落档（每条带来源链接 + 抓取日期）：
   #   roadmap20260320/技术实现/阶段8-平台化/供应商凭据三级联动/
@@ -220,10 +243,14 @@ provider_routes:
   - { host: "api.together.xyz",   protocol: openai_compatible, provider: together,       base_url: "https://api.together.xyz",            version: "/v1" }
   - { host: "api.fireworks.ai",   protocol: openai_compatible, provider: fireworks,      base_url: "https://api.fireworks.ai/inference",  version: "/v1" }
   - { host: "api.cerebras.ai",    protocol: openai_compatible, provider: cerebras,       base_url: "https://api.cerebras.ai",             version: "/v1" }
-  # 🔴 全表第二个 version: "" 的行（第一个是 api.perplexity.ai）。GitHub Models 的端点
-  #    直接是 /inference/chat/completions，没有 version 段。EffectiveUpstream 因此等于
-  #    base_url 本身 —— TS 侧拼接必须复刻这个分支，否则会拼出不存在的 /inference/v1。
-  - { host: "models.github.ai",   protocol: openai_compatible, provider: github_models,  base_url: "https://models.github.ai/inference",  version: "" }
+  # 🚫 2026-08-03 删除：models.github.ai（github_models）——**厂商已下线**。
+  #    §6 路由表体检的无鉴权探测里，两条候选路径都返回 410，body 是
+  #    {"error":{"code":"github_models_retirement_brownout",…}}。GitHub 正在
+  #    撤掉 Models API，不是我们把 URL 写错了，改 stitch 也救不回来。
+  #    行留在表里的代价不是"没用"，是**有害**：控制台会继续把这个地址填给管理员，
+  #    管理员据此创建的凭据只能得到 410，而 410 长得不像"厂商没了"，长得像我们的 bug。
+  #    连同 provider_registry.yaml 的 code、aggregator_families 的成员一起删。
+  #    证据落档：openspec/changes/provider-credential-cascade/staging-acceptance-2026-08-03.md §8.5。
   - { host: "ai-gateway.vercel.sh", protocol: openai_compatible, provider: vercel_gateway, base_url: "https://ai-gateway.vercel.sh",      version: "/v1" }
 
   # ── A 档：智谱国际站 api.z.ai —— R-2 定案 A：同一个 code `zhipu`，不拆 `zai` ──
@@ -270,7 +297,7 @@ aggregator_families:
   - aihubmix        # 🆕 aihubmix.com（500+ 模型聚合，tier-B）
   - ai302           # 🆕 302.ai（tier-B）
   - vercel_gateway  # 🆕 Vercel AI Gateway（一个 key 打通数百模型）
-  - github_models   # 🆕 GitHub Models（openai/anthropic/google/meta 同域分发）
+  # 🚫 github_models 于 2026-08-03 随其路由行一并删除（厂商 410 下线，见上方注释）。
 
 # ── provider_model_maps (P1 / design D-2): per-provider-CODE 模型名映射 ──────────
 #
