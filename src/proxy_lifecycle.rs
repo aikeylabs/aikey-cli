@@ -119,6 +119,16 @@ pub enum StartError {
     /// pidfile + sidecar even if the old process was still alive.)
     UnresponsiveStuck { pid: u32, port: u16 },
 
+    /// Layer 1 reported `Unresponsive`, but this caller did not ask for
+    /// permission to terminate it (`StartOptions::terminate_unresponsive`
+    /// is `false`). No signal was sent and no on-disk state was touched —
+    /// the existing instance is left exactly as it was found.
+    ///
+    /// This is the common case for `ensure-running` / wrapper preflight:
+    /// the right response is a diagnostic pointing at `aikey proxy
+    /// restart`, NOT an implicit kill from a liveness check.
+    UnresponsiveRefused { pid: u32, port: u16 },
+
     /// Vault password could not be verified before spawn (rate limiter
     /// counted this as a failed attempt). Caller should re-prompt.
     VaultPasswordRejected(String),
@@ -203,6 +213,12 @@ impl std::fmt::Display for StartError {
                 f,
                 "aikey-proxy exited shortly after starting; check {}",
                 stderr_log.display()
+            ),
+            StartError::UnresponsiveRefused { pid, port } => write!(
+                f,
+                "existing aikey-proxy (pid: {pid}) is not answering /health on port {port}. \
+                 Left running untouched — this command does not terminate a live process. \
+                 Run `aikey proxy restart` to replace it, or `aikey proxy status` to inspect it"
             ),
             StartError::UnresponsiveStuck { pid, port } => write!(
                 f,
@@ -639,6 +655,23 @@ pub struct StartOptions {
     /// and start refused before spawn, silently killing the drift capability.
     /// Refusal stays for drift-disabled configs (strict legacy).
     pub port_drift_enabled: bool,
+
+    /// Whether this start is allowed to TERMINATE an existing
+    /// `Unresponsive` instance (SIGTERM → SIGKILL) before spawning a
+    /// replacement. Defaults to `false` for every caller except an
+    /// explicit `aikey proxy restart`.
+    ///
+    /// **Why opt-in (2026-08-04 field incident, DESKTOP-S7JJK1B).**
+    /// `ensure-running` runs on EVERY `claude` / `codex` / `kimi` launch
+    /// and from any keep-alive timer a user has set up — the hottest path
+    /// there is. Wiring an implicit kill into it means a routine liveness
+    /// check can destroy a proxy that is mid-request, taking the user's
+    /// in-flight call with it; when the check repeats on a timer, that is
+    /// an unbounded loop with no human in it. Killing a process is an
+    /// explicit act and now requires an explicitly-asked-for command.
+    /// Callers that decline get [`StartError::UnresponsiveRefused`] and
+    /// can tell the user to run `aikey proxy restart`.
+    pub terminate_unresponsive: bool,
 }
 
 /// Where to direct the spawned child's stderr.
@@ -760,10 +793,17 @@ pub fn stop_proxy(
 /// from racing in and starting a different proxy in the gap.
 pub fn restart_proxy(
     password: &SecretString,
-    opts: StartOptions,
+    mut opts: StartOptions,
     stop_timeout: Duration,
     progress: impl FnMut(&str),
 ) -> Result<RunningState, RestartError> {
+    // `restart` IS the explicit "replace whatever is there" command — the
+    // one place where terminating a live-but-unresponsive instance is what
+    // the user asked for. Every other caller leaves it running (see
+    // StartOptions::terminate_unresponsive). Set here rather than trusted
+    // from the caller so the authorization travels with the command that
+    // carries the user's intent.
+    opts.terminate_unresponsive = true;
     // Acquire lock once for the whole compound operation.
     let _lock = acquire_lifecycle_lock().map_err(|_| RestartError::LockBusy)?;
     // Phase 1: stop. Drop the lock-acquire wrapping by calling the
@@ -1051,6 +1091,14 @@ fn start_proxy_locked_inner(
         }
         ProxyState::Unresponsive { pid, port } => {
             *entry_state_label = "Unresponsive".into();
+            // Kill authorization is opt-in (2026-08-04). A caller that did
+            // not ask to replace a live instance must leave it alone —
+            // including its pidfile + sidecar, which still correctly
+            // describe a running process. See
+            // StartOptions::terminate_unresponsive for the incident.
+            if !opts.terminate_unresponsive {
+                return Err(StartError::UnresponsiveRefused { pid, port });
+            }
             // **Round 7 review fix (HIGH)**: previously a best-effort
             // SIGTERM + 5s wait + unconditional file delete. If the old
             // proxy was still alive (e.g., handling a long-running

@@ -99,6 +99,9 @@ fn build_start_options(
         stderr_target,
         extra_env,
         port_drift_enabled,
+        // Default deny: only `restart_proxy` flips this on. A start must
+        // never be the thing that kills a live proxy.
+        terminate_unresponsive: false,
     };
     Ok((opts, env_keys))
 }
@@ -347,10 +350,20 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
     // the safer-than-`is_proxy_running` check — Layer 1 verifies
     // identity + ownership, so a `Running` here is provably ours.
     let probe_listen = proxy_listen_addr(None);
-    if matches!(
-        crate::proxy_state::proxy_state(&probe_listen),
-        crate::proxy_state::ProxyState::Running { .. }
-    ) {
+    let entry_state = crate::proxy_state::proxy_state(&probe_listen);
+    // A live instance that is failing /health is NOT ours to kill from a
+    // liveness check (2026-08-04 — see
+    // StartOptions::terminate_unresponsive). Report and stop here: falling
+    // through would reach start_proxy, which now refuses anyway, after
+    // pointlessly unlocking the vault.
+    if let crate::proxy_state::ProxyState::Unresponsive { pid, port } = entry_state {
+        eprintln!(
+            "[aikey] aikey-proxy (pid: {pid}) is not answering /health on port {port} — leaving it running"
+        );
+        eprintln!("[aikey] hint: `aikey proxy restart` to replace it");
+        return;
+    }
+    if matches!(entry_state, crate::proxy_state::ProxyState::Running { .. }) {
         // Drift self-heal guard (20260728-端口漂移baseurl自愈回写): this
         // fast-path is the consumption-side reconcile point — launchd may
         // have auto-started a DRIFTED proxy at boot with no CLI in the loop,
@@ -1816,11 +1829,16 @@ pub fn proxy_guard(password: &SecretString) -> bool {
             return false;
         }
         ProxyState::Unresponsive { pid, port } => {
-            eprintln!("[aikey] previous aikey-proxy (pid: {pid}) is unresponsive on port {port}");
-            eprintln!("[aikey] attempting restart (Layer 2 will SIGTERM/SIGKILL it first)...");
-            // Fall through to the "start" path below, which will
-            // route through start_proxy_locked → terminate_unresponsive
-            // (Round 7 fix #1).
+            // 2026-08-04: this used to fall through to the start path,
+            // which SIGTERM/SIGKILLed the incumbent. That made an implicit
+            // kill reachable from the wrapper preflight — see
+            // StartOptions::terminate_unresponsive. The proxy is alive and
+            // owns the port; replacing it is the user's call, not ours.
+            eprintln!(
+                "[aikey] aikey-proxy (pid: {pid}) is not answering /health on port {port} — leaving it running"
+            );
+            eprintln!("[aikey] hint: `aikey proxy status` to inspect, `aikey proxy restart` to replace it");
+            return false;
         }
         ProxyState::Crashed { .. } | ProxyState::Stopped => {
             // Need a (re)start.
