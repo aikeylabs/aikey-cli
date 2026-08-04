@@ -44,6 +44,16 @@ fn base_cmd(home: &PathBuf, vault: &PathBuf) -> Command {
         .env("AIKEY_NO_HOOK", "1")
         .env("RUST_LOG", "off")
         .env("NO_COLOR", "1");
+    // Windows: storage_acl::enforce_owner_only reads USERNAME to grant the
+    // current user before stripping ACL inheritance. Under env_clear() an
+    // absent USERNAME locks the non-elevated caller out of the vault file, so
+    // forward it (and USERDOMAIN) the same way PATH is forwarded.
+    if let Ok(u) = std::env::var("USERNAME") {
+        c.env("USERNAME", u);
+    }
+    if let Ok(d) = std::env::var("USERDOMAIN") {
+        c.env("USERDOMAIN", d);
+    }
     c
 }
 
@@ -70,6 +80,7 @@ fn hop(
         provider_code: provider.to_string(),
         protocol_type: "anthropic".to_string(),
         base_url: base_url.to_string(),
+        binding_id: format!("bind-{vk_id}-{provider}"),
         credential_id: format!("cred-{vk_id}-{provider}"),
         credential_revision: "1".to_string(),
         virtual_key_revision: "1".to_string(),
