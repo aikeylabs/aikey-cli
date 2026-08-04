@@ -6623,13 +6623,28 @@ fn team_key_available_for_activate(local_state: &str) -> bool {
 /// central key (material stays on the node) and a group VK (the proxy pulls the
 /// per-account credential at request time).
 fn team_key_activatable(vk: &storage::VirtualKeyCacheEntry) -> Option<String> {
+    team_key_activatable_on(vk, crate::commands_account::read_cluster_node().is_some())
+}
+
+/// The rule itself, with the one piece of ambient state taken as an argument.
+///
+/// 🔴 Split out 2026-08-04. `read_cluster_node()` reads
+/// `$HOME/.aikey/active-cluster.json` — the developer's REAL home — so the fences
+/// below were measuring whichever branch the machine they ran on happened to be
+/// in. On a laptop that has ever run `aikey use` against a cluster, the
+/// "material never arrived" fence inverted and failed; on CI it passed and the
+/// cluster branch was never exercised at all. Either way half the rule went
+/// unchecked, and the failure looked like a flake, which invites weakening
+/// `key_material_reachable` to make it stop.
+///
+/// Both callers are the same rule; only the wrapper knows where the machine is.
+fn team_key_activatable_on(vk: &storage::VirtualKeyCacheEntry, on_cluster: bool) -> Option<String> {
     if !team_key_available_for_activate(&vk.local_state) {
         return Some(format!(
             "Key '{}' is not available (state: {}). Run 'aikey key sync' to refresh.",
             vk.alias, vk.local_state
         ));
     }
-    let on_cluster = crate::commands_account::read_cluster_node().is_some();
     if !vk.key_material_reachable(on_cluster) {
         // 🔴 Say WHICH of the two it is. "Not available" alone sends someone to
         // re-check permissions or the server, when the answer is that the key

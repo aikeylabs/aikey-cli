@@ -84,11 +84,22 @@ fn team_entry(local_state: &str, ciphertext: Option<Vec<u8>>) -> storage::Virtua
     }
 }
 
+// 🔴 Every fence below drives `team_key_activatable_on` with an EXPLICIT
+// `on_cluster`, never the wrapper.
+//
+// The wrapper reads `$HOME/.aikey/active-cluster.json` — a real file on the
+// machine running the test. Until 2026-08-04 these fences called it, so what
+// they asserted depended on whether that laptop had ever run `aikey use`
+// against a cluster: on damon's Mac the first one failed outright, on CI it
+// passed and the cluster branch was never covered by anything. A fence whose
+// verdict is a property of the host is not a fence.
+
 #[test]
 fn activate_rejects_a_synced_inactive_key_whose_material_never_arrived() {
     // 2026-04-16 Bug 4, stated as the condition that actually causes it. The row
     // is state-eligible; what makes it unusable is that nothing was delivered.
-    let reason = team_key_activatable(&team_entry("synced_inactive", None))
+    // Off-cluster: there is nowhere else the material could be.
+    let reason = team_key_activatable_on(&team_entry("synced_inactive", None), false)
         .expect("a key with no delivered material must not be activatable");
     assert!(
         reason.contains("aikey key sync"),
@@ -103,16 +114,42 @@ fn activate_rejects_a_synced_inactive_key_whose_material_never_arrived() {
 }
 
 #[test]
+fn activate_accepts_that_same_row_on_a_cluster_node_where_the_material_stays_central() {
+    // The other half of the branch above, and the reason it must be an argument
+    // rather than ambient state: on a cluster WORKER a claimed key carries no
+    // local ciphertext BY DESIGN — the node holds it. Asserting only the
+    // off-cluster half would let someone "fix" a machine-dependent failure by
+    // dropping the `on_cluster && claimed` arm of `key_material_reachable`,
+    // which silently un-activates every key on every worker.
+    let mut vk = team_entry("synced_inactive", None);
+    vk.share_status = "claimed".into();
+    assert!(
+        team_key_activatable_on(&vk, true).is_none(),
+        "on a cluster node a claimed key without local ciphertext is reachable, \
+         not undelivered"
+    );
+    assert!(
+        team_key_activatable_on(&vk, false).is_some(),
+        "and off-cluster the very same row must still be refused — otherwise the \
+         cluster arm has been widened into a blanket exemption"
+    );
+}
+
+#[test]
 fn activate_accepts_a_synced_inactive_key_that_has_material() {
     // The 2026-07-23 case, and the reason a state-only rejection was wrong: the
     // picker and drawer offer this key, and it works.
     assert!(
-        team_key_activatable(&team_entry("synced_inactive", Some(vec![1, 2, 3]))).is_none(),
+        team_key_activatable_on(&team_entry("synced_inactive", Some(vec![1, 2, 3])), false)
+            .is_none(),
         "a delivered key that simply is not the selected primary is a legitimate \
          explicit pin — rejecting it makes an advertised action fail"
     );
-    assert!(team_key_activatable(&team_entry("active", Some(vec![1, 2, 3]))).is_none());
-    assert!(team_key_activatable(&team_entry("prompt_dismissed", Some(vec![1, 2, 3]))).is_none());
+    assert!(team_key_activatable_on(&team_entry("active", Some(vec![1, 2, 3])), false).is_none());
+    assert!(
+        team_key_activatable_on(&team_entry("prompt_dismissed", Some(vec![1, 2, 3])), false)
+            .is_none()
+    );
 }
 
 #[test]
@@ -127,7 +164,7 @@ fn activate_still_rejects_disabled_states_even_when_material_is_present() {
         "disabled_by_key_status",
     ] {
         assert!(
-            team_key_activatable(&team_entry(state, Some(vec![1, 2, 3]))).is_some(),
+            team_key_activatable_on(&team_entry(state, Some(vec![1, 2, 3])), false).is_some(),
             "state {state} must stay rejected even with local ciphertext"
         );
     }
@@ -141,7 +178,7 @@ fn activate_accepts_a_group_vk_that_carries_no_local_material_by_design() {
     let mut vk = team_entry("synced_inactive", None);
     vk.oauth_group_id = Some("grp-1".into());
     assert!(
-        team_key_activatable(&vk).is_none(),
+        team_key_activatable_on(&vk, false).is_none(),
         "a group VK routes without local ciphertext by design; rejecting it would \
          re-introduce the same false negative that made `use` and web set-route \
          refuse working keys"
