@@ -489,6 +489,59 @@ impl StateInputs {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Health probe policy — "slow" is not "dead"
+// ---------------------------------------------------------------------------
+
+/// Per-attempt `/health` timeout used when deciding `Running` vs
+/// `Unresponsive`.
+///
+/// **Why not 500ms (2026-08-04 field incident, DESKTOP-S7JJK1B).** The
+/// verdict this probe produces is load-bearing: `Unresponsive` is the ONE
+/// state Layer 2 is allowed to SIGTERM/SIGKILL (see the invariant note on
+/// [`compute_proxy_state`]). A 500ms budget made that verdict a function of
+/// how BUSY the proxy was rather than whether it was alive — a proxy
+/// masking a ~300KB body on a 35-second upstream call misses 500ms
+/// routinely, and every miss was a kill. The proxy's own drain budget is
+/// 30s; a liveness probe must be generous relative to the work it is
+/// probing, not relative to how fast a healthy idle answer arrives.
+///
+/// A healthy proxy answers in single-digit milliseconds, so raising the
+/// ceiling costs nothing on the happy path — the timeout is only ever
+/// reached when something is genuinely wrong.
+pub const HEALTH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Consecutive failed `/health` attempts required before we are willing to
+/// call a proxy `Unresponsive`.
+///
+/// One missed probe is a coincidence (a GC pause, a saturated worker, a
+/// Windows scheduler hiccup); three consecutive misses across
+/// [`HEALTH_PROBE_TIMEOUT`] each is a pattern. Since `Unresponsive` is a
+/// kill authorization, it must be the second thing, never the first.
+pub const HEALTH_PROBE_ATTEMPTS: u32 = 3;
+
+/// Pause between health attempts, so the retries sample distinct moments
+/// instead of hammering one stalled instant.
+pub const HEALTH_PROBE_RETRY_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Confirming `/health` probe: true as soon as ANY attempt answers 200,
+/// false only after [`HEALTH_PROBE_ATTEMPTS`] consecutive failures.
+///
+/// Returns on the first success, so the healthy path costs exactly one
+/// round-trip. The retry budget is spent only when the proxy is failing to
+/// answer — precisely the case where being sure is worth a few seconds.
+pub fn health_confirmed(port: u16) -> bool {
+    for attempt in 0..HEALTH_PROBE_ATTEMPTS {
+        if crate::proxy_proc::http_health_ok(port, HEALTH_PROBE_TIMEOUT) {
+            return true;
+        }
+        if attempt + 1 < HEALTH_PROBE_ATTEMPTS {
+            std::thread::sleep(HEALTH_PROBE_RETRY_GAP);
+        }
+    }
+    false
+}
+
 /// Read pidfile (one-line plain integer). Returns None if file missing,
 /// unreadable, or contents do not parse as u32.
 fn read_pidfile(path: &std::path::Path) -> Option<u32> {
@@ -599,9 +652,11 @@ pub fn compute_proxy_state(inputs: &StateInputs) -> ProxyState {
             Some(p) if p == pid => {
                 // Our PID owns the port. Check /health to distinguish
                 // Running (admin handler responding) from Unresponsive
-                // (port bound but handler not yet up / hung).
-                let healthy =
-                    crate::proxy_proc::http_health_ok(port, std::time::Duration::from_millis(500));
+                // (port bound but handler not yet up / hung). Confirming
+                // probe, not a single 500ms shot — see health_confirmed:
+                // this verdict authorizes a kill, so a busy proxy must not
+                // be able to fail it.
+                let healthy = health_confirmed(port);
                 if healthy {
                     ProxyState::Running {
                         pid,
@@ -736,9 +791,7 @@ fn classify_permission_denied_pid(
     match crate::proxy_proc::port_owner_pid(port).ok().flatten() {
         Some(owner) if owner == pid => {
             let meta_pid_matches = matches!(read_meta_at(meta_path), Ok(m) if m.pid == pid);
-            if meta_pid_matches
-                && crate::proxy_proc::http_health_ok(port, std::time::Duration::from_millis(500))
-            {
+            if meta_pid_matches && health_confirmed(port) {
                 return ProxyState::Running {
                     pid,
                     port,
@@ -810,6 +863,103 @@ pub fn pidfile_path() -> std::io::Result<std::path::PathBuf> {
         )
     })?;
     Ok(home.join(".aikey").join("run").join("proxy.pid"))
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// Bind a listener that accepts one connection, waits `delay`, then
+    /// answers 200. Models a proxy that is alive and correct but BUSY —
+    /// the exact shape of the 2026-08-04 incident, where a proxy serving
+    /// a 35-second upstream call could not answer within 500ms.
+    fn spawn_slow_http_once(delay: std::time::Duration) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        port
+    }
+
+    /// **The incident fence.** A proxy that takes 800ms to answer /health
+    /// is ALIVE. Under the old 500ms single-shot probe it was classified
+    /// `Unresponsive` — the one state Layer 2 is allowed to SIGKILL — so a
+    /// busy proxy was killed for being busy, mid-request, by a routine
+    /// liveness check.
+    ///
+    /// If this ever fails, the CLI has gone back to treating slow as dead.
+    #[test]
+    fn the_old_500ms_budget_would_have_condemned_this_live_proxy() {
+        let port = spawn_slow_http_once(std::time::Duration::from_millis(800));
+        assert!(
+            !crate::proxy_proc::http_health_ok(port, std::time::Duration::from_millis(500)),
+            "precondition: an 800ms responder must NOT fit inside the old 500ms \
+             budget — if it does, this test no longer models the incident"
+        );
+    }
+
+    /// The same 800ms responder, judged by the real decision helper.
+    /// Separated from the precondition above so a failure names the cause:
+    /// this one asserts the VERDICT, not the timeout arithmetic.
+    #[test]
+    fn health_confirmed_accepts_a_slow_but_live_proxy() {
+        let port = spawn_slow_http_once(std::time::Duration::from_millis(800));
+        assert!(
+            health_confirmed(port),
+            "a proxy that answers 200 in 800ms is alive and must never be \
+             classified Unresponsive (that verdict authorizes a kill)"
+        );
+    }
+
+    /// The other direction: nothing listening must still resolve to
+    /// "not healthy" — and must do so in bounded time. A retry budget that
+    /// never terminates would hang every `ensure-running` on the wrapper
+    /// hot path.
+    #[test]
+    fn health_confirmed_gives_up_on_a_dead_port_within_its_budget() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let ok = health_confirmed(port);
+        let elapsed = started.elapsed();
+
+        assert!(!ok, "a free port must not report healthy");
+        let ceiling = HEALTH_PROBE_TIMEOUT * HEALTH_PROBE_ATTEMPTS
+            + HEALTH_PROBE_RETRY_GAP * HEALTH_PROBE_ATTEMPTS
+            + std::time::Duration::from_secs(2);
+        assert!(
+            elapsed < ceiling,
+            "health_confirmed took {elapsed:?}, beyond its own budget {ceiling:?}"
+        );
+    }
+
+    /// A connection refused resolves immediately, so the retry budget is
+    /// only ever spent on a port that IS bound. Pins that the happy path
+    /// stays one round-trip: `health_confirmed` returns on first success.
+    #[test]
+    fn healthy_proxy_costs_a_single_round_trip() {
+        let port = spawn_slow_http_once(std::time::Duration::from_millis(0));
+        let started = std::time::Instant::now();
+        assert!(health_confirmed(port));
+        assert!(
+            started.elapsed() < HEALTH_PROBE_RETRY_GAP,
+            "a healthy answer must return before any retry gap elapses — \
+             the retry budget is for failures only"
+        );
+    }
 }
 
 #[cfg(test)]
