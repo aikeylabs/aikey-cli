@@ -403,8 +403,16 @@ pub fn test_provider_connectivity(
     base_url: &str,
     api_key: &str,
     kind: CredentialKind,
+    source_ref: &str,
 ) -> ConnectivityResult {
-    test_provider_connectivity_with_progress(provider_code, base_url, api_key, kind, |_, _| {})
+    test_provider_connectivity_with_progress(
+        provider_code,
+        base_url,
+        api_key,
+        kind,
+        source_ref,
+        |_, _| {},
+    )
 }
 
 /// Same probe pipeline as `test_provider_connectivity` but emits a
@@ -421,6 +429,10 @@ pub fn test_provider_connectivity_with_progress<F>(
     base_url: &str,
     api_key: &str,
     kind: CredentialKind,
+    // The credential this target came from (`TestTarget.source_ref`). Lets the
+    // proxy resolve the REAL upstream instead of the caller guessing it — see
+    // the `guessed_ping_url` comment below for why the guess was wrong.
+    source_ref: &str,
     mut on_phase: F,
 ) -> ConnectivityResult
 where
@@ -449,11 +461,18 @@ where
         || std::env::var("http_proxy").is_ok()
         || std::env::var("all_proxy").is_ok();
 
-    // Determine the REAL upstream host for Ping(DIRECT). If base_url is a
-    // localhost URL (team/OAuth TestTargets routed via aikey-proxy), fall
-    // back to the provider's canonical upstream so we still measure what
-    // the user intuitively expects ("can my laptop reach anthropic?").
-    let ping_target_url: String =
+    // Fallback ping target, used only when the proxy cannot tell us the real
+    // one (older proxy, or a credential kind it does not resolve yet).
+    //
+    // 🔴 This guess is the 2026-08-03 defect, kept ONLY as a fallback. A
+    // PersonalApi TestTarget's `base_url` is deliberately the LOCAL PROXY
+    // (bugfix 2026-04-22: the test must take the runtime path), so "the real
+    // upstream" is not in it. Substituting the provider's public host was a
+    // guess that is right for a plain API key and WRONG for an entry with its
+    // own base_url — a self-hosted gateway or an OAuth ingress. The verdict then
+    // tracked a host the key never talks to, in both directions: red while the
+    // real gateway was healthy, and GREEN while it was down.
+    let guessed_ping_url: String =
         if base_url.contains("127.0.0.1") || base_url.contains("localhost") {
             default_base_url(provider_code)
                 .unwrap_or("https://unknown")
@@ -461,16 +480,51 @@ where
         } else {
             base_url.to_string()
         };
-    let (upstream_host, upstream_port) = parse_host_port(&ping_target_url);
+
+    // Only PersonalApi references resolve server-side today. Sending a team /
+    // OAuth ref would make the proxy refuse (it fails loudly by design rather
+    // than guessing), turning a working probe red — so the gate stays here
+    // until the resolver covers those kinds.
+    let resolvable_ref = if matches!(kind, CredentialKind::PersonalApi) {
+        source_ref
+    } else {
+        ""
+    };
 
     // Cumulative result that grows as each phase completes. We pass `&result`
     // back through the `Finished` callback so renderers can format the cell
     // for the just-completed phase before the next phase even starts.
     let mut result = ConnectivityResult::default();
 
-    // ── Phase 1: Ping(DIRECT) — CLI → upstream. Independent. ─────────────
+    // ── Phase 1: Ping(PROXY) — CLI → aikey-proxy → upstream. ─────────────
+    // Uses POST /admin/probe/ping. aikey-proxy handles its own HTTPS_PROXY /
+    // NO_PROXY / egress-engine semantics internally.
+    //
+    // 🔴 Runs BEFORE Ping(DIRECT) since 2026-08-03, which is a deliberate
+    // reordering: this is the only call that can tell us which upstream the
+    // credential actually uses, and Ping(DIRECT) needs that same address to be
+    // measuring the same thing. Probing two different hosts and printing them
+    // side by side as "proxy path" vs "laptop path" was comparing nothing.
+    // Display order of the columns is unchanged.
+    on_phase(ProbePhase::PingProxy, ProbeStage::Started);
+    let (ping_ok, ping_ms, resolved_upstream) =
+        probe_via_aikey_proxy_ping(provider_code, &guessed_ping_url, resolvable_ref);
+    result.ping_ok = ping_ok;
+    result.ping_ms = ping_ms;
+    on_phase(ProbePhase::PingProxy, ProbeStage::Finished(&result));
+
+    // The address the proxy actually dialled wins; the guess is the fallback.
+    let ping_target_url = if resolved_upstream.is_empty() {
+        guessed_ping_url.clone()
+    } else {
+        resolved_upstream
+    };
+    let (upstream_host, upstream_port) = parse_host_port(&ping_target_url);
+
+    // ── Phase 2: Ping(DIRECT) — CLI → upstream. Independent. ─────────────
     // Never short-circuits the other phases. Surfaces as the "Ping(D)"
-    // column and gives users a "my laptop's path to upstream" baseline.
+    // column and gives users a "my laptop's path to upstream" baseline —
+    // against the SAME upstream the proxy just probed.
     on_phase(ProbePhase::PingDirect, ProbeStage::Started);
     let (ping_direct_ok, ping_direct_ms) = if has_proxy {
         // With a network proxy, TCP won't work — use HTTP HEAD through the
@@ -483,15 +537,6 @@ where
     result.ping_direct_ok = ping_direct_ok;
     result.ping_direct_ms = ping_direct_ms;
     on_phase(ProbePhase::PingDirect, ProbeStage::Finished(&result));
-
-    // ── Phase 2: Ping(PROXY) — CLI → aikey-proxy → upstream. ─────────────
-    // Uses the new POST /admin/probe/ping endpoint. aikey-proxy handles
-    // its own HTTPS_PROXY / NO_PROXY semantics internally.
-    on_phase(ProbePhase::PingProxy, ProbeStage::Started);
-    let (ping_ok, ping_ms) = probe_via_aikey_proxy_ping(provider_code, &ping_target_url);
-    result.ping_ok = ping_ok;
-    result.ping_ms = ping_ms;
-    on_phase(ProbePhase::PingProxy, ProbeStage::Finished(&result));
 
     // Short-circuit: if proxy can't reach upstream, skip API + Chat.
     // Critical: probing auth against a known-unreachable upstream wastes
@@ -738,14 +783,31 @@ fn probe_http_head_direct(target_url: &str, timeout: std::time::Duration) -> (bo
 ///
 /// Returns `(false, elapsed_ms)` on any transport error, unknown provider,
 /// or aikey-proxy unreachability. Short-circuits the rest of the suite.
-fn probe_via_aikey_proxy_ping(provider_code: &str, upstream_url: &str) -> (bool, u128) {
+fn probe_via_aikey_proxy_ping(
+    provider_code: &str,
+    upstream_url: &str,
+    source_ref: &str,
+) -> (bool, u128, String) {
     use std::time::Instant;
     let proxy_port = crate::commands_proxy::proxy_port();
     let endpoint = format!("http://127.0.0.1:{}/admin/probe/ping", proxy_port);
-    let body = serde_json::json!({
-        "provider": provider_code,
-        "base_url": upstream_url,
-    });
+    // `source_ref` names the CREDENTIAL so the proxy can resolve the upstream
+    // with the same function the forwarding path uses, instead of us guessing it
+    // from the provider code (2026-08-03; requirements 2026-07-18
+    // §上游地址单一解析). `base_url` stays as the fallback an older proxy — which
+    // ignores unknown fields — will keep using.
+    let body = if source_ref.is_empty() {
+        serde_json::json!({
+            "provider": provider_code,
+            "base_url": upstream_url,
+        })
+    } else {
+        serde_json::json!({
+            "provider": provider_code,
+            "base_url": upstream_url,
+            "source_ref": source_ref,
+        })
+    };
     // 4s cap — the proxy itself uses 3s internally so we allow a bit of
     // slack for request overhead.
     let agent = ureq::AgentBuilder::new()
@@ -758,22 +820,31 @@ fn probe_via_aikey_proxy_ping(provider_code: &str, upstream_url: &str) -> (bool,
         .send_string(&body.to_string())
     {
         Ok(r) => r,
-        Err(_) => return (false, start.elapsed().as_millis()),
+        Err(_) => return (false, start.elapsed().as_millis(), String::new()),
     };
     // Proxy always returns 200 with a structured JSON body — even on
     // upstream failure. If the proxy says ok:false, we propagate that.
     let parsed: serde_json::Value = match resp.into_json() {
         Ok(v) => v,
-        Err(_) => return (false, start.elapsed().as_millis()),
+        Err(_) => return (false, start.elapsed().as_millis(), String::new()),
     };
     let proxy_ok = parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
     let proxy_ms = parsed
         .get("latency_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u128;
+    // The address the proxy ACTUALLY dialled. Empty when we did not send a
+    // source_ref, or when the proxy is older than this field — in which case the
+    // caller keeps its own guess and the divergence stays visible rather than
+    // being silently presented as fact (「展示=执行」).
+    let resolved = parsed
+        .get("resolved_upstream")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     // Report proxy's own measured latency (host → upstream), not our RTT
     // to localhost (which is ~0ms and meaningless).
-    (proxy_ok, proxy_ms)
+    (proxy_ok, proxy_ms, resolved)
 }
 
 /// Result of a proxy connectivity probe.
@@ -1431,7 +1502,13 @@ pub fn run_connectivity_suite(
     if json_mode {
         for t in &targets {
             let r =
-                test_provider_connectivity(&t.probe_provider_code, &t.base_url, &t.bearer, t.kind);
+                test_provider_connectivity(
+                    &t.probe_provider_code,
+                    &t.base_url,
+                    &t.bearer,
+                    t.kind,
+                    &t.source_ref,
+                );
             if r.chat_ok || (r.chat_skipped && r.api_ok) {
                 any_chat_ok = true;
             }
@@ -1783,6 +1860,7 @@ pub fn run_connectivity_suite(
         let base_url = t.base_url.clone();
         let bearer = t.bearer.clone();
         let kind = t.kind;
+        let source_ref = t.source_ref.clone();
         let r = animate_blinking_while(
             &[W_PD, W_PING, W_API, W_CHAT_ANIM],
             format_cell,
@@ -1792,6 +1870,7 @@ pub fn run_connectivity_suite(
                     &base_url,
                     &bearer,
                     kind,
+                    &source_ref,
                     |phase, stage| {
                         let col = phase.column_index();
                         match stage {
