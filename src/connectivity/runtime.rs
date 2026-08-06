@@ -1501,14 +1501,13 @@ pub fn run_connectivity_suite(
     // ── JSON mode: probe all, collect, return; no stderr output. ─────────
     if json_mode {
         for t in &targets {
-            let r =
-                test_provider_connectivity(
-                    &t.probe_provider_code,
-                    &t.base_url,
-                    &t.bearer,
-                    t.kind,
-                    &t.source_ref,
-                );
+            let r = test_provider_connectivity(
+                &t.probe_provider_code,
+                &t.base_url,
+                &t.bearer,
+                t.kind,
+                &t.source_ref,
+            );
             if r.chat_ok || (r.chat_skipped && r.api_ok) {
                 any_chat_ok = true;
             }
