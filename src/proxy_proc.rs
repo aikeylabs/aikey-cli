@@ -404,20 +404,17 @@ pub fn process_birth_token(pid: u32) -> Result<String, BirthTokenError> {
     }
 }
 
-/// Find the PID of whatever process is listening on `tcp_port` on
-/// localhost.
+/// Find every PID listening on `tcp_port`.
 ///
 /// Used by Layer 1 decision tree to compare against our pidfile's PID
 /// — if they differ, the port is held by an external process and we
 /// must demote to `OrphanedPort` (never kill).
 ///
 /// Returns:
-/// - `Ok(Some(pid))` when exactly one PID owns the port (the dominant
-///   case — TCP LISTEN sockets are 1:1 with PID).
-/// - `Ok(None)` when no process is listening (port is free).
-/// - `Ok(Some(first_pid))` when multiple PIDs are reported (unusual —
-///   typically a forked listener; we pick the first reported and let
-///   the caller treat it as the canonical owner).
+/// - `Ok(vec![...])` with every distinct listener PID, sorted for stable
+///   diagnostics. Multiple listeners are valid when the same numeric port is
+///   bound on different addresses or address families.
+/// - `Ok(vec![])` when no process is listening (port is free).
 /// - `Err(...)` when the platform tool is missing / fails to spawn /
 ///   produces unparseable output. Layer 1 maps `Err` to "owner unknown"
 ///   → conservative `OrphanedPort` with `owner_pid: None` (don't claim
@@ -427,7 +424,7 @@ pub fn process_birth_token(pid: u32) -> Result<String, BirthTokenError> {
 /// PowerShell `Get-NetTCPConnection` on Windows. Both are present by
 /// default on supported platforms — we deliberately do NOT depend on
 /// netstat (deprecated on modern Windows, formatting varies on Linux).
-pub fn port_owner_pid(tcp_port: u16) -> Result<Option<u32>, PortOwnerError> {
+pub fn port_owner_pids(tcp_port: u16) -> Result<Vec<u32>, PortOwnerError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         // `lsof -ti :<port> -sTCP:LISTEN` outputs PIDs (one per line)
@@ -443,20 +440,7 @@ pub fn port_owner_pid(tcp_port: u16) -> Result<Option<u32>, PortOwnerError> {
         // lsof returns 1 when no match — distinguish from a real failure.
         // Exit code 0 with empty stdout is also "no match" in some
         // environments; rely on stdout, not status.
-        let stdout = std::str::from_utf8(&out.stdout)
-            .map_err(|e| PortOwnerError::Parse(format!("lsof stdout not utf8: {e}")))?;
-        let first = stdout
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .next();
-        match first {
-            None => Ok(None),
-            Some(s) => s
-                .parse::<u32>()
-                .map(Some)
-                .map_err(|_| PortOwnerError::Parse(format!("lsof returned non-pid line: {s:?}"))),
-        }
+        parse_owner_pids(&out.stdout, "lsof")
     }
     #[cfg(target_os = "windows")]
     {
@@ -465,23 +449,14 @@ pub fn port_owner_pid(tcp_port: u16) -> Result<Option<u32>, PortOwnerError> {
         // -OwningProcess is the PID column. Filter on LocalPort and
         // State Listen to mirror lsof's `-sTCP:LISTEN`.
         let script = format!(
-            "(Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess)",
+            "(Get-NetTCPConnection -LocalPort {} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess)",
             tcp_port
         );
         let out = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .output()
             .map_err(|e| PortOwnerError::Spawn(format!("powershell: {e}")))?;
-        let stdout = std::str::from_utf8(&out.stdout)
-            .map_err(|e| PortOwnerError::Parse(format!("powershell stdout not utf8: {e}")))?;
-        let trimmed = stdout.trim();
-        if trimmed.is_empty() {
-            return Ok(None);
-        }
-        trimmed
-            .parse::<u32>()
-            .map(Some)
-            .map_err(|_| PortOwnerError::Parse(format!("powershell returned non-pid: {trimmed:?}")))
+        parse_owner_pids(&out.stdout, "powershell")
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -490,6 +465,33 @@ pub fn port_owner_pid(tcp_port: u16) -> Result<Option<u32>, PortOwnerError> {
             "port_owner_pid unsupported on this platform".into(),
         ))
     }
+}
+
+/// Returns one representative listener PID for diagnostics and legacy callers.
+/// A numeric TCP port can legitimately have multiple listeners on distinct
+/// addresses/address families, so ownership checks for an expected process must
+/// use [`port_owner_pids`] and test set membership instead.
+pub fn port_owner_pid(tcp_port: u16) -> Result<Option<u32>, PortOwnerError> {
+    Ok(port_owner_pids(tcp_port)?.into_iter().next())
+}
+
+fn parse_owner_pids(raw: &[u8], source: &str) -> Result<Vec<u32>, PortOwnerError> {
+    let stdout = std::str::from_utf8(raw)
+        .map_err(|e| PortOwnerError::Parse(format!("{source} stdout not utf8: {e}")))?;
+    let mut owners = Vec::new();
+    for line in stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let pid = line.parse::<u32>().map_err(|_| {
+            PortOwnerError::Parse(format!("{source} returned non-pid line: {line:?}"))
+        })?;
+        owners.push(pid);
+    }
+    owners.sort_unstable();
+    owners.dedup();
+    Ok(owners)
 }
 
 /// Platform-appropriate one-liner the user can copy-paste to inspect
@@ -782,6 +784,12 @@ mod tests {
             }
         }
         drop(listener);
+    }
+
+    #[test]
+    fn parse_owner_pids_preserves_all_distinct_listeners() {
+        let owners = parse_owner_pids(b"93349\n716\n93349\r\n", "fixture").unwrap();
+        assert_eq!(owners, vec![716, 93349]);
     }
 
     // ── HTTP /health probe tests ───────────────────────────────────────

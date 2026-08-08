@@ -164,12 +164,18 @@ pub enum StartError {
     /// `healthy_deadline`. Drop guard already cleaned up child +
     /// pidfile + sidecar; the embedded path points to the proxy's own
     /// stderr log so the user can investigate.
-    HealthyTimeout { stderr_log: PathBuf },
+    HealthyTimeout {
+        stderr_log: PathBuf,
+        diagnostics: String,
+    },
 
     /// Child exited shortly after spawn (e.g., vault decrypt failure
     /// inside the proxy — usually means env var smuggling went wrong).
     /// Drop guard cleaned up; stderr_log points to proxy's own log.
-    ChildDiedAtStartup { stderr_log: PathBuf },
+    ChildDiedAtStartup {
+        stderr_log: PathBuf,
+        exit_status: Option<String>,
+    },
 }
 
 impl std::fmt::Display for StartError {
@@ -203,17 +209,30 @@ impl std::fmt::Display for StartError {
             ),
             StartError::PersistFailed(s) => write!(f, "failed to persist pidfile/sidecar: {s}"),
             StartError::SpawnFailed(s) => write!(f, "failed to spawn aikey-proxy: {s}"),
-            StartError::HealthyTimeout { stderr_log } => write!(
+            StartError::HealthyTimeout {
+                stderr_log,
+                diagnostics,
+            } => write!(
                 f,
-                "aikey-proxy did not become healthy in {:?}; check {}",
+                "aikey-proxy did not become healthy in {:?} ({diagnostics}); check {}",
                 DEFAULT_HEALTHY_DEADLINE,
                 stderr_log.display()
             ),
-            StartError::ChildDiedAtStartup { stderr_log } => write!(
-                f,
-                "aikey-proxy exited shortly after starting; check {}",
-                stderr_log.display()
-            ),
+            StartError::ChildDiedAtStartup {
+                stderr_log,
+                exit_status,
+            } => match exit_status {
+                Some(status) => write!(
+                    f,
+                    "aikey-proxy exited shortly after starting ({status}); check {}",
+                    stderr_log.display()
+                ),
+                None => write!(
+                    f,
+                    "aikey-proxy exited shortly after starting; check {}",
+                    stderr_log.display()
+                ),
+            },
             StartError::UnresponsiveRefused { pid, port } => write!(
                 f,
                 "existing aikey-proxy (pid: {pid}) is not answering /health on port {port}. \
@@ -379,6 +398,7 @@ pub fn persist_ownership_files(
             // log path instead of a generic "persist failed".
             return Err(StartError::ChildDiedAtStartup {
                 stderr_log: PathBuf::from("/dev/null"),
+                exit_status: None,
             });
         }
         Err(crate::proxy_proc::BirthTokenError::Parse(detail)) => {
@@ -494,6 +514,13 @@ impl StartCleanupGuard {
             meta_path,
             child,
             committed: false,
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self.child.as_mut() {
+            Some(child) => child.try_wait(),
+            None => Ok(None),
         }
     }
 
@@ -1259,7 +1286,7 @@ fn start_proxy_locked_inner(
     // We move the Child handle INTO the guard so its Drop also waits
     // for the child to be reaped (zombie prevention). Child.wait() is
     // called inside the guard's Drop after SIGTERM.
-    let guard = StartCleanupGuard::new(child_pid, pid_p.clone(), meta_p.clone(), Some(child));
+    let mut guard = StartCleanupGuard::new(child_pid, pid_p.clone(), meta_p.clone(), Some(child));
 
     // Centralized in `persist_ownership_files` so foreground / detached
     // paths share one implementation (Round 7 review fix #2).
@@ -1272,17 +1299,28 @@ fn start_proxy_locked_inner(
         // Map the helper's generic ChildDiedAtStartup (with /dev/null
         // placeholder) to one carrying THIS caller's real stderr log.
         return Err(match e {
-            StartError::ChildDiedAtStartup { .. } => StartError::ChildDiedAtStartup {
+            StartError::ChildDiedAtStartup { exit_status, .. } => StartError::ChildDiedAtStartup {
                 stderr_log: stderr_log_path,
+                exit_status,
             },
             other => other,
         });
     }
     let deadline = Instant::now() + opts.healthy_deadline;
     loop {
+        // `kill(pid, 0)` reports a zombie as alive on Unix. While startup owns
+        // the Child handle, try_wait is the authoritative cross-platform check;
+        // it also preserves the real exit status for the operator.
+        if let Ok(Some(status)) = guard.try_wait() {
+            return Err(StartError::ChildDiedAtStartup {
+                stderr_log: stderr_log_path,
+                exit_status: Some(status.to_string()),
+            });
+        }
         if !proxy_proc::process_alive(child_pid) {
             return Err(StartError::ChildDiedAtStartup {
                 stderr_log: stderr_log_path,
+                exit_status: None,
             });
         }
         // Drift discovery (2026-07-08, e2e w2b): with drift enabled the child
@@ -1330,6 +1368,7 @@ fn start_proxy_locked_inner(
         if Instant::now() >= deadline {
             return Err(StartError::HealthyTimeout {
                 stderr_log: stderr_log_path,
+                diagnostics: startup_probe_diagnostics(child_pid, port, opts.port_drift_enabled),
             });
         }
         std::thread::sleep(HEALTHY_POLL_INTERVAL);
@@ -1344,10 +1383,36 @@ fn start_proxy_locked_inner(
 /// affirmative "someone ELSE owns it" vetoes; lookup failure / unknown owner
 /// degrades to the pre-check behavior (don't block success on missing lsof).
 fn port_owned_by(port: u16, child_pid: u32) -> bool {
-    match proxy_proc::port_owner_pid(port) {
-        Ok(Some(owner)) => owner == child_pid,
-        Ok(None) | Err(_) => true,
+    match proxy_proc::port_owner_pids(port) {
+        Ok(owners) => owners.is_empty() || owners.contains(&child_pid),
+        Err(_) => true,
     }
+}
+
+// Secret-free snapshot appended to a startup timeout. This distinguishes
+// "HTTP never served" from "healthy listener rejected by the ownership guard"
+// and also exposes an undiscovered port drift without requiring the user to race
+// the cleanup guard with lsof.
+fn startup_probe_diagnostics(child_pid: u32, configured_port: u16, drift_enabled: bool) -> String {
+    let runtime_addr = runtime_actual_addr_for_pid(child_pid);
+    let probe_port = runtime_addr
+        .as_deref()
+        .map(parse_port)
+        .unwrap_or(configured_port);
+    let health_ok = proxy_proc::http_health_ok(probe_port, Duration::from_millis(500));
+    let owners = match proxy_proc::port_owner_pids(probe_port) {
+        Ok(pids) if !pids.is_empty() => pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        Ok(_) => "none".to_string(),
+        Err(err) => format!("unknown: {err}"),
+    };
+    format!(
+        "child_pid={child_pid}, configured_port={configured_port}, runtime_addr={}, probe_port={probe_port}, health_200={health_ok}, owner_pids={owners}, drift_enabled={drift_enabled}",
+        runtime_addr.as_deref().unwrap_or("unavailable")
+    )
 }
 
 /// Read the actual bound addr from `proxy-runtime.json` IFF it was written by
@@ -1559,5 +1624,37 @@ mod tests {
         let path = tmp.path().join("does_not_exist");
         best_effort_remove(&path);
         // No assertion — we just want this to NOT panic.
+    }
+
+    #[test]
+    fn cleanup_guard_observes_an_exited_child_instead_of_treating_it_as_alive() {
+        let tmp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "7"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut guard = StartCleanupGuard::new(
+            pid,
+            tmp.path().join("proxy.pid"),
+            tmp.path().join("proxy-meta.json"),
+            Some(child),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = guard.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "short-lived child did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!status.success());
+        assert_eq!(status.code(), Some(7));
     }
 }

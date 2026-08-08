@@ -926,17 +926,24 @@ fn handle_start_background(
             )
             .into())
         }
-        Err(crate::proxy_lifecycle::StartError::ChildDiedAtStartup { stderr_log }) => {
+        Err(crate::proxy_lifecycle::StartError::ChildDiedAtStartup {
+            stderr_log,
+            exit_status,
+        }) => {
             let port: u16 = listen_addr_for_msg
                 .rsplit(':')
                 .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(27200);
             Err(format!(
-                "aikey-proxy exited shortly after starting.\n  \
-                 Likely cause: address {} is already in use by another process, or the config is invalid.\n  \
+                "aikey-proxy exited shortly after starting{}.\n  \
+                 The process exited before serving /health. Check the startup log and the OS security/event log; common causes are an invalid config, a port conflict, or platform execution policy.\n  \
+                 Address: {}\n  \
                  Check:  {}\n  \
                  Logs:   {}",
+                exit_status
+                    .map(|status| format!(" ({status})"))
+                    .unwrap_or_default(),
                 listen_addr_for_msg,
                 crate::proxy_proc::port_inspect_command(port),
                 stderr_log.display()

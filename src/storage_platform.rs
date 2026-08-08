@@ -738,7 +738,8 @@ impl VirtualKeyCacheEntry {
 ///
 /// `provider_key_nonce` / `provider_key_ciphertext` may be `None` until
 /// the key is accepted.
-/// Sets a group VK's `group_runtime` column (alpha.5 CLUSTER rail, §3.3).
+/// Atomically sets a Cluster group VK's `group_runtime` and, when supplied,
+/// `my_assignment_override` columns (alpha.5 CLUSTER rail, §3.3).
 ///
 /// WHY a dedicated setter and not the structural upsert: on the MEMBER rail
 /// group_runtime is proxy-owned (channel ③ 60s poll) and the upsert fences it
@@ -748,16 +749,28 @@ impl VirtualKeyCacheEntry {
 /// the column, projecting `oauth_group_runtime.member_tokens[token_seat_id]`
 /// into the same at-rest format the proxy reader (vkeys.GroupRuntimeAccount)
 /// already parses. Single-writer-per-deployment-form preserved.
-pub fn set_group_runtime_for_vk(
+/// `assignment_override_json=None` means an older Control did not send the
+/// additive field, so last-known assignment is preserved during rolling
+/// upgrades. `Some("")` explicitly clears stale assignment state.
+pub fn set_group_runtime_state_for_vk(
     virtual_key_id: &str,
     group_runtime_json: &str,
+    assignment_override_json: Option<&str>,
 ) -> Result<(), String> {
     let conn = open_connection()?;
-    conn.execute(
-        "UPDATE managed_virtual_keys_cache SET group_runtime = ?1 WHERE virtual_key_id = ?2",
-        params![group_runtime_json, virtual_key_id],
-    )
-    .map_err(|e| format!("set group_runtime: {}", e))?;
+    match assignment_override_json {
+        Some(assignment) => conn.execute(
+            "UPDATE managed_virtual_keys_cache
+                SET group_runtime = ?1, my_assignment_override = ?2
+              WHERE virtual_key_id = ?3",
+            params![group_runtime_json, assignment, virtual_key_id],
+        ),
+        None => conn.execute(
+            "UPDATE managed_virtual_keys_cache SET group_runtime = ?1 WHERE virtual_key_id = ?2",
+            params![group_runtime_json, virtual_key_id],
+        ),
+    }
+    .map_err(|e| format!("set cluster group runtime state: {}", e))?;
     Ok(())
 }
 

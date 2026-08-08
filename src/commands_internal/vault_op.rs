@@ -363,6 +363,25 @@ struct ClusterVk {
     /// Protocol of the group binding (group rows only; slot-less).
     #[serde(default)]
     protocol_type: Option<String>,
+    /// Allocation-ledger projection for this exact (seat, group). The public
+    /// ingress hashes the assigned account to choose a Worker, so the Worker
+    /// must use the same account rather than independently re-running HRW.
+    /// Absent on an older Control means preserve last-known during rolling
+    /// upgrades; an explicit empty value means clear a stale assignment.
+    #[serde(default)]
+    assignment_override: Option<ClusterAssignmentOverride>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClusterAssignmentOverride {
+    #[serde(default)]
+    account_id: String,
+    #[serde(default)]
+    blocked: bool,
+    #[serde(default)]
+    removed: bool,
+    #[serde(default)]
+    routing_version: i64,
 }
 
 // ---- oauth_group_runtime (alpha.5, §3.2): org-wide seat-keyed OAuth tokens ----
@@ -803,20 +822,51 @@ fn apply_group_vk(
     };
     storage::upsert_virtual_key_cache(&entry)?;
 
-    // Material write is separate on purpose: the structural upsert fences
-    // group_runtime out of DO UPDATE SET (member-rail proxy ownership); on a
-    // worker node THIS apply is the sole writer. When the bundle is absent
-    // (old control), skip — keep the last-known material instead of clobbering.
+    // Material/assignment write is separate on purpose: the structural upsert
+    // fences both proxy-owned columns out of DO UPDATE SET. On a Worker node the
+    // cluster snapshot is their sole source. Updating the two columns together
+    // prevents a new token snapshot from becoming visible with an old account
+    // assignment. Absent fields from an old Control preserve last-known state.
     if bundle.is_some() {
-        storage::set_group_runtime_for_vk(
+        let assignment = vk.assignment_override.as_ref().map(|a| {
+            cluster_assignment_override_json(
+                a,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64,
+            )
+        });
+        storage::set_group_runtime_state_for_vk(
             &vk.virtual_key_id,
             &serde_json::Value::Object(material).to_string(),
+            assignment.as_deref(),
         )?;
     }
     // The provider_code this row was written under. The caller records it so the
     // binding-grain sweep can tell "the pool moved to a new provider_code" from
     // "the pool is gone" — the row's own identity under the P1e cache key.
     Ok(entry_provider_code)
+}
+
+// Builds the existing proxy persistence wire. Empty means an explicit pending
+// assignment and clears any stale row; absent is represented by Option::None at
+// the caller and preserves last-known for rolling Control upgrades.
+fn cluster_assignment_override_json(
+    assignment: &ClusterAssignmentOverride,
+    synced_at: i64,
+) -> String {
+    if assignment.account_id.is_empty() && !assignment.blocked && !assignment.removed {
+        return String::new();
+    }
+    serde_json::json!({
+        "account_id": assignment.account_id,
+        "blocked": assignment.blocked,
+        "removed": assignment.removed,
+        "routing_version": assignment.routing_version,
+        "synced_at": synced_at,
+    })
+    .to_string()
 }
 
 /// Core of cluster_apply_snapshot: encrypt + upsert each VK (owner taken per-VK
@@ -3422,6 +3472,43 @@ mod hook_envelope_tests {
         );
     }
 
+    #[test]
+    fn cluster_assignment_override_uses_proxy_persistence_wire() {
+        let bound = ClusterAssignmentOverride {
+            account_id: "acc-ledger".into(),
+            blocked: false,
+            removed: false,
+            routing_version: 42,
+        };
+        let raw = cluster_assignment_override_json(&bound, 1234);
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["account_id"], serde_json::json!("acc-ledger"));
+        assert_eq!(value["routing_version"], serde_json::json!(42));
+        assert_eq!(value["synced_at"], serde_json::json!(1234));
+
+        let blocked = ClusterAssignmentOverride {
+            account_id: String::new(),
+            blocked: true,
+            removed: false,
+            routing_version: 43,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&cluster_assignment_override_json(&blocked, 1235)).unwrap();
+        assert_eq!(value["blocked"], serde_json::json!(true));
+
+        let pending = ClusterAssignmentOverride {
+            account_id: String::new(),
+            blocked: false,
+            removed: false,
+            routing_version: 0,
+        };
+        assert_eq!(
+            cluster_assignment_override_json(&pending, 1236),
+            "",
+            "an explicit pending state must clear a stale persisted assignment"
+        );
+    }
+
     /// FENCE (五跳合约, hop 1→3): a VERBATIM sample of master's org
     /// key-delivery response (handler_org_delivery.go orgVirtualKey +
     /// groupruntime.OrgGroupRuntime wire tags) must deserialize into
@@ -3448,7 +3535,11 @@ mod hook_envelope_tests {
                 // cross-process TestWorkerClusterApply_PullsTeamOauthAccountsAndVK).
                 "oauth_group_id": "g1",
                 "token_seat_id": "seat-parent",
-                "protocol_type": "anthropic"
+                "protocol_type": "anthropic",
+                "assignment_override": {
+                    "account_id": "acc-1",
+                    "routing_version": 42
+                }
             }],
             "oauth_group_runtime": {
                 "groups": [{
@@ -3480,6 +3571,9 @@ mod hook_envelope_tests {
         assert_eq!(vk.oauth_group_id.as_deref(), Some("g1"));
         assert_eq!(vk.token_seat_id.as_deref(), Some("seat-parent"));
         assert_eq!(vk.protocol_type.as_deref(), Some("anthropic"));
+        let assignment = vk.assignment_override.as_ref().expect("assignment");
+        assert_eq!(assignment.account_id, "acc-1");
+        assert_eq!(assignment.routing_version, 42);
         let g = &p.oauth_group_runtime.as_ref().expect("runtime").groups[0];
         assert_eq!(g.provider_code, "anthropic");
         let a = &g.accounts[0];

@@ -97,8 +97,7 @@ fn apply(home: &PathBuf, vault: &PathBuf, provider_code: &str) -> String {
         .write_all(snapshot(provider_code).to_string().as_bytes())
         .unwrap();
     let out = child.wait_with_output().expect("wait");
-    String::from_utf8_lossy(&out.stdout).to_string()
-        + &String::from_utf8_lossy(&out.stderr)
+    String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr)
 }
 
 /// Counts cache rows for the pool VK, and how many carry an empty provider_code.

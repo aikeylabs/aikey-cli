@@ -647,48 +647,44 @@ pub fn compute_proxy_state(inputs: &StateInputs) -> ProxyState {
         }
         // 2d. Identity ✓ + ownership ✓ — we own this PID. Now check
         // whether the proxy is actually serving requests on the port.
-        let port_held = crate::proxy_proc::port_owner_pid(port).ok().flatten();
-        match port_held {
-            Some(p) if p == pid => {
-                // Our PID owns the port. Check /health to distinguish
-                // Running (admin handler responding) from Unresponsive
-                // (port bound but handler not yet up / hung). Confirming
-                // probe, not a single 500ms shot — see health_confirmed:
-                // this verdict authorizes a kill, so a busy proxy must not
-                // be able to fail it.
-                let healthy = health_confirmed(port);
-                if healthy {
-                    ProxyState::Running {
-                        pid,
-                        port,
-                        listen_addr: inputs.listen_addr.clone(),
-                    }
-                } else {
-                    ProxyState::Unresponsive { pid, port }
-                }
-            }
-            Some(_other) => {
-                // Our PID is alive AND ownership-verified, but the
-                // configured port is held by a DIFFERENT process. The
-                // ownership-verified PID is doing something else
-                // (possibly bound to a different port via different
-                // config); the configured port is owned by an external
-                // listener. Layer 2 cannot help here without breaking
-                // the external listener — demote to OrphanedPort.
-                ProxyState::OrphanedPort {
+        let port_owners = crate::proxy_proc::port_owner_pids(port).unwrap_or_default();
+        if port_owners.contains(&pid) {
+            // Our PID owns the port. Check /health to distinguish
+            // Running (admin handler responding) from Unresponsive
+            // (port bound but handler not yet up / hung). Confirming
+            // probe, not a single 500ms shot — see health_confirmed:
+            // this verdict authorizes a kill, so a busy proxy must not
+            // be able to fail it.
+            let healthy = health_confirmed(port);
+            if healthy {
+                ProxyState::Running {
+                    pid,
                     port,
-                    owner_pid: Some(_other),
-                    reason: OrphanReason::PortHeldByExternal,
+                    listen_addr: inputs.listen_addr.clone(),
                 }
-            }
-            None => {
-                // PID alive + ownership ✓ but port not bound. Either
-                // proxy hasn't bound yet (still starting) or it
-                // crashed mid-init. Either way it is *our* process so
-                // Layer 2 may safely kill+respawn — this is the
-                // Unresponsive case.
+            } else {
                 ProxyState::Unresponsive { pid, port }
             }
+        } else if let Some(other) = port_owners.first().copied() {
+            // Our PID is alive AND ownership-verified, but the
+            // configured port is held by a DIFFERENT process. The
+            // ownership-verified PID is doing something else
+            // (possibly bound to a different port via different
+            // config); the configured port is owned by an external
+            // listener. Layer 2 cannot help here without breaking
+            // the external listener — demote to OrphanedPort.
+            ProxyState::OrphanedPort {
+                port,
+                owner_pid: Some(other),
+                reason: OrphanReason::PortHeldByExternal,
+            }
+        } else {
+            // PID alive + ownership ✓ but port not bound. Either
+            // proxy hasn't bound yet (still starting) or it
+            // crashed mid-init. Either way it is *our* process so
+            // Layer 2 may safely kill+respawn — this is the
+            // Unresponsive case.
+            ProxyState::Unresponsive { pid, port }
         }
     } else {
         // 3. No pidfile. Check whether something else holds the port.
@@ -788,46 +784,50 @@ fn classify_permission_denied_pid(
     meta_path: &std::path::Path,
     inputs: &StateInputs,
 ) -> ProxyState {
-    match crate::proxy_proc::port_owner_pid(port).ok().flatten() {
-        Some(owner) if owner == pid => {
-            let meta_pid_matches = matches!(read_meta_at(meta_path), Ok(m) if m.pid == pid);
-            if meta_pid_matches && health_confirmed(port) {
-                return ProxyState::Running {
-                    pid,
-                    port,
-                    listen_addr: inputs.listen_addr.clone(),
-                };
-            }
-            ProxyState::OrphanedPort {
+    let owners = crate::proxy_proc::port_owner_pids(port).unwrap_or_default();
+    if owners.contains(&pid) {
+        let meta_pid_matches = matches!(read_meta_at(meta_path), Ok(m) if m.pid == pid);
+        if meta_pid_matches && health_confirmed(port) {
+            return ProxyState::Running {
+                pid,
                 port,
-                owner_pid: Some(pid),
-                reason: OrphanReason::OwnershipUnverifiablePermission,
-            }
+                listen_addr: inputs.listen_addr.clone(),
+            };
         }
-        Some(owner) => ProxyState::OrphanedPort {
+        ProxyState::OrphanedPort {
+            port,
+            owner_pid: Some(pid),
+            reason: OrphanReason::OwnershipUnverifiablePermission,
+        }
+    } else if let Some(owner) = owners.first().copied() {
+        ProxyState::OrphanedPort {
             port,
             owner_pid: Some(owner),
             reason: OrphanReason::PortHeldByExternal,
-        },
-        None => ProxyState::Crashed { stale_pid: pid },
+        }
+    } else {
+        ProxyState::Crashed { stale_pid: pid }
     }
 }
 
 fn classify_alive_unowned_pid(pidfile_pid: u32, port: u16, reason: OrphanReason) -> ProxyState {
-    match crate::proxy_proc::port_owner_pid(port) {
-        Ok(Some(owner)) if owner == pidfile_pid => ProxyState::OrphanedPort {
+    let owners = crate::proxy_proc::port_owner_pids(port).unwrap_or_default();
+    if owners.contains(&pidfile_pid) {
+        ProxyState::OrphanedPort {
             port,
-            owner_pid: Some(owner),
+            owner_pid: Some(pidfile_pid),
             reason,
-        },
-        Ok(Some(owner)) => ProxyState::OrphanedPort {
+        }
+    } else if let Some(owner) = owners.first().copied() {
+        ProxyState::OrphanedPort {
             port,
             owner_pid: Some(owner),
             reason: OrphanReason::PortHeldByExternal,
-        },
-        Ok(None) | Err(_) => ProxyState::Crashed {
+        }
+    } else {
+        ProxyState::Crashed {
             stale_pid: pidfile_pid,
-        },
+        }
     }
 }
 
