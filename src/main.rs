@@ -4739,7 +4739,7 @@ fn provider_proxy_path(code: &str) -> String {
 /// Qualifying is DERIVED from the registry where possible: the upstream
 /// `default_base_url` ending in `/v1` means this provider's SDK convention
 /// carries `/v1` inside the base URL; if `proxy_path` does not already embed
-/// it (openai, deepseek — unlike `kimi/v1`, `groq/openai/v1`), the client must
+/// it (openai, deepseek — unlike `kimi/v1`, `groq/v1`), the client must
 /// add it. Registry evolution keeps that arm correct with no code change.
 ///
 /// anthropic is the one explicit inclusion the derivation misses: its registry

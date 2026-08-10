@@ -27,7 +27,32 @@
 #   code              (required)  canonical provider_code stored in bindings
 #   family            (optional)  protocol family for UI grouping (default = code)
 #   oauth_aliases     (optional)  names that oauth_provider_to_canonical → code
-#   proxy_path        (required)  URL path segment in aikey-proxy (e.g. "groq/openai/v1")
+#   proxy_path        (required)  URL path segment in aikey-proxy (e.g. "groq/v1").
+#                                 🔴 CLIENT NAMESPACE ONLY — it has NOTHING to do
+#                                 with the upstream path. aikey-proxy strips the
+#                                 whole matched proxy_path and re-derives the
+#                                 upstream path from provider_fingerprint.yaml's
+#                                 provider_routes row (base_url + version).
+#                                 🚫 NEVER mirror upstream path segments here.
+#                                 Six rows used to (groq/openai/v1,
+#                                 openrouter/api/v1, zhipu/api/paas/v4,
+#                                 qwen/compatible-mode/v1, doubao/api/v3,
+#                                 fireworks/inference/v1) and every one of them
+#                                 sent the vendor its own base path TWICE →
+#                                 404. Corrected 2026-08-08, see
+#                                 workflow/CI/bugfix/20260808-provider-path-prefix-routing-registry-drift.md.
+#                                 Canonical shape:
+#                                   "<code>"              anthropic / openai / deepseek —
+#                                                         the SDK appends the version segment
+#                                                         itself (and `aikey route` hints it)
+#                                   "<code>/<version>"    everything else — OpenAI-SDK-style
+#                                                         clients treat base_url as ALREADY
+#                                                         versioned. <version> is the
+#                                                         provider_routes row's `version`
+#                                                         (/v1, /v3 doubao, /v4 zhipu, /v2 qianfan).
+#                                 🔴 anthropic + openai are SHIPPED (GA) — their
+#                                 proxy_path is frozen; changing it breaks users'
+#                                 existing shell env.
 #   env_api_key       (required)  API key env var name (e.g. "GROQ_API_KEY")
 #   env_base_url      (required)  base URL env var name (e.g. "GROQ_BASE_URL")
 #   default_base_url  (required)  upstream default URL (used in drawer hint, probe)
@@ -229,7 +254,14 @@ providers:
   # providers, already recognized in provider_fingerprint.yaml.
   # ──────────────────────────────────────────────────────────────────
   - code: groq
-    proxy_path: groq/openai/v1
+    # 2026-08-08: was `groq/openai/v1`, which MIRRORED the upstream base path
+    # (api.groq.com/openai + /v1). proxy_path is a CLIENT namespace only — the
+    # proxy strips it whole and re-derives /openai/v1 from the route row, so the
+    # mirrored form made the vendor receive /openai/v1/openai/v1/... → 404.
+    # Safe to change outright (no deprecated dual-prefix window) because groq
+    # was never GA — no user shell env carries the old value. Unlike `kimi`,
+    # which IS shipped and therefore keeps its deprecated prefix.
+    proxy_path: groq/v1
     env_api_key: GROQ_API_KEY
     env_base_url: GROQ_BASE_URL
     default_base_url: https://api.groq.com/openai/v1
@@ -250,7 +282,10 @@ providers:
     display_alias: grok
 
   - code: openrouter
-    proxy_path: openrouter/api/v1
+    # 2026-08-08: was `openrouter/api/v1` (mirrored openrouter.ai/api + /v1).
+    # See the groq note above for why the mirrored form 404s and why changing
+    # it needs no migration window.
+    proxy_path: openrouter/v1
     env_api_key: OPENROUTER_API_KEY
     env_base_url: OPENROUTER_BASE_URL
     default_base_url: https://openrouter.ai/api/v1
@@ -273,7 +308,10 @@ providers:
     # Brand aliases: "glm" (previously in PROVIDER_DEFAULTS) and "zhipuai"
     # (民间命名) both canonicalize to "zhipu" at binding write.
     oauth_aliases: [glm, zhipuai]
-    proxy_path: zhipu/api/paas/v4
+    # 2026-08-08: was `zhipu/api/paas/v4` (mirrored open.bigmodel.cn/api/paas
+    # + /v4). `/v4` — not `/v1` — because the route row's version is /v4 and an
+    # OpenAI-SDK client treats base_url as already versioned. See groq note.
+    proxy_path: zhipu/v4
     # Env var name follows the widespread SDK convention (ZHIPUAI_*), not
     # our canonical code.
     env_api_key: ZHIPUAI_API_KEY
@@ -285,7 +323,9 @@ providers:
 
   - code: qwen
     oauth_aliases: [dashscope, tongyi]
-    proxy_path: qwen/compatible-mode/v1
+    # 2026-08-08: was `qwen/compatible-mode/v1` (mirrored
+    # dashscope.aliyuncs.com/compatible-mode + /v1). See groq note.
+    proxy_path: qwen/v1
     # Alibaba DashScope SDKs universally use DASHSCOPE_API_KEY.
     env_api_key: DASHSCOPE_API_KEY
     env_base_url: DASHSCOPE_BASE_URL
@@ -298,7 +338,10 @@ providers:
     # User-decided 2026-04-24: canonical code = "doubao" (用户心智里是豆包),
     # env vars = ARK_* (Volcengine SDK convention).
     oauth_aliases: [ark, volcengine]
-    proxy_path: doubao/api/v3
+    # 2026-08-08: was `doubao/api/v3` (mirrored
+    # ark.cn-beijing.volces.com/api + /v3). `/v3` is the route row's version.
+    # See groq note.
+    proxy_path: doubao/v3
     env_api_key: ARK_API_KEY
     env_base_url: ARK_BASE_URL
     default_base_url: https://ark.cn-beijing.volces.com/api/v3
@@ -386,9 +429,13 @@ providers:
 
   - code: fireworks
     oauth_aliases: [fireworksai]
-    # 上游 base 是 /inference（不是裸域名），proxy_path 必须携带它，
-    # 否则代理拼出的最终 URL 会漏掉这一段。
-    proxy_path: fireworks/inference/v1
+    # 🔴 2026-08-08 更正：was `fireworks/inference/v1`，注释原文写的是"上游 base 是
+    # /inference，proxy_path 必须携带它，否则代理拼出的最终 URL 会漏掉这一段" ——
+    # **这个前提是错的**，而且它正是 D-2 的成因。proxy_path 是纯客户端命名空间：
+    # proxy 把整段 proxy_path 剥掉，上游路径完全由 provider_routes 行
+    # (base_url=https://api.fireworks.ai/inference, version=/v1) 重新推导。
+    # 镜像上游段只会让厂商收到两次 /inference/v1 → 404。
+    proxy_path: fireworks/v1
     env_api_key: FIREWORKS_API_KEY
     env_base_url: FIREWORKS_BASE_URL
     default_base_url: https://api.fireworks.ai/inference/v1
