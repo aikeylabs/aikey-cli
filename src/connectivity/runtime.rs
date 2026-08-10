@@ -84,6 +84,19 @@ pub struct ConnectivityResult {
     /// First ~512 chars of the Chat response body when the probe got an HTTP
     /// status. Same role as `api_body_snippet`, fed into chat_status_hint.
     pub chat_body_snippet: Option<String>,
+    /// Model ids the API probe's own response listed (task 4.4).
+    ///
+    /// 🔴 READ FROM THE RESPONSE THE PROBE ALREADY MAKES, not from a second
+    /// request. The API probe is a `GET /v1/models` against the same base
+    /// URL with the same credential; issuing a second one to "enumerate
+    /// models" would be a second code path that can disagree with the first
+    /// — one green cell and one empty list, with nothing saying why.
+    ///
+    /// 🔴 Empty means WE DID NOT SEE A LIST, never "the relay has no
+    /// models". Plenty of gateways serve chat and no `/models` at all (the
+    /// benign-404 allowlist above is exactly those), and callers must render
+    /// the difference rather than printing an authoritative empty set.
+    pub models_seen: Vec<String>,
 }
 
 /// Default base URLs for known providers — always use the official recommended URL.
@@ -127,9 +140,18 @@ pub fn default_base_url(provider_code: &str) -> Option<&'static str> {
 /// only — ureq's default `ureq::get()` does NOT consult any env on its
 /// own. Bugfix: 20260525-aikey-cli-install-bypasses-proxy-aware-agent.md.
 pub fn build_proxy_aware_agent(timeout: std::time::Duration) -> ureq::Agent {
-    let mut builder = ureq::AgentBuilder::new().timeout(timeout);
+    apply_declared_proxy(ureq::AgentBuilder::new().timeout(timeout)).build()
+}
 
-    // Try https_proxy, then http_proxy, then all_proxy from proxy.env or env.
+/// The user's declared outbound proxy, from `~/.aikey/proxy.env` first and
+/// the process environment second.
+///
+/// Extracted so every agent builder in this crate resolves the lane the same
+/// way. 🔴 One resolver, because "which proxy did that request actually go
+/// through" is a question that has to have one answer — the failure of two
+/// resolvers is a probe that succeeds and a real request that does not, or
+/// the reverse, with nothing reporting either.
+fn apply_declared_proxy(mut builder: ureq::AgentBuilder) -> ureq::AgentBuilder {
     let proxy_url = crate::proxy_env::read_proxy_env_var("https_proxy")
         .or_else(|| crate::proxy_env::read_proxy_env_var("http_proxy"))
         .or_else(|| crate::proxy_env::read_proxy_env_var("all_proxy"))
@@ -142,7 +164,18 @@ pub fn build_proxy_aware_agent(timeout: std::time::Duration) -> ureq::Agent {
             builder = builder.proxy(proxy);
         }
     }
-    builder.build()
+    builder
+}
+
+/// Same lane, but redirects are NOT followed by the client.
+///
+/// 🔴 For callers that have to inspect each hop themselves — today that is
+/// `provider_selfdesc::fetch`, whose gate must re-run on every hop. ureq
+/// follows 3xx *inside* the agent, i.e. below the layer a caller-side gate
+/// runs at, so hop 2 would reach its destination without ever being checked.
+/// Turning following off is what makes the check possible at all.
+pub fn build_proxy_aware_agent_no_redirect(timeout: std::time::Duration) -> ureq::Agent {
+    apply_declared_proxy(ureq::AgentBuilder::new().timeout(timeout).redirects(0)).build()
 }
 
 // ── Probe progress callbacks (2026-04-27) ────────────────────────────────
@@ -651,8 +684,13 @@ where
         match api_result {
             Ok(r) => {
                 let s = r.status();
-                let body = r.into_string().ok().map(truncate_body_snippet);
-                (true, Some(s), body)
+                let full = r.into_string().ok();
+                // 🔴 Parsed BEFORE truncation. The snippet is capped at ~512
+                // chars to keep the result cheap to clone, and a model list
+                // is routinely longer than that — reading the ids off the
+                // truncated copy would silently return the first three.
+                result.models_seen = full.as_deref().map(parse_model_ids).unwrap_or_default();
+                (true, Some(s), full.map(truncate_body_snippet))
             }
             Err(ureq::Error::Status(code, response)) => {
                 let body = response.into_string().ok().map(truncate_body_snippet);
@@ -1299,6 +1337,100 @@ fn probe_auth(provider_code: &str, api_key: &str) -> (&'static str, String) {
         // The actual URL builder appends ?key= for direct calls.
         "google" => ("x-goog-api-key", api_key.to_string()),
         _ => ("Authorization", format!("Bearer {}", api_key)),
+    }
+}
+
+/// Pull model ids out of a `/models` response body.
+///
+/// 🔴 Three shapes, because three vendors answer differently and the CLI
+/// talks to all of them: OpenAI-style `{"data":[{"id":...}]}`, Anthropic's
+/// identical envelope, and Google's `{"models":[{"name":"models/gemini-..."}]}`.
+/// A parser that only knew the first would return an empty list for Gemini —
+/// which renders as "this relay serves no models" rather than "we did not
+/// recognise the answer", and those are very different statements to make
+/// about somebody's gateway.
+///
+/// 🔴 Bounded. A hostile or broken endpoint must not decide how much memory
+/// this process allocates, and nobody needs to see the 4000th model id.
+fn parse_model_ids(body: &str) -> Vec<String> {
+    const MAX_MODELS: usize = 200;
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let array = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(|v| v.as_array());
+    let Some(items) = array else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items.iter().take(MAX_MODELS) {
+        let id = item
+            .get("id")
+            .or_else(|| item.get("name"))
+            .and_then(|v| v.as_str());
+        if let Some(id) = id {
+            // Google returns `models/gemini-2.0-flash`; the axis the vault
+            // stores is the bare id.
+            let id = id.rsplit('/').next().unwrap_or(id).trim();
+            if !id.is_empty() && !out.iter().any(|e: &String| e == id) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod model_enumeration_tests {
+    use super::parse_model_ids;
+
+    #[test]
+    fn openai_and_anthropic_shape() {
+        let body = r#"{"data":[{"id":"gpt-4o"},{"id":"claude-sonnet-4-5"}],"object":"list"}"#;
+        assert_eq!(parse_model_ids(body), vec!["gpt-4o", "claude-sonnet-4-5"]);
+    }
+
+    #[test]
+    fn google_shape_is_understood_and_the_prefix_stripped() {
+        // 🔴 A parser that only knew the OpenAI envelope would return an
+        // empty list here — which renders as "this relay serves no models"
+        // rather than "we did not recognise the answer".
+        let body = r#"{"models":[{"name":"models/gemini-2.0-flash"},{"name":"models/gemini-1.5-pro"}]}"#;
+        assert_eq!(
+            parse_model_ids(body),
+            vec!["gemini-2.0-flash", "gemini-1.5-pro"]
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_body_yields_an_empty_list_and_not_a_panic() {
+        for body in [
+            "not json at all",
+            "{}",
+            r#"{"error":{"message":"no"}}"#,
+            r#"{"data":"not an array"}"#,
+            "404 page not found",
+        ] {
+            assert!(parse_model_ids(body).is_empty(), "body: {body}");
+        }
+    }
+
+    #[test]
+    fn duplicates_are_dropped_and_the_list_is_bounded() {
+        let body = r#"{"data":[{"id":"a"},{"id":"a"},{"id":"b"}]}"#;
+        assert_eq!(parse_model_ids(body), vec!["a", "b"]);
+
+        let many: String = format!(
+            r#"{{"data":[{}]}}"#,
+            (0..500)
+                .map(|i| format!(r#"{{"id":"m{i}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(parse_model_ids(&many).len(), 200);
     }
 }
 

@@ -30,6 +30,7 @@ pub mod migrations;
 pub mod observability;
 pub mod platform_client;
 pub mod provider_registry;
+pub mod provider_selfdesc;
 pub mod providers;
 pub mod proxy_events;
 pub mod proxy_lifecycle;

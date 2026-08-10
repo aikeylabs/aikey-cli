@@ -193,6 +193,25 @@ pub(crate) enum Commands {
         /// Stored on the vault entry; the local proxy routes this key there.
         #[arg(long, value_name = "URL")]
         base_url: Option<String>,
+        /// Read the relay's own description from
+        /// <URL>/.well-known/aikey-provider.json and pre-fill this command.
+        ///
+        /// What it fills in: protocols and base URL. What it does NOT do is
+        /// believe them — everything declared in that file is checked against
+        /// a real request before anything is written, the two are shown side
+        /// by side, and only what answered is stored. A relay that claims a
+        /// protocol it does not serve produces a credential that cannot
+        /// route, which is why the measurement wins.
+        ///
+        /// Works with private and http:// addresses: an enterprise relay
+        /// usually lives inside your own network. Plain http is allowed with
+        /// a warning, because the credential you store will later travel to
+        /// that address in cleartext.
+        ///
+        /// Example:
+        ///   aikey add my-relay --from-url https://api.example-relay.com
+        #[arg(long, value_name = "URL")]
+        from_url: Option<String>,
         /// Skip installing the shell precmd hook into ~/.zshrc / ~/.bashrc.
         /// Hook coverage v1: `aikey add` now installs the hook on first use
         /// (parity with `aikey use`); pass this to opt out, or set

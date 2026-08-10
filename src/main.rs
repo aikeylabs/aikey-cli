@@ -51,6 +51,7 @@ mod proxy_proc;
 mod proxy_state;
 // migrations module is in lib.rs (used by both main.rs and executor.rs)
 use aikeylabs_aikey_cli::commands_app;
+use aikeylabs_aikey_cli::provider_selfdesc as selfdesc;
 use aikeylabs_aikey_cli::commands_audit;
 use aikeylabs_aikey_cli::migrations;
 #[allow(dead_code)]
@@ -1526,6 +1527,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             provider,
             providers,
             base_url: base_url_flag,
+            from_url,
             no_hook,
         } => {
             // Reject empty / whitespace-only alias before any interactive prompt.
@@ -1570,6 +1572,52 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            // Step 1b (P4, task 4.2): read the relay's own description, if the
+            // user pointed us at one.
+            //
+            // 🔴 BEFORE THE KEY PROMPT, DELIBERATELY. A URL that 404s, speaks a
+            // version we do not understand, or resolves to a metadata endpoint
+            // should fail while the user still has their hands on the keyboard
+            // and BEFORE they have pasted a credential into a terminal — a
+            // secret typed and then thrown away is still a secret that was
+            // typed.
+            let declared: Option<selfdesc::SelfDescription> = match &from_url {
+                None => None,
+                Some(url) => {
+                    let fetched = match selfdesc::fetch(url) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            if cli.json {
+                                json_output::error(&msg, 1);
+                            }
+                            return Err(msg.into());
+                        }
+                    };
+                    if !cli.json {
+                        use colored::Colorize;
+                        for w in &fetched.warnings {
+                            // 🔴 Printed BEFORE anything is stored, and the
+                            // warning names the consequence rather than the
+                            // rule (R-3b: the user decides, on their own
+                            // machine, about their own network).
+                            eprintln!("  {} {}", "warning:".yellow().bold(), w);
+                        }
+                        eprintln!(
+                            "  {v} Read {}",
+                            fetched.final_url.dimmed(),
+                            v = crate::symbols::BOX_V.s()
+                        );
+                        eprintln!(
+                            "  {v} That file is the operator's own description. \
+                             Nothing in it is stored until a real request confirms it.",
+                            v = crate::symbols::BOX_V.s()
+                        );
+                    }
+                    Some(fetched.desc)
+                }
+            };
+
             // Step 2: read secret value (from env, hidden TTY prompt, or stdin).
             let secret = if let Ok(test_secret) = env::var("AK_TEST_SECRET") {
                 Zeroizing::new(test_secret)
@@ -1605,6 +1653,25 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // v4.1 Stage 5+: --providers (multi) 优先级最高,然后是 --provider (single shorthand),
             // 都没给且 TTY 时进入交互式 multi-select。clap 的 `conflicts_with` 已保证 --provider /
             // --providers 不会同时给。
+            // 🔴 `--from-url` PRE-FILLS; it does not decide. An explicit
+            // `--providers` / `--base-url` on the command line still wins,
+            // because a value the user typed outranks a value a third party
+            // published about themselves — and the probe below outranks both.
+            let declared_protocols: Vec<String> = declared
+                .as_ref()
+                .map(|d| {
+                    d.protocols
+                        .iter()
+                        .map(|p| p.trim().to_lowercase())
+                        .filter(|p| !p.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let declared_base_url: Option<String> = declared
+                .as_ref()
+                .map(|d| d.base_url.trim().to_string())
+                .filter(|u| !u.is_empty());
+
             let (resolved_providers, resolved_base_url): (Vec<String>, Option<String>) =
                 if !providers.is_empty() {
                     // dedupe + lowercase,保持用户输入顺序
@@ -1644,6 +1711,11 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     (cleaned, None)
                 } else if let Some(code) = provider {
                     (vec![code.to_lowercase()], None)
+                } else if !declared_protocols.is_empty() {
+                    // From the relay's own file. 🔴 These are CANDIDATES: each
+                    // one is probed below and only the ones that answer are
+                    // written (task 4.6).
+                    (declared_protocols.clone(), declared_base_url.clone())
                 } else if std::io::stdin().is_terminal() && !cli.json {
                     use colored::Colorize;
                     let mut items: Vec<String> =
@@ -1805,7 +1877,9 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // proxy routes this key there instead of the provider default.
             let resolved_base_url = match &base_url_flag {
                 Some(u) if !u.trim().is_empty() => Some(u.trim().to_string()),
-                _ => resolved_base_url,
+                // The declaration is the next-best pre-fill, below an explicit
+                // flag and above the provider default.
+                _ => resolved_base_url.or_else(|| declared_base_url.clone()),
             };
 
             // Warn (not reject) when the user passed a provider code via
@@ -1859,7 +1933,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
             // Step 4: connectivity test — routed through the unified suite so
             // `aikey add` shares one code path with doctor / test.
-            if !cli.json && std::io::stdin().is_terminal() && env::var("AK_TEST_SECRET").is_err() {
+            //
+            // 🔴 `from_url.is_none()` because the --from-url path below runs
+            // the SAME suite unconditionally and then acts on its result.
+            // Without this guard both would run: two full probes, two rounds
+            // of real requests billed to the user's key, for one add.
+            if from_url.is_none()
+                && !cli.json
+                && std::io::stdin().is_terminal()
+                && env::var("AK_TEST_SECRET").is_err()
+            {
                 let targets = commands_project::targets_from_new_personal_key(
                     alias,
                     secret.trim(),
@@ -1904,6 +1987,144 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!();
                 }
             }
+
+            // Step 4b (P4, tasks 4.4 / 4.5 / 4.6): measure, then believe the
+            // measurement.
+            //
+            // 🔴 THIS PROBE IS NOT OPTIONAL AND NOT TTY-GATED. The ordinary
+            // `aikey add` probe is a convenience the user can skip; here it is
+            // the only reason the flag is safe. Everything we are about to
+            // write was proposed by the operator of the endpoint the key gets
+            // sent to, and a `--from-url` that trusted the file would be a
+            // command that lets a third party choose what our client does with
+            // a credential.
+            let resolved_providers: Vec<String> = if let Some(desc) = declared.as_ref() {
+                let targets = commands_project::targets_from_new_personal_key(
+                    alias,
+                    secret.trim(),
+                    &resolved_providers,
+                    resolved_base_url.as_deref(),
+                );
+                let opts = commands_project::SuiteOptions {
+                    show_proxy_row: false,
+                    header_label: Some("Measuring what this relay actually serves"),
+                    password: None,
+                    proxy_port: commands_proxy::proxy_port(),
+                    show_key_column: false,
+                    probe_raw_bearer: Some(secret.trim().to_string()),
+                    probe_raw_base_url: resolved_base_url.as_ref().map(|s| s.to_string()),
+                    probe_oauth_account_id: None,
+                };
+                let outcome =
+                    commands_project::run_connectivity_suite(targets, opts, cli.json);
+
+                // "Answered" uses the SAME rule the suite reports as
+                // any_chat_ok, so a protocol cannot be judged by one standard
+                // in the table and another when deciding what to store.
+                let mut measured_protocols: Vec<String> = Vec::new();
+                let mut measured_models: Vec<String> = Vec::new();
+                for (target, result) in &outcome.rows {
+                    let ok = result.chat_ok || (result.chat_skipped && result.api_ok);
+                    if ok && !measured_protocols.contains(&target.provider_code) {
+                        measured_protocols.push(target.provider_code.clone());
+                    }
+                    if ok {
+                        for m in &result.models_seen {
+                            if !measured_models.contains(m) {
+                                measured_models.push(m.clone());
+                            }
+                        }
+                    }
+                }
+                let measured = selfdesc::Measured {
+                    any_ok: !measured_protocols.is_empty(),
+                    protocols: measured_protocols.clone(),
+                    models: measured_models,
+                };
+
+                let effective_base = resolved_base_url.clone().unwrap_or_else(|| {
+                    resolved_providers
+                        .first()
+                        .and_then(|p| commands_project::default_base_url(p))
+                        .unwrap_or("(provider default)")
+                        .to_string()
+                });
+                let rows = selfdesc::compare(desc, &measured, &effective_base);
+                if !cli.json {
+                    render_declared_vs_measured(&rows);
+                }
+
+                // 🔴 "THE RELAY DID NOT ANSWER" AND "WE COULD NOT ASK" ARE
+                // DIFFERENT SENTENCES, and only one of them is about the
+                // relay. The suite gates API and Chat on the LOCAL PROXY
+                // reaching the upstream, because that is the path real
+                // traffic takes — so on a machine where `aikey proxy` is not
+                // running, every row fails for a reason that has nothing to
+                // do with the endpoint. Reporting that as "this relay
+                // declared things we could not confirm" blames a third party
+                // for our own missing process, which is the same mistake as
+                // counting our outages against somebody's uptime.
+                // The signal is "the proxy is the common factor": nothing
+                // got through it, and at least one target is demonstrably
+                // reachable from this machine. Requiring EVERY row to be
+                // directly reachable would miss the ordinary case where the
+                // relay declares two protocols and only one of them has a
+                // resolvable default host.
+                let proxy_blocked = !outcome.rows.is_empty()
+                    && outcome.rows.iter().all(|(_, r)| !r.ping_ok)
+                    && outcome.rows.iter().any(|(_, r)| r.ping_direct_ok);
+                if !measured.any_ok && proxy_blocked {
+                    let msg = format!(
+                        "your machine can reach that relay but the local proxy cannot, so \
+                         nothing could be confirmed.\n  \
+                         That is our side, not theirs. Start the proxy and run this again:\n    \
+                         aikey proxy start\n    \
+                         aikey add {alias} --from-url {}",
+                        from_url.as_deref().unwrap_or("<url>")
+                    );
+                    if cli.json {
+                        json_output::error(&msg, 1);
+                    }
+                    return Err(msg.into());
+                }
+
+                if !measured.any_ok {
+                    // 🔴 REFUSED, not "add anyway". The ordinary path offers
+                    // that prompt because the user chose the provider and the
+                    // URL themselves and may know better than the probe. Here
+                    // every one of those values came from a file on the far
+                    // end, and nothing in it has been confirmed — storing it
+                    // would create a credential whose whole configuration is
+                    // an unverified claim by a third party.
+                    let msg = format!(
+                        "nothing this relay declared could be confirmed: no protocol \
+                         answered with that key.\n  \
+                         The declaration is not enough on its own — a credential written \
+                         from it would look configured and would not route.\n  \
+                         If you believe the relay is fine and the probe is wrong, add it \
+                         explicitly:\n    \
+                         aikey add {alias} --providers {} --base-url {}",
+                        if desc.protocols.is_empty() {
+                            "<protocol>".to_string()
+                        } else {
+                            desc.protocols.join(",")
+                        },
+                        effective_base
+                    );
+                    if cli.json {
+                        json_output::error(&msg, 1);
+                    }
+                    return Err(msg.into());
+                }
+
+                // 🔴 TASK 4.6: only what answered is written. A declared
+                // protocol that did not answer is dropped here, not stored
+                // with a note — the vault has no "probably" column, and the
+                // proxy would route to it.
+                measured.protocols
+            } else {
+                resolved_providers
+            };
 
             // Step 5: write to vault via the shared core.
             //
@@ -2036,6 +2257,25 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     "  {v} Added key and refreshed current default activation.",
                     v = crate::symbols::BOX_V.s()
                 );
+                // Task 4.9. 🔴 Offered only on the --from-url path, and that is
+                // the point rather than an oversight: this is the one add flow
+                // where the user has just taken a relay operator's word for
+                // something. Connectivity says the endpoint answers; it says
+                // nothing about whether the model behind it is the one being
+                // advertised, which is the question `trust verify` exists for.
+                if from_url.is_some() {
+                    eprintln!("  {v}", v = crate::symbols::BOX_V.s());
+                    eprintln!(
+                        "  {v} This checked that the relay answers, not what it \
+                         answers WITH.",
+                        v = crate::symbols::BOX_V.s()
+                    );
+                    eprintln!(
+                        "  {v} Check that now:  {}",
+                        format!("aikey trust verify {}", alias).bold(),
+                        v = crate::symbols::BOX_V.s()
+                    );
+                }
                 if let Some(ref msg) = hook_msg {
                     eprintln!("  {v}", v = crate::symbols::BOX_V.s());
                     for line in msg.lines() {
@@ -8336,4 +8576,49 @@ mod auto_start_proxy_exclusion_tests {
             "--stdin-json"
         ]));
     }
+}
+
+/// Render the declared-vs-measured table (task 4.5).
+///
+/// 🔴 THE DISAGREEMENTS ARE MARKED, NOT JUST LISTED. A table where both
+/// columns are printed in the same colour is a table people skim; the whole
+/// value of this step is that the user notices we and the relay's own file do
+/// not agree, because that is a fact about a service they are about to depend
+/// on and they are the one who can go and ask about it.
+fn render_declared_vs_measured(rows: &[aikeylabs_aikey_cli::provider_selfdesc::ComparisonRow]) {
+    use colored::Colorize;
+    let v = crate::symbols::BOX_V.s();
+    eprintln!();
+    eprintln!("  {v} {}", "declared by the relay  →  measured by us".bold());
+    for r in rows {
+        let mark = if r.agrees { " " } else { "!" };
+        let line = format!(
+            "{:<10} {:<28} → {}",
+            r.field,
+            truncate_cell(&r.declared),
+            truncate_cell(&r.measured)
+        );
+        if r.agrees {
+            eprintln!("  {v} {mark} {}", line.dimmed());
+        } else {
+            eprintln!("  {v} {} {}", mark.yellow().bold(), line.yellow());
+        }
+    }
+    if rows.iter().any(|r| !r.agrees) {
+        eprintln!(
+            "  {v} {} Where the two differ, the measurement is what gets stored.",
+            "!".yellow().bold()
+        );
+    }
+    eprintln!();
+}
+
+/// Keep one cell from wrapping the table on a narrow terminal.
+fn truncate_cell(s: &str) -> String {
+    const MAX: usize = 28;
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(MAX - 1).collect();
+    format!("{kept}…")
 }
