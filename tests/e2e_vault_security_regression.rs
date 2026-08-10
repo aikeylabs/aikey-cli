@@ -47,6 +47,19 @@ impl Env {
             .env("AK_TEST_PASSWORD", password)
             .env("RUST_LOG", "off")
             .env("NO_COLOR", "1")
+            // 🔴 `get` copies the secret to the system clipboard, and on a
+            // headless host that is not a no-op: it fails with
+            //
+            //   Failed to access clipboard: X11 server connection timed out
+            //
+            // and `get` propagates it, so the command exits non-zero. The
+            // assertion that consumes it here is "after a rejected
+            // same-password change, the original password must STILL unlock
+            // the vault" — so a missing display server was being reported as a
+            // vault that had been bricked by a rejected password change. This
+            // env_clear'd Command inherits no DISPLAY either way; what it was
+            // missing is the opt-out the product already provides.
+            .env("AK_NO_CLIPBOARD", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
