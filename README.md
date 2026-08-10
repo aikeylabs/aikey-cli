@@ -97,7 +97,7 @@ Vault is unlocked once per shell session — subsequent `aikey run` calls reuse 
 | `aikey test [<alias>]` | vault.db | nothing (probe-only via `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
 | `aikey web [page]` | nothing | nothing | spawns browser → `aikey-local-server` |
 | `aikey doctor` | edition, proxy, vault, hooks, plugins (trust-local / compliance); `--last-errors` reads the proxy's local recent-error ring | auto-repairs in interactive mode: restarts a stopped proxy, starts a stopped local-server and trust-local daemon, installs a missing shell hook (`--json`: read-only) | stdout report (`--detail` adds edition-aware ODS panels; `--last-errors` renders origin, hops, trace ID, and upstream request ID) |
-| `aikey audit status` | collector completeness endpoint (+ proxy local state) | nothing | stdout per-source delivery report |
+| `aikey audit status` | collector completeness endpoint (+ proxy local state: usage WAL/dead-letter **and** the compliance upload queue) | nothing | stdout per-source delivery report + local delivery lanes |
 | `aikey audit reconcile` | collector gaps + proxy WAL | known-loss ledger (server) | stdout verdict; re-sends recoverable gaps, confirms losses |
 
 Real credentials never leave `vault.db` except as the substituted upstream auth header inside the proxy → provider call. Probe traffic carries `X-Aikey-Probe: 1` so it does not pollute usage receipts.
@@ -239,8 +239,19 @@ aikey service restart all                   # restart every installed service
 
 # Delivery audit (financial-grade usage completeness)
 aikey audit status                          # per-source: allocated / confirmed / gaps / known-loss / quarantine
+                                            # plus the local compliance upload queue (undelivered audit records)
 aikey audit reconcile                       # actively reconcile now: re-send recoverable gaps, confirm true losses
+aikey proxy replay-dead-letter              # deliver whatever is queued (usage + compliance) after fixing the cause
 ```
+
+`aikey audit status` ends with the proxy's two local delivery lanes. The compliance
+line is the one to watch on Production/Cluster: a non-empty queue means audit
+records exist that the Control Panel has **not** received yet — they are delayed,
+not lost, and `aikey proxy replay-dead-letter` delivers them once the cause is
+fixed. A `HTTP 400` there is the version-skew signature (the Control Panel is
+older than this proxy and rejects the payload); upgrade the server side first.
+If the line reads `not reported by this proxy (older build)`, the queue is
+**unmonitored** rather than empty — upgrade aikey on that machine.
 
 Run `aikey --help` for the full subcommand list (alphabetical, with a "Frequently used" shortcut section at the end).
 

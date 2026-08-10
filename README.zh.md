@@ -97,7 +97,7 @@ Vault 每个 shell session 只解锁一次 — 后续的 `aikey run` 用缓存�
 | `aikey test [<alias>]` | vault.db | 无(probe-only,带 `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
 | `aikey web [page]` | 无 | 无 | spawn 浏览器 → `aikey-local-server` |
 | `aikey doctor` | 版型 / proxy / vault / hooks / 插件(trust-local / 合规过滤)；`--last-errors` 读取 proxy 本地最近错误环形缓冲 | 交互模式自动修复：重启已停的 proxy、启动已停的 local-server 和 trust-local 守护进程、安装缺失的 shell hook（`--json` 时只读） | stdout 诊断报告（`--detail` 增加按版型区分的 ODS 面板；`--last-errors` 显示产地、途经链、trace ID 与上游 request ID） |
-| `aikey audit status` | collector completeness 端点（+ proxy 本地状态）| 无 | stdout per-source 投递报告 |
+| `aikey audit status` | collector completeness 端点（+ proxy 本地状态：用量 WAL/死信 **和**合规上报队列）| 无 | stdout per-source 投递报告 + 本地投递通道 |
 | `aikey audit reconcile` | collector 缺口 + proxy WAL | 已知丢失台账（服务端）| stdout 对账结论；补传可恢复缺口、确认丢失 |
 
 真凭据除了在 proxy → provider 调用里被替换成上游 auth header 之外,**从不离开** vault.db。Probe 流量带 `X-Aikey-Probe: 1`,不会污染用量小票。
@@ -239,8 +239,17 @@ aikey service restart all                   # 重启每个已安装服务
 
 # 投递审计（财务对账级用量完整性）
 aikey audit status                          # 按源看：已分配 / 已确认 / 缺口 / 已知丢失 / 隔离
+                                            # 同时显示本地合规上报队列（尚未送达的审计记录）
 aikey audit reconcile                       # 立即主动对账：补传可恢复缺口、确认真实丢失
+aikey proxy replay-dead-letter              # 排除故障后，把队列里积压的（用量 + 合规）重新投递出去
 ```
+
+`aikey audit status` 末尾会显示 proxy 的两条本地投递通道。**合规**那一行是 Production /
+Cluster 上要盯的：队列非空 = 有审计记录还**没有**送达控制台（Control Panel）——它们是
+**延迟**不是丢失，排除原因后用 `aikey proxy replay-dead-letter` 就能补投。那里出现
+`HTTP 400` 是**版本漂移**的典型特征（控制台比这台 proxy 旧，严格解码直接拒收），
+需要先升级服务端。如果这一行显示 `not reported by this proxy (older build)`，说明队列是
+**没被监控**而不是空的 —— 需要升级这台机器上的 aikey。
 
 `aikey --help` 看全部子命令(按字母序排列,末尾附「Frequently used」高频命令快捷区)。
 

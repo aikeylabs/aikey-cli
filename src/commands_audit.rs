@@ -13,8 +13,21 @@
 //! The completeness/reconcile endpoints live on the local collector (the
 //! local-server on Personal/Trial; the standalone collector on Production). We
 //! reach it on 127.0.0.1 at the local-server port, mirroring `aikey doctor`.
+//!
+//! ## Why the compliance lane is rendered here too (2026-08-10)
+//!
+//! `/admin/audit/status` is the ONE place an operator looks to ask "is anything
+//! undelivered on this box?". Until the compliance dead-letter work it only ever
+//! answered for USAGE, so a stalled proxy→Control Panel compliance pipeline was
+//! invisible — the audit page was empty and nothing said why (see
+//! `workflow/CI/bugfix/20260810-compliance-upload-failure-is-permanent-audit-loss.md`).
+//! The endpoint now carries a `compliance` object; this renderer is the last mile
+//! that turns it into something a human actually reads. A machine-readable
+//! endpoint nobody surfaces is not a health signal.
 
 use std::time::Duration;
+
+use colored::Colorize;
 
 use crate::local_server_probe;
 
@@ -171,18 +184,165 @@ fn trigger_reconcile(collector_base: &str) -> (String, Option<serde_json::Value>
 }
 
 fn print_local_status(local: Option<&serde_json::Value>) {
+    print!("{}", render_local_status(local));
+}
+
+/// Renders the "Local client (proxy)" block: the usage lane's delivery state
+/// plus the compliance lane's queue. Returns the text (newline-terminated) so
+/// the shape is unit-testable without capturing stdout.
+fn render_local_status(local: Option<&serde_json::Value>) -> String {
     let Some(l) = local else {
-        println!("\n  Local client (proxy): not reachable (run `aikey proxy status`).");
-        return;
+        return "\n  Local client (proxy): not reachable (run `aikey proxy status`).\n".to_string();
     };
     let rep = &l["reporter"];
-    println!(
-        "\n  Local client (proxy): allocated={} WAL-files={} dead-letter={} last-upload={}",
+    let mut out = format!(
+        "\n  Local client (proxy): allocated={} WAL-files={} dead-letter={} last-upload={}\n",
         l["allocated_seq"].as_i64().unwrap_or(0),
         l["wal_files"].as_i64().unwrap_or(0),
         l["dead_letter_count"].as_i64().unwrap_or(0),
         rep["last_upload_status"].as_str().unwrap_or("n/a"),
     );
+    out.push_str(&render_compliance_status(l.get("compliance")));
+    out
+}
+
+/// Renders the compliance (proxy → Control Panel) delivery lane.
+///
+/// Three shapes, deliberately distinguishable:
+///   * `None` / non-object — the proxy predates the compliance queue reporting.
+///     Rendered as UNAVAILABLE, never as `0`: a zero here would read as "healthy"
+///     while the box is in fact un-monitored (CLAUDE.md: no-lazy-defaults —
+///     a missing field must not be silently defaulted into a reassuring value).
+///   * queue empty — one quiet healthy line.
+///   * queue non-empty — loud, with the failure attribution and the exact next
+///     command, because a non-empty queue means audit records exist that the
+///     Control Panel has NOT got yet.
+fn render_compliance_status(compliance: Option<&serde_json::Value>) -> String {
+    const LABEL: &str = "Compliance upload (proxy → Control Panel)";
+
+    let Some(c) = compliance.filter(|c| c.is_object()) else {
+        return format!(
+            "  {} {}: not reported by this proxy (older build)\n      \
+             {} A stalled compliance queue would be INVISIBLE here. Upgrade aikey on this \
+             machine, then `aikey proxy restart`.\n",
+            crate::symbols::WARN.s().yellow(),
+            LABEL,
+            crate::symbols::HINT_ARROW.s(),
+        );
+    };
+
+    let entries = c["dead_letter_entries"].as_i64().unwrap_or(0);
+    let events = c["dead_letter_events"].as_i64().unwrap_or(0);
+    let failure = render_compliance_failure(c);
+
+    if entries <= 0 {
+        // Empty queue is the healthy state even if this process saw a failure
+        // earlier — the queue drained, so say so rather than keep alarming.
+        let recovered = match failure {
+            Some(f) => format!(" (last failure {}; queue since drained)", f),
+            None => String::new(),
+        };
+        return format!(
+            "  {} {}: nothing queued{}\n",
+            crate::symbols::CHECK.s().green(),
+            LABEL,
+            recovered
+        );
+    }
+
+    let mut out = format!(
+        "  {} {}: {}\n",
+        crate::symbols::WARN.s().yellow(),
+        LABEL,
+        format!(
+            "{} batch(es) / {} event(s) queued — these audit records are NOT delivered yet",
+            entries, events
+        )
+        .yellow()
+    );
+    if let Some(f) = &failure {
+        out.push_str(&format!("      Last failure: {}\n", f));
+    }
+    // Next step. A 400 is the version-skew signature: the Control Panel decodes
+    // strictly, so a proxy newer than the server gets its batches rejected until
+    // the server catches up. Same bytes succeed after the upgrade — which is why
+    // they are queued rather than dropped.
+    if c["last_failure_code"].as_i64() == Some(400) {
+        out.push_str(&format!(
+            "      {} Looks like version skew: the Control Panel is older than this proxy and \
+             rejects the payload.\n         Upgrade the Control Panel, then run \
+             `aikey proxy replay-dead-letter` to deliver the queue.\n",
+            crate::symbols::HINT_ARROW.s(),
+        ));
+    } else {
+        out.push_str(&format!(
+            "      {} Fix the cause above (Control Panel reachable? credentials valid?), then run \
+             `aikey proxy replay-dead-letter` to deliver the queue.\n",
+            crate::symbols::HINT_ARROW.s(),
+        ));
+    }
+    out
+}
+
+/// "12m ago, HTTP 400: <reason>" from whichever of the three failure fields the
+/// proxy actually sent (each is `omitempty`). None when this process has not
+/// seen a compliance upload fail.
+fn render_compliance_failure(c: &serde_json::Value) -> Option<String> {
+    let at = c["last_failure_at"].as_i64().unwrap_or(0);
+    let code = c["last_failure_code"].as_i64().unwrap_or(0);
+    let raw_reason = c["last_failure_reason"].as_str().unwrap_or("").trim();
+    if at == 0 && code == 0 && raw_reason.is_empty() {
+        return None;
+    }
+    // The proxy builds the reason as "<status>: <body excerpt>", so printing it
+    // after our own "HTTP <code>" would read "HTTP 400: 400: {...}". Drop the
+    // duplicated prefix, never the body.
+    let reason = match code > 0 {
+        true => raw_reason
+            .strip_prefix(&format!("{}:", code))
+            .unwrap_or(raw_reason)
+            .trim(),
+        false => raw_reason,
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if at > 0 {
+        parts.push(format_millis_ago(at));
+    }
+    if code > 0 {
+        parts.push(format!("HTTP {}", code));
+    }
+    let head = if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join(", ")
+    };
+    Some(match (head.is_empty(), reason.is_empty()) {
+        (true, _) => truncate(reason, 160),
+        (false, true) => head,
+        (false, false) => format!("{}: {}", head, truncate(reason, 160)),
+    })
+}
+
+/// Relative age of a Unix-epoch-millis instant, matching the CLI's existing
+/// "Xs/Xm/Xh/Xd ago" convention (`commands_watch`, `commands_statusline`).
+/// Relative on purpose: no locale and no display-time-zone lookup, so this
+/// stays readable on a box whose vault is locked.
+fn format_millis_ago(unix_millis: i64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(unix_millis);
+    let secs = ((now_ms - unix_millis) / 1000).max(0);
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
 fn print_table(base: &str, data: &serde_json::Value, title: &str) {
@@ -253,5 +413,198 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         let head: String = s.chars().take(n.saturating_sub(1)).collect();
         format!("{}…", head)
+    }
+}
+
+/// Fences the compliance lane's rendering against the three wire shapes
+/// `/admin/audit/status` can actually produce. The regression these pin down is
+/// the one from 2026-08-10: a compliance pipeline can be stalled while every
+/// number an operator looks at reads "fine".
+#[cfg(test)]
+mod compliance_render_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Colour is a tty-dependent global in `colored`; assert on the text.
+    fn plain(v: Option<&serde_json::Value>) -> String {
+        crate::style::strip_sgr(&render_local_status(v)).into_owned()
+    }
+
+    /// Shape 1 — current proxy, compliance lane idle. Exactly one quiet line;
+    /// must NOT claim a failure and must not print a next-step nag.
+    #[test]
+    fn healthy_compliance_renders_one_quiet_line() {
+        let out = plain(Some(&json!({
+            "source_id": "src-1",
+            "allocated_seq": 256,
+            "wal_files": 32,
+            "dead_letter_count": 0,
+            "reporter": {"last_upload_status": "ok"},
+            "compliance": {"dead_letter_entries": 0, "dead_letter_events": 0},
+        })));
+        assert!(
+            out.contains("Compliance upload (proxy → Control Panel): nothing queued"),
+            "healthy line missing: {}",
+            out
+        );
+        assert!(!out.contains("Last failure"), "spurious failure: {}", out);
+        assert!(
+            !out.contains("replay-dead-letter"),
+            "nagging with an empty queue: {}",
+            out
+        );
+    }
+
+    /// Shape 2 — backlog from a version-skew 400. The operator must see the
+    /// depth, the attribution, and the exact recovery command.
+    #[test]
+    fn backlogged_compliance_is_loud_and_actionable() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let out = plain(Some(&json!({
+            "source_id": "src-1",
+            "allocated_seq": 256,
+            "wal_files": 32,
+            "dead_letter_count": 3,
+            "reporter": {"last_upload_status": "ok"},
+            "compliance": {
+                "dead_letter_entries": 3,
+                "dead_letter_events": 12,
+                "last_failure_at": now_ms - 300_000,
+                "last_failure_code": 400,
+                "last_failure_reason": "400: json: unknown field \"trace_id\"",
+            },
+        })));
+        assert!(
+            out.contains("3 batch(es) / 12 event(s) queued"),
+            "queue depth missing: {}",
+            out
+        );
+        assert!(
+            out.contains("NOT delivered yet"),
+            "backlog not called out as undelivered: {}",
+            out
+        );
+        assert!(
+            out.contains("5m ago") && out.contains("HTTP 400") && out.contains("unknown field"),
+            "failure attribution missing: {}",
+            out
+        );
+        assert!(
+            out.contains("version skew") && out.contains("Upgrade the Control Panel"),
+            "400 skew hint missing: {}",
+            out
+        );
+        assert!(
+            out.contains("aikey proxy replay-dead-letter"),
+            "recovery command missing: {}",
+            out
+        );
+    }
+
+    /// Non-400 backlog gets the generic cause hint, not the skew story.
+    #[test]
+    fn non_400_backlog_gets_generic_next_step() {
+        let out = plain(Some(&json!({
+            "reporter": {"last_upload_status": "error"},
+            "compliance": {
+                "dead_letter_entries": 1,
+                "dead_letter_events": 1,
+                "last_failure_reason": "dial tcp 127.0.0.1:1: connection refused",
+            },
+        })));
+        assert!(
+            out.contains("connection refused") && out.contains("aikey proxy replay-dead-letter"),
+            "generic hint missing: {}",
+            out
+        );
+        assert!(!out.contains("version skew"), "wrong hint: {}", out);
+    }
+
+    /// Shape 3 — proxy older than the compliance queue reporting. The absent
+    /// field must render as UNAVAILABLE. A `0` here is the exact failure mode
+    /// this whole change exists to remove: it reads as healthy while the box is
+    /// un-monitored.
+    #[test]
+    fn old_proxy_without_compliance_field_says_unavailable_not_zero() {
+        let out = plain(Some(&json!({
+            "source_id": "src-1",
+            "allocated_seq": 10,
+            "wal_files": 1,
+            "dead_letter_count": 0,
+            "reporter": {"last_upload_status": "ok"},
+        })));
+        assert!(
+            out.contains("not reported by this proxy (older build)"),
+            "missing-section wording wrong: {}",
+            out
+        );
+        assert!(
+            out.contains("INVISIBLE") && out.contains("aikey proxy restart"),
+            "blind-spot warning / next step missing: {}",
+            out
+        );
+        assert!(
+            !out.contains("nothing queued"),
+            "absent section rendered as healthy: {}",
+            out
+        );
+    }
+
+    /// A drained queue that failed earlier is healthy — report the history,
+    /// do not keep alarming.
+    #[test]
+    fn drained_queue_after_failure_reads_healthy_with_history() {
+        let out = plain(Some(&json!({
+            "reporter": {"last_upload_status": "ok"},
+            "compliance": {
+                "dead_letter_entries": 0,
+                "dead_letter_events": 0,
+                "last_failure_code": 503,
+                "last_failure_reason": "503 service unavailable",
+            },
+        })));
+        assert!(
+            out.contains("nothing queued (last failure HTTP 503") && out.contains("since drained"),
+            "recovered wording wrong: {}",
+            out
+        );
+    }
+
+    /// The proxy being down must not be confused with "compliance is fine".
+    #[test]
+    fn unreachable_proxy_reports_no_compliance_verdict() {
+        let out = plain(None);
+        assert!(out.contains("not reachable"), "{}", out);
+        assert!(!out.contains("Compliance upload"), "{}", out);
+    }
+
+    /// The proxy's reason is "<status>: <body>"; rendering it under our own
+    /// "HTTP <code>" must not stutter "HTTP 400: 400: {...}".
+    #[test]
+    fn duplicated_status_prefix_is_collapsed_without_losing_the_body() {
+        let rendered = render_compliance_failure(&json!({
+            "last_failure_code": 400,
+            "last_failure_reason": "400: json: unknown field \"trace_id\"",
+        }))
+        .expect("failure present");
+        assert_eq!(rendered, "HTTP 400: json: unknown field \"trace_id\"");
+    }
+
+    #[test]
+    fn failure_reason_is_truncated() {
+        let long = "x".repeat(400);
+        let rendered = render_compliance_failure(&json!({
+            "last_failure_code": 400,
+            "last_failure_reason": long,
+        }))
+        .expect("failure present");
+        assert!(
+            rendered.chars().count() < 200,
+            "reason not truncated: {} chars",
+            rendered.chars().count()
+        );
     }
 }
