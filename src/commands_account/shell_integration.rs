@@ -1459,9 +1459,27 @@ pub fn display_path(relative: &str) -> String {
 ///   1. `AIKEY_SHELL_OVERRIDE`   — escape hatch for tests / sandbox.
 ///   2. `$SHELL` ends with `zsh` — POSIX convention.
 ///   3. `$SHELL` ends with `bash`.
-///   4. `$PSModulePath` set      — every PowerShell session sets this.
-///   5. `$ComSpec` set + no `$SHELL`/`$PSModulePath` — cmd.exe.
+///   4. **Windows only** — `$PSModulePath` set — every PowerShell session
+///      sets this.
+///   5. **Windows only** — `$ComSpec` set + no `$SHELL`/`$PSModulePath` —
+///      cmd.exe.
 ///   6. Unknown.
+///
+/// 🔴 Steps 4 and 5 are gated to Windows, and the gate is the whole point.
+/// On Windows `$PSModulePath` means "this session IS PowerShell". On Linux
+/// and macOS it means only "pwsh is installed somewhere on this box" — the
+/// user's actual shell may be fish, tcsh or ksh. Ungated, a fish user on any
+/// machine with PowerShell installed was classified as PowerShell, and
+/// `wire_rc_with_consent` then wrote them a `hook.ps1` and reported SUCCESS.
+/// Their fish shell never loads it, so the failure was silent: the user is
+/// told integration worked and it did nothing. `ShellUndetectable` — which
+/// tells them their shell is unsupported — is the honest answer.
+///
+/// 🚫 The platform is a PARAMETER of `shell_kind_for_platform` rather than a
+/// `cfg!` inside the body, because the only CI runner this crate has is
+/// ubuntu. Under `#[cfg(windows)]` the Windows half would compile nowhere
+/// that runs, and "no runner" is how the bug above survived in the first
+/// place. Both halves are asserted on every runner.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ShellKind {
     Zsh,
@@ -1472,6 +1490,10 @@ pub enum ShellKind {
 }
 
 pub fn shell_kind() -> ShellKind {
+    shell_kind_for_platform(cfg!(windows))
+}
+
+pub(crate) fn shell_kind_for_platform(is_windows: bool) -> ShellKind {
     if let Ok(over) = std::env::var("AIKEY_SHELL_OVERRIDE") {
         // Defensive trim: env var pasted with trailing whitespace (rare
         // but seen in PowerShell-here-string injections) shouldn't fall
@@ -1497,13 +1519,16 @@ pub fn shell_kind() -> ShellKind {
             return ShellKind::Bash;
         }
     }
-    // Win32: PowerShell sessions set PSModulePath; cmd.exe doesn't. Both
-    // set ComSpec, so we check PSModulePath first.
-    if std::env::var("PSModulePath").is_ok() {
-        return ShellKind::PowerShell;
-    }
-    if std::env::var("ComSpec").is_ok() {
-        return ShellKind::Cmd;
+    // Win32 ONLY: PowerShell sessions set PSModulePath; cmd.exe doesn't. Both
+    // set ComSpec, so we check PSModulePath first. See the 🔴 note on ShellKind
+    // for why neither may be consulted off Windows.
+    if is_windows {
+        if std::env::var("PSModulePath").is_ok() {
+            return ShellKind::PowerShell;
+        }
+        if std::env::var("ComSpec").is_ok() {
+            return ShellKind::Cmd;
+        }
     }
     ShellKind::Unknown
 }
@@ -5632,7 +5657,38 @@ mod stage3_powershell_hook_tests {
         );
         // ComSpec is also typically set on Windows, but PSModulePath wins.
         std::env::set_var("ComSpec", r"C:\Windows\System32\cmd.exe");
-        assert_eq!(shell_kind(), ShellKind::PowerShell);
+        assert_eq!(shell_kind_for_platform(true), ShellKind::PowerShell);
+    }
+
+    /// The same environment on Linux/macOS. `PSModulePath` there means pwsh is
+    /// INSTALLED, not that this session is PowerShell — and `ComSpec` is not a
+    /// Unix variable at all, so neither may promote the session.
+    #[test]
+    fn shell_kind_ignores_psmodulepath_off_windows() {
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        std::env::remove_var("SHELL");
+        std::env::set_var("PSModulePath", "/usr/local/share/powershell/Modules");
+        std::env::set_var("ComSpec", r"C:\Windows\System32\cmd.exe");
+        assert_eq!(shell_kind_for_platform(false), ShellKind::Unknown);
+    }
+
+    /// 🔴 The regression test for the real defect. A fish user on a box that
+    /// happens to have PowerShell installed — the shape of every GitHub
+    /// ubuntu runner — must be UNKNOWN, so that `wire_rc_with_consent`
+    /// answers `ShellUndetectable` instead of silently writing a `hook.ps1`
+    /// their shell will never load and calling it success.
+    #[test]
+    fn shell_kind_fish_with_powershell_installed_is_unknown_off_windows() {
+        let _snap =
+            EnvSnapshot::take(&["AIKEY_SHELL_OVERRIDE", "SHELL", "PSModulePath", "ComSpec"]);
+        std::env::remove_var("AIKEY_SHELL_OVERRIDE");
+        std::env::set_var("SHELL", "/usr/local/bin/fish");
+        std::env::set_var("PSModulePath", "/usr/local/share/powershell/Modules");
+        assert_eq!(shell_kind_for_platform(false), ShellKind::Unknown);
+        // ...and on Windows the same signals still mean PowerShell.
+        assert_eq!(shell_kind_for_platform(true), ShellKind::PowerShell);
     }
 
     #[test]
@@ -5646,7 +5702,9 @@ mod stage3_powershell_hook_tests {
         std::env::remove_var("SHELL");
         std::env::remove_var("PSModulePath");
         std::env::set_var("ComSpec", r"C:\Windows\System32\cmd.exe");
-        assert_eq!(shell_kind(), ShellKind::Cmd);
+        assert_eq!(shell_kind_for_platform(true), ShellKind::Cmd);
+        // Off Windows the same ComSpec must not manufacture a cmd.exe session.
+        assert_eq!(shell_kind_for_platform(false), ShellKind::Unknown);
     }
 
     #[test]
