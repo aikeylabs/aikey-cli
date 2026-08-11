@@ -32,7 +32,8 @@ pub use persist::{
 };
 #[allow(unused_imports)]
 pub use runtime::{
-    api_status_hint, build_proxy_aware_agent, chat_status_hint, default_base_url,
+    api_status_hint, build_proxy_aware_agent, build_proxy_aware_agent_no_redirect,
+    chat_status_hint, default_base_url,
     provider_defaults, proxy_status_hint, render_cannot_test_block, run_connectivity_suite,
     tcp_ping, test_provider_connectivity, test_proxy_connectivity, ConnectivityResult,
     ProxyProbeResult,
@@ -972,6 +973,7 @@ mod connectivity_suite_tests {
             chat_skipped: false,
             chat_skip_reason: None,
             chat_body_snippet: None,
+            models_seen: Vec::new(),
         };
         // Ping(DIRECT) must not participate in success bookkeeping —
         // it's informational only. Main overall-success logic keys on API.
@@ -1001,6 +1003,7 @@ mod connectivity_suite_tests {
             chat_skipped: false,
             chat_skip_reason: None,
             chat_body_snippet: None,
+            models_seen: Vec::new(),
         };
         assert!(
             r.ping_direct_ok && !r.ping_ok,

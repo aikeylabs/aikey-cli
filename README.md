@@ -193,6 +193,9 @@ aikey whoami                                # current active key + identity
 
 # Add credentials
 aikey add my-claude --provider anthropic    # single key via prompt
+aikey add my-relay --from-url https://api.example-relay.com
+                                            # read the relay's own description,
+                                            # then STORE ONLY WHAT ANSWERS
 aikey auth login claude                     # OAuth account (Pro/Max)
 aikey import ~/keys.txt                     # bulk import via browser confirmation
 

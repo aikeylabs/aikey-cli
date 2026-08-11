@@ -193,6 +193,9 @@ aikey whoami                                # 当前 active key + identity
 
 # 加凭据
 aikey add my-claude --provider anthropic    # 单把 key,交互式输入
+aikey add my-relay --from-url https://api.example-relay.com
+                                            # 读中转站的自述文件,
+                                            # 但只写「实测通过」的那部分
 aikey auth login claude                     # OAuth 账号(Pro/Max)
 aikey import ~/keys.txt                     # 批量导入,通过浏览器确认
 
