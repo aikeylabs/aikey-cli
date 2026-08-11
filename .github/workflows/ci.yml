@@ -31,3 +31,20 @@ jobs:
         run: make build-mock-proxy
       - name: cargo test
         run: cargo test --workspace
+
+      # 🔴 These two fences shipped with NO RUNNER (found 2026-08-11 while
+      # doing task 7.8). Neither had ever run outside the session that wrote
+      # it, and a fence that cannot fail is indistinguishable from one that
+      # is satisfied.
+      - name: guard — --from-url does not branch on edition (T-EDN-1)
+        run: |
+          ./scripts/check-from-url-edition-parity.sh
+          ./scripts/check-from-url-edition-parity.sh --self-test
+
+      # 🔴 The self-test only. The composition check itself is EXPECTED to be
+      # red while the change sits on its feature branch — that is the true
+      # state, not a CI failure. What must stay green is the checker's own
+      # ability to tell present from absent, including the
+      # infer_provider_from_url false positive it exists to survive.
+      - name: guard — release-composition checker still works (task 7.8)
+        run: ./scripts/check-release-composition.sh --self-test 2>&1 | tee /tmp/comp.log; grep -q 'self-test ㈠' /tmp/comp.log && ! grep -q 'FAIL.*self-test' /tmp/comp.log
