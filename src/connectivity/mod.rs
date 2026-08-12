@@ -33,10 +33,9 @@ pub use persist::{
 #[allow(unused_imports)]
 pub use runtime::{
     api_status_hint, build_proxy_aware_agent, build_proxy_aware_agent_no_redirect,
-    chat_status_hint, default_base_url,
-    provider_defaults, proxy_status_hint, render_cannot_test_block, run_connectivity_suite,
-    tcp_ping, test_provider_connectivity, test_proxy_connectivity, ConnectivityResult,
-    ProxyProbeResult,
+    chat_status_hint, default_base_url, provider_defaults, proxy_status_hint,
+    render_cannot_test_block, run_connectivity_suite, tcp_ping, test_provider_connectivity,
+    test_proxy_connectivity, ConnectivityResult, ProxyProbeResult,
 };
 #[allow(unused_imports)]
 pub use targets::{

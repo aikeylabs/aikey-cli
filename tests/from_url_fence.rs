@@ -156,12 +156,7 @@ fn the_reason_the_two_gates_differ_is_written_next_to_the_gate() {
     // The explanation has to be where they are standing, not in a document
     // they have no reason to open.
     let src = fs::read_to_string("src/provider_selfdesc.rs").expect("read module");
-    for required in [
-        "R-3b",
-        "dgcheck",
-        "whose machine is dialling",
-        "T-EDN-3b",
-    ] {
+    for required in ["R-3b", "dgcheck", "whose machine is dialling", "T-EDN-3b"] {
         assert!(
             src.contains(required),
             "the gate no longer explains why it is weaker than the check site's \

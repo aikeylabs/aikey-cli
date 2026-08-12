@@ -1398,7 +1398,8 @@ mod model_enumeration_tests {
         // 🔴 A parser that only knew the OpenAI envelope would return an
         // empty list here — which renders as "this relay serves no models"
         // rather than "we did not recognise the answer".
-        let body = r#"{"models":[{"name":"models/gemini-2.0-flash"},{"name":"models/gemini-1.5-pro"}]}"#;
+        let body =
+            r#"{"models":[{"name":"models/gemini-2.0-flash"},{"name":"models/gemini-1.5-pro"}]}"#;
         assert_eq!(
             parse_model_ids(body),
             vec!["gemini-2.0-flash", "gemini-1.5-pro"]

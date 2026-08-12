@@ -51,9 +51,9 @@ mod proxy_proc;
 mod proxy_state;
 // migrations module is in lib.rs (used by both main.rs and executor.rs)
 use aikeylabs_aikey_cli::commands_app;
-use aikeylabs_aikey_cli::provider_selfdesc as selfdesc;
 use aikeylabs_aikey_cli::commands_audit;
 use aikeylabs_aikey_cli::migrations;
+use aikeylabs_aikey_cli::provider_selfdesc as selfdesc;
 #[allow(dead_code)]
 mod platform_client;
 // mod profiles; // removed: profile commands dropped
@@ -2015,8 +2015,7 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     probe_raw_base_url: resolved_base_url.as_ref().map(|s| s.to_string()),
                     probe_oauth_account_id: None,
                 };
-                let outcome =
-                    commands_project::run_connectivity_suite(targets, opts, cli.json);
+                let outcome = commands_project::run_connectivity_suite(targets, opts, cli.json);
 
                 // "Answered" uses the SAME rule the suite reports as
                 // any_chat_ok, so a protocol cannot be judged by one standard
@@ -8589,7 +8588,10 @@ fn render_declared_vs_measured(rows: &[aikeylabs_aikey_cli::provider_selfdesc::C
     use colored::Colorize;
     let v = crate::symbols::BOX_V.s();
     eprintln!();
-    eprintln!("  {v} {}", "declared by the relay  →  measured by us".bold());
+    eprintln!(
+        "  {v} {}",
+        "declared by the relay  →  measured by us".bold()
+    );
     for r in rows {
         let mark = if r.agrees { " " } else { "!" };
         let line = format!(

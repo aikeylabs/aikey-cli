@@ -66,9 +66,9 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// AWS/GCP convention, and what most of them list — protects nothing on the
 /// cloud a large share of our customers actually run on.
 const METADATA_LITERALS: &[&str] = &[
-    "169.254.169.254",  // AWS / GCP / Azure / OpenStack
-    "100.100.100.200",  // Alibaba Cloud
-    "fd00:ec2::254",    // AWS IMDS over IPv6
+    "169.254.169.254", // AWS / GCP / Azure / OpenStack
+    "100.100.100.200", // Alibaba Cloud
+    "fd00:ec2::254",   // AWS IMDS over IPv6
     "metadata.google.internal",
 ];
 
@@ -124,11 +124,16 @@ pub enum FetchError {
     /// message and its own way forward rather than "it failed".
     Unreachable(String),
     /// The host answered, but not with a description.
-    Http { status: u16, url: String },
+    Http {
+        status: u16,
+        url: String,
+    },
     /// It answered 200 with something that is not the frozen shape.
     Body(String),
     /// 🔴 A version we do not understand. See `parse`.
-    UnsupportedVersion { found: u64 },
+    UnsupportedVersion {
+        found: u64,
+    },
     TooManyHops(String),
 }
 
@@ -285,7 +290,9 @@ fn is_metadata_host(host: &str) -> bool {
 /// the IPv6 forms) that a literal list keeps missing.
 fn is_metadata_addr(addr: &IpAddr) -> bool {
     match addr {
-        IpAddr::V4(v4) => v4.is_link_local() || METADATA_LITERALS.contains(&v4.to_string().as_str()),
+        IpAddr::V4(v4) => {
+            v4.is_link_local() || METADATA_LITERALS.contains(&v4.to_string().as_str())
+        }
         IpAddr::V6(v6) => {
             let s = v6.to_string();
             METADATA_LITERALS.contains(&s.as_str())
@@ -337,8 +344,8 @@ pub fn parse(body: &str) -> Result<SelfDescription, FetchError> {
     if version != SUPPORTED_VERSION {
         return Err(FetchError::UnsupportedVersion { found: version });
     }
-    let desc: SelfDescription = serde_json::from_value(value)
-        .map_err(|e| FetchError::Body(format!("{e}")))?;
+    let desc: SelfDescription =
+        serde_json::from_value(value).map_err(|e| FetchError::Body(format!("{e}")))?;
     if desc.protocols.is_empty() && desc.base_url.trim().is_empty() {
         return Err(FetchError::Body(
             "it declares neither `protocols` nor `base_url`, so there is \
@@ -612,7 +619,10 @@ mod selfdesc_parse_tests {
     fn a_higher_version_is_refused_rather_than_guessed() {
         // 🔴 §2 semantic 2. Best-effort parsing means reading a v2 file under
         // v1 rules, which mis-maps silently.
-        match parse(&V1.replace("\"aikey_provider_version\": 1", "\"aikey_provider_version\": 2")) {
+        match parse(&V1.replace(
+            "\"aikey_provider_version\": 1",
+            "\"aikey_provider_version\": 2",
+        )) {
             Err(FetchError::UnsupportedVersion { found }) => assert_eq!(found, 2),
             other => panic!("v2 gave {other:?}, want an explicit refusal"),
         }
@@ -697,7 +707,11 @@ fn fmt_list(items: &[String]) -> String {
 }
 
 /// Build the side-by-side view (task 4.5).
-pub fn compare(desc: &SelfDescription, measured: &Measured, effective_base_url: &str) -> Vec<ComparisonRow> {
+pub fn compare(
+    desc: &SelfDescription,
+    measured: &Measured,
+    effective_base_url: &str,
+) -> Vec<ComparisonRow> {
     let mut rows = Vec::new();
 
     if !desc.display_name.trim().is_empty() {
@@ -752,8 +766,7 @@ pub fn compare(desc: &SelfDescription, measured: &Measured, effective_base_url: 
     if !declared_models.is_empty() || !measured.models.is_empty() {
         rows.push(ComparisonRow {
             field: "models",
-            agrees: same_set(&declared_models, &measured.models)
-                || measured.models.is_empty(),
+            agrees: same_set(&declared_models, &measured.models) || measured.models.is_empty(),
             declared: fmt_list(&declared_models),
             measured: if measured.models.is_empty() {
                 "not listed by this relay".to_string()
@@ -770,7 +783,8 @@ fn same_set(a: &[String], b: &[String]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().all(|x| b.iter().any(|y| y.eq_ignore_ascii_case(x)))
+    a.iter()
+        .all(|x| b.iter().any(|y| y.eq_ignore_ascii_case(x)))
 }
 
 #[cfg(test)]

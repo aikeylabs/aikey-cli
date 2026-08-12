@@ -170,7 +170,12 @@ fn a_real_document_over_a_real_socket_parses_and_warns_about_http() {
     assert_eq!(fetched.desc.models, vec!["claude-sonnet-4-5"]);
     // 🔴 http:// warned rather than refused, and the warning names the
     // consequence — the credential travels to this address in cleartext later.
-    assert_eq!(fetched.warnings.len(), 1, "warnings: {:?}", fetched.warnings);
+    assert_eq!(
+        fetched.warnings.len(),
+        1,
+        "warnings: {:?}",
+        fetched.warnings
+    );
     assert!(fetched.warnings[0].contains("cleartext"));
 }
 
