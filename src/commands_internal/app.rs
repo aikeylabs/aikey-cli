@@ -58,6 +58,7 @@ pub fn handle(env: StdinEnvelope) {
         "filter-status" => handle_filter_status(env),
         "filter-set" => handle_filter_set(env),
         "filter-record-allow" => handle_filter_record_allow(env),
+        "filter-max-action" => handle_filter_max_action(env),
         other => emit_error(
             req_id,
             "I_UNKNOWN_ACTION",
@@ -607,6 +608,13 @@ fn handle_filter_status(env: StdinEnvelope) {
     // reads both compliance toggle + record-allow toggle in one call. Best-
     // effort (default false) so a read error here never masks the on/off state.
     let record_allow = commands_app::get_app_filter_record_allow(&slug).unwrap_or(false);
+    let max_action = match commands_app::get_app_filter_max_action(&slug) {
+        Ok(value) => value,
+        Err(e) => {
+            emit_error(req_id.clone(), "I_APP_FILTER_MAX_ACTION_READ_FAILED", e);
+            return;
+        }
+    };
     match commands_app::get_app_filter_stages(&slug) {
         Ok(stages) => emit(&ResultEnvelope::ok(
             req_id,
@@ -615,6 +623,7 @@ fn handle_filter_status(env: StdinEnvelope) {
                 "enabled": stages.is_some(),
                 "stages": stages.unwrap_or_default(),
                 "record_allow": record_allow,
+                "max_action": max_action,
                 // G3: master mandate locks the local toggle (org enforces ON).
                 "locked": crate::storage::compliance_master_locked(),
             }),
@@ -655,6 +664,40 @@ fn handle_filter_record_allow(env: StdinEnvelope) {
             json!({ "slug": p.slug, "record_allow": p.enable }),
         )),
         Err(e) => emit_error(req_id, "I_APP_FILTER_RECORD_ALLOW_FAILED", e),
+    }
+}
+
+/// `filter-max-action` — set the emergency enforcement ceiling. `warn` keeps
+/// detection/audit active while preventing mask/block; `full` restores Bundle
+/// actions. The change_seq bump makes the proxy re-spawn the child.
+fn handle_filter_max_action(env: StdinEnvelope) {
+    let req_id = env.request_id.clone();
+    #[derive(Deserialize)]
+    struct Payload {
+        slug: String,
+        max_action: String,
+    }
+    let p: Payload = match serde_json::from_value(env.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_error(
+                req_id,
+                "I_BAD_PAYLOAD",
+                format!("filter-max-action payload: {}", e),
+            );
+            return;
+        }
+    };
+    if let Err(e) = commands_app::validate_slug(&p.slug) {
+        emit_error(req_id, "I_INVALID_SLUG", e);
+        return;
+    }
+    match commands_app::set_app_filter_max_action(&p.slug, &p.max_action) {
+        Ok(()) => emit(&ResultEnvelope::ok(
+            req_id,
+            json!({ "slug": p.slug, "max_action": p.max_action }),
+        )),
+        Err(e) => emit_error(req_id, "I_APP_FILTER_MAX_ACTION_FAILED", e),
     }
 }
 

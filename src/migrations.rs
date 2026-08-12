@@ -1194,6 +1194,11 @@ pub mod v1_0_0_baseline {
                 filter_priority INTEGER,
                 filter_timeout_policy TEXT,
                 filter_record_allow INTEGER NOT NULL DEFAULT 0,
+                -- Maximum user-impacting action emitted by the filter.
+                -- full = preserve Bundle mask/block; warn = emergency logical
+                -- rollback while retaining findings and audit events.
+                filter_max_action TEXT NOT NULL DEFAULT 'full'
+                    CHECK (filter_max_action IN ('full', 'warn')),
                 requested_permissions TEXT,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
@@ -1217,6 +1222,12 @@ pub mod v1_0_0_baseline {
             "app_records",
             "filter_record_allow",
             "ALTER TABLE app_records ADD COLUMN filter_record_allow INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_column(
+            conn,
+            "app_records",
+            "filter_max_action",
+            "ALTER TABLE app_records ADD COLUMN filter_max_action TEXT NOT NULL DEFAULT 'full' CHECK (filter_max_action IN ('full', 'warn'))",
         )?;
 
         // No ALTER TABLE retrofit for the OTHER `app_records` columns: this
@@ -1303,6 +1314,43 @@ pub mod v1_0_0_baseline {
             rusqlite::params![crate::storage::new_source_identity().as_bytes().to_vec()],
         )
         .map_err(|e| format!("Failed to seed source_identity: {}", e))?;
+
+        activate_compliance_wave2_once(conn)?;
+
+        Ok(())
+    }
+
+    /// Apply the user-approved Wave 2 migration exactly once to vaults where
+    /// ai-compliance-detector was installed before mask/block became the
+    /// production default.
+    ///
+    /// The marker is deliberately separate from the per-build schema replay
+    /// marker. Baseline DDL is replayed after every binary update, but a later
+    /// user choice to disable compliance must survive those updates. The
+    /// SAVEPOINT makes the state change and marker atomic: an interrupted
+    /// upgrade can neither mark an unapplied migration nor repeatedly override
+    /// a user choice.
+    fn activate_compliance_wave2_once(conn: &Connection) -> Result<(), String> {
+        const MARKER: &str = "migration.compliance_wave2_mask_block_enabled";
+
+        conn.execute_batch(
+            "SAVEPOINT compliance_wave2_activation;
+             UPDATE app_records
+                SET filter_stages = '[\"pre_forward\"]',
+                    filter_priority = COALESCE(filter_priority, 10),
+                    filter_timeout_policy = COALESCE(filter_timeout_policy, 'fail_open'),
+                    filter_max_action = 'full',
+                    updated_at = strftime('%s', 'now')
+              WHERE slug = 'ai-compliance-detector'
+                AND NOT EXISTS (SELECT 1 FROM config WHERE key = 'migration.compliance_wave2_mask_block_enabled');
+             INSERT OR IGNORE INTO config (key, value)
+                  VALUES ('migration.compliance_wave2_mask_block_enabled', '1');
+             RELEASE compliance_wave2_activation;",
+        )
+        .map_err(|e| {
+            let _ = conn.execute_batch("ROLLBACK TO compliance_wave2_activation; RELEASE compliance_wave2_activation;");
+            format!("activate compliance Wave 2 migration {}: {}", MARKER, e)
+        })?;
 
         Ok(())
     }
@@ -1836,6 +1884,64 @@ mod tests {
         .unwrap_or(false)
     }
 
+    #[test]
+    fn compliance_wave2_enables_an_existing_detector_exactly_once() {
+        let conn = fresh_vault();
+        conn.execute(
+            "DELETE FROM config WHERE key='migration.compliance_wave2_mask_block_enabled'",
+            [],
+        )
+        .expect("simulate a pre-Wave-2 vault");
+        conn.execute(
+            "INSERT INTO app_records
+                (slug, name, vendor, upstreams, app_kind, filter_stages,
+                 filter_priority, filter_timeout_policy, filter_max_action)
+             VALUES
+                ('ai-compliance-detector', 'AI Compliance Detector', 'AiKey Labs', '[]',
+                 'first-party', NULL, NULL, NULL, 'warn')",
+            [],
+        )
+        .expect("seed an installed but disabled detector");
+
+        upgrade_all(&conn).expect("apply the Wave 2 activation");
+        let activated: (String, i64, String, String) = conn
+            .query_row(
+                "SELECT filter_stages, filter_priority, filter_timeout_policy, filter_max_action
+                   FROM app_records WHERE slug='ai-compliance-detector'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read activated detector");
+        assert_eq!(
+            activated,
+            (
+                "[\"pre_forward\"]".to_string(),
+                10,
+                "fail_open".to_string(),
+                "full".to_string()
+            )
+        );
+
+        conn.execute(
+            "UPDATE app_records SET filter_stages=NULL WHERE slug='ai-compliance-detector'",
+            [],
+        )
+        .expect("simulate the user's later explicit disable");
+        upgrade_all(&conn).expect("replay the idempotent baseline");
+
+        let stages: Option<String> = conn
+            .query_row(
+                "SELECT filter_stages FROM app_records WHERE slug='ai-compliance-detector'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read user-controlled state after replay");
+        assert_eq!(
+            stages, None,
+            "a later schema replay must not override the user's post-migration choice"
+        );
+    }
+
     /// T15-A from the test plan, defense B layer: rolling back to an
     /// unknown target must return Err and leave the vault completely
     /// untouched.
@@ -2240,6 +2346,9 @@ mod tests {
                 // Retrofitted via ensure_column for existing vaults; the
                 // baseline CREATE TABLE carries it for fresh installs.
                 "filter_record_allow",
+                // 2026-08-11: operational enforcement ceiling. Existing
+                // vaults are idempotently retrofitted with full.
+                "filter_max_action",
                 "requested_permissions",
                 "created_at",
                 "updated_at",

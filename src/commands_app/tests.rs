@@ -397,6 +397,46 @@ fn filter_record_allow_round_trip() {
     assert!(set_app_filter_record_allow_with_conn(&conn, "nope", true).is_err());
 }
 
+#[test]
+fn filter_max_action_round_trip_and_constraint() {
+    let conn = fresh_test_vault();
+    upsert_app_record_with_conn(
+        &conn,
+        "ai-compliance-detector",
+        "AI Compliance Detector",
+        "aikey-labs",
+        &[],
+        "first-party",
+        false,
+        &[],
+    )
+    .expect("upsert filter app");
+
+    assert_eq!(
+        get_app_filter_max_action_with_conn(&conn, "ai-compliance-detector").unwrap(),
+        "full"
+    );
+    set_app_filter_max_action_with_conn(&conn, "ai-compliance-detector", "warn").expect("set warn");
+    assert_eq!(
+        get_app_filter_max_action_with_conn(&conn, "ai-compliance-detector").unwrap(),
+        "warn"
+    );
+    set_app_filter_max_action_with_conn(&conn, "ai-compliance-detector", "full")
+        .expect("restore full");
+    assert_eq!(
+        get_app_filter_max_action_with_conn(&conn, "ai-compliance-detector").unwrap(),
+        "full"
+    );
+    assert!(set_app_filter_max_action_with_conn(&conn, "ai-compliance-detector", "block").is_err());
+    assert!(set_app_filter_max_action_with_conn(&conn, "missing", "warn").is_err());
+    assert!(conn
+        .execute(
+            "UPDATE app_records SET filter_max_action = 'allow' WHERE slug = 'ai-compliance-detector'",
+            [],
+        )
+        .is_err());
+}
+
 /// Defaults: omitting priority/policy yields priority=100, policy=fail_open so
 /// the row is always well-formed for the proxy.
 #[test]

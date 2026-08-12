@@ -500,6 +500,74 @@ pub fn get_app_filter_record_allow_with_conn(
     Ok(v.unwrap_or(0) != 0)
 }
 
+/// Sets the operational enforcement ceiling for a filter app. This changes no
+/// detector policy or Finding; `warn` only caps mask/block for rapid rollback.
+pub fn set_app_filter_max_action(slug: &str, max_action: &str) -> Result<(), String> {
+    let conn = storage::open_connection()?;
+    set_app_filter_max_action_with_conn(&conn, slug, max_action)?;
+    let _ = storage::bump_vault_change_seq();
+    Ok(())
+}
+
+pub fn set_app_filter_max_action_with_conn(
+    conn: &Connection,
+    slug: &str,
+    max_action: &str,
+) -> Result<(), String> {
+    if max_action != "full" && max_action != "warn" {
+        return Err(format!(
+            "invalid filter max action {:?}; allowed: full, warn",
+            max_action
+        ));
+    }
+    let affected = conn
+        .execute(
+            "UPDATE app_records
+                SET filter_max_action = ?2,
+                    updated_at = strftime('%s', 'now')
+              WHERE slug = ?1",
+            params![slug, max_action],
+        )
+        .map_err(|e| format!("UPDATE app_records filter_max_action: {}", e))?;
+    if affected == 0 {
+        return Err(format!(
+            "cannot set filter_max_action: app '{}' is not registered",
+            slug
+        ));
+    }
+    Ok(())
+}
+
+/// Reads the filter enforcement ceiling. Missing rows and pre-setting rows use
+/// the production-compatible default `full`.
+pub fn get_app_filter_max_action(slug: &str) -> Result<String, String> {
+    let conn = storage::open_connection()?;
+    get_app_filter_max_action_with_conn(&conn, slug)
+}
+
+pub fn get_app_filter_max_action_with_conn(
+    conn: &Connection,
+    slug: &str,
+) -> Result<String, String> {
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT filter_max_action FROM app_records WHERE slug = ?1",
+            params![slug],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|e| format!("read filter_max_action: {}", e))?
+        .flatten();
+    let value = value.unwrap_or_else(|| "full".to_string());
+    if value != "full" && value != "warn" {
+        return Err(format!(
+            "stored filter_max_action {:?} is invalid; allowed: full, warn",
+            value
+        ));
+    }
+    Ok(value)
+}
+
 /// SELECT a single `app_records` row by slug. Used by `authorize` to load
 /// the metadata for the consent prompt and by `list`.
 pub fn get_app_record(slug: &str) -> Result<Option<AppRecord>, String> {
