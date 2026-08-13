@@ -80,6 +80,12 @@ pub(crate) enum Commands {
     /// Show version info (CLI + local proxy if running)
     #[command(display_order = 100)]
     Version,
+    /// Configure device-level CLI preferences
+    #[command(display_order = 11)]
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Initialize the vault (runs automatically on first use)
     #[command(hide = true)]
     Init,
@@ -563,9 +569,15 @@ pub(crate) enum Commands {
     /// thing. Bare `aikey service status` (no name) prints a one-line
     /// summary of every service at once.
     ///
+    /// The `all` meta-target fans out to every installed service (proxy + web
+    /// + trust-local): `aikey service start all` brings them all up in one
+    /// call, skipping any not installed on this edition and any already in the
+    /// target state. `all` is NOT itself a whitelisted service name.
+    ///
     /// Examples:
     ///   aikey service status                 # all services, one line each
     ///   aikey service status trust-local     # one service, full detail
+    ///   aikey service start all              # bring up proxy + web + trust-local
     ///   aikey service restart web
     ///   aikey service stop proxy
     #[command(display_order = 27)]
@@ -581,16 +593,27 @@ pub(crate) enum Commands {
 /// label. We map short name → label internally so the user doesn't
 /// have to memorize `aikey.trust-local`.
 #[derive(Subcommand)]
+pub(crate) enum ConfigAction {
+    /// Show or set the display time zone (`auto` or an IANA ID such as Asia/Shanghai)
+    #[command(name = "time-zone")]
+    TimeZone {
+        /// Omit to show the current preference
+        value: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum ServiceAction {
-    /// Start a registered AiKey service.
+    /// Start a registered AiKey service, or `all` to bring up every installed
+    /// service (proxy + web + trust-local) in one call.
     Start {
-        /// Service short name (e.g. `trust-local`). Run without a
-        /// name to see the list of supported services.
+        /// Service short name (e.g. `trust-local`), or `all` to start every
+        /// installed service. Run without a name to see the supported list.
         name: Option<String>,
     },
-    /// Stop a registered AiKey service.
+    /// Stop a registered AiKey service, or `all` to stop every running service.
     Stop { name: Option<String> },
-    /// Restart a registered AiKey service.
+    /// Restart a registered AiKey service, or `all` for every installed service.
     Restart { name: Option<String> },
     /// Show service status. Without a name: one-line summary of every
     /// service. With a name (`web` / `proxy` / `trust-local`): full detail
@@ -1333,6 +1356,9 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
         None => "unknown".to_string(),
         Some(c) => match c {
             Commands::Init => "init".to_string(),
+            Commands::Config { action } => match action {
+                ConfigAction::TimeZone { .. } => "config.time-zone".to_string(),
+            },
             Commands::Db { action } => format!(
                 "db.{}",
                 match action {

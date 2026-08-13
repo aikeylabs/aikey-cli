@@ -96,7 +96,7 @@ Vault 每个 shell session 只解锁一次 — 后续的 `aikey run` 用缓存�
 | `aikey route` | vault.db(read-only) | 无 | stdout(可复制到第三方工具配置) |
 | `aikey test [<alias>]` | vault.db | 无(probe-only,带 `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
 | `aikey web [page]` | 无 | 无 | spawn 浏览器 → `aikey-local-server` |
-| `aikey doctor` | 版型 / proxy / vault / hooks / 插件(trust-local / 合规过滤)；`--last-errors` 读取 proxy 本地最近错误环形缓冲 | 无 | stdout 诊断报告（`--detail` 增加按版型区分的 ODS 面板；`--last-errors` 显示产地、途经链、trace ID 与上游 request ID） |
+| `aikey doctor` | 版型 / proxy / vault / hooks / 插件(trust-local / 合规过滤)；`--last-errors` 读取 proxy 本地最近错误环形缓冲 | 交互模式自动修复：重启已停的 proxy、启动已停的 local-server 和 trust-local 守护进程、安装缺失的 shell hook（`--json` 时只读） | stdout 诊断报告（`--detail` 增加按版型区分的 ODS 面板；`--last-errors` 显示产地、途经链、trace ID 与上游 request ID） |
 | `aikey audit status` | collector completeness 端点（+ proxy 本地状态）| 无 | stdout per-source 投递报告 |
 | `aikey audit reconcile` | collector 缺口 + proxy WAL | 已知丢失台账（服务端）| stdout 对账结论；补传可恢复缺口、确认丢失 |
 
@@ -215,6 +215,11 @@ aikey web                                   # 打开本地控制台(默认页)
 aikey web usage                             # 直接跳到 Usage 页
 aikey web vault                             # 直接跳到 Vault 页
 
+# 显示时区（仅影响 Web 和 CLI 的显示）
+aikey config time-zone Asia/Shanghai        # 北京 / 上海，中国标准时间
+aikey config time-zone auto                 # 跟随本设备系统时区
+aikey config time-zone --json               # 查看当前偏好
+
 # 维护
 aikey doctor                                # 诊断 PATH / hook / proxy / vault
 aikey doctor --last-errors                  # 用 caused-by 树解释最近 proxy 错误（仅读本地状态）
@@ -226,6 +231,11 @@ aikey service status                        # 一行一个: web / proxy / trust-
 aikey web status                            # 本地 web 控制台: 是否运行? 端口? vault 状态?
 aikey proxy status                          # proxy: 是否运行? pid? 监听地址?
 aikey service status trust-local            # 单个服务的详细状态
+
+# 一并启停(`all` = 全部已安装服务)
+aikey service start all                     # 一起拉起 proxy + web + trust-local(跳过未安装/已在跑)
+aikey service stop all                      # 停掉所有在运行的服务
+aikey service restart all                   # 重启每个已安装服务
 
 # 投递审计（财务对账级用量完整性）
 aikey audit status                          # 按源看：已分配 / 已确认 / 缺口 / 已知丢失 / 隔离

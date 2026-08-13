@@ -24,6 +24,7 @@ pub mod events;
 pub mod executor;
 pub mod global_config;
 pub mod json_output;
+pub mod local_server_diagnose;
 pub mod local_server_probe;
 pub mod migrations;
 pub mod observability;
@@ -47,6 +48,8 @@ pub mod team_token_normalize;
 pub mod term_caps;
 #[cfg(windows)]
 pub mod term_caps_windows;
+pub mod time_zone;
+pub mod trust_local_service;
 pub mod ui_frame;
 // Windows-only siblings — never compile on macOS / Linux. Each module
 // is `#[cfg(windows)]`-internal so the declaration here is a no-op on

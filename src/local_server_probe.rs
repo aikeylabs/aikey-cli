@@ -328,16 +328,172 @@ impl ServiceAction {
     }
 }
 
-// Why direct process management instead of launchctl / systemctl:
-//   local-install.sh and trial-install.sh both start the web service
-//   via plain `nohup ${BIN}/aikey-{local-server,full-trial} --config
-//   ${CONFIG}/control-trial.yaml`. Neither installer registers a
-//   launchd plist or systemd unit for the web service itself (only
-//   `aikey-proxy` is registered). So any launchctl/systemctl-based
-//   restart command would target a label that doesn't exist on the
-//   user's host. The original `spawn_start_command` had this bug
-//   silently — the auto-start prompt in `aikey web` was a no-op for
-//   every Personal install. Fixing it here also fixes that.
+// ── Supervisor-first start (2026-07-29) ─────────────────────────────────────
+//
+// HISTORY / why this section replaced direct-spawn-only: an older comment here
+// claimed "neither installer registers a launchd plist or systemd unit for the
+// web service" and used that to justify bare process spawning. That premise is
+// OBSOLETE on every platform (verified against the installers 2026-07-29):
+//
+//   Windows  local-install.ps1 registers ScheduledTask `AikeyLocalServer`
+//            (stderr → logs\local-server-svc.err.log); trial-install.ps1
+//            registers `AikeyFullTrial` (stderr → logs\aikey-full-trial.err.log)
+//   macOS    lib/platform.sh register_service writes
+//            ~/Library/LaunchAgents/com.aikeylabs.<name>.plist with
+//            StandardErrorPath → ~/.aikey/logs/<name>.err.log
+//   Linux    lib/platform.sh registers a SYSTEM-level systemd unit <name>
+//   (nohup remains only as the installers' no-service-manager fallback)
+//
+// Bypassing the registered supervisor cost three things at once: the service's
+// startup stderr (spawn_detached nulled it — a user whose install was broken
+// waited 25s and got NO reason at all, live Win10 2026-07-29), the supervisor's
+// auto-respawn, and the single-supervisor guarantee (local-install.ps1
+// explicitly de-registers competing supervisors so two never fight over :8090).
+//
+// So `start` now goes supervisor-first: if the installer registered one, start
+// THROUGH it; only when none is registered (legacy/nohup installs) fall back to
+// a bare spawn — loudly, and with stderr kept on disk instead of nulled.
+
+/// How the installed web service is supervised on this host, per the
+/// installers' single sources of truth (see table above). The CLI derives this
+/// deterministically instead of reading install-state.json because
+/// local-install.ps1 does not record the task name (only trial-install.ps1
+/// does) — a partial field would need this table as fallback anyway, and two
+/// sources of truth would drift.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceIdentity {
+    /// Supervisor unit id: launchd label / systemd unit / Windows task name.
+    pub unit: String,
+    /// Absolute path where the supervisor redirects the service's stderr.
+    /// None on Linux (journald owns it — `journalctl -u <unit>`).
+    pub err_log: Option<PathBuf>,
+}
+
+/// The supervisor identity for this edition ON THIS platform.
+pub fn service_identity(edition: Edition) -> ServiceIdentity {
+    service_identity_for(
+        std::env::consts::OS,
+        edition,
+        &crate::commands_account::resolve_user_home(),
+    )
+}
+
+/// Pure form of the identity table — `os` and `home` injected so the fence
+/// test can pin all 3 platforms × 2 editions from one host.
+pub(crate) fn service_identity_for(os: &str, edition: Edition, home: &Path) -> ServiceIdentity {
+    let name = web_service_binary(edition); // aikey-local-server | aikey-full-trial
+    let logs = home.join(".aikey").join("logs");
+    match os {
+        "windows" => ServiceIdentity {
+            // PascalCase task names, verbatim from the installers.
+            unit: match edition {
+                Edition::Personal => "AikeyLocalServer".to_string(),
+                Edition::Trial => "AikeyFullTrial".to_string(),
+            },
+            // ⚠️ deliberately inconsistent file names — they mirror what each
+            // installer actually writes TODAY. Renaming to something uniform
+            // here would point diagnostics at files that don't exist on every
+            // already-installed machine. (Unifying the installers is a
+            // separate decision.)
+            err_log: Some(logs.join(match edition {
+                Edition::Personal => "local-server-svc.err.log",
+                Edition::Trial => "aikey-full-trial.err.log",
+            })),
+        },
+        "macos" => ServiceIdentity {
+            unit: format!("com.aikeylabs.{}", name),
+            err_log: Some(logs.join(format!("{}.err.log", name))),
+        },
+        // Linux and anything else: systemd system unit named after the binary.
+        _ => ServiceIdentity {
+            unit: name.to_string(),
+            err_log: None,
+        },
+    }
+}
+
+/// Routing seam for `start`: supervisor when registered, bare spawn only as
+/// the degraded fallback. Pure so the fence can pin it; the ONLY caller is
+/// start_service — if a second route ever appears (e.g. "force fallback"), it
+/// must come through here, not around it.
+#[derive(Debug, PartialEq)]
+pub(crate) enum StartRoute {
+    Supervisor,
+    FallbackSpawn,
+}
+
+pub(crate) fn choose_start_route(supervisor_registered: bool) -> StartRoute {
+    if supervisor_registered {
+        StartRoute::Supervisor
+    } else {
+        StartRoute::FallbackSpawn
+    }
+}
+
+/// Did the installer register a supervisor for this service on this host?
+/// false ⇒ legacy/nohup install (or the registration step failed — the exact
+/// half-installed state observed live 2026-07-29) ⇒ caller degrades to a bare
+/// spawn with a loud warning.
+pub fn supervisor_registered(id: &ServiceIdentity) -> bool {
+    match std::env::consts::OS {
+        "windows" => {
+            // schtasks over Get-ScheduledTask: no powershell startup cost and
+            // present on every supported Windows.
+            std::process::Command::new("schtasks")
+                .args(["/Query", "/TN", &id.unit])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        "macos" => launchd_plist_path(&id.unit).exists(),
+        _ => {
+            // `systemctl cat` succeeds iff a unit file exists (running or not).
+            std::process::Command::new("systemctl")
+                .args(["cat", &id.unit])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+    }
+}
+
+fn launchd_plist_path(label: &str) -> PathBuf {
+    crate::commands_account::resolve_user_home()
+        .join("Library/LaunchAgents")
+        .join(format!("{}.plist", label))
+}
+
+/// Start the service THROUGH its registered supervisor. Stderr of the control
+/// command is captured into the error (never nulled) via
+/// `trust_local_service::run` — the same pattern the trust-local lifecycle
+/// uses.
+fn supervisor_start(id: &ServiceIdentity) -> Result<(), String> {
+    match std::env::consts::OS {
+        "windows" => crate::trust_local_service::run("schtasks", &["/Run", "/TN", &id.unit]),
+        "macos" => {
+            let uid = crate::trust_local_service::current_uid().to_string();
+            let plist = launchd_plist_path(&id.unit);
+            let plist_s = plist.to_string_lossy().to_string();
+            let domain = format!("gui/{}", uid);
+            // bootstrap = correct verb when the agent is not loaded (the state
+            // `start` usually finds). Already-loaded-but-dead (crashed /
+            // throttled) makes bootstrap fail → kickstart restarts it in
+            // place. Same two-step try_launchd_selfheal proved out.
+            crate::trust_local_service::run("launchctl", &["bootstrap", &domain, &plist_s]).or_else(
+                |boot_err| {
+                    let target = format!("{}/{}", domain, id.unit);
+                    crate::trust_local_service::run("launchctl", &["kickstart", &target]).map_err(
+                        |kick_err| format!("bootstrap: {}; kickstart: {}", boot_err, kick_err),
+                    )
+                },
+            )
+        }
+        // System unit, non-root user: plain systemctl start works where polkit
+        // allows; where it doesn't, the captured stderr says so and the caller
+        // degrades. NEVER shell out to sudo here (would hang a non-TTY flow).
+        _ => crate::trust_local_service::run("systemctl", &["start", &id.unit]),
+    }
+}
 
 fn run_service_action(edition: Edition, action: ServiceAction) -> Result<(), String> {
     match action {
@@ -353,6 +509,17 @@ fn run_service_action(edition: Edition, action: ServiceAction) -> Result<(), Str
             start_service(edition)
         }
     }
+}
+
+/// Where the FALLBACK (supervisor-less) spawn keeps the service's stderr.
+/// Anything but /dev/null: this file is what turns "died silently within 25s"
+/// into a readable reason. Appended, never truncated — consecutive failed
+/// starts stack up in order.
+pub fn cli_fallback_err_log() -> PathBuf {
+    crate::commands_account::resolve_user_home()
+        .join(".aikey")
+        .join("logs")
+        .join("local-server-cli-start.err.log")
 }
 
 fn start_service(edition: Edition) -> Result<(), String> {
@@ -384,6 +551,33 @@ fn start_service(edition: Edition) -> Result<(), String> {
         ));
     }
 
+    // Supervisor-first (2026-07-29, see section comment above): starting
+    // through the installer-registered supervisor keeps its log redirection,
+    // auto-respawn, and the single-supervisor guarantee. Only a host with no
+    // registration at all degrades to the bare spawn — loudly, because the
+    // degraded start has none of those properties.
+    let id = service_identity(edition);
+    if choose_start_route(supervisor_registered(&id)) == StartRoute::Supervisor {
+        return supervisor_start(&id).map_err(|e| {
+            format!(
+                "the {} supervisor '{}' is registered but failed to start the service: {}",
+                supervisor_kind_name(),
+                id.unit,
+                e
+            )
+        });
+    }
+    eprintln!(
+        "warning: no {} registration found for '{}' — the installer's service-registration \
+         step did not complete on this machine (re-running the installer fixes this).\n\
+         Starting {} directly as a fallback: this one-off process has NO auto-restart and \
+         will NOT come back after a reboot. Its errors are kept in {}",
+        supervisor_kind_name(),
+        id.unit,
+        bin_name,
+        cli_fallback_err_log().display(),
+    );
+
     // BR-rc.5-58 fix (2026-05-24): no `--config` arg. The binary's
     // cmd/local/main.go (Personal) sets AIKEY_CONFIG_DEFAULT_NAME=
     // control.yaml in its own startup, and cmd/full/main.go (Trial)
@@ -396,6 +590,32 @@ fn start_service(edition: Edition) -> Result<(), String> {
     // a928cd4 missed this read-side site). See bugfix
     // 20260524-personal-install-console-failed-to-start.md.
     spawn_detached(&bin)
+}
+
+/// Platform-appropriate word for "the thing the installer registers", used in
+/// user-facing messages so they match what the user can actually inspect.
+fn supervisor_kind_name() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "Scheduled Task",
+        "macos" => "launchd agent",
+        _ => "systemd unit",
+    }
+}
+
+/// Open the fallback stderr log for append, creating logs/ if needed. A None
+/// (log dir unwritable) must not block the start itself — but the spawn then
+/// keeps stderr on the CHILD's default (inherited) rather than nulling it, so
+/// the error still has somewhere to go.
+fn fallback_stderr_file() -> Option<std::fs::File> {
+    let path = cli_fallback_err_log();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()
 }
 
 fn stop_service() -> Result<(), String> {
@@ -417,6 +637,12 @@ fn stop_service() -> Result<(), String> {
     Ok(())
 }
 
+// stderr policy for BOTH platform variants (bugfix 2026-07-29): the fallback
+// spawn's stderr goes to cli_fallback_err_log(), NEVER Stdio::null(). Nulling
+// it destroyed the service's dying words — a Win10 user watched `ak web` wait
+// 25s and print no reason while SQLITE_CANTOPEN sat in the discarded stream.
+// If even the log file can't be opened, stderr stays INHERITED (visible in the
+// invoking terminal) — the error must always have somewhere to land.
 #[cfg(unix)]
 fn spawn_detached(bin: &Path) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
@@ -425,9 +651,13 @@ fn spawn_detached(bin: &Path) -> Result<(), String> {
     // No --config: binary uses env-driven DefaultConfigPath. See caller
     // start_service() docblock for full rationale (BR-rc.5-58).
     let mut cmd = Command::new(bin);
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.stdin(Stdio::null()).stdout(Stdio::null());
+    match fallback_stderr_file() {
+        Some(f) => {
+            cmd.stderr(Stdio::from(f));
+        }
+        None => {} // inherited — see policy comment above
+    }
     // setsid detaches the child from this process's session — without
     // it the spawned web service would die when the shell that ran
     // `aikey web start` exits. This matches what `nohup` gives us in
@@ -452,11 +682,15 @@ fn spawn_detached(bin: &Path) -> Result<(), String> {
     // child survives parent exit and has no console window.
     // No --config: binary uses env-driven DefaultConfigPath (BR-rc.5-58).
     const DETACHED_NO_WINDOW: u32 = 0x0800_0008;
-    Command::new(bin)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(DETACHED_NO_WINDOW)
+    let mut cmd = Command::new(bin);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null());
+    match fallback_stderr_file() {
+        Some(f) => {
+            cmd.stderr(Stdio::from(f));
+        }
+        None => {} // inherited — see policy comment above
+    }
+    cmd.creation_flags(DETACHED_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("spawn {}: {}", bin.display(), e))?;
     Ok(())
@@ -538,7 +772,7 @@ fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn find_listening_pid(port: u16) -> Option<u32> {
+pub(crate) fn find_listening_pid(port: u16) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::process::Command;
@@ -1563,6 +1797,127 @@ mod tests {
         }
 
         assert!(line.contains("NOT CONFIGURED"), "got: {}", line);
+    }
+}
+
+#[cfg(test)]
+mod supervisor_first_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // Fences for the 2026-07-29 supervisor-first start (bugfix
+    // 20260729-ak-web-autostart-bypasses-supervisor-and-discards-stderr).
+
+    /// The identity table must yield a definite supervisor id for every
+    /// (platform × edition) cell, matching what the INSTALLERS register —
+    /// including the deliberately inconsistent Windows-Personal log name.
+    ///
+    /// 能红: "fix" the Windows-Personal log name to the uniform pattern → the
+    /// literal here (which mirrors local-install.ps1) mismatches. That is the
+    /// point: renaming must be a conscious cross-repo decision, not a tidy-up.
+    #[test]
+    fn service_identity_table_covers_all_editions_and_platforms() {
+        let home = PathBuf::from("/home/u");
+        let cases: &[(&str, Edition, &str, Option<&str>)] = &[
+            (
+                "windows",
+                Edition::Personal,
+                "AikeyLocalServer",
+                Some("local-server-svc.err.log"), // ⚠️ verbatim from local-install.ps1
+            ),
+            (
+                "windows",
+                Edition::Trial,
+                "AikeyFullTrial",
+                Some("aikey-full-trial.err.log"),
+            ),
+            (
+                "macos",
+                Edition::Personal,
+                "com.aikeylabs.aikey-local-server",
+                Some("aikey-local-server.err.log"),
+            ),
+            (
+                "macos",
+                Edition::Trial,
+                "com.aikeylabs.aikey-full-trial",
+                Some("aikey-full-trial.err.log"),
+            ),
+            ("linux", Edition::Personal, "aikey-local-server", None), // journald
+            ("linux", Edition::Trial, "aikey-full-trial", None),
+        ];
+        for (os, edition, unit, err_file) in cases {
+            let id = service_identity_for(os, *edition, &home);
+            assert_eq!(&id.unit, unit, "unit for {}/{:?}", os, edition);
+            match err_file {
+                Some(f) => {
+                    let log = id.err_log.as_ref().unwrap_or_else(|| {
+                        panic!("{}/{:?} must have an err log path", os, edition)
+                    });
+                    assert!(
+                        log.ends_with(format!(".aikey/logs/{}", f)),
+                        "err log for {}/{:?}: got {}",
+                        os,
+                        edition,
+                        log.display()
+                    );
+                }
+                None => assert!(
+                    id.err_log.is_none(),
+                    "{}/{:?}: journald owns stderr, no file path",
+                    os,
+                    edition
+                ),
+            }
+        }
+    }
+
+    /// Registered supervisor ⇒ start THROUGH it, never a bare spawn beside it
+    /// (two supervisors fighting over :8090 is exactly what the installers
+    /// de-register competitors to prevent). 能红: invert choose_start_route.
+    #[test]
+    fn start_prefers_supervisor_when_registered() {
+        assert_eq!(choose_start_route(true), StartRoute::Supervisor);
+        assert_eq!(choose_start_route(false), StartRoute::FallbackSpawn);
+    }
+
+    /// 🔴 The root of the original bug: the fallback spawn nulled the child's
+    /// stderr, so a dying service left NO trace anywhere. Pin at the source
+    /// level that neither platform variant of spawn_detached does that again,
+    /// and that both route stderr through fallback_stderr_file().
+    ///
+    /// Source-scan on purpose: a runtime test can't observe a detached
+    /// child's fd table portably, and this must also hold for the platform
+    /// variant that does NOT compile on the test host.
+    #[test]
+    fn fallback_spawn_redirects_stderr_to_log() {
+        let src = include_str!("local_server_probe.rs");
+        let start = src
+            .find("fn spawn_detached")
+            .expect("spawn_detached must exist");
+        let end = src
+            .find("fn signal_terminate")
+            .expect("marker fn after spawn_detached variants");
+        let region = &src[start..end];
+        assert!(
+            !region.contains(".stderr(Stdio::null())"),
+            "spawn_detached nulls the child's stderr again — that discards the service's \
+             dying words and recreates the silent-25s bug (2026-07-29)"
+        );
+        assert_eq!(
+            region.matches("fallback_stderr_file()").count(),
+            2,
+            "both platform variants of spawn_detached must route stderr through \
+             fallback_stderr_file()"
+        );
+    }
+
+    /// The fallback err-log lives under ~/.aikey/logs with a name distinct
+    /// from every supervisor-owned log (so tails can attribute the source).
+    #[test]
+    fn cli_fallback_log_named_distinctly() {
+        let p = cli_fallback_err_log();
+        assert!(p.ends_with(".aikey/logs/local-server-cli-start.err.log"));
     }
 }
 

@@ -1077,6 +1077,9 @@ fn event_time_hm(event_time_ms: i64) -> String {
     if event_time_ms <= 0 {
         return String::new();
     }
+    if let Some(formatted) = crate::time_zone::format_hm(event_time_ms) {
+        return formatted;
+    }
     let secs = event_time_ms / 1000;
     // Resolve local offset via the standard `time_t → struct tm` path.
     // `libc::localtime_r` populates `tm_gmtoff` which encodes the
@@ -1108,6 +1111,9 @@ fn event_time_hm(event_time_ms: i64) -> String {
 
     if event_time_ms <= 0 {
         return String::new();
+    }
+    if let Some(formatted) = crate::time_zone::format_hm(event_time_ms) {
+        return formatted;
     }
     // Windows FILETIME is 100-nanosecond intervals since 1601-01-01 UTC.
     // Unix epoch (1970-01-01 UTC) sits at 116_444_736_000_000_000 in that scale.

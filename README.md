@@ -96,7 +96,7 @@ Vault is unlocked once per shell session — subsequent `aikey run` calls reuse 
 | `aikey route` | vault.db (read-only) | nothing | stdout (for copying into third-party tool config) |
 | `aikey test [<alias>]` | vault.db | nothing (probe-only via `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
 | `aikey web [page]` | nothing | nothing | spawns browser → `aikey-local-server` |
-| `aikey doctor` | edition, proxy, vault, hooks, plugins (trust-local / compliance); `--last-errors` reads the proxy's local recent-error ring | nothing | stdout report (`--detail` adds edition-aware ODS panels; `--last-errors` renders origin, hops, trace ID, and upstream request ID) |
+| `aikey doctor` | edition, proxy, vault, hooks, plugins (trust-local / compliance); `--last-errors` reads the proxy's local recent-error ring | auto-repairs in interactive mode: restarts a stopped proxy, starts a stopped local-server and trust-local daemon, installs a missing shell hook (`--json`: read-only) | stdout report (`--detail` adds edition-aware ODS panels; `--last-errors` renders origin, hops, trace ID, and upstream request ID) |
 | `aikey audit status` | collector completeness endpoint (+ proxy local state) | nothing | stdout per-source delivery report |
 | `aikey audit reconcile` | collector gaps + proxy WAL | known-loss ledger (server) | stdout verdict; re-sends recoverable gaps, confirms losses |
 
@@ -215,6 +215,11 @@ aikey web                                   # opens local console (default page)
 aikey web usage                             # jump straight to Usage page
 aikey web vault                             # jump straight to Vault page
 
+# Display time zone (Web and CLI presentation only)
+aikey config time-zone Asia/Shanghai        # Beijing / Shanghai, China Standard Time
+aikey config time-zone auto                 # follow this device's system time zone
+aikey config time-zone --json               # inspect the effective preference
+
 # Maintenance
 aikey doctor                                # diagnose PATH / hook / proxy / vault
 aikey doctor --last-errors                  # explain recent proxy errors as a caused-by tree (local state only)
@@ -226,6 +231,11 @@ aikey service status                        # one line each: web / proxy / trust
 aikey web status                            # local web console: running? port? vault state?
 aikey proxy status                          # proxy: running? pid? listen addr?
 aikey service status trust-local            # a single service in detail
+
+# Bring services up/down together (`all` = every installed service)
+aikey service start all                     # start proxy + web + trust-local (skips not-installed / already-up)
+aikey service stop all                      # stop everything that's running
+aikey service restart all                   # restart every installed service
 
 # Delivery audit (financial-grade usage completeness)
 aikey audit status                          # per-source: allocated / confirmed / gaps / known-loss / quarantine

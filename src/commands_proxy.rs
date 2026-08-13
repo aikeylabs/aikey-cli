@@ -23,7 +23,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // Fallback proxy listen address when the config cannot be parsed.
 const PROXY_HEALTH_ADDR_DEFAULT: &str = "127.0.0.1:27200";
@@ -347,6 +347,13 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
         crate::proxy_state::proxy_state(&probe_listen),
         crate::proxy_state::ProxyState::Running { .. }
     ) {
+        // Drift self-heal guard (20260728-端口漂移baseurl自愈回写): this
+        // fast-path is the consumption-side reconcile point — launchd may
+        // have auto-started a DRIFTED proxy at boot with no CLI in the loop,
+        // so the wrapper's `ensure-running` (every claude/codex/kimi launch)
+        // is where stale on-disk baseurls get re-anchored. Cheap when in
+        // sync (two small file reads); advisory on failure.
+        let _ = crate::profile_activation::reconcile_baseurl_port();
         return;
     }
 
@@ -461,6 +468,9 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
             if let Ok(seq) = crate::storage::get_vault_change_seq() {
                 let _ = crate::storage::set_proxy_loaded_seq(seq);
             }
+            // Drift self-heal (20260728): fresh start may have drifted —
+            // re-anchor on-disk baseurls before the wrapper launches the CLI.
+            let _ = crate::profile_activation::reconcile_baseurl_port();
         }
         Err(StartError::OrphanedPort {
             port,
@@ -715,7 +725,13 @@ fn read_yaml_listen_addr(config_path: Option<&std::path::Path>) -> Option<String
 /// the recorded pid is alive. Returns None when the file is absent,
 /// malformed, or its pid is dead (stale residue from a crashed prior
 /// incarnation).
-fn read_runtime_actual_addr() -> Option<String> {
+///
+/// pub(crate): also the "is there a live proxy, and where?" gate for
+/// `profile_activation::reconcile_baseurl_port` — the drift self-heal
+/// guard must only rewrite downstream configs against a *live* actual
+/// port, never against intent-level fallbacks (yaml/env), or a stopped
+/// proxy would trigger speculative rewrites.
+pub(crate) fn read_runtime_actual_addr() -> Option<String> {
     let path = runtime_snapshot_path()?;
     let text = fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -868,6 +884,11 @@ fn handle_start_background(
             if let Ok(seq) = crate::storage::get_vault_change_seq() {
                 let _ = crate::storage::set_proxy_loaded_seq(seq);
             }
+            // Drift self-heal (20260728-端口漂移baseurl自愈回写): if this
+            // start drifted (27200 busy → bound N+k), downstream baseurl
+            // configs on disk still carry the old port — re-anchor them now.
+            // Idempotent no-op when in sync; advisory on failure.
+            let _ = crate::profile_activation::reconcile_baseurl_port();
             Ok(())
         }
         Err(crate::proxy_lifecycle::StartError::OrphanedPort {
@@ -1131,6 +1152,32 @@ fn handle_start_foreground(
     // shells' `aikey proxy stop / restart / status` see it as a
     // first-class managed instance via the sidecar meta.
     drop(_lock);
+
+    // Drift self-heal at service start (20260728-端口漂移baseurl自愈回写):
+    // launchd/systemd runs THIS path at boot with no other CLI in the loop.
+    // If the child had to drift (configured port busy), on-disk baseurl
+    // configs must be re-anchored NOW — already-open terminals then pick the
+    // fix up at their next prompt via the seq bump, instead of waiting for
+    // the next wrapper launch. Short poll: the proxy writes runtime.json
+    // right after bind (typically <1s); `try_wait` (not `process_alive`)
+    // detects an early-dead child immediately — a crashed child is a zombie
+    // until reaped, which `kill(pid,0)` still reports as alive, and that
+    // would stall a crashloop for the full deadline.
+    {
+        let reconcile_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if crate::proxy_lifecycle::runtime_actual_addr_for_pid(pid).is_some() {
+                let _ = crate::profile_activation::reconcile_baseurl_port();
+                break;
+            }
+            if matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+                || Instant::now() >= reconcile_deadline
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 
     let status = child.wait()?;
 
@@ -2197,8 +2244,13 @@ struct EgressSelfCheckResponse {
 pub fn fetch_egress_selfcheck(dial: bool) -> Result<Vec<EgressCheck>, String> {
     let addr = proxy_listen_addr(None);
     // Plain agent on purpose (loopback admin call, never through this shell's
-    // proxy env). Generous timeout: with dial=true the daemon dials each account
-    // sequentially (per-account ~10s server-side), so allow for a few accounts.
+    // proxy env). Generous timeout: since 2026-07-28 the daemon dials accounts
+    // CONCURRENTLY and caps itself at 15s, so 60s is far more than needed — but
+    // it is kept deliberately, NOT tightened to ~20s: in a mixed-version fleet
+    // this CLI still talks to OLDER proxy binaries that dial SERIALLY
+    // (per-account ~10s), and tightening here would break `aikey doctor` against
+    // exactly the nodes whose egress most needs diagnosing. A too-large timeout
+    // costs nothing on a healthy node (it returns in ~1s).
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(if dial { 60 } else { 3 }))
         .build();
@@ -2232,6 +2284,34 @@ pub fn print_egress_presence() {
     );
 }
 
+/// True when this row is a real probe RESULT rather than a budget cutoff.
+///
+/// The proxy's self-check bounds itself (2026-07-28) and reports accounts it
+/// could not get to as `dialed=false, ok=false` + a reason. Those rows carry NO
+/// verdict about the egress, so every consumer must exclude them before drawing
+/// conclusions. `p.ok` is part of the test as belt-and-braces: an OK row is by
+/// definition probed, whatever `dialed` says.
+pub fn egress_path_was_probed(p: &EgressCheck) -> bool {
+    p.dialed || p.ok
+}
+
+/// `aikey doctor`'s egress verdict: true only when EVERY account we actually
+/// probed failed.
+///
+/// WHY the `!probed.is_empty()` guard (bugfix 2026-07-28): the old form was
+/// `ok_count == 0`, which turns "we probed nothing" into "everything is broken".
+/// That maps to a non-zero `aikey doctor` exit and the line "all egress paths are
+/// unreachable — check the proxy line(s) for these accounts", i.e. it sends the
+/// user to fix accounts that were never tested. An absent measurement is not a
+/// failing measurement.
+pub fn egress_all_probed_failed(paths: &[EgressCheck]) -> bool {
+    let mut probed = paths
+        .iter()
+        .filter(|p| egress_path_was_probed(p))
+        .peekable();
+    probed.peek().is_some() && probed.all(|p| !p.ok)
+}
+
 /// `aikey doctor` egress section: dials each account's configured egress once and
 /// prints OK/fail + exit IP + latency. Returns `true` when there is ≥1 configured
 /// egress and ALL of them failed (caller maps that to a non-zero exit — "失败要显
@@ -2252,11 +2332,13 @@ pub fn print_egress_doctor(json_mode: bool) -> bool {
     if !json_mode {
         println!("\nEgress connectivity (per-account):");
     }
-    let mut ok_count = 0;
     for p in &paths {
-        if p.ok {
-            ok_count += 1;
-        }
+        // dialed=false + ok=false = the daemon's self-check budget ran out before
+        // this account got a slot (2026-07-28). It is NOT a verdict on the
+        // egress, so it must not be counted as a probe, must not be printed with
+        // the failure glyph, and must not drive the all-failed exit code — else
+        // `aikey doctor` tells the user to fix an account it never tested.
+        let probed = egress_path_was_probed(p);
         if json_mode {
             continue;
         }
@@ -2273,6 +2355,18 @@ pub fn print_egress_doctor(json_mode: bool) -> bool {
                 ip.cyan(),
                 p.latency_ms
             );
+        } else if !probed {
+            let reason = if p.reason.is_empty() {
+                "not probed within the proxy's self-check budget — re-run to test it".to_string()
+            } else {
+                p.reason.clone()
+            };
+            println!(
+                "  {} {:<28} {}",
+                crate::symbols::WARN.s(),
+                p.label,
+                reason.yellow()
+            );
         } else {
             let reason = if p.reason.is_empty() {
                 "unreachable".to_string()
@@ -2287,7 +2381,7 @@ pub fn print_egress_doctor(json_mode: bool) -> bool {
             );
         }
     }
-    let all_failed = ok_count == 0;
+    let all_failed = egress_all_probed_failed(&paths);
     if all_failed && !json_mode {
         println!(
             "  {} all egress paths are unreachable — check the proxy line(s) for these accounts",
@@ -2295,6 +2389,121 @@ pub fn print_egress_doctor(json_mode: bool) -> bool {
         );
     }
     all_failed
+}
+
+/// FNV-1a 32-bit over UTF-16 code units. A DISPLAY fingerprint, not a security
+/// primitive.
+///
+/// MUST match aikey-control/web `egress-summary.ts::egressFingerprint`
+/// byte-for-byte — same seed (0x811c9dc5), same prime (0x01000193), and crucially
+/// the same UTF-16 iteration (JS `charCodeAt` yields UTF-16 code units, so a
+/// fragment with a CJK proxy name must fingerprint identically here). This is what
+/// lets `aikey env` and the web console show the SAME `#xxxxxxxx` for one config,
+/// so a user can confirm the two surfaces agree at a glance.
+fn egress_fingerprint(s: &str) -> String {
+    let mut h: u32 = 0x811c_9dc5;
+    for unit in s.encode_utf16() {
+        h ^= u32::from(unit);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    format!("{h:08x}")
+}
+
+/// Compact one-line rendering of the daemon's EFFECTIVE egress value for
+/// `aikey env`, matching the web console's `egressSummary` for the multi-line
+/// case (2026-07-25).
+///
+/// WHY: when a multi-protocol mihomo fragment is user-set it wins the layered
+/// decision, so the effective value is byte-identical to the layer-1 value —
+/// the whole YAML block was being printed twice. Collapsing the effective line to
+/// `mihomo fragment · N lines · #fp` removes the repeat while the fingerprint keeps
+/// it verifiable against layer 1 (and against the web console, which prints the
+/// same string).
+///
+/// A single URL is returned UNCHANGED on purpose: it is one line, its repeat is
+/// not noise, and layer 1 already shows it in full — collapsing it here would only
+/// hide a value the CLI otherwise shows plainly. So only the multi-line fragment
+/// is summarized (scope: exactly the reported problem).
+pub fn egress_effective_display(effective_url: &str) -> String {
+    let trimmed = effective_url.trim();
+    let non_empty_lines = trimmed.split('\n').filter(|l| !l.trim().is_empty()).count();
+    if non_empty_lines <= 1 {
+        return effective_url.to_string();
+    }
+    format!(
+        "mihomo fragment · {} lines · #{}",
+        non_empty_lines,
+        egress_fingerprint(trimmed)
+    )
+}
+
+#[cfg(test)]
+mod egress_summary_tests {
+    use super::*;
+
+    // The fingerprint is a CROSS-SURFACE contract: aikey-control/web
+    // egress-summary.ts must produce the same value. These vectors are the ground
+    // truth — if they change, the web side (and its test) must change in lockstep,
+    // or `aikey env` and the console will disagree on the same config.
+    #[test]
+    fn fingerprint_matches_web_fnv1a() {
+        // FNV-1a 32-bit, UTF-16 code units. Verify a few fixed vectors so a broken
+        // port (e.g. iterating bytes or chars instead of UTF-16) is caught.
+        assert_eq!(egress_fingerprint(""), "811c9dc5"); // seed, empty input
+        assert_eq!(egress_fingerprint("a"), "e40c292c");
+        assert_eq!(egress_fingerprint("foobar"), "bf9cf968");
+    }
+
+    #[test]
+    fn fingerprint_uses_utf16_not_bytes() {
+        // A CJK proxy name is the realistic case (users name nodes "谷歌GCP").
+        // Verified equal to the web egress-summary.ts output (2026-07-25):
+        //   egressFingerprint("谷歌")    → 291560ce
+        //   egressFingerprint("谷歌GCP") → 237089b8
+        // Iterating UTF-8 BYTES instead of UTF-16 code units would give 4dae9dd1 /
+        // 4db87859 — a silent cross-surface mismatch. These vectors catch that.
+        assert_eq!(egress_fingerprint("谷歌"), "291560ce");
+        assert_eq!(egress_fingerprint("谷歌GCP"), "237089b8");
+    }
+
+    #[test]
+    fn single_url_is_left_unchanged() {
+        assert_eq!(
+            egress_effective_display("socks5://user:pass@host:1080"),
+            "socks5://user:pass@host:1080"
+        );
+        assert_eq!(
+            egress_effective_display("http://127.0.0.1:7890"),
+            "http://127.0.0.1:7890"
+        );
+    }
+
+    #[test]
+    fn multiline_fragment_is_summarized_with_line_count_and_fp() {
+        let frag = "proxies:\n  - name: res\n    type: socks5\n    server: h\n    port: 1";
+        let got = egress_effective_display(frag);
+        assert!(
+            got.starts_with("mihomo fragment · 5 lines · #"),
+            "got: {got}"
+        );
+        // The fingerprint is over the TRIMMED value (matches web), so trailing
+        // whitespace must not change it.
+        assert_eq!(
+            egress_effective_display(frag),
+            egress_effective_display(&format!("{frag}\n  "))
+        );
+    }
+
+    #[test]
+    fn blank_lines_do_not_count() {
+        // Web filters empty lines before counting; a 2-line fragment padded with
+        // blanks stays "2 lines".
+        let got = egress_effective_display("proxies:\n\n  - name: x\n\n");
+        assert!(
+            got.contains("2 lines"),
+            "blank lines must not inflate the count: {got}"
+        );
+    }
 }
 
 #[cfg(test)]

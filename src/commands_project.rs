@@ -673,6 +673,22 @@ fn doctor_plugin_registry() -> Vec<DoctorPlugin> {
     ]
 }
 
+/// Resolve a registry binary path for the current platform. Windows plugin
+/// installers ship PE binaries with an `.exe` suffix; checking the extensionless
+/// registry path made doctor report installed plugins as absent on Windows.
+fn doctor_plugin_bin_path(
+    home: &std::path::Path,
+    plugin: &DoctorPlugin,
+    windows: bool,
+) -> std::path::PathBuf {
+    let path = home.join(plugin.rel_path);
+    if windows {
+        path.with_extension("exe")
+    } else {
+        path
+    }
+}
+
 /// Runs the doctor checks. Returns `true` iff there is ≥1 configured per-account
 /// egress and ALL of them failed connectivity — the caller maps that to a
 /// non-zero exit ("失败要显眼"). All other check failures stay advisory (doctor
@@ -805,6 +821,45 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
                     "proxy not reachable",
                     Some("proxy /version check will retry after proxy starts"),
                 );
+            }
+        }
+
+        // ── Baseurl sync (20260728-端口漂移baseurl自愈回写) ──
+        // Live actual port (runtime.json, pid-verified) vs the ports already
+        // WRITTEN into downstream configs. Port drift self-heals at the
+        // ensure-running / service-start seams; this row is the read-only
+        // backstop that makes a not-yet-healed stale port visible — before
+        // it, doctor probed the actual port and stayed green while claude
+        // hit the dead one written on disk ("失败要显眼"). Skipped silently
+        // when no live proxy (the proxy-version row above already flagged
+        // that) or when nothing local is written yet (no bindings/cluster).
+        {
+            let live_port = crate::commands_proxy::read_runtime_actual_addr()
+                .and_then(|a| a.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()));
+            if let Some(actual) = live_port {
+                // (surface, written local port) — None entries mean "surface
+                // not present / not local", which is healthy, not stale.
+                // Same collector the reconcile guard uses (single rule set).
+                let surfaces = crate::profile_activation::written_local_baseurl_ports();
+                let stale: Vec<String> = surfaces
+                    .iter()
+                    .filter_map(|(name, port)| {
+                        port.filter(|p| *p != actual)
+                            .map(|p| format!("{}:{}", name, p))
+                    })
+                    .collect();
+                if stale.is_empty() {
+                    if surfaces.iter().any(|(_, p)| p.is_some()) {
+                        emit("baseurl sync", true, &format!("port {}", actual), None);
+                    }
+                } else {
+                    emit(
+                        "baseurl sync",
+                        false,
+                        &format!("proxy on {} but stale: {}", actual, stale.join(", ")),
+                        Some("launch claude/codex once (auto-heals), or run `aikey use <alias>`"),
+                    );
+                }
             }
         }
 
@@ -1300,7 +1355,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
     // "doctor doesn't check it". Not-installed renders dim/informational and
     // never bubbles to the overall pass/fail (these are opt-in).
     {
-        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let home = dirs::home_dir().unwrap_or_default();
         let plugins = doctor_plugin_registry();
         // Paths come from the registry (single source shared with the
         // consistency test); trust-local keeps its bespoke daemon+observer
@@ -1311,8 +1366,11 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             .expect("registry has the trust-local daemon entry");
 
         // ── degrade-detector / trust-local (daemon) ──
-        let trust_local_bin = home.join(trust_local_plugin.rel_path);
-        if trust_local_bin.exists() {
+        // Use the shared service module as the install-state truth source.
+        // On Windows it resolves %USERPROFILE%\.aikey\bin\trust-local.exe;
+        // the old `$HOME/.aikey/bin/trust-local` check bypassed auto-repair,
+        // printed "not installed", and left :8801 down (QA20).
+        if crate::trust_local_service::is_installed() {
             // (a) trust-local service liveness.
             let trust_local_url = "http://127.0.0.1:8801/healthz";
             let tl_ok = ureq::get(trust_local_url)
@@ -1323,8 +1381,38 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             if tl_ok {
                 emit("trust-local", true, "running on :8801", None);
             } else {
-                emit("trust-local", false, "not reachable on :8801",
-                    Some("start it: aikey trust-local start  (or: launchctl kickstart -k gui/$UID/aikey.trust-local)"));
+                emit(
+                    "trust-local",
+                    false,
+                    "not reachable on :8801",
+                    Some("attempting start..."),
+                );
+                // Auto-fix — mirrors the proxy + web + shell-hook auto-repair. An
+                // installed-but-stopped trust-local gets ONE start attempt in
+                // interactive mode via the canonical OS-service core
+                // `trust_local_service::start` (launchctl/systemctl/schtasks — NO
+                // master password). Same one implementation `aikey service start
+                // trust-local` uses (extracted to a lib module 2026-07-26 precisely
+                // so doctor, which compiles in the lib crate, can reach it). start()
+                // already waits up to 30s for the slow (PyInstaller onefile) daemon
+                // to answer /healthz, so its Ok/Err is the authoritative verdict.
+                // --json stays non-mutating. Bugfix 20260726-doctor-autostart-trust-local.
+                if !json_mode {
+                    match crate::trust_local_service::start() {
+                        Ok(()) => emit(
+                            "trust-local start",
+                            true,
+                            "started — running on :8801",
+                            None,
+                        ),
+                        Err(_) => emit(
+                            "trust-local start",
+                            false,
+                            "start failed",
+                            Some("run 'aikey trust-local start' manually to debug"),
+                        ),
+                    }
+                }
             }
 
             // (b) rhythm observer health — read the freshest line
@@ -1332,8 +1420,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             // as `proxy.observer.built` (good) or
             // `proxy.observer.build_failed` (bad) within the first
             // few hundred lines after a restart.
-            let log_path = std::path::Path::new(&std::env::var("HOME").unwrap_or_default())
-                .join(".aikey/logs/aikey-proxy/current.jsonl");
+            let log_path = home.join(".aikey/logs/aikey-proxy/current.jsonl");
             let observer_state = if log_path.exists() {
                 std::fs::read_to_string(&log_path).ok().and_then(|s| {
                     // Take the LAST observer line (most recent
@@ -1400,7 +1487,7 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
         // that the proxy *can* spawn it. Looped from the registry's
         // non-daemon entries so adding a filter app is a one-line table edit.
         for p in plugins.iter().filter(|p| !p.is_daemon) {
-            if home.join(p.rel_path).exists() {
+            if doctor_plugin_bin_path(&home, p, cfg!(windows)).exists() {
                 emit(p.label, true, "installed (proxy-spawned filter)", None);
             } else {
                 let hint = format!("enable: aikey app install {}", p.install_slug);
@@ -1658,12 +1745,33 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             match crate::local_server_probe::read_local_server_port_or_default() {
                 Ok(port) => {
                     let base = format!("http://127.0.0.1:{}", port);
-                    match crate::local_server_probe::probe_vault_status(&base) {
+                    let mut status = crate::local_server_probe::probe_vault_status(&base);
+                    // Auto-fix — mirrors the proxy + shell-hook auto-repair earlier
+                    // in this function. An installed-but-unanswering local-server
+                    // gets ONE start attempt in interactive mode. The web start is a
+                    // launchd/nohup spawn — NO master password needed — so it's safe
+                    // unprompted. Reuses the canonical `aikey service start web` core
+                    // (never a parallel path); --json stays non-mutating like the
+                    // existing auto-fixes. Bugfix 20260725-doctor-autostart-web-trust-local.
+                    let mut restarted = false;
+                    if status.is_err() && !json_mode {
+                        println!(
+                            "{} {:<20} {}",
+                            crate::symbols::WARN.s().yellow(),
+                            "local-server",
+                            format!("not running on port {port} — attempting start...")
+                        );
+                        let _ = crate::commands_account::handle_web_service("start", false);
+                        status = crate::local_server_probe::probe_vault_status(&base);
+                        restarted = true;
+                    }
+                    match status {
                         Ok(unlocked) => (
                             "local-server",
                             true,
                             format!(
-                                "running on port {} (vault: {})",
+                                "{}running on port {} (vault: {})",
+                                if restarted { "started — " } else { "" },
                                 port,
                                 if unlocked { "unlocked" } else { "locked" }
                             ),
@@ -3016,6 +3124,21 @@ mod doctor_detail_tests {
         // relies on this — pin it so a future daemon plugin forces a review.
         let plugins = doctor_plugin_registry();
         assert_eq!(plugins.iter().filter(|p| p.is_daemon).count(), 1);
+    }
+
+    #[test]
+    fn doctor_plugin_paths_add_exe_on_windows() {
+        let home = std::path::Path::new(r"C:\Users\Administrator");
+        let plugins = doctor_plugin_registry();
+        let trust_local = plugins.iter().find(|p| p.is_daemon).unwrap();
+        assert!(
+            doctor_plugin_bin_path(home, trust_local, true).ends_with("trust-local.exe"),
+            "Windows doctor must look for the installed PE binary"
+        );
+        assert!(
+            doctor_plugin_bin_path(home, trust_local, false).ends_with("trust-local"),
+            "Unix doctor must keep the extensionless binary path"
+        );
     }
 }
 
