@@ -53,8 +53,7 @@ pub fn config_path() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(path));
     }
 
-    let home = dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())?;
-    let new_path = home.join(".aikey").join("config").join("config.json");
+    let new_path = crate::commands_account::resolve_aikey_dir().join("config").join("config.json");
 
     // Auto-migrate from legacy path (dirs::config_dir()/aikey/config.json)
     if !new_path.exists() {

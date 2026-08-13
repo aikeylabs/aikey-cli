@@ -81,8 +81,7 @@ pub struct TransitionEvent<'a> {
 /// Resolve the events log path. Returns None if home dir unavailable
 /// (best-effort; events are dropped silently in that case).
 fn events_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let dir = home.join(".aikey").join("logs");
+    let dir = crate::commands_account::resolve_aikey_dir().join("logs");
     let _ = std::fs::create_dir_all(&dir);
     Some(dir.join(EVENTS_FILENAME))
 }

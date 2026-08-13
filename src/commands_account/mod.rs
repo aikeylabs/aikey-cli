@@ -2388,8 +2388,7 @@ fn master_precondition_satisfied(
 }
 
 fn read_install_state() -> Option<serde_json::Value> {
-    let home = dirs::home_dir()?;
-    let state_path = home.join(".aikey").join("install-state.json");
+    let state_path = crate::commands_account::resolve_aikey_dir().join("install-state.json");
     let content = std::fs::read_to_string(&state_path).ok()?;
     serde_json::from_str(&content).ok()
 }

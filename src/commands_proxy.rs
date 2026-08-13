@@ -42,13 +42,9 @@ const DEFAULT_CONFIG_NAME: &str = "aikey-proxy.yaml";
 /// user typed wrong vault password; vault decrypt error was lost
 /// because stderr went to /dev/null.
 fn startup_log_path() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| {
-            h.join(".aikey")
-                .join("logs")
-                .join("aikey-proxy-startup.log")
-        })
-        .unwrap_or_else(|| PathBuf::from("/tmp/aikey-proxy-startup.log"))
+    crate::commands_account::resolve_aikey_dir()
+        .join("logs")
+        .join("aikey-proxy-startup.log")
 }
 
 /// Build a `StartOptions` struct from the existing CLI config-loading
@@ -1422,8 +1418,7 @@ pub fn handle_restart(
 
 /// Returns `~/.aikey/run/proxy.pid`.
 fn pid_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let home = dirs::home_dir().ok_or("cannot determine home directory")?;
-    Ok(home.join(".aikey").join("run").join(PID_FILENAME))
+    Ok(crate::commands_account::resolve_aikey_dir().join("run").join(PID_FILENAME))
 }
 
 fn read_pid() -> Option<u32> {
@@ -1593,8 +1588,8 @@ pub(crate) fn find_proxy_binary() -> Result<PathBuf, Box<dyn std::error::Error>>
     }
 
     // 3. ~/.aikey/bin/aikey-proxy
-    if let Some(home) = dirs::home_dir() {
-        let candidate = home.join(".aikey").join("bin").join(bin_name);
+    {
+        let candidate = crate::commands_account::resolve_aikey_dir().join("bin").join(bin_name);
         if candidate.exists() {
             return Ok(candidate);
         }
@@ -1921,8 +1916,8 @@ fn resolve_config(explicit: Option<&str>) -> Result<PathBuf, Box<dyn std::error:
     }
 
     // ~/.aikey/config/aikey-proxy.yaml  (system layer — single source of truth)
-    if let Some(home) = dirs::home_dir() {
-        let home_cfg = home.join(".aikey").join("config").join(DEFAULT_CONFIG_NAME);
+    {
+        let home_cfg = crate::commands_account::resolve_aikey_dir().join("config").join(DEFAULT_CONFIG_NAME);
         if home_cfg.exists() {
             return Ok(home_cfg);
         }

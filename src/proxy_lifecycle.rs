@@ -288,7 +288,8 @@ fn run_dir() -> std::io::Result<PathBuf> {
             "cannot determine home directory for ~/.aikey/run",
         )
     })?;
-    let dir = home.join(".aikey").join("run");
+    let _ = &home; // home retained for the error message above
+    let dir = crate::commands_account::resolve_aikey_dir().join("run");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }

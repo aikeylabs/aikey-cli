@@ -28,18 +28,17 @@ pub const SERVICE_NAME: &str = "aikey.trust-local";
 /// the CLI shell can build its TRUST_LOCAL_NOT_INSTALLED message with the exact
 /// path, matching the pre-refactor behavior.
 pub fn bin_path() -> PathBuf {
-    let home = if cfg!(windows) {
-        std::env::var("USERPROFILE").unwrap_or_default()
-    } else {
-        std::env::var("HOME").unwrap_or_default()
-    };
+    // resolve_aikey_dir() rather than a local HOME/USERPROFILE read: it is
+    // the single place that knows about AIKEY_HOME, so a relocated install
+    // (--install-dir / --sandbox) finds ITS trust-local instead of the
+    // default install's. The platform split it used to do by hand is the
+    // same one resolve_user_home() already does behind that helper.
     let binary_name = if cfg!(windows) {
         "trust-local.exe"
     } else {
         "trust-local"
     };
-    PathBuf::from(home)
-        .join(".aikey")
+    crate::commands_account::resolve_aikey_dir()
         .join("bin")
         .join(binary_name)
 }
