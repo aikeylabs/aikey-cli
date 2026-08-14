@@ -72,12 +72,93 @@ pub fn start() -> Result<(), String> {
     platform_run("start").and_then(|()| probe_healthz())
 }
 
-/// Stop the daemon. Windows additionally verifies that the exact installed
-/// binary's process tree is gone: Task Scheduler `/End` terminates only the
-/// hidden launcher on some Win10 hosts and can orphan the PyInstaller
-/// parent/worker pair while incorrectly reporting success.
+/// Stop the daemon, then verify on macOS that it actually stayed stopped.
+///
+/// Windows already verifies that the exact installed binary's process tree is
+/// gone: Task Scheduler `/End` terminates only the hidden launcher on some
+/// Win10 hosts and can orphan the PyInstaller parent/worker pair while
+/// incorrectly reporting success. macOS had no such check and needs one for a
+/// different reason — see `verify_launchd_stopped`.
+///
+/// Linux is unverified by design: `systemctl --user stop` is synchronous and
+/// systemd never restarts a unit that was stopped on purpose, so there is no
+/// respawn to catch.
 pub fn stop() -> Result<(), String> {
-    platform_run("stop")
+    platform_run("stop")?;
+    #[cfg(target_os = "macos")]
+    verify_launchd_stopped(current_uid())?;
+    Ok(())
+}
+
+/// Poll launchd until the job reports no pid — i.e. it is really down.
+///
+/// Why this check exists: macOS "stop" used to be `launchctl kill TERM`, which
+/// signals the process but leaves the job loaded, so `KeepAlive=<true/>` had
+/// launchd respawn it seconds later while we printed "stop succeeded" over the
+/// top of that (measured 2026-08-14: fresh pid ~10s later, serving again at
+/// t+20s, `runs` 40 -> 41). `launchctl_bootout` fixes the behaviour; this check
+/// is the fence that proves it, and it also catches any future path that
+/// reintroduces a signal-based stop.
+///
+/// Why we ask launchd and NOT /healthz: a healthz probe cannot tell "stopped"
+/// from "restarting". The PyInstaller binary needs ~20s to self-extract before
+/// it binds, so a respawn is invisible to any healthz poll shorter than that —
+/// during the diagnosis a 15s healthz-style window reported a clean stop for a
+/// service that was already coming back up. launchd's own job state is the only
+/// ruler that distinguishes the two.
+///
+/// Bugfix: workflow/CI/bugfix/20260814-trust-local-stop-does-not-stop-macos.md
+#[cfg(target_os = "macos")]
+fn verify_launchd_stopped(uid: u32) -> Result<(), String> {
+    let target = format!("gui/{}/{}", uid, SERVICE_NAME);
+    let deadline = Instant::now() + Duration::from_secs(STOP_VERIFY_SECS);
+    let mut last_pid = None;
+    while Instant::now() < deadline {
+        match launchd_job_pid(&target) {
+            Some(pid) => last_pid = Some(pid),
+            // No pid line (or the job isn't loaded at all) = really stopped.
+            None => return Ok(()),
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err(format!(
+        "trust-local is still running {}s after stop (launchd pid {}). The job \
+         is still loaded in launchd, which restarts it because the LaunchAgent \
+         sets KeepAlive. To stop it right now: launchctl bootout {}",
+        STOP_VERIFY_SECS,
+        last_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+        target,
+    ))
+}
+
+/// Ask launchd for the job's current pid. `None` = not running (no pid line, or
+/// the job is not loaded, or launchctl failed — all of which mean "not up").
+#[cfg(target_os = "macos")]
+fn launchd_job_pid(target: &str) -> Option<u32> {
+    let output = std::process::Command::new("launchctl")
+        .args(["print", target])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_launchd_pid(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Extract the top-level `pid = N` from `launchctl print` output.
+///
+/// Split out from the shell-out so the fence can exercise the parse against
+/// real captured output — the launchctl invocation itself is not hermetic.
+/// Only the job's own `pid =` key is a pid; the same dump also contains keys
+/// like `original pid`, `state = running`, and per-endpoint sub-dicts, so we
+/// match the exact key rather than the first number we see.
+#[cfg(target_os = "macos")]
+fn parse_launchd_pid(printed: &str) -> Option<u32> {
+    printed.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let value = trimmed.strip_prefix("pid =")?;
+        value.trim().parse::<u32>().ok()
+    })
 }
 
 /// Restart the daemon, then wait up to 30s for /healthz.
@@ -101,7 +182,7 @@ fn platform_run(verb: &str) -> Result<(), String> {
     match std::env::consts::OS {
         "macos" => match verb {
             "start" | "restart" => launchctl_kickstart(current_uid()),
-            "stop" => launchctl_kill(current_uid()),
+            "stop" => launchctl_bootout(current_uid()),
             _ => Err(format!("unknown verb '{}'", verb)),
         },
         "linux" => systemctl_user(verb),
@@ -140,16 +221,63 @@ pub(crate) fn current_uid() -> u32 {
     0
 }
 
+/// `~/Library/LaunchAgents/aikey.trust-local.plist` — the same path
+/// install_service.sh writes. Needed because a `stop` now unloads the job, so
+/// `start` may have to bootstrap it back in before kickstart can find it.
+fn launchd_plist_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{}.plist", SERVICE_NAME))
+}
+
 fn launchctl_kickstart(uid: u32) -> Result<(), String> {
+    let target = format!("gui/{}/{}", uid, SERVICE_NAME);
+    // `stop` boots the job out of the domain, so on the next start there may be
+    // nothing for kickstart to kick. Bootstrap it back in first; an "already
+    // loaded" error is the normal case (service was never stopped) and is not
+    // a failure — kickstart below is what actually (re)starts it either way.
+    let domain = format!("gui/{}", uid);
+    let plist = launchd_plist_path();
+    if plist.exists() {
+        let _ = run(
+            "launchctl",
+            &["bootstrap", &domain, &plist.to_string_lossy()],
+        );
+    }
     // -k flag = kill running and start again; idempotent for both "start" and
     // "restart" semantics.
-    let target = format!("gui/{}/{}", uid, SERVICE_NAME);
     run("launchctl", &["kickstart", "-k", &target])
 }
 
-fn launchctl_kill(uid: u32) -> Result<(), String> {
+/// Stop by UNLOADING the job, not by signalling it.
+///
+/// Why not `launchctl kill TERM` (what this did until 2026-08-14): the plist
+/// carries `KeepAlive=<true/>`, so signalling the process just makes launchd
+/// start it again — measured: "stop succeeded", then a fresh pid ~10s later and
+/// the service serving again at t+20s (`runs` 40 -> 41). Weakening the plist to
+/// `{SuccessfulExit: false}` does NOT fix it either: trust-local is a
+/// PyInstaller onefile, so launchd tracks the bootloader parent, and a
+/// signalled parent dies BY SIGNAL rather than exiting 0 — still an
+/// unsuccessful exit, still respawned (verified, `runs` 1 -> 2 -> 3).
+///
+/// `bootout` removes the job from the domain, so there is nothing left to
+/// respawn. `start` bootstraps it back in. Unconditional KeepAlive is then
+/// exactly right for every case that ISN'T a deliberate stop — a crash still
+/// self-heals, which the private-deployment brief requires.
+///
+/// Bugfix: workflow/CI/bugfix/20260814-trust-local-stop-does-not-stop-macos.md
+fn launchctl_bootout(uid: u32) -> Result<(), String> {
     let target = format!("gui/{}/{}", uid, SERVICE_NAME);
-    run("launchctl", &["kill", "TERM", &target])
+    match run("launchctl", &["bootout", &target]) {
+        Ok(()) => Ok(()),
+        // "Could not find specified service" = already unloaded. Stop is
+        // idempotent: the post-condition the caller asked for already holds.
+        Err(e) if e.contains("Could not find specified service") || e.contains("No such process") => {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn systemctl_user(verb: &str) -> Result<(), String> {
@@ -319,6 +447,16 @@ pub(crate) fn run(cmd: &str, args: &[&str]) -> Result<(), String> {
 /// timeout (service_handler.go) MUST stay above this.
 const PROBE_DEADLINE_SECS: u64 = 30;
 
+/// How long `stop` waits for launchd to report the job down.
+///
+/// Why 12s: the measured respawn appeared ~10s after the kill (launchd's own
+/// throttle floor), so the window has to clear that or the check would pass on
+/// the very gap it exists to catch. It is NOT sized against the ~20s binary
+/// boot time — we watch launchd's job state, which flips as soon as the job is
+/// spawned, long before the process finishes unpacking and binds :8801.
+#[cfg(target_os = "macos")]
+const STOP_VERIFY_SECS: u64 = 12;
+
 fn probe_healthz() -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(PROBE_DEADLINE_SECS);
     while Instant::now() < deadline {
@@ -371,6 +509,30 @@ mod tests {
         let p = bin_path();
         assert!(p.ends_with("trust-local") || p.ends_with("trust-local.exe"));
         assert!(p.to_string_lossy().contains(".aikey"));
+    }
+
+    /// Fence for the macOS stop-verification parse.
+    ///
+    /// Why it matters: if `parse_launchd_pid` ever returns None for a job that
+    /// IS running, `stop` goes back to reporting success over a live respawn —
+    /// the exact 2026-08-14 bug. The samples below are real `launchctl print`
+    /// output captured from a running aikey.trust-local, trimmed to the shapes
+    /// that matter (tab indentation preserved).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_launchd_pid_reads_the_job_pid_not_a_neighbouring_key() {
+        let running = "\tstate = running\n\truns = 43\n\tpid = 65264\n\t\tstate = active\n";
+        assert_eq!(parse_launchd_pid(running), Some(65264));
+
+        // A stopped job still prints its dump — with no pid line. Reading this
+        // as "running" would make every stop fail; reading a *running* job as
+        // stopped is the dangerous direction, covered above.
+        let stopped = "\tstate = not running\n\truns = 43\n\tlast exit code = 0\n";
+        assert_eq!(parse_launchd_pid(stopped), None);
+
+        // Keys that merely CONTAIN a number must not be mistaken for the pid.
+        let decoys = "\toriginal pid = 999\n\tstate = not running\n\truns = 43\n";
+        assert_eq!(parse_launchd_pid(decoys), None);
     }
 
     #[test]
