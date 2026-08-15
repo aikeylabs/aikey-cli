@@ -126,7 +126,9 @@ fn verify_launchd_stopped(uid: u32) -> Result<(), String> {
          is still loaded in launchd, which restarts it because the LaunchAgent \
          sets KeepAlive. To stop it right now: launchctl bootout {}",
         STOP_VERIFY_SECS,
-        last_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+        last_pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "?".into()),
         target,
     ))
 }
@@ -273,7 +275,9 @@ fn launchctl_bootout(uid: u32) -> Result<(), String> {
         Ok(()) => Ok(()),
         // "Could not find specified service" = already unloaded. Stop is
         // idempotent: the post-condition the caller asked for already holds.
-        Err(e) if e.contains("Could not find specified service") || e.contains("No such process") => {
+        Err(e)
+            if e.contains("Could not find specified service") || e.contains("No such process") =>
+        {
             Ok(())
         }
         Err(e) => Err(e),
