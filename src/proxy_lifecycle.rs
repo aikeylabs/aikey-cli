@@ -1646,7 +1646,11 @@ mod tests {
             tmp.path().join("proxy-meta.json"),
             Some(child),
         );
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Release gates run this alongside more than a thousand tests and
+        // cross-repository workers. Under that load macOS can leave a newly
+        // spawned shell unscheduled for over two seconds. Keep the assertion
+        // bounded, but give the child a realistic scheduling budget.
+        let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {
             if let Some(status) = guard.try_wait().unwrap() {
                 break status;

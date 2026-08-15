@@ -643,6 +643,18 @@ struct DoctorPlugin {
     is_daemon: bool,
 }
 
+/// The `aikey app install` slug of the compliance detector.
+///
+/// Why a named constant: this string is a cross-process contract — it is the
+/// `app_records.slug` the vault stores, the directory aikey-proxy resolves the
+/// filter binary from (`internal/supervisor/filter_hook.go`
+/// `complianceDetectorSlug`), and the key `aikey doctor` reads the filter toggle
+/// with. It was previously a bare literal in the plugin registry; the compliance
+/// health row needs the same value, and two literals two hundred lines apart is
+/// exactly how the CLI ends up reading a toggle for an app the proxy does not
+/// spawn. Pinned to `FIRST_PARTY_SLUGS` by a unit test.
+pub const COMPLIANCE_DETECTOR_SLUG: &str = "ai-compliance-detector";
+
 /// The optional first-party plugin apps `aikey doctor` reports (A2).
 ///
 /// Kept as one table so the doctor section, this list, and the app registry
@@ -661,7 +673,7 @@ fn doctor_plugin_registry() -> Vec<DoctorPlugin> {
         DoctorPlugin {
             label: "compliance-detector",
             rel_path: ".aikey/apps/ai-compliance-detector/bin/ai-compliance-detector",
-            install_slug: "ai-compliance-detector",
+            install_slug: COMPLIANCE_DETECTOR_SLUG,
             is_daemon: false,
         },
         DoctorPlugin {
@@ -847,6 +859,711 @@ pub fn fallback_policy_report(
         hint,
         rows,
     }
+}
+
+// ── Compliance-detection health (aikey doctor §7.5) ────────────────────────
+//
+// WHY THIS EXISTS. Four P0s fixed on 2026-08-13 all shared one shape: the
+// compliance filter was *configured* but not *effective*, and nothing outside
+// the process said so.
+//
+//   - 20260813-corrupt-address-asset-reports-not-degraded  (a dictionary layer
+//     landed but parsed to zero entries; the health flag still said healthy)
+//   - 20260813-childhook-write-before-deadline-wedges-main-path  (the detector
+//     child stopped answering; requests fell through un-inspected)
+//   - 20260813-pipe-input-cap-truncates-silently  (content past 16 KiB was
+//     forwarded to the upstream LLM without ever being scanned)
+//   - 20260813-audit-only-pack-still-enforces  (a pack lifecycle state whose
+//     product meaning is "observe only" was executing like `active`)
+//
+// Every one of those signals is now readable from outside the proxy — but the
+// only place that READS them was the Cluster release gate
+// (`workflow/CI/test/e2e/compliance-migration-cluster-live.sh`). Personal /
+// Trial / Production had the endpoints and no door. Under 版型意识 a diagnostic
+// that only one edition can perform is a bug, and `aikey doctor` is the one
+// self-check entry point every edition ships, so it is the correct door.
+//
+// 🔴 SOURCES ARE EXISTING ENDPOINTS ONLY (慎重新建 API):
+//   - GET /admin/compliance/packs      → the LIVE detector child, over IPC:
+//     `available`, `address_assets`, `pulled[].status`, `rules_skipped_count`
+//   - GET /v1/diagnostics/pipeline     → the PROXY's own counters:
+//     `mask_restore.{status,tool_block_scan,scan_truncated_pieces,scan_skipped_bytes}`
+//   - the vault (`app_records.filter_stages` + `compliance.master_policy`)
+//     → what the user/admin DECLARED
+// Both endpoints live on the same aikey-proxy binary that every edition runs,
+// so this row behaves identically on all four.
+//
+// 🔴 THE VERDICT IS "DECLARED vs EFFECTIVE", NOT "IS IT INSTALLED". The old row
+// checked only that the binary existed on disk, which is green on a box whose
+// detector is crash-looping. Presence is a precondition, not a health signal.
+
+/// Severity of the compliance row. Three levels, because the two-level
+/// ok/fail of `emit` cannot express the distinction the four P0s turn on:
+/// a capability that is deliberately off is fine, a capability that is
+/// silently watered down is not fine but is not an outage either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComplianceSeverity {
+    /// Healthy, or deliberately off. Renders green; never fails doctor.
+    Ok,
+    /// 🟡 The filter runs but its coverage is reduced or its enforcement is
+    /// bypassed — including "we could not find out" (an unknown must never
+    /// render as healthy: that is the exact false-green these P0s were).
+    Warn,
+    /// 🔴 Declared ON but demonstrably not filtering. Main path unprotected.
+    Error,
+}
+
+impl ComplianceSeverity {
+    /// Machine-readable tag for `--json` consumers, matching the vocabulary the
+    /// existing local-server row already emits (`"ok"` / `"warn"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComplianceSeverity::Ok => "ok",
+            ComplianceSeverity::Warn => "warn",
+            ComplianceSeverity::Error => "error",
+        }
+    }
+
+    /// Only `Error` bubbles into doctor's overall pass/fail. A watered-down
+    /// filter is reported loudly on its own row but does not turn the summary
+    /// red — same policy the local-server row established.
+    pub fn is_ok_for_summary(self) -> bool {
+        self != ComplianceSeverity::Error
+    }
+
+    fn max(self, other: Self) -> Self {
+        if (other as u8) > (self as u8) {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// One rendered `compliance` doctor row: a verdict line plus evidence sub-rows.
+/// Same shape as `FallbackPolicyReport` above, deliberately — doctor already has
+/// a "summary line + indented evidence" idiom and this is not a new one.
+pub struct ComplianceHealthReport {
+    pub severity: ComplianceSeverity,
+    /// The summary line the user reads. Self-contained enough to paste into a
+    /// ticket.
+    pub detail: String,
+    /// Cause + the next action that fixes it. Required on every non-Ok verdict.
+    pub hint: Option<String>,
+    /// `(label, value)` evidence rows, rendered indented under the verdict.
+    pub rows: Vec<(String, String)>,
+}
+
+/// What the user/admin declared about compliance detection, read from the vault.
+/// A single enum rather than two loose booleans because the three cases need
+/// three different hints and 尽量避免由多个值来决定一个开关.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComplianceToggle {
+    /// Neither the local toggle nor an org mandate is on.
+    Off,
+    /// `app_records.filter_stages` is non-NULL on this vault.
+    OnLocal,
+    /// `compliance.master_policy.enabled` — the org requires it; the proxy
+    /// force-spawns the detector even when the local toggle is NULL. Kept
+    /// distinct from `OnLocal` because the user CANNOT fix a mandated host by
+    /// themselves, so the hint must point at their admin, not at a CLI command.
+    OnMandated,
+}
+
+impl ComplianceToggle {
+    /// Resolve from the two vault reads. Mandate wins: when the org requires
+    /// compliance the proxy runs the detector regardless of the local column,
+    /// so reporting "off" because `filter_stages` is NULL would describe a host
+    /// that is in fact filtering every request.
+    pub fn resolve(local_stages_present: bool, org_mandated: bool) -> Self {
+        match (org_mandated, local_stages_present) {
+            (true, _) => ComplianceToggle::OnMandated,
+            (false, true) => ComplianceToggle::OnLocal,
+            (false, false) => ComplianceToggle::Off,
+        }
+    }
+
+    fn is_on(self) -> bool {
+        self != ComplianceToggle::Off
+    }
+}
+
+/// `degraded_reason` → (what it means for the user, what actually fixes it).
+///
+/// 🔴 WHY A TABLE AND NOT `if` BRANCHES. These are the causes the proxy
+/// ENUMERATES (`apphook.DegradeReason*`), they cross a process boundary, and each
+/// one has a DIFFERENT remedy — telling someone to reinstall a binary that is
+/// present and running (the `write_timeout` wedge) sends them round a loop that
+/// cannot terminate. A table keeps "one cause, one remedy" checkable at a glance
+/// and makes an unmapped cause obvious instead of silently falling into a
+/// neighbour's branch (不要写胶水逻辑，穷举用配置表).
+///
+/// Not exhaustive over every string the proxy can emit, on purpose: the dynamic
+/// causes carry an OS error verbatim (`not_installed: <stat error>`,
+/// `write_failed: …`), and flattening those would throw away the only detail
+/// that identifies them. They fall to `filter_worker_remedy`'s passthrough.
+const FILTER_WORKER_REMEDIES: &[(&str, &str, &str)] = &[
+    (
+        "write_timeout",
+        "WEDGED — the child process is alive but stopped reading its pipe, so requests are never inspected",
+        "recover with: aikey proxy restart — the child IS running, so reinstalling it will not help. \
+         Then grep ~/.aikey/logs/aikey-proxy/current.jsonl for proxy.apphook.degraded",
+    ),
+    (
+        "not_started",
+        "NEVER STARTED — no detector child process was spawned on this proxy generation",
+        "the child was never launched (missing/unreadable binary, or the proxy started before it was installed). \
+         Fix with: aikey app install ai-compliance-detector && aikey proxy restart",
+    ),
+    (
+        "restarting",
+        "RESTARTING — a respawn is in flight",
+        "transient: re-run aikey doctor in a few seconds. If it persists the child is crash-looping — \
+         grep ~/.aikey/logs/aikey-proxy/current.jsonl for proxy.apphook.degraded",
+    ),
+];
+
+/// Resolves one worker's `degraded_reason` into (meaning, remedy).
+fn filter_worker_remedy(reason: &str) -> (String, String) {
+    for (key, meaning, fix) in FILTER_WORKER_REMEDIES {
+        if reason == *key {
+            return ((*meaning).to_string(), (*fix).to_string());
+        }
+    }
+    // Unmapped or prefixed cause. Report it VERBATIM rather than collapsing it to
+    // "unknown": the proxy put an OS error in there and it is the only thing that
+    // identifies the failure (禁止静默 return 默认值).
+    (
+        format!("NOT ANSWERING — the proxy reports: {reason}"),
+        "recover with: aikey proxy restart — then grep ~/.aikey/logs/aikey-proxy/current.jsonl \
+         for proxy.apphook.degraded to see why"
+            .to_string(),
+    )
+}
+
+/// The generic hint used whenever the per-worker cause cannot be read (older
+/// proxy, or the endpoint did not answer). Kept as one constant so the
+/// "we could not find out" wording cannot drift between the two places that
+/// need it.
+const FILTER_FAULT_GENERIC_HINT: &str =
+    "the proxy could not reach the detector child (crashed / wedged / version mismatch). \
+     Recover with: aikey proxy restart — then grep ~/.aikey/logs/aikey-proxy/current.jsonl \
+     for proxy.apphook.degraded to see why";
+
+/// Builds the `compliance` doctor row.
+///
+/// Pure: every input is passed in so all five states below are reachable from a
+/// unit test without a live proxy, a live detector, or a vault — the states that
+/// matter most (wedged child, corrupt dictionary) are the ones you cannot stage
+/// on a developer box.
+///
+/// - `toggle`   — what the vault says (see `ComplianceToggle`).
+/// - `installed`— detector binary present on disk.
+/// - `packs`    — `GET /admin/compliance/packs` envelope; `None` = unreachable
+///                / timed out / endpoint absent on an older proxy.
+/// - `pipeline` — `GET /v1/diagnostics/pipeline`; `None` = same.
+pub fn compliance_health_report(
+    toggle: ComplianceToggle,
+    installed: bool,
+    packs: Option<&serde_json::Value>,
+    pipeline: Option<&crate::commands_proxy::PipelineDiagnosticsWire>,
+) -> ComplianceHealthReport {
+    // ── State 1: off ────────────────────────────────────────────────────
+    // Not an error, and deliberately not silent. A health panel that says
+    // nothing leaves the user unable to tell "compliance filtering isn't
+    // running" from "doctor doesn't check it" — the reason the plugin rows
+    // started being printed when absent in the first place.
+    if !toggle.is_on() {
+        return ComplianceHealthReport {
+            severity: ComplianceSeverity::Ok,
+            detail: if installed {
+                "disabled — detector installed but not enabled for filtering".to_string()
+            } else {
+                "disabled — optional compliance filter not installed".to_string()
+            },
+            hint: Some(
+                "this is a normal state; enable with: aikey app install ai-compliance-detector"
+                    .to_string(),
+            ),
+            rows: Vec::new(),
+        };
+    }
+
+    let declared = match toggle {
+        ComplianceToggle::OnMandated => "enabled by org policy",
+        _ => "enabled",
+    };
+
+    // ── State 2: declared ON, binary missing ────────────────────────────
+    // 🔴 The single worst state: the console/config promises filtering and not
+    // one byte is being inspected. On a MANDATED org it is worse still — the
+    // proxy refuses the whole data plane with 501 rather than forward
+    // unfiltered (supervisor `declaredButMissing`), so the user's `claude` is
+    // also broken and this row explains why.
+    if !installed {
+        return ComplianceHealthReport {
+            severity: ComplianceSeverity::Error,
+            detail: format!(
+                "{declared} but the detector binary is MISSING — nothing is being filtered"
+            ),
+            hint: Some(match toggle {
+                ComplianceToggle::OnMandated => "your organization mandates compliance detection \
+                     and the binary is absent, so the proxy refuses all traffic (501). \
+                     Reinstall it with: aikey app install ai-compliance-detector"
+                    .to_string(),
+                _ => "the toggle is on but ~/.aikey/apps/ai-compliance-detector/bin/ is empty. \
+                     Reinstall with: aikey app install ai-compliance-detector"
+                    .to_string(),
+            }),
+            rows: Vec::new(),
+        };
+    }
+
+    // ── State 3: declared ON, binary present, cannot read the live state ──
+    // 🟡 An UNKNOWN, reported as an unknown. Rendering this green would be the
+    // same false-green the four P0s were: the wedged-child failure mode
+    // (20260813-childhook-write-before-deadline) surfaces exactly here, because
+    // a child that stopped reading its pipe also stops answering ListPacks.
+    let Some(packs) = packs else {
+        return ComplianceHealthReport {
+            severity: ComplianceSeverity::Warn,
+            detail: format!("{declared} · UNKNOWN — cannot read the live filter state"),
+            hint: Some(
+                "the proxy did not answer GET /admin/compliance/packs (not running, or a build \
+                 without that route). Start it with: aikey proxy start — then re-run aikey doctor"
+                    .to_string(),
+            ),
+            rows: Vec::new(),
+        };
+    };
+
+    // ── State 4: declared ON, binary present, live child not answering ──
+    // 🔴 `available:false` with the binary on disk means the proxy asked the
+    // detector child and got nothing: crashed, wedged, protocol-mismatched, or
+    // never spawned. Requests keep flowing (fail-open, by design) — un-inspected.
+    let available = packs
+        .get("available")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !available {
+        // 🔴 THE B5/B36 DISCRIMINATION. `available:false` is ONE observation with
+        // several causes, and until the proxy started publishing per-worker health
+        // this row had to lump them together: "crashed / wedged / version
+        // mismatch", with a single guessed remedy. The two that matter most look
+        // identical from here and need opposite actions —
+        //   write_timeout  the child is ALIVE and running; restart the proxy,
+        //                  reinstalling changes nothing
+        //   not_started    nothing was ever spawned; the binary/install is the
+        //                  problem, restarting alone may not help
+        // — so the cause now comes from /v1/diagnostics/pipeline `filter_hook`.
+        // An older proxy omits that block and keeps exactly the old wording.
+        let down: Vec<&crate::commands_proxy::FilterWorkerWire> = pipeline
+            .and_then(|d| d.filter_hook.as_ref())
+            .map(|f| f.workers.iter().filter(|w| !w.healthy).collect())
+            .unwrap_or_default();
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for w in &down {
+            let (meaning, _) = filter_worker_remedy(&w.degraded_reason);
+            rows.push((
+                format!("worker {}", w.index),
+                format!("{meaning} (restarts so far: {})", w.restart_count),
+            ));
+        }
+        let (cause_suffix, hint) = match down.first() {
+            // The raw enumerated reason goes in the summary line so it is
+            // greppable and pasteable into a ticket; the human sentence is in the
+            // evidence row above.
+            Some(first) => (
+                format!(" ({})", first.degraded_reason),
+                filter_worker_remedy(&first.degraded_reason).1,
+            ),
+            None => (String::new(), FILTER_FAULT_GENERIC_HINT.to_string()),
+        };
+        return ComplianceHealthReport {
+            severity: ComplianceSeverity::Error,
+            detail: format!(
+                "{declared} and installed, but the live detector is NOT ANSWERING{cause_suffix} — \
+                 requests are flowing un-inspected"
+            ),
+            hint: Some(hint),
+            rows,
+        };
+    }
+
+    // ── State 5: live and answering — grade the coverage ────────────────
+    let report = packs.get("report");
+    let mut severity = ComplianceSeverity::Ok;
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut faults: Vec<String> = Vec::new();
+
+    // Packs loaded — the baseline "is anything actually detecting" evidence.
+    let pulled = report
+        .and_then(|r| r.get("pulled"))
+        .and_then(|v| v.as_array());
+    let built_in_count = report
+        .and_then(|r| r.get("built_in"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    rows.push((
+        "packs".to_string(),
+        format!(
+            "{} built-in · {} distributed",
+            built_in_count,
+            pulled.map(|a| a.len()).unwrap_or(0)
+        ),
+    ));
+
+    // 🟡 audit_only packs — bugfix 20260813-audit-only-pack-still-enforces.
+    // The console publishes a pack in two steps so an admin can watch a round
+    // before enforcing. That is a deliberate, correct action — but while it
+    // lasts, those rules RECORD and do not intervene, and an operator reading a
+    // green "compliance ok" would reasonably assume otherwise. Naming it is the
+    // whole point: the bug was that the state existed in the UI and had no
+    // effect; the mirror-image failure is having the effect and not showing it.
+    let audit_only: Vec<String> = pulled
+        .map(|a| {
+            a.iter()
+                .filter(|p| p.get("status").and_then(|s| s.as_str()) == Some("audit_only"))
+                .filter_map(|p| p.get("name").and_then(|s| s.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !audit_only.is_empty() {
+        severity = severity.max(ComplianceSeverity::Warn);
+        faults.push(format!("{} pack(s) observe-only", audit_only.len()));
+        rows.push((
+            "audit-only".to_string(),
+            format!(
+                "{} — recording findings, NOT enforcing: {}",
+                audit_only.len(),
+                audit_only.join(", ")
+            ),
+        ));
+    }
+
+    // 🟡 Rules that were shipped but could not be compiled (RE2 rejects
+    // lookahead/backreferences). Present in the pack, absent from the engine.
+    let skipped = report
+        .and_then(|r| r.get("rules_skipped_count"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if skipped > 0 {
+        severity = severity.max(ComplianceSeverity::Warn);
+        faults.push(format!("{skipped} rule(s) inactive"));
+        rows.push((
+            "rules skipped".to_string(),
+            format!("{skipped} shipped rule(s) failed to compile and are NOT detecting"),
+        ));
+    }
+
+    // 🟡 CN_ADDRESS opt-in dictionary — bugfix
+    // 20260813-corrupt-address-asset-reports-not-degraded.
+    //
+    // 🔴 THE DISCRIMINATION THAT MATTERS: `degraded == true` is ALSO the resting
+    // state of every host that simply never opted into the big dictionary (an
+    // absent assets dir degrades all three layers by design). Treating that as a
+    // fault would paint most Personal installs red and train users to ignore the
+    // row. The dangerous state the bugfix was about is the MIDDLE one — assets
+    // were delivered and a layer came back with zero usable entries (truncated
+    // download, half-written file, version skew). So: some layers loaded AND
+    // some did not ⇒ partial landing ⇒ warn; nothing loaded at all ⇒ not
+    // provisioned ⇒ informational.
+    if let Some(assets) = report.and_then(|r| r.get("address_assets")) {
+        let village = assets
+            .get("village_stems")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let community = assets
+            .get("community_names")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let degraded = assets
+            .get("degraded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let missing: Vec<String> = assets
+            .get("missing_layers")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let anything_loaded = village > 0 || community > 0;
+        if degraded && anything_loaded {
+            severity = severity.max(ComplianceSeverity::Warn);
+            faults.push("address dictionary partial".to_string());
+            rows.push((
+                "address dict".to_string(),
+                format!(
+                    "DEGRADED — {} village stems / {} community names loaded; unusable layer(s): {}",
+                    village,
+                    community,
+                    if missing.is_empty() {
+                        "(unnamed)".to_string()
+                    } else {
+                        missing.join(", ")
+                    }
+                ),
+            ));
+        } else if degraded {
+            rows.push((
+                "address dict".to_string(),
+                "opt-in big dictionary not installed (built-in minimal set in use)".to_string(),
+            ));
+        } else {
+            rows.push((
+                "address dict".to_string(),
+                format!("{village} village stems · {community} community names"),
+            ));
+        }
+    }
+
+    // Proxy-side scan SCOPE + fidelity. Absent block = older proxy; say so
+    // rather than implying the scope is fine.
+    match pipeline {
+        None => {
+            severity = severity.max(ComplianceSeverity::Warn);
+            faults.push("scan scope unknown".to_string());
+            rows.push((
+                "scan scope".to_string(),
+                "UNKNOWN — GET /v1/diagnostics/pipeline did not answer".to_string(),
+            ));
+        }
+        Some(diag) => {
+            let mr = &diag.mask_restore;
+            rows.push((
+                "scan scope".to_string(),
+                format!(
+                    "roles [{}] · tool blocks {}",
+                    mr.scan_roles.join(", "),
+                    if mr.tool_block_scan.is_empty() {
+                        "unreported"
+                    } else {
+                        &mr.tool_block_scan
+                    }
+                ),
+            ));
+            // 🟡 A deliberately-off lane is still a hole an operator must be able
+            // to read from outside the process; agent tool payloads (file reads,
+            // pasted logs) are where the sensitive text actually lives.
+            if mr.tool_block_scan == "off" {
+                severity = severity.max(ComplianceSeverity::Warn);
+                faults.push("tool blocks unscanned".to_string());
+                rows.push((
+                    "tool blocks".to_string(),
+                    "OFF — agent tool payloads bypass compliance entirely".to_string(),
+                ));
+            }
+            // 🟡 Truncation — bugfix 20260813-pipe-input-cap-truncates-silently.
+            // Anything past the 16 KiB detector input cap reached the upstream
+            // LLM uninspected, so every audit number for this proxy generation
+            // is a lower bound rather than a measurement.
+            if mr.scan_truncated_pieces > 0 {
+                severity = severity.max(ComplianceSeverity::Warn);
+                faults.push("content truncated".to_string());
+                rows.push((
+                    "unscanned".to_string(),
+                    format!(
+                        "{} content piece(s) exceeded the 16 KiB scan cap — {} byte(s) reached the \
+                         upstream LLM uninspected (generation {})",
+                        mr.scan_truncated_pieces, mr.scan_skipped_bytes, diag.generation_id
+                    ),
+                ));
+            }
+            // 🔴 Filter child-process health + verdict cache (review B5/B36/B6).
+            //
+            // `available:true` above only proves that ONE unit answered a ListPacks
+            // call. On a Production/Cluster pool the surviving worker takes that
+            // call, so a pool at 1/2 keeps reporting itself up. That is the false
+            // green this block exists to break.
+            //
+            // 🔴 THE CONSEQUENCE SENTENCE COMES FROM THE PROXY, VERBATIM. It used
+            // to be re-derived here ("dispatch is round-robin and does not skip
+            // dead workers"), and on 2026-08-14 the proxy stopped doing that
+            // (review finding B39: dispatch now skips unfit workers, so a partial
+            // pool loses headroom rather than coverage) — leaving this row stating
+            // the opposite of what the data plane does. `filter_hook.reason` is
+            // specified as the one human sentence every surface renders as-is, so
+            // rendering it is what keeps the two from drifting again. doctor still
+            // owns the severity and the per-worker remedies; it does not own the
+            // description of dispatch behaviour.
+            match diag.filter_hook.as_ref() {
+                None => {
+                    // An unknown must never render as healthy — the same rule the
+                    // `scan scope` row above follows.
+                    severity = severity.max(ComplianceSeverity::Warn);
+                    faults.push("detector process health unknown".to_string());
+                    rows.push((
+                        "detector".to_string(),
+                        "UNKNOWN — this proxy build does not report per-worker filter health, so \
+                         'the child is wedged' cannot be distinguished from 'the child is fine'. \
+                         Upgrade the proxy to see it."
+                            .to_string(),
+                    ));
+                }
+                Some(fh) => {
+                    match fh.status.as_str() {
+                        "ok" => rows.push((
+                            "detector".to_string(),
+                            format!(
+                                "{}/{} worker process(es) answering",
+                                fh.workers_healthy, fh.workers_total
+                            ),
+                        )),
+                        "partial" | "degraded" => {
+                            severity = severity.max(ComplianceSeverity::Warn);
+                            faults.push(format!(
+                                "{}/{} detector worker(s) down",
+                                fh.workers_total - fh.workers_healthy,
+                                fh.workers_total
+                            ));
+                            rows.push((
+                                "detector".to_string(),
+                                format!(
+                                    "{}/{} worker process(es) answering — {}",
+                                    fh.workers_healthy, fh.workers_total, fh.reason
+                                ),
+                            ));
+                            for w in fh.workers.iter().filter(|w| !w.healthy) {
+                                let (meaning, fix) = filter_worker_remedy(&w.degraded_reason);
+                                rows.push((
+                                    format!("worker {}", w.index),
+                                    format!(
+                                        "{meaning} (restarts so far: {}) · {fix}",
+                                        w.restart_count
+                                    ),
+                                ));
+                            }
+                        }
+                        // "inactive" here would contradict `available:true` (the
+                        // detector just answered), and an unrecognised status is a
+                        // contract drift. Neither may be silently treated as fine.
+                        other => {
+                            severity = severity.max(ComplianceSeverity::Warn);
+                            faults.push("detector process health unknown".to_string());
+                            rows.push((
+                                "detector".to_string(),
+                                format!(
+                                    "UNKNOWN — the proxy reported filter status {:?} while the \
+                                     detector was answering; these disagree, so worker health \
+                                     cannot be trusted",
+                                    other
+                                ),
+                            ));
+                        }
+                    }
+
+                    // 🟡 Verdict cache switched off at runtime (review B6). The
+                    // BEHAVIOUR is correct and deliberate: a detector that cannot
+                    // state which ruleset it is using must not have its verdicts
+                    // replayed, or a rule the admin just deleted keeps masking. What
+                    // was missing is that the price — every content piece re-scanned
+                    // every turn, a ~96% cache hit rate down to 0 — was invisible,
+                    // so the only symptom an operator ever saw was "the proxy got
+                    // slower" with nothing to attribute it to.
+                    if fh.verdict_cache.status == "suspended" {
+                        severity = severity.max(ComplianceSeverity::Warn);
+                        faults.push("verdict cache disabled".to_string());
+                        // The sentence comes from the proxy verbatim: it owns the
+                        // one judgment function for this state, and re-deriving the
+                        // wording here is how the two surfaces start disagreeing.
+                        let mut detail = if fh.verdict_cache.reason.is_empty() {
+                            "DISABLED — the detector cannot state which ruleset is live, so every \
+                             content piece is re-scanned"
+                                .to_string()
+                        } else {
+                            fh.verdict_cache.reason.clone()
+                        };
+                        if fh.verdict_cache.cause == "unsupported_op_list_packs" {
+                            detail.push_str(
+                                " Upgrade with: aikey app install ai-compliance-detector && aikey proxy restart",
+                            );
+                        }
+                        rows.push(("verdict cache".to_string(), detail));
+                    }
+                }
+            }
+
+            // 🟡 Masking works but the models are not returning placeholders, so
+            // users see `{{ADDR_1}}` instead of their own text. Not a security
+            // hole — a usability one — hence warn, and only once the proxy has
+            // enough samples to have a verdict at all.
+            if mr.status == "degraded" {
+                severity = severity.max(ComplianceSeverity::Warn);
+                faults.push("mask restore degraded".to_string());
+                rows.push((
+                    "mask restore".to_string(),
+                    format!(
+                        "DEGRADED — {}",
+                        if mr.reason.is_empty() {
+                            "too few mask placeholders are coming back intact"
+                        } else {
+                            mr.reason.as_str()
+                        }
+                    ),
+                ));
+            }
+        }
+    }
+
+    let (detail, hint) = if faults.is_empty() {
+        (
+            format!("{declared} · live filter answering · full coverage"),
+            None,
+        )
+    } else {
+        (
+            format!(
+                "{declared} · live filter answering · REDUCED COVERAGE: {}",
+                faults.join(" · ")
+            ),
+            Some(
+                "the filter is running but not inspecting everything it appears to. Read the rows \
+                 above for which layer is reduced; each is either an admin choice (audit-only \
+                 packs, tool-block lane) or a provisioning gap (dictionary, skipped rules)."
+                    .to_string(),
+            ),
+        )
+    };
+
+    ComplianceHealthReport {
+        severity,
+        detail,
+        hint,
+        rows,
+    }
+}
+
+/// One `emit(...)` call, as data: `(label, ok, detail, hint)`.
+///
+/// Why this exists rather than looping over `report.rows` at the call site:
+/// `emit` derives BOTH surfaces from these four values — the human line
+/// (`icon label detail` + dim hint) and the `--json` object (`{check, ok,
+/// detail, hint}`). Materialising the argument tuples lets a unit test assert
+/// what the user actually reads in both modes from the same values the renderer
+/// consumes, instead of re-describing the JSON shape in the test and letting the
+/// two drift.
+pub type DoctorRow = (String, bool, String, Option<String>);
+
+/// Flattens a `ComplianceHealthReport` into the rows doctor emits: the verdict
+/// row followed by its evidence rows. Evidence rows are indented (leading space)
+/// — `emit` renders a whitespace-prefixed label as a dim sub-branch of the
+/// preceding check and never bubbles it into the overall pass/fail, so the
+/// failure is called out once, by its parent.
+pub fn compliance_doctor_rows(report: &ComplianceHealthReport) -> Vec<DoctorRow> {
+    let mut out: Vec<DoctorRow> = vec![(
+        "compliance".to_string(),
+        report.severity.is_ok_for_summary(),
+        report.detail.clone(),
+        report.hint.clone(),
+    )];
+    for (label, value) in &report.rows {
+        out.push((format!(" {label}"), true, value.clone(), None));
+    }
+    out
 }
 
 /// Runs the doctor checks. Returns `true` iff there is ≥1 configured per-account
@@ -1672,11 +2389,17 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
             );
         }
 
-        // ── compliance filters (subprocess, presence-only) ──
-        // The proxy spawns these per request (stdin/stdout frames), so there
-        // is no port to probe — presence of the binary is the honest signal
-        // that the proxy *can* spawn it. Looped from the registry's
-        // non-daemon entries so adding a filter app is a one-line table edit.
+        // ── compliance filters (subprocess) ──
+        // The proxy spawns these per request (stdin/stdout frames), so there is
+        // no port of their own to probe. Presence of the binary is a
+        // PRECONDITION row, kept as-is. Looped from the registry's non-daemon
+        // entries so adding a filter app is a one-line table edit.
+        //
+        // 🔴 Presence is NOT health. A crash-looping or wedged detector has its
+        // binary sitting on disk exactly like a working one, so this loop alone
+        // was green on every failure the 2026-08-13 P0s describe. The `compliance`
+        // row below is the health verdict; these rows only answer "can the proxy
+        // spawn it at all".
         for p in plugins.iter().filter(|p| !p.is_daemon) {
             if doctor_plugin_bin_path(&home, p, cfg!(windows)).exists() {
                 emit(p.label, true, "installed (proxy-spawned filter)", None);
@@ -1688,6 +2411,50 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
                     "not installed (optional compliance filter)",
                     Some(&hint),
                 );
+            }
+        }
+
+        // ── 7.6. Compliance detection health (declared vs effective) ─────
+        //
+        // See the block comment on `compliance_health_report` for why this
+        // exists and which four P0s it closes. Rendering only — every verdict
+        // is made by the pure function so all five states are unit-tested.
+        {
+            // Declared: read from the vault. Plaintext columns/keys, no master
+            // password — doctor stays zero-prompt (交互简洁性优先).
+            let toggle = ComplianceToggle::resolve(
+                crate::commands_app::get_app_filter_stages(COMPLIANCE_DETECTOR_SLUG)
+                    .ok()
+                    .flatten()
+                    .is_some(),
+                crate::storage::compliance_master_enabled(),
+            );
+            let detector = plugins
+                .iter()
+                .find(|p| p.install_slug == COMPLIANCE_DETECTOR_SLUG);
+            let installed = detector
+                .map(|p| doctor_plugin_bin_path(&home, p, cfg!(windows)).exists())
+                .unwrap_or(false);
+
+            // Probe the live proxy ONLY when compliance is declared on. A user
+            // who never enabled it pays zero network cost, and the "off" verdict
+            // does not depend on the proxy being up.
+            let (packs, pipeline) = if toggle.is_on() {
+                (
+                    crate::commands_proxy::fetch_compliance_packs().ok(),
+                    crate::commands_proxy::fetch_pipeline_diagnostics().ok(),
+                )
+            } else {
+                (None, None)
+            };
+
+            let report =
+                compliance_health_report(toggle, installed, packs.as_ref(), pipeline.as_ref());
+            // Warn renders green-but-loud (ok=true + the state word spelled out
+            // in `detail`), matching the model-mapping row's established
+            // treatment of `degraded`; only Error turns the summary red.
+            for (label, ok, detail, hint) in compliance_doctor_rows(&report) {
+                emit(&label, ok, &detail, hint.as_deref());
             }
         }
     }
@@ -3315,6 +4082,969 @@ mod doctor_detail_tests {
         // relies on this — pin it so a future daemon plugin forces a review.
         let plugins = doctor_plugin_registry();
         assert_eq!(plugins.iter().filter(|p| p.is_daemon).count(), 1);
+    }
+
+    // ── Compliance-detection health (§7.6) ──────────────────────────
+    //
+    // These pin the five states a user can be in and, for each, the exact line
+    // the user reads — in BOTH surfaces. `compliance_doctor_rows` returns the
+    // very tuples `emit` consumes, so `render_human` / `render_json` below
+    // reproduce doctor's two renderings from the same values rather than
+    // re-describing them.
+    //
+    // Regression target: the four 2026-08-13 compliance P0s
+    // (corrupt-address-asset / childhook-wedge / pipe-input-cap /
+    // audit-only-pack). Each has a case here that goes RED if the row it
+    // depends on stops being emitted.
+
+    /// Reproduces `emit`'s human line for one row: `<icon> <label:20> <detail>`
+    /// plus the indented hint. Colour is dropped (not part of the assertion).
+    fn render_human(rows: &[DoctorRow]) -> String {
+        let mut s = String::new();
+        for (label, ok, detail, hint) in rows {
+            if label.starts_with(' ') {
+                s.push_str(&format!("    -> {:<16} {}\n", label.trim_start(), detail));
+            } else {
+                s.push_str(&format!(
+                    "{} {:<20} {}\n",
+                    if *ok { "OK" } else { "XX" },
+                    label,
+                    detail
+                ));
+            }
+            if let Some(h) = hint {
+                s.push_str(&format!("  -> {h}\n"));
+            }
+        }
+        s
+    }
+
+    /// Reproduces `emit`'s `--json` payload for one row.
+    fn render_json(rows: &[DoctorRow]) -> Vec<serde_json::Value> {
+        rows.iter()
+            .map(|(label, ok, detail, hint)| {
+                serde_json::json!({
+                    "check": label, "ok": ok, "detail": detail, "hint": hint,
+                })
+            })
+            .collect()
+    }
+
+    /// The `compliance` verdict row out of a rendered row set.
+    fn verdict(rows: &[DoctorRow]) -> &DoctorRow {
+        rows.iter()
+            .find(|(l, ..)| l == "compliance")
+            .expect("every state must emit a `compliance` verdict row")
+    }
+
+    /// A live, fully healthy `/admin/compliance/packs` envelope. Field names and
+    /// shapes are copied from a real response of the running proxy, not invented.
+    fn healthy_packs() -> serde_json::Value {
+        serde_json::json!({
+            "available": true,
+            "report": {
+                "built_in": [{"name": "cn-pii"}, {"name": "credentials"}],
+                "pulled": [
+                    {"pack_id": "p1", "name": "Live Rule Pack", "status": "active"},
+                    {"pack_id": "p2", "name": "NSFW · Political", "status": "active"}
+                ],
+                "rules_skipped_count": 0,
+                "address_assets": {
+                    "assets_dir": "/home/u/.aikey/apps/ai-compliance-detector/assets/address",
+                    "village_stems": 232447,
+                    "community_names": 402761,
+                    "missing_layers": null,
+                    "degraded": false
+                }
+            }
+        })
+    }
+
+    fn healthy_pipeline() -> crate::commands_proxy::PipelineDiagnosticsWire {
+        serde_json::from_value(serde_json::json!({
+            "generation_id": 178,
+            "mask_restore": {
+                "status": "ok",
+                "reason": "",
+                "scan_roles": ["assistant", "user"],
+                "tool_block_scan": "audit",
+                "scan_truncated_pieces": 0,
+                "scan_skipped_bytes": 0
+            },
+            // Field names and shapes copied from the proxy's FilterHookHealth
+            // (internal/proxy/diagnostics.go), not invented — a fixture that
+            // drifts from the wire turns every assertion below into a green lie.
+            "filter_hook": {
+                "status": "ok",
+                "reason": "All 1 filter unit(s) answering.",
+                "name": "ai-compliance-detector",
+                "workers_healthy": 1,
+                "workers_total": 1,
+                "workers": [{
+                    "index": 0,
+                    "healthy": true,
+                    "version": "detector/1.2.0",
+                    "content_version": "9f2c1a7b3d4e5f60",
+                    "restart_count": 0
+                }],
+                "verdict_cache": {
+                    "status": "active",
+                    "reason": "Verdicts are being reused within the current ruleset epoch.",
+                    "content_version": "9f2c1a7b3d4e5f60"
+                }
+            }
+        }))
+        .expect("fixture must parse as the real wire struct")
+    }
+
+    /// A pipeline payload with a degraded filter pool. `down` describes the
+    /// unhealthy workers as `(index, degraded_reason, restart_count)`.
+    fn pipeline_with_pool(
+        total: i64,
+        down: &[(i64, &str, u64)],
+    ) -> crate::commands_proxy::PipelineDiagnosticsWire {
+        let workers: Vec<serde_json::Value> = (0..total)
+            .map(|i| match down.iter().find(|(idx, ..)| *idx == i) {
+                Some((_, reason, restarts)) => serde_json::json!({
+                    "index": i, "healthy": false, "degraded_reason": reason,
+                    "content_version_reason": "child_degraded", "restart_count": restarts,
+                }),
+                None => serde_json::json!({
+                    "index": i, "healthy": true, "version": "detector/1.2.0",
+                    "content_version": "9f2c1a7b3d4e5f60", "restart_count": 0,
+                }),
+            })
+            .collect();
+        let healthy = total - down.len() as i64;
+        // 🔴 The `reason` sentences are copied VERBATIM from the proxy
+        // (aikey-proxy/internal/proxy/diagnostics.go filterHookHealth). doctor
+        // renders this field as-is, so a fixture with an empty/invented sentence
+        // would assert nothing about what the user actually reads.
+        let reason = if healthy == 0 {
+            format!("No filter unit is answering (0/{total}) — inbound content is forwarded un-inspected (fail-open).")
+        } else if healthy < total {
+            format!("Only {healthy} of {total} filter units are answering. Dispatch skips the unfit units, so content is still inspected — but the pool is below its provisioned process count and the survivors carry all of the load.")
+        } else {
+            format!("All {total} filter unit(s) answering.")
+        };
+        let mut wire = healthy_pipeline();
+        wire.filter_hook = serde_json::from_value(serde_json::json!({
+            "status": if healthy == 0 { "degraded" } else if healthy < total { "partial" } else { "ok" },
+            "reason": reason,
+            "name": "ai-compliance-detector",
+            "workers_healthy": healthy,
+            "workers_total": total,
+            "workers": workers,
+            "verdict_cache": {"status": "active", "reason": "", "content_version": "9f2c1a7b3d4e5f60"}
+        }))
+        .expect("pool fixture must parse as the real wire struct");
+        wire
+    }
+
+    // ── State 1/5: not enabled (user choice) ────────────────────────
+    #[test]
+    fn compliance_disabled_is_green_and_says_so_in_both_modes() {
+        for installed in [false, true] {
+            let r = compliance_health_report(ComplianceToggle::Off, installed, None, None);
+            assert_eq!(
+                r.severity,
+                ComplianceSeverity::Ok,
+                "turning compliance off is a normal state, never a doctor failure"
+            );
+            let rows = compliance_doctor_rows(&r);
+            let human = render_human(&rows);
+            assert!(human.contains("OK compliance"), "human line: {human}");
+            assert!(
+                human.contains("disabled"),
+                "the user must be able to tell 'not running' from 'not checked': {human}"
+            );
+            let json = render_json(&rows);
+            assert_eq!(json[0]["check"], "compliance");
+            assert_eq!(json[0]["ok"], true);
+            assert!(json[0]["detail"].as_str().unwrap().contains("disabled"));
+            // Every non-green verdict must carry a next action; the off state
+            // carries one too so the user knows how to turn it on.
+            assert!(json[0]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("aikey app install ai-compliance-detector"));
+        }
+    }
+
+    // ── State 2/5: enabled but binary absent (declared ≠ effective) ──
+    #[test]
+    fn compliance_enabled_without_binary_is_red_with_cause_and_fix() {
+        let r = compliance_health_report(ComplianceToggle::OnLocal, false, None, None);
+        assert_eq!(
+            r.severity,
+            ComplianceSeverity::Error,
+            "config promises filtering and nothing is filtering — the loudest state there is"
+        );
+        let rows = compliance_doctor_rows(&r);
+        let human = render_human(&rows);
+        assert!(human.contains("XX compliance"), "must render red: {human}");
+        assert!(human.contains("MISSING"), "cause must be explicit: {human}");
+        let json = render_json(&rows);
+        assert_eq!(json[0]["ok"], false, "red rows must fail in --json too");
+        let hint = json[0]["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("aikey app install"),
+            "every error needs an actionable fix: {hint}"
+        );
+    }
+
+    #[test]
+    fn compliance_org_mandated_without_binary_points_at_the_501_and_the_admin() {
+        let r = compliance_health_report(ComplianceToggle::OnMandated, false, None, None);
+        assert_eq!(r.severity, ComplianceSeverity::Error);
+        let rows = compliance_doctor_rows(&r);
+        let human = render_human(&rows);
+        // A mandated host refuses the whole data plane; doctor must say why the
+        // user's `claude` is also broken rather than reporting only "missing".
+        assert!(human.contains("org policy"), "{human}");
+        assert!(
+            human.contains("501"),
+            "the user's requests are being refused — say so: {human}"
+        );
+    }
+
+    // ── State 3/5: detector unreachable (the wedged-child shape) ────
+    #[test]
+    fn compliance_live_detector_not_answering_is_red_not_green() {
+        // Regression: 20260813-childhook-write-before-deadline-wedges-main-path.
+        // A wedged child keeps its binary on disk, so the presence row stays
+        // green; `available:false` is the only external tell.
+        let packs = serde_json::json!({"available": false});
+        let r = compliance_health_report(ComplianceToggle::OnLocal, true, Some(&packs), None);
+        assert_eq!(r.severity, ComplianceSeverity::Error);
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(human.contains("NOT ANSWERING"), "{human}");
+        assert!(
+            human.contains("un-inspected"),
+            "state the consequence, not just the symptom: {human}"
+        );
+        assert!(
+            human.contains("aikey proxy restart"),
+            "recovery step required: {human}"
+        );
+    }
+
+    #[test]
+    fn compliance_endpoint_unreachable_is_unknown_never_green_claim() {
+        // The endpoint not answering must not be dressed up as health — that is
+        // the exact false-green shape all four P0s shared.
+        let r = compliance_health_report(ComplianceToggle::OnLocal, true, None, None);
+        assert_eq!(r.severity, ComplianceSeverity::Warn);
+        let rows = compliance_doctor_rows(&r);
+        let human = render_human(&rows);
+        assert!(human.contains("UNKNOWN"), "{human}");
+        assert!(
+            !human.contains("full coverage"),
+            "must never claim coverage it could not verify: {human}"
+        );
+        let json = render_json(&rows);
+        assert!(json[0]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("aikey proxy start"));
+    }
+
+    // ── State 4/5: healthy ──────────────────────────────────────────
+    #[test]
+    fn compliance_healthy_renders_green_with_evidence_rows() {
+        let packs = healthy_packs();
+        let pipeline = healthy_pipeline();
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        );
+        assert_eq!(r.severity, ComplianceSeverity::Ok);
+        assert_eq!(
+            verdict(&compliance_doctor_rows(&r)).3,
+            None,
+            "no hint when clean"
+        );
+        let rows = compliance_doctor_rows(&r);
+        let human = render_human(&rows);
+        assert!(human.contains("OK compliance"), "{human}");
+        assert!(human.contains("full coverage"), "{human}");
+        // Evidence, not just a verdict: the counts are the substance.
+        assert!(human.contains("2 built-in · 2 distributed"), "{human}");
+        assert!(human.contains("232447 village stems"), "{human}");
+        assert!(human.contains("roles [assistant, user]"), "{human}");
+        let json = render_json(&rows);
+        assert_eq!(json[0]["ok"], true);
+        // Sub-rows are indented so `emit` renders them as dim branches and they
+        // never bubble into the overall pass/fail.
+        assert!(json[1]["check"].as_str().unwrap().starts_with(' '));
+    }
+
+    // ── State 5/5: degraded (address dictionary corrupt) ────────────
+    #[test]
+    fn compliance_partial_address_dictionary_warns_and_names_the_layer() {
+        // Regression: 20260813-corrupt-address-asset-reports-not-degraded.
+        // Two layers landed, villages.json parsed to zero → partial provisioning.
+        let mut packs = healthy_packs();
+        packs["report"]["address_assets"] = serde_json::json!({
+            "assets_dir": "/home/u/.aikey/apps/ai-compliance-detector/assets/address",
+            "village_stems": 0,
+            "community_names": 402761,
+            "missing_layers": ["villages.json"],
+            "degraded": true
+        });
+        let pipeline = healthy_pipeline();
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        );
+        assert_eq!(r.severity, ComplianceSeverity::Warn);
+        let rows = compliance_doctor_rows(&r);
+        let human = render_human(&rows);
+        assert!(human.contains("REDUCED COVERAGE"), "{human}");
+        assert!(human.contains("DEGRADED"), "{human}");
+        assert!(
+            human.contains("villages.json"),
+            "must name the broken layer, not just flag 'degraded': {human}"
+        );
+        // A watered-down filter is loud but does not turn doctor's summary red.
+        let json = render_json(&rows);
+        assert_eq!(json[0]["ok"], true);
+        assert!(json[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("address dictionary partial"));
+    }
+
+    #[test]
+    fn compliance_unprovisioned_address_dictionary_is_not_a_fault() {
+        // 🔴 The discrimination that keeps this row credible: a host that never
+        // opted into the B2 big dictionary reports degraded=true with all layers
+        // at zero. Calling that a fault would paint most Personal installs red
+        // and train users to ignore the row.
+        let mut packs = healthy_packs();
+        packs["report"]["address_assets"] = serde_json::json!({
+            "assets_dir": "",
+            "village_stems": 0,
+            "community_names": 0,
+            "missing_layers": ["villages.json", "osm-communities.txt", "osm-pois.txt"],
+            "degraded": true
+        });
+        let pipeline = healthy_pipeline();
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        );
+        assert_eq!(
+            r.severity,
+            ComplianceSeverity::Ok,
+            "not installing an opt-in dictionary is a choice, not a degradation"
+        );
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(
+            human.contains("opt-in big dictionary not installed"),
+            "{human}"
+        );
+    }
+
+    // ── The other two P0s ───────────────────────────────────────────
+    #[test]
+    fn compliance_audit_only_packs_are_named_as_not_enforcing() {
+        // Regression: 20260813-audit-only-pack-still-enforces. The fix made
+        // audit_only actually observe-only; this row makes that visible, so an
+        // operator cannot read "compliance ok" and assume those rules intervene.
+        let mut packs = healthy_packs();
+        packs["report"]["pulled"][0]["status"] = serde_json::json!("audit_only");
+        let pipeline = healthy_pipeline();
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        );
+        assert_eq!(r.severity, ComplianceSeverity::Warn);
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(human.contains("NOT enforcing"), "{human}");
+        assert!(
+            human.contains("Live Rule Pack"),
+            "name the pack so the admin knows which one to promote: {human}"
+        );
+    }
+
+    #[test]
+    fn compliance_truncated_content_is_reported_as_unscanned_bytes() {
+        // Regression: 20260813-pipe-input-cap-truncates-silently. Non-zero
+        // counters mean audit numbers are a lower bound, not a measurement.
+        let packs = healthy_packs();
+        let pipeline: crate::commands_proxy::PipelineDiagnosticsWire =
+            serde_json::from_value(serde_json::json!({
+                "generation_id": 178,
+                "mask_restore": {
+                    "status": "inactive",
+                    "scan_roles": ["assistant", "user"],
+                    "tool_block_scan": "audit",
+                    "scan_truncated_pieces": 3,
+                    "scan_skipped_bytes": 7617
+                }
+            }))
+            .unwrap();
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        );
+        assert_eq!(r.severity, ComplianceSeverity::Warn);
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(
+            human.contains("7617 byte(s) reached the upstream LLM uninspected"),
+            "{human}"
+        );
+        assert!(
+            human.contains("generation 178"),
+            "counters are generation-scoped: {human}"
+        );
+    }
+
+    #[test]
+    fn compliance_tool_block_lane_off_is_reported_as_a_bypass() {
+        let packs = healthy_packs();
+        let pipeline: crate::commands_proxy::PipelineDiagnosticsWire =
+            serde_json::from_value(serde_json::json!({
+                "mask_restore": {"scan_roles": ["user"], "tool_block_scan": "off"}
+            }))
+            .unwrap();
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        );
+        assert_eq!(r.severity, ComplianceSeverity::Warn);
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(human.contains("bypass compliance entirely"), "{human}");
+    }
+
+    #[test]
+    fn compliance_old_proxy_without_truncation_counters_stays_silent() {
+        // A proxy built before the pipe-cap fix omits the two counters. serde
+        // defaults them to 0, and 0 renders nothing — an old proxy must not be
+        // falsely accused of truncating.
+        //
+        // 🔴 It is nonetheless NOT green overall, and that changed deliberately on
+        // 2026-08-13. The same old build also omits `filter_hook`, so worker
+        // health is unreadable — and unlike a missing counter (0 has a safe
+        // meaning) there is no safe default for "is the detector wedged?".
+        // Rendering that unknown as OK is the exact false-green the four P0s
+        // shared. So: silent about truncation (nothing was measured), loud about
+        // the unknown (nothing could be measured).
+        let packs = healthy_packs();
+        let pipeline: crate::commands_proxy::PipelineDiagnosticsWire =
+            serde_json::from_value(serde_json::json!({
+                "mask_restore": {
+                    "status": "inactive",
+                    "scan_roles": ["assistant", "user"],
+                    "tool_block_scan": "audit"
+                }
+            }))
+            .expect("an older proxy's payload must still parse");
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        );
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(
+            !human.contains("uninspected"),
+            "an old proxy must not be accused of truncating: {human}"
+        );
+        assert_eq!(r.severity, ComplianceSeverity::Warn);
+        assert!(
+            human.contains("UNKNOWN"),
+            "unreadable worker health must be reported as unknown, never as healthy: {human}"
+        );
+        assert!(
+            !human.contains("full coverage"),
+            "must never claim coverage it could not verify: {human}"
+        );
+    }
+
+    // ── Filter child-process health (review B5 / B36) ───────────────
+    //
+    // Before the proxy published `filter_hook`, `available:false` was the ONLY
+    // external tell for every way the detector child can stop working, so the
+    // two states with opposite remedies — a wedged child (alive, restart the
+    // proxy) and a child that never spawned (nothing running, fix the install) —
+    // rendered as one line with one guessed hint.
+
+    /// Builds the State-4 (`available:false`) report with a given worker cause.
+    fn detector_not_answering(reason: &str) -> ComplianceHealthReport {
+        let packs = serde_json::json!({"available": false});
+        let mut pipeline = healthy_pipeline();
+        pipeline.filter_hook = serde_json::from_value(serde_json::json!({
+            "status": "degraded",
+            "reason": "No filter unit is answering (0/1).",
+            "name": "ai-compliance-detector",
+            "workers_healthy": 0,
+            "workers_total": 1,
+            "workers": [{
+                "index": 0, "healthy": false, "degraded_reason": reason,
+                "content_version_reason": "child_degraded", "restart_count": 4
+            }],
+            "verdict_cache": {"status": "suspended", "reason": "", "cause": "child_degraded"}
+        }))
+        .unwrap();
+        compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        )
+    }
+
+    #[test]
+    fn compliance_wedged_child_and_never_started_get_different_causes_and_fixes() {
+        let wedged = detector_not_answering("write_timeout");
+        let never = detector_not_answering("not_started");
+        for r in [&wedged, &never] {
+            assert_eq!(r.severity, ComplianceSeverity::Error);
+        }
+
+        let wedged_human = render_human(&compliance_doctor_rows(&wedged));
+        let never_human = render_human(&compliance_doctor_rows(&never));
+
+        // Both still say what is happening to traffic — that assertion predates
+        // this change and must survive it.
+        for h in [&wedged_human, &never_human] {
+            assert!(h.contains("NOT ANSWERING"), "{h}");
+            assert!(h.contains("un-inspected"), "{h}");
+        }
+        // …and now they differ in BOTH the cause and the remedy.
+        assert!(
+            wedged_human.contains("write_timeout") && wedged_human.contains("WEDGED"),
+            "the wedge must be named, not folded into 'crashed / wedged / mismatch': {wedged_human}"
+        );
+        assert!(
+            wedged_human.contains("reinstalling it will not help"),
+            "a wedged child IS running — sending the user to reinstall is a loop that cannot \
+             terminate: {wedged_human}"
+        );
+        assert!(
+            never_human.contains("not_started") && never_human.contains("NEVER STARTED"),
+            "{never_human}"
+        );
+        assert!(
+            never_human.contains("aikey app install ai-compliance-detector"),
+            "nothing was ever spawned — the fix is the install, not just a restart: {never_human}"
+        );
+        assert_ne!(
+            wedged_human, never_human,
+            "the two failure modes rendered identically — that IS the bug (B5)"
+        );
+
+        // Both surfaces, not just the human one.
+        let json = render_json(&compliance_doctor_rows(&wedged));
+        assert_eq!(json[0]["ok"], false);
+        assert!(json[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("write_timeout"));
+        assert!(json[0]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("aikey proxy restart"));
+        assert!(
+            json[1]["check"].as_str().unwrap().starts_with(' '),
+            "the per-worker evidence must be an indented sub-row"
+        );
+        assert!(json[1]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("restarts so far: 4"));
+    }
+
+    #[test]
+    fn compliance_not_answering_on_an_old_proxy_keeps_the_generic_wording() {
+        // No `filter_hook` block ⇒ no cause to report. The row must not invent
+        // one, and must keep working exactly as it did before.
+        let packs = serde_json::json!({"available": false});
+        let r = compliance_health_report(ComplianceToggle::OnLocal, true, Some(&packs), None);
+        assert_eq!(r.severity, ComplianceSeverity::Error);
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(human.contains("NOT ANSWERING"), "{human}");
+        assert!(human.contains("aikey proxy restart"), "{human}");
+        assert!(
+            !human.contains("WEDGED") && !human.contains("NEVER STARTED"),
+            "an old proxy reports no cause — doctor must not fabricate one: {human}"
+        );
+    }
+
+    #[test]
+    fn compliance_unmapped_degraded_reason_is_reported_verbatim() {
+        // The proxy also emits prefixed causes carrying an OS error
+        // (`not_installed: stat …`). Those must reach the user intact rather than
+        // being flattened into "unknown" — the error text is the only thing that
+        // identifies them (禁止静默 return 默认值).
+        let r =
+            detector_not_answering("not_installed: stat /opt/detector: no such file or directory");
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(
+            human.contains("no such file or directory"),
+            "the underlying OS error must survive to the user: {human}"
+        );
+    }
+
+    // ── Partial pool: the false green (review B39 intersection) ─────
+    #[test]
+    fn compliance_pool_with_a_dead_worker_is_not_reported_as_full_coverage() {
+        // 🔴 THE CORE JUDGMENT. A pool with a dead worker reports
+        // Status().Healthy = true and "1/2 workers healthy", and
+        // `/admin/compliance/packs` still answers `available:true` because the
+        // surviving worker takes the call — which is precisely why doctor cannot
+        // derive this from that endpoint alone.
+        //
+        // What is at stake changed on 2026-08-14 (review B39): dispatch used to
+        // include the dead worker, so a 2-worker pool really did fail open on
+        // half its traffic (measured: 10 Detects → 5 fail-opens; live 3-worker
+        // rerun: 4 of 12, at positions 1/4/7/10). Dispatch now skips it, so the
+        // loss is headroom, not coverage. Either way the row must not be green
+        // and must not describe dispatch in its own words — see below.
+        let packs = healthy_packs();
+        let pipeline = pipeline_with_pool(2, &[(1, "write_timeout", 2)]);
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        );
+        assert_eq!(
+            r.severity,
+            ComplianceSeverity::Warn,
+            "half the requests are un-inspected — this must not render as healthy"
+        );
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(
+            !human.contains("full coverage"),
+            "FALSE GREEN: a pool with a dead worker claimed full coverage: {human}"
+        );
+        assert!(human.contains("1/2 detector worker(s) down"), "{human}");
+        // 🔴 The consequence sentence must be the PROXY's, rendered verbatim.
+        // Asserting on the proxy's wording (not on doctor's own phrasing) is what
+        // makes this fence catch the drift that actually happened: the data plane
+        // changed and doctor kept telling users the old story.
+        assert!(
+            human.contains(
+                "Dispatch skips the unfit units, so content is still inspected — but the pool is \
+                 below its provisioned process count and the survivors carry all of the load."
+            ),
+            "doctor must render filter_hook.reason verbatim, not re-derive its own description of \
+             what dispatch does with a dead worker: {human}"
+        );
+        assert!(
+            human.contains("worker 1") && human.contains("WEDGED"),
+            "name WHICH worker and WHY: {human}"
+        );
+        // A single-worker (Personal / Trial) host is the M=1 degenerate case and
+        // must stay green when its one worker is up.
+        let ok = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&healthy_pipeline()),
+        );
+        assert_eq!(ok.severity, ComplianceSeverity::Ok);
+        assert!(
+            render_human(&compliance_doctor_rows(&ok)).contains("1/1 worker process(es) answering")
+        );
+    }
+
+    #[test]
+    fn compliance_filter_hook_status_disagreeing_with_packs_is_unknown_not_ok() {
+        // `available:true` (the detector answered) plus a filter status that says
+        // otherwise is contract drift between two endpoints on the same binary.
+        // Silently trusting either one is how a false green gets built.
+        let packs = healthy_packs();
+        let mut pipeline = healthy_pipeline();
+        pipeline.filter_hook = serde_json::from_value(serde_json::json!({
+            "status": "inactive", "workers_healthy": 0, "workers_total": 0,
+            "workers": [], "verdict_cache": {"status": "disabled"}
+        }))
+        .unwrap();
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        );
+        assert_eq!(r.severity, ComplianceSeverity::Warn);
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(human.contains("UNKNOWN"), "{human}");
+        assert!(human.contains("disagree"), "{human}");
+    }
+
+    // ── Verdict cache switched off (review B6) ──────────────────────
+    #[test]
+    fn compliance_old_detector_disables_the_verdict_cache_and_says_how_to_fix_it() {
+        // Regression: 20260813-pack-swap-does-not-invalidate-proxy-cache. A
+        // detector too old to answer op=ListPacks is HEALTHY and answering Detect,
+        // so every other signal is green — while the proxy has switched its
+        // verdict cache off (correctly: verdicts from an unstatable ruleset must
+        // not be replayed) and re-scans every content piece on every turn. Hit
+        // rate 96% → 0. Without this row the only symptom is "the proxy is slow".
+        let packs = healthy_packs();
+        let mut pipeline = healthy_pipeline();
+        pipeline.filter_hook = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "reason": "All 1 filter unit(s) answering.",
+            "name": "ai-compliance-detector",
+            "workers_healthy": 1,
+            "workers_total": 1,
+            "workers": [{
+                "index": 0, "healthy": true, "version": "detector/1.0.0",
+                "content_version_reason": "unsupported_op_list_packs", "restart_count": 0
+            }],
+            "verdict_cache": {
+                "status": "suspended",
+                "cause": "unsupported_op_list_packs",
+                "reason": "Verdict caching is OFF because the detector build cannot report which \
+                           ruleset it is using (it does not answer op=ListPacks). Every content \
+                           piece is re-scanned, so filter latency is at its cold-path cost. \
+                           Upgrade the detector to restore caching."
+            }
+        }))
+        .unwrap();
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        );
+        assert_eq!(
+            r.severity,
+            ComplianceSeverity::Warn,
+            "a silent, permanent latency regression is not a healthy state"
+        );
+        let human = render_human(&compliance_doctor_rows(&r));
+        // The worker itself is fine — the row must not read as an outage.
+        assert!(
+            human.contains("1/1 worker process(es) answering"),
+            "{human}"
+        );
+        assert!(human.contains("verdict cache"), "{human}");
+        assert!(
+            human.contains("re-scanned"),
+            "explain the cost, not just the state: {human}"
+        );
+        assert!(
+            human.contains("aikey app install ai-compliance-detector"),
+            "the remedy is an UPGRADE and it must be spelled out: {human}"
+        );
+        let json = render_json(&compliance_doctor_rows(&r));
+        assert_eq!(
+            json[0]["ok"], true,
+            "a latency regression must not fail the summary"
+        );
+        assert!(json[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("verdict cache disabled"));
+    }
+
+    #[test]
+    fn compliance_verdict_cache_suspended_by_a_crash_does_not_advise_an_upgrade() {
+        // Same suspended state, different cause. Printing "upgrade the detector"
+        // for a crashed child sends the operator down the wrong path entirely.
+        let packs = healthy_packs();
+        let mut pipeline = pipeline_with_pool(2, &[(1, "write_timeout", 1)]);
+        if let Some(fh) = pipeline.filter_hook.as_mut() {
+            fh.verdict_cache = serde_json::from_value(serde_json::json!({
+                "status": "suspended", "cause": "child_degraded",
+                "reason": "Verdict caching is OFF because the filter child is degraded and cannot \
+                           vouch for its ruleset. It clears when the child recovers."
+            }))
+            .unwrap();
+        }
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&packs),
+            Some(&pipeline),
+        );
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(human.contains("clears when the child recovers"), "{human}");
+        assert!(
+            !human.contains("Upgrade with: aikey app install"),
+            "a crashed child must not be sent for an upgrade: {human}"
+        );
+    }
+
+    #[test]
+    fn compliance_active_verdict_cache_adds_no_noise() {
+        // A healthy cache is the steady state; a row for it on every run would
+        // dilute the rows that mean something (简化设计去除冗余).
+        let r = compliance_health_report(
+            ComplianceToggle::OnLocal,
+            true,
+            Some(&healthy_packs()),
+            Some(&healthy_pipeline()),
+        );
+        assert!(!render_human(&compliance_doctor_rows(&r)).contains("verdict cache"));
+    }
+
+    #[test]
+    fn compliance_new_wire_block_is_optional_in_both_directions() {
+        // 向后兼容, all four version pairings:
+        //  - new CLI + new proxy   → the block parses and grades (covered above)
+        //  - new CLI + old proxy   → absent block ⇒ None ⇒ UNKNOWN, never a panic
+        //  - old CLI + new proxy   → serde ignores unknown fields by default
+        //  - old CLI + old proxy   → unchanged
+        let old_proxy: crate::commands_proxy::PipelineDiagnosticsWire =
+            serde_json::from_value(serde_json::json!({"mask_restore": {}}))
+                .expect("an old proxy payload must still parse");
+        assert!(
+            old_proxy.filter_hook.is_none(),
+            "an absent block must be None, not a zero-valued 0/0 that renders green"
+        );
+        // A block with only some fields (a proxy mid-upgrade, or a future one that
+        // adds fields) must also parse rather than failing the whole document.
+        let partial: crate::commands_proxy::PipelineDiagnosticsWire =
+            serde_json::from_value(serde_json::json!({
+                "filter_hook": {"status": "ok", "future_field": 42},
+                "unknown_top_level": true
+            }))
+            .expect("unknown and missing fields must both be tolerated");
+        let fh = partial.filter_hook.expect("present block must decode");
+        assert_eq!(fh.status, "ok");
+        assert_eq!(fh.workers_total, 0);
+        assert!(fh.workers.is_empty());
+        assert_eq!(fh.verdict_cache.status, "");
+    }
+
+    #[test]
+    fn compliance_missing_pipeline_block_marks_scan_scope_unknown() {
+        let packs = healthy_packs();
+        let r = compliance_health_report(ComplianceToggle::OnLocal, true, Some(&packs), None);
+        assert_eq!(r.severity, ComplianceSeverity::Warn);
+        let human = render_human(&compliance_doctor_rows(&r));
+        assert!(human.contains("scan scope"), "{human}");
+        assert!(human.contains("UNKNOWN"), "{human}");
+    }
+
+    // ── Toggle resolution ───────────────────────────────────────────
+    #[test]
+    fn compliance_toggle_resolution_is_exhaustive_and_mandate_wins() {
+        use ComplianceToggle::*;
+        // (local filter_stages present, org mandate on) → toggle
+        let cases = [
+            ((false, false), Off),
+            ((true, false), OnLocal),
+            // 🔴 Mandate wins even with a NULL local column: the proxy
+            // force-spawns the detector, so reporting "off" would describe a
+            // host that is in fact filtering every request.
+            ((false, true), OnMandated),
+            ((true, true), OnMandated),
+        ];
+        for ((local, org), want) in cases {
+            assert_eq!(
+                ComplianceToggle::resolve(local, org),
+                want,
+                "resolve(local={local}, org={org})"
+            );
+        }
+    }
+
+    #[test]
+    fn compliance_severity_only_error_fails_the_summary() {
+        assert!(ComplianceSeverity::Ok.is_ok_for_summary());
+        assert!(
+            ComplianceSeverity::Warn.is_ok_for_summary(),
+            "a watered-down filter is loud on its own row but must not turn the summary red — \
+             same policy as the local-server row"
+        );
+        assert!(!ComplianceSeverity::Error.is_ok_for_summary());
+        assert_eq!(ComplianceSeverity::Ok.as_str(), "ok");
+        assert_eq!(ComplianceSeverity::Warn.as_str(), "warn");
+        assert_eq!(ComplianceSeverity::Error.as_str(), "error");
+    }
+
+    // ── Edition coverage (版型意识) ──────────────────────────────────
+    #[test]
+    fn compliance_row_is_identical_across_all_four_editions() {
+        // 🔴 THE POINT OF THIS TEST. The bug being closed is that the runtime
+        // compliance health gate existed ONLY for Cluster. The fix is that the
+        // verdict is derived from the LOCAL aikey-proxy — the one binary every
+        // edition runs — so it cannot be edition-shaped by construction. This
+        // asserts that: identical inputs must produce a byte-identical row on
+        // every edition, and every edition must produce a row at all.
+        //
+        // NOTE on the edition axis: `local_server_probe::Edition` models only
+        // what THIS CLI can detect on its own host — Trial, Personal
+        // (local-server), and None. A Production or Cluster host presents to
+        // `detect_edition()` as one of those same three (see the doc comment on
+        // `detect_edition`), which is why the deployment shapes below map onto
+        // them rather than onto four enum variants.
+        use crate::local_server_probe::Edition;
+        let deployment_shapes: [(&str, Option<Edition>); 4] = [
+            ("Personal (local-server)", Some(Edition::Personal)),
+            ("Trial (full-trial bundle)", Some(Edition::Trial)),
+            (
+                "Production (server-install; CLI host has no local web service)",
+                None,
+            ),
+            (
+                "Cluster (node/operator host; CLI host has no local web service)",
+                None,
+            ),
+        ];
+        let packs = healthy_packs();
+        let pipeline = healthy_pipeline();
+        let mut rendered: Vec<(&str, String)> = Vec::new();
+        for (shape, edition) in deployment_shapes {
+            // The edition banner must resolve for every shape (no panic, no
+            // empty label) — doctor prints it above these rows as context.
+            let label = doctor_edition_label(edition);
+            assert!(!label.is_empty(), "{shape} has no edition banner");
+            let r = compliance_health_report(
+                ComplianceToggle::OnLocal,
+                true,
+                Some(&packs),
+                Some(&pipeline),
+            );
+            let rows = compliance_doctor_rows(&r);
+            assert!(
+                rows.iter().any(|(l, ..)| l == "compliance"),
+                "{shape} produced no compliance row — an edition-shaped diagnostic hole is a bug"
+            );
+            rendered.push((shape, render_human(&rows)));
+        }
+        let (first_shape, first) = &rendered[0];
+        for (shape, out) in &rendered[1..] {
+            assert_eq!(
+                out, first,
+                "compliance row differs between {first_shape} and {shape} — the verdict must come \
+                 from the local proxy, never from an edition branch"
+            );
+        }
+    }
+
+    #[test]
+    fn compliance_detector_slug_matches_the_app_registry() {
+        // The slug is a cross-process contract (vault app_records.slug, the
+        // proxy's filter-binary directory, this CLI's toggle read). Pin it.
+        assert!(crate::commands_app::FIRST_PARTY_SLUGS.contains(&COMPLIANCE_DETECTOR_SLUG));
+        let plugins = doctor_plugin_registry();
+        assert!(
+            plugins
+                .iter()
+                .any(|p| p.install_slug == COMPLIANCE_DETECTOR_SLUG && !p.is_daemon),
+            "the compliance health row resolves its binary through this registry entry"
+        );
     }
 
     #[test]

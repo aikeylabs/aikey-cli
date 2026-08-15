@@ -1668,12 +1668,36 @@ const COMPLIANCE_MASTER_POLICY_KEY: &str = "compliance.master_policy";
 /// mandate ON ⇒ the user can't disable it). Defaults to false (unlocked) when the
 /// key is absent / unparseable — never blocks the user spuriously.
 pub fn compliance_master_locked() -> bool {
+    compliance_master_policy_flag("locked")
+}
+
+/// Whether the org policy currently MANDATES compliance detection (master
+/// mandate ON ⇒ the proxy force-spawns the detector even when this vault's
+/// local `app_records.filter_stages` is NULL).
+///
+/// Why `aikey doctor` needs this and cannot infer it from `filter_stages`
+/// alone: on a mandated org the local toggle stays NULL while the filter is
+/// genuinely running, so a doctor that read only the local toggle would print
+/// "compliance disabled" on a host that is filtering every request — a health
+/// signal stating the opposite of reality. Reading BOTH halves is what lets
+/// doctor compare "declared" against "effective" instead of guessing.
+///
+/// Defaults to false when the key is absent / unparseable — Personal hosts have
+/// no control plane to publish a mandate, and that is the correct resting state
+/// rather than a fault.
+pub fn compliance_master_enabled() -> bool {
+    compliance_master_policy_flag("enabled")
+}
+
+/// Shared reader for the two booleans in `compliance.master_policy`. One parse
+/// site so a wire-shape change (or a missing key) can only be handled one way.
+fn compliance_master_policy_flag(field: &str) -> bool {
     let Ok(Some(s)) = read_string_config(COMPLIANCE_MASTER_POLICY_KEY) else {
         return false;
     };
     serde_json::from_str::<serde_json::Value>(&s)
         .ok()
-        .and_then(|v| v.get("locked").and_then(|l| l.as_bool()))
+        .and_then(|v| v.get(field).and_then(|l| l.as_bool()))
         .unwrap_or(false)
 }
 

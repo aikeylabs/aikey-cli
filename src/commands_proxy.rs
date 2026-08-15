@@ -2179,12 +2179,142 @@ pub struct RegistryProvenanceWire {
     pub providers_with_model_map: Vec<String>,
 }
 
+/// The compliance scan-scope + placeholder-fidelity block of
+/// `/v1/diagnostics/pipeline` (proxy `MaskRestoreHealth`).
+///
+/// 🔴 EVERY FIELD HERE IS `#[serde(default)]` ON PURPOSE. `scan_truncated_pieces`
+/// / `scan_skipped_bytes` were added by bugfix
+/// `20260813-pipe-input-cap-truncates-silently`, so a proxy built before that
+/// fix omits them. Defaulting to 0 makes an OLD proxy read as "no truncation
+/// observed" rather than failing the whole parse — and the truncation row is
+/// only rendered when the count is non-zero, so an old proxy stays silent
+/// instead of claiming a coverage guarantee it cannot make.
+///
+/// 🔴 The counters are GENERATION-scoped (the proxy hot-reloads in-process and
+/// zeroes them without restarting). `generation_id` is carried alongside so a
+/// reader comparing two samples can tell a fresh zero from a real one.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct MaskRestoreWire {
+    /// "inactive" | "ok" | "insufficient_sample" | "degraded".
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub reason: String,
+    /// Effective inbound scan-role policy, e.g. ["assistant","user"].
+    #[serde(default)]
+    pub scan_roles: Vec<String>,
+    /// "off" | "audit" — the rung for agent tool traffic.
+    #[serde(default)]
+    pub tool_block_scan: String,
+    #[serde(default)]
+    pub scan_truncated_pieces: i64,
+    #[serde(default)]
+    pub scan_skipped_bytes: i64,
+}
+
+/// One independently-failing filter unit (proxy `FilterWorkerHealth`).
+///
+/// A Personal / Trial host has exactly one; Production and Cluster can run a
+/// pool of M child processes, and `index` is the unit's ROUND-ROBIN dispatch
+/// position — "worker 1 of 2 is down" means "≈half of all requests are routed to
+/// a process that fails open".
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct FilterWorkerWire {
+    #[serde(default)]
+    pub index: i64,
+    #[serde(default)]
+    pub healthy: bool,
+    /// Enumerated cause when `!healthy`: `write_timeout` (alive but stopped
+    /// reading its pipe) | `not_started` (never spawned) | `restarting` |
+    /// `not_installed: …` / `write_failed: …` and other prefixed OS causes.
+    ///
+    /// 🔴 THIS FIELD IS THE WHOLE POINT of the block. Before it existed, doctor
+    /// saw only `available:false` on `/admin/compliance/packs` and had to report
+    /// "wedged / crashed / never started" as one undifferentiated failure, so the
+    /// remedy it printed was a guess.
+    #[serde(default)]
+    pub degraded_reason: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub content_version: String,
+    /// Why `content_version` is empty: `child_degraded` (restart) |
+    /// `unsupported_op_list_packs` (upgrade the detector) | `first_poll_pending`
+    /// | `poll_failed`.
+    #[serde(default)]
+    pub content_version_reason: String,
+    #[serde(default)]
+    pub restart_count: u64,
+}
+
+/// Whether the proxy is reusing per-piece scan verdicts (proxy `VerdictCacheHealth`).
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct VerdictCacheWire {
+    /// "disabled" (never enabled) | "active" | "suspended" (switched off at
+    /// runtime because the detector cannot state its ruleset).
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub reason: String,
+    /// Enumerated cause behind `suspended` — decides restart vs upgrade.
+    #[serde(default)]
+    pub cause: String,
+    #[serde(default)]
+    pub content_version: String,
+}
+
+/// Filter child-process health + verdict-cache state (proxy `FilterHookHealth`).
+///
+/// 🔴 WHY IT IS READ AS `Option` AND NOT `#[serde(default)]`. Every other block
+/// here defaults safely: a missing counter is genuinely 0. Worker health has NO
+/// safe default — `Default` would read as "0 of 0 workers", which a naive
+/// renderer turns green. A proxy built before 2026-08-13 omits the block
+/// entirely, and doctor must say UNKNOWN for it, never OK (an unknown rendered
+/// as healthy is the exact false-green shape the four 2026-08-13 P0s shared).
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct FilterHookWire {
+    /// "inactive" (no filter installed) | "ok" | "partial" (some units down;
+    /// since 2026-08-14 dispatch skips them, so the pool loses headroom rather
+    /// than coverage) | "degraded" (nothing answering — everything fails open).
+    #[serde(default)]
+    pub status: String,
+    /// The proxy's own one-sentence description of what the status COSTS.
+    /// Rendered verbatim by every surface — never re-derived here: the CLI
+    /// cannot know what the data plane does with a dead worker, and the round it
+    /// tried to (up to 2026-08-14) ended with `ak doctor` telling users the
+    /// opposite of the truth.
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub workers_healthy: i64,
+    #[serde(default)]
+    pub workers_total: i64,
+    #[serde(default)]
+    pub workers: Vec<FilterWorkerWire>,
+    #[serde(default)]
+    pub verdict_cache: VerdictCacheWire,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct PipelineDiagnosticsWire {
     #[serde(default)]
     pub registry: RegistryProvenanceWire,
     #[serde(default)]
     pub model_mapping: MappingHealthWire,
+    /// Compliance scan scope + mask/restore fidelity. Additive read of a block
+    /// this endpoint already serves — no new endpoint, no new proxy field
+    /// (慎重新建 API/接口协议).
+    #[serde(default)]
+    pub mask_restore: MaskRestoreWire,
+    /// Filter child-process health + verdict-cache state. `None` = this proxy
+    /// build does not report it (pre-2026-08-13) — render as UNKNOWN, never OK.
+    #[serde(default)]
+    pub filter_hook: Option<FilterHookWire>,
+    /// Scopes every counter in `mask_restore`. 0 = no supervisor wired.
+    #[serde(default)]
+    pub generation_id: i64,
 }
 
 /// Fetch the proxy's read-only model-mapping diagnostics. `Err` = proxy
@@ -2201,6 +2331,44 @@ pub fn fetch_pipeline_diagnostics() -> Result<PipelineDiagnosticsWire, String> {
         .map_err(|e| format!("cannot reach proxy at {addr}: {e}"))?;
     resp.into_json()
         .map_err(|e| format!("invalid diagnostics response: {e}"))
+}
+
+/// Fetch the proxy's effective-compliance-pack report (`GET /admin/compliance/packs`).
+///
+/// 🔴 WHY THIS ENDPOINT AND NOT A NEW ONE. It is already the proxy's
+/// externally-readable "what is the live detector actually loaded with" surface
+/// — the same one the Cluster release gate asserts against
+/// (`workflow/CI/test/e2e/compliance-migration-cluster-live.sh`) and the same
+/// one the local web console relays. Personal / Trial / Production / Cluster all
+/// run the same aikey-proxy binary, so this is the ONE source that exists in
+/// every edition (版型意识: a diagnostic that only one edition can perform is a bug).
+///
+/// 🔴 WHY LOOPBACK MUST BYPASS THE SHELL'S PROXY. A bare `ureq::AgentBuilder`
+/// carries no proxy config, which is exactly what we want: users behind a system
+/// HTTP proxy have had 127.0.0.1 probes hijacked before. Same posture as
+/// `fetch_pipeline_diagnostics` above — do not "helpfully" make this
+/// proxy-aware.
+///
+/// The admin gate exempts loopback peers, so no token is needed here.
+///
+/// `Err` = proxy unreachable, endpoint absent (older binary), or the call timed
+/// out. Callers MUST render that as "unknown", never as healthy — a wedged
+/// detector child is one of the ways this call fails to answer, and that is a
+/// fault, not a clean bill of health.
+pub fn fetch_compliance_packs() -> Result<serde_json::Value, String> {
+    let addr = proxy_listen_addr(None);
+    let agent = ureq::AgentBuilder::new()
+        // Short on purpose: this call crosses the proxy→detector stdin/stdout
+        // IPC, and a wedged child is precisely the condition we are diagnosing.
+        // doctor must degrade to "unknown" rather than hang (不阻塞用户流程).
+        .timeout(Duration::from_secs(3))
+        .build();
+    let resp = agent
+        .get(&format!("http://{addr}/admin/compliance/packs"))
+        .call()
+        .map_err(|e| format!("cannot reach proxy at {addr}: {e}"))?;
+    resp.into_json()
+        .map_err(|e| format!("invalid /admin/compliance/packs response: {e}"))
 }
 
 /// P3.5 `aikey test` tail surface: emit a WARN line when a model mapping is
