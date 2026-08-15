@@ -14,7 +14,7 @@
 //! the three-axis linkage already shipped it once (D-3) and the symptom is a
 //! credential that exists, looks configured, and cannot route.
 //!
-//! # 🔴 WHY THIS GATE IS WEAKER THAN THE ONE ON dgcheck.aikeylabs.com
+//! # 🔴 WHY THIS GATE IS WEAKER THAN THE ONE ON check.aikeylabs.com
 //!
 //! The public check site refuses private addresses and refuses `http://`
 //! outright. Copying that here would be wrong, and R-3b says so explicitly.
@@ -161,7 +161,7 @@ impl std::fmt::Display for FetchError {
                 f,
                 "that file is not an AiKey provider description: {m}\n  \
                  Expected the shape documented at \
-                 https://dgcheck.aikeylabs.com/api"
+                 https://check.aikeylabs.com/api"
             ),
             FetchError::UnsupportedVersion { found } => write!(
                 f,
