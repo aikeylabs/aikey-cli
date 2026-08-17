@@ -1058,7 +1058,17 @@ fn build_bulk_import_unavailable_error(remote_hint: Option<String>) -> String {
 // probes are the only HTTP calls in this code path). Local-server is
 // always on 127.0.0.1 — never use these helpers for arbitrary URLs.
 
-fn ureq_get_with_timeout(url: &str, timeout_secs: u64) -> Result<String, String> {
+/// Loopback-only blocking GET.
+///
+/// 🔴 Deliberately raw TcpStream rather than ureq: `ureq::get()` consults
+/// `https_proxy` / `http_proxy` from the environment, and a probe of
+/// 127.0.0.1 that goes out through the user's proxy is the classic
+/// false-unreachable this project has already been bitten by. A socket the
+/// caller opens itself cannot be hijacked that way.
+///
+/// The non-local guard below is what keeps that property true: this helper
+/// must never become a general HTTP client.
+pub(crate) fn ureq_get_with_timeout(url: &str, timeout_secs: u64) -> Result<String, String> {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;

@@ -426,7 +426,17 @@ pub(crate) enum Commands {
     },
     /// Show a summary of gateway, login, keys, and providers
     #[command(display_order = 9)]
-    Status,
+    Status {
+        /// Also report recent token usage read from the local proxy WAL.
+        ///
+        /// Off by default because it costs a bounded file scan, while the
+        /// rest of `status` is cheap metadata reads — callers that poll
+        /// frequently (the desktop tray polls services every few seconds)
+        /// must be able to get the cheap answer without paying for this one.
+        /// Only meaningful together with `--json`.
+        #[arg(long)]
+        usage: bool,
+    },
     /// Show your current login, active key, and vault status
     #[command(display_order = 9)]
     Whoami,
@@ -1465,7 +1475,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Activate { .. } => "activate".to_string(),
             Commands::Deactivate { .. } => "deactivate".to_string(),
             Commands::Route { .. } => "route".to_string(),
-            Commands::Status => "status".to_string(),
+            Commands::Status { .. } => "status".to_string(),
             Commands::Whoami => "whoami".to_string(),
             Commands::Account { action } => format!(
                 "account.{}",

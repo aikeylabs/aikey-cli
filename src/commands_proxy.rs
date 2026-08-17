@@ -343,6 +343,129 @@ pub fn try_auto_start_from_env() {
 /// + verifying password against the vault before spawning (avoids the
 /// silent-vault-decrypt-failure pitfall — see commit history /
 /// `bugfix/2026-04-28-*`).
+/// How the vault master password was obtained. Callers use this only for
+/// messaging — the password itself is identical whichever way it arrived.
+pub enum PasswordOrigin {
+    /// Injected by the caller via `AIKEY_MASTER_PASSWORD` / `AK_TEST_PASSWORD`.
+    Env,
+    /// Read from the session cache (OS keychain or encrypted file).
+    Cache,
+    /// Typed by a human just now.
+    Prompted,
+}
+
+/// Resolve AND verify the vault master password without assuming a terminal.
+///
+/// This is the single implementation of "how does something that wants to
+/// start the proxy obtain the master password". It exists because there were
+/// two of them, and they disagreed in the one case that matters.
+///
+/// `commands_proxy` had learned (bug 20260611-proxy-service-no-unattended-password)
+/// that launchd/systemd run it at login and after a crash with no terminal
+/// attached, so it consults the session cache before giving up.
+/// `commands_service` had not: it always called the interactive prompt, so it
+/// failed from every non-interactive caller — after first printing a password
+/// prompt that nobody could answer. That is what the AiKey tray hit when a
+/// user clicked "Restart proxy".
+///
+/// Three rules are preserved exactly as they were, because each is deliberate:
+///
+///   1. The env-var path is NOT verified against the vault. An env var has the
+///      same security model as a command-line flag: the caller asserted it,
+///      and the caller owns being right.
+///   2. A cached password the vault REJECTS is invalidated immediately, so a
+///      stale entry (e.g. after change-password) cannot be retried forever.
+///   3. A freshly typed password is stored only AFTER the vault accepts it,
+///      so a typo never poisons the cache.
+///
+/// Verification happens here, before the caller spawns anything: a wrong
+/// password caught now is an error message, caught later it is a child process
+/// that dies with an opaque vault-decrypt failure.
+pub fn resolve_verified_vault_password(
+    password_stdin: bool,
+) -> Result<(SecretString, PasswordOrigin), String> {
+    use std::io::IsTerminal;
+
+    if let Some(env_val) = std::env::var("AIKEY_MASTER_PASSWORD")
+        .or_else(|_| std::env::var("AK_TEST_PASSWORD"))
+        .ok()
+    {
+        // Rule 1 — trusted as given, deliberately unverified.
+        return Ok((SecretString::new(env_val), PasswordOrigin::Env));
+    }
+
+    // No terminal to ask, and no password-stdin channel: the session cache is
+    // the only remaining source. Reading it needs no terminal — only the
+    // PROMPT does — so try it before concluding there is nothing to use.
+    // TTL is deliberately not consulted here (see `session::try_get_unattended`):
+    // a machine restarting its own proxy at boot has nobody to re-authenticate,
+    // and failing on an expired sliding window would leave it with no proxy.
+    if !(io::stderr().is_terminal() || password_stdin) {
+        let cached = crate::session::try_get_unattended().ok_or_else(|| {
+            "unattended proxy start: no master password available. Set \
+             AIKEY_MASTER_PASSWORD in the service environment, or run `aikey proxy start` \
+             interactively once to populate the session cache."
+                .to_string()
+        })?;
+        if let Err(e) = crate::executor::list_secrets(&cached) {
+            // Rule 2 — a stale cache must not be retried forever.
+            crate::session::invalidate();
+            return Err(format!(
+                "cached vault password rejected: {e}. Run `aikey proxy start` interactively to refresh it."
+            ));
+        }
+        return Ok((cached, PasswordOrigin::Cache));
+    }
+
+    // Interactive (or password-stdin) path.
+    let mut from_cache = false;
+    let pw: SecretString = if let Some(cached) = (!password_stdin)
+        .then(|| crate::session::try_get())
+        .flatten()
+    {
+        crate::session::refresh();
+        from_cache = true;
+        cached
+    } else if password_stdin {
+        eprint!("{}Enter Master Password: ", crate::symbols::ICON_LOCK.pre());
+        let _ = io::stderr().flush();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+        eprintln!("***");
+        SecretString::new(line.trim().to_string())
+    } else {
+        match crate::prompt_hidden(&format!(
+            "{}Enter Master Password: ",
+            crate::symbols::ICON_LOCK.pre()
+        )) {
+            Ok(p) => SecretString::new(p),
+            Err(_) => {
+                return Err("could not read the master password from this terminal.".to_string())
+            }
+        }
+    };
+
+    if let Err(e) = crate::executor::list_secrets(&pw) {
+        if from_cache {
+            // Rule 2 again, on the interactive cache hit.
+            crate::session::invalidate();
+        }
+        return Err(format!("vault password rejected: {e}"));
+    }
+    if !from_cache {
+        // Rule 3 — only a verified password is cached.
+        crate::session::store(&pw);
+    }
+    Ok((
+        pw,
+        if from_cache {
+            PasswordOrigin::Cache
+        } else {
+            PasswordOrigin::Prompted
+        },
+    ))
+}
+
 pub fn ensure_proxy_for_use(password_stdin: bool) {
     use crate::proxy_lifecycle::{start_proxy, StartError, StderrTarget};
 
@@ -376,99 +499,17 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
 
     // 1. Resolve a candidate password.
     let stderr_target = StderrTarget::Log(startup_log_path());
-    let env_pw = std::env::var("AIKEY_MASTER_PASSWORD")
-        .or_else(|_| std::env::var("AK_TEST_PASSWORD"))
-        .ok();
 
-    let (pw, from_cache, prompted, env_path) = if let Some(env_val) = env_pw {
-        // Env-var path: caller already injected the password; trust it.
-        // No vault verification — env var has the same security model as
-        // a flag, and the caller is responsible for getting it right.
-        (SecretString::new(env_val), false, false, true)
-    } else {
-        // Interactive / cache path. Need to actually have a TTY (or
-        // password-stdin mode) to ask for a fresh password.
-        use std::io::IsTerminal;
-        if !(io::stderr().is_terminal() || password_stdin) {
-            // L9 fix A (2026-06-11): UNATTENDED start — launchd/systemd runs
-            // this exact path on login / crash-restart with no TTY. Reading
-            // the session store needs no terminal (only the interactive
-            // PROMPT does), so try it before bailing; otherwise the service
-            // looped on "Enter Master Password: requires an interactive
-            // terminal" forever and the web showed "本地服务不可用". TTL is
-            // deliberately not consulted (see try_get_unattended docs). Bug:
-            // 20260611-proxy-service-no-unattended-password.md
-            if let Some(cached) = crate::session::try_get_unattended() {
-                // Same verify-before-spawn discipline as the interactive
-                // cache path: a stale store (master password changed) must
-                // invalidate + bail here, not crashloop the spawned child.
-                if let Err(e) = crate::executor::list_secrets(&cached) {
-                    crate::session::invalidate();
-                    eprintln!("[aikey] cached vault password rejected: {}", e);
-                    eprintln!("[aikey] run `aikey proxy start` interactively to refresh it");
-                    return;
-                }
-                (cached, true, false, false)
-            } else {
-                eprintln!("[aikey] proxy not running — run `aikey proxy start` to enable routing");
-                return;
-            }
-        } else {
-            eprintln!();
-            eprintln!("Proxy not running — starting it now.");
-
-            // Cache hit: silent.
-            let mut from_cache = false;
-            let mut prompted = false;
-            let pw: SecretString = if let Some(cached) = (!password_stdin)
-                .then(|| crate::session::try_get())
-                .flatten()
-            {
-                crate::session::refresh();
-                from_cache = true;
-                cached
-            } else if password_stdin {
-                eprint!("{}Enter Master Password: ", crate::symbols::ICON_LOCK.pre());
-                let _ = io::stderr().flush();
-                let mut line = String::new();
-                let _ = io::stdin().read_line(&mut line);
-                eprintln!("***");
-                prompted = true;
-                SecretString::new(line.trim().to_string())
-            } else {
-                prompted = true;
-                match crate::prompt_hidden(&format!(
-                    "{}Enter Master Password: ",
-                    crate::symbols::ICON_LOCK.pre()
-                )) {
-                    Ok(p) => SecretString::new(p),
-                    Err(_) => {
-                        eprintln!(
-                            "  [aikey] Could not read password — run `aikey proxy start` manually."
-                        );
-                        return;
-                    }
-                }
-            };
-
-            // Verify password against the vault BEFORE spawning. Catches
-            // wrong-password early instead of letting it manifest as a
-            // silent vault-decrypt failure inside the child.
-            if let Err(e) = crate::executor::list_secrets(&pw) {
-                if from_cache {
-                    crate::session::invalidate();
-                }
-                eprintln!("  [aikey] vault password rejected: {}", e);
-                eprintln!("  [aikey] retry with: aikey proxy start");
-                return;
-            }
-            if prompted {
-                crate::session::store(&pw);
-            }
-            (pw, from_cache, prompted, false)
+    // 1. Resolve a candidate password through the ONE implementation shared
+    // with `aikey service {start,restart} proxy`. Keeping this inline is how
+    // the two paths drifted apart in the first place.
+    let pw = match resolve_verified_vault_password(password_stdin) {
+        Ok((pw, _origin)) => pw,
+        Err(e) => {
+            eprintln!("[aikey] {e}");
+            return;
         }
     };
-    let _ = (from_cache, prompted, env_path); // suppress unused warnings on cfg paths
 
     // 2. Build StartOptions + delegate to Layer 2.
     let (opts, _env_keys) = match build_start_options(None, stderr_target) {

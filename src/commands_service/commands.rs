@@ -145,7 +145,27 @@ fn status_all(json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::json!({"name": name, "running": running, "detail": detail})
             })
             .collect();
-        println!("{}", serde_json::json!({"services": payload}));
+        // 🔴 schema_version is a wire contract, not decoration.
+        //
+        // This JSON is consumed across a release boundary: the AiKey tray ships
+        // as an independent package, so "old tray + new CLI" is a NORMAL state,
+        // not an error case. Without a version the tray has no way to tell
+        // "this CLI predates the field I need" from "the field is legitimately
+        // absent", and the failure mode is silent — an empty menu, not an error.
+        //
+        // Rules for changing it (mirrors the project's wire-contract governance):
+        //   - Adding an optional field: DO NOT bump. Consumers must ignore
+        //     unknown fields, so additive changes stay compatible in both
+        //     directions and either side can upgrade first.
+        //   - Removing/renaming a field, or changing its type or meaning:
+        //     bump. That is the only change a consumer cannot absorb.
+        //   - Never use exact equality as a consumer-side gate; compare
+        //     against a minimum. Exact-match gating turns every release into
+        //     a fleet-wide breakage.
+        println!(
+            "{}",
+            serde_json::json!({"schema_version": 1, "services": payload})
+        );
     } else {
         for (name, running, detail) in &rows {
             // Aligned two-column table: fixed-width name, state glyph, detail.
@@ -493,9 +513,18 @@ mod proxy {
                 // prompt_vault_password lives in main.rs as a thin
                 // wrapper around executor::prompt_password; we
                 // reuse it via crate visibility.
-                let password = crate::prompt_vault_password(password_stdin, false)?;
-                crate::executor::list_secrets(&password)
-                    .map_err(|e| format!("vault authentication failed: {}", e))?;
+                // Reuse the ONE password-resolution core (commands_proxy::
+                // resolve_verified_vault_password). Calling prompt_vault_password
+                // here was the bug: it only knows env / stdin / interactive TTY,
+                // so every non-interactive caller — the AiKey tray, launchd, a
+                // script — got a password prompt it could not answer, and only
+                // then an error. The core consults the session cache first,
+                // exactly as `aikey proxy start` has since 2026-06-11.
+                //
+                // It also verifies before we spawn, so the explicit
+                // list_secrets check that used to live here is now redundant.
+                let (password, _origin) =
+                    crate::commands_proxy::resolve_verified_vault_password(password_stdin)?;
                 crate::commands_proxy::handle_start(None, true /*detach*/, &password)?;
                 Ok(())
             }
@@ -504,9 +533,18 @@ mod proxy {
                 Ok(())
             }
             "restart" => {
-                let password = crate::prompt_vault_password(password_stdin, false)?;
-                crate::executor::list_secrets(&password)
-                    .map_err(|e| format!("vault authentication failed: {}", e))?;
+                // Reuse the ONE password-resolution core (commands_proxy::
+                // resolve_verified_vault_password). Calling prompt_vault_password
+                // here was the bug: it only knows env / stdin / interactive TTY,
+                // so every non-interactive caller — the AiKey tray, launchd, a
+                // script — got a password prompt it could not answer, and only
+                // then an error. The core consults the session cache first,
+                // exactly as `aikey proxy start` has since 2026-06-11.
+                //
+                // It also verifies before we spawn, so the explicit
+                // list_secrets check that used to live here is now redundant.
+                let (password, _origin) =
+                    crate::commands_proxy::resolve_verified_vault_password(password_stdin)?;
                 crate::commands_proxy::handle_restart(None, &password)?;
                 Ok(())
             }

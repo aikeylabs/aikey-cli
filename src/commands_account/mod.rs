@@ -2628,7 +2628,193 @@ fn active_team_key_count(bindings: &[storage::ProviderBinding]) -> usize {
         .len()
 }
 
+/// Build the `candidates` array for `aikey status --json`: every credential the
+/// user could switch to, as METADATA ONLY.
+///
+/// 🔴 WHY THIS IS METADATA-ONLY, AND MUST STAY THAT WAY (2026-08-16)
+///
+/// This array exists so the desktop tray can offer "switch account" without
+/// reaching for `aikey list`. The tray runs under a machine-checked authority
+/// fence (aikey-tray/internal/boundary_test.go) admitting only CLI surfaces
+/// that (1) need no vault unlock and (2) return no key material. `aikey list`
+/// fails both — it needs the master password AND it enumerates keys — which is
+/// precisely why the tray was never allowed to call it.
+///
+/// `status` passes both tests today, and this addition must not change that:
+///
+///   - Every accessor below is a read-only metadata projection. None of them
+///     decrypts anything, so no master password is involved.
+///   - The fields emitted are an identifier, a display label, a kind, and
+///     provider codes. NOTHING that could be replayed.
+///
+/// 🚫 NEVER add here: `route_token` (a stable routing credential that
+/// `SecretMetadata` carries and `query_entries_with_metadata` does SELECT),
+/// `provider_key_ciphertext` / `provider_key_nonce`, `base_url`, or any token,
+/// secret or nonce. Adding one silently converts an admitted surface into a
+/// key-material surface and voids the tray's fence without turning it red.
+///
+/// `id` is deliberately the exact string `aikey key use <id>` accepts, and the
+/// exact string that comes back as `active_key.key_ref` afterwards — personal
+/// → alias, team → virtual_key_id, oauth → provider_account_id. That identity
+/// is what lets a caller mark the active row by comparing the two, instead of
+/// this array carrying its own `active` flag and becoming a second, drifting
+/// answer to a question `active_key` already answers.
+fn status_candidates(
+    personal_meta: &[storage::SecretMetadata],
+    team_keys: &[storage::VirtualKeyCacheEntry],
+    oauth_accounts: &[storage::ProviderAccountInfo],
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+
+    for e in personal_meta {
+        let providers: Vec<String> = e
+            .supported_providers
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| e.provider_code.clone().map(|p| vec![p]))
+            .unwrap_or_default();
+        out.push(serde_json::json!({
+            "id": e.alias,
+            "label": e.alias,
+            "kind": "personal",
+            "providers": providers,
+        }));
+    }
+
+    // 🔴 The team cache holds one row per BINDING, and a single virtual key can
+    // own several routes — the counting path a few lines below has always known
+    // this ("Count distinct bound VKs (one VK may own several routes)"). Emitting
+    // a candidate per row therefore lists the same credential several times: on
+    // the machine this was found on, 29 rows collapsed to 25 real credentials,
+    // with the ACTIVE key appearing four times. A hand-written fixture cannot
+    // show this; only real vault data did.
+    //
+    // Dedupe by virtual_key_id, unioning the providers each row contributes, so
+    // one credential is one row carrying everything it can serve.
+    let mut team_index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for k in team_keys {
+        let row_providers: Vec<String> = if !k.supported_providers.is_empty() {
+            k.supported_providers.clone()
+        } else if !k.provider_code.is_empty() {
+            vec![k.provider_code.clone()]
+        } else {
+            Vec::new()
+        };
+
+        if let Some(&pos) = team_index.get(k.virtual_key_id.as_str()) {
+            let existing = out[pos]["providers"]
+                .as_array_mut()
+                .expect("candidate providers is always an array");
+            for p in row_providers {
+                let v = serde_json::Value::String(p);
+                if !existing.contains(&v) {
+                    existing.push(v);
+                }
+            }
+            continue;
+        }
+
+        // local_alias is the user's own label and wins when set; the server
+        // alias is the fallback. Same precedence `aikey key use` resolves by.
+        let label = k.local_alias.clone().unwrap_or_else(|| k.alias.clone());
+        team_index.insert(k.virtual_key_id.as_str(), out.len());
+        out.push(serde_json::json!({
+            "id": k.virtual_key_id,
+            "label": label,
+            "kind": "team",
+            "providers": row_providers,
+        }));
+    }
+
+    for a in oauth_accounts {
+        let label = a
+            .local_alias
+            .clone()
+            .or_else(|| a.display_identity.clone())
+            .unwrap_or_else(|| a.provider_account_id.clone());
+        out.push(serde_json::json!({
+            "id": a.provider_account_id,
+            "label": label,
+            "kind": "oauth",
+            "providers": [a.provider.clone()],
+            // Status is carried because `aikey key use` REFUSES an OAuth
+            // account that is neither active nor idle. A UI that offered the
+            // row anyway would produce an error the user could not have
+            // predicted from what was on screen.
+            "status": a.status,
+        }));
+    }
+
+    out
+}
+
+/// Map a credential type onto the vocabulary `candidates[].kind` uses, so one
+/// credential is never called two different things depending on which array it
+/// appears in.
+fn candidate_kind_of(t: &crate::credential_type::CredentialType) -> &'static str {
+    use crate::credential_type::CredentialType as C;
+    match t {
+        C::PersonalApiKey => "personal",
+        C::ManagedVirtualKey => "team",
+        C::PersonalOAuthAccount => "oauth",
+    }
+}
+
+/// Build the `routes` array: which credential currently serves each client
+/// route.
+///
+/// 🔴 WHY THIS EXISTS (live E2E, 2026-08-16). `active_key` describes a single
+/// credential, and callers — including this project's own desktop tray — read
+/// it as "the one in use". It is not. Routing is PER PROVIDER: on the machine
+/// this was found on, THREE credentials were serving four routes at once
+/// (a team VK on deepseek and zhipu, one personal key on kimi, another on
+/// openai). A UI built on `active_key` alone shows two of those three as
+/// inactive while they are carrying live traffic.
+///
+/// Provider bindings are the routing source of truth — the counting code below
+/// has said so since 2026 ("Provider bindings are the routing SSOT"). This
+/// array simply exposes them, joined to a display label.
+///
+/// `credential_id` is the same string domain as `candidates[].id` and as
+/// `aikey key use <id>`: alias for personal, virtual_key_id for team,
+/// provider_account_id for OAuth. That identity is what lets a caller pair the
+/// two arrays without a second lookup.
+fn status_routes(
+    bindings: &[storage::ProviderBinding],
+    candidates: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    bindings
+        .iter()
+        .map(|b| {
+            // Prefer the candidate's label so the same credential reads the
+            // same in both arrays; fall back to the raw ref, which is at least
+            // true, rather than to a placeholder.
+            let label = candidates
+                .iter()
+                .find(|c| c["id"] == serde_json::Value::String(b.key_source_ref.clone()))
+                .and_then(|c| c["label"].as_str())
+                .unwrap_or(&b.key_source_ref)
+                .to_string();
+            serde_json::json!({
+                "route": b.client_route,
+                "provider": b.provider_code,
+                "protocol": b.protocol_type,
+                "credential_id": b.key_source_ref,
+                "label": label,
+                "kind": candidate_kind_of(&b.key_source_type),
+            })
+        })
+        .collect()
+}
+
 pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    handle_status_overview_with(json_mode, false)
+}
+
+pub fn handle_status_overview_with(
+    json_mode: bool,
+    include_usage: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::BTreeSet;
 
     let vault_exists = storage::get_vault_path()
@@ -2637,13 +2823,23 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     let account = storage::get_platform_account().ok().flatten();
 
     // Collect key counts.
-    let personal_count = if vault_exists {
-        storage::list_entries().map(|v| v.len()).unwrap_or(0)
+    //
+    // `personal_meta` is hoisted out of the providers/protocols block below so
+    // the same read feeds both that aggregation and the `candidates` array in
+    // the JSON branch. Reading the vault metadata twice for one command would
+    // be two chances to disagree with itself.
+    let personal_meta = if vault_exists {
+        storage::list_entries_with_metadata().unwrap_or_default()
     } else {
-        0
+        Vec::new()
     };
+    let personal_count = personal_meta.len();
     let team_keys = storage::list_virtual_key_cache().unwrap_or_default();
     let team_total = team_keys.len();
+    // OAuth accounts round out the third credential kind. Read-only accessor:
+    // it projects account metadata and never touches token material, which is
+    // what keeps `aikey status` free of any master-password requirement.
+    let oauth_accounts = storage::list_provider_accounts_readonly().unwrap_or_default();
     // Provider bindings are the routing SSOT. `local_state` is sync/eligibility
     // metadata and no longer flips to `active` for every selected protocol, so
     // counting it made status report zero while the proxy was actively routing
@@ -2665,26 +2861,22 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     // client route derived from exact Provider+Protocol truth.
     let mut providers = BTreeSet::new();
     let mut protocols = BTreeSet::new();
-    if vault_exists {
-        if let Ok(entries) = storage::list_entries_with_metadata() {
-            for e in &entries {
-                let base_url = e.base_url.as_deref().unwrap_or("");
-                if let Some(ref pc) = e.provider_code {
-                    if !pc.is_empty() {
-                        providers.insert(pc.clone());
-                        if let Some(route) = status_client_route(pc, "", base_url) {
-                            protocols.insert(route);
-                        }
-                    }
+    for e in &personal_meta {
+        let base_url = e.base_url.as_deref().unwrap_or("");
+        if let Some(ref pc) = e.provider_code {
+            if !pc.is_empty() {
+                providers.insert(pc.clone());
+                if let Some(route) = status_client_route(pc, "", base_url) {
+                    protocols.insert(route);
                 }
-                if let Some(ref sp) = e.supported_providers {
-                    for p in sp {
-                        if !p.is_empty() {
-                            providers.insert(p.clone());
-                            if let Some(route) = status_client_route(p, "", base_url) {
-                                protocols.insert(route);
-                            }
-                        }
+            }
+        }
+        if let Some(ref sp) = e.supported_providers {
+            for p in sp {
+                if !p.is_empty() {
+                    providers.insert(p.clone());
+                    if let Some(route) = status_client_route(p, "", base_url) {
+                        protocols.insert(route);
                     }
                 }
             }
@@ -2725,11 +2917,34 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     let active_cfg = storage::get_active_key_config().ok().flatten();
 
     if json_mode {
+        let candidates = status_candidates(&personal_meta, &team_keys, &oauth_accounts);
+        let routes = status_routes(&active_bindings, &candidates);
+
         let active_json = active_cfg.as_ref().map(|cfg| {
+            // 🔴 `providers` is derived from the BINDINGS, not from the stored
+            // active-key config (found by live E2E, 2026-08-16). The stored
+            // list over-claimed: on a machine where kimi routed to
+            // `kimi-code-8` and openai to `keep`, the active team VK still
+            // advertised "deepseek, kimi, openai, zhipu" — naming two
+            // providers it did not serve. Bindings are the routing source of
+            // truth, so "what does this key actually serve" comes from them.
+            //
+            // The stored rows are NOT touched: aikey-proxy reads
+            // `active_key_providers` from the vault config table directly and
+            // is unaffected by this projection.
+            let mut served: Vec<String> = active_bindings
+                .iter()
+                .filter(|b| b.key_source_ref == cfg.key_ref)
+                .map(|b| b.provider_code.clone())
+                .filter(|p| !p.is_empty())
+                .collect();
+            served.sort();
+            served.dedup();
+
             serde_json::json!({
                 "key_type": cfg.key_type,
                 "key_ref":  cfg.key_ref,
-                "providers": cfg.providers,
+                "providers": served,
             })
         });
         // Round 9 fix #1: was is_proxy_running (PID-only); now Layer 1.
@@ -2749,8 +2964,35 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
                 "team_active": active_team,
             },
             "active_key": active_json,
+            // Metadata-only switch targets. Purely additive: consumers that
+            // predate this field ignore it, so no version handshake is needed
+            // and none was added. See status_candidates for what may never go
+            // in here.
+            "candidates": candidates,
+            // Which credential serves each route, from the bindings. See
+            // status_routes: `active_key` alone cannot express this, because
+            // several credentials are routinely in use at once.
+            "routes": routes,
             "providers": providers.iter().collect::<Vec<_>>(),
             "protocols": protocols.iter().collect::<Vec<_>>(),
+            // Behind --usage because it is the only part of this command that
+            // costs a file scan; frequent pollers must be able to skip it.
+            // Absent (not null, not zeroes) when not requested — "you did not
+            // ask" and "there is none" are different answers.
+            // 🔴 Sourced from the local CONSOLE, not the proxy's WAL
+            // (decision 2026-08-16). The console is the only place on this
+            // machine that knows prices, so it is the only source that can
+            // report money — and using it means the tray and the console can
+            // never show the user two different numbers for the same day.
+            //
+            // The cost of that choice is that usage is UNAVAILABLE when the
+            // console is stopped. `usage_console` reports that as an explicit
+            // reason rather than as zero.
+            "usage": if include_usage {
+                serde_json::to_value(crate::usage_console::today_hourly()).ok()
+            } else {
+                None
+            },
         }));
         return Ok(());
     }
@@ -2896,6 +3138,250 @@ fn status_client_route(provider_code: &str, protocol_type: &str, base_url: &str)
     // custom single-route providers retain the legacy self-named fallback.
     let fallback = crate::provider_registry::client_route_for_binding(provider_code, "");
     (fallback != "mock").then(|| fallback.to_string())
+}
+
+#[cfg(test)]
+mod status_candidates_tests {
+    use super::status_candidates;
+
+    /// A personal entry carrying every sensitive field the vault can hand back.
+    /// `route_token` is the trap this fixture exists for: it lives on
+    /// `SecretMetadata`, `query_entries_with_metadata` really does SELECT it,
+    /// and it is a stable routing credential.
+    fn loaded_personal_entry() -> crate::storage::SecretMetadata {
+        crate::storage::SecretMetadata {
+            alias: "work-anthropic".to_string(),
+            created_at: Some(1_700_000_000),
+            provider_code: Some("anthropic".to_string()),
+            base_url: Some("https://internal.example.invalid".to_string()),
+            supported_providers: Some(vec!["anthropic".to_string()]),
+            route_token: Some("aikey_personal_deadbeef".to_string()),
+            last_used_at: Some(1_700_000_100),
+            use_count: Some(7),
+            extra: None,
+        }
+    }
+
+    /// 🔴 The fence. A candidate row is metadata; anything replayable that
+    /// leaks in here silently converts `aikey status` from a surface the tray's
+    /// authority fence admits into one it must not — without turning that
+    /// fence red, because it checks WHICH command is called, not what the
+    /// command returns.
+    #[test]
+    fn candidates_never_carry_key_material() {
+        let rows = status_candidates(&[loaded_personal_entry()], &[], &[]);
+        assert_eq!(rows.len(), 1);
+        let serialized = serde_json::to_string(&rows[0]).expect("serialize candidate");
+
+        for forbidden in [
+            "route_token",
+            "aikey_personal_deadbeef",
+            "provider_key_ciphertext",
+            "provider_key_nonce",
+            "base_url",
+            "internal.example.invalid",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "candidate row leaked {forbidden:?}: {serialized}"
+            );
+        }
+    }
+
+    /// The emitted key set is pinned. A new field must be a deliberate edit
+    /// here, which is the moment to re-run the "is this replayable?" question.
+    #[test]
+    fn candidate_shape_is_exactly_the_agreed_metadata() {
+        let rows = status_candidates(&[loaded_personal_entry()], &[], &[]);
+        let obj = rows[0].as_object().expect("candidate is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["id", "kind", "label", "providers"]);
+    }
+
+    /// `id` must be the string `aikey key use <id>` accepts AND the string that
+    /// comes back as `active_key.key_ref`. If these ever diverge, the UI can no
+    /// longer tell which row is active by comparing them, and would need a
+    /// second source of truth — exactly what this contract avoids.
+    #[test]
+    fn personal_candidate_id_is_the_alias_key_use_resolves() {
+        let rows = status_candidates(&[loaded_personal_entry()], &[], &[]);
+        assert_eq!(rows[0]["id"], "work-anthropic");
+        assert_eq!(rows[0]["kind"], "personal");
+    }
+
+    /// A team cache row. The cache stores one row per BINDING, so several rows
+    /// can share a `virtual_key_id` — the shape that produced the duplicate
+    /// listing this fixture exists to prevent.
+    fn team_row(vk_id: &str, alias: &str, providers: &[&str]) -> crate::storage::VirtualKeyCacheEntry {
+        crate::storage::VirtualKeyCacheEntry {
+            binding_id: format!("b-{vk_id}-{}", providers.join("-")),
+            virtual_key_id: vk_id.to_string(),
+            org_id: "org".into(),
+            seat_id: "seat".into(),
+            alias: alias.to_string(),
+            provider_code: providers.first().copied().unwrap_or("").to_string(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: "cred".into(),
+            credential_revision: "1".into(),
+            virtual_key_revision: "1".into(),
+            key_status: "active".into(),
+            share_status: "delivered".into(),
+            local_state: "ready".into(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: None,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: providers.iter().map(|s| s.to_string()).collect(),
+            provider_base_urls: Default::default(),
+            priority: 0,
+            fallback_role: String::new(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
+            owner_account_id: None,
+            owner_email: None,
+            extra: None,
+            oauth_group_id: None,
+            group_accounts: None,
+            routing_config: None,
+            group_alias: None,
+            group_runtime: None,
+        }
+    }
+
+    /// 🔴 REGRESSION (found by live E2E, 2026-08-16). `list_virtual_key_cache`
+    /// returns one row per binding and a single virtual key can own several
+    /// routes, so emitting a candidate per row listed the same credential
+    /// repeatedly — on the machine this was found on, the ACTIVE key appeared
+    /// FOUR times and 29 rows represented 25 real credentials.
+    ///
+    /// Every hand-written fixture had one row per key, so no unit test could
+    /// have seen it; the counting path in the same function had known about
+    /// multi-route VKs all along.
+    #[test]
+    fn team_rows_sharing_a_virtual_key_collapse_to_one_candidate() {
+        let rows = status_candidates(
+            &[],
+            &[
+                team_row("vk-1", "team-claude", &["anthropic"]),
+                team_row("vk-1", "team-claude", &["zhipu"]),
+                team_row("vk-1", "team-claude", &["anthropic", "openai"]),
+                team_row("vk-2", "team-other", &["kimi"]),
+            ],
+            &[],
+        );
+
+        assert_eq!(rows.len(), 2, "two distinct virtual keys, not four bindings");
+        assert_eq!(rows[0]["id"], "vk-1");
+        assert_eq!(rows[1]["id"], "vk-2");
+
+        // Providers are unioned, not overwritten: a credential's row must show
+        // everything it can serve, and must not repeat a provider.
+        let mut provs: Vec<String> = rows[0]["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        provs.sort();
+        assert_eq!(provs, vec!["anthropic", "openai", "zhipu"]);
+    }
+
+    /// An entry that predates `supported_providers` still has to report the
+    /// provider it does know, or the row renders as "no providers" for keys
+    /// that route perfectly well.
+    #[test]
+    fn legacy_entry_falls_back_to_the_single_provider_code() {
+        let mut legacy = loaded_personal_entry();
+        legacy.supported_providers = None;
+        let rows = status_candidates(&[legacy], &[], &[]);
+        assert_eq!(rows[0]["providers"], serde_json::json!(["anthropic"]));
+    }
+}
+
+#[cfg(test)]
+mod status_routes_tests {
+    use super::{status_candidates, status_routes};
+    use crate::credential_type::CredentialType;
+
+    fn binding(route: &str, provider: &str, t: CredentialType, refr: &str) -> crate::storage::ProviderBinding {
+        crate::storage::ProviderBinding {
+            profile_id: "default".into(),
+            client_route: route.into(),
+            provider_code: provider.into(),
+            protocol_type: "openai_compatible".into(),
+            key_source_type: t,
+            key_source_ref: refr.into(),
+            updated_at: None,
+        }
+    }
+
+    /// 🔴 THE FINDING (live E2E, 2026-08-16). Routing is per provider, and
+    /// several credentials are routinely in use at once. `active_key` names
+    /// exactly one, so a UI built on it alone shows credentials that are
+    /// carrying live traffic as inactive. This array is what makes the real
+    /// picture expressible.
+    #[test]
+    fn routes_report_every_credential_actually_in_use() {
+        let bindings = [
+            binding("deepseek", "deepseek", CredentialType::ManagedVirtualKey, "vk-1"),
+            binding("kimi", "kimi_code", CredentialType::PersonalApiKey, "kimi-code-8"),
+            binding("zhipu", "zhipu", CredentialType::ManagedVirtualKey, "vk-1"),
+        ];
+        let routes = status_routes(&bindings, &[]);
+
+        assert_eq!(routes.len(), 3);
+        let distinct: std::collections::BTreeSet<&str> = routes
+            .iter()
+            .map(|r| r["credential_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            2,
+            "two credentials serve three routes — the shape `active_key` cannot express"
+        );
+    }
+
+    /// The label must match the one the credential carries in `candidates`, or
+    /// the same key reads as two different things on one screen.
+    #[test]
+    fn routes_reuse_the_candidate_label() {
+        let candidates = status_candidates(
+            &[crate::storage::SecretMetadata {
+                alias: "kimi-code-8".into(),
+                created_at: None,
+                provider_code: Some("kimi_code".into()),
+                base_url: None,
+                supported_providers: None,
+                route_token: None,
+                last_used_at: None,
+                use_count: None,
+                extra: None,
+            }],
+            &[],
+            &[],
+        );
+        let routes = status_routes(
+            &[binding("kimi", "kimi_code", CredentialType::PersonalApiKey, "kimi-code-8")],
+            &candidates,
+        );
+        assert_eq!(routes[0]["label"], "kimi-code-8");
+        assert_eq!(routes[0]["kind"], "personal");
+    }
+
+    /// An unknown ref still renders something TRUE (the ref itself) rather than
+    /// a placeholder that hides which credential is bound.
+    #[test]
+    fn an_unmatched_binding_falls_back_to_the_raw_reference() {
+        let routes = status_routes(
+            &[binding("openai", "openai", CredentialType::PersonalOAuthAccount, "acct-77")],
+            &[],
+        );
+        assert_eq!(routes[0]["label"], "acct-77");
+        assert_eq!(routes[0]["kind"], "oauth");
+    }
 }
 
 #[cfg(test)]

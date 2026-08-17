@@ -102,6 +102,7 @@ mod ui_select;
 #[allow(dead_code)]
 mod ui_select_windows;
 #[allow(dead_code)]
+mod usage_console;
 mod usage_wal;
 
 // Crate-wide test-env mutex (see src/test_env_lock.rs). Declared in both
@@ -4528,8 +4529,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 cli.json,
             )?;
         }
-        Commands::Status => {
-            commands_account::handle_status_overview(cli.json)?;
+        Commands::Status { usage } => {
+            commands_account::handle_status_overview_with(cli.json, *usage)?;
             // Mode A addendum: append a local-server status line so users have
             // a single command for "is my console reachable". See
             // roadmap20260320/技术实现/update/20260422-批量导入-aikey-serve-命令移除.md

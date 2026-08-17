@@ -454,6 +454,11 @@ struct ClusterRuntimeAccount {
 #[derive(Debug, serde::Deserialize)]
 struct ClusterMemberToken {
     access_token: String,
+    /// Provider account identity bound to this member's access token. Newer
+    /// controls send it when a member explicitly confirms a pool-slot mismatch;
+    /// older payloads fall back to the account-level external_id.
+    #[serde(default)]
+    provider_account_id: String,
     #[serde(default)]
     token_expires_at: i64,
 }
@@ -711,8 +716,13 @@ fn build_group_runtime_material(
                 if tok.token_expires_at > 0 {
                     m.insert("expires_at".into(), tok.token_expires_at.into());
                 }
-                if !a.external_id.is_empty() {
-                    m.insert("external_id".into(), a.external_id.clone().into());
+                let provider_account_id = if !tok.provider_account_id.is_empty() {
+                    &tok.provider_account_id
+                } else {
+                    &a.external_id
+                };
+                if !provider_account_id.is_empty() {
+                    m.insert("external_id".into(), provider_account_id.clone().into());
                 }
                 if let Some(w) = a.window_max_util_pct {
                     m.insert("window_max_util_pct".into(), w.into());
@@ -3340,6 +3350,7 @@ mod hook_envelope_tests {
             "seat-parent".to_string(),
             ClusterMemberToken {
                 access_token: "parent-token-AAA".into(),
+                provider_account_id: "member-provider-ext-1".into(),
                 token_expires_at: 4200,
             },
         );
@@ -3347,6 +3358,7 @@ mod hook_envelope_tests {
             "seat-other".to_string(),
             ClusterMemberToken {
                 access_token: "other-token-BBB".into(),
+                provider_account_id: String::new(),
                 token_expires_at: 4300,
             },
         );
@@ -3436,7 +3448,11 @@ mod hook_envelope_tests {
             "material must be the PARENT seat's token, never another seat's"
         );
         assert_eq!(m1["expires_at"], serde_json::json!(4200));
-        assert_eq!(m1["external_id"], serde_json::json!("ext-1"));
+        assert_eq!(
+            m1["external_id"],
+            serde_json::json!("member-provider-ext-1"),
+            "the member token identity must override the shared account identity"
+        );
         assert_eq!(m1["credential_type"], serde_json::json!("oauth_account"));
         assert_eq!(m1["window_7d_max_util_pct"], serde_json::json!(88));
         assert_eq!(m1["protocol_type"], serde_json::json!("anthropic"));
