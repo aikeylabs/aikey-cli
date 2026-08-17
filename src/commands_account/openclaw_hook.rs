@@ -107,7 +107,7 @@ pub(crate) fn resolve_anthropic_team_route() -> Result<(String, String), String>
 
     // Which team VK did `aikey use` select? Prefer it when multiple exist.
     let active_team: std::collections::HashSet<String> =
-        storage::list_provider_bindings_readonly("default")
+        storage::list_provider_bindings_readonly(crate::profile_activation::DEFAULT_PROFILE)
             .unwrap_or_default()
             .iter()
             .filter(|b| {

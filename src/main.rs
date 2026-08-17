@@ -68,6 +68,8 @@ mod commands_statusline;
 mod commands_trust;
 mod commands_watch;
 #[allow(dead_code)]
+mod display_language;
+#[allow(dead_code)]
 mod events;
 #[allow(dead_code)]
 mod global_config;
@@ -101,7 +103,6 @@ mod ui_select;
 #[cfg(windows)]
 #[allow(dead_code)]
 mod ui_select_windows;
-#[allow(dead_code)]
 mod usage_console;
 mod usage_wal;
 
@@ -465,12 +466,8 @@ fn handle_stats(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Check if vault exists
-    let vault_exists = if let Ok(vault_path) = crate::storage::get_vault_path() {
-        vault_path.exists()
-    } else {
-        false
-    };
+    // Salt-based, not file-based — see storage::vault_is_initialized.
+    let vault_exists = crate::storage::vault_is_initialized();
 
     if json_mode {
         let response = serde_json::json!({
@@ -1378,6 +1375,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", serde_json::json!({"display_time_zone": current}));
                 } else {
                     println!("Display time zone: {}", current);
+                }
+            }
+            cli::ConfigAction::Language { value } => {
+                let current = if let Some(value) = value {
+                    display_language::set_preference(value)?
+                } else {
+                    display_language::preference()
+                };
+                if cli.json {
+                    println!("{}", serde_json::json!({"display_language": current}));
+                } else {
+                    println!("Tray display language: {}", current);
                 }
             }
         },
@@ -3814,10 +3823,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 KeyAction::Use {
                     alias_or_id,
+                    provider,
                     no_hook,
                 } => {
                     commands_proxy::ensure_proxy_for_use(cli.password_stdin);
-                    commands_account::handle_key_use(alias_or_id, *no_hook, None, cli.json)?;
+                    commands_account::handle_key_use(
+                        alias_or_id,
+                        *no_hook,
+                        provider.as_deref(),
+                        cli.json,
+                    )?;
                     commands_proxy::warn_if_proxy_down();
                 }
                 KeyAction::Alias {
@@ -5850,13 +5865,11 @@ pub(crate) fn prompt_vault_password(
 /// Use for HIGH-sensitivity commands (add, delete, update, import, export,
 /// secret set/upsert/delete, change-password, exec, run --direct).
 fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
-    let vault_exists = storage::get_vault_path()
-        .map(|p| p.exists())
-        .unwrap_or(false);
-
-    // Check if vault has a salt (= previously initialized with a password).
-    // A vault file may exist but be empty (e.g., session backend created it before init).
-    let vault_initialized = vault_exists && storage::get_salt().is_ok();
+    // A vault file may exist but be empty (e.g. the session backend created it
+    // before init), so this asks for a salt, not for a file. This function is
+    // where that rule was first written down; storage::vault_is_initialized now
+    // owns it so the reporting surfaces answer the same question.
+    let vault_initialized = storage::vault_is_initialized();
 
     if vault_initialized {
         // Existing vault — just ask for the password

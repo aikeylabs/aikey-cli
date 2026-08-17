@@ -386,9 +386,8 @@ pub fn resolve_verified_vault_password(
 ) -> Result<(SecretString, PasswordOrigin), String> {
     use std::io::IsTerminal;
 
-    if let Some(env_val) = std::env::var("AIKEY_MASTER_PASSWORD")
-        .or_else(|_| std::env::var("AK_TEST_PASSWORD"))
-        .ok()
+    if let Ok(env_val) =
+        std::env::var("AIKEY_MASTER_PASSWORD").or_else(|_| std::env::var("AK_TEST_PASSWORD"))
     {
         // Rule 1 — trusted as given, deliberately unverified.
         return Ok((SecretString::new(env_val), PasswordOrigin::Env));

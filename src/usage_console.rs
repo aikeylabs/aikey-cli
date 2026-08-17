@@ -165,7 +165,9 @@ pub fn today_hourly() -> ConsoleUsage {
         Err(e) => {
             // A parse failure is reported, never smoothed into "no usage" —
             // the two look identical on screen and mean opposite things.
-            return ConsoleUsage::unavailable(format!("could not read the console's usage reply: {e}"));
+            return ConsoleUsage::unavailable(format!(
+                "could not read the console's usage reply: {e}"
+            ));
         }
     };
 

@@ -16,6 +16,7 @@ pub mod config;
 pub mod connectivity;
 pub mod credential_type;
 pub mod crypto;
+pub mod display_language;
 pub mod enterprise_proxy;
 pub mod env_renderer;
 pub mod env_resolver;
@@ -25,7 +26,6 @@ pub mod executor;
 pub mod global_config;
 pub mod json_output;
 pub mod local_server_diagnose;
-pub mod usage_console;
 pub mod local_server_probe;
 pub mod migrations;
 pub mod observability;
@@ -56,6 +56,7 @@ pub mod term_caps_windows;
 pub mod time_zone;
 pub mod trust_local_service;
 pub mod ui_frame;
+pub mod usage_console;
 // Windows-only siblings — never compile on macOS / Linux. Each module
 // is `#[cfg(windows)]`-internal so the declaration here is a no-op on
 // Unix (cargo skips the file lookup entirely). Strategy A pure — see

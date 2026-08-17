@@ -1590,7 +1590,7 @@ mod unset_inactive_tests {
 
 #[cfg(test)]
 mod atomic_write_tests {
-    use super::{atomic_write, is_transient_rename_error};
+    use super::atomic_write;
 
     // Stage 4 (active-state cross-shell sync, 2026-04-27):
     // active.env is now written via temp+rename so a shell that's mid-source
@@ -2158,5 +2158,65 @@ mod active_env_render_tests {
             assert_eq!(mode, 0o600, "{name} must be 0600, got {mode:o}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod default_profile_fence {
+    /// 🔴 Every production read of the binding table must go through
+    /// DEFAULT_PROFILE, not the literal "default".
+    ///
+    /// The constant existed while three production call sites wrote the string
+    /// themselves. That is not a style issue: the vault page and the desktop
+    /// tray read the SAME table through different call paths, so a change to
+    /// the default profile would have moved one and left the other behind —
+    /// two surfaces quietly showing different bindings, with nothing failing.
+    ///
+    /// Test files are exempt: a test that pins the literal is asserting what
+    /// the default IS, which is the opposite of drifting from it.
+    #[test]
+    fn production_code_does_not_hardcode_the_default_profile() {
+        let roots = [
+            "src/commands_internal",
+            "src/commands_account",
+            "src/commands_proxy.rs",
+        ];
+        let mut offenders = Vec::new();
+        for root in roots {
+            collect(std::path::Path::new(root), &mut offenders);
+        }
+        assert!(
+            offenders.is_empty(),
+            "these production sites read the binding table with the literal \"default\" \
+             instead of profile_activation::DEFAULT_PROFILE: {offenders:?}"
+        );
+    }
+
+    fn collect(p: &std::path::Path, out: &mut Vec<String>) {
+        if p.is_dir() {
+            let Ok(entries) = std::fs::read_dir(p) else {
+                return;
+            };
+            for e in entries.flatten() {
+                collect(&e.path(), out);
+            }
+            return;
+        }
+        if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+            return;
+        }
+        let Ok(src) = std::fs::read_to_string(p) else {
+            return;
+        };
+        // Strip test modules: their literals are assertions, not drift.
+        let scanned = match src.find("#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => &src[..],
+        };
+        for (n, line) in scanned.lines().enumerate() {
+            if line.contains("list_provider_bindings") && line.contains("\"default\"") {
+                out.push(format!("{}:{}", p.display(), n + 1));
+            }
+        }
     }
 }

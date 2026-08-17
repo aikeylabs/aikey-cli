@@ -2523,9 +2523,10 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
 
     let account = storage::get_platform_account().ok().flatten();
     let active_cfg = storage::get_active_key_config().ok().flatten();
-    let vault_exists = storage::get_vault_path()
-        .map(|p| p.exists())
-        .unwrap_or(false);
+    // Salt-based, not file-based: an empty vault.db (which the session backend
+    // can create before init) is NOT an initialized vault. See
+    // storage::vault_is_initialized.
+    let vault_exists = storage::vault_is_initialized();
 
     let local_seen_version = storage::get_local_seen_sync_version();
 
@@ -2760,49 +2761,73 @@ fn candidate_kind_of(t: &crate::credential_type::CredentialType) -> &'static str
     }
 }
 
-/// Build the `routes` array: which credential currently serves each client
-/// route.
+/// Build the `routes` array: every client route this machine can serve, and
+/// which credential currently serves it.
 ///
-/// 🔴 WHY THIS EXISTS (live E2E, 2026-08-16). `active_key` describes a single
-/// credential, and callers — including this project's own desktop tray — read
-/// it as "the one in use". It is not. Routing is PER PROVIDER: on the machine
-/// this was found on, THREE credentials were serving four routes at once
-/// (a team VK on deepseek and zhipu, one personal key on kimi, another on
-/// openai). A UI built on `active_key` alone shows two of those three as
-/// inactive while they are carrying live traffic.
+/// 🔴 THE AXIS IS THE CLIENT ROUTE, NOT THE BINDING (corrected 2026-08-17).
 ///
-/// Provider bindings are the routing source of truth — the counting code below
-/// has said so since 2026 ("Provider bindings are the routing SSOT"). This
-/// array simply exposes them, joined to a display label.
+/// The first version enumerated BINDINGS, so a route with nothing bound to it
+/// simply did not exist as far as any caller could tell. On the machine this
+/// was found on that hid `anthropic` and `openai` completely — and the desktop
+/// tray, which renders this array, could therefore only ever RE-POINT a route
+/// that was already set up. Establishing the first binding for a provider was
+/// impossible from the simple view, and the user could not even see that the
+/// route existed to be set up. A list that only shows what is already done is
+/// not a control surface.
+///
+/// So the row set comes from `routes` (the client-facing protocol routes this
+/// machine knows), and bindings are joined ON to it. An unbound route is a row
+/// with an empty `credential_id` — a real state the UI must render, not an
+/// absence it should hide.
 ///
 /// `credential_id` is the same string domain as `candidates[].id` and as
 /// `aikey key use <id>`: alias for personal, virtual_key_id for team,
 /// provider_account_id for OAuth. That identity is what lets a caller pair the
 /// two arrays without a second lookup.
 fn status_routes(
+    client_routes: &std::collections::BTreeSet<String>,
     bindings: &[storage::ProviderBinding],
     candidates: &[serde_json::Value],
 ) -> Vec<serde_json::Value> {
-    bindings
+    client_routes
         .iter()
-        .map(|b| {
-            // Prefer the candidate's label so the same credential reads the
-            // same in both arrays; fall back to the raw ref, which is at least
-            // true, rather than to a placeholder.
-            let label = candidates
-                .iter()
-                .find(|c| c["id"] == serde_json::Value::String(b.key_source_ref.clone()))
-                .and_then(|c| c["label"].as_str())
-                .unwrap_or(&b.key_source_ref)
-                .to_string();
-            serde_json::json!({
-                "route": b.client_route,
-                "provider": b.provider_code,
-                "protocol": b.protocol_type,
-                "credential_id": b.key_source_ref,
-                "label": label,
-                "kind": candidate_kind_of(&b.key_source_type),
-            })
+        .map(|route| {
+            // A route is served by the binding whose provider+protocol resolve
+            // back to it — the same classifier that produced the route list, so
+            // the two cannot disagree about which bucket a binding falls in.
+            let bound = bindings.iter().find(|b| {
+                status_client_route(&b.provider_code, &b.protocol_type, "").as_deref()
+                    == Some(route)
+            });
+
+            match bound {
+                Some(b) => {
+                    let label = candidates
+                        .iter()
+                        .find(|c| c["id"] == serde_json::Value::String(b.key_source_ref.clone()))
+                        .and_then(|c| c["label"].as_str())
+                        .unwrap_or(&b.key_source_ref)
+                        .to_string();
+                    serde_json::json!({
+                        "route": route,
+                        "provider": b.provider_code,
+                        "protocol": b.protocol_type,
+                        "credential_id": b.key_source_ref,
+                        "label": label,
+                        "kind": candidate_kind_of(&b.key_source_type),
+                        "bound": true,
+                    })
+                }
+                None => serde_json::json!({
+                    "route": route,
+                    "provider": route,
+                    "protocol": "",
+                    "credential_id": "",
+                    "label": "",
+                    "kind": "",
+                    "bound": false,
+                }),
+            }
         })
         .collect()
 }
@@ -2817,9 +2842,9 @@ pub fn handle_status_overview_with(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::BTreeSet;
 
-    let vault_exists = storage::get_vault_path()
-        .map(|p| p.exists())
-        .unwrap_or(false);
+    // Salt-based: listing entries needs the salt to decrypt, so a salt-less
+    // vault file would fail the read anyway. See storage::vault_is_initialized.
+    let vault_exists = storage::vault_is_initialized();
     let account = storage::get_platform_account().ok().flatten();
 
     // Collect key counts.
@@ -2918,7 +2943,7 @@ pub fn handle_status_overview_with(
 
     if json_mode {
         let candidates = status_candidates(&personal_meta, &team_keys, &oauth_accounts);
-        let routes = status_routes(&active_bindings, &candidates);
+        let routes = status_routes(&protocols, &active_bindings, &candidates);
 
         let active_json = active_cfg.as_ref().map(|cfg| {
             // 🔴 `providers` is derived from the BINDINGS, not from the stored
@@ -2988,6 +3013,11 @@ pub fn handle_status_overview_with(
             // The cost of that choice is that usage is UNAVAILABLE when the
             // console is stopped. `usage_console` reports that as an explicit
             // reason rather than as zero.
+            // The tray's display language: "auto" (follow the OS) or a forced
+            // "en"/"zh". Carried on status because the tray already reads this
+            // one command — a preference the UI must honour should not cost a
+            // second CLI surface.
+            "display_language": crate::display_language::preference(),
             "usage": if include_usage {
                 serde_json::to_value(crate::usage_console::today_hourly()).ok()
             } else {
@@ -3213,7 +3243,11 @@ mod status_candidates_tests {
     /// A team cache row. The cache stores one row per BINDING, so several rows
     /// can share a `virtual_key_id` — the shape that produced the duplicate
     /// listing this fixture exists to prevent.
-    fn team_row(vk_id: &str, alias: &str, providers: &[&str]) -> crate::storage::VirtualKeyCacheEntry {
+    fn team_row(
+        vk_id: &str,
+        alias: &str,
+        providers: &[&str],
+    ) -> crate::storage::VirtualKeyCacheEntry {
         crate::storage::VirtualKeyCacheEntry {
             binding_id: format!("b-{vk_id}-{}", providers.join("-")),
             virtual_key_id: vk_id.to_string(),
@@ -3273,7 +3307,11 @@ mod status_candidates_tests {
             &[],
         );
 
-        assert_eq!(rows.len(), 2, "two distinct virtual keys, not four bindings");
+        assert_eq!(
+            rows.len(),
+            2,
+            "two distinct virtual keys, not four bindings"
+        );
         assert_eq!(rows[0]["id"], "vk-1");
         assert_eq!(rows[1]["id"], "vk-2");
 
@@ -3306,7 +3344,24 @@ mod status_routes_tests {
     use super::{status_candidates, status_routes};
     use crate::credential_type::CredentialType;
 
-    fn binding(route: &str, provider: &str, t: CredentialType, refr: &str) -> crate::storage::ProviderBinding {
+    /// The client-route set these bindings resolve to — the axis the array is
+    /// keyed on. Derived rather than hand-listed so a test cannot assert a
+    /// route the classifier would never produce.
+    fn routes_of(
+        bindings: &[crate::storage::ProviderBinding],
+    ) -> std::collections::BTreeSet<String> {
+        bindings
+            .iter()
+            .filter_map(|b| super::status_client_route(&b.provider_code, &b.protocol_type, ""))
+            .collect()
+    }
+
+    fn binding(
+        route: &str,
+        provider: &str,
+        t: CredentialType,
+        refr: &str,
+    ) -> crate::storage::ProviderBinding {
         crate::storage::ProviderBinding {
             profile_id: "default".into(),
             client_route: route.into(),
@@ -3326,11 +3381,21 @@ mod status_routes_tests {
     #[test]
     fn routes_report_every_credential_actually_in_use() {
         let bindings = [
-            binding("deepseek", "deepseek", CredentialType::ManagedVirtualKey, "vk-1"),
-            binding("kimi", "kimi_code", CredentialType::PersonalApiKey, "kimi-code-8"),
+            binding(
+                "deepseek",
+                "deepseek",
+                CredentialType::ManagedVirtualKey,
+                "vk-1",
+            ),
+            binding(
+                "kimi",
+                "kimi_code",
+                CredentialType::PersonalApiKey,
+                "kimi-code-8",
+            ),
             binding("zhipu", "zhipu", CredentialType::ManagedVirtualKey, "vk-1"),
         ];
-        let routes = status_routes(&bindings, &[]);
+        let routes = status_routes(&routes_of(&bindings), &bindings, &[]);
 
         assert_eq!(routes.len(), 3);
         let distinct: std::collections::BTreeSet<&str> = routes
@@ -3363,10 +3428,13 @@ mod status_routes_tests {
             &[],
             &[],
         );
-        let routes = status_routes(
-            &[binding("kimi", "kimi_code", CredentialType::PersonalApiKey, "kimi-code-8")],
-            &candidates,
-        );
+        let bindings = [binding(
+            "kimi",
+            "kimi_code",
+            CredentialType::PersonalApiKey,
+            "kimi-code-8",
+        )];
+        let routes = status_routes(&routes_of(&bindings), &bindings, &candidates);
         assert_eq!(routes[0]["label"], "kimi-code-8");
         assert_eq!(routes[0]["kind"], "personal");
     }
@@ -3375,10 +3443,13 @@ mod status_routes_tests {
     /// a placeholder that hides which credential is bound.
     #[test]
     fn an_unmatched_binding_falls_back_to_the_raw_reference() {
-        let routes = status_routes(
-            &[binding("openai", "openai", CredentialType::PersonalOAuthAccount, "acct-77")],
-            &[],
-        );
+        let bindings = [binding(
+            "openai",
+            "openai",
+            CredentialType::PersonalOAuthAccount,
+            "acct-77",
+        )];
+        let routes = status_routes(&routes_of(&bindings), &bindings, &[]);
         assert_eq!(routes[0]["label"], "acct-77");
         assert_eq!(routes[0]["kind"], "oauth");
     }
@@ -6431,7 +6502,9 @@ pub fn handle_key_use(
 
     // Bindings reread for the JSON envelope below (apply already wrote
     // active.env). Cheap; single DB read.
-    let bindings = crate::storage::list_provider_bindings_readonly("default").unwrap_or_default();
+    let bindings =
+        crate::storage::list_provider_bindings_readonly(crate::profile_activation::DEFAULT_PROFILE)
+            .unwrap_or_default();
     let promoted_routes = bindings
         .iter()
         .filter(|b| {

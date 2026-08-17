@@ -130,7 +130,9 @@ pub struct AuditReport {
 /// up, returns Warning + skip when down. Default false in doctor's
 /// summary mode; only true under `--detail`.
 pub fn audit_credential_lifecycle(include_proxy: bool) -> AuditReport {
-    let bindings = storage::list_provider_bindings_readonly("default").unwrap_or_default();
+    let bindings =
+        storage::list_provider_bindings_readonly(crate::profile_activation::DEFAULT_PROFILE)
+            .unwrap_or_default();
     let active_env_lines = proxy_env::read_active_env_lines().unwrap_or_default();
     let injected_tomls = shell_integration::injected_provider_toml_paths();
 

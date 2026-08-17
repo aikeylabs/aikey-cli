@@ -653,6 +653,12 @@ pub(crate) enum ConfigAction {
         /// Omit to show the current preference
         value: Option<String>,
     },
+    /// Show or set the desktop tray's display language (`auto`, `en`, `zh`)
+    #[command(name = "language")]
+    Language {
+        /// Omit to show the current preference
+        value: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1296,6 +1302,18 @@ pub(crate) enum KeyAction {
     Use {
         /// Virtual key alias or ID to activate
         alias_or_id: String,
+        /// Narrow the activation to a single provider (e.g. --provider openai).
+        ///
+        /// 🔴 Added 2026-08-17. The top-level shortcut `aikey use` has always
+        /// had this flag while `aikey key use` — the command it is a shortcut
+        /// FOR — did not, so the canonical command was strictly less capable
+        /// than its own alias. A caller that reasonably chose the canonical
+        /// spelling got `unrecognized command '--provider'`, which is what the
+        /// desktop tray hit when it began offering per-route switching.
+        /// Both spellings reach the same handler; they must accept the same
+        /// options.
+        #[arg(long, value_name = "PROVIDER", num_args = 0..=1, default_missing_value = "")]
+        provider: Option<String>,
         /// Skip installing the shell precmd hook into ~/.zshrc / ~/.bashrc
         #[arg(long)]
         no_hook: bool,
@@ -1411,6 +1429,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Init => "init".to_string(),
             Commands::Config { action } => match action {
                 ConfigAction::TimeZone { .. } => "config.time-zone".to_string(),
+                ConfigAction::Language { .. } => "config.language".to_string(),
             },
             Commands::Db { action } => format!(
                 "db.{}",
@@ -2920,6 +2939,92 @@ pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
         }
     }
     dp[m][n]
+}
+
+#[cfg(test)]
+mod alias_parity_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Collect the long-option names a subcommand path accepts.
+    fn long_opts(path: &[&str]) -> std::collections::BTreeSet<String> {
+        let mut cmd = Cli::command();
+        for seg in path {
+            cmd = cmd
+                .find_subcommand(seg)
+                .unwrap_or_else(|| panic!("subcommand {seg:?} not found"))
+                .clone();
+        }
+        cmd.get_arguments()
+            .filter_map(|a| a.get_long().map(str::to_string))
+            .collect()
+    }
+
+    /// 🔴 A shortcut must never be MORE capable than the command it shortcuts.
+    ///
+    /// `aikey use` documents itself as "shortcut for `key use`", and both reach
+    /// handle_key_use — but `use` grew `--provider` while `key use` did not.
+    /// A caller that chose the canonical spelling got
+    /// `unrecognized command '--provider'`; the desktop tray hit exactly that
+    /// when it started offering per-route switching, and no test could catch
+    /// it because the tray's own tests drive a FAKE cli that accepts anything.
+    ///
+    /// This compares the real clap definitions, so the two spellings cannot
+    /// drift apart again.
+    /// Options `aikey use` has that `aikey key use` still lacks.
+    ///
+    /// 🔴 THIS IS A KNOWN GAP, NOT AN APPROVED DESIGN. The fence below pins it
+    /// so it cannot GROW; it does not bless it. Closing it needs a decision
+    /// rather than a patch, because `--only` pins routing to one upstream and
+    /// therefore TURNS OFF automatic failover — replicating it onto a second
+    /// spelling is a routing-behaviour change, not a CLI tidy-up.
+    ///
+    /// `--provider` was in this list until 2026-08-17, when the desktop tray
+    /// called the canonical spelling with it and got
+    /// `unrecognized command '--provider'` in the user's face.
+    const KNOWN_SHORTCUT_ONLY_OPTS: &[&str] = &["group", "key", "only"];
+
+    #[test]
+    fn key_use_does_not_fall_further_behind_its_shortcut() {
+        let canonical = long_opts(&["key", "use"]);
+        let shortcut = long_opts(&["use"]);
+
+        let unexpected: Vec<&String> = shortcut
+            .difference(&canonical)
+            .filter(|o| !KNOWN_SHORTCUT_ONLY_OPTS.contains(&o.as_str()))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "`aikey use` grew options that `aikey key use` — the command it is a \
+             shortcut for — rejects: {unexpected:?}. Both dispatch to the same \
+             handler. Either add them to `key use`, or add them to \
+             KNOWN_SHORTCUT_ONLY_OPTS with the reason they may not be shared."
+        );
+
+        // The pinned list must stay honest: an entry that has since been added
+        // to `key use` is stale and hides the next real divergence.
+        let stale: Vec<&&str> = KNOWN_SHORTCUT_ONLY_OPTS
+            .iter()
+            .filter(|o| canonical.contains(**o))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "KNOWN_SHORTCUT_ONLY_OPTS lists {stale:?}, which `aikey key use` now \
+             accepts — remove them so the fence keeps checking what is left."
+        );
+    }
+
+    /// The flag that actually broke, pinned by name so a rename is deliberate.
+    #[test]
+    fn both_spellings_accept_provider() {
+        for path in [vec!["key", "use"], vec!["use"]] {
+            assert!(
+                long_opts(&path).contains("provider"),
+                "`aikey {}` must accept --provider",
+                path.join(" ")
+            );
+        }
+    }
 }
 
 #[cfg(test)]

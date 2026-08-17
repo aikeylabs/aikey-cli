@@ -239,9 +239,9 @@ pub fn handle_quickstart(json_mode: bool) -> Result<(), Box<dyn std::error::Erro
 
     // Gather state. All queries tolerate a missing/unreadable vault by
     // returning empty results — the landing page still works pre-vault.
-    let vault_exists = storage::get_vault_path()
-        .map(|p| p.exists())
-        .unwrap_or(false);
+    // Salt-based: listing entries needs the salt to decrypt, so a salt-less
+    // vault file would fail the read anyway. See storage::vault_is_initialized.
+    let vault_exists = storage::vault_is_initialized();
     let personal_count = if vault_exists {
         storage::list_entries().map(|v| v.len()).unwrap_or(0)
     } else {

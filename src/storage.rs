@@ -606,6 +606,29 @@ fn migrate_database(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the vault is actually usable — i.e. it has been initialized with a
+/// master password, not merely that a file exists at the vault path.
+///
+/// WHY THIS IS A NAMED FUNCTION (2026-08-17): three reporting surfaces
+/// (`whoami --json`, `status`, `stats`) each answered this question with
+/// `get_vault_path().exists()`, while the two places that actually *act* on the
+/// answer — `executor::ensure_vault_initialized` and
+/// `main::prompt_vault_password_fresh` — both require a salt, and the latter
+/// documents exactly why: "a vault file may exist but be empty (e.g. session
+/// backend created it before init)".
+///
+/// So a machine consumer asking `vault_initialized` over JSON could be told
+/// `true` for a vault that no key can be added to. That is not a cosmetic
+/// mismatch: the AiKey.app first-run state machine keys its "does the user
+/// still need to set a master password?" decision on this field, and a false
+/// positive strands the user in a state with no way forward.
+///
+/// One concept, one exit. Callers must not re-derive this from `exists()`;
+/// `vault_initialized_fence` in storage_tests asserts they don't.
+pub fn vault_is_initialized() -> bool {
+    get_salt().is_ok()
+}
+
 /// Retrieves the salt from the vault
 pub fn get_salt() -> Result<Vec<u8>, String> {
     let db_path = get_vault_path()?;
@@ -2036,6 +2059,87 @@ mod tests {
         let pw = SecretString::new("test_password".to_string());
         initialize_vault(&salt, &pw).expect("init vault");
         (dir, db_path, guard)
+    }
+
+    // ── vault_is_initialized: the single exit ────────────────────────────
+
+    /// A vault FILE is not an initialized vault. The session backend can create
+    /// an empty vault.db before any password exists, and the reporting surfaces
+    /// used to answer `vault_initialized: true` for exactly that file — telling
+    /// the AiKey.app first-run state machine the user was done when no key could
+    /// be added yet.
+    ///
+    /// Goes red against the old `get_vault_path().exists()` implementation.
+    #[test]
+    fn empty_vault_file_is_not_initialized() {
+        let _guard = VAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        std::fs::write(&db_path, b"").expect("create empty vault file");
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
+
+        assert!(db_path.exists(), "precondition: the file is there");
+        assert!(
+            !vault_is_initialized(),
+            "an empty vault.db has no salt, so no password has ever been set — \
+             reporting it as initialized strands the first-run flow with no next step"
+        );
+    }
+
+    #[test]
+    fn initialized_vault_reports_initialized() {
+        let (_dir, _, _lock) = setup_vault();
+        assert!(vault_is_initialized());
+    }
+
+    /// Concept fence, written by number of EXITS rather than by the lines that
+    /// were touched on 2026-08-17. "Is the vault initialized?" had four
+    /// independent derivations; three were wrong in the same way. Pinning the
+    /// call sites to the one function is what stops a fifth from appearing —
+    /// checking only the three known files would miss it by two characters.
+    #[test]
+    fn vault_initialized_fence() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                // storage.rs is where the concept LIVES: get_salt and
+                // initialize_vault legitimately probe the file itself.
+                if path.file_name().and_then(|f| f.to_str()) == Some("storage.rs") {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).expect("read source");
+                for (i, line) in src.lines().enumerate() {
+                    let t = line.trim();
+                    let binds_the_concept = (t.starts_with("let vault_exists")
+                        || t.starts_with("let vault_initialized"))
+                        && !t.contains("vault_is_initialized()");
+                    if binds_the_concept {
+                        offenders.push(format!("{}:{}: {}", path.display(), i + 1, t));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these bind the \"is the vault initialized?\" concept without going through \
+             storage::vault_is_initialized(). File existence is not initialization — \
+             see that function's doc comment.\n  {}",
+            offenders.join("\n  ")
+        );
     }
 
     // ── Core vault CRUD ──────────────────────────────────────────────────
