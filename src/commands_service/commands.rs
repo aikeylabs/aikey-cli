@@ -123,26 +123,53 @@ fn print_supported(json: bool) {
 /// second copy of any service's health logic and can't drift from the
 /// per-service `status` commands.
 fn status_all(json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let rows: Vec<(&str, bool, String)> = vec![
+    // The fourth element is INSTALLED, and it is not the same question as
+    // RUNNING (added 2026-08-17).
+    //
+    // A component that was never installed is not a stopped one. Reporting only
+    // `running: false` made the tray count trust-local — an opt-out-able add-on
+    // that the offline package legitimately omits — as a failure, so a machine
+    // whose CLI, proxy and console were all healthy displayed "1 of 3 services
+    // are stopped" in amber and read to the user as "the services won't start".
+    //
+    // Each predicate is the one that already decides this elsewhere, so there is
+    // no second opinion to drift: install-state.json's installed_components for
+    // the console, the binary's presence for trust-local. proxy is core — if it
+    // were absent the CLI that answers this command would not be here either.
+    let rows: Vec<(&str, bool, String, bool)> = vec![
         {
             let (r, d) = crate::local_server_probe::status_summary();
-            ("web", r, d)
+            (
+                "web",
+                r,
+                d,
+                crate::local_server_probe::is_local_server_installed(),
+            )
         },
         {
             let (r, d) = crate::commands_proxy::status_summary();
-            ("proxy", r, d)
+            ("proxy", r, d, true)
         },
         {
             let (r, d) = crate::trust_local_service::status_summary();
-            ("trust-local", r, d)
+            (
+                "trust-local",
+                r,
+                d,
+                crate::trust_local_service::is_installed(),
+            )
         },
     ];
 
     if json {
         let payload: Vec<_> = rows
             .iter()
-            .map(|(name, running, detail)| {
-                serde_json::json!({"name": name, "running": running, "detail": detail})
+            .map(|(name, running, detail, installed)| {
+                // `installed` is ADDITIVE — per the rules below, no schema bump.
+                serde_json::json!({
+                    "name": name, "running": running, "detail": detail,
+                    "installed": installed
+                })
             })
             .collect();
         // 🔴 schema_version is a wire contract, not decoration.
@@ -167,7 +194,7 @@ fn status_all(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             serde_json::json!({"schema_version": 1, "services": payload})
         );
     } else {
-        for (name, running, detail) in &rows {
+        for (name, running, detail, _installed) in &rows {
             // Aligned two-column table: fixed-width name, state glyph, detail.
             let glyph = if *running {
                 crate::symbols::RADIO_ON.s()

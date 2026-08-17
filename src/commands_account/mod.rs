@@ -2978,6 +2978,17 @@ pub fn handle_status_overview_with(
             "gateway": {
                 "running": proxy_running,
             },
+            // Whether a master password has ever been set (salt-based — see
+            // storage::vault_is_initialized). Added 2026-08-17 for the
+            // AiKey.app first-run flow, which has to decide whether to show a
+            // "set your master password" step.
+            //
+            // It lives HERE, on a command the tray is already allowed to run,
+            // rather than being read from the console's /api/user/vault/status:
+            // the tray's boundary fence forbids reaching into console vault
+            // endpoints, and an additive field on an existing command is a
+            // smaller change than widening that fence.
+            "vault_initialized": vault_exists,
             "login": {
                 "logged_in": account.is_some(),
                 "email": account.as_ref().map(|a| &a.email),
