@@ -3849,6 +3849,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 token,
                 email,
                 resend,
+                sso,
+                no_browser,
             } => {
                 commands_account::handle_login(
                     cli.json,
@@ -3856,6 +3858,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     token.clone(),
                     email.clone(),
                     *resend,
+                    sso.clone(),
+                    *no_browser,
                 )?;
             }
             AccountAction::Status => {
@@ -3889,6 +3893,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             token,
             email,
             resend,
+            sso,
+            no_browser,
         } => {
             commands_account::handle_login(
                 cli.json,
@@ -3896,6 +3902,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 token.clone(),
                 email.clone(),
                 *resend,
+                sso.clone(),
+                *no_browser,
             )?;
         }
         Commands::Logout => {
@@ -7888,10 +7896,23 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                     );
                     return Ok(());
                 }
-                Some(t) => {
-                    return Err(
-                        format!("unknown hook target '{t}' (supported: openclaw, codex)").into(),
+                // Codex desktop + IDE extension. ONE line is the whole switch —
+                // see set_codex_top_level_provider for why, and for why it is
+                // narrower than the `codex` target above (that one owns the
+                // provider block, which the CLI also rides).
+                Some("codex-desktop") => {
+                    commands_account::set_codex_top_level_provider(true)?;
+                    eprintln!(
+                        "  {} Codex desktop and the IDE extension now route through aikey.",
+                        crate::symbols::CHECK.s()
                     );
+                    return Ok(());
+                }
+                Some(t) => {
+                    return Err(format!(
+                        "unknown hook target '{t}' (supported: openclaw, codex, codex-desktop)"
+                    )
+                    .into());
                 }
                 None => {}
             }
@@ -7983,7 +8004,48 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
         HookAction::Reinstall { shell } => handle_hook_reinstall(shell.as_deref()),
         HookAction::Uninstall { target } => match target.as_deref() {
             Some("openclaw") => commands_account::openclaw_hook::uninstall().map_err(|e| e.into()),
-            Some(t) => Err(format!("unknown hook target '{t}' (supported: openclaw)").into()),
+            // 🔴 The per-tool reverse of `aikey hook install codex` (2026-08-18).
+            //
+            // Why it had to exist: there was no way to undo the Codex takeover
+            // ALONE. `aikey hook uninstall` (bare) strips the shell hook and
+            // every other tool with it — far more than someone reversing one
+            // integration is asking for — and `aikey unuse openai` is the wrong
+            // axis entirely (it removes the credential, not the routing). The
+            // tray's Integrations switch needs a reverse that is exactly as
+            // wide as the thing it turned on.
+            //
+            // Two steps, and both are needed. Stripping the config alone would
+            // be undone by the next `aikey use`, because the lifecycle funnel
+            // re-applies Codex for any active OpenAI key: without the standing
+            // refusal the switch would quietly flip itself back on. Setting the
+            // refusal alone would leave today's config in place. Together they
+            // mean "not taken over, and stay that way until I say otherwise" —
+            // and `aikey hook install codex` remains the documented way back
+            // (running it IS actionable consent, per the 2026-07-16 rule).
+            Some("codex") => {
+                commands_account::unconfigure_codex_cli();
+                global_config::set_codex_consent_never()?;
+                eprintln!(
+                    "  {} Codex takeover removed. Run `aikey hook install codex` to allow it again.",
+                    crate::symbols::CHECK.s()
+                );
+                Ok(())
+            }
+            // Removes ONLY the top-level line. The provider block, its bearer
+            // and its base_url stay, so the CLI keeps routing through the shim's
+            // runtime `-c model_provider=aikey` — that is a different switch.
+            Some("codex-desktop") => {
+                commands_account::set_codex_top_level_provider(false)?;
+                eprintln!(
+                    "  {} Codex desktop and the IDE extension no longer route through aikey (the CLI is unaffected).",
+                    crate::symbols::CHECK.s()
+                );
+                Ok(())
+            }
+            Some(t) => Err(format!(
+                "unknown hook target '{t}' (supported: openclaw, codex, codex-desktop)"
+            )
+            .into()),
             None => handle_hook_uninstall(),
         },
     }

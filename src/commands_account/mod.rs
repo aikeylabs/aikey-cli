@@ -690,6 +690,58 @@ pub fn handle_set_control_url(
 // account login / status / logout
 // ---------------------------------------------------------------------------
 
+/// Resolves `--sso <code>` against the providers `/init` advertised, returning
+/// `(display_name, authorize_url)`.
+///
+/// Extracted from handle_login so the resolution and the URL contract are unit
+/// tested against the real user-facing code path (not a test re-derivation).
+/// The authorize path mirrors the server-rendered login page's links — a
+/// two-sided contract (see SSOAuthorize route), not a guess.
+fn resolve_sso_authorize(
+    control_url: &str,
+    providers: &[crate::platform_client::SsoProviderEntry],
+    want_raw: &str,
+    session_id: &str,
+    device_code: &str,
+) -> Result<(String, String), String> {
+    let want = want_raw.trim().to_lowercase();
+    let Some(provider) = providers.iter().find(|p| p.code == want) else {
+        // The two failure modes need different fixes, so they get different
+        // sentences: "none enabled" → use email login; "wrong code" → the
+        // deployment's actual options.
+        return Err(if providers.is_empty() {
+            // An empty list is ambiguous by construction: the deployment may
+            // truly have no SSO, or the server may predate SSO discovery
+            // (sso_providers rode into /init on 2026-08-18) while its login
+            // PAGE still offers the buttons. Verified live against the
+            // pre-upgrade staging cluster, which is exactly that second case.
+            // The message owns the uncertainty instead of overclaiming.
+            format!(
+                "This control panel ({}) did not advertise any SSO providers \
+                 (it may have none enabled, or it may be an older server). \
+                 Use email login instead: aikey login \
+                 \u{2014} if its login page shows an SSO button, that still works there.",
+                control_url
+            )
+        } else {
+            let available: Vec<&str> = providers.iter().map(|p| p.code.as_str()).collect();
+            format!(
+                "SSO provider '{}' is not enabled on this control panel. Available: {}",
+                want,
+                available.join(", ")
+            )
+        });
+    };
+    let url = format!(
+        "{}/v1/auth/cli/login/sso/{}/authorize?s={}&d={}",
+        control_url.trim_end_matches('/'),
+        provider.code,
+        session_id,
+        device_code,
+    );
+    Ok((provider.display_name.clone(), url))
+}
+
 /// `aikey account login [--url URL] [--token SESSION_ID:LOGIN_TOKEN]`
 ///
 /// Starts the OAuth device-flow login via a browser web UI:
@@ -714,6 +766,8 @@ pub fn handle_login(
     flag_token: Option<String>,
     flag_email: Option<String>,
     flag_resend: bool,
+    flag_sso: Option<String>,
+    flag_no_browser: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve default URL: env var → config file → hardcoded fallback.
     let default_url = std::env::var("AIKEY_CONTROL_URL")
@@ -769,7 +823,10 @@ pub fn handle_login(
     // at QQ/Gmail. We block the second attempt within `LOGIN_THROTTLE_SECS`
     // unless --resend is passed. The file is advisory-only; concurrent
     // writes and missing files silently fall through.
-    if !flag_resend {
+    // The throttle guards outbound MAIL, so the SSO path — which sends none —
+    // must not be blocked by it. Both mail-sending paths (browser page and
+    // --no-browser) stay throttled.
+    if !flag_resend && flag_sso.is_none() {
         if let Some(last_started) = read_login_throttle() {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -801,67 +858,157 @@ pub fn handle_login(
         }
     }
 
-    // --- OAuth device flow via browser ---
     let client_version = env!("CARGO_PKG_VERSION");
     let os_platform = std::env::consts::OS;
+    let step = |n: &str| format!("  {}", format!("Step {}", n).bold().cyan());
 
-    let session = PlatformClient::init_cli_login(&control_url, client_version, os_platform)
-        .map_err(|e| format!("Login failed: {}", e))?;
+    // Three ways to establish the session; all converge on the same poll loop.
+    // (session_id, device_code, poll_interval_seconds, expires_in_seconds)
+    let (session_id, device_code, poll_secs, expires_secs);
 
-    // Record this attempt for the throttle window. Best-effort — any I/O
-    // failure is silently ignored (the throttle is a UX nudge, not security).
-    let _ = write_login_throttle();
+    if flag_no_browser {
+        // --- No-browser email flow (2026-08-18 缺口①) ---
+        // /start = init + begin in one server call: creates the session AND
+        // sends the activation mail, so no browser is needed on this machine.
+        // clap enforces `requires = "email"`; the expect documents the contract.
+        let email = flag_email
+            .as_deref()
+            .expect("--no-browser requires --email (enforced by clap)");
+        let session =
+            PlatformClient::start_cli_login(&control_url, email, client_version, os_platform)
+                .map_err(|e| format!("Login failed: {}", e))?;
+        let _ = write_login_throttle();
 
-    // Browser URL: in production nginx serves both Web and API on the same
-    // origin (control_url), so use it directly for the browser login page.
-    let mut login_url = format!(
-        "{}/auth/cli/login?s={}&d={}",
-        control_url.trim_end_matches('/'),
-        session.login_session_id,
-        session.device_code,
-    );
-    // Append Base64URL-encoded email so the login page can auto-fill it.
-    if let Some(ref email) = flag_email {
-        let encoded = base64_url_encode(email);
-        login_url.push_str(&format!("&email={}", encoded));
-    }
-
-    if !json_mode {
-        let step = |n: &str| format!("  {}", format!("Step {}", n).bold().cyan());
-        println!();
-        println!("{}  Opening browser…", step("1"));
-        println!("          {}", login_url.dimmed());
-        println!();
-        if flag_email.is_some() {
+        if !json_mode {
+            println!();
             println!(
-                "{}  Your {} is pre-filled — click {}",
-                step("2"),
-                "email".bold(),
-                "\"Send Login Link\"".bold()
+                "{}  Activation email sent to {}",
+                step("1"),
+                session.masked_email.bold()
             );
-        } else {
+            println!();
             println!(
-                "{}  Enter your {} and click {}",
+                "{}  Click the link in that email on {} device — your phone works too",
                 step("2"),
-                "email".bold(),
-                "\"Send Login Link\"".bold()
+                "any".bold()
             );
+            println!();
+            println!("  {}", "Waiting for confirmation…".dimmed());
         }
-        println!();
-        println!(
-            "{}  Check your inbox and click the {} link",
-            step("3"),
-            "activation".bold()
+        (session_id, device_code, poll_secs, expires_secs) = (
+            session.login_session_id,
+            session.device_code,
+            session.poll_interval_seconds,
+            session.expires_in_seconds,
         );
-        println!();
-        println!("  {}", "Waiting for confirmation…".dimmed());
-    }
+    } else if let Some(ref sso_code) = flag_sso {
+        // --- SSO direct flow (2026-08-18) ---
+        // /init advertises the enabled providers; an unknown code fails here
+        // with the deployment's actual options instead of a dead browser tab.
+        let session = PlatformClient::init_cli_login(&control_url, client_version, os_platform)
+            .map_err(|e| format!("Login failed: {}", e))?;
 
-    open_url_silently(&login_url);
+        let (display_name, authorize_url) = resolve_sso_authorize(
+            &control_url,
+            &session.sso_providers,
+            sso_code,
+            &session.login_session_id,
+            &session.device_code,
+        )?;
+        let provider = crate::platform_client::SsoProviderEntry {
+            code: sso_code.trim().to_lowercase(),
+            display_name,
+        };
+
+        if !json_mode {
+            println!();
+            println!(
+                "{}  Opening browser for {} sign-in…",
+                step("1"),
+                provider.display_name.bold()
+            );
+            println!("          {}", authorize_url.dimmed());
+            println!();
+            println!(
+                "{}  Complete the {} authorization (scan the QR code if asked)",
+                step("2"),
+                provider.display_name.bold()
+            );
+            println!();
+            println!("  {}", "Waiting for confirmation…".dimmed());
+        }
+        open_url_silently(&authorize_url);
+        (session_id, device_code, poll_secs, expires_secs) = (
+            session.login_session_id,
+            session.device_code,
+            session.poll_interval_seconds,
+            session.expires_in_seconds,
+        );
+    } else {
+        // --- OAuth device flow via browser (original path) ---
+        let session = PlatformClient::init_cli_login(&control_url, client_version, os_platform)
+            .map_err(|e| format!("Login failed: {}", e))?;
+
+        // Record this attempt for the throttle window. Best-effort — any I/O
+        // failure is silently ignored (the throttle is a UX nudge, not security).
+        let _ = write_login_throttle();
+
+        // Browser URL: in production nginx serves both Web and API on the same
+        // origin (control_url), so use it directly for the browser login page.
+        let mut login_url = format!(
+            "{}/auth/cli/login?s={}&d={}",
+            control_url.trim_end_matches('/'),
+            session.login_session_id,
+            session.device_code,
+        );
+        // Append Base64URL-encoded email so the login page can auto-fill it.
+        if let Some(ref email) = flag_email {
+            let encoded = base64_url_encode(email);
+            login_url.push_str(&format!("&email={}", encoded));
+        }
+
+        if !json_mode {
+            println!();
+            println!("{}  Opening browser…", step("1"));
+            println!("          {}", login_url.dimmed());
+            println!();
+            if flag_email.is_some() {
+                println!(
+                    "{}  Your {} is pre-filled — click {}",
+                    step("2"),
+                    "email".bold(),
+                    "\"Send Login Link\"".bold()
+                );
+            } else {
+                println!(
+                    "{}  Enter your {} and click {}",
+                    step("2"),
+                    "email".bold(),
+                    "\"Send Login Link\"".bold()
+                );
+            }
+            println!();
+            println!(
+                "{}  Check your inbox and click the {} link",
+                step("3"),
+                "activation".bold()
+            );
+            println!();
+            println!("  {}", "Waiting for confirmation…".dimmed());
+        }
+
+        open_url_silently(&login_url);
+        (session_id, device_code, poll_secs, expires_secs) = (
+            session.login_session_id,
+            session.device_code,
+            session.poll_interval_seconds,
+            session.expires_in_seconds,
+        );
+    }
 
     // Poll until approved, denied, or expired.
-    let poll_interval = Duration::from_secs(session.poll_interval_seconds.max(2));
-    let deadline = SystemTime::now() + Duration::from_secs(session.expires_in_seconds);
+    let poll_interval = Duration::from_secs(poll_secs.max(2));
+    let deadline = SystemTime::now() + Duration::from_secs(expires_secs);
 
     loop {
         std::thread::sleep(poll_interval);
@@ -892,19 +1039,15 @@ pub fn handle_login(
                 if token_input.is_empty() {
                     return Err("Login timed out. Run 'aikey login' to try again.".into());
                 }
-                let combined = format!("{}:{}", session.login_session_id, token_input);
+                let combined = format!("{}:{}", session_id, token_input);
                 return exchange_combined_token(&control_url, &combined, json_mode);
             } else {
                 return Err("Login session expired. Use --token for non-interactive login.".into());
             }
         }
 
-        let poll = PlatformClient::poll_cli_login(
-            &control_url,
-            &session.login_session_id,
-            &session.device_code,
-        )
-        .map_err(|e| format!("Poll failed: {}", e))?;
+        let poll = PlatformClient::poll_cli_login(&control_url, &session_id, &device_code)
+            .map_err(|e| format!("Poll failed: {}", e))?;
 
         match poll.status.as_str() {
             "pending" => {
@@ -2746,6 +2889,23 @@ fn status_candidates(
         }));
     }
 
+    // One pass at the end, not three inside the loops above: the team branch
+    // UNIONS providers across binding rows, so a per-loop projection would be
+    // computed from a partial provider list and silently drop a route the
+    // credential can in fact serve.
+    for candidate in out.iter_mut() {
+        let providers: Vec<String> = candidate["providers"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        candidate["client_routes"] = serde_json::json!(candidate_client_routes(&providers));
+    }
+
     out
 }
 
@@ -2759,6 +2919,207 @@ fn candidate_kind_of(t: &crate::credential_type::CredentialType) -> &'static str
         C::ManagedVirtualKey => "team",
         C::PersonalOAuthAccount => "oauth",
     }
+}
+
+/// Client-route slots each candidate can serve — the axis a UI must filter on.
+///
+/// 🔴 Why this exists (2026-08-18). `providers` is the SUPPLIER axis: raw codes
+/// like `kimi_code` and `moonshot`. `routes[].route` is the CLIENT axis: the
+/// slot a user picks in a tool, like `kimi`. Those two are not the same
+/// relation — `provider_registry.yaml` declares `family: kimi` on BOTH
+/// kimi_code and moonshot, so one route is served by two suppliers.
+///
+/// A consumer that filters candidates by comparing `providers` against a
+/// route's `provider` therefore answers a family question on the supplier axis
+/// and gets it wrong twice: it hides every moonshot credential from a kimi
+/// route bound to kimi_code, and for an UNBOUND route (where `provider` is the
+/// route name itself) it matches neither supplier and offers nothing at all.
+/// aikey-tray did exactly that; the web console did not, because it reads the
+/// registry's family. Emitting the client axis here means a consumer no longer
+/// has to own a provider table to ask the right question.
+///
+/// Derived with `status_client_route` — the SAME classifier `status_routes`
+/// uses to decide which route a binding falls into — so `candidates[].
+/// client_routes` and `routes[].route` cannot disagree about the slot a
+/// credential belongs to. A supplier with no honest client surface (Mock) maps
+/// Third-party takeover state, as ONE machine-readable projection.
+///
+/// 🔴 Why this exists (2026-08-18, user decision A). AiKey routes third-party
+/// AI tools through the local proxy, and the tray turns that on implicitly
+/// every time a credential is switched — while offering no way to SEE it or
+/// reverse it. The `.app` promise is "you never open a terminal", so the one
+/// escape hatch being a terminal command is the bug.
+///
+/// Before this, no consumer could answer "is codex taken over right now?":
+/// `status --json` had no such field, `aikey desktop status --json` covered
+/// only Claude Desktop, and `aikey env` knew but printed for humans only. A UI
+/// had to union three calls and invent the union rule itself — a second
+/// definition of takeover state living in the UI. This is the single one.
+///
+/// 🚫 It does NOT re-detect anything. Every value comes from the SAME
+/// predicates the remove paths use — `injected_provider_toml_paths()` (semantic
+/// detection, deliberately not marker-text: markers went blind when the third
+/// party re-serialized the file) and `claude_desktop::detect_state`. Display
+/// and "what an uninstall would actually strip" therefore cannot disagree.
+
+/// Client-route slots each candidate can serve — the axis a UI must filter on.
+///
+/// 🔴 Why this exists (2026-08-18). `providers` is the SUPPLIER axis: raw codes
+/// like `kimi_code` and `moonshot`. `routes[].route` is the CLIENT axis: the
+/// slot a user picks in a tool, like `kimi`. Those two are not the same
+/// relation — `provider_registry.yaml` declares `family: kimi` on BOTH
+/// kimi_code and moonshot, so one route is served by two suppliers.
+///
+/// A consumer that filters candidates by comparing `providers` against a
+/// route's `provider` therefore answers a family question on the supplier axis
+/// and gets it wrong twice: it hides every moonshot credential from a kimi
+/// route bound to kimi_code, and for an UNBOUND route (where `provider` is the
+/// route name itself) it matches neither supplier and offers nothing at all.
+/// aikey-tray did exactly that; the web console did not, because it reads the
+/// registry's family. Emitting the client axis here means a consumer no longer
+/// has to own a provider table to ask the right question.
+///
+/// Derived with `status_client_route` — the SAME classifier `status_routes`
+/// uses to decide which route a binding falls into — so `candidates[].
+/// client_routes` and `routes[].route` cannot disagree about the slot a
+/// credential belongs to. A supplier with no honest client surface (Mock) maps
+/// Third-party takeover state, as ONE machine-readable projection.
+///
+/// 🔴 Why this exists (2026-08-18, user decision A). AiKey routes third-party
+/// AI tools through the local proxy, and the tray turns that on implicitly
+/// every time a credential is switched — while offering no way to SEE it or
+/// reverse it. The `.app` promise is "you never open a terminal", so the one
+/// escape hatch being a terminal command is the bug.
+///
+/// Before this, no consumer could answer "is codex taken over right now?":
+/// `status --json` had no such field, `aikey desktop status --json` covered
+/// only Claude Desktop, and `aikey env` knew but printed for humans only. A UI
+/// had to union three calls and invent the union rule itself — a second
+/// definition of takeover state living in the UI. This is the single one.
+///
+/// 🚫 It does NOT re-detect anything. Every value comes from the SAME
+/// predicates the remove paths use — `injected_provider_toml_paths()` (semantic
+/// detection, deliberately not marker-text: markers went blind when the third
+/// party re-serialized the file) and `claude_desktop::detect_state`. Display
+/// and "what an uninstall would actually strip" therefore cannot disagree.
+fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
+    // The vault gate is the same precondition the tray's login surface carries:
+    // a write path that needs an interactive master-password prompt would hang a
+    // no-TTY child forever. Reported as a REASON, not a hidden disable, so the UI
+    // can say why the control is inert.
+    let blocked = |applies: bool| -> serde_json::Value {
+        if applies && !vault_initialized {
+            serde_json::Value::String("set a master password first".to_string())
+        } else {
+            serde_json::Value::Null
+        }
+    };
+
+    // ── 1. Shell hook — the delivery vehicle for every CLI face ─────────────
+    //
+    // 🔴 This is the PARENT switch, and `depends_on` below is not decoration.
+    // handle_hook_uninstall strips the third-party configs after unwiring the
+    // rc line, and on a no-TTY child (which is what the tray spawns) it does so
+    // WITHOUT asking (mod.rs:7424). D8 additionally has it restore Claude
+    // Desktop. So turning this off turns the two below off with it — deliberately,
+    // because a hook-less machine that keeps hard-pointing configs gives new
+    // terminals `Missing environment variable: OPENAI_API_KEY` and a Desktop that
+    // fails with nothing visible in the GUI.
+    let (hook_file, hook_rc, _) = crate::commands_account::hook_status_probe();
+    let hook_on = hook_file && hook_rc;
+
+    // ── 2. Claude Desktop ───────────────────────────────────────────────────
+    let desktop_state = crate::commands_account::claude_desktop::desktop_paths()
+        .map(|paths| crate::commands_account::claude_desktop::detect_state(&paths));
+    let claude_desktop_label = match desktop_state {
+        Some(crate::commands_account::claude_desktop::DesktopState::OursActive) => "taken_over",
+        Some(crate::commands_account::claude_desktop::DesktopState::Official) => "not_taken_over",
+        Some(crate::commands_account::claude_desktop::DesktopState::NotInstalled) => "not_installed",
+        // Distinct from not_installed on purpose: an infrastructure failure
+        // (Windows package query) must never render as a confident "you do not
+        // have this app".
+        Some(crate::commands_account::claude_desktop::DesktopState::DetectionFailed) => {
+            "detection_failed"
+        }
+        // Someone else (e.g. cc-switch) owns the 3p profile. Their file is never
+        // touched, so this is NOT "not taken over" and the UI must not offer a
+        // plain switch that would silently fight the other tool.
+        Some(crate::commands_account::claude_desktop::DesktopState::ForeignActive) => {
+            "foreign_active"
+        }
+        None => "not_installed",
+    };
+
+    // ── 3. Codex desktop + IDE extension ────────────────────────────────────
+    //
+    // 🔴 ONE line is the whole lever, and that is a measured fact rather than a
+    // reading of the code: research/codex-desktop-takeover/2026-08-18-codex-
+    // desktop-split-lever.md ran A/B/C with the top-level `model_provider` as the
+    // only variable. Without it a file-only client reports `provider: openai` and
+    // sends NOTHING to aikey; with `-c model_provider=aikey` (what the CLI shim
+    // injects at launch) the same config routes normally. So the desktop/IDE face
+    // and the CLI face are separable, which the 2026-07-16 consent rule could not
+    // see because it only considered edits to the shared provider block.
+    //
+    // Reading it here rather than through codex_content_has_aikey: that predicate
+    // answers "would `unuse` strip anything", which is true for the provider block
+    // alone. This switch owns exactly one line and must report exactly that line.
+    let codex_desktop_on = crate::commands_account::codex_top_level_provider_is_ours();
+
+    vec![
+        serde_json::json!({
+            "id": "shell-hook",
+            "display": "Shell hook",
+            // Windows is NOT a shell function: the CLI channel there is a shim
+            // file per tool in ~/.aikey/bin (codex.cmd, claude.cmd, kimi.cmd),
+            // which finds the real binary via `where` and injects the same
+            // runtime flag. Naming only shells would misdescribe half the
+            // installs, so the faces name the tools, not the mechanism.
+            "faces": ["claude CLI", "codex CLI", "kimi CLI"],
+            "switchable": true,
+            "taken_over": hook_on,
+            "state": if hook_on { "taken_over" } else { "not_taken_over" },
+            "depends_on": serde_json::Value::Null,
+            "blocked_reason": blocked(true),
+        }),
+        serde_json::json!({
+            "id": "claude-desktop",
+            "display": "Claude Desktop",
+            "faces": ["Claude Desktop"],
+            "switchable": true,
+            "taken_over": claude_desktop_label == "taken_over",
+            "state": claude_desktop_label,
+            "depends_on": "shell-hook",
+            "blocked_reason": blocked(true),
+        }),
+        serde_json::json!({
+            "id": "codex-desktop",
+            // 🚫 Never shorten this to "Codex desktop". The IDE extension is a
+            // file-only client too, so it rides on the same single line and
+            // cannot be left on when this is turned off. A label that hid that
+            // would let a user flip it believing the blast radius was one app.
+            "display": "Codex desktop & IDE extension",
+            "faces": ["Codex desktop", "IDE extension"],
+            "switchable": true,
+            "taken_over": codex_desktop_on,
+            "state": if codex_desktop_on { "taken_over" } else { "not_taken_over" },
+            "depends_on": "shell-hook",
+            "blocked_reason": blocked(true),
+        }),
+    ]
+}
+
+/// to no route, exactly as it does on the routes side.
+fn candidate_client_routes(providers: &[String]) -> Vec<String> {
+    let mut routes: Vec<String> = Vec::new();
+    for provider in providers {
+        if let Some(route) = status_client_route(provider, "", "") {
+            if !routes.iter().any(|r| r.eq_ignore_ascii_case(&route)) {
+                routes.push(route);
+            }
+        }
+    }
+    routes
 }
 
 /// Build the `routes` array: every client route this machine can serve, and
@@ -2989,6 +3350,11 @@ pub fn handle_status_overview_with(
             // endpoints, and an additive field on an existing command is a
             // smaller change than widening that fence.
             "vault_initialized": vault_exists,
+            // Third-party takeover, as ONE projection — see status_integrations
+            // for why it lives here rather than being unioned by each consumer
+            // from `aikey env` + `aikey desktop status --json`. Purely
+            // additive: consumers predating it ignore it.
+            "integrations": status_integrations(vault_exists),
             "login": {
                 "logged_in": account.is_some(),
                 "email": account.as_ref().map(|a| &a.email),
@@ -3184,6 +3550,7 @@ fn status_client_route(provider_code: &str, protocol_type: &str, base_url: &str)
 #[cfg(test)]
 mod status_candidates_tests {
     use super::status_candidates;
+    use super::status_integrations;
 
     /// A personal entry carrying every sensitive field the vault can hand back.
     /// `route_token` is the trap this fixture exists for: it lives on
@@ -3237,7 +3604,176 @@ mod status_candidates_tests {
         let obj = rows[0].as_object().expect("candidate is an object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, vec!["id", "kind", "label", "providers"]);
+        assert_eq!(
+            keys,
+            vec!["client_routes", "id", "kind", "label", "providers"]
+        );
+    }
+
+    /// 🔴 The kimi family fence (2026-08-18). `provider_registry.yaml` declares
+    /// `family: kimi` on BOTH kimi_code and moonshot, so ONE route slot is
+    /// served by TWO suppliers. A consumer filtering credentials by comparing
+    /// `providers` against a route's `provider` therefore asks a family
+    /// question on the supplier axis; aikey-tray did exactly that and hid every
+    /// moonshot account from the kimi route. `client_routes` is the axis that
+    /// makes the right question askable without the consumer owning a provider
+    /// table.
+    ///
+    /// Asserted against the REAL registry, not a fixture: the whole point is
+    /// that this value tracks provider_registry.yaml. A fixture would keep
+    /// passing after someone split or merged the family there.
+    #[test]
+    fn moonshot_and_kimi_code_report_the_same_client_route() {
+        for provider in ["kimi_code", "moonshot"] {
+            let mut entry = loaded_personal_entry();
+            entry.alias = format!("k-{provider}");
+            entry.provider_code = Some(provider.to_string());
+            entry.supported_providers = Some(vec![provider.to_string()]);
+
+            let rows = status_candidates(&[entry], &[], &[]);
+            let routes = rows[0]["client_routes"]
+                .as_array()
+                .expect("client_routes is an array");
+            assert!(
+                routes.iter().any(|r| r == "kimi"),
+                "{provider} must serve the kimi route slot, got {routes:?}"
+            );
+        }
+    }
+
+    /// 🔴 The hierarchy fence (2026-08-18). Turning the shell hook off turns the
+    /// two desktop takeovers off with it, and that is not incidental:
+    /// handle_hook_uninstall strips the third-party configs after unwiring the rc
+    /// line, WITHOUT asking on a no-TTY child — which is exactly what the tray
+    /// spawns — and D8 has it restore Claude Desktop too. A UI that drew three
+    /// peers would let a user turn one off and watch two others follow with no
+    /// explanation, so the dependency has to travel with the data.
+    #[test]
+    fn desktop_rows_declare_the_shell_hook_as_their_parent() {
+        let rows = status_integrations(true);
+        let parent = rows.iter().find(|r| r["id"] == "shell-hook").expect("shell-hook row");
+        assert!(parent["depends_on"].is_null(), "the parent depends on nothing");
+
+        for id in ["claude-desktop", "codex-desktop"] {
+            let row = rows.iter().find(|r| r["id"] == id).unwrap_or_else(|| {
+                panic!("{id} row is always present");
+            });
+            assert_eq!(
+                row["depends_on"], "shell-hook",
+                "{id} is torn down with the hook and must say so"
+            );
+        }
+    }
+
+    /// 🔴 The Codex desktop row governs the IDE extension too, because both are
+    /// file-only clients riding the single top-level `model_provider` line
+    /// (measured: research/codex-desktop-takeover/2026-08-18-codex-desktop-split-
+    /// lever.md). A label naming only the desktop app would let a user flip it
+    /// believing the blast radius was one application.
+    #[test]
+    fn codex_desktop_row_names_the_ide_extension_too() {
+        let rows = status_integrations(true);
+        let row = rows.iter().find(|r| r["id"] == "codex-desktop").expect("codex-desktop row");
+        let display = row["display"].as_str().unwrap_or_default();
+        assert!(
+            display.contains("IDE"),
+            "display must name the IDE extension, got {display:?}"
+        );
+        let faces: Vec<&str> = row["faces"].as_array().unwrap().iter().filter_map(|f| f.as_str()).collect();
+        assert_eq!(faces.len(), 2, "desktop + IDE, got {faces:?}");
+    }
+
+    /// The shell hook is the CLI channel for every tool, and on Windows it is a
+    /// shim FILE per tool rather than a shell function. Naming the tools instead
+    /// of the mechanism keeps the row honest on both platforms.
+    #[test]
+    fn shell_hook_row_names_every_cli_it_carries() {
+        let rows = status_integrations(true);
+        let hook = rows.iter().find(|r| r["id"] == "shell-hook").expect("shell-hook row");
+        let joined = hook["faces"].as_array().unwrap().iter()
+            .filter_map(|f| f.as_str()).collect::<Vec<_>>().join(" ");
+        for want in ["claude", "codex", "kimi"] {
+            assert!(joined.contains(want), "faces must name {want}: {joined}");
+        }
+    }
+
+    /// Codex's three faces read ONE config file    /// Codex's three faces read ONE config file, so the row must state all
+    /// three. Requirement 2026-07-16-third-party-takeover-consent.md rule 2
+    /// forbids a per-face switch; a row that named only the CLI would let a
+    /// user flip it believing the blast radius was one tool.
+    #[test]
+    fn codex_row_names_every_face_it_governs() {
+        let rows = status_integrations(true);
+        let codex = rows.iter().find(|r| r["id"] == "codex-desktop").expect("codex-desktop row");
+        let faces = codex["faces"].as_array().expect("faces is an array");
+        let joined = faces.iter().filter_map(|f| f.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(joined.contains("IDE"), "faces must name the IDE extension: {joined}");
+    }
+
+    /// An unset master password blocks the WRITE paths (a no-TTY child would
+    /// hang on the prompt), and the reason must travel with the state so the
+    /// UI can say why a control is inert instead of silently greying it.
+    #[test]
+    fn no_vault_blocks_the_switchable_rows_with_a_reason() {
+        let blocked = status_integrations(false);
+        for id in ["shell-hook", "claude-desktop", "codex-desktop"] {
+            let row = blocked.iter().find(|r| r["id"] == id).unwrap();
+            assert!(
+                row["blocked_reason"].is_string(),
+                "{id} must carry a reason when the vault is absent"
+            );
+        }
+        for row in status_integrations(true) {
+            assert!(
+                row["blocked_reason"].is_null(),
+                "{} must not be blocked once a vault exists",
+                row["id"]
+            );
+        }
+    }
+
+    /// The emitted key set is pinned, for the same reason candidate rows are: a
+    /// new field is a deliberate edit here, which is the moment to ask whether
+    /// the value can honestly be produced. `installed` was proposed and dropped
+    /// at exactly this gate — whether the codex BINARY exists is not knowable
+    /// from this process (the shell hook installs a shell FUNCTION named codex,
+    /// and a child's PATH is not the user's interactive PATH).
+    #[test]
+    fn integration_shape_is_exactly_the_agreed_metadata() {
+        for row in status_integrations(true) {
+            let obj = row.as_object().expect("integration row is an object");
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "blocked_reason",
+                    "depends_on",
+                    "display",
+                    "faces",
+                    "id",
+                    "state",
+                    "switchable",
+                    "taken_over"
+                ],
+                "unexpected shape for {}",
+                row["id"]
+            );
+        }
+    }
+
+    /// The two arrays must stay on their own axes. If `client_routes` ever
+    /// echoed the supplier code, a consumer filtering on it would be back to
+    /// exact-provider matching without anything turning red.
+    #[test]
+    fn client_routes_is_the_route_axis_not_a_copy_of_providers() {
+        let mut entry = loaded_personal_entry();
+        entry.provider_code = Some("moonshot".to_string());
+        entry.supported_providers = Some(vec!["moonshot".to_string()]);
+
+        let rows = status_candidates(&[entry], &[], &[]);
+        assert_eq!(rows[0]["providers"], serde_json::json!(["moonshot"]));
+        assert_eq!(rows[0]["client_routes"], serde_json::json!(["kimi"]));
     }
 
     /// `id` must be the string `aikey key use <id>` accepts AND the string that
@@ -10335,5 +10871,85 @@ mod sync_prune_scope_tests {
     #[test]
     fn still_prunes_the_syncing_accounts_removed_key() {
         assert!(should_prune_cached_binding(true, false, false));
+    }
+}
+
+#[cfg(test)]
+mod sso_login_tests {
+    use super::resolve_sso_authorize;
+    use crate::platform_client::{InitSessionResponse, SsoProviderEntry};
+
+    fn feishu() -> Vec<SsoProviderEntry> {
+        vec![SsoProviderEntry {
+            code: "feishu".into(),
+            display_name: "Feishu".into(),
+        }]
+    }
+
+    // The authorize path is a two-sided contract with the server's route
+    // (`/v1/auth/cli/login/sso/{provider}/authorize`) and with the links the
+    // server-rendered login page emits. This pins the CLI's half of it.
+    #[test]
+    fn builds_the_contracted_authorize_url() {
+        let (name, url) = resolve_sso_authorize(
+            "http://c.example:3000/",
+            &feishu(),
+            "feishu",
+            "sess-1",
+            "dev-1",
+        )
+        .expect("enabled provider must resolve");
+        assert_eq!(name, "Feishu");
+        assert_eq!(
+            url, "http://c.example:3000/v1/auth/cli/login/sso/feishu/authorize?s=sess-1&d=dev-1",
+            "trailing slash must be trimmed and the path must match the server route"
+        );
+    }
+
+    #[test]
+    fn provider_code_is_case_and_whitespace_tolerant() {
+        let (_, url) =
+            resolve_sso_authorize("http://c", &feishu(), "  Feishu ", "s", "d").expect("resolves");
+        assert!(url.contains("/sso/feishu/authorize"), "url = {}", url);
+    }
+
+    // Two failure modes need two different fixes, so the sentences differ:
+    // no SSO at all → point at email login; wrong code → list what exists.
+    #[test]
+    fn unknown_code_lists_the_deployments_actual_options() {
+        let err = resolve_sso_authorize("http://c", &feishu(), "dingtalk", "s", "d").unwrap_err();
+        assert!(err.contains("Available: feishu"), "err = {}", err);
+    }
+
+    #[test]
+    fn no_providers_points_at_email_login_without_overclaiming() {
+        let err = resolve_sso_authorize("http://c", &[], "feishu", "s", "d").unwrap_err();
+        assert!(err.contains("aikey login"), "err = {}", err);
+        // An old server that HAS SSO also lands here (its /init predates the
+        // field), so the sentence must not assert "no SSO exists".
+        assert!(err.contains("older server"), "err = {}", err);
+    }
+
+    // Old servers omit sso_providers entirely; the CLI must parse that as
+    // "none here", not fail. This is the backward-compat half of D2-A.
+    #[test]
+    fn init_response_without_sso_field_parses_as_empty() {
+        let resp: InitSessionResponse = serde_json::from_str(
+            r#"{"login_session_id":"s","device_code":"d","poll_interval_seconds":3,"expires_in_seconds":600}"#,
+        )
+        .expect("old wire must keep parsing");
+        assert!(resp.sso_providers.is_empty());
+    }
+
+    #[test]
+    fn init_response_with_sso_field_parses_the_entries() {
+        let resp: InitSessionResponse = serde_json::from_str(
+            r#"{"login_session_id":"s","device_code":"d","poll_interval_seconds":3,"expires_in_seconds":600,
+                "sso_providers":[{"code":"feishu","display_name":"Feishu"}]}"#,
+        )
+        .expect("new wire parses");
+        assert_eq!(resp.sso_providers.len(), 1);
+        assert_eq!(resp.sso_providers[0].code, "feishu");
+        assert_eq!(resp.sso_providers[0].display_name, "Feishu");
     }
 }

@@ -72,6 +72,22 @@ pub struct InitSessionResponse {
     pub device_code: String,
     pub poll_interval_seconds: u64,
     pub expires_in_seconds: u64,
+    /// SSO side-paths this deployment has enabled (2026-08-18, D2-A).
+    /// `#[serde(default)]` because older servers omit the field entirely —
+    /// an email-only deployment's wire is unchanged, and against an old
+    /// server this simply parses as "no SSO here".
+    #[serde(default)]
+    pub sso_providers: Vec<SsoProviderEntry>,
+}
+
+/// One enabled SSO provider, as advertised by /init. The authorize PATH is a
+/// client-side constant (`/v1/auth/cli/login/sso/{code}/authorize`) — the
+/// server deliberately does not ship it per-response; the pattern is already a
+/// two-sided contract shared with the server-rendered login page.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SsoProviderEntry {
+    pub code: String,
+    pub display_name: String,
 }
 
 /// Returned by POST /v1/auth/cli/login/start

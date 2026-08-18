@@ -142,6 +142,21 @@ pub(crate) fn open_connection_readonly() -> Result<Connection, String> {
 /// Shared connection setup: open DB + security pragmas. No migrations.
 fn open_connection_raw() -> Result<Connection, String> {
     let db_path = get_vault_path()?;
+    // Self-heal the parent directory. The installer normally creates
+    // ~/.aikey/data, but `aikey login` on a machine that never ran an
+    // installer reaches here first — and without this, the failure surfaced
+    // AFTER the user clicked their activation mail, as a raw SQLite "unable
+    // to open database file" (live E2E against staging, 2026-08-18). A path
+    // the CLI derives itself is the CLI's to create.
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "Failed to create vault directory {}: {}",
+                parent.display(),
+                e
+            )
+        })?;
+    }
     let conn = Connection::open(&db_path).map_err(|e| format!("Failed to open database: {}", e))?;
 
     // SECURITY: Enable secure delete on every connection
@@ -2059,6 +2074,26 @@ mod tests {
         let pw = SecretString::new("test_password".to_string());
         initialize_vault(&salt, &pw).expect("init vault");
         (dir, db_path, guard)
+    }
+
+    /// Regression (2026-08-18 live E2E): `aikey login` on a machine that
+    /// never ran an installer has no ~/.aikey/data yet, and the vault open
+    /// failed with a raw SQLite error — AFTER the user had already clicked
+    /// their activation mail. open_connection_raw must create the parent
+    /// directory itself: the path is CLI-derived, so it is the CLI's to make.
+    #[test]
+    fn open_connection_creates_missing_parent_directories() {
+        let guard = VAULT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = TempDir::new().expect("tempdir");
+        // Two levels that do NOT exist yet, like ~/.aikey/data on a bare box.
+        let db_path = dir.path().join("nonexistent").join("data").join("vault.db");
+        unsafe {
+            std::env::set_var("AK_VAULT_PATH", db_path.to_str().unwrap());
+        }
+        let conn = open_connection().expect("open must self-heal the missing directory");
+        drop(conn);
+        assert!(db_path.exists(), "database file was not created");
+        drop(guard);
     }
 
     // ── vault_is_initialized: the single exit ────────────────────────────

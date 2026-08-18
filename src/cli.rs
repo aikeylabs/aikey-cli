@@ -329,6 +329,15 @@ pub(crate) enum Commands {
         /// Force a new activation email even if one was sent within the last 60 seconds
         #[arg(long)]
         resend: bool,
+        /// Sign in with an SSO provider (e.g. feishu): opens the provider's
+        /// authorization page directly, skipping the email form
+        #[arg(long, value_name = "PROVIDER", conflicts_with_all = ["no_browser", "token"])]
+        sso: Option<String>,
+        /// Do not open a browser: send the activation email directly (requires
+        /// --email) and wait. Click the link on any device — even your phone —
+        /// and this login completes by itself
+        #[arg(long, requires = "email", conflicts_with = "token")]
+        no_browser: bool,
     },
     /// Open the User Console in your default browser, or control the local
     /// web service with `start` / `stop` / `restart`.
@@ -1272,6 +1281,10 @@ pub(crate) enum HookAction {
     Uninstall {
         /// Integration target. Omit = remove the shell hook (default).
         /// `openclaw` = remove the aikey provider from OpenClaw config.
+        /// `codex` = remove the Codex takeover ONLY (strips our block from
+        /// ~/.codex/config.toml and records a standing refusal so the next
+        /// `aikey use` does not re-apply it). Reverse with
+        /// `aikey hook install codex`.
         #[arg(value_name = "TARGET")]
         target: Option<String>,
     },
@@ -1344,6 +1357,15 @@ pub(crate) enum AccountAction {
         /// Force a new activation email even if one was sent within the last 60 seconds
         #[arg(long)]
         resend: bool,
+        /// Sign in with an SSO provider (e.g. feishu): opens the provider's
+        /// authorization page directly, skipping the email form
+        #[arg(long, value_name = "PROVIDER", conflicts_with_all = ["no_browser", "token"])]
+        sso: Option<String>,
+        /// Do not open a browser: send the activation email directly (requires
+        /// --email) and wait. Click the link on any device — even your phone —
+        /// and this login completes by itself
+        #[arg(long, requires = "email", conflicts_with = "token")]
+        no_browser: bool,
     },
     /// Show current login status
     Status,
@@ -1730,6 +1752,9 @@ Notes:
 Notes:
     - Shortcut for `aikey account login`.
     - Default flow uses browser + email activation.
+    - --sso <provider> (e.g. feishu) opens the provider's authorization page directly.
+    - --no-browser --email <you@corp.com> sends the activation email without a
+      browser; click the link on any device and the login completes here.
     - --token is the copy-paste fallback for non-completing browser flow.
     - Control URL precedence:
       1. --control-url
@@ -2075,10 +2100,16 @@ Detailed Commands
 
   Usage:
     aikey login [--control-url <URL>] [--token <TOKEN>] [--email <EMAIL>]
+                [--sso <PROVIDER>] [--no-browser]
 
   Notes:
     - Shortcut for `aikey account login`.
     - Default flow uses browser + email activation.
+    - --sso <provider> (e.g. feishu) opens the provider's authorization page
+      directly, skipping the email form.
+    - --no-browser --email <you@corp.com> sends the activation email without
+      opening a browser; click the link on any device (phone included) and
+      the login completes here automatically.
     - --token is the copy-paste fallback for non-completing browser flow.
     - Control URL precedence:
       1. --control-url
@@ -3178,6 +3209,8 @@ mod tests {
                 token: None,
                 email: None,
                 resend: false,
+                sso: None,
+                no_browser: false,
             },
         };
         assert_eq!(command_name(Some(&cmd)), "account.login");

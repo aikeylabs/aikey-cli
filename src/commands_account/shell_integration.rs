@@ -452,6 +452,34 @@ fn codex_config_has_aikey(p: &std::path::Path) -> bool {
     content.contains(AIKEY_BEGIN) || codex_content_has_aikey(&content)
 }
 
+/// True when `~/.codex/config.toml` carries the TOP-LEVEL `model_provider = "aikey"`.
+///
+/// 🔴 This is the desktop/IDE lever, and it is deliberately narrower than
+/// `codex_content_has_aikey`. That predicate answers "would `unuse` strip
+/// anything" and is true for the `[model_providers.aikey]` block on its own —
+/// but a config with the block and no top-level line routes the CLI (which
+/// injects `-c model_provider=aikey` at launch) while leaving every file-only
+/// client, i.e. the Codex desktop app and the IDE extension, on OpenAI.
+///
+/// Measured, not inferred: research/codex-desktop-takeover/
+/// 2026-08-18-codex-desktop-split-lever.md holds the A/B/C run where this line
+/// is the only variable — without it a file-only client reports
+/// `provider: openai` and sends nothing to aikey.
+///
+/// Reuses parse_or_heal_toml so a config a third party has re-serialized (which
+/// drops every comment, and is why marker-based detection went blind in 2026-07)
+/// is read the same way the writers read it.
+pub fn codex_top_level_provider_is_ours() -> bool {
+    let (cfg, _) = codex_config_paths();
+    let Ok(content) = std::fs::read_to_string(&cfg) else {
+        return false;
+    };
+    let Some(doc) = parse_or_heal_toml(&content) else {
+        return false;
+    };
+    doc.get("model_provider").and_then(|i| i.as_str()) == Some("aikey")
+}
+
 /// True when the config carries anything `codex_remove` would strip. Keep
 /// these three predicates in LOCKSTEP with codex_remove — the test
 /// `codex_detection_lockstep_with_remove` pins the equivalence so display
@@ -1260,6 +1288,72 @@ pub(super) fn codex_remove(existing: &str) -> TomlMergeOutcome {
     } else {
         TomlMergeOutcome::Changed(rendered)
     }
+}
+
+/// Set or clear ONLY the top-level `model_provider = "aikey"` line.
+///
+/// 🔴 This is the Codex desktop + IDE extension switch, and its narrowness is
+/// the whole point. `unconfigure_codex_cli` removes the `[model_providers.aikey]`
+/// block as well, which also unroutes the CLI — a different switch's job. This
+/// one leaves the block, the bearer and the base_url exactly as they were and
+/// moves a single line.
+///
+/// Why that line is the right lever (MEASURED, not inferred —
+/// research/codex-desktop-takeover/2026-08-18-codex-desktop-split-lever.md):
+/// with the line present a file-only client routes through aikey; with it
+/// absent the SAME config leaves that client reporting `provider: openai` and
+/// sending nothing to us, while the CLI keeps routing because its shim injects
+/// `-c model_provider=aikey` at launch. Codex desktop and the IDE extension are
+/// both file-only clients, so they ride this line together and cannot be split
+/// from each other.
+///
+/// 🚫 It deliberately does NOT create the config or the provider block. Turning
+/// this on without a block would leave `model_provider = "aikey"` pointing at a
+/// provider that does not exist, and Codex fails with "Model provider `aikey`
+/// not found" — the same shape as bugfix 2026-05-18. Absent block ⇒ no-op, and
+/// the caller's state projection keeps reporting "not taken over", which is the
+/// truth.
+pub fn set_codex_top_level_provider(on: bool) -> Result<(), String> {
+    let (config_path, _) = codex_config_paths();
+    let Ok(content) = std::fs::read_to_string(&config_path) else {
+        return Err("~/.codex/config.toml not found — open Codex once first".to_string());
+    };
+    let Some(mut doc) = parse_or_heal_toml(&content) else {
+        return Err("~/.codex/config.toml could not be parsed; not touching it".to_string());
+    };
+
+    if on {
+        let block_present = doc
+            .get("model_providers")
+            .and_then(|i| i.as_table())
+            .map(|t| t.contains_key("aikey"))
+            .unwrap_or(false);
+        if !block_present {
+            return Err(
+                "the aikey provider block is missing — activate an OpenAI key first".to_string(),
+            );
+        }
+        doc["model_provider"] = toml_edit::value("aikey");
+    } else {
+        // Only ever remove OUR value. A user who set `model_provider = "ollama"`
+        // keeps it: this switch reverses an aikey takeover, it does not own the
+        // field.
+        if doc.get("model_provider").and_then(|i| i.as_str()) != Some("aikey") {
+            return Ok(());
+        }
+        doc.as_table_mut().remove("model_provider");
+    }
+
+    let rendered = doc.to_string();
+    if rendered == content {
+        return Ok(());
+    }
+    let config_dir = config_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| resolve_user_home().join(".codex"));
+    write_config_atomic(&config_dir, &config_path, &rendered)
+        .map_err(|e| format!("cannot write ~/.codex/config.toml: {e}"))
 }
 
 /// Restore `~/.codex/config.toml` from the backup created by `configure_codex_cli`.
