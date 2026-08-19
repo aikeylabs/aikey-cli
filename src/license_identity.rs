@@ -185,9 +185,7 @@ pub fn line(state: &State) -> String {
 /// warning they see forever is a warning they learn to ignore.
 pub fn warning_for(state: &State) -> Option<String> {
     match state {
-        State::Error(cause) => Some(format!(
-            "the licensed identity is unavailable — {cause}"
-        )),
+        State::Error(cause) => Some(format!("the licensed identity is unavailable — {cause}")),
         State::Licensed(_) | State::Unlicensed => None,
     }
 }
@@ -326,7 +324,6 @@ mod tests {
         });
         format!("http://{}", addr)
     }
-
 
     // The awkward name is the point. 🔴 A name that survives an ASCII round trip
     // proves nothing about 逐字节相同: the ways two surfaces diverge in practice
@@ -469,7 +466,10 @@ mod tests {
     /// 能红: map the empty-name arm to `State::Unlicensed`.
     #[test]
     fn a_licensed_deployment_with_no_activation_is_an_error_not_unlicensed() {
-        let got = fetch(&mock_control(200, r#"{"schema_version":1,"company_name":""}"#));
+        let got = fetch(&mock_control(
+            200,
+            r#"{"schema_version":1,"company_name":""}"#,
+        ));
         assert_ne!(
             got,
             State::Unlicensed,
@@ -533,7 +533,10 @@ mod tests {
     /// fail — so these two together cannot both pass for the wrong reason.
     #[test]
     fn a_healthy_deployment_has_no_ramp_line() {
-        let base = mock_control(200, r#"{"schema_version":1,"state":"active","reminder":{"active":false}}"#);
+        let base = mock_control(
+            200,
+            r#"{"schema_version":1,"state":"active","reminder":{"active":false}}"#,
+        );
         assert_eq!(fetch_reminder(&base, "token"), None);
     }
 
