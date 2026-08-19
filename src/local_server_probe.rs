@@ -624,16 +624,32 @@ fn stop_service() -> Result<(), String> {
         Some(p) => p,
         None => return Ok(()), // already stopped
     };
-    signal_terminate(pid)?;
-    // Wait up to 5s for graceful exit; SIGKILL if still alive.
-    for _ in 0..50 {
+    // Graceful first, forceful second — and a FAILED graceful attempt ESCALATES
+    // instead of aborting. On Windows a windowless service has no WM_CLOSE
+    // recipient, so plain `taskkill` exits 1 ("can only be terminated
+    // forcefully") every single time; the old `signal_terminate(pid)?` made
+    // that abort the whole stop, so the master switch could never turn the
+    // local server off (2026-08-19). Unix SIGTERM only fails on ESRCH/EPERM,
+    // which the kill fallback answers just as well.
+    if signal_terminate(pid).is_ok() {
+        // Wait up to 5s for graceful exit before escalating.
+        for _ in 0..50 {
+            if !pid_alive(pid) {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    signal_kill(pid)?;
+    // The kill call succeeding is not the process being gone — confirm, so a
+    // survivor is a loud error here rather than a mystery at the next start.
+    for _ in 0..20 {
         if !pid_alive(pid) {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    signal_kill(pid)?;
-    Ok(())
+    Err(format!("pid {} survived taskkill/SIGKILL", pid))
 }
 
 // stderr policy for BOTH platform variants (bugfix 2026-07-29): the fallback
