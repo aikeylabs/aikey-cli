@@ -3002,6 +3002,45 @@ fn candidate_kind_of(t: &crate::credential_type::CredentialType) -> &'static str
 /// detection, deliberately not marker-text: markers went blind when the third
 /// party re-serialized the file) and `claude_desktop::detect_state`. Display
 /// and "what an uninstall would actually strip" therefore cannot disagree.
+/// Pure state table for the Codex desktop row — extracted so the precondition
+/// logic is testable without a real ~/.codex on the test machine.
+///
+/// (state, blocked_reason). The reason uses the SAME words the write-side
+/// guard emits, deliberately: whichever layer the user meets first says the
+/// same thing (名词字典 — one sentence, two surfaces).
+fn codex_desktop_row_state(
+    cfg_present: bool,
+    block_present: bool,
+    taken_over: bool,
+    foreign_provider: bool,
+) -> (&'static str, Option<&'static str>) {
+    if !cfg_present {
+        // Codex has never run here — there is nothing to take over, and the
+        // row must say so instead of offering a switch that can only error.
+        return ("not_installed", None);
+    }
+    if taken_over {
+        return ("taken_over", None);
+    }
+    if foreign_provider {
+        // The user (or another tool) set model_provider themselves. The write
+        // guard refuses to overwrite it — restore-fidelity: our reverse path
+        // deletes the line, so overwriting would LOSE their value. Same state
+        // Claude Desktop uses for a cc-switch-owned profile; the page renders
+        // it inert with "managed by another tool".
+        return ("foreign_active", None);
+    }
+    if !block_present {
+        // Config exists but no aikey provider block: turning this on would
+        // write `model_provider = "aikey"` pointing at nothing, and Codex
+        // fails with "Model provider aikey not found". Same precondition the
+        // write guard enforces; surfaced here so the switch is inert WITH the
+        // reason on screen rather than erroring after the click.
+        return ("not_taken_over", Some("activate an OpenAI key first"));
+    }
+    ("not_taken_over", None)
+}
+
 fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
     // The vault gate is the same precondition the tray's login surface carries:
     // a write path that needs an interactive master-password prompt would hang a
@@ -3034,7 +3073,9 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
     let claude_desktop_label = match desktop_state {
         Some(crate::commands_account::claude_desktop::DesktopState::OursActive) => "taken_over",
         Some(crate::commands_account::claude_desktop::DesktopState::Official) => "not_taken_over",
-        Some(crate::commands_account::claude_desktop::DesktopState::NotInstalled) => "not_installed",
+        Some(crate::commands_account::claude_desktop::DesktopState::NotInstalled) => {
+            "not_installed"
+        }
         // Distinct from not_installed on purpose: an infrastructure failure
         // (Windows package query) must never render as a confident "you do not
         // have this app".
@@ -3065,6 +3106,10 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
     // answers "would `unuse` strip anything", which is true for the provider block
     // alone. This switch owns exactly one line and must report exactly that line.
     let codex_desktop_on = crate::commands_account::codex_top_level_provider_is_ours();
+    let (codex_cfg, codex_block) = crate::commands_account::codex_desktop_preconditions();
+    let codex_foreign = crate::commands_account::codex_foreign_top_level_provider().is_some();
+    let (codex_desktop_state, codex_precondition) =
+        codex_desktop_row_state(codex_cfg, codex_block, codex_desktop_on, codex_foreign);
 
     vec![
         serde_json::json!({
@@ -3102,9 +3147,18 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
             "faces": ["Codex desktop", "IDE extension"],
             "switchable": true,
             "taken_over": codex_desktop_on,
-            "state": if codex_desktop_on { "taken_over" } else { "not_taken_over" },
+            "state": codex_desktop_state,
             "depends_on": "shell-hook",
-            "blocked_reason": blocked(true),
+            // Vault first: with no master password NO key can be activated, so
+            // the vault step is the actionable one; the missing-block reason
+            // only leads anywhere once a vault exists.
+            "blocked_reason": if !vault_initialized {
+                blocked(true)
+            } else {
+                codex_precondition
+                    .map(|r| serde_json::Value::String(r.to_string()))
+                    .unwrap_or(serde_json::Value::Null)
+            },
         }),
     ]
 }
@@ -3286,6 +3340,30 @@ pub fn handle_status_overview_with(
             }
         }
     }
+    // 🔴 OAuth accounts route too (2026-08-19, found live on Windows). The set
+    // above was fed by personal keys, team keys and bindings — and NOTHING
+    // else, so a machine whose ONLY credential is an OAuth account (fresh
+    // install + `aikey auth login`) derived an EMPTY route set. The panel's
+    // routing list is keyed on routes, so zero routes rendered zero rows and
+    // the freshly added account was invisible with no error anywhere
+    // ("主界面没有显示这个账号"). Every machine that had ever added a personal
+    // key masked this — some other credential always propped the routes up.
+    //
+    // Canonicalize first: OAuth rows store the login name ("codex", "claude"),
+    // and the classifier speaks canonical codes — the same order
+    // candidate_client_routes uses, so the account's route row and its
+    // candidate row cannot disagree.
+    for account in &oauth_accounts {
+        if account.provider.is_empty() {
+            continue;
+        }
+        let canonical = oauth_provider_to_canonical(&account.provider);
+        providers.insert(canonical.to_string());
+        if let Some(route) = status_client_route(canonical, &account.protocol_type, "") {
+            protocols.insert(route);
+        }
+    }
+
     // Bindings are the most exact local routing rows. Derive again from their
     // Provider+Protocol axes instead of trusting a legacy client_route that may
     // still contain `mock` from a pre-migration cache.
@@ -3358,7 +3436,16 @@ pub fn handle_status_overview_with(
             "login": {
                 "logged_in": account.is_some(),
                 "email": account.as_ref().map(|a| &a.email),
-                "control_url": account.as_ref().map(|a| &a.control_url),
+                // Signed out, the REMEMBERED url still travels (2026-08-19,
+                // "首次填写成功后可以记住"): a successful login persists it to
+                // config.json (persist_control_url_sidecar), and the panel's
+                // sign-in form prefills from this field — the CLI is the one
+                // memory, the view only renders it. logged_in stays the
+                // authority on state; this is prefill material, nothing more.
+                "control_url": account
+                    .as_ref()
+                    .map(|a| a.control_url.clone())
+                    .or_else(read_control_url_from_config),
             },
             "keys": {
                 "personal": personal_count,
@@ -3549,6 +3636,7 @@ fn status_client_route(provider_code: &str, protocol_type: &str, base_url: &str)
 
 #[cfg(test)]
 mod status_candidates_tests {
+    use super::codex_desktop_row_state;
     use super::status_candidates;
     use super::status_integrations;
 
@@ -3651,8 +3739,14 @@ mod status_candidates_tests {
     #[test]
     fn desktop_rows_declare_the_shell_hook_as_their_parent() {
         let rows = status_integrations(true);
-        let parent = rows.iter().find(|r| r["id"] == "shell-hook").expect("shell-hook row");
-        assert!(parent["depends_on"].is_null(), "the parent depends on nothing");
+        let parent = rows
+            .iter()
+            .find(|r| r["id"] == "shell-hook")
+            .expect("shell-hook row");
+        assert!(
+            parent["depends_on"].is_null(),
+            "the parent depends on nothing"
+        );
 
         for id in ["claude-desktop", "codex-desktop"] {
             let row = rows.iter().find(|r| r["id"] == id).unwrap_or_else(|| {
@@ -3673,13 +3767,21 @@ mod status_candidates_tests {
     #[test]
     fn codex_desktop_row_names_the_ide_extension_too() {
         let rows = status_integrations(true);
-        let row = rows.iter().find(|r| r["id"] == "codex-desktop").expect("codex-desktop row");
+        let row = rows
+            .iter()
+            .find(|r| r["id"] == "codex-desktop")
+            .expect("codex-desktop row");
         let display = row["display"].as_str().unwrap_or_default();
         assert!(
             display.contains("IDE"),
             "display must name the IDE extension, got {display:?}"
         );
-        let faces: Vec<&str> = row["faces"].as_array().unwrap().iter().filter_map(|f| f.as_str()).collect();
+        let faces: Vec<&str> = row["faces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f.as_str())
+            .collect();
         assert_eq!(faces.len(), 2, "desktop + IDE, got {faces:?}");
     }
 
@@ -3689,25 +3791,78 @@ mod status_candidates_tests {
     #[test]
     fn shell_hook_row_names_every_cli_it_carries() {
         let rows = status_integrations(true);
-        let hook = rows.iter().find(|r| r["id"] == "shell-hook").expect("shell-hook row");
-        let joined = hook["faces"].as_array().unwrap().iter()
-            .filter_map(|f| f.as_str()).collect::<Vec<_>>().join(" ");
+        let hook = rows
+            .iter()
+            .find(|r| r["id"] == "shell-hook")
+            .expect("shell-hook row");
+        let joined = hook["faces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         for want in ["claude", "codex", "kimi"] {
             assert!(joined.contains(want), "faces must name {want}: {joined}");
         }
     }
 
-    /// Codex's three faces read ONE config file    /// Codex's three faces read ONE config file, so the row must state all
-    /// three. Requirement 2026-07-16-third-party-takeover-consent.md rule 2
-    /// forbids a per-face switch; a row that named only the CLI would let a
-    /// user flip it believing the blast radius was one tool.
+    /// 🔴 The precondition fence (2026-08-18, "点击后显示 Error"). A switch the
+    /// panel offers must be operable, or inert WITH its reason on screen — a
+    /// guard that only fires after the click turns a designed refusal into a
+    /// surprise error. Pins the whole state table, including that the reason
+    /// uses the write-guard's own words (one sentence, two surfaces).
+    #[test]
+    fn codex_desktop_row_surfaces_its_preconditions() {
+        assert_eq!(
+            codex_desktop_row_state(false, false, false, false),
+            ("not_installed", None)
+        );
+        let (state, reason) = codex_desktop_row_state(true, false, false, false);
+        assert_eq!(state, "not_taken_over");
+        assert!(
+            reason.unwrap_or_default().contains("OpenAI key"),
+            "the reason must tell the user the actionable next step"
+        );
+        assert_eq!(
+            codex_desktop_row_state(true, true, false, false),
+            ("not_taken_over", None)
+        );
+        // Reversing needs no precondition — it only removes.
+        assert_eq!(
+            codex_desktop_row_state(true, true, true, false),
+            ("taken_over", None)
+        );
+        // 🔴 A user-set model_provider (ollama…) renders as foreign_active —
+        // the switch must be inert BEFORE the click, because turning it on
+        // would overwrite a value the reverse path cannot bring back.
+        assert_eq!(
+            codex_desktop_row_state(true, true, false, true),
+            ("foreign_active", None)
+        );
+    }
+
+    /// The Codex desktop row governs desktop + IDE off one config line, so it
+    /// must state both faces. Requirement 2026-07-16 rule 2 forbids a per-face
+    /// switch; a row naming only one face would let a user flip it believing
+    /// the blast radius was one tool.
     #[test]
     fn codex_row_names_every_face_it_governs() {
         let rows = status_integrations(true);
-        let codex = rows.iter().find(|r| r["id"] == "codex-desktop").expect("codex-desktop row");
+        let codex = rows
+            .iter()
+            .find(|r| r["id"] == "codex-desktop")
+            .expect("codex-desktop row");
         let faces = codex["faces"].as_array().expect("faces is an array");
-        let joined = faces.iter().filter_map(|f| f.as_str()).collect::<Vec<_>>().join(" ");
-        assert!(joined.contains("IDE"), "faces must name the IDE extension: {joined}");
+        let joined = faces
+            .iter()
+            .filter_map(|f| f.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("IDE"),
+            "faces must name the IDE extension: {joined}"
+        );
     }
 
     /// An unset master password blocks the WRITE paths (a no-TTY child would
@@ -3723,10 +3878,19 @@ mod status_candidates_tests {
                 "{id} must carry a reason when the vault is absent"
             );
         }
+        // With a vault present, the VAULT reason must be gone. Deliberately
+        // NOT "blocked_reason is null": this function probes the real
+        // machine (~/.codex, Claude Desktop paths), and legitimate
+        // machine-dependent preconditions ("activate an OpenAI key first")
+        // may be present on any given dev box — asserting null made this
+        // test flake the moment a funnel run stripped the local codex block
+        // (exactly what happened 2026-08-19). Pin the axis under test, not
+        // the whole world.
         for row in status_integrations(true) {
+            let reason = row["blocked_reason"].as_str().unwrap_or("");
             assert!(
-                row["blocked_reason"].is_null(),
-                "{} must not be blocked once a vault exists",
+                !reason.contains("master password"),
+                "{} still carries the vault reason after the vault exists: {reason}",
                 row["id"]
             );
         }
@@ -6168,7 +6332,28 @@ pub(crate) fn providers_for_client_selector(
     key_ref: &str,
     selector: &str,
 ) -> Result<Vec<String>, String> {
-    let selector = oauth_provider_to_canonical(selector).to_lowercase();
+    // 🔴 TWO axes collide on one string, and the order here is the fix for a
+    // live failure (2026-08-18). The registry gives "kimi" two meanings:
+    //
+    //   oauth alias axis:  kimi → kimi_code   (oauth_aliases, for `auth login
+    //                                          kimi` and legacy vault rows)
+    //   client-route axis: kimi = the family slot BOTH kimi_code and moonshot
+    //                                          serve (family:)
+    //
+    // The old code canonicalized the selector FIRST, so "kimi" became
+    // "kimi_code" before the route match ever ran — and a moonshot key then
+    // failed with "does not support client route 'kimi_code'", an error naming
+    // a string the caller never typed. The alias table was shadowing the
+    // family table.
+    //
+    // So: the DIRECT provider-code comparison keeps canonicalization (that is
+    // the documented alias behaviour, and it is what keeps `--provider kimi`
+    // resolving on a kimi_code key), while the client-route fallback below
+    // matches the RAW selector (that is what lets the same word reach the
+    // family slot on a moonshot key). Direct runs first, so on a key that
+    // somehow served both platforms the alias meaning wins deterministically.
+    let raw_selector = selector.to_lowercase();
+    let selector = oauth_provider_to_canonical(&raw_selector).to_lowercase();
 
     // Compatibility: an exact upstream provider selection still works.
     let mut direct = providers
@@ -6190,14 +6375,14 @@ pub(crate) fn providers_for_client_selector(
         }
     }
 
-    let matched = providers_matching_client_route(&provider_routes, &selector);
+    let matched = providers_matching_client_route(&provider_routes, &raw_selector);
     if matched.len() == 1 {
         return Ok(matched);
     }
     if matched.len() > 1 {
         return Err(format!(
             "Client route '{}' matches multiple providers ({}); select an exact provider code.",
-            selector,
+            raw_selector,
             matched.join(", ")
         ));
     }
@@ -6209,8 +6394,11 @@ pub(crate) fn providers_for_client_selector(
     supported_routes.sort();
     supported_routes.dedup();
     Err(format!(
+        // raw_selector, deliberately: the old message echoed the CANONICALIZED
+        // word, so a user who typed `--provider kimi` was told about
+        // 'kimi_code' — an error naming a string they never wrote.
         "does not support client route '{}'. Supported routes: {}; providers: {}",
-        selector,
+        raw_selector,
         supported_routes.join(", "),
         providers.join(", ")
     ))
@@ -7536,13 +7724,23 @@ pub fn handle_key_unuse(
     let mut already_unbound: Vec<String> = Vec::new();
 
     for raw in providers {
-        let selector = oauth_provider_to_canonical(&raw.to_lowercase()).to_string();
+        // 🔴 Same axis collision as providers_for_client_selector (2026-08-18,
+        // audit site ①): "kimi" is an oauth alias of kimi_code AND the family
+        // route both platforms serve. Canonicalizing first turned `unuse kimi`
+        // into `unuse kimi_code`, which matched neither the route ("kimi") nor
+        // a moonshot binding's provider — so the command reported "already
+        // unbound" and SILENTLY did nothing. The route half of the match must
+        // see the user's raw word; the canonical form keeps serving the alias
+        // (`unuse claude` → route anthropic) and exact-provider cases.
+        let raw_word = raw.to_lowercase();
+        let selector = oauth_provider_to_canonical(&raw_word).to_string();
         let bindings = storage::list_provider_bindings(crate::profile_activation::DEFAULT_PROFILE)
             .map_err(|e| format!("list active bindings: {}", e))?;
         let mut routes = bindings
             .iter()
             .filter(|binding| {
-                binding.client_route.eq_ignore_ascii_case(&selector)
+                binding.client_route.eq_ignore_ascii_case(&raw_word)
+                    || binding.client_route.eq_ignore_ascii_case(&selector)
                     || binding.provider_code.eq_ignore_ascii_case(&selector)
             })
             .map(|binding| binding.client_route.clone())
@@ -7822,7 +8020,7 @@ mod provider_mapping_tests {
 
     use super::{
         finalize_promoted_routes, provider_env_vars, provider_extra_env_vars,
-        provider_proxy_prefix, providers_matching_client_route,
+        provider_proxy_prefix, providers_for_client_selector, providers_matching_client_route,
     };
 
     #[test]
@@ -7843,6 +8041,57 @@ mod provider_mapping_tests {
         assert_eq!(
             providers_matching_client_route(&routes, "anthropic"),
             vec!["mock-a".to_string(), "mock-b".to_string()]
+        );
+    }
+
+    /// 🔴 The axis-collision fence (2026-08-18, live failure). "kimi" is BOTH
+    /// an oauth alias of kimi_code AND the family route both platforms serve.
+    /// The resolver used to canonicalize the selector first, so "kimi" became
+    /// "kimi_code" before the route match ran — and a moonshot key failed with
+    /// an error naming a string the user never typed. The vault web page never
+    /// hit this because it sends exact provider codes; the tray panel sends the
+    /// route name, which is exactly the word this trap eats.
+    #[test]
+    fn family_selector_reaches_a_moonshot_key_despite_the_oauth_alias() {
+        let selected = providers_for_client_selector(
+            &["moonshot".to_string()],
+            "personal",
+            "no-such-ref",
+            "kimi",
+        )
+        .expect("the family name must select the moonshot key");
+        assert_eq!(selected, vec!["moonshot".to_string()]);
+    }
+
+    /// The alias behaviour the canonicalization exists FOR must keep working:
+    /// on a kimi_code key, "kimi" resolves through the alias (direct match).
+    #[test]
+    fn alias_selector_still_reaches_a_kimi_code_key() {
+        let selected = providers_for_client_selector(
+            &["kimi_code".to_string()],
+            "personal",
+            "no-such-ref",
+            "kimi",
+        )
+        .expect("the deprecated alias must keep resolving");
+        assert_eq!(selected, vec!["kimi_code".to_string()]);
+    }
+
+    /// A cross-platform mismatch stays refused — kimi_code and moonshot are
+    /// different account systems with different upstreams — and the refusal
+    /// must echo the word the caller actually used.
+    #[test]
+    fn cross_platform_selector_is_refused_and_echoes_the_users_word() {
+        let err = providers_for_client_selector(
+            &["moonshot".to_string()],
+            "personal",
+            "no-such-ref",
+            "kimi_code",
+        )
+        .expect_err("a moonshot key must not accept the kimi_code platform");
+        assert!(
+            err.contains("'kimi_code'"),
+            "refusal must name the input: {err}"
         );
     }
 

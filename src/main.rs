@@ -7086,13 +7086,45 @@ fn resolve_single_provider(
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(ov) = provider_override {
         let code = provider_canonical(ov);
-        if !providers.iter().any(|p| provider_canonical(p) == code) {
-            return Err(format!(
-                "Key '{}' does not support provider '{}'. Supported: {}.\n  Try: aikey activate {} --provider {}",
-                display, code, providers.join(", "), display, provider_canonical(&providers[0])
-            ).into());
+        if let Some(direct) = providers.iter().find(|p| provider_canonical(p) == code) {
+            return Ok(provider_canonical(direct));
         }
-        return Ok(code);
+        // 🔴 Route-axis fallback (2026-08-18, audit site ②). "kimi" is BOTH an
+        // oauth alias of kimi_code and the family route moonshot serves;
+        // canonicalizing alone turned `--provider kimi` on a moonshot key into
+        // a refusal naming 'kimi_code' — a word the user never typed. Mirror of
+        // providers_for_client_selector's fix: direct canonical match first
+        // (alias behaviour preserved), then the RAW word against each
+        // provider's client route.
+        let raw = ov.to_lowercase();
+        let route_hits: Vec<&String> = providers
+            .iter()
+            .filter(|p| {
+                crate::provider_registry::client_route_for_binding(&provider_canonical(p), "")
+                    .eq_ignore_ascii_case(&raw)
+            })
+            .collect();
+        if route_hits.len() == 1 {
+            return Ok(provider_canonical(route_hits[0]));
+        }
+        if route_hits.len() > 1 {
+            return Err(format!(
+                "Client route '{}' matches multiple providers ({}); select an exact provider code.",
+                ov,
+                route_hits
+                    .iter()
+                    .map(|p| provider_canonical(p))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into());
+        }
+        return Err(format!(
+            // ov, deliberately: the refusal must echo the word the user typed,
+            // never the alias table's rewrite of it.
+            "Key '{}' does not support provider '{}'. Supported: {}.\n  Try: aikey activate {} --provider {}",
+            display, ov, providers.join(", "), display, provider_canonical(&providers[0])
+        ).into());
     }
     if providers.len() == 1 {
         return Ok(provider_canonical(&providers[0]));
@@ -7874,6 +7906,7 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             target,
             shell,
             no_hook,
+            yes,
         } => {
             match target.as_deref() {
                 Some("openclaw") => {
@@ -7969,7 +8002,7 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                     Err(e) => Err(e.into()),
                 }
             } else {
-                match commands_account::ensure_shell_hook(false) {
+                match commands_account::ensure_shell_hook_with_consent(false, *yes) {
                     Some(msg) => {
                         println!("{}", msg);
                     }

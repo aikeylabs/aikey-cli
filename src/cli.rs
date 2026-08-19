@@ -1254,6 +1254,12 @@ pub(crate) enum HookAction {
         /// Useful in CI / sandbox tests that want Layer 1 only.
         #[arg(long)]
         no_hook: bool,
+        /// Grant the rc-wiring confirmation non-interactively. For GUI callers
+        /// whose click IS the consent (the tray's takeover switch, same class
+        /// as the web modal's wire-rc button) — without it a no-TTY caller
+        /// gets Layer 1 only and a hint nobody reads.
+        #[arg(long)]
+        yes: bool,
     },
     /// Force re-write both layers (hook file + rc block) and report which
     /// file was touched. Use after a major hook template change (e.g. the

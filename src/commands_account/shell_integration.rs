@@ -452,6 +452,49 @@ fn codex_config_has_aikey(p: &std::path::Path) -> bool {
     content.contains(AIKEY_BEGIN) || codex_content_has_aikey(&content)
 }
 
+/// Preconditions for the Codex desktop takeover switch, as two independent
+/// facts: (config.toml exists, the `[model_providers.aikey]` block exists).
+///
+/// 🔴 Why this is surfaced BEFORE the switch (2026-08-18, "codex desktop 本机
+/// 没有安装，但是点击后显示 Error"): set_codex_top_level_provider guards both
+/// conditions, correctly — but a guard that fires on click means the panel
+/// offered a switch it knew nothing about, and the user meets the refusal as
+/// an error instead of as a disabled control with the reason on screen. The
+/// status projection reads these same facts so the row is honest up front;
+/// the write-side guard stays as the second line of defence.
+pub fn codex_desktop_preconditions() -> (bool, bool) {
+    let (cfg, _) = codex_config_paths();
+    let Ok(content) = std::fs::read_to_string(&cfg) else {
+        return (false, false);
+    };
+    let Some(doc) = parse_or_heal_toml(&content) else {
+        // Unparseable is treated as "present, block unknown→absent": the write
+        // side refuses to touch an unparseable file too, so the switch stays
+        // blocked with the activate-first reason rather than lying "not
+        // installed" about a file that plainly exists.
+        return (true, false);
+    };
+    let block = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table())
+        .map(|t| t.contains_key("aikey"))
+        .unwrap_or(false);
+    (true, block)
+}
+
+/// The top-level `model_provider` value when it is neither absent nor ours —
+/// i.e. a value the user (or another tool) set, which the takeover switch
+/// refuses to overwrite. None = absent or "aikey".
+pub fn codex_foreign_top_level_provider() -> Option<String> {
+    let (cfg, _) = codex_config_paths();
+    let content = std::fs::read_to_string(&cfg).ok()?;
+    let doc = parse_or_heal_toml(&content)?;
+    match doc.get("model_provider").and_then(|i| i.as_str()) {
+        Some(v) if v != "aikey" => Some(v.to_string()),
+        _ => None,
+    }
+}
+
 /// True when `~/.codex/config.toml` carries the TOP-LEVEL `model_provider = "aikey"`.
 ///
 /// 🔴 This is the desktop/IDE lever, and it is deliberately narrower than
@@ -1333,6 +1376,20 @@ pub fn set_codex_top_level_provider(on: bool) -> Result<(), String> {
                 "the aikey provider block is missing — activate an OpenAI key first".to_string(),
             );
         }
+        // 🔴 Never overwrite a FOREIGN value (2026-08-18, restore-fidelity
+        // gap): a user's own `model_provider = "ollama"` would be replaced by
+        // "aikey" here, and the reverse path deletes the line outright — the
+        // user's value would be gone. The lifecycle funnel has always had this
+        // rule (detect_codex_model_provider_conflict: conflicting value →
+        // top-level untouched, the CLI wrapper injects -c instead); the switch
+        // must not be the one path that skips it.
+        if let Some(existing_value) = doc.get("model_provider").and_then(|i| i.as_str()) {
+            if existing_value != "aikey" {
+                return Err(format!(
+                    "Codex's model_provider is set to '{existing_value}' (by you or another tool) — AiKey won't overwrite it. Remove that line from ~/.codex/config.toml first if you want AiKey to take over."
+                ));
+            }
+        }
         doc["model_provider"] = toml_edit::value("aikey");
     } else {
         // Only ever remove OUR value. A user who set `model_provider = "ollama"`
@@ -2124,6 +2181,24 @@ pub(super) fn replace_between_markers(
 /// mutation**, use [`refresh_hook_file_only`] instead — that's the
 /// non-interactive entry point used by `aikey hook update`.
 pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
+    ensure_shell_hook_with_consent(no_hook, false)
+}
+
+/// `ensure_shell_hook` with an explicit consent carrier.
+///
+/// 🔴 Why `assume_yes` exists (2026-08-18, "点击 Shell hook 开关开启无效"): the
+/// TTY gates below are consent gates — "stdin is redirected" is read as "no
+/// human present to grant the rc edit". That is right for pipes and CI, and
+/// WRONG for a GUI whose click is itself the grant: the tray's takeover switch
+/// spawned `hook install`, the no-TTY branch rendered Layer 1, declined the rc
+/// wiring, exited 0 — and the switch visibly did nothing while reporting
+/// success. Same consent class as the web modal's wire-rc button, which
+/// carries its grant through `_internal hook-op`; a public flag (`--yes`) is
+/// the equivalent carrier for public-command callers.
+///
+/// `assume_yes` grants ONLY the rc-wiring consent. AIKEY_NO_HOOK and --no-hook
+/// still win — an explicit opt-out beats a GUI's implicit opt-in.
+pub fn ensure_shell_hook_with_consent(no_hook: bool, assume_yes: bool) -> Option<String> {
     if no_hook
         || std::env::var("AIKEY_NO_HOOK")
             .map(|v| v == "1")
@@ -2205,7 +2280,7 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         // discipline as the fresh-install branch — non-TTY callers
         // (CI, pipes) get a hint instead of a silent rewrite.
         RcStateForKind::LegacyMarker { rc_file, .. } => {
-            if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
+            if !assume_yes && (!io::stderr().is_terminal() || !io::stdin().is_terminal()) {
                 return Some(format!(
                     "  Detected legacy aikey hook (v1/v2) in {}.\n  \
                      Migration to v3 needs interactive confirmation.\n  \
@@ -2245,7 +2320,7 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
         // consent because stdin/stderr being redirected is a strong signal
         // there is no human to grant it.
         RcStateForKind::NoMarker { canonical_rc_file } => {
-            if !io::stderr().is_terminal() || !io::stdin().is_terminal() {
+            if !assume_yes && (!io::stderr().is_terminal() || !io::stdin().is_terminal()) {
                 return Some(format!(
                     "  Shell hook file rendered, but ~/.{} (rc-file) wiring needs interactive confirmation.\n  \
                      Run interactively: {}\n  \
@@ -2268,6 +2343,25 @@ pub fn ensure_shell_hook(no_hook: bool) -> Option<String> {
                 format!("File:   {}", canonical_rc_file.display()),
                 format!("Add:    source ~/.aikey/{}  (v3)", hook_filename),
             ];
+            // assume_yes carries the consent already (a GUI click), so the
+            // prompt is skipped ENTIRELY rather than answered by EOF: a no-TTY
+            // read_line would happen to default to yes, but "works by
+            // accident of the EOF path" is not a contract, and the question
+            // box would land in a log nobody is reading.
+            if assume_yes {
+                let summary = match write_v3_layers_with_consent(&home, hook_kind) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Some(format!(
+                            "  Could not write to {}. Source ~/.aikey/{} manually.",
+                            canonical_rc_file.display(),
+                            hook_filename
+                        ));
+                    }
+                };
+                let _ = summary;
+                return None;
+            }
             crate::ui_frame::eprint_box(crate::symbols::QUESTION.s(), "Install Shell Hook", &rows);
             eprint!("  Proceed? [Y/n] (default Y): ");
             io::stderr().flush().ok();
