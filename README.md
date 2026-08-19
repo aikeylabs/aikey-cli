@@ -96,7 +96,7 @@ Vault is unlocked once per shell session — subsequent `aikey run` calls reuse 
 | `aikey route` | vault.db (read-only) | nothing | stdout (for copying into third-party tool config) |
 | `aikey test [<alias>]` | vault.db | nothing (probe-only via `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
 | `aikey web [page]` | nothing | nothing | spawns browser → `aikey-local-server` |
-| `aikey doctor` | edition, proxy, vault, hooks, plugins (trust-local / compliance); `--last-errors` reads the proxy's local recent-error ring | auto-repairs in interactive mode: restarts a stopped proxy, starts a stopped local-server and trust-local daemon, installs a missing shell hook (`--json`: read-only) | stdout report (`--detail` adds edition-aware ODS panels; `--last-errors` renders origin, hops, trace ID, and upstream request ID) |
+| `aikey doctor` | edition, proxy, vault, hooks, plugins (trust-local / compliance), **licensed identity** (`GET /v1/license/identity` on the signed-in control plane); `--last-errors` reads the proxy's local recent-error ring | auto-repairs in interactive mode: restarts a stopped proxy, starts a stopped local-server and trust-local daemon, installs a missing shell hook (`--json`: read-only) | stdout report (`--detail` adds edition-aware ODS panels; `--last-errors` renders origin, hops, trace ID, and upstream request ID) |
 | `aikey audit status` | collector completeness endpoint (+ proxy local state: usage WAL/dead-letter **and** the compliance upload queue) | nothing | stdout per-source delivery report + local delivery lanes |
 | `aikey audit reconcile` | collector gaps + proxy WAL | known-loss ledger (server) | stdout verdict; re-sends recoverable gaps, confirms losses |
 
@@ -257,6 +257,27 @@ If the line reads `not reported by this proxy (older build)`, the queue is
 **unmonitored** rather than empty — upgrade aikey on that machine.
 
 Run `aikey --help` for the full subcommand list (alphabetical, with a "Frequently used" shortcut section at the end).
+
+### Licensed identity — the "Licensed to" row
+
+`aikey status` and `aikey doctor` each print one row naming who this deployment is licensed to. The
+same row appears on the web sign-in and settings pages, and all of them render a **byte-identical**
+string — the company name is never trimmed, re-cased or truncated on its way to a screen.
+
+It says exactly one of three things:
+
+| row | what it means | what to do |
+| --- | --- | --- |
+| `Licensed to: <company>` | this deployment is activated to that company | nothing |
+| `Licensed to: Personal edition (not commercially licensed)` | this install has no licence and is not meant to have one | nothing — the normal Personal state, and it is never warned about |
+| `Licensed to: unavailable` | this deployment carries licensing but its identity could not be established | read the `[aikey] warning:` line printed with it; it names the cause and the next step |
+
+The third row is deliberately NOT the same as the second. "There is no licence here" and "I could not
+find out" call for opposite actions: a control plane that has fallen over, or a server that was never
+activated, must not look like a Personal install.
+
+The lookup never blocks the command and never changes its exit code. `--json` carries the same
+information as `license.{state,company_name,cause,line}`.
 
 ## 10. Error Codes
 

@@ -2724,6 +2724,14 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     // Active key config.
     let active_cfg = storage::get_active_key_config().ok().flatten();
 
+    // Licensed identity (specs/license-identity ID-02). Resolved once, before
+    // the output branch, so the JSON surface and the human surface report the
+    // same state — the same reason identity.Report() renders from Line().
+    //
+    // Best effort and never blocking: `resolve` returns a state on every path,
+    // including "unreachable". 旁路不能拖累主链路.
+    let licence = crate::license_identity::resolve();
+
     if json_mode {
         let active_json = active_cfg.as_ref().map(|cfg| {
             serde_json::json!({
@@ -2751,7 +2759,37 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
             "active_key": active_json,
             "providers": providers.iter().collect::<Vec<_>>(),
             "protocols": protocols.iter().collect::<Vec<_>>(),
+            // 🔴 The rendered `line` is included, not just the parts, so a script
+            // reading --json sees the exact bytes a person sees. A JSON surface
+            // that reported only `company_name` would let the text and machine
+            // forms drift the moment the line gained a state.
+            "license": {
+                "state": match &licence {
+                    crate::license_identity::State::Licensed(_) => "licensed",
+                    crate::license_identity::State::Unlicensed => "unlicensed",
+                    crate::license_identity::State::Error(_) => "error",
+                },
+                "company_name": match &licence {
+                    crate::license_identity::State::Licensed(name) => Some(name.clone()),
+                    _ => None,
+                },
+                // The cause is what makes the error actionable; absent otherwise.
+                "cause": match &licence {
+                    crate::license_identity::State::Error(cause) => Some(cause.clone()),
+                    _ => None,
+                },
+                "line": crate::license_identity::line(&licence),
+            },
         }));
+        // 🚫 No warning line here, and the reason is this codebase's own
+        // convention: json_output::print_json writes the payload to STDERR, so a
+        // warning printed alongside it would land in the middle of the machine's
+        // own stream and break `aikey --json status 2>&1 | jq`.
+        //
+        // 失败要显眼 is still satisfied — better than by a warning. The failure is
+        // IN the payload, as `license.state == "error"` with `license.cause`, on
+        // the exact channel the caller is already parsing. A scripted consumer
+        // reads a field; it does not scrape a warning line.
         return Ok(());
     }
 
@@ -2784,6 +2822,21 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
             rows.push(format!("  status:  {}", "not logged in".dimmed()));
             rows.push("  hint:    run `aikey login` to connect to your team".to_string());
         }
+    }
+    rows.push(String::new());
+
+    // ── Licence ─────────────────────────────────────────────────────────────
+    //
+    // 🚫 Printed verbatim from the one renderer. specs/license-identity requires
+    // this row to be byte-identical with `aikey doctor`, the web sign-in page and
+    // the web settings page; a surface that added padding, colour inside the
+    // string, or its own "Licensed to" prefix would break that.
+    rows.push(crate::license_identity::line(&licence));
+    // The thirty-day ramp's trailing line, when the deployment has one. 🚫 Never
+    // affects the exit code: `expiring` has planes identical to `active`, so a
+    // status that started failing here would invent an outage.
+    if let Some(reminder) = crate::license_identity::reminder() {
+        rows.push(format!("  {reminder}"));
     }
     rows.push(String::new());
 
@@ -2861,6 +2914,11 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     }
 
     crate::ui_frame::print_box(crate::symbols::ICON_CHART.s(), "Status", &rows);
+
+    // After the box, so the cause is the last thing on screen and carries the
+    // next step. 🚫 Only fires for the error state — a Personal install is not
+    // experiencing a fault and must not be warned at, every single run.
+    crate::license_identity::warn_if_error(&licence);
 
     Ok(())
 }
