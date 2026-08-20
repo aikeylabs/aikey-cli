@@ -60,6 +60,7 @@ mod platform_client;
 // mod core; // removed: profile-based resolver dropped
 mod cli;
 mod commands_auth;
+mod commands_compliance;
 mod commands_import;
 mod commands_init;
 mod commands_internal;
@@ -4938,6 +4939,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // the same handle_web_service / commands_proxy::handle_*
             // functions.
             commands_service::handle_service(action, cli.json, cli.password_stdin)?;
+        }
+        Commands::Compliance { action } => {
+            // The proxy's pre-forward content filter, NOT a daemon — see the
+            // module doc for why it is its own command rather than a
+            // `service` name.
+            commands_compliance::handle_compliance(action, cli.json)?;
         }
     }
     Ok(())

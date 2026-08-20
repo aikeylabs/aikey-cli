@@ -159,6 +159,30 @@ fn status_all(json: bool) -> Result<(), Box<dyn std::error::Error>> {
                 crate::trust_local_service::is_installed(),
             )
         },
+        // 🔴 Compliance detection is NOT a daemon (2026-08-19 product decision
+        // to show it here anyway). It has no process, port or launchd label —
+        // it is a FILTER STAGE the proxy spawns a child for. It appears in this
+        // list because that is where users look for "what is AiKey doing on
+        // this machine", but it is deliberately NOT in SUPPORTED_SERVICES:
+        //
+        //   • `service stop all` must never be able to switch a SAFETY control
+        //     off as a side effect of "turn AiKey off".
+        //   • SUPPORTED_SERVICES doubles as the security whitelist for the
+        //     console's /api/internal/services/<name>/<action> endpoint, which
+        //     would then bypass the vault-unlock that the console's own
+        //     compliance toggle requires.
+        //
+        // So this row is READ-ONLY here; the switch routes to `aikey
+        // compliance on|off`, which the `control` field below names.
+        {
+            let toggle = crate::commands_compliance::current_toggle();
+            (
+                "compliance",
+                toggle != crate::commands_project::ComplianceToggle::Off,
+                crate::commands_compliance::state_detail(toggle),
+                crate::commands_compliance::detector_installed(),
+            )
+        },
     ];
 
     if json {
@@ -166,10 +190,20 @@ fn status_all(json: bool) -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|(name, running, detail, installed)| {
                 // `installed` is ADDITIVE — per the rules below, no schema bump.
-                serde_json::json!({
+                let mut row = serde_json::json!({
                     "name": name, "running": running, "detail": detail,
                     "installed": installed
-                })
+                });
+                // ADDITIVE, same rule: `control` tells a consumer that this
+                // row's switch is NOT `service start/stop` — the desktop app
+                // routes it to `aikey compliance on|off` instead. `locked`
+                // says the org mandates it, so the switch must render
+                // un-actionable rather than fail on click.
+                if *name == "compliance" {
+                    row["control"] = serde_json::json!("compliance");
+                    row["locked"] = serde_json::json!(crate::storage::compliance_master_locked());
+                }
+                row
             })
             .collect();
         // 🔴 schema_version is a wire contract, not decoration.
@@ -711,5 +745,52 @@ mod tests {
                 "unexpected trust-local down-detail: {detail}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod compliance_row_tests {
+    //! Fences for the compliance row added 2026-08-19.
+
+    /// 🔴 THE safety property. `service stop all` fans out over `order`;
+    /// compliance must never be in it, because "turn AiKey off" would then
+    /// PERSISTENTLY disable a safety control (filter_stages is a stored
+    /// column, not a process — it would stay off after the next start).
+    ///
+    /// Written against the source text because the fan-out list is a literal
+    /// inside `handle_all`: a unit test cannot call it without starting real
+    /// services, and the thing worth guarding is exactly that this name is
+    /// absent from that list.
+    #[test]
+    fn compliance_is_not_in_the_all_fanout() {
+        let src = include_str!("commands.rs");
+        let line = src
+            .lines()
+            .find(|l| l.contains("let mut order = vec!["))
+            .expect("the `all` fan-out order list is gone — re-point this fence");
+        assert!(
+            !line.contains("compliance"),
+            "compliance joined the `service ... all` fan-out: {line}\n\
+             `stop all` would then persistently disable content scanning — a \
+             safety control switched off as a side effect of turning AiKey off."
+        );
+    }
+
+    /// The other half of the same decision: it must also stay out of the
+    /// whitelist, which is the console's `/api/internal/services/<name>/
+    /// <action>` security boundary AND the `service start/stop <name>`
+    /// surface. The switch belongs to `aikey compliance`, which applies the
+    /// org-policy refusal.
+    #[test]
+    fn compliance_is_not_a_whitelisted_service() {
+        assert!(
+            !super::SUPPORTED_SERVICES
+                .iter()
+                .any(|(n, _)| *n == "compliance"),
+            "compliance entered SUPPORTED_SERVICES — that whitelist is the \
+             console service endpoint's security boundary, and it would let a \
+             caller disable compliance without the vault unlock the console's \
+             own compliance toggle requires."
+        );
     }
 }

@@ -1342,7 +1342,12 @@ pub mod v1_0_0_baseline {
                     filter_max_action = 'full',
                     updated_at = strftime('%s', 'now')
               WHERE slug = 'ai-compliance-detector'
-                AND NOT EXISTS (SELECT 1 FROM config WHERE key = 'migration.compliance_wave2_mask_block_enabled');
+                AND NOT EXISTS (SELECT 1 FROM config WHERE key = 'migration.compliance_wave2_mask_block_enabled')
+                -- 2026-08-19: never force the filter back on over an EXPLICIT
+                -- user disable (marker written by clear_app_filter_stages,
+                -- removed by any explicit re-enable). A default-activation
+                -- wave upgrades defaults, it does not overrule user choices.
+                AND NOT EXISTS (SELECT 1 FROM config WHERE key = 'user.filter_disabled.ai-compliance-detector');
              INSERT OR IGNORE INTO config (key, value)
                   VALUES ('migration.compliance_wave2_mask_block_enabled', '1');
              RELEASE compliance_wave2_activation;",
@@ -1940,6 +1945,67 @@ mod tests {
             stages, None,
             "a later schema replay must not override the user's post-migration choice"
         );
+    }
+
+    /// 2026-08-19 (filterpipe-501 triage相邻发现): a user who explicitly
+    /// disabled the filter BEFORE Wave 2 arrives must not have it forced back
+    /// on by the activation migration. The explicit choice is recorded by
+    /// clear_app_filter_stages (config marker); the wave honors it.
+    #[test]
+    fn compliance_wave2_respects_pre_wave_explicit_user_disable() {
+        let conn = fresh_vault();
+        conn.execute(
+            "DELETE FROM config WHERE key='migration.compliance_wave2_mask_block_enabled'",
+            [],
+        )
+        .expect("simulate a pre-Wave-2 vault");
+        conn.execute(
+            "INSERT INTO app_records
+                (slug, name, vendor, upstreams, app_kind, filter_stages,
+                 filter_priority, filter_timeout_policy, filter_max_action)
+             VALUES
+                ('ai-compliance-detector', 'AI Compliance Detector', 'AiKey Labs', '[]',
+                 'first-party', '[\"pre_forward\"]', 10, 'fail_open', 'full')",
+            [],
+        )
+        .expect("seed an enabled detector");
+        // The user's explicit disable, via the REAL production core (which
+        // also records the do-not-override marker).
+        crate::commands_app::clear_app_filter_stages_with_conn(&conn, "ai-compliance-detector")
+            .expect("explicit user disable");
+
+        upgrade_all(&conn).expect("apply Wave 2 over the disabled vault");
+
+        let stages: Option<String> = conn
+            .query_row(
+                "SELECT filter_stages FROM app_records WHERE slug='ai-compliance-detector'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read state after wave");
+        assert_eq!(
+            stages, None,
+            "Wave 2 must not force the filter back on over an explicit user disable"
+        );
+
+        // An explicit re-enable clears the marker: the next default-activation
+        // wave treats this vault normally again.
+        crate::commands_app::set_app_filter_stages_with_conn(
+            &conn,
+            "ai-compliance-detector",
+            &["pre_forward".to_string()],
+            None,
+            None,
+        )
+        .expect("explicit re-enable");
+        let marker: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM config WHERE key='user.filter_disabled.ai-compliance-detector'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read marker");
+        assert_eq!(marker, 0, "explicit enable must clear the disable marker");
     }
 
     /// T15-A from the test plan, defense B layer: rolling back to an

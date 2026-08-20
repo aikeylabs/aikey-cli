@@ -647,6 +647,46 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    /// Turn AI compliance detection on or off, or show its current state.
+    ///
+    /// Compliance detection scans request content BEFORE it is forwarded
+    /// upstream (the `pre_forward` stage). It is NOT a standalone daemon: the
+    /// local proxy spawns the ai-compliance-detector child when this toggle is
+    /// on, and stops it when the toggle goes off — the switch writes
+    /// `app_records.filter_stages`, and the proxy picks the change up within
+    /// ~5s. That is why this is its own command and not `aikey service`, whose
+    /// verbs manage process lifecycles.
+    ///
+    /// Why a public command at all (2026-08-19): the toggle previously existed
+    /// only in the local console's web page and as a hidden `_internal`
+    /// action, so a terminal user could not turn it on, and the desktop app —
+    /// which is only allowed to call PUBLIC commands — could not show it.
+    ///
+    /// Organisation policy wins: when your admin mandates compliance, the
+    /// proxy runs the detector no matter what this vault says, and `off` is
+    /// refused with an explanation rather than silently doing nothing.
+    ///
+    /// Examples:
+    ///   aikey compliance status        # on / off, and who decided it
+    ///   aikey compliance on
+    ///   aikey compliance off
+    #[command(display_order = 28)]
+    Compliance {
+        #[command(subcommand)]
+        action: ComplianceAction,
+    },
+}
+
+/// Subcommands for `aikey compliance`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ComplianceAction {
+    /// Enable content scanning before forwarding (filter_stages = pre_forward).
+    On,
+    /// Disable content scanning. Refused when org policy mandates compliance.
+    Off,
+    /// Show whether scanning is active, and whether it is local or mandated.
+    Status,
 }
 
 /// Subcommands for `aikey service`.
@@ -1643,6 +1683,11 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 ServiceAction::Stop { .. } => "service.stop".to_string(),
                 ServiceAction::Restart { .. } => "service.restart".to_string(),
                 ServiceAction::Status { .. } => "service.status".to_string(),
+            },
+            Commands::Compliance { action } => match action {
+                ComplianceAction::On => "compliance.on".to_string(),
+                ComplianceAction::Off => "compliance.off".to_string(),
+                ComplianceAction::Status => "compliance.status".to_string(),
             },
         },
     }
