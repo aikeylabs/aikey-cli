@@ -684,7 +684,13 @@ fn sync_active_key_config_from_bindings(bindings: &[ProviderBinding]) -> Result<
 
     // Use the first binding as the representative key.
     let first = &bindings[0];
-    let all_providers: Vec<String> = bindings.iter().map(|b| b.client_route.clone()).collect();
+    // 🔴 SUPPLIER axis, not the client route (bugfix 2026-08-20). The proxy
+    // matches this list against the provider code it derives from the request
+    // path, so a route name here only matched by accident of the registry
+    // alias `kimi → kimi_code`. A moonshot key bound to the kimi route wrote
+    // "kimi", canonicalised to "kimi_code", and every `/moonshot/v1` request
+    // came back NO_ACTIVE_KEY while `/kimi/v1` on the SAME key worked.
+    let all_providers: Vec<String> = bindings.iter().map(|b| b.provider_code.clone()).collect();
 
     storage::set_active_key_config(&storage::ActiveKeyConfig {
         key_type: first.key_source_type.clone(),
@@ -2218,5 +2224,48 @@ mod default_profile_fence {
                 out.push(format!("{}:{}", p.display(), n + 1));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod active_key_axis_tests {
+    use super::*;
+
+    /// 🔴 `active_key_providers` is the SUPPLIER axis, not the client route
+    /// (bugfix 2026-08-20 NO_ACTIVE_KEY-for-moonshot).
+    ///
+    /// The two axes are different vocabularies: a `kimi` ROUTE can be served
+    /// by the `kimi_code` or the `moonshot` SUPPLIER. Writing the route name
+    /// into a field the proxy matches against supplier codes worked only
+    /// because the registry aliases `kimi → kimi_code`, so the route name
+    /// happened to canonicalise to a real supplier. Bind a moonshot key and
+    /// the disguise fails: `/moonshot/v1` gets NO_ACTIVE_KEY while
+    /// `/kimi/v1` still works, on the same key.
+    ///
+    /// Structural because the value only reaches the proxy through SQLite;
+    /// this pins the FIELD, which is where the bug lived.
+    #[test]
+    fn active_providers_are_written_from_the_supplier_axis() {
+        // Scan the ASSIGNMENT LINE only — prose in this file (and in the fix's
+        // own comment) mentions both axis names, and a whole-file scan matches
+        // itself. Same self-reference trap as the usage-scope fence.
+        let src = include_str!("profile_activation.rs");
+        let line = src
+            .lines()
+            .find(|l| l.contains("let all_providers: Vec<String>"))
+            .expect("the all_providers assignment is gone — re-point this fence");
+        let marker = format!("b.{}_code.clone()", "provider");
+        assert!(
+            line.contains(marker.as_str()),
+            "sync_active_key_config_from_bindings must collect provider_code \
+             (the SUPPLIER axis). Collecting client_route re-introduces \
+             NO_ACTIVE_KEY for every supplier whose name differs from its \
+             route (moonshot under the kimi route, first reported 2026-08-20)."
+        );
+        let wrong = format!("b.{}_route.clone()", "client");
+        assert!(
+            !line.contains(wrong.as_str()),
+            "the client_route axis is being written into active_key_providers again"
+        );
     }
 }

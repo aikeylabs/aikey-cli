@@ -2473,7 +2473,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     json_output::success(payload);
                 } else {
                     // Partial/total failure: emit JSON + non-zero exit.
-                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                    // STDOUT: same stream contract as json_output (bugfix
+                    // 2026-08-20) — these hand-rolled payloads are the
+                    // SUCCESS-shaped machine output of a --json command and
+                    // must not land on a different stream than their
+                    // json_output siblings.
+                    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
                     std::process::exit(if ok_count > 0 { 2 } else { 1 });
                 }
             } else {
@@ -2772,7 +2777,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "credentials_tested": outcome.json_results,
                         "last_test_persisted": persisted.iter().filter(|p| p.persisted).count(),
                     });
-                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                    // STDOUT: same stream contract as json_output (bugfix
+                    // 2026-08-20) — these hand-rolled payloads are the
+                    // SUCCESS-shaped machine output of a --json command and
+                    // must not land on a different stream than their
+                    // json_output siblings.
+                    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
                 let code = exit_code_from_outcome(&outcome);
                 print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
@@ -2861,7 +2871,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "results": outcome.json_results,
                         "last_test_persisted": persisted.iter().filter(|p| p.persisted).count(),
                     });
-                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                    // STDOUT: same stream contract as json_output (bugfix
+                    // 2026-08-20) — these hand-rolled payloads are the
+                    // SUCCESS-shaped machine output of a --json command and
+                    // must not land on a different stream than their
+                    // json_output siblings.
+                    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
                 let code = exit_code_from_outcome(&outcome);
                 print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
@@ -2939,7 +2954,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         })).collect::<Vec<_>>(),
                         "last_test_persisted": persisted.iter().filter(|p| p.persisted).count(),
                     });
-                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                    // STDOUT: same stream contract as json_output (bugfix
+                    // 2026-08-20) — these hand-rolled payloads are the
+                    // SUCCESS-shaped machine output of a --json command and
+                    // must not land on a different stream than their
+                    // json_output siblings.
+                    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
                 let code = exit_code_from_outcome(&outcome);
                 print_test_rc_unwired_warning(cli.json, code == EXIT_OK);

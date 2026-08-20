@@ -27,13 +27,24 @@ This contract does NOT cover:
 
 - `--json` is a **global flag**.
 - In `--json` mode, the CLI emits **machine-readable JSON**.
-- **Important**: different commands currently write JSON to **different channels**.
-  - Some commands emit JSON on **stdout** (e.g. `aikey stats`, `aikey env generate`, `aikey env check`).
-  - Some commands emit JSON on **stderr** (via the shared JSON helpers, and especially for `aikey run --json`).
+- JSON payloads go to **stdout**; human diagnostics go to **stderr** (the universal
+  convention). One documented exception: **`aikey run --json`** keeps its own
+  envelope on **stderr**, because `run` hands stdout to the child process it wraps.
+- One command emits **one** envelope. A failing command does not print both its
+  own result and a second top-level error object.
+
+> Changed 2026-08-20. Before that, every `--json` payload went to stderr, so
+> `aikey <cmd> --json > file` produced an empty file and any consumer that
+> discarded stderr silently saw nothing. See
+> `workflow/CI/bugfix/2026-08-20-aikey-json-output-on-stderr.md`. Consumers that
+> must support older CLIs can detect the contract once with
+> `aikey --version --json` and observe which stream carries the payload
+> (aikey-tray does exactly this).
 
 **External contract for consumers**:
 
-- Always capture **both stdout and stderr**.
+- Read **stdout** for JSON. Capturing stderr as well is still useful for
+  diagnostics, and remains REQUIRED for `aikey run --json`.
 - Parse JSON from whichever stream contains it.
 - Treat the process **exit code** as the primary success/failure signal.
 
@@ -44,7 +55,7 @@ This contract does NOT cover:
   - stderr: warnings/errors/diagnostics
 
 - **JSON mode**
-  - JSON may appear on stdout or stderr depending on the command.
+  - JSON appears on **stdout** (since 2026-08-20).
   - For `aikey run --json`, JSON metadata is emitted to **stderr** to avoid mixing with child process output.
 
 ## Password prompts in JSON mode

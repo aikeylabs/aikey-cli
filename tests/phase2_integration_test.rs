@@ -7,8 +7,11 @@ use tempfile::TempDir;
 
 /// Helper function to parse JSON from stderr (where --json output goes)
 fn parse_json_output(output: &assert_cmd::assert::Assert) -> Value {
-    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
-    serde_json::from_str(&stderr).expect("Should be valid JSON")
+    // STDOUT since 2026-08-20 (bugfix aikey-json-output-on-stderr): json_output
+    // writes machine-readable payloads to stdout. Reading stderr here silently
+    // yielded an empty string and "Should be valid JSON" was the only symptom.
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    serde_json::from_str(&stdout).expect("Should be valid JSON")
 }
 
 /// Helper struct to manage test environment

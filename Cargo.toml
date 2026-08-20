@@ -95,7 +95,14 @@ unused_must_use = "allow"
 
 [package]
 name = "aikeylabs-aikey-cli"
-version = "1.0.1-alpha.1"
+# Keep in sync with the release this build belongs to (workflow/CLAUDE.md).
+# Release builds override it via AIKEY_BUILD_VERSION; DEV builds fall back to
+# this value, and it feeds more than the banner: the vault schema marker
+# (migrations.rs) and the first-party app manifest TAG (build.rs → app install).
+# Left at 1.0.1-alpha.1 while the product shipped alpha.4-alpha.6, dev binaries
+# reported a version four releases stale — which broke aikey-tray's CLI-version
+# capability probe (bugfix 2026-08-20 aikey-json-output-on-stderr).
+version = "1.0.1-alpha.7"
 edition = "2021"
 authors = ["AiKey Founder <aikeyfounder@gmail.com>"]
 description = "Secure local-first secret management CLI tool"

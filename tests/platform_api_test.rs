@@ -46,8 +46,8 @@ fn test_secret_set_new_secret() {
 
     assert!(output.status.success());
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let json: Value = serde_json::from_str(&stderr).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout).unwrap();
 
     assert_eq!(json["ok"], true);
     assert_eq!(json["name"], "test_key");
@@ -87,8 +87,8 @@ fn test_secret_set_duplicate_error() {
 
     assert!(!output.status.success());
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let json: Value = serde_json::from_str(&stderr).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout).unwrap();
 
     assert_eq!(json["ok"], false);
     assert_eq!(json["code"], "ALIAS_EXISTS");
@@ -115,8 +115,8 @@ fn test_secret_set_requires_from_stdin() {
 
     assert!(!output.status.success());
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let json: Value = serde_json::from_str(&stderr).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout).unwrap();
 
     assert_eq!(json["ok"], false);
     assert_eq!(json["code"], "INVALID_INPUT");
@@ -164,8 +164,8 @@ fn test_secret_set_empty_value_error() {
 
     assert!(!output.status.success());
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let json: Value = serde_json::from_str(&stderr).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout).unwrap();
 
     assert_eq!(json["ok"], false);
     assert_eq!(json["code"], "INVALID_INPUT");
@@ -193,8 +193,8 @@ fn test_error_code_vault_locked() {
 
     assert!(!output.status.success());
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let json: Value = serde_json::from_str(&stderr).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout).unwrap();
 
     assert_eq!(json["ok"], false);
     // Check that we got an error message about authentication
@@ -241,8 +241,8 @@ fn test_secret_set_integration_with_get() {
 
     assert!(output.status.success());
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let json: Value = serde_json::from_str(&stderr).unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(&stdout).unwrap();
 
     assert_eq!(json["alias"], "integration_key");
     assert_eq!(json["value"], "integration_value");

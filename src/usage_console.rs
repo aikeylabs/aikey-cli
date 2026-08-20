@@ -155,6 +155,30 @@ fn system_zone() -> Option<String> {
     None
 }
 
+/// Today's calendar date, resolved in `zone` (UTC when the zone is unknown).
+///
+/// 🔴 Resolve it in the SAME zone the URL declares via `&tz=` (bugfix
+/// 2026-08-20). The two must agree or the request asks for "yesterday's date,
+/// bucketed in today's zone" for the hours around local midnight.
+///
+/// WHY it is sent at all, rather than letting the server default: the hourly
+/// endpoint shares its parameter parsing with the multi-day timeline
+/// endpoints, whose default range starts 30 days back. Omitting `date` used to
+/// select THAT day — a single day one month in the past — and the panel showed
+/// 0 forever while the console (which always sends `date`) showed the real
+/// number. The server now defaults to today as well, so this is belt AND
+/// braces: the request states the day it means instead of relying on the other
+/// side to guess the same one.
+fn today_in(zone: Option<&str>) -> String {
+    let now = chrono::Utc::now();
+    match zone.and_then(|z| z.parse::<chrono_tz::Tz>().ok()) {
+        Some(tz) => now.with_timezone(&tz).format("%Y-%m-%d").to_string(),
+        // Unknown/absent zone: the server buckets in UTC in exactly this
+        // case, so a UTC date keeps the two ends on the same day.
+        None => now.format("%Y-%m-%d").to_string(),
+    }
+}
+
 /// Fetch today's hourly usage from the local console.
 pub fn today_hourly() -> ConsoleUsage {
     let account = match crate::storage::get_platform_account().ok().flatten() {
@@ -187,9 +211,10 @@ pub fn today_hourly() -> ConsoleUsage {
     //
     // 🔴 The Personal WEB deliberately does NOT send it (用户 2026-08-20:
     // "不要影响 Personal web 端") — same endpoint, unchanged answer there.
+    let today = today_in(zone.as_deref());
     let mut url = format!(
-        "http://127.0.0.1:{}/api/user/usage/personal/hourly?scope=all&account_id={}",
-        port, account.account_id
+        "http://127.0.0.1:{}/api/user/usage/personal/hourly?scope=all&account_id={}&date={}",
+        port, account.account_id, today
     );
     if let Some(z) = &zone {
         url.push_str("&tz=");
@@ -251,8 +276,8 @@ pub fn today_hourly() -> ConsoleUsage {
     // route that is dropped below — by_route stays empty, the panel shows
     // machine totals only, and nothing here can take the headline down.
     let mut grouped_url = format!(
-        "http://127.0.0.1:{}/api/user/usage/personal/hourly?scope=all&account_id={}&group_by=provider",
-        port, account.account_id
+        "http://127.0.0.1:{}/api/user/usage/personal/hourly?scope=all&account_id={}&date={}&group_by=provider",
+        port, account.account_id, today
     );
     if let Some(z) = &zone {
         grouped_url.push_str("&tz=");
@@ -333,6 +358,28 @@ mod scope_wiring_tests {
             "expected BOTH hourly fetches (totals + group_by=provider) to send \
              scope=all, found {n}. A mismatch makes the headline and the \
              per-route chart disagree about the same day."
+        );
+    }
+
+    /// Both fetches must also NAME the day they mean (bugfix 2026-08-20).
+    /// The hourly endpoint shares its parameter parsing with the multi-day
+    /// timeline endpoints, whose default range starts 30 days back; a request
+    /// that omits `date` selected that day and got an empty array, which the
+    /// panel rendered as a perfectly convincing 0. The server-side default is
+    /// fixed too — this keeps the request self-describing so the two ends
+    /// cannot drift apart again.
+    #[test]
+    fn both_hourly_fetches_name_the_day() {
+        let src = include_str!("usage_console.rs");
+        // Same runtime-assembled needle trick as above: include_str! reads
+        // THIS file, so a literal would match itself.
+        let needle = format!("&{}=", "date");
+        let n = src.matches(needle.as_str()).count();
+        assert_eq!(
+            n, 2,
+            "expected BOTH hourly fetches to pin an explicit date, found {n}. \
+             Without it the server answers for the day 30 days ago and the \
+             desktop panel reads 0."
         );
     }
 }

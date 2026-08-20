@@ -74,13 +74,18 @@ pub(crate) fn handle_service(
                 .join(", "),
         );
         if json {
-            println!(
-                "{}",
-                serde_json::json!({"ok": false, "error": "UNKNOWN_SERVICE", "detail": msg})
+            // Print the envelope AND exit here: returning Err would let
+            // main.rs's top-level handler print a SECOND envelope, and both
+            // now land on stdout (stream contract, bugfix 2026-08-20), so a
+            // consumer parsing stdout gets two back-to-back objects and
+            // json.Unmarshal fails with "Extra data" — masking this detail
+            // behind a generic spawn error. One command, one envelope.
+            crate::json_output::print_json_exit(
+                serde_json::json!({"ok": false, "error": "UNKNOWN_SERVICE", "detail": msg}),
+                1,
             );
-        } else {
-            eprintln!("{}", msg);
         }
+        eprintln!("{}", msg);
         return Err(msg.into());
     }
 
@@ -346,7 +351,14 @@ fn run_all(verb: &str, json: bool, password_stdin: bool) -> Result<(), Box<dyn s
 
     if failed > 0 {
         // Non-zero exit — failures must be loud (project principle).
-        return Err(format!("service {verb} all: {failed} service(s) failed").into());
+        let detail = format!("service {verb} all: {failed} service(s) failed");
+        if json {
+            // emit_summary already wrote this run's envelope; exiting here
+            // keeps main.rs from appending a second one to the same stream
+            // (one command, one envelope — see the UNKNOWN_SERVICE branch).
+            std::process::exit(1);
+        }
+        return Err(detail.into());
     }
     Ok(())
 }
@@ -471,13 +483,13 @@ mod trust_local {
                 bin.display()
             );
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"ok": false, "error": "TRUST_LOCAL_NOT_INSTALLED", "detail": msg})
+                // One command, one envelope — see the UNKNOWN_SERVICE branch.
+                crate::json_output::print_json_exit(
+                    serde_json::json!({"ok": false, "error": "TRUST_LOCAL_NOT_INSTALLED", "detail": msg}),
+                    1,
                 );
-            } else {
-                eprintln!("{}", msg);
             }
+            eprintln!("{}", msg);
             return Err(msg.into());
         }
 
