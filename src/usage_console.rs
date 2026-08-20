@@ -179,8 +179,16 @@ pub fn today_hourly() -> ConsoleUsage {
         }
     };
     let zone = display_zone();
+    // scope=all — every identity on THIS machine (2026-08-20): personal keys,
+    // team keys and OAuth all report under different org/account tags, and the
+    // desktop app's headline is the machine's total, not one slice of it. The
+    // local-server honours it only because a personal DB is one human's data;
+    // a team deployment ignores the parameter entirely.
+    //
+    // 🔴 The Personal WEB deliberately does NOT send it (用户 2026-08-20:
+    // "不要影响 Personal web 端") — same endpoint, unchanged answer there.
     let mut url = format!(
-        "http://127.0.0.1:{}/api/user/usage/personal/hourly?account_id={}",
+        "http://127.0.0.1:{}/api/user/usage/personal/hourly?scope=all&account_id={}",
         port, account.account_id
     );
     if let Some(z) = &zone {
@@ -243,7 +251,7 @@ pub fn today_hourly() -> ConsoleUsage {
     // route that is dropped below — by_route stays empty, the panel shows
     // machine totals only, and nothing here can take the headline down.
     let mut grouped_url = format!(
-        "http://127.0.0.1:{}/api/user/usage/personal/hourly?account_id={}&group_by=provider",
+        "http://127.0.0.1:{}/api/user/usage/personal/hourly?scope=all&account_id={}&group_by=provider",
         port, account.account_id
     );
     if let Some(z) = &zone {
@@ -304,4 +312,27 @@ pub fn today_hourly() -> ConsoleUsage {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod scope_wiring_tests {
+    /// Both usage fetches must carry scope=all: the headline totals and the
+    /// per-route breakdown have to agree, and both are the MACHINE's usage
+    /// (personal + team + OAuth), not the personal-key slice (2026-08-20).
+    /// Source-level because the URLs are format! literals; a behavioural test
+    /// would need the whole local-server.
+    #[test]
+    fn both_hourly_fetches_request_the_all_scope() {
+        let src = include_str!("usage_console.rs");
+        // Needle assembled at runtime: include_str! reads THIS file too, so a
+        // literal needle would also match itself and inflate the count.
+        let needle = format!("personal/hourly?{}=all", "scope");
+        let n = src.matches(needle.as_str()).count();
+        assert_eq!(
+            n, 2,
+            "expected BOTH hourly fetches (totals + group_by=provider) to send \
+             scope=all, found {n}. A mismatch makes the headline and the \
+             per-route chart disagree about the same day."
+        );
+    }
 }
