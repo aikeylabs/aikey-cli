@@ -329,6 +329,15 @@ pub(crate) enum Commands {
         /// Force a new activation email even if one was sent within the last 60 seconds
         #[arg(long)]
         resend: bool,
+        /// Sign in with an SSO provider (e.g. feishu): opens the provider's
+        /// authorization page directly, skipping the email form
+        #[arg(long, value_name = "PROVIDER", conflicts_with_all = ["no_browser", "token"])]
+        sso: Option<String>,
+        /// Do not open a browser: send the activation email directly (requires
+        /// --email) and wait. Click the link on any device — even your phone —
+        /// and this login completes by itself
+        #[arg(long, requires = "email", conflicts_with = "token")]
+        no_browser: bool,
     },
     /// Open the User Console in your default browser, or control the local
     /// web service with `start` / `stop` / `restart`.
@@ -426,7 +435,17 @@ pub(crate) enum Commands {
     },
     /// Show a summary of gateway, login, keys, and providers
     #[command(display_order = 9)]
-    Status,
+    Status {
+        /// Also report recent token usage read from the local proxy WAL.
+        ///
+        /// Off by default because it costs a bounded file scan, while the
+        /// rest of `status` is cheap metadata reads — callers that poll
+        /// frequently (the desktop tray polls services every few seconds)
+        /// must be able to get the cheap answer without paying for this one.
+        /// Only meaningful together with `--json`.
+        #[arg(long)]
+        usage: bool,
+    },
     /// Show your current login, active key, and vault status
     #[command(display_order = 9)]
     Whoami,
@@ -628,6 +647,46 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         action: ServiceAction,
     },
+
+    /// Turn AI compliance detection on or off, or show its current state.
+    ///
+    /// Compliance detection scans request content BEFORE it is forwarded
+    /// upstream (the `pre_forward` stage). It is NOT a standalone daemon: the
+    /// local proxy spawns the ai-compliance-detector child when this toggle is
+    /// on, and stops it when the toggle goes off — the switch writes
+    /// `app_records.filter_stages`, and the proxy picks the change up within
+    /// ~5s. That is why this is its own command and not `aikey service`, whose
+    /// verbs manage process lifecycles.
+    ///
+    /// Why a public command at all (2026-08-19): the toggle previously existed
+    /// only in the local console's web page and as a hidden `_internal`
+    /// action, so a terminal user could not turn it on, and the desktop app —
+    /// which is only allowed to call PUBLIC commands — could not show it.
+    ///
+    /// Organisation policy wins: when your admin mandates compliance, the
+    /// proxy runs the detector no matter what this vault says, and `off` is
+    /// refused with an explanation rather than silently doing nothing.
+    ///
+    /// Examples:
+    ///   aikey compliance status        # on / off, and who decided it
+    ///   aikey compliance on
+    ///   aikey compliance off
+    #[command(display_order = 28)]
+    Compliance {
+        #[command(subcommand)]
+        action: ComplianceAction,
+    },
+}
+
+/// Subcommands for `aikey compliance`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ComplianceAction {
+    /// Enable content scanning before forwarding (filter_stages = pre_forward).
+    On,
+    /// Disable content scanning. Refused when org policy mandates compliance.
+    Off,
+    /// Show whether scanning is active, and whether it is local or mandated.
+    Status,
 }
 
 /// Subcommands for `aikey service`.
@@ -640,6 +699,12 @@ pub(crate) enum ConfigAction {
     /// Show or set the display time zone (`auto` or an IANA ID such as Asia/Shanghai)
     #[command(name = "time-zone")]
     TimeZone {
+        /// Omit to show the current preference
+        value: Option<String>,
+    },
+    /// Show or set the desktop tray's display language (`auto`, `en`, `zh`)
+    #[command(name = "language")]
+    Language {
         /// Omit to show the current preference
         value: Option<String>,
     },
@@ -1229,6 +1294,12 @@ pub(crate) enum HookAction {
         /// Useful in CI / sandbox tests that want Layer 1 only.
         #[arg(long)]
         no_hook: bool,
+        /// Grant the rc-wiring confirmation non-interactively. For GUI callers
+        /// whose click IS the consent (the tray's takeover switch, same class
+        /// as the web modal's wire-rc button) — without it a no-TTY caller
+        /// gets Layer 1 only and a hint nobody reads.
+        #[arg(long)]
+        yes: bool,
     },
     /// Force re-write both layers (hook file + rc block) and report which
     /// file was touched. Use after a major hook template change (e.g. the
@@ -1256,6 +1327,10 @@ pub(crate) enum HookAction {
     Uninstall {
         /// Integration target. Omit = remove the shell hook (default).
         /// `openclaw` = remove the aikey provider from OpenClaw config.
+        /// `codex` = remove the Codex takeover ONLY (strips our block from
+        /// ~/.codex/config.toml and records a standing refusal so the next
+        /// `aikey use` does not re-apply it). Reverse with
+        /// `aikey hook install codex`.
         #[arg(value_name = "TARGET")]
         target: Option<String>,
     },
@@ -1286,6 +1361,18 @@ pub(crate) enum KeyAction {
     Use {
         /// Virtual key alias or ID to activate
         alias_or_id: String,
+        /// Narrow the activation to a single provider (e.g. --provider openai).
+        ///
+        /// 🔴 Added 2026-08-17. The top-level shortcut `aikey use` has always
+        /// had this flag while `aikey key use` — the command it is a shortcut
+        /// FOR — did not, so the canonical command was strictly less capable
+        /// than its own alias. A caller that reasonably chose the canonical
+        /// spelling got `unrecognized command '--provider'`, which is what the
+        /// desktop tray hit when it began offering per-route switching.
+        /// Both spellings reach the same handler; they must accept the same
+        /// options.
+        #[arg(long, value_name = "PROVIDER", num_args = 0..=1, default_missing_value = "")]
+        provider: Option<String>,
         /// Skip installing the shell precmd hook into ~/.zshrc / ~/.bashrc
         #[arg(long)]
         no_hook: bool,
@@ -1316,6 +1403,15 @@ pub(crate) enum AccountAction {
         /// Force a new activation email even if one was sent within the last 60 seconds
         #[arg(long)]
         resend: bool,
+        /// Sign in with an SSO provider (e.g. feishu): opens the provider's
+        /// authorization page directly, skipping the email form
+        #[arg(long, value_name = "PROVIDER", conflicts_with_all = ["no_browser", "token"])]
+        sso: Option<String>,
+        /// Do not open a browser: send the activation email directly (requires
+        /// --email) and wait. Click the link on any device — even your phone —
+        /// and this login completes by itself
+        #[arg(long, requires = "email", conflicts_with = "token")]
+        no_browser: bool,
     },
     /// Show current login status
     Status,
@@ -1401,6 +1497,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Init => "init".to_string(),
             Commands::Config { action } => match action {
                 ConfigAction::TimeZone { .. } => "config.time-zone".to_string(),
+                ConfigAction::Language { .. } => "config.language".to_string(),
             },
             Commands::Db { action } => format!(
                 "db.{}",
@@ -1465,7 +1562,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
             Commands::Activate { .. } => "activate".to_string(),
             Commands::Deactivate { .. } => "deactivate".to_string(),
             Commands::Route { .. } => "route".to_string(),
-            Commands::Status => "status".to_string(),
+            Commands::Status { .. } => "status".to_string(),
             Commands::Whoami => "whoami".to_string(),
             Commands::Account { action } => format!(
                 "account.{}",
@@ -1587,6 +1684,11 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                 ServiceAction::Restart { .. } => "service.restart".to_string(),
                 ServiceAction::Status { .. } => "service.status".to_string(),
             },
+            Commands::Compliance { action } => match action {
+                ComplianceAction::On => "compliance.on".to_string(),
+                ComplianceAction::Off => "compliance.off".to_string(),
+                ComplianceAction::Status => "compliance.status".to_string(),
+            },
         },
     }
 }
@@ -1701,6 +1803,9 @@ Notes:
 Notes:
     - Shortcut for `aikey account login`.
     - Default flow uses browser + email activation.
+    - --sso <provider> (e.g. feishu) opens the provider's authorization page directly.
+    - --no-browser --email <you@corp.com> sends the activation email without a
+      browser; click the link on any device and the login completes here.
     - --token is the copy-paste fallback for non-completing browser flow.
     - Control URL precedence:
       1. --control-url
@@ -2046,10 +2151,16 @@ Detailed Commands
 
   Usage:
     aikey login [--control-url <URL>] [--token <TOKEN>] [--email <EMAIL>]
+                [--sso <PROVIDER>] [--no-browser]
 
   Notes:
     - Shortcut for `aikey account login`.
     - Default flow uses browser + email activation.
+    - --sso <provider> (e.g. feishu) opens the provider's authorization page
+      directly, skipping the email form.
+    - --no-browser --email <you@corp.com> sends the activation email without
+      opening a browser; click the link on any device (phone included) and
+      the login completes here automatically.
     - --token is the copy-paste fallback for non-completing browser flow.
     - Control URL precedence:
       1. --control-url
@@ -2913,6 +3024,92 @@ pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 #[cfg(test)]
+mod alias_parity_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Collect the long-option names a subcommand path accepts.
+    fn long_opts(path: &[&str]) -> std::collections::BTreeSet<String> {
+        let mut cmd = Cli::command();
+        for seg in path {
+            cmd = cmd
+                .find_subcommand(seg)
+                .unwrap_or_else(|| panic!("subcommand {seg:?} not found"))
+                .clone();
+        }
+        cmd.get_arguments()
+            .filter_map(|a| a.get_long().map(str::to_string))
+            .collect()
+    }
+
+    /// 🔴 A shortcut must never be MORE capable than the command it shortcuts.
+    ///
+    /// `aikey use` documents itself as "shortcut for `key use`", and both reach
+    /// handle_key_use — but `use` grew `--provider` while `key use` did not.
+    /// A caller that chose the canonical spelling got
+    /// `unrecognized command '--provider'`; the desktop tray hit exactly that
+    /// when it started offering per-route switching, and no test could catch
+    /// it because the tray's own tests drive a FAKE cli that accepts anything.
+    ///
+    /// This compares the real clap definitions, so the two spellings cannot
+    /// drift apart again.
+    /// Options `aikey use` has that `aikey key use` still lacks.
+    ///
+    /// 🔴 THIS IS A KNOWN GAP, NOT AN APPROVED DESIGN. The fence below pins it
+    /// so it cannot GROW; it does not bless it. Closing it needs a decision
+    /// rather than a patch, because `--only` pins routing to one upstream and
+    /// therefore TURNS OFF automatic failover — replicating it onto a second
+    /// spelling is a routing-behaviour change, not a CLI tidy-up.
+    ///
+    /// `--provider` was in this list until 2026-08-17, when the desktop tray
+    /// called the canonical spelling with it and got
+    /// `unrecognized command '--provider'` in the user's face.
+    const KNOWN_SHORTCUT_ONLY_OPTS: &[&str] = &["group", "key", "only"];
+
+    #[test]
+    fn key_use_does_not_fall_further_behind_its_shortcut() {
+        let canonical = long_opts(&["key", "use"]);
+        let shortcut = long_opts(&["use"]);
+
+        let unexpected: Vec<&String> = shortcut
+            .difference(&canonical)
+            .filter(|o| !KNOWN_SHORTCUT_ONLY_OPTS.contains(&o.as_str()))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "`aikey use` grew options that `aikey key use` — the command it is a \
+             shortcut for — rejects: {unexpected:?}. Both dispatch to the same \
+             handler. Either add them to `key use`, or add them to \
+             KNOWN_SHORTCUT_ONLY_OPTS with the reason they may not be shared."
+        );
+
+        // The pinned list must stay honest: an entry that has since been added
+        // to `key use` is stale and hides the next real divergence.
+        let stale: Vec<&&str> = KNOWN_SHORTCUT_ONLY_OPTS
+            .iter()
+            .filter(|o| canonical.contains(**o))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "KNOWN_SHORTCUT_ONLY_OPTS lists {stale:?}, which `aikey key use` now \
+             accepts — remove them so the fence keeps checking what is left."
+        );
+    }
+
+    /// The flag that actually broke, pinned by name so a rename is deliberate.
+    #[test]
+    fn both_spellings_accept_provider() {
+        for path in [vec!["key", "use"], vec!["use"]] {
+            assert!(
+                long_opts(&path).contains("provider"),
+                "`aikey {}` must accept --provider",
+                path.join(" ")
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3063,6 +3260,8 @@ mod tests {
                 token: None,
                 email: None,
                 resend: false,
+                sso: None,
+                no_browser: false,
             },
         };
         assert_eq!(command_name(Some(&cmd)), "account.login");

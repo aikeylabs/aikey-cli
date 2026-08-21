@@ -740,6 +740,21 @@ fn handle_filter_set(env: StdinEnvelope) {
         );
         return;
     }
+    // Declaration-requires-capability (W2, bugfix 2026-08-19 filterpipe-501):
+    // the console toggle must not write a filter declaration the proxy cannot
+    // pair with a runnable binary — that combination fail-closes ALL traffic.
+    // Same choke rule as `aikey compliance on`.
+    if p.enable && p.slug == "ai-compliance-detector" && !crate::commands_app::detector_installed()
+    {
+        emit_error(
+            req_id,
+            "I_APP_FILTER_BINARY_MISSING",
+            "the compliance detector is not installed on this machine; enabling would block \
+             all AI traffic (fail-closed). Install it first: aikey app install ai-compliance-detector"
+                .to_string(),
+        );
+        return;
+    }
     let res = if p.enable {
         commands_app::set_app_filter_stages(&p.slug, &["pre_forward".to_string()], None, None)
     } else {

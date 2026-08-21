@@ -277,7 +277,13 @@ pub const EVENT_CLI_BINDING_RECONCILED: &str = "cli.binding.reconciled";
 pub const EVENT_CLI_BINDING_AUTO_ASSIGN_SKIPPED: &str =
     "cli.binding.auto_assign_skipped_unreachable";
 
+// Web-driven first-run vault setup (_internal init). The session cache is
+// best-effort — a keychain can decline — and a silent decline would leave the
+// proxy asking for a password the user believes they already configured.
+pub const EVENT_CLI_VAULT_SESSION_CACHE_SKIPPED: &str = "cli.vault.session_cache_skipped";
+
 // UPPER_SNAKE error codes (logging-conventions.md).
+pub const ERRCODE_SESSION_BACKEND_UNKNOWN: &str = "SESSION_BACKEND_UNKNOWN";
 pub const ERRCODE_BINDING_MATERIAL_UNREACHABLE: &str = "BINDING_MATERIAL_UNREACHABLE";
 pub const ERRCODE_KIMI_STOP_PAYLOAD_UNRECOGNIZED: &str = "KIMI_STOP_PAYLOAD_UNRECOGNIZED";
 pub const ERRCODE_KIMI_SESSION_DIR_MISSING: &str = "KIMI_SESSION_DIR_MISSING";

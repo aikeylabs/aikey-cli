@@ -343,6 +343,128 @@ pub fn try_auto_start_from_env() {
 /// + verifying password against the vault before spawning (avoids the
 /// silent-vault-decrypt-failure pitfall — see commit history /
 /// `bugfix/2026-04-28-*`).
+/// How the vault master password was obtained. Callers use this only for
+/// messaging — the password itself is identical whichever way it arrived.
+pub enum PasswordOrigin {
+    /// Injected by the caller via `AIKEY_MASTER_PASSWORD` / `AK_TEST_PASSWORD`.
+    Env,
+    /// Read from the session cache (OS keychain or encrypted file).
+    Cache,
+    /// Typed by a human just now.
+    Prompted,
+}
+
+/// Resolve AND verify the vault master password without assuming a terminal.
+///
+/// This is the single implementation of "how does something that wants to
+/// start the proxy obtain the master password". It exists because there were
+/// two of them, and they disagreed in the one case that matters.
+///
+/// `commands_proxy` had learned (bug 20260611-proxy-service-no-unattended-password)
+/// that launchd/systemd run it at login and after a crash with no terminal
+/// attached, so it consults the session cache before giving up.
+/// `commands_service` had not: it always called the interactive prompt, so it
+/// failed from every non-interactive caller — after first printing a password
+/// prompt that nobody could answer. That is what the AiKey tray hit when a
+/// user clicked "Restart proxy".
+///
+/// Three rules are preserved exactly as they were, because each is deliberate:
+///
+///   1. The env-var path is NOT verified against the vault. An env var has the
+///      same security model as a command-line flag: the caller asserted it,
+///      and the caller owns being right.
+///   2. A cached password the vault REJECTS is invalidated immediately, so a
+///      stale entry (e.g. after change-password) cannot be retried forever.
+///   3. A freshly typed password is stored only AFTER the vault accepts it,
+///      so a typo never poisons the cache.
+///
+/// Verification happens here, before the caller spawns anything: a wrong
+/// password caught now is an error message, caught later it is a child process
+/// that dies with an opaque vault-decrypt failure.
+pub fn resolve_verified_vault_password(
+    password_stdin: bool,
+) -> Result<(SecretString, PasswordOrigin), String> {
+    use std::io::IsTerminal;
+
+    if let Ok(env_val) =
+        std::env::var("AIKEY_MASTER_PASSWORD").or_else(|_| std::env::var("AK_TEST_PASSWORD"))
+    {
+        // Rule 1 — trusted as given, deliberately unverified.
+        return Ok((SecretString::new(env_val), PasswordOrigin::Env));
+    }
+
+    // No terminal to ask, and no password-stdin channel: the session cache is
+    // the only remaining source. Reading it needs no terminal — only the
+    // PROMPT does — so try it before concluding there is nothing to use.
+    // TTL is deliberately not consulted here (see `session::try_get_unattended`):
+    // a machine restarting its own proxy at boot has nobody to re-authenticate,
+    // and failing on an expired sliding window would leave it with no proxy.
+    if !(io::stderr().is_terminal() || password_stdin) {
+        let cached = crate::session::try_get_unattended().ok_or_else(|| {
+            "unattended proxy start: no master password available. Set \
+             AIKEY_MASTER_PASSWORD in the service environment, or run `aikey proxy start` \
+             interactively once to populate the session cache."
+                .to_string()
+        })?;
+        if let Err(e) = crate::executor::list_secrets(&cached) {
+            // Rule 2 — a stale cache must not be retried forever.
+            crate::session::invalidate();
+            return Err(format!(
+                "cached vault password rejected: {e}. Run `aikey proxy start` interactively to refresh it."
+            ));
+        }
+        return Ok((cached, PasswordOrigin::Cache));
+    }
+
+    // Interactive (or password-stdin) path.
+    let mut from_cache = false;
+    let pw: SecretString = if let Some(cached) = (!password_stdin)
+        .then(|| crate::session::try_get())
+        .flatten()
+    {
+        crate::session::refresh();
+        from_cache = true;
+        cached
+    } else if password_stdin {
+        eprint!("{}Enter Master Password: ", crate::symbols::ICON_LOCK.pre());
+        let _ = io::stderr().flush();
+        let mut line = String::new();
+        let _ = io::stdin().read_line(&mut line);
+        eprintln!("***");
+        SecretString::new(line.trim().to_string())
+    } else {
+        match crate::prompt_hidden(&format!(
+            "{}Enter Master Password: ",
+            crate::symbols::ICON_LOCK.pre()
+        )) {
+            Ok(p) => SecretString::new(p),
+            Err(_) => {
+                return Err("could not read the master password from this terminal.".to_string())
+            }
+        }
+    };
+
+    if let Err(e) = crate::executor::list_secrets(&pw) {
+        if from_cache {
+            // Rule 2 again, on the interactive cache hit.
+            crate::session::invalidate();
+        }
+        return Err(format!("vault password rejected: {e}"));
+    }
+    if !from_cache {
+        // Rule 3 — only a verified password is cached.
+        crate::session::store(&pw);
+    }
+    Ok((
+        pw,
+        if from_cache {
+            PasswordOrigin::Cache
+        } else {
+            PasswordOrigin::Prompted
+        },
+    ))
+}
+
 pub fn ensure_proxy_for_use(password_stdin: bool) {
     use crate::proxy_lifecycle::{start_proxy, StartError, StderrTarget};
 
@@ -376,99 +498,17 @@ pub fn ensure_proxy_for_use(password_stdin: bool) {
 
     // 1. Resolve a candidate password.
     let stderr_target = StderrTarget::Log(startup_log_path());
-    let env_pw = std::env::var("AIKEY_MASTER_PASSWORD")
-        .or_else(|_| std::env::var("AK_TEST_PASSWORD"))
-        .ok();
 
-    let (pw, from_cache, prompted, env_path) = if let Some(env_val) = env_pw {
-        // Env-var path: caller already injected the password; trust it.
-        // No vault verification — env var has the same security model as
-        // a flag, and the caller is responsible for getting it right.
-        (SecretString::new(env_val), false, false, true)
-    } else {
-        // Interactive / cache path. Need to actually have a TTY (or
-        // password-stdin mode) to ask for a fresh password.
-        use std::io::IsTerminal;
-        if !(io::stderr().is_terminal() || password_stdin) {
-            // L9 fix A (2026-06-11): UNATTENDED start — launchd/systemd runs
-            // this exact path on login / crash-restart with no TTY. Reading
-            // the session store needs no terminal (only the interactive
-            // PROMPT does), so try it before bailing; otherwise the service
-            // looped on "Enter Master Password: requires an interactive
-            // terminal" forever and the web showed "本地服务不可用". TTL is
-            // deliberately not consulted (see try_get_unattended docs). Bug:
-            // 20260611-proxy-service-no-unattended-password.md
-            if let Some(cached) = crate::session::try_get_unattended() {
-                // Same verify-before-spawn discipline as the interactive
-                // cache path: a stale store (master password changed) must
-                // invalidate + bail here, not crashloop the spawned child.
-                if let Err(e) = crate::executor::list_secrets(&cached) {
-                    crate::session::invalidate();
-                    eprintln!("[aikey] cached vault password rejected: {}", e);
-                    eprintln!("[aikey] run `aikey proxy start` interactively to refresh it");
-                    return;
-                }
-                (cached, true, false, false)
-            } else {
-                eprintln!("[aikey] proxy not running — run `aikey proxy start` to enable routing");
-                return;
-            }
-        } else {
-            eprintln!();
-            eprintln!("Proxy not running — starting it now.");
-
-            // Cache hit: silent.
-            let mut from_cache = false;
-            let mut prompted = false;
-            let pw: SecretString = if let Some(cached) = (!password_stdin)
-                .then(|| crate::session::try_get())
-                .flatten()
-            {
-                crate::session::refresh();
-                from_cache = true;
-                cached
-            } else if password_stdin {
-                eprint!("{}Enter Master Password: ", crate::symbols::ICON_LOCK.pre());
-                let _ = io::stderr().flush();
-                let mut line = String::new();
-                let _ = io::stdin().read_line(&mut line);
-                eprintln!("***");
-                prompted = true;
-                SecretString::new(line.trim().to_string())
-            } else {
-                prompted = true;
-                match crate::prompt_hidden(&format!(
-                    "{}Enter Master Password: ",
-                    crate::symbols::ICON_LOCK.pre()
-                )) {
-                    Ok(p) => SecretString::new(p),
-                    Err(_) => {
-                        eprintln!(
-                            "  [aikey] Could not read password — run `aikey proxy start` manually."
-                        );
-                        return;
-                    }
-                }
-            };
-
-            // Verify password against the vault BEFORE spawning. Catches
-            // wrong-password early instead of letting it manifest as a
-            // silent vault-decrypt failure inside the child.
-            if let Err(e) = crate::executor::list_secrets(&pw) {
-                if from_cache {
-                    crate::session::invalidate();
-                }
-                eprintln!("  [aikey] vault password rejected: {}", e);
-                eprintln!("  [aikey] retry with: aikey proxy start");
-                return;
-            }
-            if prompted {
-                crate::session::store(&pw);
-            }
-            (pw, from_cache, prompted, false)
+    // 1. Resolve a candidate password through the ONE implementation shared
+    // with `aikey service {start,restart} proxy`. Keeping this inline is how
+    // the two paths drifted apart in the first place.
+    let pw = match resolve_verified_vault_password(password_stdin) {
+        Ok((pw, _origin)) => pw,
+        Err(e) => {
+            eprintln!("[aikey] {e}");
+            return;
         }
     };
-    let _ = (from_cache, prompted, env_path); // suppress unused warnings on cfg paths
 
     // 2. Build StartOptions + delegate to Layer 2.
     let (opts, _env_keys) = match build_start_options(None, stderr_target) {
@@ -2179,12 +2219,142 @@ pub struct RegistryProvenanceWire {
     pub providers_with_model_map: Vec<String>,
 }
 
+/// The compliance scan-scope + placeholder-fidelity block of
+/// `/v1/diagnostics/pipeline` (proxy `MaskRestoreHealth`).
+///
+/// 🔴 EVERY FIELD HERE IS `#[serde(default)]` ON PURPOSE. `scan_truncated_pieces`
+/// / `scan_skipped_bytes` were added by bugfix
+/// `20260813-pipe-input-cap-truncates-silently`, so a proxy built before that
+/// fix omits them. Defaulting to 0 makes an OLD proxy read as "no truncation
+/// observed" rather than failing the whole parse — and the truncation row is
+/// only rendered when the count is non-zero, so an old proxy stays silent
+/// instead of claiming a coverage guarantee it cannot make.
+///
+/// 🔴 The counters are GENERATION-scoped (the proxy hot-reloads in-process and
+/// zeroes them without restarting). `generation_id` is carried alongside so a
+/// reader comparing two samples can tell a fresh zero from a real one.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct MaskRestoreWire {
+    /// "inactive" | "ok" | "insufficient_sample" | "degraded".
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub reason: String,
+    /// Effective inbound scan-role policy, e.g. ["assistant","user"].
+    #[serde(default)]
+    pub scan_roles: Vec<String>,
+    /// "off" | "audit" — the rung for agent tool traffic.
+    #[serde(default)]
+    pub tool_block_scan: String,
+    #[serde(default)]
+    pub scan_truncated_pieces: i64,
+    #[serde(default)]
+    pub scan_skipped_bytes: i64,
+}
+
+/// One independently-failing filter unit (proxy `FilterWorkerHealth`).
+///
+/// A Personal / Trial host has exactly one; Production and Cluster can run a
+/// pool of M child processes, and `index` is the unit's ROUND-ROBIN dispatch
+/// position — "worker 1 of 2 is down" means "≈half of all requests are routed to
+/// a process that fails open".
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct FilterWorkerWire {
+    #[serde(default)]
+    pub index: i64,
+    #[serde(default)]
+    pub healthy: bool,
+    /// Enumerated cause when `!healthy`: `write_timeout` (alive but stopped
+    /// reading its pipe) | `not_started` (never spawned) | `restarting` |
+    /// `not_installed: …` / `write_failed: …` and other prefixed OS causes.
+    ///
+    /// 🔴 THIS FIELD IS THE WHOLE POINT of the block. Before it existed, doctor
+    /// saw only `available:false` on `/admin/compliance/packs` and had to report
+    /// "wedged / crashed / never started" as one undifferentiated failure, so the
+    /// remedy it printed was a guess.
+    #[serde(default)]
+    pub degraded_reason: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub content_version: String,
+    /// Why `content_version` is empty: `child_degraded` (restart) |
+    /// `unsupported_op_list_packs` (upgrade the detector) | `first_poll_pending`
+    /// | `poll_failed`.
+    #[serde(default)]
+    pub content_version_reason: String,
+    #[serde(default)]
+    pub restart_count: u64,
+}
+
+/// Whether the proxy is reusing per-piece scan verdicts (proxy `VerdictCacheHealth`).
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct VerdictCacheWire {
+    /// "disabled" (never enabled) | "active" | "suspended" (switched off at
+    /// runtime because the detector cannot state its ruleset).
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub reason: String,
+    /// Enumerated cause behind `suspended` — decides restart vs upgrade.
+    #[serde(default)]
+    pub cause: String,
+    #[serde(default)]
+    pub content_version: String,
+}
+
+/// Filter child-process health + verdict-cache state (proxy `FilterHookHealth`).
+///
+/// 🔴 WHY IT IS READ AS `Option` AND NOT `#[serde(default)]`. Every other block
+/// here defaults safely: a missing counter is genuinely 0. Worker health has NO
+/// safe default — `Default` would read as "0 of 0 workers", which a naive
+/// renderer turns green. A proxy built before 2026-08-13 omits the block
+/// entirely, and doctor must say UNKNOWN for it, never OK (an unknown rendered
+/// as healthy is the exact false-green shape the four 2026-08-13 P0s shared).
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct FilterHookWire {
+    /// "inactive" (no filter installed) | "ok" | "partial" (some units down;
+    /// since 2026-08-14 dispatch skips them, so the pool loses headroom rather
+    /// than coverage) | "degraded" (nothing answering — everything fails open).
+    #[serde(default)]
+    pub status: String,
+    /// The proxy's own one-sentence description of what the status COSTS.
+    /// Rendered verbatim by every surface — never re-derived here: the CLI
+    /// cannot know what the data plane does with a dead worker, and the round it
+    /// tried to (up to 2026-08-14) ended with `ak doctor` telling users the
+    /// opposite of the truth.
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub workers_healthy: i64,
+    #[serde(default)]
+    pub workers_total: i64,
+    #[serde(default)]
+    pub workers: Vec<FilterWorkerWire>,
+    #[serde(default)]
+    pub verdict_cache: VerdictCacheWire,
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct PipelineDiagnosticsWire {
     #[serde(default)]
     pub registry: RegistryProvenanceWire,
     #[serde(default)]
     pub model_mapping: MappingHealthWire,
+    /// Compliance scan scope + mask/restore fidelity. Additive read of a block
+    /// this endpoint already serves — no new endpoint, no new proxy field
+    /// (慎重新建 API/接口协议).
+    #[serde(default)]
+    pub mask_restore: MaskRestoreWire,
+    /// Filter child-process health + verdict-cache state. `None` = this proxy
+    /// build does not report it (pre-2026-08-13) — render as UNKNOWN, never OK.
+    #[serde(default)]
+    pub filter_hook: Option<FilterHookWire>,
+    /// Scopes every counter in `mask_restore`. 0 = no supervisor wired.
+    #[serde(default)]
+    pub generation_id: i64,
 }
 
 /// Fetch the proxy's read-only model-mapping diagnostics. `Err` = proxy
@@ -2201,6 +2371,44 @@ pub fn fetch_pipeline_diagnostics() -> Result<PipelineDiagnosticsWire, String> {
         .map_err(|e| format!("cannot reach proxy at {addr}: {e}"))?;
     resp.into_json()
         .map_err(|e| format!("invalid diagnostics response: {e}"))
+}
+
+/// Fetch the proxy's effective-compliance-pack report (`GET /admin/compliance/packs`).
+///
+/// 🔴 WHY THIS ENDPOINT AND NOT A NEW ONE. It is already the proxy's
+/// externally-readable "what is the live detector actually loaded with" surface
+/// — the same one the Cluster release gate asserts against
+/// (`workflow/CI/test/e2e/compliance-migration-cluster-live.sh`) and the same
+/// one the local web console relays. Personal / Trial / Production / Cluster all
+/// run the same aikey-proxy binary, so this is the ONE source that exists in
+/// every edition (版型意识: a diagnostic that only one edition can perform is a bug).
+///
+/// 🔴 WHY LOOPBACK MUST BYPASS THE SHELL'S PROXY. A bare `ureq::AgentBuilder`
+/// carries no proxy config, which is exactly what we want: users behind a system
+/// HTTP proxy have had 127.0.0.1 probes hijacked before. Same posture as
+/// `fetch_pipeline_diagnostics` above — do not "helpfully" make this
+/// proxy-aware.
+///
+/// The admin gate exempts loopback peers, so no token is needed here.
+///
+/// `Err` = proxy unreachable, endpoint absent (older binary), or the call timed
+/// out. Callers MUST render that as "unknown", never as healthy — a wedged
+/// detector child is one of the ways this call fails to answer, and that is a
+/// fault, not a clean bill of health.
+pub fn fetch_compliance_packs() -> Result<serde_json::Value, String> {
+    let addr = proxy_listen_addr(None);
+    let agent = ureq::AgentBuilder::new()
+        // Short on purpose: this call crosses the proxy→detector stdin/stdout
+        // IPC, and a wedged child is precisely the condition we are diagnosing.
+        // doctor must degrade to "unknown" rather than hang (不阻塞用户流程).
+        .timeout(Duration::from_secs(3))
+        .build();
+    let resp = agent
+        .get(&format!("http://{addr}/admin/compliance/packs"))
+        .call()
+        .map_err(|e| format!("cannot reach proxy at {addr}: {e}"))?;
+    resp.into_json()
+        .map_err(|e| format!("invalid /admin/compliance/packs response: {e}"))
 }
 
 /// P3.5 `aikey test` tail surface: emit a WARN line when a model mapping is

@@ -74,13 +74,18 @@ pub(crate) fn handle_service(
                 .join(", "),
         );
         if json {
-            println!(
-                "{}",
-                serde_json::json!({"ok": false, "error": "UNKNOWN_SERVICE", "detail": msg})
+            // Print the envelope AND exit here: returning Err would let
+            // main.rs's top-level handler print a SECOND envelope, and both
+            // now land on stdout (stream contract, bugfix 2026-08-20), so a
+            // consumer parsing stdout gets two back-to-back objects and
+            // json.Unmarshal fails with "Extra data" — masking this detail
+            // behind a generic spawn error. One command, one envelope.
+            crate::json_output::print_json_exit(
+                serde_json::json!({"ok": false, "error": "UNKNOWN_SERVICE", "detail": msg}),
+                1,
             );
-        } else {
-            eprintln!("{}", msg);
         }
+        eprintln!("{}", msg);
         return Err(msg.into());
     }
 
@@ -123,31 +128,112 @@ fn print_supported(json: bool) {
 /// second copy of any service's health logic and can't drift from the
 /// per-service `status` commands.
 fn status_all(json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let rows: Vec<(&str, bool, String)> = vec![
+    // The fourth element is INSTALLED, and it is not the same question as
+    // RUNNING (added 2026-08-17).
+    //
+    // A component that was never installed is not a stopped one. Reporting only
+    // `running: false` made the tray count trust-local — an opt-out-able add-on
+    // that the offline package legitimately omits — as a failure, so a machine
+    // whose CLI, proxy and console were all healthy displayed "1 of 3 services
+    // are stopped" in amber and read to the user as "the services won't start".
+    //
+    // Each predicate is the one that already decides this elsewhere, so there is
+    // no second opinion to drift: install-state.json's installed_components for
+    // the console, the binary's presence for trust-local. proxy is core — if it
+    // were absent the CLI that answers this command would not be here either.
+    let rows: Vec<(&str, bool, String, bool)> = vec![
         {
             let (r, d) = crate::local_server_probe::status_summary();
-            ("web", r, d)
+            (
+                "web",
+                r,
+                d,
+                crate::local_server_probe::is_local_server_installed(),
+            )
         },
         {
             let (r, d) = crate::commands_proxy::status_summary();
-            ("proxy", r, d)
+            ("proxy", r, d, true)
         },
         {
             let (r, d) = crate::trust_local_service::status_summary();
-            ("trust-local", r, d)
+            (
+                "trust-local",
+                r,
+                d,
+                crate::trust_local_service::is_installed(),
+            )
+        },
+        // 🔴 Compliance detection is NOT a daemon (2026-08-19 product decision
+        // to show it here anyway). It has no process, port or launchd label —
+        // it is a FILTER STAGE the proxy spawns a child for. It appears in this
+        // list because that is where users look for "what is AiKey doing on
+        // this machine", but it is deliberately NOT in SUPPORTED_SERVICES:
+        //
+        //   • `service stop all` must never be able to switch a SAFETY control
+        //     off as a side effect of "turn AiKey off".
+        //   • SUPPORTED_SERVICES doubles as the security whitelist for the
+        //     console's /api/internal/services/<name>/<action> endpoint, which
+        //     would then bypass the vault-unlock that the console's own
+        //     compliance toggle requires.
+        //
+        // So this row is READ-ONLY here; the switch routes to `aikey
+        // compliance on|off`, which the `control` field below names.
+        {
+            let toggle = crate::commands_compliance::current_toggle();
+            (
+                "compliance",
+                toggle != crate::commands_project::ComplianceToggle::Off,
+                crate::commands_compliance::state_detail(toggle),
+                crate::commands_compliance::detector_installed(),
+            )
         },
     ];
 
     if json {
         let payload: Vec<_> = rows
             .iter()
-            .map(|(name, running, detail)| {
-                serde_json::json!({"name": name, "running": running, "detail": detail})
+            .map(|(name, running, detail, installed)| {
+                // `installed` is ADDITIVE — per the rules below, no schema bump.
+                let mut row = serde_json::json!({
+                    "name": name, "running": running, "detail": detail,
+                    "installed": installed
+                });
+                // ADDITIVE, same rule: `control` tells a consumer that this
+                // row's switch is NOT `service start/stop` — the desktop app
+                // routes it to `aikey compliance on|off` instead. `locked`
+                // says the org mandates it, so the switch must render
+                // un-actionable rather than fail on click.
+                if *name == "compliance" {
+                    row["control"] = serde_json::json!("compliance");
+                    row["locked"] = serde_json::json!(crate::storage::compliance_master_locked());
+                }
+                row
             })
             .collect();
-        println!("{}", serde_json::json!({"services": payload}));
+        // 🔴 schema_version is a wire contract, not decoration.
+        //
+        // This JSON is consumed across a release boundary: the AiKey tray ships
+        // as an independent package, so "old tray + new CLI" is a NORMAL state,
+        // not an error case. Without a version the tray has no way to tell
+        // "this CLI predates the field I need" from "the field is legitimately
+        // absent", and the failure mode is silent — an empty menu, not an error.
+        //
+        // Rules for changing it (mirrors the project's wire-contract governance):
+        //   - Adding an optional field: DO NOT bump. Consumers must ignore
+        //     unknown fields, so additive changes stay compatible in both
+        //     directions and either side can upgrade first.
+        //   - Removing/renaming a field, or changing its type or meaning:
+        //     bump. That is the only change a consumer cannot absorb.
+        //   - Never use exact equality as a consumer-side gate; compare
+        //     against a minimum. Exact-match gating turns every release into
+        //     a fleet-wide breakage.
+        println!(
+            "{}",
+            serde_json::json!({"schema_version": 1, "services": payload})
+        );
     } else {
-        for (name, running, detail) in &rows {
+        for (name, running, detail, _installed) in &rows {
             // Aligned two-column table: fixed-width name, state glyph, detail.
             let glyph = if *running {
                 crate::symbols::RADIO_ON.s()
@@ -265,7 +351,14 @@ fn run_all(verb: &str, json: bool, password_stdin: bool) -> Result<(), Box<dyn s
 
     if failed > 0 {
         // Non-zero exit — failures must be loud (project principle).
-        return Err(format!("service {verb} all: {failed} service(s) failed").into());
+        let detail = format!("service {verb} all: {failed} service(s) failed");
+        if json {
+            // emit_summary already wrote this run's envelope; exiting here
+            // keeps main.rs from appending a second one to the same stream
+            // (one command, one envelope — see the UNKNOWN_SERVICE branch).
+            std::process::exit(1);
+        }
+        return Err(detail.into());
     }
     Ok(())
 }
@@ -390,13 +483,13 @@ mod trust_local {
                 bin.display()
             );
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"ok": false, "error": "TRUST_LOCAL_NOT_INSTALLED", "detail": msg})
+                // One command, one envelope — see the UNKNOWN_SERVICE branch.
+                crate::json_output::print_json_exit(
+                    serde_json::json!({"ok": false, "error": "TRUST_LOCAL_NOT_INSTALLED", "detail": msg}),
+                    1,
                 );
-            } else {
-                eprintln!("{}", msg);
             }
+            eprintln!("{}", msg);
             return Err(msg.into());
         }
 
@@ -493,9 +586,18 @@ mod proxy {
                 // prompt_vault_password lives in main.rs as a thin
                 // wrapper around executor::prompt_password; we
                 // reuse it via crate visibility.
-                let password = crate::prompt_vault_password(password_stdin, false)?;
-                crate::executor::list_secrets(&password)
-                    .map_err(|e| format!("vault authentication failed: {}", e))?;
+                // Reuse the ONE password-resolution core (commands_proxy::
+                // resolve_verified_vault_password). Calling prompt_vault_password
+                // here was the bug: it only knows env / stdin / interactive TTY,
+                // so every non-interactive caller — the AiKey tray, launchd, a
+                // script — got a password prompt it could not answer, and only
+                // then an error. The core consults the session cache first,
+                // exactly as `aikey proxy start` has since 2026-06-11.
+                //
+                // It also verifies before we spawn, so the explicit
+                // list_secrets check that used to live here is now redundant.
+                let (password, _origin) =
+                    crate::commands_proxy::resolve_verified_vault_password(password_stdin)?;
                 crate::commands_proxy::handle_start(None, true /*detach*/, &password)?;
                 Ok(())
             }
@@ -504,9 +606,18 @@ mod proxy {
                 Ok(())
             }
             "restart" => {
-                let password = crate::prompt_vault_password(password_stdin, false)?;
-                crate::executor::list_secrets(&password)
-                    .map_err(|e| format!("vault authentication failed: {}", e))?;
+                // Reuse the ONE password-resolution core (commands_proxy::
+                // resolve_verified_vault_password). Calling prompt_vault_password
+                // here was the bug: it only knows env / stdin / interactive TTY,
+                // so every non-interactive caller — the AiKey tray, launchd, a
+                // script — got a password prompt it could not answer, and only
+                // then an error. The core consults the session cache first,
+                // exactly as `aikey proxy start` has since 2026-06-11.
+                //
+                // It also verifies before we spawn, so the explicit
+                // list_secrets check that used to live here is now redundant.
+                let (password, _origin) =
+                    crate::commands_proxy::resolve_verified_vault_password(password_stdin)?;
                 crate::commands_proxy::handle_restart(None, &password)?;
                 Ok(())
             }
@@ -646,5 +757,52 @@ mod tests {
                 "unexpected trust-local down-detail: {detail}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod compliance_row_tests {
+    //! Fences for the compliance row added 2026-08-19.
+
+    /// 🔴 THE safety property. `service stop all` fans out over `order`;
+    /// compliance must never be in it, because "turn AiKey off" would then
+    /// PERSISTENTLY disable a safety control (filter_stages is a stored
+    /// column, not a process — it would stay off after the next start).
+    ///
+    /// Written against the source text because the fan-out list is a literal
+    /// inside `handle_all`: a unit test cannot call it without starting real
+    /// services, and the thing worth guarding is exactly that this name is
+    /// absent from that list.
+    #[test]
+    fn compliance_is_not_in_the_all_fanout() {
+        let src = include_str!("commands.rs");
+        let line = src
+            .lines()
+            .find(|l| l.contains("let mut order = vec!["))
+            .expect("the `all` fan-out order list is gone — re-point this fence");
+        assert!(
+            !line.contains("compliance"),
+            "compliance joined the `service ... all` fan-out: {line}\n\
+             `stop all` would then persistently disable content scanning — a \
+             safety control switched off as a side effect of turning AiKey off."
+        );
+    }
+
+    /// The other half of the same decision: it must also stay out of the
+    /// whitelist, which is the console's `/api/internal/services/<name>/
+    /// <action>` security boundary AND the `service start/stop <name>`
+    /// surface. The switch belongs to `aikey compliance`, which applies the
+    /// org-policy refusal.
+    #[test]
+    fn compliance_is_not_a_whitelisted_service() {
+        assert!(
+            !super::SUPPORTED_SERVICES
+                .iter()
+                .any(|(n, _)| *n == "compliance"),
+            "compliance entered SUPPORTED_SERVICES — that whitelist is the \
+             console service endpoint's security boundary, and it would let a \
+             caller disable compliance without the vault unlock the console's \
+             own compliance toggle requires."
+        );
     }
 }

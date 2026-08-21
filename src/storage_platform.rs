@@ -401,15 +401,26 @@ pub fn clear_managed_key_ciphertexts() -> Result<usize, String> {
 /// the account that originally accepted them.
 pub fn disable_keys_for_account_scope(new_account_id: &str) -> Result<(), String> {
     let conn = open_connection()?;
-    conn.execute(
-        "UPDATE managed_virtual_keys_cache
+    let changed = conn
+        .execute(
+            "UPDATE managed_virtual_keys_cache
             SET local_state = 'disabled_by_account_scope',
                 synced_at   = strftime('%s', 'now')
           WHERE (owner_account_id IS NULL OR owner_account_id != ?1)
             AND local_state != 'disabled_by_account_scope'",
-        params![new_account_id],
-    )
-    .map_err(|e| format!("Failed to scope-disable keys for account switch: {}", e))?;
+            params![new_account_id],
+        )
+        .map_err(|e| format!("Failed to scope-disable keys for account switch: {}", e))?;
+    // Scope-disabling IS "a vault write that can affect which keys the proxy
+    // resolves" (the proxy's route query filters `disabled_by_%` rows out), so
+    // the seq bump lives HERE — at the mutation's single exit — not in the
+    // callers. `aikey logout` without team bindings used to skip the bump and
+    // the proxy kept serving the disabled VK from its in-memory registry until
+    // an unrelated vault write or a restart (bugfix 2026-08-19). Bump only when
+    // rows actually changed so idempotent re-runs don't churn proxy reloads.
+    if changed > 0 {
+        let _ = super::bump_vault_change_seq();
+    }
     Ok(())
 }
 
@@ -2224,6 +2235,101 @@ pub fn update_provider_account_status(id: &str, status: &str) -> Result<(), Stri
     )
     .map_err(|e| format!("Failed to update provider account status: {}", e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod account_scope_disable_seq_fence_tests {
+    use super::*;
+
+    /// Bugfix 2026-08-19 — `aikey logout` marked team VKs
+    /// `disabled_by_account_scope` but never bumped `runtime.vault.change_seq`
+    /// on the no-team-bindings path, so the proxy's 5s sync loop
+    /// (`vaultSeq == loadedSeq` early return) kept serving the disabled VK
+    /// from its in-memory registry until an unrelated vault write or restart.
+    /// The fix pins the bump to the mutation itself; this fence pins the fix.
+    ///
+    /// 能红: drop the `bump_vault_change_seq` call from
+    /// `disable_keys_for_account_scope` (verified red during authoring).
+    #[test]
+    fn scope_disable_bumps_change_seq_only_when_rows_change() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("vault.db");
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).expect("salt");
+        let pw = secrecy::SecretString::new("test_password".to_string());
+        crate::storage::initialize_vault(&salt, &pw).expect("init vault");
+
+        let entry = VirtualKeyCacheEntry {
+            binding_id: String::new(),
+            priority: 1,
+            fallback_role: "primary".to_string(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
+            virtual_key_id: "vk-fence".into(),
+            org_id: "org-1".into(),
+            seat_id: "seat-1".into(),
+            alias: "vk-fence".into(),
+            provider_code: "anthropic".into(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: "cred-1".into(),
+            credential_revision: "r1".into(),
+            virtual_key_revision: "vr1".into(),
+            key_status: "active".into(),
+            share_status: "claimed".into(),
+            local_state: "active".into(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: None,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec!["anthropic".into()],
+            provider_base_urls: std::collections::HashMap::new(),
+            owner_account_id: Some("acct-1".into()),
+            owner_email: None,
+            group_runtime: None,
+            group_alias: None,
+            extra: None,
+            oauth_group_id: None,
+            group_accounts: None,
+            routing_config: None,
+        };
+        upsert_virtual_key_cache(&entry).expect("seed vk row");
+
+        let before = crate::storage::get_vault_change_seq().expect("seq before");
+
+        // Logout path: "" matches no owner → every non-disabled row flips.
+        disable_keys_for_account_scope("").expect("scope disable");
+        let after = crate::storage::get_vault_change_seq().expect("seq after");
+        assert_eq!(
+            after,
+            before + 1,
+            "scope-disable changed rows but did not advance change_seq — the \
+             proxy's 5s sync early-returns on an unchanged seq and keeps \
+             serving the disabled VK (the 2026-08-19 logout bug)"
+        );
+
+        let conn = open_connection().expect("conn");
+        let state: String = conn
+            .query_row(
+                "SELECT local_state FROM managed_virtual_keys_cache WHERE virtual_key_id = 'vk-fence'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row state");
+        assert_eq!(state, "disabled_by_account_scope");
+        drop(conn);
+
+        // Idempotent re-run: zero rows change → seq must NOT move (no reload churn).
+        disable_keys_for_account_scope("").expect("idempotent re-run");
+        let after_rerun = crate::storage::get_vault_change_seq().expect("seq after rerun");
+        assert_eq!(
+            after_rerun, after,
+            "a no-op scope-disable must not bump change_seq — every bump costs \
+             the proxy a full registry rebuild"
+        );
+    }
 }
 
 #[cfg(test)]

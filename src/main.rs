@@ -60,6 +60,7 @@ mod platform_client;
 // mod core; // removed: profile-based resolver dropped
 mod cli;
 mod commands_auth;
+mod commands_compliance;
 mod commands_import;
 mod commands_init;
 mod commands_internal;
@@ -67,6 +68,8 @@ mod commands_service;
 mod commands_statusline;
 mod commands_trust;
 mod commands_watch;
+#[allow(dead_code)]
+mod display_language;
 #[allow(dead_code)]
 mod events;
 #[allow(dead_code)]
@@ -102,7 +105,7 @@ mod ui_select;
 #[cfg(windows)]
 #[allow(dead_code)]
 mod ui_select_windows;
-#[allow(dead_code)]
+mod usage_console;
 mod usage_wal;
 
 // Crate-wide test-env mutex (see src/test_env_lock.rs). Declared in both
@@ -465,12 +468,8 @@ fn handle_stats(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Check if vault exists
-    let vault_exists = if let Ok(vault_path) = crate::storage::get_vault_path() {
-        vault_path.exists()
-    } else {
-        false
-    };
+    // Salt-based, not file-based — see storage::vault_is_initialized.
+    let vault_exists = crate::storage::vault_is_initialized();
 
     if json_mode {
         let response = serde_json::json!({
@@ -1378,6 +1377,18 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     println!("{}", serde_json::json!({"display_time_zone": current}));
                 } else {
                     println!("Display time zone: {}", current);
+                }
+            }
+            cli::ConfigAction::Language { value } => {
+                let current = if let Some(value) = value {
+                    display_language::set_preference(value)?
+                } else {
+                    display_language::preference()
+                };
+                if cli.json {
+                    println!("{}", serde_json::json!({"display_language": current}));
+                } else {
+                    println!("Tray display language: {}", current);
                 }
             }
         },
@@ -2463,7 +2474,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     json_output::success(payload);
                 } else {
                     // Partial/total failure: emit JSON + non-zero exit.
-                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                    // STDOUT: same stream contract as json_output (bugfix
+                    // 2026-08-20) — these hand-rolled payloads are the
+                    // SUCCESS-shaped machine output of a --json command and
+                    // must not land on a different stream than their
+                    // json_output siblings.
+                    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
                     std::process::exit(if ok_count > 0 { 2 } else { 1 });
                 }
             } else {
@@ -2762,7 +2778,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "credentials_tested": outcome.json_results,
                         "last_test_persisted": persisted.iter().filter(|p| p.persisted).count(),
                     });
-                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                    // STDOUT: same stream contract as json_output (bugfix
+                    // 2026-08-20) — these hand-rolled payloads are the
+                    // SUCCESS-shaped machine output of a --json command and
+                    // must not land on a different stream than their
+                    // json_output siblings.
+                    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
                 let code = exit_code_from_outcome(&outcome);
                 print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
@@ -2851,7 +2872,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         "results": outcome.json_results,
                         "last_test_persisted": persisted.iter().filter(|p| p.persisted).count(),
                     });
-                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                    // STDOUT: same stream contract as json_output (bugfix
+                    // 2026-08-20) — these hand-rolled payloads are the
+                    // SUCCESS-shaped machine output of a --json command and
+                    // must not land on a different stream than their
+                    // json_output siblings.
+                    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
                 let code = exit_code_from_outcome(&outcome);
                 print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
@@ -2929,7 +2955,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         })).collect::<Vec<_>>(),
                         "last_test_persisted": persisted.iter().filter(|p| p.persisted).count(),
                     });
-                    eprintln!("{}", serde_json::to_string_pretty(&payload).unwrap());
+                    // STDOUT: same stream contract as json_output (bugfix
+                    // 2026-08-20) — these hand-rolled payloads are the
+                    // SUCCESS-shaped machine output of a --json command and
+                    // must not land on a different stream than their
+                    // json_output siblings.
+                    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
                 }
                 let code = exit_code_from_outcome(&outcome);
                 print_test_rc_unwired_warning(cli.json, code == EXIT_OK);
@@ -3814,10 +3845,16 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 KeyAction::Use {
                     alias_or_id,
+                    provider,
                     no_hook,
                 } => {
                     commands_proxy::ensure_proxy_for_use(cli.password_stdin);
-                    commands_account::handle_key_use(alias_or_id, *no_hook, None, cli.json)?;
+                    commands_account::handle_key_use(
+                        alias_or_id,
+                        *no_hook,
+                        provider.as_deref(),
+                        cli.json,
+                    )?;
                     commands_proxy::warn_if_proxy_down();
                 }
                 KeyAction::Alias {
@@ -3834,6 +3871,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 token,
                 email,
                 resend,
+                sso,
+                no_browser,
             } => {
                 commands_account::handle_login(
                     cli.json,
@@ -3841,6 +3880,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                     token.clone(),
                     email.clone(),
                     *resend,
+                    sso.clone(),
+                    *no_browser,
                 )?;
             }
             AccountAction::Status => {
@@ -3874,6 +3915,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             token,
             email,
             resend,
+            sso,
+            no_browser,
         } => {
             commands_account::handle_login(
                 cli.json,
@@ -3881,6 +3924,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 token.clone(),
                 email.clone(),
                 *resend,
+                sso.clone(),
+                *no_browser,
             )?;
         }
         Commands::Logout => {
@@ -4529,8 +4574,8 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 cli.json,
             )?;
         }
-        Commands::Status => {
-            commands_account::handle_status_overview(cli.json)?;
+        Commands::Status { usage } => {
+            commands_account::handle_status_overview_with(cli.json, *usage)?;
             // Mode A addendum: append a local-server status line so users have
             // a single command for "is my console reachable". See
             // roadmap20260320/技术实现/update/20260422-批量导入-aikey-serve-命令移除.md
@@ -4915,6 +4960,12 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             // the same handle_web_service / commands_proxy::handle_*
             // functions.
             commands_service::handle_service(action, cli.json, cli.password_stdin)?;
+        }
+        Commands::Compliance { action } => {
+            // The proxy's pre-forward content filter, NOT a daemon — see the
+            // module doc for why it is its own command rather than a
+            // `service` name.
+            commands_compliance::handle_compliance(action, cli.json)?;
         }
     }
     Ok(())
@@ -5850,13 +5901,11 @@ pub(crate) fn prompt_vault_password(
 /// Use for HIGH-sensitivity commands (add, delete, update, import, export,
 /// secret set/upsert/delete, change-password, exec, run --direct).
 fn prompt_vault_password_fresh(password_stdin: bool, json_mode: bool) -> io::Result<SecretString> {
-    let vault_exists = storage::get_vault_path()
-        .map(|p| p.exists())
-        .unwrap_or(false);
-
-    // Check if vault has a salt (= previously initialized with a password).
-    // A vault file may exist but be empty (e.g., session backend created it before init).
-    let vault_initialized = vault_exists && storage::get_salt().is_ok();
+    // A vault file may exist but be empty (e.g. the session backend created it
+    // before init), so this asks for a salt, not for a file. This function is
+    // where that rule was first written down; storage::vault_is_initialized now
+    // owns it so the reporting surfaces answer the same question.
+    let vault_initialized = storage::vault_is_initialized();
 
     if vault_initialized {
         // Existing vault — just ask for the password
@@ -7065,13 +7114,45 @@ fn resolve_single_provider(
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(ov) = provider_override {
         let code = provider_canonical(ov);
-        if !providers.iter().any(|p| provider_canonical(p) == code) {
-            return Err(format!(
-                "Key '{}' does not support provider '{}'. Supported: {}.\n  Try: aikey activate {} --provider {}",
-                display, code, providers.join(", "), display, provider_canonical(&providers[0])
-            ).into());
+        if let Some(direct) = providers.iter().find(|p| provider_canonical(p) == code) {
+            return Ok(provider_canonical(direct));
         }
-        return Ok(code);
+        // 🔴 Route-axis fallback (2026-08-18, audit site ②). "kimi" is BOTH an
+        // oauth alias of kimi_code and the family route moonshot serves;
+        // canonicalizing alone turned `--provider kimi` on a moonshot key into
+        // a refusal naming 'kimi_code' — a word the user never typed. Mirror of
+        // providers_for_client_selector's fix: direct canonical match first
+        // (alias behaviour preserved), then the RAW word against each
+        // provider's client route.
+        let raw = ov.to_lowercase();
+        let route_hits: Vec<&String> = providers
+            .iter()
+            .filter(|p| {
+                crate::provider_registry::client_route_for_binding(&provider_canonical(p), "")
+                    .eq_ignore_ascii_case(&raw)
+            })
+            .collect();
+        if route_hits.len() == 1 {
+            return Ok(provider_canonical(route_hits[0]));
+        }
+        if route_hits.len() > 1 {
+            return Err(format!(
+                "Client route '{}' matches multiple providers ({}); select an exact provider code.",
+                ov,
+                route_hits
+                    .iter()
+                    .map(|p| provider_canonical(p))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into());
+        }
+        return Err(format!(
+            // ov, deliberately: the refusal must echo the word the user typed,
+            // never the alias table's rewrite of it.
+            "Key '{}' does not support provider '{}'. Supported: {}.\n  Try: aikey activate {} --provider {}",
+            display, ov, providers.join(", "), display, provider_canonical(&providers[0])
+        ).into());
     }
     if providers.len() == 1 {
         return Ok(provider_canonical(&providers[0]));
@@ -7853,6 +7934,7 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
             target,
             shell,
             no_hook,
+            yes,
         } => {
             match target.as_deref() {
                 Some("openclaw") => {
@@ -7875,10 +7957,23 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                     );
                     return Ok(());
                 }
-                Some(t) => {
-                    return Err(
-                        format!("unknown hook target '{t}' (supported: openclaw, codex)").into(),
+                // Codex desktop + IDE extension. ONE line is the whole switch —
+                // see set_codex_top_level_provider for why, and for why it is
+                // narrower than the `codex` target above (that one owns the
+                // provider block, which the CLI also rides).
+                Some("codex-desktop") => {
+                    commands_account::set_codex_top_level_provider(true)?;
+                    eprintln!(
+                        "  {} Codex desktop and the IDE extension now route through aikey.",
+                        crate::symbols::CHECK.s()
                     );
+                    return Ok(());
+                }
+                Some(t) => {
+                    return Err(format!(
+                        "unknown hook target '{t}' (supported: openclaw, codex, codex-desktop)"
+                    )
+                    .into());
                 }
                 None => {}
             }
@@ -7935,7 +8030,7 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                     Err(e) => Err(e.into()),
                 }
             } else {
-                match commands_account::ensure_shell_hook(false) {
+                match commands_account::ensure_shell_hook_with_consent(false, *yes) {
                     Some(msg) => {
                         println!("{}", msg);
                     }
@@ -7970,7 +8065,48 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
         HookAction::Reinstall { shell } => handle_hook_reinstall(shell.as_deref()),
         HookAction::Uninstall { target } => match target.as_deref() {
             Some("openclaw") => commands_account::openclaw_hook::uninstall().map_err(|e| e.into()),
-            Some(t) => Err(format!("unknown hook target '{t}' (supported: openclaw)").into()),
+            // 🔴 The per-tool reverse of `aikey hook install codex` (2026-08-18).
+            //
+            // Why it had to exist: there was no way to undo the Codex takeover
+            // ALONE. `aikey hook uninstall` (bare) strips the shell hook and
+            // every other tool with it — far more than someone reversing one
+            // integration is asking for — and `aikey unuse openai` is the wrong
+            // axis entirely (it removes the credential, not the routing). The
+            // tray's Integrations switch needs a reverse that is exactly as
+            // wide as the thing it turned on.
+            //
+            // Two steps, and both are needed. Stripping the config alone would
+            // be undone by the next `aikey use`, because the lifecycle funnel
+            // re-applies Codex for any active OpenAI key: without the standing
+            // refusal the switch would quietly flip itself back on. Setting the
+            // refusal alone would leave today's config in place. Together they
+            // mean "not taken over, and stay that way until I say otherwise" —
+            // and `aikey hook install codex` remains the documented way back
+            // (running it IS actionable consent, per the 2026-07-16 rule).
+            Some("codex") => {
+                commands_account::unconfigure_codex_cli();
+                global_config::set_codex_consent_never()?;
+                eprintln!(
+                    "  {} Codex takeover removed. Run `aikey hook install codex` to allow it again.",
+                    crate::symbols::CHECK.s()
+                );
+                Ok(())
+            }
+            // Removes ONLY the top-level line. The provider block, its bearer
+            // and its base_url stay, so the CLI keeps routing through the shim's
+            // runtime `-c model_provider=aikey` — that is a different switch.
+            Some("codex-desktop") => {
+                commands_account::set_codex_top_level_provider(false)?;
+                eprintln!(
+                    "  {} Codex desktop and the IDE extension no longer route through aikey (the CLI is unaffected).",
+                    crate::symbols::CHECK.s()
+                );
+                Ok(())
+            }
+            Some(t) => Err(format!(
+                "unknown hook target '{t}' (supported: openclaw, codex, codex-desktop)"
+            )
+            .into()),
             None => handle_hook_uninstall(),
         },
     }

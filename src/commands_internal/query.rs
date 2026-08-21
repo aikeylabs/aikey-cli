@@ -676,7 +676,9 @@ fn load_active_binding_refs() -> (ActiveBindingMap, ActiveBindingMap, ActiveBind
     let mut personal: ActiveBindingMap = HashMap::new();
     let mut oauth: ActiveBindingMap = HashMap::new();
     let mut team: ActiveBindingMap = HashMap::new();
-    if let Ok(bindings) = storage::list_provider_bindings_readonly("default") {
+    if let Ok(bindings) =
+        storage::list_provider_bindings_readonly(crate::profile_activation::DEFAULT_PROFILE)
+    {
         for b in bindings {
             match b.key_source_type {
                 CredentialType::PersonalApiKey => {

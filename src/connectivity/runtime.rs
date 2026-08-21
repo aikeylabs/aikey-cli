@@ -3124,7 +3124,6 @@ mod probe_raw_error_classification_tests {
     use super::{proxy_probe_full_hint, test_proxy_connectivity, ProxyProbeResult};
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
     use std::thread;
 
     /// Mock proxy returning a single canned JSON-error response.

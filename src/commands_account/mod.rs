@@ -690,6 +690,58 @@ pub fn handle_set_control_url(
 // account login / status / logout
 // ---------------------------------------------------------------------------
 
+/// Resolves `--sso <code>` against the providers `/init` advertised, returning
+/// `(display_name, authorize_url)`.
+///
+/// Extracted from handle_login so the resolution and the URL contract are unit
+/// tested against the real user-facing code path (not a test re-derivation).
+/// The authorize path mirrors the server-rendered login page's links — a
+/// two-sided contract (see SSOAuthorize route), not a guess.
+fn resolve_sso_authorize(
+    control_url: &str,
+    providers: &[crate::platform_client::SsoProviderEntry],
+    want_raw: &str,
+    session_id: &str,
+    device_code: &str,
+) -> Result<(String, String), String> {
+    let want = want_raw.trim().to_lowercase();
+    let Some(provider) = providers.iter().find(|p| p.code == want) else {
+        // The two failure modes need different fixes, so they get different
+        // sentences: "none enabled" → use email login; "wrong code" → the
+        // deployment's actual options.
+        return Err(if providers.is_empty() {
+            // An empty list is ambiguous by construction: the deployment may
+            // truly have no SSO, or the server may predate SSO discovery
+            // (sso_providers rode into /init on 2026-08-18) while its login
+            // PAGE still offers the buttons. Verified live against the
+            // pre-upgrade staging cluster, which is exactly that second case.
+            // The message owns the uncertainty instead of overclaiming.
+            format!(
+                "This control panel ({}) did not advertise any SSO providers \
+                 (it may have none enabled, or it may be an older server). \
+                 Use email login instead: aikey login \
+                 \u{2014} if its login page shows an SSO button, that still works there.",
+                control_url
+            )
+        } else {
+            let available: Vec<&str> = providers.iter().map(|p| p.code.as_str()).collect();
+            format!(
+                "SSO provider '{}' is not enabled on this control panel. Available: {}",
+                want,
+                available.join(", ")
+            )
+        });
+    };
+    let url = format!(
+        "{}/v1/auth/cli/login/sso/{}/authorize?s={}&d={}",
+        control_url.trim_end_matches('/'),
+        provider.code,
+        session_id,
+        device_code,
+    );
+    Ok((provider.display_name.clone(), url))
+}
+
 /// `aikey account login [--url URL] [--token SESSION_ID:LOGIN_TOKEN]`
 ///
 /// Starts the OAuth device-flow login via a browser web UI:
@@ -714,6 +766,8 @@ pub fn handle_login(
     flag_token: Option<String>,
     flag_email: Option<String>,
     flag_resend: bool,
+    flag_sso: Option<String>,
+    flag_no_browser: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Resolve default URL: env var → config file → hardcoded fallback.
     let default_url = std::env::var("AIKEY_CONTROL_URL")
@@ -769,7 +823,10 @@ pub fn handle_login(
     // at QQ/Gmail. We block the second attempt within `LOGIN_THROTTLE_SECS`
     // unless --resend is passed. The file is advisory-only; concurrent
     // writes and missing files silently fall through.
-    if !flag_resend {
+    // The throttle guards outbound MAIL, so the SSO path — which sends none —
+    // must not be blocked by it. Both mail-sending paths (browser page and
+    // --no-browser) stay throttled.
+    if !flag_resend && flag_sso.is_none() {
         if let Some(last_started) = read_login_throttle() {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -801,67 +858,157 @@ pub fn handle_login(
         }
     }
 
-    // --- OAuth device flow via browser ---
     let client_version = env!("CARGO_PKG_VERSION");
     let os_platform = std::env::consts::OS;
+    let step = |n: &str| format!("  {}", format!("Step {}", n).bold().cyan());
 
-    let session = PlatformClient::init_cli_login(&control_url, client_version, os_platform)
-        .map_err(|e| format!("Login failed: {}", e))?;
+    // Three ways to establish the session; all converge on the same poll loop.
+    // (session_id, device_code, poll_interval_seconds, expires_in_seconds)
+    let (session_id, device_code, poll_secs, expires_secs);
 
-    // Record this attempt for the throttle window. Best-effort — any I/O
-    // failure is silently ignored (the throttle is a UX nudge, not security).
-    let _ = write_login_throttle();
+    if flag_no_browser {
+        // --- No-browser email flow (2026-08-18 缺口①) ---
+        // /start = init + begin in one server call: creates the session AND
+        // sends the activation mail, so no browser is needed on this machine.
+        // clap enforces `requires = "email"`; the expect documents the contract.
+        let email = flag_email
+            .as_deref()
+            .expect("--no-browser requires --email (enforced by clap)");
+        let session =
+            PlatformClient::start_cli_login(&control_url, email, client_version, os_platform)
+                .map_err(|e| format!("Login failed: {}", e))?;
+        let _ = write_login_throttle();
 
-    // Browser URL: in production nginx serves both Web and API on the same
-    // origin (control_url), so use it directly for the browser login page.
-    let mut login_url = format!(
-        "{}/auth/cli/login?s={}&d={}",
-        control_url.trim_end_matches('/'),
-        session.login_session_id,
-        session.device_code,
-    );
-    // Append Base64URL-encoded email so the login page can auto-fill it.
-    if let Some(ref email) = flag_email {
-        let encoded = base64_url_encode(email);
-        login_url.push_str(&format!("&email={}", encoded));
-    }
-
-    if !json_mode {
-        let step = |n: &str| format!("  {}", format!("Step {}", n).bold().cyan());
-        println!();
-        println!("{}  Opening browser…", step("1"));
-        println!("          {}", login_url.dimmed());
-        println!();
-        if flag_email.is_some() {
+        if !json_mode {
+            println!();
             println!(
-                "{}  Your {} is pre-filled — click {}",
-                step("2"),
-                "email".bold(),
-                "\"Send Login Link\"".bold()
+                "{}  Activation email sent to {}",
+                step("1"),
+                session.masked_email.bold()
             );
-        } else {
+            println!();
             println!(
-                "{}  Enter your {} and click {}",
+                "{}  Click the link in that email on {} device — your phone works too",
                 step("2"),
-                "email".bold(),
-                "\"Send Login Link\"".bold()
+                "any".bold()
             );
+            println!();
+            println!("  {}", "Waiting for confirmation…".dimmed());
         }
-        println!();
-        println!(
-            "{}  Check your inbox and click the {} link",
-            step("3"),
-            "activation".bold()
+        (session_id, device_code, poll_secs, expires_secs) = (
+            session.login_session_id,
+            session.device_code,
+            session.poll_interval_seconds,
+            session.expires_in_seconds,
         );
-        println!();
-        println!("  {}", "Waiting for confirmation…".dimmed());
-    }
+    } else if let Some(ref sso_code) = flag_sso {
+        // --- SSO direct flow (2026-08-18) ---
+        // /init advertises the enabled providers; an unknown code fails here
+        // with the deployment's actual options instead of a dead browser tab.
+        let session = PlatformClient::init_cli_login(&control_url, client_version, os_platform)
+            .map_err(|e| format!("Login failed: {}", e))?;
 
-    open_url_silently(&login_url);
+        let (display_name, authorize_url) = resolve_sso_authorize(
+            &control_url,
+            &session.sso_providers,
+            sso_code,
+            &session.login_session_id,
+            &session.device_code,
+        )?;
+        let provider = crate::platform_client::SsoProviderEntry {
+            code: sso_code.trim().to_lowercase(),
+            display_name,
+        };
+
+        if !json_mode {
+            println!();
+            println!(
+                "{}  Opening browser for {} sign-in…",
+                step("1"),
+                provider.display_name.bold()
+            );
+            println!("          {}", authorize_url.dimmed());
+            println!();
+            println!(
+                "{}  Complete the {} authorization (scan the QR code if asked)",
+                step("2"),
+                provider.display_name.bold()
+            );
+            println!();
+            println!("  {}", "Waiting for confirmation…".dimmed());
+        }
+        open_url_silently(&authorize_url);
+        (session_id, device_code, poll_secs, expires_secs) = (
+            session.login_session_id,
+            session.device_code,
+            session.poll_interval_seconds,
+            session.expires_in_seconds,
+        );
+    } else {
+        // --- OAuth device flow via browser (original path) ---
+        let session = PlatformClient::init_cli_login(&control_url, client_version, os_platform)
+            .map_err(|e| format!("Login failed: {}", e))?;
+
+        // Record this attempt for the throttle window. Best-effort — any I/O
+        // failure is silently ignored (the throttle is a UX nudge, not security).
+        let _ = write_login_throttle();
+
+        // Browser URL: in production nginx serves both Web and API on the same
+        // origin (control_url), so use it directly for the browser login page.
+        let mut login_url = format!(
+            "{}/auth/cli/login?s={}&d={}",
+            control_url.trim_end_matches('/'),
+            session.login_session_id,
+            session.device_code,
+        );
+        // Append Base64URL-encoded email so the login page can auto-fill it.
+        if let Some(ref email) = flag_email {
+            let encoded = base64_url_encode(email);
+            login_url.push_str(&format!("&email={}", encoded));
+        }
+
+        if !json_mode {
+            println!();
+            println!("{}  Opening browser…", step("1"));
+            println!("          {}", login_url.dimmed());
+            println!();
+            if flag_email.is_some() {
+                println!(
+                    "{}  Your {} is pre-filled — click {}",
+                    step("2"),
+                    "email".bold(),
+                    "\"Send Login Link\"".bold()
+                );
+            } else {
+                println!(
+                    "{}  Enter your {} and click {}",
+                    step("2"),
+                    "email".bold(),
+                    "\"Send Login Link\"".bold()
+                );
+            }
+            println!();
+            println!(
+                "{}  Check your inbox and click the {} link",
+                step("3"),
+                "activation".bold()
+            );
+            println!();
+            println!("  {}", "Waiting for confirmation…".dimmed());
+        }
+
+        open_url_silently(&login_url);
+        (session_id, device_code, poll_secs, expires_secs) = (
+            session.login_session_id,
+            session.device_code,
+            session.poll_interval_seconds,
+            session.expires_in_seconds,
+        );
+    }
 
     // Poll until approved, denied, or expired.
-    let poll_interval = Duration::from_secs(session.poll_interval_seconds.max(2));
-    let deadline = SystemTime::now() + Duration::from_secs(session.expires_in_seconds);
+    let poll_interval = Duration::from_secs(poll_secs.max(2));
+    let deadline = SystemTime::now() + Duration::from_secs(expires_secs);
 
     loop {
         std::thread::sleep(poll_interval);
@@ -892,19 +1039,15 @@ pub fn handle_login(
                 if token_input.is_empty() {
                     return Err("Login timed out. Run 'aikey login' to try again.".into());
                 }
-                let combined = format!("{}:{}", session.login_session_id, token_input);
+                let combined = format!("{}:{}", session_id, token_input);
                 return exchange_combined_token(&control_url, &combined, json_mode);
             } else {
                 return Err("Login session expired. Use --token for non-interactive login.".into());
             }
         }
 
-        let poll = PlatformClient::poll_cli_login(
-            &control_url,
-            &session.login_session_id,
-            &session.device_code,
-        )
-        .map_err(|e| format!("Poll failed: {}", e))?;
+        let poll = PlatformClient::poll_cli_login(&control_url, &session_id, &device_code)
+            .map_err(|e| format!("Poll failed: {}", e))?;
 
         match poll.status.as_str() {
             "pending" => {
@@ -2523,9 +2666,10 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
 
     let account = storage::get_platform_account().ok().flatten();
     let active_cfg = storage::get_active_key_config().ok().flatten();
-    let vault_exists = storage::get_vault_path()
-        .map(|p| p.exists())
-        .unwrap_or(false);
+    // Salt-based, not file-based: an empty vault.db (which the session backend
+    // can create before init) is NOT an initialized vault. See
+    // storage::vault_is_initialized.
+    let vault_exists = storage::vault_is_initialized();
 
     let local_seen_version = storage::get_local_seen_sync_version();
 
@@ -2628,22 +2772,514 @@ fn active_team_key_count(bindings: &[storage::ProviderBinding]) -> usize {
         .len()
 }
 
+/// Build the `candidates` array for `aikey status --json`: every credential the
+/// user could switch to, as METADATA ONLY.
+///
+/// 🔴 WHY THIS IS METADATA-ONLY, AND MUST STAY THAT WAY (2026-08-16)
+///
+/// This array exists so the desktop tray can offer "switch account" without
+/// reaching for `aikey list`. The tray runs under a machine-checked authority
+/// fence (aikey-tray/internal/boundary_test.go) admitting only CLI surfaces
+/// that (1) need no vault unlock and (2) return no key material. `aikey list`
+/// fails both — it needs the master password AND it enumerates keys — which is
+/// precisely why the tray was never allowed to call it.
+///
+/// `status` passes both tests today, and this addition must not change that:
+///
+///   - Every accessor below is a read-only metadata projection. None of them
+///     decrypts anything, so no master password is involved.
+///   - The fields emitted are an identifier, a display label, a kind, and
+///     provider codes. NOTHING that could be replayed.
+///
+/// 🚫 NEVER add here: `route_token` (a stable routing credential that
+/// `SecretMetadata` carries and `query_entries_with_metadata` does SELECT),
+/// `provider_key_ciphertext` / `provider_key_nonce`, `base_url`, or any token,
+/// secret or nonce. Adding one silently converts an admitted surface into a
+/// key-material surface and voids the tray's fence without turning it red.
+///
+/// `id` is deliberately the exact string `aikey key use <id>` accepts, and the
+/// exact string that comes back as `active_key.key_ref` afterwards — personal
+/// → alias, team → virtual_key_id, oauth → provider_account_id. That identity
+/// is what lets a caller mark the active row by comparing the two, instead of
+/// this array carrying its own `active` flag and becoming a second, drifting
+/// answer to a question `active_key` already answers.
+fn status_candidates(
+    personal_meta: &[storage::SecretMetadata],
+    team_keys: &[storage::VirtualKeyCacheEntry],
+    oauth_accounts: &[storage::ProviderAccountInfo],
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+
+    for e in personal_meta {
+        let providers: Vec<String> = e
+            .supported_providers
+            .clone()
+            .filter(|v| !v.is_empty())
+            .or_else(|| e.provider_code.clone().map(|p| vec![p]))
+            .unwrap_or_default();
+        out.push(serde_json::json!({
+            "id": e.alias,
+            "label": e.alias,
+            "kind": "personal",
+            "providers": providers,
+        }));
+    }
+
+    // 🔴 The team cache holds one row per BINDING, and a single virtual key can
+    // own several routes — the counting path a few lines below has always known
+    // this ("Count distinct bound VKs (one VK may own several routes)"). Emitting
+    // a candidate per row therefore lists the same credential several times: on
+    // the machine this was found on, 29 rows collapsed to 25 real credentials,
+    // with the ACTIVE key appearing four times. A hand-written fixture cannot
+    // show this; only real vault data did.
+    //
+    // Dedupe by virtual_key_id, unioning the providers each row contributes, so
+    // one credential is one row carrying everything it can serve.
+    let mut team_index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for k in team_keys {
+        let row_providers: Vec<String> = if !k.supported_providers.is_empty() {
+            k.supported_providers.clone()
+        } else if !k.provider_code.is_empty() {
+            vec![k.provider_code.clone()]
+        } else {
+            Vec::new()
+        };
+
+        if let Some(&pos) = team_index.get(k.virtual_key_id.as_str()) {
+            let existing = out[pos]["providers"]
+                .as_array_mut()
+                .expect("candidate providers is always an array");
+            for p in row_providers {
+                let v = serde_json::Value::String(p);
+                if !existing.contains(&v) {
+                    existing.push(v);
+                }
+            }
+            continue;
+        }
+
+        // local_alias is the user's own label and wins when set; the server
+        // alias is the fallback. Same precedence `aikey key use` resolves by.
+        let label = k.local_alias.clone().unwrap_or_else(|| k.alias.clone());
+        team_index.insert(k.virtual_key_id.as_str(), out.len());
+        out.push(serde_json::json!({
+            "id": k.virtual_key_id,
+            "label": label,
+            "kind": "team",
+            "providers": row_providers,
+        }));
+    }
+
+    for a in oauth_accounts {
+        let label = a
+            .local_alias
+            .clone()
+            .or_else(|| a.display_identity.clone())
+            .unwrap_or_else(|| a.provider_account_id.clone());
+        out.push(serde_json::json!({
+            "id": a.provider_account_id,
+            "label": label,
+            "kind": "oauth",
+            "providers": [a.provider.clone()],
+            // Status is carried because `aikey key use` REFUSES an OAuth
+            // account that is neither active nor idle. A UI that offered the
+            // row anyway would produce an error the user could not have
+            // predicted from what was on screen.
+            "status": a.status,
+        }));
+    }
+
+    // One pass at the end, not three inside the loops above: the team branch
+    // UNIONS providers across binding rows, so a per-loop projection would be
+    // computed from a partial provider list and silently drop a route the
+    // credential can in fact serve.
+    for candidate in out.iter_mut() {
+        let providers: Vec<String> = candidate["providers"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        candidate["client_routes"] = serde_json::json!(candidate_client_routes(&providers));
+    }
+
+    out
+}
+
+/// Map a credential type onto the vocabulary `candidates[].kind` uses, so one
+/// credential is never called two different things depending on which array it
+/// appears in.
+fn candidate_kind_of(t: &crate::credential_type::CredentialType) -> &'static str {
+    use crate::credential_type::CredentialType as C;
+    match t {
+        C::PersonalApiKey => "personal",
+        C::ManagedVirtualKey => "team",
+        C::PersonalOAuthAccount => "oauth",
+    }
+}
+
+/// Client-route slots each candidate can serve — the axis a UI must filter on.
+///
+/// 🔴 Why this exists (2026-08-18). `providers` is the SUPPLIER axis: raw codes
+/// like `kimi_code` and `moonshot`. `routes[].route` is the CLIENT axis: the
+/// slot a user picks in a tool, like `kimi`. Those two are not the same
+/// relation — `provider_registry.yaml` declares `family: kimi` on BOTH
+/// kimi_code and moonshot, so one route is served by two suppliers.
+///
+/// A consumer that filters candidates by comparing `providers` against a
+/// route's `provider` therefore answers a family question on the supplier axis
+/// and gets it wrong twice: it hides every moonshot credential from a kimi
+/// route bound to kimi_code, and for an UNBOUND route (where `provider` is the
+/// route name itself) it matches neither supplier and offers nothing at all.
+/// aikey-tray did exactly that; the web console did not, because it reads the
+/// registry's family. Emitting the client axis here means a consumer no longer
+/// has to own a provider table to ask the right question.
+///
+/// Derived with `status_client_route` — the SAME classifier `status_routes`
+/// uses to decide which route a binding falls into — so `candidates[].
+/// client_routes` and `routes[].route` cannot disagree about the slot a
+/// credential belongs to. A supplier with no honest client surface (Mock) maps
+/// Third-party takeover state, as ONE machine-readable projection.
+///
+/// 🔴 Why this exists (2026-08-18, user decision A). AiKey routes third-party
+/// AI tools through the local proxy, and the tray turns that on implicitly
+/// every time a credential is switched — while offering no way to SEE it or
+/// reverse it. The `.app` promise is "you never open a terminal", so the one
+/// escape hatch being a terminal command is the bug.
+///
+/// Before this, no consumer could answer "is codex taken over right now?":
+/// `status --json` had no such field, `aikey desktop status --json` covered
+/// only Claude Desktop, and `aikey env` knew but printed for humans only. A UI
+/// had to union three calls and invent the union rule itself — a second
+/// definition of takeover state living in the UI. This is the single one.
+///
+/// 🚫 It does NOT re-detect anything. Every value comes from the SAME
+/// predicates the remove paths use — `injected_provider_toml_paths()` (semantic
+/// detection, deliberately not marker-text: markers went blind when the third
+/// party re-serialized the file) and `claude_desktop::detect_state`. Display
+/// and "what an uninstall would actually strip" therefore cannot disagree.
+
+/// Client-route slots each candidate can serve — the axis a UI must filter on.
+///
+/// 🔴 Why this exists (2026-08-18). `providers` is the SUPPLIER axis: raw codes
+/// like `kimi_code` and `moonshot`. `routes[].route` is the CLIENT axis: the
+/// slot a user picks in a tool, like `kimi`. Those two are not the same
+/// relation — `provider_registry.yaml` declares `family: kimi` on BOTH
+/// kimi_code and moonshot, so one route is served by two suppliers.
+///
+/// A consumer that filters candidates by comparing `providers` against a
+/// route's `provider` therefore answers a family question on the supplier axis
+/// and gets it wrong twice: it hides every moonshot credential from a kimi
+/// route bound to kimi_code, and for an UNBOUND route (where `provider` is the
+/// route name itself) it matches neither supplier and offers nothing at all.
+/// aikey-tray did exactly that; the web console did not, because it reads the
+/// registry's family. Emitting the client axis here means a consumer no longer
+/// has to own a provider table to ask the right question.
+///
+/// Derived with `status_client_route` — the SAME classifier `status_routes`
+/// uses to decide which route a binding falls into — so `candidates[].
+/// client_routes` and `routes[].route` cannot disagree about the slot a
+/// credential belongs to. A supplier with no honest client surface (Mock) maps
+/// Third-party takeover state, as ONE machine-readable projection.
+///
+/// 🔴 Why this exists (2026-08-18, user decision A). AiKey routes third-party
+/// AI tools through the local proxy, and the tray turns that on implicitly
+/// every time a credential is switched — while offering no way to SEE it or
+/// reverse it. The `.app` promise is "you never open a terminal", so the one
+/// escape hatch being a terminal command is the bug.
+///
+/// Before this, no consumer could answer "is codex taken over right now?":
+/// `status --json` had no such field, `aikey desktop status --json` covered
+/// only Claude Desktop, and `aikey env` knew but printed for humans only. A UI
+/// had to union three calls and invent the union rule itself — a second
+/// definition of takeover state living in the UI. This is the single one.
+///
+/// 🚫 It does NOT re-detect anything. Every value comes from the SAME
+/// predicates the remove paths use — `injected_provider_toml_paths()` (semantic
+/// detection, deliberately not marker-text: markers went blind when the third
+/// party re-serialized the file) and `claude_desktop::detect_state`. Display
+/// and "what an uninstall would actually strip" therefore cannot disagree.
+/// Pure state table for the Codex desktop row — extracted so the precondition
+/// logic is testable without a real ~/.codex on the test machine.
+///
+/// (state, blocked_reason). The reason uses the SAME words the write-side
+/// guard emits, deliberately: whichever layer the user meets first says the
+/// same thing (名词字典 — one sentence, two surfaces).
+fn codex_desktop_row_state(
+    cfg_present: bool,
+    block_present: bool,
+    taken_over: bool,
+    foreign_provider: bool,
+) -> (&'static str, Option<&'static str>) {
+    if !cfg_present {
+        // Codex has never run here — there is nothing to take over, and the
+        // row must say so instead of offering a switch that can only error.
+        return ("not_installed", None);
+    }
+    if taken_over {
+        return ("taken_over", None);
+    }
+    if foreign_provider {
+        // The user (or another tool) set model_provider themselves. The write
+        // guard refuses to overwrite it — restore-fidelity: our reverse path
+        // deletes the line, so overwriting would LOSE their value. Same state
+        // Claude Desktop uses for a cc-switch-owned profile; the page renders
+        // it inert with "managed by another tool".
+        return ("foreign_active", None);
+    }
+    if !block_present {
+        // Config exists but no aikey provider block: turning this on would
+        // write `model_provider = "aikey"` pointing at nothing, and Codex
+        // fails with "Model provider aikey not found". Same precondition the
+        // write guard enforces; surfaced here so the switch is inert WITH the
+        // reason on screen rather than erroring after the click.
+        return ("not_taken_over", Some("activate an OpenAI key first"));
+    }
+    ("not_taken_over", None)
+}
+
+fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
+    // The vault gate is the same precondition the tray's login surface carries:
+    // a write path that needs an interactive master-password prompt would hang a
+    // no-TTY child forever. Reported as a REASON, not a hidden disable, so the UI
+    // can say why the control is inert.
+    let blocked = |applies: bool| -> serde_json::Value {
+        if applies && !vault_initialized {
+            serde_json::Value::String("set a master password first".to_string())
+        } else {
+            serde_json::Value::Null
+        }
+    };
+
+    // ── 1. Shell hook — the delivery vehicle for every CLI face ─────────────
+    //
+    // 🔴 This is the PARENT switch, and `depends_on` below is not decoration.
+    // handle_hook_uninstall strips the third-party configs after unwiring the
+    // rc line, and on a no-TTY child (which is what the tray spawns) it does so
+    // WITHOUT asking (mod.rs:7424). D8 additionally has it restore Claude
+    // Desktop. So turning this off turns the two below off with it — deliberately,
+    // because a hook-less machine that keeps hard-pointing configs gives new
+    // terminals `Missing environment variable: OPENAI_API_KEY` and a Desktop that
+    // fails with nothing visible in the GUI.
+    let (hook_file, hook_rc, _) = crate::commands_account::hook_status_probe();
+    let hook_on = hook_file && hook_rc;
+
+    // ── 2. Claude Desktop ───────────────────────────────────────────────────
+    let desktop_state = crate::commands_account::claude_desktop::desktop_paths()
+        .map(|paths| crate::commands_account::claude_desktop::detect_state(&paths));
+    let claude_desktop_label = match desktop_state {
+        Some(crate::commands_account::claude_desktop::DesktopState::OursActive) => "taken_over",
+        Some(crate::commands_account::claude_desktop::DesktopState::Official) => "not_taken_over",
+        Some(crate::commands_account::claude_desktop::DesktopState::NotInstalled) => {
+            "not_installed"
+        }
+        // Distinct from not_installed on purpose: an infrastructure failure
+        // (Windows package query) must never render as a confident "you do not
+        // have this app".
+        Some(crate::commands_account::claude_desktop::DesktopState::DetectionFailed) => {
+            "detection_failed"
+        }
+        // Someone else (e.g. cc-switch) owns the 3p profile. Their file is never
+        // touched, so this is NOT "not taken over" and the UI must not offer a
+        // plain switch that would silently fight the other tool.
+        Some(crate::commands_account::claude_desktop::DesktopState::ForeignActive) => {
+            "foreign_active"
+        }
+        None => "not_installed",
+    };
+
+    // ── 3. Codex desktop + IDE extension ────────────────────────────────────
+    //
+    // 🔴 ONE line is the whole lever, and that is a measured fact rather than a
+    // reading of the code: research/codex-desktop-takeover/2026-08-18-codex-
+    // desktop-split-lever.md ran A/B/C with the top-level `model_provider` as the
+    // only variable. Without it a file-only client reports `provider: openai` and
+    // sends NOTHING to aikey; with `-c model_provider=aikey` (what the CLI shim
+    // injects at launch) the same config routes normally. So the desktop/IDE face
+    // and the CLI face are separable, which the 2026-07-16 consent rule could not
+    // see because it only considered edits to the shared provider block.
+    //
+    // Reading it here rather than through codex_content_has_aikey: that predicate
+    // answers "would `unuse` strip anything", which is true for the provider block
+    // alone. This switch owns exactly one line and must report exactly that line.
+    let codex_desktop_on = crate::commands_account::codex_top_level_provider_is_ours();
+    let (codex_cfg, codex_block) = crate::commands_account::codex_desktop_preconditions();
+    let codex_foreign = crate::commands_account::codex_foreign_top_level_provider().is_some();
+    let (codex_desktop_state, codex_precondition) =
+        codex_desktop_row_state(codex_cfg, codex_block, codex_desktop_on, codex_foreign);
+
+    vec![
+        serde_json::json!({
+            "id": "shell-hook",
+            "display": "Shell hook",
+            // Windows is NOT a shell function: the CLI channel there is a shim
+            // file per tool in ~/.aikey/bin (codex.cmd, claude.cmd, kimi.cmd),
+            // which finds the real binary via `where` and injects the same
+            // runtime flag. Naming only shells would misdescribe half the
+            // installs, so the faces name the tools, not the mechanism.
+            "faces": ["claude CLI", "codex CLI", "kimi CLI"],
+            "switchable": true,
+            "taken_over": hook_on,
+            "state": if hook_on { "taken_over" } else { "not_taken_over" },
+            "depends_on": serde_json::Value::Null,
+            "blocked_reason": blocked(true),
+        }),
+        serde_json::json!({
+            "id": "claude-desktop",
+            "display": "Claude Desktop",
+            "faces": ["Claude Desktop"],
+            "switchable": true,
+            "taken_over": claude_desktop_label == "taken_over",
+            "state": claude_desktop_label,
+            "depends_on": "shell-hook",
+            "blocked_reason": blocked(true),
+        }),
+        serde_json::json!({
+            "id": "codex-desktop",
+            // 🚫 Never shorten this to "Codex desktop". The IDE extension is a
+            // file-only client too, so it rides on the same single line and
+            // cannot be left on when this is turned off. A label that hid that
+            // would let a user flip it believing the blast radius was one app.
+            "display": "Codex desktop & IDE extension",
+            "faces": ["Codex desktop", "IDE extension"],
+            "switchable": true,
+            "taken_over": codex_desktop_on,
+            "state": codex_desktop_state,
+            "depends_on": "shell-hook",
+            // Vault first: with no master password NO key can be activated, so
+            // the vault step is the actionable one; the missing-block reason
+            // only leads anywhere once a vault exists.
+            "blocked_reason": if !vault_initialized {
+                blocked(true)
+            } else {
+                codex_precondition
+                    .map(|r| serde_json::Value::String(r.to_string()))
+                    .unwrap_or(serde_json::Value::Null)
+            },
+        }),
+    ]
+}
+
+/// to no route, exactly as it does on the routes side.
+fn candidate_client_routes(providers: &[String]) -> Vec<String> {
+    let mut routes: Vec<String> = Vec::new();
+    for provider in providers {
+        if let Some(route) = status_client_route(provider, "", "") {
+            if !routes.iter().any(|r| r.eq_ignore_ascii_case(&route)) {
+                routes.push(route);
+            }
+        }
+    }
+    routes
+}
+
+/// Build the `routes` array: every client route this machine can serve, and
+/// which credential currently serves it.
+///
+/// 🔴 THE AXIS IS THE CLIENT ROUTE, NOT THE BINDING (corrected 2026-08-17).
+///
+/// The first version enumerated BINDINGS, so a route with nothing bound to it
+/// simply did not exist as far as any caller could tell. On the machine this
+/// was found on that hid `anthropic` and `openai` completely — and the desktop
+/// tray, which renders this array, could therefore only ever RE-POINT a route
+/// that was already set up. Establishing the first binding for a provider was
+/// impossible from the simple view, and the user could not even see that the
+/// route existed to be set up. A list that only shows what is already done is
+/// not a control surface.
+///
+/// So the row set comes from `routes` (the client-facing protocol routes this
+/// machine knows), and bindings are joined ON to it. An unbound route is a row
+/// with an empty `credential_id` — a real state the UI must render, not an
+/// absence it should hide.
+///
+/// `credential_id` is the same string domain as `candidates[].id` and as
+/// `aikey key use <id>`: alias for personal, virtual_key_id for team,
+/// provider_account_id for OAuth. That identity is what lets a caller pair the
+/// two arrays without a second lookup.
+fn status_routes(
+    client_routes: &std::collections::BTreeSet<String>,
+    bindings: &[storage::ProviderBinding],
+    candidates: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    client_routes
+        .iter()
+        .map(|route| {
+            // A route is served by the binding whose provider+protocol resolve
+            // back to it — the same classifier that produced the route list, so
+            // the two cannot disagree about which bucket a binding falls in.
+            let bound = bindings.iter().find(|b| {
+                status_client_route(&b.provider_code, &b.protocol_type, "").as_deref()
+                    == Some(route)
+            });
+
+            match bound {
+                Some(b) => {
+                    let label = candidates
+                        .iter()
+                        .find(|c| c["id"] == serde_json::Value::String(b.key_source_ref.clone()))
+                        .and_then(|c| c["label"].as_str())
+                        .unwrap_or(&b.key_source_ref)
+                        .to_string();
+                    serde_json::json!({
+                        "route": route,
+                        "provider": b.provider_code,
+                        "protocol": b.protocol_type,
+                        "credential_id": b.key_source_ref,
+                        "label": label,
+                        "kind": candidate_kind_of(&b.key_source_type),
+                        "bound": true,
+                    })
+                }
+                None => serde_json::json!({
+                    "route": route,
+                    "provider": route,
+                    "protocol": "",
+                    "credential_id": "",
+                    "label": "",
+                    "kind": "",
+                    "bound": false,
+                }),
+            }
+        })
+        .collect()
+}
+
 pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    handle_status_overview_with(json_mode, false)
+}
+
+pub fn handle_status_overview_with(
+    json_mode: bool,
+    include_usage: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::BTreeSet;
 
-    let vault_exists = storage::get_vault_path()
-        .map(|p| p.exists())
-        .unwrap_or(false);
+    // Salt-based: listing entries needs the salt to decrypt, so a salt-less
+    // vault file would fail the read anyway. See storage::vault_is_initialized.
+    let vault_exists = storage::vault_is_initialized();
     let account = storage::get_platform_account().ok().flatten();
 
     // Collect key counts.
-    let personal_count = if vault_exists {
-        storage::list_entries().map(|v| v.len()).unwrap_or(0)
+    //
+    // `personal_meta` is hoisted out of the providers/protocols block below so
+    // the same read feeds both that aggregation and the `candidates` array in
+    // the JSON branch. Reading the vault metadata twice for one command would
+    // be two chances to disagree with itself.
+    let personal_meta = if vault_exists {
+        storage::list_entries_with_metadata().unwrap_or_default()
     } else {
-        0
+        Vec::new()
     };
+    let personal_count = personal_meta.len();
     let team_keys = storage::list_virtual_key_cache().unwrap_or_default();
     let team_total = team_keys.len();
+    // OAuth accounts round out the third credential kind. Read-only accessor:
+    // it projects account metadata and never touches token material, which is
+    // what keeps `aikey status` free of any master-password requirement.
+    let oauth_accounts = storage::list_provider_accounts_readonly().unwrap_or_default();
     // Provider bindings are the routing SSOT. `local_state` is sync/eligibility
     // metadata and no longer flips to `active` for every selected protocol, so
     // counting it made status report zero while the proxy was actively routing
@@ -2665,26 +3301,22 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     // client route derived from exact Provider+Protocol truth.
     let mut providers = BTreeSet::new();
     let mut protocols = BTreeSet::new();
-    if vault_exists {
-        if let Ok(entries) = storage::list_entries_with_metadata() {
-            for e in &entries {
-                let base_url = e.base_url.as_deref().unwrap_or("");
-                if let Some(ref pc) = e.provider_code {
-                    if !pc.is_empty() {
-                        providers.insert(pc.clone());
-                        if let Some(route) = status_client_route(pc, "", base_url) {
-                            protocols.insert(route);
-                        }
-                    }
+    for e in &personal_meta {
+        let base_url = e.base_url.as_deref().unwrap_or("");
+        if let Some(ref pc) = e.provider_code {
+            if !pc.is_empty() {
+                providers.insert(pc.clone());
+                if let Some(route) = status_client_route(pc, "", base_url) {
+                    protocols.insert(route);
                 }
-                if let Some(ref sp) = e.supported_providers {
-                    for p in sp {
-                        if !p.is_empty() {
-                            providers.insert(p.clone());
-                            if let Some(route) = status_client_route(p, "", base_url) {
-                                protocols.insert(route);
-                            }
-                        }
+            }
+        }
+        if let Some(ref sp) = e.supported_providers {
+            for p in sp {
+                if !p.is_empty() {
+                    providers.insert(p.clone());
+                    if let Some(route) = status_client_route(p, "", base_url) {
+                        protocols.insert(route);
                     }
                 }
             }
@@ -2708,6 +3340,30 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
             }
         }
     }
+    // 🔴 OAuth accounts route too (2026-08-19, found live on Windows). The set
+    // above was fed by personal keys, team keys and bindings — and NOTHING
+    // else, so a machine whose ONLY credential is an OAuth account (fresh
+    // install + `aikey auth login`) derived an EMPTY route set. The panel's
+    // routing list is keyed on routes, so zero routes rendered zero rows and
+    // the freshly added account was invisible with no error anywhere
+    // ("主界面没有显示这个账号"). Every machine that had ever added a personal
+    // key masked this — some other credential always propped the routes up.
+    //
+    // Canonicalize first: OAuth rows store the login name ("codex", "claude"),
+    // and the classifier speaks canonical codes — the same order
+    // candidate_client_routes uses, so the account's route row and its
+    // candidate row cannot disagree.
+    for account in &oauth_accounts {
+        if account.provider.is_empty() {
+            continue;
+        }
+        let canonical = oauth_provider_to_canonical(&account.provider);
+        providers.insert(canonical.to_string());
+        if let Some(route) = status_client_route(canonical, &account.protocol_type, "") {
+            protocols.insert(route);
+        }
+    }
+
     // Bindings are the most exact local routing rows. Derive again from their
     // Provider+Protocol axes instead of trusting a legacy client_route that may
     // still contain `mock` from a pre-migration cache.
@@ -2733,11 +3389,34 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
     let licence = crate::license_identity::resolve();
 
     if json_mode {
+        let candidates = status_candidates(&personal_meta, &team_keys, &oauth_accounts);
+        let routes = status_routes(&protocols, &active_bindings, &candidates);
+
         let active_json = active_cfg.as_ref().map(|cfg| {
+            // 🔴 `providers` is derived from the BINDINGS, not from the stored
+            // active-key config (found by live E2E, 2026-08-16). The stored
+            // list over-claimed: on a machine where kimi routed to
+            // `kimi-code-8` and openai to `keep`, the active team VK still
+            // advertised "deepseek, kimi, openai, zhipu" — naming two
+            // providers it did not serve. Bindings are the routing source of
+            // truth, so "what does this key actually serve" comes from them.
+            //
+            // The stored rows are NOT touched: aikey-proxy reads
+            // `active_key_providers` from the vault config table directly and
+            // is unaffected by this projection.
+            let mut served: Vec<String> = active_bindings
+                .iter()
+                .filter(|b| b.key_source_ref == cfg.key_ref)
+                .map(|b| b.provider_code.clone())
+                .filter(|p| !p.is_empty())
+                .collect();
+            served.sort();
+            served.dedup();
+
             serde_json::json!({
                 "key_type": cfg.key_type,
                 "key_ref":  cfg.key_ref,
-                "providers": cfg.providers,
+                "providers": served,
             })
         });
         // Round 9 fix #1: was is_proxy_running (PID-only); now Layer 1.
@@ -2746,10 +3425,35 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
             "gateway": {
                 "running": proxy_running,
             },
+            // Whether a master password has ever been set (salt-based — see
+            // storage::vault_is_initialized). Added 2026-08-17 for the
+            // AiKey.app first-run flow, which has to decide whether to show a
+            // "set your master password" step.
+            //
+            // It lives HERE, on a command the tray is already allowed to run,
+            // rather than being read from the console's /api/user/vault/status:
+            // the tray's boundary fence forbids reaching into console vault
+            // endpoints, and an additive field on an existing command is a
+            // smaller change than widening that fence.
+            "vault_initialized": vault_exists,
+            // Third-party takeover, as ONE projection — see status_integrations
+            // for why it lives here rather than being unioned by each consumer
+            // from `aikey env` + `aikey desktop status --json`. Purely
+            // additive: consumers predating it ignore it.
+            "integrations": status_integrations(vault_exists),
             "login": {
                 "logged_in": account.is_some(),
                 "email": account.as_ref().map(|a| &a.email),
-                "control_url": account.as_ref().map(|a| &a.control_url),
+                // Signed out, the REMEMBERED url still travels (2026-08-19,
+                // "首次填写成功后可以记住"): a successful login persists it to
+                // config.json (persist_control_url_sidecar), and the panel's
+                // sign-in form prefills from this field — the CLI is the one
+                // memory, the view only renders it. logged_in stays the
+                // authority on state; this is prefill material, nothing more.
+                "control_url": account
+                    .as_ref()
+                    .map(|a| a.control_url.clone())
+                    .or_else(read_control_url_from_config),
             },
             "keys": {
                 "personal": personal_count,
@@ -2757,6 +3461,15 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
                 "team_active": active_team,
             },
             "active_key": active_json,
+            // Metadata-only switch targets. Purely additive: consumers that
+            // predate this field ignore it, so no version handshake is needed
+            // and none was added. See status_candidates for what may never go
+            // in here.
+            "candidates": candidates,
+            // Which credential serves each route, from the bindings. See
+            // status_routes: `active_key` alone cannot express this, because
+            // several credentials are routinely in use at once.
+            "routes": routes,
             "providers": providers.iter().collect::<Vec<_>>(),
             "protocols": protocols.iter().collect::<Vec<_>>(),
             // 🔴 The rendered `line` is included, not just the parts, so a script
@@ -2779,6 +3492,29 @@ pub fn handle_status_overview(json_mode: bool) -> Result<(), Box<dyn std::error:
                     _ => None,
                 },
                 "line": crate::license_identity::line(&licence),
+            },
+            // Behind --usage because it is the only part of this command that
+            // costs a file scan; frequent pollers must be able to skip it.
+            // Absent (not null, not zeroes) when not requested — "you did not
+            // ask" and "there is none" are different answers.
+            // 🔴 Sourced from the local CONSOLE, not the proxy's WAL
+            // (decision 2026-08-16). The console is the only place on this
+            // machine that knows prices, so it is the only source that can
+            // report money — and using it means the tray and the console can
+            // never show the user two different numbers for the same day.
+            //
+            // The cost of that choice is that usage is UNAVAILABLE when the
+            // console is stopped. `usage_console` reports that as an explicit
+            // reason rather than as zero.
+            // The tray's display language: "auto" (follow the OS) or a forced
+            // "en"/"zh". Carried on status because the tray already reads this
+            // one command — a preference the UI must honour should not cost a
+            // second CLI surface.
+            "display_language": crate::display_language::preference(),
+            "usage": if include_usage {
+                serde_json::to_value(crate::usage_console::today_hourly()).ok()
+            } else {
+                None
             },
         }));
         // 🚫 No warning line here, and the reason is this codebase's own
@@ -2954,6 +3690,538 @@ fn status_client_route(provider_code: &str, protocol_type: &str, base_url: &str)
     // custom single-route providers retain the legacy self-named fallback.
     let fallback = crate::provider_registry::client_route_for_binding(provider_code, "");
     (fallback != "mock").then(|| fallback.to_string())
+}
+
+#[cfg(test)]
+mod status_candidates_tests {
+    use super::codex_desktop_row_state;
+    use super::status_candidates;
+    use super::status_integrations;
+
+    /// A personal entry carrying every sensitive field the vault can hand back.
+    /// `route_token` is the trap this fixture exists for: it lives on
+    /// `SecretMetadata`, `query_entries_with_metadata` really does SELECT it,
+    /// and it is a stable routing credential.
+    fn loaded_personal_entry() -> crate::storage::SecretMetadata {
+        crate::storage::SecretMetadata {
+            alias: "work-anthropic".to_string(),
+            created_at: Some(1_700_000_000),
+            provider_code: Some("anthropic".to_string()),
+            base_url: Some("https://internal.example.invalid".to_string()),
+            supported_providers: Some(vec!["anthropic".to_string()]),
+            route_token: Some("aikey_personal_deadbeef".to_string()),
+            last_used_at: Some(1_700_000_100),
+            use_count: Some(7),
+            extra: None,
+        }
+    }
+
+    /// 🔴 The fence. A candidate row is metadata; anything replayable that
+    /// leaks in here silently converts `aikey status` from a surface the tray's
+    /// authority fence admits into one it must not — without turning that
+    /// fence red, because it checks WHICH command is called, not what the
+    /// command returns.
+    #[test]
+    fn candidates_never_carry_key_material() {
+        let rows = status_candidates(&[loaded_personal_entry()], &[], &[]);
+        assert_eq!(rows.len(), 1);
+        let serialized = serde_json::to_string(&rows[0]).expect("serialize candidate");
+
+        for forbidden in [
+            "route_token",
+            "aikey_personal_deadbeef",
+            "provider_key_ciphertext",
+            "provider_key_nonce",
+            "base_url",
+            "internal.example.invalid",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "candidate row leaked {forbidden:?}: {serialized}"
+            );
+        }
+    }
+
+    /// The emitted key set is pinned. A new field must be a deliberate edit
+    /// here, which is the moment to re-run the "is this replayable?" question.
+    #[test]
+    fn candidate_shape_is_exactly_the_agreed_metadata() {
+        let rows = status_candidates(&[loaded_personal_entry()], &[], &[]);
+        let obj = rows[0].as_object().expect("candidate is an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["client_routes", "id", "kind", "label", "providers"]
+        );
+    }
+
+    /// 🔴 The kimi family fence (2026-08-18). `provider_registry.yaml` declares
+    /// `family: kimi` on BOTH kimi_code and moonshot, so ONE route slot is
+    /// served by TWO suppliers. A consumer filtering credentials by comparing
+    /// `providers` against a route's `provider` therefore asks a family
+    /// question on the supplier axis; aikey-tray did exactly that and hid every
+    /// moonshot account from the kimi route. `client_routes` is the axis that
+    /// makes the right question askable without the consumer owning a provider
+    /// table.
+    ///
+    /// Asserted against the REAL registry, not a fixture: the whole point is
+    /// that this value tracks provider_registry.yaml. A fixture would keep
+    /// passing after someone split or merged the family there.
+    #[test]
+    fn moonshot_and_kimi_code_report_the_same_client_route() {
+        for provider in ["kimi_code", "moonshot"] {
+            let mut entry = loaded_personal_entry();
+            entry.alias = format!("k-{provider}");
+            entry.provider_code = Some(provider.to_string());
+            entry.supported_providers = Some(vec![provider.to_string()]);
+
+            let rows = status_candidates(&[entry], &[], &[]);
+            let routes = rows[0]["client_routes"]
+                .as_array()
+                .expect("client_routes is an array");
+            assert!(
+                routes.iter().any(|r| r == "kimi"),
+                "{provider} must serve the kimi route slot, got {routes:?}"
+            );
+        }
+    }
+
+    /// 🔴 The hierarchy fence (2026-08-18). Turning the shell hook off turns the
+    /// two desktop takeovers off with it, and that is not incidental:
+    /// handle_hook_uninstall strips the third-party configs after unwiring the rc
+    /// line, WITHOUT asking on a no-TTY child — which is exactly what the tray
+    /// spawns — and D8 has it restore Claude Desktop too. A UI that drew three
+    /// peers would let a user turn one off and watch two others follow with no
+    /// explanation, so the dependency has to travel with the data.
+    #[test]
+    fn desktop_rows_declare_the_shell_hook_as_their_parent() {
+        let rows = status_integrations(true);
+        let parent = rows
+            .iter()
+            .find(|r| r["id"] == "shell-hook")
+            .expect("shell-hook row");
+        assert!(
+            parent["depends_on"].is_null(),
+            "the parent depends on nothing"
+        );
+
+        for id in ["claude-desktop", "codex-desktop"] {
+            let row = rows.iter().find(|r| r["id"] == id).unwrap_or_else(|| {
+                panic!("{id} row is always present");
+            });
+            assert_eq!(
+                row["depends_on"], "shell-hook",
+                "{id} is torn down with the hook and must say so"
+            );
+        }
+    }
+
+    /// 🔴 The Codex desktop row governs the IDE extension too, because both are
+    /// file-only clients riding the single top-level `model_provider` line
+    /// (measured: research/codex-desktop-takeover/2026-08-18-codex-desktop-split-
+    /// lever.md). A label naming only the desktop app would let a user flip it
+    /// believing the blast radius was one application.
+    #[test]
+    fn codex_desktop_row_names_the_ide_extension_too() {
+        let rows = status_integrations(true);
+        let row = rows
+            .iter()
+            .find(|r| r["id"] == "codex-desktop")
+            .expect("codex-desktop row");
+        let display = row["display"].as_str().unwrap_or_default();
+        assert!(
+            display.contains("IDE"),
+            "display must name the IDE extension, got {display:?}"
+        );
+        let faces: Vec<&str> = row["faces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f.as_str())
+            .collect();
+        assert_eq!(faces.len(), 2, "desktop + IDE, got {faces:?}");
+    }
+
+    /// The shell hook is the CLI channel for every tool, and on Windows it is a
+    /// shim FILE per tool rather than a shell function. Naming the tools instead
+    /// of the mechanism keeps the row honest on both platforms.
+    #[test]
+    fn shell_hook_row_names_every_cli_it_carries() {
+        let rows = status_integrations(true);
+        let hook = rows
+            .iter()
+            .find(|r| r["id"] == "shell-hook")
+            .expect("shell-hook row");
+        let joined = hook["faces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for want in ["claude", "codex", "kimi"] {
+            assert!(joined.contains(want), "faces must name {want}: {joined}");
+        }
+    }
+
+    /// 🔴 The precondition fence (2026-08-18, "点击后显示 Error"). A switch the
+    /// panel offers must be operable, or inert WITH its reason on screen — a
+    /// guard that only fires after the click turns a designed refusal into a
+    /// surprise error. Pins the whole state table, including that the reason
+    /// uses the write-guard's own words (one sentence, two surfaces).
+    #[test]
+    fn codex_desktop_row_surfaces_its_preconditions() {
+        assert_eq!(
+            codex_desktop_row_state(false, false, false, false),
+            ("not_installed", None)
+        );
+        let (state, reason) = codex_desktop_row_state(true, false, false, false);
+        assert_eq!(state, "not_taken_over");
+        assert!(
+            reason.unwrap_or_default().contains("OpenAI key"),
+            "the reason must tell the user the actionable next step"
+        );
+        assert_eq!(
+            codex_desktop_row_state(true, true, false, false),
+            ("not_taken_over", None)
+        );
+        // Reversing needs no precondition — it only removes.
+        assert_eq!(
+            codex_desktop_row_state(true, true, true, false),
+            ("taken_over", None)
+        );
+        // 🔴 A user-set model_provider (ollama…) renders as foreign_active —
+        // the switch must be inert BEFORE the click, because turning it on
+        // would overwrite a value the reverse path cannot bring back.
+        assert_eq!(
+            codex_desktop_row_state(true, true, false, true),
+            ("foreign_active", None)
+        );
+    }
+
+    /// The Codex desktop row governs desktop + IDE off one config line, so it
+    /// must state both faces. Requirement 2026-07-16 rule 2 forbids a per-face
+    /// switch; a row naming only one face would let a user flip it believing
+    /// the blast radius was one tool.
+    #[test]
+    fn codex_row_names_every_face_it_governs() {
+        let rows = status_integrations(true);
+        let codex = rows
+            .iter()
+            .find(|r| r["id"] == "codex-desktop")
+            .expect("codex-desktop row");
+        let faces = codex["faces"].as_array().expect("faces is an array");
+        let joined = faces
+            .iter()
+            .filter_map(|f| f.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("IDE"),
+            "faces must name the IDE extension: {joined}"
+        );
+    }
+
+    /// An unset master password blocks the WRITE paths (a no-TTY child would
+    /// hang on the prompt), and the reason must travel with the state so the
+    /// UI can say why a control is inert instead of silently greying it.
+    #[test]
+    fn no_vault_blocks_the_switchable_rows_with_a_reason() {
+        let blocked = status_integrations(false);
+        for id in ["shell-hook", "claude-desktop", "codex-desktop"] {
+            let row = blocked.iter().find(|r| r["id"] == id).unwrap();
+            assert!(
+                row["blocked_reason"].is_string(),
+                "{id} must carry a reason when the vault is absent"
+            );
+        }
+        // With a vault present, the VAULT reason must be gone. Deliberately
+        // NOT "blocked_reason is null": this function probes the real
+        // machine (~/.codex, Claude Desktop paths), and legitimate
+        // machine-dependent preconditions ("activate an OpenAI key first")
+        // may be present on any given dev box — asserting null made this
+        // test flake the moment a funnel run stripped the local codex block
+        // (exactly what happened 2026-08-19). Pin the axis under test, not
+        // the whole world.
+        for row in status_integrations(true) {
+            let reason = row["blocked_reason"].as_str().unwrap_or("");
+            assert!(
+                !reason.contains("master password"),
+                "{} still carries the vault reason after the vault exists: {reason}",
+                row["id"]
+            );
+        }
+    }
+
+    /// The emitted key set is pinned, for the same reason candidate rows are: a
+    /// new field is a deliberate edit here, which is the moment to ask whether
+    /// the value can honestly be produced. `installed` was proposed and dropped
+    /// at exactly this gate — whether the codex BINARY exists is not knowable
+    /// from this process (the shell hook installs a shell FUNCTION named codex,
+    /// and a child's PATH is not the user's interactive PATH).
+    #[test]
+    fn integration_shape_is_exactly_the_agreed_metadata() {
+        for row in status_integrations(true) {
+            let obj = row.as_object().expect("integration row is an object");
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "blocked_reason",
+                    "depends_on",
+                    "display",
+                    "faces",
+                    "id",
+                    "state",
+                    "switchable",
+                    "taken_over"
+                ],
+                "unexpected shape for {}",
+                row["id"]
+            );
+        }
+    }
+
+    /// The two arrays must stay on their own axes. If `client_routes` ever
+    /// echoed the supplier code, a consumer filtering on it would be back to
+    /// exact-provider matching without anything turning red.
+    #[test]
+    fn client_routes_is_the_route_axis_not_a_copy_of_providers() {
+        let mut entry = loaded_personal_entry();
+        entry.provider_code = Some("moonshot".to_string());
+        entry.supported_providers = Some(vec!["moonshot".to_string()]);
+
+        let rows = status_candidates(&[entry], &[], &[]);
+        assert_eq!(rows[0]["providers"], serde_json::json!(["moonshot"]));
+        assert_eq!(rows[0]["client_routes"], serde_json::json!(["kimi"]));
+    }
+
+    /// `id` must be the string `aikey key use <id>` accepts AND the string that
+    /// comes back as `active_key.key_ref`. If these ever diverge, the UI can no
+    /// longer tell which row is active by comparing them, and would need a
+    /// second source of truth — exactly what this contract avoids.
+    #[test]
+    fn personal_candidate_id_is_the_alias_key_use_resolves() {
+        let rows = status_candidates(&[loaded_personal_entry()], &[], &[]);
+        assert_eq!(rows[0]["id"], "work-anthropic");
+        assert_eq!(rows[0]["kind"], "personal");
+    }
+
+    /// A team cache row. The cache stores one row per BINDING, so several rows
+    /// can share a `virtual_key_id` — the shape that produced the duplicate
+    /// listing this fixture exists to prevent.
+    fn team_row(
+        vk_id: &str,
+        alias: &str,
+        providers: &[&str],
+    ) -> crate::storage::VirtualKeyCacheEntry {
+        crate::storage::VirtualKeyCacheEntry {
+            binding_id: format!("b-{vk_id}-{}", providers.join("-")),
+            virtual_key_id: vk_id.to_string(),
+            org_id: "org".into(),
+            seat_id: "seat".into(),
+            alias: alias.to_string(),
+            provider_code: providers.first().copied().unwrap_or("").to_string(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: "cred".into(),
+            credential_revision: "1".into(),
+            virtual_key_revision: "1".into(),
+            key_status: "active".into(),
+            share_status: "delivered".into(),
+            local_state: "ready".into(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: None,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: providers.iter().map(|s| s.to_string()).collect(),
+            provider_base_urls: Default::default(),
+            priority: 0,
+            fallback_role: String::new(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
+            owner_account_id: None,
+            owner_email: None,
+            extra: None,
+            oauth_group_id: None,
+            group_accounts: None,
+            routing_config: None,
+            group_alias: None,
+            group_runtime: None,
+        }
+    }
+
+    /// 🔴 REGRESSION (found by live E2E, 2026-08-16). `list_virtual_key_cache`
+    /// returns one row per binding and a single virtual key can own several
+    /// routes, so emitting a candidate per row listed the same credential
+    /// repeatedly — on the machine this was found on, the ACTIVE key appeared
+    /// FOUR times and 29 rows represented 25 real credentials.
+    ///
+    /// Every hand-written fixture had one row per key, so no unit test could
+    /// have seen it; the counting path in the same function had known about
+    /// multi-route VKs all along.
+    #[test]
+    fn team_rows_sharing_a_virtual_key_collapse_to_one_candidate() {
+        let rows = status_candidates(
+            &[],
+            &[
+                team_row("vk-1", "team-claude", &["anthropic"]),
+                team_row("vk-1", "team-claude", &["zhipu"]),
+                team_row("vk-1", "team-claude", &["anthropic", "openai"]),
+                team_row("vk-2", "team-other", &["kimi"]),
+            ],
+            &[],
+        );
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "two distinct virtual keys, not four bindings"
+        );
+        assert_eq!(rows[0]["id"], "vk-1");
+        assert_eq!(rows[1]["id"], "vk-2");
+
+        // Providers are unioned, not overwritten: a credential's row must show
+        // everything it can serve, and must not repeat a provider.
+        let mut provs: Vec<String> = rows[0]["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        provs.sort();
+        assert_eq!(provs, vec!["anthropic", "openai", "zhipu"]);
+    }
+
+    /// An entry that predates `supported_providers` still has to report the
+    /// provider it does know, or the row renders as "no providers" for keys
+    /// that route perfectly well.
+    #[test]
+    fn legacy_entry_falls_back_to_the_single_provider_code() {
+        let mut legacy = loaded_personal_entry();
+        legacy.supported_providers = None;
+        let rows = status_candidates(&[legacy], &[], &[]);
+        assert_eq!(rows[0]["providers"], serde_json::json!(["anthropic"]));
+    }
+}
+
+#[cfg(test)]
+mod status_routes_tests {
+    use super::{status_candidates, status_routes};
+    use crate::credential_type::CredentialType;
+
+    /// The client-route set these bindings resolve to — the axis the array is
+    /// keyed on. Derived rather than hand-listed so a test cannot assert a
+    /// route the classifier would never produce.
+    fn routes_of(
+        bindings: &[crate::storage::ProviderBinding],
+    ) -> std::collections::BTreeSet<String> {
+        bindings
+            .iter()
+            .filter_map(|b| super::status_client_route(&b.provider_code, &b.protocol_type, ""))
+            .collect()
+    }
+
+    fn binding(
+        route: &str,
+        provider: &str,
+        t: CredentialType,
+        refr: &str,
+    ) -> crate::storage::ProviderBinding {
+        crate::storage::ProviderBinding {
+            profile_id: "default".into(),
+            client_route: route.into(),
+            provider_code: provider.into(),
+            protocol_type: "openai_compatible".into(),
+            key_source_type: t,
+            key_source_ref: refr.into(),
+            updated_at: None,
+        }
+    }
+
+    /// 🔴 THE FINDING (live E2E, 2026-08-16). Routing is per provider, and
+    /// several credentials are routinely in use at once. `active_key` names
+    /// exactly one, so a UI built on it alone shows credentials that are
+    /// carrying live traffic as inactive. This array is what makes the real
+    /// picture expressible.
+    #[test]
+    fn routes_report_every_credential_actually_in_use() {
+        let bindings = [
+            binding(
+                "deepseek",
+                "deepseek",
+                CredentialType::ManagedVirtualKey,
+                "vk-1",
+            ),
+            binding(
+                "kimi",
+                "kimi_code",
+                CredentialType::PersonalApiKey,
+                "kimi-code-8",
+            ),
+            binding("zhipu", "zhipu", CredentialType::ManagedVirtualKey, "vk-1"),
+        ];
+        let routes = status_routes(&routes_of(&bindings), &bindings, &[]);
+
+        assert_eq!(routes.len(), 3);
+        let distinct: std::collections::BTreeSet<&str> = routes
+            .iter()
+            .map(|r| r["credential_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            2,
+            "two credentials serve three routes — the shape `active_key` cannot express"
+        );
+    }
+
+    /// The label must match the one the credential carries in `candidates`, or
+    /// the same key reads as two different things on one screen.
+    #[test]
+    fn routes_reuse_the_candidate_label() {
+        let candidates = status_candidates(
+            &[crate::storage::SecretMetadata {
+                alias: "kimi-code-8".into(),
+                created_at: None,
+                provider_code: Some("kimi_code".into()),
+                base_url: None,
+                supported_providers: None,
+                route_token: None,
+                last_used_at: None,
+                use_count: None,
+                extra: None,
+            }],
+            &[],
+            &[],
+        );
+        let bindings = [binding(
+            "kimi",
+            "kimi_code",
+            CredentialType::PersonalApiKey,
+            "kimi-code-8",
+        )];
+        let routes = status_routes(&routes_of(&bindings), &bindings, &candidates);
+        assert_eq!(routes[0]["label"], "kimi-code-8");
+        assert_eq!(routes[0]["kind"], "personal");
+    }
+
+    /// An unknown ref still renders something TRUE (the ref itself) rather than
+    /// a placeholder that hides which credential is bound.
+    #[test]
+    fn an_unmatched_binding_falls_back_to_the_raw_reference() {
+        let bindings = [binding(
+            "openai",
+            "openai",
+            CredentialType::PersonalOAuthAccount,
+            "acct-77",
+        )];
+        let routes = status_routes(&routes_of(&bindings), &bindings, &[]);
+        assert_eq!(routes[0]["label"], "acct-77");
+        assert_eq!(routes[0]["kind"], "oauth");
+    }
 }
 
 #[cfg(test)]
@@ -5122,7 +6390,28 @@ pub(crate) fn providers_for_client_selector(
     key_ref: &str,
     selector: &str,
 ) -> Result<Vec<String>, String> {
-    let selector = oauth_provider_to_canonical(selector).to_lowercase();
+    // 🔴 TWO axes collide on one string, and the order here is the fix for a
+    // live failure (2026-08-18). The registry gives "kimi" two meanings:
+    //
+    //   oauth alias axis:  kimi → kimi_code   (oauth_aliases, for `auth login
+    //                                          kimi` and legacy vault rows)
+    //   client-route axis: kimi = the family slot BOTH kimi_code and moonshot
+    //                                          serve (family:)
+    //
+    // The old code canonicalized the selector FIRST, so "kimi" became
+    // "kimi_code" before the route match ever ran — and a moonshot key then
+    // failed with "does not support client route 'kimi_code'", an error naming
+    // a string the caller never typed. The alias table was shadowing the
+    // family table.
+    //
+    // So: the DIRECT provider-code comparison keeps canonicalization (that is
+    // the documented alias behaviour, and it is what keeps `--provider kimi`
+    // resolving on a kimi_code key), while the client-route fallback below
+    // matches the RAW selector (that is what lets the same word reach the
+    // family slot on a moonshot key). Direct runs first, so on a key that
+    // somehow served both platforms the alias meaning wins deterministically.
+    let raw_selector = selector.to_lowercase();
+    let selector = oauth_provider_to_canonical(&raw_selector).to_lowercase();
 
     // Compatibility: an exact upstream provider selection still works.
     let mut direct = providers
@@ -5144,14 +6433,14 @@ pub(crate) fn providers_for_client_selector(
         }
     }
 
-    let matched = providers_matching_client_route(&provider_routes, &selector);
+    let matched = providers_matching_client_route(&provider_routes, &raw_selector);
     if matched.len() == 1 {
         return Ok(matched);
     }
     if matched.len() > 1 {
         return Err(format!(
             "Client route '{}' matches multiple providers ({}); select an exact provider code.",
-            selector,
+            raw_selector,
             matched.join(", ")
         ));
     }
@@ -5163,8 +6452,11 @@ pub(crate) fn providers_for_client_selector(
     supported_routes.sort();
     supported_routes.dedup();
     Err(format!(
+        // raw_selector, deliberately: the old message echoed the CANONICALIZED
+        // word, so a user who typed `--provider kimi` was told about
+        // 'kimi_code' — an error naming a string they never wrote.
         "does not support client route '{}'. Supported routes: {}; providers: {}",
-        selector,
+        raw_selector,
         supported_routes.join(", "),
         providers.join(", ")
     ))
@@ -6003,7 +7295,9 @@ pub fn handle_key_use(
 
     // Bindings reread for the JSON envelope below (apply already wrote
     // active.env). Cheap; single DB read.
-    let bindings = crate::storage::list_provider_bindings_readonly("default").unwrap_or_default();
+    let bindings =
+        crate::storage::list_provider_bindings_readonly(crate::profile_activation::DEFAULT_PROFILE)
+            .unwrap_or_default();
     let promoted_routes = bindings
         .iter()
         .filter(|b| {
@@ -6488,13 +7782,23 @@ pub fn handle_key_unuse(
     let mut already_unbound: Vec<String> = Vec::new();
 
     for raw in providers {
-        let selector = oauth_provider_to_canonical(&raw.to_lowercase()).to_string();
+        // 🔴 Same axis collision as providers_for_client_selector (2026-08-18,
+        // audit site ①): "kimi" is an oauth alias of kimi_code AND the family
+        // route both platforms serve. Canonicalizing first turned `unuse kimi`
+        // into `unuse kimi_code`, which matched neither the route ("kimi") nor
+        // a moonshot binding's provider — so the command reported "already
+        // unbound" and SILENTLY did nothing. The route half of the match must
+        // see the user's raw word; the canonical form keeps serving the alias
+        // (`unuse claude` → route anthropic) and exact-provider cases.
+        let raw_word = raw.to_lowercase();
+        let selector = oauth_provider_to_canonical(&raw_word).to_string();
         let bindings = storage::list_provider_bindings(crate::profile_activation::DEFAULT_PROFILE)
             .map_err(|e| format!("list active bindings: {}", e))?;
         let mut routes = bindings
             .iter()
             .filter(|binding| {
-                binding.client_route.eq_ignore_ascii_case(&selector)
+                binding.client_route.eq_ignore_ascii_case(&raw_word)
+                    || binding.client_route.eq_ignore_ascii_case(&selector)
                     || binding.provider_code.eq_ignore_ascii_case(&selector)
             })
             .map(|binding| binding.client_route.clone())
@@ -6774,7 +8078,7 @@ mod provider_mapping_tests {
 
     use super::{
         finalize_promoted_routes, provider_env_vars, provider_extra_env_vars,
-        provider_proxy_prefix, providers_matching_client_route,
+        provider_proxy_prefix, providers_for_client_selector, providers_matching_client_route,
     };
 
     #[test]
@@ -6795,6 +8099,57 @@ mod provider_mapping_tests {
         assert_eq!(
             providers_matching_client_route(&routes, "anthropic"),
             vec!["mock-a".to_string(), "mock-b".to_string()]
+        );
+    }
+
+    /// 🔴 The axis-collision fence (2026-08-18, live failure). "kimi" is BOTH
+    /// an oauth alias of kimi_code AND the family route both platforms serve.
+    /// The resolver used to canonicalize the selector first, so "kimi" became
+    /// "kimi_code" before the route match ran — and a moonshot key failed with
+    /// an error naming a string the user never typed. The vault web page never
+    /// hit this because it sends exact provider codes; the tray panel sends the
+    /// route name, which is exactly the word this trap eats.
+    #[test]
+    fn family_selector_reaches_a_moonshot_key_despite_the_oauth_alias() {
+        let selected = providers_for_client_selector(
+            &["moonshot".to_string()],
+            "personal",
+            "no-such-ref",
+            "kimi",
+        )
+        .expect("the family name must select the moonshot key");
+        assert_eq!(selected, vec!["moonshot".to_string()]);
+    }
+
+    /// The alias behaviour the canonicalization exists FOR must keep working:
+    /// on a kimi_code key, "kimi" resolves through the alias (direct match).
+    #[test]
+    fn alias_selector_still_reaches_a_kimi_code_key() {
+        let selected = providers_for_client_selector(
+            &["kimi_code".to_string()],
+            "personal",
+            "no-such-ref",
+            "kimi",
+        )
+        .expect("the deprecated alias must keep resolving");
+        assert_eq!(selected, vec!["kimi_code".to_string()]);
+    }
+
+    /// A cross-platform mismatch stays refused — kimi_code and moonshot are
+    /// different account systems with different upstreams — and the refusal
+    /// must echo the word the caller actually used.
+    #[test]
+    fn cross_platform_selector_is_refused_and_echoes_the_users_word() {
+        let err = providers_for_client_selector(
+            &["moonshot".to_string()],
+            "personal",
+            "no-such-ref",
+            "kimi_code",
+        )
+        .expect_err("a moonshot key must not accept the kimi_code platform");
+        assert!(
+            err.contains("'kimi_code'"),
+            "refusal must name the input: {err}"
         );
     }
 
@@ -9823,5 +11178,85 @@ mod sync_prune_scope_tests {
     #[test]
     fn still_prunes_the_syncing_accounts_removed_key() {
         assert!(should_prune_cached_binding(true, false, false));
+    }
+}
+
+#[cfg(test)]
+mod sso_login_tests {
+    use super::resolve_sso_authorize;
+    use crate::platform_client::{InitSessionResponse, SsoProviderEntry};
+
+    fn feishu() -> Vec<SsoProviderEntry> {
+        vec![SsoProviderEntry {
+            code: "feishu".into(),
+            display_name: "Feishu".into(),
+        }]
+    }
+
+    // The authorize path is a two-sided contract with the server's route
+    // (`/v1/auth/cli/login/sso/{provider}/authorize`) and with the links the
+    // server-rendered login page emits. This pins the CLI's half of it.
+    #[test]
+    fn builds_the_contracted_authorize_url() {
+        let (name, url) = resolve_sso_authorize(
+            "http://c.example:3000/",
+            &feishu(),
+            "feishu",
+            "sess-1",
+            "dev-1",
+        )
+        .expect("enabled provider must resolve");
+        assert_eq!(name, "Feishu");
+        assert_eq!(
+            url, "http://c.example:3000/v1/auth/cli/login/sso/feishu/authorize?s=sess-1&d=dev-1",
+            "trailing slash must be trimmed and the path must match the server route"
+        );
+    }
+
+    #[test]
+    fn provider_code_is_case_and_whitespace_tolerant() {
+        let (_, url) =
+            resolve_sso_authorize("http://c", &feishu(), "  Feishu ", "s", "d").expect("resolves");
+        assert!(url.contains("/sso/feishu/authorize"), "url = {}", url);
+    }
+
+    // Two failure modes need two different fixes, so the sentences differ:
+    // no SSO at all → point at email login; wrong code → list what exists.
+    #[test]
+    fn unknown_code_lists_the_deployments_actual_options() {
+        let err = resolve_sso_authorize("http://c", &feishu(), "dingtalk", "s", "d").unwrap_err();
+        assert!(err.contains("Available: feishu"), "err = {}", err);
+    }
+
+    #[test]
+    fn no_providers_points_at_email_login_without_overclaiming() {
+        let err = resolve_sso_authorize("http://c", &[], "feishu", "s", "d").unwrap_err();
+        assert!(err.contains("aikey login"), "err = {}", err);
+        // An old server that HAS SSO also lands here (its /init predates the
+        // field), so the sentence must not assert "no SSO exists".
+        assert!(err.contains("older server"), "err = {}", err);
+    }
+
+    // Old servers omit sso_providers entirely; the CLI must parse that as
+    // "none here", not fail. This is the backward-compat half of D2-A.
+    #[test]
+    fn init_response_without_sso_field_parses_as_empty() {
+        let resp: InitSessionResponse = serde_json::from_str(
+            r#"{"login_session_id":"s","device_code":"d","poll_interval_seconds":3,"expires_in_seconds":600}"#,
+        )
+        .expect("old wire must keep parsing");
+        assert!(resp.sso_providers.is_empty());
+    }
+
+    #[test]
+    fn init_response_with_sso_field_parses_the_entries() {
+        let resp: InitSessionResponse = serde_json::from_str(
+            r#"{"login_session_id":"s","device_code":"d","poll_interval_seconds":3,"expires_in_seconds":600,
+                "sso_providers":[{"code":"feishu","display_name":"Feishu"}]}"#,
+        )
+        .expect("new wire parses");
+        assert_eq!(resp.sso_providers.len(), 1);
+        assert_eq!(resp.sso_providers[0].code, "feishu");
+        assert_eq!(resp.sso_providers[0].display_name, "Feishu");
     }
 }

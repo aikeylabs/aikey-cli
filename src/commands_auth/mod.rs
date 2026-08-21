@@ -1183,8 +1183,16 @@ fn handle_use(
     // Map OAuth provider to canonical code (claude→anthropic, codex→openai)
     let canonical = oauth_provider_to_canonical(&target.provider);
 
-    // Get old binding for the provider (for replacement notice)
-    let old_binding = storage::get_provider_binding("default", canonical)
+    // Get old binding for the ROUTE this provider serves (for the replacement
+    // notice). 🔴 The bindings table is keyed by CLIENT ROUTE, not provider
+    // code (storage_platform.rs: the physical provider_code column carries the
+    // route; the upstream lives in binding_provider_code). Passing the
+    // canonical provider here meant a Kimi account looked up a "kimi_code" row
+    // in a table keyed "kimi" — a guaranteed miss, so the "replacing previous
+    // binding" notice silently never fired for any family-split provider
+    // (axis audit 2026-08-18, site ③).
+    let route = crate::provider_registry::client_route_for_binding(canonical, "");
+    let old_binding = storage::get_provider_binding("default", route)
         .ok()
         .flatten();
 

@@ -368,6 +368,14 @@ pub fn set_app_filter_stages_with_conn(
             slug
         ));
     }
+    // An explicit enable supersedes any earlier explicit disable — drop the
+    // do-not-override marker so future default-activation migrations treat
+    // this vault normally again (see clear_app_filter_stages_with_conn).
+    conn.execute(
+        "DELETE FROM config WHERE key = ?1",
+        params![user_filter_disabled_marker(slug)],
+    )
+    .map_err(|e| format!("clear user filter-disabled marker: {}", e))?;
     Ok(())
 }
 
@@ -402,7 +410,42 @@ pub fn clear_app_filter_stages_with_conn(conn: &Connection, slug: &str) -> Resul
             slug
         ));
     }
+    // Record the EXPLICIT user choice (bugfix 2026-08-19): default-activation
+    // migrations (e.g. activate_compliance_wave2_once) must never force a
+    // filter back on over a deliberate disable. The marker lives in config so
+    // it survives baseline DDL replays and binary upgrades; any explicit
+    // re-enable (set_app_filter_stages) removes it.
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?1, '1')",
+        params![user_filter_disabled_marker(slug)],
+    )
+    .map_err(|e| format!("record user filter-disabled marker: {}", e))?;
     Ok(())
+}
+
+/// Whether the compliance detector binary is on this machine, at the SAME
+/// canonical path the installer writes and the proxy resolves
+/// (<home>/.aikey/apps/ai-compliance-detector/bin/ai-compliance-detector[.exe]).
+/// Lives in the lib (not bin-only commands_compliance) so the console-toggle
+/// internal handler can share the single truth (W2, bugfix 2026-08-19).
+pub fn detector_installed() -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let p = home.join(".aikey/apps/ai-compliance-detector/bin/ai-compliance-detector");
+    if cfg!(windows) {
+        p.with_extension("exe").exists()
+    } else {
+        p.exists()
+    }
+}
+
+/// Config key marking "the user explicitly disabled this app's filter".
+/// Consumed by default-activation migrations (migrations.rs) as a do-not-
+/// override guard; written by the disable half of the toggle, cleared by the
+/// enable half.
+pub fn user_filter_disabled_marker(slug: &str) -> String {
+    format!("user.filter_disabled.{}", slug)
 }
 
 /// Reads an app's filter state — the STATUS half of the compliance toggle.
