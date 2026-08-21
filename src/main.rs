@@ -8,6 +8,7 @@ mod config;
 #[allow(dead_code)]
 mod connectivity;
 #[allow(dead_code)]
+mod control_plane_error;
 mod credential_type;
 mod crypto;
 #[allow(dead_code)]
