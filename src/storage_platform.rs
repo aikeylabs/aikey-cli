@@ -2517,3 +2517,37 @@ pub fn pin_client_route_to_group_member(
         .map_err(|e| format!("pin client route to a route-group member: {}", e))?;
     Ok(changed == 1)
 }
+
+/// The seat this machine's team membership occupies, if any.
+///
+/// WHY THIS EXISTS (2026-08-21): usage for team-issued keys — including the
+/// OAuth account pool — is reported to the TEAM server, not the local
+/// collector (`collector_routes.team`, per
+/// 20260510-personal-team-数据隔离与合并显示.md constraint 1). The team
+/// server keys that usage by **seat_id**; querying it with the platform
+/// `account_id` returns an empty array, which is how the desktop panel came to
+/// show only the machine-local slice and none of the user's Claude traffic.
+///
+/// Read from the managed-VK cache rather than `platform_account`, which has no
+/// seat column. `seat_id` is a plaintext column — no master password, so the
+/// tray boundary (no key material, no password) is untouched. Any row will do:
+/// one machine's cache is one member's seat (single-tenant, see
+/// feedback_single_tenant_org_hardcoded).
+pub fn get_team_seat_id() -> Result<Option<String>, String> {
+    let db_path = get_vault_path()?;
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = open_connection()?;
+    let seat = conn
+        .query_row(
+            "SELECT seat_id FROM managed_virtual_keys_cache
+              WHERE seat_id IS NOT NULL AND seat_id <> ''
+              LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    Ok(seat)
+}
