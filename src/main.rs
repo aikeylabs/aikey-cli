@@ -4634,10 +4634,35 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         match session::try_get_unattended() {
                             Some(pw) => pw,
                             None => {
-                                return Err("unattended proxy start: no master password available. \
-                                     Set AIKEY_MASTER_PASSWORD in the service environment, or run \
-                                     `aikey proxy start` interactively once to populate the session cache."
-                                    .into());
+                                // 🔴 Carries an ERROR CODE, and speaks to two
+                                // audiences (2026-08-22).
+                                //
+                                // The desktop app reaches this state on a
+                                // perfectly ordinary path: `uninstall.sh
+                                // --keep-data` keeps the vault but drops the
+                                // keychain entry and the .session_* files, so
+                                // the next install owns credentials it cannot
+                                // open. The tray needs to tell THIS failure
+                                // apart from every other start failure to offer
+                                // the one control that fixes it, and matching on
+                                // prose would break the moment anyone reworded
+                                // it — hence the code, first thing in the line.
+                                //
+                                // The old text named only terminal remedies on
+                                // the one edition whose promise is that you
+                                // never open a terminal. The console route now
+                                // comes first; the env-var route stays for
+                                // servers and CI, where it is the right answer.
+                                return Err(format!(
+                                    "[{}] unattended proxy start: this machine has no master \
+                                     password cached (no keychain entry, no session file, no \
+                                     environment variable). Unlock once in the AiKey console and \
+                                     the proxy will start by itself from then on. For servers and \
+                                     CI, set AIKEY_MASTER_PASSWORD in the service environment \
+                                     instead.",
+                                    crate::observability::ERRCODE_VAULT_LOCKED_NO_CACHED_PASSWORD
+                                )
+                                .into());
                             }
                         }
                     } else {

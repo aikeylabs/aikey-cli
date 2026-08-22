@@ -290,6 +290,21 @@ pub const ERRCODE_KIMI_SESSION_DIR_MISSING: &str = "KIMI_SESSION_DIR_MISSING";
 pub const ERRCODE_CLAUDE_STATUSLINE_PAYLOAD_UNRECOGNIZED: &str =
     "CLAUDE_STATUSLINE_PAYLOAD_UNRECOGNIZED";
 
+/// An unattended `aikey proxy start` found no master password on this machine:
+/// no env var, no OS keychain entry, no session file.
+///
+/// Why it needs a CODE and not just a sentence (2026-08-22): the desktop app
+/// reaches this state legitimately — `uninstall.sh --keep-data` keeps the vault
+/// but drops the keychain AND the `.session_*` files, so the very next install
+/// has credentials it cannot open. The tray has to tell THIS failure apart from
+/// every other start failure in order to offer the one thing that fixes it
+/// (unlock once in the console). Matching on the message text would break the
+/// moment anyone rewords it; the code is the contract.
+///
+/// Consumer: aikey-tray `servicebridge.IsVaultLocked`, fenced against this
+/// constant so the two cannot drift.
+pub const ERRCODE_VAULT_LOCKED_NO_CACHED_PASSWORD: &str = "VAULT_LOCKED_NO_CACHED_PASSWORD";
+
 /// Convenience: log a WARN with an event name + optional error code. Used by
 /// degrade-to-default code paths that must not stay silent (logging-conventions:
 /// "解析失败、字段缺失、shape 不匹配回落默认值必须配 WARN 日志").
