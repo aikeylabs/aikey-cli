@@ -426,12 +426,7 @@ mod tests {
 
     #[test]
     fn timeout_is_recognised_on_every_platform_errno() {
-        for detail in [
-            "timed out",
-            "os error 60",
-            "os error 110",
-            "os error 10060",
-        ] {
+        for detail in ["timed out", "os error 60", "os error 110", "os error 10060"] {
             let d = classify("https://h:1", TransportKind::Io, detail)
                 .unwrap_or_else(|| panic!("not matched: {}", detail));
             assert!(d.cause.contains("timed out"), "{}", detail);
@@ -568,11 +563,7 @@ mod tests {
             .call()
             .expect_err("a closed port must refuse");
         let out = explain(&base, &err);
-        assert!(
-            out.contains("Nothing is listening"),
-            "got:\n{}",
-            out
-        );
+        assert!(out.contains("Nothing is listening"), "got:\n{}", out);
     }
 
     /// Contract test, NOT a fence. Verified by mutation on 2026-08-21: routing
@@ -593,9 +584,7 @@ mod tests {
             if let Ok((mut sock, _)) = listener.accept() {
                 let mut buf = [0u8; 1024];
                 let _ = sock.read(&mut buf);
-                let _ = sock.write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
-                );
+                let _ = sock.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
                 let _ = sock.flush();
             }
         });

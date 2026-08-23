@@ -1517,6 +1517,7 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
                     crate::commands_internal::InternalAction::App(_) => "app",
                     crate::commands_internal::InternalAction::Init(_) => "init",
                     crate::commands_internal::InternalAction::HookOp(_) => "hook-op",
+                    crate::commands_internal::InternalAction::Unlock(_) => "unlock",
                 }
             ),
             Commands::Add { .. } => "add".to_string(),

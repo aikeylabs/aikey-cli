@@ -4654,16 +4654,15 @@ fn run_command(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                                 // never open a terminal. The console route now
                                 // comes first; the env-var route stays for
                                 // servers and CI, where it is the right answer.
-                                return Err(format!(
-                                    "[{}] unattended proxy start: this machine has no master \
-                                     password cached (no keychain entry, no session file, no \
-                                     environment variable). Unlock once in the AiKey console and \
-                                     the proxy will start by itself from then on. For servers and \
-                                     CI, set AIKEY_MASTER_PASSWORD in the service environment \
-                                     instead.",
-                                    crate::observability::ERRCODE_VAULT_LOCKED_NO_CACHED_PASSWORD
-                                )
-                                .into());
+                                // ONE exit for this concept — see
+                                // session::no_cached_password_error. The sentence
+                                // used to be written out here AND in
+                                // commands_proxy.rs, and adding the error code to
+                                // this copy fixed only this path: `aikey service
+                                // restart proxy` goes through the other one, so
+                                // the desktop panel kept showing the old
+                                // terminal-flavoured text with no code in it.
+                                return Err(session::no_cached_password_error().into());
                             }
                         }
                     } else {

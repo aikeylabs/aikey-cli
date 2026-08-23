@@ -155,7 +155,7 @@ pub fn handle() {
 /// being populated"), so a keychain that declined would otherwise be reported as
 /// success — and the user would be told the proxy is set up when it will still
 /// ask for a password.
-fn cache_password(backend: &str, password: &SecretString) -> bool {
+pub(super) fn cache_password(backend: &str, password: &SecretString) -> bool {
     // Whitelist: the value crosses a process boundary from the web layer, and
     // the preference is persisted into the vault. An unknown string would be
     // written and then silently mean "no cache" to every later reader.
@@ -192,7 +192,7 @@ fn cache_password(backend: &str, password: &SecretString) -> bool {
     cached
 }
 
-fn emit(result: &ResultEnvelope) {
+pub(super) fn emit(result: &ResultEnvelope) {
     let out = serde_json::to_string(result).unwrap_or_else(|_| {
         r#"{"status":"error","error_code":"I_INTERNAL","error_message":"failed to serialize"}"#
             .to_string()

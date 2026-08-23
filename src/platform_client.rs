@@ -905,7 +905,12 @@ impl PlatformClient {
             .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
-            .map_err(|e| format!("sync-version request failed: {}", explain(&self.base_url, &e)))?;
+            .map_err(|e| {
+                format!(
+                    "sync-version request failed: {}",
+                    explain(&self.base_url, &e)
+                )
+            })?;
         resp.into_json::<SyncVersionResponse>()
             .map_err(|e| format!("failed to parse sync-version response: {}", e))
     }
@@ -923,7 +928,12 @@ impl PlatformClient {
             .get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
-            .map_err(|e| format!("managed-keys-snapshot request failed: {}", explain(&self.base_url, &e)))?;
+            .map_err(|e| {
+                format!(
+                    "managed-keys-snapshot request failed: {}",
+                    explain(&self.base_url, &e)
+                )
+            })?;
         resp.into_json::<ManagedKeysSnapshotResponse>()
             .map_err(|e| format!("failed to parse managed-keys-snapshot response: {}", e))
     }
