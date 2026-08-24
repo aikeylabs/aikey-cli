@@ -172,27 +172,29 @@ mod unlock_fences {
     use tempfile::TempDir;
 
     /// Isolates a vault so these tests never touch the developer's real one.
-    /// Same shape as init.rs's fixture — the vault path env override is the
-    /// single mechanism both use.
-    fn isolated_vault() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
-        let guard = crate::storage::TEST_VAULT_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    ///
+    /// 🔴 HOME must move too, not just the vault path (2026-08-22, learned the
+    /// hard way). session.rs resolves .session_pw / .session_key /
+    /// .session_meta from `dirs::home_dir()/.aikey` and does NOT honour
+    /// AK_VAULT_PATH — a fixture that overrode only the vault path let these
+    /// tests write the DEVELOPER'S real cached master password.
+    ///
+    /// 🔴 And moving HOME must go through `HomeVaultEnvGuard` (2026-08-23).
+    /// The first version of this fixture set HOME by hand while holding only
+    /// TEST_VAULT_LOCK. HOME is guarded by a DIFFERENT mutex
+    /// (`ENV_MUTATION_LOCK`, see src/test_env_lock.rs), so these tests ran
+    /// concurrently with `session::tests` and stomped each other's HOME —
+    /// `test_meta_round_trip` read vault_seq 0 instead of 42, and
+    /// `optional_read_uses_file_backend` failed outright because HOME pointed
+    /// at this fixture's already-dropped TempDir. It also never restored HOME
+    /// or AK_VAULT_PATH, leaking a dangling HOME into every later test in the
+    /// process. The guard takes BOTH locks in the crate's established order
+    /// and restores both variables on Drop; the whole class of bug is only
+    /// avoidable by never hand-rolling the env mutation here.
+    fn isolated_vault() -> (TempDir, crate::test_env_lock::HomeVaultEnvGuard) {
         let dir = TempDir::new().expect("tempdir");
-        unsafe {
-            std::env::set_var(
-                "AK_VAULT_PATH",
-                dir.path().join("vault.db").to_str().unwrap(),
-            );
-            // 🔴 HOME too, not just the vault path (2026-08-22, learned the hard way).
-            // session.rs resolves .session_pw / .session_key / .session_meta from
-            // `dirs::home_dir()/.aikey` and does NOT honour AK_VAULT_PATH — so a
-            // fixture that overrode only the vault path let these tests write the
-            // DEVELOPER'S real cached master password, clobbering it with a test
-            // value and breaking an unrelated test that shares the same files.
-            // Any test that touches session:: must move HOME.
-            std::env::set_var("HOME", dir.path().to_str().unwrap());
-        }
+        let vault_path = dir.path().join("vault.db");
+        let guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &vault_path);
         (dir, guard)
     }
 

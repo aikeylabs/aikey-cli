@@ -205,6 +205,18 @@ mod tests {
 
     #[test]
     fn openai_oauth_overrides_path_and_body_with_responses_shape() {
+        // 🔴 This test moves HOME (see below), and HOME is a PROCESS-global
+        // guarded by the crate-wide ENV_MUTATION_LOCK (src/test_env_lock.rs).
+        // Without this lock the test raced `session::tests`, which also moves
+        // HOME: whichever finished first restored HOME out from under the
+        // other, so `session::tests::test_meta_round_trip` read vault_seq 0
+        // instead of 42 and `optional_read_uses_file_backend` could not even
+        // write its file. Held for the whole test, not just the mutation, so
+        // the restore below is also inside the critical section.
+        // Fence: tests/env_mutation_lock_fence.rs.
+        let _env_lock = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let a = oauth_addons_for("openai").expect("openai OAuth addons must exist");
         let url = a.url("http://127.0.0.1:27200/openai", "/v1/chat/completions");
         // path_override 取代了默认
