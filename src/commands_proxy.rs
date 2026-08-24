@@ -400,12 +400,8 @@ pub fn resolve_verified_vault_password(
     // a machine restarting its own proxy at boot has nobody to re-authenticate,
     // and failing on an expired sliding window would leave it with no proxy.
     if !(io::stderr().is_terminal() || password_stdin) {
-        let cached = crate::session::try_get_unattended().ok_or_else(|| {
-            "unattended proxy start: no master password available. Set \
-             AIKEY_MASTER_PASSWORD in the service environment, or run `aikey proxy start` \
-             interactively once to populate the session cache."
-                .to_string()
-        })?;
+        let cached = crate::session::try_get_unattended()
+            .ok_or_else(crate::session::no_cached_password_error)?;
         if let Err(e) = crate::executor::list_secrets(&cached) {
             // Rule 2 — a stale cache must not be retried forever.
             crate::session::invalidate();

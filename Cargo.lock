@@ -103,6 +103,7 @@ dependencies = [
  "fs2",
  "hex",
  "hmac",
+ "iana-time-zone",
  "keyring",
  "libc",
  "md-5",

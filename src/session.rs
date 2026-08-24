@@ -336,6 +336,43 @@ pub fn try_get_without_os_prompt() -> Option<SecretString> {
 /// be expired/absent). "disabled" → None: the user explicitly opted out of
 /// caching, so unattended start is unavailable by their choice.
 /// Bug: workflow/CI/bugfix/20260611-proxy-service-no-unattended-password.md
+/// The ONE place that says "this machine has no cached master password".
+///
+/// 🔴 WHY THIS IS A FUNCTION (2026-08-22). The sentence existed twice — in
+/// `main.rs`'s ProxyAction::Start and in `commands_proxy.rs`'s unattended
+/// branch — written out by hand in both. Adding an error code to one of them
+/// fixed exactly one path: `aikey service restart proxy` goes through the OTHER,
+/// so the desktop panel still showed the old terminal-flavoured sentence with no
+/// code in it, and the "unlock in the console" recovery button could never fire.
+/// The panel was left telling a non-technical user to run a shell command.
+///
+/// A concept with no name in the code gets re-derived by hand every time it is
+/// needed, and the copies drift. This is the name.
+///
+/// The code comes FIRST in the string: consumers match on it (aikey-tray's
+/// servicebridge.IsVaultLocked), and matching on prose breaks the moment anyone
+/// rewords or translates it.
+pub fn no_cached_password_error() -> String {
+    format!(
+        // 🔴 Do NOT point at the console (2026-08-22, second correction).
+        // An earlier version of this line said "unlock once in the AiKey console
+        // and the proxy will start by itself" — that is FALSE. The console's
+        // UnlockHandler unlocks the console's OWN session and never touches the
+        // CLI session cache, so following that advice leaves the proxy exactly as
+        // dead, with nothing explaining why. A true message that names a terminal
+        // beats a false one that names a GUI.
+        //
+        // The GUI path is being built (`_internal unlock` + a panel form). When it
+        // lands, this text should name it — and only then.
+        "[{}] unattended proxy start: this machine has no master password cached \
+         (no keychain entry, no session file, no environment variable). Run \
+         `aikey proxy start` once from a terminal to supply it — the proxy starts by \
+         itself from then on. For servers and CI, set AIKEY_MASTER_PASSWORD in the \
+         service environment instead.",
+        crate::observability::ERRCODE_VAULT_LOCKED_NO_CACHED_PASSWORD
+    )
+}
+
 pub fn try_get_unattended() -> Option<SecretString> {
     let pref = crate::storage::get_session_backend_pref()?;
     match pref.as_str() {
@@ -680,5 +717,141 @@ mod tests {
                 "meta file should be removed after invalidate"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod locked_error_tests {
+    /// The "no cached master password" sentence must exist in exactly ONE place.
+    ///
+    /// 🔴 It existed in two (2026-08-22): `main.rs`'s ProxyAction::Start and
+    /// `commands_proxy.rs`'s unattended branch, each written out by hand. An
+    /// error code was added to one of them — and `aikey service restart proxy`,
+    /// which is what the desktop panel's restart button calls, goes through the
+    /// OTHER. So the panel kept rendering the old terminal-flavoured sentence,
+    /// the code never appeared in it, and the "unlock in the console" recovery
+    /// button could not fire. A non-technical user was told to run a shell
+    /// command, on the edition built so that they never have to.
+    ///
+    /// 能红: paste the sentence back into any other file.
+    #[test]
+    fn the_sentence_has_exactly_one_home() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // 🔴 BOTH wordings (2026-08-23). This keyed on the NEW phrase only, so a
+        // surviving copy of the OLD one ("no master password available") — exactly
+        // what a revert or a stale branch brings back — was invisible to it.
+        // Found during live VM acceptance, when an old-worded error surfaced and
+        // this fence had nothing to say. A fence that recognises only the FIXED
+        // shape cannot catch the regression it exists for.
+        let needles = ["no master password cached", "no master password available"];
+        let mut homes: Vec<String> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).unwrap_or_default();
+                // Only count lines that BUILD the message, not the ones that
+                // talk about it: a comment explaining the rule must not trip it.
+                let builds = body.lines().any(|l| {
+                    let t = l.trim_start();
+                    needles.iter().any(|n| l.contains(n))
+                        && !t.starts_with("//")
+                        && !t.starts_with("///")
+                        && !t.starts_with("//!")
+                });
+                if builds {
+                    homes.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                }
+            }
+        }
+        assert_eq!(
+            homes,
+            vec!["session.rs".to_string()],
+            "the locked-vault sentence must live only in session.rs::no_cached_password_error, \
+             found it in {:?}. A second copy is how one path got an error code and the other \
+             did not, leaving the desktop panel with a dead error and no way forward.",
+            homes
+        );
+    }
+
+    /// Every ERRCODE_* has at most ONE producer.
+    ///
+    /// The general rule behind the test above. An error code exists because
+    /// something OUTSIDE this binary matches on it — aikey-tray's
+    /// servicebridge.IsVaultLocked is the current consumer — and a contract with
+    /// two producers is a contract that drifts. That is exactly what happened on
+    /// 2026-08-22: two hand-written copies of one sentence, the code added to
+    /// one, and the path the desktop panel actually calls left without it.
+    ///
+    /// Codes are allowed to appear in tests and comments freely; only the
+    /// SOURCE lines that emit them are counted.
+    ///
+    /// 能红: emit any existing ERRCODE_* from a second file.
+    #[test]
+    fn every_error_code_has_at_most_one_producer() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let obs = std::fs::read_to_string(src.join("observability.rs")).expect("observability.rs");
+        let codes: Vec<String> = obs
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim_start();
+                if !l.starts_with("pub const ERRCODE_") {
+                    return None;
+                }
+                l.split_whitespace()
+                    .nth(2)
+                    .map(|n| n.trim_end_matches(':').to_string())
+            })
+            .collect();
+        assert!(
+            !codes.is_empty(),
+            "no ERRCODE_* constants found — this fence covers nothing"
+        );
+
+        let mut stack = vec![src];
+        let mut files: Vec<(String, String)> = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).expect("read dir") {
+                let path = e.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|x| x.to_str()) == Some("rs") {
+                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                    files.push((name, std::fs::read_to_string(&path).unwrap_or_default()));
+                }
+            }
+        }
+
+        for code in codes {
+            let mut producers: Vec<&str> = Vec::new();
+            for (name, body) in &files {
+                if name == "observability.rs" {
+                    continue; // the definition, not a producer
+                }
+                let emits = body.lines().any(|l| {
+                    let t = l.trim_start();
+                    l.contains(&code) && !t.starts_with("//") && !t.starts_with("///")
+                });
+                if emits {
+                    producers.push(name);
+                }
+            }
+            assert!(
+                producers.len() <= 1,
+                "{} is emitted from {:?}. An error code is a CONTRACT with something outside \
+                 this binary, and two producers drift: on 2026-08-22 one copy got the code and \
+                 the path the desktop panel actually calls did not, so its recovery button never \
+                 fired. Give the message one producer and call it from both sites.",
+                code,
+                producers
+            );
+        }
     }
 }

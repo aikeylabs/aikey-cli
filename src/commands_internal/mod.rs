@@ -28,6 +28,7 @@ pub mod protocol;
 pub mod query;
 pub mod rules;
 pub mod stdin_json;
+pub mod unlock;
 pub mod update_alias;
 pub mod vault_op;
 
@@ -67,6 +68,15 @@ pub enum InternalAction {
     /// ~/.aikey/hook.* and ~/.zshrc); uses its own envelope shape in hook_op.rs.
     HookOp(StdinOnlyArgs),
 
+    /// Re-feed credentials to an ALREADY-EXISTING vault (2026-08-22).
+    /// The panel's only way to populate the CLI session cache used to be
+    /// first-run `Init`; with a vault already present the GUI had no path at
+    /// all, so a machine whose cache was cleared (`uninstall --keep-data`,
+    /// an externally wiped keychain, a vault copied to a new machine) could
+    /// only be fixed from a terminal. Own envelope like Init: the caller holds
+    /// a password, not the vault_key this command exists to derive.
+    Unlock(StdinOnlyArgs),
+
     /// Phase 4 third-party Agent management (web "Connected Apps" UI).
     /// envelope.action ∈ {list, get, route, revoke, pause, resume, rotate}.
     /// All sub-actions wrap public `commands_app` pub fn cores; this
@@ -103,6 +113,12 @@ pub fn dispatch(action: &InternalAction) {
         init::handle();
         return;
     }
+    // Same reason as Init: own envelope (no vault_key_hex — deriving it is the
+    // point), own stdin reader inside the handler.
+    if let InternalAction::Unlock(_) = action {
+        unlock::handle();
+        return;
+    }
     // hook-op shares init's pattern: own envelope (no vault_key_hex),
     // own stdin reader inside the handler. Bypass the shared envelope
     // reader so the missing vault_key_hex doesn't trigger an error.
@@ -120,6 +136,7 @@ pub fn dispatch(action: &InternalAction) {
         InternalAction::App(_) => "app",
         InternalAction::Init(_) => unreachable!("handled above"),
         InternalAction::HookOp(_) => unreachable!("handled above"),
+        InternalAction::Unlock(_) => unreachable!("handled above"),
     };
     let env = match stdin_json::read_envelope() {
         Ok(e) => e,
@@ -147,5 +164,6 @@ pub fn dispatch(action: &InternalAction) {
         InternalAction::App(_) => app::handle(env),
         InternalAction::Init(_) => unreachable!("handled above"),
         InternalAction::HookOp(_) => unreachable!("handled above"),
+        InternalAction::Unlock(_) => unreachable!("handled above"),
     }
 }
