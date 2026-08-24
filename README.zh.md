@@ -96,7 +96,7 @@ Vault 每个 shell session 只解锁一次 — 后续的 `aikey run` 用缓存�
 | `aikey route` | vault.db(read-only) | 无 | stdout(可复制到第三方工具配置) |
 | `aikey test [<alias>]` | vault.db | 无(probe-only,带 `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
 | `aikey web [page]` | 无 | 无 | spawn 浏览器 → `aikey-local-server` |
-| `aikey doctor` | 版型 / proxy / vault / hooks / 插件(trust-local / 合规过滤)；`--last-errors` 读取 proxy 本地最近错误环形缓冲 | 交互模式自动修复：重启已停的 proxy、启动已停的 local-server 和 trust-local 守护进程、安装缺失的 shell hook（`--json` 时只读） | stdout 诊断报告（`--detail` 增加按版型区分的 ODS 面板；`--last-errors` 显示产地、途经链、trace ID 与上游 request ID） |
+| `aikey doctor` | 版型 / proxy / vault / hooks / 插件(trust-local / 合规过滤)、**授权方**（向已登录控制面取 `GET /v1/license/identity`）；`--last-errors` 读取 proxy 本地最近错误环形缓冲 | 交互模式自动修复：重启已停的 proxy、启动已停的 local-server 和 trust-local 守护进程、安装缺失的 shell hook（`--json` 时只读） | stdout 诊断报告（`--detail` 增加按版型区分的 ODS 面板；`--last-errors` 显示产地、途经链、trace ID 与上游 request ID） |
 | `aikey audit status` | collector completeness 端点（+ proxy 本地状态：用量 WAL/死信 **和**合规上报队列）| 无 | stdout per-source 投递报告 + 本地投递通道 |
 | `aikey audit reconcile` | collector 缺口 + proxy WAL | 已知丢失台账（服务端）| stdout 对账结论；补传可恢复缺口、确认丢失 |
 
@@ -255,6 +255,24 @@ Cluster 上要盯的：队列非空 = 有审计记录还**没有**送达控制�
 **没被监控**而不是空的 —— 需要升级这台机器上的 aikey。
 
 `aikey --help` 看全部子命令(按字母序排列,末尾附「Frequently used」高频命令快捷区)。
+
+### 授权方 —— 「Licensed to」那一行
+
+`aikey status` 和 `aikey doctor` 各会打印一行，说明这套部署授权给谁。同一行也出现在 Web 登录页和设置页，
+四处渲染**逐字节相同**的字符串 —— 公司名在送到屏幕的路上不会被 trim、改大小写或截断。
+
+它只会是三者之一：
+
+| 行 | 含义 | 该做什么 |
+| --- | --- | --- |
+| `Licensed to: <公司名>` | 已激活到该公司 | 无需处理 |
+| `Licensed to: Personal edition (not commercially licensed)` | 本机没有授权，也本来就不该有 | 无需处理 —— Personal 的正常状态，永远不会告警 |
+| `Licensed to: unavailable` | 这是受授权部署，但身份确立不了 | 看同时打印的 `[aikey] warning:` 行，它写明了原因和下一步 |
+
+第三行**故意**不等于第二行。「这里没有授权」和「我没查出来」对应的动作**相反**：一个挂掉的控制面、或一台
+从未激活的服务器，绝不能看起来像一台 Personal 装机。
+
+这次查询不阻塞命令，也不改变退出码。`--json` 以 `license.{state,company_name,cause,line}` 输出同样的信息。
 
 ## 10. 错误码
 

@@ -1582,6 +1582,55 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
     // build_errors drive the "cannot test" block beneath the table.
     let mut deferred_suite: Option<(Vec<TestTarget>, Vec<BuildTargetError>)> = None;
 
+    // ── Licensed identity (specs/license-identity ID-02) ────────────────────
+    //
+    // 🔴 Printed FIRST and verbatim, exactly as `aikey status` prints it and as
+    // the web sign-in and settings pages render it. ID-02 requires all four to
+    // be byte-identical, and a diagnostic is the likeliest place for that to
+    // break — diagnostics get written in a hurry, against whatever value is
+    // nearest. So this row does not go through `emit`: the check-table format
+    // would prepend an icon and a padded label to the line, and the line IS the
+    // artifact under comparison.
+    //
+    // 🚫 It is deliberately not a pass/fail check. "This install has no licence"
+    // is a resting state for Personal, and a ✗ against it would report the
+    // open-source user as broken.
+    let licence = crate::license_identity::resolve();
+    let licence_reminder = crate::license_identity::reminder();
+    if !json_mode {
+        println!("{}", crate::license_identity::line(&licence));
+        // Same line, same producer, same prohibition on composing our own text.
+        if let Some(reminder) = &licence_reminder {
+            println!("{reminder}");
+        }
+        println!();
+    } else {
+        results.push(serde_json::json!({
+            "check": "license_identity",
+            "state": match &licence {
+                crate::license_identity::State::Licensed(_) => "licensed",
+                crate::license_identity::State::Unlicensed => "unlicensed",
+                crate::license_identity::State::Error(_) => "error",
+            },
+            "cause": match &licence {
+                crate::license_identity::State::Error(cause) => Some(cause.clone()),
+                _ => None,
+            },
+            "line": crate::license_identity::line(&licence),
+            // A field to read, not a line to scrape — the same convention the
+            // error cause above follows for scripted callers.
+            "reminder": licence_reminder,
+        }));
+    }
+    // 🚫 Human mode only. json_output::print_json writes the report to STDERR
+    // (this codebase's long-standing convention), so a warning emitted in --json
+    // mode would be interleaved with the machine's own payload. The error state
+    // reaches a scripted caller as the `license_identity` check's `state` and
+    // `cause` fields instead — a field to read, not a line to scrape.
+    if !json_mode {
+        crate::license_identity::warn_if_error(&licence);
+    }
+
     // Helper: print one check row, collect for JSON.
     // label is left-padded to 18 chars; detail is the right-hand info string.
     let mut emit = |label: &str, ok: bool, detail: &str, hint: Option<&str>| {

@@ -75,6 +75,7 @@ mod display_language;
 mod events;
 #[allow(dead_code)]
 mod global_config;
+mod license_identity;
 mod local_server_diagnose;
 mod local_server_probe;
 #[allow(dead_code)]
