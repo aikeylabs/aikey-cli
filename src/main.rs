@@ -6008,10 +6008,14 @@ fn prompt_password_secure(
     let prompt_str = if json_mode { "" } else { prompt };
     let password = prompt_hidden(prompt_str).map_err(|e| {
         if e.kind() == io::ErrorKind::Other || e.raw_os_error() == Some(6) {
+            // Built by the session module so the refusal carries
+            // ERRCODE_VAULT_LOCKED_NO_CACHED_PASSWORD (GUI consumers match on
+            // the code) and so the guidance names AIKEY_MASTER_PASSWORD, not
+            // the test-only AK_TEST_PASSWORD. See session.rs,
+            // password_unavailable_error.
             io::Error::new(
                 io::ErrorKind::Other,
-                "aikey requires an interactive terminal to read the master password.\n\
-                 Tip: run from a terminal, or set AK_TEST_PASSWORD for scripted use.",
+                crate::session::password_prompt_no_tty_error(),
             )
         } else {
             e

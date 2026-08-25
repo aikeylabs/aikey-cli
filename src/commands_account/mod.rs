@@ -2814,6 +2814,19 @@ fn status_candidates(
     oauth_accounts: &[storage::ProviderAccountInfo],
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
+    // (provider, protocol, base_url) triples per candidate id, feeding the
+    // client_routes projection below. The PROTOCOL must ride along
+    // (2026-08-25, bugfix 20260825-custom-provider-key-invisible-in-tray):
+    // resolving from the bare provider code sent a CUSTOM provider
+    // ("my-llm-service", protocol openai_compatible on its binding row) down
+    // the registry-miss path with an empty protocol, landing on the
+    // self-named fallback route — a slot nothing renders, so the key synced
+    // fine and then vanished from the tray. The binding rows have carried
+    // the protocol all along; dropping it here was the whole defect. This
+    // also restores the invariant documented above status_routes:
+    // candidates[].client_routes and routes[].route agree about the slot.
+    let mut route_inputs: std::collections::HashMap<String, Vec<(String, String, String)>> =
+        std::collections::HashMap::new();
 
     for e in personal_meta {
         let providers: Vec<String> = e
@@ -2822,6 +2835,12 @@ fn status_candidates(
             .filter(|v| !v.is_empty())
             .or_else(|| e.provider_code.clone().map(|p| vec![p]))
             .unwrap_or_default();
+        route_inputs.entry(e.alias.clone()).or_default().extend(
+            providers
+                .iter()
+                .cloned()
+                .map(|p| (p, String::new(), String::new())),
+        );
         out.push(serde_json::json!({
             "id": e.alias,
             "label": e.alias,
@@ -2850,6 +2869,15 @@ fn status_candidates(
             Vec::new()
         };
 
+        route_inputs
+            .entry(k.virtual_key_id.clone())
+            .or_default()
+            .extend(
+                row_providers
+                    .iter()
+                    .cloned()
+                    .map(|p| (p, k.protocol_type.clone(), k.base_url.clone())),
+            );
         if let Some(&pos) = team_index.get(k.virtual_key_id.as_str()) {
             let existing = out[pos]["providers"]
                 .as_array_mut()
@@ -2881,6 +2909,10 @@ fn status_candidates(
             .clone()
             .or_else(|| a.display_identity.clone())
             .unwrap_or_else(|| a.provider_account_id.clone());
+        route_inputs
+            .entry(a.provider_account_id.clone())
+            .or_default()
+            .push((a.provider.clone(), String::new(), String::new()));
         out.push(serde_json::json!({
             "id": a.provider_account_id,
             "label": label,
@@ -2899,16 +2931,9 @@ fn status_candidates(
     // computed from a partial provider list and silently drop a route the
     // credential can in fact serve.
     for candidate in out.iter_mut() {
-        let providers: Vec<String> = candidate["providers"]
-            .as_array()
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        candidate["client_routes"] = serde_json::json!(candidate_client_routes(&providers));
+        let id = candidate["id"].as_str().unwrap_or_default();
+        let inputs = route_inputs.get(id).cloned().unwrap_or_default();
+        candidate["client_routes"] = serde_json::json!(candidate_client_routes(&inputs));
     }
 
     out
@@ -3169,10 +3194,10 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
 }
 
 /// to no route, exactly as it does on the routes side.
-fn candidate_client_routes(providers: &[String]) -> Vec<String> {
+fn candidate_client_routes(inputs: &[(String, String, String)]) -> Vec<String> {
     let mut routes: Vec<String> = Vec::new();
-    for provider in providers {
-        if let Some(route) = status_client_route(provider, "", "") {
+    for (provider, protocol, base_url) in inputs {
+        if let Some(route) = status_client_route(provider, protocol, base_url) {
             if !routes.iter().any(|r| r.eq_ignore_ascii_case(&route)) {
                 routes.push(route);
             }
@@ -4065,6 +4090,73 @@ mod status_candidates_tests {
             group_alias: None,
             group_runtime: None,
         }
+    }
+
+    /// Source-同源 integration: the REAL vault round trip for a CUSTOM
+    /// provider binding (2026-08-25, bugfix
+    /// 20260825-custom-provider-key-invisible-in-tray).
+    ///
+    /// A hand fixture cannot prove this chain — the bug lived across it: the
+    /// sync writer stores `(provider_code, protocol_type)` per binding row,
+    /// but the candidates emitter collected only the provider codes and
+    /// resolved routes with an EMPTY protocol, so a custom provider
+    /// ("my-llm-service", protocol openai_compatible) fell to the self-named
+    /// fallback route "my-llm-service" — a slot no consumer renders (the tray
+    /// files rows under family routes), making the key invisible in the app
+    /// while the web (which resolves via the binding protocol) showed it.
+    /// This also broke the documented invariant above status_routes:
+    /// candidates[].client_routes and routes[].route must not disagree about
+    /// a credential's slot.
+    ///
+    /// Chain under test: real migrations → real `upsert_virtual_key_cache`
+    /// (the key-sync writer) → real `list_virtual_key_cache` (the status
+    /// reader) → real `status_candidates` (the emitter).
+    #[test]
+    fn custom_provider_binding_resolves_to_family_route_through_real_vault() {
+        let tmp = std::env::temp_dir().join(format!("aikey-custom-route-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(&tmp, &tmp.join("vault.db"));
+        crate::migrations::ensure_schema_current(&tmp.join("vault.db")).expect("migrations");
+
+        // The key-sync writer, fed the exact shape the wire delivers for a
+        // custom provider: binding carries its protocol.
+        let mut custom = team_row(
+            "vk-custom",
+            "key-feishu-prod-openai-main",
+            &["my-llm-service"],
+        );
+        custom.protocol_type = "openai_compatible".into();
+        crate::storage::upsert_virtual_key_cache(&custom).expect("upsert custom");
+        let mut builtin = team_row("vk-builtin", "team-anthropic", &["anthropic"]);
+        builtin.protocol_type = "anthropic".into();
+        crate::storage::upsert_virtual_key_cache(&builtin).expect("upsert builtin");
+
+        let cached = crate::storage::list_virtual_key_cache().expect("list");
+        assert_eq!(
+            cached.len(),
+            2,
+            "both binding rows must round-trip the vault"
+        );
+
+        let rows = status_candidates(&[], &cached, &[]);
+        let by_id = |id: &str| {
+            rows.iter()
+                .find(|r| r["id"] == id)
+                .expect("candidate present")
+        };
+
+        // 🔴 The custom provider's slot is its PROTOCOL FAMILY route — the
+        // slot the tray renders and the slot routes[] uses. The self-named
+        // "my-llm-service" is not a slot; emitting it made the key invisible.
+        assert_eq!(
+            by_id("vk-custom")["client_routes"],
+            serde_json::json!(["openai"]),
+            "custom provider + openai_compatible binding must file under the openai family route"
+        );
+        assert_eq!(
+            by_id("vk-builtin")["client_routes"],
+            serde_json::json!(["anthropic"])
+        );
     }
 
     /// 🔴 REGRESSION (found by live E2E, 2026-08-16). `list_virtual_key_cache`
@@ -7028,10 +7120,15 @@ pub fn handle_key_use(
                 None => {
                     let can_prompt = !json_mode && std::io::stdin().is_terminal();
                     if !can_prompt {
-                        return Err(format!(
-                            "Key '{}' needs to be downloaded but no master password is available. \
-                             Set AK_TEST_PASSWORD or run from an interactive terminal.",
-                            entry.alias
+                        // 🔴 Built by the session module so the refusal carries
+                        // ERRCODE_VAULT_LOCKED_NO_CACHED_PASSWORD. The tray
+                        // spawns this exact invocation (no TTY) when a team-key
+                        // radio is clicked, and its unlock form triggers on the
+                        // CODE — a bare sentence here was a GUI dead end
+                        // (winpc2, 2026-08-25). Regression:
+                        // tests/e2e_key_use_vault_locked_errcode.rs
+                        return Err(crate::session::password_unavailable_for_sync_error(
+                            &entry.alias,
                         )
                         .into());
                     }

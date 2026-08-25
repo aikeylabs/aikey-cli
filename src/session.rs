@@ -385,24 +385,82 @@ pub fn try_get_without_os_prompt() -> Option<SecretString> {
 /// servicebridge.IsVaultLocked), and matching on prose breaks the moment anyone
 /// rewords or translates it.
 pub fn no_cached_password_error() -> String {
-    format!(
-        // 🔴 Do NOT point at the console (2026-08-22, second correction).
-        // An earlier version of this line said "unlock once in the AiKey console
-        // and the proxy will start by itself" — that is FALSE. The console's
-        // UnlockHandler unlocks the console's OWN session and never touches the
-        // CLI session cache, so following that advice leaves the proxy exactly as
-        // dead, with nothing explaining why. A true message that names a terminal
-        // beats a false one that names a GUI.
-        //
-        // The GUI path is being built (`_internal unlock` + a panel form). When it
-        // lands, this text should name it — and only then.
-        "[{}] unattended proxy start: this machine has no master password cached \
-         (no keychain entry, no session file, no environment variable). Run \
-         `aikey proxy start` once from a terminal to supply it — the proxy starts by \
-         itself from then on. For servers and CI, set AIKEY_MASTER_PASSWORD in the \
-         service environment instead.",
-        crate::observability::ERRCODE_VAULT_LOCKED_NO_CACHED_PASSWORD
+    // 🔴 Do NOT point at the console (2026-08-22, second correction).
+    // An earlier version of this line said "unlock once in the AiKey console
+    // and the proxy will start by itself" — that is FALSE. The console's
+    // UnlockHandler unlocks the console's OWN session and never touches the
+    // CLI session cache, so following that advice leaves the proxy exactly as
+    // dead, with nothing explaining why. A true message that names a terminal
+    // beats a false one that names a GUI.
+    //
+    // The tray panel's unlock form (`_internal unlock`) triggers on the CODE
+    // this message carries, so the GUI recovery needs no naming here.
+    password_unavailable_error(
+        "unattended proxy start",
+        "Run `aikey proxy start` once from a terminal to supply it — the proxy \
+         starts by itself from then on. For servers and CI, set \
+         AIKEY_MASTER_PASSWORD in the service environment instead.",
     )
+}
+
+/// The single builder for every "this machine cannot supply the master
+/// password right now" refusal.
+///
+/// 🔴 ALL such refusals must be built here — hand-rolled sentences are how the
+/// tray dead end happened (2026-08-25, winpc2): `aikey key use` on an
+/// undelivered team key raised a bare string ("Set AK_TEST_PASSWORD or run
+/// from an interactive terminal"), the tray panel passed it through verbatim,
+/// and its unlock form — which matches on the ERROR CODE, never on prose —
+/// stayed shut. The 2026-08-22 fix had coded only the proxy-start exit of this
+/// concept; this builder is the "all exits of the concept" correction, and the
+/// `no_password_sentences_live_in_session_rs` fence keeps new exits from
+/// bypassing it.
+/// Bugfix: workflow/CI/bugfix/2026-08-25-tray-team-key-switch-locked-vault-dead-end.md
+///
+/// The code comes FIRST in the string: consumers match on it (aikey-tray's
+/// servicebridge.IsVaultLocked and the panel's act()).
+/// `remedy` must never name AK_TEST_PASSWORD — that is a test-only variable;
+/// the product answer for unattended use is AIKEY_MASTER_PASSWORD.
+pub fn password_unavailable_error(context: &str, remedy: &str) -> String {
+    format!(
+        "[{}] {}: no master password is available on this machine \
+         (no keychain entry, no session file, no environment variable). {}",
+        crate::observability::ERRCODE_VAULT_LOCKED_NO_CACHED_PASSWORD,
+        context,
+        remedy
+    )
+}
+
+/// Refusal for a command that needed the password to download key material
+/// (`aikey key use` on an undelivered team key) but had no TTY to prompt on.
+pub fn password_unavailable_for_sync_error(alias: &str) -> String {
+    password_unavailable_error(
+        &format!("key '{}' needs its key material downloaded", alias),
+        // No GUI pointer here: where a panel exists (the tray), its unlock
+        // form opens itself on the CODE above, so the only reader who needs
+        // this sentence is a terminal or script user.
+        "Run this command once from an interactive terminal to enter it (the \
+         session is then cached). For scripts and CI, set \
+         AIKEY_MASTER_PASSWORD in the environment.",
+    )
+}
+
+/// Refusal raised when the interactive password prompt itself cannot run
+/// because stdin is not a terminal.
+pub fn password_prompt_no_tty_error() -> String {
+    password_unavailable_error(
+        "reading the master password",
+        "Run this command from an interactive terminal. For scripts and CI, \
+         set AIKEY_MASTER_PASSWORD in the environment.",
+    )
+}
+
+/// Short hint for status/diagnostic TABLE CELLS (e.g. the `aikey test`
+/// "cannot test" table) — deliberately code-free: it is display prose inside a
+/// table, not a refusal error that machines match on. Lives here so the fence
+/// keeping password-guidance wording in one file holds.
+pub fn password_required_hint() -> String {
+    "vault password needed — rerun this command in an interactive terminal".to_string()
 }
 
 pub fn try_get_unattended() -> Option<SecretString> {

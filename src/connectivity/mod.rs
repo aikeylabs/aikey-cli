@@ -417,7 +417,9 @@ impl BuildTargetError {
                 "proxy required — run `aikey proxy start`".to_string()
             }
             BuildTargetError::PasswordRequired { .. } => {
-                "vault password needed — rerun this command in an interactive terminal".to_string()
+                // Wording owned by session.rs so every password-guidance
+                // sentence has one home (see password_unavailable_error).
+                crate::session::password_required_hint()
             }
             BuildTargetError::DecryptFailed { detail, .. } => format!("decrypt failed: {}", detail),
             BuildTargetError::TeamKeyNotDelivered { virtual_key_id, .. } => format!(
