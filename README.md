@@ -9,15 +9,21 @@
 
 **FinOps & AI governance for AI provider keys.** Encrypted local vault for your Claude / Codex / Kimi / OpenAI keys + OAuth accounts. Routes every AI request through a local proxy you control — so cost, routing, and audit stay on your machine, and tools see only revocable route tokens instead of real provider keys.
 
-## Who this is for
+## ✨ Highlights
 
-| You're a... | Jump to |
-|---|---|
-| **Developer** who wants to use AI tools without pasting real keys into project files | [Quick start](#7-quick-start) → [Usage examples](#9-usage-examples) |
-| **Team / FinOps evaluator** assessing if AiKey fits your governance model | [Responsibilities](#1-responsibilities) → [Architecture](#2-architecture) → [Tech stack](#5-tech-stack--why) |
-| **Contributor** considering a PR or downstream integration | [Project structure](#11-project-structure) → [Data flow](#4-data-flow) → [Error codes](#10-error-codes) |
+- **One vault for every AI credential.** API keys *and* OAuth accounts (Claude Pro/Max, Codex/ChatGPT, Kimi) live together in one encrypted local vault. Tools only ever see revocable route tokens — rotate or swap the real key and no tool config changes.
+- **Switch provider / account mid-work, without breaking your flow.** `aikey use <alias>` flips the active credential for *every* tool at once; the shell hook makes new terminals just work; `aikey activate` scopes a switch to just the current shell. Quota exhausted on one upstream? Route groups keep the failover order — the session keeps going.
+- **One key, multiple protocols.** Aggregator gateways (OpenRouter-style relays) that speak both Anthropic and OpenAI protocols register once with `aikey add --providers anthropic,openai` — the proxy routes each request by protocol, one vault entry covers both.
+- **A cost receipt after every session.** `aikey run -- claude` prints what the session cost when it exits. `aikey watch` is a `top`-style live usage dashboard; `aikey web usage` opens the local trends console. Your FinOps data never leaves your machine.
+- **Every AI tool becomes a governed app.** `aikey app register` gives each agent (Cursor, OpenCode, custom bots) its own bearer + its own binding — pause, rotate, or revoke one tool in one command without touching the others.
+- **Import the mess you already have.** `aikey import` bulk-parses unstructured text (env files, notes, chat pastes) with a browser confirm flow. `aikey add --from-url` reads a relay's self-description — then *verifies it with a live probe* and stores only what actually answered.
+- **Self-healing diagnostics.** `aikey doctor` doesn't just report — it restarts a stopped proxy, revives the web console, reinstalls a missing shell hook. `--last-errors` explains recent failures as a caused-by tree with trace IDs.
+- **Know when you're being degraded.** `aikey trust` (via the optional degrade-detector plugin) checks whether an upstream silently substituted a weaker model behind your key.
+- **Compliance scanning, one switch.** `aikey compliance on` scans request content *before* it leaves your machine — pre-forward, inside the local proxy, no external service.
+- **Beyond the terminal.** Route Claude Desktop through the same governance (`aikey desktop install`), get per-conversation cost in your Claude Code status line (`aikey statusline install`), and watch it all from the desktop tray.
+- **Audit-grade usage completeness.** `aikey audit status` accounts for every usage record — allocated / confirmed / gaps / known-loss — and `aikey audit reconcile` actively re-delivers what's recoverable.
 
----
+One static binary. No runtime dependencies. Works offline. Apache-2.0.
 
 ## 1. Responsibilities
 
@@ -31,7 +37,7 @@
 
 **Does NOT**
 
-- Export plaintext secrets to files, env vars, or stdout (no `aikey export`, no eval-style injection).
+- Export plaintext secrets to files, env vars, or stdout (`aikey export` writes an **encrypted** `.akb` backup only — no plaintext export path, no eval-style injection).
 - Sync vault to cloud by default. The vault is **device-local**; cross-device migration is explicitly out of scope.
 - Replace your provider account. AiKey is a **runtime credential layer** — keys still belong to your providers.
 - Send telemetry from local CLI invocations. The `aikeylabs.com` install wrapper does send anonymous install events; unset `AIKEY_TELEMETRY_TOKEN` to disable.
@@ -92,7 +98,7 @@ Vault is unlocked once per shell session — subsequent `aikey run` calls reuse 
 | `aikey auth login <provider>` | OAuth callback over loopback | vault.db (provider_account row + OAuth token) | proxy on next request |
 | `aikey use <alias>` | vault.db | `~/.aikey/active.env` + provider bindings | shell hook / `aikey run` env injection |
 | `aikey run -- <cmd>` | vault.db (active binding) | child process env only | child process |
-| `aikey app authorize <slug>` | vault.db | vault.db (app_record row + scoped binding) | third-party app via `aikey_app_<64-hex>` |
+| `aikey app register --slug <slug> …` | vault.db (current `aikey use` selection, snapshotted as the app's binding) | vault.db (app_records UPSERT + app bearer + binding snapshot) | third-party agent via `aikey_app_<64-hex>` |
 | `aikey route` | vault.db (read-only) | nothing | stdout (for copying into third-party tool config) |
 | `aikey test [<alias>]` | vault.db | nothing (probe-only via `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
 | `aikey web [page]` | nothing | nothing | spawns browser → `aikey-local-server` |
@@ -150,7 +156,7 @@ Real credentials never leave `vault.db` except as the substituted upstream auth 
 
 ```bash
 # 1. Install (auto-detects OS, installs to ~/.aikey/)
-curl -fsSL https://aikeylabs.com/zh/i/of | sh
+curl -fsSL https://aikeylabs.com/i/of | bash
 
 # 2. Re-source your shell so PATH picks up the binary
 source ~/.zshrc      # or ~/.bashrc
@@ -209,25 +215,44 @@ aikey unuse anthropic                       # clear active for one provider
 aikey run -- claude                         # one-shot through proxy
 aikey run -- python eval.py                 # works with any tool reading provider env
 
-# Third-party apps (issue a scoped app bearer)
-aikey app authorize my-cursor               # → prints OPENAI_BASE_URL + app bearer
+# Third-party agents (per-app bearer + per-app binding)
+aikey app register --slug my-cursor --name "Cursor" --upstreams openai
+                                            # → prints OPENAI_BASE_URL + app bearer
+                                            #   (idempotent: re-run reuses the bearer)
+aikey app route my-cursor                   # optional: override the per-upstream binding
+aikey app reveal-token my-cursor            # re-print a misplaced bearer (vault-gated)
+aikey app rotate my-cursor                  # suspected leak: revoke + reissue atomically
 aikey app revoke my-cursor                  # immediate revocation
+
+# Claude Desktop routing
+aikey desktop status                        # detection, consent, gateway reachability
+aikey desktop install                       # route Claude Desktop through aikey
+aikey desktop uninstall                     # restore official mode (undoes only aikey's takeover)
+
+# Compliance content scanning (pre-forward stage)
+aikey compliance status                     # on / off, and who decided it
+aikey compliance on                         # scan request content before forwarding upstream
+aikey compliance off                        # refused (with explanation) when org policy mandates it
 
 # Web Vault UI
 aikey web                                   # opens local console (default page)
 aikey web usage                             # jump straight to Usage page
 aikey web vault                             # jump straight to Vault page
+aikey web --copy-url                        # copy the authed URL instead of opening a browser
 
-# Display time zone (Web and CLI presentation only)
+# Display preferences (presentation only)
 aikey config time-zone Asia/Shanghai        # Beijing / Shanghai, China Standard Time
 aikey config time-zone auto                 # follow this device's system time zone
-aikey config time-zone --json               # inspect the effective preference
+aikey config language zh                    # desktop tray language: auto / en / zh
 
 # Maintenance
 aikey doctor                                # diagnose PATH / hook / proxy / vault
 aikey doctor --last-errors                  # explain recent proxy errors as a caused-by tree (local state only)
 aikey test --all                            # connectivity test all credentials
+aikey watch                                 # top-style live dashboard of recent usage (local WAL)
 aikey proxy restart                         # restart the local proxy
+aikey export "*" backup.akb                 # encrypted backup of matching secrets (.akb)
+aikey change-password                       # rotate the vault master password
 
 # Service status (which daemons are up)
 aikey service status                        # one line each: web / proxy / trust-local
@@ -316,12 +341,15 @@ aikey-cli/
 │   ├── connectivity/             # probe pipeline (per-provider /v1/models)
 │   ├── commands_account/         # account / `use` / lifecycle pipeline
 │   ├── commands_auth/            # OAuth flows (Claude / Codex / Kimi)
-│   ├── commands_app/             # third-party app integration (`aikey app authorize`)
+│   ├── commands_app/             # third-party app integration (`aikey app register`)
 │   ├── commands_internal/        # `_internal vault-op` (IPC from local-server)
 │   ├── commands_proxy.rs         # proxy lifecycle (start / stop / restart)
 │   ├── commands_statusline.rs    # shell statusline integration
 │   ├── commands_watch.rs         # watch mode for usage events
-│   └── (more: env, import, init, project, ...)
+│   ├── commands_compliance.rs    # `aikey compliance` on/off/status toggle
+│   ├── commands_service/         # umbrella service control (web / proxy / trust-local)
+│   ├── commands_trust/           # `aikey trust` degrade-detection passthrough
+│   └── (more: agent, env, import, init, project, ...)
 ├── aikey-sdk/                    # reusable lib crate (used by other Rust callers)
 ├── docs/                         # VAULT_SPEC.md + cli-platform-contract.md
 ├── scripts/                      # one-off probes (kimi / statusline / e2e dashboards)

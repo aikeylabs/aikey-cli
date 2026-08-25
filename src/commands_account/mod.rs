@@ -1174,6 +1174,11 @@ fn finish_login(
         &refresh_token,
         token_expires_at,
         control_url,
+        // Persist the server-composed human identity (D1 wire field) so
+        // `status --json` consumers (tray) can show "李承熙 · feishu:…"
+        // instead of the synthetic sso+…@sso.local handle in `email`
+        // (2026-08-25, bugfix 20260825-tray-shows-synthetic-sso-handle).
+        account.display_identity.as_deref(),
     )?;
 
     // Why: after clear-install + login, the vault DB exists (created by session
@@ -3444,6 +3449,14 @@ pub fn handle_status_overview_with(
             "login": {
                 "logged_in": account.is_some(),
                 "email": account.as_ref().map(|a| &a.email),
+                // Human identity for display surfaces (tray popover). Additive:
+                // consumers predating it ignore it. Null when the vault has
+                // none (email logins, legacy sessions, pre-D1 servers) — the
+                // consumer must then fall back per the display_label contract:
+                // a real email may be shown, a synthetic sso+…@sso.local
+                // handle NEVER (it is a DB key, not a person; see
+                // platform_client.rs AccountInfo::display_label).
+                "display_name": account.as_ref().and_then(|a| a.display_identity.as_deref()),
                 // Signed out, the REMEMBERED url still travels (2026-08-19,
                 // "首次填写成功后可以记住"): a successful login persists it to
                 // config.json (persist_control_url_sidecar), and the panel's
@@ -10679,6 +10692,7 @@ mod probe_token_tests {
             logged_in_at: 0,
             refresh_token: refresh.map(str::to_string),
             token_expires_at: Some(i64::MAX), // never expire by clock
+            display_identity: None,
         }
     }
 

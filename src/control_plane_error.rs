@@ -7,9 +7,11 @@
 //! error chain. For a transport failure that chain is written for the person
 //! who wrote the TLS stack, not for the person running the CLI. A real report:
 //!
-//!     Error: Login failed: login init failed: https://120.24.220.105:3000/...:
-//!     Connection Failed: tls connection init failed: received corrupt message
-//!     of type InvalidContentType
+//! ```text
+//! Error: Login failed: login init failed: https://120.24.220.105:3000/...:
+//! Connection Failed: tls connection init failed: received corrupt message
+//! of type InvalidContentType
+//! ```
 //!
 //! That text names no cause the user can act on, yet the cause was simple and
 //! certain: the URL said `https://` and the server answered in plain HTTP, so

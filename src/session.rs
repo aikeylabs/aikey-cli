@@ -283,7 +283,36 @@ fn file_delete() {
 ///
 /// This does **not** refresh the TTL; call [`refresh`] after a successful
 /// use of the returned password.
+/// True when the process runs in injected-password mode (`AK_TEST_PASSWORD` /
+/// `AIKEY_MASTER_PASSWORD`): tests and scripted starts that carry the vault
+/// password in the environment.
+///
+/// 🔴 In this mode the session layer must NEVER touch the OS keychain
+/// (2026-08-25, bugfix 20260825-e2e-tests-clobber-real-keychain-entry). The
+/// keychain entry name is global per OS user — it does not follow the test's
+/// temporary HOME — so an e2e run that cached its throwaway password
+/// OVERWROTE the developer's real cached master password, and its teardown
+/// then DELETED the entry outright. The real vault's `aikey proxy start`
+/// picked up the test password and failed with "cached vault password
+/// rejected" on a perfectly healthy vault. Eight e2e harnesses (and every
+/// future one) already set AK_TEST_PASSWORD, so gating HERE — the single
+/// choke point every keychain read/write/delete flows through — isolates all
+/// of them at once, with no new environment knob.
+fn injected_password() -> Option<SecretString> {
+    for key in ["AIKEY_MASTER_PASSWORD", "AK_TEST_PASSWORD"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                return Some(SecretString::new(v));
+            }
+        }
+    }
+    None
+}
+
 pub fn try_get() -> Option<SecretString> {
+    if let Some(pw) = injected_password() {
+        return Some(pw); // injected mode: the env IS the session — see injected_password
+    }
     let meta = load_meta()?;
 
     let pw = match meta.backend.as_str() {
@@ -305,6 +334,9 @@ pub fn try_get() -> Option<SecretString> {
 /// session. Password-required operations continue to use [`try_get`] and retain
 /// the normal interactive security behavior.
 pub fn try_get_without_os_prompt() -> Option<SecretString> {
+    if let Some(pw) = injected_password() {
+        return Some(pw);
+    }
     let meta = load_meta()?;
     match meta.backend.as_str() {
         "file" => file_get(),
@@ -374,6 +406,9 @@ pub fn no_cached_password_error() -> String {
 }
 
 pub fn try_get_unattended() -> Option<SecretString> {
+    if let Some(pw) = injected_password() {
+        return Some(pw);
+    }
     let pref = crate::storage::get_session_backend_pref()?;
     match pref.as_str() {
         "keychain" => keychain_get().or_else(file_get),
@@ -464,6 +499,9 @@ pub fn maybe_configure_backend() {
 /// Respects the user's backend preference (set via `maybe_configure_backend`).
 /// Silent on failure — the caller must not depend on the cache being populated.
 pub fn store(pw: &SecretString) {
+    if injected_password().is_some() {
+        return; // injected mode never touches keychain or meta — see injected_password
+    }
     let pref = crate::storage::get_session_backend_pref();
     if pref.as_deref() == Some("disabled") {
         return;
@@ -499,6 +537,9 @@ pub fn store(pw: &SecretString) {
 /// Should be called after every successful use of a cached password.
 /// No-op if there is no active session.
 pub fn refresh() {
+    if injected_password().is_some() {
+        return;
+    }
     let path = match session_meta_path() {
         Some(p) => p,
         None => return,
@@ -524,6 +565,9 @@ pub fn refresh() {
 /// and the session metadata. Call this after a successful `change-password`
 /// operation or whenever the cached password must be discarded.
 pub fn invalidate() {
+    if injected_password().is_some() {
+        return; // injected mode owns no cached state; deleting here would nuke the REAL user's entry
+    }
     keychain_delete();
     file_delete();
     remove_meta();
@@ -853,5 +897,52 @@ mod locked_error_tests {
                 producers
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod injected_password_isolation_tests {
+    //! Fence for the injected-password keychain isolation (2026-08-25, bugfix
+    //! 20260825-e2e-tests-clobber-real-keychain-entry). The OS keychain entry
+    //! is global per OS user; a test that stores or invalidates through the
+    //! session layer clobbers the DEVELOPER'S real cached master password.
+    //! With AK_TEST_PASSWORD set, every entry point must (a) answer from the
+    //! env and (b) leave both the keychain and the session meta file alone.
+    //!
+    //! 能红: drop the injected_password() guard from store() → the meta file
+    //! appears in the temp HOME and the first assertion fails.
+    //!
+    //! Env vars are process-global, so these cases run as ONE test to avoid
+    //! parallel-test races on AK_TEST_PASSWORD.
+    use super::*;
+
+    #[test]
+    fn injected_mode_never_touches_keychain_or_meta() {
+        let tmp = std::env::temp_dir().join(format!("aikey-session-iso-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // HomeVaultEnvGuard: takes ENV_MUTATION_LOCK + restores HOME/AK_VAULT_PATH
+        // on drop — the env_mutation_lock_fence contract for any test that moves
+        // HOME (this very fence caught this test's first version).
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(&tmp, &tmp.join("vault.db"));
+        std::env::set_var("AK_TEST_PASSWORD", "throwaway-pw");
+
+        // (a) reads answer from the env — no keychain lookup, no meta needed.
+        let got = try_get().expect("injected password must be returned");
+        assert_eq!(got.expose_secret(), "throwaway-pw");
+        assert!(try_get_without_os_prompt().is_some());
+        assert!(try_get_unattended().is_some());
+
+        // (b) writes and deletes are no-ops: no session meta materialises.
+        store(&SecretString::new("throwaway-pw".into()));
+        refresh();
+        invalidate();
+        let meta = tmp.join(".aikey").join(".session_meta");
+        assert!(
+            !meta.exists(),
+            "session meta was written in injected-password mode — the paired keychain \
+             write would have clobbered the real user's global entry (the 2026-08-25 incident)"
+        );
+
+        std::env::remove_var("AK_TEST_PASSWORD");
     }
 }

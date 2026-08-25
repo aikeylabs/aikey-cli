@@ -411,7 +411,8 @@ pub mod v1_0_0_baseline {
                 control_url       TEXT NOT NULL,
                 logged_in_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 refresh_token     TEXT,
-                token_expires_at  INTEGER
+                token_expires_at  INTEGER,
+                display_identity  TEXT
             )",
             [],
         )
@@ -1084,6 +1085,19 @@ pub mod v1_0_0_baseline {
             (
                 "token_expires_at",
                 "ALTER TABLE platform_account ADD COLUMN token_expires_at INTEGER",
+            ),
+            // display_identity (2026-08-25, bugfix 20260825-tray-shows-synthetic-
+            // sso-handle): the server has composed a human identity ("李承熙 ·
+            // feishu:6ad2973d") in the login response since D1 (2026-07-21), but
+            // the CLI never persisted it — so `status --json` could only offer
+            // the account email, which for an SSO member is the DB-internal
+            // synthetic handle (sso+feishu.<hex>@sso.local), and the tray
+            // rendered exactly that. Nullable: email logins and pre-existing
+            // sessions have none; consumers must fall back WITHOUT ever showing
+            // a synthetic handle (see AccountInfo::display_label's contract).
+            (
+                "display_identity",
+                "ALTER TABLE platform_account ADD COLUMN display_identity TEXT",
             ),
         ] {
             ensure_column(conn, "platform_account", col, ddl)?;

@@ -9,15 +9,21 @@
 
 **面向开发者的 AI Key 治理与 FinOps 工作台。** 在本地加密 Vault 中保管 Claude / Codex / Kimi / OpenAI 的 API Key 和 OAuth 账号,每一次 AI 调用都通过你自己机器上的本地 Proxy — 成本、路由、审计都留在本机,工具拿到的只是可吊销的 route token,而不是真实 provider key。
 
-## 这份文档给谁看
+## ✨ 核心亮点
 
-| 你是... | 直接跳到 |
-|---|---|
-| **开发者** — 想用 AI 工具但不愿把真实 key 写进项目文件 | [快速开始](#7-快速开始) → [使用示例](#9-使用示例) |
-| **团队 / FinOps 评估者** — 在评估 AiKey 是否符合治理模型 | [职责](#1-职责) → [架构](#2-架构) → [技术栈选型](#5-技术栈选型--为什么) |
-| **贡献者 / 下游集成方** — 在考虑 PR 或基于 AiKey 做集成 | [项目结构](#11-项目结构) → [数据流](#4-数据流) → [错误码](#10-错误码) |
+- **一个 Vault 装下所有 AI 凭据。** API Key *和* OAuth 账号(Claude Pro/Max、Codex/ChatGPT、Kimi)统一放进本地加密 Vault。工具只见可吊销的 route token — 换真 key、轮换凭据,工具配置一行不用改。
+- **工作中途切换 provider / 账号,不打断当前流程。** `aikey use <alias>` 一条命令同时切换*所有*工具的活跃凭据;shell hook 让新开的终端自动生效;`aikey activate` 只切当前 shell。某个上游额度用完?路由组按 failover 顺序自动兜底 — 会话继续跑。
+- **一把 key,多种协议。** 同时支持 Anthropic 和 OpenAI 协议的聚合网关(OpenRouter 类中转站)只需注册一次:`aikey add --providers anthropic,openai` — proxy 按协议分发请求,一条 vault 记录两边都能用。
+- **每次会话结束打一张成本小票。** `aikey run -- claude` 退出时告诉你这一场花了多少钱。`aikey watch` 是 `top` 风格的实时用量面板;`aikey web usage` 打开本地趋势控制台。FinOps 数据不出你的机器。
+- **每个 AI 工具都变成受治理的 app。** `aikey app register` 给每个 Agent(Cursor、OpenCode、自研 bot)独立的 bearer + 独立的绑定 — 暂停、轮换、吊销某一个工具,一条命令,互不影响。
+- **把你手头的"一堆 key"直接导进来。** `aikey import` 批量解析非结构化文本(env 文件、笔记、聊天记录粘贴),浏览器里确认入库。`aikey add --from-url` 读中转站的自述文件 — 然后*用真实请求实测验证*,只存实际打得通的部分。
+- **会自我修复的诊断。** `aikey doctor` 不只报告问题 — 它会重启挂掉的 proxy、拉起 web 控制台、补装缺失的 shell hook。`--last-errors` 用 caused-by 树 + trace ID 解释最近的失败。
+- **上游偷偷降智,能被发现。** `aikey trust`(配合可选的 degrade-detector 插件)按 key 检测上游是否悄悄换了更弱的模型。
+- **合规检测,一个开关。** `aikey compliance on` 在请求*离开你的机器之前*扫描内容 — pre-forward 阶段,跑在本地 proxy 内,不经过外部服务。
+- **不止于终端。** Claude Desktop 也走同一套治理(`aikey desktop install`);Claude Code 状态栏实时显示本轮成本(`aikey statusline install`);桌面托盘随时看全局。
+- **审计对账级的用量完整性。** `aikey audit status` 对每条用量记录做台账 — 已分配 / 已确认 / 缺口 / 已知丢失;`aikey audit reconcile` 主动补投可恢复的缺口。
 
----
+单一静态二进制。零运行时依赖。离线可用。Apache-2.0。
 
 ## 1. 职责
 
@@ -31,7 +37,7 @@
 
 **不做什么**
 
-- 不导出明文 secrets 到文件、env var 或 stdout(没有 `aikey export`,没有 eval 风格的注入)。
+- 不导出明文 secrets 到文件、env var 或 stdout(`aikey export` 只产出 **加密** 的 `.akb` 备份 — 没有明文导出路径,没有 eval 风格的注入)。
 - 默认不同步 vault 到云。Vault 是 **设备本地** 的;跨设备迁移目前明确不在 scope 内。
 - 不替代你的 provider 账号。AiKey 是 **运行时凭据层** — key 还是属于你的 provider。
 - 本地 CLI 调用不发 telemetry。`aikeylabs.com` 安装 wrapper 会发匿名安装事件;`unset AIKEY_TELEMETRY_TOKEN` 关掉。
@@ -92,7 +98,7 @@ Vault 每个 shell session 只解锁一次 — 后续的 `aikey run` 用缓存�
 | `aikey auth login <provider>` | OAuth callback via loopback | vault.db(provider_account 行 + OAuth token) | 下次请求时 proxy |
 | `aikey use <alias>` | vault.db | `~/.aikey/active.env` + provider 绑定 | shell hook / `aikey run` env 注入 |
 | `aikey run -- <cmd>` | vault.db(active binding) | 仅子进程 env | 子进程 |
-| `aikey app authorize <slug>` | vault.db | vault.db(app_record 行 + scoped binding) | 第三方 app 通过 `aikey_app_<64-hex>` |
+| `aikey app register --slug <slug> …` | vault.db(当前 `aikey use` 选择,快照为该 app 的绑定) | vault.db(app_records UPSERT + app bearer + 绑定快照) | 第三方 Agent 通过 `aikey_app_<64-hex>` |
 | `aikey route` | vault.db(read-only) | 无 | stdout(可复制到第三方工具配置) |
 | `aikey test [<alias>]` | vault.db | 无(probe-only,带 `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
 | `aikey web [page]` | 无 | 无 | spawn 浏览器 → `aikey-local-server` |
@@ -150,7 +156,7 @@ Vault 每个 shell session 只解锁一次 — 后续的 `aikey run` 用缓存�
 
 ```bash
 # 1. 安装(自动检测 OS,装到 ~/.aikey/)
-curl -fsSL https://aikeylabs.com/zh/i/of | sh
+curl -fsSL https://aikeylabs.com/zh/i/of | bash
 
 # 2. 重新 source shell 让 PATH 生效
 source ~/.zshrc      # 或 ~/.bashrc
@@ -209,25 +215,44 @@ aikey unuse anthropic                       # 清掉某 provider 的 active
 aikey run -- claude                         # 一次性通过 proxy
 aikey run -- python eval.py                 # 任何读 provider env 的工具都行
 
-# 第三方 app(签发 scoped app bearer)
-aikey app authorize my-cursor               # → 打印 OPENAI_BASE_URL + app bearer
+# 第三方 Agent(per-app bearer + per-app 绑定)
+aikey app register --slug my-cursor --name "Cursor" --upstreams openai
+                                            # → 打印 OPENAI_BASE_URL + app bearer
+                                            #   (幂等:重跑复用同一 bearer)
+aikey app route my-cursor                   # 可选:按 upstream 覆盖该 app 的绑定
+aikey app reveal-token my-cursor            # 找回丢失的 bearer(需 vault 解锁)
+aikey app rotate my-cursor                  # 疑似泄露:原子地吊销 + 重签
 aikey app revoke my-cursor                  # 立即吊销
+
+# Claude Desktop 接管
+aikey desktop status                        # 检测 / 授权同意 / 网关可达性诊断
+aikey desktop install                       # 让 Claude Desktop 走 aikey 路由
+aikey desktop uninstall                     # 恢复官方模式(只撤销 aikey 自己的接管)
+
+# 合规内容检测(pre-forward 阶段)
+aikey compliance status                     # 开 / 关,以及是谁决定的
+aikey compliance on                         # 转发上游之前先扫描请求内容
+aikey compliance off                        # 组织策略强制开启时会拒绝(并说明原因)
 
 # Web Vault UI
 aikey web                                   # 打开本地控制台(默认页)
 aikey web usage                             # 直接跳到 Usage 页
 aikey web vault                             # 直接跳到 Vault 页
+aikey web --copy-url                        # 复制带鉴权的 URL 而不是打开浏览器
 
-# 显示时区（仅影响 Web 和 CLI 的显示）
-aikey config time-zone Asia/Shanghai        # 北京 / 上海，中国标准时间
+# 显示偏好(仅影响展示)
+aikey config time-zone Asia/Shanghai        # 北京 / 上海,中国标准时间
 aikey config time-zone auto                 # 跟随本设备系统时区
-aikey config time-zone --json               # 查看当前偏好
+aikey config language zh                    # 桌面托盘语言:auto / en / zh
 
 # 维护
 aikey doctor                                # 诊断 PATH / hook / proxy / vault
 aikey doctor --last-errors                  # 用 caused-by 树解释最近 proxy 错误（仅读本地状态）
 aikey test --all                            # 连通性测试所有凭据
+aikey watch                                 # top 风格实时用量面板(读本地 WAL)
 aikey proxy restart                         # 重启 local proxy
+aikey export "*" backup.akb                 # 加密备份匹配的 secrets(.akb 格式)
+aikey change-password                       # 更换 vault master 密码
 
 # 服务状态(哪些后台进程在运行)
 aikey service status                        # 一行一个: web / proxy / trust-local
@@ -311,12 +336,15 @@ aikey-cli/
 │   ├── connectivity/             # probe pipeline(per-provider /v1/models)
 │   ├── commands_account/         # account / `use` / lifecycle pipeline
 │   ├── commands_auth/            # OAuth flows(Claude / Codex / Kimi)
-│   ├── commands_app/             # 第三方 app 集成(`aikey app authorize`)
+│   ├── commands_app/             # 第三方 app 集成(`aikey app register`)
 │   ├── commands_internal/        # `_internal vault-op`(local-server 调过来的 IPC)
 │   ├── commands_proxy.rs         # proxy 生命周期(start / stop / restart)
 │   ├── commands_statusline.rs    # shell statusline 集成
 │   ├── commands_watch.rs         # usage 事件的 watch 模式
-│   └── (其他:env、import、init、project ...)
+│   ├── commands_compliance.rs    # `aikey compliance` 开关(on/off/status)
+│   ├── commands_service/         # 统一服务控制(web / proxy / trust-local)
+│   ├── commands_trust/           # `aikey trust` 降智检测透传
+│   └── (其他:agent、env、import、init、project ...)
 ├── aikey-sdk/                    # 可复用的 lib crate(其他 Rust caller 用)
 ├── docs/                         # VAULT_SPEC.md + cli-platform-contract.md
 ├── scripts/                      # 一次性 probe 脚本(kimi / statusline / e2e 仪表盘)

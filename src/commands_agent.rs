@@ -97,6 +97,9 @@ pub(crate) fn register(
         &refresh_token,
         expires_at,
         &control_url,
+        // Agent seats have no human display identity — the bot placeholder
+        // email above is what whoami-style views render.
+        None,
     )?;
 
     // Wire the local proxy to the master the SAME way `aikey login` does — write

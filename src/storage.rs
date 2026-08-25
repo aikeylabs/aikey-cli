@@ -2343,6 +2343,36 @@ mod tests {
         let acc = get_platform_account().unwrap().expect("should exist");
         assert_eq!(acc.control_url, "http://new-url:3000");
 
+        // display_identity round trip (2026-08-25, bugfix
+        // 20260825-tray-shows-synthetic-sso-handle): the SSO login path
+        // persists the server-composed human identity; consumers (status
+        // --json → tray) read it back verbatim.
+        save_oauth_session(
+            "acc-sso",
+            "sso+feishu.0123456789abcdef@sso.local",
+            "jwt",
+            "refresh",
+            9999999999,
+            "http://localhost:3000",
+            Some("李承熙 · feishu:6ad2973d"),
+        )
+        .expect("save sso");
+        let acc = get_platform_account().unwrap().expect("should exist");
+        assert_eq!(
+            acc.display_identity.as_deref(),
+            Some("李承熙 · feishu:6ad2973d")
+        );
+
+        // 🔴 An email re-login must not carry a stale SSO display name along:
+        // save_platform_account omits the column, so REPLACE nulls it. If this
+        // assertion breaks, someone taught the email path to preserve the old
+        // row's display_identity — that resurrects the previous person's name
+        // on a shared machine.
+        save_platform_account("acc-2", "real@corp.com", "jwt2", "http://localhost:3000")
+            .expect("save email");
+        let acc = get_platform_account().unwrap().expect("should exist");
+        assert_eq!(acc.display_identity, None);
+
         // Clear
         clear_platform_account().expect("clear");
         assert!(get_platform_account().unwrap().is_none());

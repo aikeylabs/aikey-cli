@@ -28,6 +28,12 @@ pub struct PlatformAccount {
     pub logged_in_at: i64,
     pub refresh_token: Option<String>, // OAuth refresh token; None on legacy rows
     pub token_expires_at: Option<i64>, // Unix epoch when access_token expires
+    /// Server-composed human identity ("李承熙 · feishu:6ad2973d"), persisted
+    /// at login (2026-08-25). None on email logins, legacy rows, and old
+    /// servers. 🔴 Consumers must fall back to a NEUTRAL label — never the
+    /// synthetic sso+…@sso.local handle in `email` (display_label contract,
+    /// platform_client.rs).
+    pub display_identity: Option<String>,
 }
 
 /// Upserts the singleton platform_account row (id = 1).
@@ -68,7 +74,7 @@ pub fn get_platform_account() -> Result<Option<PlatformAccount>, String> {
     let conn = open_connection()?;
     let result = conn.query_row(
         "SELECT account_id, email, jwt_token, control_url, logged_in_at,
-                refresh_token, token_expires_at
+                refresh_token, token_expires_at, display_identity
            FROM platform_account WHERE id = 1",
         [],
         |row| {
@@ -80,6 +86,7 @@ pub fn get_platform_account() -> Result<Option<PlatformAccount>, String> {
                 logged_in_at: row.get(4)?,
                 refresh_token: row.get(5)?,
                 token_expires_at: row.get(6)?,
+                display_identity: row.get(7)?,
             })
         },
     );
@@ -102,20 +109,22 @@ pub fn save_oauth_session(
     refresh_token: &str,
     token_expires_at: i64,
     control_url: &str,
+    display_identity: Option<&str>,
 ) -> Result<(), String> {
     let conn = open_connection()?;
     conn.execute(
         "INSERT OR REPLACE INTO platform_account
              (id, account_id, email, jwt_token, control_url, logged_in_at,
-              refresh_token, token_expires_at)
-         VALUES (1, ?1, ?2, ?3, ?4, strftime('%s', 'now'), ?5, ?6)",
+              refresh_token, token_expires_at, display_identity)
+         VALUES (1, ?1, ?2, ?3, ?4, strftime('%s', 'now'), ?5, ?6, ?7)",
         params![
             account_id,
             email,
             access_token,
             control_url,
             refresh_token,
-            token_expires_at
+            token_expires_at,
+            display_identity
         ],
     )
     .map_err(|e| format!("Failed to save OAuth session: {}", e))?;
