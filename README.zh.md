@@ -13,146 +13,19 @@
 
 - **一个 Vault 装下所有 AI 凭据。** API Key *和* OAuth 账号(Claude Pro/Max、Codex/ChatGPT、Kimi)统一放进本地加密 Vault。工具只见可吊销的 route token — 换真 key、轮换凭据,工具配置一行不用改。
 - **工作中途切换 provider / 账号,不打断当前流程。** `aikey use <alias>` 一条命令同时切换*所有*工具的活跃凭据;shell hook 让新开的终端自动生效;`aikey activate` 只切当前 shell。某个上游额度用完?路由组按 failover 顺序自动兜底 — 会话继续跑。
-- **一把 key,多种协议。** 同时支持 Anthropic 和 OpenAI 协议的聚合网关(OpenRouter 类中转站)只需注册一次:`aikey add --providers anthropic,openai` — proxy 按协议分发请求,一条 vault 记录两边都能用。
 - **每次会话结束打一张成本小票。** `aikey run -- claude` 退出时告诉你这一场花了多少钱。`aikey watch` 是 `top` 风格的实时用量面板;`aikey web usage` 打开本地趋势控制台。FinOps 数据不出你的机器。
 - **每个 AI 工具都变成受治理的 app。** `aikey app register` 给每个 Agent(Cursor、OpenCode、自研 bot)独立的 bearer + 独立的绑定 — 暂停、轮换、吊销某一个工具,一条命令,互不影响。
 - **把你手头的"一堆 key"直接导进来。** `aikey import` 批量解析非结构化文本(env 文件、笔记、聊天记录粘贴),浏览器里确认入库。`aikey add --from-url` 读中转站的自述文件 — 然后*用真实请求实测验证*,只存实际打得通的部分。
+- **一把 key,多种协议。** 同时支持 Anthropic 和 OpenAI 协议的聚合网关(OpenRouter 类中转站)只需注册一次:`aikey add --providers anthropic,openai` — proxy 按协议分发请求,一条 vault 记录两边都能用。
 - **会自我修复的诊断。** `aikey doctor` 不只报告问题 — 它会重启挂掉的 proxy、拉起 web 控制台、补装缺失的 shell hook。`--last-errors` 用 caused-by 树 + trace ID 解释最近的失败。
 - **上游偷偷降智,能被发现。** `aikey trust`(配合可选的 degrade-detector 插件)按 key 检测上游是否悄悄换了更弱的模型。
 - **合规检测,一个开关。** `aikey compliance on` 在请求*离开你的机器之前*扫描内容 — pre-forward 阶段,跑在本地 proxy 内,不经过外部服务。
-- **不止于终端。** Claude Desktop 也走同一套治理(`aikey desktop install`);Claude Code 状态栏实时显示本轮成本(`aikey statusline install`);桌面托盘随时看全局。
 - **审计对账级的用量完整性。** `aikey audit status` 对每条用量记录做台账 — 已分配 / 已确认 / 缺口 / 已知丢失;`aikey audit reconcile` 主动补投可恢复的缺口。
+- **不止于终端。** Claude Desktop 也走同一套治理(`aikey desktop install`);Claude Code 状态栏实时显示本轮成本(`aikey statusline install`);桌面托盘随时看全局。
 
 单一静态二进制。零运行时依赖。离线可用。Apache-2.0。
 
-## 1. 职责
-
-**做什么**
-
-- 把 API Key + provider OAuth token 存到本地 SQLite vault,Argon2id + AES-256-GCM 加密。
-- 签发可吊销的 **route token**(`aikey_personal_<64-hex>` / `aikey_team_<vk_id>` / `aikey_active_<provider>`),通过 `aikey-proxy` 路由到上游 provider。
-- 运行时通过 `aikey run -- <cmd>` 或 shell hook 注入凭据 — 不污染子进程之外的 env 变量。
-- 跟踪 per-key / per-provider 用量,会话结束打印成本小票。
-- 打开本地 Vault Web UI(`aikey web`),后端是 `aikey-local-server`。
-
-**不做什么**
-
-- 不导出明文 secrets 到文件、env var 或 stdout(`aikey export` 只产出 **加密** 的 `.akb` 备份 — 没有明文导出路径,没有 eval 风格的注入)。
-- 默认不同步 vault 到云。Vault 是 **设备本地** 的;跨设备迁移目前明确不在 scope 内。
-- 不替代你的 provider 账号。AiKey 是 **运行时凭据层** — key 还是属于你的 provider。
-- 本地 CLI 调用不发 telemetry。`aikeylabs.com` 安装 wrapper 会发匿名安装事件;`unset AIKEY_TELEMETRY_TOKEN` 关掉。
-
-**兄弟组件**(各自独立 repo,都在 [github.com/aikeylabs](https://github.com/aikeylabs))
-
-- [`aikey-proxy`](https://github.com/aikeylabs/aikey-proxy) — 本地 HTTP proxy。在出口边界把 route token 换成真实凭据。
-- [`aikey-local-server`](https://github.com/aikeylabs/aikey-local-server) — 本地 web server,后端服务 `aikey web`(Vault UI + 成本仪表盘)。
-
-## 2. 架构
-
-```mermaid
-flowchart LR
-  user(["你 / CI"]) -->|"aikey run -- claude"| cli["aikey CLI"]
-  cli -->|"解锁 + 注入<br/>aikey_active_*"| proxy["aikey-proxy<br/>127.0.0.1:27200"]
-  cli <-->|"读 / 写"| vault[("Vault<br/>~/.aikey/data/vault.db<br/>Argon2id + AES-256-GCM")]
-  cli -.启动 + 打开浏览器.-> webui["aikey-local-server<br/>127.0.0.1:8090"]
-  webui <-->|"_internal IPC<br/>stdin/stdout"| cli
-  proxy -->|"Authorization: Bearer <real_key><br/>或 x-api-key (Anthropic)"| provider["Provider API<br/>Anthropic / OpenAI / Kimi / …"]
-  proxy -->|"usage event"| wal[("usage_wal/<br/>append-only JSONL")]
-```
-
-**为什么这样设计**:vault 解锁后,CLI 自己不再持有真 provider key — 替换发生在 `aikey-proxy` 的 TLS 出口边界。工具看到的永远是稳定的 route token;真 key 在 vault 内被换掉,工具配置一行不用动。
-
-Web UI 不直接访问 vault。它调 `aikey-local-server`,后者用子进程模式启 CLI(`aikey _internal vault-op …`)— 所以 Web 写盘和 CLI 写盘 **走同一份 Rust 代码**。"CLI 做的事"和"web 做的事"不会漂移。
-
-## 3. 调用时序 — `aikey run -- claude`
-
-```mermaid
-sequenceDiagram
-  participant U as 用户
-  participant CLI as aikey CLI
-  participant V as Vault SQLite
-  participant P as aikey-proxy
-  participant API as Provider API
-
-  U->>CLI: aikey run -- claude
-  CLI->>V: 提示输入 master 密码(session 有效就用缓存)
-  V-->>CLI: KDF 解锁 → DEK
-  CLI->>P: 确保 proxy 在跑(没跑就 autostart)
-  CLI->>CLI: 给子进程构造 env(aikey_active_<provider> + base_url)
-  CLI->>U: spawn `claude` 子进程
-  U->>P: claude → 127.0.0.1:27200(Bearer aikey_active_*)
-  P->>V: 把 sentinel 解析成 active 绑定的真实凭据
-  P->>API: 用真 key 转发(在 TLS 出口边界替换)
-  API-->>P: stream 响应
-  P-->>U: 把响应转回工具
-  P->>P: 追加 usage 事件到 usage_wal(provider / tokens / 成本)
-```
-
-Vault 每个 shell session 只解锁一次 — 后续的 `aikey run` 用缓存的 DEK,直到 session 超时。别的 shell 不共享(无跨 shell 泄露)。
-
-## 4. 数据流
-
-| 命令 | 读 | 写 | 下游消费者 |
-|---|---|---|---|
-| `aikey add <alias>` | vault.db(alias 唯一性) | vault.db(加密 entry) | 下次请求时 proxy |
-| `aikey auth login <provider>` | OAuth callback via loopback | vault.db(provider_account 行 + OAuth token) | 下次请求时 proxy |
-| `aikey use <alias>` | vault.db | `~/.aikey/active.env` + provider 绑定 | shell hook / `aikey run` env 注入 |
-| `aikey run -- <cmd>` | vault.db(active binding) | 仅子进程 env | 子进程 |
-| `aikey app register --slug <slug> …` | vault.db(当前 `aikey use` 选择,快照为该 app 的绑定) | vault.db(app_records UPSERT + app bearer + 绑定快照) | 第三方 Agent 通过 `aikey_app_<64-hex>` |
-| `aikey route` | vault.db(read-only) | 无 | stdout(可复制到第三方工具配置) |
-| `aikey test [<alias>]` | vault.db | 无(probe-only,带 `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
-| `aikey web [page]` | 无 | 无 | spawn 浏览器 → `aikey-local-server` |
-| `aikey doctor` | 版型 / proxy / vault / hooks / 插件(trust-local / 合规过滤)、**授权方**（向已登录控制面取 `GET /v1/license/identity`）；`--last-errors` 读取 proxy 本地最近错误环形缓冲 | 交互模式自动修复：重启已停的 proxy、启动已停的 local-server 和 trust-local 守护进程、安装缺失的 shell hook（`--json` 时只读） | stdout 诊断报告（`--detail` 增加按版型区分的 ODS 面板；`--last-errors` 显示产地、途经链、trace ID 与上游 request ID） |
-| `aikey audit status` | collector completeness 端点（+ proxy 本地状态：用量 WAL/死信 **和**合规上报队列）| 无 | stdout per-source 投递报告 + 本地投递通道 |
-| `aikey audit reconcile` | collector 缺口 + proxy WAL | 已知丢失台账（服务端）| stdout 对账结论；补传可恢复缺口、确认丢失 |
-
-真凭据除了在 proxy → provider 调用里被替换成上游 auth header 之外,**从不离开** vault.db。Probe 流量带 `X-Aikey-Probe: 1`,不会污染用量小票。
-
-## 5. 技术栈选型 — 为什么
-
-| 层 | 选择 | 为什么 |
-|---|---|---|
-| 语言 | Rust 2021 | 单一静态二进制,无 host 运行时依赖;内存安全,凭据处理类型安全 |
-| CLI 解析 | `clap` v4 derive | 声明式;自动生成 `--help`;子命令别名(`ls`、`browse`) |
-| 存储 | SQLite via `rusqlite`(`bundled`) | 零安装足迹;不需要服务进程;文件可移植 |
-| 密码 KDF | Argon2id,**m=64 MiB, t=3, p=4**([crypto.rs:24](src/crypto.rs)) | OWASP 推荐;抗 GPU 攻击 |
-| 对称加密 | AES-256-GCM([crypto.rs:9](src/crypto.rs)) | AEAD,带认证;NIST 标准 |
-| 内存卫生 | `secrecy` + `zeroize` | 敏感字节 drop 时清零;不会被 `Debug` 日志泄露 |
-| OAuth | 各 provider 独立实现在 `commands_auth/` | 原生 OAuth 2.0 + PKCE;不依赖第三方 broker;broker 跑本地 |
-| 密码 prompt | `rpassword` | TTY 关回显;在受限 shell 也能工作 |
-| IPC(CLI ↔ local-server)| JSON envelope 走 stdin/stdout(`_internal vault-op`)| CLI 触发还是 web 触发,vault 写盘走同一份 Rust 代码 |
-
-**钉死的决策**:`rusqlite` 用 `bundled` 静态链接 SQLite。代价是二进制 +1.5 MB,换回的是 host SQLite 版本差异为零。
-
-## 6. 运行环境
-
-| 项 | 要求 |
-|---|---|
-| OS | macOS 12+ / Linux(Ubuntu 20.04+ / CentOS 8+ / Alpine 3.16+)/ Windows 10+ |
-| 架构 | x86_64 / arm64 |
-| 运行时依赖 | **无**(单一静态二进制) |
-| 磁盘 | ~30 MB 二进制 + vault 每条凭据约 1 KB |
-| 网络 | 仅出向 provider API;proxy 绑 `127.0.0.1:27200`(loopback) |
-
-**文件系统布局**(`$AIKEY_HOME`,默认 `~/.aikey/`)
-
-```
-~/.aikey/
-├── bin/                # aikey、aikey-proxy、ak(软链)、[aikey-local-server]
-├── config/             # 渲染后的 service 配置(aikey-proxy.yaml 等)
-├── data/
-│   └── vault.db        # 加密 SQLite,文件权限 0600
-├── logs/               # CLI + proxy 日志(轮转)
-├── active.env          # 当前 `aikey use` 选择(per-provider)
-├── identity            # 匿名本地安装 UUID
-├── hook.sh             # 安装 hook 后从 shell rc source
-├── uninstall.sh        # 完整清理脚本,用 --yes 跑
-└── backups/            # 破坏性操作前的 vault 自动快照
-```
-
-**默认端口**:`127.0.0.1:27200`(proxy)和 `127.0.0.1:8090`(local-server / web UI)。可通过 `AIKEY_PROXY_PORT` / `CONSOLE_PORT` env 覆盖。
-
-## 7. 快速开始
+## 1. 快速开始
 
 ```bash
 # 1. 安装(自动检测 OS,装到 ~/.aikey/)
@@ -175,7 +48,7 @@ aikey run -- claude
 
 想用 OAuth(Claude Pro/Max、ChatGPT Plus、Kimi Code)而不是 API key:`aikey auth login claude`(或 `codex` / `kimi`)。
 
-## 8. 首次启动会发生什么
+## 2. 首次启动会发生什么
 
 第一次跑会自动做以下事(以及为什么):
 
@@ -189,7 +62,7 @@ aikey run -- claude
 
 > **重置 / 忘掉**:删 `~/.aikey/identity` 重生成安装 ID;跑 `~/.aikey/uninstall.sh --yes` 完整清理(不可逆 — 但会先在 `~/.aikey/backups/` 自动备份)。
 
-## 9. 使用示例
+## 3. 使用示例
 
 ```bash
 # 看清单
@@ -298,6 +171,133 @@ Cluster 上要盯的：队列非空 = 有审计记录还**没有**送达控制�
 从未激活的服务器，绝不能看起来像一台 Personal 装机。
 
 这次查询不阻塞命令，也不改变退出码。`--json` 以 `license.{state,company_name,cause,line}` 输出同样的信息。
+
+## 4. 职责
+
+**做什么**
+
+- 把 API Key + provider OAuth token 存到本地 SQLite vault,Argon2id + AES-256-GCM 加密。
+- 签发可吊销的 **route token**(`aikey_personal_<64-hex>` / `aikey_team_<vk_id>` / `aikey_active_<provider>`),通过 `aikey-proxy` 路由到上游 provider。
+- 运行时通过 `aikey run -- <cmd>` 或 shell hook 注入凭据 — 不污染子进程之外的 env 变量。
+- 跟踪 per-key / per-provider 用量,会话结束打印成本小票。
+- 打开本地 Vault Web UI(`aikey web`),后端是 `aikey-local-server`。
+
+**不做什么**
+
+- 不导出明文 secrets 到文件、env var 或 stdout(`aikey export` 只产出 **加密** 的 `.akb` 备份 — 没有明文导出路径,没有 eval 风格的注入)。
+- 默认不同步 vault 到云。Vault 是 **设备本地** 的;跨设备迁移目前明确不在 scope 内。
+- 不替代你的 provider 账号。AiKey 是 **运行时凭据层** — key 还是属于你的 provider。
+- 本地 CLI 调用不发 telemetry。`aikeylabs.com` 安装 wrapper 会发匿名安装事件;`unset AIKEY_TELEMETRY_TOKEN` 关掉。
+
+**兄弟组件**(各自独立 repo,都在 [github.com/aikeylabs](https://github.com/aikeylabs))
+
+- [`aikey-proxy`](https://github.com/aikeylabs/aikey-proxy) — 本地 HTTP proxy。在出口边界把 route token 换成真实凭据。
+- [`aikey-local-server`](https://github.com/aikeylabs/aikey-local-server) — 本地 web server,后端服务 `aikey web`(Vault UI + 成本仪表盘)。
+
+## 5. 架构
+
+```mermaid
+flowchart LR
+  user(["你 / CI"]) -->|"aikey run -- claude"| cli["aikey CLI"]
+  cli -->|"解锁 + 注入<br/>aikey_active_*"| proxy["aikey-proxy<br/>127.0.0.1:27200"]
+  cli <-->|"读 / 写"| vault[("Vault<br/>~/.aikey/data/vault.db<br/>Argon2id + AES-256-GCM")]
+  cli -.启动 + 打开浏览器.-> webui["aikey-local-server<br/>127.0.0.1:8090"]
+  webui <-->|"_internal IPC<br/>stdin/stdout"| cli
+  proxy -->|"Authorization: Bearer <real_key><br/>或 x-api-key (Anthropic)"| provider["Provider API<br/>Anthropic / OpenAI / Kimi / …"]
+  proxy -->|"usage event"| wal[("usage_wal/<br/>append-only JSONL")]
+```
+
+**为什么这样设计**:vault 解锁后,CLI 自己不再持有真 provider key — 替换发生在 `aikey-proxy` 的 TLS 出口边界。工具看到的永远是稳定的 route token;真 key 在 vault 内被换掉,工具配置一行不用动。
+
+Web UI 不直接访问 vault。它调 `aikey-local-server`,后者用子进程模式启 CLI(`aikey _internal vault-op …`)— 所以 Web 写盘和 CLI 写盘 **走同一份 Rust 代码**。"CLI 做的事"和"web 做的事"不会漂移。
+
+## 6. 调用时序 — `aikey run -- claude`
+
+```mermaid
+sequenceDiagram
+  participant U as 用户
+  participant CLI as aikey CLI
+  participant V as Vault SQLite
+  participant P as aikey-proxy
+  participant API as Provider API
+
+  U->>CLI: aikey run -- claude
+  CLI->>V: 提示输入 master 密码(session 有效就用缓存)
+  V-->>CLI: KDF 解锁 → DEK
+  CLI->>P: 确保 proxy 在跑(没跑就 autostart)
+  CLI->>CLI: 给子进程构造 env(aikey_active_<provider> + base_url)
+  CLI->>U: spawn `claude` 子进程
+  U->>P: claude → 127.0.0.1:27200(Bearer aikey_active_*)
+  P->>V: 把 sentinel 解析成 active 绑定的真实凭据
+  P->>API: 用真 key 转发(在 TLS 出口边界替换)
+  API-->>P: stream 响应
+  P-->>U: 把响应转回工具
+  P->>P: 追加 usage 事件到 usage_wal(provider / tokens / 成本)
+```
+
+Vault 每个 shell session 只解锁一次 — 后续的 `aikey run` 用缓存的 DEK,直到 session 超时。别的 shell 不共享(无跨 shell 泄露)。
+
+## 7. 数据流
+
+| 命令 | 读 | 写 | 下游消费者 |
+|---|---|---|---|
+| `aikey add <alias>` | vault.db(alias 唯一性) | vault.db(加密 entry) | 下次请求时 proxy |
+| `aikey auth login <provider>` | OAuth callback via loopback | vault.db(provider_account 行 + OAuth token) | 下次请求时 proxy |
+| `aikey use <alias>` | vault.db | `~/.aikey/active.env` + provider 绑定 | shell hook / `aikey run` env 注入 |
+| `aikey run -- <cmd>` | vault.db(active binding) | 仅子进程 env | 子进程 |
+| `aikey app register --slug <slug> …` | vault.db(当前 `aikey use` 选择,快照为该 app 的绑定) | vault.db(app_records UPSERT + app bearer + 绑定快照) | 第三方 Agent 通过 `aikey_app_<64-hex>` |
+| `aikey route` | vault.db(read-only) | 无 | stdout(可复制到第三方工具配置) |
+| `aikey test [<alias>]` | vault.db | 无(probe-only,带 `X-Aikey-Probe: 1`) | proxy → upstream `/v1/models` |
+| `aikey web [page]` | 无 | 无 | spawn 浏览器 → `aikey-local-server` |
+| `aikey doctor` | 版型 / proxy / vault / hooks / 插件(trust-local / 合规过滤)、**授权方**（向已登录控制面取 `GET /v1/license/identity`）；`--last-errors` 读取 proxy 本地最近错误环形缓冲 | 交互模式自动修复：重启已停的 proxy、启动已停的 local-server 和 trust-local 守护进程、安装缺失的 shell hook（`--json` 时只读） | stdout 诊断报告（`--detail` 增加按版型区分的 ODS 面板；`--last-errors` 显示产地、途经链、trace ID 与上游 request ID） |
+| `aikey audit status` | collector completeness 端点（+ proxy 本地状态：用量 WAL/死信 **和**合规上报队列）| 无 | stdout per-source 投递报告 + 本地投递通道 |
+| `aikey audit reconcile` | collector 缺口 + proxy WAL | 已知丢失台账（服务端）| stdout 对账结论；补传可恢复缺口、确认丢失 |
+
+真凭据除了在 proxy → provider 调用里被替换成上游 auth header 之外,**从不离开** vault.db。Probe 流量带 `X-Aikey-Probe: 1`,不会污染用量小票。
+
+## 8. 技术栈选型 — 为什么
+
+| 层 | 选择 | 为什么 |
+|---|---|---|
+| 语言 | Rust 2021 | 单一静态二进制,无 host 运行时依赖;内存安全,凭据处理类型安全 |
+| CLI 解析 | `clap` v4 derive | 声明式;自动生成 `--help`;子命令别名(`ls`、`browse`) |
+| 存储 | SQLite via `rusqlite`(`bundled`) | 零安装足迹;不需要服务进程;文件可移植 |
+| 密码 KDF | Argon2id,**m=64 MiB, t=3, p=4**([crypto.rs:24](src/crypto.rs)) | OWASP 推荐;抗 GPU 攻击 |
+| 对称加密 | AES-256-GCM([crypto.rs:9](src/crypto.rs)) | AEAD,带认证;NIST 标准 |
+| 内存卫生 | `secrecy` + `zeroize` | 敏感字节 drop 时清零;不会被 `Debug` 日志泄露 |
+| OAuth | 各 provider 独立实现在 `commands_auth/` | 原生 OAuth 2.0 + PKCE;不依赖第三方 broker;broker 跑本地 |
+| 密码 prompt | `rpassword` | TTY 关回显;在受限 shell 也能工作 |
+| IPC(CLI ↔ local-server)| JSON envelope 走 stdin/stdout(`_internal vault-op`)| CLI 触发还是 web 触发,vault 写盘走同一份 Rust 代码 |
+
+**钉死的决策**:`rusqlite` 用 `bundled` 静态链接 SQLite。代价是二进制 +1.5 MB,换回的是 host SQLite 版本差异为零。
+
+## 9. 运行环境
+
+| 项 | 要求 |
+|---|---|
+| OS | macOS 12+ / Linux(Ubuntu 20.04+ / CentOS 8+ / Alpine 3.16+)/ Windows 10+ |
+| 架构 | x86_64 / arm64 |
+| 运行时依赖 | **无**(单一静态二进制) |
+| 磁盘 | ~30 MB 二进制 + vault 每条凭据约 1 KB |
+| 网络 | 仅出向 provider API;proxy 绑 `127.0.0.1:27200`(loopback) |
+
+**文件系统布局**(`$AIKEY_HOME`,默认 `~/.aikey/`)
+
+```
+~/.aikey/
+├── bin/                # aikey、aikey-proxy、ak(软链)、[aikey-local-server]
+├── config/             # 渲染后的 service 配置(aikey-proxy.yaml 等)
+├── data/
+│   └── vault.db        # 加密 SQLite,文件权限 0600
+├── logs/               # CLI + proxy 日志(轮转)
+├── active.env          # 当前 `aikey use` 选择(per-provider)
+├── identity            # 匿名本地安装 UUID
+├── hook.sh             # 安装 hook 后从 shell rc source
+├── uninstall.sh        # 完整清理脚本,用 --yes 跑
+└── backups/            # 破坏性操作前的 vault 自动快照
+```
+
+**默认端口**:`127.0.0.1:27200`(proxy)和 `127.0.0.1:8090`(local-server / web UI)。可通过 `AIKEY_PROXY_PORT` / `CONSOLE_PORT` env 覆盖。
 
 ## 10. 错误码
 
