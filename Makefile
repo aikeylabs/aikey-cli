@@ -216,6 +216,37 @@ fmt-check:
 	$(CARGO) fmt -- --check
 
 # ---------------------------------------------------------------------------
+# Release guards (public-trust-check-platform, tasks 7.6 / 7.8)
+# ---------------------------------------------------------------------------
+
+## Both fences below. 🔴 They existed without a runner until 2026-08-11, and
+## a fence with no runner cannot fail — which looks exactly like a fence that
+## is satisfied.
+.PHONY: guard-release
+guard-release: guard-edition-parity guard-release-composition
+
+## T-EDN-1: the --from-url path must not branch on edition (task 7.6).
+.PHONY: guard-edition-parity
+guard-edition-parity:
+	./scripts/check-from-url-edition-parity.sh
+	./scripts/check-from-url-edition-parity.sh --self-test
+
+## Task 7.8: is this change actually IN the branch a release would package?
+## 🔴 Judges $(RELEASE_BRANCH) (default develop-v1.0.5), NOT the checkout —
+## the offline package's self-proof shows a package installs, never that it
+## contains the change the release was cut for.
+RELEASE_BRANCH ?= develop-v1.0.5
+.PHONY: guard-release-composition
+guard-release-composition:
+	RELEASE_BRANCH=$(RELEASE_BRANCH) ./scripts/check-release-composition.sh
+
+## The self-test half, which can run even while the composition check is
+## legitimately red (the change is not on the release branch yet).
+.PHONY: guard-release-composition-selftest
+guard-release-composition-selftest:
+	RELEASE_BRANCH=$(RELEASE_BRANCH) ./scripts/check-release-composition.sh --self-test || true
+
+# ---------------------------------------------------------------------------
 # Install / uninstall
 # ---------------------------------------------------------------------------
 
