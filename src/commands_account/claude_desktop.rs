@@ -211,6 +211,25 @@ pub(crate) fn route_material_for_anthropic(proxy_port: u16) -> Option<RouteMater
     let binding = crate::storage::get_provider_binding("default", "anthropic")
         .ok()
         .flatten()?;
+    // A binding ROW is not servable material (2026-08-27, customer machine).
+    // `disable_keys_for_account_scope` (login/account switch) marks the key
+    // disabled_by_* but clears no binding rows, and the proxy's route query
+    // filters disabled keys out — so a takeover written from this row points
+    // Claude Desktop at a route the proxy will refuse ("Couldn't connect to
+    // Claude", reproduced in takeover_left_stale_when_account_scope_disables_
+    // the_key). Same truth the panel's routes projection reports: a disabled
+    // key renders as "unset". Answering Some here made the SAME question —
+    // "does anthropic have a credential?" — give two different answers.
+    if binding.key_source_type == crate::credential_type::CredentialType::ManagedVirtualKey {
+        let servable = crate::storage::get_virtual_key_cache(&binding.key_source_ref)
+            .ok()
+            .flatten()
+            .map(|k| k.local_state == "active" && k.key_status == "active")
+            .unwrap_or(false);
+        if !servable {
+            return None;
+        }
+    }
     let prefix = crate::commands_account::provider_proxy_prefix_pub("anthropic");
     Some(
         match crate::commands_account::cluster_route(
@@ -622,6 +641,137 @@ pub struct DesktopSwitch {
     pub needs_consent: bool,
 }
 
+/// What the staleness reconcile did this pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaleReconcile {
+    /// No contradiction: not ours, not installed, or material present.
+    NoAction,
+    /// Our takeover was active with NO servable anthropic material — restored
+    /// the official config (idempotent). Desktop must be restarted to pick it
+    /// up; the note sidecar carries that fact to the tray.
+    Restored,
+    /// Contradiction found but the restore write failed — surfaced, not fatal.
+    RestoreFailed,
+}
+
+/// Idempotent reconcile for the invariant「Desktop takeover active ⇔ anthropic
+/// has servable material」(事件驱动写必配幂等对账读, enforced 2026-08-27).
+///
+/// WHY this exists: the un-takeover half of the funnel only runs on
+/// `key use`/`key unuse`/`hook uninstall`. An account switch (`aikey login`)
+/// marks the bound key disabled_by_account_scope WITHOUT passing through any
+/// of those, so the 3p config outlived its credential and Claude Desktop sat
+/// on a dead route with an error page we cannot edit (customer machine,
+/// 2026-08-27; reproduced in tests). This is the missing reconcile READ on the
+/// consumption path — `status` — which both the tray poll and a human
+/// diagnosing the machine are guaranteed to hit.
+///
+/// Safety properties (each fenced):
+///   - only OursActive is ever touched — Official / ForeignActive (cc-switch)
+///     are never modified, contradiction or not;
+///   - restore is idempotent (second pass → NoAction);
+///   - a restore failure degrades to a report, never an error — status is a
+///     read surface and must keep answering (旁路不阻塞主链路).
+pub(crate) fn reconcile_stale_takeover(proxy_port: u16) -> StaleReconcile {
+    let Some(paths) = desktop_paths() else {
+        return StaleReconcile::NoAction;
+    };
+    reconcile_stale_at(&paths, proxy_port)
+}
+
+/// Testable core of `reconcile_stale_takeover` (paths injected — the same
+/// pattern as `reconcile_active_at`, so fences exercise the REAL logic).
+pub(crate) fn reconcile_stale_at(paths: &DesktopPaths, proxy_port: u16) -> StaleReconcile {
+    if detect_state(paths) != DesktopState::OursActive {
+        return StaleReconcile::NoAction;
+    }
+    if route_material_for_anthropic(proxy_port).is_some() {
+        return StaleReconcile::NoAction;
+    }
+    match remove_our_residue(paths) {
+        Ok(_) => {
+            // Best-effort note so the tray can keep saying "restart Claude
+            // Desktop" after the fact. Enhancement, never a dependency: a
+            // failed write is a WARN and nothing else changes.
+            write_restore_note();
+            eprintln!(
+                "[aikey] Claude Desktop takeover auto-restored: its anthropic credential is no \
+                 longer usable on this machine (signed into a different account, or the key was \
+                 revoked). Restart Claude Desktop to reconnect it to claude.ai directly."
+            );
+            StaleReconcile::Restored
+        }
+        Err(e) => {
+            eprintln!(
+                "[aikey] warning: Claude Desktop is routed through aikey but anthropic has no \
+                 usable credential, and restoring the official config failed: {}. Claude Desktop \
+                 will not connect until a credential is bound or the takeover is removed.",
+                e
+            );
+            StaleReconcile::RestoreFailed
+        }
+    }
+}
+
+/// Sidecar note: the tray reads it to keep showing "restart Claude Desktop"
+/// after an auto-restore (state alone cannot say it — post-restore the config
+/// IS official, but a running Desktop still holds the old routing in memory).
+/// Cleared on the next successful takeover. Read/write are both soft.
+fn restore_note_path() -> Option<PathBuf> {
+    Some(
+        crate::commands_account::shell_integration::resolve_aikey_dir()
+            .join("desktop_restore_note.json"),
+    )
+}
+
+fn write_restore_note() {
+    let Some(path) = restore_note_path() else {
+        return;
+    };
+    let note = json!({
+        "restored_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "reason": "no servable anthropic credential",
+    });
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, note.to_string()) {
+        eprintln!(
+            "[aikey] warning: could not record the desktop restore note: {}",
+            e
+        );
+    }
+}
+
+/// Whether an auto-restore note is present and fresh (≤48h). Soft read: a
+/// missing or corrupt note is simply "no note".
+pub(crate) fn recent_restore_note() -> bool {
+    let Some(path) = restore_note_path() else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let ts = v.get("restored_at").and_then(|t| t.as_u64()).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(ts) <= 48 * 3600
+}
+
+pub(crate) fn clear_restore_note() {
+    if let Some(path) = restore_note_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Funnel entry (anthropic-active branch). State machine per plan §4.1:
 /// NotInstalled→skip; OursActive→material drift compare, rewrite if changed;
 /// Official/Foreign→consent gate (pref `always`→takeover, `never`→skip,
@@ -706,12 +856,15 @@ pub(crate) fn perform_takeover(paths: &DesktopPaths, proxy_port: u16) -> Desktop
         };
     };
     match takeover_at(paths, &material) {
-        Ok(TakeoverResult::Installed) => DesktopSwitch {
-            detected: true,
-            configured: true,
-            restart_required: true,
-            needs_consent: false,
-        },
+        Ok(TakeoverResult::Installed) => {
+            clear_restore_note();
+            DesktopSwitch {
+                detected: true,
+                configured: true,
+                restart_required: true,
+                needs_consent: false,
+            }
+        }
         Ok(TakeoverResult::Unchanged) => DesktopSwitch {
             detected: true,
             configured: true,
@@ -1115,6 +1268,281 @@ pub(crate) fn handle_desktop_uninstall() -> Result<(), Box<dyn std::error::Error
 
 #[cfg(test)]
 mod tests {
+    // ─── 2026-08-27 客户机复现：接管滞留（材料消失后无人收拾）────────
+    //
+    // 复刻时序（全部真实函数，无 mock）：
+    //   1. 有 anthropic 材料（team VK active + binding 行）→ 接管写下
+    //   2. 账号切换打标 disable_keys_for_account_scope（login 的真实路径）
+    //   3. 期间没有任何 key use/unuse → funnel 从未运行
+    // 期望不变量（对账读，尚未实现 → 本测试当前 RED = 复现成功）：
+    //   「Desktop 接管 active ⇔ anthropic 路由有可服务材料」
+    // 现状（复现证据，见 -- --nocapture 输出）：
+    //   接管仍 OursActive；route_material_for_anthropic 仍 Some（binding 行
+    //   还在，指向已 disabled 的 VK）——与面板 routes 投影的「未设置」分裂：
+    //   同一个「anthropic 有没有凭据」两份实现两个答案。Desktop 打 proxy，
+    //   proxy 的路由查询过滤 disabled_by_% → 请求失败 → 客户看到
+    //   "Couldn't connect to Claude"（推理面假设 A 的我方边界内证据）。
+    #[test]
+    fn takeover_left_stale_when_account_scope_disables_the_key() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("vault.db");
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).unwrap();
+        let pw = secrecy::SecretString::new("takeover-stale-pw".to_string());
+        crate::storage::initialize_vault(&salt, &pw).unwrap();
+
+        // 1a. team VK（acct-1 所有，active）——客户机上就是 key-damonlee1020-…
+        let entry = crate::storage::VirtualKeyCacheEntry {
+            binding_id: String::new(),
+            virtual_key_id: "vk-cust".into(),
+            org_id: "org-1".into(),
+            seat_id: "seat-1".into(),
+            alias: "key-cust-claude".into(),
+            provider_code: "anthropic".into(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: String::new(),
+            credential_revision: String::new(),
+            virtual_key_revision: String::new(),
+            key_status: "active".into(),
+            share_status: "accepted".into(),
+            local_state: "active".into(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: None,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec!["anthropic".into()],
+            provider_base_urls: std::collections::HashMap::new(),
+            priority: 1,
+            fallback_role: "primary".into(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
+            owner_account_id: Some("acct-1".into()),
+            owner_email: None,
+            extra: None,
+            oauth_group_id: None,
+            group_accounts: None,
+            routing_config: None,
+            group_alias: None,
+            group_runtime: None,
+        };
+        crate::storage::upsert_virtual_key_cache(&entry).unwrap();
+        // 1b. anthropic 路由绑定 → 材料可得
+        crate::storage::set_provider_binding(
+            "default",
+            "anthropic",
+            "managed_virtual_key",
+            "vk-cust",
+        )
+        .unwrap();
+        assert!(
+            route_material_for_anthropic(27200).is_some(),
+            "前提：有材料（否则接管不会发生）"
+        );
+
+        // 1c. 接管写下（真实 reconcile：consent=always 复刻客户机「开关全开」）
+        crate::global_config::set_claude_desktop_consent("always").unwrap();
+        let tmp_desk = TempDir::new().unwrap();
+        let paths = installed_paths(&tmp_desk);
+        let sw = reconcile_active_at(&paths, 27200, false);
+        assert!(sw.configured, "接管必须成功写下（客户机的既成事实）");
+        assert_eq!(detect_state(&paths), DesktopState::OursActive);
+
+        // 2. 账号切换（feishu 登录）→ login 真实路径打标；funnel 不跑
+        crate::storage::disable_keys_for_account_scope("acct-feishu").unwrap();
+
+        // ── 复现证据输出 ──
+        let material_after = route_material_for_anthropic(27200);
+        let state_after = detect_state(&paths);
+        eprintln!("── 复现现场 ──");
+        eprintln!("  VK local_state      : disabled_by_account_scope（login 打标）");
+        eprintln!("  binding 行           : 仍存在（无人清理）");
+        eprintln!(
+            "  route_material       : {:?}",
+            material_after.as_ref().map(|m| &m.base_url)
+        );
+        eprintln!("  desktop detect_state : {:?}（3p 配置滞留）", state_after);
+
+        // ── 不变量 1（材料统一真相源，2026-08-27 修复）：disabled key 不是材料 ──
+        assert!(
+            material_after.is_none(),
+            "material consistency: key 已 disabled_by_account_scope，takeover 材料函数必须与\
+             面板 routes 投影同答「无」— 答 Some 就是同概念两份实现的分裂（客户机事故根因之一）"
+        );
+        // 打标本身不动 Desktop 文件（login 路径没有 funnel）——滞留仍在：
+        assert_eq!(
+            state_after,
+            DesktopState::OursActive,
+            "打标后、对账前：滞留存在（前提）"
+        );
+
+        // ── 不变量 2（幂等对账读）：status 必经之路收拾滞留 ──
+        let first = reconcile_stale_at(&paths, 27200);
+        assert_eq!(
+            first,
+            StaleReconcile::Restored,
+            "对账必须把「接管 active + 无可服务材料」的滞留还原为官方直连"
+        );
+        assert_ne!(
+            detect_state(&paths),
+            DesktopState::OursActive,
+            "还原后 3p 配置不得仍指向 aikey"
+        );
+        assert!(
+            recent_restore_note(),
+            "还原须留下 note，托盘据此持续提示重启 Desktop"
+        );
+        // 幂等：第二遍必须零动作（status 每 4s 轮询一次，churn 就是事故）
+        assert_eq!(
+            reconcile_stale_at(&paths, 27200),
+            StaleReconcile::NoAction,
+            "对账必须幂等 — 第二遍不得再产生任何动作"
+        );
+    }
+
+    /// 围栏（不引发新问题之一）：正常态绝不误伤 — 材料在，对账零动作。
+    /// 能红：把 reconcile 的材料检查取反 / 删掉 OursActive 门。
+    #[test]
+    fn reconcile_never_touches_a_healthy_takeover() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("vault.db");
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).unwrap();
+        let pw = secrecy::SecretString::new("healthy-pw".to_string());
+        crate::storage::initialize_vault(&salt, &pw).unwrap();
+        seed_active_vk_with_binding();
+        crate::global_config::set_claude_desktop_consent("always").unwrap();
+        let tmp_desk = TempDir::new().unwrap();
+        let paths = installed_paths(&tmp_desk);
+        assert!(reconcile_active_at(&paths, 27200, false).configured);
+
+        // desktop_paths() inside reconcile_stale_takeover resolves from HOME —
+        // point it at OUR tempdir installation by mirroring the layout there.
+        // (installed_paths uses its own tempdir; the stale reconcile resolves
+        // paths itself, so a healthy state must be asserted through the same
+        // detect + material questions it asks.)
+        assert_eq!(detect_state(&paths), DesktopState::OursActive);
+        assert!(route_material_for_anthropic(27200).is_some());
+        // The reconcile applied to THESE paths must answer NoAction:
+        assert_eq!(reconcile_stale_at(&paths, 27200), StaleReconcile::NoAction);
+        assert_eq!(
+            detect_state(&paths),
+            DesktopState::OursActive,
+            "健康接管不得被拆"
+        );
+    }
+
+    /// 围栏（不引发新问题之二）：别人的接管（cc-switch / 官方态）绝不触碰 —
+    /// 哪怕矛盾条件成立（无材料）。能红：删掉 OursActive 守卫。
+    #[test]
+    fn reconcile_never_touches_foreign_or_official_configs() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("vault.db");
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).unwrap();
+        let pw = secrecy::SecretString::new("foreign-pw".to_string());
+        crate::storage::initialize_vault(&salt, &pw).unwrap();
+        // 无任何 binding → 材料 None（矛盾条件的一半永真）
+        let tmp_desk = TempDir::new().unwrap();
+        let paths = installed_paths(&tmp_desk);
+        // Official 态（无我方 profile）
+        assert_ne!(detect_state(&paths), DesktopState::OursActive);
+        let read_all = |p: &DesktopPaths| {
+            (
+                std::fs::read_to_string(&p.normal_config).unwrap_or_default(),
+                std::fs::read_to_string(&p.threep_config).unwrap_or_default(),
+                std::fs::read_to_string(&p.meta).unwrap_or_default(),
+            )
+        };
+        let before = read_all(&paths);
+        assert_eq!(reconcile_stale_at(&paths, 27200), StaleReconcile::NoAction);
+        assert_eq!(before, read_all(&paths), "非我方接管的配置一个字节都不许动");
+    }
+
+    /// 围栏：note sidecar 软读 — 损坏 JSON 当作无 note，绝不 panic。
+    #[test]
+    fn restore_note_read_is_soft_against_corruption() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("vault.db");
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
+        let aikey_dir = crate::commands_account::shell_integration::resolve_aikey_dir();
+        std::fs::create_dir_all(&aikey_dir).unwrap();
+        std::fs::write(aikey_dir.join("desktop_restore_note.json"), b"{corrupt").unwrap();
+        assert!(
+            !recent_restore_note(),
+            "坏 note 必须当作无 note（增强非依赖）"
+        );
+    }
+
+    /// 围栏（材料统一不误伤其它凭据型）：personal key 绑定不受 managed 检查影响。
+    /// 能红：把 servable 检查扩到所有 key_source_type。
+    #[test]
+    fn material_check_only_gates_managed_keys() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("vault.db");
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).unwrap();
+        let pw = secrecy::SecretString::new("personal-pw".to_string());
+        crate::storage::initialize_vault(&salt, &pw).unwrap();
+        crate::storage::set_provider_binding("default", "anthropic", "personal", "my-key").unwrap();
+        assert!(
+            route_material_for_anthropic(27200).is_some(),
+            "personal 绑定无 disabled 概念，材料判定不得误杀"
+        );
+    }
+
+    /// helper: 一条 active team VK + anthropic binding（多用例共用）。
+    fn seed_active_vk_with_binding() {
+        let entry = crate::storage::VirtualKeyCacheEntry {
+            binding_id: String::new(),
+            virtual_key_id: "vk-healthy".into(),
+            org_id: "org-1".into(),
+            seat_id: "seat-1".into(),
+            alias: "key-healthy".into(),
+            provider_code: "anthropic".into(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: String::new(),
+            credential_revision: String::new(),
+            virtual_key_revision: String::new(),
+            key_status: "active".into(),
+            share_status: "accepted".into(),
+            local_state: "active".into(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: None,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec!["anthropic".into()],
+            provider_base_urls: std::collections::HashMap::new(),
+            priority: 1,
+            fallback_role: "primary".into(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
+            owner_account_id: Some("acct-1".into()),
+            owner_email: None,
+            extra: None,
+            oauth_group_id: None,
+            group_accounts: None,
+            routing_config: None,
+            group_alias: None,
+            group_runtime: None,
+        };
+        crate::storage::upsert_virtual_key_cache(&entry).unwrap();
+        crate::storage::set_provider_binding(
+            "default",
+            "anthropic",
+            "managed_virtual_key",
+            "vk-healthy",
+        )
+        .unwrap();
+    }
+
     use super::*;
     use tempfile::TempDir;
 

@@ -306,10 +306,21 @@ pub fn render(base_url: &str, diag: &Diagnosis) -> String {
 /// Recognised transport failures are enriched; everything else — including
 /// every HTTP status error, which is a business outcome and not ours to
 /// interpret — is returned exactly as `ureq` rendered it.
-pub fn explain(base_url: &str, err: &ureq::Error) -> String {
+pub fn explain(base_url: &str, err: ureq::Error) -> String {
     let raw = err.to_string();
     let kind = match err {
-        ureq::Error::Status(_, _) => return raw,
+        // An HTTP-status error carries the server's answer, and the server
+        // spends real effort on that answer: DomainErrorResponse ships
+        // {"error": "<BIZ_* code>", "message": "<actionable sentence>"}
+        // (aikey-control shared/respond.go). Returning ureq's bare
+        // "<url>: status code 409" here threw all of that away — the user
+        // saw a naked status code while the body said exactly what to do
+        // (live case 2026-08-27: tray key switch printed "status code 409"
+        // twice; the discarded body said "no active protocol binding found
+        // for this token" with code BIZ_BIND_NO_ACTIVE). The [CODE] token is
+        // deliberate: sentences are for people, codes are for machines —
+        // GUI surfaces (tray act()) match on codes to open recovery UI.
+        ureq::Error::Status(status, resp) => return explain_status(status, resp, raw),
         ureq::Error::Transport(t) => match t.kind() {
             ureq::ErrorKind::ConnectionFailed => TransportKind::ConnectionFailed,
             ureq::ErrorKind::Dns => TransportKind::Dns,
@@ -327,6 +338,31 @@ pub fn explain(base_url: &str, err: &ureq::Error) -> String {
     }
 }
 
+/// Render an HTTP-status error with the server's own code + message when the
+/// body carries the control-plane error shape; fall back to ureq's raw string
+/// for anything else (HTML error pages, proxies, non-JSON bodies).
+fn explain_status(status: u16, resp: ureq::Response, raw: String) -> String {
+    // into_string() is capped by ureq (~10 MB); error bodies are tiny. Any
+    // read failure degrades to the raw string — never worse than before.
+    let Ok(body) = resp.into_string() else {
+        return raw;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return raw;
+    };
+    let code = v.get("error").and_then(|c| c.as_str()).unwrap_or("");
+    let message = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
+    // Both present → the full form. Codes are SCREAMING_SNAKE strings; a JSON
+    // body whose "error" is an object (some other service's shape) falls out
+    // through the as_str() above and lands on raw.
+    match (code.is_empty(), message.is_empty()) {
+        (false, false) => format!("status code {} [{}]: {}", status, code, message),
+        (false, true) => format!("status code {} [{}]", status, code),
+        (true, false) => format!("status code {}: {}", status, message),
+        (true, true) => raw,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +376,71 @@ mod tests {
     const REAL_PLAINTEXT_ERROR: &str = "https://120.24.220.105:3000/v1/auth/cli/login/init: \
          Connection Failed: tls connection init failed: received corrupt message of type \
          InvalidContentType";
+
+    /// One-shot HTTP server answering `status` with `body` — the same shape
+    /// the control plane's DomainErrorResponse emits.
+    fn one_shot(status: u16, content_type: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status, content_type, body.len(), body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        base
+    }
+
+    /// 2026-08-27 live case: the tray key switch printed a naked
+    /// "status code 409" twice while the DISCARDED body named the exact
+    /// state (BIZ_BIND_NO_ACTIVE) and the remedy. The server's code and
+    /// message must survive into the rendered error: sentences for people,
+    /// [CODES] for machines (tray act() matches on them).
+    #[test]
+    fn status_error_carries_the_servers_code_and_message() {
+        let base = one_shot(
+            409,
+            "application/json",
+            r#"{"error":"BIZ_BIND_NO_ACTIVE","message":"no active protocol binding found for this token"}"#,
+        );
+        let err = ureq::get(&base).call().expect_err("must be a status error");
+        let out = explain(&base, err);
+        assert!(
+            out.contains("[BIZ_BIND_NO_ACTIVE]"),
+            "the machine-readable code must survive: {}",
+            out
+        );
+        assert!(
+            out.contains("no active protocol binding"),
+            "the server's actionable sentence must survive: {}",
+            out
+        );
+    }
+
+    /// A body that is not the control-plane shape (nginx HTML, a proxy's
+    /// text page) must fall back to ureq's raw string — never invent
+    /// structure that is not there.
+    #[test]
+    fn status_error_with_non_json_body_falls_back_to_raw() {
+        let base = one_shot(502, "text/html", "<html>bad gateway</html>");
+        let err = ureq::get(&base).call().expect_err("must be a status error");
+        let out = explain(&base, err);
+        assert!(
+            out.contains("status code 502"),
+            "raw fallback must keep the status: {}",
+            out
+        );
+        assert!(
+            !out.contains("<html>"),
+            "must not dump an HTML body into the terminal: {}",
+            out
+        );
+    }
 
     fn classify_cf(detail: &str) -> Option<Diagnosis> {
         classify(
@@ -540,7 +641,7 @@ mod tests {
             other => panic!("expected a transport error, got {:?}", other),
         }
 
-        let out = explain(&base, &err);
+        let out = explain(&base, err);
         assert!(
             out.contains("answered in plain HTTP"),
             "the real failure must be diagnosed, got:\n{}",
@@ -564,7 +665,7 @@ mod tests {
         let err = ureq::get(&format!("{}/accounts/me", base))
             .call()
             .expect_err("a closed port must refuse");
-        let out = explain(&base, &err);
+        let out = explain(&base, err);
         assert!(out.contains("Nothing is listening"), "got:\n{}", out);
     }
 
@@ -594,8 +695,9 @@ mod tests {
         let err = ureq::get(&format!("{}/accounts/me", base))
             .call()
             .expect_err("401 must be an error");
-        let out = explain(&base, &err);
-        assert_eq!(out, err.to_string());
+        let raw = err.to_string();
+        let out = explain(&base, err);
+        assert_eq!(out, raw);
         assert!(
             !out.contains("Cause:") && !out.contains("To fix:"),
             "no diagnosis vocabulary may leak into a status error: {}",

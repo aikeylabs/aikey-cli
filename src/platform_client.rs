@@ -612,7 +612,7 @@ impl PlatformClient {
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
-            .map_err(|e| format!("login request failed: {}", explain(base_url, &e)))?;
+            .map_err(|e| format!("login request failed: {}", explain(base_url, e)))?;
 
         resp.into_json::<LoginResponse>()
             .map_err(|e| format!("failed to parse login response: {}", e))
@@ -637,7 +637,7 @@ impl PlatformClient {
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
-            .map_err(|e| format!("login init failed: {}", explain(base_url, &e)))?;
+            .map_err(|e| format!("login init failed: {}", explain(base_url, e)))?;
         resp.into_json::<InitSessionResponse>()
             .map_err(|e| format!("failed to parse login init response: {}", e))
     }
@@ -660,7 +660,7 @@ impl PlatformClient {
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
-            .map_err(|e| format!("login start failed: {}", explain(base_url, &e)))?;
+            .map_err(|e| format!("login start failed: {}", explain(base_url, e)))?;
         resp.into_json::<StartSessionResponse>()
             .map_err(|e| format!("failed to parse login start response: {}", e))
     }
@@ -680,7 +680,7 @@ impl PlatformClient {
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
-            .map_err(|e| format!("poll request failed: {}", explain(base_url, &e)))?;
+            .map_err(|e| format!("poll request failed: {}", explain(base_url, e)))?;
         resp.into_json::<PollResponse>()
             .map_err(|e| format!("failed to parse poll response: {}", e))
     }
@@ -703,7 +703,7 @@ impl PlatformClient {
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
             .send_json(&body)
-            .map_err(|e| format!("exchange request failed: {}", explain(base_url, &e)))?;
+            .map_err(|e| format!("exchange request failed: {}", explain(base_url, e)))?;
         resp.into_json::<LoginTokenExchangeResponse>()
             .map(PollResponse::from)
             .map_err(|e| format!("failed to parse exchange response: {}", e))
@@ -731,7 +731,7 @@ impl PlatformClient {
                     ureq::Error::Status(status, _) if status == 401 || status == 403 => {
                         format!("login expired (HTTP {})", status)
                     }
-                    _ => format!("token refresh failed: {}", explain(base_url, &e)),
+                    _ => format!("token refresh failed: {}", explain(base_url, e)),
                 }
             })?;
         resp.into_json::<RefreshResponse>()
@@ -815,7 +815,7 @@ impl PlatformClient {
                 ureq::Error::Status(status, ref r) => {
                     format!("register failed (HTTP {}): {}", status, r.status_text())
                 }
-                _ => format!("register request failed: {}", explain(base_url, &e)),
+                _ => format!("register request failed: {}", explain(base_url, e)),
             })?;
         resp.into_json::<RegisterDigitalEmployeeResponse>()
             .map_err(|e| format!("failed to parse register response: {}", e))
@@ -831,7 +831,7 @@ impl PlatformClient {
         let resp = ureq::get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
-            .map_err(|e| format!("all-keys request failed: {}", explain(&self.base_url, &e)))?;
+            .map_err(|e| format!("all-keys request failed: {}", explain(&self.base_url, e)))?;
 
         let data: serde_json::Value = resp
             .into_json()
@@ -908,7 +908,7 @@ impl PlatformClient {
             .map_err(|e| {
                 format!(
                     "sync-version request failed: {}",
-                    explain(&self.base_url, &e)
+                    explain(&self.base_url, e)
                 )
             })?;
         resp.into_json::<SyncVersionResponse>()
@@ -931,7 +931,7 @@ impl PlatformClient {
             .map_err(|e| {
                 format!(
                     "managed-keys-snapshot request failed: {}",
-                    explain(&self.base_url, &e)
+                    explain(&self.base_url, e)
                 )
             })?;
         resp.into_json::<ManagedKeysSnapshotResponse>()
@@ -948,7 +948,7 @@ impl PlatformClient {
         let resp = ureq::get(&url)
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .call()
-            .map_err(|e| format!("delivery request failed: {}", explain(&self.base_url, &e)))?;
+            .map_err(|e| format!("delivery request failed: {}", explain(&self.base_url, e)))?;
 
         resp.into_json::<DeliveryPayload>()
             .map_err(|e| format!("failed to parse delivery payload: {}", e))
@@ -963,7 +963,7 @@ impl PlatformClient {
             .set("Authorization", &format!("Bearer {}", self.jwt))
             .set("Content-Type", "application/json")
             .send_string("{}")
-            .map_err(|e| format!("claim request failed: {}", explain(&self.base_url, &e)))?;
+            .map_err(|e| format!("claim request failed: {}", explain(&self.base_url, e)))?;
 
         Ok(())
     }

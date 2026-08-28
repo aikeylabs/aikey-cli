@@ -2900,6 +2900,18 @@ fn status_candidates(
             "label": label,
             "kind": "team",
             "providers": row_providers,
+            // Carried for the same reason the OAuth branch below carries
+            // `status`: `aikey key use` refuses a disabled_by_* key, and a UI
+            // that offered the row anyway would produce an error the user
+            // could not have predicted from what was on screen. Live case
+            // 2026-08-27: a customer machine held keys from TWO accounts
+            // (email + feishu), the tray rendered the other account's key as
+            // an ordinary radio, and clicking it could only ever fail with
+            // "belongs to a different account". The terminal picker has
+            // partitioned on this state since day one (main.rs partition on
+            // disabled_by_account_scope) — the tray consumes candidates, so
+            // candidates must carry the same truth.
+            "state": k.local_state,
         }));
     }
 
@@ -3072,6 +3084,13 @@ fn codex_desktop_row_state(
 }
 
 fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
+    // 幂等对账读（2026-08-27 客户机）：「Desktop 接管 active ⇔ anthropic 有可
+    // 服务材料」的必经检查点。挂在这里而不是各调用方：status 是托盘 4s 轮询与
+    // 人工诊断的共同必经之路，投影本身又要反映对账后的状态，所以对账必须先于
+    // detect_state 读取。只碰 OursActive；还原失败软降级为 blocked_reason。
+    let desktop_reconcile = crate::commands_account::claude_desktop::reconcile_stale_takeover(
+        crate::commands_proxy::proxy_port(),
+    );
     // The vault gate is the same precondition the tray's login surface carries:
     // a write path that needs an interactive master-password prompt would hang a
     // no-TTY child forever. Reported as a REASON, not a hidden disable, so the UI
@@ -3165,7 +3184,33 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
             "taken_over": claude_desktop_label == "taken_over",
             "state": claude_desktop_label,
             "depends_on": "shell-hook",
-            "blocked_reason": blocked(true),
+            // 拼因果，别让用户对着 Desktop 自己的错误页猜（拍板 2026-08-27）：
+            // 还原失败 = 接管还活着但路由已死 —— 这是 Desktop 连不上的原因句。
+            "blocked_reason": if desktop_reconcile
+                == crate::commands_account::claude_desktop::StaleReconcile::RestoreFailed
+            {
+                serde_json::Value::String(
+                    "taken over but anthropic has no usable credential — Claude Desktop cannot \
+                     connect until a credential is bound or the takeover is removed"
+                        .to_string(),
+                )
+            } else {
+                blocked(true)
+            },
+            // 自动还原之后，配置已是官方，但开着的 Desktop 仍持旧路由在内存里。
+            // note sidecar（48h 内）驱动这句提示；下一次成功接管时清除。
+            "detail": if desktop_reconcile
+                == crate::commands_account::claude_desktop::StaleReconcile::Restored
+                || crate::commands_account::claude_desktop::recent_restore_note()
+            {
+                serde_json::Value::String(
+                    "auto-restored to direct claude.ai (its aikey credential became unusable) — \
+                     restart Claude Desktop if it is open"
+                        .to_string(),
+                )
+            } else {
+                serde_json::Value::Null
+            },
         }),
         serde_json::json!({
             "id": "codex-desktop",
@@ -4004,8 +4049,23 @@ mod status_candidates_tests {
             let obj = row.as_object().expect("integration row is an object");
             let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
             keys.sort_unstable();
-            assert_eq!(
-                keys,
+            // `detail` is claude-desktop-only (2026-08-27): the auto-restore
+            // notice ("restart Claude Desktop") — informational, never gates
+            // the switch (that is blocked_reason's job). Deliberately admitted
+            // through this gate; the tray relays it via Integration.Detail.
+            let expected: Vec<&str> = if row["id"] == "claude-desktop" {
+                vec![
+                    "blocked_reason",
+                    "depends_on",
+                    "detail",
+                    "display",
+                    "faces",
+                    "id",
+                    "state",
+                    "switchable",
+                    "taken_over",
+                ]
+            } else {
                 vec![
                     "blocked_reason",
                     "depends_on",
@@ -4014,11 +4074,10 @@ mod status_candidates_tests {
                     "id",
                     "state",
                     "switchable",
-                    "taken_over"
-                ],
-                "unexpected shape for {}",
-                row["id"]
-            );
+                    "taken_over",
+                ]
+            };
+            assert_eq!(keys, expected, "unexpected shape for {}", row["id"]);
         }
     }
 
