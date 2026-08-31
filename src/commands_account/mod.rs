@@ -2720,6 +2720,30 @@ pub fn handle_whoami(json_mode: bool) -> Result<(), Box<dyn std::error::Error>> 
                 format!("({})", a.account_id).dimmed()
             );
             println!("{:<16} {}", "Control URL:".bold(), a.control_url.dimmed());
+
+            // ── Licensed to ──────────────────────────────────────────────────
+            // 技术方案 §7.1「三处身份水印」的第三处。前两处（Web 登录页、设置页）
+            // 已经在控制台里；这一处一直缺着，而 CLI 恰恰是开发者每天真正盯着的
+            // 那个界面 —— 也就是说，一套被转卖或被复制的部署，从工位上看过去和
+            // 正版长得一模一样。
+            //
+            // 🚫 只显示，不判断。授权状态是在控制面判的，那里的依据是签过名的
+            // Activation。CLI 如果拿这个答案去做任何决定，那这套授权用一个本地
+            // 代理就能改掉。
+            //
+            // 🔴 拿不到就什么都不打印，不打「未知」也不打错误。个人版根本没有
+            // license 面（404 是正常情况），控制面不在线也是正常情况 —— 一个身份
+            // 水印不该成为日常命令的一种新失败方式。
+            if !a.jwt_token.is_empty() {
+                if let Some(company) =
+                    PlatformClient::licensed_company_name(&a.control_url, &a.jwt_token)
+                {
+                    // 逐字渲染，不截断、不改写。specs/license-identity 要求四个
+                    // 界面显示的是同一个字符串的同样的字节：一个被截断的公司名在
+                    // 合同纠纷里不能拿来当证据。
+                    println!("{:<16} {}", "Licensed to:".bold(), company.cyan());
+                }
+            }
         }
         None => {
             println!("{:<16} {}", "Account:".bold(), "not logged in".dimmed());
