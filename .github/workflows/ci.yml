@@ -27,6 +27,39 @@ jobs:
         with:
           go-version: '1.26.x'
       - uses: Swatinem/rust-cache@v2
+      # 🔴 provider_fingerprint's golden-parity test reads
+      # ../pkg/providerroutes/testdata/registry_golden.json — the answer set Go
+      # exports, which is the entire point of a CROSS-LANGUAGE parity test: Rust
+      # and Go must agree on one fixture, not on two copies. The path is relative
+      # to the crate root, so pkg has to sit beside this checkout the way it does
+      # in the monorepo working tree.
+      #
+      # 🔴 develop-v1.0.5, not the default branch: six of pkg's module
+      # directories do not exist on main. The test panics rather than skipping
+      # when the file is absent, and it is right to — a parity test that skips
+      # when it cannot find the other language's answers reports the same green
+      # as one that agreed.
+      - name: Check out pkg beside this checkout (cross-language parity fixture)
+        env:
+          TOKEN: ${{ secrets.AIKEY_CI_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::AIKEY_CI_TOKEN is not configured. The Rust↔Go parity test" \
+                 "reads its expectations from the private sibling pkg/. Refusing to run" \
+                 "a suite whose parity half cannot execute."
+            exit 1
+          fi
+          url="https://x-access-token:${TOKEN}@github.com/AiKeyLabs/pkg.git"
+          for ref in "${{ github.head_ref || github.ref_name }}" develop-v1.0.5; do
+            if [ -n "$ref" ] && git ls-remote --exit-code --heads "$url" "$ref" >/dev/null 2>&1; then
+              echo "::notice::pkg @ ${ref}"
+              git clone --quiet --depth 1 --branch "$ref" "$url" "$(dirname "$GITHUB_WORKSPACE")/pkg"
+              break
+            fi
+          done
+          test -f "$(dirname "$GITHUB_WORKSPACE")/pkg/providerroutes/testdata/registry_golden.json" \
+            || { echo "::error::pkg checked out without the golden fixture"; exit 1; }
       - name: Build mock_proxy (enables lifecycle E2E)
         run: make build-mock-proxy
       - name: cargo test

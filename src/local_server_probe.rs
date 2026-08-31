@@ -1297,7 +1297,9 @@ mod tests {
 
     #[test]
     fn read_local_server_port_picks_control_yaml_personal_path() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_personal_yaml_under(tmp.path(), 8091);
         with_home(tmp.path(), || {
@@ -1307,7 +1309,9 @@ mod tests {
 
     #[test]
     fn read_local_server_port_falls_back_to_control_trial_yaml() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         // Only the legacy / Trial name exists
         write_yaml_under(tmp.path(), 9092);
@@ -1318,7 +1322,9 @@ mod tests {
 
     #[test]
     fn read_local_server_port_prefers_control_yaml_when_both_present() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_personal_yaml_under(tmp.path(), 8093); // control.yaml
         write_yaml_under(tmp.path(), 7777); // control-trial.yaml (legacy)
@@ -1445,7 +1451,9 @@ mod tests {
 
     #[test]
     fn status_line_running_unlocked() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_oneshot(r#"{"unlocked":true}"#);
         let tmp = tempfile::tempdir().unwrap();
         write_yaml_under(tmp.path(), port);
@@ -1467,7 +1475,9 @@ mod tests {
 
     #[test]
     fn status_line_running_locked() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_oneshot(r#"{"unlocked":false}"#);
         let tmp = tempfile::tempdir().unwrap();
         write_yaml_under(tmp.path(), port);
@@ -1492,7 +1502,9 @@ mod tests {
 
     #[test]
     fn status_line_not_running_includes_start_hint() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = pick_unused_port();
         let tmp = tempfile::tempdir().unwrap();
         write_yaml_under(tmp.path(), port);
@@ -1552,7 +1564,9 @@ mod tests {
 
     #[test]
     fn is_local_server_installed_true_for_personal_with_console() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(
             tmp.path(),
@@ -1565,7 +1579,9 @@ mod tests {
 
     #[test]
     fn is_local_server_installed_true_for_trial() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(tmp.path(), r#"{"installed_components":["full-trial"]}"#);
         with_home(tmp.path(), || {
@@ -1575,7 +1591,9 @@ mod tests {
 
     #[test]
     fn is_local_server_installed_false_for_cli_only() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(tmp.path(), r#"{"installed_components":["aikey-cli"]}"#);
         with_home(tmp.path(), || {
@@ -1585,7 +1603,9 @@ mod tests {
 
     #[test]
     fn is_local_server_installed_false_when_state_missing() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         with_home(tmp.path(), || {
             assert!(!is_local_server_installed());
@@ -1596,7 +1616,9 @@ mod tests {
 
     #[test]
     fn detect_edition_returns_personal_for_local_server_only() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(
             tmp.path(),
@@ -1609,7 +1631,9 @@ mod tests {
 
     #[test]
     fn detect_edition_returns_trial_for_full_trial() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(tmp.path(), r#"{"installed_components":["full-trial"]}"#);
         with_home(tmp.path(), || {
@@ -1625,7 +1649,9 @@ mod tests {
         // the error — a whole trial install read as "not installed".
         // Readers must tolerate BOM'd files forever (they're already on
         // customer machines).
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(
             tmp.path(),
@@ -1641,7 +1667,9 @@ mod tests {
         // If a host's install-state.json mentions both (unusual but
         // possible on a machine that ran both installers), the running
         // listener is full-trial, so service control must target Trial.
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(
             tmp.path(),
@@ -1654,7 +1682,9 @@ mod tests {
 
     #[test]
     fn detect_edition_none_for_cli_only() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(tmp.path(), r#"{"installed_components":["aikey-cli"]}"#);
         with_home(tmp.path(), || {
@@ -1664,7 +1694,9 @@ mod tests {
 
     #[test]
     fn detect_edition_none_when_state_missing() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         with_home(tmp.path(), || {
             assert_eq!(detect_edition(), None);
@@ -1683,7 +1715,9 @@ mod tests {
     fn or_default_returns_yaml_port_when_yaml_present() {
         // YAML present → strict and _or_default agree on the YAML port.
         // Default fallback is NOT consulted.
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(
             tmp.path(),
@@ -1700,7 +1734,9 @@ mod tests {
         // YAML absent + install-state says local-server installed → default.
         // This is the BR-rc.5-47 regression pin: must NOT propagate the
         // strict error (which would say "Local Bulk Import requires...").
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(
             tmp.path(),
@@ -1716,7 +1752,9 @@ mod tests {
 
     #[test]
     fn or_default_falls_back_to_8090_for_trial_too() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(tmp.path(), r#"{"installed_components":["full-trial"]}"#);
         with_home(tmp.path(), || {
@@ -1732,7 +1770,9 @@ mod tests {
         // install-state has no local-server / no full-trial → fall back
         // should NOT kick in. The strict Bulk-Import wording is correct
         // semantically: the user has no local-server install.
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(tmp.path(), r#"{"installed_components":["aikey-cli"]}"#);
         with_home(tmp.path(), || {
@@ -1751,7 +1791,9 @@ mod tests {
         // strict error surfaces. Important: an upgrade or fresh-clone
         // host without the state file shouldn't silently default to a
         // port that doesn't exist.
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         with_home(tmp.path(), || {
             let err = read_local_server_port_or_default().unwrap_err();
@@ -1798,7 +1840,9 @@ mod tests {
 
     #[test]
     fn is_local_server_installed_false_when_state_malformed() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         write_install_state(tmp.path(), "not-json");
         with_home(tmp.path(), || {
@@ -1808,7 +1852,9 @@ mod tests {
 
     #[test]
     fn status_line_not_configured_when_no_yaml_no_config_json() {
-        let _g = crate::test_env_lock::ENV_MUTATION_LOCK.lock().unwrap();
+        let _g = crate::test_env_lock::ENV_MUTATION_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", tmp.path());

@@ -187,12 +187,27 @@ fn use_two_axis_summary_and_mislabel_prompt() {
     println!("\n================ LIVE A: `aikey use glm-team` ================\n{a_out}");
 
     // ── 4. Live run B: `aikey use multi-team` under a PTY → prompt text ───────
-    // `script -q /dev/null <cmd>` gives the child a real TTY so the interactive
-    // multi-provider branch (and its prompt) is reached; feed "1" on stdin.
+    // `script` gives the child a real TTY so the interactive multi-provider
+    // branch (and its prompt) is reached; feed "1" on stdin.
+    //
+    // 🔴 The two `script`s take the command in DIFFERENT positions, and getting
+    // it wrong does not look like a platform problem:
+    //
+    //   BSD (macOS):        script -q /dev/null CMD ARGS...
+    //   util-linux (Linux): script -q -c "CMD ARGS..." /dev/null
+    //
+    // Written the BSD way only, util-linux parses our own trailing flags as ITS
+    // options and dies with `script: unrecognized option '--no-hook'` — which
+    // the assertion below then reports as "mislabel fix not observed", i.e. as
+    // a product regression in the prompt text. This test passed on a developer
+    // Mac and had never once run on Linux.
     let mut b = Command::new("script")
-        .args(["-q", "/dev/null"])
-        .arg(bin())
-        .args(["use", "multi-team", "--no-hook"])
+        .args(script_pty_args(&[
+            &bin().to_string_lossy(),
+            "use",
+            "multi-team",
+            "--no-hook",
+        ]))
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", &tmp)
@@ -285,4 +300,36 @@ fn use_two_axis_summary_and_mislabel_prompt() {
 
     println!("\n✓ two-axis summary + member/Agent route boundary verified live\n");
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Build the argv for `script(1)` that runs `cmd` under a PTY, on either
+/// implementation.
+///
+/// 🔴 The two are not compatible and the difference is positional:
+///
+///   BSD (macOS):        script -q /dev/null CMD ARGS...
+///   util-linux (Linux): script -q -c "CMD ARGS..." /dev/null
+///
+/// On Linux the command has to be ONE argument, so it is shell-quoted here.
+/// Single quotes are the only safe form — a path or argument containing a
+/// space, `$` or `"` would otherwise be re-split by the shell `script` spawns,
+/// and the failure would surface as the child never starting rather than as a
+/// quoting bug.
+fn script_pty_args(cmd: &[&str]) -> Vec<String> {
+    if cfg!(target_os = "macos") {
+        let mut v = vec!["-q".to_string(), "/dev/null".to_string()];
+        v.extend(cmd.iter().map(|s| s.to_string()));
+        return v;
+    }
+    let quoted = cmd
+        .iter()
+        .map(|s| format!("'{}'", s.replace('\'', r"'\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    vec![
+        "-q".to_string(),
+        "-c".to_string(),
+        quoted,
+        "/dev/null".to_string(),
+    ]
 }

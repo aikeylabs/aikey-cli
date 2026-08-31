@@ -592,6 +592,41 @@ impl std::fmt::Display for TokenProbeError {
 
 impl std::error::Error for TokenProbeError {}
 
+/// Extracts the licensed company name from a `/v1/license/status` body.
+///
+/// 🔴 Split out from the fetch so it can be tested. The rules below are the ones
+/// with consequences, and none of them is exercised by anything that needs a
+/// socket — leaving them inside an HTTP call would have meant the only way to
+/// check them was to read them.
+pub(crate) fn parse_licensed_company_name(body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+
+    // 🔴 The schema version is checked rather than ignored. The status shape is
+    // versioned precisely so a client that cannot read it says nothing — and
+    // here "says nothing" is the correct behaviour, because a watermark rendered
+    // from a misread document would display the WRONG company name. A blank
+    // watermark is a missing feature; a wrong one is a false statement about who
+    // this deployment belongs to, printed on the surface people trust most.
+    if parsed.get("schema_version").and_then(|v| v.as_u64()) != Some(1) {
+        return None;
+    }
+    // Both shapes carry it: the administrator's full Status nests it under
+    // `identity`, and a member's reduced view (MemberStatus — one field, by
+    // design) has it at the top level. A member running `aikey status` must see
+    // the same watermark an administrator does; that is the point of the
+    // watermark.
+    let name = parsed
+        .get("identity")
+        .and_then(|i| i.get("company_name"))
+        .or_else(|| parsed.get("company_name"))
+        .and_then(|v| v.as_str())?
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 impl PlatformClient {
     /// Creates a new client using a JWT already stored in `platform_account`.
     pub fn new(base_url: &str, jwt: &str) -> Self {
@@ -785,6 +820,41 @@ impl PlatformClient {
             Err(ureq::Error::Status(_, _)) => Err(TokenProbeError::Offline),
             Err(ureq::Error::Transport(_)) => Err(TokenProbeError::Offline),
         }
+    }
+
+    /// GET /v1/license/status — the licensed company name, for the CLI's
+    /// identity watermark (技术方案 §7.1 「三处身份水印」的第三处).
+    ///
+    /// 🔴 What a watermark is for. The other two — the web login page and the
+    /// settings page — exist so that a deployment cannot be quietly passed off as
+    /// somebody else's. The CLI is the surface a developer looks at every day,
+    /// and it was the one place the licensed name never appeared, so a resold or
+    /// copied deployment looked exactly like a legitimate one from the seat that
+    /// spends the most hours in front of it.
+    ///
+    /// 🚫 It is DISPLAY, not enforcement. Nothing about this call decides
+    /// anything: the name is rendered, and licence state is decided in the
+    /// control plane where it is signed. A CLI that acted on this answer would be
+    /// a CLI whose licensing could be changed with a local proxy.
+    ///
+    /// 🔴 Returns None on every failure, deliberately and without an error type.
+    /// The alternative is that a slow or absent control service makes
+    /// `aikey status` fail — turning an identity display into a new way for the
+    /// daily-driver command to break. Personal has no licence surface at all and
+    /// answers 404, which is the ordinary case rather than a fault.
+    ///
+    /// The 2-second timeout matches probe_token's, for the same reason recorded
+    /// there: this runs inside an interactive command.
+    pub fn licensed_company_name(base_url: &str, jwt: &str) -> Option<String> {
+        let url = format!("{}/v1/license/status", base_url.trim_end_matches('/'));
+        let body = ureq::get(&url)
+            .set("Authorization", &format!("Bearer {}", jwt))
+            .timeout(std::time::Duration::from_secs(2))
+            .call()
+            .ok()?
+            .into_string()
+            .ok()?;
+        parse_licensed_company_name(&body)
     }
 
     /// POST /v1/digital-employees/register — self-register this host as a
@@ -1310,5 +1380,82 @@ mod chain_wire_contract_tests {
              plane adds a field — a client-side outage caused by a server-side change, on clients \
              nobody upgraded."
         );
+    }
+}
+
+#[cfg(test)]
+mod licensed_company_name_tests {
+    // 技术方案 §7.1「三处身份水印」的第三处：aikey CLI。
+    //
+    // 🔴 水印的失败模式不是「没显示」，是「显示错了」。前者是缺个功能；后者是在
+    // 开发者每天都看的那个界面上，就「这套部署属于谁」这件事印了一句假话。下面每
+    // 条测试都是围着这个区别写的。
+    use super::parse_licensed_company_name;
+
+    const COMPANY: &str = "深圳示例科技有限公司";
+
+    #[test]
+    fn an_administrators_status_renders_the_company_name() {
+        let body = format!(
+            r#"{{"schema_version":1,"applicable":true,"identity":{{"company_name":"{COMPANY}","serial":"a1b2c3"}}}}"#
+        );
+        assert_eq!(parse_licensed_company_name(&body).as_deref(), Some(COMPANY));
+    }
+
+    #[test]
+    fn a_members_reduced_status_renders_the_same_name() {
+        // MemberStatus is one field by design. A member must see the same
+        // watermark an administrator does — a watermark only administrators can
+        // see is not a watermark.
+        let body = format!(r#"{{"schema_version":1,"company_name":"{COMPANY}"}}"#);
+        assert_eq!(parse_licensed_company_name(&body).as_deref(), Some(COMPANY));
+    }
+
+    #[test]
+    fn a_future_schema_renders_nothing_rather_than_guessing() {
+        let body = format!(r#"{{"schema_version":2,"identity":{{"company_name":"{COMPANY}"}}}}"#);
+        assert_eq!(
+            parse_licensed_company_name(&body),
+            None,
+            "a newer status shape was read anyway. The field this client happens to \
+             recognise may not mean the same thing in that shape, and printing it \
+             would be a false statement about who this deployment belongs to"
+        );
+    }
+
+    #[test]
+    fn a_document_that_is_not_a_licence_status_renders_nothing() {
+        for body in [
+            r#"{"company_name":"somebody else"}"#, // no schema_version at all
+            r#"{"schema_version":1}"#,             // right shape, no name
+            r#"{"schema_version":1,"identity":{"company_name":"   "}}"#, // blank
+            r#"not json at all"#,
+            r#""#,
+        ] {
+            assert_eq!(
+                parse_licensed_company_name(body),
+                None,
+                "rendered a watermark from {body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_name_is_rendered_byte_for_byte() {
+        // specs/license-identity requires every surface to show the same string.
+        // 🚫 No truncation, no width limit, no ellipsis: a shortened legal name
+        // is not the legal name, and this value's whole job is to be comparable
+        // against a contract.
+        let long = "北京某某某某某某某某某某某某某某某某某某科技发展有限责任公司";
+        let body = format!(r#"{{"schema_version":1,"company_name":"{long}"}}"#);
+        assert_eq!(parse_licensed_company_name(&body).as_deref(), Some(long));
+
+        // Surrounding whitespace IS trimmed — that is transport noise, not part
+        // of the name — but nothing INSIDE it is touched. A name whose internal
+        // spacing was normalised would stop matching the business licence it is
+        // supposed to be comparable against.
+        let inner = "AiKey  Labs   (Shenzhen)";
+        let body = format!(r#"{{"schema_version":1,"company_name":"  {inner}  "}}"#);
+        assert_eq!(parse_licensed_company_name(&body).as_deref(), Some(inner));
     }
 }
