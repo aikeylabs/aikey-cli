@@ -240,6 +240,48 @@ pub fn resolve() -> State {
 /// works when the CLI's token has expired. That matters: an expired token is
 /// exactly when someone runs `aikey status` to find out what is wrong, and a row
 /// that needed a token would go dark at the moment it was wanted.
+/// Maps "this control plane serves no licensing routes" to a state.
+///
+/// Split out so the decision is testable without install state or a server: the
+/// caller establishes the fact, this decides what it means.
+fn licensing_absent(base: &str, own_local_server: bool) -> State {
+    if own_local_server {
+        // The resting state, and the one D9 describes: our own Personal
+        // local-server, which mounts no licensing surface by design. 🚫 No
+        // warning — this is the open-source user and nothing is wrong.
+        return State::Unlicensed;
+    }
+    State::Error(format!(
+        "{base} serves no licence identity; it is a control plane built before \
+         licensing shipped, so this deployment's licence cannot be read here. \
+         Upgrade the control plane to see it"
+    ))
+}
+
+/// Is `base` the local-server this install manages?
+///
+/// Loopback AND the port install state records. Both halves matter: a team
+/// deployment reached over the network is not ours however it answers, and a
+/// different service on loopback is not our local-server either.
+fn points_at_own_local_server(base: &str) -> bool {
+    let Ok(port) = crate::local_server_probe::read_local_server_port_or_default() else {
+        // No local-server installed, so nothing here can be ours. 🚫 Not "assume
+        // Personal": that is the guess this whole change removes.
+        return false;
+    };
+    let authority = base
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let authority = authority.split('/').next().unwrap_or("");
+    let (host, got_port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok()),
+        None => (authority, None),
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1");
+    loopback && got_port == Some(port)
+}
+
 fn fetch(control_url: &str) -> State {
     let base = control_url.trim_end_matches('/');
     if base.is_empty() {
@@ -275,8 +317,35 @@ fn fetch(control_url: &str) -> State {
         },
         // 404 is design D9 speaking: a Personal-mode control plane mounts no
         // licensing route at all, so its absence IS the answer "not licensed".
-        // The established convention — the web client reads 404 the same way.
-        Err(ureq::Error::Status(404, _)) => State::Unlicensed,
+        //
+        // 🔴 …but ONLY when the plane on the other end is a Personal one, and a
+        // 404 alone does not establish that (2026-08-26). A Production or Cluster
+        // control plane built before licensing shipped answers 404 for exactly the
+        // same reason a Personal one does — the route is not there — and reading
+        // that as "Personal edition (not commercially licensed)" tells the
+        // operator of a licensed deployment that no licence applies to them. That
+        // is the collapse the three states at the top of this file exist to
+        // prevent, arriving through a door D9 left open.
+        //
+        // Measured: 120.24.220.105:3000 serves a master console and answers 404
+        // for every /v1/license/* route, and this row called it Personal.
+        //
+        // 🚫 Two other discriminators were tried and are wrong, so do not
+        // reintroduce them:
+        //   * probing /master/* — these deployments serve the SPA's index.html
+        //     for ANY unknown path, so every edition answers 200;
+        //   * "a platform account implies a team deployment" — a Personal
+        //     local-server mounts the CLI login routes too, so Personal installs
+        //     have one as well. Flipping on that would warn every Personal user
+        //     on every `aikey status`, forever.
+        //
+        // What IS direct evidence: whether the control plane we are pointed at is
+        // the local-server THIS install manages. That comes from install state we
+        // already read, needs nothing from the server, and leaves D9 untouched —
+        // Personal still mounts no licensing surface.
+        Err(ureq::Error::Status(404, _)) => {
+            licensing_absent(base, points_at_own_local_server(base))
+        }
         Err(ureq::Error::Status(code, _)) => State::Error(format!(
             "{base} answered {code} for the licence identity; \
              check the control-plane logs"
@@ -441,17 +510,23 @@ mod tests {
         }
     }
 
-    /// 🔴 404 is design D9 speaking, not a fault.
+    /// 🔴 404 from OUR OWN local-server is design D9 speaking, not a fault.
     ///
     /// A Personal-mode control plane mounts no licensing route at all, so the
     /// route's absence IS the answer. Mapping it to an error would warn every
-    /// Personal user on every run.
+    /// Personal user on every run — that is still the reason this state exists.
     ///
-    /// 能红: map `Status(404, _)` to `State::Error`.
+    /// 🔴 Refined 2026-08-26: the 404 ALONE used to carry this, and it cannot.
+    /// A Production or Cluster plane built before licensing answers 404 for the
+    /// same reason, and this row then called a licensed deployment "Personal".
+    /// The quiet answer is now conditioned on evidence that the plane is ours;
+    /// the sibling test below pins the other half.
+    ///
+    /// 能红: map our own local-server's absent route to `State::Error`.
     #[test]
-    fn an_absent_licensing_route_is_unlicensed_not_an_error() {
+    fn an_absent_licensing_route_on_our_own_local_server_is_unlicensed_not_an_error() {
         assert_eq!(
-            fetch(&mock_control(404, r#"{"error":"not found"}"#)),
+            licensing_absent("http://127.0.0.1:8090", true),
             State::Unlicensed
         );
     }
@@ -571,5 +646,129 @@ mod tests {
             line(&fetch(&base)),
             format!("{LICENSED_TO_LABEL}{LEGAL_NAME}")
         );
+    }
+
+    /// A 404 from a plane that is NOT our own local-server must not be read as
+    /// "Personal edition".
+    ///
+    /// 🔴 The regression this pins shipped: 120.24.220.105:3000 serves a master
+    /// console and 404s every /v1/license/* route because it was built before
+    /// licensing, and this row told its operator "not commercially licensed".
+    /// The header of this file forbids exactly that collapse; D9's "404 means
+    /// Personal" is only true when the plane on the other end is Personal, and a
+    /// 404 alone never established that.
+    #[test]
+    fn a_404_from_someone_elses_control_plane_is_an_error_not_personal() {
+        // Through the real agent, not the pure helper: 404-vs-500-vs-unreachable
+        // is a TRANSPORT distinction, and the mock's random loopback port is not
+        // the local-server this install manages — which is exactly the foreign
+        // plane this pins.
+        let state = fetch(&mock_control(404, r#"{"error":"not found"}"#));
+        match &state {
+            State::Error(cause) => {
+                // Actionable, or the operator learns nothing they can use.
+                assert!(
+                    cause.contains("before"),
+                    "the cause must say the plane predates licensing: {cause}"
+                );
+                assert!(
+                    cause.contains("Upgrade"),
+                    "the cause must name the fix: {cause}"
+                );
+            }
+            other => panic!("a foreign 404 became {other:?}; that is the collapse this guards"),
+        }
+        // And it must not claim Personal anywhere in what a user sees.
+        let rendered = line(&state);
+        assert!(
+            !rendered.contains("Personal"),
+            "rendered line claims Personal for a foreign control plane: {rendered}"
+        );
+    }
+
+    /// The resting state still rests. A Personal user must not be warned on
+    /// every `aikey status` forever — that is why this is decided by evidence
+    /// about OUR local-server rather than by flipping the 404 wholesale.
+    #[test]
+    fn a_404_from_our_own_local_server_is_the_quiet_unlicensed_state() {
+        let state = licensing_absent("http://127.0.0.1:8090", true);
+        assert!(matches!(state, State::Unlicensed), "got {state:?}");
+        assert!(warning_for(&State::Unlicensed).is_none());
+    }
+
+    /// The Personal path must keep working, and only a machine that actually
+    /// has a local-server can prove it.
+    ///
+    /// 🔴 This is the half that is easy to break while "fixing" the foreign-404
+    /// case: tighten the ownership test a little too far and every Personal user
+    /// starts getting a warning on every `aikey status` — the regression the
+    /// state above exists to prevent. Skipped where no local-server is
+    /// installed rather than asserted-away, because a green run on a machine
+    /// that could not have checked is worse than a skip that says so.
+    #[test]
+    fn our_own_local_server_is_recognised_when_one_is_installed() {
+        let Ok(port) = crate::local_server_probe::read_local_server_port_or_default() else {
+            eprintln!("skipped: no local-server installed on this machine");
+            return;
+        };
+        for base in [
+            format!("http://127.0.0.1:{port}"),
+            format!("http://localhost:{port}"),
+            format!("http://127.0.0.1:{port}/"),
+        ] {
+            assert!(
+                points_at_own_local_server(&base),
+                "{base} is this install's own local-server (port {port}) and was not \
+                 recognised; a Personal user would now be warned on every status"
+            );
+            assert_eq!(
+                licensing_absent(&base, points_at_own_local_server(&base)),
+                State::Unlicensed
+            );
+        }
+    }
+
+    /// Both halves of "ours" are load-bearing.
+    #[test]
+    fn only_loopback_on_the_recorded_port_counts_as_our_local_server() {
+        // A team deployment that happens to use the same port is not ours.
+        assert!(!points_at_own_local_server(
+            "http://control.corp.example:8090"
+        ));
+        // Nor is an arbitrary loopback service on some other port.
+        assert!(!points_at_own_local_server("http://127.0.0.1:65533"));
+    }
+
+    /// 🚫 The 404 decision must not become "ask the server a second question".
+    ///
+    /// Two discriminators were measured and rejected: probing /master/* (these
+    /// deployments serve the SPA's index.html for ANY unknown path, so every
+    /// edition answers 200) and "a platform account implies a team deployment"
+    /// (Personal local-servers mount the CLI login routes too). Both would have
+    /// been extra requests answering nothing.
+    ///
+    /// So this pins the SHAPE rather than grepping for path literals — a fence
+    /// that searches for "/master/" matches its own needle and can never be
+    /// green. What it asserts is that the function deciding "is this ours" does
+    /// no I/O at all: it reads install state, and nothing else.
+    ///
+    /// 能红: make points_at_own_local_server issue an HTTP request.
+    #[test]
+    fn the_ownership_decision_does_no_io() {
+        let src = include_str!("license_identity.rs");
+        let start = src.find("fn points_at_own_local_server").expect(
+            "the ownership decision was renamed; update this fence rather than deleting it",
+        );
+        let body = &src[start..];
+        let end = body.find("\nfn ").unwrap_or(body.len());
+        let body = &body[..end];
+        for io in ["ureq", "AgentBuilder", "agent.get", "TcpStream"] {
+            assert!(
+                !body.contains(io),
+                "points_at_own_local_server now performs I/O ({io}); the whole point is \
+                 that ownership is decided from install state we already have, so the row \
+                 cannot get slower or start depending on a second endpoint"
+            );
+        }
     }
 }
