@@ -221,10 +221,23 @@ pub(crate) fn route_material_for_anthropic(proxy_port: u16) -> Option<RouteMater
     // key renders as "unset". Answering Some here made the SAME question —
     // "does anthropic have a credential?" — give two different answers.
     if binding.key_source_type == crate::credential_type::CredentialType::ManagedVirtualKey {
+        // 🔴 Ask the SHARED predicate, never re-derive it here (2026-08-31).
+        //
+        // The first version of this guard wrote its own rule and demanded
+        // `local_state == "active"` — a value the sync path never writes. Every
+        // team key is `synced_inactive`, so the guard was effectively `false`:
+        // Desktop takeover was refused on every machine with a team credential,
+        // with a message telling the user to run `aikey use` for a key the panel
+        // was already showing as bound. The reconcile consumes this same
+        // function, so an installed takeover was torn down as well.
+        //
+        // `is_servable` is the rule the picker / web set-route / activation have
+        // used since 2026-04-10. One name, one answer to one question.
+        let on_cluster = crate::commands_account::read_cluster_node().is_some();
         let servable = crate::storage::get_virtual_key_cache(&binding.key_source_ref)
             .ok()
             .flatten()
-            .map(|k| k.local_state == "active" && k.key_status == "active")
+            .map(|k| k.is_servable(on_cluster))
             .unwrap_or(false);
         if !servable {
             return None;
@@ -328,6 +341,13 @@ pub(crate) enum DesktopState {
     /// `3p` but applied by someone else (e.g. cc-switch). D5: silent
     /// takeover is allowed; their profile FILE is never touched.
     ForeignActive,
+    /// `3p` with NOBODY's profile applied — no appliedId and no profile file
+    /// in the library. This is RESIDUE, not a foreign takeover (2026-08-31,
+    /// winpc2). Distinguishing it matters because ForeignActive carries a
+    /// promise never to touch it, and a machine parked here would otherwise
+    /// route Claude Desktop at a gateway nobody serves, for ever, with no
+    /// path back. Healable: the reconcile restores 1p.
+    OrphanedThirdParty,
 }
 
 fn detect_installation(paths: &DesktopPaths) -> DesktopInstallation {
@@ -390,11 +410,30 @@ pub(crate) fn detect_state(paths: &DesktopPaths) -> DesktopState {
     if !mode_3p {
         return DesktopState::Official;
     }
-    if applied_id(&paths.meta).as_deref() == Some(PROFILE_ID) {
-        DesktopState::OursActive
-    } else {
-        DesktopState::ForeignActive
+    match applied_id(&paths.meta).as_deref() {
+        Some(PROFILE_ID) => DesktopState::OursActive,
+        // 🔴 Residue, not a foreign owner (2026-08-31). THREE conditions must
+        // hold together — a real third-party takeover fails at least one:
+        //   mode=3p  AND  no applied id  AND  no profile file in the library.
+        // Anything with someone's id, or with a profile file sitting there,
+        // stays ForeignActive and keeps the never-touch promise.
+        None if !library_has_any_profile(paths) => DesktopState::OrphanedThirdParty,
+        _ => DesktopState::ForeignActive,
     }
+}
+
+/// Whether the 3p config library holds ANY profile file (ours or a foreign
+/// tool's). `_meta.json` is bookkeeping, not a profile.
+fn library_has_any_profile(paths: &DesktopPaths) -> bool {
+    let Ok(entries) = std::fs::read_dir(&paths.config_library) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_name()
+            .to_str()
+            .map(|n| n != "_meta.json" && n.ends_with(".json"))
+            .unwrap_or(false)
+    })
 }
 
 // ─── Takeover ───────────────────────────────────────────────────────────
@@ -577,6 +616,18 @@ pub(crate) fn restore_at(paths: &DesktopPaths) -> Result<RestoreResult, String> 
             _ => "Claude Desktop installation detection failed".to_string(),
         }),
         DesktopState::ForeignActive => Ok(RestoreResult::NotOursSkipped),
+        // Our own residue (mode=3p, nobody's profile). Same treatment as
+        // OursActive: write 1p back and clear what is left. Skipping it —
+        // which is what the pre-2026-08-31 ForeignActive verdict caused —
+        // parks Claude Desktop on a gateway nobody serves with no way back.
+        DesktopState::OrphanedThirdParty => {
+            write_deployment_mode(&paths.normal_config, "1p")?;
+            if paths.threep_config.exists() {
+                write_deployment_mode(&paths.threep_config, "1p")?;
+            }
+            remove_our_residue(paths)?;
+            Ok(RestoreResult::Restored)
+        }
         DesktopState::Official => {
             // Mode already official; clear any residue we left behind
             // (profile + meta claim) so state converges. No mode write.
@@ -682,13 +733,36 @@ pub(crate) fn reconcile_stale_takeover(proxy_port: u16) -> StaleReconcile {
 /// Testable core of `reconcile_stale_takeover` (paths injected — the same
 /// pattern as `reconcile_active_at`, so fences exercise the REAL logic).
 pub(crate) fn reconcile_stale_at(paths: &DesktopPaths, proxy_port: u16) -> StaleReconcile {
-    if detect_state(paths) != DesktopState::OursActive {
-        return StaleReconcile::NoAction;
+    // TWO healable states, not one (2026-08-31, winpc2 live).
+    //
+    //   OursActive          — takeover live; heal only when its material died.
+    //   OrphanedThirdParty  — mode=3p with nobody's profile: OUR residue, and
+    //                         ALWAYS wrong regardless of material. A machine
+    //                         parked here routes Claude Desktop at a gateway
+    //                         nobody serves. The first version gated on
+    //                         OursActive alone, so an already-orphaned machine
+    //                         answered NoAction for ever — the heal existed and
+    //                         could not be reached (found on winpc2 AFTER the
+    //                         orphan verdict shipped: state read correctly,
+    //                         deploymentMode stayed 3p).
+    match detect_state(paths) {
+        DesktopState::OrphanedThirdParty => {} // always heal — no material test
+        DesktopState::OursActive => {
+            if route_material_for_anthropic(proxy_port).is_some() {
+                return StaleReconcile::NoAction;
+            }
+        }
+        _ => return StaleReconcile::NoAction,
     }
-    if route_material_for_anthropic(proxy_port).is_some() {
-        return StaleReconcile::NoAction;
-    }
-    match remove_our_residue(paths) {
+    // 🔴 restore_at, NOT remove_our_residue (fixed 2026-08-31, winpc2).
+    // The first version called the residue cleaner directly and skipped the
+    // `write_deployment_mode(1p)` that restore_at does FIRST — leaving
+    // mode=3p with nobody's profile applied: an orphan the old detect_state
+    // read as ForeignActive, which our own guard then refused to touch. The
+    // machine could never come back, while the log claimed "auto-restored".
+    // Calling the established restore keeps ONE implementation of "undo a
+    // takeover" instead of a second one that drifts.
+    match restore_at(paths) {
         Ok(_) => {
             // Best-effort note so the tray can keep saying "restart Claude
             // Desktop" after the fact. Enhancement, never a dependency: a
@@ -806,7 +880,12 @@ pub(crate) fn reconcile_active_at(
             DesktopSwitch::default()
         }
         DesktopState::OursActive => perform_takeover(paths, proxy_port),
-        DesktopState::Official | DesktopState::ForeignActive => {
+        // Our own residue takes the consent path like Official does: there is
+        // no third party to surprise, and a fresh takeover overwrites the
+        // orphan cleanly (2026-08-31).
+        DesktopState::Official
+        | DesktopState::OrphanedThirdParty
+        | DesktopState::ForeignActive => {
             match crate::global_config::get_claude_desktop_consent()
                 .unwrap_or(None)
                 .as_deref()
@@ -984,6 +1063,10 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
                 DesktopState::Official => "official",
                 DesktopState::OursActive => "aikey",
                 DesktopState::ForeignActive => "other",
+                // Says what it is, not who owns it: "other" sent a 2026-08-31
+                // diagnosis down the wrong path ("another tool took it over")
+                // when the truth was our own leftovers.
+                DesktopState::OrphanedThirdParty => "orphaned-3p (our residue)",
             };
             let base_url = read_json_object(&p.profile)
                 .ok()
@@ -1147,6 +1230,31 @@ pub(crate) fn handle_desktop_status(json_mode: bool) -> Result<(), Box<dyn std::
 /// `aikey desktop install` — manual takeover (D8①). The explicit command is
 /// itself actionable consent: it clears a standing `never` (its documented
 /// exit) and, on a TTY with no pref, still confirms once (default Yes).
+/// The refusal the user reads when Desktop cannot be taken over.
+///
+/// 🔴 A named function so it can be fenced (2026-08-31). The message used to be
+/// one sentence for two very different situations, and for the situation that
+/// actually happened — a key WAS chosen, it just was not servable — it told the
+/// user to go and choose a key. They had already done that; the panel was even
+/// showing it as bound. Being sent to redo the one step you got right is worse
+/// than a bare error.
+fn desktop_refusal(unservable_reason: Option<String>) -> String {
+    match unservable_reason {
+        // A credential IS bound; it cannot be served right now. Never suggest
+        // `aikey use` here — choosing it again changes nothing.
+        Some(why) => format!(
+            "[I_DESKTOP_KEY_NOT_SERVABLE] the credential bound to claude cannot be used \
+             right now: {}. Desktop follows that binding, so it was not taken over. \
+             Nothing on this machine was changed.",
+            why
+        ),
+        // Nothing is bound at all — here, choosing one IS the next step.
+        None => "[I_DESKTOP_NO_ANTHROPIC_BINDING] no active claude credential — run \
+                 `aikey use <claude credential>` first (Desktop follows the active binding)"
+            .to_string(),
+    }
+}
+
 pub(crate) fn handle_desktop_install() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::IsTerminal;
     let Some(paths) = desktop_paths() else {
@@ -1185,11 +1293,27 @@ pub(crate) fn handle_desktop_install() -> Result<(), Box<dyn std::error::Error>>
     }
     let proxy_port = crate::commands_proxy::proxy_port();
     if route_material_for_anthropic(proxy_port).is_none() {
-        return Err(
-            "[I_DESKTOP_NO_ANTHROPIC_BINDING] no active claude credential — run \
-             `aikey use <claude credential>` first (Desktop follows the active binding)"
-                .into(),
-        );
+        // 🔴 Two different situations, two different next steps (2026-08-31).
+        //
+        // The single message used to be "run `aikey use` first" — which, when the
+        // user HAD already chosen a key, sent them to redo the one thing they had
+        // done right. That is what made the winpc2 report so confusing: the panel
+        // showed the credential bound while this told them there was none.
+        //
+        // The explanation comes from the shared layer (`unservable_reason`); this
+        // file must not inspect key fields itself — re-deriving the rule here is
+        // exactly the mistake that caused the outage.
+        let on_cluster = crate::commands_account::read_cluster_node().is_some();
+        let bound = crate::storage::get_provider_binding("default", "anthropic")
+            .ok()
+            .flatten();
+        let why = bound.and_then(|b| {
+            crate::storage::get_virtual_key_cache(&b.key_source_ref)
+                .ok()
+                .flatten()
+                .and_then(|k| k.unservable_reason(on_cluster))
+        });
+        return Err(desktop_refusal(why).into());
     }
     let pref = crate::global_config::get_claude_desktop_consent().unwrap_or(None);
     if pref.as_deref() == Some("never") {
@@ -1282,6 +1406,109 @@ mod tests {
     //   同一个「anthropic 有没有凭据」两份实现两个答案。Desktop 打 proxy，
     //   proxy 的路由查询过滤 disabled_by_% → 请求失败 → 客户看到
     //   "Couldn't connect to Claude"（推理面假设 A 的我方边界内证据）。
+    /// 🔴 这个文件不许自己推导「KEY 能不能服务」（2026-08-31）。
+    ///
+    /// 上一版就是在这里从零写了第四份判据并写窄了。行为围栏能挡住"这一次写错"，
+    /// 挡不住"下一次又抄一份"——所以再加一道结构断言：本文件的**生产代码**里
+    /// 不得出现 `local_state`，要问就问 `is_servable`。
+    ///
+    /// 扫描前先剥掉注释行，且只扫 `#[cfg(test)]` 之前的部分：注释里本来就写着
+    /// `local_state == "active"` 在讲这段历史，测试 fixture 也要写这个字段——
+    /// 不剥就会被自己的文字骗（本仓已有三次自匹配围栏的先例）。
+    #[test]
+    fn this_file_does_not_re_derive_servability() {
+        let src = include_str!("claude_desktop.rs");
+        let production = match src.find("#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        let code_only: String = production
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let needle = format!("local{}state", "_");
+        assert!(
+            !code_only.contains(&needle),
+            "生产代码里又出现了 {needle} —— 可服务性判据只有一个名字（is_servable）。\
+             自己推导一份，就是 2026-08-28 那次的复现方式"
+        );
+        assert!(
+            code_only.contains(&format!("is{}servable(", "_")),
+            "守卫不再向共享判据提问了；它一旦自己判断，就会和 picker / web / \
+             activation 给出不同答案（面板说 bound=true、接管说没凭据）"
+        );
+    }
+
+    #[test]
+    /// 🔴 已经选好 KEY 的用户，不能被支去重新选一次（2026-08-31，winpc2）。
+    ///
+    /// 两种失败长得完全不同：
+    ///   - 压根没绑定 → "去 `aikey use` 选一个" 是对的下一步
+    ///   - 绑了但当前不可服务 → 再选一次**什么都不会变**，这句话纯属误导
+    /// 出事那天用户看到的正是后者配前者的文案，于是他反复确认自己"明明选了 KEY"。
+    ///
+    /// 能红：把两条分支的错误码/文案换成同一句。
+    fn refusal_tells_a_bound_key_apart_from_no_key_at_all() {
+        let bound_but_dead = desktop_refusal(Some("the key is revoked on the server".into()));
+        assert!(
+            bound_but_dead.contains("I_DESKTOP_KEY_NOT_SERVABLE"),
+            "GUI 要靠错误码开对的表单，两种失败必须给不同的码：{bound_but_dead}"
+        );
+        assert!(
+            bound_but_dead.contains("revoked"),
+            "没把「为什么不可用」带出来，用户只知道失败不知道下一步：{bound_but_dead}"
+        );
+        assert!(
+            !bound_but_dead.contains("aikey use"),
+            "把已经选好 KEY 的用户支去重新选 —— 这正是 winpc2 那天的困惑来源：{bound_but_dead}"
+        );
+
+        let nothing_bound = desktop_refusal(None);
+        assert!(
+            nothing_bound.contains("I_DESKTOP_NO_ANTHROPIC_BINDING"),
+            "真的没绑定时要保留原来的码，别把既有的 GUI 处理逻辑打断"
+        );
+        assert!(
+            nothing_bound.contains("aikey use"),
+            "这一种情况下「去选一个」才是正确的下一步，不该被一并删掉"
+        );
+    }
+
+    #[test]
+    /// 🔴 winpc2 的那台机器，作为围栏（2026-08-31）。
+    ///
+    /// 用户选好了团队 KEY、绑定在、面板自己都显示 `bound: true`，点接管却报
+    /// `I_DESKTOP_NO_ANTHROPIC_BINDING`「没有可用的 claude 凭据」。原因是
+    /// 2026-08-28 加的守卫自己另写了一份判据，要求 `local_state == "active"` ——
+    /// 而同步链路给团队 KEY 写的一直是 `synced_inactive`。守卫因此恒假，
+    /// **所有**带团队凭据的机器都装不上接管；`reconcile_stale_at` 用的是同一个
+    /// 函数，所以已装好的接管还会被它主动拆掉。
+    ///
+    /// 能红：把守卫改回 `k.local_state == "active"`。
+    fn a_synced_team_key_is_servable_material_for_desktop() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("vault.db");
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).unwrap();
+        let pw = secrecy::SecretString::new("winpc2-pw".to_string());
+        crate::storage::initialize_vault(&salt, &pw).unwrap();
+
+        // 真机形态：OAuth 组 KEY，本地无密文（设计如此），local_state 是同步链路
+        // 实际写入的 synced_inactive。
+        seed_active_vk_with_binding();
+
+        assert!(
+            route_material_for_anthropic(27200).is_some(),
+            "同步下来的团队 KEY 被判成「没有凭据」——用户选好了 KEY、绑定在、\
+             面板显示 bound=true，接管却装不上（winpc2 2026-08-31 现场）"
+        );
+    }
+
     #[test]
     fn takeover_left_stale_when_account_scope_disables_the_key() {
         let dir = TempDir::new().unwrap();
@@ -1307,7 +1534,11 @@ mod tests {
             virtual_key_revision: String::new(),
             key_status: "active".into(),
             share_status: "accepted".into(),
-            local_state: "active".into(),
+            // 🔴 真机形态，不是想当然的取值（2026-08-31）。同步链路写的是
+            // `synced_inactive`（storage.rs，2026-06-05 起），`"active"` 这个值
+            // 生产里根本不出现 —— 上一版 fixture 就是拿它演了一台不存在的机器，
+            // 于是守卫写错了判据而围栏全绿。
+            local_state: "synced_inactive".into(),
             expires_at: None,
             provider_key_nonce: None,
             provider_key_ciphertext: None,
@@ -1322,7 +1553,9 @@ mod tests {
             owner_account_id: Some("acct-1".into()),
             owner_email: None,
             extra: None,
-            oauth_group_id: None,
+            // OAuth 组 KEY：材料由 proxy 走通道③拉取，本地无密文是**设计如此**。
+            // winpc2 上出问题的那把（team-oauth-开发组-…）正是这个形态。
+            oauth_group_id: Some("grp-1".into()),
             group_accounts: None,
             routing_config: None,
             group_alias: None,
@@ -1399,6 +1632,114 @@ mod tests {
             reconcile_stale_at(&paths, 27200),
             StaleReconcile::NoAction,
             "对账必须幂等 — 第二遍不得再产生任何动作"
+        );
+    }
+
+    /// 🔴 终态围栏（2026-08-31，winpc2 真机发现）：对账**必须落到 Official**。
+    ///
+    /// 08-27 的第一版只调 `remove_our_residue`（删 profile + 清 appliedId），
+    /// 漏掉了它前面那句 `write_deployment_mode(1p)` —— 结果 deploymentMode 仍是
+    /// "3p"，机器停在 mode=3p + appliedId=空 的**孤儿态**：
+    ///   · 日志却打 "auto-restored to direct claude.ai"（说谎：Desktop 仍指向死网关）
+    ///   · detect_state 把它判成 ForeignActive → 我们自己的 Foreign 守卫拒绝再碰
+    ///     → **回不来的中间态**（INV-E1/E2 明令禁止的形态）
+    ///
+    /// 原 5 条围栏为什么没拦住：它们只断言"离开了 OursActive"和"Foreign 字节不动"，
+    /// **没有一条断言"到达了正确终态"**。断言起点不断言终点，孤儿态从这条缝穿过去。
+    ///
+    /// 能红：把 reconcile 改回只调 `remove_our_residue`。
+    #[test]
+    fn reconcile_lands_on_official_not_an_orphan() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("vault.db");
+        let _guard = crate::test_env_lock::HomeVaultEnvGuard::new(dir.path(), &db_path);
+        let mut salt = [0u8; 16];
+        crate::crypto::generate_salt(&mut salt).unwrap();
+        let pw = secrecy::SecretString::new("orphan-pw".to_string());
+        crate::storage::initialize_vault(&salt, &pw).unwrap();
+        seed_active_vk_with_binding();
+        crate::global_config::set_claude_desktop_consent("always").unwrap();
+        let tmp_desk = TempDir::new().unwrap();
+        let paths = installed_paths(&tmp_desk);
+        assert!(reconcile_active_at(&paths, 27200, false).configured);
+
+        // 材料消失（账号切换的真实路径）
+        crate::storage::disable_keys_for_account_scope("acct-other").unwrap();
+        assert_eq!(reconcile_stale_at(&paths, 27200), StaleReconcile::Restored);
+
+        // ── 终态断言（本围栏的全部理由）──
+        assert_eq!(
+            deployment_mode(&paths.normal_config).as_deref(),
+            Some("1p"),
+            "对账后 deploymentMode 必须回到 1p —— 否则 Desktop 仍指向已死的 aikey 网关，\
+             而日志已经宣称 auto-restored（说谎）"
+        );
+        assert_eq!(
+            detect_state(&paths),
+            DesktopState::Official,
+            "对账必须落到 Official。停在 mode=3p + appliedId 空 = 孤儿态，会被 detect_state \
+             判成 ForeignActive，然后被我们自己的 Foreign 守卫永久拒绝触碰 —— 回不来的中间态"
+        );
+    }
+
+    /// 🔴 已中招的机器必须能自愈（2026-08-31 winpc2 活体发现的第二道缝）。
+    ///
+    /// 上一版围栏只测「从 OursActive 出发 → 落到 Official」，而对账入口
+    /// `if detect_state != OursActive { return NoAction }` 把孤儿态挡在门外：
+    /// **判定修好了、自愈进不去门**，真机上 state 读对了而 deploymentMode 仍是 3p。
+    /// 断言起点齐全 ≠ 断言全部入口。
+    ///
+    /// 能红：把入口 match 改回只认 OursActive。
+    #[test]
+    fn an_already_orphaned_machine_heals_itself() {
+        let tmp = TempDir::new().unwrap();
+        let paths = installed_paths(&tmp);
+        // winpc2 现场逐字形态：mode=3p、_meta 无 appliedId、库内无 profile
+        write_deployment_mode(&paths.normal_config, "3p").unwrap();
+        std::fs::create_dir_all(&paths.config_library).unwrap();
+        std::fs::write(&paths.meta, "{}").unwrap();
+        assert_eq!(detect_state(&paths), DesktopState::OrphanedThirdParty);
+
+        assert_eq!(
+            reconcile_stale_at(&paths, 27200),
+            StaleReconcile::Restored,
+            "孤儿态必须被对账收拾 —— 它与材料无关，任何时候都是错的"
+        );
+        assert_eq!(
+            deployment_mode(&paths.normal_config).as_deref(),
+            Some("1p"),
+            "自愈后 deploymentMode 必须回到 1p，否则 Desktop 仍指向无人服务的网关"
+        );
+        assert_eq!(detect_state(&paths), DesktopState::Official);
+        // 幂等：第二遍零动作
+        assert_eq!(reconcile_stale_at(&paths, 27200), StaleReconcile::NoAction);
+    }
+
+    /// 孤儿态（已中招的机器）必须能被自愈，而**真** Foreign 依旧绝不触碰。
+    /// 能红：把 OrphanedThirdParty 判定去掉（孤儿又变回 ForeignActive）。
+    #[test]
+    fn orphaned_third_party_is_healable_but_real_foreign_is_not() {
+        let tmp = TempDir::new().unwrap();
+        let paths = installed_paths(&tmp);
+
+        // 孤儿态：mode=3p，appliedId 空，configLibrary 无任何 profile 文件
+        // （winpc2 2026-08-31 现场的逐字形态）
+        write_deployment_mode(&paths.normal_config, "3p").unwrap();
+        std::fs::create_dir_all(&paths.config_library).unwrap();
+        std::fs::write(&paths.meta, "{}").unwrap();
+        assert_eq!(
+            detect_state(&paths),
+            DesktopState::OrphanedThirdParty,
+            "mode=3p 但没有任何 appliedId、也没有任何 profile 文件 —— 这是我们自己留下的\
+             残骸，不是别人的接管；判成 Foreign 会让它永远无法自愈"
+        );
+
+        // 真 Foreign：别人的 appliedId 在
+        std::fs::write(&paths.meta, r#"{"appliedId":"cc-switch-0000-0000-0000-000000000000"}"#).unwrap();
+        assert_eq!(
+            detect_state(&paths),
+            DesktopState::ForeignActive,
+            "有他人 appliedId = 真的被别的工具接管，安全承诺不变：绝不触碰"
         );
     }
 
@@ -1512,7 +1853,11 @@ mod tests {
             virtual_key_revision: String::new(),
             key_status: "active".into(),
             share_status: "accepted".into(),
-            local_state: "active".into(),
+            // 🔴 真机形态，不是想当然的取值（2026-08-31）。同步链路写的是
+            // `synced_inactive`（storage.rs，2026-06-05 起），`"active"` 这个值
+            // 生产里根本不出现 —— 上一版 fixture 就是拿它演了一台不存在的机器，
+            // 于是守卫写错了判据而围栏全绿。
+            local_state: "synced_inactive".into(),
             expires_at: None,
             provider_key_nonce: None,
             provider_key_ciphertext: None,
@@ -1527,7 +1872,9 @@ mod tests {
             owner_account_id: Some("acct-1".into()),
             owner_email: None,
             extra: None,
-            oauth_group_id: None,
+            // OAuth 组 KEY：材料由 proxy 走通道③拉取，本地无密文是**设计如此**。
+            // winpc2 上出问题的那把（team-oauth-开发组-…）正是这个形态。
+            oauth_group_id: Some("grp-1".into()),
             group_accounts: None,
             routing_config: None,
             group_alias: None,

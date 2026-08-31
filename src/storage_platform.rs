@@ -723,6 +723,59 @@ impl VirtualKeyCacheEntry {
     /// (`I_KEY_NOT_DELIVERED` → 422). One predicate keeps the three paths from
     /// diverging again. `claimed` is required so an unclaimed (pending_claim) seat
     /// is never treated as usable just because the client is on a cluster.
+    /// Whether this team key can be SERVED right now — the single rule every
+    /// consumer that asks "does this credential actually work?" must share.
+    ///
+    /// Three conditions, and all three have to hold:
+    ///   1. `local_state` is a usable state. **`synced_inactive` IS usable** —
+    ///      it is what the sync path writes for every team key delivered from
+    ///      the server (`storage.rs`, since 2026-06-05); it means "not the
+    ///      currently selected one", not "broken". The states that disqualify
+    ///      are the `disabled_by_*` / `stale` family.
+    ///   2. `key_status == "active"` — not revoked / recycled / expired.
+    ///   3. material is reachable (see `key_material_reachable` above).
+    ///
+    /// 🔴 WHY this became a named method (2026-08-31). The rule had lived since
+    /// 2026-04-10 as inline copies in the picker / web set-route / activation
+    /// paths. A guard added to the Claude Desktop takeover on 2026-08-28 wrote a
+    /// FOURTH copy from scratch and got it wrong — it demanded
+    /// `local_state == "active"`, a value the sync path never writes — so every
+    /// team key was judged unservable and Desktop takeover was refused on every
+    /// machine with a team credential ("no active claude credential" while the
+    /// panel showed the very same credential bound). Its unit fence stayed green
+    /// because the fixture seeded `local_state: "active"`, a state that does not
+    /// occur in production.
+    ///
+    /// Copies are how that happened; a name is how it stops.
+    /// Why this key is NOT servable, in words a panel can show.
+    ///
+    /// For MESSAGES ONLY — never branch on it. `is_servable` stays the single
+    /// decision; this just explains that decision. Keeping the explanation next
+    /// to the rule is deliberate: a caller that had to inspect the fields itself
+    /// would be re-deriving the rule again, which is the mistake this whole file
+    /// section exists to prevent (2026-08-31).
+    pub fn unservable_reason(&self, on_cluster: bool) -> Option<String> {
+        if self.is_servable(on_cluster) {
+            return None;
+        }
+        if !matches!(self.local_state.as_str(), "active" | "synced_inactive") {
+            return Some(format!(
+                "it was disabled on this machine (state: {})",
+                self.local_state
+            ));
+        }
+        if self.key_status != "active" {
+            return Some(format!("the key is {} on the server", self.key_status));
+        }
+        Some("its key material has not been delivered to this machine yet".to_string())
+    }
+
+    pub fn is_servable(&self, on_cluster: bool) -> bool {
+        matches!(self.local_state.as_str(), "active" | "synced_inactive")
+            && self.key_status == "active"
+            && self.key_material_reachable(on_cluster)
+    }
+
     pub fn key_material_reachable(&self, on_cluster: bool) -> bool {
         // Group VKs (oauth_group_id set) carry NO local key material BY DESIGN —
         // the per-account credential is pulled by the proxy via channel ③ (group
@@ -734,6 +787,152 @@ impl VirtualKeyCacheEntry {
         self.provider_key_ciphertext.is_some()
             || (on_cluster && self.share_status == "claimed")
             || self.oauth_group_id.is_some()
+    }
+}
+
+#[cfg(test)]
+mod servable_tests {
+    use super::*;
+
+    /// 全字段显式构造，**故意不给这个类型加 `Default`**：一个 Default 会让
+    /// "随手造一个不真实的 fixture" 变容易，而这正是 2026-08-28 那次的病根
+    /// （fixture 填了生产中不存在的 `local_state: "active"`）。
+    fn entry(local_state: &str, key_status: &str) -> VirtualKeyCacheEntry {
+        VirtualKeyCacheEntry {
+            binding_id: String::new(),
+            virtual_key_id: "vk-1".into(),
+            org_id: "org-1".into(),
+            seat_id: "seat-1".into(),
+            alias: "key-1".into(),
+            provider_code: "anthropic".into(),
+            protocol_type: "anthropic".into(),
+            base_url: String::new(),
+            credential_id: String::new(),
+            credential_revision: String::new(),
+            virtual_key_revision: String::new(),
+            key_status: key_status.into(),
+            share_status: "accepted".into(),
+            local_state: local_state.into(),
+            expires_at: None,
+            provider_key_nonce: None,
+            provider_key_ciphertext: None,
+            synced_at: 0,
+            local_alias: None,
+            supported_providers: vec!["anthropic".into()],
+            provider_base_urls: std::collections::HashMap::new(),
+            priority: 1,
+            fallback_role: "primary".into(),
+            route_group_id: String::new(),
+            route_group_name: String::new(),
+            owner_account_id: Some("acct-1".into()),
+            owner_email: None,
+            extra: None,
+            // OAuth 组 KEY 的形态：本地无密文但材料可达（proxy 走通道③）。
+            oauth_group_id: Some("grp-1".into()),
+            group_accounts: None,
+            routing_config: None,
+            group_alias: None,
+            group_runtime: None,
+        }
+    }
+
+    /// 🔴 判据的取值表，按**同步链路真实写入的值**枚举（2026-08-31）。
+    ///
+    /// 出事的那次，守卫只认字面 `"active"` —— 一个同步链路从不写入的值 ——
+    /// 而它的单测 fixture 恰好也填了 `"active"`，于是围栏演了一台不存在的机器，
+    /// 全绿着放行了一个恒假的判据。表驱动是为了让"漏掉某个真实取值"这件事
+    /// 变成结构性不可能，而不是靠下一个人记得。
+    #[test]
+    fn servable_accepts_the_states_the_sync_path_actually_writes() {
+        // 可用：synced_inactive 是团队 KEY 同步下来的常态（storage.rs, 2026-06-05）
+        assert!(
+            entry("synced_inactive", "active").is_servable(false),
+            "synced_inactive 是同步下来的正常状态，判成不可用会拒掉所有团队 KEY"
+        );
+        assert!(entry("active", "active").is_servable(false));
+
+        // 不可用：disabled_* 家族与 stale
+        for bad in [
+            "disabled_by_account_scope",
+            "disabled_by_key_status",
+            "stale",
+        ] {
+            assert!(
+                !entry(bad, "active").is_servable(false),
+                "{bad} 必须判为不可服务：代理的路由查询会过滤掉它，\
+                 放行等于把客户端指向一条代理会拒绝的路线"
+            );
+        }
+
+        // key_status 是独立的一维：状态可用不代表 KEY 没被吊销
+        assert!(
+            !entry("synced_inactive", "revoked").is_servable(false),
+            "已吊销的 KEY 不得因为 local_state 正常就被放行"
+        );
+    }
+
+    /// 🔴 说清是哪一种失败（2026-08-31）。
+    ///
+    /// 出事时只有一句话："no active claude credential — run `aikey use` first"。
+    /// 而用户**已经选好了 KEY**，于是这句话把他支去重做唯一做对了的那一步。
+    /// 三种不可服务的原因要各说各的，且不得反过来影响判定（`is_servable` 仍是
+    /// 唯一决策，这里只负责解释）。
+    #[test]
+    fn unservable_reason_tells_the_three_failures_apart() {
+        // 可服务时没有理由可说 —— 一句多余的解释就是一次误导
+        assert!(entry("synced_inactive", "active")
+            .unservable_reason(false)
+            .is_none());
+
+        let disabled = entry("disabled_by_account_scope", "active")
+            .unservable_reason(false)
+            .expect("被停用必须有理由");
+        assert!(
+            disabled.contains("disabled_by_account_scope"),
+            "没说清是哪个状态，用户和支持都无从下手：{disabled}"
+        );
+
+        let revoked = entry("synced_inactive", "revoked")
+            .unservable_reason(false)
+            .expect("已吊销必须有理由");
+        assert!(
+            revoked.contains("revoked"),
+            "服务端吊销要说成服务端的事，不能让用户去本地找问题：{revoked}"
+        );
+
+        let mut undelivered = entry("synced_inactive", "active");
+        undelivered.oauth_group_id = None;
+        undelivered.provider_key_ciphertext = None;
+        let m = undelivered
+            .unservable_reason(false)
+            .expect("材料未下发必须有理由");
+        assert!(
+            m.contains("material"),
+            "材料未下发要说成「还没发到这台机器」，而不是「没有凭据」：{m}"
+        );
+
+        // 三条理由必须互不相同 —— 否则等于又回到"一句话打发所有失败"
+        assert!(disabled != revoked && revoked != m && disabled != m);
+    }
+
+    /// 材料可达性是第三个条件，不能因为前两个满足就跳过。
+    #[test]
+    fn servable_still_requires_reachable_material() {
+        let mut e = entry("synced_inactive", "active");
+        e.oauth_group_id = None; // 非组 KEY
+        e.provider_key_ciphertext = None; // 未下发
+        e.share_status = "accepted".into(); // 未认领
+        assert!(
+            !e.is_servable(false),
+            "既无本地密文、又不在集群、也不是组 KEY —— 材料不可达，不得判为可服务"
+        );
+        assert!(
+            !e.is_servable(true),
+            "仅仅「在集群上」不够，席位还得是 claimed"
+        );
+
+        e.share_status = "claimed".into();
+        assert!(e.is_servable(true), "集群 + 已认领 = 中央 KEY，材料可达");
     }
 }
 

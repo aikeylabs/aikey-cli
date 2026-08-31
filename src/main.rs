@@ -8088,6 +8088,26 @@ fn handle_hook_command(action: &HookAction) -> Result<(), Box<dyn std::error::Er
                         );
                     }
                 }
+                // 🔴 Write, then READ BACK — do not trust the return value
+                // (2026-08-31, winpc2).
+                //
+                // `ensure_shell_hook_with_consent` returns `Option<String>`,
+                // which cannot express "this failed": every branch, success and
+                // refusal alike, exited 0. The tray reads the exit code, so a
+                // Windows switch that wired nothing still reported success —
+                // and the user's only reading was "the switch is broken".
+                //
+                // The read-back is gated on `--yes` ON PURPOSE. Without it,
+                // "rc not wired" is a legitimate outcome: an interactive user
+                // answered no, or the H1.5 non-TTY guard declined and printed
+                // the hint. WITH it, consent was carried, so anything short of
+                // a wired rc is a real failure and has to be loud.
+                //
+                // `hook_status_probe` is the shared rc-wired truth source
+                // (doctor / `aikey use` / wire-rc all read it) and is
+                // shell-aware, so this one check covers PowerShell and
+                // zsh/bash alike instead of a per-shell assertion.
+                commands_account::verify_consent_actually_wired_rc(*yes)?;
                 Ok(())
             }
         }

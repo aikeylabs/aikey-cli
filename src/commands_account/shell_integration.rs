@@ -2213,6 +2213,32 @@ pub fn ensure_shell_hook_with_consent(no_hook: bool, assume_yes: bool) -> Option
     // through to the bash/zsh branch would print a misleading "Shell not
     // recognized" message every `aikey use` for Windows users.
     if shell_kind() == ShellKind::PowerShell {
+        // 🔴 assume_yes must survive THIS branch (2026-08-31, winpc2).
+        //
+        // The 2026-08-18 fix that introduced `assume_yes` threaded it through
+        // the zsh/bash path and left this line calling a function that does not
+        // take it — so on Windows the grant was dropped at the very first
+        // branch. `ensure_powershell_hook`'s H1.5 non-TTY guard then declined
+        // the rc edit and returned a HINT, main printed it and exited 0, and
+        // the tray (which reads the exit code) reported success while the
+        // switch had done nothing. Measured on winpc2: `hook install --yes`
+        // → exit 0, $PROFILE marker absent. Same defect as 2026-08-18, same
+        // sentence, one platform over.
+        //
+        // Routing to `wire_rc_with_consent` rather than adding a parameter
+        // keeps ONE implementation of "consent is carried, skip the TTY gate":
+        // it is the same core the Web modal's Allow button uses, and it already
+        // wires every present PowerShell flavor (2026-07-12). A second copy
+        // here is exactly how the two paths drifted apart in the first place.
+        if assume_yes {
+            return match wire_rc_with_consent() {
+                Ok(()) => None, // caller prints the shared success line
+                Err(reason) => Some(format!(
+                    "  Could not wire the PowerShell profile: {:?}.                      The hook file is still available to load manually.",
+                    reason
+                )),
+            };
+        }
         return super::shell_integration_windows::ensure_powershell_hook();
     }
 
@@ -2591,6 +2617,41 @@ pub fn web_install_hook_file_layer1() -> (bool, Option<HookFailureReason>) {
 
 /// Read-only hook readiness probe (2026-07-10, GET /api/user/hook/status).
 ///
+/// Error code for "consent was carried but the rc never got wired".
+///
+/// Emitted from exactly ONE place (the function below) so a GUI consumer can
+/// match on it; duplicating the literal elsewhere splits the contract.
+pub const ERRCODE_HOOK_RC_NOT_WIRED: &str = "HOOK_RC_NOT_WIRED";
+
+/// Write, then READ BACK: did the rc actually get wired?
+///
+/// 🔴 Why this is a named function and not three lines at the call site
+/// (2026-08-31). `ensure_shell_hook_with_consent` returns `Option<String>`,
+/// which cannot express "this failed" — every outcome, success and refusal
+/// alike, exited 0. On Windows the consent was being dropped, nothing was
+/// wired, and the tray (which reads the exit code) reported success. A concept
+/// with no name in the code gets re-derived by hand at each call site and
+/// drifts; this is the single exit, and the fence asserts callers use it.
+///
+/// Gated on `assume_yes` ON PURPOSE. Without a carried consent, "rc not wired"
+/// is a legitimate outcome — an interactive user answered no, or the H1.5
+/// non-TTY guard declined and printed its hint. WITH one, anything short of a
+/// wired rc is a real failure and must be loud.
+pub fn verify_consent_actually_wired_rc(assume_yes: bool) -> Result<(), String> {
+    if !assume_yes {
+        return Ok(());
+    }
+    let (_file_installed, rc_wired, _reason) = hook_status_probe();
+    if rc_wired {
+        return Ok(());
+    }
+    Err(format!(
+        "[{}] the shell hook file was written but your shell startup file was not wired, \
+         so the hook will not load in new terminals. Nothing else on this machine was changed.",
+        ERRCODE_HOOK_RC_NOT_WIRED
+    ))
+}
+
 /// Returns `(file_installed, rc_wired, failure_reason)` — the exact triple
 /// the Web envelope carries — WITHOUT writing anything. This must NOT be
 /// implemented on top of `web_install_hook_file_layer1`: that helper
@@ -3084,10 +3145,15 @@ pub(super) fn apply_bash_profile_shim_if_needed(home: &str, kind: HookKind) -> b
 /// environment-level opt-out wins. Returns `AikeyNoHook` so the front-end
 /// can surface "you opted out — unset AIKEY_NO_HOOK to enable" copy.
 ///
-/// **Shell discipline**: only zsh / bash. PowerShell users go through
-/// [`super::shell_integration_windows::ensure_powershell_hook`]; from
-/// Web that path is currently surfaced as `ShellUndetectable` since it
-/// needs $PROFILE handling that doesn't fit this POSIX-rc shape.
+/// **Shell discipline**: zsh / bash go through the POSIX helper below;
+/// PowerShell routes to `wire_powershell_rc_no_tty`. (This doc claimed
+/// PowerShell was "surfaced as ShellUndetectable" until 2026-08-31 — stale
+/// since BR-rc.5-77 on 2026-05-26, and misleading in a decision-relevant
+/// way: it reads as "this core cannot serve Windows", which is exactly the
+/// wrong conclusion for anyone looking for a consent-carrying entry point.)
+///
+/// Callers: the Web modal's Allow button, and `hook install --yes` on
+/// PowerShell (2026-08-31) — both are "a click that IS the consent".
 pub fn wire_rc_with_consent() -> Result<(), HookFailureReason> {
     if std::env::var("AIKEY_NO_HOOK")
         .map(|v| v == "1")
@@ -3136,7 +3202,11 @@ pub fn wire_rc_with_consent() -> Result<(), HookFailureReason> {
 
 /// BR-rc.5-77: PowerShell-side equivalent of `write_v3_layers_with_consent`
 /// for Web-modal callers. Writes hook.ps1 (Layer 1) + injects v3 marker
-/// block into the first existing PowerShell $PROFILE candidate (Layer 2).
+/// block into EVERY present PowerShell $PROFILE candidate (Layer 2) — this
+/// doc said "the first existing candidate" until 2026-08-31; the code has
+/// wired all present flavors since 2026-07-12 (see 3a below) and a reader
+/// deciding whether this path is equivalent to `ensure_powershell_hook`
+/// would have been told the wrong thing.
 /// Skips the TTY check that `ensure_powershell_hook` has — Web modal
 /// "Allow" IS the consent gate.
 fn wire_powershell_rc_no_tty(home: &str) -> Result<(), HookFailureReason> {
@@ -4858,6 +4928,218 @@ tool_call_timeout_ms = 60000\n"
     // static raced against session::tests and the three other test modules
     // below — fix recorded in workflow/CI/bugfix.
     use crate::test_env_lock::ENV_MUTATION_LOCK;
+
+    // The consent has one more exit than the branches above: the COMMAND that
+    // carries it. `hook install --yes` has to hand the flag to the helper, and
+    // — because `Option<String>` cannot express failure — it has to READ BACK
+    // whether the rc actually got wired. Without the read-back a dropped grant
+    // is silent again (exit 0), which is the whole defect.
+    //
+    // Asserted on main.rs's source because the dispatch lives in a binary the
+    // lib tests cannot call. Needles are assembled at runtime: a literal would
+    // match THIS file if the scan ever widened (a self-matching fence has
+    // already shipped green three times in this repo).
+    #[test]
+    fn hook_install_forwards_consent_and_reads_back_the_result() {
+        let main_rs = include_str!("../main.rs");
+        let start = main_rs
+            .find(&format!("Hook{}::Install {{", "Action"))
+            .expect("hook install handler not found in main.rs");
+        let end = main_rs[start..]
+            .find(&format!("Hook{}::Reinstall", "Action"))
+            .map(|i| start + i)
+            .unwrap_or(main_rs.len());
+        let handler = &main_rs[start..end];
+
+        let forwards = format!("ensure_shell_hook_with_consent({}, *yes)", "false");
+        assert!(
+            handler.contains(&forwards),
+            "`hook install` no longer forwards --yes to the consent helper. The GUI's \
+             click stops being consent, the H1.5 non-TTY guard declines the rc edit, and \
+             the command still exits 0 — the tray reports success having wired nothing."
+        );
+
+        // Only the CALL is asserted here — whether the read-back actually
+        // refuses is a behaviour, and behaviour is asserted in the test below.
+        // The first draft of this fence checked that `hook_status_probe()`
+        // appeared in the handler and passed happily when the whole block was
+        // made unreachable: a spelling assertion wearing a behaviour's clothes.
+        let single_exit = format!("verify_consent_actually{}(*yes)", "_wired_rc");
+        assert!(
+            handler.contains(&single_exit),
+            "`hook install` no longer calls the read-back. The helper returns \
+             Option<String>, which cannot say 'this failed', so without it every outcome \
+             exits 0 and the tray reports success having wired nothing (winpc2 2026-08-31)."
+        );
+    }
+
+    // The behaviour the call above is worth having.
+    #[test]
+    fn read_back_refuses_only_when_consent_was_carried() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // An rc with user content and NO aikey marker: nothing got wired.
+        std::fs::write(tmp.path().join(".zshrc"), "# user content\n").expect("seed rc");
+
+        let prev_home = std::env::var("HOME").ok();
+        let prev_shell = std::env::var("SHELL").ok();
+        let prev_nohook = std::env::var("AIKEY_NO_HOOK").ok();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("SHELL", "/bin/zsh");
+            std::env::remove_var("AIKEY_NO_HOOK");
+        }
+
+        let carried = verify_consent_actually_wired_rc(true);
+        let not_carried = verify_consent_actually_wired_rc(false);
+
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_shell {
+                Some(v) => std::env::set_var("SHELL", v),
+                None => std::env::remove_var("SHELL"),
+            }
+            match prev_nohook {
+                Some(v) => std::env::set_var("AIKEY_NO_HOOK", v),
+                None => std::env::remove_var("AIKEY_NO_HOOK"),
+            }
+        }
+
+        let err = carried.expect_err(
+            "consent was carried and the rc is unwired — this MUST fail. Reporting success \
+             here is the winpc2 defect: the tray reads the exit code and flips the switch on.",
+        );
+        assert!(
+            err.contains(ERRCODE_HOOK_RC_NOT_WIRED),
+            "the failure carries no error code; GUI consumers match on codes, not prose: {err}"
+        );
+        assert!(
+            not_carried.is_ok(),
+            "with no consent carried, an unwired rc is the user answering no (or H1.5 \
+             declining a non-TTY caller) — legitimate, and must NOT be an error"
+        );
+    }
+
+    // ── 2026-08-31: a carried consent must survive EVERY shell branch ──────
+    //
+    // 🔴 Why this is written per-SHELL and not per-line. `--yes` exists so a
+    // GUI click can stand in for the TTY prompt (2026-08-18, "点击 Shell hook
+    // 开关开启无效"). That fix threaded the flag through the zsh/bash path and
+    // left `ensure_shell_hook_with_consent`'s PowerShell branch calling a
+    // function that does not take it — so on Windows the grant was dropped at
+    // the first branch, the H1.5 guard declined the rc edit, the command exited
+    // 0, and the tray reported success while nothing had been wired. Measured
+    // on winpc2 2026-08-31: exit 0, $PROFILE marker absent.
+    //
+    // The same defect, the same sentence, one platform over. A fence that
+    // asserted "the zsh path forwards the flag" would have been green through
+    // all of it. So this one enumerates the CONCEPT'S EXITS — every shell kind
+    // that has an rc file — and each case carries its own control showing H1.5
+    // still refuses when consent was NOT carried.
+    //
+    // cargo test runs without a controlling TTY, so these ARE the non-TTY
+    // branches; no pty needed.
+    #[test]
+    fn carried_consent_wires_rc_in_every_shell_and_absent_consent_still_refuses() {
+        let _guard = ENV_MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // (override, SHELL, rc path under HOME, human name)
+        //
+        // Both env vars are set on purpose: this function's POSIX branch reads
+        // the raw `SHELL` var while its PowerShell check goes through
+        // `shell_kind()` (which honors AIKEY_SHELL_OVERRIDE). Two detection
+        // mechanisms in one function — driving only one of them makes a case
+        // fall through to "Shell not recognized" and fail for a reason that has
+        // nothing to do with consent.
+        let cases: [(&str, &str, &[&str], &str); 3] = [
+            ("zsh", "/bin/zsh", &[".zshrc"], "zsh"),
+            ("bash", "/bin/bash", &[".bashrc"], "bash"),
+            (
+                "powershell",
+                "",
+                &[".config", "powershell", "profile.ps1"],
+                "PowerShell",
+            ),
+        ];
+
+        for (override_kind, shell_var, rc_parts, name) in cases {
+            for carried in [false, true] {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                let home = tmp.path().to_str().expect("home utf-8").to_string();
+                let mut rc = tmp.path().to_path_buf();
+                for part in rc_parts {
+                    rc.push(part);
+                }
+                std::fs::create_dir_all(rc.parent().expect("rc parent")).expect("mkdir rc");
+                // The rc file must EXIST: the PowerShell writer wires every
+                // PRESENT profile flavor, so a sandbox with no profile at all
+                // would report "not wired" for a reason that has nothing to do
+                // with consent — a green fence proving nothing.
+                std::fs::write(&rc, "# user content\n").expect("seed rc");
+
+                let prev_home = std::env::var("HOME").ok();
+                let prev_shell = std::env::var("SHELL").ok();
+                let prev_override = std::env::var("AIKEY_SHELL_OVERRIDE").ok();
+                let prev_nohook = std::env::var("AIKEY_NO_HOOK").ok();
+                unsafe {
+                    std::env::set_var("HOME", &home);
+                    if shell_var.is_empty() {
+                        std::env::remove_var("SHELL");
+                    } else {
+                        std::env::set_var("SHELL", shell_var);
+                    }
+                    std::env::set_var("AIKEY_SHELL_OVERRIDE", override_kind);
+                    // An opt-out inherited from the developer's own shell
+                    // beats consent by design — it would make every case pass
+                    // for the wrong reason.
+                    std::env::remove_var("AIKEY_NO_HOOK");
+                }
+
+                let _ = ensure_shell_hook_with_consent(false, carried);
+                let wired = std::fs::read_to_string(&rc)
+                    .map(|c| c.contains(V3_BEGIN))
+                    .unwrap_or(false);
+
+                unsafe {
+                    match prev_home {
+                        Some(v) => std::env::set_var("HOME", v),
+                        None => std::env::remove_var("HOME"),
+                    }
+                    match prev_shell {
+                        Some(v) => std::env::set_var("SHELL", v),
+                        None => std::env::remove_var("SHELL"),
+                    }
+                    match prev_override {
+                        Some(v) => std::env::set_var("AIKEY_SHELL_OVERRIDE", v),
+                        None => std::env::remove_var("AIKEY_SHELL_OVERRIDE"),
+                    }
+                    match prev_nohook {
+                        Some(v) => std::env::set_var("AIKEY_NO_HOOK", v),
+                        None => std::env::remove_var("AIKEY_NO_HOOK"),
+                    }
+                }
+
+                if carried {
+                    assert!(
+                        wired,
+                        "{name}: --yes carried the consent and the rc was still not wired. \
+                         A GUI caller gets Layer 1 and a hint nobody reads, the command exits 0, \
+                         and the switch reports success while doing nothing (winpc2, 2026-08-31)."
+                    );
+                } else {
+                    assert!(
+                        !wired,
+                        "{name}: rc was wired with NO consent carried and no TTY present. \
+                         H1.5 exists so a piped / CI invocation can never silently rewrite a \
+                         user's shell startup file."
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn ensure_shell_hook_refuses_rc_append_in_non_tty() {

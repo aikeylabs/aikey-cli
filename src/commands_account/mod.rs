@@ -3131,6 +3131,13 @@ fn status_integrations(vault_initialized: bool) -> Vec<serde_json::Value> {
         Some(crate::commands_account::claude_desktop::DesktopState::DetectionFailed) => {
             "detection_failed"
         }
+        // Our own leftovers, not a third party's takeover (2026-08-31). Shown
+        // as not_taken_over because that is the truth the user can act on —
+        // AiKey is NOT routing Desktop right now; the reconcile on this very
+        // status pass has already restored 1p.
+        Some(crate::commands_account::claude_desktop::DesktopState::OrphanedThirdParty) => {
+            "not_taken_over"
+        }
         // Someone else (e.g. cc-switch) owns the 3p profile. Their file is never
         // touched, so this is NOT "not taken over" and the UI must not offer a
         // plain switch that would silently fight the other tool.

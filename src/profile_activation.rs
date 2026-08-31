@@ -1221,14 +1221,10 @@ fn find_replacement_candidate(
         if vk.virtual_key_id == excluded_ref && excluded_type == "team" {
             continue;
         }
-        // Only consider usable team keys.
-        if vk.local_state != "active" && vk.local_state != "synced_inactive" {
-            continue;
-        }
-        if vk.key_status != "active" {
-            continue;
-        }
-        if !vk.key_material_reachable(on_cluster) {
+        // Only consider usable team keys. Same three conditions as before,
+        // now expressed by the shared `is_servable` (2026-08-31): keeping them
+        // inline here is how a fourth, wrong copy got written elsewhere.
+        if !vk.is_servable(on_cluster) {
             continue;
         }
         if let Ok((provider_code, protocol_type)) =
