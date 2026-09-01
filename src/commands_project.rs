@@ -2839,6 +2839,18 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
         any_failed = true;
     }
 
+    // ── 远程诊断信息（2026-09-01，用户要求「一条 ak doctor 收齐」）─────────
+    //
+    // 为什么并进主命令而不是只留 --last-errors：远程支援时对面是客户，
+    // 「再跑一条带 flag 的命令」就是又一轮往返。doctor 一把梭收齐：
+    //   · 最近错误响应（proxy last-errors 环：状态/来源/错误码/trace）
+    //   · 硬吊销留痕（auth-demotions 环：何时、因上游说了什么、判死了哪把 token 前缀）
+    // 两个环都是 proxy 落的本地文件，天然不含密钥（fingerprint 只留 12 字符前缀，
+    // 响应体/消息原文一律不落盘）——整段输出可以直接粘进工单。
+    // 详细的 caused-by 树仍走 `aikey doctor --last-errors`。
+    // bugfix: workflow/CI/bugfix/2026-09-01-auth-failure-demotion-discards-upstream-evidence.md
+    let diagnostics = print_remote_diagnostics(json_mode);
+
     if !json_mode {
         println!("{}", crate::symbols::BOX_H.s().repeat(52).dimmed());
         if any_failed {
@@ -2850,6 +2862,8 @@ pub fn handle_doctor(json_mode: bool) -> Result<bool, Box<dyn std::error::Error>
         json_output::print_json(serde_json::json!({
             "ok": !any_failed,
             "checks": results,
+            // 结构化诊断快照：随 --json 一并带走，远程收集脚本不用再拼文件路径。
+            "diagnostics": diagnostics,
         }));
     }
 
@@ -3307,6 +3321,76 @@ mod hook_wiring_check_tests {
         assert!(hook_wiring_check(false, true).0);
         assert!(hook_wiring_check(false, false).0);
     }
+}
+
+/// One-shot remote-diagnosis snapshot for plain `aikey doctor` (2026-09-01).
+///
+/// Reads the proxy's two local diagnostic rings and prints a condensed view;
+/// returns the raw JSON for `--json` mode. Both files are written secrets-free
+/// by the proxy (truncated fingerprints, no bodies), so the whole section is
+/// safe to paste into a ticket. Missing file = "none recorded", never an error:
+/// doctor must stay useful on a machine where the proxy has not run yet.
+fn print_remote_diagnostics(json_mode: bool) -> serde_json::Value {
+    use colored::Colorize;
+
+    let run_dir = match std::env::var("AIKEY_RUN_DIR") {
+        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => match dirs::home_dir() {
+            Some(h) => h.join(".aikey/run"),
+            None => return serde_json::json!({}),
+        },
+    };
+    let read_entries = |name: &str| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(run_dir.join(name))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| v.get("entries").and_then(|e| e.as_array()).cloned())
+            .unwrap_or_default()
+    };
+    let errors = read_entries("last-errors.json");
+    let demotions = read_entries("auth-demotions.json");
+
+    if !json_mode {
+        println!();
+        println!("{}", "远程诊断信息 (Remote diagnostics — safe to paste)".bold());
+        // 硬吊销留痕：这是「登录成功→一会儿变登录失效」类问题的第一手证据。
+        if demotions.is_empty() {
+            println!("  {} {}", "硬吊销:".dimmed(), "无记录".dimmed());
+        } else {
+            println!("  {}", "硬吊销 (token demotions, newest last):".yellow());
+            for e in demotions.iter().rev().take(5).rev() {
+                let at = e.get("at_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                let status = e.get("upstream_status").and_then(|v| v.as_i64()).unwrap_or(0);
+                let etype = e.get("upstream_error_type").and_then(|v| v.as_str()).unwrap_or("-");
+                let seat = e.get("seat_id").and_then(|v| v.as_str()).unwrap_or("");
+                let fp = e.get("fingerprint_prefix").and_then(|v| v.as_str()).unwrap_or("");
+                println!(
+                    "    at_ms={} upstream={} type={} seat={} fp={}",
+                    at,
+                    if status == 0 { "旧版无证据".to_string() } else { status.to_string() },
+                    etype, seat, fp
+                );
+            }
+        }
+        // 最近错误响应（凝缩版；完整 caused-by 树用 --last-errors）。
+        if errors.is_empty() {
+            println!("  {} {}", "最近错误:".dimmed(), "无记录".dimmed());
+        } else {
+            println!("  {}", "最近错误响应 (newest last, full tree: doctor --last-errors):".yellow());
+            for e in errors.iter().rev().take(5).rev() {
+                let at = e.get("at_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                let status = e.get("status").and_then(|v| v.as_i64()).unwrap_or(0);
+                let origin = e.get("origin").and_then(|v| v.as_str()).unwrap_or("");
+                let code = e.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                let trace = e.get("trace_id").and_then(|v| v.as_str()).unwrap_or("");
+                println!("    at_ms={} status={} origin={} code={} trace={}", at, status, origin, code, trace);
+            }
+        }
+    }
+    serde_json::json!({
+        "auth_demotions": demotions,
+        "last_errors": errors,
+    })
 }
 
 /// `aikey doctor --last-errors` — render the proxy's most-recent error responses

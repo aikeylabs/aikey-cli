@@ -55,10 +55,15 @@ const LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// is non-blocking; we busy-wait between attempts.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Budget for the child to BIND its port. A child that cannot own a port
-/// within 5s has almost certainly crashed (spawn errors, config errors and
-/// port conflicts all surface in well under a second), so failing fast here
-/// is still right.
+/// Budget for the child to BIND its port. Crashes (spawn errors, config
+/// errors, port conflicts) surface in well under a second, so this still
+/// fails fast relative to the 60s starting window.
+///
+/// 15s, not 5s (user decision 2026-09-01): binding is not instant on the
+/// machines this bug came from — Defender scans the 34MB binary BEFORE the
+/// process even runs (spawn is 25-40x slower on Windows), and the customer
+/// report was from exactly such a box. 5s of pre-bind budget was the same
+/// unmeasured optimism as the old single deadline, just one step earlier.
 ///
 /// 🔴 What this deadline must NOT do any more (2026-09-01, customer machine
 /// 方波 + winpc2): treat "bound but not yet healthy" as crashed. The old
@@ -70,7 +75,7 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// KILLED the almost-ready child on each retry — a fixed timeout turned
 /// "slow machine" into "can never start". Once the child owns the port, the
 /// wait continues under [`DEFAULT_STARTING_DEADLINE`] instead.
-pub const DEFAULT_HEALTHY_DEADLINE: Duration = Duration::from_secs(5);
+pub const DEFAULT_HEALTHY_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Total budget for a child that HAS bound its port to finish initializing
 /// (vault Argon2, egress engine, broker, observers) and answer /health 200.
@@ -81,6 +86,12 @@ pub const DEFAULT_HEALTHY_DEADLINE: Duration = Duration::from_secs(5);
 /// starting surface (2026-09-01) reports its init phase on /health, which
 /// the timeout diagnostics include so "wedged WHERE" is answerable.
 pub const DEFAULT_STARTING_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a BOUND child may stay quiet before the CLI tells the human this
+/// is a wait, not a hang. Decoupled from the bind budget on purpose: when the
+/// bind budget moved 5s→15s (2026-09-01) an announcement tied to it would
+/// have kept the terminal silent for 15s — the silence this whole fix removes.
+const STILL_STARTING_ANNOUNCE_AFTER: Duration = Duration::from_secs(5);
 
 /// Polling interval inside the healthy-poll loop. 250ms balances "user
 /// doesn't notice" with "child has time to bind the port".
@@ -1467,7 +1478,10 @@ fn start_proxy_locked_inner(
         }
         // Once bound, tell the human this is a WAIT, not a hang — the old
         // silent 5s window is precisely what made slow and dead identical.
-        if ever_bound && !still_starting_announced && started_at.elapsed() >= opts.healthy_deadline {
+        if ever_bound
+            && !still_starting_announced
+            && started_at.elapsed() >= STILL_STARTING_ANNOUNCE_AFTER
+        {
             still_starting_announced = true;
             eprintln!(
                 "[aikey] aikey-proxy is still starting (port {} bound, pid {}); \
@@ -1672,7 +1686,28 @@ mod tests {
     // warm start on a healthy box; customer machines blew 5s every time and
     // could never start the proxy again). The verdict is a pure function so
     // the whole decision table sits here without clocks, sockets or children.
-    use crate::proxy_lifecycle::{startup_wait_verdict, StartupWaitVerdict};
+    use crate::proxy_lifecycle::{
+        startup_wait_verdict, StartupWaitVerdict, DEFAULT_HEALTHY_DEADLINE,
+        DEFAULT_STARTING_DEADLINE,
+    };
+
+    #[test]
+    fn decided_budgets_hold() {
+        // 🔴 These numbers are DECISIONS, not defaults (2026-09-01 拍板):
+        // bind 15s (Defender scans the 34MB binary before the process even
+        // runs on the machines this bug came from), total 60s (3.9s measured
+        // warm × an order of magnitude). The old values lived only in a
+        // comment and drifted from reality unmeasured — that comment WAS the
+        // bug. Changing either number is a new decision: take it back to the
+        // user, then update this fence with the new rationale.
+        use std::time::Duration;
+        assert_eq!(DEFAULT_HEALTHY_DEADLINE, Duration::from_secs(15));
+        assert_eq!(DEFAULT_STARTING_DEADLINE, Duration::from_secs(60));
+        assert!(
+            DEFAULT_HEALTHY_DEADLINE < DEFAULT_STARTING_DEADLINE,
+            "the bind budget must stay inside the total budget"
+        );
+    }
 
     #[test]
     fn startup_wait_two_budget_table() {
