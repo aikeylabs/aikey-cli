@@ -96,6 +96,7 @@ fn build_start_options(
         binary_path,
         listen_addr,
         healthy_deadline: crate::proxy_lifecycle::DEFAULT_HEALTHY_DEADLINE,
+        starting_deadline: crate::proxy_lifecycle::DEFAULT_STARTING_DEADLINE,
         stderr_target,
         extra_env,
         port_drift_enabled,

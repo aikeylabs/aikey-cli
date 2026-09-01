@@ -58,10 +58,21 @@ pub fn current_toggle() -> ComplianceToggle {
 /// Returned rather than printed so `service status` can render the same words
 /// in its own table — the two surfaces cannot drift.
 pub fn state_detail(toggle: ComplianceToggle) -> String {
-    match toggle {
-        ComplianceToggle::OnMandated => "on — required by your organization's policy".to_string(),
-        ComplianceToggle::OnLocal => "on — scanning before forward".to_string(),
-        ComplianceToggle::Off => "off — requests are forwarded unscanned".to_string(),
+    let base = match toggle {
+        ComplianceToggle::OnMandated => "on — required by your organization's policy",
+        ComplianceToggle::OnLocal => "on — scanning before forward",
+        ComplianceToggle::Off => "off — requests are forwarded unscanned",
+    };
+    // Password-lane level (阶段8/合规密码档分级). Only the org force is stated
+    // here: this process can prove "forced advanced" from the mirrored org
+    // policy, but the machine's own effective level lives with the running
+    // detector (health surface) — claiming it from here would be the health
+    // signal stating more than it knows. Wording is the single source the Web
+    // console mirrors (compliancePage.passwordTier.* keys carry the long form).
+    if toggle != ComplianceToggle::Off && crate::storage::compliance_master_password_advanced() {
+        format!("{base}; password lane: advanced (enforced by your organization)")
+    } else {
+        base.to_string()
     }
 }
 
@@ -79,6 +90,7 @@ pub(crate) fn handle_compliance(
                         "enabled": toggle != ComplianceToggle::Off,
                         "mandated": toggle == ComplianceToggle::OnMandated,
                         "locked": crate::storage::compliance_master_locked(),
+                        "password_tier_forced_advanced": crate::storage::compliance_master_password_advanced(),
                         "detail": state_detail(toggle),
                     })
                 );

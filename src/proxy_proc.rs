@@ -572,6 +572,28 @@ pub fn http_health_ok(port: u16, timeout: std::time::Duration) -> bool {
     }
 }
 
+/// Best-effort read of the proxy's startup phase from a 503 "starting"
+/// /health body (`{"status":"starting","phase":"egress",…}`, served since
+/// 2026-09-01 from the moment the port is bound). Returns None for old
+/// proxies (which serve nothing before init completes), for healthy 200s,
+/// and for anything unparseable — the caller treats None as "no phase info",
+/// never as a health verdict. Diagnostics only; decisions stay on
+/// [`http_health_ok`].
+pub fn http_starting_phase(port: u16, timeout: std::time::Duration) -> Option<String> {
+    let url = format!("http://127.0.0.1:{port}/health");
+    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let body = match agent.get(&url).call() {
+        Ok(_) => return None, // 200 = healthy; there is no "starting" phase to report
+        Err(ureq::Error::Status(503, resp)) => resp.into_string().ok()?,
+        Err(_) => return None,
+    };
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    if v.get("status")?.as_str()? != "starting" {
+        return None;
+    }
+    Some(v.get("phase")?.as_str()?.to_string())
+}
+
 /// Errors from [`port_owner_pid`]. Layer 1 maps both variants to
 /// "owner unknown" (= `OrphanedPort` with `owner_pid: None`).
 #[derive(Debug)]

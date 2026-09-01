@@ -1727,6 +1727,22 @@ pub fn compliance_master_enabled() -> bool {
     compliance_master_policy_flag("enabled")
 }
 
+/// Whether the org policy currently FORCES the password lane to advanced
+/// (阶段8/合规密码档分级 R-credential-password-tier-4). The proxy mirrors the
+/// org's `password_tier` into `compliance.master_policy` for display; only the
+/// exact value "advanced" is a force — absent / "" / unknown all mean "no
+/// force: the machine's own level (factory simple) governs". Same failure
+/// direction as the flags above: never claims enforcement it cannot prove.
+pub fn compliance_master_password_advanced() -> bool {
+    let Ok(Some(s)) = read_string_config(COMPLIANCE_MASTER_POLICY_KEY) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&s)
+        .ok()
+        .and_then(|v| v.get("password_tier").and_then(|t| t.as_str().map(|t| t == "advanced")))
+        .unwrap_or(false)
+}
+
 /// Shared reader for the two booleans in `compliance.master_policy`. One parse
 /// site so a wire-shape change (or a missing key) can only be handled one way.
 fn compliance_master_policy_flag(field: &str) -> bool {

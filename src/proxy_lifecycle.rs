@@ -55,11 +55,32 @@ const LIFECYCLE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// is non-blocking; we busy-wait between attempts.
 const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Default timeout for `start_proxy` to consider the spawned child
-/// "healthy" (process_alive + HTTP /health 200). 5s is enough for cold
-/// starts on most laptops; longer than that almost always means the
-/// proxy crashed silently.
+/// Budget for the child to BIND its port. A child that cannot own a port
+/// within 5s has almost certainly crashed (spawn errors, config errors and
+/// port conflicts all surface in well under a second), so failing fast here
+/// is still right.
+///
+/// 🔴 What this deadline must NOT do any more (2026-09-01, customer machine
+/// 方波 + winpc2): treat "bound but not yet healthy" as crashed. The old
+/// comment claimed "5s is enough for cold starts on most laptops; longer
+/// than that almost always means the proxy crashed silently" — measured
+/// false: a healthy Windows test box started in 3881ms WARM, leaving 1.1s of
+/// margin, and a slower customer machine (Defender scanning the 34MB binary,
+/// Argon2 vault derive) blew the budget every time. The drop guard then
+/// KILLED the almost-ready child on each retry — a fixed timeout turned
+/// "slow machine" into "can never start". Once the child owns the port, the
+/// wait continues under [`DEFAULT_STARTING_DEADLINE`] instead.
 pub const DEFAULT_HEALTHY_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Total budget for a child that HAS bound its port to finish initializing
+/// (vault Argon2, egress engine, broker, observers) and answer /health 200.
+/// Sized from measurement, not optimism: 3.9s warm on a healthy box ⇒ a slow
+/// cold machine gets an order of magnitude, not 28%. A child still not
+/// healthy after this long is genuinely wedged and IS killed — the fix is
+/// not killing the merely-slow, not sparing the truly stuck. The proxy's
+/// starting surface (2026-09-01) reports its init phase on /health, which
+/// the timeout diagnostics include so "wedged WHERE" is answerable.
+pub const DEFAULT_STARTING_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Polling interval inside the healthy-poll loop. 250ms balances "user
 /// doesn't notice" with "child has time to bind the port".
@@ -660,6 +681,9 @@ pub struct StartOptions {
     /// (process_alive + HTTP /health 200). Default
     /// [`DEFAULT_HEALTHY_DEADLINE`].
     pub healthy_deadline: Duration,
+    /// Total budget once the child owns its port (see
+    /// [`DEFAULT_STARTING_DEADLINE`]); must be >= `healthy_deadline`.
+    pub starting_deadline: Duration,
 
     /// Where to redirect the proxy child's stderr. Typically the
     /// startup log (`~/.aikey/logs/aikey-proxy-startup.log`); can be
@@ -1086,6 +1110,40 @@ pub fn start_proxy_locked(
     result
 }
 
+/// One tick's verdict for the startup wait. Pure so the whole decision table
+/// is testable without clocks, sockets or children.
+///
+/// 🔴 The distinction this encodes (2026-09-01): "has not bound yet" and
+/// "bound but still initializing" are DIFFERENT states with different budgets.
+/// Collapsing them into one 5s deadline is what killed almost-ready proxies on
+/// slow machines — see DEFAULT_HEALTHY_DEADLINE's doc for the measurements.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartupWaitVerdict {
+    /// Keep polling.
+    KeepWaiting,
+    /// Child never bound its port within the bind budget — fail fast.
+    FailNeverBound,
+    /// Child bound but did not become healthy within the total budget — it is
+    /// genuinely wedged; fail (and the guard may kill it).
+    FailStuckStarting,
+}
+
+pub(crate) fn startup_wait_verdict(
+    elapsed: Duration,
+    ever_bound: bool,
+    bind_deadline: Duration,
+    starting_deadline: Duration,
+) -> StartupWaitVerdict {
+    if ever_bound {
+        if elapsed >= starting_deadline {
+            return StartupWaitVerdict::FailStuckStarting;
+        }
+    } else if elapsed >= bind_deadline {
+        return StartupWaitVerdict::FailNeverBound;
+    }
+    StartupWaitVerdict::KeepWaiting
+}
+
 fn start_proxy_locked_inner(
     password: &SecretString,
     opts: StartOptions,
@@ -1306,7 +1364,9 @@ fn start_proxy_locked_inner(
             other => other,
         });
     }
-    let deadline = Instant::now() + opts.healthy_deadline;
+    let started_at = Instant::now();
+    let mut ever_bound = false;
+    let mut still_starting_announced = false;
     loop {
         // `kill(pid, 0)` reports a zombie as alive on Unix. While startup owns
         // the Child handle, try_wait is the authoritative cross-platform check;
@@ -1365,11 +1425,57 @@ fn start_proxy_locked_inner(
                 listen_addr: opts.listen_addr,
             });
         }
-        if Instant::now() >= deadline {
-            return Err(StartError::HealthyTimeout {
-                stderr_log: stderr_log_path,
-                diagnostics: startup_probe_diagnostics(child_pid, port, opts.port_drift_enabled),
-            });
+        // Strict ownership (owners CONTAIN the child) — the permissive
+        // port_owned_by treats "cannot tell" as owned, which is right for the
+        // success path but would grant the extended budget on no evidence.
+        if !ever_bound {
+            if let Ok(owners) = proxy_proc::port_owner_pids(probe_port) {
+                ever_bound = owners.contains(&child_pid);
+            }
+        }
+        match startup_wait_verdict(
+            started_at.elapsed(),
+            ever_bound,
+            opts.healthy_deadline,
+            opts.starting_deadline,
+        ) {
+            StartupWaitVerdict::KeepWaiting => {}
+            StartupWaitVerdict::FailNeverBound => {
+                return Err(StartError::HealthyTimeout {
+                    stderr_log: stderr_log_path,
+                    diagnostics: startup_probe_diagnostics(child_pid, port, opts.port_drift_enabled),
+                });
+            }
+            StartupWaitVerdict::FailStuckStarting => {
+                // Genuinely wedged. Say WHERE if the starting surface knows.
+                let mut diagnostics =
+                    startup_probe_diagnostics(child_pid, port, opts.port_drift_enabled);
+                if let Some(phase) = proxy_proc::http_starting_phase(
+                    probe_port,
+                    Duration::from_millis(500),
+                ) {
+                    diagnostics.push_str(&format!(
+                        ", stuck_in_phase={phase} — the proxy bound its port and began \
+                         initializing but never finished this phase"
+                    ));
+                }
+                return Err(StartError::HealthyTimeout {
+                    stderr_log: stderr_log_path,
+                    diagnostics,
+                });
+            }
+        }
+        // Once bound, tell the human this is a WAIT, not a hang — the old
+        // silent 5s window is precisely what made slow and dead identical.
+        if ever_bound && !still_starting_announced && started_at.elapsed() >= opts.healthy_deadline {
+            still_starting_announced = true;
+            eprintln!(
+                "[aikey] aikey-proxy is still starting (port {} bound, pid {}); \
+                 waiting up to {:?} for it to finish initializing…",
+                probe_port,
+                child_pid,
+                opts.starting_deadline
+            );
         }
         std::thread::sleep(HEALTHY_POLL_INTERVAL);
     }
@@ -1558,6 +1664,87 @@ fn chrono_now_rfc3339() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    // ── 2026-09-01: two budgets, not one ───────────────────────────────────
+    //
+    // 🔴 The regression this table pins: a child that HAS bound its port is
+    // slow, not dead. The old single 5s deadline killed it (measured: 3881ms
+    // warm start on a healthy box; customer machines blew 5s every time and
+    // could never start the proxy again). The verdict is a pure function so
+    // the whole decision table sits here without clocks, sockets or children.
+    use crate::proxy_lifecycle::{startup_wait_verdict, StartupWaitVerdict};
+
+    #[test]
+    fn startup_wait_two_budget_table() {
+        use std::time::Duration;
+        let bind = Duration::from_secs(5);
+        let total = Duration::from_secs(60);
+        let s = |secs| Duration::from_secs(secs);
+
+        // Never bound: the old fast-fail is kept — crashes surface quickly.
+        assert_eq!(
+            startup_wait_verdict(s(4), false, bind, total),
+            StartupWaitVerdict::KeepWaiting
+        );
+        assert_eq!(
+            startup_wait_verdict(s(5), false, bind, total),
+            StartupWaitVerdict::FailNeverBound,
+            "a child that cannot even bind within the bind budget is crashed; \
+             waiting 60s for it would slow every genuine failure by 12x"
+        );
+
+        // Bound: the 5s mark must NOT fail any more — this exact row is the
+        // customer outage ("slow machine" → "can never start").
+        assert_eq!(
+            startup_wait_verdict(s(5), true, bind, total),
+            StartupWaitVerdict::KeepWaiting,
+            "bound-but-initializing was killed at 5s; that turned a 3.9s-warm \
+             start into a guaranteed failure on any colder machine"
+        );
+        assert_eq!(
+            startup_wait_verdict(s(59), true, bind, total),
+            StartupWaitVerdict::KeepWaiting
+        );
+        assert_eq!(
+            startup_wait_verdict(s(60), true, bind, total),
+            StartupWaitVerdict::FailStuckStarting,
+            "a bound child that cannot finish init in 60s is genuinely wedged; \
+             sparing it would leave a port squatted by a zombie forever"
+        );
+
+        // Binding late is fine as long as it happens: once bound, only the
+        // total budget applies (the bind budget is not retroactive).
+        assert_eq!(
+            startup_wait_verdict(s(30), true, bind, total),
+            StartupWaitVerdict::KeepWaiting
+        );
+    }
+
+    // The table above cannot see whether the LOOP consults it — cutting the
+    // `ever_bound` probe would leave the table green while reverting the fix
+    // (the per-part-fences-miss-the-wire lesson, three times this week).
+    #[test]
+    fn startup_loop_actually_consults_the_two_budget_verdict() {
+        // Scoped to the PRODUCTION half of the file: include_str! sees this
+        // test too, whose own table calls the function seven times — an
+        // unscoped count is satisfied by the test itself with the loop call
+        // deleted (caught before commit; fifth self-matching fence this week).
+        let src = include_str!("proxy_lifecycle.rs");
+        let production = &src[..src.find("mod tests").expect("tests module marker")];
+        let needle = format!("startup_wait_{}(", "verdict");
+        assert!(
+            production.matches(needle.as_str()).count() >= 2,
+            "the loop no longer consults startup_wait_verdict (only the \
+             definition remains) — the decision table is decoration and the \
+             single-deadline kill is back"
+        );
+        assert!(
+            production.contains(&format!("owners.contains(&child_{})", "pid")),
+            "ever_bound is no longer derived from STRICT port ownership; the \
+             permissive check would grant the extended budget on no evidence"
+        );
+    }
+
     use super::*;
 
     /// RFC3339 formatter sanity: format roundtrips through manual
