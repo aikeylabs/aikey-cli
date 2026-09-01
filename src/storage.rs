@@ -1739,7 +1739,10 @@ pub fn compliance_master_password_advanced() -> bool {
     };
     serde_json::from_str::<serde_json::Value>(&s)
         .ok()
-        .and_then(|v| v.get("password_tier").and_then(|t| t.as_str().map(|t| t == "advanced")))
+        .and_then(|v| {
+            v.get("password_tier")
+                .and_then(|t| t.as_str().map(|t| t == "advanced"))
+        })
         .unwrap_or(false)
 }
 

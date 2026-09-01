@@ -1454,17 +1454,20 @@ fn start_proxy_locked_inner(
             StartupWaitVerdict::FailNeverBound => {
                 return Err(StartError::HealthyTimeout {
                     stderr_log: stderr_log_path,
-                    diagnostics: startup_probe_diagnostics(child_pid, port, opts.port_drift_enabled),
+                    diagnostics: startup_probe_diagnostics(
+                        child_pid,
+                        port,
+                        opts.port_drift_enabled,
+                    ),
                 });
             }
             StartupWaitVerdict::FailStuckStarting => {
                 // Genuinely wedged. Say WHERE if the starting surface knows.
                 let mut diagnostics =
                     startup_probe_diagnostics(child_pid, port, opts.port_drift_enabled);
-                if let Some(phase) = proxy_proc::http_starting_phase(
-                    probe_port,
-                    Duration::from_millis(500),
-                ) {
+                if let Some(phase) =
+                    proxy_proc::http_starting_phase(probe_port, Duration::from_millis(500))
+                {
                     diagnostics.push_str(&format!(
                         ", stuck_in_phase={phase} — the proxy bound its port and began \
                          initializing but never finished this phase"
@@ -1486,9 +1489,7 @@ fn start_proxy_locked_inner(
             eprintln!(
                 "[aikey] aikey-proxy is still starting (port {} bound, pid {}); \
                  waiting up to {:?} for it to finish initializing…",
-                probe_port,
-                child_pid,
-                opts.starting_deadline
+                probe_port, child_pid, opts.starting_deadline
             );
         }
         std::thread::sleep(HEALTHY_POLL_INTERVAL);

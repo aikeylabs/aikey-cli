@@ -3352,7 +3352,10 @@ fn print_remote_diagnostics(json_mode: bool) -> serde_json::Value {
 
     if !json_mode {
         println!();
-        println!("{}", "远程诊断信息 (Remote diagnostics — safe to paste)".bold());
+        println!(
+            "{}",
+            "远程诊断信息 (Remote diagnostics — safe to paste)".bold()
+        );
         // 硬吊销留痕：这是「登录成功→一会儿变登录失效」类问题的第一手证据。
         if demotions.is_empty() {
             println!("  {} {}", "硬吊销:".dimmed(), "无记录".dimmed());
@@ -3360,15 +3363,30 @@ fn print_remote_diagnostics(json_mode: bool) -> serde_json::Value {
             println!("  {}", "硬吊销 (token demotions, newest last):".yellow());
             for e in demotions.iter().rev().take(5).rev() {
                 let at = e.get("at_ms").and_then(|v| v.as_i64()).unwrap_or(0);
-                let status = e.get("upstream_status").and_then(|v| v.as_i64()).unwrap_or(0);
-                let etype = e.get("upstream_error_type").and_then(|v| v.as_str()).unwrap_or("-");
+                let status = e
+                    .get("upstream_status")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let etype = e
+                    .get("upstream_error_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
                 let seat = e.get("seat_id").and_then(|v| v.as_str()).unwrap_or("");
-                let fp = e.get("fingerprint_prefix").and_then(|v| v.as_str()).unwrap_or("");
+                let fp = e
+                    .get("fingerprint_prefix")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 println!(
                     "    at_ms={} upstream={} type={} seat={} fp={}",
                     at,
-                    if status == 0 { "旧版无证据".to_string() } else { status.to_string() },
-                    etype, seat, fp
+                    if status == 0 {
+                        "旧版无证据".to_string()
+                    } else {
+                        status.to_string()
+                    },
+                    etype,
+                    seat,
+                    fp
                 );
             }
         }
@@ -3376,14 +3394,20 @@ fn print_remote_diagnostics(json_mode: bool) -> serde_json::Value {
         if errors.is_empty() {
             println!("  {} {}", "最近错误:".dimmed(), "无记录".dimmed());
         } else {
-            println!("  {}", "最近错误响应 (newest last, full tree: doctor --last-errors):".yellow());
+            println!(
+                "  {}",
+                "最近错误响应 (newest last, full tree: doctor --last-errors):".yellow()
+            );
             for e in errors.iter().rev().take(5).rev() {
                 let at = e.get("at_ms").and_then(|v| v.as_i64()).unwrap_or(0);
                 let status = e.get("status").and_then(|v| v.as_i64()).unwrap_or(0);
                 let origin = e.get("origin").and_then(|v| v.as_str()).unwrap_or("");
                 let code = e.get("code").and_then(|v| v.as_str()).unwrap_or("");
                 let trace = e.get("trace_id").and_then(|v| v.as_str()).unwrap_or("");
-                println!("    at_ms={} status={} origin={} code={} trace={}", at, status, origin, code, trace);
+                println!(
+                    "    at_ms={} status={} origin={} code={} trace={}",
+                    at, status, origin, code, trace
+                );
             }
         }
     }
