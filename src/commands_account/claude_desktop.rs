@@ -883,9 +883,7 @@ pub(crate) fn reconcile_active_at(
         // Our own residue takes the consent path like Official does: there is
         // no third party to surprise, and a fresh takeover overwrites the
         // orphan cleanly (2026-08-31).
-        DesktopState::Official
-        | DesktopState::OrphanedThirdParty
-        | DesktopState::ForeignActive => {
+        DesktopState::Official | DesktopState::OrphanedThirdParty | DesktopState::ForeignActive => {
             match crate::global_config::get_claude_desktop_consent()
                 .unwrap_or(None)
                 .as_deref()
@@ -1735,7 +1733,11 @@ mod tests {
         );
 
         // 真 Foreign：别人的 appliedId 在
-        std::fs::write(&paths.meta, r#"{"appliedId":"cc-switch-0000-0000-0000-000000000000"}"#).unwrap();
+        std::fs::write(
+            &paths.meta,
+            r#"{"appliedId":"cc-switch-0000-0000-0000-000000000000"}"#,
+        )
+        .unwrap();
         assert_eq!(
             detect_state(&paths),
             DesktopState::ForeignActive,
