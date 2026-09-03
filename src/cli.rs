@@ -219,6 +219,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         no_hook: bool,
     },
+    /// Host a local MCP server through the gateway (tools for your Agent,
+    /// with the credential kept in the vault instead of your client config)
+    #[command(subcommand)]
+    Mcp(McpCommands),
     /// Show all personal, team, and OAuth keys (alias for `aikey key list`)
     #[command(alias = "ls", display_order = 2)]
     List,
@@ -1495,6 +1499,21 @@ pub(crate) fn command_name(cmd: Option<&Commands>) -> String {
         None => "unknown".to_string(),
         Some(c) => match c {
             Commands::Init => "init".to_string(),
+            // 🔴 The SUBcommand is named, never its arguments: a backend name is
+            // user data and a credential alias is a hint about their
+            // infrastructure. Neither belongs in a log field.
+            Commands::Mcp(sub) => format!(
+                "mcp.{}",
+                match sub {
+                    McpCommands::Add { .. } => "add",
+                    McpCommands::List => "list",
+                    McpCommands::Remove { .. } => "remove",
+                    McpCommands::Test { .. } => "test",
+                    McpCommands::Scan => "scan",
+                    McpCommands::Review { .. } => "review",
+                    McpCommands::Adopt { .. } => "adopt",
+                }
+            ),
             Commands::Config { action } => match action {
                 ConfigAction::TimeZone { .. } => "config.time-zone".to_string(),
                 ConfigAction::Language { .. } => "config.language".to_string(),
@@ -3477,4 +3496,124 @@ mod tests {
             Some(Commands::Web { ref page, .. }) if page.as_deref() == Some("status")
         ));
     }
+}
+
+/// `aikey mcp …` — hosting local MCP servers (P5 task 5.6, design §5.3).
+///
+/// 🔴 Three of the four never touch the vault: `list` and `remove` are config
+/// edits, and `test` asks the running gateway (which already holds the derived
+/// key) rather than decrypting a second time. Only `add --secret-stdin`, which
+/// is genuinely storing a new secret, asks for the Master Password.
+#[derive(Subcommand, Debug)]
+pub enum McpCommands {
+    /// Register a local MCP server and expose it through the gateway
+    Add {
+        /// Short name for this server, e.g. `postgres`. Also its id.
+        name: String,
+        /// The executable to run, e.g. `npx`.
+        #[arg(long, value_name = "COMMAND")]
+        command: String,
+        /// One argument to the command. Repeat for each, e.g.
+        /// `--arg -y --arg @modelcontextprotocol/server-postgres`.
+        ///
+        /// Repeated rather than one quoted string so nothing has to guess how
+        /// to split it — a path with a space in it is why that guessing goes
+        /// wrong.
+        /// 🔴 allow_hyphen_values: the canonical invocation in the design is
+        /// `npx -y <package>`, and without this clap reads `-y` as one of its
+        /// own flags and refuses the command. The very first example in the
+        /// documentation would not have run.
+        #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Vault alias of the credential this server needs.
+        ///
+        /// If the alias already exists, this command only records the
+        /// reference and does NOT ask for your Master Password.
+        #[arg(long, value_name = "ALIAS")]
+        credential: Option<String>,
+        /// Environment variable the credential is passed to the server as,
+        /// e.g. `PGPASSWORD`. Required whenever --credential is given.
+        #[arg(long, value_name = "VAR")]
+        credential_env: Option<String>,
+        /// Read a NEW secret from stdin and store it in the vault under
+        /// --credential. This is the only form that asks for your Master
+        /// Password.
+        ///
+        /// 🔴 There is deliberately no `--secret <value>` flag: a secret on the
+        /// command line is visible to every other user on the machine via `ps`
+        /// and lands in your shell history — the exposure this whole feature
+        /// exists to remove.
+        #[arg(long)]
+        secret_stdin: bool,
+        /// Overwrite an existing backend with the same name.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// List the configured local MCP servers
+    #[command(alias = "ls")]
+    List,
+    /// Remove a local MCP server (the vault credential is kept)
+    #[command(alias = "rm")]
+    Remove {
+        /// Name of the backend to remove.
+        name: String,
+    },
+    /// Ask the running gateway how each hosted server is doing
+    Test {
+        /// Only report this backend (omit for all).
+        name: Option<String>,
+    },
+    /// Report the MCP servers already configured on this machine, and which
+    /// of them carry a credential in cleartext.
+    ///
+    /// 🔴 Read-only. It changes nothing, opens no vault and asks for no
+    /// password — run it before deciding whether to run `aikey mcp adopt`.
+    Scan,
+    /// Move the credentials `aikey mcp scan` found into the vault, and rewrite
+    /// the config that held them.
+    ///
+    /// 🔴 Run `aikey mcp scan` first. This edits files in your home directory,
+    /// and once the plaintext is replaced it is gone.
+    Adopt {
+        /// Only adopt this server. Repeat for several; omit for all of them.
+        #[arg(long = "server", value_name = "NAME")]
+        server: Vec<String>,
+        /// Which of your keys' route tokens the rewritten config should carry.
+        /// Omit to use the first one.
+        #[arg(long, value_name = "ALIAS")]
+        key: Option<String>,
+        /// Show what would happen and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Do not ask for confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// See what changed on the servers you host, and decide what to do.
+    ///
+    /// A tool's description is an instruction handed to the model, so a tool
+    /// whose server changed it is HELD until you look. This is where you look.
+    Review {
+        /// Accept this server: publish its tools if this is its first review,
+        /// and take its current definitions if they changed.
+        #[arg(long, value_name = "SERVER")]
+        accept: Option<String>,
+        /// With --accept, leave these tools out. Everything else is accepted.
+        ///
+        /// 🔴 The default is to accept ALL of them, on purpose: a review that
+        /// makes you tick forty boxes is one people abandon, and abandoning it
+        /// leaves the credentials where they were.
+        #[arg(long = "except", value_name = "TOOL", requires = "accept")]
+        except: Vec<String>,
+        /// Mark one tool as read-only: if its server changes, it keeps serving
+        /// the version you accepted instead of disappearing.
+        ///
+        /// Written as <server>/<tool>, e.g. postgres/query.
+        #[arg(long, value_name = "SERVER/TOOL")]
+        read_only: Option<String>,
+        /// Mark one tool as making changes (the default): if its server
+        /// changes, it is hidden and refused until you accept.
+        #[arg(long, value_name = "SERVER/TOOL")]
+        write: Option<String>,
+    },
 }
